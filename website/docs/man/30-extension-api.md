@@ -151,7 +151,25 @@ Built-ins stay TUI-local when they need immediate UI/session behavior. Extension
 
 ### UI focus
 
-`ctx.ui.render({ focus = true, target = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. `input` nodes inside a focused overlay are edited by the TUI itself; each edit emits a structured `ui` event with `type = "change"`, `node`, `value`, and optional `action`, and Enter emits `type = "submit"`. Extensions should update their own state from those events and re-render the input value. Overlays without `focus = true`, including toasts and status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
+`ctx.ui.render({ focus = true, target = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. `input` nodes inside a focused overlay are edited by the TUI itself; each edit emits a structured `ui` event with `type = "change"`, `node`, `value`, and optional `action`, and Enter emits `type = "submit"`. Extensions should update their own state from those events and re-render the input value. Overlays without `focus = true`, including status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
+
+Notifications use the fidget-style API instead of `ctx.ui.render` targets:
+
+```lua
+ctx.ui.notify("Ready for input", {
+  id = "agent-ready",     -- replacement key
+  group = "agent",        -- compact left label when no title is set
+  level = "info",         -- debug/info/warn/error/success
+  title = "Agent",        -- optional label
+  annote = "until input", -- optional right-side note
+  progress = false,
+  done = false,
+})
+
+ctx.ui.notify_clear("agent-ready")
+```
+
+Notifications render as a quiet bottom-right stack, replacing previous entries with the same id. Use them for transient liveness and status; use `ctx.ui.render` for structured/persistent surfaces.
 
 UI render trees support `view`, `text`, `input`, `chip`, `progress`, `separator`, and `surface` nodes. Visual frame chrome is composed on `view.style.chrome`; top-level render specs describe placement/focus only. The full text-node API, including wrapping, spans, ANSI/Markdown formats, links, and selection hints, is documented in [Context](context.html#ui-text-nodes). `surface` remains available for framebuffer graphs.
 

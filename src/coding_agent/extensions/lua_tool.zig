@@ -1806,7 +1806,7 @@ test "extension command context publishes host-owned editor buffer actions" {
     try testing.expectEqual(@as(usize, 0), store.editor_actions.items.len);
 }
 
-test "ctx.ui v3 exposes only render and frame" {
+test "ctx.ui v3 exposes render frame and notifications" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1837,10 +1837,11 @@ test "ctx.ui v3 exposes only render and frame" {
         \\      count = count + 1
         \\      assert(type(v) == "function")
         \\    end
-        \\    assert(count == 2)
-        \\    assert(seen.render and seen.frame)
+        \\    assert(count == 5)
+        \\    assert(seen.render and seen.frame and seen.notify and seen.notify_clear and seen.progress)
         \\    ctx.ui.render({ id = "demo" })
         \\    ctx.ui.frame({ id = "demo" })
+        \\    ctx.ui.notify("demo", { id = "notify" })
         \\    ctx.ui.render("not-a-table")
         \\    ctx.ui.frame(nil)
         \\  end,
@@ -1848,7 +1849,7 @@ test "ctx.ui v3 exposes only render and frame" {
     , "register_ui_v3_perimeter_command");
 
     try runner.dispatchCommand("ui-v3-perimeter", "");
-    try testing.expectEqual(@as(usize, 1), store.render_count);
+    try testing.expectEqual(@as(usize, 2), store.render_count);
     try testing.expectEqual(@as(usize, 1), store.frame_count);
 }
 
@@ -2229,7 +2230,7 @@ test "extension command rejects arbitrary coroutine yield" {
     try testing.expectError(error.UnexpectedYield, runner.dispatchCommand("bad-yield", ""));
 }
 
-test "ctx.ui.render parses v3 target tables" {
+test "ctx.ui.notify publishes notification render" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -2248,23 +2249,19 @@ test "ctx.ui.render parses v3 target tables" {
     defer runner.endLoadContext();
     try state.doString(
         \\zi.command({
-        \\  name = "ui-target-table",
-        \\  description = "ui-target-table",
+        \\  name = "ui-notify",
+        \\  description = "ui-notify",
         \\  handler = function(_, ctx)
-        \\    ctx.ui.render({ id = "mission", target = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" }, root = { type = "text", text = "go" } })
-        \\    ctx.ui.render({ id = "notice", target = { kind = "toast", anchor = "top_right", lifetime = "until_input" }, root = { type = "text", text = "hi" } })
+        \\    ctx.ui.notify("Ready for input", { id = "agent-ready", group = "agent", level = "success", annote = "until input" })
         \\  end,
         \\})
-    , "ui_target_table");
+    , "ui_notify");
 
-    try runner.dispatchCommand("ui-target-table", "");
-    try testing.expectEqual(@as(usize, 2), store.render_specs.items.len);
-    try testing.expectEqual(extension_ui.UiTarget.overlay, store.render_specs.items[0].target);
-    try testing.expectEqual(@as(f32, 92), store.render_specs.items[0].target_options.width.?.percent);
-    try testing.expectEqual(extension_ui.UiBackdrop.dim, store.render_specs.items[0].target_options.backdrop.?);
-    try testing.expectEqual(extension_ui.UiTarget.toast, store.render_specs.items[1].target);
-    try testing.expectEqual(extension_ui.UiAnchor.top_right, store.render_specs.items[1].target_options.anchor.?);
-    try testing.expectEqual(extension_ui.UiLifetime.until_input, store.render_specs.items[1].target_options.lifetime.?);
+    try runner.dispatchCommand("ui-notify", "");
+    try testing.expectEqual(@as(usize, 1), store.render_specs.items.len);
+    try testing.expectEqual(extension_ui.UiTarget.notification, store.render_specs.items[0].target);
+    try testing.expectEqualStrings("agent-ready", store.render_specs.items[0].id);
+    try testing.expect(store.render_specs.items[0].root != null);
 }
 
 test "todo command can call ctx.ui.render perimeter" {

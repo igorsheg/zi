@@ -27,7 +27,7 @@ pub fn publishPending(self: *Interactive) void {
 
 pub fn applyRenderUpdates(self: *Interactive, updates: []const extension_ui.RenderSpec) void {
     for (updates) |update| self.extension_ui_state.applyRender(update);
-    syncExtensionToastOverlay(self);
+    syncExtensionNotificationOverlay(self);
     syncExtensionOverlay(self);
     self.tui.dirty = true;
 }
@@ -72,12 +72,13 @@ pub fn applyCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.Ex
     self.tui.dirty = true;
 }
 
-fn extensionToastOptions(self: *Interactive) overlay_mod.OverlayOptions {
+fn extensionNotificationOptions(self: *Interactive) overlay_mod.OverlayOptions {
     var options = overlay_mod.OverlayPresets.topToast();
-    options.width = 40;
+    options.anchor = .bottom_right;
+    options.width = 44;
     options.max_height = null;
     options.max_height_percent = 40;
-    return self.extension_ui_state.syncOverlayOptions(.toast, options);
+    return self.extension_ui_state.syncOverlayOptions(.notification, options);
 }
 
 fn extensionOverlayOptions(self: *Interactive) overlay_mod.OverlayOptions {
@@ -86,16 +87,16 @@ fn extensionOverlayOptions(self: *Interactive) overlay_mod.OverlayOptions {
     return self.extension_ui_state.syncOverlayOptions(.overlay, options);
 }
 
-pub fn syncExtensionToastOverlay(self: *Interactive) void {
-    if (self.extension_ui_state.hasToastViews()) {
-        if (self.extension_toast_overlay) |handle| {
-            handle.setOptions(extensionToastOptions(self));
+pub fn syncExtensionNotificationOverlay(self: *Interactive) void {
+    if (self.extension_ui_state.hasNotificationViews()) {
+        if (self.extension_notification_overlay) |handle| {
+            handle.setOptions(extensionNotificationOptions(self));
             handle.setHidden(false);
         } else {
-            self.extension_toast_overlay = self.tui.showOverlay(self.extension_ui_state.toastComponent(), extensionToastOptions(self));
+            self.extension_notification_overlay = self.tui.showOverlay(self.extension_ui_state.notificationComponent(), extensionNotificationOptions(self));
         }
-    } else if (self.extension_toast_overlay) |handle| {
-        self.extension_toast_overlay = null;
+    } else if (self.extension_notification_overlay) |handle| {
+        self.extension_notification_overlay = null;
         handle.hide();
     }
 }

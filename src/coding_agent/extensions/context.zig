@@ -159,11 +159,17 @@ fn pushUiApi(
         return;
     }
 
-    c.lua_createtable(L, 0, 2);
+    c.lua_createtable(L, 0, 5);
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiRender);
     c.lua_setfield(L, -2, "render");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiFrame);
     c.lua_setfield(L, -2, "frame");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotify);
+    c.lua_setfield(L, -2, "notify");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotifyClear);
+    c.lua_setfield(L, -2, "notify_clear");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiProgress);
+    c.lua_setfield(L, -2, "progress");
 }
 
 fn pushEditorApi(
@@ -266,6 +272,109 @@ fn ctxUiFrame(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn ctxUiNotify(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    publishNotifyFromArgs(L) catch {};
+    return 0;
+}
+
+fn ctxUiNotifyClear(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    if (c.lua_type(L, 1) == c.LUA_TSTRING) {
+        c.lua_createtable(L, 0, 2);
+        c.lua_pushvalue(L, 1);
+        c.lua_setfield(L, -2, "id");
+        c.lua_pushboolean(L, 1);
+        c.lua_setfield(L, -2, "clear");
+        _ = c.lua_pushliteral(L, "");
+        c.lua_replace(L, 1);
+        c.lua_replace(L, 2);
+    } else if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        c.lua_pushboolean(L, 1);
+        c.lua_setfield(L, 1, "clear");
+        _ = c.lua_pushliteral(L, "");
+        c.lua_insert(L, 1);
+    }
+    publishNotifyFromArgs(L) catch {};
+    return 0;
+}
+
+fn ctxUiProgress(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    // ctx.ui.progress({ id=..., message=... }) publishes an in-flight notification.
+    if (c.lua_type(L, 1) == c.LUA_TTABLE) {
+        _ = c.lua_getfield(L, 1, "message");
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) {
+            c.lua_pop(L, 1);
+            _ = c.lua_pushliteral(L, "working");
+        }
+        c.lua_pushvalue(L, 1);
+        c.lua_pushboolean(L, 1);
+        c.lua_setfield(L, -2, "progress");
+        c.lua_remove(L, 1);
+        publishNotifyFromArgs(L) catch {};
+    }
+    c.lua_createtable(L, 0, 3);
+    pushUiMethod(L, stateRunnerFromUpvalue(L), stateOwnerFromUpvalue(L), &ctxUiNotify);
+    c.lua_setfield(L, -2, "update");
+    pushUiMethod(L, stateRunnerFromUpvalue(L), stateOwnerFromUpvalue(L), &ctxUiNotify);
+    c.lua_setfield(L, -2, "finish");
+    pushUiMethod(L, stateRunnerFromUpvalue(L), stateOwnerFromUpvalue(L), &ctxUiNotifyClear);
+    c.lua_setfield(L, -2, "clear");
+    return 1;
+}
+
+fn publishNotifyFromArgs(L: *c.lua_State) !void {
+    const runner = stateRunnerFromUpvalue(L);
+    const bound = switch (runner.runtime) {
+        .bound => |bound| bound,
+        .stub => return,
+    };
+    const callback = bound.publish_render orelse return;
+
+    var arena = std.heap.ArenaAllocator.init(runner.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const message = if (c.lua_type(L, 1) == c.LUA_TSTRING) luaString(L, 1) orelse "" else "";
+    const opts_idx: c_int = if (c.lua_type(L, 2) == c.LUA_TTABLE) c.lua_absindex(L, 2) else 0;
+    const fallback_id = if (message.len > 0) message else "notification";
+    const id = if (opts_idx != 0) try readStringFieldLimit(aa, L, opts_idx, "id", fallback_id, ui_id_bytes) else try aa.dupe(u8, fallback_id[0..@min(fallback_id.len, ui_id_bytes)]);
+    const level = if (opts_idx != 0) try readNotifyLevelField(L, opts_idx, "level") else extension_ui.NotifyLevel.info;
+    const group = if (opts_idx != 0) try readOptionalStringFieldLimit(aa, L, opts_idx, "group", ui_id_bytes) else null;
+    const title = if (opts_idx != 0) try readOptionalStringFieldLimit(aa, L, opts_idx, "title", ui_text_bytes) else null;
+    const annote = if (opts_idx != 0) try readOptionalStringFieldLimit(aa, L, opts_idx, "annote", ui_text_bytes) else null;
+    const clear = if (opts_idx != 0) readBoolField(L, opts_idx, "clear", false) else false;
+    const done = if (opts_idx != 0) readBoolField(L, opts_idx, "done", false) else false;
+    const progress = if (opts_idx != 0) readBoolField(L, opts_idx, "progress", false) else false;
+    var lifetime = if (opts_idx != 0) notifyLifetime(readOptionalU32Field(L, opts_idx, "ttl_ms") orelse readOptionalSecondsAsMsField(L, opts_idx, "ttl")) else @import("../../tui/notifications.zig").Lifetime.manual;
+    if (lifetime == .manual and done) lifetime = @import("../../tui/notifications.zig").Lifetime.doneDefault();
+    const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+
+    const notify = extension_ui.NotifySpec{ .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)), .generation = runner.generation, .id = id, .message = try aa.dupe(u8, message), .group = group, .title = title, .annote = annote, .level = level, .progress = progress, .done = done, .clear = clear, .created_ns = now_ns, .updated_ns = now_ns, .lifetime = lifetime };
+    const root = if (notify.clear) null else try notifyNode(aa, notify);
+    const spec = extension_ui.RenderSpec{ .state_owner_id = notify.state_owner_id, .generation = notify.generation, .id = notify.id, .target = .notification, .order = 0, .remove = notify.clear, .root = root, .notification = notify };
+    try callback(bound.session, spec);
+}
+
+fn notifyLifetime(ttl_ms: ?u32) @import("../../tui/notifications.zig").Lifetime {
+    return if (ttl_ms) |ms| .{ .ttl_ms = ms } else .manual;
+}
+
+fn notifyNode(aa: std.mem.Allocator, notify: extension_ui.NotifySpec) !extension_ui.UiNode {
+    const icon = switch (notify.level) {
+        .debug => "·",
+        .info => "●",
+        .warn => "▲",
+        .error_ => "✖",
+        .success => "✓",
+    };
+    const prefix = if (notify.progress and !notify.done) "◐" else icon;
+    const label = if (notify.title) |title| title else if (notify.group) |group| group else prefix;
+    const text = if (notify.annote) |annote| try std.fmt.allocPrint(aa, "{s} {s} — {s}", .{ label, notify.message, annote }) else try std.fmt.allocPrint(aa, "{s} {s}", .{ label, notify.message });
+    return .{ .text = .{ .text = text, .style = .{ .tone = extension_ui.notificationTone(notify), .dim = notify.done }, .wrap = .word, .max_lines = 2 } };
+}
+
 fn publishRenderFromArgs(L: *c.lua_State) !void {
     if (c.lua_type(L, 1) != c.LUA_TTABLE) return;
     const runner = stateRunnerFromUpvalue(L);
@@ -360,10 +469,23 @@ fn parseTargetKindField(L: *c.lua_State, idx: c_int) !extension_ui.UiTarget {
 fn parseTargetKind(value: []const u8) !extension_ui.UiTarget {
     if (std.mem.eql(u8, value, "overlay")) return .overlay;
     if (std.mem.eql(u8, value, "status")) return .status;
-    if (std.mem.eql(u8, value, "toast")) return .toast;
+    if (std.mem.eql(u8, value, "notification")) return .notification;
     if (std.mem.eql(u8, value, "editor.border.top")) return .editor_border_top;
     if (std.mem.eql(u8, value, "editor.border.bottom")) return .editor_border_bottom;
     return error.InvalidUiTarget;
+}
+
+fn readNotifyLevelField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !extension_ui.NotifyLevel {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .info;
+    const value = luaString(L, -1) orelse return .info;
+    if (std.mem.eql(u8, value, "debug")) return .debug;
+    if (std.mem.eql(u8, value, "info")) return .info;
+    if (std.mem.eql(u8, value, "warn") or std.mem.eql(u8, value, "warning")) return .warn;
+    if (std.mem.eql(u8, value, "error") or std.mem.eql(u8, value, "danger")) return .error_;
+    if (std.mem.eql(u8, value, "success")) return .success;
+    return error.InvalidNotifyLevel;
 }
 
 fn readAnchorField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiAnchor {
@@ -733,6 +855,14 @@ fn readOptionalU32Field(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?u32 {
     if (c.lua_type(L, -1) != c.LUA_TNUMBER) return null;
     const raw: i64 = @intCast(c.lua_tointegerx(L, -1, null));
     return if (raw < 0) null else @intCast(raw);
+}
+fn readOptionalSecondsAsMsField(L: *c.lua_State, idx: c_int, field: [:0]const u8) ?u32 {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TNUMBER) return null;
+    const raw = c.lua_tonumberx(L, -1, null);
+    if (!std.math.isFinite(raw) or raw < 0) return null;
+    return @intFromFloat(@min(raw * 1000.0, @as(f64, @floatFromInt(std.math.maxInt(u32)))));
 }
 fn readFloatField(L: *c.lua_State, idx: c_int, field: [:0]const u8, default: f32) f32 {
     _ = c.lua_getfield(L, idx, field.ptr);

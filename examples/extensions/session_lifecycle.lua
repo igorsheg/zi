@@ -1,6 +1,19 @@
 local function ui_toast(ctx, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = "notice", target = { kind = "toast", anchor = "top_right", lifetime = "until_input" }, root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
+  if not (ctx and ctx.ui and ctx.ui.notify) then return end
+  local opts = { id = "notice", level = "info" }
+  if type(tone) == "string" then opts.level = tone end
+  if type(tone) == "table" then
+    opts.level = tone.level or tone.kind or tone.tone or opts.level
+    opts.id = tone.id or opts.id
+    opts.group = tone.group
+    opts.title = tone.title
+    opts.annote = tone.annote
+    opts.progress = tone.progress
+    opts.done = tone.done
+  end
+  if opts.level == "warning" then opts.level = "warn" end
+  if opts.level == "danger" then opts.level = "error" end
+  ctx.ui.notify(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
@@ -28,12 +41,21 @@ local function ui_report_spec(ctx, spec)
 end
 
 local function ui_toast(ctx, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
-    id = "notice",
-    target = { kind = "toast", anchor = "top_right", lifetime = "until_input" },
-    root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } },
-  })
+  if not (ctx and ctx.ui and ctx.ui.notify) then return end
+  local opts = { id = "notice", level = "info" }
+  if type(tone) == "string" then opts.level = tone end
+  if type(tone) == "table" then
+    opts.level = tone.level or tone.kind or tone.tone or opts.level
+    opts.id = tone.id or opts.id
+    opts.group = tone.group
+    opts.title = tone.title
+    opts.annote = tone.annote
+    opts.progress = tone.progress
+    opts.done = tone.done
+  end
+  if opts.level == "warning" then opts.level = "warn" end
+  if opts.level == "danger" then opts.level = "error" end
+  ctx.ui.notify(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)

@@ -37,7 +37,7 @@ pub const ExtensionUiState = struct {
     input_states: std.StringHashMap(TextInput),
     theme: *const Theme,
     status_component: TargetComponent,
-    toast_component: TargetComponent,
+    notification_component: TargetComponent,
     overlay_component: TargetComponent,
     editor_border_top_component: TargetComponent,
     editor_border_bottom_component: TargetComponent,
@@ -50,7 +50,7 @@ pub const ExtensionUiState = struct {
             .input_states = std.StringHashMap(TextInput).init(allocator),
             .theme = themes_builtin.dark(),
             .status_component = .{ .target = .status },
-            .toast_component = .{ .target = .toast },
+            .notification_component = .{ .target = .notification },
             .overlay_component = .{ .target = .overlay },
             .editor_border_top_component = .{ .target = .editor_border_top },
             .editor_border_bottom_component = .{ .target = .editor_border_bottom },
@@ -93,9 +93,9 @@ pub const ExtensionUiState = struct {
         return self.status_component.component();
     }
 
-    pub fn toastComponent(self: *ExtensionUiState) Component {
-        self.toast_component.state = self;
-        return self.toast_component.component();
+    pub fn notificationComponent(self: *ExtensionUiState) Component {
+        self.notification_component.state = self;
+        return self.notification_component.component();
     }
 
     pub fn overlayComponent(self: *ExtensionUiState) Component {
@@ -113,8 +113,8 @@ pub const ExtensionUiState = struct {
         return self.editor_border_bottom_component.component();
     }
 
-    pub fn hasToastViews(self: *ExtensionUiState) bool {
-        return self.hasTargetViews(.toast);
+    pub fn hasNotificationViews(self: *ExtensionUiState) bool {
+        return self.hasTargetViews(.notification);
     }
 
     pub fn hasOverlayViews(self: *ExtensionUiState) bool {
@@ -182,7 +182,14 @@ pub const ExtensionUiState = struct {
                 self.allocator.free(key);
                 return;
             }
-            const cloned = extension_ui.RenderSpec.clone(self.allocator, render) catch {
+            var render_for_clone = render;
+            if (render_for_clone.notification) |*n| {
+                if (entry.value_ptr.spec.notification) |old| {
+                    n.created_ns = old.created_ns;
+                    n.count = if (std.mem.eql(u8, n.message, old.message)) old.count + 1 else 1;
+                }
+            }
+            const cloned = extension_ui.RenderSpec.clone(self.allocator, render_for_clone) catch {
                 self.allocator.free(key);
                 return;
             };
@@ -207,6 +214,27 @@ pub const ExtensionUiState = struct {
             self.allocator.free(key);
         };
         syncInputValues(self, render);
+    }
+
+    pub fn tickNotifications(self: *ExtensionUiState, now_ns: i128) bool {
+        var keys = std.ArrayList([]const u8).empty;
+        defer keys.deinit(self.allocator);
+        var has_active_progress = false;
+        var it = self.views.iterator();
+        while (it.next()) |entry| {
+            const notify = entry.value_ptr.spec.notification orelse continue;
+            if (notify.progress and !notify.done) has_active_progress = true;
+            if (notify.ttlMs()) |ttl_ms| {
+                const age_ns = now_ns - notify.updated_ns;
+                if (age_ns >= @as(i128, ttl_ms) * std.time.ns_per_ms) keys.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (keys.items) |k| {
+            var old = self.views.fetchRemove(k) orelse continue;
+            self.allocator.free(old.key);
+            old.value.deinit(self.allocator);
+        }
+        return keys.items.len > 0 or has_active_progress;
     }
 
     pub fn applyFrame(self: *ExtensionUiState, frame: extension_ui.UiFrame) void {
@@ -393,6 +421,7 @@ const TargetComponent = struct {
         self.width_method = region.buf.width_method;
         const ordered = self.orderedViews() catch return;
         defer self.state.allocator.free(ordered);
+        if (self.target == .notification) return renderNotifications(self, ordered, region);
         var y: u32 = 0;
         for (ordered) |view| {
             if (y >= region.height) break;
@@ -405,6 +434,7 @@ const TargetComponent = struct {
     pub fn measure(self: *TargetComponent, width: u32) Measurement {
         const ordered = self.orderedViews() catch return .{ .min_height = 0, .preferred_height = 0 };
         defer self.state.allocator.free(ordered);
+        if (self.target == .notification) return .{ .min_height = if (ordered.len > 0) 1 else 0, .preferred_height = @intCast(@min(ordered.len, 12)) };
         var total: u32 = 0;
         for (ordered) |view| {
             if (view.spec.root) |root| total += measureNode(self.state, root, width, self.width_method);
@@ -416,6 +446,50 @@ const TargetComponent = struct {
         return self.state.orderedTargetViews(self.target);
     }
 };
+
+fn renderNotifications(component: *TargetComponent, ordered: []*ViewRecord, region: Region) void {
+    if (region.width == 0 or region.height == 0) return;
+    const state = component.state;
+    const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+    const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+    const visible = @min(ordered.len, region.height);
+    const start = ordered.len - visible;
+    var y: u32 = 0;
+    var last_group: ?[]const u8 = null;
+    for (ordered[start..]) |view| {
+        if (y >= region.height) break;
+        const notify = view.spec.notification orelse {
+            if (view.spec.root) |root| renderNode(state, view.spec, root, region.sub(0, y, region.width, 1));
+            y += 1;
+            continue;
+        };
+        const group = notify.group orelse "";
+        const show_group = last_group == null or !std.mem.eql(u8, last_group.?, group);
+        last_group = group;
+        const frame_idx: usize = @intCast(@mod(@divTrunc(now_ns, 120 * std.time.ns_per_ms), frames.len));
+        const icon = if (notify.progress and !notify.done) frames[frame_idx] else switch (notify.level) {
+            .debug => "·",
+            .info => "●",
+            .warn => "▲",
+            .error_ => "✖",
+            .success => "✓",
+        };
+        const label = if (notify.title) |title| title else if (show_group and group.len > 0) group else icon;
+        const suffix = if (notify.annote) |annote| annote else if (notify.done) "done" else "";
+        const rendered_message = if (notify.count > 1)
+            std.fmt.allocPrint(state.allocator, "({d}x) {s}", .{ notify.count, notify.message }) catch notify.message
+        else
+            notify.message;
+        defer if (rendered_message.ptr != notify.message.ptr) state.allocator.free(rendered_message);
+        const text = if (suffix.len > 0)
+            std.fmt.allocPrint(state.allocator, "{s} {s} — {s}", .{ label, rendered_message, suffix }) catch notify.message
+        else
+            std.fmt.allocPrint(state.allocator, "{s} {s}", .{ label, rendered_message }) catch notify.message;
+        defer if (text.ptr != notify.message.ptr) state.allocator.free(text);
+        renderText(state, region.sub(0, y, region.width, 1), .{ .text = text, .style = .{ .tone = extension_ui.notificationTone(notify), .dim = notify.done }, .wrap = .word, .max_lines = 1 });
+        y += 1;
+    }
+}
 
 fn applyTargetOptions(options: *overlay_mod.OverlayOptions, target: extension_ui.UiTargetOptions) void {
     if (target.width) |v| applyWidth(options, v);
@@ -1497,31 +1571,31 @@ test "extension ui surface uses keyed frame lookup" {
     try std.testing.expect(buf.get(0, 0).fg.eql(Color.rgb(255, 0, 0)));
 }
 
-test "extension ui sorts toast views and filters status" {
+test "extension ui sorts notification views and filters status" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .target = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
-    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .target = .toast, .order = 2, .root = .{ .text = .{ .text = "b" } } });
-    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .target = .toast, .order = 1, .root = .{ .text = .{ .text = "z" } } });
-    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .toast, .order = 1, .root = .{ .text = .{ .text = "a" } } });
+    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .target = .notification, .order = 2, .root = .{ .text = .{ .text = "b" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .target = .notification, .order = 1, .root = .{ .text = .{ .text = "z" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .notification, .order = 1, .root = .{ .text = .{ .text = "a" } } });
 
-    try std.testing.expect(state.hasToastViews());
+    try std.testing.expect(state.hasNotificationViews());
     var buf = try Buffer.init(std.testing.allocator, 4, 3, .wcwidth);
     defer buf.deinit();
-    var comp = state.toastComponent();
+    var comp = state.notificationComponent();
     comp.render(buf.region());
     try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
     try std.testing.expectEqual(@as(u21, 'z'), cpAt(&buf, 0, 1));
     try std.testing.expectEqual(@as(u21, 'b'), cpAt(&buf, 0, 2));
 }
 
-test "extension ui remove final toast clears presence" {
+test "extension ui remove final notification clears presence" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "toast", .target = .toast, .root = .{ .text = .{ .text = "hi" } } });
-    try std.testing.expect(state.hasToastViews());
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "toast", .target = .toast, .remove = true });
-    try std.testing.expect(!state.hasToastViews());
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "toast", .target = .notification, .root = .{ .text = .{ .text = "hi" } } });
+    try std.testing.expect(state.hasNotificationViews());
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "toast", .target = .notification, .remove = true });
+    try std.testing.expect(!state.hasNotificationViews());
 }
 
 test "extension ui sorts overlay views and filters other targets" {

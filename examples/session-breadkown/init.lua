@@ -71,8 +71,10 @@ local function pad_right(s, n) s = tostring(s or ""); if #s > n then return s:su
 local function pad_left(s, n) s = tostring(s or ""); if #s > n then return s:sub(1, n) end; return string.rep(" ", n - #s) .. s end
 
 local function toast(ctx, text, tone)
-  if ctx and ctx.ui and ctx.ui.render then
-    ctx.ui.render({ id = VIEW .. "-toast", target = { kind = "toast", anchor = "top_right", lifetime = "until_input" }, root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
+  if ctx and ctx.ui and ctx.ui.notify then
+    local level = tone or "info"
+    if level == "danger" then level = "error" end
+    ctx.ui.notify(tostring(text or ""), { id = VIEW .. "-notice", level = level })
   end
 end
 

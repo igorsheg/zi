@@ -74,13 +74,22 @@ Most tools, commands, and events receive `ctx`.
 
 ## UI
 
-`ctx.ui` publishes host-owned UI intent. Extensions describe views; zi owns placement, focus, and redraw. API v3 exposes two methods:
+`ctx.ui` publishes host-owned UI intent. Extensions describe views; zi owns placement, focus, and redraw. API v3 exposes three methods:
 
 `ctx.ui.render(spec)`
-: Publish, update, or remove a retained UI view. `spec.id` is required. `spec.target` is one of `status`, `toast`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }`. Set `spec.remove = true` to clear a view. `spec.root` is a node tree (`view`, `text`, `input`, `chip`, `progress`, `separator`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`.
+: Publish, update, or remove a retained UI view. `spec.id` is required. `spec.target` is one of `status`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }`. Set `spec.remove = true` to clear a view. `spec.root` is a node tree (`view`, `text`, `input`, `chip`, `progress`, `separator`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`.
 
 `ctx.ui.frame(spec)`
 : Publish a frame for a `surface` node in an existing render tree. `spec.view` names the render view id, `spec.node` names the surface node id, and `spec.data` contains frame bytes. Supported formats include `rgba8888` and `halfblock_rgb`. `surface` remains the node type for framebuffer graphs and other pixel/cell-frame visuals.
+
+`ctx.ui.notify(message, opts?)`
+: Publish or update a fidget-style notification in the bottom-right notification stack. `opts.id` is the replacement key. `opts.level` is `debug`, `info`, `warn`, `error`, or `success`; `opts.group`, `opts.title`, `opts.annote`, `opts.progress`, and `opts.done` shape the compact row. Repeated identical messages with the same id collapse as `(Nx)`. Done notifications linger briefly by default; set `ttl` seconds or `ttl_ms` to control expiry.
+
+`ctx.ui.notify_clear(id_or_opts)`
+: Remove a retained notification by id.
+
+`ctx.ui.progress(opts)`
+: Start a progress notification (`opts.id`, `opts.message`, `opts.group`, `opts.title`) with an animated spinner. Update the same progress row by calling `ctx.ui.notify(next_message, { id = opts.id, progress = true })`; finish with `{ done = true }`.
 
 ### UI input nodes
 
@@ -186,11 +195,7 @@ ctx.ui.render({
 Example:
 
 ```lua
-ctx.ui.render({
-  id = "hello",
-  target = { kind = "toast", anchor = "top_right", lifetime = "until_input" },
-  root = { type = "text", text = "Hello from zi" },
-})
+ctx.ui.notify("Hello from zi", { id = "hello", level = "info" })
 
 ctx.ui.render({
   id = "panel",

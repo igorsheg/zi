@@ -17,8 +17,10 @@ local function boot_frame(w, h) return string.rep(string.char(8, 8, 12, 8, 8, 12
 local function is_dangerous_wad_path(wad) return wad == "/" or wad:match("^/+$") ~= nil end
 
 local function toast(ctx, text, tone)
-  if ctx and ctx.ui and ctx.ui.render then
-    ctx.ui.render({ id = "doom-toast", target = { kind = "toast", anchor = "top_right", lifetime = "until_input" }, root = { type = "text", text = text, style = { tone = tone or "info" } } })
+  if ctx and ctx.ui and ctx.ui.notify then
+    local level = tone or "info"
+    if level == "danger" then level = "error" end
+    ctx.ui.notify(tostring(text or ""), { id = "doom-notice", group = "doom", level = level })
   end
 end
 

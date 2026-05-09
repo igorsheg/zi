@@ -1,10 +1,11 @@
 const std = @import("std");
 const json_value = @import("../../json/value.zig");
+const notifications = @import("../../tui/notifications.zig");
 
 pub const UiTarget = enum {
     overlay,
     status,
-    toast,
+    notification,
     editor_border_top,
     editor_border_bottom,
 };
@@ -44,6 +45,19 @@ pub const UiTargetOptions = struct {
 };
 
 pub const Tone = enum { neutral, muted, info, success, warning, danger, accent };
+
+pub const NotifyLevel = notifications.Level;
+pub const NotifySpec = notifications.Spec;
+
+pub fn notificationTone(spec: NotifySpec) Tone {
+    return switch (spec.level) {
+        .debug => .muted,
+        .info => .info,
+        .warn => .warning,
+        .error_ => .danger,
+        .success => .success,
+    };
+}
 
 pub const BorderStyle = enum { rounded, square };
 
@@ -364,6 +378,7 @@ pub const RenderSpec = struct {
     focus: bool = false,
     remove: bool = false,
     root: ?UiNode = null,
+    notification: ?NotifySpec = null,
     keys: []KeyBinding = &.{},
 
     pub fn clone(allocator: std.mem.Allocator, spec: RenderSpec) !RenderSpec {
@@ -376,6 +391,11 @@ pub const RenderSpec = struct {
             var rr = r.*;
             rr.deinit(allocator);
         };
+        const notification = if (spec.notification) |n| try NotifySpec.clone(allocator, n) else null;
+        errdefer if (notification) |*n| {
+            var nn = n.*;
+            nn.deinit(allocator);
+        };
         const keys = try allocator.alloc(KeyBinding, spec.keys.len);
         var initialized: usize = 0;
         errdefer {
@@ -386,7 +406,7 @@ pub const RenderSpec = struct {
             keys[i] = try KeyBinding.clone(allocator, k);
             initialized += 1;
         }
-        return .{ .state_owner_id = state_owner_id, .generation = spec.generation, .id = id, .target = spec.target, .target_options = try UiTargetOptions.clone(allocator, spec.target_options), .order = spec.order, .focus = spec.focus, .remove = spec.remove, .root = root, .keys = keys };
+        return .{ .state_owner_id = state_owner_id, .generation = spec.generation, .id = id, .target = spec.target, .target_options = try UiTargetOptions.clone(allocator, spec.target_options), .order = spec.order, .focus = spec.focus, .remove = spec.remove, .root = root, .notification = notification, .keys = keys };
     }
 
     pub fn deinit(self: *RenderSpec, allocator: std.mem.Allocator) void {
@@ -394,6 +414,7 @@ pub const RenderSpec = struct {
         allocator.free(self.id);
         self.target_options.deinit(allocator);
         if (self.root) |*r| r.deinit(allocator);
+        if (self.notification) |*n| n.deinit(allocator);
         for (self.keys) |*k| k.deinit(allocator);
         allocator.free(self.keys);
         self.* = undefined;

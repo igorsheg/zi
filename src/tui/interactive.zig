@@ -74,6 +74,7 @@ const keybindings = @import("keybindings.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 const request_mod = @import("../coding_agent/request.zig");
 const extension_ui = @import("../coding_agent/extensions/ui.zig");
+const notifications = @import("notifications.zig");
 const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
 const list_picker_mod = @import("components/list_picker.zig");
@@ -187,7 +188,7 @@ pub const Interactive = struct {
     status_line: StatusLine,
     pending_image_banner: text_mod.Text,
     extension_ui_state: ExtensionUiState,
-    extension_toast_overlay: ?tui_mod.OverlayHandle = null,
+    extension_notification_overlay: ?tui_mod.OverlayHandle = null,
     extension_overlay_handle: ?tui_mod.OverlayHandle = null,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
@@ -497,6 +498,10 @@ pub const Interactive = struct {
 
             const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
             if (self.tui.tickAnimations(now_ns)) {
+                self.tui.dirty = true;
+            }
+            if (self.extension_ui_state.tickNotifications(now_ns)) {
+                extension_ui_flow.syncExtensionNotificationOverlay(self);
                 self.tui.dirty = true;
             }
 
@@ -1226,6 +1231,13 @@ pub const Interactive = struct {
             break :blk owned;
         };
         _ = self.publishLifecycleUiEvent(.{ .extension_keybindings_updated = .{ .keybindings = extension_bindings } });
+    }
+
+    pub fn notify(self: *Interactive, spec: notifications.Spec) void {
+        const root: ?extension_ui.UiNode = if (spec.clear) null else .{ .text = .{ .text = spec.message, .style = .{ .tone = extension_ui.notificationTone(spec) }, .max_lines = 1 } };
+        self.extension_ui_state.applyRender(.{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .id = spec.id, .target = .notification, .remove = spec.clear, .root = root, .notification = spec });
+        extension_ui_flow.syncExtensionNotificationOverlay(self);
+        self.tui.dirty = true;
     }
 
     pub fn publishPendingExtensionUi(self: *Interactive) void {

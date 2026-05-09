@@ -85,7 +85,7 @@ return function(zi)
     description = "Save a session note.",
     handler = function(args, ctx)
       local ok = ctx.session.append_note({ kind = "manual", body = tostring(args or "") })
-      if ctx.ui then ctx.ui.render({ id = "note", target = { kind = "toast", lifetime = "until_input" }, root = { type = "text", text = ok and "note saved" or "note failed" } }) end
+      if ctx.ui then ctx.ui.notify(ok and "note saved" or "note failed", { id = "note", level = ok and "success" or "error" }) end
     end,
   })
 end
@@ -113,7 +113,7 @@ An event is for policy or reaction. Keep it easy to explain later.
 zi.on("message", function(event, ctx)
   local message = event.message or {}
   if message.role == "assistant" and ctx.ui then
-    ctx.ui.render({ id = "assistant-replied", target = { kind = "toast", lifetime = "until_input" }, root = { type = "text", text = "assistant replied" } })
+    ctx.ui.notify("assistant replied", { id = "assistant-replied", level = "info" })
   end
 end)
 ```
