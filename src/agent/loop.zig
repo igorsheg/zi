@@ -376,9 +376,10 @@ const WorkerUpdateQueue = struct {
 
 const PreparedToolCall = struct {
     tool_call: ai.protocol.ToolCall,
-    tool: protocol.AgentTool,
+    tool: ?protocol.AgentTool,
     effective_args: std.json.Value,
     finalized: bool = false,
+    result_message: ?ai.protocol.ToolResultMessage = null,
     worker: ?WorkerExecution = null,
 };
 
@@ -387,13 +388,23 @@ const WorkerExecution = struct {
     queue: *WorkerUpdateQueue,
     prepared_index: usize,
     signal: AbortSignal,
+    completion_counter: *std.atomic.Value(usize),
     thread: ?std.Thread = null,
     result: ?protocol.AgentToolResult = null,
+    completion_order: std.atomic.Value(usize) = std.atomic.Value(usize).init(std.math.maxInt(usize)),
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     updates_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn run(self: *WorkerExecution, prepared: *const PreparedToolCall) void {
-        const execution = prepared.tool.start(
+        const tool = prepared.tool orelse {
+            self.result = makeAgentToolTextResult(self.arena.allocator(), "Tool execution failed", true);
+            const order = self.completion_counter.fetchAdd(1, .acq_rel);
+            self.completion_order.store(order, .release);
+            self.done.store(true, .release);
+            self.queue.notify();
+            return;
+        };
+        const execution = tool.start(
             self.arena.allocator(),
             prepared.tool_call.id,
             prepared.effective_args,
@@ -402,6 +413,8 @@ const WorkerExecution = struct {
             @ptrCast(self),
         );
         self.result = resolveToolExecution(execution, self.arena.allocator(), self.signal, &workerUpdateCallback, @ptrCast(self));
+        const order = self.completion_counter.fetchAdd(1, .acq_rel);
+        self.completion_order.store(order, .release);
         self.done.store(true, .release);
         self.queue.notify();
     }
@@ -491,7 +504,7 @@ fn executeToolCalls(
             const tool = findTool(tools, tc.name);
             if (tool == null) {
                 const err_msg = std.fmt.allocPrint(turn_allocator, "Tool {s} not found", .{tc.name}) catch "Tool not found";
-                emitImmediateError(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
+                appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx);
                 continue;
             }
 
@@ -499,14 +512,14 @@ fn executeToolCalls(
             const prepared_args = if (t.prepare_arguments) |prep_fn|
                 prep_fn(turn_allocator, tc.arguments) catch |err| {
                     const err_msg = std.fmt.allocPrint(turn_allocator, "Tool {s} argument preparation failed: {s}", .{ tc.name, @errorName(err) }) catch "Tool argument preparation failed";
-                    emitImmediateError(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
+                    appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx);
                     continue;
                 }
             else
                 tc.arguments;
 
             if (validateToolArguments(turn_allocator, t.parameters, prepared_args, "arguments")) |err_msg| {
-                emitImmediateError(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
+                appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx);
                 continue;
             }
 
@@ -525,12 +538,12 @@ fn executeToolCalls(
                 if (hook.call(hook_ctx, signal)) |before_result| {
                     if (before_result.block) {
                         const reason = before_result.reason orelse "Tool execution was blocked";
-                        emitImmediateError(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, tc, reason, event_sink, event_ctx);
+                        appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, reason, event_sink, event_ctx);
                         continue;
                     }
                     if (before_result.args) |replacement| {
                         if (validateToolArguments(turn_allocator, t.parameters, replacement, "arguments")) |err_msg| {
-                            emitImmediateError(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, tc, err_msg, event_sink, event_ctx);
+                            appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx);
                             continue;
                         }
                         effective_args = replacement;
@@ -547,14 +560,17 @@ fn executeToolCalls(
         else => {},
     };
 
+    var completion_counter = std.atomic.Value(usize).init(0);
     if (config.tool_execution == .parallel) {
         for (prepared_calls.items, 0..) |*prepared, prepared_index| {
-            if (prepared.tool.affinity != .worker_thread) continue;
+            const tool = prepared.tool orelse continue;
+            if (tool.affinity != .worker_thread) continue;
             prepared.worker = .{
                 .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
                 .queue = &update_queue,
                 .prepared_index = prepared_index,
                 .signal = signal,
+                .completion_counter = &completion_counter,
             };
             prepared.worker.?.thread = std.Thread.spawn(.{}, WorkerExecution.run, .{ &prepared.worker.?, prepared }) catch {
                 prepared.worker.?.arena.deinit();
@@ -564,67 +580,137 @@ fn executeToolCalls(
         }
     }
 
-    for (prepared_calls.items, 0..) |*prepared, index| {
+    var finalized_count = countFinalizedPreparedCalls(prepared_calls.items);
+    while (finalized_count < prepared_calls.items.len) {
         if (isAborted(signal)) {
-            closeWorkerUpdates(prepared_calls.items[index..]);
-            emitAbortedPreparedCalls(prepared_calls.items[index..], event_sink, event_ctx, turn_allocator);
+            closeWorkerUpdates(prepared_calls.items);
+            emitAbortedPreparedCalls(prepared_calls.items, event_sink, event_ctx, turn_allocator);
             return;
         }
 
-        if (prepared.worker) |*worker| {
-            while (!worker.done.load(.acquire)) {
-                drainWorkerUpdates(&update_queue, &drained_updates, turn_allocator, prepared_calls.items, event_sink, event_ctx);
-                if (isAborted(signal)) {
-                    closeWorkerUpdates(prepared_calls.items[index..]);
-                    emitAbortedPreparedCalls(prepared_calls.items[index..], event_sink, event_ctx, turn_allocator);
-                    return;
-                }
-                if (worker.done.load(.acquire)) break;
-                update_queue.waitForActivity(std.time.ns_per_ms);
-            }
+        drainWorkerUpdates(&update_queue, &drained_updates, turn_allocator, prepared_calls.items, event_sink, event_ctx);
 
+        if (findCompletedWorker(prepared_calls.items)) |completed_index| {
+            var prepared = &prepared_calls.items[completed_index];
+            var worker = &prepared.worker.?;
             worker.updates_closed.store(true, .release);
             if (worker.thread) |thread| {
                 thread.join();
                 worker.thread = null;
             }
             drainWorkerUpdates(&update_queue, &drained_updates, turn_allocator, prepared_calls.items, event_sink, event_ctx);
-
             const result = worker.result orelse makeAgentToolTextResult(turn_allocator, "Tool execution failed", true);
-            if (isAborted(signal)) {
-                closeWorkerUpdates(prepared_calls.items[index..]);
-                emitAbortedPreparedCalls(prepared_calls.items[index..], event_sink, event_ctx, turn_allocator);
-                return;
-            }
-            finalizePreparedToolCall(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
+            prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
             prepared.finalized = true;
+            finalized_count += 1;
             continue;
         }
 
-        var update_bridge = bridge_mod.UpdateBridge{
-            .sink = event_sink,
-            .sink_ctx = event_ctx,
-            .tool_call_id = prepared.tool_call.id,
-            .tool_name = prepared.tool_call.name,
-            .args = prepared.tool_call.arguments,
-        };
-        const execution = prepared.tool.start(
-            turn_allocator,
-            prepared.tool_call.id,
-            prepared.effective_args,
-            signal,
-            &bridge_mod.UpdateBridge.callback,
-            @ptrCast(&update_bridge),
-        );
-        const result = resolveToolExecution(execution, turn_allocator, signal, &bridge_mod.UpdateBridge.callback, @ptrCast(&update_bridge));
-        if (isAborted(signal)) {
-            closeWorkerUpdates(prepared_calls.items[index..]);
-            emitAbortedPreparedCalls(prepared_calls.items[index..], event_sink, event_ctx, turn_allocator);
-            return;
+        if (findNextAgentThreadCall(prepared_calls.items)) |inline_index| {
+            var prepared = &prepared_calls.items[inline_index];
+            var update_bridge = bridge_mod.UpdateBridge{
+                .sink = event_sink,
+                .sink_ctx = event_ctx,
+                .tool_call_id = prepared.tool_call.id,
+                .tool_name = prepared.tool_call.name,
+                .args = prepared.tool_call.arguments,
+            };
+            const tool = prepared.tool orelse continue;
+            const execution = tool.start(
+                turn_allocator,
+                prepared.tool_call.id,
+                prepared.effective_args,
+                signal,
+                &bridge_mod.UpdateBridge.callback,
+                @ptrCast(&update_bridge),
+            );
+            const result = resolveToolExecution(execution, turn_allocator, signal, &bridge_mod.UpdateBridge.callback, @ptrCast(&update_bridge));
+            if (isAborted(signal)) {
+                closeWorkerUpdates(prepared_calls.items);
+                emitAbortedPreparedCalls(prepared_calls.items, event_sink, event_ctx, turn_allocator);
+                return;
+            }
+            prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
+            prepared.finalized = true;
+            finalized_count += 1;
+            continue;
         }
-        finalizePreparedToolCall(run_allocator, turn_allocator, ctx_messages, new_messages, tool_results, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
-        prepared.finalized = true;
+
+        update_queue.waitForActivity(std.time.ns_per_ms);
     }
+
+    emitPreparedToolResultMessagesInSourceOrder(run_allocator, ctx_messages, new_messages, tool_results, prepared_calls.items, event_sink, event_ctx);
+}
+
+fn appendImmediateError(
+    run_allocator: std.mem.Allocator,
+    turn_allocator: std.mem.Allocator,
+    prepared_calls: *std.ArrayListUnmanaged(PreparedToolCall),
+    tc: ai.protocol.ToolCall,
+    msg: []const u8,
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+) void {
+    const err_tool_result = makeAgentToolTextResult(turn_allocator, msg, true);
+    const err_result = makeErrorToolResult(run_allocator, tc.id, tc.name, msg);
+    emitToolExecutionEnd(event_sink, event_ctx, tc, true, err_tool_result);
+    prepared_calls.append(turn_allocator, .{
+        .tool_call = tc,
+        .tool = null,
+        .effective_args = tc.arguments,
+        .finalized = true,
+        .result_message = err_result,
+    }) catch {};
+}
+
+fn countFinalizedPreparedCalls(prepared_calls: []const PreparedToolCall) usize {
+    var count: usize = 0;
+    for (prepared_calls) |prepared| {
+        if (prepared.finalized) count += 1;
+    }
+    return count;
+}
+
+fn emitPreparedToolResultMessagesInSourceOrder(
+    allocator: std.mem.Allocator,
+    ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
+    tool_results: *std.ArrayListUnmanaged(ai.protocol.ToolResultMessage),
+    prepared_calls: []const PreparedToolCall,
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+) void {
+    for (prepared_calls) |prepared| {
+        const tool_result_msg = prepared.result_message orelse continue;
+        emitToolResultMessage(event_sink, event_ctx, tool_result_msg);
+        ctx_messages.append(allocator, .{ .tool_result = tool_result_msg }) catch {};
+        new_messages.append(allocator, .{ .tool_result = tool_result_msg }) catch {};
+        tool_results.append(allocator, tool_result_msg) catch {};
+    }
+}
+
+fn findCompletedWorker(prepared_calls: []const PreparedToolCall) ?usize {
+    var best_index: ?usize = null;
+    var best_order: usize = std.math.maxInt(usize);
+    for (prepared_calls, 0..) |*prepared, index| {
+        if (prepared.finalized) continue;
+        const worker = &(prepared.worker orelse continue);
+        if (!worker.done.load(.acquire)) continue;
+        const order = worker.completion_order.load(.acquire);
+        if (order < best_order) {
+            best_order = order;
+            best_index = index;
+        }
+    }
+    return best_index;
+}
+
+fn findNextAgentThreadCall(prepared_calls: []const PreparedToolCall) ?usize {
+    for (prepared_calls, 0..) |prepared, index| {
+        if (prepared.finalized) continue;
+        if (prepared.worker == null) return index;
+    }
+    return null;
 }
 
 fn closeWorkerUpdates(prepared_calls: []PreparedToolCall) void {
@@ -676,9 +762,6 @@ fn emitAbortedPreparedCalls(
 fn finalizePreparedToolCall(
     run_allocator: std.mem.Allocator,
     turn_allocator: std.mem.Allocator,
-    ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
-    new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
-    tool_results: *std.ArrayListUnmanaged(ai.protocol.ToolResultMessage),
     assistant_msg: ai.protocol.AssistantMessage,
     tool_phase_messages: []const protocol.AgentMessage,
     tools: []const protocol.AgentTool,
@@ -689,7 +772,7 @@ fn finalizePreparedToolCall(
     signal: AbortSignal,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
-) void {
+) ai.protocol.ToolResultMessage {
     var final_content = result.content;
     var final_details = result.details;
     const final_presentation = result.presentation;
@@ -741,38 +824,14 @@ fn finalizePreparedToolCall(
     };
     const tool_result_msg = message_memory.cloneToolResultMessage(run_allocator, unowned_tool_result_msg) catch unowned_tool_result_msg;
 
-    emitToolResult(event_sink, event_ctx, prepared.tool_call, tool_result_msg, final_is_error, final_agent_result);
-    ctx_messages.append(run_allocator, .{ .tool_result = tool_result_msg }) catch {};
-    new_messages.append(run_allocator, .{ .tool_result = tool_result_msg }) catch {};
-    tool_results.append(run_allocator, tool_result_msg) catch {};
+    emitToolExecutionEnd(event_sink, event_ctx, prepared.tool_call, final_is_error, final_agent_result);
+    return tool_result_msg;
 }
 
-/// Emit an immediate error result for a tool call that failed during preparation.
-/// Covers: tool not found, beforeToolCall blocked, arg preparation failure.
-fn emitImmediateError(
-    run_allocator: std.mem.Allocator,
-    turn_allocator: std.mem.Allocator,
-    ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
-    new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
-    tool_results: *std.ArrayListUnmanaged(ai.protocol.ToolResultMessage),
-    tc: ai.protocol.ToolCall,
-    msg: []const u8,
-    event_sink: protocol.AgentEventSink,
-    event_ctx: ?*anyopaque,
-) void {
-    const err_tool_result = makeAgentToolTextResult(turn_allocator, msg, true);
-    const err_result = makeErrorToolResult(run_allocator, tc.id, tc.name, msg);
-    emitToolResult(event_sink, event_ctx, tc, err_result, true, err_tool_result);
-    ctx_messages.append(run_allocator, .{ .tool_result = err_result }) catch {};
-    new_messages.append(run_allocator, .{ .tool_result = err_result }) catch {};
-    tool_results.append(run_allocator, err_result) catch {};
-}
-
-fn emitToolResult(
+fn emitToolExecutionEnd(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
     tc: ai.protocol.ToolCall,
-    result: ai.protocol.ToolResultMessage,
     is_error: bool,
     tool_result: protocol.AgentToolResult,
 ) void {
@@ -782,7 +841,13 @@ fn emitToolResult(
         .result = tool_result,
         .is_error = is_error,
     } }, event_ctx);
+}
 
+fn emitToolResultMessage(
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+    result: ai.protocol.ToolResultMessage,
+) void {
     const msg = protocol.AgentMessage{ .tool_result = result };
     event_sink(.{ .message_start = .{ .message = msg } }, event_ctx);
     event_sink(.{ .message_end = .{ .message = msg } }, event_ctx);
@@ -1034,7 +1099,7 @@ test "validateToolArguments rejects missing required field" {
     try std.testing.expect(std.mem.indexOf(u8, err_msg.?, "arguments.path") != null);
 }
 
-test "parallel worker updates stream live before source-ordered finalization" {
+test "parallel worker updates stream live before completion-ordered finalization" {
     const ToolCtx = struct {
         which: enum { first, second },
     };
@@ -1134,9 +1199,9 @@ test "parallel worker updates stream live before source-ordered finalization" {
     try std.testing.expect(collector.events.items[0] == .update);
     try std.testing.expectEqualStrings("call-2", collector.events.items[0].update);
     try std.testing.expect(collector.events.items[1] == .end);
-    try std.testing.expectEqualStrings("call-1", collector.events.items[1].end);
+    try std.testing.expectEqualStrings("call-2", collector.events.items[1].end);
     try std.testing.expect(collector.events.items[2] == .end);
-    try std.testing.expectEqualStrings("call-2", collector.events.items[2].end);
+    try std.testing.expectEqualStrings("call-1", collector.events.items[2].end);
     try std.testing.expectEqual(@as(usize, 2), tool_results.items.len);
     try std.testing.expectEqualStrings("call-1", tool_results.items[0].tool_call_id);
     try std.testing.expectEqualStrings("call-2", tool_results.items[1].tool_call_id);

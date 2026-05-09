@@ -4,6 +4,7 @@ const std = @import("std");
 pub const Io = std.Io;
 
 pub const TaskGroup = @import("task_group.zig").TaskGroup;
+pub const CompletionGroup = @import("completion_group.zig").CompletionGroup;
 pub const AbortController = @import("abort_signal.zig").AbortController;
 pub const AbortSignal = @import("abort_signal.zig").AbortSignal;
 pub const AbortGuard = @import("abort_guard.zig").AbortGuard;
@@ -18,6 +19,7 @@ pub const process = @import("process.zig");
 pub const job = @import("job.zig");
 pub const fs = @import("fs.zig");
 pub const worker = @import("worker.zig");
+pub const completion_group = @import("completion_group.zig");
 pub const BlockingWorker = worker.BlockingWorker;
 
 pub const default_io: Io = std.Options.debug_io;
