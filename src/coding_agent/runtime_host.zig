@@ -1531,6 +1531,94 @@ test "runtime host runs pre-prompt threshold compaction before sending next prom
     try testing.expectEqual(@as(usize, 1), fp.call_count);
 }
 
+test "runtime host auto compaction uses current branch after session cache was populated" {
+    const compactor = @import("session/compactor.zig");
+    const compaction_hooks = @import("session/compaction_hooks.zig");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
+    const agent_dir = try std.fs.path.join(allocator, &.{ workspace, ".zi-agent" });
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, agent_dir);
+
+    var fp = faux.FauxProvider.init(allocator);
+    const response_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("after compact")};
+    fp.setResponses(&.{faux.fauxAssistantMessage(allocator, &response_content, .stop)});
+
+    var registry = ai.provider.Registry.init(allocator);
+    try registry.register("faux", fp.provider(), null);
+
+    const create_options = sdk.CreateOptions{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = workspace,
+        .agent_dir_override = agent_dir,
+        .registry = &registry,
+        .tools = &.{},
+        .no_session = false,
+    };
+    const session = try createOwnedTestAgentSessionWithOptions(allocator, create_options);
+
+    _ = session.session_store.appendMessage(.{ .user = .{ .content = .{ .text = "old user" }, .timestamp = 1 } }) orelse return error.TestUnexpectedResult;
+    const old_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("old answer")};
+    _ = session.session_store.appendMessage(.{ .assistant = faux.fauxAssistantMessage(allocator, &old_content, .stop) }) orelse return error.TestUnexpectedResult;
+
+    _ = try session.session_store.readEntries();
+
+    _ = session.session_store.appendMessage(.{ .user = .{ .content = .{ .text = "new user" }, .timestamp = 3 } }) orelse return error.TestUnexpectedResult;
+    const new_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("new answer")};
+    const expected_first_kept = session.session_store.appendMessage(.{ .assistant = faux.fauxAssistantMessage(allocator, &new_content, .stop) }) orelse return error.TestUnexpectedResult;
+
+    const prior_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("prior oversized context")};
+    var prior = faux.fauxAssistantMessage(allocator, &prior_content, .stop);
+    prior.usage.total_tokens = 112_000;
+    prior.usage.input = 112_000;
+    try session.agent.setMessages(&.{.{ .assistant = prior }});
+
+    const Hook = struct {
+        allocator: std.mem.Allocator,
+        seen_first_kept: ?[]const u8 = null,
+
+        fn before(payload: compaction_hooks.BeforeCompactPayload, ctx: ?*anyopaque) compaction_hooks.BeforeCompactOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.seen_first_kept = self.allocator.dupe(u8, payload.preparation.first_kept_entry_id) catch return .cancel;
+            return .{ .provide = .{
+                .summary = "hook summary",
+                .first_kept_entry_id = payload.preparation.first_kept_entry_id,
+                .tokens_before = payload.preparation.tokens_before,
+            } };
+        }
+    };
+    var hook = Hook{ .allocator = allocator };
+    session.setCompactionHooks(.{ .ctx = &hook, .before_compact = Hook.before });
+
+    var collector = LifecycleCollector{ .allocator = allocator };
+    defer collector.deinit();
+    var host = try RuntimeHost.init(session, allocator, allocator, create_options, .{
+        .compaction_executor = compactor.createExecutor(),
+    });
+    defer host.deinit();
+    host.setLifecycleHooks(.{
+        .on_compaction_start = &LifecycleCollector.onCompactionStart,
+        .on_compaction_end = &LifecycleCollector.onCompactionEnd,
+        .ctx = @ptrCast(&collector),
+    });
+
+    const outcome = try host.runUserContent(.{ .text = "continue" });
+
+    try testing.expectEqual(RunOutcome.success, outcome);
+    try testing.expectEqualStrings(expected_first_kept, hook.seen_first_kept.?);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
+    try testing.expect(collector.compaction_ends.items[0].success);
+    try testing.expectEqual(CompactionReason.threshold, collector.compaction_ends.items[0].reason);
+    try testing.expectEqualStrings(expected_first_kept, collector.compaction_ends.items[0].result.?.first_kept_entry_id);
+    try testing.expectEqual(@as(usize, 1), fp.call_count);
+}
+
 test "runtime host reports cancelled compaction as aborted without an error string" {
     const session = try createOwnedTestAgentSession(testing.allocator, null);
     var host = try RuntimeHost.init(session, testing.allocator, testing.allocator, createTestCreateOptions(null), .{

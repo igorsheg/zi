@@ -14,7 +14,6 @@ const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../root.zig");
-const context_mod = @import("../../session/context.zig");
 const prep = @import("compaction_prep.zig");
 const hooks_mod = @import("compaction_hooks.zig");
 const session_runner = @import("../session_runner.zig");
@@ -111,8 +110,7 @@ fn execute(
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const entries = try session.session_store.readEntries();
-    const path = try context_mod.buildBranchEntries(allocator, entries, .current);
+    const path = try session.session_store.buildCurrentBranchAlloc(allocator);
     if (path.len == 0) return error.NothingToCompact;
 
     const settings: prep.CompactionSettings = .{
@@ -225,6 +223,70 @@ fn execute(
         .details = details_arg,
         .from_hook = from_hook,
     };
+}
+
+test "compactor prepares from current branch including entries appended after cache" {
+    const testing = std.testing;
+    const sdk = @import("../sdk.zig");
+    const faux = @import("../../ai/faux.zig");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.fs.path.resolve(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "workspace" });
+    const agent_dir = try std.fs.path.resolve(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "agent" });
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, cwd);
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, agent_dir);
+
+    var session = try sdk.createAgentSession(allocator, .{
+        .model = faux.fauxModel(),
+        .api_key = "test-key",
+        .cwd = cwd,
+        .agent_dir_override = agent_dir,
+        .tools = &.{},
+        .no_session = false,
+    });
+    defer session.deinit();
+
+    _ = session.session_store.appendMessage(.{ .user = .{ .content = .{ .text = "old user" }, .timestamp = 1 } }) orelse return error.TestUnexpectedResult;
+    const old_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("old answer")};
+    _ = session.session_store.appendMessage(.{ .assistant = faux.fauxAssistantMessage(allocator, &old_content, .stop) }) orelse return error.TestUnexpectedResult;
+
+    // Populate the session store cache, then append more flushed entries. This
+    // recreates the resumed-session shape where readEntries() alone is stale and
+    // buildCurrentBranchAlloc() must merge writer.appended_entries.
+    _ = try session.session_store.readEntries();
+
+    _ = session.session_store.appendMessage(.{ .user = .{ .content = .{ .text = "new user" }, .timestamp = 3 } }) orelse return error.TestUnexpectedResult;
+    const new_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("new answer")};
+    const expected_first_kept = session.session_store.appendMessage(.{ .assistant = faux.fauxAssistantMessage(allocator, &new_content, .stop) }) orelse return error.TestUnexpectedResult;
+
+    const Hook = struct {
+        allocator: std.mem.Allocator,
+        seen_first_kept: ?[]const u8 = null,
+
+        fn before(payload: hooks_mod.BeforeCompactPayload, ctx: ?*anyopaque) hooks_mod.BeforeCompactOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.seen_first_kept = self.allocator.dupe(u8, payload.preparation.first_kept_entry_id) catch return .cancel;
+            return .{ .provide = .{
+                .summary = "hook summary",
+                .first_kept_entry_id = payload.preparation.first_kept_entry_id,
+                .tokens_before = payload.preparation.tokens_before,
+            } };
+        }
+    };
+    var hook = Hook{ .allocator = allocator };
+    session.setCompactionHooks(.{ .ctx = &hook, .before_compact = Hook.before });
+
+    const executor = createExecutor();
+    const result = try executor.func(&session, .threshold, .{ .enabled = true, .reserve_tokens = 1, .keep_recent_tokens = 1 }, .{}, executor.ctx);
+
+    try testing.expectEqualStrings(expected_first_kept, hook.seen_first_kept.?);
+    try testing.expectEqualStrings(expected_first_kept, result.first_kept_entry_id);
+    try testing.expect(result.from_hook.?);
 }
 
 fn entryIdExists(entries: []const @import("../../session/protocol.zig").SessionEntry, id: []const u8) bool {
