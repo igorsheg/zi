@@ -112,7 +112,7 @@ pub const ScrollTextOverlay = struct {
 
         var row: u32 = 0;
         if (self.subtitle.len > 0 and inner.height > 0) {
-            _ = inner.writeStr(0, row, self.subtitle, muted, Color.default, .{});
+            self.renderOneLineText(inner.sub(0, row, inner.width, 1), self.subtitle, muted);
             row += 1;
         }
 
@@ -139,7 +139,18 @@ pub const ScrollTextOverlay = struct {
 
         var footer_buf: [160]u8 = undefined;
         const footer = std.fmt.bufPrint(&footer_buf, "↑/↓ j/k scroll  PgUp/PgDn page  g/G top/bottom  Esc close  {d}/{d}", .{ self.text.scroll_offset, max_offset }) catch "↑/↓ scroll  Esc close";
-        _ = inner.writeStr(0, footer_y, footer, muted, Color.default, .{});
+        self.renderOneLineText(inner.sub(0, footer_y, inner.width, 1), footer, muted);
+    }
+
+    fn renderOneLineText(self: *ScrollTextOverlay, region: Region, content: []const u8, fg: Color) void {
+        var text = text_mod.Text.init(self.allocator, region.buf.width_method);
+        defer text.deinit();
+        text.content = content;
+        text.fg = fg;
+        text.wrap_mode = .none;
+        text.overflow = .ellipsis;
+        text.max_lines = 1;
+        text.render(region);
     }
 
     fn scrollUp(self: *ScrollTextOverlay, n: u32) void {

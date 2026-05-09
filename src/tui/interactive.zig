@@ -307,7 +307,7 @@ pub const Interactive = struct {
             .pending_image_banner = text_mod.Text.init(allocator, tui.terminal.capabilities.width_method),
             .extension_ui_state = ExtensionUiState.init(allocator),
             .notification_center = notifications.Center.init(allocator),
-            .greeter = .{ .version = app_meta.version },
+            .greeter = .{ .allocator = allocator, .version = app_meta.version },
             .footer = .{},
             .logs_overlay = ScrollTextOverlay.init(allocator, themes_builtin.dark(), tui.terminal.capabilities.width_method),
             .transcript = Transcript.init(allocator),

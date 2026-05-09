@@ -852,7 +852,7 @@ fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: ext
     switch (node) {
         .text => |t| renderText(state, region, t),
         .chip => |ch| renderChip(region, ch.label),
-        .progress => |pr| renderProgress(region, pr),
+        .progress => |pr| renderProgress(state, region, pr),
         .separator => |sep| renderSeparator(state, region, sep),
         .surface => |s| if (state.findFrame(view.state_owner_id, view.id, s.id)) |frame| {
             if (frame.generation >= view.generation) framebuffer_surface_mod.renderFrame(region, frame, 0);
@@ -1014,7 +1014,7 @@ fn renderSeparator(state: *ExtensionUiState, region: Region, sep: extension_ui.U
     (chrome_mod.Separator{ .color = color }).render(region, state.activeTheme());
 }
 
-fn renderProgress(region: Region, pr: extension_ui.UiNode.Progress) void {
+fn renderProgress(state: *ExtensionUiState, region: Region, pr: extension_ui.UiNode.Progress) void {
     if (pr.value) |value| {
         if (region.width < 3) return;
         const pct = @max(0, @min(value, 1));
@@ -1025,12 +1025,14 @@ fn renderProgress(region: Region, pr: extension_ui.UiNode.Progress) void {
         while (x < inner) : (x += 1) region.set(x + 1, 0, charCell(if (x < filled) '█' else ' ', Color.default, Color.default, Attributes.none));
         region.set(region.width - 1, 0, charCell(']', Color.default, Color.default, Attributes.none));
     } else if (pr.label) |label| {
-        writeClipped(region, label);
+        var text = TextComponent.init(state.allocator, region.buf.width_method);
+        defer text.deinit();
+        text.content = label;
+        text.wrap_mode = .none;
+        text.overflow = .ellipsis;
+        text.max_lines = 1;
+        text.render(region);
     }
-}
-
-fn writeClipped(region: Region, text: []const u8) void {
-    _ = region.writeStr(0, 0, text, Color.default, Color.default, Attributes.none);
 }
 
 fn charCell(cp: u21, fg: Color, bg: Color, attrs: Attributes) Cell {
