@@ -52,9 +52,69 @@ need() {
   fi
 }
 
-need curl
+has() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+download() {
+  url=$1
+  output=$2
+
+  if has curl; then
+    curl_path=$(command -v curl)
+    case "$curl_path" in
+      */snap/*)
+        if has wget; then
+          wget -q "$url" -O "$output"
+          return
+        fi
+        echo "error: curl installed with snap cannot download files due to missing permissions" >&2
+        echo "hint: install curl with a different package manager, or install wget" >&2
+        exit 1
+        ;;
+    esac
+
+    curl -fsSL "$url" -o "$output"
+  elif has wget; then
+    wget -q "$url" -O "$output"
+  else
+    echo "error: required command not found: curl or wget" >&2
+    exit 1
+  fi
+}
+
+fetch() {
+  url=$1
+
+  if has curl; then
+    curl_path=$(command -v curl)
+    case "$curl_path" in
+      */snap/*)
+        if has wget; then
+          wget -qO- "$url"
+          return
+        fi
+        echo "error: curl installed with snap cannot download files due to missing permissions" >&2
+        echo "hint: install curl with a different package manager, or install wget" >&2
+        exit 1
+        ;;
+    esac
+
+    curl -fsSL "$url"
+  elif has wget; then
+    wget -qO- "$url"
+  else
+    echo "error: required command not found: curl or wget" >&2
+    exit 1
+  fi
+}
+
 need tar
 need mktemp
+need grep
+need sed
+need mv
+need cp
 
 if command -v shasum >/dev/null 2>&1; then
   checksum_cmd="shasum -a 256"
@@ -84,13 +144,12 @@ case "$os:$arch" in
 esac
 
 if [ -z "$version" ]; then
-  latest_url="https://github.com/$repo/releases/latest"
-  resolved_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$latest_url")
-  tag=${resolved_url##*/}
+  latest_api_url="https://api.github.com/repos/$repo/releases/latest"
+  tag=$(fetch "$latest_api_url" | grep '"tag_name"' | head -n 1 | sed 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/')
   case "$tag" in
     v*) version=${tag#v} ;;
     *)
-      echo "error: could not resolve latest release version from $resolved_url" >&2
+      echo "error: could not resolve latest release version from GitHub API" >&2
       exit 1
       ;;
   esac
@@ -99,15 +158,27 @@ fi
 archive="zi-v$version-$target.tar.gz"
 base_url="https://github.com/$repo/releases/download/v$version"
 work_dir=$(mktemp -d)
-trap 'rm -rf "$work_dir"' EXIT INT TERM
+install_tmp=
+cleanup() {
+  if [ -n "$install_tmp" ]; then
+    rm -f "$install_tmp"
+  fi
+  rm -rf "$work_dir"
+}
+interrupt() {
+  cleanup
+  exit 1
+}
+trap cleanup EXIT
+trap interrupt INT TERM
 
 printf 'zi installer\n'
 printf '  version: %s\n' "$version"
 printf '  target:  %s\n' "$target"
 printf '  dir:     %s\n' "$install_dir"
 
-curl -fsSL "$base_url/$archive" -o "$work_dir/$archive"
-curl -fsSL "$base_url/checksums.txt" -o "$work_dir/checksums.txt"
+download "$base_url/$archive" "$work_dir/$archive"
+download "$base_url/checksums.txt" "$work_dir/checksums.txt"
 
 (
   cd "$work_dir"
@@ -128,25 +199,31 @@ if [ ! -x "$package_dir/bin/zi" ]; then
   exit 1
 fi
 
-cp "$package_dir/bin/zi" "$install_dir/zi"
-chmod 755 "$install_dir/zi"
+install_tmp=$(mktemp "$install_dir/.zi.XXXXXX")
+cp "$package_dir/bin/zi" "$install_tmp"
+chmod 755 "$install_tmp"
 
 # Unsigned Mach-O binaries downloaded from the internet can be killed by
 # macOS before main() runs. Ad-hoc signing is local, requires no Apple
 # identity, and keeps the CLI usable until we have Developer ID notarization.
 if [ "$os" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
-  codesign --force --sign - "$install_dir/zi" >/dev/null 2>&1 || {
-    echo "warning: failed to ad-hoc sign $install_dir/zi" >&2
+  codesign --force --sign - "$install_tmp" >/dev/null 2>&1 || {
+    echo "warning: failed to ad-hoc sign $install_tmp" >&2
   }
 fi
 
-printf '\ninstalled zi to %s/zi\n' "$install_dir"
+mv "$install_tmp" "$install_dir/zi"
+install_tmp=
 
-if command -v "$install_dir/zi" >/dev/null 2>&1; then
-  "$install_dir/zi" --version
-else
-  printf '\nadd this to your shell profile if needed:\n\n'
-  printf '  export PATH="%s:$PATH"\n\n' "$install_dir"
-  printf 'then run:\n\n'
-  printf '  zi --version\n'
-fi
+printf '\ninstalled zi to %s/zi\n' "$install_dir"
+"$install_dir/zi" --version
+
+case ":$PATH:" in
+  *":$install_dir:"*) ;;
+  *)
+    printf '\nadd this to your shell profile if needed:\n\n'
+    printf '  export PATH="%s:$PATH"\n\n' "$install_dir"
+    printf 'then run:\n\n'
+    printf '  zi --version\n'
+    ;;
+esac
