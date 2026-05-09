@@ -6,6 +6,7 @@ const cell_mod = @import("../cell.zig");
 const text_component_mod = @import("../components/text.zig");
 const notifications = @import("../notifications.zig");
 const overlay_mod = @import("../primitives/overlay.zig");
+const chrome_mod = @import("../primitives/chrome.zig");
 const Interactive = @import("../interactive.zig").Interactive;
 const Component = component_mod.Component;
 const Region = buffer_mod.Region;
@@ -13,6 +14,7 @@ const Measurement = component_mod.Measurement;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
 const TextComponent = text_component_mod.Text;
+const TextRun = text_component_mod.TextRun;
 
 pub const NotificationComponent = struct {
     interactive: *Interactive = undefined,
@@ -46,32 +48,63 @@ pub const NotificationComponent = struct {
             const icon = if (item.progress and !item.done) frames[frame_idx] else levelIcon(item.level);
             const label = if (item.title) |title| title else if (show_group and group.len > 0) group else icon;
             const suffix = if (item.annote) |annote| annote else if (item.done) "done" else "";
-            const rendered_message = if (item.count > 1)
-                std.fmt.allocPrint(allocator, "({d}x) {s}", .{ item.count, item.message }) catch item.message
-            else
-                item.message;
-            defer if (rendered_message.ptr != item.message.ptr) allocator.free(rendered_message);
-            const text = if (suffix.len > 0)
-                std.fmt.allocPrint(allocator, "{s} {s} — {s}", .{ label, rendered_message, suffix }) catch item.message
-            else
-                std.fmt.allocPrint(allocator, "{s} {s}", .{ label, rendered_message }) catch item.message;
-            defer if (text.ptr != item.message.ptr) allocator.free(text);
-            renderNotificationText(allocator, region.sub(0, y, region.width, 1), text, .{ .dim = item.done });
+            const tone_fg = chrome_mod.toneFg(self.interactive.theme, notificationTone(item.level));
+            const muted_fg = chrome_mod.toneFg(self.interactive.theme, .muted);
+            renderNotificationText(allocator, region.sub(0, y, region.width, 1), .{
+                .label = label,
+                .message = item.message,
+                .suffix = suffix,
+                .count = item.count,
+                .fg = tone_fg,
+                .muted_fg = muted_fg,
+                .done = item.done,
+            });
             y += 1;
         }
     }
 };
 
-fn renderNotificationText(allocator: std.mem.Allocator, region: Region, text: []const u8, attrs: Attributes) void {
+const NotificationText = struct {
+    label: []const u8,
+    message: []const u8,
+    suffix: []const u8,
+    count: u32,
+    fg: Color,
+    muted_fg: Color,
+    done: bool,
+};
+
+fn renderNotificationText(allocator: std.mem.Allocator, region: Region, text: NotificationText) void {
     var component = TextComponent.init(allocator, region.buf.width_method);
     defer component.deinit();
-    component.content = text;
-    component.attrs = attrs;
+
+    const base_attrs = Attributes{ .dim = text.done };
+    const label_attrs = Attributes{ .bold = !text.done, .dim = text.done };
+    const count_prefix = if (text.count > 1) std.fmt.allocPrint(allocator, "({d}x) ", .{text.count}) catch "" else "";
+    defer if (count_prefix.len > 0) allocator.free(count_prefix);
+
+    var runs_buf: [6]TextRun = undefined;
+    var run_count: usize = 0;
+    appendRun(&runs_buf, &run_count, .{ .text = text.label, .fg = text.fg, .attrs = label_attrs });
+    appendRun(&runs_buf, &run_count, .{ .text = " ", .fg = text.fg, .attrs = base_attrs });
+    if (count_prefix.len > 0) appendRun(&runs_buf, &run_count, .{ .text = count_prefix, .fg = text.muted_fg, .attrs = base_attrs });
+    appendRun(&runs_buf, &run_count, .{ .text = text.message, .fg = text.fg, .attrs = base_attrs });
+    if (text.suffix.len > 0) {
+        appendRun(&runs_buf, &run_count, .{ .text = " — ", .fg = text.muted_fg, .attrs = base_attrs });
+        appendRun(&runs_buf, &run_count, .{ .text = text.suffix, .fg = text.muted_fg, .attrs = base_attrs });
+    }
+
+    component.setRuns(runs_buf[0..run_count]);
     component.wrap_mode = .none;
     component.overflow = .ellipsis;
     component.max_lines = 1;
     component.text_align = .left;
     component.render(region);
+}
+
+fn appendRun(buf: *[6]TextRun, len: *usize, run: TextRun) void {
+    buf[len.*] = run;
+    len.* += 1;
 }
 
 /// Native notification UI surface. Extension APIs adapt into this; they do not
@@ -156,5 +189,15 @@ fn levelIcon(level: notifications.Level) []const u8 {
         .warn => "▲",
         .error_ => "✖",
         .success => "✓",
+    };
+}
+
+fn notificationTone(level: notifications.Level) chrome_mod.Tone {
+    return switch (level) {
+        .debug => .muted,
+        .info => .info,
+        .warn => .warning,
+        .error_ => .danger,
+        .success => .success,
     };
 }
