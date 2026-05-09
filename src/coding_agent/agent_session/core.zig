@@ -90,9 +90,15 @@ pub const AgentSessionCore = struct {
         return try self.resultFromAgent();
     }
 
-    pub fn abort(self: *AgentSessionCore) void { self.agent.abort(); }
-    pub fn isBusy(self: *const AgentSessionCore) bool { return self.agent.isRunning(); }
-    pub fn messages(self: *const AgentSessionCore) []const protocol.AgentMessage { return self.agent.messages(); }
+    pub fn abort(self: *AgentSessionCore) void {
+        self.agent.abort();
+    }
+    pub fn isBusy(self: *const AgentSessionCore) bool {
+        return self.agent.isRunning();
+    }
+    pub fn messages(self: *const AgentSessionCore) []const protocol.AgentMessage {
+        return self.agent.messages();
+    }
 
     pub fn contextUsage(self: *AgentSessionCore) ?ContextUsage {
         if (self.context_usage_fn) |f| return f.func(f.ptr);

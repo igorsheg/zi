@@ -220,14 +220,32 @@ fn freeAssistantMessageEvent(allocator: std.mem.Allocator, event: *ai.protocol.A
     switch (event.*) {
         .start => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.partial),
         .text_start => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.partial),
-        .text_delta => |*e| { allocator.free(e.delta); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
-        .text_end => |*e| { allocator.free(e.content); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .text_delta => |*e| {
+            allocator.free(e.delta);
+            agent_message_memory.freeAssistantMessage(allocator, &e.partial);
+        },
+        .text_end => |*e| {
+            allocator.free(e.content);
+            agent_message_memory.freeAssistantMessage(allocator, &e.partial);
+        },
         .thinking_start => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.partial),
-        .thinking_delta => |*e| { allocator.free(e.delta); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
-        .thinking_end => |*e| { allocator.free(e.content); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .thinking_delta => |*e| {
+            allocator.free(e.delta);
+            agent_message_memory.freeAssistantMessage(allocator, &e.partial);
+        },
+        .thinking_end => |*e| {
+            allocator.free(e.content);
+            agent_message_memory.freeAssistantMessage(allocator, &e.partial);
+        },
         .toolcall_start => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.partial),
-        .toolcall_delta => |*e| { allocator.free(e.delta); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
-        .toolcall_end => |*e| { freeToolCall(allocator, e.tool_call); agent_message_memory.freeAssistantMessage(allocator, &e.partial); },
+        .toolcall_delta => |*e| {
+            allocator.free(e.delta);
+            agent_message_memory.freeAssistantMessage(allocator, &e.partial);
+        },
+        .toolcall_end => |*e| {
+            freeToolCall(allocator, e.tool_call);
+            agent_message_memory.freeAssistantMessage(allocator, &e.partial);
+        },
         .done => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.message),
         .@"error" => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.@"error"),
     }
