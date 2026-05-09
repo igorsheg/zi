@@ -2261,7 +2261,8 @@ test "ctx.ui.notify publishes notification render" {
     try testing.expectEqual(@as(usize, 1), store.render_specs.items.len);
     try testing.expectEqual(extension_ui.UiTarget.notification, store.render_specs.items[0].target);
     try testing.expectEqualStrings("agent-ready", store.render_specs.items[0].id);
-    try testing.expect(store.render_specs.items[0].root != null);
+    try testing.expect(store.render_specs.items[0].notification != null);
+    try testing.expectEqualStrings("Ready for input", store.render_specs.items[0].notification.?.message);
 }
 
 test "todo command can call ctx.ui.render perimeter" {

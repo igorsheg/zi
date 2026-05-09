@@ -1,5 +1,6 @@
 const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const ui_event_mod = @import("../ui_event.zig");
+const notifications_flow = @import("notifications.zig");
 const overlay_mod = @import("../primitives/overlay.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
@@ -26,8 +27,13 @@ pub fn publishPending(self: *Interactive) void {
 }
 
 pub fn applyRenderUpdates(self: *Interactive, updates: []const extension_ui.RenderSpec) void {
-    for (updates) |update| self.extension_ui_state.applyRender(update);
-    syncExtensionNotificationOverlay(self);
+    for (updates) |update| {
+        if (update.notification) |notification| {
+            notifications_flow.notify(self, notification);
+        } else {
+            self.extension_ui_state.applyRender(update);
+        }
+    }
     syncExtensionOverlay(self);
     self.tui.dirty = true;
 }
@@ -72,33 +78,10 @@ pub fn applyCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.Ex
     self.tui.dirty = true;
 }
 
-fn extensionNotificationOptions(self: *Interactive) overlay_mod.OverlayOptions {
-    var options = overlay_mod.OverlayPresets.topToast();
-    options.anchor = .bottom_right;
-    options.width = 44;
-    options.max_height = null;
-    options.max_height_percent = 40;
-    return self.extension_ui_state.syncOverlayOptions(.notification, options);
-}
-
 fn extensionOverlayOptions(self: *Interactive) overlay_mod.OverlayOptions {
     var options = overlay_mod.OverlayPresets.centerDialog();
     options.non_capturing = !self.extension_ui_state.targetWantsFocus(.overlay);
     return self.extension_ui_state.syncOverlayOptions(.overlay, options);
-}
-
-pub fn syncExtensionNotificationOverlay(self: *Interactive) void {
-    if (self.extension_ui_state.hasNotificationViews()) {
-        if (self.extension_notification_overlay) |handle| {
-            handle.setOptions(extensionNotificationOptions(self));
-            handle.setHidden(false);
-        } else {
-            self.extension_notification_overlay = self.tui.showOverlay(self.extension_ui_state.notificationComponent(), extensionNotificationOptions(self));
-        }
-    } else if (self.extension_notification_overlay) |handle| {
-        self.extension_notification_overlay = null;
-        handle.hide();
-    }
 }
 
 pub fn syncExtensionOverlay(self: *Interactive) void {

@@ -352,27 +352,12 @@ fn publishNotifyFromArgs(L: *c.lua_State) !void {
     const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
 
     const notify = extension_ui.NotifySpec{ .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)), .generation = runner.generation, .id = id, .message = try aa.dupe(u8, message), .group = group, .title = title, .annote = annote, .level = level, .progress = progress, .done = done, .clear = clear, .created_ns = now_ns, .updated_ns = now_ns, .lifetime = lifetime };
-    const root = if (notify.clear) null else try notifyNode(aa, notify);
-    const spec = extension_ui.RenderSpec{ .state_owner_id = notify.state_owner_id, .generation = notify.generation, .id = notify.id, .target = .notification, .order = 0, .remove = notify.clear, .root = root, .notification = notify };
+    const spec = extension_ui.RenderSpec{ .state_owner_id = notify.state_owner_id, .generation = notify.generation, .id = notify.id, .target = .notification, .order = 0, .remove = notify.clear, .root = null, .notification = notify };
     try callback(bound.session, spec);
 }
 
 fn notifyLifetime(ttl_ms: ?u32) @import("../../tui/notifications.zig").Lifetime {
     return if (ttl_ms) |ms| .{ .ttl_ms = ms } else .manual;
-}
-
-fn notifyNode(aa: std.mem.Allocator, notify: extension_ui.NotifySpec) !extension_ui.UiNode {
-    const icon = switch (notify.level) {
-        .debug => "·",
-        .info => "●",
-        .warn => "▲",
-        .error_ => "✖",
-        .success => "✓",
-    };
-    const prefix = if (notify.progress and !notify.done) "◐" else icon;
-    const label = if (notify.title) |title| title else if (notify.group) |group| group else prefix;
-    const text = if (notify.annote) |annote| try std.fmt.allocPrint(aa, "{s} {s} — {s}", .{ label, notify.message, annote }) else try std.fmt.allocPrint(aa, "{s} {s}", .{ label, notify.message });
-    return .{ .text = .{ .text = text, .style = .{ .tone = extension_ui.notificationTone(notify), .dim = notify.done }, .wrap = .word, .max_lines = 2 } };
 }
 
 fn publishRenderFromArgs(L: *c.lua_State) !void {

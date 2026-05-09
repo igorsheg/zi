@@ -75,6 +75,7 @@ const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 const request_mod = @import("../coding_agent/request.zig");
 const extension_ui = @import("../coding_agent/extensions/ui.zig");
 const notifications = @import("notifications.zig");
+const notifications_flow = @import("interactive/notifications.zig");
 const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
 const list_picker_mod = @import("components/list_picker.zig");
@@ -188,7 +189,9 @@ pub const Interactive = struct {
     status_line: StatusLine,
     pending_image_banner: text_mod.Text,
     extension_ui_state: ExtensionUiState,
-    extension_notification_overlay: ?tui_mod.OverlayHandle = null,
+    notification_center: notifications.Center,
+    notification_component: notifications_flow.NotificationComponent = .{},
+    notification_overlay: ?tui_mod.OverlayHandle = null,
     extension_overlay_handle: ?tui_mod.OverlayHandle = null,
     greeter: greeter_mod.Greeter,
     footer: footer_mod.Footer,
@@ -303,6 +306,7 @@ pub const Interactive = struct {
             .status_line = StatusLine.init(allocator),
             .pending_image_banner = text_mod.Text.init(allocator, tui.terminal.capabilities.width_method),
             .extension_ui_state = ExtensionUiState.init(allocator),
+            .notification_center = notifications.Center.init(allocator),
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
             .hotkeys_overlay = .{},
@@ -417,6 +421,7 @@ pub const Interactive = struct {
         self.selection.deinit(self.allocator);
         self.transcript.deinit();
         self.extension_ui_state.deinit();
+        self.notification_center.deinit();
         self.logs_overlay.deinit();
         self.pending_image_banner.deinit();
         self.status_line.deinit();
@@ -500,8 +505,8 @@ pub const Interactive = struct {
             if (self.tui.tickAnimations(now_ns)) {
                 self.tui.dirty = true;
             }
-            if (self.extension_ui_state.tickNotifications(now_ns)) {
-                extension_ui_flow.syncExtensionNotificationOverlay(self);
+            if (notifications_flow.tick(self, now_ns)) {
+                notifications_flow.sync(self);
                 self.tui.dirty = true;
             }
 
@@ -1234,10 +1239,7 @@ pub const Interactive = struct {
     }
 
     pub fn notify(self: *Interactive, spec: notifications.Spec) void {
-        const root: ?extension_ui.UiNode = if (spec.clear) null else .{ .text = .{ .text = spec.message, .style = .{ .tone = extension_ui.notificationTone(spec) }, .max_lines = 1 } };
-        self.extension_ui_state.applyRender(.{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .id = spec.id, .target = .notification, .remove = spec.clear, .root = root, .notification = spec });
-        extension_ui_flow.syncExtensionNotificationOverlay(self);
-        self.tui.dirty = true;
+        notifications_flow.notify(self, spec);
     }
 
     pub fn publishPendingExtensionUi(self: *Interactive) void {
