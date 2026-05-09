@@ -11,7 +11,6 @@ pub fn apply(self: *Interactive, theme: theme_mod.Theme) void {
     self.theme = &self.theme_storage;
     self.greeter.theme = self.theme;
     self.footer.theme = self.theme;
-    self.hotkeys_overlay.theme = self.theme;
     self.extension_ui_state.setTheme(self.theme);
     if (self.active_editor_bound) {
         self.active_editor.setTheme(self.theme);

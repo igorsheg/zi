@@ -11,7 +11,6 @@ const status_line_mod = @import("components/status_line.zig");
 const greeter_mod = @import("components/greeter.zig");
 const footer_mod = @import("components/footer.zig");
 const editor_mod = @import("components/editor.zig");
-const hotkeys_overlay_mod = @import("components/hotkeys_overlay.zig");
 const ui_event_mod = @import("ui_event.zig");
 const ai_complete_worker_mod = @import("../coding_agent/extensions/ai_complete_worker.zig");
 const system_worker_mod = @import("../coding_agent/extensions/system_worker.zig");
@@ -49,8 +48,8 @@ const settings_flow_mod = @import("interactive/settings_flow.zig");
 const status_snapshot_mod = @import("interactive/status_snapshot.zig");
 const status_flow = @import("interactive/status_flow.zig");
 const memory_telemetry = @import("interactive/runtime/memory_telemetry.zig");
-const overlay_flow = @import("interactive/overlay_flow.zig");
 const simple_picker_flow_mod = @import("interactive/simple_picker_flow.zig");
+const hotkeys_flow = @import("interactive/hotkeys_flow.zig");
 const idle_request = @import("interactive/runtime/idle_request.zig");
 const runtime_loop = @import("interactive/runtime/loop.zig");
 const job_manager_mod = @import("interactive/runtime/job_manager.zig");
@@ -103,6 +102,7 @@ const userFacingFailureMessage = agent_ui_event_mod.userFacingFailureMessage;
 const PendingImageAttachment = clipboard_images_mod.PendingImageAttachment;
 const ModelPickerFlow = model_picker_flow_mod.ModelPickerFlow;
 const ResumePickerFlow = resume_picker_flow_mod.ResumePickerFlow;
+const HotkeysFlow = hotkeys_flow.HotkeysFlow;
 const ExtensionUiState = extension_ui_state_mod.ExtensionUiState;
 const session_store_mod = @import("../coding_agent/session/store.zig");
 const session_index_worker_mod = @import("interactive/session_index_worker.zig");
@@ -223,7 +223,7 @@ pub const Interactive = struct {
     command_registry: CommandRegistry,
     autocomplete_provider: CombinedAutocompleteProvider = undefined,
     autocomplete_provider_bound: bool = false,
-    hotkeys_overlay: hotkeys_overlay_mod.HotkeysOverlay,
+    hotkeys_flow: ?HotkeysFlow = null,
     logs_overlay: ScrollTextOverlay,
     extension_keybindings: std.ArrayListUnmanaged(ui_event_mod.ExtensionKeybindingEntry) = .empty,
     extension_command_actions: extension_runner_mod.ExtensionCommandActions = undefined,
@@ -309,7 +309,6 @@ pub const Interactive = struct {
             .notification_center = notifications.Center.init(allocator),
             .greeter = .{ .version = app_meta.version },
             .footer = .{},
-            .hotkeys_overlay = .{},
             .logs_overlay = ScrollTextOverlay.init(allocator, themes_builtin.dark(), tui.terminal.capabilities.width_method),
             .transcript = Transcript.init(allocator),
             .conversation_projection = conversation_projection_mod.ProjectionState.init(msg_allocator),
@@ -382,6 +381,7 @@ pub const Interactive = struct {
         self.drainUiEvents();
         self.closeModelPickerFlow();
         self.closeResumePickerFlow();
+        self.closeHotkeysFlow();
         self.settings_picker.deinit();
         self.thinking_picker.deinit();
         self.login_picker.deinit();
@@ -971,16 +971,25 @@ pub const Interactive = struct {
         return true;
     }
 
-    pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
-        return overlay_flow.bottomSheetOptions(self);
+    pub fn overlayTopMargin(self: *Interactive) u32 {
+        return if (self.greeter_dismissed) 0 else self.greeter.measure(self.tui.width()).preferred_height;
     }
 
-    fn centerDialogOptions(self: *Interactive) overlay_mod.OverlayOptions {
-        return overlay_flow.centerDialogOptions(self);
+    pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
+        return overlay_mod.OverlayPresets.ivy(.{
+            .top_margin = self.overlayTopMargin(),
+            .fill = Color.default,
+        });
+    }
+
+    pub fn centeredOverlayOptions(self: *Interactive, config: overlay_mod.OverlayPresetOptions) overlay_mod.OverlayOptions {
+        var resolved = config;
+        resolved.top_margin = self.overlayTopMargin();
+        return overlay_mod.OverlayPresets.centered(resolved);
     }
 
     fn showHotkeysOverlay(self: *Interactive) void {
-        overlay_flow.showHotkeys(self);
+        hotkeys_flow.show(self);
     }
 
     fn showLogs(self: *Interactive, args: []const u8) void {
@@ -1065,19 +1074,21 @@ pub const Interactive = struct {
         on_select: ?*const fn (selection: PickerSelection, ctx: ?*anyopaque) void,
         on_cancel: ?*const fn (ctx: ?*anyopaque) void,
     ) void {
-        overlay_flow.configureSimplePicker(self, picker, title, max_visible, items, on_select, on_cancel);
+        picker.configure(self.allocator, self.theme, title, max_visible, items, @ptrCast(self), on_select, on_cancel);
     }
 
     pub fn showSimplePickerOverlay(
         self: *Interactive,
         picker: *SimplePickerFlow,
     ) void {
-        overlay_flow.showSimplePickerOverlay(self, picker);
+        self.cancelTranscriptSelection();
+        picker.hide();
+        picker.handle = self.tui.showOverlay(picker.picker.component(), self.bottomSheetOptions());
     }
 
     pub fn hideSimplePickerOverlay(self: *Interactive, picker: *SimplePickerFlow) void {
         _ = self;
-        overlay_flow.hideSimplePickerOverlay(picker);
+        picker.hide();
     }
 
     pub fn dispatchIdleRequest(self: *Interactive, req: AgentRequest, options: IdleRequestDispatch) bool {
@@ -1086,6 +1097,10 @@ pub const Interactive = struct {
 
     fn closeResumePickerFlow(self: *Interactive) void {
         session_flow.close(self);
+    }
+
+    fn closeHotkeysFlow(self: *Interactive) void {
+        hotkeys_flow.close(self);
     }
 
     pub fn showSessionPicker(self: *Interactive, restore_session_model: bool) void {

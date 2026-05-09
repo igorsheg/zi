@@ -77,8 +77,39 @@ pub const OverlayOptions = struct {
 /// Generic overlay layout presets. Terminal-level only — no knowledge of
 /// app layout slots (editor, footer, etc.). App-specific presets that
 /// account for layout belong in the composition root (e.g., interactive.zig).
+pub const OverlayPresetOptions = struct {
+    top_margin: u32 = 0,
+    bottom_margin: ?u32 = null,
+    fill: ?Color = null,
+    width_percent: ?u8 = null,
+    max_height_percent: ?u8 = null,
+};
+
 pub const OverlayPresets = struct {
+    /// Telescope-style ivy layout — full-width bottom sheet for pickers.
+    pub fn ivy(config: OverlayPresetOptions) OverlayOptions {
+        return .{
+            .anchor = .bottom_left,
+            .width_percent = config.width_percent orelse 100,
+            .max_height_percent = config.max_height_percent orelse 40,
+            .margin_top = config.top_margin,
+            .margin_bottom = config.bottom_margin orelse 0,
+            .surface = .{ .fill = config.fill orelse Color.default },
+        };
+    }
+
     /// Centered modal dialog — confirmations, settings, selectors.
+    pub fn centered(config: OverlayPresetOptions) OverlayOptions {
+        var options = centerDialog();
+        options.margin_top = config.top_margin;
+        options.margin_bottom = config.bottom_margin orelse 1;
+        if (config.width_percent) |width_percent| options.width_percent = width_percent;
+        if (config.max_height_percent) |max_height_percent| options.max_height_percent = max_height_percent;
+        options.surface = .{ .fill = config.fill orelse Color.default };
+        return options;
+    }
+
+    /// Legacy centered modal defaults. Prefer centered(config) at call sites.
     pub fn centerDialog() OverlayOptions {
         return .{
             .anchor = .center,
