@@ -11,7 +11,8 @@ const log = std.log.scoped(.storage);
 
 const stale_threshold_ns: i128 = 30 * std.time.ns_per_s;
 const max_retries: u32 = 10;
-const retry_delay_ns: u64 = 20 * std.time.ns_per_ms;
+const retry_min_delay_ns: u64 = 100 * std.time.ns_per_ms;
+const retry_max_delay_ns: u64 = 10 * std.time.ns_per_s;
 const max_file_size: usize = 1 * 1024 * 1024;
 
 /// A file with proper-lockfile-compatible directory locking.
@@ -63,7 +64,7 @@ pub const LockedFile = struct {
                         self.breakLock();
                         continue;
                     }
-                    self.io.sleep(.fromNanoseconds(@intCast(retry_delay_ns)), .awake) catch {};
+                    self.io.sleep(.fromNanoseconds(@intCast(retryDelayNs(attempt))), .awake) catch {};
                     continue;
                 },
                 else => {
@@ -86,7 +87,7 @@ pub const LockedFile = struct {
         var dir = std.Io.Dir.cwd().openDir(self.io, self.lock_path, .{}) catch return false;
         defer dir.close(self.io);
         const stat = dir.stat(self.io) catch return false;
-        const now = @as(i128, @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds()));
+        const now = @as(i128, @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds()));
         const age_ns = now - @as(i128, @intCast(stat.mtime.toNanoseconds()));
         return age_ns > stale_threshold_ns;
     }
@@ -95,6 +96,12 @@ pub const LockedFile = struct {
         std.Io.Dir.cwd().deleteDir(self.io, self.lock_path) catch {};
     }
 };
+
+fn retryDelayNs(attempt: u32) u64 {
+    const shift: u6 = @intCast(@min(attempt, 16));
+    const delay = retry_min_delay_ns << shift;
+    return @min(delay, retry_max_delay_ns);
+}
 
 pub const MemoryFile = struct {
     content: ?[]const u8 = null,

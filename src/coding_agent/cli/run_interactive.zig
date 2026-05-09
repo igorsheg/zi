@@ -77,13 +77,12 @@ pub fn run(
         return .{ .err = .no_model_available };
     };
 
-    if (options.api_key) |cli_key| {
-        const provider_str = ai.json_util.providerToString(effective_model.provider);
-        runtime.auth_storage.setRuntimeApiKey(provider_str, cli_key);
-    }
     const provider_str = ai.json_util.providerToString(effective_model.provider);
-    const api_key: []const u8 = runtime.auth_storage.getApiKey(provider_str) orelse "";
-    const needs_auth = api_key.len == 0;
+    const api_key: []const u8 = if (options.api_key) |cli_key| blk: {
+        runtime.auth_storage.setRuntimeApiKey(provider_str, cli_key);
+        break :blk cli_key;
+    } else "";
+    const needs_auth = !runtime.auth_storage.hasAuth(provider_str);
     const allowlist_opt = try common.parseToolAllowlist(ctx.allocator, options.tool_allowlist_csv);
 
     const session_create_options: sdk.CreateOptions = .{

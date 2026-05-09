@@ -3,8 +3,11 @@ const pkce = @import("pkce.zig");
 const callback_server = @import("callback_server.zig");
 const auth_types = @import("types.zig");
 const provider_mod = @import("../../ai/provider.zig");
+const zio_fs = @import("../../zio/fs.zig");
 
 const log = std.log.scoped(.oauth);
+
+extern "c" fn system(command: [*:0]const u8) c_int;
 
 /// Per-provider OAuth configuration.
 /// Shared PKCE + callback infra; per-provider hooks for protocol differences.
@@ -560,32 +563,35 @@ fn doTokenExchange(
     payload: []const u8,
     expires_buffer_ms: i64,
 ) ExchangeResult {
-    var client: std.http.Client = .{ .allocator = allocator, .io = std.Options.debug_io };
-    defer client.deinit();
+    const state = pkce.generateState();
+    const body_path = std.fmt.allocPrint(allocator, ".zig-cache/zi-oauth-{s}.body", .{&state}) catch return .{ .err = "OOM" };
+    defer allocator.free(body_path);
+    const out_path = std.fmt.allocPrint(allocator, ".zig-cache/zi-oauth-{s}.out", .{&state}) catch return .{ .err = "OOM" };
+    defer allocator.free(out_path);
+    const err_path = std.fmt.allocPrint(allocator, ".zig-cache/zi-oauth-{s}.err", .{&state}) catch return .{ .err = "OOM" };
+    defer allocator.free(err_path);
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, body_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, out_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, err_path) catch {};
 
-    var body_writer_buf: [8192]u8 = undefined;
-    var body_writer: std.Io.Writer = .fixed(&body_writer_buf);
+    zio_fs.writeFileTruncate(std.Options.debug_io, body_path, payload) catch return .{ .err = "failed to write token request" };
 
-    const result = client.fetch(.{
-        .location = .{ .url = url_str },
-        .method = .POST,
-        .payload = payload,
-        .extra_headers = &.{
-            .{ .name = "accept", .value = "application/json" },
-        },
-        .headers = .{
-            .content_type = .{ .override = content_type },
-        },
-        .response_writer = &body_writer,
-    }) catch |err| {
-        log.err("token exchange request failed: {s}", .{@errorName(err)});
-        return .{ .err = "failed to connect to token endpoint" };
-    };
+    const command = std.fmt.allocPrint(
+        allocator,
+        "/usr/bin/curl --silent --show-error --fail-with-body --max-time 20 --request POST --header 'accept: application/json' --header 'content-type: {s}' --data-binary '@{s}' '{s}' >'{s}' 2>'{s}'",
+        .{ content_type, body_path, url_str, out_path, err_path },
+    ) catch return .{ .err = "OOM" };
+    defer allocator.free(command);
 
-    const body = body_writer.buffered();
-
-    if (result.status != .ok) {
-        log.err("token exchange failed: HTTP {d}: {s}", .{ @intFromEnum(result.status), body });
+    const command_z = allocator.dupeZ(u8, command) catch return .{ .err = "OOM" };
+    defer allocator.free(command_z);
+    const rc = system(command_z.ptr);
+    const body = zio_fs.readFileAlloc(std.Options.debug_io, allocator, out_path, .limited(64 * 1024)) catch return .{ .err = "failed to read token response" };
+    defer allocator.free(body);
+    if (rc != 0) {
+        const stderr = zio_fs.readFileAlloc(std.Options.debug_io, allocator, err_path, .limited(8 * 1024)) catch "";
+        defer if (stderr.len > 0) allocator.free(stderr);
+        log.err("token exchange failed: {s}", .{stderr});
         return .{ .err = "token exchange failed" };
     }
 

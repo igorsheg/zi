@@ -5,10 +5,11 @@ const json_util = @import("../../ai/json_util.zig");
 const request_mod = @import("../../coding_agent/request.zig");
 const oauth_mod = @import("../../coding_agent/auth/oauth.zig");
 const list_picker_mod = @import("../components/list_picker.zig");
-const runtime_process = @import("../../zio/root.zig").process;
 
 const Interactive = @import("../interactive.zig").Interactive;
 const PickerSelection = list_picker_mod.Selection;
+
+extern "c" fn system(command: [*:0]const u8) c_int;
 
 pub fn clearEntries(self: *Interactive) void {
     var i: usize = 0;
@@ -200,23 +201,30 @@ fn threadFn(ctx: *Context) void {
 fn onAuth(url: []const u8, ctx: ?*anyopaque) void {
     const self: *Interactive = @ptrCast(@alignCast(ctx.?));
 
-    var result = runtime_process.run(std.heap.page_allocator, std.Options.debug_io, .{
-        .argv = if (builtin.os.tag == .macos)
-            &.{ "open", url }
-        else
-            &.{ "xdg-open", url },
-        .capture_stdout = false,
-        .capture_stderr = false,
-        .timeout_ms = 5000,
-    });
-    defer result.deinit(std.heap.page_allocator);
-
-    const msg = self.msg_allocator.dupe(u8, "login: check your browser") catch return;
+    const opened = openAuthUrl(url);
+    const msg = if (opened)
+        self.msg_allocator.dupe(u8, "login: check your browser") catch return
+    else
+        std.fmt.allocPrint(self.msg_allocator, "login URL: {s}", .{url}) catch return;
     _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = msg, .kind = .auth_url } });
 }
 
 fn onProgress(msg: []const u8, ctx: ?*anyopaque) void {
+    if (std.mem.eql(u8, msg, "Waiting for browser authentication...")) return;
     const self: *Interactive = @ptrCast(@alignCast(ctx.?));
     const owned = self.msg_allocator.dupe(u8, msg) catch return;
     _ = self.publishSnapshotUiEvent(.{ .login_progress = .{ .message = owned, .kind = .info } });
+}
+
+fn openAuthUrl(url: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, url, '\'')) |_| return false;
+    const command = std.fmt.allocPrint(
+        std.heap.page_allocator,
+        if (builtin.os.tag == .macos) "/usr/bin/open '{s}' >/dev/null 2>&1" else "xdg-open '{s}' >/dev/null 2>&1",
+        .{url},
+    ) catch return false;
+    defer std.heap.page_allocator.free(command);
+    const command_z = std.heap.page_allocator.dupeZ(u8, command) catch return false;
+    defer std.heap.page_allocator.free(command_z);
+    return system(command_z.ptr) == 0;
 }

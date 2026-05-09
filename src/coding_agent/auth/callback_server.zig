@@ -52,13 +52,13 @@ pub fn waitForCallback(
 
         var read_buf: [4096]u8 = undefined;
         var reader = stream.reader(std.Options.debug_io, &read_buf);
-        const request_bytes = reader.interface.allocRemaining(allocator, .limited(read_buf.len)) catch {
+        const request_line = (reader.interface.takeDelimiter('\n') catch {
+            sendResponse(stream, "400 Bad Request", error_html);
+            continue;
+        }) orelse {
             sendResponse(stream, "400 Bad Request", error_html);
             continue;
         };
-        defer allocator.free(request_bytes);
-        const request_line_end = std.mem.indexOfScalar(u8, request_bytes, '\n') orelse request_bytes.len;
-        const request_line = request_bytes[0..request_line_end];
 
         const result = parseCallbackRequest(allocator, request_line, path, expected_state);
 
