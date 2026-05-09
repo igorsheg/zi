@@ -8,6 +8,14 @@ pub const Lifetime = union(enum) {
     manual,
     ttl_ms: u32,
 
+    pub fn default() Lifetime {
+        return .{ .ttl_ms = 5000 };
+    }
+
+    pub fn progressDefault() Lifetime {
+        return .manual;
+    }
+
     pub fn doneDefault() Lifetime {
         return .{ .ttl_ms = 3000 };
     }
@@ -27,7 +35,7 @@ pub const Spec = struct {
     clear: bool = false,
     created_ns: i128 = 0,
     updated_ns: i128 = 0,
-    lifetime: Lifetime = .manual,
+    lifetime: Lifetime = Lifetime.default(),
     count: u32 = 1,
 
     pub fn ttlMs(self: Spec) ?u32 {

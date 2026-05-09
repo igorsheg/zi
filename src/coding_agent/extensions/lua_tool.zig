@@ -2263,6 +2263,7 @@ test "ctx.ui.notify publishes notification render" {
     try testing.expectEqualStrings("agent-ready", store.render_specs.items[0].id);
     try testing.expect(store.render_specs.items[0].notification != null);
     try testing.expectEqualStrings("Ready for input", store.render_specs.items[0].notification.?.message);
+    try testing.expectEqual(@as(?u32, 5000), store.render_specs.items[0].notification.?.ttlMs());
 }
 
 test "todo command can call ctx.ui.render perimeter" {

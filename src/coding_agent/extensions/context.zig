@@ -347,8 +347,8 @@ fn publishNotifyFromArgs(L: *c.lua_State) !void {
     const clear = if (opts_idx != 0) readBoolField(L, opts_idx, "clear", false) else false;
     const done = if (opts_idx != 0) readBoolField(L, opts_idx, "done", false) else false;
     const progress = if (opts_idx != 0) readBoolField(L, opts_idx, "progress", false) else false;
-    var lifetime = if (opts_idx != 0) notifyLifetime(readOptionalU32Field(L, opts_idx, "ttl_ms") orelse readOptionalSecondsAsMsField(L, opts_idx, "ttl")) else @import("../../tui/notifications.zig").Lifetime.manual;
-    if (lifetime == .manual and done) lifetime = @import("../../tui/notifications.zig").Lifetime.doneDefault();
+    const ttl_ms = if (opts_idx != 0) readOptionalU32Field(L, opts_idx, "ttl_ms") orelse readOptionalSecondsAsMsField(L, opts_idx, "ttl") else null;
+    const lifetime = notifyLifetime(ttl_ms, progress, done);
     const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
 
     const notify = extension_ui.NotifySpec{ .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)), .generation = runner.generation, .id = id, .message = try aa.dupe(u8, message), .group = group, .title = title, .annote = annote, .level = level, .progress = progress, .done = done, .clear = clear, .created_ns = now_ns, .updated_ns = now_ns, .lifetime = lifetime };
@@ -356,8 +356,14 @@ fn publishNotifyFromArgs(L: *c.lua_State) !void {
     try callback(bound.session, spec);
 }
 
-fn notifyLifetime(ttl_ms: ?u32) @import("../../tui/notifications.zig").Lifetime {
-    return if (ttl_ms) |ms| .{ .ttl_ms = ms } else .manual;
+fn notifyLifetime(ttl_ms: ?u32, progress: bool, done: bool) @import("../../tui/notifications.zig").Lifetime {
+    const Lifetime = @import("../../tui/notifications.zig").Lifetime;
+    if (ttl_ms) |ms| {
+        if (ms != 0) return .{ .ttl_ms = ms };
+    }
+    if (done) return Lifetime.doneDefault();
+    if (progress) return Lifetime.progressDefault();
+    return Lifetime.default();
 }
 
 fn publishRenderFromArgs(L: *c.lua_State) !void {
