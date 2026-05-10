@@ -78,7 +78,7 @@ pub fn completeUserText(
         .system_prompt = system_prompt,
         .api_key = if (api_key.len > 0) api_key else null,
         .max_tokens = max_tokens,
-        .reasoning = if (current_model.reasoning) .high else null,
+        .reasoning = resolveReasoning(current_model, self.agent.thinkingLevel()),
     });
     return switch (result) {
         .completed => |completed| completed.text,

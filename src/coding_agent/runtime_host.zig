@@ -1531,6 +1531,81 @@ test "runtime host runs pre-prompt threshold compaction before sending next prom
     try testing.expectEqual(@as(usize, 1), fp.call_count);
 }
 
+test "runtime host auto compaction runs once and resets context usage after compaction" {
+    const compactor = @import("session/compactor.zig");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var fp = faux.FauxProvider.init(allocator);
+    defer fp.deinit();
+
+    const summary_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("history summary")};
+    var history_summary = faux.fauxAssistantMessage(allocator, &summary_content, .stop);
+    history_summary.usage.total_tokens = 100;
+    history_summary.usage.input = 100;
+    const turn_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("turn prefix summary")};
+    var turn_summary = faux.fauxAssistantMessage(allocator, &turn_content, .stop);
+    turn_summary.usage.total_tokens = 100;
+    turn_summary.usage.input = 100;
+    const first_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("after compact")};
+    var first_response = faux.fauxAssistantMessage(allocator, &first_content, .stop);
+    first_response.usage.total_tokens = 512;
+    first_response.usage.input = 500;
+    first_response.usage.output = 12;
+    const second_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("still stable")};
+    var second_response = faux.fauxAssistantMessage(allocator, &second_content, .stop);
+    second_response.usage.total_tokens = 768;
+    second_response.usage.input = 750;
+    second_response.usage.output = 18;
+    fp.setResponses(&.{ history_summary, turn_summary, first_response, second_response });
+
+    var registry = ai.provider.Registry.init(allocator);
+    defer registry.deinit();
+    try registry.register("faux", fp.provider(), null);
+
+    const session = try createOwnedTestAgentSession(allocator, &registry);
+    _ = session.session_store.appendMessage(.{ .user = .{ .content = .{ .text = "old user" }, .timestamp = 1 } }) orelse return error.TestUnexpectedResult;
+    const old_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("old answer")};
+    var old_assistant = faux.fauxAssistantMessage(allocator, &old_content, .stop);
+    old_assistant.usage.total_tokens = 120_000;
+    old_assistant.usage.input = 120_000;
+    _ = session.session_store.appendMessage(.{ .assistant = old_assistant }) orelse return error.TestUnexpectedResult;
+    _ = session.session_store.appendMessage(.{ .user = .{ .content = .{ .text = "kept user" }, .timestamp = 3 } }) orelse return error.TestUnexpectedResult;
+    const kept_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("kept stale assistant")};
+    var kept_assistant = faux.fauxAssistantMessage(allocator, &kept_content, .stop);
+    kept_assistant.usage.total_tokens = 121_000;
+    kept_assistant.usage.input = 121_000;
+    _ = session.session_store.appendMessage(.{ .assistant = kept_assistant }) orelse return error.TestUnexpectedResult;
+
+    const initial_context = try session.session_store.buildCurrentContext();
+    try session.agent.setMessages(initial_context.messages);
+
+    var collector = LifecycleCollector{ .allocator = allocator };
+    defer collector.deinit();
+    var host = try RuntimeHost.init(session, allocator, allocator, createTestCreateOptions(&registry), .{
+        .compaction_policy = .{ .enabled = true, .reserve_tokens = 16_384, .keep_recent_tokens = 1 },
+        .compaction_executor = compactor.createExecutor(),
+    });
+    defer host.deinit();
+    host.setLifecycleHooks(.{
+        .on_compaction_start = &LifecycleCollector.onCompactionStart,
+        .on_compaction_end = &LifecycleCollector.onCompactionEnd,
+        .ctx = @ptrCast(&collector),
+    });
+
+    try testing.expectEqual(RunOutcome.success, try host.runUserContent(.{ .text = "continue" }));
+    try testing.expectEqual(@as(usize, 1), collector.compaction_starts.items.len);
+    try testing.expectEqual(@as(usize, 1), collector.compaction_ends.items.len);
+    try testing.expect(collector.compaction_ends.items[0].success);
+    try testing.expectEqual(@as(?u64, 512), host.currentSession().getContextUsage().?.tokens);
+
+    try testing.expectEqual(RunOutcome.success, try host.runUserContent(.{ .text = "continue again" }));
+    try testing.expectEqual(@as(usize, 1), collector.compaction_starts.items.len);
+    try testing.expectEqual(@as(usize, 4), fp.call_count);
+}
+
 test "runtime host auto compaction uses current branch after session cache was populated" {
     const compactor = @import("session/compactor.zig");
     const compaction_hooks = @import("session/compaction_hooks.zig");
