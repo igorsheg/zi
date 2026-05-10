@@ -1,18 +1,15 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const child_process = @import("child_process.zig");
 const guard_mod = @import("guard.zig");
 const AbortGuard = guard_mod.AbortGuard;
 const AbortSignal = @import("abort_signal.zig").AbortSignal;
-const TaskGroup = @import("tasks.zig").TaskGroup;
 const TimeoutGuard = guard_mod.TimeoutGuard;
 
 pub const default_max_output_bytes: usize = 1024 * 1024;
 const poll_interval_ms: u64 = 25;
 
-pub const EnvPair = struct {
-    key: []const u8,
-    value: []const u8,
-};
+pub const EnvPair = child_process.EnvPair;
 
 pub const StreamKind = enum { stdout, stderr };
 
@@ -177,15 +174,13 @@ const RunContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     request: Request,
-    env_map_storage: ?std.process.Environ.Map = null,
-
-    child: ?std.process.Child = null,
-    child_id: ?std.process.Child.Id = null,
+    child: child_process.ChildProcess = undefined,
     abort_guard: ?AbortGuard = null,
     timeout_guard: ?TimeoutGuard = null,
-    capture_tasks: CaptureTasks = .{},
     stdout_capture: Capture,
     stderr_capture: Capture,
+    term: ?std.process.Child.Term = null,
+    spawn_failed: bool = false,
 
     const InitError = error{ EmptyArgv, EnvironmentBuildFailed };
 
@@ -199,43 +194,43 @@ const RunContext = struct {
             .stdout_capture = Capture.init(std.heap.smp_allocator, request.max_stdout_bytes, request.capture_stdout),
             .stderr_capture = Capture.init(std.heap.smp_allocator, request.max_stderr_bytes, request.capture_stderr),
         };
-        errdefer ctx.deinit();
-
-        if (request.env.len > 0 or request.clear_env) {
-            ctx.env_map_storage = std.process.Environ.Map.init(allocator);
-            for (request.env) |pair| {
-                ctx.env_map_storage.?.put(pair.key, pair.value) catch return error.EnvironmentBuildFailed;
-            }
-        }
+        ctx.child = child_process.ChildProcess.init(io, .{
+            .argv = request.argv,
+            .cwd = request.cwd,
+            .env = request.env,
+            .clear_env = request.clear_env,
+            .process_group = request.process_group,
+            .stdin = request.stdin != null,
+            .close_stdin_before_wait = request.stdin != null,
+            .stdout = true,
+            .stderr = true,
+        }, .{ .ptr = @ptrCast(&ctx), .submit = RunContext.submitChildEvent });
         return ctx;
     }
 
     fn deinit(ctx: *RunContext) void {
         if (ctx.abort_guard) |*guard| guard.stop();
         if (ctx.timeout_guard) |*guard| guard.stop();
-        ctx.capture_tasks.join();
+        ctx.child.wait();
         ctx.stdout_capture.deinit();
         ctx.stderr_capture.deinit();
-        if (ctx.env_map_storage) |*env_map| env_map.deinit();
     }
 
     fn run(ctx: *RunContext) Result {
-        ctx.spawnChild() catch |err| return errorFmt(ctx.allocator, "spawn failed: {s}", .{@errorName(err)});
+        ctx.child.sink.ptr = @ptrCast(ctx);
+        ctx.child.start() catch |err| return errorFmt(ctx.allocator, "spawn failed: {s}", .{@errorName(err)});
+        if (!ctx.child.waitReady(5000)) return errorResult(ctx.allocator, "spawn failed");
         ctx.startAbortGuard();
         ctx.startTimeoutGuard();
-        ctx.startCaptureTasks() catch |err| {
-            ctx.killChild(.KILL);
-            return errorFmt(ctx.allocator, "capture setup failed: {s}", .{@errorName(err)});
-        };
         ctx.writeStdin();
 
-        ctx.pumpWhileCapturing();
-        ctx.captureTasksJoin();
+        ctx.pumpWhileRunning();
+        ctx.child.wait();
         if (ctx.request.on_wait) |callback| callback.call();
-
-        const term = ctx.waitChild() catch |err| return errorFmt(ctx.allocator, "wait failed: {s}", .{@errorName(err)});
         if (ctx.timeout_guard) |*guard| guard.markExited();
 
+        if (ctx.spawn_failed) return errorResult(ctx.allocator, "spawn failed");
+        const term = ctx.term orelse return errorResult(ctx.allocator, "wait failed");
         if (ctx.stdout_capture.err) |err| return captureErrorResult(ctx.allocator, "stdout", err, term, &ctx.stdout_capture, &ctx.stderr_capture);
         if (ctx.stderr_capture.err) |err| return captureErrorResult(ctx.allocator, "stderr", err, term, &ctx.stdout_capture, &ctx.stderr_capture);
 
@@ -255,21 +250,8 @@ const RunContext = struct {
         return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
     }
 
-    fn spawnChild(ctx: *RunContext) !void {
-        ctx.child = try std.process.spawn(ctx.io, .{
-            .argv = ctx.request.argv,
-            .cwd = if (ctx.request.cwd) |cwd| .{ .path = cwd } else .inherit,
-            .environ_map = if (ctx.env_map_storage) |*env_map| env_map else null,
-            .stdin = if (ctx.request.stdin != null) .pipe else .ignore,
-            .stdout = .pipe,
-            .stderr = .pipe,
-            .pgid = if (ctx.request.process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
-        });
-        ctx.child_id = ctx.child.?.id.?;
-    }
-
     fn startAbortGuard(ctx: *RunContext) void {
-        const child_id = ctx.child_id.?;
+        const child_id = ctx.child.childId() orelse return;
         ctx.abort_guard = if (ctx.request.signal) |signal|
             AbortGuard.start(ctx.io, signal, .{ .interrupt_process_group = if (ctx.request.process_group) child_id else null, .kill_pid = if (ctx.request.process_group) null else child_id })
         else
@@ -277,94 +259,41 @@ const RunContext = struct {
     }
 
     fn startTimeoutGuard(ctx: *RunContext) void {
-        ctx.timeout_guard = TimeoutGuard.start(ctx.io, ctx.request.timeout_ms, ctx.child_id.?, ctx.request.process_group);
-    }
-
-    fn startCaptureTasks(ctx: *RunContext) CaptureTasks.StartError!void {
-        try ctx.capture_tasks.start(ctx.io, ctx.child.?, &ctx.stdout_capture, &ctx.stderr_capture, ctx.request.on_chunk);
-    }
-
-    fn killChild(ctx: *RunContext, sig: std.posix.SIG) void {
-        const child_id = ctx.child_id orelse return;
-        if (ctx.request.process_group) killProcessGroup(child_id, sig) else std.posix.kill(child_id, sig) catch {};
-    }
-
-    fn captureTasksJoin(ctx: *RunContext) void {
-        ctx.capture_tasks.join();
+        const child_id = ctx.child.childId() orelse return;
+        ctx.timeout_guard = TimeoutGuard.start(ctx.io, ctx.request.timeout_ms, child_id, ctx.request.process_group);
     }
 
     fn writeStdin(ctx: *RunContext) void {
         const stdin_bytes = ctx.request.stdin orelse return;
-        const child = if (ctx.child) |*child| child else return;
-        const stdin_file = child.stdin orelse return;
-        var write_buf: [4096]u8 = undefined;
-        var stdin_writer = stdin_file.writer(ctx.io, &write_buf);
-        stdin_writer.interface.writeAll(stdin_bytes) catch {};
-        stdin_writer.interface.flush() catch {};
-        stdin_file.close(ctx.io);
-        child.stdin = null;
+        ctx.child.write(stdin_bytes) catch {};
+        ctx.child.closeStdin();
     }
 
-    fn waitChild(ctx: *RunContext) std.process.Child.WaitError!std.process.Child.Term {
-        return ctx.child.?.wait(ctx.io);
-    }
-
-    fn pumpWhileCapturing(ctx: *RunContext) void {
-        while (!ctx.capture_tasks.done(&ctx.stdout_capture, &ctx.stderr_capture)) {
+    fn pumpWhileRunning(ctx: *RunContext) void {
+        while (!ctx.child.isExited()) {
             if (ctx.request.on_wait) |callback| callback.call();
             ctx.io.sleep(.fromMilliseconds(poll_interval_ms), .awake) catch {};
         }
     }
 
+    fn submitChildEvent(ptr: *anyopaque, event: child_process.Event) bool {
+        const ctx: *RunContext = @ptrCast(@alignCast(ptr));
+        switch (event) {
+            .stdout => |bytes| ctx.stdout_capture.acceptChunk(.stdout, bytes, ctx.request.on_chunk) catch |err| {
+                ctx.stdout_capture.err = err;
+            },
+            .stderr => |bytes| ctx.stderr_capture.acceptChunk(.stderr, bytes, ctx.request.on_chunk) catch |err| {
+                ctx.stderr_capture.err = err;
+            },
+            .spawn_failed => ctx.spawn_failed = true,
+            .exit => |term| ctx.term = term,
+        }
+        return true;
+    }
+
     fn didTimeout(ctx: *const RunContext) bool {
         const guard = ctx.timeout_guard orelse return false;
         return guard.didTimeout();
-    }
-};
-
-const CaptureTasks = struct {
-    group: TaskGroup = undefined,
-    started: bool = false,
-
-    /// Child-pipe capture requires true concurrent progress: stdout and stderr
-    /// must drain simultaneously or a child can deadlock when either pipe fills.
-    /// `TaskGroup.concurrent` owns the backend policy, including OS-thread
-    /// fallback when the active `std.Io` backend cannot provide concurrency.
-    const StartError = error{ConcurrencyUnavailable};
-
-    fn start(
-        self: *CaptureTasks,
-        io: std.Io,
-        child: std.process.Child,
-        stdout_capture: *Capture,
-        stderr_capture: *Capture,
-        on_chunk: ?ChunkCallback,
-    ) StartError!void {
-        self.group = TaskGroup.init(io);
-        self.started = true;
-        errdefer self.cancel();
-        if (child.stdout) |stdout_file| {
-            try self.group.concurrent(Capture.readAll, .{ stdout_capture, io, stdout_file, StreamKind.stdout, on_chunk });
-        }
-        if (child.stderr) |stderr_file| {
-            try self.group.concurrent(Capture.readAll, .{ stderr_capture, io, stderr_file, StreamKind.stderr, on_chunk });
-        }
-    }
-
-    fn join(self: *CaptureTasks) void {
-        if (!self.started) return;
-        self.group.wait() catch {};
-        self.started = false;
-    }
-
-    fn cancel(self: *CaptureTasks) void {
-        if (!self.started) return;
-        self.group.cancel();
-        self.started = false;
-    }
-
-    fn done(_: *const CaptureTasks, stdout_capture: *const Capture, stderr_capture: *const Capture) bool {
-        return stdout_capture.done.load(.acquire) and stderr_capture.done.load(.acquire);
     }
 };
 

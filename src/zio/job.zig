@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const TaskGroup = @import("tasks.zig").TaskGroup;
+const child_process = @import("child_process.zig");
 
 /// Small zio-owned long-running process supervisor.
 ///
@@ -74,16 +74,19 @@ pub const Manager = struct {
         job.* = .{
             .id = id,
             .allocator = self.allocator,
-            .io = self.io,
             .sink = self.sink,
             .request = owned_request,
         };
+        job.child = child_process.ChildProcess.init(self.io, .{
+            .argv = job.request.argv,
+            .cwd = job.request.cwd,
+            .process_group = true,
+        }, .{ .ptr = @ptrCast(job), .submit = Job.submitChildEvent });
         owned_request = .{ .argv = &.{} };
         errdefer job.deinit(self.allocator);
         try self.jobs.put(self.allocator, id, job);
         errdefer _ = self.jobs.remove(id);
-        job.tasks = TaskGroup.init(self.io);
-        try job.tasks.concurrent(Job.run, .{job});
+        try job.child.start();
     }
 
     pub fn stop(self: *Manager, id: u64) void {
@@ -98,7 +101,7 @@ pub const Manager = struct {
 
     fn destroyJob(self: *Manager, job: *Job) void {
         job.stop();
-        job.tasks.wait() catch {};
+        job.child.wait();
         job.deinit(self.allocator);
         self.allocator.destroy(job);
     }
@@ -107,109 +110,43 @@ pub const Manager = struct {
 const Job = struct {
     id: u64,
     allocator: std.mem.Allocator,
-    io: std.Io,
     sink: EventSink,
     request: StartRequest,
-    tasks: TaskGroup = undefined,
-    mutex: std.Io.Mutex = .init,
-    child_id: ?std.process.Child.Id = null,
-    stdin_file: ?std.Io.File = null,
-    stopping: bool = false,
+    child: child_process.ChildProcess = undefined,
 
     fn deinit(self: *Job, allocator: std.mem.Allocator) void {
         self.request.deinit(allocator);
         self.* = undefined;
     }
 
-    fn run(self: *Job) void {
-        var child = std.process.spawn(self.io, .{
-            .argv = self.request.argv,
-            .cwd = if (self.request.cwd) |cwd| .{ .path = cwd } else .inherit,
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .pipe,
-            .pgid = if (supportsProcessGroups()) 0 else null,
-        }) catch {
-            _ = self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .exit, .code = null });
-            return;
-        };
-
-        self.mutex.lockUncancelable(self.io);
-        self.child_id = child.id;
-        self.stdin_file = child.stdin;
-        self.mutex.unlock(self.io);
-
-        var readers = TaskGroup.init(self.io);
-        defer readers.cancel();
-        if (child.stdout) |stdout_file| {
-            readers.concurrent(readPipe, .{ self, stdout_file, EventKind.stdout }) catch {};
-        }
-        if (child.stderr) |stderr_file| {
-            readers.concurrent(readPipe, .{ self, stderr_file, EventKind.stderr }) catch {};
-        }
-
-        const term = child.wait(self.io) catch null;
-        readers.wait() catch {};
-
-        self.mutex.lockUncancelable(self.io);
-        self.child_id = null;
-        self.stdin_file = null;
-        self.mutex.unlock(self.io);
-
-        const code: ?i64 = if (term) |t| switch (t) {
-            .exited => |code| @intCast(code),
-            else => null,
-        } else null;
-        _ = self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .exit, .code = code });
-    }
-
     fn stop(self: *Job) void {
-        self.mutex.lockUncancelable(self.io);
-        self.stopping = true;
-        const child_id = self.child_id;
-        self.mutex.unlock(self.io);
-        if (child_id) |pid| {
-            killChild(pid, .TERM);
-            self.io.sleep(.fromMilliseconds(100), .awake) catch {};
-            self.mutex.lockUncancelable(self.io);
-            const still_running = self.child_id == pid;
-            self.mutex.unlock(self.io);
-            if (still_running) killChild(pid, .KILL);
-        }
+        self.child.stop();
     }
 
     fn write(self: *Job, data: []const u8) !void {
-        self.mutex.lockUncancelable(self.io);
-        const file = self.stdin_file orelse {
-            self.mutex.unlock(self.io);
-            return error.JobNotReady;
+        return self.child.write(data) catch |err| switch (err) {
+            error.ProcessNotReady => error.JobNotReady,
+            else => err,
         };
-        self.mutex.unlock(self.io);
-        try file.writeStreamingAll(self.io, data);
     }
 
-    fn readPipe(self: *Job, file: std.Io.File, kind: EventKind) void {
-        var buf: [64 * 1024]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(file.handle, &buf) catch return;
-            if (n == 0) return;
-            _ = self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = kind, .data = buf[0..n] });
-        }
+    fn submitChildEvent(ptr: *anyopaque, event: child_process.Event) bool {
+        const self: *Job = @ptrCast(@alignCast(ptr));
+        return switch (event) {
+            .stdout => |bytes| self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .stdout, .data = bytes }),
+            .stderr => |bytes| self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .stderr, .data = bytes }),
+            .spawn_failed => self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .exit, .code = null }),
+            .exit => |term| self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .exit, .code = exitCode(term) }),
+        };
+    }
+
+    fn exitCode(term: ?std.process.Child.Term) ?i64 {
+        return if (term) |t| switch (t) {
+            .exited => |code| @intCast(code),
+            else => null,
+        } else null;
     }
 };
-
-fn supportsProcessGroups() bool {
-    return builtin.os.tag != .windows and builtin.os.tag != .wasi;
-}
-
-fn killChild(child_id: std.process.Child.Id, sig: std.posix.SIG) void {
-    if (supportsProcessGroups()) {
-        const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(child_id));
-        std.posix.kill(group_pid, sig) catch {};
-    } else {
-        std.posix.kill(child_id, sig) catch {};
-    }
-}
 
 const testing = std.testing;
 
