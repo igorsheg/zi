@@ -111,10 +111,7 @@ pub const ExtensionUiState = struct {
     }
 
     pub fn targetWantsFocus(self: *ExtensionUiState, target: extension_ui.UiTarget) bool {
-        const ordered = self.orderedTargetViews(target) catch return false;
-        defer self.allocator.free(ordered);
-        if (ordered.len == 0) return false;
-        return ordered[ordered.len - 1].spec.focus;
+        return SlotPolicy.forTarget(target).wantsFocus(self);
     }
 
     pub fn handleOverlayInput(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
@@ -148,11 +145,7 @@ pub const ExtensionUiState = struct {
     }
 
     fn hasTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) bool {
-        var it = self.views.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.spec.target == target and entry.value_ptr.root != null) return true;
-        }
-        return false;
+        return SlotPolicy.forTarget(target).hasViews(self);
     }
 
     pub fn applyRender(self: *ExtensionUiState, render: extension_ui.RenderSpec) void {
@@ -243,25 +236,11 @@ pub const ExtensionUiState = struct {
     }
 
     pub fn syncOverlayOptions(self: *ExtensionUiState, target: extension_ui.UiTarget, base: overlay_mod.OverlayOptions) overlay_mod.OverlayOptions {
-        var options = base;
-        const ordered = self.orderedTargetViews(target) catch return options;
-        defer self.allocator.free(ordered);
-        if (ordered.len == 0) return options;
-        applyTargetOptions(&options, ordered[ordered.len - 1].spec.target_options);
-        return options;
+        return SlotPolicy.forTarget(target).overlayOptions(self, base);
     }
 
     fn orderedTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) ![]*ViewRecord {
-        var list = std.ArrayList(*ViewRecord).empty;
-        errdefer list.deinit(self.allocator);
-        var it = self.views.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.spec.target == target and entry.value_ptr.root != null) {
-                try list.append(self.allocator, entry.value_ptr);
-            }
-        }
-        std.mem.sort(*ViewRecord, list.items, {}, lessView);
-        return list.toOwnedSlice(self.allocator);
+        return SlotPolicy.forTarget(target).orderedViews(self);
     }
 };
 
@@ -435,6 +414,51 @@ const FrameRecord = struct {
     frame: extension_ui.UiFrame,
     fn deinit(self: *FrameRecord, allocator: std.mem.Allocator) void {
         self.frame.deinit(allocator);
+    }
+};
+
+const SlotPolicy = struct {
+    target: extension_ui.UiTarget,
+
+    fn forTarget(target: extension_ui.UiTarget) SlotPolicy {
+        return .{ .target = target };
+    }
+
+    fn orderedViews(self: SlotPolicy, state: *ExtensionUiState) ![]*ViewRecord {
+        var list = std.ArrayList(*ViewRecord).empty;
+        errdefer list.deinit(state.allocator);
+        var it = state.views.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.spec.target == self.target and entry.value_ptr.root != null) {
+                try list.append(state.allocator, entry.value_ptr);
+            }
+        }
+        std.mem.sort(*ViewRecord, list.items, {}, lessView);
+        return list.toOwnedSlice(state.allocator);
+    }
+
+    fn hasViews(self: SlotPolicy, state: *ExtensionUiState) bool {
+        var it = state.views.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.spec.target == self.target and entry.value_ptr.root != null) return true;
+        }
+        return false;
+    }
+
+    fn wantsFocus(self: SlotPolicy, state: *ExtensionUiState) bool {
+        const ordered = self.orderedViews(state) catch return false;
+        defer state.allocator.free(ordered);
+        if (ordered.len == 0) return false;
+        return ordered[ordered.len - 1].spec.focus;
+    }
+
+    fn overlayOptions(self: SlotPolicy, state: *ExtensionUiState, base: overlay_mod.OverlayOptions) overlay_mod.OverlayOptions {
+        var options = base;
+        const ordered = self.orderedViews(state) catch return options;
+        defer state.allocator.free(ordered);
+        if (ordered.len == 0) return options;
+        applyTargetOptions(&options, ordered[ordered.len - 1].spec.target_options);
+        return options;
     }
 };
 
