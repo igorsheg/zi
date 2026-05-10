@@ -4,15 +4,15 @@ const std = @import("std");
 ///
 /// Contract:
 /// - `async` is logical fan-out and may run inline on the active `std.Io` backend.
-/// - `concurrent` requires simultaneous progress. It first asks `std.Io.Group` and
-///   falls back to an owned OS thread when the backend cannot provide concurrency.
+/// - `concurrent` requires simultaneous progress and always uses an owned OS
+///   thread. Long-lived zi workers and child-pipe readers must not depend on an
+///   evented `std.Io` backend making progress on the TUI/control thread.
 /// - `wait` joins all owned work and closes the set.
-/// - `cancel` cancels `std.Io` work and joins fallback threads. Fallback threads are
+/// - `cancel` cancels `std.Io` async work and joins concurrent threads. Threads are
 ///   not preempted; callers must pass cooperative cancellation/resource guards when
 ///   the work can block indefinitely.
 ///
-/// This is the only place new zio code should encode the std.Io-vs-thread backend
-/// decision for scoped fan-out.
+/// This is the only place new zio code should spawn scoped OS threads.
 pub const TaskGroup = struct {
     io: std.Io,
     group: std.Io.Group = .init,
@@ -30,14 +30,10 @@ pub const TaskGroup = struct {
 
     pub fn concurrent(self: *TaskGroup, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.ConcurrentError!void {
         std.debug.assert(!self.closed);
-        self.group.concurrent(self.io, function, args) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => {
-                const thread = std.Thread.spawn(.{}, function, args) catch return error.ConcurrencyUnavailable;
-                self.threads.append(std.heap.page_allocator, thread) catch {
-                    thread.join();
-                    return error.ConcurrencyUnavailable;
-                };
-            },
+        const thread = std.Thread.spawn(.{}, function, args) catch return error.ConcurrencyUnavailable;
+        self.threads.append(std.heap.page_allocator, thread) catch {
+            thread.join();
+            return error.ConcurrencyUnavailable;
         };
     }
 
