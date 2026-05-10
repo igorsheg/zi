@@ -1,6 +1,7 @@
 const std = @import("std");
 const zio = @import("../zio/root.zig");
 const protocol = @import("types.zig");
+const json_util = @import("../ai/json_util.zig");
 
 /// Agent-domain tool execution event stream.
 ///
@@ -23,9 +24,15 @@ pub const ToolExecutionEvent = union(enum) {
 
 pub const ToolUpdate = struct {
     prepared_index: usize,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args: std.json.Value,
     partial_result: protocol.AgentToolResult,
 
     pub fn deinit(self: *ToolUpdate, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        allocator.free(self.tool_name);
+        json_util.freeJsonValue(allocator, self.args);
         self.partial_result.free(allocator);
         self.* = undefined;
     }

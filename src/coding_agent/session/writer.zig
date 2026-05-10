@@ -5,6 +5,7 @@ const ai = @import("../../ai/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
 const time_util = @import("../../lib/time_util.zig");
+const message_memory = @import("../../agent/message_memory.zig");
 
 /// Manages writing session entries to a JSONL file.
 /// Tracks leafId for tree structure and generates unique entry IDs.
@@ -145,7 +146,10 @@ pub const SessionWriter = struct {
     /// - Buffers until first assistant message appears
     /// - Then flushes all buffered entries + appends incrementally
     pub fn appendMessage(self: *SessionWriter, msg: agent.protocol.AgentMessage) ?[]const u8 {
-        const entry = self.createEntry(.{ .message = .{ .message = msg } }) orelse return null;
+        var owned_msg = message_memory.cloneMessage(self.allocator, msg) catch return null;
+        errdefer message_memory.freeMessage(self.allocator, &owned_msg);
+
+        const entry = self.createEntry(.{ .message = .{ .message = owned_msg } }) orelse return null;
         const entry_id = entry.id;
 
         switch (msg) {
@@ -353,6 +357,10 @@ fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, s
                     allocator.free(label.target_id);
                     if (label.label) |value| allocator.free(value);
                 },
+                .message => |message| {
+                    var owned = message.message;
+                    message_memory.freeMessage(allocator, &owned);
+                },
                 .custom => |custom| if (custom.data) |value| ai.json_util.freeJsonValue(allocator, value),
                 else => {},
             }
@@ -373,6 +381,10 @@ fn freeAppendedEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) vo
         .label => |label| {
             allocator.free(label.target_id);
             if (label.label) |value| allocator.free(value);
+        },
+        .message => |message| {
+            var owned = message.message;
+            message_memory.freeMessage(allocator, &owned);
         },
         .custom => |custom| if (custom.data) |value| ai.json_util.freeJsonValue(allocator, value),
         else => {},

@@ -318,16 +318,26 @@ const WorkerExecution = struct {
     arena: std.heap.ArenaAllocator,
     group: *tool_execution_group.ToolExecutionGroup,
     prepared_index: usize,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args: std.json.Value,
     signal: AbortSignal,
+
+    fn deinit(self: *WorkerExecution) void {
+        self.group.allocator.free(self.tool_call_id);
+        self.group.allocator.free(self.tool_name);
+        json_util.freeJsonValue(self.group.allocator, self.args);
+        self.arena.deinit();
+        self.owner_allocator.destroy(self);
+    }
 
     fn run(self: *WorkerExecution, prepared: *const PreparedToolCall) void {
         const tool = prepared.tool orelse {
             self.group.emit(.{ .completed = .{
                 .prepared_index = self.prepared_index,
-                .result = makeAgentToolTextResult(self.arena.allocator(), "Tool execution failed", true),
+                .result = makeAgentToolTextResult(self.group.allocator, "Tool execution failed", true),
             } });
-            self.arena.deinit();
-            self.owner_allocator.destroy(self);
+            self.deinit();
             return;
         };
         const execution = tool.start(
@@ -344,8 +354,7 @@ const WorkerExecution = struct {
             .prepared_index = self.prepared_index,
             .result = owned,
         } });
-        self.arena.deinit();
-        self.owner_allocator.destroy(self);
+        self.deinit();
     }
 };
 
@@ -368,9 +377,30 @@ fn resolveToolExecution(
 
 fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaque) void {
     const worker: *WorkerExecution = @ptrCast(@alignCast(ctx.?));
-    const owned = partial_result.clone(worker.group.allocator) catch return;
+    const allocator = worker.group.allocator;
+
+    const tool_call_id = allocator.dupe(u8, worker.tool_call_id) catch return;
+    const tool_name = allocator.dupe(u8, worker.tool_name) catch {
+        allocator.free(tool_call_id);
+        return;
+    };
+    const args = json_util.cloneJsonValue(allocator, worker.args) catch {
+        allocator.free(tool_call_id);
+        allocator.free(tool_name);
+        return;
+    };
+    const owned = partial_result.clone(allocator) catch {
+        allocator.free(tool_call_id);
+        allocator.free(tool_name);
+        json_util.freeJsonValue(allocator, args);
+        return;
+    };
+
     worker.group.emit(.{ .update = .{
         .prepared_index = worker.prepared_index,
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .args = args,
         .partial_result = owned,
     } });
 }
@@ -474,16 +504,33 @@ fn executeToolCalls(
                 const tool = prepared.tool orelse continue;
                 if (tool.affinity != .worker_thread) continue;
                 const worker = std.heap.page_allocator.create(WorkerExecution) catch continue;
+                const tool_call_id = group.allocator.dupe(u8, prepared.tool_call.id) catch {
+                    std.heap.page_allocator.destroy(worker);
+                    continue;
+                };
+                const tool_name = group.allocator.dupe(u8, prepared.tool_call.name) catch {
+                    group.allocator.free(tool_call_id);
+                    std.heap.page_allocator.destroy(worker);
+                    continue;
+                };
+                const args = json_util.cloneJsonValue(group.allocator, prepared.tool_call.arguments) catch {
+                    group.allocator.free(tool_call_id);
+                    group.allocator.free(tool_name);
+                    std.heap.page_allocator.destroy(worker);
+                    continue;
+                };
                 worker.* = .{
                     .owner_allocator = std.heap.page_allocator,
                     .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
                     .group = group,
                     .prepared_index = prepared_index,
+                    .tool_call_id = tool_call_id,
+                    .tool_name = tool_name,
+                    .args = args,
                     .signal = signal,
                 };
                 group.concurrent(WorkerExecution.run, .{ worker, prepared }) catch {
-                    worker.arena.deinit();
-                    std.heap.page_allocator.destroy(worker);
+                    worker.deinit();
                     continue;
                 };
                 prepared.worker_started = true;
@@ -536,7 +583,9 @@ fn executeToolCalls(
                 switch (owned_event) {
                     .update => |update| emitWorkerUpdate(prepared_calls.items, update, event_sink, event_ctx),
                     .completed => |completion| {
+                        if (completion.prepared_index >= prepared_calls.items.len) continue;
                         var prepared = &prepared_calls.items[completion.prepared_index];
+                        if (prepared.finalized) continue;
                         prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, completion.result, config, system_prompt, signal, event_sink, event_ctx);
                         prepared.finalized = true;
                         finalized_count += 1;
@@ -612,11 +661,11 @@ fn emitWorkerUpdate(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
-    const prepared = prepared_calls[update.prepared_index];
+    if (update.prepared_index >= prepared_calls.len) return;
     event_sink(.{ .tool_execution_update = .{
-        .tool_call_id = prepared.tool_call.id,
-        .tool_name = prepared.tool_call.name,
-        .args = prepared.tool_call.arguments,
+        .tool_call_id = update.tool_call_id,
+        .tool_name = update.tool_name,
+        .args = update.args,
         .partial_result = update.partial_result,
     } }, event_ctx);
 }
