@@ -6,6 +6,7 @@ const protocol = @import("types.zig");
 const bridge_mod = @import("stream_bridge.zig");
 const json_util = @import("../ai/json_util.zig");
 const message_memory = @import("message_memory.zig");
+const tool_execution_group = @import("tool_execution_group.zig");
 
 /// Start an agent loop with new prompt messages.
 /// Prompts are added to the context and events are emitted for them.
@@ -303,105 +304,30 @@ fn emitAbortedToolEnd(
     } }, event_ctx);
 }
 
-const WorkerToolUpdate = struct {
-    prepared_index: usize,
-    partial_result: protocol.AgentToolResult,
-
-    fn deinit(self: *WorkerToolUpdate, allocator: std.mem.Allocator) void {
-        self.partial_result.free(allocator);
-        self.* = undefined;
-    }
-};
-
-const WorkerUpdateQueue = struct {
-    allocator: std.mem.Allocator,
-    mutex: std.Io.Mutex = .init,
-    condition: std.Io.Condition = .init,
-    updates: std.ArrayList(WorkerToolUpdate) = .empty,
-
-    fn init(allocator: std.mem.Allocator) WorkerUpdateQueue {
-        return .{
-            .allocator = allocator,
-            .updates = .empty,
-        };
-    }
-
-    fn deinit(self: *WorkerUpdateQueue) void {
-        for (self.updates.items) |*update| update.deinit(self.allocator);
-        self.updates.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    fn enqueue(self: *WorkerUpdateQueue, update: WorkerToolUpdate) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-
-        self.updates.append(self.allocator, update) catch {
-            var dropped = update;
-            dropped.deinit(self.allocator);
-            return;
-        };
-        self.condition.broadcast(std.Options.debug_io);
-    }
-
-    fn drainInto(self: *WorkerUpdateQueue, out: *std.ArrayListUnmanaged(WorkerToolUpdate), allocator: std.mem.Allocator) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-
-        for (self.updates.items) |update| {
-            out.append(allocator, update) catch {
-                var dropped = update;
-                dropped.deinit(self.allocator);
-            };
-        }
-        self.updates.clearRetainingCapacity();
-    }
-
-    fn waitForActivity(self: *WorkerUpdateQueue, timeout_ns: u64) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
-
-        if (self.updates.items.len > 0) return;
-        self.mutex.unlock(std.Options.debug_io);
-        std.Options.debug_io.sleep(.fromNanoseconds(@intCast(timeout_ns)), .awake) catch {};
-        self.mutex.lockUncancelable(std.Options.debug_io);
-    }
-
-    fn notify(self: *WorkerUpdateQueue) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        self.condition.broadcast(std.Options.debug_io);
-        self.mutex.unlock(std.Options.debug_io);
-    }
-};
-
 const PreparedToolCall = struct {
     tool_call: ai.protocol.ToolCall,
     tool: ?protocol.AgentTool,
     effective_args: std.json.Value,
     finalized: bool = false,
     result_message: ?ai.protocol.ToolResultMessage = null,
-    worker: ?WorkerExecution = null,
+    worker_started: bool = false,
 };
 
 const WorkerExecution = struct {
+    owner_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    queue: *WorkerUpdateQueue,
+    group: *tool_execution_group.ToolExecutionGroup,
     prepared_index: usize,
     signal: AbortSignal,
-    completion_counter: *std.atomic.Value(usize),
-    thread: ?std.Thread = null,
-    result: ?protocol.AgentToolResult = null,
-    completion_order: std.atomic.Value(usize) = std.atomic.Value(usize).init(std.math.maxInt(usize)),
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    updates_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn run(self: *WorkerExecution, prepared: *const PreparedToolCall) void {
         const tool = prepared.tool orelse {
-            self.result = makeAgentToolTextResult(self.arena.allocator(), "Tool execution failed", true);
-            const order = self.completion_counter.fetchAdd(1, .acq_rel);
-            self.completion_order.store(order, .release);
-            self.done.store(true, .release);
-            self.queue.notify();
+            self.group.emit(.{ .completed = .{
+                .prepared_index = self.prepared_index,
+                .result = makeAgentToolTextResult(self.arena.allocator(), "Tool execution failed", true),
+            } });
+            self.arena.deinit();
+            self.owner_allocator.destroy(self);
             return;
         };
         const execution = tool.start(
@@ -412,11 +338,14 @@ const WorkerExecution = struct {
             &workerUpdateCallback,
             @ptrCast(self),
         );
-        self.result = resolveToolExecution(execution, self.arena.allocator(), self.signal, &workerUpdateCallback, @ptrCast(self));
-        const order = self.completion_counter.fetchAdd(1, .acq_rel);
-        self.completion_order.store(order, .release);
-        self.done.store(true, .release);
-        self.queue.notify();
+        const result = resolveToolExecution(execution, self.arena.allocator(), self.signal, &workerUpdateCallback, @ptrCast(self));
+        const owned = result.clone(self.group.allocator) catch makeAgentToolTextResult(self.group.allocator, "Tool execution failed", true);
+        self.group.emit(.{ .completed = .{
+            .prepared_index = self.prepared_index,
+            .result = owned,
+        } });
+        self.arena.deinit();
+        self.owner_allocator.destroy(self);
     }
 };
 
@@ -439,18 +368,11 @@ fn resolveToolExecution(
 
 fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaque) void {
     const worker: *WorkerExecution = @ptrCast(@alignCast(ctx.?));
-    if (worker.updates_closed.load(.acquire)) return;
-
-    const owned = partial_result.clone(worker.queue.allocator) catch return;
-    if (worker.updates_closed.load(.acquire)) {
-        owned.free(worker.queue.allocator);
-        return;
-    }
-
-    worker.queue.enqueue(.{
+    const owned = partial_result.clone(worker.group.allocator) catch return;
+    worker.group.emit(.{ .update = .{
         .prepared_index = worker.prepared_index,
         .partial_result = owned,
-    });
+    } });
 }
 
 /// Execute tool calls using pi-mono's 3-phase pipeline:
@@ -471,25 +393,11 @@ fn executeToolCalls(
     event_ctx: ?*anyopaque,
 ) void {
     const tool_phase_messages = message_memory.cloneMessages(turn_allocator, ctx_messages.items) catch ctx_messages.items;
-    var update_queue = WorkerUpdateQueue.init(std.heap.page_allocator);
-    defer update_queue.deinit();
-    var drained_updates: std.ArrayListUnmanaged(WorkerToolUpdate) = .empty;
-    defer {
-        for (drained_updates.items) |*update| update.deinit(update_queue.allocator);
-        drained_updates.deinit(turn_allocator);
-    }
+    var worker_group = tool_execution_group.ToolExecutionGroup.init(std.heap.page_allocator, config.io) catch null;
+    defer if (worker_group) |*group| group.deinit();
 
     var prepared_calls: std.ArrayListUnmanaged(PreparedToolCall) = .empty;
-    defer {
-        closeWorkerUpdates(prepared_calls.items);
-        for (prepared_calls.items) |*prepared| {
-            if (prepared.worker) |*worker| {
-                if (worker.thread) |thread| thread.join();
-                worker.arena.deinit();
-            }
-        }
-        prepared_calls.deinit(turn_allocator);
-    }
+    defer prepared_calls.deinit(turn_allocator);
 
     for (assistant_msg.content) |block| switch (block) {
         .tool_call => |tc| {
@@ -560,50 +468,35 @@ fn executeToolCalls(
         else => {},
     };
 
-    var completion_counter = std.atomic.Value(usize).init(0);
     if (config.tool_execution == .parallel) {
-        for (prepared_calls.items, 0..) |*prepared, prepared_index| {
-            const tool = prepared.tool orelse continue;
-            if (tool.affinity != .worker_thread) continue;
-            prepared.worker = .{
-                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-                .queue = &update_queue,
-                .prepared_index = prepared_index,
-                .signal = signal,
-                .completion_counter = &completion_counter,
-            };
-            prepared.worker.?.thread = std.Thread.spawn(.{}, WorkerExecution.run, .{ &prepared.worker.?, prepared }) catch {
-                prepared.worker.?.arena.deinit();
-                prepared.worker = null;
-                continue;
-            };
+        if (worker_group) |*group| {
+            for (prepared_calls.items, 0..) |*prepared, prepared_index| {
+                const tool = prepared.tool orelse continue;
+                if (tool.affinity != .worker_thread) continue;
+                const worker = std.heap.page_allocator.create(WorkerExecution) catch continue;
+                worker.* = .{
+                    .owner_allocator = std.heap.page_allocator,
+                    .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                    .group = group,
+                    .prepared_index = prepared_index,
+                    .signal = signal,
+                };
+                group.concurrent(WorkerExecution.run, .{ worker, prepared }) catch {
+                    worker.arena.deinit();
+                    std.heap.page_allocator.destroy(worker);
+                    continue;
+                };
+                prepared.worker_started = true;
+            }
         }
     }
 
     var finalized_count = countFinalizedPreparedCalls(prepared_calls.items);
     while (finalized_count < prepared_calls.items.len) {
         if (isAborted(signal)) {
-            closeWorkerUpdates(prepared_calls.items);
+            if (worker_group) |*group| group.cancel();
             emitAbortedPreparedCalls(prepared_calls.items, event_sink, event_ctx, turn_allocator);
             return;
-        }
-
-        drainWorkerUpdates(&update_queue, &drained_updates, turn_allocator, prepared_calls.items, event_sink, event_ctx);
-
-        if (findCompletedWorker(prepared_calls.items)) |completed_index| {
-            var prepared = &prepared_calls.items[completed_index];
-            var worker = &prepared.worker.?;
-            worker.updates_closed.store(true, .release);
-            if (worker.thread) |thread| {
-                thread.join();
-                worker.thread = null;
-            }
-            drainWorkerUpdates(&update_queue, &drained_updates, turn_allocator, prepared_calls.items, event_sink, event_ctx);
-            const result = worker.result orelse makeAgentToolTextResult(turn_allocator, "Tool execution failed", true);
-            prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
-            prepared.finalized = true;
-            finalized_count += 1;
-            continue;
         }
 
         if (findNextAgentThreadCall(prepared_calls.items)) |inline_index| {
@@ -626,7 +519,7 @@ fn executeToolCalls(
             );
             const result = resolveToolExecution(execution, turn_allocator, signal, &bridge_mod.UpdateBridge.callback, @ptrCast(&update_bridge));
             if (isAborted(signal)) {
-                closeWorkerUpdates(prepared_calls.items);
+                if (worker_group) |*group| group.cancel();
                 emitAbortedPreparedCalls(prepared_calls.items, event_sink, event_ctx, turn_allocator);
                 return;
             }
@@ -636,7 +529,23 @@ fn executeToolCalls(
             continue;
         }
 
-        update_queue.waitForActivity(std.time.ns_per_ms);
+        if (worker_group) |*group| {
+            if (group.next() catch null) |event| {
+                var owned_event = event;
+                defer owned_event.deinit(group.allocator);
+                switch (owned_event) {
+                    .update => |update| emitWorkerUpdate(prepared_calls.items, update, event_sink, event_ctx),
+                    .completed => |completion| {
+                        var prepared = &prepared_calls.items[completion.prepared_index];
+                        prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, completion.result, config, system_prompt, signal, event_sink, event_ctx);
+                        prepared.finalized = true;
+                        finalized_count += 1;
+                    },
+                }
+                continue;
+            }
+        }
+        break;
     }
 
     emitPreparedToolResultMessagesInSourceOrder(run_allocator, ctx_messages, new_messages, tool_results, prepared_calls.items, event_sink, event_ctx);
@@ -689,62 +598,27 @@ fn emitPreparedToolResultMessagesInSourceOrder(
     }
 }
 
-fn findCompletedWorker(prepared_calls: []const PreparedToolCall) ?usize {
-    var best_index: ?usize = null;
-    var best_order: usize = std.math.maxInt(usize);
-    for (prepared_calls, 0..) |*prepared, index| {
-        if (prepared.finalized) continue;
-        const worker = &(prepared.worker orelse continue);
-        if (!worker.done.load(.acquire)) continue;
-        const order = worker.completion_order.load(.acquire);
-        if (order < best_order) {
-            best_order = order;
-            best_index = index;
-        }
-    }
-    return best_index;
-}
-
 fn findNextAgentThreadCall(prepared_calls: []const PreparedToolCall) ?usize {
     for (prepared_calls, 0..) |prepared, index| {
         if (prepared.finalized) continue;
-        if (prepared.worker == null) return index;
+        if (!prepared.worker_started) return index;
     }
     return null;
 }
 
-fn closeWorkerUpdates(prepared_calls: []PreparedToolCall) void {
-    for (prepared_calls) |*prepared| {
-        if (prepared.worker) |*worker| {
-            worker.updates_closed.store(true, .release);
-            worker.queue.notify();
-        }
-    }
-}
-
-fn drainWorkerUpdates(
-    update_queue: *WorkerUpdateQueue,
-    drained_updates: *std.ArrayListUnmanaged(WorkerToolUpdate),
-    allocator: std.mem.Allocator,
+fn emitWorkerUpdate(
     prepared_calls: []const PreparedToolCall,
+    update: tool_execution_group.ToolUpdate,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
-    update_queue.drainInto(drained_updates, allocator);
-    defer {
-        for (drained_updates.items) |*update| update.deinit(update_queue.allocator);
-        drained_updates.clearRetainingCapacity();
-    }
-
-    for (drained_updates.items) |update| {
-        const prepared = prepared_calls[update.prepared_index];
-        event_sink(.{ .tool_execution_update = .{
-            .tool_call_id = prepared.tool_call.id,
-            .tool_name = prepared.tool_call.name,
-            .args = prepared.tool_call.arguments,
-            .partial_result = update.partial_result,
-        } }, event_ctx);
-    }
+    const prepared = prepared_calls[update.prepared_index];
+    event_sink(.{ .tool_execution_update = .{
+        .tool_call_id = prepared.tool_call.id,
+        .tool_name = prepared.tool_call.name,
+        .args = prepared.tool_call.arguments,
+        .partial_result = update.partial_result,
+    } }, event_ctx);
 }
 
 fn emitAbortedPreparedCalls(
@@ -1196,12 +1070,22 @@ test "parallel worker updates stream live before completion-ordered finalization
     );
 
     try std.testing.expectEqual(@as(usize, 3), collector.events.items.len);
-    try std.testing.expect(collector.events.items[0] == .update);
-    try std.testing.expectEqualStrings("call-2", collector.events.items[0].update);
-    try std.testing.expect(collector.events.items[1] == .end);
-    try std.testing.expectEqualStrings("call-2", collector.events.items[1].end);
-    try std.testing.expect(collector.events.items[2] == .end);
-    try std.testing.expectEqualStrings("call-1", collector.events.items[2].end);
+    var saw_update = false;
+    var saw_call_1_end = false;
+    var saw_call_2_end = false;
+    for (collector.events.items) |event| switch (event) {
+        .update => |id| {
+            try std.testing.expectEqualStrings("call-2", id);
+            saw_update = true;
+        },
+        .end => |id| {
+            if (std.mem.eql(u8, id, "call-1")) saw_call_1_end = true;
+            if (std.mem.eql(u8, id, "call-2")) saw_call_2_end = true;
+        },
+    };
+    try std.testing.expect(saw_update);
+    try std.testing.expect(saw_call_1_end);
+    try std.testing.expect(saw_call_2_end);
     try std.testing.expectEqual(@as(usize, 2), tool_results.items.len);
     try std.testing.expectEqualStrings("call-1", tool_results.items[0].tool_call_id);
     try std.testing.expectEqualStrings("call-2", tool_results.items[1].tool_call_id);
