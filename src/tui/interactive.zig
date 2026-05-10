@@ -17,6 +17,7 @@ const system_worker_mod = @import("../coding_agent/extensions/system_worker.zig"
 const extension_runner_mod = @import("../coding_agent/extensions/runner.zig");
 const system_command_mod = @import("../coding_agent/extensions/system_command.zig");
 const transcript_mod = @import("conversation/transcript.zig");
+const transcript_item_mod = @import("conversation/transcript_item.zig");
 const conversation_projection_mod = @import("conversation/projection.zig");
 const overlay_mod = @import("primitives/overlay.zig");
 const tool_display_mod = @import("conversation/tool_display.zig");
@@ -120,12 +121,6 @@ const CompactionPolicy = coding_agent_mod.runtime_host.CompactionPolicy;
 const CompactionExecutor = coding_agent_mod.runtime_host.CompactionExecutor;
 const log = std.log.scoped(.tui_interactive);
 
-fn deinitTranscriptText(ctx: *anyopaque, allocator: std.mem.Allocator) void {
-    const text: *text_mod.Text = @ptrCast(@alignCast(ctx));
-    text.deinit();
-    allocator.destroy(text);
-}
-
 const MouseCapture = selection_flow.MouseCapture;
 const SelectionController = @import("selection/mod.zig").SelectionController;
 const AgentSession = coding_agent_mod.AgentSession;
@@ -157,6 +152,54 @@ const StatusLine = status_line_mod.StatusLine;
 const TUI = tui_mod.TUI;
 const EditorInterface = editor_iface_mod.EditorInterface;
 const StatusData = status_data_mod.StatusData;
+
+fn formatSessionInfo(allocator: std.mem.Allocator, session: *const AgentSession) ![]u8 {
+    const stats = session.getSessionStats();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("Session Info\n\n");
+    try writer.print("File: {s}\n", .{if (stats.session_file.len > 0) stats.session_file else "In-memory"});
+    try writer.print("ID: {s}\n\n", .{stats.session_id});
+
+    try writer.writeAll("Messages\n");
+    try writer.print("User: {d}\n", .{stats.user_messages});
+    try writer.print("Assistant: {d}\n", .{stats.assistant_messages});
+    try writer.print("Tool Calls: {d}\n", .{stats.tool_calls});
+    try writer.print("Tool Results: {d}\n", .{stats.tool_results});
+    if (stats.custom_messages > 0) try writer.print("Custom: {d}\n", .{stats.custom_messages});
+    if (stats.compaction_summaries > 0) try writer.print("Compaction Summaries: {d}\n", .{stats.compaction_summaries});
+    if (stats.branch_summaries > 0) try writer.print("Branch Summaries: {d}\n", .{stats.branch_summaries});
+    try writer.print("Total: {d}\n\n", .{stats.total_messages});
+
+    try writer.writeAll("Tokens\n");
+    try writer.print("Input: {d}\n", .{stats.tokens.input});
+    try writer.print("Output: {d}\n", .{stats.tokens.output});
+    if (stats.tokens.cache_read > 0) try writer.print("Cache Read: {d}\n", .{stats.tokens.cache_read});
+    if (stats.tokens.cache_write > 0) try writer.print("Cache Write: {d}\n", .{stats.tokens.cache_write});
+    try writer.print("Total: {d}\n", .{stats.tokens.total});
+
+    if (stats.context_usage) |usage| {
+        try writer.writeAll("\nContext\n");
+        if (usage.tokens) |tokens| {
+            if (usage.percent) |percent| {
+                try writer.print("Usage: {d} / {d} ({d:.1}%)\n", .{ tokens, usage.context_window, percent });
+            } else {
+                try writer.print("Usage: {d} / {d}\n", .{ tokens, usage.context_window });
+            }
+        } else {
+            try writer.print("Usage: unknown / {d}\n", .{usage.context_window});
+        }
+    }
+
+    if (stats.cost > 0) {
+        try writer.writeAll("\nCost\n");
+        try writer.print("Total: ${d:.4}\n", .{stats.cost});
+    }
+
+    return out.toOwnedSlice();
+}
 
 const ClipboardImageReader = *const fn (allocator: std.mem.Allocator) ?[]u8;
 
@@ -970,6 +1013,7 @@ pub const Interactive = struct {
             .settings => self.showSettingsPicker(),
             .hotkeys => self.showHotkeysOverlay(),
             .memory => self.showMemoryTelemetry(),
+            .session => self.showSessionInfo(),
             .logs => self.showLogs(args),
         }
         return true;
@@ -1035,23 +1079,31 @@ pub const Interactive = struct {
         self.tui.dirty = true;
     }
 
+    fn showSessionInfo(self: *Interactive) void {
+        const content = formatSessionInfo(self.allocator, self.runtime_host.currentSession()) catch {
+            self.status_line.setPrimary("session info unavailable", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
+            return;
+        };
+        defer self.allocator.free(content);
+
+        self.addTextTranscriptItem(content, .accent, "session info added to transcript");
+        self.tui.dirty = true;
+    }
+
     fn addTextTranscriptItem(self: *Interactive, content: []const u8, color: theme_mod.FgColor, success_message: []const u8) void {
-        var row = self.allocator.create(text_mod.Text) catch {
+        var item = transcript_item_mod.text(self.allocator, .{
+            .content = content,
+            .width_method = self.tui.terminal.capabilities.width_method,
+            .fg = self.theme.fg(color),
+        }) catch {
             self.status_line.setPrimary("transcript allocation failed", self.theme.fg(.@"error"));
             self.tui.dirty = true;
             return;
         };
-        row.* = text_mod.Text.init(self.allocator, self.tui.terminal.capabilities.width_method);
-        row.fg = self.theme.fg(color);
-        row.setContent(content);
 
-        const item: transcript_mod.TranscriptItem = .{
-            .renderable = transcript_mod.TranscriptRenderable.init(text_mod.Text, row),
-            .deinit_ctx = @ptrCast(row),
-            .deinit_fn = deinitTranscriptText,
-        };
         if (!self.transcript.addItem(item)) {
-            deinitTranscriptText(@ptrCast(row), self.allocator);
+            item.deinit(self.allocator);
             self.status_line.setPrimary("transcript unavailable", self.theme.fg(.@"error"));
         } else {
             self.status_line.setPrimary(success_message, self.theme.fg(.accent));

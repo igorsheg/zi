@@ -38,6 +38,33 @@ pub const ExtensionRunner = extension_runner_mod.ExtensionRunner;
 pub const SidePromptEventSink = extension_runner_mod.AiSessionEventSink;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 pub const ContextUsage = session_core.context_usage.ContextUsage;
+
+/// Borrowed point-in-time session statistics. String slices borrow from AgentSession
+/// and must not outlive the session they were read from.
+pub const SessionStats = struct {
+    session_file: []const u8,
+    session_id: []const u8,
+    user_messages: usize,
+    assistant_messages: usize,
+    tool_calls: usize,
+    tool_results: usize,
+    custom_messages: usize,
+    compaction_summaries: usize,
+    branch_summaries: usize,
+    total_messages: usize,
+    tokens: TokenStats,
+    cost: f64,
+    context_usage: ?ContextUsage,
+
+    pub const TokenStats = struct {
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        total: u64,
+    };
+};
+
 const PendingExtensionUi = pending_extension_ui_mod.PendingExtensionUi;
 const session_proto = session_core.protocol;
 
@@ -826,6 +853,51 @@ pub const AgentSession = struct {
 
     pub fn getSessionFile(self: *const AgentSession) []const u8 {
         return self.session_store.sessionFile();
+    }
+
+    pub fn getSessionStats(self: *const AgentSession) SessionStats {
+        const messages = self.agent.messages();
+        var stats = SessionStats{
+            .session_file = self.session_store.sessionFile(),
+            .session_id = self.session_store.sessionId(),
+            .user_messages = 0,
+            .assistant_messages = 0,
+            .tool_calls = 0,
+            .tool_results = 0,
+            .custom_messages = 0,
+            .compaction_summaries = 0,
+            .branch_summaries = 0,
+            .total_messages = messages.len,
+            .tokens = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+            .cost = 0,
+            .context_usage = self.getContextUsage(),
+        };
+
+        for (messages) |message| {
+            switch (message) {
+                .user => stats.user_messages += 1,
+                .assistant => |assistant| {
+                    stats.assistant_messages += 1;
+                    for (assistant.content) |block| switch (block) {
+                        .tool_call => stats.tool_calls += 1,
+                        else => {},
+                    };
+                    stats.tokens.input += assistant.usage.input;
+                    stats.tokens.output += assistant.usage.output;
+                    stats.tokens.cache_read += assistant.usage.cache_read;
+                    stats.tokens.cache_write += assistant.usage.cache_write;
+                    stats.cost += assistant.usage.cost.total;
+                },
+                .tool_result => stats.tool_results += 1,
+                .custom => stats.custom_messages += 1,
+                .compaction_summary => stats.compaction_summaries += 1,
+                .branch_summary => stats.branch_summaries += 1,
+            }
+        }
+
+        stats.tokens.total = stats.tokens.input + stats.tokens.output + stats.tokens.cache_read + stats.tokens.cache_write;
+
+        return stats;
     }
 
     /// Public accessor — the TUI layer uses this to wire the

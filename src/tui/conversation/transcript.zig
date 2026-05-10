@@ -16,6 +16,7 @@ const themes_builtin = @import("../../themes/builtin.zig");
 const display_wrap_mod = @import("../wrap/display.zig");
 const rendered_tool_result_view = @import("rendered_tool_result.zig");
 const selection_mod = @import("../selection/mod.zig");
+const transcript_item_mod = @import("transcript_item.zig");
 
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
@@ -24,126 +25,12 @@ const Point = selection_mod.Point;
 const Rect = selection_mod.Rect;
 const GlobalSelection = selection_mod.GlobalSelection;
 
-/// Type-erased transcript row interface.
-///
-/// Unlike the general TUI `Component` protocol, transcript rows MUST support
-/// native slice rendering. The transcript is a viewport compositor and never
-/// allocates full offscreen scratch surfaces just to crop visible rows.
-pub const TranscriptRenderable = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        render_slice: *const fn (ptr: *anyopaque, region: Region, first_row: u32) void,
-        measure: *const fn (ptr: *anyopaque, width: u32) Measurement,
-        next_animation_deadline: *const fn (ptr: *anyopaque, now_ns: i128) ?i128,
-        tick_animation: *const fn (ptr: *anyopaque, now_ns: i128) bool,
-    };
-
-    pub fn init(comptime T: type, ptr: *T) TranscriptRenderable {
-        comptime {
-            if (!@hasDecl(T, "renderSlice")) {
-                @compileError(@typeName(T) ++ " must implement renderSlice(region, first_row) to live in the transcript");
-            }
-            if (!@hasDecl(T, "measure")) {
-                @compileError(@typeName(T) ++ " must implement measure(width) to live in the transcript");
-            }
-        }
-
-        const gen = struct {
-            fn renderSlice(erased: *anyopaque, region: Region, first_row: u32) void {
-                const self: *T = @ptrCast(@alignCast(erased));
-                self.renderSlice(region, first_row);
-            }
-            fn measure(erased: *anyopaque, width: u32) Measurement {
-                const self: *T = @ptrCast(@alignCast(erased));
-                return self.measure(width);
-            }
-            fn nextAnimationDeadline(erased: *anyopaque, now_ns: i128) ?i128 {
-                const self: *T = @ptrCast(@alignCast(erased));
-                if (@hasDecl(T, "nextAnimationDeadline")) {
-                    return self.nextAnimationDeadline(now_ns);
-                }
-                return null;
-            }
-            fn tickAnimation(erased: *anyopaque, now_ns: i128) bool {
-                const self: *T = @ptrCast(@alignCast(erased));
-                if (@hasDecl(T, "tickAnimation")) {
-                    return self.tickAnimation(now_ns);
-                }
-                return false;
-            }
-        };
-
-        return .{
-            .ptr = @ptrCast(ptr),
-            .vtable = &.{
-                .render_slice = gen.renderSlice,
-                .measure = gen.measure,
-                .next_animation_deadline = gen.nextAnimationDeadline,
-                .tick_animation = gen.tickAnimation,
-            },
-        };
-    }
-
-    pub fn eql(a: TranscriptRenderable, b: TranscriptRenderable) bool {
-        return a.ptr == b.ptr and a.vtable == b.vtable;
-    }
-
-    pub fn renderSlice(self: TranscriptRenderable, region: Region, first_row: u32) void {
-        self.vtable.render_slice(self.ptr, region, first_row);
-    }
-
-    pub fn measure(self: TranscriptRenderable, width: u32) Measurement {
-        return self.vtable.measure(self.ptr, width);
-    }
-
-    pub fn nextAnimationDeadline(self: TranscriptRenderable, now_ns: i128) ?i128 {
-        return self.vtable.next_animation_deadline(self.ptr, now_ns);
-    }
-
-    pub fn tickAnimation(self: TranscriptRenderable, now_ns: i128) bool {
-        return self.vtable.tick_animation(self.ptr, now_ns);
-    }
-};
-
-/// Behavior tag for transcript-owned items.
-/// Renderables remain tagged for routing updates and typed retained-row access.
-pub const ItemId = enum(u64) { _ };
-pub const SemanticVersion = u64;
-
-pub const ItemKind = enum {
-    generic,
-    markdown,
-    assistant_message,
-    user_message,
-    queued_user_message,
-    tool_execution,
-};
-
-/// Cleanup function type for owned items.
-pub const DeinitFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void;
-
-/// A single item in the transcript — slice-native renderable plus metadata.
-///
-/// Replaces the previous closed TranscriptRow union. Built-in types
-/// (assistant, tool, user) are convenience constructors that set `kind` +
-/// metadata. Extensions may inject arbitrary transcript renderables with
-/// kind=.generic.
-pub const TranscriptItem = struct {
-    renderable: TranscriptRenderable,
-    kind: ItemKind = .generic,
-    retained_item_id: ?ItemId = null,
-    retained_semantic_version: ?SemanticVersion = null,
-    /// For tool_execution: route updates by ID via pending_tools HashMap.
-    tool_call_id: ?[]const u8 = null,
-    /// Owned cleanup context. Called on item removal/transcript clear.
-    deinit_ctx: ?*anyopaque = null,
-    deinit_fn: ?DeinitFn = null,
-    pub fn deinit(self: *TranscriptItem, allocator: std.mem.Allocator) void {
-        if (self.deinit_fn) |f| f(self.deinit_ctx.?, allocator);
-    }
-};
+pub const TranscriptRenderable = transcript_item_mod.TranscriptRenderable;
+pub const TranscriptItem = transcript_item_mod.TranscriptItem;
+pub const ItemKind = transcript_item_mod.ItemKind;
+pub const ItemId = transcript_item_mod.ItemId;
+pub const SemanticVersion = transcript_item_mod.SemanticVersion;
+pub const DeinitFn = transcript_item_mod.DeinitFn;
 
 const FirstVisible = struct {
     index: usize,

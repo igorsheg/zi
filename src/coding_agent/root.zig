@@ -22,6 +22,7 @@ pub const SessionStore = agent_session.SessionStore;
 pub const ExtensionRunner = agent_session.ExtensionRunner;
 pub const ExtensionRunnerRef = agent_session.ExtensionRunnerRef;
 pub const ContextUsage = agent_session.ContextUsage;
+pub const SessionStats = agent_session.SessionStats;
 pub const OpenSessionResult = session.store.OpenSessionResult;
 pub const openSession = session.store.SessionStore.openForResume;
 pub const RuntimeHost = runtime_host.RuntimeHost;

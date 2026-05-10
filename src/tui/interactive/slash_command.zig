@@ -17,6 +17,7 @@ pub const BuiltinInteractiveCommand = enum {
     settings,
     hotkeys,
     memory,
+    session,
     logs,
 };
 
@@ -42,6 +43,7 @@ pub fn builtinInteractiveCommand(name: []const u8) ?BuiltinInteractiveCommand {
     if (std.mem.eql(u8, name, "settings")) return .settings;
     if (std.mem.eql(u8, name, "hotkeys")) return .hotkeys;
     if (std.mem.eql(u8, name, "memory")) return .memory;
+    if (std.mem.eql(u8, name, "session")) return .session;
     if (std.mem.eql(u8, name, "logs")) return .logs;
     return null;
 }

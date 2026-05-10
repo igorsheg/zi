@@ -5,6 +5,7 @@ const control_mod = @import("../../agent/control.zig");
 const agent_protocol = agent_root.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const transcript_mod = @import("transcript.zig");
+const transcript_item_mod = @import("transcript_item.zig");
 const tool_display_mod = @import("tool_display.zig");
 const editor_iface_mod = @import("../edit/interface.zig");
 const markdown_mod = @import("../components/markdown.zig");
@@ -1598,22 +1599,13 @@ fn createMarkdownRow(
     bg: Color,
     width_method: grapheme.WidthMethod,
 ) !TranscriptItem {
-    const md = try allocator.create(Markdown);
-    errdefer allocator.destroy(md);
-    md.* = Markdown.init(allocator, width_method);
-    errdefer md.deinit();
-    md.theme = theme;
-    md.padding_x = 1;
-    md.padding_y = if (bg.eql(Color.default)) 0 else 1;
-    md.fg = fg;
-    md.bg = bg;
-    md.setContent(content);
-    return .{
-        .renderable = TranscriptRenderable.init(Markdown, md),
-        .kind = .markdown,
-        .deinit_ctx = @ptrCast(md),
-        .deinit_fn = deinitMarkdown,
-    };
+    return transcript_item_mod.markdown(allocator, .{
+        .content = content,
+        .theme = theme,
+        .width_method = width_method,
+        .fg = fg,
+        .bg = bg,
+    });
 }
 
 fn deinitAssistantMessageRow(ctx: *anyopaque, allocator: std.mem.Allocator) void {
@@ -1631,12 +1623,6 @@ fn deinitUserMessageRow(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 fn deinitToolExecutionRow(ctx: *anyopaque, _: std.mem.Allocator) void {
     const te: *transcript_mod.ToolExecution = @ptrCast(@alignCast(ctx));
     te.deinit();
-}
-
-fn deinitMarkdown(ctx: *anyopaque, allocator: std.mem.Allocator) void {
-    const md: *Markdown = @ptrCast(@alignCast(ctx));
-    md.deinit();
-    allocator.destroy(md);
 }
 
 fn customContentText(
