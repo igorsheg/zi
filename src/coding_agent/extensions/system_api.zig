@@ -8,9 +8,10 @@ const c = lua_runtime.c;
 pub fn ziSystem(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
-    const request = parseSystemRequest(runner.allocator, L) catch |err| {
+    var request = parseSystemRequest(runner.allocator, L) catch |err| {
         return luaErrorFmt(L, "zi.system: invalid request: {s}", .{@errorName(err)});
     };
+    request.signal = runner.current_signal orelse @import("../../zio/root.zig").AbortSignal.none;
     const id = runner.beginSystemAsync(request);
     return c.lua_yieldk(L, 0, @intCast(id), ziSystemContinue);
 }

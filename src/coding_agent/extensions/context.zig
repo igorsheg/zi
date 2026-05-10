@@ -9,6 +9,7 @@ const session_core = @import("../../session/root.zig");
 const extension_ui = @import("ui.zig");
 const request_mod = @import("../request.zig");
 const ai_provider = @import("../../ai/provider.zig");
+const abort_signal_mod = @import("../../zio/root.zig").abort;
 
 const c = lua_runtime.c;
 const limits = @import("limits.zig");
@@ -1753,7 +1754,7 @@ fn ctxAiSessionPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
         pushAiCompleteError(L, "ctx.ai.session.prompt: side session is busy");
         return 1;
     }
-    var request = runner_mod.AiSessionPromptRequest{ .session_id = session_id, .prompt = prompt };
+    var request = runner_mod.AiSessionPromptRequest{ .session_id = session_id, .prompt = prompt, .signal = runner.current_signal orelse abort_signal_mod.AbortSignal.none };
     request.callbacks_ref = readOptionalCallbacksRef(L, prompt_arg);
     request.source_L = if (request.callbacks_ref != c.LUA_NOREF) L else null;
     const id = runner.beginAiSessionPromptAsync(request);
@@ -1922,10 +1923,11 @@ fn ctxAiSessionClear(L_opt: ?*c.lua_State) callconv(.c) c_int {
 fn ctxAiComplete(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = stateRunnerFromUpvalue(L);
-    const request = parseAiCompleteRequest(runner.allocator, L) catch {
+    var request = parseAiCompleteRequest(runner.allocator, L) catch {
         pushAiCompleteError(L, "ctx.ai.complete: invalid request");
         return 1;
     };
+    request.signal = runner.current_signal orelse abort_signal_mod.AbortSignal.none;
     const id = runner.beginAiCompleteAsync(request);
     return c.lua_yieldk(L, 0, @intCast(id), ctxAiCompleteContinue);
 }

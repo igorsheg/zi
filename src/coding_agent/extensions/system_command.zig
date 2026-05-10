@@ -1,5 +1,6 @@
 const std = @import("std");
-const process = @import("../../zio/root.zig").process;
+const zio = @import("../../zio/root.zig");
+const process = zio.process;
 
 pub const default_max_output_bytes: usize = process.default_max_output_bytes;
 pub const EnvPair = process.EnvPair;
@@ -17,6 +18,7 @@ pub const Request = struct {
     max_stderr_bytes: usize = default_max_output_bytes,
     text: bool = true,
     stdio: Stdio = .capture,
+    signal: zio.AbortSignal = zio.AbortSignal.none,
 };
 
 pub const Completed = struct {
@@ -101,6 +103,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
         .max_stdout_bytes = request.max_stdout_bytes,
         .max_stderr_bytes = request.max_stderr_bytes,
         .process_group = true,
+        .signal = request.signal,
     });
     defer proc_result.deinit(allocator);
 
@@ -122,6 +125,7 @@ fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: Request) Resul
         .env = request.env,
         .clear_env = request.clear_env,
         .process_group = false,
+        .signal = request.signal,
     });
     defer proc_result.deinit(allocator);
 

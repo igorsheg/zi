@@ -130,6 +130,7 @@ pub const TerminalRequest = struct {
     env: []const EnvPair = &.{},
     clear_env: bool = false,
     process_group: bool = true,
+    signal: ?AbortSignal = null,
 };
 
 pub fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: TerminalRequest) Result {
@@ -153,6 +154,13 @@ pub fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: TerminalRe
         .stderr = .inherit,
         .pgid = if (request.process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     }) catch |err| return errorFmt(allocator, "spawn failed: {s}", .{@errorName(err)});
+
+    const child_id = child.id.?;
+    var abort_guard = if (request.signal) |signal|
+        AbortGuard.start(io, signal, .{ .interrupt_process_group = if (request.process_group) child_id else null, .kill_pid = if (request.process_group) null else child_id })
+    else
+        AbortGuard.start(io, AbortSignal.none, .{});
+    defer abort_guard.stop();
 
     const term = child.wait(io) catch |err| return errorFmt(allocator, "wait failed: {s}", .{@errorName(err)});
     const stdout = allocator.dupe(u8, "") catch return errorResult(allocator, "failed to allocate stdout");

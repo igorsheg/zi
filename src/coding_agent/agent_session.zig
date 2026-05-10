@@ -639,6 +639,7 @@ pub const AgentSession = struct {
             .headers = owned.headers,
             .max_tokens = owned.max_tokens,
             .reasoning = owned.reasoning,
+            .signal = owned.signal,
             .on_event = if (forwarder != null and owned.stream_events) &AiCompleteEventForwarder.onEvent else null,
             .on_event_ctx = if (forwarder != null) @ptrCast(&forwarder.?) else null,
         });
@@ -654,6 +655,51 @@ pub const AgentSession = struct {
         fn onEvent(event: extension_runner_mod.AiCompleteStreamEvent, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.sink.emit(self.sink.ptr, event);
+        }
+    };
+
+    const LinkedSideAbort = struct {
+        state: ?*State = null,
+        thread: ?std.Thread = null,
+
+        const AbortSignal = @import("../zio/root.zig").AbortSignal;
+        const State = struct {
+            signal: AbortSignal,
+            core: *agent_session_core_mod.AgentSessionCore,
+            done: std.atomic.Value(bool) = .init(false),
+        };
+
+        fn start(signal: AbortSignal, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
+            if (signal.isNone()) return .{};
+            const state = std.heap.page_allocator.create(State) catch return .{};
+            state.* = .{ .signal = signal, .core = core };
+            const thread = std.Thread.spawn(.{}, LinkedSideAbort.watch, .{state}) catch {
+                std.heap.page_allocator.destroy(state);
+                return .{};
+            };
+            return .{ .state = state, .thread = thread };
+        }
+
+        fn stop(self: *LinkedSideAbort) void {
+            const state = self.state orelse return;
+            state.done.store(true, .release);
+            state.signal.notifyWaiters();
+            if (self.thread) |thread| thread.join();
+            std.heap.page_allocator.destroy(state);
+            self.* = .{};
+        }
+
+        fn watch(state: *State) void {
+            switch (state.signal.waitUntil(null, LinkedSideAbort.donePredicate, @ptrCast(state))) {
+                .aborted => {},
+                .predicate, .timeout, .none => return,
+            }
+            if (!state.done.load(.acquire)) state.core.abort();
+        }
+
+        fn donePredicate(ctx: ?*anyopaque) bool {
+            const state: *State = @ptrCast(@alignCast(ctx.?));
+            return state.done.load(.acquire);
         }
     };
 
@@ -678,7 +724,12 @@ pub const AgentSession = struct {
 
         side.running = true;
         defer side.running = false;
+        if (request.signal.isAborted()) return .cancelled;
+
         const side_core = try self.ensureSideCore(side);
+        var abort_link = LinkedSideAbort.start(request.signal, side_core);
+        defer abort_link.stop();
+
         var event_ctx = SideAgentEventContext{ .sink = event_sink };
         const token = if (event_sink != null) side_core.agent.subscribe(SideAgentEventContext.onEvent, @ptrCast(&event_ctx)) else SubscriptionToken{ .id = 0 };
         defer side_core.agent.unsubscribe(token);

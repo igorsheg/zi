@@ -445,7 +445,7 @@ fn serviceYieldedSpawnToolCoroutine(
         .model = req.model,
         .tools = req.tools,
         .append_system_prompt = req.append_system_prompt,
-        .signal = runner.current_signal,
+        .signal = req.signal,
         .on_event = if (has_observer) &SpawnEventFanout.callback else null,
         .on_event_ctx = if (has_observer) @ptrCast(&fanout) else null,
         .on_wait = if (has_observer) &SpawnEventFanout.drainCallback else null,
@@ -563,6 +563,7 @@ fn runToolSystemRequest(runner: *runner_mod.ExtensionRunner, request: runner_mod
             .capture => .capture,
             .terminal => .terminal,
         },
+        .signal = request.signal,
     });
 }
 

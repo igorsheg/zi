@@ -24,6 +24,7 @@ pub const Request = struct {
     headers: ?[]const ai.protocol.Header = null,
     max_tokens: ?u64 = null,
     reasoning: ?ai.protocol.ThinkingLevel = null,
+    signal: zio.AbortSignal = zio.AbortSignal.none,
     stream_events: bool = false,
 
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
@@ -84,6 +85,7 @@ const Handler = struct {
             .headers = request.headers,
             .max_tokens = request.max_tokens,
             .reasoning = request.reasoning,
+            .signal = request.signal,
             .on_event = if (request.stream_events) &EventFanout.callback else null,
             .on_event_ctx = if (request.stream_events) @ptrCast(&fanout) else null,
         });

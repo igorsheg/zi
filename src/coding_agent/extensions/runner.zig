@@ -41,6 +41,7 @@ pub const AsyncKind = enum {
 
 pub const AiCompleteRequest = struct {
     prompt: []const u8,
+    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
     system_prompt: ?[]const u8 = null,
     max_tokens: ?u64 = null,
     model: ?[]const u8 = null,
@@ -63,6 +64,7 @@ pub const AiCompleteRequest = struct {
 pub const AiSessionPromptRequest = struct {
     session_id: u64,
     prompt: []const u8,
+    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
     callbacks_ref: c_int = lua_runtime.c.LUA_NOREF,
     source_L: ?*lua_runtime.c.lua_State = null,
 
@@ -276,6 +278,7 @@ pub const SystemStdio = enum { capture, terminal };
 
 pub const SystemRequest = struct {
     argv: []const []const u8,
+    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
     cwd: ?[]const u8 = null,
     stdin: ?[]const u8 = null,
     env: []const SystemEnvPair = &.{},
@@ -310,6 +313,7 @@ pub const SystemRequest = struct {
 
         return .{
             .argv = argv,
+            .signal = self.signal,
             .cwd = if (self.cwd) |value| try allocator.dupe(u8, value) else null,
             .stdin = if (self.stdin) |value| try allocator.dupe(u8, value) else null,
             .env = env,
@@ -793,6 +797,7 @@ pub const ExtensionCommandActions = struct {
 
 pub const SpawnRequest = struct {
     task: []const u8,
+    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
     model: ?[]const u8 = null,
     tools: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,

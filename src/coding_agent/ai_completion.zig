@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const zio = @import("../zio/root.zig");
 
 const log = std.log.scoped(.ai_completion);
 
@@ -14,6 +15,7 @@ pub const PreparedTextCompletionRequest = struct {
     headers: ?[]const ai.protocol.Header = null,
     max_tokens: ?u64 = null,
     reasoning: ?ai.protocol.ThinkingLevel = null,
+    signal: zio.AbortSignal = zio.AbortSignal.none,
     on_event: ?StreamEventCallback = null,
     on_event_ctx: ?*anyopaque = null,
 };
@@ -60,6 +62,7 @@ pub fn runPreparedTextCompletion(
                 .api_key = request.api_key,
                 .headers = request.headers,
                 .max_tokens = request.max_tokens,
+                .signal = request.signal,
             },
             .reasoning = request.reasoning,
         },

@@ -64,6 +64,7 @@ const Handler = struct {
                 .capture => .capture,
                 .terminal => .terminal,
             },
+            .signal = request.signal,
         });
     }
 };

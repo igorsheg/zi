@@ -51,7 +51,7 @@ pub fn ziSpawn(L_opt: ?*c.lua_State) callconv(.c) c_int {
         .model = owned_req.model,
         .tools = owned_req.tools,
         .append_system_prompt = owned_req.append_system_prompt,
-        .signal = runner.current_signal,
+        .signal = owned_req.signal,
         .on_event = if (has_observer) &SpawnEventFanout.callback else null,
         .on_event_ctx = if (has_observer) @ptrCast(&fanout) else null,
         .on_wait = if (has_observer) &SpawnEventFanout.drainCallback else null,
@@ -138,6 +138,7 @@ fn buildSpawnRequest(
 
     return .{
         .task = runner.allocator.dupe(u8, task) catch return writeErr(err_buf, "zi.spawn: out of memory"),
+        .signal = runner.current_signal orelse @import("../../zio/root.zig").AbortSignal.none,
         .model = if (model) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
         .tools = if (tools) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
         .append_system_prompt = if (system_append) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
