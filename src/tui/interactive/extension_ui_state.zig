@@ -125,7 +125,7 @@ pub const ExtensionUiState = struct {
             i -= 1;
             const spec = ordered[i].spec;
             if (!spec.focus) continue;
-            const input = firstInput(spec.root orelse continue) orelse continue;
+            const input = (ordered[i].root orelse continue).firstInput() orelse continue;
             return editInput(self, spec, input, key) catch null;
         }
         return null;
@@ -150,7 +150,7 @@ pub const ExtensionUiState = struct {
     fn hasTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) bool {
         var it = self.views.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.spec.target == target and entry.value_ptr.spec.root != null) return true;
+            if (entry.value_ptr.spec.target == target and entry.value_ptr.root != null) return true;
         }
         return false;
     }
@@ -178,13 +178,13 @@ pub const ExtensionUiState = struct {
                     n.count = if (std.mem.eql(u8, n.message, old.message)) old.count + 1 else 1;
                 }
             }
-            const cloned = extension_ui.RenderSpec.clone(self.allocator, render_for_clone) catch {
+            const record = ViewRecord.init(self.allocator, render_for_clone) catch {
                 self.allocator.free(key);
                 return;
             };
             entry.value_ptr.deinit(self.allocator);
-            entry.value_ptr.* = .{ .spec = cloned };
-            syncInputValues(self, render);
+            entry.value_ptr.* = record;
+            syncInputValues(self, entry.value_ptr);
             self.allocator.free(key);
             return;
         }
@@ -193,16 +193,17 @@ pub const ExtensionUiState = struct {
             self.allocator.free(key);
             return;
         }
-        const cloned = extension_ui.RenderSpec.clone(self.allocator, render) catch {
+        const record = ViewRecord.init(self.allocator, render) catch {
             self.allocator.free(key);
             return;
         };
-        self.views.put(key, .{ .spec = cloned }) catch {
-            var owned = cloned;
+        self.views.put(key, record) catch {
+            var owned = record;
             owned.deinit(self.allocator);
             self.allocator.free(key);
+            return;
         };
-        syncInputValues(self, render);
+        if (self.views.getPtr(key)) |stored| syncInputValues(self, stored);
     }
 
     pub fn applyFrame(self: *ExtensionUiState, frame: extension_ui.UiFrame) void {
@@ -255,7 +256,7 @@ pub const ExtensionUiState = struct {
         errdefer list.deinit(self.allocator);
         var it = self.views.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.spec.target == target and entry.value_ptr.spec.root != null) {
+            if (entry.value_ptr.spec.target == target and entry.value_ptr.root != null) {
                 try list.append(self.allocator, entry.value_ptr);
             }
         }
@@ -272,27 +273,72 @@ const InputRef = struct {
     on_submit: ?[]const u8,
 };
 
-fn firstInput(node: extension_ui.UiNode) ?InputRef {
-    return switch (node) {
-        .input => |input| .{ .id = input.id, .value = input.value, .on_input = input.on_input, .on_change = input.on_change, .on_submit = input.on_submit },
-        .view => |view| blk: {
-            for (view.children) |child| if (firstInput(child)) |found| break :blk found;
-            break :blk null;
-        },
-        else => null,
-    };
-}
+const RetainedNode = struct {
+    node: extension_ui.UiNode,
+    children: []RetainedNode = &.{},
 
-fn syncInputValues(self: *ExtensionUiState, render: extension_ui.RenderSpec) void {
-    if (render.root) |root| syncInputValuesNode(self, render.state_owner_id, render.id, root);
-}
-
-fn syncInputValuesNode(self: *ExtensionUiState, owner: []const u8, view: []const u8, node: extension_ui.UiNode) void {
-    switch (node) {
-        .input => |input| syncInputState(self, owner, view, input.id, input.value) catch {},
-        .view => |v| for (v.children) |child| syncInputValuesNode(self, owner, view, child),
-        else => {},
+    fn init(allocator: std.mem.Allocator, source: extension_ui.UiNode) !RetainedNode {
+        return switch (source) {
+            .view => |view| blk: {
+                const id = if (view.id) |v| try allocator.dupe(u8, v) else null;
+                errdefer if (id) |v| allocator.free(v);
+                var style = try extension_ui.Style.clone(allocator, view.style);
+                errdefer style.deinit(allocator);
+                const children = try allocator.alloc(RetainedNode, view.children.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (children[0..initialized]) |*child| child.deinit(allocator);
+                    allocator.free(children);
+                }
+                for (view.children, 0..) |child, i| {
+                    children[i] = try RetainedNode.init(allocator, child);
+                    initialized += 1;
+                }
+                break :blk .{ .node = .{ .view = .{ .id = id, .style = style, .children = &.{} } }, .children = children };
+            },
+            else => .{ .node = try extension_ui.UiNode.clone(allocator, source), .children = &.{} },
+        };
     }
+
+    fn deinit(self: *RetainedNode, allocator: std.mem.Allocator) void {
+        for (self.children) |*child| child.deinit(allocator);
+        allocator.free(self.children);
+        self.deinitPayload(allocator);
+        self.* = undefined;
+    }
+
+    fn deinitPayload(self: *RetainedNode, allocator: std.mem.Allocator) void {
+        switch (self.node) {
+            .view => |*view| {
+                if (view.id) |v| allocator.free(v);
+                view.style.deinit(allocator);
+            },
+            else => self.node.deinit(allocator),
+        }
+    }
+
+    fn firstInput(self: *const RetainedNode) ?InputRef {
+        return switch (self.node) {
+            .input => |input| .{ .id = input.id, .value = input.value, .on_input = input.on_input, .on_change = input.on_change, .on_submit = input.on_submit },
+            .view => blk: {
+                for (self.children) |*child| if (child.firstInput()) |found| break :blk found;
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    fn syncInputValues(self: *const RetainedNode, state: *ExtensionUiState, owner: []const u8, view_id: []const u8) void {
+        switch (self.node) {
+            .input => |input| syncInputState(state, owner, view_id, input.id, input.value) catch {},
+            .view => for (self.children) |*child| child.syncInputValues(state, owner, view_id),
+            else => {},
+        }
+    }
+};
+
+fn syncInputValues(self: *ExtensionUiState, record: *const ViewRecord) void {
+    if (record.root) |*root| root.syncInputValues(self, record.spec.state_owner_id, record.spec.id);
 }
 
 fn clearInputValuesForView(self: *ExtensionUiState, owner: []const u8, view: []const u8) void {
@@ -364,8 +410,24 @@ fn editInput(self: *ExtensionUiState, spec: extension_ui.RenderSpec, input: Inpu
 
 const ViewRecord = struct {
     spec: extension_ui.RenderSpec,
+    root: ?RetainedNode = null,
+
+    fn init(allocator: std.mem.Allocator, spec: extension_ui.RenderSpec) !ViewRecord {
+        var cloned = try extension_ui.RenderSpec.clone(allocator, spec);
+        errdefer cloned.deinit(allocator);
+        const root = if (spec.root) |source| try RetainedNode.init(allocator, source) else null;
+        errdefer if (root) |*r| {
+            var owned = r.*;
+            owned.deinit(allocator);
+        };
+        if (cloned.root) |*old_root| old_root.deinit(allocator);
+        cloned.root = null;
+        return .{ .spec = cloned, .root = root };
+    }
+
     fn deinit(self: *ViewRecord, allocator: std.mem.Allocator) void {
         self.spec.deinit(allocator);
+        if (self.root) |*root| root.deinit(allocator);
     }
 };
 
@@ -392,8 +454,9 @@ const TargetComponent = struct {
         var y: u32 = 0;
         for (ordered) |view| {
             if (y >= region.height) break;
-            const h = @min(measureNode(self.state, view.spec.root orelse continue, region.width, region.buf.width_method), region.height - y);
-            renderNode(self.state, view.spec, view.spec.root.?, region.sub(0, y, region.width, h));
+            const root = view.root orelse continue;
+            const h = @min(measureNode(self.state, root, region.width, region.buf.width_method), region.height - y);
+            renderNode(self.state, view.spec, root, region.sub(0, y, region.width, h));
             y += h;
         }
     }
@@ -403,7 +466,7 @@ const TargetComponent = struct {
         defer self.state.allocator.free(ordered);
         var total: u32 = 0;
         for (ordered) |view| {
-            if (view.spec.root) |root| total += measureNode(self.state, root, width, self.width_method);
+            if (view.root) |root| total += measureNode(self.state, root, width, self.width_method);
         }
         return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
     }
@@ -497,32 +560,32 @@ fn lessView(_: void, a: *ViewRecord, b: *ViewRecord) bool {
 
 const Rect = struct { x: u32, y: u32, width: u32, height: u32 };
 
-fn measureNode(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32, width_method: WidthMethod) u32 {
-    return switch (node) {
+fn measureNode(state: *ExtensionUiState, node: RetainedNode, width: u32, width_method: WidthMethod) u32 {
+    return switch (node.node) {
         .text => |t| measureText(state, t, width, width_method),
         .chip => 1,
         .progress => 1,
         .separator => 1,
         .surface => |s| constraintHeight(s.style.height) orelse 1,
         .input => 1,
-        .view => |b| measureView(state, b, width, width_method),
+        .view => |b| measureView(state, b, node.children, width, width_method),
     };
 }
 
-fn measureView(state: *ExtensionUiState, b: extension_ui.UiNode.View, width: u32, width_method: WidthMethod) u32 {
+fn measureView(state: *ExtensionUiState, b: extension_ui.UiNode.View, children: []const RetainedNode, width: u32, width_method: WidthMethod) u32 {
     const border: u32 = if (hasFrameChrome(b.style.chrome)) 1 else 0;
     const pad_v = edge(b.style.padding.top) + edge(b.style.padding.bottom);
     const pad_h = edge(b.style.padding.left) + edge(b.style.padding.right);
     const child_width = width -| (border * 2 + pad_h);
     var content: u32 = 0;
-    if (b.children.len == 0) {
+    if (children.len == 0) {
         content = 0;
     } else if (b.style.flex_direction == .row) {
-        for (b.children) |child| content = @max(content, measureNode(state, child, child_width, width_method));
+        for (children) |child| content = @max(content, measureNode(state, child, child_width, width_method));
     } else {
-        for (b.children, 0..) |child, i| {
+        for (children, 0..) |child, i| {
             content += measureNode(state, child, child_width, width_method);
-            if (i + 1 < b.children.len) content += edge(b.style.gap);
+            if (i + 1 < children.len) content += edge(b.style.gap);
         }
     }
     return @max(1, border * 2 + pad_v + content);
@@ -848,9 +911,9 @@ fn renderText(state: *ExtensionUiState, region: Region, t: extension_ui.UiNode.T
     text.render(region);
 }
 
-fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: extension_ui.UiNode, region: Region) void {
+fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: RetainedNode, region: Region) void {
     if (region.width == 0 or region.height == 0) return;
-    switch (node) {
+    switch (node.node) {
         .text => |t| renderText(state, region, t),
         .chip => |ch| renderChip(state, region, ch.label),
         .progress => |pr| renderProgress(state, region, pr),
@@ -859,11 +922,11 @@ fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: ext
             if (frame.generation >= view.generation) framebuffer_surface_mod.renderFrame(region, frame, 0);
         },
         .input => |input| renderInput(state, view, region, input),
-        .view => |b| renderView(state, view, b, region),
+        .view => |b| renderView(state, view, b, node.children, region),
     }
 }
 
-fn renderView(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, region: Region) void {
+fn renderView(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Region) void {
     var inner = region;
     if (renderChrome(state, b.style.chrome, region)) |chrome_inner| {
         inner = chrome_inner;
@@ -873,44 +936,113 @@ fn renderView(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extens
     const pt = edge(b.style.padding.top);
     const pb = edge(b.style.padding.bottom);
     inner = inner.sub(@min(pl, inner.width), @min(pt, inner.height), inner.width -| pl -| pr, inner.height -| pt -| pb);
-    if (b.children.len == 0 or inner.width == 0 or inner.height == 0) return;
-    if (b.style.flex_direction == .row) renderRow(state, view, b, inner) else renderColumn(state, view, b, inner);
+    if (children.len == 0 or inner.width == 0 or inner.height == 0) return;
+    if (b.style.flex_direction == .row) renderRow(state, view, b, children, inner) else renderColumn(state, view, b, children, inner);
 }
 
-fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, region: Region) void {
+fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Region) void {
     const gap = edge(b.style.gap);
-    var y: u32 = 0;
-    for (b.children, 0..) |child, i| {
+    const total_gap = gap *| @as(u32, @intCast(if (children.len > 0) children.len - 1 else 0));
+    const avail = region.height -| total_gap;
+    var fixed: u32 = 0;
+    var grow_sum: f32 = 0;
+    for (children) |child| {
+        const grow = nodeStyle(child).flex_grow;
+        if (grow > 0) grow_sum += grow else fixed += resolveHeight(state, child, region.width, avail, region.buf.width_method);
+    }
+    const remaining = avail -| fixed;
+    const used = if (grow_sum > 0) region.height else fixed + total_gap;
+    var y = justifyOffset(b.style.justify, region.height, used);
+    const extra_gap = justifyExtraGap(b.style.justify, region.height, used, children.len);
+    for (children, 0..) |child, i| {
         if (y >= region.height) break;
-        const h = @min(resolveHeight(state, child, region.width, region.height - y, region.buf.width_method), region.height - y);
-        renderNode(state, view, child, region.sub(0, y, region.width, h));
+        const grow = nodeStyle(child).flex_grow;
+        const desired = if (grow > 0 and grow_sum > 0) @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(remaining)) * grow / grow_sum))) else resolveHeight(state, child, region.width, region.height - y, region.buf.width_method);
+        const h = @min(desired, region.height - y);
+        const child_w = crossWidth(child, region.width);
+        const x = alignOffset(b.style.alignment, region.width, child_w);
+        renderNode(state, view, child, region.sub(x, y, @min(child_w, region.width - x), h));
         y += h;
-        if (i + 1 < b.children.len) y +|= gap;
+        if (i + 1 < children.len) y +|= gap + extra_gap;
     }
 }
 
-fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, region: Region) void {
+fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Region) void {
     const gap = edge(b.style.gap);
-    const total_gap = gap *| @as(u32, @intCast(if (b.children.len > 0) b.children.len - 1 else 0));
+    const total_gap = gap *| @as(u32, @intCast(if (children.len > 0) children.len - 1 else 0));
     const avail = region.width -| total_gap;
     var fixed: u32 = 0;
-    var fill_count: u32 = 0;
-    for (b.children) |child| {
-        if (widthConstraint(child)) |w| fixed += resolveConstraint(w, avail) else fill_count += 1;
+    var grow_sum: f32 = 0;
+    for (children) |child| {
+        const grow = nodeStyle(child).flex_grow;
+        if (grow > 0) grow_sum += grow else if (widthConstraint(child)) |w| fixed += resolveConstraint(w, avail) else fixed += measureNode(state, child, avail, region.buf.width_method);
     }
-    const fill_w = if (fill_count > 0) (avail -| fixed) / fill_count else 0;
-    var x: u32 = 0;
-    for (b.children, 0..) |child, i| {
+    const remaining = avail -| fixed;
+    const used = if (grow_sum > 0) region.width else fixed + total_gap;
+    var x = justifyOffset(b.style.justify, region.width, used);
+    const extra_gap = justifyExtraGap(b.style.justify, region.width, used, children.len);
+    for (children, 0..) |child, i| {
         if (x >= region.width) break;
-        const w = @min(if (widthConstraint(child)) |cw| resolveConstraint(cw, avail) else fill_w, region.width - x);
-        renderNode(state, view, child, region.sub(x, 0, w, region.height));
+        const grow = nodeStyle(child).flex_grow;
+        const desired = if (grow > 0 and grow_sum > 0) @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(remaining)) * grow / grow_sum))) else if (widthConstraint(child)) |cw| resolveConstraint(cw, avail) else measureNode(state, child, avail, region.buf.width_method);
+        const w = @min(desired, region.width - x);
+        const child_h = crossHeight(child, region.height);
+        const y = alignOffset(b.style.alignment, region.height, child_h);
+        renderNode(state, view, child, region.sub(x, y, w, @min(child_h, region.height - y)));
         x += w;
-        if (i + 1 < b.children.len) x +|= gap;
+        if (i + 1 < children.len) x +|= gap + extra_gap;
     }
 }
 
-fn resolveHeight(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32, avail: u32, width_method: WidthMethod) u32 {
-    const c = switch (node) {
+fn nodeStyle(node: RetainedNode) extension_ui.Style {
+    return switch (node.node) {
+        .view => |v| v.style,
+        .text => |t| t.style,
+        .chip => |c| c.style,
+        .progress => |p| p.style,
+        .separator => |s| s.style,
+        .surface => |s| s.style,
+        .input => |i| i.style,
+    };
+}
+
+fn justifyOffset(justify: extension_ui.Justify, container: u32, used: u32) u32 {
+    if (used >= container) return 0;
+    const extra = container - used;
+    return switch (justify) {
+        .start, .space_between => 0,
+        .center => extra / 2,
+        .end => extra,
+    };
+}
+
+fn justifyExtraGap(justify: extension_ui.Justify, container: u32, used: u32, child_count: usize) u32 {
+    if (justify != .space_between or child_count < 2 or used >= container) return 0;
+    return (container - used) / @as(u32, @intCast(child_count - 1));
+}
+
+fn alignOffset(alignment: extension_ui.Align, container: u32, child: u32) u32 {
+    if (child >= container) return 0;
+    const extra = container - child;
+    return switch (alignment) {
+        .start, .stretch => 0,
+        .center => extra / 2,
+        .end => extra,
+    };
+}
+
+fn crossWidth(node: RetainedNode, container: u32) u32 {
+    if (nodeStyle(node).alignment == .stretch) return container;
+    return if (widthConstraint(node)) |w| @min(resolveConstraint(w, container), container) else container;
+}
+
+fn crossHeight(node: RetainedNode, container: u32) u32 {
+    if (nodeStyle(node).alignment == .stretch) return container;
+    return if (nodeStyle(node).height) |h| @min(resolveConstraint(h, container), container) else container;
+}
+
+fn resolveHeight(state: *ExtensionUiState, node: RetainedNode, width: u32, avail: u32, width_method: WidthMethod) u32 {
+    const c = switch (node.node) {
         .view => |b| b.style.height,
         .text => |t| t.style.height,
         .chip => |c| c.style.height,
@@ -923,8 +1055,8 @@ fn resolveHeight(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32
     return measureNode(state, node, width, width_method);
 }
 
-fn widthConstraint(node: extension_ui.UiNode) ?extension_ui.Constraint {
-    return switch (node) {
+fn widthConstraint(node: RetainedNode) ?extension_ui.Constraint {
+    return switch (node.node) {
         .view => |b| b.style.width,
         .text => |t| t.style.width,
         .chip => |c| c.style.width,
@@ -1112,7 +1244,7 @@ test "extension ui retains clone remove and generation gates" {
     const stale = extension_ui.UiNode{ .text = .{ .text = "old" } };
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = stale });
     const rec = state.views.get("owner\x1fview").?;
-    try std.testing.expectEqualStrings("new", rec.spec.root.?.text.text);
+    try std.testing.expectEqualStrings("new", rec.root.?.node.text.text);
 
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .remove = true });
     try std.testing.expectEqual(@as(usize, 1), state.views.count());
@@ -1165,6 +1297,38 @@ test "extension ui renders text" {
     comp.render(buf.region());
     try std.testing.expectEqual(@as(u21, 'h'), cpAt(&buf, 0, 0));
     try std.testing.expectEqual(@as(u21, 'o'), cpAt(&buf, 4, 0));
+}
+
+test "extension ui row justify center honors retained layout" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const a = extension_ui.UiNode{ .text = .{ .text = "a", .style = .{ .width = .{ .fixed = 1 } } } };
+    const b = extension_ui.UiNode{ .text = .{ .text = "b", .style = .{ .width = .{ .fixed = 1 } } } };
+    const children = [_]extension_ui.UiNode{ a, b };
+    const root = extension_ui.UiNode{ .view = .{ .style = .{ .flex_direction = .row, .justify = .center }, .children = @constCast(&children) } };
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    var buf = try Buffer.init(std.testing.allocator, 6, 1, .wcwidth);
+    defer buf.deinit();
+    var comp = state.statusComponent();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 2, 0));
+    try std.testing.expectEqual(@as(u21, 'b'), cpAt(&buf, 3, 0));
+}
+
+test "extension ui row flex grow consumes remaining width before justify" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const a = extension_ui.UiNode{ .text = .{ .text = "a", .style = .{ .width = .{ .fixed = 1 } } } };
+    const b = extension_ui.UiNode{ .text = .{ .text = "b", .style = .{ .flex_grow = 1 } } };
+    const children = [_]extension_ui.UiNode{ a, b };
+    const root = extension_ui.UiNode{ .view = .{ .style = .{ .flex_direction = .row, .justify = .end }, .children = @constCast(&children) } };
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    var buf = try Buffer.init(std.testing.allocator, 6, 1, .wcwidth);
+    defer buf.deinit();
+    var comp = state.statusComponent();
+    comp.render(buf.region());
+    try std.testing.expectEqual(@as(u21, 'a'), cpAt(&buf, 0, 0));
+    try std.testing.expectEqual(@as(u21, 'b'), cpAt(&buf, 1, 0));
 }
 
 test "extension ui measures and renders multiline text" {
