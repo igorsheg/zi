@@ -16,6 +16,8 @@ const Theme = theme_mod.Theme;
 const Shimmer = shimmer_mod.Config;
 const ShuffleText = shuffle_text_mod.ShuffleText;
 
+const default_shimmer_peak = Color.rgb(0xF2, 0xF1, 0xEF);
+
 /// Single TUI-owned composer for the status area.
 ///
 /// Status semantics (primary messages, working state, extension statuses) are
@@ -228,13 +230,23 @@ pub const StatusLine = struct {
             .band_half_width = 5,
             .base_fg = base,
             .edge_fg = edge,
-            .peak_fg = Color.rgb(0xF2, 0xF1, 0xEF),
+            .peak_fg = if (self.theme) |theme| shimmerPeakColor(theme.fg(.text)) else self.primary_fg,
             .base_attrs = .{ .dim = true },
             .edge_attrs = .{},
             .peak_attrs = .{},
         };
     }
 };
+
+fn shimmerPeakColor(text_fg: Color) Color {
+    return switch (text_fg) {
+        // The builtin themes intentionally use terminal-default text. That color is
+        // unknown to us, so it cannot be RGB-interpolated; use pi-mono's concrete
+        // off-white peak to preserve the smooth shimmer gradient.
+        .default_color => default_shimmer_peak,
+        else => text_fg,
+    };
+}
 
 fn currentMs() u64 {
     const ms = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds();
@@ -281,4 +293,20 @@ test "StatusLine publishes shimmer animation while working" {
     try testing.expect(line.nextAnimationDeadline(now_ns) != null);
     try testing.expect(!line.tickAnimation(now_ns));
     try testing.expect(line.nextAnimationDeadline(now_ns + 1) != null);
+}
+
+test "StatusLine uses concrete shimmer peak for terminal default theme text" {
+    var theme = Theme{
+        .fg_colors = [_]Color{Color.rgb(1, 1, 1)} ** @typeInfo(theme_mod.FgColor).@"enum".fields.len,
+        .bg_colors = [_]Color{Color.default} ** @typeInfo(theme_mod.BgColor).@"enum".fields.len,
+    };
+    theme.fg_colors[@intFromEnum(theme_mod.FgColor.dim)] = Color.rgb(0x66, 0x66, 0x66);
+    theme.fg_colors[@intFromEnum(theme_mod.FgColor.muted)] = Color.rgb(0x80, 0x80, 0x80);
+    theme.fg_colors[@intFromEnum(theme_mod.FgColor.text)] = Color.default;
+
+    var line = StatusLine.init(testing.allocator);
+    defer line.deinit();
+    line.setTheme(&theme);
+
+    try testing.expect(line.shimmerConfig().peak_fg.eql(default_shimmer_peak));
 }

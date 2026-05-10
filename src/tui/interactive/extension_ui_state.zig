@@ -852,7 +852,7 @@ fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: ext
     if (region.width == 0 or region.height == 0) return;
     switch (node) {
         .text => |t| renderText(state, region, t),
-        .chip => |ch| renderChip(region, ch.label),
+        .chip => |ch| renderChip(state, region, ch.label),
         .progress => |pr| renderProgress(state, region, pr),
         .separator => |sep| renderSeparator(state, region, sep),
         .surface => |s| if (state.findFrame(view.state_owner_id, view.id, s.id)) |frame| {
@@ -995,11 +995,14 @@ fn toChromeBorderStyle(border: extension_ui.BorderStyle) chrome_mod.BorderStyle 
     };
 }
 
-fn renderChip(region: Region, label: []const u8) void {
-    _ = region.writeStr(0, 0, "[ ", Color.default, Color.default, Attributes.none);
-    if (region.width > 2) _ = region.writeStr(2, 0, label, Color.default, Color.default, Attributes.none);
+fn renderChip(state: *ExtensionUiState, region: Region, label: []const u8) void {
+    const theme = state.activeTheme();
+    const chrome = theme.fg(.border_muted);
+    const fg = theme.fg(.text);
+    _ = region.writeStr(0, 0, "[ ", chrome, Color.default, Attributes.none);
+    if (region.width > 2) _ = region.writeStr(2, 0, label, fg, Color.default, Attributes.none);
     const close_x = @min(@as(u32, @intCast(label.len)) + 2, region.width - 1);
-    if (close_x + 1 < region.width) _ = region.writeStr(close_x, 0, " ]", Color.default, Color.default, Attributes.none);
+    if (close_x + 1 < region.width) _ = region.writeStr(close_x, 0, " ]", chrome, Color.default, Attributes.none);
 }
 
 fn renderInput(state: *ExtensionUiState, view: extension_ui.RenderSpec, region: Region, input: extension_ui.UiNode.Input) void {
@@ -1021,10 +1024,17 @@ fn renderProgress(state: *ExtensionUiState, region: Region, pr: extension_ui.UiN
         const pct = @max(0, @min(value, 1));
         const inner = region.width - 2;
         const filled: u32 = @intFromFloat(@as(f32, @floatFromInt(inner)) * pct);
-        region.set(0, 0, charCell('[', Color.default, Color.default, Attributes.none));
+        const theme = state.activeTheme();
+        const chrome = theme.fg(.border_muted);
+        const filled_fg = theme.fg(.accent);
+        const empty_fg = theme.fg(.dim);
+        region.set(0, 0, charCell('[', chrome, Color.default, Attributes.none));
         var x: u32 = 0;
-        while (x < inner) : (x += 1) region.set(x + 1, 0, charCell(if (x < filled) '█' else ' ', Color.default, Color.default, Attributes.none));
-        region.set(region.width - 1, 0, charCell(']', Color.default, Color.default, Attributes.none));
+        while (x < inner) : (x += 1) {
+            const fg = if (x < filled) filled_fg else empty_fg;
+            region.set(x + 1, 0, charCell(if (x < filled) '█' else ' ', fg, Color.default, Attributes.none));
+        }
+        region.set(region.width - 1, 0, charCell(']', chrome, Color.default, Attributes.none));
     } else if (pr.label) |label| {
         var text = TextComponent.init(state.allocator, region.buf.width_method);
         defer text.deinit();
