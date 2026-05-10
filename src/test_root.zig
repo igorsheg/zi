@@ -47,6 +47,4 @@ test {
     _ = @import("coding_agent/extensions/loader.zig");
     _ = @import("coding_agent/extensions/lua_tool.zig");
     _ = @import("coding_agent/extensions/lua_renderer.zig");
-    _ = @import("coding_agent/extensions/webview_api.zig");
-    _ = @import("coding_agent/webview/root.zig");
 }

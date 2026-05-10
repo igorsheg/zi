@@ -1,7 +1,6 @@
 const request_mod = @import("../../coding_agent/request.zig");
 const oauth_mod = @import("../../coding_agent/auth/oauth.zig");
 const extension_runner_mod = @import("../../coding_agent/extensions/runner.zig");
-const webview_api = @import("../../coding_agent/extensions/webview_api.zig");
 
 pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExtensionAsyncFromRunner: anytype) bool {
     var buf: [16]AgentRequest = undefined;
@@ -15,7 +14,6 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
         while (i < n) : (i += 1) {
             var req = &buf[i];
             bindExtensionCommandActions(self);
-            bindExtensionWebviewDispatcher(self);
             switch (req.*) {
                 .prompt => |p| {
                     prompt_processed = true;
@@ -142,13 +140,6 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
                     req.* = .{ .refresh_status_snapshot = {} };
                     self.publishPendingExtensionUi();
                 },
-                .extension_webview_pump => {
-                    idle_processed = true;
-                    if (self.runtime_host.currentSession().extensionRunner()) |runner| {
-                        _ = webview_api.pumpEvents(runner);
-                    }
-                    self.publishPendingExtensionUi();
-                },
                 .tool_expanded_changed => |event| {
                     idle_processed = true;
                     if (self.runtime_host.currentSession().extensionRunner()) |runner| {
@@ -188,22 +179,6 @@ fn bindExtensionCommandActions(self: anytype) void {
         .send_user_message = &sendUserMessageFromExtension,
     };
     runner.setCommandActions(&self.extension_command_actions);
-}
-
-fn bindExtensionWebviewDispatcher(self: anytype) void {
-    const runner = self.runtime_host.currentSession().extensionRunner() orelse return;
-    runner.webview_manager.setEventDispatcher(.{
-        .ptr = @ptrCast(self),
-        .wake_fn = &wakeWebviewPump,
-    });
-}
-
-fn wakeWebviewPump(ptr: *anyopaque) bool {
-    const self: *@import("../interactive.zig").Interactive = @ptrCast(@alignCast(ptr));
-    return switch (self.request_queue.trySend(.{ .extension_webview_pump = {} })) {
-        .ok, .dropped => true,
-        .full, .closed, .oom => false,
-    };
 }
 
 fn flushDeferredUserPrompts(self: anytype) bool {

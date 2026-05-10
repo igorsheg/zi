@@ -7,7 +7,6 @@ const json_util = @import("../../ai/json_util.zig");
 const agent_protocol = @import("../../agent/types.zig");
 const session_core = @import("../../session/root.zig");
 const extension_ui = @import("ui.zig");
-const webview_api = @import("webview_api.zig");
 const request_mod = @import("../request.zig");
 const ai_provider = @import("../../ai/provider.zig");
 const abort_signal_mod = @import("../../zio/root.zig").abort;
@@ -27,7 +26,7 @@ pub fn pushExtensionContext(
     runner: *runner_mod.ExtensionRunner,
     provenance: ?resource_types.ExtensionProvenance,
 ) !void {
-    c.lua_createtable(L, 0, 15);
+    c.lua_createtable(L, 0, 14);
 
     _ = c.lua_pushlstring(L, runner.cwd.ptr, runner.cwd.len);
     c.lua_setfield(L, -2, "cwd");
@@ -41,9 +40,6 @@ pub fn pushExtensionContext(
 
     pushUiApi(L, runner, provenance);
     c.lua_setfield(L, -2, "ui");
-
-    webview_api.pushContextApi(L, runner, provenance);
-    c.lua_setfield(L, -2, "webview");
 
     pushEditorApi(L, runner, provenance);
     c.lua_setfield(L, -2, "editor");

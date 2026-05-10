@@ -24,7 +24,6 @@ pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
         .session = @ptrCast(self),
         .ui = null,
         .command_actions = null,
-        .io = self._stream_closure.io,
         .get_model = &runtimeGetModel,
         .models_get = &runtimeModelsGet,
         .models_get_one = &runtimeModelsGetOne,

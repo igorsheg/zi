@@ -17,7 +17,6 @@ const auth_types = @import("../auth/types.zig");
 const request_mod = @import("../request.zig");
 const extension_ui = @import("ui.zig");
 const system_command = @import("system_command.zig");
-const webview = @import("../webview/root.zig");
 
 const log = std.log.scoped(.zi_runner);
 
@@ -598,7 +597,6 @@ pub const ExtensionRuntime = union(enum) {
         session: *anyopaque,
         ui: ?*anyopaque = null,
         command_actions: ?*ExtensionCommandActions = null,
-        io: std.Io = std.Options.debug_io,
 
         /// Context action seams used by tool/event `ctx.*` helpers.
         /// Stored as function pointers here so extension modules can call
@@ -881,7 +879,6 @@ pub const ExtensionRunner = struct {
     /// `bindRuntime` (D7) into the AI provider registry. v1 leaves
     /// this empty; v3 wires `zi.provider`.
     provider_queue: registries.ProviderQueue,
-    webview_manager: webview.Manager,
 
     /// Lua state for this generation. Borrowed (NOT owned) — the
     /// state is constructed and owned by the SDK factory or the
@@ -1058,7 +1055,6 @@ pub const ExtensionRunner = struct {
             .command_registry = registries.CommandRegistry.init(allocator),
             .keybinding_registry = registries.KeybindingRegistry.init(allocator),
             .provider_queue = registries.ProviderQueue.init(allocator),
-            .webview_manager = webview.Manager.init(allocator),
             .loaded_extensions = .empty,
             .hook_arena = std.heap.ArenaAllocator.init(allocator),
         };
@@ -1225,7 +1221,6 @@ pub const ExtensionRunner = struct {
 
     pub fn deinit(self: *ExtensionRunner) void {
         self.clearAsyncState();
-        self.webview_manager.deinit(if (self.lua_state) |state| state.L else null);
         self.provider_queue.deinit();
         self.keybinding_registry.deinit();
         self.command_registry.deinit();
@@ -1255,7 +1250,6 @@ pub const ExtensionRunner = struct {
     /// phases cast them to concrete types at use sites.
     pub fn bindRuntime(self: *ExtensionRunner, bound: ExtensionRuntime.Bound, provider_registry: *ai.provider.Registry) !void {
         if (self.runtime != .stub) return error.AlreadyBound;
-        self.webview_manager.setIo(bound.io);
         self.runtime = .{ .bound = bound };
         self._provider_registry = provider_registry;
         errdefer self._provider_registry = null;
