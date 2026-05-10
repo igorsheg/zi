@@ -63,6 +63,10 @@ Markdown pages live next to the HTML pages. If a link ends in `.html`, the match
 - [CLI](cli.html) — run modes, prompt inputs, sessions, flags
 - [Settings](settings.html) — user/project configuration
 - [Resource discovery](resources.html) — user/project roots, settings paths, packages
+- [Skills](skills.html) — reusable Markdown craft notes
+- [Prompts](prompts.html) — Markdown prompt templates
+- [Themes](themes.html) — TUI color JSON
+- [Agent context](agent-context.html) — `AGENTS.md` and `CLAUDE.md`
 - [Extensions](extensions.html) — extension files, loading, lifecycle
 - [API](api.html) — tools, commands, providers, events, jobs, JSON
 - [Context](context.html) — `ctx.ui`, `ctx.editor`, `ctx.session`, `ctx.models`, `ctx.ai`
