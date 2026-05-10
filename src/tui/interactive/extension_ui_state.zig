@@ -454,9 +454,11 @@ const TargetComponent = struct {
         var y: u32 = 0;
         for (ordered) |view| {
             if (y >= region.height) break;
-            const root = view.root orelse continue;
-            const h = @min(measureNode(self.state, root, region.width, region.buf.width_method), region.height - y);
-            renderNode(self.state, view.spec, root, region.sub(0, y, region.width, h));
+            const root = if (view.root) |*root| root else continue;
+            const h = @min(measureNode(self.state, root.*, region.width, region.buf.width_method), region.height - y);
+            var layout = layoutNode(self.state, root, .{ .x = 0, .y = y, .width = region.width, .height = h }, region.buf.width_method) catch continue;
+            defer layout.deinit(self.state.allocator);
+            paintLayout(self.state, view.spec, layout, region);
             y += h;
         }
     }
@@ -911,36 +913,61 @@ fn renderText(state: *ExtensionUiState, region: Region, t: extension_ui.UiNode.T
     text.render(region);
 }
 
-fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: RetainedNode, region: Region) void {
-    if (region.width == 0 or region.height == 0) return;
-    switch (node.node) {
-        .text => |t| renderText(state, region, t),
-        .chip => |ch| renderChip(state, region, ch.label),
-        .progress => |pr| renderProgress(state, region, pr),
-        .separator => |sep| renderSeparator(state, region, sep),
-        .surface => |s| if (state.findFrame(view.state_owner_id, view.id, s.id)) |frame| {
-            if (frame.generation >= view.generation) framebuffer_surface_mod.renderFrame(region, frame, 0);
-        },
-        .input => |input| renderInput(state, view, region, input),
-        .view => |b| renderView(state, view, b, node.children, region),
+const LayoutBox = struct {
+    node: *const RetainedNode,
+    rect: Rect,
+    children: []LayoutBox = &.{},
+
+    fn deinit(self: *LayoutBox, allocator: std.mem.Allocator) void {
+        for (self.children) |*child| child.deinit(allocator);
+        allocator.free(self.children);
+        self.* = undefined;
     }
+};
+
+fn layoutNode(state: *ExtensionUiState, node: *const RetainedNode, rect: Rect, width_method: WidthMethod) !LayoutBox {
+    if (rect.width == 0 or rect.height == 0) return .{ .node = node, .rect = rect };
+    return switch (node.node) {
+        .view => |view| try layoutView(state, node, view, node.children, rect, width_method),
+        else => .{ .node = node, .rect = rect },
+    };
 }
 
-fn renderView(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Region) void {
-    var inner = region;
-    if (renderChrome(state, b.style.chrome, region)) |chrome_inner| {
-        inner = chrome_inner;
-    }
-    const pl = edge(b.style.padding.left);
-    const pr = edge(b.style.padding.right);
-    const pt = edge(b.style.padding.top);
-    const pb = edge(b.style.padding.bottom);
-    inner = inner.sub(@min(pl, inner.width), @min(pt, inner.height), inner.width -| pl -| pr, inner.height -| pt -| pb);
-    if (children.len == 0 or inner.width == 0 or inner.height == 0) return;
-    if (b.style.flex_direction == .row) renderRow(state, view, b, children, inner) else renderColumn(state, view, b, children, inner);
+fn layoutView(state: *ExtensionUiState, node: *const RetainedNode, view: extension_ui.UiNode.View, children: []const RetainedNode, rect: Rect, width_method: WidthMethod) !LayoutBox {
+    const inner = viewInnerRect(view, rect);
+    const child_boxes = if (children.len == 0 or inner.width == 0 or inner.height == 0)
+        &.{}
+    else if (view.style.flex_direction == .row)
+        try layoutRow(state, view, children, inner, width_method)
+    else
+        try layoutColumn(state, view, children, inner, width_method);
+    return .{ .node = node, .rect = rect, .children = child_boxes };
 }
 
-fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Region) void {
+fn viewInnerRect(view: extension_ui.UiNode.View, rect: Rect) Rect {
+    var inner = rect;
+    const border: u32 = if (hasFrameChrome(view.style.chrome)) 1 else 0;
+    inner.x +|= @min(border, inner.width);
+    inner.y +|= @min(border, inner.height);
+    inner.width = inner.width -| border * 2;
+    inner.height = inner.height -| border * 2;
+    const pl = edge(view.style.padding.left);
+    const pr = edge(view.style.padding.right);
+    const pt = edge(view.style.padding.top);
+    const pb = edge(view.style.padding.bottom);
+    inner.x +|= @min(pl, inner.width);
+    inner.y +|= @min(pt, inner.height);
+    inner.width = inner.width -| pl -| pr;
+    inner.height = inner.height -| pt -| pb;
+    return inner;
+}
+
+fn layoutColumn(state: *ExtensionUiState, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Rect, width_method: WidthMethod) ![]LayoutBox {
+    var boxes = std.ArrayList(LayoutBox).empty;
+    errdefer {
+        for (boxes.items) |*box| box.deinit(state.allocator);
+        boxes.deinit(state.allocator);
+    }
     const gap = edge(b.style.gap);
     const total_gap = gap *| @as(u32, @intCast(if (children.len > 0) children.len - 1 else 0));
     const avail = region.height -| total_gap;
@@ -948,7 +975,7 @@ fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: exte
     var grow_sum: f32 = 0;
     for (children) |child| {
         const grow = nodeStyle(child).flex_grow;
-        if (grow > 0) grow_sum += grow else fixed += resolveHeight(state, child, region.width, avail, region.buf.width_method);
+        if (grow > 0) grow_sum += grow else fixed += resolveHeight(state, child, region.width, avail, width_method);
     }
     const remaining = avail -| fixed;
     const used = if (grow_sum > 0) region.height else fixed + total_gap;
@@ -957,17 +984,23 @@ fn renderColumn(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: exte
     for (children, 0..) |child, i| {
         if (y >= region.height) break;
         const grow = nodeStyle(child).flex_grow;
-        const desired = if (grow > 0 and grow_sum > 0) @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(remaining)) * grow / grow_sum))) else resolveHeight(state, child, region.width, region.height - y, region.buf.width_method);
+        const desired = if (grow > 0 and grow_sum > 0) @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(remaining)) * grow / grow_sum))) else resolveHeight(state, child, region.width, region.height - y, width_method);
         const h = @min(desired, region.height - y);
         const child_w = crossWidth(child, region.width);
         const x = alignOffset(b.style.alignment, region.width, child_w);
-        renderNode(state, view, child, region.sub(x, y, @min(child_w, region.width - x), h));
+        try boxes.append(state.allocator, try layoutNode(state, &children[i], .{ .x = region.x + x, .y = region.y + y, .width = @min(child_w, region.width - x), .height = h }, width_method));
         y += h;
         if (i + 1 < children.len) y +|= gap + extra_gap;
     }
+    return boxes.toOwnedSlice(state.allocator);
 }
 
-fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Region) void {
+fn layoutRow(state: *ExtensionUiState, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Rect, width_method: WidthMethod) ![]LayoutBox {
+    var boxes = std.ArrayList(LayoutBox).empty;
+    errdefer {
+        for (boxes.items) |*box| box.deinit(state.allocator);
+        boxes.deinit(state.allocator);
+    }
     const gap = edge(b.style.gap);
     const total_gap = gap *| @as(u32, @intCast(if (children.len > 0) children.len - 1 else 0));
     const avail = region.width -| total_gap;
@@ -975,7 +1008,7 @@ fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extensi
     var grow_sum: f32 = 0;
     for (children) |child| {
         const grow = nodeStyle(child).flex_grow;
-        if (grow > 0) grow_sum += grow else if (widthConstraint(child)) |w| fixed += resolveConstraint(w, avail) else fixed += measureNode(state, child, avail, region.buf.width_method);
+        if (grow > 0) grow_sum += grow else if (widthConstraint(child)) |w| fixed += resolveConstraint(w, avail) else fixed += measureNode(state, child, avail, width_method);
     }
     const remaining = avail -| fixed;
     const used = if (grow_sum > 0) region.width else fixed + total_gap;
@@ -984,13 +1017,47 @@ fn renderRow(state: *ExtensionUiState, view: extension_ui.RenderSpec, b: extensi
     for (children, 0..) |child, i| {
         if (x >= region.width) break;
         const grow = nodeStyle(child).flex_grow;
-        const desired = if (grow > 0 and grow_sum > 0) @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(remaining)) * grow / grow_sum))) else if (widthConstraint(child)) |cw| resolveConstraint(cw, avail) else measureNode(state, child, avail, region.buf.width_method);
+        const desired = if (grow > 0 and grow_sum > 0) @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(remaining)) * grow / grow_sum))) else if (widthConstraint(child)) |cw| resolveConstraint(cw, avail) else measureNode(state, child, avail, width_method);
         const w = @min(desired, region.width - x);
         const child_h = crossHeight(child, region.height);
         const y = alignOffset(b.style.alignment, region.height, child_h);
-        renderNode(state, view, child, region.sub(x, y, w, @min(child_h, region.height - y)));
+        try boxes.append(state.allocator, try layoutNode(state, &children[i], .{ .x = region.x + x, .y = region.y + y, .width = w, .height = @min(child_h, region.height - y) }, width_method));
         x += w;
         if (i + 1 < children.len) x +|= gap + extra_gap;
+    }
+    return boxes.toOwnedSlice(state.allocator);
+}
+
+fn renderNode(state: *ExtensionUiState, view: extension_ui.RenderSpec, node: extension_ui.UiNode, region: Region) void {
+    var retained = RetainedNode.init(state.allocator, node) catch return;
+    defer retained.deinit(state.allocator);
+    var layout = layoutNode(state, &retained, .{ .x = 0, .y = 0, .width = region.width, .height = region.height }, region.buf.width_method) catch return;
+    defer layout.deinit(state.allocator);
+    paintLayout(state, view, layout, region);
+}
+
+fn measureUiNode(state: *ExtensionUiState, node: extension_ui.UiNode, width: u32, width_method: WidthMethod) u32 {
+    var retained = RetainedNode.init(state.allocator, node) catch return 0;
+    defer retained.deinit(state.allocator);
+    return measureNode(state, retained, width, width_method);
+}
+
+fn paintLayout(state: *ExtensionUiState, view: extension_ui.RenderSpec, box: LayoutBox, root_region: Region) void {
+    if (box.rect.width == 0 or box.rect.height == 0) return;
+    const region = root_region.sub(@min(box.rect.x, root_region.width), @min(box.rect.y, root_region.height), @min(box.rect.width, root_region.width -| box.rect.x), @min(box.rect.height, root_region.height -| box.rect.y));
+    switch (box.node.node) {
+        .text => |t| renderText(state, region, t),
+        .chip => |ch| renderChip(state, region, ch.label),
+        .progress => |pr| renderProgress(state, region, pr),
+        .separator => |sep| renderSeparator(state, region, sep),
+        .surface => |s| if (state.findFrame(view.state_owner_id, view.id, s.id)) |frame| {
+            if (frame.generation >= view.generation) framebuffer_surface_mod.renderFrame(region, frame, 0);
+        },
+        .input => |input| renderInput(state, view, region, input),
+        .view => |v| {
+            _ = renderChrome(state, v.style.chrome, region);
+            for (box.children) |child| paintLayout(state, view, child, root_region);
+        },
     }
 }
 
@@ -1465,7 +1532,7 @@ test "extension ui wraps text spans across span boundaries" {
     defer state.deinit();
     const spans = [_]extension_ui.TextSpan{ .{ .text = "abc", .style = .{ .tone = .info } }, .{ .text = "def", .style = .{ .tone = .warning } } };
     const node = extension_ui.UiNode{ .text = .{ .text = "abcdef", .spans = @constCast(&spans), .wrap = .char } };
-    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 3, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 2), measureUiNode(&state, node, 3, .wcwidth));
     var buf = try Buffer.init(std.testing.allocator, 3, 2, .wcwidth);
     defer buf.deinit();
     renderNode(&state, .{ .state_owner_id = "o", .generation = 1, .id = "v" }, node, buf.region());
@@ -1479,7 +1546,7 @@ test "extension ui ansi text strips escapes for measurement and render" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     const node = extension_ui.UiNode{ .text = .{ .text = "a\x1b[31mb\x1b[0mc", .format = .ansi, .wrap = .char } };
-    try std.testing.expectEqual(@as(u32, 1), measureNode(&state, node, 3, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 1), measureUiNode(&state, node, 3, .wcwidth));
 
     var buf = try Buffer.init(std.testing.allocator, 3, 1, .wcwidth);
     defer buf.deinit();
@@ -1642,7 +1709,7 @@ test "extension ui markdown text measures multiline height and maps scroll_y" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     const measured_node = extension_ui.UiNode{ .text = .{ .format = .markdown, .text = "# Title\nBody" } };
-    try std.testing.expectEqual(@as(u32, 3), measureNode(&state, measured_node, 20, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 3), measureUiNode(&state, measured_node, 20, .wcwidth));
 
     // Markdown has no knobs for extension Text max_lines/scroll_x/align, but it does
     // share the vertical scroll model through scroll_y -> Markdown.scroll_offset.
@@ -1766,8 +1833,8 @@ test "extension ui text measurement uses supplied width method" {
     defer state.deinit();
 
     const node = extension_ui.UiNode{ .text = .{ .text = "☕x", .wrap = .char } };
-    try std.testing.expectEqual(@as(u32, 1), measureNode(&state, node, 2, .wcwidth));
-    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 2, .unicode));
+    try std.testing.expectEqual(@as(u32, 1), measureUiNode(&state, node, 2, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 2), measureUiNode(&state, node, 2, .unicode));
 }
 
 test "extension ui markdown measurement uses supplied width method" {
@@ -1775,8 +1842,8 @@ test "extension ui markdown measurement uses supplied width method" {
     defer state.deinit();
 
     const node = extension_ui.UiNode{ .text = .{ .format = .markdown, .text = "☕x" } };
-    try std.testing.expectEqual(@as(u32, 1), measureNode(&state, node, 2, .wcwidth));
-    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 2, .unicode));
+    try std.testing.expectEqual(@as(u32, 1), measureUiNode(&state, node, 2, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 2), measureUiNode(&state, node, 2, .unicode));
 }
 
 test "extension ui text max_lines and scroll_y affect measurement and render" {
@@ -1784,7 +1851,7 @@ test "extension ui text max_lines and scroll_y affect measurement and render" {
     defer state.deinit();
 
     const node = extension_ui.UiNode{ .text = .{ .text = "aa bb cc dd", .max_lines = 2, .scroll_y = 1 } };
-    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 3, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 2), measureUiNode(&state, node, 3, .wcwidth));
 
     var buf = try Buffer.init(std.testing.allocator, 3, 2, .wcwidth);
     defer buf.deinit();
@@ -1798,7 +1865,7 @@ test "extension ui text wrap none measures explicit lines" {
     defer state.deinit();
 
     const node = extension_ui.UiNode{ .text = .{ .text = "hello world\nbye", .wrap = .none } };
-    try std.testing.expectEqual(@as(u32, 2), measureNode(&state, node, 5, .wcwidth));
+    try std.testing.expectEqual(@as(u32, 2), measureUiNode(&state, node, 5, .wcwidth));
 
     var buf = try Buffer.init(std.testing.allocator, 5, 2, .wcwidth);
     defer buf.deinit();
