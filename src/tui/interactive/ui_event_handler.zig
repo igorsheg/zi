@@ -89,8 +89,8 @@ pub fn handle(self: anytype, ev: *UiEvent) void {
             self.tui.dirty = true;
         },
         .login_complete => |l| {
-            if (self.login_thread) |t| t.join();
-            self.login_thread = null;
+            if (self.login_tasks) |*tasks| tasks.wait() catch {};
+            self.login_tasks = null;
 
             if (l.success) {
                 self.status_line.setPrimary(l.message, self.theme.fg(.success));

@@ -1,6 +1,7 @@
 const std = @import("std");
 const path_search = @import("path.zig");
 const file_ignore = @import("file_ignore.zig");
+const TaskGroup = @import("../zio/tasks.zig").TaskGroup;
 
 pub const Candidate = struct {
     relative_path: []const u8,
@@ -21,7 +22,7 @@ pub const Options = struct {
 
 pub const Session = struct {
     shared: *Shared,
-    thread: std.Thread,
+    tasks: TaskGroup,
 
     const Shared = struct {
         allocator: std.mem.Allocator,
@@ -39,8 +40,10 @@ pub const Session = struct {
         shared.* = .{ .allocator = allocator, .io = io, .options = options };
         errdefer allocator.destroy(shared);
 
-        const thread = try std.Thread.spawn(.{}, workerMain, .{shared});
-        return .{ .shared = shared, .thread = thread };
+        var tasks = TaskGroup.init(io);
+        errdefer tasks.cancel();
+        try tasks.concurrent(workerMain, .{shared});
+        return .{ .shared = shared, .tasks = tasks };
     }
 
     pub fn cancel(self: *Session) void {
@@ -62,7 +65,7 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         self.cancel();
-        self.thread.join();
+        self.tasks.wait() catch {};
         self.shared.results.deinit(self.shared.allocator);
         self.shared.allocator.destroy(self.shared);
         self.* = undefined;

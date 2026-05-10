@@ -52,7 +52,7 @@ pub fn handle(self: anytype, key: Key) void {
             return;
         }
 
-        if (self.login_thread != null) {
+        if (self.login_tasks != null) {
             self.login_cancelled.store(true, .release);
             return;
         }

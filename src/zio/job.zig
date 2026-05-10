@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const TaskGroup = @import("tasks.zig").TaskGroup;
 
 /// Small zio-owned long-running process supervisor.
 ///
@@ -81,7 +82,8 @@ pub const Manager = struct {
         errdefer job.deinit(self.allocator);
         try self.jobs.put(self.allocator, id, job);
         errdefer _ = self.jobs.remove(id);
-        job.thread = try std.Thread.spawn(.{}, Job.run, .{job});
+        job.tasks = TaskGroup.init(self.io);
+        try job.tasks.concurrent(Job.run, .{job});
     }
 
     pub fn stop(self: *Manager, id: u64) void {
@@ -96,7 +98,7 @@ pub const Manager = struct {
 
     fn destroyJob(self: *Manager, job: *Job) void {
         job.stop();
-        job.thread.join();
+        job.tasks.wait() catch {};
         job.deinit(self.allocator);
         self.allocator.destroy(job);
     }
@@ -108,7 +110,7 @@ const Job = struct {
     io: std.Io,
     sink: EventSink,
     request: StartRequest,
-    thread: std.Thread = undefined,
+    tasks: TaskGroup = undefined,
     mutex: std.Io.Mutex = .init,
     child_id: ?std.process.Child.Id = null,
     stdin_file: ?std.Io.File = null,
@@ -137,18 +139,17 @@ const Job = struct {
         self.stdin_file = child.stdin;
         self.mutex.unlock(self.io);
 
-        var stdout_thread: ?std.Thread = null;
-        var stderr_thread: ?std.Thread = null;
+        var readers = TaskGroup.init(self.io);
+        defer readers.cancel();
         if (child.stdout) |stdout_file| {
-            stdout_thread = std.Thread.spawn(.{}, readPipe, .{ self, stdout_file, EventKind.stdout }) catch null;
+            readers.concurrent(readPipe, .{ self, stdout_file, EventKind.stdout }) catch {};
         }
         if (child.stderr) |stderr_file| {
-            stderr_thread = std.Thread.spawn(.{}, readPipe, .{ self, stderr_file, EventKind.stderr }) catch null;
+            readers.concurrent(readPipe, .{ self, stderr_file, EventKind.stderr }) catch {};
         }
 
         const term = child.wait(self.io) catch null;
-        if (stdout_thread) |thread| thread.join();
-        if (stderr_thread) |thread| thread.join();
+        readers.wait() catch {};
 
         self.mutex.lockUncancelable(self.io);
         self.child_id = null;

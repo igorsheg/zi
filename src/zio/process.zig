@@ -1,8 +1,10 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const AbortGuard = @import("abort_guard.zig").AbortGuard;
+const guard_mod = @import("guard.zig");
+const AbortGuard = guard_mod.AbortGuard;
 const AbortSignal = @import("abort_signal.zig").AbortSignal;
-const TaskGroup = @import("task_group.zig").TaskGroup;
+const TaskGroup = @import("tasks.zig").TaskGroup;
+const TimeoutGuard = guard_mod.TimeoutGuard;
 
 pub const default_max_output_bytes: usize = 1024 * 1024;
 const poll_interval_ms: u64 = 25;
@@ -321,17 +323,13 @@ const RunContext = struct {
 };
 
 const CaptureTasks = struct {
-    group: IoGroupCaptureTasks = .{},
-    threads: ThreadCaptureTasks = .{},
-    active: Active = .none,
+    group: TaskGroup = undefined,
+    started: bool = false,
 
-    const Active = enum { none, group, threads };
-
-    /// Child-pipe capture prefers the structured zio/std.Io path. It must use
-    /// true concurrency: stdout and stderr have to drain simultaneously or a
-    /// child can deadlock once either pipe fills. If the active backend cannot
-    /// provide concurrency, fall back to dedicated blocking reader threads behind
-    /// this same process primitive.
+    /// Child-pipe capture requires true concurrent progress: stdout and stderr
+    /// must drain simultaneously or a child can deadlock when either pipe fills.
+    /// `TaskGroup.concurrent` owns the backend policy, including OS-thread
+    /// fallback when the active `std.Io` backend cannot provide concurrency.
     const StartError = error{ConcurrencyUnavailable};
 
     fn start(
@@ -342,43 +340,6 @@ const CaptureTasks = struct {
         stderr_capture: *Capture,
         on_chunk: ?ChunkCallback,
     ) StartError!void {
-        self.group.start(io, child, stdout_capture, stderr_capture, on_chunk) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => {
-                self.group.cancel();
-                try self.threads.start(io, child, stdout_capture, stderr_capture, on_chunk);
-                self.active = .threads;
-                return;
-            },
-        };
-        self.active = .group;
-    }
-
-    fn join(self: *CaptureTasks) void {
-        switch (self.active) {
-            .none => {},
-            .group => self.group.join(),
-            .threads => self.threads.join(),
-        }
-        self.active = .none;
-    }
-
-    fn done(_: *const CaptureTasks, stdout_capture: *const Capture, stderr_capture: *const Capture) bool {
-        return stdout_capture.done.load(.acquire) and stderr_capture.done.load(.acquire);
-    }
-};
-
-const IoGroupCaptureTasks = struct {
-    group: TaskGroup = undefined,
-    started: bool = false,
-
-    fn start(
-        self: *IoGroupCaptureTasks,
-        io: std.Io,
-        child: std.process.Child,
-        stdout_capture: *Capture,
-        stderr_capture: *Capture,
-        on_chunk: ?ChunkCallback,
-    ) CaptureTasks.StartError!void {
         self.group = TaskGroup.init(io);
         self.started = true;
         errdefer self.cancel();
@@ -390,45 +351,20 @@ const IoGroupCaptureTasks = struct {
         }
     }
 
-    fn join(self: *IoGroupCaptureTasks) void {
+    fn join(self: *CaptureTasks) void {
         if (!self.started) return;
         self.group.wait() catch {};
         self.started = false;
     }
 
-    fn cancel(self: *IoGroupCaptureTasks) void {
+    fn cancel(self: *CaptureTasks) void {
         if (!self.started) return;
         self.group.cancel();
         self.started = false;
     }
-};
 
-const ThreadCaptureTasks = struct {
-    stdout_thread: ?std.Thread = null,
-    stderr_thread: ?std.Thread = null,
-
-    fn start(
-        self: *ThreadCaptureTasks,
-        io: std.Io,
-        child: std.process.Child,
-        stdout_capture: *Capture,
-        stderr_capture: *Capture,
-        on_chunk: ?ChunkCallback,
-    ) CaptureTasks.StartError!void {
-        errdefer self.join();
-        if (child.stdout) |stdout_file| {
-            self.stdout_thread = std.Thread.spawn(.{}, Capture.readAll, .{ stdout_capture, io, stdout_file, StreamKind.stdout, on_chunk }) catch return error.ConcurrencyUnavailable;
-        }
-        if (child.stderr) |stderr_file| {
-            self.stderr_thread = std.Thread.spawn(.{}, Capture.readAll, .{ stderr_capture, io, stderr_file, StreamKind.stderr, on_chunk }) catch return error.ConcurrencyUnavailable;
-        }
-    }
-
-    fn join(self: *ThreadCaptureTasks) void {
-        if (self.stdout_thread) |thread| thread.join();
-        if (self.stderr_thread) |thread| thread.join();
-        self.stdout_thread = null;
-        self.stderr_thread = null;
+    fn done(_: *const CaptureTasks, stdout_capture: *const Capture, stderr_capture: *const Capture) bool {
+        return stdout_capture.done.load(.acquire) and stderr_capture.done.load(.acquire);
     }
 };
 
@@ -507,57 +443,6 @@ const Capture = struct {
     fn toOwnedParent(self: *Capture, allocator: std.mem.Allocator) ![]u8 {
         return allocator.dupe(u8, self.buf.items);
     }
-};
-
-const TimeoutGuard = struct {
-    io: std.Io,
-    state: *TimeoutState,
-    thread: ?std.Thread,
-
-    const TimeoutState = struct {
-        done: std.Io.Event = .unset,
-        did_timeout: std.atomic.Value(bool) = .init(false),
-    };
-
-    fn start(io: std.Io, timeout_ms: ?u64, child_id: std.process.Child.Id, process_group: bool) TimeoutGuard {
-        const ms = timeout_ms orelse return .{ .io = io, .state = &noop_state, .thread = null };
-        const state = std.heap.page_allocator.create(TimeoutState) catch return .{ .io = io, .state = &noop_state, .thread = null };
-        state.* = .{};
-        const thread = std.Thread.spawn(.{}, watchdog, .{ io, ms, child_id, process_group, state }) catch null;
-        if (thread == null) {
-            std.heap.page_allocator.destroy(state);
-            return .{ .io = io, .state = &noop_state, .thread = null };
-        }
-        return .{ .io = io, .state = state, .thread = thread };
-    }
-
-    fn markExited(self: *TimeoutGuard) void {
-        self.state.done.set(self.io);
-    }
-
-    fn stop(self: *TimeoutGuard) void {
-        self.state.done.set(self.io);
-        if (self.thread) |thread| thread.join();
-        if (self.state != &noop_state) std.heap.page_allocator.destroy(self.state);
-        self.state = &noop_state;
-        self.thread = null;
-    }
-
-    fn didTimeout(self: *const TimeoutGuard) bool {
-        return self.state.did_timeout.load(.acquire);
-    }
-
-    fn watchdog(io: std.Io, timeout_ms: u64, child_id: std.process.Child.Id, process_group: bool, state: *TimeoutState) void {
-        state.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .boot } }) catch |err| switch (err) {
-            error.Timeout => {
-                state.did_timeout.store(true, .release);
-                if (process_group) killProcessGroup(child_id, std.posix.SIG.KILL) else std.posix.kill(child_id, std.posix.SIG.KILL) catch {};
-            },
-            error.Canceled => {},
-        };
-    }
-
-    var noop_state: TimeoutState = .{ .done = .is_set };
 };
 
 fn killProcessGroup(pgid: std.process.Child.Id, sig: std.posix.SIG) void {

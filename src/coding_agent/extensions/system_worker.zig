@@ -84,7 +84,7 @@ pub const SystemWorker = struct {
         return .{
             .allocator = allocator,
             .io = io,
-            .worker = try WorkerImpl.init(allocator, .{ .allocator = allocator, .io = io }),
+            .worker = try WorkerImpl.initIo(allocator, io, .{ .allocator = allocator, .io = io }),
         };
     }
 

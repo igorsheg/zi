@@ -311,6 +311,7 @@ const PreparedToolCall = struct {
     finalized: bool = false,
     result_message: ?ai.protocol.ToolResultMessage = null,
     worker_started: bool = false,
+    pending_worker_result: ?protocol.AgentToolResult = null,
 };
 
 const WorkerExecution = struct {
@@ -581,14 +582,13 @@ fn executeToolCalls(
                 var owned_event = event;
                 defer owned_event.deinit(group.allocator);
                 switch (owned_event) {
-                    .update => |update| emitWorkerUpdate(prepared_calls.items, update, event_sink, event_ctx),
+                    .update => |update| emitWorkerUpdate(turn_allocator, prepared_calls.items, update, event_sink, event_ctx),
                     .completed => |completion| {
                         if (completion.prepared_index >= prepared_calls.items.len) continue;
                         var prepared = &prepared_calls.items[completion.prepared_index];
                         if (prepared.finalized) continue;
-                        prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, completion.result, config, system_prompt, signal, event_sink, event_ctx);
-                        prepared.finalized = true;
-                        finalized_count += 1;
+                        prepared.pending_worker_result = completion.result.clone(turn_allocator) catch completion.result;
+                        finalized_count += finalizeReadyWorkerCompletions(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared_calls.items, config, system_prompt, signal, event_sink, event_ctx);
                     },
                 }
                 continue;
@@ -647,6 +647,31 @@ fn emitPreparedToolResultMessagesInSourceOrder(
     }
 }
 
+fn finalizeReadyWorkerCompletions(
+    run_allocator: std.mem.Allocator,
+    turn_allocator: std.mem.Allocator,
+    assistant_msg: ai.protocol.AssistantMessage,
+    tool_phase_messages: []const protocol.AgentMessage,
+    tools: []const protocol.AgentTool,
+    prepared_calls: []PreparedToolCall,
+    config: protocol.AgentLoopConfig,
+    system_prompt: []const u8,
+    signal: AbortSignal,
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+) usize {
+    var finalized: usize = 0;
+    for (prepared_calls) |*prepared| {
+        if (prepared.finalized) continue;
+        if (!prepared.worker_started) break;
+        const result = prepared.pending_worker_result orelse break;
+        prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
+        prepared.finalized = true;
+        finalized += 1;
+    }
+    return finalized;
+}
+
 fn findNextAgentThreadCall(prepared_calls: []const PreparedToolCall) ?usize {
     for (prepared_calls, 0..) |prepared, index| {
         if (prepared.finalized) continue;
@@ -656,17 +681,28 @@ fn findNextAgentThreadCall(prepared_calls: []const PreparedToolCall) ?usize {
 }
 
 fn emitWorkerUpdate(
+    allocator: std.mem.Allocator,
     prepared_calls: []const PreparedToolCall,
     update: tool_execution_group.ToolUpdate,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
     if (update.prepared_index >= prepared_calls.len) return;
+
+    // Worker update events are delivered from a mailbox-owned payload that is
+    // deinitialized immediately after the synchronous sink call returns. Clone
+    // through the turn arena so event sinks that retain slices for the duration
+    // of the turn observe stable memory, matching inline tool event lifetimes.
+    const tool_call_id = allocator.dupe(u8, update.tool_call_id) catch update.tool_call_id;
+    const tool_name = allocator.dupe(u8, update.tool_name) catch update.tool_name;
+    const args = json_util.cloneJsonValue(allocator, update.args) catch update.args;
+    const partial_result = update.partial_result.clone(allocator) catch update.partial_result;
+
     event_sink(.{ .tool_execution_update = .{
-        .tool_call_id = update.tool_call_id,
-        .tool_name = update.tool_name,
-        .args = update.args,
-        .partial_result = update.partial_result,
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .args = args,
+        .partial_result = partial_result,
     } }, event_ctx);
 }
 

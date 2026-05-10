@@ -28,6 +28,7 @@ const pending_extension_ui_mod = @import("agent_session/pending_extension_ui.zig
 const agent_session_core_mod = @import("agent_session/core.zig");
 const extension_ui = @import("extensions/ui.zig");
 const session_event_mod = @import("session_event.zig");
+const zio = @import("../zio/root.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -659,47 +660,26 @@ pub const AgentSession = struct {
     };
 
     const LinkedSideAbort = struct {
-        state: ?*State = null,
-        thread: ?std.Thread = null,
+        guard: zio.guard.AbortCallbackGuard = undefined,
+        active: bool = false,
 
-        const AbortSignal = @import("../zio/root.zig").AbortSignal;
-        const State = struct {
-            signal: AbortSignal,
-            core: *agent_session_core_mod.AgentSessionCore,
-            done: std.atomic.Value(bool) = .init(false),
-        };
-
-        fn start(signal: AbortSignal, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
+        fn start(signal: zio.AbortSignal, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
             if (signal.isNone()) return .{};
-            const state = std.heap.page_allocator.create(State) catch return .{};
-            state.* = .{ .signal = signal, .core = core };
-            const thread = std.Thread.spawn(.{}, LinkedSideAbort.watch, .{state}) catch {
-                std.heap.page_allocator.destroy(state);
-                return .{};
+            return .{
+                .guard = zio.guard.AbortCallbackGuard.start(std.Options.debug_io, signal, .{ .ctx = @ptrCast(core), .call = abortCore }),
+                .active = true,
             };
-            return .{ .state = state, .thread = thread };
         }
 
         fn stop(self: *LinkedSideAbort) void {
-            const state = self.state orelse return;
-            state.done.store(true, .release);
-            state.signal.notifyWaiters();
-            if (self.thread) |thread| thread.join();
-            std.heap.page_allocator.destroy(state);
+            if (!self.active) return;
+            self.guard.stop();
             self.* = .{};
         }
 
-        fn watch(state: *State) void {
-            switch (state.signal.waitUntil(null, LinkedSideAbort.donePredicate, @ptrCast(state))) {
-                .aborted => {},
-                .predicate, .timeout, .none => return,
-            }
-            if (!state.done.load(.acquire)) state.core.abort();
-        }
-
-        fn donePredicate(ctx: ?*anyopaque) bool {
-            const state: *State = @ptrCast(@alignCast(ctx.?));
-            return state.done.load(.acquire);
+        fn abortCore(ctx: ?*anyopaque) void {
+            const core: *agent_session_core_mod.AgentSessionCore = @ptrCast(@alignCast(ctx.?));
+            core.abort();
         }
     };
 

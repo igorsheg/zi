@@ -1,5 +1,6 @@
 const std = @import("std");
 const mailbox_mod = @import("mailbox.zig");
+const tasks_mod = @import("tasks.zig");
 
 /// A tiny typed worker-thread wrapper around `zio.Mailbox`.
 ///
@@ -37,13 +38,19 @@ pub fn BlockingWorker(
         const Self = @This();
 
         allocator: std.mem.Allocator,
+        io: std.Io,
         queue: Queue,
         handler: Handler,
-        thread: ?std.Thread = null,
+        tasks: ?tasks_mod.TaskGroup = null,
 
         pub fn init(allocator: std.mem.Allocator, handler: Handler) !Self {
+            return initIo(allocator, std.Options.debug_io, handler);
+        }
+
+        pub fn initIo(allocator: std.mem.Allocator, io: std.Io, handler: Handler) !Self {
             return .{
                 .allocator = allocator,
+                .io = io,
                 .queue = try Queue.init(allocator),
                 .handler = handler,
             };
@@ -59,17 +66,20 @@ pub fn BlockingWorker(
         }
 
         pub fn start(self: *Self) !void {
-            if (self.thread != null) return;
-            self.thread = try std.Thread.spawn(.{}, run, .{self});
+            if (self.tasks != null) return;
+            var group = tasks_mod.TaskGroup.init(self.io);
+            errdefer group.cancel();
+            try group.concurrent(run, .{self});
+            self.tasks = group;
         }
 
         /// Ordered shutdown: stop accepting new requests, let the worker drain
         /// already queued requests, then join it.
         pub fn stop(self: *Self) void {
             self.queue.close();
-            if (self.thread) |thread| {
-                thread.join();
-                self.thread = null;
+            if (self.tasks) |*group| {
+                group.wait() catch {};
+                self.tasks = null;
             }
         }
 

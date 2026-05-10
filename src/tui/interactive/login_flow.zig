@@ -4,6 +4,7 @@ const logging = @import("../../logging.zig");
 const json_util = @import("../../ai/json_util.zig");
 const request_mod = @import("../../coding_agent/request.zig");
 const oauth_mod = @import("../../coding_agent/auth/oauth.zig");
+const zio = @import("../../zio/root.zig");
 const list_picker_mod = @import("../components/list_picker.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
@@ -62,7 +63,7 @@ pub fn showPicker(self: *Interactive) void {
 }
 
 pub fn start(self: *Interactive, provider_id: []const u8) void {
-    if (self.login_thread != null) {
+    if (self.login_tasks != null) {
         self.status_line.setPrimary("login already in progress", self.theme.fg(.warning));
         return;
     }
@@ -86,11 +87,14 @@ pub fn start(self: *Interactive, provider_id: []const u8) void {
         .provider = provider,
     };
 
-    self.login_thread = std.Thread.spawn(.{}, threadFn, .{login_ctx}) catch {
+    var tasks = zio.TaskGroup.init(self.io);
+    tasks.concurrent(threadFn, .{login_ctx}) catch {
+        tasks.cancel();
         self.msg_allocator.destroy(login_ctx);
-        self.status_line.setPrimary("failed to spawn login thread", self.theme.fg(.@"error"));
+        self.status_line.setPrimary("failed to spawn login task", self.theme.fg(.@"error"));
         return;
     };
+    self.login_tasks = tasks;
 }
 
 fn onProviderSelected(selection: PickerSelection, ctx: ?*anyopaque) void {

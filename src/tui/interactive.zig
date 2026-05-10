@@ -27,7 +27,8 @@ const tui_mod = @import("tui.zig");
 const editor_iface_mod = @import("edit/interface.zig");
 const input_buffer_mod = @import("terminal/input_buffer.zig");
 const queues_mod = @import("interactive/runtime/queues.zig");
-const mailbox_mod = @import("../zio/root.zig").mailbox;
+const zio = @import("../zio/root.zig");
+const mailbox_mod = zio.mailbox;
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const model_flow = @import("interactive/model_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
@@ -254,7 +255,7 @@ pub const Interactive = struct {
     login_picker_items: [8]SelectItem = undefined,
     login_picker_entries: [8]oauth_mod.ProviderListEntry = undefined,
     login_picker_count: usize = 0,
-    login_thread: ?std.Thread = null,
+    login_tasks: ?zio.TaskGroup = null,
     login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     snapshot_event_queue: UiSnapshotQueue,
@@ -264,7 +265,7 @@ pub const Interactive = struct {
     job_manager: job_manager_mod.JobManager,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
     session_event_token: ?RuntimeHost.EventSubscriptionToken = null,
-    agent_thread: ?std.Thread = null,
+    agent_tasks: ?zio.TaskGroup = null,
     running: bool = true,
     is_streaming: bool = false,
     request_in_flight: bool = false,
@@ -344,22 +345,22 @@ pub const Interactive = struct {
     }
 
     pub fn deinit(self: *Interactive) void {
-        if (self.login_thread != null) {
+        if (self.login_tasks) |*tasks| {
             self.login_cancelled.store(true, .release);
-            if (self.login_thread) |t| t.join();
-            self.login_thread = null;
+            tasks.wait() catch {};
+            self.login_tasks = null;
         }
         self.session_index_worker.stop();
         if (self.ai_complete_worker) |*worker| worker.worker.stop();
         if (self.system_worker) |*worker| worker.worker.stop();
         self.terminal_system_queue.clear();
 
-        if (self.agent_thread) |t| {
+        if (self.agent_tasks) |*tasks| {
             if (self.is_streaming) self.runtime_host.abortCurrentRun();
             self.enqueueAgentShutdown();
             self.request_queue.close();
-            t.join();
-            self.agent_thread = null;
+            tasks.wait() catch {};
+            self.agent_tasks = null;
             self.is_streaming = false;
             self.request_in_flight = false;
         } else {
@@ -430,8 +431,11 @@ pub const Interactive = struct {
     }
 
     fn startAgentThread(self: *Interactive) !void {
-        if (self.agent_thread != null) return;
-        self.agent_thread = try std.Thread.spawn(.{}, runtime_loop.agentThread, .{self});
+        if (self.agent_tasks != null) return;
+        var tasks = zio.TaskGroup.init(self.io);
+        errdefer tasks.cancel();
+        try tasks.concurrent(runtime_loop.agentThread, .{self});
+        self.agent_tasks = tasks;
     }
 
     fn startSessionIndexWorker(self: *Interactive) !void {
