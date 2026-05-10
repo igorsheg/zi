@@ -315,7 +315,6 @@ const Capture = struct {
         self.* = undefined;
     }
 
-
     fn acceptChunk(self: *Capture, kind: StreamKind, chunk: []const u8, on_chunk: ?ChunkCallback) CaptureError!void {
         if (on_chunk) |callback| callback.call(kind, chunk);
         if (!self.store) return;
@@ -327,7 +326,6 @@ const Capture = struct {
         return allocator.dupe(u8, self.buf.items);
     }
 };
-
 
 fn captureErrorResult(
     allocator: std.mem.Allocator,
