@@ -87,8 +87,30 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    if (target.result.os.tag == .macos) {
+        const webview_host_mod = b.createModule(.{
+            .root_source_file = b.path("tools/zi-webview-host/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip,
+            .link_libc = true,
+        });
+        webview_host_mod.addCSourceFile(.{ .file = b.path("src/coding_agent/webview/host/macos_host.m"), .flags = &.{"-fobjc-arc"} });
+        webview_host_mod.linkFramework("AppKit", .{});
+        webview_host_mod.linkFramework("Foundation", .{});
+        webview_host_mod.linkFramework("WebKit", .{});
+        const webview_host = b.addExecutable(.{
+            .name = "zi-webview-host",
+            .root_module = webview_host_mod,
+        });
+        b.installArtifact(webview_host);
+    }
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+    if (target.result.os.tag == .macos) {
+        run_cmd.setEnvironmentVariable("ZI_WEBVIEW_HOST", b.getInstallPath(.bin, "zi-webview-host"));
+    }
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run zi").dependOn(&run_cmd.step);
 

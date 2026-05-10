@@ -10,6 +10,7 @@ pub const slash_commands = @import("slash_commands.zig");
 pub const auth = @import("auth/root.zig");
 pub const settings = @import("settings/root.zig");
 pub const resources = @import("resources/root.zig");
+pub const webview = @import("webview/root.zig");
 pub const skills = @import("skills/root.zig");
 pub const cli = @import("cli/root.zig");
 pub const session = @import("session/root.zig");
