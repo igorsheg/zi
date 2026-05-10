@@ -61,6 +61,7 @@ Markdown pages live next to the HTML pages. If a link ends in `.html`, the match
 ## Pages
 
 - [CLI](cli.html) — run modes, prompt inputs, sessions, flags
+- [Settings](settings.html) — user/project configuration
 - [Resource discovery](resources.html) — user/project roots, settings paths, packages
 - [Extensions](extensions.html) — extension files, loading, lifecycle
 - [API](api.html) — tools, commands, providers, events, jobs, JSON
