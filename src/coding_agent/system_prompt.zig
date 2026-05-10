@@ -165,13 +165,15 @@ fn containsGuideline(list: []const []const u8, needle: []const u8) bool {
 
 fn writeZiDocsSection(w: *std.Io.Writer) !void {
     try w.writeAll(
-        "\nZi documentation (read only when the user asks about zi itself, its CLI, config, tools, sessions, skills, or TUI):\n" ++
+        "\nZi documentation (read only when the user asks about zi itself, its CLI, settings, resources, tools, sessions, skills, prompts, themes, agent context, extensions, or TUI):\n" ++
             "- Search documentation: `zi --docs <query>`\n" ++
             "- Read documentation topics: `zi --man [topic]`\n" ++
             "- CLI usage and actions: `zi --help`\n" ++
-            "- When asked about: CLI usage, configuration, tools, sessions, skills, TUI, keybindings, providers, adding models, or zi internals\n" ++
+            "- Topics: `intro`, `cli`, `settings`, `resources`, `skills`, `prompts`, `themes`, `agent-context`, `extensions`, `api`, `context`, `guidance`\n" ++
+            "- When asked about: CLI usage, configuration, resource discovery, skills, prompts, themes, AGENTS.md/CLAUDE.md, tools, sessions, providers, adding models, or zi internals\n" ++
             "- When working on zi topics, use `zi --docs <query>` and `zi --man [topic]` before implementing\n" ++
-            "- Follow cross-references from `zi --man` topics to related embedded docs\n",
+            "- Follow cross-references from `zi --man` topics to related embedded docs\n" ++
+            "- Prefer the docs over memory. Stale assumptions are bugs with better posture.\n",
     );
 }
 
@@ -219,6 +221,7 @@ test "default prompt includes zi identity help and cwd" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "operating inside zi, a coding agent harness") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Zi documentation (read only when the user asks about zi itself") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "`settings`, `resources`, `skills`, `prompts`, `themes`, `agent-context`") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "docs/README.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Current working directory: /home/user/project") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Be concise in your responses") != null);
