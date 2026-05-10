@@ -445,6 +445,7 @@ fn readTargetField(L: *c.lua_State, idx: c_int) !ParsedTarget {
             options.anchor = try readAnchorField(L, tidx, "anchor");
             options.backdrop = try readBackdropField(L, tidx, "backdrop");
             options.lifetime = try readLifetimeField(L, tidx, "lifetime");
+            options.preset = try readOverlayPresetField(L, tidx, "preset");
             break :blk .{ .kind = kind, .options = options };
         },
         else => .{},
@@ -504,6 +505,14 @@ fn readBackdropField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extensi
     if (std.mem.eql(u8, value, "dim")) return .dim;
     if (std.mem.eql(u8, value, "fill")) return .fill;
     return error.InvalidUiBackdrop;
+}
+
+fn readOverlayPresetField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiOverlayPreset {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    const value = luaString(L, -1) orelse return null;
+    return extension_ui.UiOverlayPreset.parse(value) orelse error.InvalidUiOverlayPreset;
 }
 
 fn readLifetimeField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiLifetime {

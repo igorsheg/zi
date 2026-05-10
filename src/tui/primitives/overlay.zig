@@ -85,6 +85,30 @@ pub const OverlayPresetOptions = struct {
     max_height_percent: ?u8 = null,
 };
 
+pub const OverlayPreset = enum {
+    ivy,
+    centered,
+    center_dialog,
+    top_toast,
+
+    pub fn parse(value: []const u8) ?OverlayPreset {
+        if (std.mem.eql(u8, value, "ivy")) return .ivy;
+        if (std.mem.eql(u8, value, "centered")) return .centered;
+        if (std.mem.eql(u8, value, "center_dialog")) return .center_dialog;
+        if (std.mem.eql(u8, value, "top_toast")) return .top_toast;
+        return null;
+    }
+
+    pub fn options(self: OverlayPreset, config: OverlayPresetOptions) OverlayOptions {
+        return switch (self) {
+            .ivy => OverlayPresets.ivy(config),
+            .centered => OverlayPresets.centered(config),
+            .center_dialog => OverlayPresets.centerDialog(),
+            .top_toast => OverlayPresets.topToast(),
+        };
+    }
+};
+
 pub const OverlayPresets = struct {
     /// Telescope-style ivy layout — full-width bottom sheet for pickers.
     pub fn ivy(config: OverlayPresetOptions) OverlayOptions {

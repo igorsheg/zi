@@ -114,7 +114,7 @@ local function render(ctx)
   if not has_ui(ctx) then return end
   ctx.ui.render({
     id = VIEW_ID,
-    target = { kind = "overlay", width = "80%", max_height = "80%", anchor = "top_center", backdrop = "dim" },
+    target = { kind = "overlay", preset = "ivy" },
     focus = true,
     keys = {
       { key = "escape", action = "close" },

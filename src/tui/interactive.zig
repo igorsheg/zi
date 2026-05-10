@@ -975,19 +975,6 @@ pub const Interactive = struct {
         return if (self.greeter_dismissed) 0 else self.greeter.measure(self.tui.width()).preferred_height;
     }
 
-    pub fn bottomSheetOptions(self: *Interactive) overlay_mod.OverlayOptions {
-        return overlay_mod.OverlayPresets.ivy(.{
-            .top_margin = self.overlayTopMargin(),
-            .fill = Color.default,
-        });
-    }
-
-    pub fn centeredOverlayOptions(self: *Interactive, config: overlay_mod.OverlayPresetOptions) overlay_mod.OverlayOptions {
-        var resolved = config;
-        resolved.top_margin = self.overlayTopMargin();
-        return overlay_mod.OverlayPresets.centered(resolved);
-    }
-
     fn showHotkeysOverlay(self: *Interactive) void {
         hotkeys_flow.show(self);
     }
@@ -1025,7 +1012,10 @@ pub const Interactive = struct {
             self.tui.dirty = true;
             return;
         };
-        _ = self.tui.showOverlay(self.logs_overlay.component(), self.bottomSheetOptions());
+        _ = self.tui.showOverlay(
+            self.logs_overlay.component(),
+            overlay_mod.OverlayPreset.ivy.options(.{ .top_margin = self.overlayTopMargin(), .fill = Color.default }),
+        );
     }
 
     fn showMemoryTelemetry(self: *Interactive) void {
@@ -1083,7 +1073,10 @@ pub const Interactive = struct {
     ) void {
         self.cancelTranscriptSelection();
         picker.hide();
-        picker.handle = self.tui.showOverlay(picker.picker.component(), self.bottomSheetOptions());
+        picker.handle = self.tui.showOverlay(
+            picker.picker.component(),
+            overlay_mod.OverlayPreset.ivy.options(.{ .top_margin = self.overlayTopMargin(), .fill = Color.default }),
+        );
     }
 
     pub fn hideSimplePickerOverlay(self: *Interactive, picker: *SimplePickerFlow) void {

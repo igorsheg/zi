@@ -5,6 +5,7 @@ const list_picker_mod = @import("../components/list_picker.zig");
 const select_list_mod = @import("../components/select_list.zig");
 const theme_mod = @import("../theme.zig");
 const tui_mod = @import("../tui.zig");
+const overlay_mod = @import("../primitives/overlay.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
 const ListPicker = list_picker_mod.ListPicker;
@@ -108,7 +109,9 @@ pub fn show(self: *Interactive) void {
     self.hotkeys_flow = flow;
     self.hotkeys_flow.?.handle = self.tui.showOverlay(
         self.hotkeys_flow.?.picker.component(),
-        self.centeredOverlayOptions(.{ .fill = self.theme.bg(.tool_pending_bg) }),
+        overlay_mod.OverlayPreset.ivy.options(.{
+            .top_margin = self.overlayTopMargin(),
+        }),
     );
 }
 

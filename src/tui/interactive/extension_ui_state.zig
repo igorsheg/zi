@@ -414,6 +414,7 @@ const TargetComponent = struct {
 };
 
 fn applyTargetOptions(options: *overlay_mod.OverlayOptions, target: extension_ui.UiTargetOptions) void {
+    if (target.preset) |preset| options.* = preset.options(.{});
     if (target.width) |v| applyWidth(options, v);
     // Current overlay manager does not expose exact height; use height as a max-height constraint.
     if (target.height) |v| applyMaxHeight(options, v);

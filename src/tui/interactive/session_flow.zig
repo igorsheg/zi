@@ -2,6 +2,7 @@ const std = @import("std");
 const coding_agent_mod = @import("../../coding_agent/root.zig");
 const session_store_mod = @import("../../coding_agent/session/store.zig");
 const list_picker_mod = @import("../components/list_picker.zig");
+const overlay_mod = @import("../primitives/overlay.zig");
 const resume_picker_flow_mod = @import("resume_picker_flow.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
@@ -43,7 +44,7 @@ pub fn show(self: *Interactive, restore_session_model: bool) void {
     self.resume_picker_flow = flow;
     self.resume_picker_flow.?.handle = self.tui.showOverlay(
         self.resume_picker_flow.?.picker.component(),
-        self.bottomSheetOptions(),
+        overlay_mod.OverlayPreset.ivy.options(.{ .top_margin = self.overlayTopMargin() }),
     );
     self.tui.dirty = true;
 
