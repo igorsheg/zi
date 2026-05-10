@@ -165,10 +165,13 @@ fn containsGuideline(list: []const []const u8, needle: []const u8) bool {
 
 fn writeZiDocsSection(w: *std.Io.Writer) !void {
     try w.writeAll(
-        "\nZi help (lazy progressive eval):\n" ++
-            "- `zi --help` prints CLI usage and actions\n" ++
-            "- `zi --docs <query>` searches embedded zi docs\n" ++
-            "- `zi --man [topic]` lists topics or prints one embedded doc\n",
+        "\nZi documentation (read only when the user asks about zi itself, its CLI, config, tools, sessions, skills, or TUI):\n" ++
+            "- Search documentation: `zi --docs <query>`\n" ++
+            "- Read documentation topics: `zi --man [topic]`\n" ++
+            "- CLI usage and actions: `zi --help`\n" ++
+            "- When asked about: CLI usage, configuration, tools, sessions, skills, TUI, keybindings, providers, adding models, or zi internals\n" ++
+            "- When working on zi topics, use `zi --docs <query>` and `zi --man [topic]` before implementing\n" ++
+            "- Follow cross-references from `zi --man` topics to related embedded docs\n",
     );
 }
 
@@ -215,7 +218,7 @@ test "default prompt includes zi identity help and cwd" {
     defer std.testing.allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "operating inside zi, a coding agent harness") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Zi help (lazy progressive eval)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Zi documentation (read only when the user asks about zi itself") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "docs/README.md") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Current working directory: /home/user/project") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Be concise in your responses") != null);
@@ -287,7 +290,7 @@ test "default prompt orders zi help append context and read-gated skills" {
     defer std.testing.allocator.free(with_read);
 
     try expectOrderedSubstrings(with_read, &.{
-        "Zi help (lazy progressive eval)",
+        "Zi documentation (read only when the user asks about zi itself",
         "appended guidance",
         "# Project Context",
         "<available_skills>",
