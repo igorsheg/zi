@@ -95,7 +95,6 @@ test "TaskGroup concurrent work makes simultaneous progress" {
 
     var ctx = Ctx{};
     var group = TaskGroup.init(std.Options.debug_io);
-    defer group.cancel();
 
     try group.concurrent(Ctx.runA, .{&ctx});
     try group.concurrent(Ctx.runB, .{&ctx});
@@ -116,7 +115,6 @@ test "TaskGroup owns async fan-out until wait" {
     var value = std.atomic.Value(u32).init(0);
     var ctx: Ctx = .{ .value = &value };
     var group = TaskGroup.init(std.Options.debug_io);
-    defer group.cancel();
 
     group.async(Ctx.add, .{ &ctx, 2 });
     group.async(Ctx.add, .{ &ctx, 3 });

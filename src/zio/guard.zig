@@ -10,6 +10,10 @@ pub const AbortController = abort_signal_mod.AbortController;
 /// This is the end-state home for watchdog-shaped code: wait for abort,
 /// timeout, or owner-done, then interrupt the blocking resource and join before
 /// that resource is destroyed.
+///
+/// Guard state boxes use `page_allocator` because they are tiny, fixed-size, and
+/// guard startup should degrade to inert/no-op rather than add allocator plumbing
+/// to every blocking-resource callsite. Lifetime is bounded by `stop()`.
 pub const AbortGuard = struct {
     state: *State,
     thread: ?std.Thread,

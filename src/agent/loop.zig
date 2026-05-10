@@ -587,7 +587,8 @@ fn executeToolCalls(
                         if (completion.prepared_index >= prepared_calls.items.len) continue;
                         var prepared = &prepared_calls.items[completion.prepared_index];
                         if (prepared.finalized) continue;
-                        prepared.pending_worker_result = completion.result.clone(turn_allocator) catch completion.result;
+                        prepared.pending_worker_result = completion.result.clone(turn_allocator) catch
+                            makeAgentToolTextResult(turn_allocator, "Tool execution result allocation failed", true);
                         finalized_count += finalizeReadyWorkerCompletions(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared_calls.items, config, system_prompt, signal, event_sink, event_ctx);
                     },
                 }

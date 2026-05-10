@@ -117,7 +117,6 @@ pub fn commandExists(allocator: std.mem.Allocator, io: std.Io, command: []const 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
     var ctx = RunContext.init(allocator, io, request) catch |err| switch (err) {
         error.EmptyArgv => return errorResult(allocator, "empty argv"),
-        error.EnvironmentBuildFailed => return errorResult(allocator, "failed to build environment"),
     };
     defer ctx.deinit();
     return ctx.run();
@@ -182,7 +181,7 @@ const RunContext = struct {
     term: ?std.process.Child.Term = null,
     spawn_failed: bool = false,
 
-    const InitError = error{ EmptyArgv, EnvironmentBuildFailed };
+    const InitError = error{EmptyArgv};
 
     fn init(allocator: std.mem.Allocator, io: std.Io, request: Request) InitError!RunContext {
         if (request.argv.len == 0) return error.EmptyArgv;
@@ -304,7 +303,6 @@ const Capture = struct {
     max_bytes: usize,
     buf: std.ArrayListUnmanaged(u8) = .empty,
     err: ?CaptureError = null,
-    done: std.atomic.Value(bool) = .init(false),
 
     store: bool,
 
@@ -317,50 +315,6 @@ const Capture = struct {
         self.* = undefined;
     }
 
-    fn readAllIo(self: *Capture, io: std.Io, file: std.Io.File, kind: StreamKind, on_chunk: ?ChunkCallback) void {
-        defer self.done.store(true, .release);
-        var local_buf: [4096]u8 = undefined;
-        while (true) {
-            const n = file.readStreaming(io, &.{&local_buf}) catch |err| switch (err) {
-                error.EndOfStream => return,
-                error.WouldBlock => {
-                    io.sleep(.fromMilliseconds(1), .awake) catch {};
-                    continue;
-                },
-                else => {
-                    self.err = error.ReadFailed;
-                    return;
-                },
-            };
-            self.acceptChunk(kind, local_buf[0..n], on_chunk) catch |err| {
-                self.err = err;
-                return;
-            };
-        }
-    }
-
-    fn readAll(self: *Capture, io: std.Io, file: std.Io.File, kind: StreamKind, on_chunk: ?ChunkCallback) void {
-        defer self.done.store(true, .release);
-        var local_buf: [4096]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(file.handle, &local_buf) catch |err| switch (err) {
-                error.WouldBlock => {
-                    io.sleep(.fromMilliseconds(1), .awake) catch {};
-                    continue;
-                },
-                else => {
-                    self.err = error.ReadFailed;
-                    return;
-                },
-            };
-            if (n == 0) return;
-            const chunk = local_buf[0..n];
-            self.acceptChunk(kind, chunk, on_chunk) catch |err| {
-                self.err = err;
-                return;
-            };
-        }
-    }
 
     fn acceptChunk(self: *Capture, kind: StreamKind, chunk: []const u8, on_chunk: ?ChunkCallback) CaptureError!void {
         if (on_chunk) |callback| callback.call(kind, chunk);
@@ -374,14 +328,6 @@ const Capture = struct {
     }
 };
 
-fn killProcessGroup(pgid: std.process.Child.Id, sig: std.posix.SIG) void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        std.posix.kill(pgid, sig) catch {};
-        return;
-    }
-    const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(pgid));
-    std.posix.kill(group_pid, sig) catch {};
-}
 
 fn captureErrorResult(
     allocator: std.mem.Allocator,
@@ -393,9 +339,10 @@ fn captureErrorResult(
 ) Result {
     if (err == error.OutputTooLarge) {
         const stdout = stdout_capture.toOwnedParent(allocator) catch return errorResult(allocator, "failed to allocate stdout");
-        errdefer allocator.free(stdout);
-        const stderr = stderr_capture.toOwnedParent(allocator) catch return errorResult(allocator, "failed to allocate stderr");
-        errdefer allocator.free(stderr);
+        const stderr = stderr_capture.toOwnedParent(allocator) catch {
+            allocator.free(stdout);
+            return errorResult(allocator, "failed to allocate stderr");
+        };
         return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
     }
     return errorFmt(allocator, "{s} read failed: {s}", .{ stream, @errorName(err) });
