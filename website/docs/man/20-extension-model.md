@@ -6,7 +6,7 @@ aliases:
   - extension
   - extension model
   - teach zi
-  - discovery
+  - extension files
   - loading
   - lifecycle
 ---
@@ -34,28 +34,9 @@ Good extensions are boring to inspect: clear name, clear inputs, visible effects
 
 The host API is in [API](api.html). Handler context is in [Context](context.html).
 
-## Discovery
+zi loads extensions from the `extensions/` directory in any resource root. See [Resource discovery](resources.html) for user/project locations, settings paths, packages, and root precedence.
 
-zi discovers extensions from extension roots.
-
-```text
-<root>/
-├─ extensions/
-│  ├─ notify.lua
-│  └─ code-review/
-│     ├─ init.lua
-│     └─ lua/
-│        └─ code_review/
-│           └─ render.lua
-├─ lua/
-│  └─ shared/
-│     └─ util.lua
-├─ prompts/
-├─ skills/
-├─ themes/
-├─ agents/
-└─ after/
-```
+## Extension files
 
 Supported shapes:
 
@@ -71,13 +52,24 @@ Module lookup is deterministic:
 2. shared `lua/` folders from runtime roots
 3. Lua's default paths
 
-Runtime root precedence:
+Within one root, discovery is lexical. Most duplicate registrations are first claimant wins. Slash commands keep duplicate names callable through resolved names.
+
+## After roots
+
+Runtime extension roots may contain an `after/` directory:
 
 ```text
-explicit > user > project > builtin
+<root>/
+└─ after/
+   ├─ 10-local/
+   │  └─ extensions/
+   │     └─ tweak.lua
+   └─ 20-team/
+      └─ extensions/
+         └─ policy.lua
 ```
 
-Within a root, discovery is lexical. Most duplicate registrations are first claimant wins. Slash commands keep duplicate names callable through resolved names.
+Each directory directly under `after/` is treated as another runtime root, loaded after the parent root in lexical order. Use this for late customization, not for hidden policy.
 
 ## Loading
 

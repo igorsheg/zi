@@ -222,7 +222,7 @@ Event names:
 : Pick a session directory at startup.
 
 `resources_discover`
-: Add resource folders for `lua/`, `prompts/`, `skills`, `themes`, and `agents`.
+: Aggregate event name reserved for resource-folder discovery. Current startup discovery is static; see [Resource discovery](resources.html).
 
 `input`
 : Middleware over submitted prompt text after slash-command dispatch.
