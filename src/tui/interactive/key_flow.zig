@@ -13,12 +13,12 @@ pub fn handle(self: anytype, key: Key) void {
         }
         if (self.extension_ui_state.handleOverlayInput(key)) |event| {
             log.debug("overlay input event type={s} node={s} action={s} value_len={d}", .{ @tagName(event.type), event.node orelse "", event.action orelse "", if (event.value) |value| value.len else 0 });
-            dispatchExtensionUiEvent(self, event);
+            if (dispatchExtensionUiEvent(self, event)) _ = self.extension_ui_state.dismissTopOverlayAfterInput();
             self.tui.dirty = true;
             return;
         }
         if (self.extension_ui_state.matchOverlayKey(key)) |event| {
-            dispatchExtensionUiEvent(self, event);
+            if (dispatchExtensionUiEvent(self, event)) _ = self.extension_ui_state.dismissTopOverlayAfterInput();
             self.tui.dirty = true;
             return;
         }
@@ -157,13 +157,14 @@ pub fn handle(self: anytype, key: Key) void {
     }
 }
 
-fn dispatchExtensionUiEvent(self: anytype, event: @import("../../coding_agent/extensions/ui.zig").UiEvent) void {
-    const owned = @import("../../coding_agent/extensions/ui.zig").UiEvent.clone(self.msg_allocator, event) catch return;
+fn dispatchExtensionUiEvent(self: anytype, event: @import("../../coding_agent/extensions/ui.zig").UiEvent) bool {
+    const owned = @import("../../coding_agent/extensions/ui.zig").UiEvent.clone(self.msg_allocator, event) catch return false;
     switch (self.request_queue.trySend(.{ .extension_ui_event = owned })) {
-        .ok, .dropped => {},
+        .ok, .dropped => return true,
         .full, .closed, .oom => |rejected| {
             var failed = rejected;
             failed.deinit(self.msg_allocator);
+            return false;
         },
     }
 }

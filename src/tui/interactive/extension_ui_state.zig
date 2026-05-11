@@ -32,7 +32,7 @@ const log = std.log.scoped(.extension_ui_input);
 
 pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
-    views: std.StringHashMap(SlotContribution),
+    contributions: std.StringHashMap(SlotContribution),
     frames: std.StringHashMap(FrameRecord),
     input_states: std.StringHashMap(TextInput),
     theme: *const Theme,
@@ -44,7 +44,7 @@ pub const ExtensionUiState = struct {
     pub fn init(allocator: std.mem.Allocator) ExtensionUiState {
         return .{
             .allocator = allocator,
-            .views = std.StringHashMap(SlotContribution).init(allocator),
+            .contributions = std.StringHashMap(SlotContribution).init(allocator),
             .frames = std.StringHashMap(FrameRecord).init(allocator),
             .input_states = std.StringHashMap(TextInput).init(allocator),
             .theme = themes_builtin.dark(),
@@ -56,12 +56,12 @@ pub const ExtensionUiState = struct {
     }
 
     pub fn deinit(self: *ExtensionUiState) void {
-        var vit = self.views.iterator();
+        var vit = self.contributions.iterator();
         while (vit.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
-        self.views.deinit();
+        self.contributions.deinit();
 
         var fit = self.frames.iterator();
         while (fit.next()) |entry| {
@@ -120,6 +120,10 @@ pub const ExtensionUiState = struct {
 
     pub fn matchOverlayKey(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
         return SlotPolicy.forSlot(.overlay).routeKey(self, key);
+    }
+
+    pub fn dismissTopOverlayAfterInput(self: *ExtensionUiState) bool {
+        return SlotPolicy.forSlot(.overlay).dismissTopAfterInput(self);
     }
 
     fn hasSlotViews(self: *ExtensionUiState, slot: extension_ui.UiSlot) bool {
@@ -374,7 +378,7 @@ const SlotContributionLifecycle = struct {
     fn applyRender(state: *ExtensionUiState, render: extension_ui.RenderSpec) void {
         const contribution_key = SlotContributionKey.fromRender(render);
         const key = contribution_key.alloc(state.allocator) catch return;
-        if (state.views.getEntry(key)) |entry| {
+        if (state.contributions.getEntry(key)) |entry| {
             if (render.generation < entry.value_ptr.spec.generation) {
                 state.allocator.free(key);
                 return;
@@ -397,7 +401,7 @@ const SlotContributionLifecycle = struct {
     }
 
     fn removeExisting(state: *ExtensionUiState, key: []const u8) void {
-        var old = state.views.fetchRemove(key) orelse return;
+        var old = state.contributions.fetchRemove(key) orelse return;
         clearInputValuesForView(state, old.value.spec.state_owner_id, old.value.spec.id);
         clearFramesForView(state, old.value.spec.state_owner_id, old.value.spec.id);
         state.allocator.free(old.key);
@@ -424,13 +428,13 @@ const SlotContributionLifecycle = struct {
             state.allocator.free(key);
             return;
         };
-        state.views.put(key, record) catch {
+        state.contributions.put(key, record) catch {
             var owned = record;
             owned.deinit(state.allocator);
             state.allocator.free(key);
             return;
         };
-        if (state.views.getPtr(key)) |stored| syncInputValues(state, stored);
+        if (state.contributions.getPtr(key)) |stored| syncInputValues(state, stored);
     }
 };
 
@@ -451,7 +455,7 @@ const SlotPolicy = struct {
     fn orderedViews(self: SlotPolicy, state: *ExtensionUiState) ![]*SlotContribution {
         var list = std.ArrayList(*SlotContribution).empty;
         errdefer list.deinit(state.allocator);
-        var it = state.views.iterator();
+        var it = state.contributions.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.spec.slot == self.slot and entry.value_ptr.root != null) {
                 try list.append(state.allocator, entry.value_ptr);
@@ -462,7 +466,7 @@ const SlotPolicy = struct {
     }
 
     fn hasViews(self: SlotPolicy, state: *ExtensionUiState) bool {
-        var it = state.views.iterator();
+        var it = state.contributions.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.spec.slot == self.slot and entry.value_ptr.root != null) return true;
         }
@@ -508,6 +512,17 @@ const SlotPolicy = struct {
             return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .type = .key, .action = binding.action, .key = binding.key, .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
         }
         return null;
+    }
+
+    fn dismissTopAfterInput(self: SlotPolicy, state: *ExtensionUiState) bool {
+        if (self.slot != .overlay) return false;
+        const top = self.topView(state) orelse return false;
+        if (top.spec.slot_options.lifetime != .until_input) return false;
+        const contribution_key = SlotContributionKey{ .owner = top.spec.state_owner_id, .view = top.spec.id };
+        const key = contribution_key.alloc(state.allocator) catch return false;
+        defer state.allocator.free(key);
+        SlotContributionLifecycle.removeExisting(state, key);
+        return true;
     }
 };
 
@@ -1375,21 +1390,21 @@ fn cpAt(buf: *Buffer, x: u32, y: u32) u21 {
 test "extension ui retains clone remove and generation gates" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    try std.testing.expectEqual(@as(usize, 0), state.views.count());
+    try std.testing.expectEqual(@as(usize, 0), state.contributions.count());
 
     const root = extension_ui.UiNode{ .text = .{ .text = "new" } };
     state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .slot = .status, .root = root });
-    try std.testing.expectEqual(@as(usize, 1), state.views.count());
+    try std.testing.expectEqual(@as(usize, 1), state.contributions.count());
 
     const stale = extension_ui.UiNode{ .text = .{ .text = "old" } };
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = stale });
-    const rec = state.views.get("owner\x1fview").?;
+    const rec = state.contributions.get("owner\x1fview").?;
     try std.testing.expectEqualStrings("new", rec.root.?.node.text.text);
 
     state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .remove = true });
-    try std.testing.expectEqual(@as(usize, 1), state.views.count());
+    try std.testing.expectEqual(@as(usize, 1), state.contributions.count());
     state.applyRender(.{ .state_owner_id = "owner", .generation = 3, .id = "view", .remove = true });
-    try std.testing.expectEqual(@as(usize, 0), state.views.count());
+    try std.testing.expectEqual(@as(usize, 0), state.contributions.count());
 }
 
 test "extension ui edits focused overlay input and emits structured events" {
@@ -1899,6 +1914,26 @@ test "extension ui overlay key routes only to top focused view" {
     try std.testing.expectEqualStrings("upper-close", event.action.?);
 }
 
+test "extension ui until_input lifetime dismisses after routed input" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "overlay", .slot = .overlay, .slot_options = .{ .lifetime = .until_input }, .focus = true, .root = .{ .input = .{ .id = "input", .value = "a", .on_input = "input" } } });
+    const event = state.handleOverlayInput(.{ .code = .char, .char = 'b' }).?;
+    try std.testing.expectEqualStrings("ab", event.value.?);
+    try std.testing.expect(state.dismissTopOverlayAfterInput());
+    try std.testing.expect(!state.hasOverlayViews());
+}
+
+test "extension ui manual lifetime survives routed key" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const keys = [_]extension_ui.KeyBinding{.{ .key = "escape", .action = "close" }};
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "overlay", .slot = .overlay, .slot_options = .{ .lifetime = .manual }, .focus = true, .root = .{ .text = .{ .text = "hi" } }, .keys = @constCast(&keys) });
+    _ = state.matchOverlayKey(.{ .code = .escape }).?;
+    try std.testing.expect(!state.dismissTopOverlayAfterInput());
+    try std.testing.expect(state.hasOverlayViews());
+}
+
 test "extension ui maps retained overlay slot options" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
@@ -1947,7 +1982,7 @@ test "extension ui renders and removes editor border bottom views" {
     try std.testing.expectEqual(@as(u21, 'h'), cpAt(&buf, 2, 0));
 
     state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "bottom", .slot = .editor_border_bottom, .remove = true });
-    try std.testing.expectEqual(@as(usize, 0), state.views.count());
+    try std.testing.expectEqual(@as(usize, 0), state.contributions.count());
     const m = comp.measure(8);
     try std.testing.expectEqual(@as(u32, 0), m.preferred_height);
 }
