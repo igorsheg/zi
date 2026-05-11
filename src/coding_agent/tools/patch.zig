@@ -125,27 +125,43 @@ fn parsePatch(allocator: std.mem.Allocator, raw_text: []const u8) !std.ArrayList
     while (it.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, "\r");
         const trimmed = std.mem.trim(u8, line, " \t");
-        if (std.mem.eql(u8, trimmed, "*** Begin Patch")) { in_patch = true; continue; }
-        if (std.mem.eql(u8, trimmed, "*** End Patch")) { saw_end = true; break; }
+        if (std.mem.eql(u8, trimmed, "*** Begin Patch")) {
+            in_patch = true;
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "*** End Patch")) {
+            saw_end = true;
+            break;
+        }
         if (!in_patch) continue;
-        if (std.mem.startsWith(u8, line, "*** Add File:")) { if (current) |h| try finishHunk(allocator, &hunks, h); current = .{ .tag = .add, .path = nonEmpty(std.mem.trim(u8, line[13..], " \t")) orelse return error.EmptyPath }; continue; }
-        if (std.mem.startsWith(u8, line, "*** Delete File:")) { if (current) |h| try finishHunk(allocator, &hunks, h); current = .{ .tag = .delete, .path = nonEmpty(std.mem.trim(u8, line[16..], " \t")) orelse return error.EmptyPath }; continue; }
-        if (std.mem.startsWith(u8, line, "*** Update File:")) { if (current) |h| try finishHunk(allocator, &hunks, h); current = .{ .tag = .update, .path = nonEmpty(std.mem.trim(u8, line[16..], " \t")) orelse return error.EmptyPath }; continue; }
-        if (std.mem.startsWith(u8, line, "*** Move to:")) { if (current) |*h| h.move_path = nonEmpty(std.mem.trim(u8, line[12..], " \t")) orelse return error.EmptyPath else return error.MoveWithoutFile; continue; }
+        if (std.mem.startsWith(u8, line, "*** Add File:")) {
+            if (current) |h| try finishHunk(allocator, &hunks, h);
+            current = .{ .tag = .add, .path = nonEmpty(std.mem.trim(u8, line[13..], " \t")) orelse return error.EmptyPath };
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "*** Delete File:")) {
+            if (current) |h| try finishHunk(allocator, &hunks, h);
+            current = .{ .tag = .delete, .path = nonEmpty(std.mem.trim(u8, line[16..], " \t")) orelse return error.EmptyPath };
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "*** Update File:")) {
+            if (current) |h| try finishHunk(allocator, &hunks, h);
+            current = .{ .tag = .update, .path = nonEmpty(std.mem.trim(u8, line[16..], " \t")) orelse return error.EmptyPath };
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "*** Move to:")) {
+            if (current) |*h| h.move_path = nonEmpty(std.mem.trim(u8, line[12..], " \t")) orelse return error.EmptyPath else return error.MoveWithoutFile;
+            continue;
+        }
         if (current) |*h| {
             switch (h.tag) {
                 .delete => return error.MalformedDeleteFileLine,
                 .add => {
                     if (std.mem.startsWith(u8, line, "@@") or std.mem.eql(u8, line, "*** End of File")) return error.MalformedAddFileLine;
-                    if (line.len > 0 and line[0] == '+') try h.lines.append(allocator, .{ .tag = '+', .text = line[1..] })
-                    else return error.MalformedAddFileLine;
+                    if (line.len > 0 and line[0] == '+') try h.lines.append(allocator, .{ .tag = '+', .text = line[1..] }) else return error.MalformedAddFileLine;
                 },
                 .update => {
-                    if (std.mem.startsWith(u8, line, "@@")) try h.lines.append(allocator, .{ .tag = '@', .text = std.mem.trim(u8, line[2..], " \t") })
-                    else if (std.mem.eql(u8, line, "*** End of File")) try h.lines.append(allocator, .{ .tag = '$', .text = "" })
-                    else if (line.len == 0) try h.lines.append(allocator, .{ .tag = ' ', .text = "" })
-                    else if (line[0] == '+' or line[0] == '-' or line[0] == ' ') try h.lines.append(allocator, .{ .tag = line[0], .text = line[1..] })
-                    else return error.MalformedPatchLine;
+                    if (std.mem.startsWith(u8, line, "@@")) try h.lines.append(allocator, .{ .tag = '@', .text = std.mem.trim(u8, line[2..], " \t") }) else if (std.mem.eql(u8, line, "*** End of File")) try h.lines.append(allocator, .{ .tag = '$', .text = "" }) else if (line.len == 0) try h.lines.append(allocator, .{ .tag = ' ', .text = "" }) else if (line[0] == '+' or line[0] == '-' or line[0] == ' ') try h.lines.append(allocator, .{ .tag = line[0], .text = line[1..] }) else return error.MalformedPatchLine;
                 },
             }
         } else return error.BodyBeforeFile;
@@ -160,7 +176,9 @@ fn finishHunk(allocator: std.mem.Allocator, hunks: *std.ArrayList(Hunk), h: Hunk
     if (h.path.len == 0) return error.EmptyPath;
     try hunks.append(allocator, h);
 }
-fn nonEmpty(s: []const u8) ?[]const u8 { return if (s.len == 0) null else s; }
+fn nonEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len == 0) null else s;
+}
 
 fn stripHeredoc(text: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -179,7 +197,10 @@ fn stripHeredoc(text: []const u8) []const u8 {
     return trimmed;
 }
 
-fn deinitHunks(allocator: std.mem.Allocator, hunks: *std.ArrayList(Hunk)) void { for (hunks.items) |*h| h.lines.deinit(allocator); hunks.deinit(allocator); }
+fn deinitHunks(allocator: std.mem.Allocator, hunks: *std.ArrayList(Hunk)) void {
+    for (hunks.items) |*h| h.lines.deinit(allocator);
+    hunks.deinit(allocator);
+}
 
 fn buildPlan(allocator: std.mem.Allocator, cwd: []const u8, hunks: []Hunk) !std.ArrayList(PlanChange) {
     var plan: std.ArrayList(PlanChange) = .empty;
@@ -221,13 +242,16 @@ fn buildPlan(allocator: std.mem.Allocator, cwd: []const u8, hunks: []Hunk) !std.
                 change.tag = if (change.dest_path == null) .update else .move;
                 try plan.append(allocator, change);
                 appended = true;
-            }
+            },
         }
     }
     return plan;
 }
 
-fn deinitPlan(allocator: std.mem.Allocator, plan: *std.ArrayList(PlanChange)) void { for (plan.items) |*c| c.deinit(allocator); plan.deinit(allocator); }
+fn deinitPlan(allocator: std.mem.Allocator, plan: *std.ArrayList(PlanChange)) void {
+    for (plan.items) |*c| c.deinit(allocator);
+    plan.deinit(allocator);
+}
 
 fn exists(path: []const u8) !bool {
     std.Io.Dir.cwd().access(std.Options.debug_io, path, .{}) catch |err| switch (err) {
@@ -266,18 +290,27 @@ fn applyUpdate(allocator: std.mem.Allocator, original: []const u8, patch_lines: 
     while (start < patch_lines.len) {
         var anchor: ?[]const u8 = null;
         var eof = false;
-        if (patch_lines[start].tag == '@') { if (patch_lines[start].text.len > 0) anchor = patch_lines[start].text; start += 1; }
+        if (patch_lines[start].tag == '@') {
+            if (patch_lines[start].text.len > 0) anchor = patch_lines[start].text;
+            start += 1;
+        }
         var end = start;
         while (end < patch_lines.len and patch_lines[end].tag != '@') : (end += 1) {
             if (patch_lines[end].tag == '$') eof = true;
         }
-        if (start == end) { start = end; continue; }
+        if (start == end) {
+            start = end;
+            continue;
+        }
         var old_lines: std.ArrayList([]const u8) = .empty;
         defer old_lines.deinit(allocator);
         var new_lines: std.ArrayList([]const u8) = .empty;
         defer new_lines.deinit(allocator);
         for (patch_lines[start..end]) |line| switch (line.tag) {
-            ' ' => { try old_lines.append(allocator, line.text); try new_lines.append(allocator, line.text); },
+            ' ' => {
+                try old_lines.append(allocator, line.text);
+                try new_lines.append(allocator, line.text);
+            },
             '-' => try old_lines.append(allocator, line.text),
             '+' => try new_lines.append(allocator, line.text),
             '$' => {},
@@ -330,7 +363,10 @@ fn matchAt(lines: []const []const u8, pattern: []const []const u8, at: usize) bo
     const Mode = enum { exact, rstrip, trim, normalized };
     inline for (.{ Mode.exact, Mode.rstrip, Mode.trim, Mode.normalized }) |mode| {
         var ok = true;
-        for (pattern, 0..) |p, j| if (!lineEqual(lines[at + j], p, mode)) { ok = false; break; };
+        for (pattern, 0..) |p, j| if (!lineEqual(lines[at + j], p, mode)) {
+            ok = false;
+            break;
+        };
         if (ok) return true;
     }
     return false;
@@ -366,9 +402,9 @@ fn normalizedEqual(a: []const u8, b: []const u8) bool {
 const Token = struct { text: []const u8, len: usize };
 fn normalizedToken(s: []const u8) Token {
     const reps = [_]struct { bytes: []const u8, repl: []const u8 }{
-        .{ .bytes = "\xE2\x80\x98", .repl = "'" }, .{ .bytes = "\xE2\x80\x99", .repl = "'" },
-        .{ .bytes = "\xE2\x80\x9C", .repl = "\"" }, .{ .bytes = "\xE2\x80\x9D", .repl = "\"" },
-        .{ .bytes = "\xE2\x80\x93", .repl = "-" }, .{ .bytes = "\xE2\x80\x94", .repl = "-" },
+        .{ .bytes = "\xE2\x80\x98", .repl = "'" },   .{ .bytes = "\xE2\x80\x99", .repl = "'" },
+        .{ .bytes = "\xE2\x80\x9C", .repl = "\"" },  .{ .bytes = "\xE2\x80\x9D", .repl = "\"" },
+        .{ .bytes = "\xE2\x80\x93", .repl = "-" },   .{ .bytes = "\xE2\x80\x94", .repl = "-" },
         .{ .bytes = "\xE2\x80\xA6", .repl = "..." }, .{ .bytes = "\xC2\xA0", .repl = " " },
     };
     for (reps) |r| if (std.mem.startsWith(u8, s, r.bytes)) return .{ .text = r.repl, .len = r.bytes.len };
@@ -404,8 +440,17 @@ fn collectLockPaths(allocator: std.mem.Allocator, plan: []const PlanChange) !std
     }
     return paths;
 }
-fn freeStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void { for (list.items) |s| allocator.free(s); list.deinit(allocator); }
-fn sortStrings(items: [][]u8) void { std.mem.sort([]u8, items, {}, struct { fn less(_: void, a: []const u8, b: []const u8) bool { return std.mem.lessThan(u8, a, b); } }.less); }
+fn freeStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |s| allocator.free(s);
+    list.deinit(allocator);
+}
+fn sortStrings(items: [][]u8) void {
+    std.mem.sort([]u8, items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+}
 fn tryAcquireLock(allocator: std.mem.Allocator, locks: *std.ArrayList(*lock_registry.Entry), path: []const u8) !void {
     try locks.append(allocator, try lock_registry.global().acquirePath(allocator, path));
 }
@@ -525,10 +570,17 @@ fn truncateOwnedText(allocator: std.mem.Allocator, owned: []u8) ![]u8 {
 
 fn commitPlan(plan: []const PlanChange) !void {
     for (plan) |c| switch (c.tag) {
-        .add => { if (std.fs.path.dirname(c.path)) |p| try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, p); try writeFileAtomic(c.path, c.new_content.?, null); },
+        .add => {
+            if (std.fs.path.dirname(c.path)) |p| try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, p);
+            try writeFileAtomic(c.path, c.new_content.?, null);
+        },
         .delete => try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, c.path),
         .update => try writeFileAtomic(c.path, c.new_content.?, c.permissions),
-        .move => { if (std.fs.path.dirname(c.dest_path.?)) |p| try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, p); try writeFileAtomic(c.dest_path.?, c.new_content.?, c.permissions); try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, c.path); },
+        .move => {
+            if (std.fs.path.dirname(c.dest_path.?)) |p| try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, p);
+            try writeFileAtomic(c.dest_path.?, c.new_content.?, c.permissions);
+            try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, c.path);
+        },
     };
 }
 

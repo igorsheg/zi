@@ -110,7 +110,10 @@ pub fn commandExists(allocator: std.mem.Allocator, io: std.Io, command: []const 
         .completed => |completed| completed,
         else => return false,
     };
-    return switch (completed.term) { .exited => |code| code == 0, else => false };
+    return switch (completed.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, options: RunOptions) RunError!RunResult {
@@ -298,14 +301,24 @@ fn buildEnvMap(allocator: std.mem.Allocator, env: []const EnvPair, clear_env: bo
 }
 
 const shell_argv: []const []const u8 = if (builtin.os.tag == .windows) &.{ "cmd.exe", "/c" } else &.{ "/bin/sh", "-c" };
-fn skipShellProcessTestsIfUnsupported() !void { if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest; }
-fn runShell(script: []const u8, options: RunOptions) !RunResult { var argv = [_][]const u8{ shell_argv[0], shell_argv[1], script }; var o = options; o.argv = &argv; return run(std.testing.allocator, std.Options.debug_io, o); }
+fn skipShellProcessTestsIfUnsupported() !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+}
+fn runShell(script: []const u8, options: RunOptions) !RunResult {
+    var argv = [_][]const u8{ shell_argv[0], shell_argv[1], script };
+    var o = options;
+    o.argv = &argv;
+    return run(std.testing.allocator, std.Options.debug_io, o);
+}
 
 test "process.run captures both output streams without mixing them" {
     try skipShellProcessTestsIfUnsupported();
     var result = try runShell("printf out; printf err >&2", .{ .argv = &.{} });
     defer result.deinit(std.testing.allocator);
-    const completed = switch (result) { .completed => |x| x, else => return error.UnexpectedProcessError };
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
     try std.testing.expectEqualSlices(u8, "out", completed.stdout);
     try std.testing.expectEqualSlices(u8, "err", completed.stderr);
 }
@@ -315,7 +328,10 @@ test "process.run drains large stdout and stderr concurrently" {
     const script = "i=0; while [ $i -lt 2048 ]; do printf 'oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo'; printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' >&2; i=$((i+1)); done";
     var result = try runShell(script, .{ .argv = &.{}, .timeout_ms = 5000 });
     defer result.deinit(std.testing.allocator);
-    const completed = switch (result) { .completed => |x| x, else => return error.UnexpectedProcessError };
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
     try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stdout.len);
     try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stderr.len);
 }
@@ -324,7 +340,10 @@ test "process.run writes stdin then closes the child pipe" {
     try skipShellProcessTestsIfUnsupported();
     var result = try runShell("cat", .{ .argv = &.{}, .stdin = .{ .bytes = "hello stdin" } });
     defer result.deinit(std.testing.allocator);
-    const completed = switch (result) { .completed => |x| x, else => return error.UnexpectedProcessError };
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
     try std.testing.expectEqualSlices(u8, "hello stdin", completed.stdout);
 }
 
@@ -332,7 +351,10 @@ test "process.run timeout preserves output emitted before termination" {
     try skipShellProcessTestsIfUnsupported();
     var result = try runShell("printf before; sleep 5; printf after", .{ .argv = &.{}, .timeout_ms = 100 });
     defer result.deinit(std.testing.allocator);
-    const timed_out = switch (result) { .timed_out => |x| x, else => return error.UnexpectedProcessCompletion };
+    const timed_out = switch (result) {
+        .timed_out => |x| x,
+        else => return error.UnexpectedProcessCompletion,
+    };
     try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "before") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "after") == null);
 }
@@ -341,7 +363,10 @@ test "process.run reports output limit as typed partial" {
     try skipShellProcessTestsIfUnsupported();
     var result = try runShell("printf abcdef", .{ .argv = &.{}, .stdout_limit = .limited(3) });
     defer result.deinit(std.testing.allocator);
-    const failed = switch (result) { .stdout_too_long => |x| x, else => return error.UnexpectedProcessCompletion };
+    const failed = switch (result) {
+        .stdout_too_long => |x| x,
+        else => return error.UnexpectedProcessCompletion,
+    };
     try std.testing.expect(std.mem.indexOf(u8, failed.message, "stdout exceeded output limit") != null);
 }
 
