@@ -115,33 +115,11 @@ pub const ExtensionUiState = struct {
     }
 
     pub fn handleOverlayInput(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
-        const ordered = self.orderedSlotViews(.overlay) catch return null;
-        defer self.allocator.free(ordered);
-        var i = ordered.len;
-        while (i > 0) {
-            i -= 1;
-            const spec = ordered[i].spec;
-            if (!spec.focus) continue;
-            const input = (ordered[i].root orelse continue).firstInput() orelse continue;
-            return editInput(self, spec, input, key) catch null;
-        }
-        return null;
+        return SlotPolicy.forSlot(.overlay).routeInput(self, key);
     }
 
     pub fn matchOverlayKey(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
-        const ordered = self.orderedSlotViews(.overlay) catch return null;
-        defer self.allocator.free(ordered);
-        var i = ordered.len;
-        while (i > 0) {
-            i -= 1;
-            const spec = ordered[i].spec;
-            for (spec.keys) |binding| {
-                const parsed = keys_mod.parseKeySpec(binding.key) catch continue;
-                if (!parsed.eql(key)) continue;
-                return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .type = .key, .action = binding.action, .key = binding.key, .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
-            }
-        }
-        return null;
+        return SlotPolicy.forSlot(.overlay).routeKey(self, key);
     }
 
     fn hasSlotViews(self: *ExtensionUiState, slot: extension_ui.UiSlot) bool {
@@ -445,20 +423,45 @@ const SlotPolicy = struct {
         return false;
     }
 
-    fn wantsFocus(self: SlotPolicy, state: *ExtensionUiState) bool {
-        const ordered = self.orderedViews(state) catch return false;
+    fn topView(self: SlotPolicy, state: *ExtensionUiState) ?*ViewRecord {
+        const ordered = self.orderedViews(state) catch return null;
         defer state.allocator.free(ordered);
-        if (ordered.len == 0) return false;
-        return ordered[ordered.len - 1].spec.focus;
+        if (ordered.len == 0) return null;
+        return ordered[ordered.len - 1];
+    }
+
+    fn wantsFocus(self: SlotPolicy, state: *ExtensionUiState) bool {
+        const top = self.topView(state) orelse return false;
+        return self.slot == .overlay and top.spec.focus;
     }
 
     fn overlayOptions(self: SlotPolicy, state: *ExtensionUiState, base: overlay_mod.OverlayOptions) overlay_mod.OverlayOptions {
         var options = base;
-        const ordered = self.orderedViews(state) catch return options;
-        defer state.allocator.free(ordered);
-        if (ordered.len == 0) return options;
-        applySlotOptions(&options, ordered[ordered.len - 1].spec.slot_options);
+        const top = self.topView(state) orelse return options;
+        applySlotOptions(&options, top.spec.slot_options);
         return options;
+    }
+
+    fn routeInput(self: SlotPolicy, state: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
+        if (self.slot != .overlay) return null;
+        const top = self.topView(state) orelse return null;
+        const spec = top.spec;
+        if (!spec.focus) return null;
+        const input = (top.root orelse return null).firstInput() orelse return null;
+        return editInput(state, spec, input, key) catch null;
+    }
+
+    fn routeKey(self: SlotPolicy, state: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
+        if (self.slot != .overlay) return null;
+        const top = self.topView(state) orelse return null;
+        const spec = top.spec;
+        if (!spec.focus) return null;
+        for (spec.keys) |binding| {
+            const parsed = keys_mod.parseKeySpec(binding.key) catch continue;
+            if (!parsed.eql(key)) continue;
+            return .{ .state_owner_id = spec.state_owner_id, .generation = spec.generation, .view = spec.id, .type = .key, .action = binding.action, .key = binding.key, .ctrl = key.ctrl, .alt = key.alt, .shift = key.shift };
+        }
+        return null;
     }
 };
 
@@ -1799,7 +1802,36 @@ test "extension ui overlay focus follows top ordered view" {
     try std.testing.expect(state.slotWantsFocus(.overlay));
 }
 
-test "extension ui maps retained overlay target options" {
+test "extension ui overlay input routes only to top focused view" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "background", .slot = .overlay, .order = 1, .focus = true, .root = .{ .input = .{ .id = "bg", .value = "a", .on_input = "bg-input" } } });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "front", .slot = .overlay, .order = 2, .focus = false, .root = .{ .text = .{ .text = "front" } } });
+    try std.testing.expect(state.handleOverlayInput(.{ .code = .char, .char = 'x' }) == null);
+
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "front", .slot = .overlay, .order = 2, .focus = true, .root = .{ .input = .{ .id = "front", .value = "z", .on_input = "front-input" } } });
+    const event = state.handleOverlayInput(.{ .code = .char, .char = 'i' }).?;
+    try std.testing.expectEqualStrings("front", event.view);
+    try std.testing.expectEqualStrings("front", event.node.?);
+    try std.testing.expectEqualStrings("zi", event.value.?);
+}
+
+test "extension ui overlay key routes only to top focused view" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    const lower_keys = [_]extension_ui.KeyBinding{.{ .key = "escape", .action = "lower-close" }};
+    const upper_keys = [_]extension_ui.KeyBinding{.{ .key = "escape", .action = "upper-close" }};
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "lower", .slot = .overlay, .order = 1, .focus = true, .root = .{ .text = .{ .text = "lower" } }, .keys = @constCast(&lower_keys) });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "upper", .slot = .overlay, .order = 2, .focus = false, .root = .{ .text = .{ .text = "upper" } }, .keys = @constCast(&upper_keys) });
+    try std.testing.expect(state.matchOverlayKey(.{ .code = .escape }) == null);
+
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "upper", .slot = .overlay, .order = 2, .focus = true, .root = .{ .text = .{ .text = "upper" } }, .keys = @constCast(&upper_keys) });
+    const event = state.matchOverlayKey(.{ .code = .escape }).?;
+    try std.testing.expectEqualStrings("upper", event.view);
+    try std.testing.expectEqualStrings("upper-close", event.action.?);
+}
+
+test "extension ui maps retained overlay slot options" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     state.applyRender(.{
