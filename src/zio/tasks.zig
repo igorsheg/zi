@@ -14,13 +14,14 @@ const std = @import("std");
 ///
 /// This is the only place new zio code should spawn scoped OS threads.
 pub const TaskGroup = struct {
+    allocator: std.mem.Allocator,
     io: std.Io,
     group: std.Io.Group = .init,
     threads: std.ArrayList(std.Thread) = .empty,
     closed: bool = false,
 
-    pub fn init(io: std.Io) TaskGroup {
-        return .{ .io = io };
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) TaskGroup {
+        return .{ .allocator = allocator, .io = io };
     }
 
     pub fn async(self: *TaskGroup, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
@@ -30,11 +31,9 @@ pub const TaskGroup = struct {
 
     pub fn concurrent(self: *TaskGroup, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.ConcurrentError!void {
         std.debug.assert(!self.closed);
+        self.threads.ensureUnusedCapacity(self.allocator, 1) catch return error.ConcurrencyUnavailable;
         const thread = std.Thread.spawn(.{}, function, args) catch return error.ConcurrencyUnavailable;
-        self.threads.append(std.heap.page_allocator, thread) catch {
-            thread.join();
-            return error.ConcurrencyUnavailable;
-        };
+        self.threads.appendAssumeCapacity(thread);
     }
 
     pub fn wait(self: *TaskGroup) std.Io.Cancelable!void {
@@ -44,7 +43,7 @@ pub const TaskGroup = struct {
             io_result = err;
         };
         self.joinThreads();
-        self.threads.deinit(std.heap.page_allocator);
+        self.threads.deinit(self.allocator);
         self.threads = .empty;
         return io_result;
     }
@@ -53,7 +52,7 @@ pub const TaskGroup = struct {
         self.closed = true;
         self.group.cancel(self.io);
         self.joinThreads();
-        self.threads.deinit(std.heap.page_allocator);
+        self.threads.deinit(self.allocator);
         self.threads = .empty;
     }
 
@@ -90,7 +89,7 @@ test "TaskGroup concurrent work makes simultaneous progress" {
     };
 
     var ctx = Ctx{};
-    var group = TaskGroup.init(std.Options.debug_io);
+    var group = TaskGroup.init(std.testing.allocator, std.Options.debug_io);
 
     try group.concurrent(Ctx.runA, .{&ctx});
     try group.concurrent(Ctx.runB, .{&ctx});
@@ -110,7 +109,7 @@ test "TaskGroup owns async fan-out until wait" {
 
     var value = std.atomic.Value(u32).init(0);
     var ctx: Ctx = .{ .value = &value };
-    var group = TaskGroup.init(std.Options.debug_io);
+    var group = TaskGroup.init(std.testing.allocator, std.Options.debug_io);
 
     group.async(Ctx.add, .{ &ctx, 2 });
     group.async(Ctx.add, .{ &ctx, 3 });

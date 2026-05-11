@@ -17,8 +17,7 @@ pub const MappedFile = struct {
     bytes: []align(std.heap.page_size_min) const u8,
 
     pub fn deinit(self: *MappedFile) void {
-        if (self.bytes.len == 0) return;
-        std.posix.munmap(@constCast(self.bytes));
+        if (self.bytes.len != 0) std.posix.munmap(@constCast(self.bytes));
         self.bytes = &.{};
     }
 };
@@ -160,7 +159,10 @@ pub fn appendFile(
     bytes: []const u8,
 ) !void {
     if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .allow_directory = false });
+    const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .allow_directory = false }) catch |err| switch (err) {
+        error.FileNotFound => try std.Io.Dir.cwd().createFile(io, path, .{}),
+        else => return err,
+    };
     defer file.close(io);
     const stat = try file.stat(io);
     try file.writePositionalAll(io, bytes, stat.size);

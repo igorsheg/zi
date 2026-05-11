@@ -58,6 +58,7 @@ pub const ChildProcess = struct {
     tasks: TaskGroup = undefined,
     started: bool = false,
     mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     child_id: ?std.process.Child.Id = null,
     stdin_file: ?std.Io.File = null,
     ready: bool = false,
@@ -71,7 +72,7 @@ pub const ChildProcess = struct {
 
     pub fn start(self: *ChildProcess) !void {
         if (self.started) return;
-        self.tasks = TaskGroup.init(self.io);
+        self.tasks = TaskGroup.init(std.heap.smp_allocator, self.io);
         errdefer self.tasks.cancel();
         try self.tasks.concurrent(run, .{self});
         self.started = true;
@@ -86,10 +87,8 @@ pub const ChildProcess = struct {
     pub fn stop(self: *ChildProcess) void {
         self.mutex.lockUncancelable(self.io);
         self.stop_requested = true;
-        const child_id = self.child_id;
+        self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
-
-        if (child_id) |pid| self.terminateOwnedChild(pid);
     }
 
     pub fn childId(self: *ChildProcess) ?std.process.Child.Id {
@@ -167,20 +166,34 @@ pub const ChildProcess = struct {
         self.stdin_file = child.stdin;
         self.ready = true;
         const stop_requested = self.stop_requested;
+        self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
 
-        if (stop_requested) self.terminateOwnedChild(child.id.?);
-
-        var readers = TaskGroup.init(self.io);
+        var readers = TaskGroup.init(std.heap.smp_allocator, self.io);
         defer readers.cancel();
+
+        readers.concurrent(terminationWatcher, .{ self, child.id.? }) catch {
+            self.terminateOwnedChild(child.id.?);
+            _ = child.wait(self.io) catch null;
+            self.markExited();
+            _ = self.sink.submit(self.sink.ptr, .spawn_failed);
+            return;
+        };
+
+        if (stop_requested) self.condition.broadcast(self.io);
+
         if (child.stdout) |stdout_file| {
+            child.stdout = null;
             readers.concurrent(readPipe, .{ self, stdout_file, StreamKind.stdout }) catch {
+                stdout_file.close(self.io);
                 self.handleStartFailure(&child, &readers, .stdout_reader);
                 return;
             };
         }
         if (child.stderr) |stderr_file| {
+            child.stderr = null;
             readers.concurrent(readPipe, .{ self, stderr_file, StreamKind.stderr }) catch {
+                stderr_file.close(self.io);
                 self.handleStartFailure(&child, &readers, .stderr_reader);
                 return;
             };
@@ -204,14 +217,15 @@ pub const ChildProcess = struct {
             }
         }
 
-        readers.wait() catch {};
         const term = child.wait(self.io) catch null;
-
         self.mutex.lockUncancelable(self.io);
         self.child_id = null;
         self.stdin_file = null;
         self.exited = true;
+        self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
+
+        readers.wait() catch {};
 
         _ = self.sink.submit(self.sink.ptr, .{ .exit = term });
     }
@@ -225,6 +239,7 @@ pub const ChildProcess = struct {
         self.child_id = null;
         self.stdin_file = null;
         self.exited = true;
+        self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
         _ = self.sink.submit(self.sink.ptr, .spawn_failed);
     }
@@ -232,7 +247,22 @@ pub const ChildProcess = struct {
     fn markExited(self: *ChildProcess) void {
         self.mutex.lockUncancelable(self.io);
         self.exited = true;
+        self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
+    }
+
+    fn terminationWatcher(self: *ChildProcess, child_id: std.process.Child.Id) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        while (!self.stop_requested and self.child_id == child_id and !self.exited) {
+            self.condition.waitUncancelable(self.io, &self.mutex);
+        }
+        if (!self.stop_requested or self.child_id != child_id or self.exited) return;
+
+        self.mutex.unlock(self.io);
+        self.terminateOwnedChild(child_id);
+        self.mutex.lockUncancelable(self.io);
     }
 
     fn terminateOwnedChild(self: *ChildProcess, child_id: std.process.Child.Id) void {
@@ -245,6 +275,7 @@ pub const ChildProcess = struct {
     }
 
     fn readPipe(self: *ChildProcess, file: std.Io.File, kind: StreamKind) void {
+        defer file.close(self.io);
         var buf: [64 * 1024]u8 = undefined;
         while (true) {
             const n = std.posix.read(file.handle, &buf) catch return;

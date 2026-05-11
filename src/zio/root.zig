@@ -8,12 +8,7 @@ pub const TaskGroup = tasks.TaskGroup;
 pub const AbortController = @import("abort_signal.zig").AbortController;
 pub const AbortSignal = @import("abort_signal.zig").AbortSignal;
 pub const guard = @import("guard.zig");
-pub const AbortGuard = guard.AbortGuard;
-pub const abort = struct {
-    pub const AbortController = @import("abort_signal.zig").AbortController;
-    pub const AbortSignal = @import("abort_signal.zig").AbortSignal;
-    pub const AbortGuard = guard.AbortGuard;
-};
+pub const InterruptGuard = guard.InterruptGuard;
 pub const mailbox = @import("mailbox.zig");
 pub const Mailbox = mailbox.Mailbox;
 pub const child_process = @import("child_process.zig");

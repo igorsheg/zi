@@ -94,6 +94,24 @@ pub const Manager = struct {
         job.stop();
     }
 
+    /// Destroy a job that has already exited. Returns false if the id is
+    /// unknown or the process is still running.
+    pub fn reap(self: *Manager, id: u64) bool {
+        const job = self.jobs.get(id) orelse return false;
+        if (!job.child.isExited()) return false;
+        _ = self.jobs.remove(id);
+        self.destroyJob(job);
+        return true;
+    }
+
+    /// Stop and destroy a job regardless of current state.
+    pub fn remove(self: *Manager, id: u64) bool {
+        const job = self.jobs.get(id) orelse return false;
+        _ = self.jobs.remove(id);
+        self.destroyJob(job);
+        return true;
+    }
+
     pub fn write(self: *Manager, id: u64, data: []const u8) !void {
         const job = self.jobs.get(id) orelse return error.UnknownJob;
         try job.write(data);

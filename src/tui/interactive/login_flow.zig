@@ -87,7 +87,7 @@ pub fn start(self: *Interactive, provider_id: []const u8) void {
         .provider = provider,
     };
 
-    var tasks = zio.TaskGroup.init(self.io);
+    var tasks = zio.TaskGroup.init(self.allocator, self.io);
     tasks.concurrent(threadFn, .{login_ctx}) catch {
         tasks.cancel();
         self.msg_allocator.destroy(login_ctx);

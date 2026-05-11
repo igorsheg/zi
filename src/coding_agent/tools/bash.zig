@@ -518,7 +518,7 @@ test "runCommand abort kills the spawned process group, not just the shell pid" 
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const testing = std.testing;
-    const abort_signal = @import("../../zio/root.zig").abort;
+    const abort_signal = @import("../../zio/root.zig");
     const pid_file = try std.fmt.allocPrint(testing.allocator, "/tmp/zi-bash-abort-{d}.pid", .{@as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()))});
     defer testing.allocator.free(pid_file);
     std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, pid_file) catch {};

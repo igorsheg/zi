@@ -72,6 +72,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         queue: QueueStorage = .{},
         mutex: std.Io.Mutex = .init,
         allocator: std.mem.Allocator,
+        io: std.Io,
         state: State = .active,
         rejected_count: usize = 0,
         dropped_count: usize = 0,
@@ -164,7 +165,11 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         };
 
         pub fn init(allocator: std.mem.Allocator) !Self {
-            var self = Self{ .allocator = allocator };
+            return initIo(allocator, std.Options.debug_io);
+        }
+
+        pub fn initIo(allocator: std.mem.Allocator, io: std.Io) !Self {
+            var self = Self{ .allocator = allocator, .io = io };
             switch (config.wakeup) {
                 .none => {},
                 .pipe => self.wake_pipe = try wake_mod.Pipe.init(),
@@ -211,8 +216,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         /// - `.full`     — bounded queue rejected send; caller receives original message back
         /// - `.oom`      — append allocation failed; caller receives original message back
         pub fn trySend(self: *Self, item: T) TrySendResult {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             if (self.state != .active) {
                 self.rejected_count += 1;
@@ -259,8 +264,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         }
 
         pub fn closeMode(self: *Self, mode: CloseMode) void {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             if (self.state == .closed) return;
             switch (mode) {
@@ -281,8 +286,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         }
 
         pub fn drainInto(self: *Self, out: []T) usize {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             const count = self.queue.drainInto(out);
             self.reconcileStateAndWakeLocked();
@@ -294,8 +299,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             visitor: *const fn (item: *const T, ctx: ?*anyopaque) anyerror!void,
             ctx: ?*anyopaque,
         ) anyerror!void {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             for (0..self.queue.len) |i| {
                 try visitor(self.queue.itemPtr(i), ctx);
@@ -312,8 +317,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             visitor: *const fn (item: *const T, ctx: ?*anyopaque) anyerror!void,
             ctx: ?*anyopaque,
         ) anyerror!void {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             for (0..self.queue.len) |i| {
                 try visitor(self.queue.itemPtr(i), ctx);
@@ -336,8 +341,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             predicate: *const fn (item: *const T, ctx: ?*anyopaque) bool,
             ctx: ?*anyopaque,
         ) usize {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             if (self.queue.len == 0) return 0;
             const original_len = self.queue.len;
@@ -348,10 +353,9 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
 
             var kept: usize = 0;
             var dropped: usize = 0;
-            for (snapshot) |item| {
+            for (snapshot, 0..) |item, i| {
                 if (predicate(&item, ctx)) {
-                    var mutable = item;
-                    Self.cleanupItem(&mutable, self.allocator);
+                    Self.cleanupItem(self.queue.itemPtr(i), self.allocator);
                     dropped += 1;
                 } else {
                     self.queue.storage.items[kept] = item;
@@ -366,8 +370,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         }
 
         pub fn clear(self: *Self) void {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             for (0..self.queue.len) |i| {
                 Self.cleanupItem(self.queue.itemPtr(i), self.allocator);
@@ -426,15 +430,15 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         }
 
         pub fn acknowledgeWake(self: *Self) void {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             if (self.queue.len != 0) return;
             self.clearWakeLocked();
         }
 
         pub fn stats(self: *Self) Stats {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return .{
                 .pending_depth = self.queue.len,
                 .high_water_depth = self.high_water_depth,
@@ -448,26 +452,26 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         }
 
         pub fn lifecycleState(self: *Self) State {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.state;
         }
 
         pub fn isClosed(self: *Self) bool {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.state != .active;
         }
 
         pub fn isDrained(self: *Self) bool {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.state == .closed;
         }
 
         pub fn pendingDepth(self: *Self) usize {
-            self.mutex.lockUncancelable(std.Options.debug_io);
-            defer self.mutex.unlock(std.Options.debug_io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.queue.len;
         }
 
@@ -485,7 +489,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
                 .none => {},
                 .pipe => {
                     if (self.wake_signaled) return;
-                    if (!self.wake_pipe.?.signal(std.Options.debug_io)) return;
+                    if (!self.wake_pipe.?.signal(self.io)) return;
                     self.wake_signaled = true;
                     self.wake_count += 1;
                 },

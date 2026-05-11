@@ -1,4 +1,4 @@
-const abort_signal_mod = @import("../zio/root.zig").abort;
+const abort_signal_mod = @import("../zio/root.zig");
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("types.zig");

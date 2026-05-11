@@ -9,7 +9,7 @@ const session_core = @import("../../session/root.zig");
 const extension_ui = @import("ui.zig");
 const request_mod = @import("../request.zig");
 const ai_provider = @import("../../ai/provider.zig");
-const abort_signal_mod = @import("../../zio/root.zig").abort;
+const abort_signal_mod = @import("../../zio/root.zig");
 
 const c = lua_runtime.c;
 const limits = @import("limits.zig");

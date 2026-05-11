@@ -68,8 +68,8 @@ pub const ToolExecutionGroup = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !ToolExecutionGroup {
         return .{
             .allocator = allocator,
-            .tasks = zio.TaskGroup.init(io),
-            .events = try EventMailbox.init(allocator),
+            .tasks = zio.TaskGroup.init(allocator, io),
+            .events = try EventMailbox.initIo(allocator, io),
         };
     }
 

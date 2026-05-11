@@ -2,9 +2,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const child_process = @import("child_process.zig");
 const guard_mod = @import("guard.zig");
-const AbortGuard = guard_mod.AbortGuard;
+const InterruptGuard = guard_mod.InterruptGuard;
 const AbortSignal = @import("abort_signal.zig").AbortSignal;
-const TimeoutGuard = guard_mod.TimeoutGuard;
 
 pub const default_max_output_bytes: usize = 1024 * 1024;
 const poll_interval_ms: u64 = 25;
@@ -155,9 +154,9 @@ pub fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: TerminalRe
 
     const child_id = child.id.?;
     var abort_guard = if (request.signal) |signal|
-        AbortGuard.start(io, signal, .{ .interrupt_process_group = if (request.process_group) child_id else null, .kill_pid = if (request.process_group) null else child_id })
+        InterruptGuard.start(io, .{ .signal = signal, .actions = .{ .interrupt_process_group = if (request.process_group) child_id else null, .kill_pid = if (request.process_group) null else child_id } }) catch |err| return errorFmt(allocator, "interrupt guard failed: {s}", .{@errorName(err)})
     else
-        AbortGuard.start(io, AbortSignal.none, .{});
+        InterruptGuard.start(io, .{}) catch |err| return errorFmt(allocator, "interrupt guard failed: {s}", .{@errorName(err)});
     defer abort_guard.stop();
 
     const term = child.wait(io) catch |err| return errorFmt(allocator, "wait failed: {s}", .{@errorName(err)});
@@ -174,8 +173,7 @@ const RunContext = struct {
     io: std.Io,
     request: Request,
     child: child_process.ChildProcess = undefined,
-    abort_guard: ?AbortGuard = null,
-    timeout_guard: ?TimeoutGuard = null,
+    interrupt_guard: ?InterruptGuard = null,
     stdout_capture: Capture,
     stderr_capture: Capture,
     term: ?std.process.Child.Term = null,
@@ -208,8 +206,7 @@ const RunContext = struct {
     }
 
     fn deinit(ctx: *RunContext) void {
-        if (ctx.abort_guard) |*guard| guard.stop();
-        if (ctx.timeout_guard) |*guard| guard.stop();
+        if (ctx.interrupt_guard) |*guard| guard.stop();
         ctx.child.wait();
         ctx.stdout_capture.deinit();
         ctx.stderr_capture.deinit();
@@ -219,14 +216,13 @@ const RunContext = struct {
         ctx.child.sink.ptr = @ptrCast(ctx);
         ctx.child.start() catch |err| return errorFmt(ctx.allocator, "spawn failed: {s}", .{@errorName(err)});
         if (!ctx.child.waitReady(5000)) return errorResult(ctx.allocator, "spawn failed");
-        ctx.startAbortGuard();
-        ctx.startTimeoutGuard();
+        ctx.startInterruptGuard() catch |err| return errorFmt(ctx.allocator, "interrupt guard failed: {s}", .{@errorName(err)});
         ctx.writeStdin();
 
         ctx.pumpWhileRunning();
         ctx.child.wait();
         if (ctx.request.on_wait) |callback| callback.call();
-        if (ctx.timeout_guard) |*guard| guard.markExited();
+        if (ctx.interrupt_guard) |*guard| guard.markDone();
 
         if (ctx.spawn_failed) return errorResult(ctx.allocator, "spawn failed");
         const term = ctx.term orelse return errorResult(ctx.allocator, "wait failed");
@@ -249,17 +245,16 @@ const RunContext = struct {
         return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
     }
 
-    fn startAbortGuard(ctx: *RunContext) void {
+    fn startInterruptGuard(ctx: *RunContext) !void {
         const child_id = ctx.child.childId() orelse return;
-        ctx.abort_guard = if (ctx.request.signal) |signal|
-            AbortGuard.start(ctx.io, signal, .{ .interrupt_process_group = if (ctx.request.process_group) child_id else null, .kill_pid = if (ctx.request.process_group) null else child_id })
-        else
-            AbortGuard.start(ctx.io, AbortSignal.none, .{});
-    }
-
-    fn startTimeoutGuard(ctx: *RunContext) void {
-        const child_id = ctx.child.childId() orelse return;
-        ctx.timeout_guard = TimeoutGuard.start(ctx.io, ctx.request.timeout_ms, child_id, ctx.request.process_group);
+        ctx.interrupt_guard = try InterruptGuard.start(ctx.io, .{
+            .signal = ctx.request.signal orelse AbortSignal.none,
+            .timeout_ms = ctx.request.timeout_ms,
+            .actions = if (ctx.request.process_group)
+                .{ .interrupt_process_group = child_id }
+            else
+                .{ .kill_pid = child_id },
+        });
     }
 
     fn writeStdin(ctx: *RunContext) void {
@@ -291,7 +286,7 @@ const RunContext = struct {
     }
 
     fn didTimeout(ctx: *const RunContext) bool {
-        const guard = ctx.timeout_guard orelse return false;
+        const guard = ctx.interrupt_guard orelse return false;
         return guard.didTimeout();
     }
 };
@@ -335,13 +330,19 @@ fn captureErrorResult(
     stdout_capture: *Capture,
     stderr_capture: *Capture,
 ) Result {
+    _ = term;
     if (err == error.OutputTooLarge) {
         const stdout = stdout_capture.toOwnedParent(allocator) catch return errorResult(allocator, "failed to allocate stdout");
         const stderr = stderr_capture.toOwnedParent(allocator) catch {
             allocator.free(stdout);
             return errorResult(allocator, "failed to allocate stderr");
         };
-        return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
+        const message = std.fmt.allocPrint(allocator, "{s} exceeded output limit", .{stream}) catch {
+            allocator.free(stdout);
+            allocator.free(stderr);
+            return errorResult(allocator, "output exceeded limit");
+        };
+        return .{ .err = .{ .message = message, .stdout = stdout, .stderr = stderr } };
     }
     return errorFmt(allocator, "{s} read failed: {s}", .{ stream, @errorName(err) });
 }
@@ -437,4 +438,19 @@ test "process.run timeout preserves output emitted before termination" {
     const timed_out = try expectTimeout(result);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "before") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "after") == null);
+}
+
+test "process.run reports output limit as an error" {
+    try skipShellProcessTestsIfUnsupported();
+
+    var result = runShell("printf abcdef", .{ .argv = &.{}, .max_stdout_bytes = 3 });
+    defer result.deinit(std.testing.allocator);
+
+    const failed = switch (result) {
+        .err => |failed| failed,
+        .completed => return error.UnexpectedProcessCompletion,
+        .timeout => return error.UnexpectedTimeout,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, failed.message, "stdout exceeded output limit") != null);
+    try std.testing.expectEqualSlices(u8, "", failed.stderr);
 }

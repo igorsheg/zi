@@ -2,7 +2,7 @@
 /// parse JSONL events from stdout, collect output and usage stats.
 /// Zig equivalent of pi-spawn.ts.
 const std = @import("std");
-const abort_signal = @import("../zio/root.zig").abort;
+const abort_signal = @import("../zio/root.zig");
 const ai = @import("../ai/root.zig");
 
 /// Per-event observer callback. Fires once for every parsed JSONL line

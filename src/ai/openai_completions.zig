@@ -11,9 +11,9 @@ const request_transform = @import("request_transform.zig");
 const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
-const zio_abort = @import("../zio/root.zig").abort;
-const AbortSignal = zio_abort.AbortSignal;
-const AbortGuard = zio_abort.AbortGuard;
+const zio = @import("../zio/root.zig");
+const AbortSignal = zio.AbortSignal;
+const InterruptGuard = zio.InterruptGuard;
 const env_api_keys = @import("env_api_keys.zig");
 
 pub const OpenAICompletionsProvider = struct {
@@ -152,9 +152,12 @@ pub const OpenAICompletionsProvider = struct {
         };
         defer req.deinit();
 
-        var abort_guard = AbortGuard.start(options.io, options.signal, .{
-            .shutdown_fd = AbortGuard.httpRequestShutdownFd(&req),
-        });
+        var abort_guard = InterruptGuard.start(options.io, .{ .signal = options.signal, .actions = .{
+            .shutdown_fd = InterruptGuard.httpRequestShutdownFd(&req),
+        } }) catch |err| {
+            emitError(allocator, callback, callback_ctx, model, "failed to start interrupt guard: {s}", .{@errorName(err)});
+            return;
+        };
         defer abort_guard.stop();
 
         req.sendBodyComplete(request_payload) catch |err| {

@@ -51,7 +51,7 @@ pub fn BlockingWorker(
             return .{
                 .allocator = allocator,
                 .io = io,
-                .queue = try Queue.init(allocator),
+                .queue = try Queue.initIo(allocator, io),
                 .handler = handler,
             };
         }
@@ -67,7 +67,7 @@ pub fn BlockingWorker(
 
         pub fn start(self: *Self) !void {
             if (self.tasks != null) return;
-            var group = tasks_mod.TaskGroup.init(self.io);
+            var group = tasks_mod.TaskGroup.init(self.allocator, self.io);
             errdefer group.cancel();
             try group.concurrent(run, .{self});
             self.tasks = group;

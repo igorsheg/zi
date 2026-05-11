@@ -687,13 +687,13 @@ pub const AgentSession = struct {
     };
 
     const LinkedSideAbort = struct {
-        guard: zio.guard.AbortCallbackGuard = undefined,
+        guard: zio.InterruptGuard = undefined,
         active: bool = false,
 
         fn start(signal: zio.AbortSignal, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
             if (signal.isNone()) return .{};
             return .{
-                .guard = zio.guard.AbortCallbackGuard.start(std.Options.debug_io, signal, .{ .ctx = @ptrCast(core), .call = abortCore }),
+                .guard = zio.InterruptGuard.start(std.Options.debug_io, .{ .signal = signal, .actions = .{ .callback = .{ .ctx = @ptrCast(core), .call = abortCore } } }) catch return .{},
                 .active = true,
             };
         }

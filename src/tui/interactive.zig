@@ -361,10 +361,10 @@ pub const Interactive = struct {
             .runtime_host = runtime_host,
             .command_registry = CommandRegistry.init(allocator),
             .input = input_buffer_mod.InputBuffer.init(allocator),
-            .snapshot_event_queue = try UiSnapshotQueue.init(msg_allocator),
-            .lifecycle_event_queue = try UiLifecycleQueue.init(msg_allocator),
-            .request_queue = try RequestQueue.init(msg_allocator),
-            .terminal_system_queue = try TerminalSystemQueue.init(msg_allocator),
+            .snapshot_event_queue = try UiSnapshotQueue.initIo(msg_allocator, io),
+            .lifecycle_event_queue = try UiLifecycleQueue.initIo(msg_allocator, io),
+            .request_queue = try RequestQueue.initIo(msg_allocator, io),
+            .terminal_system_queue = try TerminalSystemQueue.initIo(msg_allocator, io),
             .job_manager = undefined,
             .session_index_worker = try session_index_worker_mod.SessionIndexWorker.init(msg_allocator),
             .auth_storage = auth_storage,
@@ -475,7 +475,7 @@ pub const Interactive = struct {
 
     fn startAgentThread(self: *Interactive) !void {
         if (self.agent_tasks != null) return;
-        var tasks = zio.TaskGroup.init(self.io);
+        var tasks = zio.TaskGroup.init(self.allocator, self.io);
         errdefer tasks.cancel();
         try tasks.concurrent(runtime_loop.agentThread, .{self});
         self.agent_tasks = tasks;
