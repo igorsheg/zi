@@ -6,7 +6,7 @@ const context_mod = @import("../../session/context.zig");
 const context_usage = @import("../../session/context_usage.zig");
 const storage = @import("../../storage.zig");
 const agent_mod = @import("../../agent/root.zig");
-const zio_fs = @import("../../zio/root.zig").fs;
+const zio_fs = @import("../../zio/root.zig").file;
 
 /// Metadata about a session file, for listing.
 pub const SessionInfo = struct {

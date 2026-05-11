@@ -18,7 +18,7 @@ pub const Request = struct {
     max_stderr_bytes: usize = default_max_output_bytes,
     text: bool = true,
     stdio: Stdio = .capture,
-    signal: zio.AbortSignal = zio.AbortSignal.none,
+    signal: zio.cancel.Token = zio.cancel.Token.none,
 };
 
 pub const Completed = struct {

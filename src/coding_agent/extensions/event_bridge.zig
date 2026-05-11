@@ -793,7 +793,7 @@ fn pushToolExecEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!v
 ///     deep-clone per tool call when extensions are loaded.
 pub fn beforeToolCall(
     ctx_arg: agent_protocol.BeforeToolCallContext,
-    signal: abort_signal_mod.AbortSignal,
+    signal: abort_signal_mod.cancel.Token,
     hook_ctx: ?*anyopaque,
 ) ?agent_protocol.BeforeToolCallResult {
     _ = signal;
@@ -848,7 +848,7 @@ fn beforeToolCallImpl(
 ///     and are out of scope.
 pub fn afterToolCall(
     ctx_arg: agent_protocol.AfterToolCallContext,
-    signal: abort_signal_mod.AbortSignal,
+    signal: abort_signal_mod.cancel.Token,
     hook_ctx: ?*anyopaque,
 ) ?agent_protocol.AfterToolCallResult {
     _ = signal;
@@ -1341,7 +1341,7 @@ test "beforeToolCall blocks tool execution when handler returns block=true" {
         .context = .{ .system_prompt = "", .messages = &.{} },
     };
 
-    const result = beforeToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(runner));
+    const result = beforeToolCall(ctx, abort_signal_mod.cancel.Token.none, @ptrCast(runner));
     try testing.expect(result != null);
     try testing.expect(result.?.block);
     try testing.expectEqualStrings("nope", result.?.reason.?);
@@ -1373,7 +1373,7 @@ test "beforeToolCall returns mutated args when handler rewrites them" {
         .context = .{ .system_prompt = "", .messages = &.{} },
     };
 
-    const result = beforeToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(runner));
+    const result = beforeToolCall(ctx, abort_signal_mod.cancel.Token.none, @ptrCast(runner));
     try testing.expect(result != null);
     try testing.expect(!result.?.block);
 
@@ -1424,7 +1424,7 @@ test "afterToolCall transforms result content via transformable chain" {
         .context = .{ .system_prompt = "", .messages = &.{} },
     };
 
-    const result = afterToolCall(ctx, abort_signal_mod.AbortSignal.none, @ptrCast(runner));
+    const result = afterToolCall(ctx, abort_signal_mod.cancel.Token.none, @ptrCast(runner));
     try testing.expect(result != null);
     try testing.expect(result.?.content != null);
 

@@ -41,7 +41,7 @@ pub const AsyncKind = enum {
 
 pub const AiCompleteRequest = struct {
     prompt: []const u8,
-    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
+    signal: abort_signal.cancel.Token = abort_signal.cancel.Token.none,
     system_prompt: ?[]const u8 = null,
     max_tokens: ?u64 = null,
     model: ?[]const u8 = null,
@@ -64,7 +64,7 @@ pub const AiCompleteRequest = struct {
 pub const AiSessionPromptRequest = struct {
     session_id: u64,
     prompt: []const u8,
-    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
+    signal: abort_signal.cancel.Token = abort_signal.cancel.Token.none,
     callbacks_ref: c_int = lua_runtime.c.LUA_NOREF,
     source_L: ?*lua_runtime.c.lua_State = null,
 
@@ -278,7 +278,7 @@ pub const SystemStdio = enum { capture, terminal };
 
 pub const SystemRequest = struct {
     argv: []const []const u8,
-    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
+    signal: abort_signal.cancel.Token = abort_signal.cancel.Token.none,
     cwd: ?[]const u8 = null,
     stdin: ?[]const u8 = null,
     env: []const SystemEnvPair = &.{},
@@ -797,7 +797,7 @@ pub const ExtensionCommandActions = struct {
 
 pub const SpawnRequest = struct {
     task: []const u8,
-    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
+    signal: abort_signal.cancel.Token = abort_signal.cancel.Token.none,
     model: ?[]const u8 = null,
     tools: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
@@ -848,7 +848,7 @@ pub const LoadContext = struct {
 
 pub const ExtensionRunner = struct {
     pub const ToolExecutionContext = struct {
-        signal: abort_signal.AbortSignal,
+        signal: abort_signal.cancel.Token,
         on_update: ?agent_protocol.AgentToolUpdateCallback = null,
         update_ctx: ?*anyopaque = null,
     };
@@ -1408,7 +1408,7 @@ pub const ExtensionRunner = struct {
 
         self.setModuleContext(state, kb.source.provenance);
         const had_tool_execution = self.current_tool_execution != null;
-        if (!had_tool_execution) self.current_tool_execution = .{ .signal = abort_signal.AbortSignal.none };
+        if (!had_tool_execution) self.current_tool_execution = .{ .signal = abort_signal.cancel.Token.none };
         defer {
             if (!had_tool_execution) self.current_tool_execution = null;
         }
@@ -1531,7 +1531,7 @@ pub const ExtensionRunner = struct {
 
         self.setModuleContext(state, cmd.source.provenance);
         const had_tool_execution = self.current_tool_execution != null;
-        if (!had_tool_execution) self.current_tool_execution = .{ .signal = abort_signal.AbortSignal.none };
+        if (!had_tool_execution) self.current_tool_execution = .{ .signal = abort_signal.cancel.Token.none };
         defer {
             if (!had_tool_execution) self.current_tool_execution = null;
         }

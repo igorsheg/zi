@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 
-const mailbox_mod = @import("../../../zio/root.zig").mailbox;
+const queue_mod = @import("../../../zio/root.zig").queue;
 const ui_event_mod = @import("../../ui_event.zig");
 
 const UiEvent = ui_event_mod.UiEvent;
@@ -9,21 +9,21 @@ const UiEvent = ui_event_mod.UiEvent;
 pub const ui_snapshot_queue_capacity: usize = 64;
 pub const ui_lifecycle_queue_capacity: usize = 64;
 
-/// Mailbox-backed agent/helper → TUI snapshot channel.
+/// Queue-backed agent/helper → TUI snapshot channel.
 ///
 /// Snapshot/progress traffic is bounded and lossy: the latest semantic
 /// state will be republished, so intermediate snapshots may be dropped.
-pub const UiSnapshotQueue = mailbox_mod.Mailbox(UiEvent, .{
+pub const UiSnapshotQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = ui_snapshot_queue_capacity, .on_full = .drop_newest } },
     .wakeup = .pipe,
 });
 
-/// Mailbox-backed agent/helper → TUI lifecycle channel.
+/// Queue-backed agent/helper → TUI lifecycle channel.
 ///
 /// Terminal lifecycle outcomes must not disappear silently, so this
 /// channel rejects on overload instead of dropping.
-pub const UiLifecycleQueue = mailbox_mod.Mailbox(UiEvent, .{
+pub const UiLifecycleQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = ui_lifecycle_queue_capacity, .on_full = .reject } },
     .wakeup = .pipe,

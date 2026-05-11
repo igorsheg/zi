@@ -53,23 +53,23 @@ fn cleanupEvent(item: *anyopaque, allocator: std.mem.Allocator) void {
     event.deinit(allocator);
 }
 
-const EventMailbox = zio.Mailbox(ToolExecutionEvent, .{
+const EventQueue = zio.queue.Queue(ToolExecutionEvent, .{
     .cleanup = .{ .custom = cleanupEvent },
     .wakeup = .pipe,
 });
 
 pub const ToolExecutionGroup = struct {
     allocator: std.mem.Allocator,
-    tasks: zio.TaskGroup,
-    events: EventMailbox,
+    tasks: zio.task.Group,
+    events: EventQueue,
     pending_workers: usize = 0,
     closed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !ToolExecutionGroup {
         return .{
             .allocator = allocator,
-            .tasks = zio.TaskGroup.init(allocator, io),
-            .events = try EventMailbox.initIo(allocator, io),
+            .tasks = zio.task.Group.init(allocator, io),
+            .events = try EventQueue.initIo(allocator, io),
         };
     }
 
@@ -79,13 +79,13 @@ pub const ToolExecutionGroup = struct {
         self.* = undefined;
     }
 
-    pub fn concurrent(
+    pub fn spawnThread(
         self: *ToolExecutionGroup,
         function: anytype,
         args: std.meta.ArgsTuple(@TypeOf(function)),
     ) std.Io.ConcurrentError!void {
         std.debug.assert(!self.closed);
-        try self.tasks.concurrent(function, args);
+        try self.tasks.spawnThread(function, args);
         self.pending_workers += 1;
     }
 

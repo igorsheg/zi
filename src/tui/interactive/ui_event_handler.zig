@@ -89,7 +89,7 @@ pub fn handle(self: anytype, ev: *UiEvent) void {
             self.tui.dirty = true;
         },
         .login_complete => |l| {
-            if (self.login_tasks) |*tasks| tasks.wait() catch {};
+            if (self.login_tasks) |*tasks| tasks.join() catch {};
             self.login_tasks = null;
 
             if (l.success) {

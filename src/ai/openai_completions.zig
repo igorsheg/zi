@@ -12,8 +12,8 @@ const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
 const zio = @import("../zio/root.zig");
-const AbortSignal = zio.AbortSignal;
-const InterruptGuard = zio.InterruptGuard;
+const Token = zio.cancel.Token;
+const fd = zio.fd;
 const env_api_keys = @import("env_api_keys.zig");
 
 pub const OpenAICompletionsProvider = struct {
@@ -152,9 +152,7 @@ pub const OpenAICompletionsProvider = struct {
         };
         defer req.deinit();
 
-        var abort_guard = InterruptGuard.start(options.io, .{ .signal = options.signal, .actions = .{
-            .shutdown_fd = InterruptGuard.httpRequestShutdownFd(&req),
-        } }) catch |err| {
+        var abort_guard = fd.ShutdownOnCancel.start(options.io, options.signal, fd.httpRequestShutdownFd(&req)) catch |err| {
             emitError(allocator, callback, callback_ctx, model, "failed to start interrupt guard: {s}", .{@errorName(err)});
             return;
         };
@@ -205,7 +203,7 @@ pub fn processStream(
     allocator: std.mem.Allocator,
     reader: anytype,
     model: protocol.Model,
-    abort_flag: AbortSignal,
+    abort_flag: Token,
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
 ) void {
@@ -1115,7 +1113,7 @@ const test_model: protocol.Model = .{
 
 fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestCollector) void {
     var reader: std.Io.Reader = .fixed(sse_bytes);
-    processStream(arena, &reader, test_model, AbortSignal.none, TestCollector.callback, collector);
+    processStream(arena, &reader, test_model, Token.none, TestCollector.callback, collector);
 }
 
 fn expectEventAt(col: TestCollector, index: usize, kind: TestCollector.EventKind) !void {

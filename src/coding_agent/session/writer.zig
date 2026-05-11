@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio_fs = @import("../../zio/fs.zig");
+const zio_fs = @import("../../zio/file.zig");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const proto = @import("../../session/protocol.zig");

@@ -1,7 +1,7 @@
 const std = @import("std");
 const zio = @import("../../zio/root.zig");
 const blocking_worker_mod = zio.worker;
-const mailbox_mod = zio.mailbox;
+const queue_mod = zio.queue;
 const session_store = @import("../../coding_agent/session/store.zig");
 const ui_event_mod = @import("../ui_event.zig");
 
@@ -156,7 +156,7 @@ const Handler = struct {
     }
 };
 
-const WorkerImpl = blocking_worker_mod.BlockingWorker(Request, Handler, .{
+const WorkerImpl = blocking_worker_mod.Worker(Request, Handler, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } },
     .wakeup = .pipe,

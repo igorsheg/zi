@@ -432,11 +432,11 @@ const TestEventCounter = struct {
 
 test "ziSpawn watchdog aborts a quiet child within ~200ms" {
     const override = [_][]const u8{ "sh", "-c", "sleep 30" };
-    var controller = @import("../zio/root.zig").AbortController{};
+    var controller = @import("../zio/root.zig").cancel.Source{};
     const signal = controller.beginRun();
 
     const Aborter = struct {
-        fn run(c: *@import("../zio/root.zig").AbortController) void {
+        fn run(c: *@import("../zio/root.zig").cancel.Source) void {
             std.Options.debug_io.sleep(.fromNanoseconds(@intCast(100 * std.time.ns_per_ms)), .awake) catch {};
             c.requestAbort();
         }

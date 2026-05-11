@@ -5,7 +5,7 @@ const auth_types = @import("auth/types.zig");
 const extension_runner = @import("extensions/runner.zig");
 const extension_ui = @import("extensions/ui.zig");
 const message_memory = @import("../agent/message_memory.zig");
-const mailbox_mod = @import("../zio/root.zig").mailbox;
+const queue_mod = @import("../zio/root.zig").queue;
 
 /// AgentRequest — mailbox payload for the TUI → agent mutation channel.
 ///
@@ -228,7 +228,7 @@ pub const AgentRequest = union(enum) {
 
 pub const request_queue_capacity: usize = 64;
 
-pub const RequestQueue = mailbox_mod.Mailbox(AgentRequest, .{
+pub const RequestQueue = queue_mod.Queue(AgentRequest, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = request_queue_capacity, .on_full = .reject } },
     .wakeup = .pipe,

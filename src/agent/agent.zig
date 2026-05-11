@@ -68,7 +68,7 @@ pub const Agent = struct {
     is_running: std.atomic.Value(bool),
     is_streaming: bool = false,
     error_message: ?[]const u8 = null,
-    abort_controller: abort_signal_mod.AbortController,
+    abort_controller: abort_signal_mod.cancel.Source,
 
     pub const Options = struct {
         system_prompt: []const u8 = "",
@@ -259,7 +259,7 @@ pub const Agent = struct {
         return self.is_running.load(.acquire);
     }
 
-    pub fn abortSignal(self: *Agent) abort_signal_mod.AbortSignal {
+    pub fn abortSignal(self: *Agent) abort_signal_mod.cancel.Token {
         return self.abort_controller.signal();
     }
 

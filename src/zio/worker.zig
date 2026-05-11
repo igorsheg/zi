@@ -1,10 +1,10 @@
 const std = @import("std");
-const mailbox_mod = @import("mailbox.zig");
-const tasks_mod = @import("tasks.zig");
+const queue_mod = @import("queue.zig");
+const task_mod = @import("task.zig");
 
-/// A tiny typed worker-thread wrapper around `zio.Mailbox`.
+/// A tiny typed worker-thread wrapper around `zio.queue.Queue`.
 ///
-/// This owns only mechanics: thread spawn/join, mailbox wait/drain, and
+/// This owns only mechanics: thread spawn/join, queue wait/drain, and
 /// drained-request cleanup. Product semantics stay in the typed `Handler`.
 ///
 /// Handler contract:
@@ -15,24 +15,24 @@ const tasks_mod = @import("tasks.zig");
 ///
 ///   pub fn deinit(self: *Request, allocator: std.mem.Allocator) void
 ///
-/// The mailbox also uses `.cleanup = .deinit` for undelivered queued items;
+/// The queue also uses `.cleanup = .deinit` for undelivered queued items;
 /// this wrapper cleans only requests that were transferred to the worker by
 /// `drainInto`.
-pub fn BlockingWorker(
+pub fn Worker(
     comptime Request: type,
     comptime Handler: type,
-    comptime config: mailbox_mod.Config,
+    comptime config: queue_mod.Config,
 ) type {
     comptime {
         if (config.wakeup != .pipe) {
-            @compileError("BlockingWorker requires mailbox wakeup=.pipe");
+            @compileError("Worker requires queue wakeup=.pipe");
         }
         if (!@hasDecl(Handler, "handle")) {
-            @compileError("BlockingWorker Handler must declare handle(self, request)");
+            @compileError("Worker Handler must declare handle(self, request)");
         }
     }
 
-    const Queue = mailbox_mod.Mailbox(Request, config);
+    const Queue = queue_mod.Queue(Request, config);
 
     return struct {
         const Self = @This();
@@ -41,7 +41,7 @@ pub fn BlockingWorker(
         io: std.Io,
         queue: Queue,
         handler: Handler,
-        tasks: ?tasks_mod.TaskGroup = null,
+        tasks: ?task_mod.Group = null,
 
         pub fn init(allocator: std.mem.Allocator, handler: Handler) !Self {
             return initIo(allocator, std.Options.debug_io, handler);
@@ -67,9 +67,9 @@ pub fn BlockingWorker(
 
         pub fn start(self: *Self) !void {
             if (self.tasks != null) return;
-            var group = tasks_mod.TaskGroup.init(self.allocator, self.io);
+            var group = task_mod.Group.init(self.allocator, self.io);
             errdefer group.cancel();
-            try group.concurrent(run, .{self});
+            try group.spawnThread(run, .{self});
             self.tasks = group;
         }
 
@@ -78,7 +78,7 @@ pub fn BlockingWorker(
         pub fn stop(self: *Self) void {
             self.queue.close();
             if (self.tasks) |*group| {
-                group.wait() catch {};
+                group.join() catch {};
                 self.tasks = null;
             }
         }

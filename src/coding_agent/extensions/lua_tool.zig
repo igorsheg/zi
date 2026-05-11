@@ -154,7 +154,7 @@ fn execute(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
     args: std.json.Value,
-    signal: abort_signal_mod.AbortSignal,
+    signal: abort_signal_mod.cancel.Token,
     on_update: ?agent_protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) agent_protocol.AgentToolExecution {
@@ -292,7 +292,7 @@ const PendingLuaToolExecution = struct {
     generation: runner_mod.Generation,
     cancelled: bool = false,
 
-    fn wait(ptr: *anyopaque, allocator: std.mem.Allocator, signal: abort_signal_mod.AbortSignal, on_update: ?agent_protocol.AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult {
+    fn wait(ptr: *anyopaque, allocator: std.mem.Allocator, signal: abort_signal_mod.cancel.Token, on_update: ?agent_protocol.AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.cancelled or isAbortedToolSignal(signal)) return errorResult(allocator, "tool execution cancelled");
         if (self.runner.generation != self.generation) return errorResult(allocator, "tool execution cancelled by extension reload");
@@ -382,11 +382,11 @@ const PendingLuaToolExecution = struct {
     }
 };
 
-fn isAbortedToolSignal(signal: abort_signal_mod.AbortSignal) bool {
+fn isAbortedToolSignal(signal: abort_signal_mod.cancel.Token) bool {
     return signal.isAborted();
 }
 
-fn awaitToolExecutionForCompat(execution: agent_protocol.AgentToolExecution, allocator: std.mem.Allocator, signal: abort_signal_mod.AbortSignal) AgentToolResult {
+fn awaitToolExecutionForCompat(execution: agent_protocol.AgentToolExecution, allocator: std.mem.Allocator, signal: abort_signal_mod.cancel.Token) AgentToolResult {
     return switch (execution) {
         .ready => |result| result,
         .pending => |pending| blk: {
@@ -1116,10 +1116,10 @@ test "lua tool ctx exposes binding from tool provenance" {
         arena.allocator(),
         "id-binding",
         .{ .null = {} },
-        abort_signal_mod.AbortSignal.none,
+        abort_signal_mod.cancel.Token.none,
         null,
         null,
-    ), arena.allocator(), abort_signal_mod.AbortSignal.none);
+    ), arena.allocator(), abort_signal_mod.cancel.Token.none);
 
     try testing.expect(!result.is_error);
     try testing.expect(result.details == .object);
@@ -2316,7 +2316,7 @@ test "todo command can call ctx.ui.render perimeter" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const add_args = try todoArgs(arena.allocator(), "add", "ship perimeter", null);
-    const add_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
+    const add_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-1", add_args, abort_signal_mod.cancel.Token.none, null, null), arena.allocator(), abort_signal_mod.cancel.Token.none);
     try testing.expect(!add_result.is_error);
 
     try runner.dispatchCommand("todos", "");
@@ -2345,7 +2345,7 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const add_args = try todoArgs(arena.allocator(), "add", "persist me", null);
-        const add_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-1", add_args, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
+        const add_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-1", add_args, abort_signal_mod.cancel.Token.none, null, null), arena.allocator(), abort_signal_mod.cancel.Token.none);
         try testing.expect(!add_result.is_error);
     }
 
@@ -2367,7 +2367,7 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         const list_args = try todoArgs(arena.allocator(), "list", null, null);
-        const list_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-2", list_args, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
+        const list_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-2", list_args, abort_signal_mod.cancel.Token.none, null, null), arena.allocator(), abort_signal_mod.cancel.Token.none);
         try testing.expect(!list_result.is_error);
         try testing.expectEqualStrings("No todos", list_result.content[0].text.text);
     }
@@ -2421,7 +2421,7 @@ test "lua tool execution maps Lua return shapes and runtime errors to AgentToolR
     try args_obj.put(testing.allocator, "who", .{ .string = "zi" });
 
     const echo_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("echo").?.*);
-    const echo_execution = echo_tool.start(arena.allocator(), "id-ready", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null);
+    const echo_execution = echo_tool.start(arena.allocator(), "id-ready", .{ .object = args_obj }, abort_signal_mod.cancel.Token.none, null, null);
     switch (echo_execution) {
         .ready => |echo_ready| {
             try testing.expect(!echo_ready.is_error);
@@ -2429,32 +2429,32 @@ test "lua tool execution maps Lua return shapes and runtime errors to AgentToolR
         },
         .pending => return error.ExpectedReadyLuaToolExecution,
     }
-    const echo = awaitToolExecutionForCompat(echo_tool.start(arena.allocator(), "id-1", .{ .object = args_obj }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
+    const echo = awaitToolExecutionForCompat(echo_tool.start(arena.allocator(), "id-1", .{ .object = args_obj }, abort_signal_mod.cancel.Token.none, null, null), arena.allocator(), abort_signal_mod.cancel.Token.none);
     try testing.expect(!echo.is_error);
     try testing.expectEqualStrings("hello zi", echo.content[0].text.text);
 
     const system_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("system_echo").?.*);
-    const system_execution = system_tool.start(arena.allocator(), "id-system-pending", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null);
+    const system_execution = system_tool.start(arena.allocator(), "id-system-pending", .{ .null = {} }, abort_signal_mod.cancel.Token.none, null, null);
     const system_ready = switch (system_execution) {
         .ready => return error.ExpectedPendingLuaToolExecution,
         .pending => |pending| blk: {
             defer pending.free(arena.allocator());
-            break :blk pending.await(arena.allocator(), abort_signal_mod.AbortSignal.none, null, null);
+            break :blk pending.await(arena.allocator(), abort_signal_mod.cancel.Token.none, null, null);
         },
     };
     try testing.expect(!system_ready.is_error);
     try testing.expectEqualStrings("tool-system", system_ready.content[0].text.text);
-    const system_echo = awaitToolExecutionForCompat(system_tool.start(arena.allocator(), "id-system", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
+    const system_echo = awaitToolExecutionForCompat(system_tool.start(arena.allocator(), "id-system", .{ .null = {} }, abort_signal_mod.cancel.Token.none, null, null), arena.allocator(), abort_signal_mod.cancel.Token.none);
     try testing.expect(!system_echo.is_error);
     try testing.expectEqualStrings("tool-system", system_echo.content[0].text.text);
 
     const fail_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("fail").?.*);
-    const fail = awaitToolExecutionForCompat(fail_tool.start(arena.allocator(), "id-2", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
+    const fail = awaitToolExecutionForCompat(fail_tool.start(arena.allocator(), "id-2", .{ .null = {} }, abort_signal_mod.cancel.Token.none, null, null), arena.allocator(), abort_signal_mod.cancel.Token.none);
     try testing.expect(fail.is_error);
     try testing.expectEqualStrings("boom", fail.content[0].text.text);
 
     const explode_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("explode").?.*);
-    const explode = awaitToolExecutionForCompat(explode_tool.start(arena.allocator(), "id-3", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
+    const explode = awaitToolExecutionForCompat(explode_tool.start(arena.allocator(), "id-3", .{ .null = {} }, abort_signal_mod.cancel.Token.none, null, null), arena.allocator(), abort_signal_mod.cancel.Token.none);
     try testing.expect(explode.is_error);
     try testing.expect(explode.content.len >= 1);
 }
@@ -2483,10 +2483,10 @@ test "lua tool cpu loop aborts through debug hook" {
     defer args_obj.deinit(testing.allocator);
     const spin_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("spin").?.*);
 
-    var controller = abort_signal_mod.AbortController{};
+    var controller = abort_signal_mod.cancel.Source{};
     const signal = controller.beginRun();
     const Aborter = struct {
-        fn run(ctrl: *abort_signal_mod.AbortController) void {
+        fn run(ctrl: *abort_signal_mod.cancel.Source) void {
             std.Options.debug_io.sleep(.fromMilliseconds(50), .awake) catch {};
             ctrl.requestAbort();
         }

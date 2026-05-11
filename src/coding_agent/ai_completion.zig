@@ -15,7 +15,7 @@ pub const PreparedTextCompletionRequest = struct {
     headers: ?[]const ai.protocol.Header = null,
     max_tokens: ?u64 = null,
     reasoning: ?ai.protocol.ThinkingLevel = null,
-    signal: zio.AbortSignal = zio.AbortSignal.none,
+    signal: zio.cancel.Token = zio.cancel.Token.none,
     on_event: ?StreamEventCallback = null,
     on_event_ctx: ?*anyopaque = null,
 };

@@ -5,7 +5,7 @@
 /// Lock protocol uses proper-lockfile compatible mkdir-based locking (30s stale).
 const std = @import("std");
 
-const zio_fs = @import("zio/fs.zig");
+const zio_fs = @import("zio/file.zig");
 
 const log = std.log.scoped(.storage);
 

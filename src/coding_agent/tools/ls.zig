@@ -35,7 +35,7 @@ fn execute(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
     args: std.json.Value,
-    signal: protocol.AbortSignal,
+    signal: protocol.Token,
     on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) protocol.AgentToolExecution {
@@ -47,7 +47,7 @@ fn executeSync(
     allocator: std.mem.Allocator,
     _: []const u8,
     args: std.json.Value,
-    _: protocol.AbortSignal,
+    _: protocol.Token,
     _: ?protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) protocol.AgentToolResult {

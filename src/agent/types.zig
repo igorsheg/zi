@@ -15,7 +15,7 @@ pub const ToolResultMessage = ai.protocol.ToolResultMessage;
 pub const Usage = ai.protocol.Usage;
 pub const StopReason = ai.protocol.StopReason;
 pub const StreamOptions = ai.protocol.StreamOptions;
-pub const AbortSignal = @import("../zio/root.zig").AbortSignal;
+pub const Token = @import("../zio/root.zig").cancel.Token;
 pub const SimpleStreamOptions = ai.protocol.SimpleStreamOptions;
 
 /// Stream hook — wraps provider's streamSimple with context for closure state.
@@ -66,12 +66,12 @@ pub const TransformContextHook = struct {
     func: *const fn (
         allocator: std.mem.Allocator,
         messages: []const AgentMessage,
-        signal: AbortSignal,
+        signal: Token,
         ctx: ?*anyopaque,
     ) []const AgentMessage,
     ctx: ?*anyopaque = null,
 
-    pub fn call(self: TransformContextHook, allocator: std.mem.Allocator, messages: []const AgentMessage, signal: AbortSignal) []const AgentMessage {
+    pub fn call(self: TransformContextHook, allocator: std.mem.Allocator, messages: []const AgentMessage, signal: Token) []const AgentMessage {
         return self.func(allocator, messages, signal, self.ctx);
     }
 };
@@ -245,11 +245,11 @@ pub const AgentToolExecution = union(enum) {
 
     pub const Pending = struct {
         ptr: *anyopaque,
-        wait: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, signal: AbortSignal, on_update: ?AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult,
+        wait: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, signal: Token, on_update: ?AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult,
         cancel: ?*const fn (ptr: *anyopaque) void = null,
         deinit: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void = null,
 
-        pub fn await(self: Pending, allocator: std.mem.Allocator, signal: AbortSignal, on_update: ?AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult {
+        pub fn await(self: Pending, allocator: std.mem.Allocator, signal: Token, on_update: ?AgentToolUpdateCallback, update_ctx: ?*anyopaque) AgentToolResult {
             return self.wait(self.ptr, allocator, signal, on_update, update_ctx);
         }
 
@@ -282,7 +282,7 @@ pub const AgentTool = struct {
         allocator: std.mem.Allocator,
         tool_call_id: []const u8,
         args: std.json.Value,
-        signal: AbortSignal,
+        signal: Token,
         on_update: ?AgentToolUpdateCallback,
         update_ctx: ?*anyopaque,
     ) AgentToolExecution,
@@ -292,7 +292,7 @@ pub const AgentTool = struct {
         allocator: std.mem.Allocator,
         tool_call_id: []const u8,
         args: std.json.Value,
-        signal: AbortSignal,
+        signal: Token,
         on_update: ?AgentToolUpdateCallback,
         update_ctx: ?*anyopaque,
     ) AgentToolExecution {
@@ -380,10 +380,10 @@ pub const AfterToolCallContext = struct {
 /// Hook: called before tool execution, after arg validation.
 /// Return block=true to prevent execution.
 pub const BeforeToolCallHook = struct {
-    func: *const fn (ctx_arg: BeforeToolCallContext, signal: AbortSignal, hook_ctx: ?*anyopaque) ?BeforeToolCallResult,
+    func: *const fn (ctx_arg: BeforeToolCallContext, signal: Token, hook_ctx: ?*anyopaque) ?BeforeToolCallResult,
     ctx: ?*anyopaque = null,
 
-    pub fn call(self: BeforeToolCallHook, context: BeforeToolCallContext, signal: AbortSignal) ?BeforeToolCallResult {
+    pub fn call(self: BeforeToolCallHook, context: BeforeToolCallContext, signal: Token) ?BeforeToolCallResult {
         return self.func(context, signal, self.ctx);
     }
 };
@@ -391,10 +391,10 @@ pub const BeforeToolCallHook = struct {
 /// Hook: called after tool execution.
 /// Return overrides for content/details/isError.
 pub const AfterToolCallHook = struct {
-    func: *const fn (ctx_arg: AfterToolCallContext, signal: AbortSignal, hook_ctx: ?*anyopaque) ?AfterToolCallResult,
+    func: *const fn (ctx_arg: AfterToolCallContext, signal: Token, hook_ctx: ?*anyopaque) ?AfterToolCallResult,
     ctx: ?*anyopaque = null,
 
-    pub fn call(self: AfterToolCallHook, context: AfterToolCallContext, signal: AbortSignal) ?AfterToolCallResult {
+    pub fn call(self: AfterToolCallHook, context: AfterToolCallContext, signal: Token) ?AfterToolCallResult {
         return self.func(context, signal, self.ctx);
     }
 };

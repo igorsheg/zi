@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const TaskGroup = @import("tasks.zig").TaskGroup;
+const Group = @import("task.zig").Group;
 
 pub const EnvPair = struct {
     key: []const u8,
@@ -11,7 +11,7 @@ pub const EnvPair = struct {
 ///
 /// Owns spawn/wait, live stdin, concurrent stdout/stderr draining, process-group
 /// termination, and event delivery. Higher-level modules decide whether events
-/// become captured output (`zio.process`) or long-running job events (`zio.job`).
+/// become captured output (`zio.process`) or long-running job events (`zio.process.Jobs`).
 pub const StreamKind = enum { stdout, stderr };
 
 /// Child process event delivered synchronously to `EventSink.submit`.
@@ -55,7 +55,7 @@ pub const ChildProcess = struct {
     io: std.Io,
     request: StartRequest,
     sink: EventSink,
-    tasks: TaskGroup = undefined,
+    tasks: Group = undefined,
     started: bool = false,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
@@ -72,15 +72,15 @@ pub const ChildProcess = struct {
 
     pub fn start(self: *ChildProcess) !void {
         if (self.started) return;
-        self.tasks = TaskGroup.init(std.heap.smp_allocator, self.io);
+        self.tasks = Group.init(std.heap.smp_allocator, self.io);
         errdefer self.tasks.cancel();
-        try self.tasks.concurrent(run, .{self});
+        try self.tasks.spawnThread(run, .{self});
         self.started = true;
     }
 
     pub fn wait(self: *ChildProcess) void {
         if (!self.started) return;
-        self.tasks.wait() catch {};
+        self.tasks.join() catch {};
         self.started = false;
     }
 
@@ -169,10 +169,10 @@ pub const ChildProcess = struct {
         self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
 
-        var readers = TaskGroup.init(std.heap.smp_allocator, self.io);
+        var readers = Group.init(std.heap.smp_allocator, self.io);
         defer readers.cancel();
 
-        readers.concurrent(terminationWatcher, .{ self, child.id.? }) catch {
+        readers.spawnThread(terminationWatcher, .{ self, child.id.? }) catch {
             self.terminateOwnedChild(child.id.?);
             _ = child.wait(self.io) catch null;
             self.markExited();
@@ -184,7 +184,7 @@ pub const ChildProcess = struct {
 
         if (child.stdout) |stdout_file| {
             child.stdout = null;
-            readers.concurrent(readPipe, .{ self, stdout_file, StreamKind.stdout }) catch {
+            readers.spawnThread(readPipe, .{ self, stdout_file, StreamKind.stdout }) catch {
                 stdout_file.close(self.io);
                 self.handleStartFailure(&child, &readers, .stdout_reader);
                 return;
@@ -192,7 +192,7 @@ pub const ChildProcess = struct {
         }
         if (child.stderr) |stderr_file| {
             child.stderr = null;
-            readers.concurrent(readPipe, .{ self, stderr_file, StreamKind.stderr }) catch {
+            readers.spawnThread(readPipe, .{ self, stderr_file, StreamKind.stderr }) catch {
                 stderr_file.close(self.io);
                 self.handleStartFailure(&child, &readers, .stderr_reader);
                 return;
@@ -225,15 +225,15 @@ pub const ChildProcess = struct {
         self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
 
-        readers.wait() catch {};
+        readers.join() catch {};
 
         _ = self.sink.submit(self.sink.ptr, .{ .exit = term });
     }
 
-    fn handleStartFailure(self: *ChildProcess, child: *std.process.Child, readers: *TaskGroup, failure: StartFailure) void {
+    fn handleStartFailure(self: *ChildProcess, child: *std.process.Child, readers: *Group, failure: StartFailure) void {
         _ = failure;
         if (child.id) |pid| self.terminateOwnedChild(pid);
-        readers.wait() catch {};
+        readers.join() catch {};
         _ = child.wait(self.io) catch null;
         self.mutex.lockUncancelable(self.io);
         self.child_id = null;

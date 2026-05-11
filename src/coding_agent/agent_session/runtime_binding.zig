@@ -82,7 +82,7 @@ fn agentEventSinkFromRunnerRef(event: protocol.AgentEvent, ctx: ?*anyopaque) voi
 
 fn beforeToolCallFromRunnerRef(
     ctx_arg: protocol.BeforeToolCallContext,
-    signal: @import("../../zio/root.zig").AbortSignal,
+    signal: @import("../../zio/root.zig").cancel.Token,
     ctx: ?*anyopaque,
 ) ?protocol.BeforeToolCallResult {
     const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
@@ -92,7 +92,7 @@ fn beforeToolCallFromRunnerRef(
 
 fn afterToolCallFromRunnerRef(
     ctx_arg: protocol.AfterToolCallContext,
-    signal: @import("../../zio/root.zig").AbortSignal,
+    signal: @import("../../zio/root.zig").cancel.Token,
     ctx: ?*anyopaque,
 ) ?protocol.AfterToolCallResult {
     const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));

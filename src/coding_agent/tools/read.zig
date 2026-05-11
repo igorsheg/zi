@@ -16,7 +16,7 @@ const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const output_buffer = @import("output_buffer.zig");
 const image = @import("../../image/root.zig");
-const zio_fs = @import("../../zio/root.zig").fs;
+const zio_fs = @import("../../zio/root.zig").file;
 
 const MAX_LINES: usize = 500;
 const MAX_FILE_BYTES: usize = util.Limits.text_result_bytes;
@@ -57,7 +57,7 @@ fn execute(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
     args: std.json.Value,
-    signal: protocol.AbortSignal,
+    signal: protocol.Token,
     on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) protocol.AgentToolExecution {
@@ -69,7 +69,7 @@ fn executeSync(
     allocator: std.mem.Allocator,
     _: []const u8,
     args: std.json.Value,
-    _: protocol.AbortSignal,
+    _: protocol.Token,
     _: ?protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) protocol.AgentToolResult {

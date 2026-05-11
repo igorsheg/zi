@@ -32,7 +32,7 @@ const diff_unified = @import("../../diff/unified.zig");
 const tool_result_details = @import("result_details.zig");
 const lock_registry = @import("lock_registry.zig");
 const json_value = @import("../../json/value.zig");
-const zio_fs = @import("../../zio/root.zig").fs;
+const zio_fs = @import("../../zio/root.zig").file;
 
 const SCHEMA =
     \\{"type":"object","properties":{
@@ -144,7 +144,7 @@ fn execute(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
     args: std.json.Value,
-    signal: protocol.AbortSignal,
+    signal: protocol.Token,
     on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) protocol.AgentToolExecution {
@@ -156,7 +156,7 @@ fn executeSync(
     allocator: std.mem.Allocator,
     _: []const u8,
     args: std.json.Value,
-    _: protocol.AbortSignal,
+    _: protocol.Token,
     _: ?protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) protocol.AgentToolResult {
@@ -1242,7 +1242,7 @@ test "execute returns unified diff content with structured diff details" {
         testing.allocator,
         "call-1",
         args,
-        protocol.AbortSignal.none,
+        protocol.Token.none,
         null,
         null,
     );

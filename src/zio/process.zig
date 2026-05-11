@@ -1,9 +1,9 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const guard_mod = @import("guard.zig");
-const InterruptGuard = guard_mod.InterruptGuard;
-pub const AbortSignal = @import("abort_signal.zig").AbortSignal;
+pub const Token = @import("cancel.zig").Token;
+const cancel = @import("cancel.zig");
 const child_process = @import("child_process.zig");
+pub const Jobs = @import("job.zig");
 
 pub const default_max_output_bytes: usize = 1024 * 1024;
 pub const EnvPair = child_process.EnvPair;
@@ -34,7 +34,7 @@ pub const RunOptions = struct {
     stderr_limit: std.Io.Limit = .limited(default_max_output_bytes),
     timeout_ms: ?u64 = null,
     kill_scope: KillScope = .process_group,
-    signal: AbortSignal = AbortSignal.none,
+    signal: Token = Token.none,
 };
 
 pub const StreamOptions = struct {
@@ -47,7 +47,7 @@ pub const StreamOptions = struct {
     stderr_limit: std.Io.Limit = .limited(default_max_output_bytes),
     timeout_ms: ?u64 = null,
     kill_scope: KillScope = .process_group,
-    signal: AbortSignal = AbortSignal.none,
+    signal: Token = Token.none,
     on_chunk: ?ChunkCallback = null,
 };
 
@@ -94,7 +94,7 @@ pub const RunError = error{
     WaitFailed,
     ReadFailed,
     OutOfMemory,
-    InterruptGuardFailed,
+    InterruptorFailed,
 };
 
 pub fn commandExists(allocator: std.mem.Allocator, io: std.Io, command: []const u8) bool {
@@ -158,7 +158,7 @@ pub const InheritOptions = struct {
     clear_env: bool = false,
     stdin: Stdin = .inherit,
     kill_scope: KillScope = .process_group,
-    signal: AbortSignal = AbortSignal.none,
+    signal: Token = Token.none,
 };
 
 pub fn runInherit(io: std.Io, options: InheritOptions) RunError!std.process.Child.Term {
@@ -176,10 +176,10 @@ pub fn runInherit(io: std.Io, options: InheritOptions) RunError!std.process.Chil
         .pgid = childPgid(options.kill_scope),
     }) catch return error.SpawnFailed;
     const child_id = child.id.?;
-    var guard = InterruptGuard.start(io, .{ .signal = options.signal, .actions = killActions(options.kill_scope, child_id) }) catch return error.InterruptGuardFailed;
-    defer guard.stop();
+    var interruptor = ProcessInterruptor.start(io, child_id, options.kill_scope, null, options.signal) catch return error.InterruptorFailed;
+    defer interruptor.stop();
     const term = child.wait(io) catch return error.WaitFailed;
-    guard.markDone();
+    interruptor.markDone();
     return term;
 }
 
@@ -200,8 +200,8 @@ fn runStreamCapture(allocator: std.mem.Allocator, io: std.Io, options: StreamOpt
     errdefer child.kill(io);
     const child_id = child.id.?;
 
-    var guard = InterruptGuard.start(io, .{ .signal = options.signal, .timeout_ms = options.timeout_ms, .actions = killActions(options.kill_scope, child_id) }) catch return error.InterruptGuardFailed;
-    defer guard.stop();
+    var interruptor = ProcessInterruptor.start(io, child_id, options.kill_scope, options.timeout_ms, options.signal) catch return error.InterruptorFailed;
+    defer interruptor.stop();
 
     if (options.stdin == .bytes) {
         const bytes = options.stdin.bytes;
@@ -238,9 +238,9 @@ fn runStreamCapture(allocator: std.mem.Allocator, io: std.Io, options: StreamOpt
     emitNew(options.on_chunk, .stderr, stderr_reader.buffered(), &stderr_seen);
     multi_reader.checkAnyError() catch return error.ReadFailed;
     const term = child.wait(io) catch return error.WaitFailed;
-    guard.markDone();
+    interruptor.markDone();
 
-    if (guard.didTimeout()) {
+    if (interruptor.didTimeout()) {
         var buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "timed out after {d}ms", .{options.timeout_ms orelse 0}) catch "timed out";
         return partial(allocator, &multi_reader, .timed_out, msg);
@@ -285,11 +285,81 @@ fn childPgid(scope: KillScope) ?std.process.Child.Id {
     return null;
 }
 
-fn killActions(scope: KillScope, child_id: std.process.Child.Id) InterruptGuard.Actions {
-    return switch (scope) {
-        .child => .{ .kill_pid = child_id },
-        .process_group => .{ .interrupt_process_group = child_id },
+const ProcessInterruptor = struct {
+    state: *State,
+    thread: ?std.Thread = null,
+
+    const State = struct {
+        refs: std.atomic.Value(u32) = .init(1),
+        done: std.atomic.Value(bool) = .init(false),
+        did_timeout: std.atomic.Value(bool) = .init(false),
+        child_id: std.process.Child.Id,
+        kill_scope: KillScope,
     };
+
+    var noop_state = State{ .refs = .init(std.math.maxInt(u32)), .done = .init(true), .child_id = 0, .kill_scope = .child };
+
+    fn start(io: std.Io, child_id: std.process.Child.Id, kill_scope: KillScope, timeout_ms: ?u64, signal: Token) !ProcessInterruptor {
+        if (timeout_ms == null and signal.isNone()) return .{ .state = &noop_state };
+        const state = try std.heap.page_allocator.create(State);
+        state.* = .{ .refs = .init(2), .child_id = child_id, .kill_scope = kill_scope };
+        const thread = std.Thread.spawn(.{}, watch, .{ io, state, timeout_ms, signal }) catch |err| {
+            std.heap.page_allocator.destroy(state);
+            return err;
+        };
+        return .{ .state = state, .thread = thread };
+    }
+
+    fn markDone(self: *ProcessInterruptor) void {
+        self.state.done.store(true, .release);
+    }
+
+    fn stop(self: *ProcessInterruptor) void {
+        self.markDone();
+        if (self.thread) |thread| thread.detach();
+        release(self.state);
+        self.* = .{ .state = &noop_state };
+    }
+
+    fn didTimeout(self: *const ProcessInterruptor) bool {
+        return self.state.did_timeout.load(.acquire);
+    }
+
+    fn watch(io: std.Io, state: *State, timeout_ms: ?u64, signal: Token) void {
+        defer release(state);
+        const start_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+        while (!state.done.load(.acquire)) {
+            if (signal.isAborted()) {
+                killChild(state.child_id, state.kill_scope, .TERM);
+                return;
+            }
+            if (timeout_ms) |ms| {
+                const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+                if (now_ms - start_ms >= ms) {
+                    if (!state.done.load(.acquire)) {
+                        state.did_timeout.store(true, .release);
+                        killChild(state.child_id, state.kill_scope, .TERM);
+                    }
+                    return;
+                }
+            }
+            io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
+
+    fn release(state: *State) void {
+        if (state == &noop_state) return;
+        if (state.refs.fetchSub(1, .acq_rel) == 1) std.heap.page_allocator.destroy(state);
+    }
+};
+
+fn killChild(child_id: std.process.Child.Id, scope: KillScope, sig: std.posix.SIG) void {
+    if (scope == .process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(child_id));
+        std.posix.kill(group_pid, sig) catch {};
+    } else {
+        std.posix.kill(child_id, sig) catch {};
+    }
 }
 
 fn buildEnvMap(allocator: std.mem.Allocator, env: []const EnvPair, clear_env: bool) !?std.process.Environ.Map {
@@ -321,6 +391,19 @@ test "process.run captures both output streams without mixing them" {
     };
     try std.testing.expectEqualSlices(u8, "out", completed.stdout);
     try std.testing.expectEqualSlices(u8, "err", completed.stderr);
+}
+
+test "process.run returns immediately when command exits before timeout" {
+    try skipShellProcessTestsIfUnsupported();
+    const start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds();
+    var result = try runShell("true", .{ .argv = &.{}, .timeout_ms = 10_000 });
+    defer result.deinit(std.testing.allocator);
+    const elapsed = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds() - start;
+    try std.testing.expect(elapsed < 500);
+    switch (result) {
+        .completed => {},
+        else => return error.UnexpectedProcessError,
+    }
 }
 
 test "process.run drains large stdout and stderr concurrently" {
@@ -372,10 +455,10 @@ test "process.run reports output limit as typed partial" {
 
 test "process.run aborts a blocked child promptly" {
     try skipShellProcessTestsIfUnsupported();
-    var controller = guard_mod.AbortController{};
+    var controller = cancel.Source{};
     const signal = controller.beginRun();
     const Aborter = struct {
-        fn run(ctrl: *guard_mod.AbortController) void {
+        fn run(ctrl: *cancel.Source) void {
             std.Options.debug_io.sleep(.fromMilliseconds(50), .awake) catch {};
             ctrl.requestAbort();
         }
@@ -392,10 +475,10 @@ test "process.run aborts a blocked child promptly" {
 
 test "process.run aborts a child process group promptly" {
     try skipShellProcessTestsIfUnsupported();
-    var controller = guard_mod.AbortController{};
+    var controller = cancel.Source{};
     const signal = controller.beginRun();
     const Aborter = struct {
-        fn run(ctrl: *guard_mod.AbortController) void {
+        fn run(ctrl: *cancel.Source) void {
             std.Options.debug_io.sleep(.fromMilliseconds(50), .awake) catch {};
             ctrl.requestAbort();
         }

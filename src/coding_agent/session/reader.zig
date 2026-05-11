@@ -3,7 +3,7 @@ const ai = @import("../../ai/root.zig");
 const agent = @import("../../agent/root.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
-const zio_fs = @import("../../zio/root.zig").fs;
+const zio_fs = @import("../../zio/root.zig").file;
 
 pub const TelemetrySnapshot = struct {
     read_count: u64 = 0,

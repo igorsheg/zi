@@ -6,8 +6,8 @@ const std = @import("std");
 ///
 /// The signal is generation-scoped: when the owner starts a new run,
 /// stale signals from the previous run become aborted automatically.
-pub const AbortSignal = struct {
-    controller: ?*AbortController,
+pub const Token = struct {
+    controller: ?*Source,
     expected_generation: u64,
 
     pub const WaitPredicate = *const fn (ctx: ?*anyopaque) bool;
@@ -19,21 +19,21 @@ pub const AbortSignal = struct {
     };
 
     /// Sentinel for "no abort signal" — never triggers.
-    pub const none: AbortSignal = .{
+    pub const none: Token = .{
         .controller = null,
         .expected_generation = 0,
     };
 
-    pub fn isAborted(self: AbortSignal) bool {
+    pub fn isAborted(self: Token) bool {
         const controller = self.controller orelse return false;
         return controller.generation.load(.acquire) != self.expected_generation or controller.aborted.load(.acquire);
     }
 
-    pub fn isNone(self: AbortSignal) bool {
+    pub fn isNone(self: Token) bool {
         return self.controller == null and self.expected_generation == 0;
     }
 
-    pub fn runId(self: AbortSignal) u64 {
+    pub fn runId(self: Token) u64 {
         return self.expected_generation;
     }
 
@@ -43,7 +43,7 @@ pub const AbortSignal = struct {
     /// This is zi's wake-driven replacement for helper threads that used
     /// to poll `isAborted()` with `sleep(100ms)`.
     pub fn waitUntil(
-        self: AbortSignal,
+        self: Token,
         timeout_ns: ?u64,
         predicate: ?WaitPredicate,
         predicate_ctx: ?*anyopaque,
@@ -54,7 +54,7 @@ pub const AbortSignal = struct {
     /// Same as `waitUntil`, but participates in the caller-provided `std.Io`
     /// backend for clocks, sleep, mutex, and condition waits.
     pub fn waitUntilIo(
-        self: AbortSignal,
+        self: Token,
         io: std.Io,
         timeout_ns: ?u64,
         predicate: ?WaitPredicate,
@@ -96,7 +96,7 @@ pub const AbortSignal = struct {
 
     /// Wake threads blocked in `waitUntil` so they can re-check their
     /// predicates. Used by helper shutdown paths in addition to abort.
-    pub fn notifyWaiters(self: AbortSignal) void {
+    pub fn notifyWaiters(self: Token) void {
         const controller = self.controller orelse return;
         controller.notifyWaiters();
     }
@@ -105,14 +105,14 @@ pub const AbortSignal = struct {
 /// Run-scoped abort controller.
 ///
 /// One owner mutates it (`beginRun`, `requestAbort`); readers receive
-/// `AbortSignal` snapshots that stay valid for the lifetime of the run.
-pub const AbortController = struct {
+/// `Token` snapshots that stay valid for the lifetime of the run.
+pub const Source = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
     aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
 
-    pub fn beginRun(self: *AbortController) AbortSignal {
+    pub fn beginRun(self: *Source) Token {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
 
@@ -128,37 +128,37 @@ pub const AbortController = struct {
         };
     }
 
-    pub fn signal(self: *AbortController) AbortSignal {
+    pub fn signal(self: *Source) Token {
         return .{
             .controller = self,
             .expected_generation = self.generation.load(.acquire),
         };
     }
 
-    pub fn requestAbort(self: *AbortController) void {
+    pub fn requestAbort(self: *Source) void {
         self.aborted.store(true, .release);
         self.notifyWaiters();
     }
 
-    pub fn notifyWaiters(self: *AbortController) void {
+    pub fn notifyWaiters(self: *Source) void {
         self.notifyWaitersIo(std.Options.debug_io);
     }
 
-    pub fn notifyWaitersIo(self: *AbortController, io: std.Io) void {
+    pub fn notifyWaitersIo(self: *Source, io: std.Io) void {
         self.condition.broadcast(io);
     }
 
-    pub fn isAborted(self: *const AbortController) bool {
+    pub fn isAborted(self: *const Source) bool {
         return self.aborted.load(.acquire);
     }
 
-    pub fn currentRunId(self: *const AbortController) u64 {
+    pub fn currentRunId(self: *const Source) u64 {
         return self.generation.load(.acquire);
     }
 };
 
-test "AbortController invalidates stale signals when a new run begins" {
-    var controller = AbortController{};
+test "Source invalidates stale signals when a new run begins" {
+    var controller = Source{};
 
     const first = controller.beginRun();
     try std.testing.expect(!first.isAborted());
@@ -173,20 +173,20 @@ test "AbortController invalidates stale signals when a new run begins" {
     try std.testing.expect(first.isAborted());
 }
 
-test "AbortSignal.waitUntil wakes for abort without polling" {
-    var controller = AbortController{};
+test "Token.waitUntil wakes for abort without polling" {
+    var controller = Source{};
     const signal = controller.beginRun();
 
     const WaitCtx = struct {
-        signal: AbortSignal,
-        result: *AbortSignal.WaitResult,
+        signal: Token,
+        result: *Token.WaitResult,
 
         fn run(ctx: *@This()) void {
             ctx.result.* = ctx.signal.waitUntil(null, null, null);
         }
     };
 
-    var result: AbortSignal.WaitResult = .none;
+    var result: Token.WaitResult = .none;
     var ctx: WaitCtx = .{ .signal = signal, .result = &result };
     const thread = try std.Thread.spawn(.{}, WaitCtx.run, .{&ctx});
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const zio_fs = @import("../../zio/root.zig").fs;
+const zio_fs = @import("../../zio/root.zig").file;
 const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");

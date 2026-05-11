@@ -90,7 +90,7 @@ pub const StreamOptions = struct {
     io: std.Io = std.Options.debug_io,
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
-    signal: abort_signal_mod.AbortSignal = abort_signal_mod.AbortSignal.none,
+    signal: abort_signal_mod.cancel.Token = abort_signal_mod.cancel.Token.none,
     api_key: ?[]const u8 = null,
     /// Preferred transport for providers that support multiple transports.
     transport: ?Transport = null,

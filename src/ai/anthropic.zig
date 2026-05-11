@@ -1,6 +1,6 @@
 const zio = @import("../zio/root.zig");
-const AbortSignal = zio.AbortSignal;
-const InterruptGuard = zio.InterruptGuard;
+const Token = zio.cancel.Token;
+const fd = zio.fd;
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const ai_models = @import("models.zig");
@@ -148,9 +148,7 @@ pub const AnthropicProvider = struct {
         };
         defer req.deinit();
 
-        var abort_guard = InterruptGuard.start(options.io, .{ .signal = options.signal, .actions = .{
-            .shutdown_fd = InterruptGuard.httpRequestShutdownFd(&req),
-        } }) catch |err| {
+        var abort_guard = fd.ShutdownOnCancel.start(options.io, options.signal, fd.httpRequestShutdownFd(&req)) catch |err| {
             emitError(allocator, callback, callback_ctx, model.api, model.provider, model.id, "failed to start interrupt guard: {s}", .{@errorName(err)});
             return;
         };

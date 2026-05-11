@@ -3,7 +3,7 @@ const pkce = @import("pkce.zig");
 const callback_server = @import("callback_server.zig");
 const auth_types = @import("types.zig");
 const provider_mod = @import("../../ai/provider.zig");
-const zio_fs = @import("../../zio/fs.zig");
+const zio_fs = @import("../../zio/file.zig");
 
 const log = std.log.scoped(.oauth);
 

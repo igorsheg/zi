@@ -23,7 +23,7 @@ pub const ExtensionKeybindingEntry = struct {
     display: []u8,
 };
 
-/// Mailbox-owned TUI event; no borrowed agent pointers cross threads.
+/// Queue-owned TUI event; no borrowed agent pointers cross threads.
 pub const UiEvent = union(enum) {
     consumed: void,
 

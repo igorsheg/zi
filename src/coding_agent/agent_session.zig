@@ -688,26 +688,44 @@ pub const AgentSession = struct {
     };
 
     const LinkedSideAbort = struct {
-        guard: zio.InterruptGuard = undefined,
-        active: bool = false,
+        state: ?*State = null,
+        thread: ?std.Thread = null,
 
-        fn start(signal: zio.AbortSignal, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
+        const State = struct {
+            done: std.atomic.Value(bool) = .init(false),
+            core: *agent_session_core_mod.AgentSessionCore,
+        };
+
+        fn start(signal: zio.cancel.Token, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
             if (signal.isNone()) return .{};
+            const state = std.heap.page_allocator.create(State) catch return .{};
+            state.* = .{ .core = core };
+            const thread = std.Thread.spawn(.{}, watch, .{ signal, state }) catch {
+                std.heap.page_allocator.destroy(state);
+                return .{};
+            };
             return .{
-                .guard = zio.InterruptGuard.start(std.Options.debug_io, .{ .signal = signal, .actions = .{ .callback = .{ .ctx = @ptrCast(core), .call = abortCore } } }) catch return .{},
-                .active = true,
+                .state = state,
+                .thread = thread,
             };
         }
 
         fn stop(self: *LinkedSideAbort) void {
-            if (!self.active) return;
-            self.guard.stop();
+            const state = self.state orelse return;
+            state.done.store(true, .release);
+            if (self.thread) |thread| thread.detach();
             self.* = .{};
         }
 
-        fn abortCore(ctx: ?*anyopaque) void {
-            const core: *agent_session_core_mod.AgentSessionCore = @ptrCast(@alignCast(ctx.?));
-            core.abort();
+        fn watch(signal: zio.cancel.Token, state: *State) void {
+            defer std.heap.page_allocator.destroy(state);
+            while (!state.done.load(.acquire)) {
+                if (signal.isAborted()) {
+                    state.core.abort();
+                    return;
+                }
+                std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+            }
         }
     };
 
@@ -1324,7 +1342,7 @@ fn echoToolDefinition() tool_def.ToolDefinition {
         .label = "echo",
         .parameters = .null,
         .impl = .{ .builtin = .{ .execute = &struct {
-            fn exec(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: std.json.Value, _: protocol.AbortSignal, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
+            fn exec(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: std.json.Value, _: protocol.Token, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
                 const c = alloc.alloc(protocol.AgentToolResult.ContentBlock, 1) catch return .{ .content = &.{} };
                 c[0] = .{ .text = .{ .text = "echoed" } };
                 return .{ .content = c };
@@ -1377,7 +1395,7 @@ fn stubExec(
     _: std.mem.Allocator,
     _: []const u8,
     _: std.json.Value,
-    _: protocol.AbortSignal,
+    _: protocol.Token,
     _: ?protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) protocol.AgentToolResult {

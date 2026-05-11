@@ -2,7 +2,7 @@ const std = @import("std");
 const ai = @import("../../ai/root.zig");
 const zio = @import("../../zio/root.zig");
 const blocking_worker_mod = zio.worker;
-const mailbox_mod = zio.mailbox;
+const queue_mod = zio.queue;
 const extension_runner = @import("runner.zig");
 const ai_completion = @import("../ai_completion.zig");
 
@@ -24,7 +24,7 @@ pub const Request = struct {
     headers: ?[]const ai.protocol.Header = null,
     max_tokens: ?u64 = null,
     reasoning: ?ai.protocol.ThinkingLevel = null,
-    signal: zio.AbortSignal = zio.AbortSignal.none,
+    signal: zio.cancel.Token = zio.cancel.Token.none,
     stream_events: bool = false,
 
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
@@ -97,7 +97,7 @@ const Handler = struct {
     }
 };
 
-const WorkerImpl = blocking_worker_mod.BlockingWorker(Request, Handler, .{
+const WorkerImpl = blocking_worker_mod.Worker(Request, Handler, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } },
     .wakeup = .pipe,
@@ -150,7 +150,7 @@ test "ai completion worker thread enqueues faux provider result" {
     defer allocator.free(response.content);
     faux_provider.setResponses(&.{response});
 
-    const Queue = mailbox_mod.Mailbox(extension_runner.AsyncResult, .{
+    const Queue = queue_mod.Queue(extension_runner.AsyncResult, .{
         .cleanup = .deinit,
         .policy = .{ .bounded = .{ .capacity = 4, .on_full = .reject } },
         .wakeup = .pipe,

@@ -1,5 +1,5 @@
 const abort_signal_mod = @import("../zio/root.zig");
-const AbortSignal = abort_signal_mod.AbortSignal;
+const Token = abort_signal_mod.cancel.Token;
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("types.zig");
@@ -19,7 +19,7 @@ pub fn runAgentLoop(
     config: protocol.AgentLoopConfig,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
-    signal: AbortSignal,
+    signal: Token,
 ) void {
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (prompts) |p| {
@@ -60,7 +60,7 @@ pub fn runAgentLoopContinue(
     config: protocol.AgentLoopConfig,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
-    signal: AbortSignal,
+    signal: Token,
 ) ContinueError!void {
     if (context.messages.len == 0) {
         return error.EmptyContext;
@@ -93,7 +93,7 @@ fn runLoop(
     new_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     context: protocol.AgentContext,
     config: protocol.AgentLoopConfig,
-    signal: AbortSignal,
+    signal: Token,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
@@ -239,7 +239,7 @@ fn streamAssistantResponse(
     turn_allocator: std.mem.Allocator,
     ctx_messages: *std.ArrayListUnmanaged(protocol.AgentMessage),
     config: protocol.AgentLoopConfig,
-    signal: AbortSignal,
+    signal: Token,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
     llm_tools: []const ai.protocol.Tool,
@@ -322,7 +322,7 @@ const WorkerExecution = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     args: std.json.Value,
-    signal: AbortSignal,
+    signal: Token,
 
     fn deinit(self: *WorkerExecution) void {
         self.group.allocator.free(self.tool_call_id);
@@ -362,7 +362,7 @@ const WorkerExecution = struct {
 fn resolveToolExecution(
     execution: protocol.AgentToolExecution,
     allocator: std.mem.Allocator,
-    signal: AbortSignal,
+    signal: Token,
     on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) protocol.AgentToolResult {
@@ -419,7 +419,7 @@ fn executeToolCalls(
     tools: []const protocol.AgentTool,
     config: protocol.AgentLoopConfig,
     system_prompt: []const u8,
-    signal: AbortSignal,
+    signal: Token,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
@@ -530,7 +530,7 @@ fn executeToolCalls(
                     .args = args,
                     .signal = signal,
                 };
-                group.concurrent(WorkerExecution.run, .{ worker, prepared }) catch {
+                group.spawnThread(WorkerExecution.run, .{ worker, prepared }) catch {
                     worker.deinit();
                     continue;
                 };
@@ -657,7 +657,7 @@ fn finalizeReadyWorkerCompletions(
     prepared_calls: []PreparedToolCall,
     config: protocol.AgentLoopConfig,
     system_prompt: []const u8,
-    signal: AbortSignal,
+    signal: Token,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) usize {
@@ -729,7 +729,7 @@ fn finalizePreparedToolCall(
     result: protocol.AgentToolResult,
     config: protocol.AgentLoopConfig,
     system_prompt: []const u8,
-    signal: AbortSignal,
+    signal: Token,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) ai.protocol.ToolResultMessage {
@@ -985,7 +985,7 @@ fn onPayloadAdapter(allocator: std.mem.Allocator, payload: std.json.Value, model
     return hook.call(allocator, payload, model.*);
 }
 
-fn isAborted(signal: AbortSignal) bool {
+fn isAborted(signal: Token) bool {
     return signal.isAborted();
 }
 
@@ -1086,7 +1086,7 @@ test "parallel worker updates stream live before completion-ordered finalization
             allocator: std.mem.Allocator,
             _: []const u8,
             _: std.json.Value,
-            _: AbortSignal,
+            _: Token,
             on_update: ?protocol.AgentToolUpdateCallback,
             update_ctx: ?*anyopaque,
         ) protocol.AgentToolExecution {
@@ -1150,7 +1150,7 @@ test "parallel worker updates stream live before completion-ordered finalization
         &tools,
         testLoopConfig(.parallel),
         "",
-        AbortSignal.none,
+        Token.none,
         Collector.emit,
         @ptrCast(&collector),
     );
@@ -1199,7 +1199,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
             allocator: std.mem.Allocator,
             _: []const u8,
             _: std.json.Value,
-            signal: AbortSignal,
+            signal: Token,
             on_update: ?protocol.AgentToolUpdateCallback,
             update_ctx: ?*anyopaque,
         ) protocol.AgentToolExecution {
@@ -1215,7 +1215,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
         }
     };
     const Aborter = struct {
-        fn run(controller: *abort_signal_mod.AbortController) void {
+        fn run(controller: *abort_signal_mod.cancel.Source) void {
             std.Options.debug_io.sleep(.fromNanoseconds(@intCast(5 * std.time.ns_per_ms)), .awake) catch {};
             controller.requestAbort();
         }
@@ -1240,7 +1240,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
         .{ .name = "two", .description = "", .label = "Two", .parameters = .null, .ctx = @ptrCast(&tool_ctx), .affinity = .worker_thread, .execute = &Exec.run },
     };
 
-    var controller = abort_signal_mod.AbortController{};
+    var controller = abort_signal_mod.cancel.Source{};
     const signal = controller.beginRun();
     const aborter = try std.Thread.spawn(.{}, Aborter.run, .{&controller});
     defer aborter.join();

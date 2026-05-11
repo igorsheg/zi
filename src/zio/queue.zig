@@ -45,27 +45,27 @@ pub const CloseMode = enum {
     immediate,
 };
 
-/// Mailbox(T) is zi's small typed cross-thread message primitive.
+/// Queue(T) is zi's small typed cross-thread message primitive.
 ///
 /// Durable semantic contract:
-/// - one mailbox carries mutation/work messages for a single owner boundary
+/// - one queue carries mutation/work messages for a single owner boundary
 /// - message payload ownership must remain explicit across the thread crossing
 /// - queue policy is explicit at init time, never implicit at the call site
 /// - close/drain/deinit are distinct operations
 /// - wake integration is composed alongside queue storage, not confused with it
-/// - snapshots remain a separate primitive; mailbox use must not become ask/reply for UI reads
+/// - snapshots remain a separate primitive; queue use must not become ask/reply for UI reads
 /// - lifecycle is explicit: `active -> closing -> closed`
 ///
 /// Delivery/cleanup semantics:
 /// - `send` is best-effort and performs cleanup for any undelivered message
 /// - `trySend` preserves the original message on `.closed`, `.full`, and `.oom`
-/// - `.dropped` means queue policy intentionally discarded the newest message and the mailbox already cleaned it up
+/// - `.dropped` means queue policy intentionally discarded the newest message and the queue already cleaned it up
 /// - `drainInto` transfers ownership of drained messages to the consumer buffer
 /// - `visitPending` reads queued items without transferring ownership
-/// - `clear` drops any queued items still retained by the mailbox
+/// - `clear` drops any queued items still retained by the queue
 /// - `close` stops future sends but preserves already queued work for drain
-/// - `deinit` cleans up any undelivered messages still retained by the mailbox
-pub fn Mailbox(comptime T: type, comptime config: Config) type {
+/// - `deinit` cleans up any undelivered messages still retained by the queue
+pub fn Queue(comptime T: type, comptime config: Config) type {
     comptime validateConfig(T, config);
 
     return struct {
@@ -211,8 +211,8 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         ///
         /// Results:
         /// - `.ok`       — message enqueued
-        /// - `.dropped`  — queue policy intentionally dropped newest; message already cleaned up by mailbox
-        /// - `.closed`   — mailbox not accepting sends (`closing` or `closed`); caller receives original message back
+        /// - `.dropped`  — queue policy intentionally dropped newest; message already cleaned up by queue
+        /// - `.closed`   — queue not accepting sends (`closing` or `closed`); caller receives original message back
         /// - `.full`     — bounded queue rejected send; caller receives original message back
         /// - `.oom`      — append allocation failed; caller receives original message back
         pub fn trySend(self: *Self, item: T) TrySendResult {
@@ -335,7 +335,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
         /// Preserves FIFO order for the remaining items. Useful for latest-wins
         /// semantic snapshots where queued stale states should not retain large
         /// payloads while the consumer is busy. If temporary storage cannot be
-        /// allocated, leaves the mailbox unchanged and returns 0.
+        /// allocated, leaves the queue unchanged and returns 0.
         pub fn dropMatching(
             self: *Self,
             predicate: *const fn (item: *const T, ctx: ?*anyopaque) bool,
@@ -381,7 +381,7 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             self.reconcileStateAndWakeLocked();
         }
 
-        /// Non-blocking acknowledgement hook for wake-integrated mailboxes.
+        /// Non-blocking acknowledgement hook for wake-integrated queuees.
         ///
         /// Coalesced readiness stays armed until the queue drains. This hook is
         /// therefore safe to call from an external poll loop before the caller
@@ -393,20 +393,20 @@ pub fn Mailbox(comptime T: type, comptime config: Config) type {
             }
         }
 
-        /// Block on the mailbox wake primitive until it becomes readable or the
+        /// Block on the queue wake primitive until it becomes readable or the
         /// timeout elapses. Returns `true` when the wake fd fired, `false` on
         /// timeout or unrelated poll wakeups.
         ///
-        /// Readiness is coalesced: one wake means "mailbox state changed to
+        /// Readiness is coalesced: one wake means "queue state changed to
         /// readable/terminal", not "N messages were enqueued". The wake remains
-        /// armed until the consumer drains the mailbox to empty or explicitly
+        /// armed until the consumer drains the queue to empty or explicitly
         /// acknowledges a terminal empty state.
         ///
         /// Only valid for `.pipe` wakeups; `.none` intentionally has no
         /// blocking scheduler surface.
         pub fn waitReadable(self: *Self, timeout_ms: i32) !bool {
             comptime if (config.wakeup != .pipe) {
-                @compileError("Mailbox.waitReadable requires wakeup=.pipe");
+                @compileError("Queue.waitReadable requires wakeup=.pipe");
             };
 
             var pfd = [1]posix.pollfd{.{
@@ -522,14 +522,14 @@ fn validateConfig(comptime T: type, comptime config: Config) void {
         .none => {},
         .deinit => {
             if (!@hasDecl(T, "deinit")) {
-                @compileError("Mailbox cleanup=.deinit requires T.deinit(allocator)");
+                @compileError("Queue cleanup=.deinit requires T.deinit(allocator)");
             }
         },
         .custom => |func| {
             const FuncType = @TypeOf(func);
             const info = @typeInfo(FuncType);
             if (info != .pointer or @typeInfo(info.pointer.child) != .@"fn") {
-                @compileError("Mailbox cleanup=.custom requires a function pointer");
+                @compileError("Queue cleanup=.custom requires a function pointer");
             }
         },
     }
@@ -538,32 +538,32 @@ fn validateConfig(comptime T: type, comptime config: Config) void {
         .unbounded => {},
         .bounded => |bounded| {
             if (bounded.capacity == 0) {
-                @compileError("bounded Mailbox capacity must be > 0");
+                @compileError("bounded Queue capacity must be > 0");
             }
         },
     }
 }
 
-test "Mailbox ring storage preserves FIFO across partial drains and wraparound" {
+test "Queue ring storage preserves FIFO across partial drains and wraparound" {
     const Msg = struct { value: u32 };
 
-    var mailbox = try Mailbox(Msg, .{ .policy = .unbounded, .wakeup = .none }).init(std.testing.allocator);
-    defer mailbox.deinit();
+    var queue = try Queue(Msg, .{ .policy = .unbounded, .wakeup = .none }).init(std.testing.allocator);
+    defer queue.deinit();
 
     for (1..9) |i| {
-        try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = @intCast(i) }));
+        try std.testing.expectEqual(.ok, queue.trySend(.{ .value = @intCast(i) }));
     }
 
     var first: [3]Msg = undefined;
-    try std.testing.expectEqual(@as(usize, 3), mailbox.drainInto(&first));
+    try std.testing.expectEqual(@as(usize, 3), queue.drainInto(&first));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, &[_]u32{ first[0].value, first[1].value, first[2].value });
 
     for (9..15) |i| {
-        try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = @intCast(i) }));
+        try std.testing.expectEqual(.ok, queue.trySend(.{ .value = @intCast(i) }));
     }
 
     var rest: [16]Msg = undefined;
-    const n = mailbox.drainInto(&rest);
+    const n = queue.drainInto(&rest);
     try std.testing.expectEqual(@as(usize, 11), n);
     try std.testing.expectEqualSlices(u32, &.{ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 }, &[_]u32{
         rest[0].value,
@@ -578,15 +578,15 @@ test "Mailbox ring storage preserves FIFO across partial drains and wraparound" 
         rest[9].value,
         rest[10].value,
     });
-    const stats = mailbox.stats();
+    const stats = queue.stats();
     try std.testing.expectEqual(@as(usize, 0), stats.pending_depth);
     try std.testing.expectEqual(@as(usize, 11), stats.high_water_depth);
     try std.testing.expectEqual(@as(usize, 14), stats.send_count);
     try std.testing.expectEqual(@as(usize, 0), stats.wake_count);
-    try std.testing.expectEqual(State.active, mailbox.lifecycleState());
+    try std.testing.expectEqual(State.active, queue.lifecycleState());
 }
 
-test "Mailbox bounded policies make rejection vs drop explicit and preserve cleanup ownership" {
+test "Queue bounded policies make rejection vs drop explicit and preserve cleanup ownership" {
     const Msg = struct { value: u32 };
 
     const CleanupState = struct {
@@ -599,7 +599,7 @@ test "Mailbox bounded policies make rejection vs drop explicit and preserve clea
         }
     };
 
-    var reject_box = try Mailbox(Msg, .{ .policy = .{ .bounded = .{ .capacity = 1, .on_full = .reject } } }).init(std.testing.allocator);
+    var reject_box = try Queue(Msg, .{ .policy = .{ .bounded = .{ .capacity = 1, .on_full = .reject } } }).init(std.testing.allocator);
     defer reject_box.deinit();
 
     try std.testing.expectEqual(.ok, reject_box.trySend(.{ .value = 1 }));
@@ -614,7 +614,7 @@ test "Mailbox bounded policies make rejection vs drop explicit and preserve clea
     try std.testing.expectEqual(@as(usize, 1), reject_stats.send_count);
 
     CleanupState.cleaned = 0;
-    var drop_box = try Mailbox(Msg, .{
+    var drop_box = try Queue(Msg, .{
         .cleanup = .{ .custom = &CleanupState.cleanup },
         .policy = .{ .bounded = .{ .capacity = 1, .on_full = .drop_newest } },
     }).init(std.testing.allocator);
@@ -635,7 +635,7 @@ test "Mailbox bounded policies make rejection vs drop explicit and preserve clea
     try std.testing.expectEqual(@as(u32, 11), out[0].value);
 }
 
-test "Mailbox dropMatching cleans matches and preserves FIFO order" {
+test "Queue dropMatching cleans matches and preserves FIFO order" {
     const Msg = struct { value: u32 };
     const CleanupState = struct {
         var cleaned: usize = 0;
@@ -650,67 +650,67 @@ test "Mailbox dropMatching cleans matches and preserves FIFO order" {
     };
 
     CleanupState.cleaned = 0;
-    var mailbox = try Mailbox(Msg, .{ .cleanup = .{ .custom = &CleanupState.cleanup } }).init(std.testing.allocator);
-    defer mailbox.deinit();
+    var queue = try Queue(Msg, .{ .cleanup = .{ .custom = &CleanupState.cleanup } }).init(std.testing.allocator);
+    defer queue.deinit();
 
-    for (1..6) |i| try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = @intCast(i) }));
-    try std.testing.expectEqual(@as(usize, 2), mailbox.dropMatching(&CleanupState.isEven, null));
+    for (1..6) |i| try std.testing.expectEqual(.ok, queue.trySend(.{ .value = @intCast(i) }));
+    try std.testing.expectEqual(@as(usize, 2), queue.dropMatching(&CleanupState.isEven, null));
     try std.testing.expectEqual(@as(usize, 2), CleanupState.cleaned);
 
     var out: [4]Msg = undefined;
-    const n = mailbox.drainInto(&out);
+    const n = queue.drainInto(&out);
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqualSlices(u32, &.{ 1, 3, 5 }, &[_]u32{ out[0].value, out[1].value, out[2].value });
 
-    for (10..18) |i| try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = @intCast(i) }));
+    for (10..18) |i| try std.testing.expectEqual(.ok, queue.trySend(.{ .value = @intCast(i) }));
     var partial: [3]Msg = undefined;
-    try std.testing.expectEqual(@as(usize, 3), mailbox.drainInto(&partial));
-    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 18 }));
-    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 19 }));
-    try std.testing.expectEqual(@as(usize, 3), mailbox.dropMatching(&CleanupState.isEven, null));
+    try std.testing.expectEqual(@as(usize, 3), queue.drainInto(&partial));
+    try std.testing.expectEqual(.ok, queue.trySend(.{ .value = 18 }));
+    try std.testing.expectEqual(.ok, queue.trySend(.{ .value = 19 }));
+    try std.testing.expectEqual(@as(usize, 3), queue.dropMatching(&CleanupState.isEven, null));
 
     var wrapped_out: [8]Msg = undefined;
-    const wrapped_n = mailbox.drainInto(&wrapped_out);
+    const wrapped_n = queue.drainInto(&wrapped_out);
     try std.testing.expectEqual(@as(usize, 4), wrapped_n);
     try std.testing.expectEqualSlices(u32, &.{ 13, 15, 17, 19 }, &[_]u32{ wrapped_out[0].value, wrapped_out[1].value, wrapped_out[2].value, wrapped_out[3].value });
 }
 
-test "Mailbox coalesces pipe wake readiness until the queue drains" {
+test "Queue coalesces pipe wake readiness until the queue drains" {
     const Msg = struct { value: u32 };
-    var mailbox = try Mailbox(Msg, .{ .wakeup = .pipe }).init(std.testing.allocator);
-    defer mailbox.deinit();
+    var queue = try Queue(Msg, .{ .wakeup = .pipe }).init(std.testing.allocator);
+    defer queue.deinit();
 
-    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 9 }));
-    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 10 }));
-    try std.testing.expect(mailbox.hasWakeFd());
+    try std.testing.expectEqual(.ok, queue.trySend(.{ .value = 9 }));
+    try std.testing.expectEqual(.ok, queue.trySend(.{ .value = 10 }));
+    try std.testing.expect(queue.hasWakeFd());
 
     var pfd = [1]posix.pollfd{.{
-        .fd = mailbox.wakeReadFd().?,
+        .fd = queue.wakeReadFd().?,
         .events = posix.POLL.IN,
         .revents = 0,
     }};
     try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pfd, 0));
-    try std.testing.expect(try mailbox.waitReadable(0));
-    try std.testing.expectEqual(@as(usize, 1), mailbox.stats().wake_count);
+    try std.testing.expect(try queue.waitReadable(0));
+    try std.testing.expectEqual(@as(usize, 1), queue.stats().wake_count);
 
     pfd[0].revents = 0;
     try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pfd, 0));
 
     var out: [1]Msg = undefined;
-    try std.testing.expectEqual(@as(usize, 1), mailbox.drainInto(&out));
+    try std.testing.expectEqual(@as(usize, 1), queue.drainInto(&out));
     try std.testing.expectEqual(@as(u32, 9), out[0].value);
 
     pfd[0].revents = 0;
     try std.testing.expectEqual(@as(usize, 1), try posix.poll(&pfd, 0));
 
-    try std.testing.expectEqual(@as(usize, 1), mailbox.drainInto(&out));
+    try std.testing.expectEqual(@as(usize, 1), queue.drainInto(&out));
     try std.testing.expectEqual(@as(u32, 10), out[0].value);
 
     pfd[0].revents = 0;
     try std.testing.expectEqual(@as(usize, 0), try posix.poll(&pfd, 0));
 }
 
-test "Mailbox closeImmediate closes, cleans pending work, and wakes terminal waiters" {
+test "Queue closeImmediate closes, cleans pending work, and wakes terminal waiters" {
     const Msg = struct { value: u32 };
     const CleanupState = struct {
         var cleaned: usize = 0;
@@ -722,47 +722,47 @@ test "Mailbox closeImmediate closes, cleans pending work, and wakes terminal wai
     };
 
     CleanupState.cleaned = 0;
-    var mailbox = try Mailbox(Msg, .{ .cleanup = .{ .custom = &CleanupState.cleanup }, .wakeup = .pipe }).init(std.testing.allocator);
-    defer mailbox.deinit();
+    var queue = try Queue(Msg, .{ .cleanup = .{ .custom = &CleanupState.cleanup }, .wakeup = .pipe }).init(std.testing.allocator);
+    defer queue.deinit();
 
-    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 1 }));
-    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 2 }));
-    mailbox.closeImmediate();
+    try std.testing.expectEqual(.ok, queue.trySend(.{ .value = 1 }));
+    try std.testing.expectEqual(.ok, queue.trySend(.{ .value = 2 }));
+    queue.closeImmediate();
 
-    try std.testing.expectEqual(State.closed, mailbox.lifecycleState());
-    try std.testing.expect(mailbox.isDrained());
+    try std.testing.expectEqual(State.closed, queue.lifecycleState());
+    try std.testing.expect(queue.isDrained());
     try std.testing.expectEqual(@as(usize, 2), CleanupState.cleaned);
-    try std.testing.expectEqual(@as(usize, 0), mailbox.pendingDepth());
-    try std.testing.expect(try mailbox.waitReadable(0));
+    try std.testing.expectEqual(@as(usize, 0), queue.pendingDepth());
+    try std.testing.expect(try queue.waitReadable(0));
 
-    switch (mailbox.trySend(.{ .value = 3 })) {
+    switch (queue.trySend(.{ .value = 3 })) {
         .closed => |msg| try std.testing.expectEqual(@as(u32, 3), msg.value),
         else => return error.UnexpectedResult,
     }
 }
 
-test "Mailbox close transitions active to closing to closed and preserves queued work" {
+test "Queue close transitions active to closing to closed and preserves queued work" {
     const Msg = struct { value: u32 };
-    var mailbox = try Mailbox(Msg, .{ .wakeup = .pipe }).init(std.testing.allocator);
-    defer mailbox.deinit();
+    var queue = try Queue(Msg, .{ .wakeup = .pipe }).init(std.testing.allocator);
+    defer queue.deinit();
 
-    try std.testing.expectEqual(.ok, mailbox.trySend(.{ .value = 21 }));
-    mailbox.close();
+    try std.testing.expectEqual(.ok, queue.trySend(.{ .value = 21 }));
+    queue.close();
 
-    try std.testing.expect(mailbox.isClosed());
-    try std.testing.expectEqual(State.closing, mailbox.lifecycleState());
-    switch (mailbox.trySend(.{ .value = 22 })) {
+    try std.testing.expect(queue.isClosed());
+    try std.testing.expectEqual(State.closing, queue.lifecycleState());
+    switch (queue.trySend(.{ .value = 22 })) {
         .closed => |msg| try std.testing.expectEqual(@as(u32, 22), msg.value),
         else => return error.UnexpectedResult,
     }
 
     var out: [2]Msg = undefined;
-    try std.testing.expectEqual(@as(usize, 1), mailbox.drainInto(&out));
+    try std.testing.expectEqual(@as(usize, 1), queue.drainInto(&out));
     try std.testing.expectEqual(@as(u32, 21), out[0].value);
-    const stats = mailbox.stats();
+    const stats = queue.stats();
     try std.testing.expectEqual(@as(usize, 1), stats.rejected_count);
     try std.testing.expectEqual(@as(usize, 1), stats.send_count);
     try std.testing.expectEqual(@as(usize, 1), stats.high_water_depth);
-    try std.testing.expectEqual(State.closed, mailbox.lifecycleState());
-    try std.testing.expect(mailbox.isDrained());
+    try std.testing.expectEqual(State.closed, queue.lifecycleState());
+    try std.testing.expect(queue.isDrained());
 }

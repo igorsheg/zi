@@ -1,5 +1,5 @@
 const std = @import("std");
-const mailbox_mod = @import("../zio/root.zig").mailbox;
+const queue_mod = @import("../zio/root.zig").queue;
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 
@@ -40,7 +40,7 @@ pub const QueuedMessageSnapshot = struct {
     }
 };
 
-const MessageMailbox = mailbox_mod.Mailbox(protocol.AgentMessage, .{
+const MessageStore = queue_mod.Queue(protocol.AgentMessage, .{
     .cleanup = .{ .custom = cleanupAgentMessage },
     .policy = .unbounded,
     .wakeup = .none,
@@ -168,26 +168,26 @@ pub const RunControl = struct {
 };
 
 const MessageQueue = struct {
-    mailbox: MessageMailbox,
+    queue: MessageStore,
     mode: QueueMode,
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator, mode: QueueMode) !MessageQueue {
         return .{
-            .mailbox = try MessageMailbox.init(allocator),
+            .queue = try MessageStore.init(allocator),
             .mode = mode,
             .allocator = allocator,
         };
     }
 
     fn deinit(self: *MessageQueue) void {
-        self.mailbox.deinit();
+        self.queue.deinit();
         self.* = undefined;
     }
 
     fn enqueue(self: *MessageQueue, message: protocol.AgentMessage) EnqueueResult {
         const owned = message_memory.cloneMessage(self.allocator, message) catch return .oom;
-        switch (self.mailbox.trySend(owned)) {
+        switch (self.queue.trySend(owned)) {
             .ok => return .ok,
             .dropped, .full => unreachable,
             .closed => |returned| {
@@ -204,11 +204,11 @@ const MessageQueue = struct {
     }
 
     fn hasItems(self: *MessageQueue) bool {
-        return self.mailbox.pendingDepth() > 0;
+        return self.queue.pendingDepth() > 0;
     }
 
     fn clear(self: *MessageQueue) void {
-        self.mailbox.clear();
+        self.queue.clear();
     }
 
     fn visitPending(
@@ -216,13 +216,13 @@ const MessageQueue = struct {
         visitor: *const fn (item: *const protocol.AgentMessage, ctx: ?*anyopaque) anyerror!void,
         ctx: ?*anyopaque,
     ) !void {
-        try self.mailbox.visitPending(visitor, ctx);
+        try self.queue.visitPending(visitor, ctx);
     }
 
     fn drain(self: *MessageQueue, arena: std.mem.Allocator) []const protocol.AgentMessage {
         const target_count = switch (self.mode) {
-            .all => self.mailbox.pendingDepth(),
-            .one_at_a_time => @min(@as(usize, 1), self.mailbox.pendingDepth()),
+            .all => self.queue.pendingDepth(),
+            .one_at_a_time => @min(@as(usize, 1), self.queue.pendingDepth()),
         };
         if (target_count == 0) return &.{};
 
@@ -233,7 +233,7 @@ const MessageQueue = struct {
 
         while (remaining > 0) {
             const take = @min(remaining, buf.len);
-            const drained = self.mailbox.drainInto(buf[0..take]);
+            const drained = self.queue.drainInto(buf[0..take]);
             if (drained == 0) break;
 
             for (buf[0..drained]) |item| {
@@ -274,7 +274,7 @@ const MessageQueue = struct {
         };
 
         var ctx = SnapshotCtx{ .allocator = allocator, .out = &out };
-        self.mailbox.visitPending(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
+        self.queue.visitPending(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
         const snapshot = out.toOwnedSlice(allocator) catch return &.{};
         success = true;
         return snapshot;
@@ -292,7 +292,7 @@ const MessageQueue = struct {
         };
 
         var ctx = SnapshotCtx{ .allocator = allocator, .out = &out };
-        self.mailbox.visitAndClear(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
+        self.queue.visitAndClear(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
         const snapshot = out.toOwnedSlice(allocator) catch return &.{};
         success = true;
         return snapshot;

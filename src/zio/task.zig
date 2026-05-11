@@ -13,30 +13,30 @@ const std = @import("std");
 ///   the work can block indefinitely.
 ///
 /// This is the only place new zio code should spawn scoped OS threads.
-pub const TaskGroup = struct {
+pub const Group = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     group: std.Io.Group = .init,
     threads: std.ArrayList(std.Thread) = .empty,
     closed: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) TaskGroup {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) Group {
         return .{ .allocator = allocator, .io = io };
     }
 
-    pub fn async(self: *TaskGroup, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+    pub fn startIo(self: *Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
         std.debug.assert(!self.closed);
         self.group.async(self.io, function, args);
     }
 
-    pub fn concurrent(self: *TaskGroup, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.ConcurrentError!void {
+    pub fn spawnThread(self: *Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.ConcurrentError!void {
         std.debug.assert(!self.closed);
         self.threads.ensureUnusedCapacity(self.allocator, 1) catch return error.ConcurrencyUnavailable;
         const thread = std.Thread.spawn(.{}, function, args) catch return error.ConcurrencyUnavailable;
         self.threads.appendAssumeCapacity(thread);
     }
 
-    pub fn wait(self: *TaskGroup) std.Io.Cancelable!void {
+    pub fn join(self: *Group) std.Io.Cancelable!void {
         self.closed = true;
         var io_result: std.Io.Cancelable!void = {};
         self.group.await(self.io) catch |err| {
@@ -48,7 +48,7 @@ pub const TaskGroup = struct {
         return io_result;
     }
 
-    pub fn cancel(self: *TaskGroup) void {
+    pub fn cancel(self: *Group) void {
         self.closed = true;
         self.group.cancel(self.io);
         self.joinThreads();
@@ -56,13 +56,13 @@ pub const TaskGroup = struct {
         self.threads = .empty;
     }
 
-    fn joinThreads(self: *TaskGroup) void {
+    fn joinThreads(self: *Group) void {
         for (self.threads.items) |thread| thread.join();
         self.threads.clearRetainingCapacity();
     }
 };
 
-test "TaskGroup concurrent work makes simultaneous progress" {
+test "Group concurrent work makes simultaneous progress" {
     const Ctx = struct {
         a_started: std.atomic.Value(bool) = .init(false),
         b_started: std.atomic.Value(bool) = .init(false),
@@ -89,17 +89,17 @@ test "TaskGroup concurrent work makes simultaneous progress" {
     };
 
     var ctx = Ctx{};
-    var group = TaskGroup.init(std.testing.allocator, std.Options.debug_io);
+    var group = Group.init(std.testing.allocator, std.Options.debug_io);
 
-    try group.concurrent(Ctx.runA, .{&ctx});
-    try group.concurrent(Ctx.runB, .{&ctx});
-    try group.wait();
+    try group.spawnThread(Ctx.runA, .{&ctx});
+    try group.spawnThread(Ctx.runB, .{&ctx});
+    try group.join();
 
     try std.testing.expect(ctx.a_observed_b.load(.acquire));
     try std.testing.expect(ctx.b_observed_a.load(.acquire));
 }
 
-test "TaskGroup owns async fan-out until wait" {
+test "Group owns async fan-out until wait" {
     const Ctx = struct {
         value: *std.atomic.Value(u32),
         fn add(ctx: *@This(), amount: u32) void {
@@ -109,11 +109,11 @@ test "TaskGroup owns async fan-out until wait" {
 
     var value = std.atomic.Value(u32).init(0);
     var ctx: Ctx = .{ .value = &value };
-    var group = TaskGroup.init(std.testing.allocator, std.Options.debug_io);
+    var group = Group.init(std.testing.allocator, std.Options.debug_io);
 
-    group.async(Ctx.add, .{ &ctx, 2 });
-    group.async(Ctx.add, .{ &ctx, 3 });
-    try group.wait();
+    group.startIo(Ctx.add, .{ &ctx, 2 });
+    group.startIo(Ctx.add, .{ &ctx, 3 });
+    try group.join();
 
     try std.testing.expectEqual(@as(u32, 5), value.load(.acquire));
 }

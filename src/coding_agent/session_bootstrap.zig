@@ -1201,7 +1201,7 @@ fn dummyToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
     _: std.json.Value,
-    _: agent_mod.protocol.AbortSignal,
+    _: agent_mod.protocol.Token,
     _: ?agent_mod.protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) agent_mod.protocol.AgentToolExecution {

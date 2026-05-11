@@ -11,8 +11,8 @@ const request_transform = @import("request_transform.zig");
 const partial_json = @import("../json/partial.zig");
 const replay = @import("openai_responses_replay.zig");
 const zio = @import("../zio/root.zig");
-const AbortSignal = zio.AbortSignal;
-const InterruptGuard = zio.InterruptGuard;
+const Token = zio.cancel.Token;
+const fd = zio.fd;
 
 pub const AuthFactory = struct {
     ctx: ?*anyopaque = null,
@@ -142,9 +142,7 @@ pub fn streamCore(
     };
     defer req.deinit();
 
-    var abort_guard = InterruptGuard.start(options.io, .{ .signal = options.signal, .actions = .{
-        .shutdown_fd = InterruptGuard.httpRequestShutdownFd(&req),
-    } }) catch |err| {
+    var abort_guard = fd.ShutdownOnCancel.start(options.io, options.signal, fd.httpRequestShutdownFd(&req)) catch |err| {
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to start interrupt guard: {s}", .{@errorName(err)});
         return;
     };
@@ -267,7 +265,7 @@ pub fn processStream(
     allocator: std.mem.Allocator,
     reader: anytype,
     model: protocol.Model,
-    abort_flag: AbortSignal,
+    abort_flag: Token,
     provider_label: []const u8,
     callback: ai_provider.EventCallback,
     callback_ctx: ?*anyopaque,
@@ -279,7 +277,7 @@ pub fn processStreamMapped(
     allocator: std.mem.Allocator,
     reader: anytype,
     model: protocol.Model,
-    abort_flag: AbortSignal,
+    abort_flag: Token,
     provider_label: []const u8,
     event_mapper: EventMapper,
     callback: ai_provider.EventCallback,
@@ -1593,7 +1591,7 @@ fn runProcessWithMapper(
     collector: *TestCollector,
 ) void {
     var reader: std.Io.Reader = .fixed(sse_bytes);
-    processStreamMapped(arena, &reader, test_model, AbortSignal.none, "openai-responses", event_mapper, TestCollector.cb, collector);
+    processStreamMapped(arena, &reader, test_model, Token.none, "openai-responses", event_mapper, TestCollector.cb, collector);
 }
 
 fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestCollector) void {

@@ -78,7 +78,7 @@ pub const SpawnConfig = struct {
     model: ?[]const u8 = null,
     tools: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
-    signal: abort_signal.AbortSignal = abort_signal.AbortSignal.none,
+    signal: abort_signal.cancel.Token = abort_signal.cancel.Token.none,
 
     /// Optional per-event observer. See `EventCallback` for the
     /// contract. `on_event_ctx` is passed through verbatim.

@@ -11,7 +11,7 @@ const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const lock_registry = @import("lock_registry.zig");
-const zio_fs = @import("../../zio/root.zig").fs;
+const zio_fs = @import("../../zio/root.zig").file;
 const diff_mod = @import("../../diff/document.zig");
 const diff_unified = @import("../../diff/unified.zig");
 const tool_result_details = @import("result_details.zig");
@@ -77,11 +77,11 @@ const PlanChange = struct {
     }
 };
 
-fn execute(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator, tool_call_id: []const u8, args: std.json.Value, signal: protocol.AbortSignal, on_update: ?protocol.AgentToolUpdateCallback, update_ctx: ?*anyopaque) protocol.AgentToolExecution {
+fn execute(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator, tool_call_id: []const u8, args: std.json.Value, signal: protocol.Token, on_update: ?protocol.AgentToolUpdateCallback, update_ctx: ?*anyopaque) protocol.AgentToolExecution {
     return .{ .ready = executeSync(raw_ctx, allocator, tool_call_id, args, signal, on_update, update_ctx) };
 }
 
-fn executeSync(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator, _: []const u8, args: std.json.Value, _: protocol.AbortSignal, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
+fn executeSync(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator, _: []const u8, args: std.json.Value, _: protocol.Token, _: ?protocol.AgentToolUpdateCallback, _: ?*anyopaque) protocol.AgentToolResult {
     const ctx: *util.BuiltinCtx = @ptrCast(@alignCast(raw_ctx orelse return util.errorResult(allocator, "patch tool: missing context")));
     const patch_text = util.getString(args, "patchText") orelse return util.errorResult(allocator, "patch tool: missing 'patchText' argument");
 

@@ -87,8 +87,8 @@ pub fn start(self: *Interactive, provider_id: []const u8) void {
         .provider = provider,
     };
 
-    var tasks = zio.TaskGroup.init(self.allocator, self.io);
-    tasks.concurrent(threadFn, .{login_ctx}) catch {
+    var tasks = zio.task.Group.init(self.allocator, self.io);
+    tasks.spawnThread(threadFn, .{login_ctx}) catch {
         tasks.cancel();
         self.msg_allocator.destroy(login_ctx);
         self.status_line.setPrimary("failed to spawn login task", self.theme.fg(.@"error"));
