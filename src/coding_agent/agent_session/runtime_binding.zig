@@ -113,7 +113,7 @@ fn runtimeModelsGetOne(session_ptr: *anyopaque, allocator: std.mem.Allocator, mo
 }
 
 fn runtimeIsIdle(session_ptr: *anyopaque) bool {
-    return !session(session_ptr).agent.isStreaming();
+    return !session(session_ptr).agent.isRunning();
 }
 
 fn runtimeAbort(session_ptr: *anyopaque) void {

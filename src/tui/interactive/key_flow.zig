@@ -34,7 +34,7 @@ pub fn handle(self: anytype, key: Key) void {
             self.runtime_host.abortRetry();
             return;
         }
-        if (self.is_streaming) {
+        if (self.runtime_host.currentSession().agent.isRunning()) {
             self.runtime_host.abortCurrentRun();
             self.status_line.setPrimary("aborted", self.theme.fg(.@"error"));
             self.tui.dirty = true;
@@ -60,7 +60,7 @@ pub fn handle(self: anytype, key: Key) void {
             self.runtime_host.abortRetry();
             return;
         }
-        if (self.is_streaming) {
+        if (self.runtime_host.currentSession().agent.isRunning()) {
             self.runtime_host.abortCurrentRun();
             self.status_line.setPrimary("aborted", self.theme.fg(.@"error"));
             self.tui.dirty = true;
