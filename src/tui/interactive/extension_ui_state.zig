@@ -1013,7 +1013,7 @@ const LayoutBox = struct {
     }
 };
 
-fn layoutNode(state: *ExtensionUiState, node: *const RetainedNode, rect: Rect, width_method: WidthMethod) !LayoutBox {
+fn layoutNode(state: *ExtensionUiState, node: *const RetainedNode, rect: Rect, width_method: WidthMethod) std.mem.Allocator.Error!LayoutBox {
     if (rect.width == 0 or rect.height == 0) return .{ .node = node, .rect = rect };
     return switch (node.node) {
         .view => |view| try layoutView(state, node, view, node.children, rect, width_method),
@@ -1021,10 +1021,10 @@ fn layoutNode(state: *ExtensionUiState, node: *const RetainedNode, rect: Rect, w
     };
 }
 
-fn layoutView(state: *ExtensionUiState, node: *const RetainedNode, view: extension_ui.UiNode.View, children: []const RetainedNode, rect: Rect, width_method: WidthMethod) !LayoutBox {
+fn layoutView(state: *ExtensionUiState, node: *const RetainedNode, view: extension_ui.UiNode.View, children: []const RetainedNode, rect: Rect, width_method: WidthMethod) std.mem.Allocator.Error!LayoutBox {
     const inner = viewInnerRect(view, rect);
     const child_boxes = if (children.len == 0 or inner.width == 0 or inner.height == 0)
-        &.{}
+        try state.allocator.alloc(LayoutBox, 0)
     else if (view.style.flex_direction == .row)
         try layoutRow(state, view, children, inner, width_method)
     else
@@ -1050,7 +1050,7 @@ fn viewInnerRect(view: extension_ui.UiNode.View, rect: Rect) Rect {
     return inner;
 }
 
-fn layoutColumn(state: *ExtensionUiState, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Rect, width_method: WidthMethod) ![]LayoutBox {
+fn layoutColumn(state: *ExtensionUiState, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Rect, width_method: WidthMethod) std.mem.Allocator.Error![]LayoutBox {
     var boxes = std.ArrayList(LayoutBox).empty;
     errdefer {
         for (boxes.items) |*box| box.deinit(state.allocator);
@@ -1083,7 +1083,7 @@ fn layoutColumn(state: *ExtensionUiState, b: extension_ui.UiNode.View, children:
     return boxes.toOwnedSlice(state.allocator);
 }
 
-fn layoutRow(state: *ExtensionUiState, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Rect, width_method: WidthMethod) ![]LayoutBox {
+fn layoutRow(state: *ExtensionUiState, b: extension_ui.UiNode.View, children: []const RetainedNode, region: Rect, width_method: WidthMethod) std.mem.Allocator.Error![]LayoutBox {
     var boxes = std.ArrayList(LayoutBox).empty;
     errdefer {
         for (boxes.items) |*box| box.deinit(state.allocator);
