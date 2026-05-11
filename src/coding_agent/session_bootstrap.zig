@@ -169,6 +169,7 @@ pub const ExtensionRuntimeBundle = struct {
 };
 
 pub const ReloadExtensionOptions = struct {
+    model: ai.protocol.Model,
     resource_loader: resources.ResourceLoader,
     io: std.Io = std.Options.debug_io,
     settings_manager: ?*settings_manager_mod.SettingsManager = null,
@@ -235,6 +236,7 @@ fn buildBuiltinDefinitions(allocator: std.mem.Allocator, options: BuiltinOptions
 }
 
 pub const PrepareOptions = struct {
+    model: ai.protocol.Model,
     api_key: []const u8 = "",
     cwd: []const u8,
     io: std.Io = std.Options.debug_io,
@@ -330,7 +332,10 @@ pub fn prepareSessionDeps(
     else
         builtins.definitions;
 
-    const filtered = try filterToolDefinitions(allocator, definitions, options.tool_allowlist);
+    const filtered = try filterToolDefinitions(allocator, definitions, .{
+        .allowlist = options.tool_allowlist,
+        .model_policy = ToolSelectionPolicy.forModel(options.model),
+    });
     defer filtered.deinit(allocator);
 
     const tools = try buildAgentTools(allocator, filtered.items, extension_runtime.runner);
@@ -390,7 +395,10 @@ pub fn prepareExtensionRuntimeBundle(
     else
         builtins.definitions;
 
-    const filtered = try filterToolDefinitions(allocator, definitions, options.tool_allowlist);
+    const filtered = try filterToolDefinitions(allocator, definitions, .{
+        .allowlist = options.tool_allowlist,
+        .model_policy = ToolSelectionPolicy.forModel(options.model),
+    });
     defer filtered.deinit(allocator);
 
     const tools = try buildAgentTools(allocator, filtered.items, extension_runtime.runner);
@@ -425,28 +433,101 @@ const FilteredDefinitions = struct {
     }
 };
 
+const ToolDefinitionFilter = struct {
+    allowlist: ?[]const []const u8 = null,
+    model_policy: ToolSelectionPolicy = .{},
+};
+
+const ToolSelectionPolicy = struct {
+    prefer_patch: bool = false,
+
+    fn forModel(model: ai.protocol.Model) ToolSelectionPolicy {
+        return .{ .prefer_patch = modelPrefersPatch(model) };
+    }
+};
+
+const EditSurface = enum { edit, patch };
+
+fn modelPrefersPatch(model: ai.protocol.Model) bool {
+    return switch (model.api) {
+        .openai_responses,
+        .openai_codex_responses,
+        .azure_openai_responses,
+        => true,
+        else => switch (model.provider) {
+            .openai,
+            .openai_codex,
+            => true,
+            else => modelIdPrefersPatch(model.id),
+        },
+    };
+}
+
+fn modelIdPrefersPatch(id: []const u8) bool {
+    return startsWithIgnoreCase(id, "gpt-5") or containsIgnoreCase(id, "codex");
+}
+
+fn startsWithIgnoreCase(s: []const u8, prefix: []const u8) bool {
+    return s.len >= prefix.len and std.ascii.eqlIgnoreCase(s[0..prefix.len], prefix);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
 fn filterToolDefinitions(
     allocator: std.mem.Allocator,
     definitions: []const tool_def.ToolDefinition,
-    allowlist: ?[]const []const u8,
+    filter: ToolDefinitionFilter,
 ) !FilteredDefinitions {
-    const allow = allowlist orelse return .{ .items = definitions };
-
+    const edit_surface = selectEditSurface(definitions, filter);
     const filtered = try allocator.alloc(tool_def.ToolDefinition, definitions.len);
     var count: usize = 0;
     for (definitions) |definition| {
-        for (allow) |wanted| {
-            const trimmed = std.mem.trim(u8, wanted, &std.ascii.whitespace);
-            if (trimmed.len == 0) continue;
-            if (std.ascii.eqlIgnoreCase(trimmed, definition.name) or std.ascii.eqlIgnoreCase(trimmed, definition.label)) {
-                filtered[count] = definition;
-                count += 1;
-                break;
-            }
+        if (filter.allowlist) |allow| {
+            if (!definitionAllowed(definition, allow)) continue;
         }
+        if (std.mem.eql(u8, definition.name, "edit") and edit_surface != .edit) continue;
+        if (std.mem.eql(u8, definition.name, "patch") and edit_surface != .patch) continue;
+        filtered[count] = definition;
+        count += 1;
     }
 
+    if (count == definitions.len) {
+        allocator.free(filtered);
+        return .{ .items = definitions };
+    }
     return .{ .items = filtered[0..count], .owned_slice = true };
+}
+
+fn selectEditSurface(definitions: []const tool_def.ToolDefinition, filter: ToolDefinitionFilter) EditSurface {
+    var has_allowed_edit = false;
+    var has_allowed_patch = false;
+    for (definitions) |definition| {
+        if (!std.mem.eql(u8, definition.name, "edit") and !std.mem.eql(u8, definition.name, "patch")) continue;
+        if (filter.allowlist) |allow| {
+            if (!definitionAllowed(definition, allow)) continue;
+        }
+        if (std.mem.eql(u8, definition.name, "edit")) has_allowed_edit = true;
+        if (std.mem.eql(u8, definition.name, "patch")) has_allowed_patch = true;
+    }
+    if (filter.model_policy.prefer_patch and has_allowed_patch) return .patch;
+    return if (has_allowed_edit) .edit else .patch;
+}
+
+fn definitionAllowed(definition: tool_def.ToolDefinition, allow: []const []const u8) bool {
+    for (allow) |wanted| {
+        const trimmed = std.mem.trim(u8, wanted, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(trimmed, definition.name) or std.ascii.eqlIgnoreCase(trimmed, definition.label)) return true;
+    }
+    return false;
 }
 
 pub fn buildAgentTools(
@@ -1113,4 +1194,88 @@ test "stream closure resolves claim api_key and layers provider headers before r
     try testing.expectEqualStrings("request-override", capture.last_headers[2].value);
     try testing.expectEqualStrings("x-request", capture.last_headers[3].key);
     try testing.expectEqualStrings("request-local", capture.last_headers[3].value);
+}
+
+fn dummyToolExecute(
+    _: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    _: agent_mod.protocol.AbortSignal,
+    _: ?agent_mod.protocol.AgentToolUpdateCallback,
+    _: ?*anyopaque,
+) agent_mod.protocol.AgentToolExecution {
+    _ = allocator;
+    return .{ .ready = .{ .content = &.{}, .is_error = false } };
+}
+
+fn testToolDefinition(name: []const u8) tool_def.ToolDefinition {
+    return .{
+        .name = name,
+        .label = name,
+        .description = name,
+        .parameters = .null,
+        .impl = .{ .builtin = .{ .execute = dummyToolExecute } },
+        .source = .{ .kind = "builtin", .id = name },
+    };
+}
+
+fn testModel(api_value: ai.protocol.Api, provider_value: ai.protocol.Provider, id: []const u8) ai.protocol.Model {
+    return .{
+        .id = id,
+        .name = id,
+        .api = api_value,
+        .provider = provider_value,
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 1024,
+    };
+}
+
+fn hasTool(definitions: []const tool_def.ToolDefinition, name: []const u8) bool {
+    for (definitions) |definition| if (std.mem.eql(u8, definition.name, name)) return true;
+    return false;
+}
+
+test "tool policy exposes patch instead of edit for OpenAI responses" {
+    const defs = [_]tool_def.ToolDefinition{ testToolDefinition("read"), testToolDefinition("edit"), testToolDefinition("patch") };
+    const filtered = try filterToolDefinitions(testing.allocator, &defs, .{ .model_policy = ToolSelectionPolicy.forModel(testModel(.openai_responses, .openai, "gpt-5")) });
+    defer filtered.deinit(testing.allocator);
+    try testing.expect(hasTool(filtered.items, "read"));
+    try testing.expect(!hasTool(filtered.items, "edit"));
+    try testing.expect(hasTool(filtered.items, "patch"));
+}
+
+test "tool policy exposes edit instead of patch for non OpenAI models" {
+    const defs = [_]tool_def.ToolDefinition{ testToolDefinition("read"), testToolDefinition("edit"), testToolDefinition("patch") };
+    const filtered = try filterToolDefinitions(testing.allocator, &defs, .{ .model_policy = ToolSelectionPolicy.forModel(testModel(.anthropic_messages, .anthropic, "claude")) });
+    defer filtered.deinit(testing.allocator);
+    try testing.expect(hasTool(filtered.items, "read"));
+    try testing.expect(hasTool(filtered.items, "edit"));
+    try testing.expect(!hasTool(filtered.items, "patch"));
+}
+
+test "tool policy falls back to edit when OpenAI patch is unavailable" {
+    const defs = [_]tool_def.ToolDefinition{ testToolDefinition("read"), testToolDefinition("edit") };
+    const filtered = try filterToolDefinitions(testing.allocator, &defs, .{ .model_policy = ToolSelectionPolicy.forModel(testModel(.openai_responses, .openai, "gpt-5")) });
+    defer filtered.deinit(testing.allocator);
+    try testing.expect(hasTool(filtered.items, "read"));
+    try testing.expect(hasTool(filtered.items, "edit"));
+    try testing.expect(!hasTool(filtered.items, "patch"));
+}
+
+test "tool policy composes allowlist before model surface selection" {
+    const defs = [_]tool_def.ToolDefinition{ testToolDefinition("read"), testToolDefinition("edit"), testToolDefinition("patch") };
+    const allow = [_][]const u8{ "read", "edit", "patch" };
+    const filtered = try filterToolDefinitions(testing.allocator, &defs, .{
+        .allowlist = &allow,
+        .model_policy = ToolSelectionPolicy.forModel(testModel(.openai_responses, .openai, "gpt-5")),
+    });
+    defer filtered.deinit(testing.allocator);
+    try testing.expect(hasTool(filtered.items, "read"));
+    try testing.expect(!hasTool(filtered.items, "edit"));
+    try testing.expect(hasTool(filtered.items, "patch"));
 }

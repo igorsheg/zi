@@ -76,6 +76,7 @@ pub fn createAgentSession(
     options: CreateOptions,
 ) !AgentSession {
     const prepared = try session_bootstrap.prepareSessionDeps(allocator, .{
+        .model = options.model,
         .api_key = options.api_key,
         .cwd = options.cwd,
         .io = options.io,

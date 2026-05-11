@@ -228,6 +228,7 @@ pub const AgentSession = struct {
 
     pub fn initTestSession(allocator: std.mem.Allocator, options: TestInitOptions) AgentSession {
         const prepared = session_bootstrap.prepareSessionDeps(allocator, .{
+            .model = options.model,
             .api_key = options.api_key,
             .cwd = options.cwd,
             .resource_loader = options.resource_loader,

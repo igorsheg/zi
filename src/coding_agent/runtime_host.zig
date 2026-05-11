@@ -223,6 +223,7 @@ pub const RuntimeHost = struct {
 
         try self.session.resource_loader.reload();
         const next = try session_bootstrap.prepareExtensionRuntimeBundle(self.session_allocator, .{
+            .model = self.create_options.model,
             .resource_loader = self.session.resource_loader,
             .io = self.create_options.io,
             .settings_manager = self.create_options.settings_manager,
