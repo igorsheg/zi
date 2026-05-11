@@ -32,7 +32,7 @@ const log = std.log.scoped(.extension_ui_input);
 
 pub const ExtensionUiState = struct {
     allocator: std.mem.Allocator,
-    views: std.StringHashMap(ViewRecord),
+    views: std.StringHashMap(SlotContribution),
     frames: std.StringHashMap(FrameRecord),
     input_states: std.StringHashMap(TextInput),
     theme: *const Theme,
@@ -44,7 +44,7 @@ pub const ExtensionUiState = struct {
     pub fn init(allocator: std.mem.Allocator) ExtensionUiState {
         return .{
             .allocator = allocator,
-            .views = std.StringHashMap(ViewRecord).init(allocator),
+            .views = std.StringHashMap(SlotContribution).init(allocator),
             .frames = std.StringHashMap(FrameRecord).init(allocator),
             .input_states = std.StringHashMap(TextInput).init(allocator),
             .theme = themes_builtin.dark(),
@@ -127,54 +127,7 @@ pub const ExtensionUiState = struct {
     }
 
     pub fn applyRender(self: *ExtensionUiState, render: extension_ui.RenderSpec) void {
-        const key = makeViewKey(self.allocator, render.state_owner_id, render.id) catch return;
-        errdefer self.allocator.free(key);
-        if (self.views.getEntry(key)) |entry| {
-            if (render.generation < entry.value_ptr.spec.generation) {
-                self.allocator.free(key);
-                return;
-            }
-            if (render.remove) {
-                var old = self.views.fetchRemove(entry.key_ptr.*).?;
-                clearInputValuesForView(self, render.state_owner_id, render.id);
-                self.allocator.free(old.key);
-                old.value.deinit(self.allocator);
-                self.allocator.free(key);
-                return;
-            }
-            var render_for_clone = render;
-            if (render_for_clone.notification) |*n| {
-                if (entry.value_ptr.spec.notification) |old| {
-                    n.created_ns = old.created_ns;
-                    n.count = if (std.mem.eql(u8, n.message, old.message)) old.count + 1 else 1;
-                }
-            }
-            const record = ViewRecord.init(self.allocator, render_for_clone) catch {
-                self.allocator.free(key);
-                return;
-            };
-            entry.value_ptr.deinit(self.allocator);
-            entry.value_ptr.* = record;
-            syncInputValues(self, entry.value_ptr);
-            self.allocator.free(key);
-            return;
-        }
-
-        if (render.remove) {
-            self.allocator.free(key);
-            return;
-        }
-        const record = ViewRecord.init(self.allocator, render) catch {
-            self.allocator.free(key);
-            return;
-        };
-        self.views.put(key, record) catch {
-            var owned = record;
-            owned.deinit(self.allocator);
-            self.allocator.free(key);
-            return;
-        };
-        if (self.views.getPtr(key)) |stored| syncInputValues(self, stored);
+        SlotContributionLifecycle.applyRender(self, render);
     }
 
     pub fn applyFrame(self: *ExtensionUiState, frame: extension_ui.UiFrame) void {
@@ -217,7 +170,7 @@ pub const ExtensionUiState = struct {
         return SlotPolicy.forSlot(slot).overlayOptions(self, base);
     }
 
-    fn orderedSlotViews(self: *ExtensionUiState, slot: extension_ui.UiSlot) ![]*ViewRecord {
+    fn orderedSlotViews(self: *ExtensionUiState, slot: extension_ui.UiSlot) ![]*SlotContribution {
         return SlotPolicy.forSlot(slot).orderedViews(self);
     }
 };
@@ -294,7 +247,7 @@ const RetainedNode = struct {
     }
 };
 
-fn syncInputValues(self: *ExtensionUiState, record: *const ViewRecord) void {
+fn syncInputValues(self: *ExtensionUiState, record: *const SlotContribution) void {
     if (record.root) |*root| root.syncInputValues(self, record.spec.state_owner_id, record.spec.id);
 }
 
@@ -311,6 +264,22 @@ fn clearInputValuesForView(self: *ExtensionUiState, owner: []const u8, view: []c
         var old = self.input_states.fetchRemove(k) orelse continue;
         self.allocator.free(old.key);
         old.value.deinit();
+    }
+}
+
+fn clearFramesForView(self: *ExtensionUiState, owner: []const u8, view: []const u8) void {
+    const prefix = std.fmt.allocPrint(self.allocator, "{s}\x1f{s}\x1f", .{ owner, view }) catch return;
+    defer self.allocator.free(prefix);
+    var keys = std.ArrayList([]const u8).empty;
+    defer keys.deinit(self.allocator);
+    var it = self.frames.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) keys.append(self.allocator, entry.key_ptr.*) catch break;
+    }
+    for (keys.items) |k| {
+        var old = self.frames.fetchRemove(k) orelse continue;
+        self.allocator.free(old.key);
+        old.value.deinit(self.allocator);
     }
 }
 
@@ -365,11 +334,24 @@ fn editInput(self: *ExtensionUiState, spec: extension_ui.RenderSpec, input: Inpu
     }
 }
 
-const ViewRecord = struct {
+const SlotContributionKey = struct {
+    owner: []const u8,
+    view: []const u8,
+
+    fn fromRender(render: extension_ui.RenderSpec) SlotContributionKey {
+        return .{ .owner = render.state_owner_id, .view = render.id };
+    }
+
+    fn alloc(self: SlotContributionKey, allocator: std.mem.Allocator) ![]const u8 {
+        return makeViewKey(allocator, self.owner, self.view);
+    }
+};
+
+const SlotContribution = struct {
     spec: extension_ui.RenderSpec,
     root: ?RetainedNode = null,
 
-    fn init(allocator: std.mem.Allocator, spec: extension_ui.RenderSpec) !ViewRecord {
+    fn init(allocator: std.mem.Allocator, spec: extension_ui.RenderSpec) !SlotContribution {
         var cloned = try extension_ui.RenderSpec.clone(allocator, spec);
         errdefer cloned.deinit(allocator);
         const root = if (spec.root) |source| try RetainedNode.init(allocator, source) else null;
@@ -382,9 +364,73 @@ const ViewRecord = struct {
         return .{ .spec = cloned, .root = root };
     }
 
-    fn deinit(self: *ViewRecord, allocator: std.mem.Allocator) void {
+    fn deinit(self: *SlotContribution, allocator: std.mem.Allocator) void {
         self.spec.deinit(allocator);
         if (self.root) |*root| root.deinit(allocator);
+    }
+};
+
+const SlotContributionLifecycle = struct {
+    fn applyRender(state: *ExtensionUiState, render: extension_ui.RenderSpec) void {
+        const contribution_key = SlotContributionKey.fromRender(render);
+        const key = contribution_key.alloc(state.allocator) catch return;
+        if (state.views.getEntry(key)) |entry| {
+            if (render.generation < entry.value_ptr.spec.generation) {
+                state.allocator.free(key);
+                return;
+            }
+            if (render.remove) {
+                removeExisting(state, entry.key_ptr.*);
+                state.allocator.free(key);
+                return;
+            }
+            replaceExisting(state, entry.value_ptr, render);
+            state.allocator.free(key);
+            return;
+        }
+
+        if (render.remove) {
+            state.allocator.free(key);
+            return;
+        }
+        insertNew(state, key, render);
+    }
+
+    fn removeExisting(state: *ExtensionUiState, key: []const u8) void {
+        var old = state.views.fetchRemove(key) orelse return;
+        clearInputValuesForView(state, old.value.spec.state_owner_id, old.value.spec.id);
+        clearFramesForView(state, old.value.spec.state_owner_id, old.value.spec.id);
+        state.allocator.free(old.key);
+        old.value.deinit(state.allocator);
+    }
+
+    fn replaceExisting(state: *ExtensionUiState, existing: *SlotContribution, render: extension_ui.RenderSpec) void {
+        var render_for_clone = render;
+        if (render_for_clone.notification) |*n| {
+            if (existing.spec.notification) |old| {
+                n.created_ns = old.created_ns;
+                n.count = if (std.mem.eql(u8, n.message, old.message)) old.count + 1 else 1;
+            }
+        }
+        const record = SlotContribution.init(state.allocator, render_for_clone) catch return;
+        clearFramesForView(state, existing.spec.state_owner_id, existing.spec.id);
+        existing.deinit(state.allocator);
+        existing.* = record;
+        syncInputValues(state, existing);
+    }
+
+    fn insertNew(state: *ExtensionUiState, key: []const u8, render: extension_ui.RenderSpec) void {
+        const record = SlotContribution.init(state.allocator, render) catch {
+            state.allocator.free(key);
+            return;
+        };
+        state.views.put(key, record) catch {
+            var owned = record;
+            owned.deinit(state.allocator);
+            state.allocator.free(key);
+            return;
+        };
+        if (state.views.getPtr(key)) |stored| syncInputValues(state, stored);
     }
 };
 
@@ -402,8 +448,8 @@ const SlotPolicy = struct {
         return .{ .slot = slot };
     }
 
-    fn orderedViews(self: SlotPolicy, state: *ExtensionUiState) ![]*ViewRecord {
-        var list = std.ArrayList(*ViewRecord).empty;
+    fn orderedViews(self: SlotPolicy, state: *ExtensionUiState) ![]*SlotContribution {
+        var list = std.ArrayList(*SlotContribution).empty;
         errdefer list.deinit(state.allocator);
         var it = state.views.iterator();
         while (it.next()) |entry| {
@@ -411,7 +457,7 @@ const SlotPolicy = struct {
                 try list.append(state.allocator, entry.value_ptr);
             }
         }
-        std.mem.sort(*ViewRecord, list.items, {}, lessView);
+        std.mem.sort(*SlotContribution, list.items, {}, lessView);
         return list.toOwnedSlice(state.allocator);
     }
 
@@ -423,7 +469,7 @@ const SlotPolicy = struct {
         return false;
     }
 
-    fn topView(self: SlotPolicy, state: *ExtensionUiState) ?*ViewRecord {
+    fn topView(self: SlotPolicy, state: *ExtensionUiState) ?*SlotContribution {
         const ordered = self.orderedViews(state) catch return null;
         defer state.allocator.free(ordered);
         if (ordered.len == 0) return null;
@@ -500,7 +546,7 @@ const TargetComponent = struct {
         return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
     }
 
-    fn orderedViews(self: *TargetComponent) ![]*ViewRecord {
+    fn orderedViews(self: *TargetComponent) ![]*SlotContribution {
         return self.state.orderedSlotViews(self.slot);
     }
 };
@@ -580,7 +626,7 @@ fn toOverlayBackdrop(backdrop: extension_ui.UiBackdrop) overlay_mod.OverlayBackd
     };
 }
 
-fn lessView(_: void, a: *ViewRecord, b: *ViewRecord) bool {
+fn lessView(_: void, a: *SlotContribution, b: *SlotContribution) bool {
     if (a.spec.order != b.spec.order) return a.spec.order < b.spec.order;
     const owner_cmp = std.mem.order(u8, a.spec.state_owner_id, b.spec.state_owner_id);
     if (owner_cmp != .eq) return owner_cmp == .lt;
@@ -1764,7 +1810,29 @@ test "extension ui surface uses keyed frame lookup" {
     try std.testing.expect(buf.get(0, 0).fg.eql(Color.rgb(255, 0, 0)));
 }
 
-test "extension ui sorts overlay views and filters other targets" {
+test "extension ui contribution removal clears owned frames" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = .{ .surface = .{ .id = "node" } } });
+    const red = [_]u8{ 255, 0, 0, 255 };
+    state.applyFrame(.{ .state_owner_id = "owner", .generation = 1, .view = "view", .node = "node", .width = 1, .height = 1, .data = &red });
+    try std.testing.expectEqual(@as(usize, 1), state.frames.count());
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .remove = true });
+    try std.testing.expectEqual(@as(usize, 0), state.frames.count());
+}
+
+test "extension ui contribution replacement clears stale frames" {
+    var state = ExtensionUiState.init(std.testing.allocator);
+    defer state.deinit();
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = .{ .surface = .{ .id = "old" } } });
+    const red = [_]u8{ 255, 0, 0, 255 };
+    state.applyFrame(.{ .state_owner_id = "owner", .generation = 1, .view = "view", .node = "old", .width = 1, .height = 1, .data = &red });
+    try std.testing.expectEqual(@as(usize, 1), state.frames.count());
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .slot = .status, .root = .{ .text = .{ .text = "new" } } });
+    try std.testing.expectEqual(@as(usize, 0), state.frames.count());
+}
+
+test "extension ui sorts overlay views and filters other slots" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .slot = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
