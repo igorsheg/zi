@@ -25,7 +25,7 @@ pub fn ziSpawn(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return 0;
     } orelse return 0;
 
-    if (runner.current_signal != null) {
+    if (runner.current_tool_execution != null) {
         runner.current_spawn_request = req;
         return c.lua_yieldk(L, 0, 0, ziSpawnContinue);
     }
@@ -136,9 +136,10 @@ fn buildSpawnRequest(
         return writeErr(err_buf, "zi.spawn: 'on' must be a table");
     }
 
+    const exec = runner.requireToolExecution("zi.spawn");
     return .{
         .task = runner.allocator.dupe(u8, task) catch return writeErr(err_buf, "zi.spawn: out of memory"),
-        .signal = runner.current_signal orelse @import("../../zio/root.zig").AbortSignal.none,
+        .signal = exec.signal,
         .model = if (model) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
         .tools = if (tools) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
         .append_system_prompt = if (system_append) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,

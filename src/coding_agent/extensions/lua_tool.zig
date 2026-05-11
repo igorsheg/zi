@@ -141,13 +141,9 @@ fn execute(
     var co_owned = true;
     defer if (co_owned) co.deinit();
 
-    tctx.runner.current_signal = signal;
-    tctx.runner.current_update_callback = on_update;
-    tctx.runner.current_update_ctx = update_ctx;
+    tctx.runner.current_tool_execution = .{ .signal = signal, .on_update = on_update, .update_ctx = update_ctx };
     defer {
-        tctx.runner.current_signal = null;
-        tctx.runner.current_update_callback = null;
-        tctx.runner.current_update_ctx = null;
+        tctx.runner.current_tool_execution = null;
     }
 
     prepareHandlerCoroutine(state, tctx.runner, &co, tctx.lua_ref, tctx.provenance, args) catch |err| {
@@ -269,13 +265,9 @@ const PendingLuaToolExecution = struct {
         if (self.runner.generation != self.generation) return errorResult(allocator, "tool execution cancelled by extension reload");
 
         self.runner.assertOnLuaThread();
-        self.runner.current_signal = signal;
-        self.runner.current_update_callback = on_update;
-        self.runner.current_update_ctx = update_ctx;
+        self.runner.current_tool_execution = .{ .signal = signal, .on_update = on_update, .update_ctx = update_ctx };
         defer {
-            self.runner.current_signal = null;
-            self.runner.current_update_callback = null;
-            self.runner.current_update_ctx = null;
+            self.runner.current_tool_execution = null;
         }
 
         if (self.provenance) |prov| self.runner.beginExecutionContext(self.runner.sourceForProvenance(prov));
@@ -833,7 +825,8 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
     const runner: *runner_mod.ExtensionRunner = @ptrCast(@alignCast(ud.?));
 
-    const cb = runner.current_update_callback orelse return 0;
+    const exec = runner.current_tool_execution orelse return 0;
+    const cb = exec.on_update orelse return 0;
 
     if (c.lua_type(L, 1) != c.LUA_TTABLE) return 0;
 
@@ -843,7 +836,7 @@ fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
     const partial = parseReturn(aa, L, 1, partial_tool_result_limits) catch emptyResult();
 
-    cb(partial, runner.current_update_ctx);
+    cb(partial, exec.update_ctx);
 
     return 0;
 }

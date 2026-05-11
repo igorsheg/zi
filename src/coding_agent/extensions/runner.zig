@@ -847,6 +847,12 @@ pub const LoadContext = struct {
 };
 
 pub const ExtensionRunner = struct {
+    pub const ToolExecutionContext = struct {
+        signal: abort_signal.AbortSignal,
+        on_update: ?agent_protocol.AgentToolUpdateCallback = null,
+        update_ctx: ?*anyopaque = null,
+    };
+
     allocator: std.mem.Allocator,
     io: std.Io = std.Options.debug_io,
 
@@ -897,34 +903,10 @@ pub const ExtensionRunner = struct {
     /// instances stay valid (they just can't dispatch).
     lua_state: ?*lua_runtime.LuaState = null,
 
-    /// Abort signal for the currently executing Lua tool. Set by
-    /// `lua_tool.execute` before invoking the user's handler and
-    /// cleared on return. Read by host functions like `zi.spawn`
-    /// that need to forward the parent's abort into a child
-    /// subprocess.
-    ///
-    /// Single-threaded contract: the Lua state runs one coroutine
-    /// at a time, so a single mutable slot is safe without locking.
-    /// If concurrent tools ever land, this becomes per-coroutine
-    /// state.
-    ///
-    /// Null when no Lua tool is running. `zi.spawn` callers from
-    /// non-tool contexts (e.g. an event handler that wants to
-    /// fan out a sub-agent) will see no abort forwarding — the
-    /// child runs uninterruptible from the parent's POV.
-    current_signal: ?abort_signal.AbortSignal = null,
-
-    /// Update callback + ctx for the currently executing Lua tool.
-    /// Set by `lua_tool.execute` before invoking the user's
-    /// handler so the Lua-callable `ctx.update(partial)` host
-    /// function can forward partial results back through the
-    /// agent loop's update bridge.
-    ///
-    /// Lifetime + thread contract is identical to `current_signal`:
-    /// single-threaded slot, valid for the duration of one tool
-    /// execution, cleared on return.
-    current_update_callback: ?agent_protocol.AgentToolUpdateCallback = null,
-    current_update_ctx: ?*anyopaque = null,
+    /// Current Lua tool execution context. Host functions must require this
+    /// context when they start blocking child work so cancellation cannot be
+    /// silently dropped in the middle of a tool run.
+    current_tool_execution: ?ToolExecutionContext = null,
 
     /// Working directory of the parent agent. Published to Lua tools
     /// via `ctx.cwd` so they can spawn child processes in the
@@ -1381,9 +1363,12 @@ pub const ExtensionRunner = struct {
     pub fn isReloadIdle(self: *const ExtensionRunner) bool {
         return self.load_context == null and
             self.execution_context == null and
-            self.current_signal == null and
-            self.current_update_callback == null and
+            self.current_tool_execution == null and
             self.current_spawn_request == null;
+    }
+
+    pub fn requireToolExecution(self: *ExtensionRunner, comptime api_name: []const u8) ToolExecutionContext {
+        return self.current_tool_execution orelse std.debug.panic("{s}: missing active tool execution context", .{api_name});
     }
 
     /// Dispatch an extension command by its visible invocation name.
@@ -1539,6 +1524,12 @@ pub const ExtensionRunner = struct {
         };
 
         self.setModuleContext(state, cmd.source.provenance);
+        const had_tool_execution = self.current_tool_execution != null;
+        if (!had_tool_execution) self.current_tool_execution = .{ .signal = abort_signal.AbortSignal.none };
+        defer {
+            if (!had_tool_execution) self.current_tool_execution = null;
+        }
+
         if (cmd.source.provenance) |provenance| {
             self.beginExecutionContext(self.sourceForProvenance(provenance));
             defer self.endExecutionContext();

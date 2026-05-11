@@ -1763,7 +1763,7 @@ fn ctxAiSessionPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
         pushAiCompleteError(L, "ctx.ai.session.prompt: side session is busy");
         return 1;
     }
-    var request = runner_mod.AiSessionPromptRequest{ .session_id = session_id, .prompt = prompt, .signal = runner.current_signal orelse abort_signal_mod.AbortSignal.none };
+    var request = runner_mod.AiSessionPromptRequest{ .session_id = session_id, .prompt = prompt, .signal = runner.requireToolExecution("zi.ai.session.prompt").signal };
     request.callbacks_ref = readOptionalCallbacksRef(L, prompt_arg);
     request.source_L = if (request.callbacks_ref != c.LUA_NOREF) L else null;
     const id = runner.beginAiSessionPromptAsync(request);
@@ -1936,7 +1936,7 @@ fn ctxAiComplete(L_opt: ?*c.lua_State) callconv(.c) c_int {
         pushAiCompleteError(L, "ctx.ai.complete: invalid request");
         return 1;
     };
-    request.signal = runner.current_signal orelse abort_signal_mod.AbortSignal.none;
+    request.signal = runner.requireToolExecution("zi.ai.complete").signal;
     const id = runner.beginAiCompleteAsync(request);
     return c.lua_yieldk(L, 0, @intCast(id), ctxAiCompleteContinue);
 }
