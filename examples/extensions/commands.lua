@@ -18,7 +18,7 @@ end
 
 local function ui_status(ctx, id, text, tone)
   if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id, target = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
+  ctx.ui.render({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
 end
 
 local function ui_status_spec(ctx, spec)
@@ -28,12 +28,12 @@ end
 
 local function ui_progress_spec(ctx, spec)
   if not (ctx and ctx.ui and ctx.ui.render and spec) then return end
-  ctx.ui.render({ id = spec.id or "progress", target = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
+  ctx.ui.render({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
 end
 
 local function ui_report(ctx, id, title, body)
   if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id or "report", target = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
+  ctx.ui.render({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
 end
 
 local function ui_report_spec(ctx, spec)
@@ -62,7 +62,7 @@ local function ui_status(ctx, id, text, tone)
   if not (ctx and ctx.ui and ctx.ui.render) then return end
   ctx.ui.render({
     id = id,
-    target = "status",
+    slot = "status",
     root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } },
   })
 end
@@ -71,7 +71,7 @@ local function ui_report(ctx, id, title, body)
   if not (ctx and ctx.ui and ctx.ui.render) then return end
   ctx.ui.render({
     id = id or "report",
-    target = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" },
+    slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" },
     keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
     root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = {
       { type = "text", text = tostring(body or "") },
@@ -83,8 +83,8 @@ return function(zi)
     name = "hello",
     description = "Show a greeting from an extension command.",
     handler = function(args, ctx)
-      local target = args
-      if target == nil or target == "" then target = "zi" end
+      local slot = args
+      if slot == nil or slot == "" then slot = "zi" end
 
       ui_report_spec(ctx, {
         id = "hello-command",

@@ -81,7 +81,7 @@ pub fn applyCommandsUpdate(self: *Interactive, commands: []const ui_event_mod.Ex
 fn extensionOverlayOptions(self: *Interactive) overlay_mod.OverlayOptions {
     var options = overlay_mod.OverlayPresets.centerDialog();
     options = self.extension_ui_state.syncOverlayOptions(.overlay, options);
-    options.non_capturing = !self.extension_ui_state.targetWantsFocus(.overlay);
+    options.non_capturing = !self.extension_ui_state.slotWantsFocus(.overlay);
     return options;
 }
 

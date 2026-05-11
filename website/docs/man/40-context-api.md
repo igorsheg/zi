@@ -77,7 +77,7 @@ Most tools, commands, and events receive `ctx`.
 `ctx.ui` publishes host-owned UI intent. Extensions describe views; zi owns placement, focus, and redraw. API v3 exposes three methods:
 
 `ctx.ui.render(spec)`
-: Publish, update, or remove a retained UI view. `spec.id` is required. `spec.target` is one of `status`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }`. Set `spec.remove = true` to clear a view. `spec.root` is a node tree (`view`, `text`, `input`, `chip`, `progress`, `separator`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`.
+: Publish, update, or remove a retained UI view. `spec.id` is required. `spec.slot` is one of `status`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }`. Set `spec.remove = true` to clear a view. `spec.root` is a node tree (`view`, `text`, `input`, `chip`, `progress`, `separator`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`.
 
 `ctx.ui.frame(spec)`
 : Publish a frame for a `surface` node in an existing render tree. `spec.view` names the render view id, `spec.node` names the surface node id, and `spec.data` contains frame bytes. Supported formats include `rgba8888` and `halfblock_rgb`. `surface` remains the node type for framebuffer graphs and other pixel/cell-frame visuals.
@@ -120,7 +120,7 @@ Example:
 ```lua
 ctx.ui.render({
   id = "rename-session",
-  target = { kind = "overlay", width = "50%", anchor = "center", backdrop = "dim" },
+  slot = { kind = "overlay", width = "50%", anchor = "center", backdrop = "dim" },
   focus = true,
   root = { type = "view", style = { chrome = { kind = "frame", title = "Rename" }, padding = 1 }, children = {
     { type = "input", id = "name", value = state.name or "", placeholder = "Session name", on_change = "rename.change", on_submit = "rename.submit" },
@@ -180,7 +180,7 @@ Dashboard text example:
 ```lua
 ctx.ui.render({
   id = "session-breakdown",
-  target = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center" },
+  slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center" },
   root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1, gap = 1 }, children = {
     { type = "text", wrap = "none", spans = {
       { text = "7d", style = { tone = "accent", bold = true } },
@@ -199,7 +199,7 @@ ctx.ui.notify("Hello from zi", { id = "hello", level = "info" })
 
 ctx.ui.render({
   id = "panel",
-  target = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" },
+  slot = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" },
   keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
   root = { type = "view", style = { chrome = { kind = "frame", title = "Panel", border = "rounded", tone = "muted" }, padding = 1 }, children = {
     { type = "text", text = "Press q or Esc to close." },

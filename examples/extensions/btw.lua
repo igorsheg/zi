@@ -114,7 +114,7 @@ local function render(ctx)
   if not has_ui(ctx) then return end
   ctx.ui.render({
     id = VIEW_ID,
-    target = { kind = "overlay", preset = "ivy" },
+    slot = { kind = "overlay", preset = "ivy" },
     focus = true,
     keys = {
       { key = "escape", action = "close" },
@@ -291,8 +291,8 @@ local function inject_summary(ctx)
   end
   local msg = "Summary of my BTW side conversation:\n\n" .. tostring(result.text or "")
   if ctx.send_user_message then
-    local target = (ctx.is_idle and ctx.is_idle()) and "prompt" or "follow_up"
-    ctx.send_user_message(msg, { target = target })
+    local slot = (ctx.is_idle and ctx.is_idle()) and "prompt" or "follow_up"
+    ctx.send_user_message(msg, { slot = target })
     reset(ctx)
     close_overlay(ctx)
   elseif ctx.editor and ctx.editor.set_text then

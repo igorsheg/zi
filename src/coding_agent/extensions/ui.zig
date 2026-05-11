@@ -3,7 +3,7 @@ const json_value = @import("../../json/value.zig");
 const notifications = @import("../../tui/notifications.zig");
 const overlay_mod = @import("../../tui/primitives/overlay.zig");
 
-pub const UiTarget = enum {
+pub const UiSlot = enum {
     overlay,
     status,
     notification,
@@ -29,7 +29,7 @@ pub const TextOverflow = enum { clip, ellipsis };
 pub const TextAlign = enum { left, center, right };
 pub const TextFormat = enum { plain, ansi, markdown };
 
-pub const UiTargetOptions = struct {
+pub const UiSlotOptions = struct {
     width: ?Constraint = null,
     height: ?Constraint = null,
     min_width: ?Constraint = null,
@@ -41,10 +41,10 @@ pub const UiTargetOptions = struct {
     lifetime: ?UiLifetime = null,
     preset: ?UiOverlayPreset = null,
 
-    pub fn clone(_: std.mem.Allocator, options: UiTargetOptions) !UiTargetOptions {
+    pub fn clone(_: std.mem.Allocator, options: UiSlotOptions) !UiSlotOptions {
         return options;
     }
-    pub fn deinit(_: *UiTargetOptions, _: std.mem.Allocator) void {}
+    pub fn deinit(_: *UiSlotOptions, _: std.mem.Allocator) void {}
 };
 
 pub const Tone = enum { neutral, muted, info, success, warning, danger, accent };
@@ -375,8 +375,8 @@ pub const RenderSpec = struct {
     state_owner_id: []const u8,
     generation: u64,
     id: []const u8,
-    target: UiTarget = .overlay,
-    target_options: UiTargetOptions = .{},
+    slot: UiSlot = .overlay,
+    slot_options: UiSlotOptions = .{},
     order: i64 = 0,
     focus: bool = false,
     remove: bool = false,
@@ -409,13 +409,13 @@ pub const RenderSpec = struct {
             keys[i] = try KeyBinding.clone(allocator, k);
             initialized += 1;
         }
-        return .{ .state_owner_id = state_owner_id, .generation = spec.generation, .id = id, .target = spec.target, .target_options = try UiTargetOptions.clone(allocator, spec.target_options), .order = spec.order, .focus = spec.focus, .remove = spec.remove, .root = root, .notification = notification, .keys = keys };
+        return .{ .state_owner_id = state_owner_id, .generation = spec.generation, .id = id, .slot = spec.slot, .slot_options = try UiSlotOptions.clone(allocator, spec.slot_options), .order = spec.order, .focus = spec.focus, .remove = spec.remove, .root = root, .notification = notification, .keys = keys };
     }
 
     pub fn deinit(self: *RenderSpec, allocator: std.mem.Allocator) void {
         allocator.free(self.state_owner_id);
         allocator.free(self.id);
-        self.target_options.deinit(allocator);
+        self.slot_options.deinit(allocator);
         if (self.root) |*r| r.deinit(allocator);
         if (self.notification) |*n| n.deinit(allocator);
         for (self.keys) |*k| k.deinit(allocator);
@@ -576,13 +576,13 @@ test "ui v3 render spec clone owns node tree" {
     const testing = std.testing;
     const child = UiNode{ .text = .{ .id = "child", .text = "hello", .style = .{ .tone = .info } } };
     const root = UiNode{ .view = .{ .id = "root-node", .style = .{ .flex_direction = .row, .gap = 1 }, .children = @constCast(&[_]UiNode{child}) } };
-    const spec = RenderSpec{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .target_options = .{ .anchor = .top_right, .preset = .ivy }, .root = root, .keys = @constCast(&[_]KeyBinding{.{ .key = "ctrl+x", .action = "close" }}) };
+    const spec = RenderSpec{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .slot_options = .{ .anchor = .top_right, .preset = .ivy }, .root = root, .keys = @constCast(&[_]KeyBinding{.{ .key = "ctrl+x", .action = "close" }}) };
     var cloned = try RenderSpec.clone(testing.allocator, spec);
     defer cloned.deinit(testing.allocator);
     try testing.expectEqualStrings("owner", cloned.state_owner_id);
-    try testing.expectEqual(UiTarget.status, cloned.target);
-    try testing.expectEqual(UiAnchor.top_right, cloned.target_options.anchor.?);
-    try testing.expectEqual(UiOverlayPreset.ivy, cloned.target_options.preset.?);
+    try testing.expectEqual(UiSlot.status, cloned.slot);
+    try testing.expectEqual(UiAnchor.top_right, cloned.slot_options.anchor.?);
+    try testing.expectEqual(UiOverlayPreset.ivy, cloned.slot_options.preset.?);
     try testing.expect(cloned.root != null);
     try testing.expectEqual(@as(usize, 1), cloned.keys.len);
 }

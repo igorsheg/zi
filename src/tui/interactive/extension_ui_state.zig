@@ -48,10 +48,10 @@ pub const ExtensionUiState = struct {
             .frames = std.StringHashMap(FrameRecord).init(allocator),
             .input_states = std.StringHashMap(TextInput).init(allocator),
             .theme = themes_builtin.dark(),
-            .status_component = .{ .target = .status },
-            .overlay_component = .{ .target = .overlay },
-            .editor_border_top_component = .{ .target = .editor_border_top },
-            .editor_border_bottom_component = .{ .target = .editor_border_bottom },
+            .status_component = .{ .slot = .status },
+            .overlay_component = .{ .slot = .overlay },
+            .editor_border_top_component = .{ .slot = .editor_border_top },
+            .editor_border_bottom_component = .{ .slot = .editor_border_bottom },
         };
     }
 
@@ -107,15 +107,15 @@ pub const ExtensionUiState = struct {
     }
 
     pub fn hasOverlayViews(self: *ExtensionUiState) bool {
-        return self.hasTargetViews(.overlay);
+        return self.hasSlotViews(.overlay);
     }
 
-    pub fn targetWantsFocus(self: *ExtensionUiState, target: extension_ui.UiTarget) bool {
-        return SlotPolicy.forTarget(target).wantsFocus(self);
+    pub fn slotWantsFocus(self: *ExtensionUiState, slot: extension_ui.UiSlot) bool {
+        return SlotPolicy.forSlot(slot).wantsFocus(self);
     }
 
     pub fn handleOverlayInput(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
-        const ordered = self.orderedTargetViews(.overlay) catch return null;
+        const ordered = self.orderedSlotViews(.overlay) catch return null;
         defer self.allocator.free(ordered);
         var i = ordered.len;
         while (i > 0) {
@@ -129,7 +129,7 @@ pub const ExtensionUiState = struct {
     }
 
     pub fn matchOverlayKey(self: *ExtensionUiState, key: keys_mod.Key) ?extension_ui.UiEvent {
-        const ordered = self.orderedTargetViews(.overlay) catch return null;
+        const ordered = self.orderedSlotViews(.overlay) catch return null;
         defer self.allocator.free(ordered);
         var i = ordered.len;
         while (i > 0) {
@@ -144,8 +144,8 @@ pub const ExtensionUiState = struct {
         return null;
     }
 
-    fn hasTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) bool {
-        return SlotPolicy.forTarget(target).hasViews(self);
+    fn hasSlotViews(self: *ExtensionUiState, slot: extension_ui.UiSlot) bool {
+        return SlotPolicy.forSlot(slot).hasViews(self);
     }
 
     pub fn applyRender(self: *ExtensionUiState, render: extension_ui.RenderSpec) void {
@@ -235,12 +235,12 @@ pub const ExtensionUiState = struct {
         return rec.frame;
     }
 
-    pub fn syncOverlayOptions(self: *ExtensionUiState, target: extension_ui.UiTarget, base: overlay_mod.OverlayOptions) overlay_mod.OverlayOptions {
-        return SlotPolicy.forTarget(target).overlayOptions(self, base);
+    pub fn syncOverlayOptions(self: *ExtensionUiState, slot: extension_ui.UiSlot, base: overlay_mod.OverlayOptions) overlay_mod.OverlayOptions {
+        return SlotPolicy.forSlot(slot).overlayOptions(self, base);
     }
 
-    fn orderedTargetViews(self: *ExtensionUiState, target: extension_ui.UiTarget) ![]*ViewRecord {
-        return SlotPolicy.forTarget(target).orderedViews(self);
+    fn orderedSlotViews(self: *ExtensionUiState, slot: extension_ui.UiSlot) ![]*ViewRecord {
+        return SlotPolicy.forSlot(slot).orderedViews(self);
     }
 };
 
@@ -418,10 +418,10 @@ const FrameRecord = struct {
 };
 
 const SlotPolicy = struct {
-    target: extension_ui.UiTarget,
+    slot: extension_ui.UiSlot,
 
-    fn forTarget(target: extension_ui.UiTarget) SlotPolicy {
-        return .{ .target = target };
+    fn forSlot(slot: extension_ui.UiSlot) SlotPolicy {
+        return .{ .slot = slot };
     }
 
     fn orderedViews(self: SlotPolicy, state: *ExtensionUiState) ![]*ViewRecord {
@@ -429,7 +429,7 @@ const SlotPolicy = struct {
         errdefer list.deinit(state.allocator);
         var it = state.views.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.spec.target == self.target and entry.value_ptr.root != null) {
+            if (entry.value_ptr.spec.slot == self.slot and entry.value_ptr.root != null) {
                 try list.append(state.allocator, entry.value_ptr);
             }
         }
@@ -440,7 +440,7 @@ const SlotPolicy = struct {
     fn hasViews(self: SlotPolicy, state: *ExtensionUiState) bool {
         var it = state.views.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.spec.target == self.target and entry.value_ptr.root != null) return true;
+            if (entry.value_ptr.spec.slot == self.slot and entry.value_ptr.root != null) return true;
         }
         return false;
     }
@@ -457,14 +457,14 @@ const SlotPolicy = struct {
         const ordered = self.orderedViews(state) catch return options;
         defer state.allocator.free(ordered);
         if (ordered.len == 0) return options;
-        applyTargetOptions(&options, ordered[ordered.len - 1].spec.target_options);
+        applySlotOptions(&options, ordered[ordered.len - 1].spec.slot_options);
         return options;
     }
 };
 
 const TargetComponent = struct {
     state: *ExtensionUiState = undefined,
-    target: extension_ui.UiTarget,
+    slot: extension_ui.UiSlot,
     width_method: WidthMethod = .wcwidth,
 
     fn component(self: *TargetComponent) Component {
@@ -498,22 +498,22 @@ const TargetComponent = struct {
     }
 
     fn orderedViews(self: *TargetComponent) ![]*ViewRecord {
-        return self.state.orderedTargetViews(self.target);
+        return self.state.orderedSlotViews(self.slot);
     }
 };
 
-fn applyTargetOptions(options: *overlay_mod.OverlayOptions, target: extension_ui.UiTargetOptions) void {
-    if (target.preset) |preset| options.* = preset.options(.{});
-    if (target.width) |v| applyWidth(options, v);
+fn applySlotOptions(options: *overlay_mod.OverlayOptions, slot: extension_ui.UiSlotOptions) void {
+    if (slot.preset) |preset| options.* = preset.options(.{});
+    if (slot.width) |v| applyWidth(options, v);
     // Current overlay manager does not expose exact height; use height as a max-height constraint.
-    if (target.height) |v| applyMaxHeight(options, v);
-    if (target.min_width) |v| {
+    if (slot.height) |v| applyMaxHeight(options, v);
+    if (slot.min_width) |v| {
         if (fixedConstraint(v)) |n| options.min_width = n;
     }
     // max_width is parsed and retained for v3, but OverlayOptions has no max_width field yet.
-    if (target.max_height) |v| applyMaxHeight(options, v);
-    if (target.anchor) |v| options.anchor = toOverlayAnchor(v);
-    if (target.backdrop) |v| options.backdrop = toOverlayBackdrop(v);
+    if (slot.max_height) |v| applyMaxHeight(options, v);
+    if (slot.anchor) |v| options.anchor = toOverlayAnchor(v);
+    if (slot.backdrop) |v| options.backdrop = toOverlayBackdrop(v);
 }
 
 fn applyWidth(options: *overlay_mod.OverlayOptions, c: extension_ui.Constraint) void {
@@ -1329,11 +1329,11 @@ test "extension ui retains clone remove and generation gates" {
     try std.testing.expectEqual(@as(usize, 0), state.views.count());
 
     const root = extension_ui.UiNode{ .text = .{ .text = "new" } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .slot = .status, .root = root });
     try std.testing.expectEqual(@as(usize, 1), state.views.count());
 
     const stale = extension_ui.UiNode{ .text = .{ .text = "old" } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = stale });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = stale });
     const rec = state.views.get("owner\x1fview").?;
     try std.testing.expectEqualStrings("new", rec.root.?.node.text.text);
 
@@ -1347,7 +1347,7 @@ test "extension ui edits focused overlay input and emits structured events" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     const root = extension_ui.UiNode{ .input = .{ .id = "filter", .value = "z", .placeholder = "Filter", .on_input = "input", .on_change = "changed", .on_submit = "submitted" } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .overlay, .focus = true, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .overlay, .focus = true, .root = root });
 
     const changed = state.handleOverlayInput(.{ .code = .char, .char = 'i' }).?;
     try std.testing.expectEqual(extension_ui.UiEventType.input, changed.type);
@@ -1370,9 +1370,9 @@ test "extension ui edits focused overlay input and emits structured events" {
 test "extension ui render resyncs input state" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .overlay, .focus = true, .root = .{ .input = .{ .id = "filter", .value = "a" } } });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .overlay, .focus = true, .root = .{ .input = .{ .id = "filter", .value = "a" } } });
     _ = state.handleOverlayInput(.{ .code = .char, .char = 'b' }).?;
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .target = .overlay, .focus = true, .root = .{ .input = .{ .id = "filter", .value = "server" } } });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .slot = .overlay, .focus = true, .root = .{ .input = .{ .id = "filter", .value = "server" } } });
     const submitted = state.handleOverlayInput(.{ .code = .enter }).?;
     try std.testing.expectEqualStrings("server", submitted.value.?);
 }
@@ -1381,7 +1381,7 @@ test "extension ui renders text" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     const root = extension_ui.UiNode{ .text = .{ .text = "hello" } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
     var buf = try Buffer.init(std.testing.allocator, 10, 1, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
@@ -1397,7 +1397,7 @@ test "extension ui row justify center honors retained layout" {
     const b = extension_ui.UiNode{ .text = .{ .text = "b", .style = .{ .width = .{ .fixed = 1 } } } };
     const children = [_]extension_ui.UiNode{ a, b };
     const root = extension_ui.UiNode{ .view = .{ .style = .{ .flex_direction = .row, .justify = .center }, .children = @constCast(&children) } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
     var buf = try Buffer.init(std.testing.allocator, 6, 1, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
@@ -1413,7 +1413,7 @@ test "extension ui row flex grow consumes remaining width before justify" {
     const b = extension_ui.UiNode{ .text = .{ .text = "b", .style = .{ .flex_grow = 1 } } };
     const children = [_]extension_ui.UiNode{ a, b };
     const root = extension_ui.UiNode{ .view = .{ .style = .{ .flex_direction = .row, .justify = .end }, .children = @constCast(&children) } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
     var buf = try Buffer.init(std.testing.allocator, 6, 1, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
@@ -1426,7 +1426,7 @@ test "extension ui measures and renders multiline text" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     const root = extension_ui.UiNode{ .text = .{ .text = "hello\nworld" } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
 
     var comp = state.statusComponent();
     const measured = comp.measure(10);
@@ -1446,7 +1446,7 @@ test "extension ui wraps text and lays out following column content below it" {
     const chip = extension_ui.UiNode{ .chip = .{ .label = "next" } };
     const children = [_]extension_ui.UiNode{ text, chip };
     const root = extension_ui.UiNode{ .view = .{ .children = @constCast(&children) } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
 
     var comp = state.statusComponent();
     const measured = comp.measure(5);
@@ -1465,7 +1465,7 @@ test "extension ui renders bordered box" {
     defer state.deinit();
     const child = extension_ui.UiNode{ .text = .{ .text = "hi" } };
     const root = extension_ui.UiNode{ .view = .{ .style = .{ .chrome = .{ .frame = .{} }, .padding = .{ .left = 1, .top = 0 } }, .children = @constCast(&[_]extension_ui.UiNode{child}) } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
     var buf = try Buffer.init(std.testing.allocator, 8, 3, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
@@ -1478,9 +1478,9 @@ test "extension ui renders bordered box" {
 test "extension ui sorts status views by order and id" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "b", .target = .status, .order = 2, .root = .{ .text = .{ .text = "b" } } });
-    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "a", .target = .status, .order = 1, .root = .{ .text = .{ .text = "a" } } });
-    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "c", .target = .status, .order = 1, .root = .{ .text = .{ .text = "c" } } });
+    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "b", .slot = .status, .order = 2, .root = .{ .text = .{ .text = "b" } } });
+    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "a", .slot = .status, .order = 1, .root = .{ .text = .{ .text = "a" } } });
+    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "c", .slot = .status, .order = 1, .root = .{ .text = .{ .text = "c" } } });
     var buf = try Buffer.init(std.testing.allocator, 4, 3, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
@@ -1498,7 +1498,7 @@ test "extension ui renders text spans with colors and attributes" {
         .{ .text = "!", .style = .{ .tone = .danger, .italic = true, .strikethrough = true } },
     };
     const root = extension_ui.UiNode{ .text = .{ .text = "ok!", .spans = @constCast(&spans) } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
     var buf = try Buffer.init(std.testing.allocator, 4, 1, .wcwidth);
     defer buf.deinit();
     var comp = state.statusComponent();
@@ -1520,7 +1520,7 @@ test "extension ui renders default text style colors and attrs" {
     var buf = try Buffer.init(std.testing.allocator, 8, 1, .wcwidth);
     defer buf.deinit();
     const root = extension_ui.UiNode{ .text = .{ .text = "hi", .style = .{ .fg = extension_ui.Color.rgb(9, 8, 7), .bg = extension_ui.Color.rgb(6, 5, 4), .bold = true, .dim = true, .italic = true, .underline = true, .strikethrough = true } } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
     state.statusComponent().render(buf.region());
     const cell = buf.get(0, 0);
     try std.testing.expect(cell.fg.eql(Color.rgb(9, 8, 7)));
@@ -1748,7 +1748,7 @@ test "extension ui surface uses keyed frame lookup" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     const root = extension_ui.UiNode{ .surface = .{ .id = "node", .style = .{ .height = .{ .fixed = 1 } } } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "view", .slot = .status, .root = root });
     const red = [_]u8{ 255, 0, 0, 255, 255, 0, 0, 255 };
     const blue = [_]u8{ 0, 0, 255, 255, 0, 0, 255, 255 };
     state.applyFrame(.{ .state_owner_id = "owner", .generation = 1, .view = "other", .node = "node", .width = 1, .height = 2, .data = &blue });
@@ -1764,10 +1764,10 @@ test "extension ui surface uses keyed frame lookup" {
 test "extension ui sorts overlay views and filters other targets" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .target = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
-    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .target = .overlay, .order = 2, .root = .{ .text = .{ .text = "b" } } });
-    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .target = .overlay, .order = 1, .root = .{ .text = .{ .text = "z" } } });
-    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .overlay, .order = 1, .root = .{ .text = .{ .text = "a" } } });
+    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .slot = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
+    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .slot = .overlay, .order = 2, .root = .{ .text = .{ .text = "b" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .slot = .overlay, .order = 1, .root = .{ .text = .{ .text = "z" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .slot = .overlay, .order = 1, .root = .{ .text = .{ .text = "a" } } });
 
     try std.testing.expect(state.hasOverlayViews());
     var buf = try Buffer.init(std.testing.allocator, 4, 3, .wcwidth);
@@ -1782,21 +1782,21 @@ test "extension ui sorts overlay views and filters other targets" {
 test "extension ui remove final overlay clears presence" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "overlay", .target = .overlay, .root = .{ .text = .{ .text = "hi" } } });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "overlay", .slot = .overlay, .root = .{ .text = .{ .text = "hi" } } });
     try std.testing.expect(state.hasOverlayViews());
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "overlay", .target = .overlay, .remove = true });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "overlay", .slot = .overlay, .remove = true });
     try std.testing.expect(!state.hasOverlayViews());
 }
 
 test "extension ui overlay focus follows top ordered view" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "background", .target = .overlay, .order = 1, .focus = true, .root = .{ .text = .{ .text = "bg" } } });
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "front", .target = .overlay, .order = 2, .focus = false, .root = .{ .text = .{ .text = "front" } } });
-    try std.testing.expect(!state.targetWantsFocus(.overlay));
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "background", .slot = .overlay, .order = 1, .focus = true, .root = .{ .text = .{ .text = "bg" } } });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "front", .slot = .overlay, .order = 2, .focus = false, .root = .{ .text = .{ .text = "front" } } });
+    try std.testing.expect(!state.slotWantsFocus(.overlay));
 
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "front", .target = .overlay, .order = 2, .focus = true, .root = .{ .text = .{ .text = "front" } } });
-    try std.testing.expect(state.targetWantsFocus(.overlay));
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "front", .slot = .overlay, .order = 2, .focus = true, .root = .{ .text = .{ .text = "front" } } });
+    try std.testing.expect(state.slotWantsFocus(.overlay));
 }
 
 test "extension ui maps retained overlay target options" {
@@ -1806,8 +1806,8 @@ test "extension ui maps retained overlay target options" {
         .state_owner_id = "owner",
         .generation = 1,
         .id = "overlay",
-        .target = .overlay,
-        .target_options = .{ .width = .{ .percent = 92 }, .max_height = .{ .percent = 90 }, .anchor = .center, .backdrop = .dim },
+        .slot = .overlay,
+        .slot_options = .{ .width = .{ .percent = 92 }, .max_height = .{ .percent = 90 }, .anchor = .center, .backdrop = .dim },
         .root = .{ .text = .{ .text = "hi" } },
     });
     const options = state.syncOverlayOptions(.overlay, .{});
@@ -1820,10 +1820,10 @@ test "extension ui maps retained overlay target options" {
 test "extension ui sorts editor border top views and filters other targets" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .target = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
-    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .target = .editor_border_top, .order = 2, .root = .{ .text = .{ .text = "b" } } });
-    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .target = .editor_border_top, .order = 1, .root = .{ .text = .{ .text = "z" } } });
-    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .target = .editor_border_top, .order = 1, .root = .{ .text = .{ .text = "a" } } });
+    state.applyRender(.{ .state_owner_id = "o", .generation = 1, .id = "status", .slot = .status, .order = 0, .root = .{ .text = .{ .text = "s" } } });
+    state.applyRender(.{ .state_owner_id = "b", .generation = 1, .id = "late", .slot = .editor_border_top, .order = 2, .root = .{ .text = .{ .text = "b" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "z", .slot = .editor_border_top, .order = 1, .root = .{ .text = .{ .text = "z" } } });
+    state.applyRender(.{ .state_owner_id = "a", .generation = 1, .id = "a", .slot = .editor_border_top, .order = 1, .root = .{ .text = .{ .text = "a" } } });
 
     var buf = try Buffer.init(std.testing.allocator, 4, 3, .wcwidth);
     defer buf.deinit();
@@ -1837,7 +1837,7 @@ test "extension ui sorts editor border top views and filters other targets" {
 test "extension ui renders and removes editor border bottom views" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "bottom", .target = .editor_border_bottom, .root = .{ .chip = .{ .label = "hint" } } });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "bottom", .slot = .editor_border_bottom, .root = .{ .chip = .{ .label = "hint" } } });
 
     var buf = try Buffer.init(std.testing.allocator, 8, 1, .wcwidth);
     defer buf.deinit();
@@ -1846,7 +1846,7 @@ test "extension ui renders and removes editor border bottom views" {
     try std.testing.expectEqual(@as(u21, '['), cpAt(&buf, 0, 0));
     try std.testing.expectEqual(@as(u21, 'h'), cpAt(&buf, 2, 0));
 
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "bottom", .target = .editor_border_bottom, .remove = true });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 2, .id = "bottom", .slot = .editor_border_bottom, .remove = true });
     try std.testing.expectEqual(@as(usize, 0), state.views.count());
     const m = comp.measure(8);
     try std.testing.expectEqual(@as(u32, 0), m.preferred_height);
@@ -1902,7 +1902,7 @@ test "extension ui wires text align and scroll_x" {
     var state = ExtensionUiState.init(std.testing.allocator);
     defer state.deinit();
     const root = extension_ui.UiNode{ .text = .{ .text = "abcdef", .wrap = .none, .@"align" = .right, .scroll_x = 4 } };
-    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .target = .status, .root = root });
+    state.applyRender(.{ .state_owner_id = "owner", .generation = 1, .id = "view", .slot = .status, .root = root });
 
     var buf = try Buffer.init(std.testing.allocator, 5, 1, .wcwidth);
     defer buf.deinit();

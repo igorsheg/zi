@@ -432,7 +432,7 @@ local function render(ctx)
   local root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1, gap = 1 }, children = children }
   ctx.ui.render({
     id = VIEW,
-    target = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" },
+    slot = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" },
     focus = true,
     keys = {
       { key = "escape", action = "close" }, { key = "q", action = "close" },
@@ -455,7 +455,7 @@ end
 local function load_data(ctx)
   state.busy = true
   if ctx.ui and ctx.ui.render then
-    ctx.ui.render({ id = VIEW, target = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" }, root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "progress", label = "Analyzing ~/.zi/agent/sessions…" } } } })
+    ctx.ui.render({ id = VIEW, slot = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" }, root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "progress", label = "Analyzing ~/.zi/agent/sessions…" } } } })
   end
   -- zi.system keeps this example small. A streaming zi.job loader would improve
   -- progress on very large histories, but would add more helper/Lua plumbing.

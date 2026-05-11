@@ -32,7 +32,7 @@ end
 local function render_workbench(ctx)
   ctx.ui.render({
     id = view_id,
-    target = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" },
+    slot = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" },
     focus = true,
     keys = {
       { key = "escape", action = "close" }, { key = "q", action = "close" },

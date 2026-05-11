@@ -125,7 +125,7 @@ return function(zi)
     handler = function(args, ctx)
       ctx.ui.render({
         id = "hello-command",
-        target = { kind = "overlay", preset = "centered" },
+        slot = { kind = "overlay", preset = "centered" },
         focus = true,
         keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
         root = {
@@ -151,9 +151,9 @@ Built-ins stay TUI-local when they need immediate UI/session behavior. Extension
 
 ### UI focus
 
-Overlay targets accept semantic presets with explicit fields as overrides: `preset = "ivy"` renders a full-width bottom sheet, `preset = "centered"` renders a modal dialog, and `preset = "top_toast"` renders a small top-right overlay. For example: `target = { kind = "overlay", preset = "ivy", max_height = "55%" }`.
+Overlay slots accept semantic presets with explicit fields as overrides: `preset = "ivy"` renders a full-width bottom sheet, `preset = "centered"` renders a modal dialog, and `preset = "top_toast"` renders a small top-right overlay. For example: `slot = { kind = "overlay", preset = "ivy", max_height = "55%" }`.
 
-`ctx.ui.render({ focus = true, target = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. `input` nodes inside a focused overlay are edited by the TUI itself; each edit emits a structured `ui` event with `type = "change"`, `node`, `value`, and optional `action`, and Enter emits `type = "submit"`. Extensions should update their own state from those events and re-render the input value. Overlays without `focus = true`, including status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
+`ctx.ui.render({ focus = true, slot = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. `input` nodes inside a focused overlay are edited by the TUI itself; each edit emits a structured `ui` event with `type = "change"`, `node`, `value`, and optional `action`, and Enter emits `type = "submit"`. Extensions should update their own state from those events and re-render the input value. Overlays without `focus = true`, including status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
 
 Notifications use the fidget-style API instead of `ctx.ui.render` targets:
 

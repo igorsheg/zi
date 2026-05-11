@@ -353,7 +353,7 @@ fn publishNotifyFromArgs(L: *c.lua_State) !void {
     const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
 
     const notify = extension_ui.NotifySpec{ .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)), .generation = runner.generation, .id = id, .message = try aa.dupe(u8, message), .group = group, .title = title, .annote = annote, .level = level, .progress = progress, .done = done, .clear = clear, .created_ns = now_ns, .updated_ns = now_ns, .lifetime = lifetime };
-    const spec = extension_ui.RenderSpec{ .state_owner_id = notify.state_owner_id, .generation = notify.generation, .id = notify.id, .target = .notification, .order = 0, .remove = notify.clear, .root = null, .notification = notify };
+    const spec = extension_ui.RenderSpec{ .state_owner_id = notify.state_owner_id, .generation = notify.generation, .id = notify.id, .slot = .notification, .order = 0, .remove = notify.clear, .root = null, .notification = notify };
     try callback(bound.session, spec);
 }
 
@@ -381,13 +381,13 @@ fn publishRenderFromArgs(L: *c.lua_State) !void {
     const aa = arena.allocator();
     const spec_idx = c.lua_absindex(L, 1);
     if (hasField(L, spec_idx, "title")) return error.InvalidUiRenderTitle;
-    const target = try readTargetField(L, spec_idx);
+    const slot = try readSlotField(L, spec_idx);
     const spec = extension_ui.RenderSpec{
         .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)),
         .generation = runner.generation,
         .id = try readStringFieldLimit(aa, L, spec_idx, "id", "root", ui_id_bytes),
-        .target = target.kind,
-        .target_options = target.options,
+        .slot = slot.kind,
+        .slot_options = slot.options,
         .order = readIntField(L, spec_idx, "order", 0),
         .focus = readBoolField(L, spec_idx, "focus", false),
         .remove = readBoolField(L, spec_idx, "remove", false),
@@ -425,17 +425,17 @@ fn publishFrameFromArgs(L: *c.lua_State) !void {
     try callback(bound.session, spec);
 }
 
-const ParsedTarget = struct { kind: extension_ui.UiTarget = .overlay, options: extension_ui.UiTargetOptions = .{} };
+const ParsedSlot = struct { kind: extension_ui.UiSlot = .overlay, options: extension_ui.UiSlotOptions = .{} };
 
-fn readTargetField(L: *c.lua_State, idx: c_int) !ParsedTarget {
-    _ = c.lua_getfield(L, idx, "target");
+fn readSlotField(L: *c.lua_State, idx: c_int) !ParsedSlot {
+    _ = c.lua_getfield(L, idx, "slot");
     defer c.lua_pop(L, 1);
     return switch (c.lua_type(L, -1)) {
-        c.LUA_TSTRING => .{ .kind = try parseTargetKind(luaString(L, -1) orelse return .{}) },
+        c.LUA_TSTRING => .{ .kind = try parseSlotKind(luaString(L, -1) orelse return .{}) },
         c.LUA_TTABLE => blk: {
             const tidx = c.lua_absindex(L, -1);
-            const kind = try parseTargetKindField(L, tidx);
-            var options: extension_ui.UiTargetOptions = .{};
+            const kind = try parseSlotKindField(L, tidx);
+            var options: extension_ui.UiSlotOptions = .{};
             options.width = readConstraintField(L, tidx, "width");
             options.height = readConstraintField(L, tidx, "height");
             options.min_width = readConstraintField(L, tidx, "min_width");
@@ -452,20 +452,20 @@ fn readTargetField(L: *c.lua_State, idx: c_int) !ParsedTarget {
     };
 }
 
-fn parseTargetKindField(L: *c.lua_State, idx: c_int) !extension_ui.UiTarget {
+fn parseSlotKindField(L: *c.lua_State, idx: c_int) !extension_ui.UiSlot {
     _ = c.lua_getfield(L, idx, "kind");
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return .overlay;
-    return try parseTargetKind(luaString(L, -1) orelse return .overlay);
+    return try parseSlotKind(luaString(L, -1) orelse return .overlay);
 }
 
-fn parseTargetKind(value: []const u8) !extension_ui.UiTarget {
+fn parseSlotKind(value: []const u8) !extension_ui.UiSlot {
     if (std.mem.eql(u8, value, "overlay")) return .overlay;
     if (std.mem.eql(u8, value, "status")) return .status;
     if (std.mem.eql(u8, value, "notification")) return .notification;
     if (std.mem.eql(u8, value, "editor.border.top")) return .editor_border_top;
     if (std.mem.eql(u8, value, "editor.border.bottom")) return .editor_border_bottom;
-    return error.InvalidUiTarget;
+    return error.InvalidUiSlot;
 }
 
 fn readNotifyLevelField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !extension_ui.NotifyLevel {
