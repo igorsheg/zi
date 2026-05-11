@@ -37,7 +37,7 @@ const TextParser = struct {
 
 const BuiltinParser = union(enum) {
     text: TextParser,
-    edit: void,
+    diff: void,
 };
 
 const BuiltinRenderState = struct {
@@ -55,11 +55,11 @@ const BuiltinRenderState = struct {
         return @ptrCast(state);
     }
 
-    fn createEdit(allocator: Allocator) ?*anyopaque {
+    fn createDiff(allocator: Allocator) ?*anyopaque {
         const state = allocator.create(BuiltinRenderState) catch return null;
         state.* = .{
             .allocator = allocator,
-            .parser = .edit,
+            .parser = .diff,
             .surface = OwnedSurface.init(allocator),
         };
         return @ptrCast(state);
@@ -75,7 +75,7 @@ const BuiltinRenderState = struct {
         self.surface.clear();
         switch (self.parser) {
             .text => |parser| rebuildTextSurface(&self.surface, ctx.result, parser.mode, parser.collapsed_excerpts) catch {},
-            .edit => rebuildEditSurface(&self.surface, ctx) catch {},
+            .diff => rebuildDiffDetailsSurface(&self.surface, ctx) catch {},
         }
     }
 };
@@ -217,9 +217,9 @@ fn rebuildLiteralSurface(surface: *OwnedSurface, text: []const u8, collapsed_exc
     try surface.setCollapsedExcerpts(collapsed_excerpts);
 }
 
-fn rebuildEditSurface(surface: *OwnedSurface, ctx: *const ToolStateContext) !void {
+fn rebuildDiffDetailsSurface(surface: *OwnedSurface, ctx: *const ToolStateContext) !void {
     const result = ctx.result orelse {
-        try rebuildLiteralSurface(surface, "malformed edit result: missing tool result", &TAIL_5);
+        try rebuildLiteralSurface(surface, "malformed diff result: missing tool result", &TAIL_5);
         return;
     };
 
@@ -379,8 +379,8 @@ fn initHeadTailShortState(allocator: Allocator) ?*anyopaque {
     return BuiltinRenderState.createText(allocator, .plain, &HEAD_TAIL_SHORT);
 }
 
-fn initEditState(allocator: Allocator) ?*anyopaque {
-    return BuiltinRenderState.createEdit(allocator);
+fn initDiffState(allocator: Allocator) ?*anyopaque {
+    return BuiltinRenderState.createDiff(allocator);
 }
 
 fn skillNameFromReadPath(path: []const u8) ?[]const u8 {
@@ -468,7 +468,20 @@ pub const edit_renderer = ToolRenderer{
     .render_call = editCall,
     .render_result_slice = retainedRenderSlice,
     .measure_result = retainedMeasure,
-    .init_state = initEditState,
+    .init_state = initDiffState,
+    .deinit_state = BuiltinRenderState.deinitOpaque,
+    .result_changed = builtinResultChanged,
+};
+
+fn patchCall(ctx: *const ToolRenderContext) void {
+    renderTitle(ctx, "Patch", "apply_patch");
+}
+
+pub const patch_renderer = ToolRenderer{
+    .render_call = patchCall,
+    .render_result_slice = retainedRenderSlice,
+    .measure_result = retainedMeasure,
+    .init_state = initDiffState,
     .deinit_state = BuiltinRenderState.deinitOpaque,
     .result_changed = builtinResultChanged,
 };
@@ -600,7 +613,7 @@ fn prepareRendererStateForTest(
 
     if (renderer.result_changed) |changed_fn| {
         var ctx = ToolStateContext{
-            .tool_name = "edit",
+            .tool_name = "test",
             .tool_call_id = "call-test",
             .args = .null,
             .result = result,
@@ -678,7 +691,7 @@ test "bashCall accepts legacy command arg for old sessions" {
     try testing.expectEqualStrings("$ ls -la", rowAscii(&buf, 0, &line));
 }
 
-test "edit renderer prefers structured diff details over fallback text" {
+fn expectDiffRendererPrefersDetails(renderer: ToolRenderer) !void {
     const diff_mod = @import("../../../diff/document.zig");
 
     var doc = try diff_mod.buildDocument(testing.allocator, &[_]diff_mod.Input{.{
@@ -705,9 +718,9 @@ test "edit renderer prefers structured diff details over fallback text" {
         .is_error = false,
     };
 
-    const state = try prepareRendererStateForTest(testing.allocator, edit_renderer, result, false);
+    const state = try prepareRendererStateForTest(testing.allocator, renderer, result, false);
     defer if (state) |resolved| {
-        if (edit_renderer.deinit_state) |deinit_fn| deinit_fn(resolved, testing.allocator);
+        if (renderer.deinit_state) |deinit_fn| deinit_fn(resolved, testing.allocator);
     };
     const builtin_state = stateFrom(state).?;
 
@@ -726,4 +739,12 @@ test "edit renderer prefers structured diff details over fallback text" {
     }
     try testing.expect(saw_removed);
     try testing.expect(saw_added);
+}
+
+test "edit renderer prefers structured diff details over fallback text" {
+    try expectDiffRendererPrefersDetails(edit_renderer);
+}
+
+test "patch renderer prefers structured diff details over fallback text" {
+    try expectDiffRendererPrefersDetails(patch_renderer);
 }

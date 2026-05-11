@@ -60,8 +60,8 @@ const Hunk = struct { tag: HunkTag, path: []const u8, move_path: ?[]const u8 = n
 const PlanTag = enum { add, delete, update, move };
 const PlanChange = struct {
     tag: PlanTag,
-    path: []u8,
-    dest_path: ?[]u8 = null,
+    path: []const u8,
+    dest_path: ?[]const u8 = null,
     old_content: ?[]u8 = null,
     new_content: ?[]u8 = null,
     old_text: ?[]u8 = null,
@@ -123,7 +123,7 @@ fn parsePatch(allocator: std.mem.Allocator, raw_text: []const u8) !std.ArrayList
     var current: ?Hunk = null;
     var it = std.mem.splitScalar(u8, std.mem.trim(u8, text, " \t\r\n"), '\n');
     while (it.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std.mem.trim(u8, raw_line, "\r");
         const trimmed = std.mem.trim(u8, line, " \t");
         if (std.mem.eql(u8, trimmed, "*** Begin Patch")) { in_patch = true; continue; }
         if (std.mem.eql(u8, trimmed, "*** End Patch")) { saw_end = true; break; }
@@ -336,10 +336,16 @@ fn matchAt(lines: []const []const u8, pattern: []const []const u8, at: usize) bo
     return false;
 }
 
+fn trimRight(comptime T: type, slice: []const T, values: []const T) []const T {
+    var end = slice.len;
+    while (end > 0 and std.mem.indexOfScalar(T, values, slice[end - 1]) != null) end -= 1;
+    return slice[0..end];
+}
+
 fn lineEqual(a: []const u8, b: []const u8, comptime mode: anytype) bool {
     return switch (mode) {
         .exact => std.mem.eql(u8, a, b),
-        .rstrip => std.mem.eql(u8, std.mem.trimRight(u8, a, " \t"), std.mem.trimRight(u8, b, " \t")),
+        .rstrip => std.mem.eql(u8, trimRight(u8, a, " \t"), trimRight(u8, b, " \t")),
         .trim => std.mem.eql(u8, std.mem.trim(u8, a, " \t"), std.mem.trim(u8, b, " \t")),
         .normalized => normalizedEqual(std.mem.trim(u8, a, " \t"), std.mem.trim(u8, b, " \t")),
     };

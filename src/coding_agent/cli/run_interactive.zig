@@ -109,6 +109,7 @@ pub fn run(
         .{ .tool_name = "read", .renderer = builtin_renderers.read_renderer },
         .{ .tool_name = "write", .renderer = builtin_renderers.write_renderer },
         .{ .tool_name = "edit", .renderer = builtin_renderers.edit_renderer },
+        .{ .tool_name = "patch", .renderer = builtin_renderers.patch_renderer },
         .{ .tool_name = "grep", .renderer = builtin_renderers.grep_renderer },
         .{ .tool_name = "find", .renderer = builtin_renderers.find_renderer },
         .{ .tool_name = "ls", .renderer = builtin_renderers.ls_renderer },
