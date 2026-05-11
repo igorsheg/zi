@@ -43,6 +43,37 @@ const c = lua_runtime.c;
 const log = std.log.scoped(.zi_lua_tool);
 
 const AgentToolResult = agent_protocol.AgentToolResult;
+const abort_hook_registry_key: u8 = 0;
+const lua_abort_hook_instruction_count: c_int = 10_000;
+
+fn installAbortHook(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
+    c.lua_pushlightuserdata(L, @constCast(&abort_hook_registry_key));
+    c.lua_pushlightuserdata(L, runner);
+    c.lua_settable(L, c.LUA_REGISTRYINDEX);
+    c.lua_sethook(L, abortHook, c.LUA_MASKCOUNT, lua_abort_hook_instruction_count);
+}
+
+fn clearAbortHook(L: *c.lua_State) void {
+    c.lua_sethook(L, null, 0, 0);
+    c.lua_pushlightuserdata(L, @constCast(&abort_hook_registry_key));
+    c.lua_pushnil(L);
+    c.lua_settable(L, c.LUA_REGISTRYINDEX);
+}
+
+fn abortHook(L: ?*c.lua_State, _: ?*c.lua_Debug) callconv(.c) void {
+    const state = L orelse return;
+    c.lua_pushlightuserdata(state, @constCast(&abort_hook_registry_key));
+    _ = c.lua_gettable(state, c.LUA_REGISTRYINDEX);
+    const raw = c.lua_touserdata(state, -1) orelse {
+        c.lua_pop(state, 1);
+        return;
+    };
+    const runner: *runner_mod.ExtensionRunner = @ptrCast(@alignCast(raw));
+    c.lua_pop(state, 1);
+    if (runner.current_tool_execution) |ctx| {
+        if (ctx.signal.isAborted()) _ = c.luaL_error(state, "tool execution cancelled");
+    }
+}
 
 const ToolResultLimits = struct {
     max_text_bytes: usize,
@@ -156,6 +187,8 @@ fn execute(
 
     var nargs: c_int = 2;
     while (true) {
+        installAbortHook(co.L, tctx.runner);
+        defer clearAbortHook(co.L);
         const r = co.resumeWith(nargs) catch |err| {
             log.warn("lua tool execution failed: {s}", .{@errorName(err)});
             return .{ .ready = errorResult(allocator, @errorName(err)) };
@@ -291,6 +324,8 @@ const PendingLuaToolExecution = struct {
                 };
             }
 
+            installAbortHook(self.co.L, self.runner);
+            defer clearAbortHook(self.co.L);
             const r = self.co.resumeWith(0) catch |err| {
                 log.warn("lua tool continuation failed: {s}", .{@errorName(err)});
                 return errorResult(allocator, @errorName(err));
@@ -2422,4 +2457,45 @@ test "lua tool execution maps Lua return shapes and runtime errors to AgentToolR
     const explode = awaitToolExecutionForCompat(explode_tool.start(arena.allocator(), "id-3", .{ .null = {} }, abort_signal_mod.AbortSignal.none, null, null), arena.allocator(), abort_signal_mod.AbortSignal.none);
     try testing.expect(explode.is_error);
     try testing.expect(explode.content.len >= 1);
+}
+
+test "lua tool cpu loop aborts through debug hook" {
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    api_v3.install(&state, &runner);
+
+    try state.doString(
+        \\zi.tool({
+        \\  name = "spin",
+        \\  description = "spin",
+        \\  parameters = { type = "object", properties = {} },
+        \\  execute = function(args) while true do end end,
+        \\})
+    , "register_spin_tool");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var args_obj: std.json.ObjectMap = .{};
+    defer args_obj.deinit(testing.allocator);
+    const spin_tool = try buildAgentTool(testing.allocator, &runner, runner.tool_registry.get("spin").?.*);
+
+    var controller = abort_signal_mod.AbortController{};
+    const signal = controller.beginRun();
+    const Aborter = struct {
+        fn run(ctrl: *abort_signal_mod.AbortController) void {
+            std.Options.debug_io.sleep(.fromMilliseconds(50), .awake) catch {};
+            ctrl.requestAbort();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Aborter.run, .{&controller});
+    defer thread.join();
+    const start = std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds();
+    const result = awaitToolExecutionForCompat(spin_tool.start(arena.allocator(), "id-spin", .{ .object = args_obj }, signal, null, null), arena.allocator(), signal);
+    const elapsed = std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds() - start;
+    try testing.expect(result.is_error);
+    try testing.expect(elapsed < 1000);
 }

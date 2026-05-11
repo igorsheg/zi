@@ -1407,6 +1407,12 @@ pub const ExtensionRunner = struct {
         };
 
         self.setModuleContext(state, kb.source.provenance);
+        const had_tool_execution = self.current_tool_execution != null;
+        if (!had_tool_execution) self.current_tool_execution = .{ .signal = abort_signal.AbortSignal.none };
+        defer {
+            if (!had_tool_execution) self.current_tool_execution = null;
+        }
+
         if (kb.source.provenance) |provenance| {
             self.beginExecutionContext(self.sourceForProvenance(provenance));
             defer self.endExecutionContext();
