@@ -62,7 +62,7 @@ fn executeSync(
     allocator: std.mem.Allocator,
     _: []const u8,
     args: std.json.Value,
-    _: protocol.AbortSignal,
+    signal: protocol.AbortSignal,
     _: ?protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) protocol.AgentToolResult {
@@ -90,14 +90,16 @@ fn executeSync(
         .argv = &argv,
         .stdout_limit = .limited(util.Limits.process_stdout_bytes),
         .stderr = .ignore,
-        .kill_scope = .child,
+        .kill_scope = .process_group,
+        .signal = signal,
     }) catch |err| return util.errorf(allocator, "find error: {s}", .{@errorName(err)});
     defer proc_result.deinit(allocator);
 
     const completed = switch (proc_result) {
         .completed => |completed| completed,
         .timed_out => return util.errorResult(allocator, "find timed out"),
-        .stdout_too_long, .stderr_too_long, .aborted => |err| return util.errorf(allocator, "find error: {s}", .{err.message}),
+        .aborted => return util.errorResult(allocator, "find aborted"),
+        .stdout_too_long, .stderr_too_long => |err| return util.errorf(allocator, "find error: {s}", .{err.message}),
     };
     const code: u8 = switch (completed.term) {
         .exited => |c| c,

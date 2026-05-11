@@ -344,3 +344,43 @@ test "process.run reports output limit as typed partial" {
     const failed = switch (result) { .stdout_too_long => |x| x, else => return error.UnexpectedProcessCompletion };
     try std.testing.expect(std.mem.indexOf(u8, failed.message, "stdout exceeded output limit") != null);
 }
+
+test "process.run aborts a blocked child promptly" {
+    try skipShellProcessTestsIfUnsupported();
+    var controller = guard_mod.AbortController{};
+    const signal = controller.beginRun();
+    const Aborter = struct {
+        fn run(ctrl: *guard_mod.AbortController) void {
+            std.Options.debug_io.sleep(.fromMilliseconds(50), .awake) catch {};
+            ctrl.requestAbort();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Aborter.run, .{&controller});
+    defer thread.join();
+    const start = std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds();
+    var result = try runShell("sleep 10", .{ .argv = &.{}, .signal = signal, .kill_scope = .process_group });
+    defer result.deinit(std.testing.allocator);
+    const elapsed = std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds() - start;
+    try std.testing.expect(result == .aborted);
+    try std.testing.expect(elapsed < 1000);
+}
+
+test "process.run aborts a child process group promptly" {
+    try skipShellProcessTestsIfUnsupported();
+    var controller = guard_mod.AbortController{};
+    const signal = controller.beginRun();
+    const Aborter = struct {
+        fn run(ctrl: *guard_mod.AbortController) void {
+            std.Options.debug_io.sleep(.fromMilliseconds(50), .awake) catch {};
+            ctrl.requestAbort();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Aborter.run, .{&controller});
+    defer thread.join();
+    const start = std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds();
+    var result = try runShell("sleep 10 & wait", .{ .argv = &.{}, .signal = signal, .kill_scope = .process_group });
+    defer result.deinit(std.testing.allocator);
+    const elapsed = std.Io.Clock.awake.now(std.Options.debug_io).toMilliseconds() - start;
+    try std.testing.expect(result == .aborted);
+    try std.testing.expect(elapsed < 1000);
+}

@@ -71,7 +71,7 @@ fn executeSync(
     allocator: std.mem.Allocator,
     _: []const u8,
     args: std.json.Value,
-    _: protocol.AbortSignal,
+    signal: protocol.AbortSignal,
     _: ?protocol.AgentToolUpdateCallback,
     _: ?*anyopaque,
 ) protocol.AgentToolResult {
@@ -120,14 +120,16 @@ fn executeSync(
         .argv = argv.items,
         .stdout_limit = .limited(util.Limits.process_stdout_bytes),
         .stderr = .ignore,
-        .kill_scope = .child,
+        .kill_scope = .process_group,
+        .signal = signal,
     }) catch |err| return util.errorf(allocator, "grep error: {s}", .{@errorName(err)});
     defer proc_result.deinit(allocator);
 
     const completed = switch (proc_result) {
         .completed => |completed| completed,
         .timed_out => return util.errorResult(allocator, "grep timed out"),
-        .stdout_too_long, .stderr_too_long, .aborted => |err| return util.errorf(allocator, "grep error: {s}", .{err.message}),
+        .aborted => return util.errorResult(allocator, "grep aborted"),
+        .stdout_too_long, .stderr_too_long => |err| return util.errorf(allocator, "grep error: {s}", .{err.message}),
     };
     const exited_code: u8 = switch (completed.term) {
         .exited => |c| c,

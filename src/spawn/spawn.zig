@@ -71,7 +71,7 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     var proc_result = runtime_process.stream(allocator, config.io, .{
         .argv = built.argv.items,
         .cwd = .{ .path = config.cwd },
-        .signal = config.signal orelse runtime_process.AbortSignal.none,
+        .signal = config.signal,
         .stdout_limit = .unlimited,
         .stderr_limit = .limited(1024 * 1024),
         .on_chunk = .{ .ctx = @ptrCast(&line_ctx), .func = &JsonlCtx.onChunk },
@@ -106,9 +106,7 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
         },
     }
 
-    if (config.signal) |sig| {
-        if (sig.isAborted()) result.cancelled = true;
-    }
+    if (config.signal.isAborted()) result.cancelled = true;
 
     if (trace_file) |f| {
         if (result.stderr_output.items.len > 0) {
