@@ -165,30 +165,25 @@ fn runCommand(
         .update_ctx = update_ctx,
     };
 
-    var proc_result = runtime_process.run(allocator, io, .{
+    var proc_result = runtime_process.stream(allocator, io, .{
         .argv = shell_argv,
-        .cwd = cwd,
+        .cwd = .{ .path = cwd },
         .timeout_ms = if (timeout_secs) |secs| secs * std.time.ms_per_s else null,
         .signal = signal,
-        .capture_stdout = false,
-        .capture_stderr = false,
+        .stdout_limit = .unlimited,
+        .stderr_limit = .unlimited,
         .on_chunk = .{ .ctx = @ptrCast(&callback_ctx), .func = &BashChunkCtx.onChunk },
-    });
+    }) catch return util.errorResult(allocator, "command error: failed to run command");
     defer proc_result.deinit(allocator);
     callback_ctx.emitFinal();
-
-    if (proc_result == .err) {
-        return util.errorf(allocator, "command error: {s}", .{proc_result.err.message});
-    }
 
     const completed = CompletedOutput{ .output_text = capture.finishText(allocator) catch allocator.dupe(u8, "") catch &.{} };
     defer if (completed.output_text.len > 0) allocator.free(completed.output_text);
 
-    const did_timeout = proc_result == .timeout;
+    const did_timeout = proc_result == .timed_out;
     const term: ?std.process.Child.Term = switch (proc_result) {
         .completed => |completed_result| completed_result.term,
-        .timeout => null,
-        .err => null,
+        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => null,
     };
 
     const result_text = formatCommandTranscript(allocator, command, completed.output_text) catch

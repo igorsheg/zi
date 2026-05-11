@@ -95,49 +95,35 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
     }
     var proc_result = process.run(allocator, io, .{
         .argv = request.argv,
-        .cwd = request.cwd,
-        .stdin = request.stdin,
+        .cwd = if (request.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .stdin = if (request.stdin) |bytes| .{ .bytes = bytes } else .ignore,
         .env = request.env,
         .clear_env = request.clear_env,
         .timeout_ms = request.timeout_ms,
-        .max_stdout_bytes = request.max_stdout_bytes,
-        .max_stderr_bytes = request.max_stderr_bytes,
-        .process_group = true,
+        .stdout_limit = .limited(request.max_stdout_bytes),
+        .stderr_limit = .limited(request.max_stderr_bytes),
+        .kill_scope = .process_group,
         .signal = request.signal,
-    });
+    }) catch |err| return errorResult(allocator, @errorName(err));
     defer proc_result.deinit(allocator);
 
     return switch (proc_result) {
         .completed => |completed| completedResult(allocator, completed, request.text),
-        .timeout => |timeout| timeoutResult(allocator, timeout, request.text),
-        .err => |err| .{ .err = .{
-            .message = allocator.dupe(u8, err.message) catch &.{},
-            .stdout = if (err.stdout.len > 0) allocator.dupe(u8, err.stdout) catch &.{} else &.{},
-            .stderr = if (err.stderr.len > 0) allocator.dupe(u8, err.stderr) catch &.{} else &.{},
-        } },
+        .timed_out => |timeout| timeoutResult(allocator, timeout, request.text),
+        .stdout_too_long, .stderr_too_long, .aborted => |err| partialErrorResult(allocator, err, request.text),
     };
 }
 
 fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
-    var proc_result = process.runTerminal(allocator, io, .{
+    const term = process.runInherit(io, .{
         .argv = request.argv,
-        .cwd = request.cwd,
+        .cwd = if (request.cwd) |cwd| .{ .path = cwd } else .inherit,
         .env = request.env,
         .clear_env = request.clear_env,
-        .process_group = false,
+        .kill_scope = .child,
         .signal = request.signal,
-    });
-    defer proc_result.deinit(allocator);
-
-    return switch (proc_result) {
-        .completed => |completed| completedResult(allocator, completed, request.text),
-        .timeout => |timeout| timeoutResult(allocator, timeout, request.text),
-        .err => |err| .{ .err = .{
-            .message = allocator.dupe(u8, err.message) catch &.{},
-            .stdout = if (err.stdout.len > 0) allocator.dupe(u8, err.stdout) catch &.{} else &.{},
-            .stderr = if (err.stderr.len > 0) allocator.dupe(u8, err.stderr) catch &.{} else &.{},
-        } },
-    };
+    }) catch |err| return errorResult(allocator, @errorName(err));
+    return completedResult(allocator, .{ .term = term, .stdout = &.{}, .stderr = &.{} }, request.text);
 }
 
 fn completedResult(allocator: std.mem.Allocator, completed: process.Completed, text: bool) Result {
@@ -160,13 +146,22 @@ fn completedResult(allocator: std.mem.Allocator, completed: process.Completed, t
     } };
 }
 
-fn timeoutResult(allocator: std.mem.Allocator, timeout: process.TimedOut, text: bool) Result {
+fn timeoutResult(allocator: std.mem.Allocator, timeout: process.Partial, text: bool) Result {
     const stdout = cloneOutput(allocator, timeout.stdout, text) catch return errorResult(allocator, "failed to allocate stdout");
     errdefer allocator.free(stdout);
     const stderr = cloneOutput(allocator, timeout.stderr, text) catch return errorResult(allocator, "failed to allocate stderr");
     errdefer allocator.free(stderr);
     const message = allocator.dupe(u8, timeout.message) catch return errorResult(allocator, "timed out");
     return .{ .timeout = .{ .stdout = stdout, .stderr = stderr, .message = message } };
+}
+
+fn partialErrorResult(allocator: std.mem.Allocator, failed: process.Partial, text: bool) Result {
+    const stdout = cloneOutput(allocator, failed.stdout, text) catch return errorResult(allocator, "failed to allocate stdout");
+    errdefer allocator.free(stdout);
+    const stderr = cloneOutput(allocator, failed.stderr, text) catch return errorResult(allocator, "failed to allocate stderr");
+    errdefer allocator.free(stderr);
+    const message = allocator.dupe(u8, failed.message) catch return errorResult(allocator, "process failed");
+    return .{ .err = .{ .message = message, .stdout = stdout, .stderr = stderr } };
 }
 
 fn cloneOutput(allocator: std.mem.Allocator, bytes: []const u8, text: bool) ![]u8 {

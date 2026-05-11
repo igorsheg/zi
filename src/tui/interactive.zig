@@ -804,14 +804,14 @@ pub const Interactive = struct {
     fn detectGitBranch(self: *Interactive) void {
         var result = runtime_process.run(self.allocator, self.io, .{
             .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
-            .max_stdout_bytes = 256,
-            .capture_stderr = false,
-        });
+            .stdout_limit = .limited(256),
+            .stderr = .ignore,
+        }) catch return;
         defer result.deinit(self.allocator);
 
         const completed = switch (result) {
             .completed => |completed| completed,
-            .timeout, .err => return,
+            .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return,
         };
         switch (completed.term) {
             .exited => |code| if (code != 0) return,

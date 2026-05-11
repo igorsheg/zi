@@ -118,16 +118,16 @@ fn executeSync(
 
     var proc_result = runtime_process.run(allocator, ctx.io, .{
         .argv = argv.items,
-        .max_stdout_bytes = util.Limits.process_stdout_bytes,
-        .max_stderr_bytes = 0,
-        .process_group = false,
-    });
+        .stdout_limit = .limited(util.Limits.process_stdout_bytes),
+        .stderr = .ignore,
+        .kill_scope = .child,
+    }) catch |err| return util.errorf(allocator, "grep error: {s}", .{@errorName(err)});
     defer proc_result.deinit(allocator);
 
     const completed = switch (proc_result) {
         .completed => |completed| completed,
-        .timeout => return util.errorResult(allocator, "grep timed out"),
-        .err => |err| return util.errorf(allocator, "grep error: {s}", .{err.message}),
+        .timed_out => return util.errorResult(allocator, "grep timed out"),
+        .stdout_too_long, .stderr_too_long, .aborted => |err| return util.errorf(allocator, "grep error: {s}", .{err.message}),
     };
     const exited_code: u8 = switch (completed.term) {
         .exited => |c| c,

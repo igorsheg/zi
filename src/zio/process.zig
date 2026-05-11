@@ -1,16 +1,17 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const child_process = @import("child_process.zig");
 const guard_mod = @import("guard.zig");
 const InterruptGuard = guard_mod.InterruptGuard;
-const AbortSignal = @import("abort_signal.zig").AbortSignal;
+pub const AbortSignal = @import("abort_signal.zig").AbortSignal;
+const child_process = @import("child_process.zig");
 
 pub const default_max_output_bytes: usize = 1024 * 1024;
-const poll_interval_ms: u64 = 25;
-
 pub const EnvPair = child_process.EnvPair;
-
 pub const StreamKind = enum { stdout, stderr };
+
+pub const KillScope = enum { child, process_group };
+pub const Stdin = union(enum) { ignore, inherit, bytes: []const u8 };
+pub const Output = enum { ignore, inherit, capture };
 
 pub const ChunkCallback = struct {
     ctx: ?*anyopaque = null,
@@ -21,436 +22,325 @@ pub const ChunkCallback = struct {
     }
 };
 
-pub const WaitCallback = struct {
-    ctx: ?*anyopaque = null,
-    func: *const fn (ctx: ?*anyopaque) void,
-
-    fn call(self: WaitCallback) void {
-        self.func(self.ctx);
-    }
-};
-
-pub const Request = struct {
+pub const RunOptions = struct {
     argv: []const []const u8,
-    cwd: ?[]const u8 = null,
-    stdin: ?[]const u8 = null,
+    cwd: std.process.Child.Cwd = .inherit,
     env: []const EnvPair = &.{},
     clear_env: bool = false,
+    stdin: Stdin = .ignore,
+    stdout: Output = .capture,
+    stderr: Output = .capture,
+    stdout_limit: std.Io.Limit = .limited(default_max_output_bytes),
+    stderr_limit: std.Io.Limit = .limited(default_max_output_bytes),
     timeout_ms: ?u64 = null,
-    max_stdout_bytes: usize = default_max_output_bytes,
-    max_stderr_bytes: usize = default_max_output_bytes,
-    capture_stdout: bool = true,
-    capture_stderr: bool = true,
-    process_group: bool = true,
-    signal: ?AbortSignal = null,
+    kill_scope: KillScope = .process_group,
+    signal: AbortSignal = AbortSignal.none,
+};
+
+pub const StreamOptions = struct {
+    argv: []const []const u8,
+    cwd: std.process.Child.Cwd = .inherit,
+    env: []const EnvPair = &.{},
+    clear_env: bool = false,
+    stdin: Stdin = .ignore,
+    stdout_limit: std.Io.Limit = .limited(default_max_output_bytes),
+    stderr_limit: std.Io.Limit = .limited(default_max_output_bytes),
+    timeout_ms: ?u64 = null,
+    kill_scope: KillScope = .process_group,
+    signal: AbortSignal = AbortSignal.none,
     on_chunk: ?ChunkCallback = null,
-    /// Called from the thread that invoked run() while the child is alive.
-    /// Use this to drain thread-safe event queues produced by on_chunk.
-    on_wait: ?WaitCallback = null,
 };
 
 pub const Completed = struct {
     term: std.process.Child.Term,
-    stdout: []const u8,
-    stderr: []const u8,
+    stdout: []u8,
+    stderr: []u8,
 };
 
-pub const TimedOut = struct {
-    stdout: []const u8,
-    stderr: []const u8,
-    message: []const u8,
+pub const Partial = struct {
+    stdout: []u8,
+    stderr: []u8,
+    message: []u8,
 };
 
-pub const Failed = struct {
-    message: []const u8,
-    stdout: []const u8 = &.{},
-    stderr: []const u8 = &.{},
-};
-
-pub const Result = union(enum) {
+pub const RunResult = union(enum) {
     completed: Completed,
-    timeout: TimedOut,
-    err: Failed,
+    timed_out: Partial,
+    stdout_too_long: Partial,
+    stderr_too_long: Partial,
+    aborted: Partial,
 
-    pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *RunResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .completed => |completed| {
-                allocator.free(completed.stdout);
-                allocator.free(completed.stderr);
+            .completed => |x| {
+                allocator.free(x.stdout);
+                allocator.free(x.stderr);
             },
-            .timeout => |timeout| {
-                allocator.free(timeout.stdout);
-                allocator.free(timeout.stderr);
-                allocator.free(timeout.message);
-            },
-            .err => |err| {
-                allocator.free(err.message);
-                if (err.stdout.len > 0) allocator.free(err.stdout);
-                if (err.stderr.len > 0) allocator.free(err.stderr);
+            .timed_out, .stdout_too_long, .stderr_too_long, .aborted => |x| {
+                allocator.free(x.stdout);
+                allocator.free(x.stderr);
+                allocator.free(x.message);
             },
         }
         self.* = undefined;
     }
+};
+
+pub const RunError = error{
+    EmptyArgv,
+    InvalidStdio,
+    EnvironmentBuildFailed,
+    SpawnFailed,
+    WaitFailed,
+    ReadFailed,
+    OutOfMemory,
+    InterruptGuardFailed,
 };
 
 pub fn commandExists(allocator: std.mem.Allocator, io: std.Io, command: []const u8) bool {
     var result = run(allocator, io, .{
         .argv = &.{ command, "--version" },
-        .capture_stdout = false,
-        .capture_stderr = false,
+        .stdout = .ignore,
+        .stderr = .ignore,
         .timeout_ms = 2000,
-        .process_group = false,
-    });
+        .kill_scope = .child,
+    }) catch return false;
     defer result.deinit(allocator);
-
     const completed = switch (result) {
         .completed => |completed| completed,
-        .timeout, .err => return false,
+        else => return false,
     };
-    return switch (completed.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
+    return switch (completed.term) { .exited => |code| code == 0, else => false };
 }
 
-pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
-    var ctx = RunContext.init(allocator, io, request) catch |err| switch (err) {
-        error.EmptyArgv => return errorResult(allocator, "empty argv"),
-    };
-    defer ctx.deinit();
-    return ctx.run();
+pub fn run(allocator: std.mem.Allocator, io: std.Io, options: RunOptions) RunError!RunResult {
+    if (options.stdout == .inherit or options.stderr == .inherit or options.stdin == .inherit) return runInheritCaptureUnsupported(allocator, io, options);
+    return runStreamCapture(allocator, io, .{
+        .argv = options.argv,
+        .cwd = options.cwd,
+        .env = options.env,
+        .clear_env = options.clear_env,
+        .stdin = options.stdin,
+        .stdout_limit = if (options.stdout == .capture) options.stdout_limit else .limited(0),
+        .stderr_limit = if (options.stderr == .capture) options.stderr_limit else .limited(0),
+        .timeout_ms = options.timeout_ms,
+        .kill_scope = options.kill_scope,
+        .signal = options.signal,
+        .on_chunk = null,
+    }, options.stdout == .capture, options.stderr == .capture);
 }
 
-pub const TerminalRequest = struct {
+fn runInheritCaptureUnsupported(allocator: std.mem.Allocator, io: std.Io, options: RunOptions) RunError!RunResult {
+    if (options.stdout != .inherit or options.stderr != .inherit or options.stdin == .bytes) return error.InvalidStdio;
+    const term = try runInherit(io, .{
+        .argv = options.argv,
+        .cwd = options.cwd,
+        .env = options.env,
+        .clear_env = options.clear_env,
+        .stdin = options.stdin,
+        .kill_scope = options.kill_scope,
+        .signal = options.signal,
+    });
+    return .{ .completed = .{ .term = term, .stdout = try allocator.dupe(u8, ""), .stderr = try allocator.dupe(u8, "") } };
+}
+
+pub fn stream(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions) RunError!RunResult {
+    return runStreamCapture(allocator, io, options, false, false);
+}
+
+pub const InheritOptions = struct {
     argv: []const []const u8,
-    cwd: ?[]const u8 = null,
+    cwd: std.process.Child.Cwd = .inherit,
     env: []const EnvPair = &.{},
     clear_env: bool = false,
-    process_group: bool = true,
-    signal: ?AbortSignal = null,
+    stdin: Stdin = .inherit,
+    kill_scope: KillScope = .process_group,
+    signal: AbortSignal = AbortSignal.none,
 };
 
-pub fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: TerminalRequest) Result {
-    if (request.argv.len == 0) return errorResult(allocator, "empty argv");
-
-    var env_map_storage: ?std.process.Environ.Map = null;
+pub fn runInherit(io: std.Io, options: InheritOptions) RunError!std.process.Child.Term {
+    if (options.argv.len == 0) return error.EmptyArgv;
+    if (options.stdin == .bytes) return error.InvalidStdio;
+    var env_map_storage = buildEnvMap(std.heap.smp_allocator, options.env, options.clear_env) catch return error.EnvironmentBuildFailed;
     defer if (env_map_storage) |*env_map| env_map.deinit();
-    if (request.env.len > 0 or request.clear_env) {
-        env_map_storage = std.process.Environ.Map.init(allocator);
-        for (request.env) |pair| {
-            env_map_storage.?.put(pair.key, pair.value) catch return errorResult(allocator, "failed to build environment");
-        }
-    }
-
     var child = std.process.spawn(io, .{
-        .argv = request.argv,
-        .cwd = if (request.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .argv = options.argv,
+        .cwd = options.cwd,
         .environ_map = if (env_map_storage) |*env_map| env_map else null,
-        .stdin = .inherit,
+        .stdin = if (options.stdin == .inherit) .inherit else .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
-        .pgid = if (request.process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
-    }) catch |err| return errorFmt(allocator, "spawn failed: {s}", .{@errorName(err)});
-
+        .pgid = childPgid(options.kill_scope),
+    }) catch return error.SpawnFailed;
     const child_id = child.id.?;
-    var abort_guard = if (request.signal) |signal|
-        InterruptGuard.start(io, .{ .signal = signal, .actions = .{ .interrupt_process_group = if (request.process_group) child_id else null, .kill_pid = if (request.process_group) null else child_id } }) catch |err| return errorFmt(allocator, "interrupt guard failed: {s}", .{@errorName(err)})
-    else
-        InterruptGuard.start(io, .{}) catch |err| return errorFmt(allocator, "interrupt guard failed: {s}", .{@errorName(err)});
-    defer abort_guard.stop();
+    var guard = InterruptGuard.start(io, .{ .signal = options.signal, .actions = killActions(options.kill_scope, child_id) }) catch return error.InterruptGuardFailed;
+    defer guard.stop();
+    const term = child.wait(io) catch return error.WaitFailed;
+    guard.markDone();
+    return term;
+}
 
-    const term = child.wait(io) catch |err| return errorFmt(allocator, "wait failed: {s}", .{@errorName(err)});
-    const stdout = allocator.dupe(u8, "") catch return errorResult(allocator, "failed to allocate stdout");
-    const stderr = allocator.dupe(u8, "") catch {
-        allocator.free(stdout);
-        return errorResult(allocator, "failed to allocate stderr");
-    };
+fn runStreamCapture(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, store_stdout: bool, store_stderr: bool) RunError!RunResult {
+    if (options.argv.len == 0) return error.EmptyArgv;
+    var env_map_storage = buildEnvMap(allocator, options.env, options.clear_env) catch return error.EnvironmentBuildFailed;
+    defer if (env_map_storage) |*env_map| env_map.deinit();
+
+    var child = std.process.spawn(io, .{
+        .argv = options.argv,
+        .cwd = options.cwd,
+        .environ_map = if (env_map_storage) |*env_map| env_map else null,
+        .stdin = if (options.stdin == .bytes) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = childPgid(options.kill_scope),
+    }) catch return error.SpawnFailed;
+    errdefer child.kill(io);
+    const child_id = child.id.?;
+
+    var guard = InterruptGuard.start(io, .{ .signal = options.signal, .timeout_ms = options.timeout_ms, .actions = killActions(options.kill_scope, child_id) }) catch return error.InterruptGuardFailed;
+    defer guard.stop();
+
+    if (options.stdin == .bytes) {
+        const bytes = options.stdin.bytes;
+        child.stdin.?.writeStreamingAll(io, bytes) catch {};
+        child.stdin.?.close(io);
+        child.stdin = null;
+    }
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+    var stdout_seen: usize = 0;
+    var stderr_seen: usize = 0;
+
+    while (multi_reader.fill(64, .none)) |_| {
+        emitNew(options.on_chunk, .stdout, stdout_reader.buffered(), &stdout_seen);
+        emitNew(options.on_chunk, .stderr, stderr_reader.buffered(), &stderr_seen);
+        if (tooLong(stdout_reader.buffered().len, options.stdout_limit)) {
+            child.kill(io);
+            return partial(allocator, &multi_reader, .stdout_too_long, "stdout exceeded output limit");
+        }
+        if (tooLong(stderr_reader.buffered().len, options.stderr_limit)) {
+            child.kill(io);
+            return partial(allocator, &multi_reader, .stderr_too_long, "stderr exceeded output limit");
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return error.ReadFailed,
+    }
+    emitNew(options.on_chunk, .stdout, stdout_reader.buffered(), &stdout_seen);
+    emitNew(options.on_chunk, .stderr, stderr_reader.buffered(), &stderr_seen);
+    multi_reader.checkAnyError() catch return error.ReadFailed;
+    const term = child.wait(io) catch return error.WaitFailed;
+    guard.markDone();
+
+    if (guard.didTimeout()) {
+        var buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "timed out after {d}ms", .{options.timeout_ms orelse 0}) catch "timed out";
+        return partial(allocator, &multi_reader, .timed_out, msg);
+    }
+    if (options.signal.isAborted()) return partial(allocator, &multi_reader, .aborted, "aborted");
+
+    const stdout = if (store_stdout) multi_reader.toOwnedSlice(0) catch return error.OutOfMemory else allocator.dupe(u8, "") catch return error.OutOfMemory;
+    errdefer allocator.free(stdout);
+    const stderr = if (store_stderr) multi_reader.toOwnedSlice(1) catch return error.OutOfMemory else allocator.dupe(u8, "") catch return error.OutOfMemory;
     return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
 }
 
-const RunContext = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    request: Request,
-    child: child_process.ChildProcess = undefined,
-    interrupt_guard: ?InterruptGuard = null,
-    stdout_capture: Capture,
-    stderr_capture: Capture,
-    term: ?std.process.Child.Term = null,
-    spawn_failed: bool = false,
-
-    const InitError = error{EmptyArgv};
-
-    fn init(allocator: std.mem.Allocator, io: std.Io, request: Request) InitError!RunContext {
-        if (request.argv.len == 0) return error.EmptyArgv;
-
-        var ctx = RunContext{
-            .allocator = allocator,
-            .io = io,
-            .request = request,
-            .stdout_capture = Capture.init(std.heap.smp_allocator, request.max_stdout_bytes, request.capture_stdout),
-            .stderr_capture = Capture.init(std.heap.smp_allocator, request.max_stderr_bytes, request.capture_stderr),
-        };
-        ctx.child = child_process.ChildProcess.init(io, .{
-            .argv = request.argv,
-            .cwd = request.cwd,
-            .env = request.env,
-            .clear_env = request.clear_env,
-            .process_group = request.process_group,
-            .stdin = request.stdin != null,
-            .close_stdin_before_wait = request.stdin != null,
-            .stdout = true,
-            .stderr = true,
-        }, .{ .ptr = @ptrCast(&ctx), .submit = RunContext.submitChildEvent });
-        return ctx;
-    }
-
-    fn deinit(ctx: *RunContext) void {
-        if (ctx.interrupt_guard) |*guard| guard.stop();
-        ctx.child.wait();
-        ctx.stdout_capture.deinit();
-        ctx.stderr_capture.deinit();
-    }
-
-    fn run(ctx: *RunContext) Result {
-        ctx.child.sink.ptr = @ptrCast(ctx);
-        ctx.child.start() catch |err| return errorFmt(ctx.allocator, "spawn failed: {s}", .{@errorName(err)});
-        if (!ctx.child.waitReady(5000)) return errorResult(ctx.allocator, "spawn failed");
-        ctx.startInterruptGuard() catch |err| return errorFmt(ctx.allocator, "interrupt guard failed: {s}", .{@errorName(err)});
-        ctx.writeStdin();
-
-        ctx.pumpWhileRunning();
-        ctx.child.wait();
-        if (ctx.request.on_wait) |callback| callback.call();
-        if (ctx.interrupt_guard) |*guard| guard.markDone();
-
-        if (ctx.spawn_failed) return errorResult(ctx.allocator, "spawn failed");
-        const term = ctx.term orelse return errorResult(ctx.allocator, "wait failed");
-        if (ctx.stdout_capture.err) |err| return captureErrorResult(ctx.allocator, "stdout", err, term, &ctx.stdout_capture, &ctx.stderr_capture);
-        if (ctx.stderr_capture.err) |err| return captureErrorResult(ctx.allocator, "stderr", err, term, &ctx.stdout_capture, &ctx.stderr_capture);
-
-        const stdout = ctx.stdout_capture.toOwnedParent(ctx.allocator) catch return errorResult(ctx.allocator, "failed to allocate stdout");
-        errdefer ctx.allocator.free(stdout);
-        const stderr = ctx.stderr_capture.toOwnedParent(ctx.allocator) catch return errorResult(ctx.allocator, "failed to allocate stderr");
-        errdefer ctx.allocator.free(stderr);
-
-        if (ctx.didTimeout()) {
-            return .{ .timeout = .{
-                .stdout = stdout,
-                .stderr = stderr,
-                .message = std.fmt.allocPrint(ctx.allocator, "timed out after {d}ms", .{ctx.request.timeout_ms orelse 0}) catch return errorResult(ctx.allocator, "timed out"),
-            } };
-        }
-
-        return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
-    }
-
-    fn startInterruptGuard(ctx: *RunContext) !void {
-        const child_id = ctx.child.childId() orelse return;
-        ctx.interrupt_guard = try InterruptGuard.start(ctx.io, .{
-            .signal = ctx.request.signal orelse AbortSignal.none,
-            .timeout_ms = ctx.request.timeout_ms,
-            .actions = if (ctx.request.process_group)
-                .{ .interrupt_process_group = child_id }
-            else
-                .{ .kill_pid = child_id },
-        });
-    }
-
-    fn writeStdin(ctx: *RunContext) void {
-        const stdin_bytes = ctx.request.stdin orelse return;
-        ctx.child.write(stdin_bytes) catch {};
-        ctx.child.closeStdin();
-    }
-
-    fn pumpWhileRunning(ctx: *RunContext) void {
-        while (!ctx.child.isExited()) {
-            if (ctx.request.on_wait) |callback| callback.call();
-            ctx.io.sleep(.fromMilliseconds(poll_interval_ms), .awake) catch {};
-        }
-    }
-
-    fn submitChildEvent(ptr: *anyopaque, event: child_process.Event) bool {
-        const ctx: *RunContext = @ptrCast(@alignCast(ptr));
-        switch (event) {
-            .stdout => |bytes| ctx.stdout_capture.acceptChunk(.stdout, bytes, ctx.request.on_chunk) catch |err| {
-                ctx.stdout_capture.err = err;
-            },
-            .stderr => |bytes| ctx.stderr_capture.acceptChunk(.stderr, bytes, ctx.request.on_chunk) catch |err| {
-                ctx.stderr_capture.err = err;
-            },
-            .spawn_failed => ctx.spawn_failed = true,
-            .exit => |term| ctx.term = term,
-        }
-        return true;
-    }
-
-    fn didTimeout(ctx: *const RunContext) bool {
-        const guard = ctx.interrupt_guard orelse return false;
-        return guard.didTimeout();
-    }
-};
-
-const CaptureError = error{ OutputTooLarge, ReadFailed };
-
-const Capture = struct {
-    allocator: std.mem.Allocator,
-    max_bytes: usize,
-    buf: std.ArrayListUnmanaged(u8) = .empty,
-    err: ?CaptureError = null,
-
-    store: bool,
-
-    fn init(allocator: std.mem.Allocator, max_bytes: usize, store: bool) Capture {
-        return .{ .allocator = allocator, .max_bytes = max_bytes, .store = store };
-    }
-
-    fn deinit(self: *Capture) void {
-        self.buf.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    fn acceptChunk(self: *Capture, kind: StreamKind, chunk: []const u8, on_chunk: ?ChunkCallback) CaptureError!void {
-        if (on_chunk) |callback| callback.call(kind, chunk);
-        if (!self.store) return;
-        if (self.buf.items.len + chunk.len > self.max_bytes) return error.OutputTooLarge;
-        self.buf.appendSlice(self.allocator, chunk) catch return error.ReadFailed;
-    }
-
-    fn toOwnedParent(self: *Capture, allocator: std.mem.Allocator) ![]u8 {
-        return allocator.dupe(u8, self.buf.items);
-    }
-};
-
-fn captureErrorResult(
-    allocator: std.mem.Allocator,
-    stream: []const u8,
-    err: CaptureError,
-    term: std.process.Child.Term,
-    stdout_capture: *Capture,
-    stderr_capture: *Capture,
-) Result {
-    _ = term;
-    if (err == error.OutputTooLarge) {
-        const stdout = stdout_capture.toOwnedParent(allocator) catch return errorResult(allocator, "failed to allocate stdout");
-        const stderr = stderr_capture.toOwnedParent(allocator) catch {
-            allocator.free(stdout);
-            return errorResult(allocator, "failed to allocate stderr");
-        };
-        const message = std.fmt.allocPrint(allocator, "{s} exceeded output limit", .{stream}) catch {
-            allocator.free(stdout);
-            allocator.free(stderr);
-            return errorResult(allocator, "output exceeded limit");
-        };
-        return .{ .err = .{ .message = message, .stdout = stdout, .stderr = stderr } };
-    }
-    return errorFmt(allocator, "{s} read failed: {s}", .{ stream, @errorName(err) });
-}
-
-fn errorResult(allocator: std.mem.Allocator, message: []const u8) Result {
-    return .{ .err = .{ .message = allocator.dupe(u8, message) catch &.{} } };
-}
-
-fn errorFmt(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Result {
-    const msg = std.fmt.allocPrint(allocator, fmt, args) catch return errorResult(allocator, "command failed");
-    return .{ .err = .{ .message = msg } };
-}
-
-const shell_argv: []const []const u8 = if (builtin.os.tag == .windows)
-    &.{ "cmd.exe", "/c" }
-else
-    &.{ "/bin/sh", "-c" };
-
-fn skipShellProcessTestsIfUnsupported() !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-}
-
-fn runShell(script: []const u8, request: Request) Result {
-    var argv = [_][]const u8{ shell_argv[0], shell_argv[1], script };
-    var with_argv = request;
-    with_argv.argv = &argv;
-    return run(std.testing.allocator, std.Options.debug_io, with_argv);
-}
-
-fn expectCompleted(result: Result) !Completed {
-    return switch (result) {
-        .completed => |completed| completed,
-        .timeout => error.UnexpectedTimeout,
-        .err => error.UnexpectedProcessError,
+fn partial(allocator: std.mem.Allocator, multi_reader: *std.Io.File.MultiReader, comptime tag: std.meta.Tag(RunResult), msg: []const u8) RunError!RunResult {
+    const stdout = multi_reader.toOwnedSlice(0) catch return error.OutOfMemory;
+    errdefer allocator.free(stdout);
+    const stderr = multi_reader.toOwnedSlice(1) catch return error.OutOfMemory;
+    errdefer allocator.free(stderr);
+    const message = allocator.dupe(u8, msg) catch return error.OutOfMemory;
+    const p = Partial{ .stdout = stdout, .stderr = stderr, .message = message };
+    return switch (tag) {
+        .timed_out => .{ .timed_out = p },
+        .stdout_too_long => .{ .stdout_too_long = p },
+        .stderr_too_long => .{ .stderr_too_long = p },
+        .aborted => .{ .aborted = p },
+        else => unreachable,
     };
 }
 
-fn expectTimeout(result: Result) !TimedOut {
-    return switch (result) {
-        .timeout => |timeout| timeout,
-        .completed => error.UnexpectedProcessCompletion,
-        .err => error.UnexpectedProcessError,
+fn emitNew(callback: ?ChunkCallback, kind: StreamKind, bytes: []const u8, seen: *usize) void {
+    if (callback == null) return;
+    if (bytes.len <= seen.*) return;
+    callback.?.call(kind, bytes[seen.*..]);
+    seen.* = bytes.len;
+}
+
+fn tooLong(len: usize, limit: std.Io.Limit) bool {
+    return if (limit.toInt()) |n| len > n else false;
+}
+
+fn childPgid(scope: KillScope) ?std.process.Child.Id {
+    if (scope == .process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) return 0;
+    return null;
+}
+
+fn killActions(scope: KillScope, child_id: std.process.Child.Id) InterruptGuard.Actions {
+    return switch (scope) {
+        .child => .{ .kill_pid = child_id },
+        .process_group => .{ .interrupt_process_group = child_id },
     };
 }
+
+fn buildEnvMap(allocator: std.mem.Allocator, env: []const EnvPair, clear_env: bool) !?std.process.Environ.Map {
+    if (env.len == 0 and !clear_env) return null;
+    var map = std.process.Environ.Map.init(allocator);
+    errdefer map.deinit();
+    for (env) |pair| try map.put(pair.key, pair.value);
+    return map;
+}
+
+const shell_argv: []const []const u8 = if (builtin.os.tag == .windows) &.{ "cmd.exe", "/c" } else &.{ "/bin/sh", "-c" };
+fn skipShellProcessTestsIfUnsupported() !void { if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest; }
+fn runShell(script: []const u8, options: RunOptions) !RunResult { var argv = [_][]const u8{ shell_argv[0], shell_argv[1], script }; var o = options; o.argv = &argv; return run(std.testing.allocator, std.Options.debug_io, o); }
 
 test "process.run captures both output streams without mixing them" {
     try skipShellProcessTestsIfUnsupported();
-
-    var result = runShell("printf out; printf err >&2", .{ .argv = &.{} });
+    var result = try runShell("printf out; printf err >&2", .{ .argv = &.{} });
     defer result.deinit(std.testing.allocator);
-
-    const completed = try expectCompleted(result);
+    const completed = switch (result) { .completed => |x| x, else => return error.UnexpectedProcessError };
     try std.testing.expectEqualSlices(u8, "out", completed.stdout);
     try std.testing.expectEqualSlices(u8, "err", completed.stderr);
 }
 
 test "process.run drains large stdout and stderr concurrently" {
     try skipShellProcessTestsIfUnsupported();
-    const repeats = 2048;
-    const chunk_len = 64;
-    const script =
-        "i=0; " ++
-        "while [ $i -lt 2048 ]; do " ++
-        "printf 'oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo'; " ++
-        "printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' >&2; " ++
-        "i=$((i+1)); " ++
-        "done";
-
-    var result = runShell(script, .{ .argv = &.{}, .timeout_ms = 5000 });
+    const script = "i=0; while [ $i -lt 2048 ]; do printf 'oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo'; printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' >&2; i=$((i+1)); done";
+    var result = try runShell(script, .{ .argv = &.{}, .timeout_ms = 5000 });
     defer result.deinit(std.testing.allocator);
-
-    const completed = try expectCompleted(result);
-    try std.testing.expectEqual(@as(usize, repeats * chunk_len), completed.stdout.len);
-    try std.testing.expectEqual(@as(usize, repeats * chunk_len), completed.stderr.len);
+    const completed = switch (result) { .completed => |x| x, else => return error.UnexpectedProcessError };
+    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stdout.len);
+    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stderr.len);
 }
 
 test "process.run writes stdin then closes the child pipe" {
     try skipShellProcessTestsIfUnsupported();
-
-    var result = runShell("cat", .{ .argv = &.{}, .stdin = "hello stdin" });
+    var result = try runShell("cat", .{ .argv = &.{}, .stdin = .{ .bytes = "hello stdin" } });
     defer result.deinit(std.testing.allocator);
-
-    const completed = try expectCompleted(result);
+    const completed = switch (result) { .completed => |x| x, else => return error.UnexpectedProcessError };
     try std.testing.expectEqualSlices(u8, "hello stdin", completed.stdout);
 }
 
 test "process.run timeout preserves output emitted before termination" {
     try skipShellProcessTestsIfUnsupported();
-
-    var result = runShell("printf before; sleep 5; printf after", .{ .argv = &.{}, .timeout_ms = 100 });
+    var result = try runShell("printf before; sleep 5; printf after", .{ .argv = &.{}, .timeout_ms = 100 });
     defer result.deinit(std.testing.allocator);
-
-    const timed_out = try expectTimeout(result);
+    const timed_out = switch (result) { .timed_out => |x| x, else => return error.UnexpectedProcessCompletion };
     try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "before") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "after") == null);
 }
 
-test "process.run reports output limit as an error" {
+test "process.run reports output limit as typed partial" {
     try skipShellProcessTestsIfUnsupported();
-
-    var result = runShell("printf abcdef", .{ .argv = &.{}, .max_stdout_bytes = 3 });
+    var result = try runShell("printf abcdef", .{ .argv = &.{}, .stdout_limit = .limited(3) });
     defer result.deinit(std.testing.allocator);
-
-    const failed = switch (result) {
-        .err => |failed| failed,
-        .completed => return error.UnexpectedProcessCompletion,
-        .timeout => return error.UnexpectedTimeout,
-    };
+    const failed = switch (result) { .stdout_too_long => |x| x, else => return error.UnexpectedProcessCompletion };
     try std.testing.expect(std.mem.indexOf(u8, failed.message, "stdout exceeded output limit") != null);
-    try std.testing.expectEqualSlices(u8, "", failed.stderr);
 }

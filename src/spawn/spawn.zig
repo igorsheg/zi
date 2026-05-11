@@ -68,16 +68,18 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     };
     defer line_ctx.decoder.deinit();
 
-    var proc_result = runtime_process.run(allocator, config.io, .{
+    var proc_result = runtime_process.stream(allocator, config.io, .{
         .argv = built.argv.items,
-        .cwd = config.cwd,
-        .signal = config.signal,
-        .max_stdout_bytes = 0,
-        .capture_stdout = false,
-        .max_stderr_bytes = 1024 * 1024,
+        .cwd = .{ .path = config.cwd },
+        .signal = config.signal orelse runtime_process.AbortSignal.none,
+        .stdout_limit = .unlimited,
+        .stderr_limit = .limited(1024 * 1024),
         .on_chunk = .{ .ctx = @ptrCast(&line_ctx), .func = &JsonlCtx.onChunk },
-        .on_wait = if (config.on_wait) |cb| .{ .ctx = config.on_wait_ctx, .func = cb } else null,
-    });
+    }) catch {
+        result.exit_code = 1;
+        result.error_message = allocator.dupe(u8, "failed to launch child process") catch null;
+        return result;
+    };
     defer proc_result.deinit(allocator);
     line_ctx.flushTail();
 
@@ -89,14 +91,16 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
             };
             result.stderr_output.appendSlice(allocator, completed.stderr) catch {};
         },
-        .timeout => |timeout| {
+        .timed_out => |timeout| {
             result.exit_code = 1;
             result.stderr_output.appendSlice(allocator, timeout.stderr) catch {};
             result.error_message = allocator.dupe(u8, timeout.message) catch null;
         },
-        .err => |err| {
+        .stdout_too_long, .stderr_too_long, .aborted => |err| {
             result.exit_code = 1;
+            if (proc_result == .aborted) result.cancelled = true;
             result.error_message = allocator.dupe(u8, err.message) catch null;
+            result.stderr_output.appendSlice(allocator, err.stderr) catch {};
             if (trace_file) |f| traceWrite(config.io, f, "--- spawn FAILED to launch: {s}\n", .{err.message});
             return result;
         },
@@ -148,9 +152,12 @@ const JsonlCtx = struct {
     fn onChunk(raw_ctx: ?*anyopaque, kind: runtime_process.StreamKind, bytes: []const u8) void {
         if (kind != .stdout) return;
         const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
-        self.mutex.lockUncancelable(self.config.io);
-        defer self.mutex.unlock(self.config.io);
-        self.decoder.feed(bytes, self.sink()) catch {};
+        {
+            self.mutex.lockUncancelable(self.config.io);
+            defer self.mutex.unlock(self.config.io);
+            self.decoder.feed(bytes, self.sink()) catch {};
+        }
+        if (self.config.on_wait) |cb| cb(self.config.on_wait_ctx);
     }
 
     fn flushTail(self: *@This()) void {

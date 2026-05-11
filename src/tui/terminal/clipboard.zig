@@ -209,14 +209,14 @@ fn runCommandCaptureTimeout(allocator: std.mem.Allocator, argv: []const []const 
     var result = runtime_process.run(allocator, std.Options.debug_io, .{
         .argv = argv,
         .timeout_ms = timeout_ms,
-        .max_stdout_bytes = max_clipboard_image_bytes,
-        .capture_stderr = false,
-    });
+        .stdout_limit = .limited(max_clipboard_image_bytes),
+        .stderr = .ignore,
+    }) catch return null;
     defer result.deinit(allocator);
 
     const completed = switch (result) {
         .completed => |completed| completed,
-        .timeout, .err => return null,
+        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return null,
     };
     switch (completed.term) {
         .exited => |code| if (code != 0) return null,
@@ -261,15 +261,15 @@ fn decodeBase64Owned(allocator: std.mem.Allocator, encoded: []const u8) ?[]u8 {
 fn copyViaCommand(argv: []const []const u8, text: []const u8) bool {
     var result = runtime_process.run(std.heap.page_allocator, std.Options.debug_io, .{
         .argv = argv,
-        .stdin = text,
-        .capture_stdout = false,
-        .capture_stderr = false,
-    });
+        .stdin = .{ .bytes = text },
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
     defer result.deinit(std.heap.page_allocator);
 
     const completed = switch (result) {
         .completed => |completed| completed,
-        .timeout, .err => return false,
+        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return false,
     };
     return switch (completed.term) {
         .exited => |code| code == 0,

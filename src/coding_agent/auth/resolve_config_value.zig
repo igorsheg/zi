@@ -87,14 +87,14 @@ fn executeCommandUncached(config: []const u8) ?[]const u8 {
 
     var result = runtime_process.run(allocator, std.Options.debug_io, .{
         .argv = &.{ "/bin/sh", "-c", command },
-        .max_stdout_bytes = 50 * 1024,
-        .capture_stderr = false,
-    });
+        .stdout_limit = .limited(50 * 1024),
+        .stderr = .ignore,
+    }) catch return null;
     defer result.deinit(allocator);
 
     const completed = switch (result) {
         .completed => |completed| completed,
-        .timeout, .err => return null,
+        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return null,
     };
     switch (completed.term) {
         .exited => |code| if (code != 0) return null,
