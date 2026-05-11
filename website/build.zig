@@ -29,8 +29,14 @@ pub fn build(b: *std.Build) void {
 
     const man_pages = .{
         .{ "docs/man/00-intro.md", "man/index.html", "man/index.md", "zi(1)", "", "", "cli", "cli.html" },
-        .{ "docs/man/10-cli.md", "man/cli.html", "man/cli.md", "cli", "intro", "index.html", "extensions", "extensions.html" },
-        .{ "docs/man/20-extension-model.md", "man/extensions.html", "man/extensions.md", "extensions", "cli", "cli.html", "api", "api.html" },
+        .{ "docs/man/10-cli.md", "man/cli.html", "man/cli.md", "cli", "intro", "index.html", "settings", "settings.html" },
+        .{ "docs/man/12-settings.md", "man/settings.html", "man/settings.md", "settings", "cli", "cli.html", "resources", "resources.html" },
+        .{ "docs/man/15-resources.md", "man/resources.html", "man/resources.md", "resources", "settings", "settings.html", "skills", "skills.html" },
+        .{ "docs/man/16-skills.md", "man/skills.html", "man/skills.md", "skills", "resources", "resources.html", "prompts", "prompts.html" },
+        .{ "docs/man/17-prompts.md", "man/prompts.html", "man/prompts.md", "prompts", "skills", "skills.html", "themes", "themes.html" },
+        .{ "docs/man/18-themes.md", "man/themes.html", "man/themes.md", "themes", "prompts", "prompts.html", "agent context", "agent-context.html" },
+        .{ "docs/man/19-agent-context.md", "man/agent-context.html", "man/agent-context.md", "agent context", "themes", "themes.html", "extensions", "extensions.html" },
+        .{ "docs/man/20-extension-model.md", "man/extensions.html", "man/extensions.md", "extensions", "agent context", "agent-context.html", "api", "api.html" },
         .{ "docs/man/30-extension-api.md", "man/api.html", "man/api.md", "api", "extensions", "extensions.html", "context", "context.html" },
         .{ "docs/man/40-context-api.md", "man/context.html", "man/context.md", "context", "api", "api.html", "guidance", "guidance.html" },
         .{ "docs/man/50-guidance.md", "man/guidance.html", "man/guidance.md", "guidance", "context", "context.html", "", "" },
