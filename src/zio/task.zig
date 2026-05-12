@@ -9,8 +9,7 @@ pub const Group = struct {
         return .{ .allocator = allocator };
     }
 
-    // The group owns every spawned thread. No detach, no clever lifetime bargain,
-    // no mystery meat running after shutdown. Join or cancel clears the room.
+    // Group owns every spawned thread. No detached work; join/cancel waits before deinit.
     pub fn spawnThread(self: *Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.ConcurrentError!void {
         std.debug.assert(!self.closed);
         self.threads.ensureUnusedCapacity(self.allocator, 1) catch return error.ConcurrencyUnavailable;

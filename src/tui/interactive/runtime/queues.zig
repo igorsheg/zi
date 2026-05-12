@@ -9,6 +9,7 @@ const UiEvent = ui_event_mod.UiEvent;
 pub const ui_snapshot_queue_capacity: usize = 64;
 pub const ui_lifecycle_queue_capacity: usize = 64;
 
+// Snapshot traffic is lossy. Lifecycle traffic rejects overload so callers keep ownership.
 pub const UiSnapshotQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = ui_snapshot_queue_capacity, .on_full = .drop_newest } },

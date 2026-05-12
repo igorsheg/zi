@@ -16,15 +16,14 @@ pub fn main(init: std.process.Init) !void {
     env.setProcessEnvironment(init.environ_map);
     logging.setThreadLabel(.main);
 
-    // This is the front door. Keep it boring: build the command, wire the runtime, fire once.
-    // If policy leaks in here, somebody made a maze and handed the demon a shotgun.
+    // Main is wiring only. Command policy belongs in cli/, runtime policy belongs in runtime/.
     var main_heap: runtime_app.MainHeap = .{};
     defer main_heap.deinit();
 
     const heap_allocator = main_heap.allocator();
 
     const allocator = heap_allocator;
-    // Message memory crosses threads. Give it the SMP heap or enjoy haunted ownership bugs.
+    // Agent/UI messages cross threads; allocate them from the thread-safe heap.
     const msg_allocator = std.heap.smp_allocator;
 
     var raw_args: std.ArrayListUnmanaged([]const u8) = .empty;

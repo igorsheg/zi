@@ -143,6 +143,7 @@ pub const RuntimeHost = struct {
         self.* = undefined;
     }
 
+    // RuntimeHost owns AgentSession and extension Lua. UI threads communicate by queue.
     pub fn shutdownCurrentSessionOnAgentThread(self: *RuntimeHost) void {
         self.shutdownSessionLifecycle(.exit, null, null);
     }

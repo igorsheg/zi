@@ -17,6 +17,7 @@ pub const Token = struct {
         .expected_generation = 0,
     };
 
+    // Token validity is the Source generation, not only the aborted flag.
     pub fn isAborted(self: Token) bool {
         const controller = self.controller orelse return false;
         return controller.generation.load(.acquire) != self.expected_generation or controller.aborted.load(.acquire);
@@ -92,6 +93,7 @@ pub const Source = struct {
     aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
 
+    // beginRun invalidates old tokens and wakes waiters before returning the new token.
     pub fn beginRun(self: *Source) Token {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);

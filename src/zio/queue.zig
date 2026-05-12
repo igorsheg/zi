@@ -18,6 +18,7 @@ pub const FullBehavior = enum {
     drop_newest,
 };
 
+// Reject returns ownership to the caller. drop_newest consumes through queue cleanup.
 pub const QueuePolicy = union(enum) {
     unbounded,
     bounded: struct {
@@ -166,6 +167,7 @@ pub fn Queue(comptime T: type, comptime config: Config) type {
             self.* = undefined;
         }
 
+        // send consumes rejected items and runs cleanup. trySend returns ownership on failure.
         pub fn send(self: *Self, item: T) void {
             switch (self.trySend(item)) {
                 .ok, .dropped => {},
