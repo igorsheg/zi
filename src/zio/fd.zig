@@ -22,4 +22,3 @@ pub fn setNonblocking(fd: posix.fd_t) !void {
 pub fn setCloseOnExec(fd: posix.fd_t) !void {
     if (std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) < 0) return error.Unexpected;
 }
-

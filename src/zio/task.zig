@@ -83,4 +83,3 @@ test "Group concurrent work makes simultaneous progress" {
     try std.testing.expect(ctx.a_observed_b.load(.acquire));
     try std.testing.expect(ctx.b_observed_a.load(.acquire));
 }
-
