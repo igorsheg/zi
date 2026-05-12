@@ -1,57 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Group = @import("task.zig").Group;
+const fd_util = @import("fd.zig");
+const types = @import("process_engine_types.zig");
 
-pub const EnvPair = struct {
-    key: []const u8,
-    value: []const u8,
-};
+pub const EnvPair = types.EnvPair;
+pub const StreamKind = types.StreamKind;
+pub const Event = types.Event;
+pub const EventSink = types.EventSink;
+pub const StartRequest = types.StartRequest;
 
-/// Owned adapter around one OS child process.
-///
-/// Owns spawn/wait, live stdin, concurrent stdout/stderr draining, process-group
-/// termination, and event delivery. Higher-level modules decide whether events
-/// become captured output (`zio.process`) or long-running job events (`zio.process.Jobs`).
-pub const StreamKind = enum { stdout, stderr };
-
-/// Child process event delivered synchronously to `EventSink.submit`.
-///
-/// `stdout`/`stderr` byte slices are temporary reader stack buffers. A sink that
-/// retains event data after `submit` returns must copy it first.
-pub const Event = union(enum) {
-    stdout: []const u8,
-    stderr: []const u8,
-    exit: ?std.process.Child.Term,
-    spawn_failed,
-};
-
-/// Synchronous event consumer. Returning `false` only reports backpressure to
-/// the caller; `ChildProcess` keeps draining to avoid pipe deadlock.
-pub const EventSink = struct {
-    ptr: *anyopaque,
-    submit: *const fn (ptr: *anyopaque, event: Event) bool,
-};
-
-pub const StartFailure = enum {
-    stdout_reader,
-    stderr_reader,
-};
-
-/// Borrowed child start configuration. All slices (`argv`, `cwd`, `env` and env
-/// pair members) must outlive `ChildProcess.start()` through `wait()`.
-pub const StartRequest = struct {
-    argv: []const []const u8,
-    cwd: ?[]const u8 = null,
-    env: []const EnvPair = &.{},
-    clear_env: bool = false,
-    process_group: bool = true,
-    stdin: bool = true,
-    close_stdin_before_wait: bool = false,
-    stdout: bool = true,
-    stderr: bool = true,
-};
-
-pub const ChildProcess = struct {
+pub const Engine = struct {
     io: std.Io,
     request: StartRequest,
     sink: EventSink,
@@ -65,45 +24,71 @@ pub const ChildProcess = struct {
     exited: bool = false,
     close_stdin_requested: bool = false,
     stop_requested: bool = false,
+    timed_out: bool = false,
+    aborted: bool = false,
 
-    pub fn init(io: std.Io, request: StartRequest, sink: EventSink) ChildProcess {
+    pub const StopReason = enum { requested, timeout, abort };
+
+    pub fn init(io: std.Io, request: StartRequest, sink: EventSink) Engine {
         return .{ .io = io, .request = request, .sink = sink };
     }
 
-    pub fn start(self: *ChildProcess) !void {
+    pub fn start(self: *Engine) !void {
         if (self.started) return;
+        std.debug.assert(!self.ready and !self.exited);
         self.tasks = Group.init(std.heap.smp_allocator, self.io);
         errdefer self.tasks.cancel();
         try self.tasks.spawnThread(run, .{self});
         self.started = true;
     }
 
-    pub fn wait(self: *ChildProcess) void {
+    pub fn join(self: *Engine) void {
         if (!self.started) return;
         self.tasks.join() catch {};
         self.started = false;
     }
 
-    pub fn stop(self: *ChildProcess) void {
+    pub fn stop(self: *Engine) void {
+        self.stopWithReason(.requested);
+    }
+
+    pub fn stopWithReason(self: *Engine, reason: StopReason) void {
         self.mutex.lockUncancelable(self.io);
         self.stop_requested = true;
+        switch (reason) {
+            .requested => {},
+            .timeout => self.timed_out = true,
+            .abort => self.aborted = true,
+        }
         self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
     }
 
-    pub fn childId(self: *ChildProcess) ?std.process.Child.Id {
+    pub fn didTimeout(self: *Engine) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.timed_out;
+    }
+
+    pub fn didAbort(self: *Engine) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.aborted;
+    }
+
+    pub fn childId(self: *Engine) ?std.process.Child.Id {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.child_id;
     }
 
-    pub fn isExited(self: *ChildProcess) bool {
+    pub fn isExited(self: *Engine) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.exited;
     }
 
-    pub fn waitReady(self: *ChildProcess, timeout_ms: u64) bool {
+    pub fn waitReady(self: *Engine, timeout_ms: u64) bool {
         var waited: u64 = 0;
         while (waited <= timeout_ms) : (waited += 1) {
             self.mutex.lockUncancelable(self.io);
@@ -117,7 +102,7 @@ pub const ChildProcess = struct {
         return false;
     }
 
-    pub fn write(self: *ChildProcess, data: []const u8) !void {
+    pub fn write(self: *Engine, data: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         const file = self.stdin_file orelse {
             self.mutex.unlock(self.io);
@@ -127,13 +112,14 @@ pub const ChildProcess = struct {
         try file.writeStreamingAll(self.io, data);
     }
 
-    pub fn closeStdin(self: *ChildProcess) void {
+    pub fn closeStdin(self: *Engine) void {
         self.mutex.lockUncancelable(self.io);
         self.close_stdin_requested = true;
+        self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
     }
 
-    fn run(self: *ChildProcess) void {
+    fn run(self: *Engine) void {
         var env_map_storage: ?std.process.Environ.Map = null;
         defer if (env_map_storage) |*env_map| env_map.deinit();
         if (self.request.env.len > 0 or self.request.clear_env) {
@@ -160,6 +146,7 @@ pub const ChildProcess = struct {
             self.markExited();
             return;
         };
+        defer if (child.stdin) |stdin_file| stdin_file.close(self.io);
 
         self.mutex.lockUncancelable(self.io);
         self.child_id = child.id;
@@ -171,6 +158,16 @@ pub const ChildProcess = struct {
 
         var readers = Group.init(std.heap.smp_allocator, self.io);
         defer readers.cancel();
+
+        if (self.request.timeout_ms != null or !self.request.signal.isNone()) {
+            readers.spawnThread(timeoutWatcher, .{self}) catch {
+                self.terminateOwnedChild(child.id.?);
+                _ = child.wait(self.io) catch null;
+                self.markExited();
+                _ = self.sink.submit(self.sink.ptr, .spawn_failed);
+                return;
+            };
+        }
 
         readers.spawnThread(terminationWatcher, .{ self, child.id.? }) catch {
             self.terminateOwnedChild(child.id.?);
@@ -184,38 +181,24 @@ pub const ChildProcess = struct {
 
         if (child.stdout) |stdout_file| {
             child.stdout = null;
+            fd_util.setNonblocking(stdout_file.handle) catch {};
             readers.spawnThread(readPipe, .{ self, stdout_file, StreamKind.stdout }) catch {
                 stdout_file.close(self.io);
-                self.handleStartFailure(&child, &readers, .stdout_reader);
+                self.handleStartFailure(&child, &readers);
                 return;
             };
         }
         if (child.stderr) |stderr_file| {
             child.stderr = null;
+            fd_util.setNonblocking(stderr_file.handle) catch {};
             readers.spawnThread(readPipe, .{ self, stderr_file, StreamKind.stderr }) catch {
                 stderr_file.close(self.io);
-                self.handleStartFailure(&child, &readers, .stderr_reader);
+                self.handleStartFailure(&child, &readers);
                 return;
             };
         }
 
-        if (self.request.close_stdin_before_wait) {
-            var waited: u64 = 0;
-            while (waited < 5000) : (waited += 1) {
-                self.mutex.lockUncancelable(self.io);
-                const close_requested = self.close_stdin_requested;
-                self.mutex.unlock(self.io);
-                if (close_requested) break;
-                self.io.sleep(.fromMilliseconds(1), .awake) catch {};
-            }
-            if (child.stdin) |stdin_file| {
-                stdin_file.close(self.io);
-                child.stdin = null;
-                self.mutex.lockUncancelable(self.io);
-                self.stdin_file = null;
-                self.mutex.unlock(self.io);
-            }
-        }
+        if (self.request.close_stdin_before_wait) self.waitForCloseStdin(&child);
 
         const term = child.wait(self.io) catch null;
         self.mutex.lockUncancelable(self.io);
@@ -230,8 +213,38 @@ pub const ChildProcess = struct {
         _ = self.sink.submit(self.sink.ptr, .{ .exit = term });
     }
 
-    fn handleStartFailure(self: *ChildProcess, child: *std.process.Child, readers: *Group, failure: StartFailure) void {
-        _ = failure;
+    fn waitForCloseStdin(self: *Engine, child: *std.process.Child) void {
+        var waited: u64 = 0;
+        while (waited < 5000) : (waited += 1) {
+            self.mutex.lockUncancelable(self.io);
+            const done = self.close_stdin_requested or self.stop_requested or self.exited;
+            self.mutex.unlock(self.io);
+            if (done) break;
+            self.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+
+        if (child.stdin) |stdin_file| {
+            stdin_file.close(self.io);
+            child.stdin = null;
+            self.mutex.lockUncancelable(self.io);
+            self.stdin_file = null;
+            self.mutex.unlock(self.io);
+        }
+    }
+
+    fn handleStartFailure(self: *Engine, child: *std.process.Child, readers: *Group) void {
+        if (child.stdin) |stdin_file| {
+            stdin_file.close(self.io);
+            child.stdin = null;
+        }
+        if (child.stdout) |stdout_file| {
+            stdout_file.close(self.io);
+            child.stdout = null;
+        }
+        if (child.stderr) |stderr_file| {
+            stderr_file.close(self.io);
+            child.stderr = null;
+        }
         if (child.id) |pid| self.terminateOwnedChild(pid);
         readers.join() catch {};
         _ = child.wait(self.io) catch null;
@@ -244,14 +257,14 @@ pub const ChildProcess = struct {
         _ = self.sink.submit(self.sink.ptr, .spawn_failed);
     }
 
-    fn markExited(self: *ChildProcess) void {
+    fn markExited(self: *Engine) void {
         self.mutex.lockUncancelable(self.io);
         self.exited = true;
         self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
     }
 
-    fn terminationWatcher(self: *ChildProcess, child_id: std.process.Child.Id) void {
+    fn terminationWatcher(self: *Engine, child_id: std.process.Child.Id) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -265,7 +278,30 @@ pub const ChildProcess = struct {
         self.mutex.lockUncancelable(self.io);
     }
 
-    fn terminateOwnedChild(self: *ChildProcess, child_id: std.process.Child.Id) void {
+    fn timeoutWatcher(self: *Engine) void {
+        const start_ms = std.Io.Clock.awake.now(self.io).toMilliseconds();
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            const done = self.exited or self.child_id == null or self.stop_requested;
+            self.mutex.unlock(self.io);
+            if (done) return;
+
+            if (self.request.signal.isAborted()) {
+                self.stopWithReason(.abort);
+                return;
+            }
+            if (self.request.timeout_ms) |ms| {
+                const now_ms = std.Io.Clock.awake.now(self.io).toMilliseconds();
+                if (now_ms - start_ms >= ms) {
+                    self.stopWithReason(.timeout);
+                    return;
+                }
+            }
+            self.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
+
+    fn terminateOwnedChild(self: *Engine, child_id: std.process.Child.Id) void {
         killChild(child_id, self.request.process_group, .TERM);
         self.io.sleep(.fromMilliseconds(100), .awake) catch {};
         self.mutex.lockUncancelable(self.io);
@@ -274,11 +310,21 @@ pub const ChildProcess = struct {
         if (still_current) killChild(child_id, self.request.process_group, .KILL);
     }
 
-    fn readPipe(self: *ChildProcess, file: std.Io.File, kind: StreamKind) void {
+    fn readPipe(self: *Engine, file: std.Io.File, kind: StreamKind) void {
         defer file.close(self.io);
         var buf: [64 * 1024]u8 = undefined;
         while (true) {
-            const n = std.posix.read(file.handle, &buf) catch return;
+            const n = std.posix.read(file.handle, &buf) catch |err| switch (err) {
+                error.WouldBlock => {
+                    self.mutex.lockUncancelable(self.io);
+                    const done = self.stop_requested and self.exited;
+                    self.mutex.unlock(self.io);
+                    if (done) return;
+                    self.io.sleep(.fromMilliseconds(10), .awake) catch {};
+                    continue;
+                },
+                else => return,
+            };
             if (n == 0) return;
             const bytes = buf[0..n];
             _ = self.sink.submit(self.sink.ptr, switch (kind) {

@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const child_process = @import("child_process.zig");
+const process_engine = @import("process_engine.zig");
 
 /// Small zio-owned long-running process supervisor.
 ///
@@ -77,7 +77,7 @@ pub const Manager = struct {
             .sink = self.sink,
             .request = owned_request,
         };
-        job.child = child_process.ChildProcess.init(self.io, .{
+        job.engine = process_engine.Engine.init(self.io, .{
             .argv = job.request.argv,
             .cwd = job.request.cwd,
             .process_group = true,
@@ -86,7 +86,7 @@ pub const Manager = struct {
         errdefer job.deinit(self.allocator);
         try self.jobs.put(self.allocator, id, job);
         errdefer _ = self.jobs.remove(id);
-        try job.child.start();
+        try job.engine.start();
     }
 
     pub fn stop(self: *Manager, id: u64) void {
@@ -98,7 +98,7 @@ pub const Manager = struct {
     /// unknown or the process is still running.
     pub fn reap(self: *Manager, id: u64) bool {
         const job = self.jobs.get(id) orelse return false;
-        if (!job.child.isExited()) return false;
+        if (!job.engine.isExited()) return false;
         _ = self.jobs.remove(id);
         self.destroyJob(job);
         return true;
@@ -119,7 +119,7 @@ pub const Manager = struct {
 
     fn destroyJob(self: *Manager, job: *Job) void {
         job.stop();
-        job.child.wait();
+        job.engine.join();
         job.deinit(self.allocator);
         self.allocator.destroy(job);
     }
@@ -130,7 +130,7 @@ const Job = struct {
     allocator: std.mem.Allocator,
     sink: EventSink,
     request: StartRequest,
-    child: child_process.ChildProcess = undefined,
+    engine: process_engine.Engine = undefined,
 
     fn deinit(self: *Job, allocator: std.mem.Allocator) void {
         self.request.deinit(allocator);
@@ -138,17 +138,17 @@ const Job = struct {
     }
 
     fn stop(self: *Job) void {
-        self.child.stop();
+        self.engine.stop();
     }
 
     fn write(self: *Job, data: []const u8) !void {
-        return self.child.write(data) catch |err| switch (err) {
+        return self.engine.write(data) catch |err| switch (err) {
             error.ProcessNotReady => error.JobNotReady,
             else => err,
         };
     }
 
-    fn submitChildEvent(ptr: *anyopaque, event: child_process.Event) bool {
+    fn submitChildEvent(ptr: *anyopaque, event: process_engine.Event) bool {
         const self: *Job = @ptrCast(@alignCast(ptr));
         return switch (event) {
             .stdout => |bytes| self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .stdout, .data = bytes }),

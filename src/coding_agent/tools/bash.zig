@@ -241,6 +241,25 @@ test "runCommand exits naturally before timeout" {
     try expectTextBlockContains(result, "done");
 }
 
+test "runCommand true returns immediately before long timeout" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds();
+    const result = runCommand(
+        arena.allocator(),
+        std.Options.debug_io,
+        "true",
+        "/tmp",
+        10,
+        protocol.Token.none,
+    );
+    const elapsed = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds() - start;
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(elapsed < 500);
+}
+
 test "runCommand reports timeout" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
