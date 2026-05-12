@@ -19,13 +19,6 @@ const StyleSpan = text_layout.StyleSpan;
 const LayoutCache = text_layout.LayoutCache;
 const TextBuffer = text_layout.TextBuffer;
 
-/// Styled text with word wrapping, padding, and scroll support.
-///
-/// Wraps content at word boundaries when rendering into a Region.
-/// Supports horizontal/vertical padding (matching pi-mono's Text component).
-/// When content exceeds the visible area, `scroll_offset` controls which
-/// wrapped lines are visible. Call `scrollToBottom` after updating content
-/// to auto-follow streaming output.
 pub const Text = struct {
     content: []const u8 = "",
     fg: Color = Color.default,
@@ -42,9 +35,6 @@ pub const Text = struct {
     link: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
-    /// Owned content and style mapping. Direct `content` assignment remains
-    /// supported for plain compatibility; setContent/setRuns copy into this
-    /// buffer when callers want lifetime-safe content.
     buffer: TextBuffer = .{},
     layout_cache: LayoutCache = .{},
     width_method: grapheme.WidthMethod = .wcwidth,
@@ -78,8 +68,6 @@ pub const Text = struct {
         self.invalidateCache();
     }
 
-    /// Scroll so the last wrapped line is visible at the bottom of the region.
-    /// Call after setContent during streaming to auto-follow.
     pub fn scrollToBottom(self: *Text, visible_height: u32) void {
         const total = self.totalLines(visible_height);
         if (total > visible_height) {
@@ -89,7 +77,6 @@ pub const Text = struct {
         }
     }
 
-    /// Total lines this text would occupy (wrapped lines + padding).
     pub fn totalLines(self: *Text, visible_width: u32) u32 {
         const m = self.measure(visible_width);
         return m.preferred_height;

@@ -5,12 +5,9 @@ const proto = @import("protocol.zig");
 const faux = ai.faux;
 
 pub const ContextUsage = struct {
-    /// Estimated context tokens, or null when unknown immediately after
-    /// compaction and before the first post-compaction assistant usage.
     tokens: ?u64,
     context_window: u64,
-    /// Percent of the model context window consumed. Null when `tokens`
-    /// is unknown.
+
     percent: ?f64,
 };
 
@@ -21,8 +18,6 @@ pub const ContextUsageEstimate = struct {
     last_usage_index: ?usize,
 };
 
-/// pi-mono source:
-/// packages/coding-agent/src/core/compaction/compaction.ts:135-137
 pub fn calculateContextTokens(usage: ai.protocol.Usage) u64 {
     return if (usage.total_tokens != 0)
         usage.total_tokens
@@ -30,8 +25,6 @@ pub fn calculateContextTokens(usage: ai.protocol.Usage) u64 {
         usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
-/// pi-mono source:
-/// packages/coding-agent/src/core/compaction/compaction.ts:186-214
 pub fn estimateContextTokens(messages: []const agent.protocol.AgentMessage) ContextUsageEstimate {
     var estimator = ContextUsageEstimator{};
     for (messages) |message| estimator.observe(message);
@@ -93,8 +86,6 @@ const ContextUsageEstimator = struct {
     }
 };
 
-/// pi-mono source:
-/// packages/coding-agent/src/core/compaction/compaction.ts:232-290
 pub fn estimateTokens(message: agent.protocol.AgentMessage) u64 {
     var chars: usize = 0;
 

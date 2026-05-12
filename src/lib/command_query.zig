@@ -9,11 +9,6 @@ pub const Options = struct {
     trim: bool = true,
 };
 
-/// Run a small external query and return stdout only when it exits 0.
-///
-/// This is for product probes such as git branch/status helpers, config value
-/// commands, and clipboard adapters. Interactive/user command execution belongs
-/// in `zio.process.run` callers, not here.
 pub fn stdout(allocator: std.mem.Allocator, io: std.Io, options: Options) ?[]u8 {
     var result = process.run(allocator, io, .{
         .argv = options.argv,

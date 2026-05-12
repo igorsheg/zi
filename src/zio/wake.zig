@@ -2,10 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const fd = @import("fd.zig");
 
-/// Nonblocking close-on-exec wake pipe.
-///
-/// This intentionally contains the small amount of platform fd plumbing needed
-/// by runtime/mailbox. Higher layers should not call pipe/fcntl/close directly.
 pub const Pipe = struct {
     read_fd: posix.fd_t,
     write_fd: posix.fd_t,

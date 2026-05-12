@@ -70,9 +70,6 @@ pub const TextBuffer = struct {
     }
 
     pub fn styleAt(self: *const TextBuffer, byte_offset: usize, fallback: StyleSpan) StyleSpan {
-        // The span list is intentionally simple and ordered by byte range. Text
-        // components have small style counts; keeping lookup linear avoids a
-        // heavier index while preserving one obvious style mapping model.
         for (self.styles.items) |span| {
             if (byte_offset >= span.start and byte_offset < span.end) return span;
             if (byte_offset < span.start) break;

@@ -1,10 +1,5 @@
 const std = @import("std");
 
-/// Process environment captured by Zig 0.16 startup.
-///
-/// Prefer this over libc's global getenv so reads observe the same environment
-/// snapshot that std.process.spawn receives through std.process.Init. The
-/// pointer is installed once at program startup and then treated as immutable.
 var process_environment: ?*const std.process.Environ.Map = null;
 
 pub fn setProcessEnvironment(environ_map: *const std.process.Environ.Map) void {

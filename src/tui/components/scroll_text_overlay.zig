@@ -15,8 +15,6 @@ const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Key = keys_mod.Key;
 
-/// Focusable, scrollable text panel intended for modal overlays.
-/// Owns its content and renders a compact title/header plus help footer.
 pub const ScrollTextOverlay = struct {
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme,

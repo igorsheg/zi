@@ -1,10 +1,8 @@
 const std = @import("std");
 
 pub const WidthMethod = enum {
-    /// Terminal wcwidth-compatible behavior. This is the conservative default
-    /// for multiplexers and terminals that do not support explicit Unicode width.
     wcwidth,
-    /// Unicode/emoji-biased behavior for modern terminals.
+
     unicode,
 };
 
@@ -19,10 +17,6 @@ pub const Cluster = struct {
     single_codepoint: ?u21,
 };
 
-/// Returns the display width (in terminal columns) of a Unicode codepoint.
-/// 0 for combining marks, zero-width chars, controls.
-/// 2 for CJK ideographs, fullwidth forms, wide emoji.
-/// 1 for everything else.
 pub fn charWidth(cp: u21, method: WidthMethod) u2 {
     if (cp >= 0x20 and cp <= 0x7E) return 1;
 
@@ -117,7 +111,6 @@ pub fn nextGraphemeBoundary(text: []const u8, byte_offset: usize, method: WidthM
     return text.len;
 }
 
-/// Returns the total display width (in terminal columns) of a UTF-8 string.
 pub fn strWidth(text: []const u8, method: WidthMethod) usize {
     var cols: usize = 0;
     var start: usize = 0;
@@ -129,8 +122,6 @@ pub fn strWidth(text: []const u8, method: WidthMethod) usize {
     return cols;
 }
 
-/// Returns the longest prefix of `text` that fits within `max_cols` display columns.
-/// Never splits a grapheme cluster.
 pub fn sliceToWidth(text: []const u8, max_cols: usize, method: WidthMethod) []const u8 {
     var cols: usize = 0;
     var start: usize = 0;

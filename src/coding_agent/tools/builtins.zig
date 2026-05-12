@@ -1,8 +1,3 @@
-//! Built-in tool definitions. Constructs the canonical product-layer
-//! tool definitions the AgentSession ships with by default: bash,
-//! read, write, edit, patch, grep, find, ls. The shared `BuiltinCtx` (cwd) is
-//! allocated once per session and threaded into each builtin impl.
-
 const std = @import("std");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
@@ -33,10 +28,6 @@ pub const BuildOptions = struct {
     image_auto_resize: bool = true,
 };
 
-/// Build the default tool definitions. Caller owns the returned
-/// `Bundle` and must call `deinit` on session teardown. The `cwd`
-/// is copied so worker-thread tool executions never depend on a borrowed
-/// session/bootstrap path slice staying alive.
 pub fn build(allocator: std.mem.Allocator, cwd: []const u8, options: BuildOptions) !Bundle {
     const ctx = try allocator.create(util.BuiltinCtx);
     errdefer allocator.destroy(ctx);

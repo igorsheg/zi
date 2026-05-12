@@ -10,17 +10,9 @@ const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
 const Shimmer = shimmer_mod.Config;
 
-/// Loader that renders only a shimmered message label.
-///
-/// Renders as two rows: an empty line (top padding) followed by
-/// `{message}`, matching pi-mono's loader spacing without the spinner.
-/// returns `["", ...super.render(width)]`.
-///
-/// Animation is deadline-driven through the generic component animation hooks,
-/// so callers no longer need to special-case loader ticking in the main loop.
 pub const Loader = struct {
     shimmer_phase: u32 = 0,
-    /// Owned message buffer — setMessage copies into this.
+
     message_buf: [128]u8 = undefined,
     message_len: u8 = 0,
     shimmer_edge_fg: Color = Color.default,

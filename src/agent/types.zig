@@ -18,8 +18,6 @@ pub const StreamOptions = ai.protocol.StreamOptions;
 pub const Token = @import("../zio/root.zig").cancel.Token;
 pub const SimpleStreamOptions = ai.protocol.SimpleStreamOptions;
 
-/// Stream hook — wraps provider's streamSimple with context for closure state.
-/// pi-mono source: packages/agent/src/types.ts:24-26
 pub const StreamHook = struct {
     func: *const fn (
         ctx: ?*anyopaque,
@@ -45,8 +43,6 @@ pub const StreamHook = struct {
     }
 };
 
-/// Hook: converts AgentMessage[] → LLM Message[] before each LLM call.
-/// pi-mono source: packages/agent/src/types.ts:100-125
 pub const ConvertToLlmHook = struct {
     func: *const fn (
         allocator: std.mem.Allocator,
@@ -60,8 +56,6 @@ pub const ConvertToLlmHook = struct {
     }
 };
 
-/// Hook: transforms context (AgentMessage[] → AgentMessage[]) before convertToLlm.
-/// pi-mono source: packages/agent/src/types.ts:127-147
 pub const TransformContextHook = struct {
     func: *const fn (
         allocator: std.mem.Allocator,
@@ -76,8 +70,6 @@ pub const TransformContextHook = struct {
     }
 };
 
-/// Hook: returns queued messages (steering or follow-up).
-/// pi-mono source: packages/agent/src/types.ts:160-183
 pub const GetMessagesHook = struct {
     func: *const fn (allocator: std.mem.Allocator, ctx: ?*anyopaque) []const AgentMessage,
     ctx: ?*anyopaque = null,
@@ -87,8 +79,6 @@ pub const GetMessagesHook = struct {
     }
 };
 
-/// Thinking/reasoning level — extends ai.ThinkingLevel with "off".
-/// pi-mono source: packages/agent/src/types.ts:220
 pub const ThinkingLevel = enum {
     off,
     minimal,
@@ -98,35 +88,27 @@ pub const ThinkingLevel = enum {
     xhigh,
 };
 
-/// Tool execution mode.
-/// pi-mono source: packages/agent/src/types.ts:35
 pub const ToolExecutionMode = enum {
     sequential,
     parallel,
 };
 
-/// Which thread may execute a tool implementation.
 pub const ToolExecutionAffinity = enum {
     agent_thread,
     worker_thread,
 };
 
-/// Alias for ToolCall when used in agent context.
-/// pi-mono source: packages/agent/src/types.ts:38
 pub const AgentToolCall = ToolCall;
 
-/// Agent message — union of LLM messages + custom app messages.
-/// pi-mono source: packages/agent/src/types.ts:245
-/// In zig, custom messages use a tagged union variant.
 pub const AgentMessage = union(enum) {
     user: ai.protocol.UserMessage,
     assistant: ai.protocol.AssistantMessage,
     tool_result: ai.protocol.ToolResultMessage,
-    /// pi-mono: CompactionSummaryMessage (messages.ts:62-67)
+
     compaction_summary: CompactionSummaryMessage,
-    /// pi-mono: BranchSummaryMessage (messages.ts:55-60)
+
     branch_summary: BranchSummaryMessage,
-    /// pi-mono: CustomMessage (messages.ts:46-53)
+
     custom: CustomMessage,
 
     pub const CompactionSummaryMessage = struct {
@@ -155,8 +137,6 @@ pub const AgentMessage = union(enum) {
     };
 };
 
-/// Tool result returned from tool execution.
-/// pi-mono source: packages/agent/src/types.ts:281-286
 pub const AgentToolResult = struct {
     content: []const ContentBlock,
     details: std.json.Value = .null,
@@ -168,7 +148,6 @@ pub const AgentToolResult = struct {
         image: ImageContent,
     };
 
-    /// Deep-clone into owned memory so the caller can outlive the source.
     pub fn clone(self: AgentToolResult, allocator: std.mem.Allocator) !AgentToolResult {
         const content = try allocator.alloc(ContentBlock, self.content.len);
         var initialized: usize = 0;
@@ -212,7 +191,6 @@ pub const AgentToolResult = struct {
         };
     }
 
-    /// Free all owned memory produced by clone.
     pub fn free(self: AgentToolResult, allocator: std.mem.Allocator) void {
         for (self.content) |block| switch (block) {
             .text => |t| {
@@ -230,15 +208,8 @@ pub const AgentToolResult = struct {
     }
 };
 
-/// Callback for streaming tool execution updates.
 pub const AgentToolUpdateCallback = *const fn (partial_result: AgentToolResult, ctx: ?*anyopaque) void;
 
-/// In-flight tool execution.
-///
-/// This is the Zig-native analogue of pi-mono's
-/// `Promise<AgentToolResult>` return from `AgentTool.execute`: a tool may
-/// complete immediately or hand the agent loop a continuation that can be
-/// waited/cancelled without encoding extension-specific state in the loop.
 pub const AgentToolExecution = union(enum) {
     ready: AgentToolResult,
     pending: Pending,
@@ -263,19 +234,15 @@ pub const AgentToolExecution = union(enum) {
     };
 };
 
-/// Tool definition for the agent runtime.
-/// Extends ai.Tool with execution capability.
-/// pi-mono source: packages/agent/src/types.ts:292-307
 pub const AgentTool = struct {
     name: []const u8,
     description: []const u8,
     label: []const u8,
     parameters: std.json.Value,
-    /// Opaque context pointer for tool state (cwd, config, etc).
+
     ctx: ?*anyopaque = null,
     affinity: ToolExecutionAffinity = .agent_thread,
-    /// Optional compatibility shim for raw tool-call arguments before hooks and execution.
-    /// Returned JSON must either alias `args` or be allocated from the supplied allocator.
+
     prepare_arguments: ?*const fn (allocator: std.mem.Allocator, args: std.json.Value) anyerror!std.json.Value = null,
     execute: *const fn (
         ctx: ?*anyopaque,
@@ -300,16 +267,12 @@ pub const AgentTool = struct {
     }
 };
 
-/// Agent context snapshot passed to the loop.
-/// pi-mono source: packages/agent/src/types.ts:310-317
 pub const AgentContext = struct {
     system_prompt: []const u8,
     messages: []const AgentMessage,
     tools: ?[]const AgentTool = null,
 };
 
-/// Public agent state.
-/// pi-mono source: packages/agent/src/types.ts:253-278
 pub const AgentState = struct {
     system_prompt: []const u8 = "",
     model: Model = .{
@@ -333,24 +296,12 @@ pub const AgentState = struct {
     error_message: ?[]const u8 = null,
 };
 
-/// Result from beforeToolCall hook.
-/// pi-mono source: packages/agent/src/types.ts:46-49
-///
-/// `args` replaces the arguments passed to the tool. `null` means
-/// "use the prepared args unchanged" — the agent loop resolves this
-/// with `effective_args = hook_result.args orelse prepared_args`.
-/// Used by the extension runner's `tool_call` event dispatch: Lua
-/// handlers return a replacement `input` table, which the runner
-/// deep-copies into an owned `std.json.Value` and surfaces here.
-/// See `docs/extensions.md`.
 pub const BeforeToolCallResult = struct {
     block: bool = false,
     reason: ?[]const u8 = null,
     args: ?std.json.Value = null,
 };
 
-/// Context passed to beforeToolCall hook.
-/// pi-mono source: packages/agent/src/types.ts:69-78
 pub const BeforeToolCallContext = struct {
     assistant_message: AssistantMessage,
     tool_call: ToolCall,
@@ -358,16 +309,12 @@ pub const BeforeToolCallContext = struct {
     context: AgentContext,
 };
 
-/// Result from afterToolCall hook — partial override.
-/// pi-mono source: packages/agent/src/types.ts:62-66
 pub const AfterToolCallResult = struct {
     content: ?[]const AgentToolResult.ContentBlock = null,
     details: ?std.json.Value = null,
     is_error: ?bool = null,
 };
 
-/// Context passed to afterToolCall hook.
-/// pi-mono source: packages/agent/src/types.ts:81-94
 pub const AfterToolCallContext = struct {
     assistant_message: AssistantMessage,
     tool_call: ToolCall,
@@ -377,8 +324,6 @@ pub const AfterToolCallContext = struct {
     context: AgentContext,
 };
 
-/// Hook: called before tool execution, after arg validation.
-/// Return block=true to prevent execution.
 pub const BeforeToolCallHook = struct {
     func: *const fn (ctx_arg: BeforeToolCallContext, signal: Token, hook_ctx: ?*anyopaque) ?BeforeToolCallResult,
     ctx: ?*anyopaque = null,
@@ -388,8 +333,6 @@ pub const BeforeToolCallHook = struct {
     }
 };
 
-/// Hook: called after tool execution.
-/// Return overrides for content/details/isError.
 pub const AfterToolCallHook = struct {
     func: *const fn (ctx_arg: AfterToolCallContext, signal: Token, hook_ctx: ?*anyopaque) ?AfterToolCallResult,
     ctx: ?*anyopaque = null,
@@ -399,13 +342,6 @@ pub const AfterToolCallHook = struct {
     }
 };
 
-/// Hook: transforms the raw provider request payload before HTTP send.
-///
-/// Mirrors pi-mono's `onPayload` seam. The hook runs at the provider
-/// request boundary, after the agent loop has built stream options but
-/// before the HTTP payload is sent.
-///
-/// See `docs/extensions.md`.
 pub const OnPayloadHook = struct {
     func: *const fn (allocator: std.mem.Allocator, payload: std.json.Value, model: Model, ctx: ?*anyopaque) std.json.Value,
     ctx: ?*anyopaque = null,
@@ -415,8 +351,6 @@ pub const OnPayloadHook = struct {
     }
 };
 
-/// Hook: resolves API key dynamically per LLM request (e.g. expiring OAuth tokens).
-/// pi-mono source: packages/agent/src/types.ts:157
 pub const GetApiKeyHook = struct {
     func: *const fn (provider: []const u8, ctx: ?*anyopaque) ?[]const u8,
     ctx: ?*anyopaque = null,
@@ -426,8 +360,6 @@ pub const GetApiKeyHook = struct {
     }
 };
 
-/// Configuration for the agent loop — all hooks and options.
-/// pi-mono source: packages/agent/src/types.ts:96-214
 pub const AgentLoopConfig = struct {
     model: Model,
     stream: StreamHook,
@@ -471,8 +403,6 @@ pub const AgentLoopConfig = struct {
     }
 };
 
-/// Agent events — emitted for UI/logging.
-/// pi-mono source: packages/agent/src/types.ts:326-341
 pub const AgentEvent = union(enum) {
     agent_start: void,
     agent_end: struct { messages: []const AgentMessage },
@@ -486,7 +416,6 @@ pub const AgentEvent = union(enum) {
     tool_execution_end: struct { tool_call_id: []const u8, tool_name: []const u8, result: AgentToolResult, is_error: bool },
 };
 
-/// Agent event callback.
 pub const AgentEventSink = *const fn (event: AgentEvent, ctx: ?*anyopaque) void;
 
 test "AgentToolResult clone+free round-trip with text content" {

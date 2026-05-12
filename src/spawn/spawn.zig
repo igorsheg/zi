@@ -1,10 +1,3 @@
-/// ziSpawn — spawn a child zi process in --mode json, parse JSONL events,
-/// collect the last assistant text output and usage stats.
-///
-/// Zig equivalent of piSpawn() in pi-spawn.ts.
-/// Reads stdout line-by-line, parses each as a JSON agent event.
-/// On "message_end" with role=="assistant": extracts text, accumulates usage.
-/// stderr is collected after stdout EOF.
 const std = @import("std");
 const types = @import("types.zig");
 const runtime_process = @import("../zio/root.zig").process;
@@ -325,10 +318,6 @@ fn jsonToF64(val: ?std.json.Value) f64 {
     };
 }
 
-/// Open the file referenced by `ZI_SPAWN_TRACE` for append. Returns
-/// null if the env var is unset, the path is invalid, or the file
-/// can't be opened. All trace operations are best-effort: failures
-/// silently disable tracing for the rest of this spawn.
 fn openTraceFile(io: std.Io) ?std.Io.File {
     const path = @import("env").get("ZI_SPAWN_TRACE") orelse return null;
     if (path.len == 0) return null;

@@ -1,5 +1,3 @@
-//! mdman - Markdown to man page (and HTML) converter
-
 const std = @import("std");
 const parser = @import("parser.zig");
 const roff = @import("roff.zig");

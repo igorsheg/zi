@@ -7,7 +7,6 @@ const keys_mod = @import("../../tui/terminal/keys.zig");
 
 const c = lua_runtime.c;
 
-/// Keybinding definition parser: accepts `key` and/or dense-array `keys`.
 pub fn ziRegisterKeybinding(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);

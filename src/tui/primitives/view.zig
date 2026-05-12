@@ -6,30 +6,17 @@ const keys_mod = @import("../terminal/keys.zig");
 const Region = buffer_mod.Region;
 const Key = keys_mod.Key;
 
-/// Height requirements reported by a component during layout.
 pub const Measurement = struct {
     min_height: u32,
     preferred_height: u32,
 };
 
-/// Cursor position and style for a focused component.
 pub const CursorState = struct {
     x: u32,
     y: u32,
     style: cell_mod.CursorStyle = .bar,
 };
 
-/// Type-erased component interface.
-/// Views implement render/handleInput/measure/cursorState and expose
-/// themselves via `component()` for use in layout primitives.
-///
-/// Heavy components can optionally implement `renderSlice(region, first_row)`
-/// so viewport owners can paint visible rows directly without full-surface
-/// scratch rendering.
-///
-/// Focus: components that can receive focus implement `setFocused(bool)`.
-/// The FocusManager (on TUI) is the source of truth for who has focus.
-/// Components use `focused` state to gate input handling and cursor display.
 pub const Component = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -117,9 +104,6 @@ pub const Component = struct {
         };
     }
 
-    /// Component identity — two Components are equal iff they wrap the same object.
-    /// ptr is the instance pointer; vtable is shared per type so ptr alone suffices,
-    /// but checking both guards against accidental aliasing across type-erased boundaries.
     pub fn eql(a: Component, b: Component) bool {
         return a.ptr == b.ptr and a.vtable == b.vtable;
     }

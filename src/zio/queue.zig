@@ -39,32 +39,11 @@ pub const State = enum {
 };
 
 pub const CloseMode = enum {
-    /// Stop accepting sends and preserve already queued work for consumers.
     graceful,
-    /// Stop accepting sends and cleanup/drop all queued work immediately.
+
     immediate,
 };
 
-/// Queue(T) is zi's small typed cross-thread message primitive.
-///
-/// Durable semantic contract:
-/// - one queue carries mutation/work messages for a single owner boundary
-/// - message payload ownership must remain explicit across the thread crossing
-/// - queue policy is explicit at init time, never implicit at the call site
-/// - close/drain/deinit are distinct operations
-/// - wake integration is composed alongside queue storage, not confused with it
-/// - snapshots remain a separate primitive; queue use must not become ask/reply for UI reads
-/// - lifecycle is explicit: `active -> closing -> closed`
-///
-/// Delivery/cleanup semantics:
-/// - `send` is best-effort and performs cleanup for any undelivered message
-/// - `trySend` preserves the original message on `.closed`, `.full`, and `.oom`
-/// - `.dropped` means queue policy intentionally discarded the newest message and the queue already cleaned it up
-/// - `drainInto` transfers ownership of drained messages to the consumer buffer
-/// - `visitPending` reads queued items without transferring ownership
-/// - `clear` drops any queued items still retained by the queue
-/// - `close` stops future sends but preserves already queued work for drain
-/// - `deinit` cleans up any undelivered messages still retained by the queue
 pub fn Queue(comptime T: type, comptime config: Config) type {
     comptime validateConfig(T, config);
 
@@ -187,12 +166,6 @@ pub fn Queue(comptime T: type, comptime config: Config) type {
             self.* = undefined;
         }
 
-        /// Best-effort enqueue surface for existing call sites.
-        ///
-        /// Semantics:
-        /// - delivered items are retained for receiver-side drain
-        /// - `.drop_newest` bounded policy cleans the item and treats that as a handled outcome
-        /// - `.closed`, `.full`, and `.oom` all clean the unsent item locally
         pub fn send(self: *Self, item: T) void {
             switch (self.trySend(item)) {
                 .ok, .dropped => {},
@@ -207,14 +180,6 @@ pub fn Queue(comptime T: type, comptime config: Config) type {
             self.send(item);
         }
 
-        /// Precise enqueue surface that preserves ownership on failure.
-        ///
-        /// Results:
-        /// - `.ok`       — message enqueued
-        /// - `.dropped`  — queue policy intentionally dropped newest; message already cleaned up by queue
-        /// - `.closed`   — queue not accepting sends (`closing` or `closed`); caller receives original message back
-        /// - `.full`     — bounded queue rejected send; caller receives original message back
-        /// - `.oom`      — append allocation failed; caller receives original message back
         pub fn trySend(self: *Self, item: T) TrySendResult {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -307,11 +272,6 @@ pub fn Queue(comptime T: type, comptime config: Config) type {
             }
         }
 
-        /// Atomic snapshot-and-clear: visits each pending item with the
-        /// mutex held, then cleans up and resets the queue — all under a
-        /// single lock acquisition so callers never observe a partial
-        /// drain. A visitor error aborts the traversal without clearing
-        /// any items, matching `visitPending` semantics.
         pub fn visitAndClear(
             self: *Self,
             visitor: *const fn (item: *const T, ctx: ?*anyopaque) anyerror!void,
@@ -331,11 +291,6 @@ pub fn Queue(comptime T: type, comptime config: Config) type {
             self.reconcileStateAndWakeLocked();
         }
 
-        /// Drop queued items matching `predicate`, cleaning each dropped item.
-        /// Preserves FIFO order for the remaining items. Useful for latest-wins
-        /// semantic snapshots where queued stale states should not retain large
-        /// payloads while the consumer is busy. If temporary storage cannot be
-        /// allocated, leaves the queue unchanged and returns 0.
         pub fn dropMatching(
             self: *Self,
             predicate: *const fn (item: *const T, ctx: ?*anyopaque) bool,
@@ -381,11 +336,6 @@ pub fn Queue(comptime T: type, comptime config: Config) type {
             self.reconcileStateAndWakeLocked();
         }
 
-        /// Non-blocking acknowledgement hook for wake-integrated queuees.
-        ///
-        /// Coalesced readiness stays armed until the queue drains. This hook is
-        /// therefore safe to call from an external poll loop before the caller
-        /// drains messages: if work is still pending, the readiness byte remains.
         pub fn wait(self: *Self) void {
             switch (config.wakeup) {
                 .none => {},
@@ -393,17 +343,6 @@ pub fn Queue(comptime T: type, comptime config: Config) type {
             }
         }
 
-        /// Block on the queue wake primitive until it becomes readable or the
-        /// timeout elapses. Returns `true` when the wake fd fired, `false` on
-        /// timeout or unrelated poll wakeups.
-        ///
-        /// Readiness is coalesced: one wake means "queue state changed to
-        /// readable/terminal", not "N messages were enqueued". The wake remains
-        /// armed until the consumer drains the queue to empty or explicitly
-        /// acknowledges a terminal empty state.
-        ///
-        /// Only valid for `.pipe` wakeups; `.none` intentionally has no
-        /// blocking scheduler surface.
         pub fn waitReadable(self: *Self, timeout_ms: i32) !bool {
             comptime if (config.wakeup != .pipe) {
                 @compileError("Queue.waitReadable requires wakeup=.pipe");

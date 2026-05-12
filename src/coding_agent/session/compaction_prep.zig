@@ -1,16 +1,3 @@
-//! Pure compaction domain logic.
-//!
-//! This module owns the cut-point + split-turn + file-op semantics of a
-//! compaction. It does not mutate session state, publish events, read
-//! credentials, or touch any mailbox. Session mutation and LLM I/O belong
-//! to the executor (`compactor.zig`).
-//!
-//! pi-mono parity references:
-//!  .references/pi-mono/packages/coding-agent/src/core/compaction/compaction.ts
-//!  .references/pi-mono/packages/coding-agent/src/core/compaction/utils.ts
-//!
-//! Owned by slice zi-v3j.10.2.
-
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
@@ -41,7 +28,6 @@ pub const FileOperations = struct {
     }
 };
 
-/// pi-mono utils.ts: extractFileOpsFromMessage
 pub fn extractFileOpsFromMessage(
     allocator: std.mem.Allocator,
     message: AgentMessage,
@@ -73,7 +59,6 @@ pub const ComputedFileLists = struct {
     modified_files: []const []const u8,
 };
 
-/// pi-mono utils.ts: computeFileLists
 pub fn computeFileLists(
     allocator: std.mem.Allocator,
     file_ops: *const FileOperations,
@@ -107,7 +92,6 @@ pub fn computeFileLists(
     };
 }
 
-/// pi-mono utils.ts: formatFileOperations
 pub fn formatFileOperations(
     allocator: std.mem.Allocator,
     read_files: []const []const u8,
@@ -144,8 +128,7 @@ fn strLessThan(_: void, a: []const u8, b: []const u8) bool {
 
 pub const CutPointResult = struct {
     first_kept_entry_index: usize,
-    /// Index of the user-role entry that starts a split turn, or null when
-    /// the cut falls cleanly at a user boundary.
+
     turn_start_index: ?usize,
     is_split_turn: bool,
 };
@@ -161,9 +144,6 @@ fn isValidCutEntry(entry: SessionEntry) bool {
     };
 }
 
-/// Is this entry a valid *turn start* boundary for split-turn handling?
-/// pi-mono findTurnStartIndex: user (or bashExecution, n/a here) messages,
-/// plus branch_summary and custom_message entry types.
 fn isTurnStartEntry(entry: SessionEntry) bool {
     return switch (entry.entry) {
         .message => |m| m.message == .user,
@@ -179,7 +159,6 @@ fn isUserRoleCut(entry: SessionEntry) bool {
     };
 }
 
-/// pi-mono compaction.ts: findTurnStartIndex
 pub fn findTurnStartIndex(
     entries: []const SessionEntry,
     entry_index: usize,
@@ -193,13 +172,6 @@ pub fn findTurnStartIndex(
     return null;
 }
 
-/// pi-mono compaction.ts: findCutPoint + findValidCutPoints
-///
-/// Walk backwards from newest in [start_index, end_index), accumulating
-/// estimated message tokens. Once we meet `keep_recent_tokens`, snap to
-/// the nearest valid cut at or after that entry. Then pull the cut back
-/// over any non-message entries (settings changes, etc.) that belong with
-/// the kept region.
 pub fn findCutPoint(
     entries: []const SessionEntry,
     start_index: usize,
@@ -274,11 +246,6 @@ pub const CompactionPreparation = struct {
     settings: CompactionSettings,
 };
 
-/// pi-mono compaction.ts: prepareCompaction
-///
-/// Returns null when there is nothing the domain layer can compact
-/// (empty branch, already-compacted tail, or no messages to summarize).
-/// The executor maps that into the appropriate lifecycle event.
 pub fn prepareCompaction(
     allocator: std.mem.Allocator,
     path_entries: []const SessionEntry,
@@ -405,11 +372,6 @@ fn collectCarriedFileOps(
     }
 }
 
-/// pi-mono utils.ts: serializeConversation
-///
-/// Serializes conversation messages to a text block that cannot be mistaken
-/// for a continuation turn. Tool results are truncated to
-/// TOOL_RESULT_MAX_CHARS to keep the summarization request bounded.
 pub fn serializeConversation(
     allocator: std.mem.Allocator,
     messages: []const AgentMessage,

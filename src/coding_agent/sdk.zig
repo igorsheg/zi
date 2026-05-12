@@ -1,18 +1,3 @@
-//! Composition-root factory for AgentSession.
-//!
-//! This is the canonical bootstrap path used by print/json/interactive
-//! modes. `main.zig` resolves mode-specific concerns (auth, settings,
-//! model choice), then hands session construction to this module.
-//!
-//! `createAgentSession(...)` owns the shared bootstrap wiring that
-//! should not be duplicated at top-level callsites:
-//! - resolve the on-disk session directory
-//! - create/open the SessionStore when needed
-//! - construct the ResourceLoader as the single owner of loaded
-//!   extensions, prompt inputs, skills, and future resource kinds
-//! - assemble the provider/tool/extension environment the session runs in
-//! - inject prepared deps into AgentSession
-
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
@@ -32,16 +17,15 @@ pub const PreparedSessionDeps = session_bootstrap.PreparedDeps;
 
 pub const CreateOptions = struct {
     model: ai.protocol.Model,
-    /// Static API key fallback. Used only when no `auth_storage` is
-    /// attached or its lookup returns empty.
+
     api_key: []const u8 = "",
     cwd: []const u8,
     io: std.Io = std.Options.debug_io,
-    /// ResourceLoader bootstrap input: custom system-prompt source.
+
     system_prompt: ?[]const u8 = null,
-    /// ResourceLoader bootstrap input: injected AGENTS/CLAUDE-style files.
+
     context_files: []const resources.types.AgentsFile = &.{},
-    /// ResourceLoader bootstrap input: explicit extension roots/paths.
+
     extension_paths: []const []const u8 = &.{},
     agent_dir_override: ?[]const u8 = null,
     max_tokens: ?u64 = 4096,
@@ -55,22 +39,16 @@ pub const CreateOptions = struct {
     thinking_level: ?agent_mod.protocol.ThinkingLevel = null,
     session_store: ?SessionStore = null,
     no_session: bool = false,
-    /// ResourceLoader bootstrap input: append-system-prompt source.
+
     append_system_prompt: ?[]const u8 = null,
     tool_allowlist: ?[]const []const u8 = null,
     extension_generation: extension_runner_mod.Generation = 0,
 };
 
-/// Resolve the on-disk directory for a session's files before the
-/// SessionStore is created. Caller owns the returned slice.
 pub fn resolveSessionDir(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     return storage.getSessionDirForCwd(allocator, cwd, null);
 }
 
-/// Build a fully-initialized `AgentSession` from resolved external
-/// dependencies (model, api key, registry, etc.). The caller still
-/// owns auth/settings/model resolution because those have mode-specific
-/// error handling (print mode exits, interactive mode surfaces a prompt).
 pub fn createAgentSession(
     allocator: std.mem.Allocator,
     options: CreateOptions,

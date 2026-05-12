@@ -9,8 +9,6 @@ const log = std.log.scoped(.oauth);
 
 extern "c" fn system(command: [*:0]const u8) c_int;
 
-/// Per-provider OAuth configuration.
-/// Shared PKCE + callback infra; per-provider hooks for protocol differences.
 pub const OAuthProvider = struct {
     pub const Kind = enum {
         builtin,
@@ -39,15 +37,10 @@ pub const OAuthProvider = struct {
     callback_port: u16,
     callback_path: []const u8,
 
-    /// Build the full authorization URL including PKCE challenge.
-    /// Caller owns returned slice.
     build_authorize_url: *const fn (allocator: std.mem.Allocator, flow: *const FlowContext) ?[]u8,
 
-    /// Exchange authorization code for tokens. POST to token endpoint.
-    /// Caller owns the OAuthCredential (strings are allocated with allocator).
     exchange_code: *const fn (allocator: std.mem.Allocator, req: ExchangeRequest) ExchangeResult,
 
-    /// Refresh an expired token.
     refresh_token: *const fn (allocator: std.mem.Allocator, credential: auth_types.OAuthCredential) ExchangeResult,
 };
 

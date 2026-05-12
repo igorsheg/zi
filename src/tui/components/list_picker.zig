@@ -26,10 +26,6 @@ const Theme = theme_mod.Theme;
 const MAX_ITEMS = 512;
 const MAX_QUERY = 128;
 
-/// Modal picker surface composed from Panel, TextInput, StatusText, and SelectList.
-///
-/// Filtering/selection bookkeeping lives in PickerState; this view wires state to
-/// primitives and reports selection/cancellation via callbacks.
 pub const Selection = struct {
     item: *const SelectItem,
     source_index: usize,
@@ -46,10 +42,6 @@ pub const Status = struct {
     kind: StatusKind = .info,
 };
 
-/// Query/filter/selection bookkeeping for picker-like surfaces.
-///
-/// It owns no rendering primitives and borrows caller item storage. The view
-/// layer decides how to present `visibleItems()`.
 pub const PickerState = struct {
     searchable: bool = false,
     all_items: []const SelectItem = &.{},
@@ -216,8 +208,6 @@ pub const ListPicker = struct {
         };
     }
 
-    /// Set items and enable search. Caller owns `items` memory.
-    /// `search_texts` is optional — if null, search matches on item.label.
     pub fn setItems(self: *ListPicker, items: []const SelectItem) void {
         self.list.empty_text = self.empty_text;
         self.list.setItems(self.state.setItems(items));

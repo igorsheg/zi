@@ -62,30 +62,11 @@ pub const ToolRenderContext = struct {
     width: u32,
 };
 
-/// Static registration of a zig-native tool renderer (built-in tools
-/// like bash, read, find — compiled into the binary, looked up by
-/// name once at tool-call start).
 pub const Registration = struct {
     tool_name: []const u8,
     renderer: ToolRenderer,
 };
 
-/// Resolver seam between tool names and renderers.
-///
-/// Two reasons this is a resolver and not a plain slice:
-///
-///   1. **dynamic sources**: Lua-registered tools live in the
-///      runtime `ExtensionRunner` and only exist once the loader
-///      has run. A static array can't see them.
-///
-///   2. **reload safety**: the Lua-renderer path (F1c) needs the
-///      runner pointer so it can look up the handler ref for the
-///      active generation, not a stale slice captured at startup.
-///
-/// `interactive.zig` builds a resolver with `ctx = extension_runner_ref`
-/// and a `resolve_fn` that consults both built-in entries and the
-/// runner's tool registry. Tests build one with a fixed slice and no
-/// extension runner.
 pub const ToolRendererResolver = struct {
     ctx: ?*anyopaque = null,
     resolve_fn: *const fn (ctx: ?*anyopaque, tool_name: []const u8) ToolRenderer,
@@ -94,9 +75,6 @@ pub const ToolRendererResolver = struct {
         return self.resolve_fn(self.ctx, tool_name);
     }
 
-    /// Build a resolver backed by a static `[]const Registration`
-    /// slice. Matches the old `ToolRendererRegistry.get` behavior
-    /// and is what tests use.
     pub fn fromStatic(entries: *const []const Registration) ToolRendererResolver {
         const S = struct {
             fn resolveStatic(ctx: ?*anyopaque, tool_name: []const u8) ToolRenderer {
@@ -113,7 +91,6 @@ pub const ToolRendererResolver = struct {
     }
 };
 
-/// Empty resolver — resolves nothing, all tools use fallbacks.
 pub const empty_resolver = ToolRendererResolver{
     .ctx = null,
     .resolve_fn = struct {

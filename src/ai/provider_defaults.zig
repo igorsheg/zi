@@ -1,22 +1,3 @@
-//! Canonical built-in provider bundle.
-//!
-//! Why this module exists: previously each entry path (interactive,
-//! print, json, tests) hand-built its own `ai.provider.Registry` and
-//! manually registered the providers it cared about. That meant
-//!   1. adding a provider required touching every mode in `main.zig`,
-//!   2. switching to a model whose `api` wasn't registered silently
-//!      no-op'd inside `StreamClosure.streamFn` ("Working..." then
-//!      nothing — see beads zi-yjc),
-//!   3. the upcoming extension `provider_queue` (D2) had no single
-//!      registry to flush into.
-//!
-//! `Bundle` is the one place that knows the full set of built-in
-//! providers, owns their backing structs on the heap, and registers
-//! them into a `Registry` under their `Api` identifiers. The sdk
-//! factory creates one per `AgentSession` and stores it on the
-//! session for tear-down. Tests that want a custom registry pass
-//! their own and skip the bundle.
-
 const std = @import("std");
 const provider_mod = @import("provider.zig");
 const anthropic = @import("anthropic.zig");
@@ -24,9 +5,6 @@ const openai_completions = @import("openai_completions.zig");
 const openai_responses = @import("openai_responses.zig");
 const openai_codex = @import("openai_codex.zig");
 
-/// Heap-owned set of built-in providers + the registry they're
-/// registered into. One bundle per generation; deinit destroys
-/// every owned provider after closing the registry.
 pub const Bundle = struct {
     allocator: std.mem.Allocator,
     registry: *provider_mod.Registry,
@@ -36,13 +14,6 @@ pub const Bundle = struct {
     openai_responses_prov: *openai_responses.OpenAIResponsesProvider,
     openai_codex_prov: *openai_codex.OpenAICodexProvider,
 
-    /// Allocate a fresh registry, populate it with every built-in
-    /// provider, and return an owned bundle.
-    ///
-    /// Caller deinits via `deinit`. Order matters: the registry must
-    /// outlive any `AgentSession` that holds a reference to it,
-    /// which is why both live in the same struct and the session's
-    /// deinit drops the bundle after the agent.
     pub fn init(allocator: std.mem.Allocator) !*Bundle {
         const self = try allocator.create(Bundle);
         errdefer allocator.destroy(self);

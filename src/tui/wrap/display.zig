@@ -5,7 +5,6 @@ const grapheme = @import("../grapheme.zig");
 const Segment = breaks_mod.Segment;
 const SegmentOptions = breaks_mod.SegmentOptions;
 
-/// A wrapped display line represented as byte offsets into source text.
 pub const Line = struct {
     start: usize,
     end: usize,
@@ -21,16 +20,6 @@ const display_options = SegmentOptions{
     .consume_overflow_whitespace = true,
 };
 
-/// Wrap plain UTF-8 text for display surfaces.
-///
-/// Policy:
-/// - splits on explicit newlines first
-/// - wraps at word boundaries when possible
-/// - breaks long runs by grapheme width when needed
-/// - strips leading whitespace on continuation lines
-/// - trims trailing whitespace on all lines
-///
-/// Returns byte-offset pairs into `text`. Caller owns the returned slice.
 pub fn wordWrap(text: []const u8, max_width: usize, allocator: std.mem.Allocator, width_method: grapheme.WidthMethod) ![]Line {
     if (max_width == 0) return try allocator.dupe(Line, &.{.{ .start = 0, .end = 0 }});
 

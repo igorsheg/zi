@@ -1,27 +1,3 @@
-//! Edit tool — replace text in a file with 3-tier matching.
-//!
-//! pi-mono parity: ports `edit-file.ts`. Carries over:
-//! - tier-1 exact match → tier-2 unescape (\\n,\\t,\\r,\\\\) → tier-3
-//!   "fuzzy" (trim trailing whitespace per line + smart-quote/dash
-//!   normalization). Tier 3 mirrors pi's normalizeForFuzzyMatch sans the
-//!   NFKC pass — full unicode normalization is not in zig std and the
-//!   high-frequency cases (smart quotes / em dash / nbsp) cover almost
-//!   every observed mismatch.
-//! - replace_all single-edit mode
-//! - multi-edit mode with overlap detection
-//! - redaction marker guard (rejects new_str that introduces a
-//!   "[REDACTED]" / "// ... existing code" placeholder)
-//! - CRLF preservation: detect file's line ending, normalize to LF for
-//!   matching, restore on write.
-//!
-//! Per-path mutex via `lock_registry`: two concurrent edits targeting
-//! the same canonicalized file serialize, mirroring the ts override's
-//! `withFileLock` on a `realpathSync.native` key. The lock spans the
-//! full read-modify-write window.
-//!
-//! Skipped (deferred): BOM preservation (rare in practice for files we
-//! edit), file-tracker hookup for undo_edit.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("../../agent/types.zig");
@@ -490,11 +466,6 @@ const EditError = error{
     OutOfMemory,
 };
 
-/// Per-failure context. Populated by `applyEdits` on the error return
-/// path so the caller can build a descriptive message that tells the
-/// model WHICH edit failed and WHAT it tried to match. Without this
-/// the model just sees "NotFound" and loops forever retrying the same
-/// broken old_str.
 const EditFailure = struct {
     edit_index: usize,
     kind: enum { not_found, ambiguous, overlap },
@@ -966,9 +937,6 @@ fn formatEditError(
     }
 }
 
-/// Truncate to the first line, then to PREVIEW_MAX bytes. Returns
-/// owned memory unless the input is short enough to slice (in which
-/// case it returns the static string "?" sentinel — caller checks).
 fn previewLine(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     const nl = std.mem.indexOfScalar(u8, s, '\n') orelse s.len;
     const first = s[0..nl];

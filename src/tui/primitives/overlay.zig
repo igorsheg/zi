@@ -10,7 +10,6 @@ const Cell = cell_mod.Cell;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
 
-/// Anchor point for overlay positioning.
 pub const OverlayAnchor = enum {
     center,
     top_left,
@@ -21,31 +20,20 @@ pub const OverlayAnchor = enum {
     bottom_center,
 };
 
-/// How the overlay's own rectangle should be painted before the component
-/// renders into it.
 pub const OverlaySurface = union(enum) {
-    /// Paint nothing — underlying content remains visible anywhere the component
-    /// does not draw.
     transparent,
-    /// Fill the overlay rect with spaces using this background color, hiding the
-    /// content below without adding a separate backdrop outside the rect.
+
     fill: Color,
 };
 
-/// How the screen behind an overlay should be painted before the overlay's
-/// own surface and component render.
 pub const OverlayBackdrop = union(enum) {
-    /// Leave the already-rendered content untouched.
     none,
-    /// Fill the full terminal region with this background color before drawing
-    /// the overlay. The overlay surface/component then render on top.
+
     fill: Color,
-    /// Apply the terminal "dim" attribute to already-rendered cells.
+
     dim,
 };
 
-/// Overlay positioning and sizing options.
-/// Matches pi-mono's OverlayOptions interface.
 pub const OverlayOptions = struct {
     width: ?u32 = null,
     width_percent: ?u8 = null,
@@ -64,19 +52,13 @@ pub const OverlayOptions = struct {
     margin_bottom: u32 = 0,
     margin_left: u32 = 0,
 
-    /// If true, don't capture keyboard focus when shown.
     non_capturing: bool = false,
 
-    /// Whether the overlay rect is transparent or painted with a background
-    /// before the component renders.
     surface: OverlaySurface = .transparent,
-    /// Whether a backdrop should be painted behind the overlay.
+
     backdrop: OverlayBackdrop = .none,
 };
 
-/// Generic overlay layout presets. Terminal-level only — no knowledge of
-/// app layout slots (editor, footer, etc.). App-specific presets that
-/// account for layout belong in the composition root (e.g., interactive.zig).
 pub const OverlayPresetOptions = struct {
     top_margin: u32 = 0,
     bottom_margin: ?u32 = null,
@@ -110,7 +92,6 @@ pub const OverlayPreset = enum {
 };
 
 pub const OverlayPresets = struct {
-    /// Telescope-style ivy layout — full-width bottom sheet for pickers.
     pub fn ivy(config: OverlayPresetOptions) OverlayOptions {
         return .{
             .anchor = .bottom_left,
@@ -122,7 +103,6 @@ pub const OverlayPresets = struct {
         };
     }
 
-    /// Centered modal dialog — confirmations, settings, selectors.
     pub fn centered(config: OverlayPresetOptions) OverlayOptions {
         var options = centerDialog();
         options.margin_top = config.top_margin;
@@ -133,7 +113,6 @@ pub const OverlayPresets = struct {
         return options;
     }
 
-    /// Legacy centered modal defaults. Prefer centered(config) at call sites.
     pub fn centerDialog() OverlayOptions {
         return .{
             .anchor = .center,
@@ -146,7 +125,6 @@ pub const OverlayPresets = struct {
         };
     }
 
-    /// Non-capturing top-right toast — transient notifications.
     pub fn topToast() OverlayOptions {
         return .{
             .anchor = .top_right,
@@ -160,7 +138,6 @@ pub const OverlayPresets = struct {
     }
 };
 
-/// Internal overlay entry in the stack.
 pub const OverlayEntry = struct {
     id: u64,
     component: Component,
@@ -170,8 +147,6 @@ pub const OverlayEntry = struct {
     focus_order: u64,
 };
 
-/// Legacy handle — kept for tests that use OverlayManager directly.
-/// Production code should use tui.OverlayHandle which is wired into focus.
 pub const OverlayHandle = struct {
     id: u64,
     manager: *OverlayManager,
@@ -192,8 +167,6 @@ pub const OverlayHandle = struct {
     }
 };
 
-/// Overlay stack manager. Lives on Interactive (composition root).
-/// Handles overlay lifecycle, z-order, and rendering into cell buffer.
 pub const OverlayManager = struct {
     stack: std.ArrayListUnmanaged(OverlayEntry) = .empty,
     next_id: u64 = 1,
@@ -208,8 +181,6 @@ pub const OverlayManager = struct {
         self.stack.deinit(self.allocator);
     }
 
-    /// Show an overlay. Returns a legacy handle (for direct OverlayManager usage).
-    /// `pre_focus` is the currently focused component (saved for restore).
     pub fn showOverlay(
         self: *OverlayManager,
         comp: Component,
@@ -220,7 +191,6 @@ pub const OverlayManager = struct {
         return .{ .id = id, .manager = self };
     }
 
-    /// Show an overlay and return the entry ID (for TUI-level handle construction).
     pub fn showOverlayReturnId(
         self: *OverlayManager,
         comp: Component,
@@ -246,14 +216,12 @@ pub const OverlayManager = struct {
         pre_focus: ?Component = null,
     };
 
-    /// Hide the topmost overlay. Returns pre_focus for the caller to restore.
     pub fn hideTopmost(self: *OverlayManager) HideResult {
         if (self.stack.items.len == 0) return .{};
         const entry = self.stack.pop();
         return .{ .pre_focus = if (entry) |e| e.pre_focus else null };
     }
 
-    /// Remove a specific overlay by handle ID. Returns pre_focus if found.
     pub fn removeOverlay(self: *OverlayManager, id: u64) ?Component {
         for (self.stack.items, 0..) |entry, i| {
             if (entry.id == id) {
@@ -271,7 +239,6 @@ pub const OverlayManager = struct {
         return false;
     }
 
-    /// Get the topmost visible capturing overlay's component (for focus).
     pub fn topmostCapturingComponent(self: *const OverlayManager) ?Component {
         var i: usize = self.stack.items.len;
         while (i > 0) {
@@ -284,9 +251,6 @@ pub const OverlayManager = struct {
         return null;
     }
 
-    /// Render all visible overlays into the buffer region, sorted by focus_order
-    /// (lower first = behind, higher = on top). Matches pi-mono's compositeOverlays
-    /// which sorts visibleEntries by focusOrder before compositing.
     pub fn renderOverlays(self: *OverlayManager, region: Region) void {
         const term_w = region.width;
         const term_h = region.height;
@@ -323,7 +287,6 @@ pub const OverlayManager = struct {
         }
     }
 
-    /// Bump the focus_order for an overlay (brings to front).
     pub fn bumpFocusOrder(self: *OverlayManager, id: u64) void {
         if (self.findEntry(id)) |entry| {
             self.focus_order_counter += 1;

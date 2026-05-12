@@ -1,8 +1,3 @@
-//! Renderers for the zig built-in tools (read, write, edit, grep,
-//! find, ls). Complex result rendering is retained: we parse/build a
-//! tool surface on result mutation, then measure/paint slices from the
-//! cached surface without reallocating during render.
-
 const std = @import("std");
 const tool_display_mod = @import("../tool_display.zig");
 const boxed_surface = @import("../../surfaces/boxed.zig");

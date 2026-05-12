@@ -1,16 +1,11 @@
 const std = @import("std");
 const types = @import("types.zig");
 
-/// Storage backend for settings — abstracts file I/O and locking.
-/// pi-mono: settings-manager.ts:133-135
 pub const SettingsStorage = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Execute callback while holding the lock for scope.
-        /// Callback receives current file content (null if missing).
-        /// Callback returns new content to write (null to skip write).
         with_lock: *const fn (
             ptr: *anyopaque,
             scope: types.SettingsScope,
@@ -34,8 +29,6 @@ pub const SettingsStorage = struct {
     }
 };
 
-/// In-memory settings storage for testing.
-/// pi-mono: settings-manager.ts:209-224
 pub const InMemorySettingsStorage = struct {
     global: ?[]const u8 = null,
     project: ?[]const u8 = null,

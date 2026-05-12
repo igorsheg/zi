@@ -107,8 +107,6 @@ fn appendRun(buf: *[6]TextRun, len: *usize, run: TextRun) void {
     len.* += 1;
 }
 
-/// Native notification UI surface. Extension APIs adapt into this; they do not
-/// own notification placement or lifecycle.
 pub fn notify(self: *Interactive, spec: notifications.Spec) void {
     self.notification_center.apply(spec) catch return;
     sync(self);

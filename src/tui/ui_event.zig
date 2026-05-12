@@ -23,7 +23,6 @@ pub const ExtensionKeybindingEntry = struct {
     display: []u8,
 };
 
-/// Queue-owned TUI event; no borrowed agent pointers cross threads.
 pub const UiEvent = union(enum) {
     consumed: void,
 
@@ -188,7 +187,6 @@ pub const UiEvent = union(enum) {
         };
     }
 
-    /// Free with the same allocator that built the mailbox payload.
     pub fn deinit(self: *UiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .consumed => {},

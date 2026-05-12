@@ -1,11 +1,3 @@
-//! Patch tool — apply Codex/OpenAI apply_patch style patches.
-//!
-//! Production shape: parse -> plan all changes -> lock all affected paths in
-//! deterministic order -> commit. Matching is line-oriented and follows the
-//! opencode/Codex behavior: exact, rstrip, trim, then normalized punctuation.
-//! Move commits are best-effort atomic: the destination is atomically written,
-//! then the source is deleted; a delete failure may leave both files present.
-
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");

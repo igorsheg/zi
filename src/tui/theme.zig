@@ -6,7 +6,6 @@ pub const Color = cell_mod.Color;
 pub const FgColor = tokens.FgColor;
 pub const BgColor = tokens.BgColor;
 
-/// Semantic color theme matching pi-mono's token model.
 pub const Theme = struct {
     fg_colors: [fg_count]Color,
     bg_colors: [bg_count]Color,

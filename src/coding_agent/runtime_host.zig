@@ -21,11 +21,6 @@ const event_bridge = @import("extensions/event_bridge.zig");
 const lua_renderer = @import("extensions/lua_renderer.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
 
-/// Conversation snapshots are high-frequency, cross-thread payloads. Keep
-/// extension-rendered committed tool rows bounded so a slow TUI cannot retain
-/// `queue_depth * full_session_render_output` bytes. Older committed rows fall
-/// back to built-in rendering if they need to be rebuilt; live/in-flight tool
-/// rows are still rendered normally.
 const max_committed_rendered_tool_entries_per_snapshot: usize = 16;
 
 pub const QueueKind = control_mod.QueueKind;
@@ -156,8 +151,6 @@ pub const RuntimeHost = struct {
         return self.session;
     }
 
-    /// Dispatch an extension command on the agent thread by visible
-    /// invocation name. Errors if no runner or no such command.
     pub fn dispatchExtensionCommand(self: *RuntimeHost, name: []const u8, args: []const u8) !void {
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchCommand(name, args);
@@ -317,14 +310,10 @@ pub const RuntimeHost = struct {
         self.extension_oauth_refresh_dispatcher = dispatcher;
     }
 
-    /// Agent-thread-only helper for the queued-input restore flow.
     pub fn restoreQueuedMessagesOnAgentThread(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
         return self.session.restoreQueuedMessagesOnAgentThread(allocator);
     }
 
-    /// Thread-safe run-control enqueue. Callable from any thread while a
-    /// run is active — this is the point of the run-control boundary.
-    /// `text` is not retained; the agent clones it into an owned message.
     pub fn enqueueQueuedText(
         self: *RuntimeHost,
         kind: control_mod.QueueKind,
@@ -340,13 +329,10 @@ pub const RuntimeHost = struct {
         };
     }
 
-    /// Thread-safe read of the current run-control queue state.
     pub fn snapshotQueuedMessages(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
         return self.session.cloneQueuedMessageSnapshot(allocator);
     }
 
-    /// Thread-safe atomic drain: returns what was queued and clears the
-    /// queues in a single run-control mutation.
     pub fn takeQueuedMessagesAndClear(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
         return self.session.restoreQueuedMessagesOnAgentThread(allocator);
     }
@@ -1602,10 +1588,6 @@ test "runtime host auto compaction runs once and resets context usage after comp
     try testing.expect(collector.compaction_ends.items[0].success);
     try testing.expectEqual(@as(?u64, 512), host.currentSession().getContextUsage().?.tokens);
 
-    // The post-compaction provider call must be built from the rebuilt compacted
-    // agent context, not from the oversized pre-compaction transcript. If this
-    // regresses, the provider reports the same large usage again and threshold
-    // compaction loops on every prompt.
     try testing.expect(fp.captured_contexts.items.len >= 3);
     const post_compaction_context = fp.captured_contexts.items[2];
     try testing.expect(post_compaction_context.messages.len >= 2);

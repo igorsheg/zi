@@ -1,21 +1,3 @@
-//! Model resolution chain — `findInitialModel`, `parseModelPattern`,
-//! `resolveCliModel`, `restoreModelFromSession`.
-//!
-//! 1:1 port of pi-mono's `packages/coding-agent/src/core/model-resolver.ts`.
-//! The WHAT must match — same ordering, same fallback rules, same
-//! warning strings — so existing pi-mono session files and CLI usage
-//! transfer cleanly. The HOW is idiomatic zig: no regex (manual byte
-//! scan for the date pattern), no `.map/.filter` (explicit loops), no
-//! recursion-through-promises.
-//!
-//! Scope limits for phase 2:
-//!   - `cli_provider` parameter is plumbed through but always null
-//!     (zi has no --provider flag yet).
-//!   - `scoped_models` is always an empty slice (no --scope yet).
-//!   - `resolveModelScope` (glob matching) is not ported — phase 2
-//!     does not wire --scope, and minimatch has no zig equivalent we
-//!     want to own today.
-
 const std = @import("std");
 const protocol = @import("../ai/protocol.zig");
 const json_util = @import("../ai/json_util.zig");
@@ -34,38 +16,32 @@ pub const ScopedModel = struct {
 pub const ParsedModelResult = struct {
     model: ?Model,
     thinking_level: ?ThinkingLevel,
-    /// When non-null, owned by `ParseOptions.warning_allocator`.
-    /// Scope-mode callers (future `--scope`) will consume this; phase
-    /// 2 passes `warning_allocator = null` and the slot stays null.
+
     warning: ?[]u8,
 };
 
 pub const ResolveCliModelResult = struct {
     model: ?Model,
     thinking_level: ?ThinkingLevel,
-    /// Caller-owned when non-null (formatted via `allocator`). `[]u8`
-    /// (not const) so consumers can pass it straight to queue
-    /// payloads that expect a mutable slice, e.g. `UiEvent`.
+
     warning: ?[]u8,
-    /// Caller-owned when non-null.
+
     err: ?[]u8,
 };
 
 pub const InitialModelResult = struct {
     model: ?Model,
     thinking_level: ThinkingLevel,
-    /// Caller-owned when non-null.
+
     fallback_message: ?[]u8,
 };
 
 pub const RestoreResult = struct {
     model: ?Model,
-    /// Caller-owned when non-null.
+
     fallback_message: ?[]u8,
 };
 
-/// pi-mono: model-resolver.ts:50-57
-/// Returns true if id ends with `-latest` or does NOT end with `-YYYYMMDD`.
 fn isAlias(id: []const u8) bool {
     if (std.mem.endsWith(u8, id, "-latest")) return true;
     if (id.len < 9) return true;
@@ -77,17 +53,6 @@ fn isAlias(id: []const u8) bool {
     return false;
 }
 
-/// pi-mono uses `isValidThinkingLevel` from cli/args.ts:50-54, which
-/// accepts `"off" | "minimal" | "low" | "medium" | "high" | "xhigh"`.
-/// We map `"off"` → null since `protocol.ThinkingLevel` has no `off`
-/// variant.
-///
-/// KNOWN DRIFT: pi-mono distinguishes "no level" from "explicit off",
-/// preserving "off" through `parseModelPattern`. We collapse both to
-/// null, and `findInitialModel` then `orelse`s null into
-/// DEFAULT_THINKING_LEVEL. Observably masked in phase 2 because no
-/// caller reads `init_result.thinking_level`; revisit when thinking
-/// is wired into the agent loop. Oracle review 2026-04-08.
 fn parseThinkingLevel(s: []const u8) ParsedThinking {
     if (std.mem.eql(u8, s, "off")) return .{ .valid = true, .level = null };
     if (std.mem.eql(u8, s, "minimal")) return .{ .valid = true, .level = .minimal };
@@ -115,9 +80,6 @@ fn idDescLessThan(_: void, a: Model, b: Model) bool {
     return std.mem.order(u8, a.id, b.id) == .gt;
 }
 
-/// pi-mono: model-resolver.ts:64-106
-/// Three-stage match: canonical `provider/id`, then `provider/id`
-/// split-exact, then bare id.
 pub fn findExactModelReferenceMatch(
     reference: []const u8,
     available_models: []const Model,
@@ -172,9 +134,6 @@ pub fn findExactModelReferenceMatch(
     return if (stage3_count == 1) stage3_hit else null;
 }
 
-/// pi-mono: model-resolver.ts:112-142
-/// Exact match first, then case-insensitive substring on id/name.
-/// Prefers aliases (sorted high→low) over dated versions.
 fn tryMatchModel(
     allocator: std.mem.Allocator,
     pattern: []const u8,
@@ -229,16 +188,10 @@ fn tryMatchModel(
 
 pub const ParseOptions = struct {
     allow_invalid_thinking_level_fallback: bool = true,
-    /// Optional allocator for formatting the invalid-thinking-level
-    /// warning. When null, a generic static string is used. pi-mono
-    /// tests assert the full formatted message, so scope-mode callers
-    /// should pass an allocator to get byte-exact parity.
+
     warning_allocator: ?std.mem.Allocator = null,
 };
 
-/// pi-mono: model-resolver.ts:180-233
-/// Tries the full pattern, then progressively strips `:suffix` until
-/// a match is found (handling OpenRouter ids that contain colons).
 pub fn parseModelPattern(
     allocator: std.mem.Allocator,
     pattern: []const u8,
@@ -292,11 +245,6 @@ pub fn parseModelPattern(
     return inner;
 }
 
-/// pi-mono: model-resolver.ts:151-165
-/// Used by `resolveCliModel` when `--provider` pins a provider but
-/// `--model` names an id we don't have. Returns a clone of the
-/// provider's default model with id/name overridden. The id/name
-/// slices are borrowed from the caller.
 fn buildFallbackModel(
     provider: protocol.Provider,
     model_id: []const u8,
@@ -333,12 +281,10 @@ pub const ResolveCliOptions = struct {
     cli_provider: ?[]const u8 = null,
     cli_model: ?[]const u8 = null,
     registry: *const ModelRegistry,
-    /// Allocator for warning/error strings returned in the result.
-    /// Caller owns any non-null `warning`/`err`.
+
     allocator: std.mem.Allocator,
 };
 
-/// pi-mono: model-resolver.ts:328-458
 pub fn resolveCliModel(opts: ResolveCliOptions) ResolveCliModelResult {
     const cli_model = opts.cli_model orelse return .{
         .model = null,
@@ -503,14 +449,6 @@ pub const FindInitialOptions = struct {
     allocator: std.mem.Allocator,
 };
 
-/// pi-mono: model-resolver.ts:474-554
-/// Hierarchy:
-///   1. CLI provider+model → resolveCliModel (error exits caller).
-///   2. First scoped model (skipped when resuming).
-///   3. settings default provider+model via `registry.find`.
-///   4. Walk `default_model_per_provider` against auth-filtered list.
-///   5. First auth-configured model in catalog.
-///   6. null.
 pub fn findInitialModel(opts: FindInitialOptions) !InitialModelResult {
     if (opts.cli_provider != null and opts.cli_model != null) {
         const resolved = resolveCliModel(.{
@@ -616,12 +554,6 @@ pub const RestoreOptions = struct {
     allocator: std.mem.Allocator,
 };
 
-/// pi-mono: model-resolver.ts:559-628
-/// Called on session resume. Returns the saved model if it still
-/// exists and has auth; otherwise the current model, then a default-
-/// provider match, then the first authed model, then null. The
-/// `fallback_message` is a human-readable description suitable for
-/// the status line.
 pub fn restoreModelFromSession(opts: RestoreOptions) !RestoreResult {
     const saved_provider = json_util.parseProvider(opts.saved_provider);
     const restored = opts.registry.find(saved_provider, opts.saved_model_id);

@@ -11,9 +11,6 @@ const json_util = @import("../../ai/json_util.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const SelectItem = select_list_mod.SelectItem;
 
-/// Owns all transient heap-backed data for one `/model` overlay.
-/// Catalog models are borrowed from Interactive's TUI-owned snapshot;
-/// derived search rows live here.
 pub const ModelPickerFlow = struct {
     arena: std.heap.ArenaAllocator,
     rows: []Row = &.{},

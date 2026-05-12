@@ -1,8 +1,3 @@
-//! AI-protocol-specific enum↔string converters. Generic JSON
-//! helpers (clone/free/typed accessors) were moved to
-//! `src/json/value.zig`, and generic text helpers now live in
-//! `src/lib/string_util.zig`; this file re-exports them so legacy
-//! call sites keep working while the migration settles.
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const json_value = @import("../json/value.zig");

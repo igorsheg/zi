@@ -31,12 +31,6 @@ const macos_clipboard = if (builtin.os.tag == .macos) struct {
     fn zi_clipboard_free(_: [*]u8) void {}
 };
 
-/// Best-effort clipboard write for TUI interactions.
-///
-/// Always emits OSC 52 first so remote sessions can still copy through the
-/// terminal. Local/native helpers are then attempted opportunistically. The
-/// return value reports whether a local/native helper confirmed success; OSC 52
-/// delivery cannot be acknowledged by the terminal.
 pub fn copyText(text: []const u8) bool {
     if (text.len == 0) return false;
     emitOsc52(text);
@@ -48,11 +42,6 @@ pub fn copyText(text: []const u8) bool {
     };
 }
 
-/// Best-effort clipboard image read for interactive paste.
-///
-/// Returns an owned raw byte slice when an image is available, otherwise null.
-/// Failures are intentionally collapsed to null so callsites can present a
-/// simple "no image available" UX without exposing platform helper details.
 pub fn readImage(allocator: std.mem.Allocator) ?[]u8 {
     return switch (builtin.os.tag) {
         .macos => readImageMacos(allocator),

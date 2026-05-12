@@ -1,6 +1,3 @@
-//! Partial JSON for streamed tool arguments.
-//! Mirrors npm `partial-json`: strict first, then best-effort partial.
-
 const std = @import("std");
 
 pub const Allow = packed struct(u8) {
@@ -52,7 +49,6 @@ pub fn parse(
     return value;
 }
 
-// OOM is not partial JSON.
 pub fn parseStreaming(
     allocator: std.mem.Allocator,
     src: []const u8,

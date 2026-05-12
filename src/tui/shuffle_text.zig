@@ -1,9 +1,5 @@
 const std = @import("std");
 
-/// Small reusable text-shuffle animation for TUI strings.
-///
-/// The component owns its PRNG, rate-limits itself, and only reports `true` from
-/// `tick` when the caller should copy/use `rendered()` and invalidate the UI.
 pub const ShuffleText = struct {
     allocator: std.mem.Allocator,
     options: Options,
@@ -20,23 +16,16 @@ pub const ShuffleText = struct {
     next_frame_ms: u64 = 0,
 
     pub const Options = struct {
-        /// Total animation duration.
         duration_ms: u64 = 600,
 
-        /// Minimum time between generated frames. 33ms is roughly 30fps.
         frame_ms: u64 = 33,
 
-        /// UTF-8 characters used during the shuffle phase.
         random_chars: []const u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
 
-        /// UTF-8 character/string shown before the shuffle phase begins.
         empty_char: []const u8 = "-",
 
-        /// I/O backend used to seed the component when `seed` is null.
         io: std.Io = std.Options.debug_io,
 
-        /// Optional deterministic seed for tests/demos. When null, the component
-        /// seeds itself from `io.randomSecure`, falling back to `io.random`.
         seed: ?u64 = null,
     };
 
@@ -70,7 +59,6 @@ pub const ShuffleText = struct {
         self.* = undefined;
     }
 
-    /// The caller owns `text`; keep it alive while this component may render it.
     pub fn setText(self: *ShuffleText, text: []const u8) Error!void {
         self.original = text;
         self.original_spans.clearRetainingCapacity();
@@ -125,7 +113,6 @@ pub const ShuffleText = struct {
         return self.output.items;
     }
 
-    /// Advances the animation. Returns true only when `rendered()` changed.
     pub fn tick(self: *ShuffleText, now_ms: u64) Error!bool {
         if (!self.running) return false;
         if (now_ms < self.next_frame_ms) return false;

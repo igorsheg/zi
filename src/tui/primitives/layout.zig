@@ -11,13 +11,6 @@ const Measurement = view_mod.Measurement;
 const CursorState = view_mod.CursorState;
 const Key = keys_mod.Key;
 
-/// Vertical stack layout primitive.
-///
-/// Children are laid out top-to-bottom. One child can be designated as
-/// "flex" (takes remaining vertical space after fixed children are measured).
-/// One child can be designated as "focused" (receives input and provides cursor).
-///
-/// Children are borrowed — Stack does not own their lifetimes.
 pub const ChildRect = struct {
     x: u32,
     y: u32,
@@ -45,7 +38,7 @@ pub const Child = struct {
 pub const Stack = struct {
     children: std.ArrayListUnmanaged(Child) = .empty,
     allocator: std.mem.Allocator,
-    /// Cached from last render() call, used by cursorState() for y-offset.
+
     last_render_width: u32 = 80,
     last_render_height: u32 = 24,
 
@@ -285,8 +278,6 @@ pub const Stack = struct {
         };
     }
 
-    /// Compute the y-offset of a child at the given index,
-    /// replicating the layout logic from render() using cached dimensions.
     fn computeChildYOffset(self: *const Stack, target_idx: usize) u32 {
         const w = self.last_render_width;
         const h = self.last_render_height;

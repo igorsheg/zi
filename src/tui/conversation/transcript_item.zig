@@ -13,11 +13,6 @@ const Color = cell_mod.Color;
 const Text = text_mod.Text;
 const Markdown = markdown_mod.Markdown;
 
-/// Type-erased transcript row interface.
-///
-/// Unlike the general TUI `Component` protocol, transcript rows MUST support
-/// native slice rendering. The transcript is a viewport compositor and never
-/// allocates full offscreen scratch surfaces just to crop visible rows.
 pub const TranscriptRenderable = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -96,8 +91,6 @@ pub const TranscriptRenderable = struct {
     }
 };
 
-/// Behavior tag for transcript-owned items.
-/// Renderables remain tagged for routing updates and typed retained-row access.
 pub const ItemId = enum(u64) { _ };
 pub const SemanticVersion = u64;
 
@@ -110,22 +103,16 @@ pub const ItemKind = enum {
     tool_execution,
 };
 
-/// Cleanup function type for owned items.
 pub const DeinitFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void;
 
-/// A single item in the transcript — slice-native renderable plus metadata.
-///
-/// Conversation/session semantics are projected before this type. A
-/// TranscriptItem only describes how a row is rendered, retained, routed, and
-/// destroyed inside the transcript viewport.
 pub const TranscriptItem = struct {
     renderable: TranscriptRenderable,
     kind: ItemKind = .generic,
     retained_item_id: ?ItemId = null,
     retained_semantic_version: ?SemanticVersion = null,
-    /// For tool_execution: route updates by ID via pending_tools HashMap.
+
     tool_call_id: ?[]const u8 = null,
-    /// Owned cleanup context. Called on item removal/transcript clear.
+
     deinit_ctx: ?*anyopaque = null,
     deinit_fn: ?DeinitFn = null,
 

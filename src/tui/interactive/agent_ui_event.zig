@@ -25,8 +25,6 @@ pub fn userFacingFailureMessage(
     };
 }
 
-/// Convert an AgentEvent to a small TUI side-effect event.
-/// Conversation semantics cross separately as `conversation_state`.
 pub fn convertAgentUiEvent(event: AgentEvent, allocator: std.mem.Allocator) ?UiEvent {
     switch (event) {
         .message_update => |mu| switch (mu.assistant_message_event) {

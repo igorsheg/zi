@@ -8,9 +8,6 @@ const json_util = @import("../ai/json_util.zig");
 const message_memory = @import("message_memory.zig");
 const tool_execution_group = @import("tool_execution_group.zig");
 
-/// Start an agent loop with new prompt messages.
-/// Prompts are added to the context and events are emitted for them.
-///
 pub fn runAgentLoop(
     run_allocator: std.mem.Allocator,
     turn_allocator_parent: std.mem.Allocator,
@@ -45,9 +42,6 @@ pub fn runAgentLoop(
     runLoop(run_allocator, turn_allocator_parent, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
 }
 
-/// Continue an agent loop from existing context without adding a new message.
-/// Used for retries — context already has user message or tool results.
-///
 pub const ContinueError = error{
     EmptyContext,
     AssistantTail,
@@ -83,9 +77,6 @@ pub fn runAgentLoopContinue(
     runLoop(run_allocator, turn_allocator_parent, &ctx_messages, &new_messages, context, config, signal, event_sink, event_ctx);
 }
 
-/// Main loop logic shared by runAgentLoop and runAgentLoopContinue.
-///   outer loop: continues when follow-up messages arrive after agent would stop
-///   inner loop: processes tool calls and steering messages
 fn runLoop(
     run_allocator: std.mem.Allocator,
     turn_allocator_parent: std.mem.Allocator,
@@ -232,8 +223,6 @@ fn runLoop(
     event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
 }
 
-/// Stream an assistant response from the LLM.
-/// Applies transformContext → convertToLlm pipeline before calling the stream function.
 fn streamAssistantResponse(
     run_allocator: std.mem.Allocator,
     turn_allocator: std.mem.Allocator,
@@ -288,8 +277,6 @@ fn streamAssistantResponse(
     return assistant_msg;
 }
 
-/// Emit a synthetic tool_execution_end for a tool that was started but not
-/// finished due to abort. Ensures balanced start/end lifecycle events.
 fn emitAbortedToolEnd(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
@@ -406,9 +393,6 @@ fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaq
     } });
 }
 
-/// Execute tool calls using pi-mono's 3-phase pipeline:
-/// prepare sequentially, optionally execute worker-safe tools in parallel,
-/// finalize in assistant source order.
 fn executeToolCalls(
     run_allocator: std.mem.Allocator,
     turn_allocator: std.mem.Allocator,
@@ -690,10 +674,6 @@ fn emitWorkerUpdate(
 ) void {
     if (update.prepared_index >= prepared_calls.len) return;
 
-    // Worker update events are delivered from a mailbox-owned payload that is
-    // deinitialized immediately after the synchronous sink call returns. Clone
-    // through the turn arena so event sinks that retain slices for the duration
-    // of the turn observe stable memory, matching inline tool event lifetimes.
     const tool_call_id = allocator.dupe(u8, update.tool_call_id) catch update.tool_call_id;
     const tool_name = allocator.dupe(u8, update.tool_name) catch update.tool_name;
     const args = json_util.cloneJsonValue(allocator, update.args) catch update.args;

@@ -9,20 +9,12 @@ const UiEvent = ui_event_mod.UiEvent;
 pub const ui_snapshot_queue_capacity: usize = 64;
 pub const ui_lifecycle_queue_capacity: usize = 64;
 
-/// Queue-backed agent/helper → TUI snapshot channel.
-///
-/// Snapshot/progress traffic is bounded and lossy: the latest semantic
-/// state will be republished, so intermediate snapshots may be dropped.
 pub const UiSnapshotQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = ui_snapshot_queue_capacity, .on_full = .drop_newest } },
     .wakeup = .pipe,
 });
 
-/// Queue-backed agent/helper → TUI lifecycle channel.
-///
-/// Terminal lifecycle outcomes must not disappear silently, so this
-/// channel rejects on overload instead of dropping.
 pub const UiLifecycleQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = ui_lifecycle_queue_capacity, .on_full = .reject } },

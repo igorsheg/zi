@@ -43,10 +43,7 @@ pub const RebuildOptions = struct {
 const DesiredItem = struct {
     item_id: transcript_mod.ItemId,
     semantic_version: transcript_mod.SemanticVersion,
-    /// P2: null means "the transcript already has a retained row with
-    /// this id+version; reconcile must only retain/move, not replace or
-    /// insert." Non-null rows are owned until reconcile transfers
-    /// ownership via insertItemAt/replaceItemAt and disarmDesiredRow.
+
     row: ?TranscriptItem = null,
     seed_editor_history: bool = false,
     history_text: ?ExtractedText = null,
@@ -112,18 +109,6 @@ const CommittedCacheReuse = enum {
     retry_changed,
 };
 
-/// Cached metadata for the committed portion of the last projected
-/// view snapshot. Reused by replaceViewSnapshot when the incoming
-/// snapshot points at the same *SharedCommitted and the cache key
-/// inputs (retry_attempt) still match — lets us skip rebuilding the
-/// committed-message portion of desired items, which is the hot part
-/// of the projection loop on soft updates.
-///
-/// The cache retains its own reference on `committed` because the
-/// pointer is used as a cache key across frames; without the retain,
-/// a failed full-rebuild after the previous view_snapshot is released
-/// could leave the cache holding a freed pointer that a later frame
-/// would compare against (ABA risk).
 const CommittedProjectionCache = struct {
     committed: *conversation_state_mod.SharedCommitted,
     retry_attempt: u32,
@@ -482,9 +467,6 @@ const QueuedUserMessageKind = enum {
     follow_up,
 };
 
-/// Editor history should survive append-only conversation growth, but whole
-/// conversation replacement must reseed it from committed user messages.
-/// We treat the previous committed user-message sequence as a prefix contract.
 fn committedUserHistoryIsPrefix(
     previous_messages: []const agent_protocol.AgentMessage,
     next_messages: []const agent_protocol.AgentMessage,
@@ -521,11 +503,6 @@ fn buildDesiredItems(
     return buildDesiredItemsFull(allocator, resolver, transcript, view, queued, options, hide_thinking_block, null);
 }
 
-/// Full builder: rebuilds committed-message desired items from scratch
-/// and appends transient items (active assistant, live tool executions,
-/// queued messages). If `cache_out` is non-null, records the committed
-/// prefix metadata so a later soft update with an unchanged committed
-/// pointer can skip the committed portion.
 fn buildDesiredItemsFull(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
@@ -577,10 +554,6 @@ fn buildDesiredItemsFull(
     return desired_items;
 }
 
-/// Fast path for unchanged committed snapshots: build only active/queued rows.
-/// The committed prefix is already retained in the transcript and represented
-/// by `CommittedProjectionCache.items`, so soft streaming updates avoid
-/// allocating one DesiredItem per historical row.
 fn buildTransientDesiredItems(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,

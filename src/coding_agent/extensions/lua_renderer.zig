@@ -1,47 +1,3 @@
-//! Lua-driven tool renderers.
-//!
-//! Bridges the first vertical of zi's host-owned presentation contract:
-//! `zi.tool({ render_call = ..., render_result = ... })` maps
-//! to the tool `call` and `result` presentation slots and returns owned,
-//! width-agnostic presentation documents.
-//!
-//! Since zi-wub.5/.6 the agent thread is the single owner of
-//! `lua_state`, so any `render_result` dispatch must happen there.
-//! This module builds a `RenderedToolResult` by running the hook against a
-//! tool result and deep-copying the returned spans into arena-owned
-//! Zig data. Callers decide whether to render immediately, cache, or
-//! discard the result.
-//!
-//! ## Restricted render environment
-//!
-//! The Lua hook receives exactly two arguments:
-//!
-//!   1. `result` — the tool result table (`{ content, is_error,
-//!      details }`), same shape the hook returned from `execute`.
-//!   2. `ctx` — a small table with `{ width, expanded, is_error }`.
-//!      Intentionally minimal. Render hooks are PURE FUNCTIONS —
-//!      they MUST NOT call `zi.spawn` (blocking + abort-racing),
-//!      `zi.on` (mutation during dispatch), or any other host
-//!      function that mutates runner state. We enforce this at
-//!      the policy level via documentation; a future hardening
-//!      could sandbox by running the hook in a stripped
-//!      environment.
-//!
-//! ## Ownership
-//!
-//! Every `*RenderedToolResult` is arena-allocated: one arena per
-//! render state, freed wholesale on `deinit`. Strings parsed from
-//! the Lua stack are duped into the arena before the coroutine
-//! deinits. After `dispatchRenderResult` returns, the state holds
-//! no references into Lua memory and can survive any subsequent
-//! GC, reload, or runner teardown.
-//!
-//! ## Fallback
-//!
-//! Any failure (missing state, malformed return, Lua error, OOM)
-//! produces `null`. The transcript falls back to the default
-//! text-wrap formatter. Render hooks MUST fail open.
-
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
@@ -72,9 +28,6 @@ pub const DispatchInput = struct {
     is_error: bool,
 };
 
-/// Run the render_call hook for `tool_name` if one exists, and return
-/// an owned presentation document. Returns null on missing hook or any
-/// failure so callers can fall back to builtin/default call rendering.
 pub fn dispatchRenderCall(
     allocator: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
@@ -108,12 +61,6 @@ pub fn dispatchRenderCall(
     return out_state;
 }
 
-/// Input variant that takes an `AgentToolResult` directly instead
-/// of a pre-built json.Value. Used by the transcript, which holds
-/// `AgentToolResult` as owned zig state and doesn't want to build
-/// an ephemeral json tree just to throw it away. Args are still
-/// passed as json because that's what the agent layer gives us
-/// (tool calls are decoded from JSON).
 pub const DispatchInputFromResult = struct {
     tool_name: []const u8,
     args: std.json.Value,
@@ -122,9 +69,6 @@ pub const DispatchInputFromResult = struct {
     is_error: bool,
 };
 
-/// Variant of `dispatchRenderResult` that takes an `AgentToolResult`
-/// and pushes the Lua table manually (content blocks + is_error +
-/// details) without an intermediate json.Value allocation.
 pub fn dispatchRenderResultFromResult(
     allocator: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
@@ -133,13 +77,6 @@ pub fn dispatchRenderResultFromResult(
     return dispatchRenderResultFromResultOn(allocator, runner, input, null);
 }
 
-/// Variant that lets the caller specify the *currently running*
-/// `lua_State`. Required when this is invoked from a host C function
-/// that's executing on a coroutine (e.g. `ctx.update` fired from
-/// inside `zi.spawn`'s event trampoline) — Lua API calls must happen
-/// on the current thread, not on the main state, or `lua_newthread`
-/// corrupts the stack and the next `lua_resume` blows up inside
-/// `luaH_getshortstr`. Pass `null` when you're already on main.
 pub fn dispatchRenderResultFromResultOn(
     allocator: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
@@ -216,10 +153,6 @@ fn runOneFromResult(
     return parseReturnValue(arena, co.L, top);
 }
 
-/// Push `{ content = [...], is_error, details }` matching the shape
-/// a Lua `execute` function returns. Image blocks are skipped —
-/// renderers operating on binary content should look them up
-/// through `details` instead.
 fn pushAgentToolResult(L: *c.lua_State, r: agent_protocol.AgentToolResult) void {
     c.lua_createtable(L, 0, 3);
 
@@ -255,13 +188,6 @@ fn pushAgentToolResult(L: *c.lua_State, r: agent_protocol.AgentToolResult) void 
     c.lua_setfield(L, -2, "presentation");
 }
 
-/// Run the render_result hook for `tool_name` if one exists, and
-/// return an owned `*RenderedToolResult` with both collapsed and
-/// expanded variants. Returns null on any failure — caller falls
-/// back to default rendering.
-///
-/// MUST be called from the agent thread (the lua-owning thread).
-/// Use `runner.assertOnLuaThread()` to verify.
 pub fn dispatchRenderResult(
     allocator: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,

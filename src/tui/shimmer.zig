@@ -8,13 +8,12 @@ const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
 
 pub const Config = struct {
-    /// Quantized animation cadence. 33ms ≈ 30 FPS.
     step_ns: i128 = 33_333_333,
-    /// Invisible padding before the text so the band can sweep in naturally.
+
     lead_pad_cols: u32 = 6,
-    /// Invisible padding after the text so the band can sweep out naturally.
+
     tail_pad_cols: u32 = 10,
-    /// Half-width of the highlight band in terminal columns.
+
     band_half_width: u32 = 2,
 
     base_fg: Color,

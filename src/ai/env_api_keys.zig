@@ -1,16 +1,5 @@
 const std = @import("std");
 
-/// Get API key for a provider from known environment variables.
-/// Port of pi-mono's getEnvApiKey (packages/ai/src/env-api-keys.ts:63-133).
-///
-/// Returns the env var value if set, null otherwise.
-/// Special cases:
-///   - "anthropic": checks ANTHROPIC_OAUTH_TOKEN first, then ANTHROPIC_API_KEY
-///   - "github-copilot": checks COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN
-///   - "amazon-bedrock": checks AWS_PROFILE, AWS_ACCESS_KEY_ID+AWS_SECRET_ACCESS_KEY,
-///     AWS_BEARER_TOKEN_BEDROCK, container/web-identity credential sources
-///   - "google-vertex": checks GOOGLE_CLOUD_API_KEY, then ADC credentials
-///     (skipping ADC file check for now — just check env vars)
 pub fn getEnvApiKey(provider: []const u8) ?[]const u8 {
     const eql = std.mem.eql;
 

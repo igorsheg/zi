@@ -6,7 +6,6 @@ const tool_registry = @import("registries/tool_registry.zig");
 
 const c = lua_runtime.c;
 
-/// Lua `zi.command(spec)`: duplicate names surface as `name:1`, `name:2`, …
 pub fn ziCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const api_name = "zi.command";
 

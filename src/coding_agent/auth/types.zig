@@ -2,24 +2,16 @@ const std = @import("std");
 const json_util = @import("../../ai/json_util.zig");
 const json_write = @import("../../json/write.zig");
 
-/// API key credential — stored as `{"type": "api_key", "key": "..."}` in auth.json.
-/// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:22-25
 pub const ApiKeyCredential = struct {
     key: []const u8,
 };
 
-/// OAuth credential — stored with refresh/access/expires in auth.json.
-/// pi-mono source: packages/ai/src/utils/oauth/types.ts:3-8
-/// Extra provider-specific fields (projectId, enterpriseUrl, etc.) are captured
-/// in the `extras` map so round-tripping preserves unknown keys.
 pub const OAuthCredential = struct {
     refresh: []const u8,
     access: []const u8,
-    /// Unix timestamp in milliseconds when the access token expires.
+
     expires: i64,
-    /// Provider-specific extra fields (e.g. projectId, enterpriseUrl).
-    /// Preserves unknown keys for round-trip fidelity with pi-mono's
-    /// `[key: string]: unknown` index signature on OAuthCredentials.
+
     extras: std.json.ObjectMap,
 };
 
@@ -72,24 +64,15 @@ pub fn cloneOAuthCredential(allocator: std.mem.Allocator, cred: OAuthCredential)
     };
 }
 
-/// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:31
 pub const AuthCredential = union(enum) {
     api_key: ApiKeyCredential,
     oauth: OAuthCredential,
 };
 
-/// pi-mono source: packages/coding-agent/src/core/auth-storage.ts:33
 pub const AuthStorageData = std.StringHashMap(AuthCredential);
 
 const log = std.log.scoped(.auth_storage);
 
-/// Resilience (zi-kfg): the OUTER `std.json.parseFromSlice` is the
-/// only operation that can fail this whole function — if the file
-/// is malformed JSON, there's nothing to recover. But once we have
-/// a parsed object, individual entry failures (missing fields,
-/// wrong types, bad UTF-8 in values) are LOGGED AND SKIPPED rather
-/// than aborting the whole map. One bricked entry must not take
-/// down every other credential. zi-m7q taught us this the hard way.
 pub fn parseAuthJson(allocator: std.mem.Allocator, json_content: []const u8) !AuthStorageData {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_content, .{});
     defer parsed.deinit();
@@ -121,9 +104,6 @@ pub fn parseAuthJson(allocator: std.mem.Allocator, json_content: []const u8) !Au
     return data;
 }
 
-/// Parse a single auth.json entry value (the object after the
-/// provider key). Errors here are recoverable — the caller will
-/// log + skip and continue with the rest of the map.
 fn parseEntry(allocator: std.mem.Allocator, obj: std.json.Value) !AuthCredential {
     if (obj != .object) return error.UnexpectedToken;
 
@@ -193,7 +173,6 @@ fn freeOneCredential(allocator: std.mem.Allocator, cred: AuthCredential) void {
     }
 }
 
-/// Produces `JSON.stringify(data, null, 2)` output — 2-space indent.
 pub fn writeAuthJson(writer: *std.Io.Writer, data: *const AuthStorageData) !void {
     var jw: std.json.Stringify = .{
         .writer = writer,

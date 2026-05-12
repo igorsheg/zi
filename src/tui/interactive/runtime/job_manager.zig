@@ -8,10 +8,6 @@ const json_root = @import("../../../json/root.zig");
 const jsonl = json_root.jsonl;
 const json_value = json_root.value;
 
-/// Interactive wiring for zio.process.Jobs.Manager.
-///
-/// This layer translates extension-domain start requests/events to the generic
-/// zio job supervisor. It intentionally owns no threads/process mechanics.
 pub const FrameSink = struct {
     ptr: *anyopaque,
     submit: *const fn (ptr: *anyopaque, frame: extension_ui.UiFrame) bool,

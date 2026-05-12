@@ -4,8 +4,6 @@ const posix = std.posix;
 const ansi = @import("ansi.zig");
 const grapheme = @import("../grapheme.zig");
 
-/// Global terminal pointer for signal/panic cleanup.
-/// Set by Terminal.installSignalHandlers(), cleared by Terminal.deinit().
 var global_terminal: ?*Terminal = null;
 
 fn signalCleanupHandler(_: std.posix.SIG) callconv(.c) void {
@@ -22,7 +20,6 @@ fn signalCleanupHandler(_: std.posix.SIG) callconv(.c) void {
     _ = posix.raise(posix.SIG.INT) catch {};
 }
 
-/// Override the default panic handler to restore terminal before crashing.
 pub const panic = struct {
     pub fn call(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
         if (global_terminal) |t| {
@@ -125,7 +122,6 @@ pub const Terminal = struct {
         return caps;
     }
 
-    /// Enter raw mode: disable echo, canonical processing, signals.
     pub fn enterRawMode(self: *Terminal) !void {
         const orig = try posix.tcgetattr(self.fd_in);
         self.original_termios = orig;
@@ -149,7 +145,6 @@ pub const Terminal = struct {
         self.raw_mode = true;
     }
 
-    /// Restore original terminal settings.
     pub fn exitRawMode(self: *Terminal) void {
         if (self.original_termios) |orig| {
             posix.tcsetattr(self.fd_in, .FLUSH, orig) catch {};
@@ -158,7 +153,6 @@ pub const Terminal = struct {
         self.raw_mode = false;
     }
 
-    /// Query terminal size via ioctl.
     pub fn updateSize(self: *Terminal) void {
         var ws: posix.winsize = undefined;
         const rc = posix.system.ioctl(self.fd_out, posix.T.IOCGWINSZ, @intFromPtr(&ws));
@@ -214,12 +208,10 @@ pub const Terminal = struct {
         self.bracketed_paste_active = false;
     }
 
-    /// Query kitty keyboard protocol support (CSI ? u).
     pub fn queryKittyProtocol(self: *Terminal) void {
         self.write(ansi.kitty_query);
     }
 
-    /// Enable kitty keyboard protocol: disambiguate + event types + alternate keys.
     pub fn enableKittyProtocol(self: *Terminal) void {
         self.write(ansi.kitty_keyboard_enable);
         self.kitty_active = true;
@@ -230,7 +222,6 @@ pub const Terminal = struct {
         self.kitty_active = false;
     }
 
-    /// Enable xterm modifyOtherKeys mode 2 (fallback when kitty unavailable).
     pub fn enableModifyOtherKeys(self: *Terminal) void {
         self.write(ansi.modify_other_keys_enable);
         self.modify_other_keys_active = true;
@@ -241,19 +232,16 @@ pub const Terminal = struct {
         self.modify_other_keys_active = false;
     }
 
-    /// Enable SGR mouse tracking (button events + scroll wheel).
     pub fn enableMouseTracking(self: *Terminal) void {
         if (!self.mouse_tracking_active) self.write(ansi.mouse_tracking_enable);
         self.mouse_tracking_active = true;
     }
 
-    /// Disable mouse tracking.
     pub fn disableMouseTracking(self: *Terminal) void {
         if (self.mouse_tracking_active) self.write(ansi.mouse_tracking_disable);
         self.mouse_tracking_active = false;
     }
 
-    /// Read available input bytes (non-blocking if raw mode with MIN=0).
     pub fn readInput(self: *Terminal, buf: []u8) !usize {
         return posix.read(self.fd_in, buf) catch |err| switch (err) {
             error.WouldBlock => return 0,
@@ -261,8 +249,6 @@ pub const Terminal = struct {
         };
     }
 
-    /// Install signal handlers that restore terminal on SIGINT/SIGTERM.
-    /// Must be called after enterRawMode.
     pub fn installSignalHandlers(self: *Terminal) void {
         global_terminal = self;
         const act = posix.Sigaction{
@@ -274,8 +260,6 @@ pub const Terminal = struct {
         posix.sigaction(posix.SIG.INT, &act, null);
     }
 
-    /// Minimal restore for signal/panic context (async-signal-safe).
-    /// Only uses write() — no allocations, no locks.
     pub fn emergencyRestore(self: *Terminal) void {
         const out: std.Io.File = .{ .handle = self.fd_out, .flags = .{ .nonblocking = false } };
         var buf: [128]u8 = undefined;
@@ -287,7 +271,6 @@ pub const Terminal = struct {
         }
     }
 
-    /// Cleanup: restore terminal state.
     pub fn deinit(self: *Terminal) void {
         if (self.kitty_active) self.disableKittyProtocol();
         if (self.modify_other_keys_active) self.disableModifyOtherKeys();

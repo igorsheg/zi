@@ -1,23 +1,16 @@
 const std = @import("std");
 
-/// What happens when a slash command is executed.
 pub const CommandAction = union(enum) {
-    /// Built-in command: direct function call on main thread.
     builtin: *const fn (args: []const u8, ctx: *CommandContext) anyerror!void,
-    /// Extension-registered command: dispatched on the agent thread
-    /// via AgentRequest.extension_command. The TUI registry stores only
-    /// the visible name + description as a marker.
+
     extension: void,
-    /// Prompt template: text expanded and sent to LLM.
+
     prompt_template,
-    /// Skill: expanded with skill: prefix.
+
     skill,
 };
 
-/// Opaque context passed to command handlers.
-/// Will be filled in when we wire up interactive mode.
 pub const CommandContext = struct {
-    /// Placeholder — will hold references to session, agent, UI, etc.
     _reserved: ?*anyopaque = null,
 };
 
@@ -28,7 +21,6 @@ pub const Source = enum {
     skill,
 };
 
-/// A slash command entry in the registry.
 pub const SlashCommand = struct {
     name: []const u8,
     description: ?[]const u8 = null,
@@ -38,10 +30,6 @@ pub const SlashCommand = struct {
 
 pub const BUILTIN_COMMANDS = [_]SlashCommand{};
 
-/// Owns the dynamic set of slash commands.
-/// Main-thread owned — no synchronization needed.
-/// Built-in commands are static (comptime). Dynamic commands come from
-/// extensions, prompts, and skills at runtime.
 pub const CommandRegistry = struct {
     builtins: []const SlashCommand,
     dynamic: std.ArrayListUnmanaged(SlashCommand) = .empty,
@@ -62,8 +50,6 @@ pub const CommandRegistry = struct {
         self.dynamic.deinit(self.allocator);
     }
 
-    /// Register a dynamic command (extension/prompt/skill).
-    /// Takes ownership of `cmd.name` / `cmd.description`.
     pub fn register(self: *CommandRegistry, cmd: SlashCommand) void {
         self.dynamic.append(self.allocator, cmd) catch {
             self.allocator.free(cmd.name);
@@ -72,7 +58,6 @@ pub const CommandRegistry = struct {
         };
     }
 
-    /// Unregister a dynamic command by name. Returns true if found and removed.
     pub fn unregister(self: *CommandRegistry, name: []const u8) bool {
         for (self.dynamic.items, 0..) |_, i| {
             if (std.mem.eql(u8, self.dynamic.items[i].name, name)) {
@@ -85,12 +70,10 @@ pub const CommandRegistry = struct {
         return false;
     }
 
-    /// Total command count (builtins + dynamic).
     pub fn count(self: *const CommandRegistry) usize {
         return self.builtins.len + self.dynamic.items.len;
     }
 
-    /// Find a command by name. Checks builtins first, then dynamic.
     pub fn findCommand(self: *const CommandRegistry, name: []const u8) ?*const SlashCommand {
         for (self.builtins) |*cmd| {
             if (std.mem.eql(u8, cmd.name, name)) return cmd;

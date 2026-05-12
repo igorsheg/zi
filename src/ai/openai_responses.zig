@@ -1,19 +1,3 @@
-//! OpenAI Responses API provider — bearer token to
-//! `{base_url}/v1/responses`. Thin wrapper over `openai_responses_core`:
-//! injects the bearer-token auth factory and the standard `/v1/responses`
-//! path. Everything else lives in the shared core so that phase 3c's
-//! `openai-codex-responses` can reuse the same SSE processor and payload
-//! builder with its own oauth-token auth factory and ChatGPT backend URL.
-//!
-//! pi-mono source: `packages/ai/src/providers/openai-responses.ts`
-//!
-//! ## Phase 3b scope
-//!
-//! Registered as `"openai-responses"` in `Bundle.init`. Smoke-tested only
-//! against unit fixtures (user has ChatGPT subscription auth, not a raw
-//! OPENAI_API_KEY); phase 3c will live-exercise the core end-to-end once
-//! the codex provider lands.
-
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const ai_models = @import("models.zig");
@@ -84,8 +68,6 @@ pub const OpenAIResponsesProvider = struct {
     fn deinitImpl(_: *anyopaque) void {}
 };
 
-/// Bearer token auth factory — pulls the API key from `StreamOptions.api_key`
-/// and formats `Authorization: Bearer <key>` into the provided scratch buffer.
 fn buildBearerAuth(
     _: ?*anyopaque,
     buf: []u8,

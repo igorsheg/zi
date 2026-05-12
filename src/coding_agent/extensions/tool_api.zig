@@ -7,7 +7,6 @@ const tool_def = @import("../tools/definition.zig");
 const c = lua_runtime.c;
 const log = std.log.scoped(.zi_api);
 
-/// Lua `zi.tool(spec)`: first registration for a name wins; duplicates return `false`.
 pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const api_name = "zi.tool";
 
@@ -86,14 +85,6 @@ const BuildError = error{
     InvalidUtf8,
 };
 
-/// Walk the Lua table at stack index 1 and produce a
-/// `ToolDefinition` whose owned fields all live in the runner's
-/// allocator. On any error every allocation made so far is freed.
-///
-/// Stack discipline: leaves the stack at the same height as on
-/// entry. Each `lua_getfield` pushes one value; we pop it after
-/// extraction. The `execute` function gets `luaL_ref`d, which pops
-/// it from the stack and returns a registry slot.
 fn buildExtensionTool(
     L: *c.lua_State,
     runner: *runner_mod.ExtensionRunner,
@@ -202,14 +193,10 @@ fn buildExtensionTool(
     };
 }
 
-/// Free every owned field of a partially-built tool. Used by the
-/// rejection path (`!accepted`) and by registry-insert OOM. Mirrors
-/// `ToolRegistry.freeEntry` minus the registry-managed bookkeeping.
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
     tool_def.freeOwned(allocator, tool);
 }
 
-/// Read a required string field. Pushes/pops one stack slot.
 fn requireString(
     L: *c.lua_State,
     table_idx: c_int,
@@ -232,8 +219,6 @@ fn requireString(
     }
 }
 
-/// Read an optional string field. Returns null if absent (nil), or
-/// the duped slice. Errors only on type mismatch.
 fn optionalString(
     L: *c.lua_State,
     table_idx: c_int,
@@ -255,9 +240,6 @@ fn optionalString(
     }
 }
 
-/// Read an optional array of strings. Empty/absent → empty slice
-/// (caller doesn't need to special-case null). Type mismatch on
-/// the table or any element → invalid_err.
 fn optionalStringArray(
     L: *c.lua_State,
     table_idx: c_int,

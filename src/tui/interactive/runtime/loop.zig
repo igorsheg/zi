@@ -24,6 +24,8 @@ pub fn enqueueShutdown(self: *Interactive) void {
     }
 }
 
+// Agent-thread country. UI code may send requests, but it does not touch session guts.
+// Cross that border and the bugs stop reproducing like cowards.
 pub fn discardRequests(self: *Interactive, requests: []AgentRequest) void {
     for (requests) |*req| req.deinit(self.msg_allocator);
 }

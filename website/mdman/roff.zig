@@ -1,13 +1,9 @@
-//! Roff/man page output renderer.
-
 const std = @import("std");
 const parser = @import("parser.zig");
 const Node = parser.Node;
 const Span = parser.Span;
 const Document = parser.Document;
 
-/// Render a Document to roff format.
-/// All allocations use the provided allocator (typically an arena).
 pub fn render(allocator: std.mem.Allocator, doc: Document, name: []const u8, section: []const u8) ![]const u8 {
     var buffer: std.ArrayListUnmanaged(u8) = .empty;
     const writer = buffer.writer(allocator);

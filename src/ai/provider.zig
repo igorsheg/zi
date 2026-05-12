@@ -2,19 +2,13 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const json_value = @import("../json/value.zig");
 
-/// Callback invoked for each streaming event.
 pub const EventCallback = *const fn (event: protocol.AssistantMessageEvent, ctx: ?*anyopaque) void;
 
-/// Provider interface — vtable-based polymorphism.
-/// Matches pi-mono's ApiProvider contract: stream and streamSimple.
 pub const Provider = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Stream a response. Must NOT return errors for request/runtime failures.
-        /// Failures are encoded as error events via the callback.
-        /// Terminal event (done or error) must always be emitted.
         stream: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
@@ -25,7 +19,6 @@ pub const Provider = struct {
             callback_ctx: ?*anyopaque,
         ) void,
 
-        /// Stream with simplified options (includes reasoning level).
         stream_simple: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
@@ -36,10 +29,8 @@ pub const Provider = struct {
             callback_ctx: ?*anyopaque,
         ) void,
 
-        /// Provider name for diagnostics.
         get_name: *const fn (ptr: *anyopaque) []const u8,
 
-        /// Clean up resources.
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
@@ -215,8 +206,6 @@ const BaseUrlClaimProvider = struct {
     }
 };
 
-/// API registry — active projection keyed by Api identifier, with a
-/// separate name-keyed claim layer for extension-owned overrides.
 pub const Registry = struct {
     const BaselineRegistration = struct {
         provider: Provider,
@@ -257,8 +246,6 @@ pub const Registry = struct {
         self.claim_index.deinit();
     }
 
-    /// Register a built-in / baseline provider for an API identifier.
-    /// The registry owns duplicated `api` and `source_id` metadata, but not `prov`.
     pub fn register(self: *Registry, api: []const u8, prov: Provider, source_id: ?[]const u8) !void {
         const owned_api = try self.allocator.dupe(u8, api);
         var api_transferred = false;
@@ -383,7 +370,6 @@ pub const Registry = struct {
         }
     }
 
-    /// Look up provider by API identifier.
     pub fn get(self: *const Registry, api: []const u8) ?Provider {
         return self.providers.get(api);
     }
@@ -409,7 +395,6 @@ pub const Registry = struct {
         return &claim.registration;
     }
 
-    /// Unregister all providers and claims with a given source_id.
     pub fn unregisterBySource(self: *Registry, source_id: []const u8) void {
         var baseline_removed = false;
         while (true) {
@@ -460,8 +445,6 @@ pub const Registry = struct {
         }
     }
 
-    /// Get all registered providers. Caller owns the returned slice.
-    /// pi-mono equivalent: getApiProviders()
     pub fn getAll(self: *const Registry, allocator: std.mem.Allocator) ![]Provider {
         const count = self.providers.count();
         const result = try allocator.alloc(Provider, count);
@@ -474,7 +457,6 @@ pub const Registry = struct {
         return result;
     }
 
-    /// Clear all providers and dynamic claims.
     pub fn clear(self: *Registry) void {
         self.providers.clearRetainingCapacity();
         self.clearClaims();
@@ -544,7 +526,6 @@ pub const Registry = struct {
     }
 };
 
-/// Convert Api to its string identifier for registry lookup.
 pub fn apiToString(api: protocol.Api) []const u8 {
     return switch (api) {
         .openai_completions => "openai-completions",

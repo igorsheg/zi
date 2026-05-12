@@ -10,10 +10,6 @@ pub const SelectItem = select_list_mod.SelectItem;
 pub const OverlayHandle = tui_mod.OverlayHandle;
 pub const Theme = theme_mod.Theme;
 
-/// Reusable overlay lifecycle for static menu-style pickers.
-///
-/// Payload storage remains with each domain flow. This keeps the helper deep:
-/// it owns picker presentation/lifecycle, not domain meaning.
 pub const SimplePickerFlow = struct {
     picker: ListPicker = undefined,
     configured: bool = false,

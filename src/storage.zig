@@ -1,8 +1,3 @@
-/// Shared file storage primitives — lockdir protocol, file I/O with permissions,
-/// and path resolution for all persistent data.
-///
-/// All zi data lives under ~/.zi/ (or ZI_CODING_AGENT_DIR override).
-/// Lock protocol uses proper-lockfile compatible mkdir-based locking (30s stale).
 const std = @import("std");
 
 const zio_fs = @import("zio/file.zig");
@@ -15,7 +10,6 @@ const retry_min_delay_ns: u64 = 100 * std.time.ns_per_ms;
 const retry_max_delay_ns: u64 = 10 * std.time.ns_per_s;
 const max_file_size: usize = 1 * 1024 * 1024;
 
-/// A file with proper-lockfile-compatible directory locking.
 pub const LockedFile = struct {
     path: []const u8,
     lock_path: []const u8,
@@ -38,7 +32,6 @@ pub const LockedFile = struct {
         self.allocator.free(self.path);
     }
 
-    /// Read file content. Returns null if file doesn't exist.
     pub fn readContent(self: *const LockedFile, allocator: std.mem.Allocator) ?[]const u8 {
         return zio_fs.readFileAlloc(self.io, allocator, self.path, .limited(max_file_size)) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -49,12 +42,10 @@ pub const LockedFile = struct {
         };
     }
 
-    /// Write content to file. Creates parent dirs (0o700) and file (0o600).
     pub fn writeContent(self: *const LockedFile, content: []const u8) !void {
         try zio_fs.writeFileTruncate(self.io, self.path, content);
     }
 
-    /// Acquire the lockdir. Returns true on success, false after max retries.
     pub fn acquireLock(self: *const LockedFile) bool {
         var attempt: u32 = 0;
         while (attempt < max_retries) : (attempt += 1) {
@@ -78,7 +69,6 @@ pub const LockedFile = struct {
         return false;
     }
 
-    /// Release the lockdir.
     pub fn releaseLock(self: *const LockedFile) void {
         std.Io.Dir.cwd().deleteDir(self.io, self.lock_path) catch {};
     }
@@ -133,8 +123,6 @@ pub const MemoryFile = struct {
     pub fn releaseLock(_: *const MemoryFile) void {}
 };
 
-/// Get the agent directory. Honors ZI_CODING_AGENT_DIR env var.
-/// Default: ~/.zi/agent
 pub fn getAgentDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]const u8 {
     if (override) |dir| return allocator.dupe(u8, dir);
 
@@ -146,40 +134,34 @@ pub fn getAgentDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]const
     return std.fs.path.join(allocator, &.{ home, ".zi", "agent" });
 }
 
-/// Get the project-local config directory: <cwd>/.zi
 pub fn getProjectDir(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     return std.fs.path.join(allocator, &.{ cwd, ".zi" });
 }
 
-/// Get the sessions root directory: <agent_dir>/sessions
 pub fn getSessionsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
     const agent_dir = try getAgentDir(allocator, agent_dir_override);
     defer allocator.free(agent_dir);
     return std.fs.path.join(allocator, &.{ agent_dir, "sessions" });
 }
 
-/// Get the diagnostics root directory: <agent_dir>/diagnostics
 pub fn getDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
     const agent_dir = try getAgentDir(allocator, agent_dir_override);
     defer allocator.free(agent_dir);
     return std.fs.path.join(allocator, &.{ agent_dir, "diagnostics" });
 }
 
-/// Get the memory diagnostics directory: <agent_dir>/diagnostics/memory
 pub fn getMemoryDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
     const diagnostics_dir = try getDiagnosticsDir(allocator, agent_dir_override);
     defer allocator.free(diagnostics_dir);
     return std.fs.path.join(allocator, &.{ diagnostics_dir, "memory" });
 }
 
-/// Get the logs diagnostics directory: <agent_dir>/diagnostics/logs
 pub fn getLogDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
     const diagnostics_dir = try getDiagnosticsDir(allocator, agent_dir_override);
     defer allocator.free(diagnostics_dir);
     return std.fs.path.join(allocator, &.{ diagnostics_dir, "logs" });
 }
 
-/// Get the session directory for a specific cwd: <agent_dir>/sessions/<encoded-cwd>
 pub fn getSessionDirForCwd(allocator: std.mem.Allocator, cwd: []const u8, agent_dir_override: ?[]const u8) ![]const u8 {
     const sessions_dir = try getSessionsDir(allocator, agent_dir_override);
     defer allocator.free(sessions_dir);
@@ -188,9 +170,6 @@ pub fn getSessionDirForCwd(allocator: std.mem.Allocator, cwd: []const u8, agent_
     return std.fs.path.join(allocator, &.{ sessions_dir, safe_cwd });
 }
 
-/// Encode cwd into a safe directory name.
-/// /Users/foo/bar → --Users-foo-bar--
-/// Matches pi-mono's getDefaultSessionDir encoding.
 pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     var start: usize = 0;
     if (cwd.len > 0 and (cwd[0] == '/' or cwd[0] == '\\')) start = 1;
@@ -207,7 +186,6 @@ pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     return result;
 }
 
-/// Expand ~ prefix in a path.
 fn expandTilde(allocator: std.mem.Allocator, dir: []const u8) ![]const u8 {
     if (std.mem.eql(u8, dir, "~")) {
         const home = @import("env").get("HOME") orelse return error.NoHomeDir;

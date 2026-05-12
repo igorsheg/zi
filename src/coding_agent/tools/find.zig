@@ -1,10 +1,3 @@
-//! Glob (a.k.a. find) tool — fast file finder via `rg --files`.
-//!
-//! pi-mono parity: ports `glob.ts`. Spawns
-//!   rg --files --hidden --color=never --sortr modified --glob !.git --glob !.jj --glob <pat>
-//! and returns a relative-path listing sorted by mtime descending.
-//! Supports limit + offset pagination.
-
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");

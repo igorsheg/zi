@@ -1,15 +1,3 @@
-//! Read tool — file & directory reader with line numbers, range slicing,
-//! secret-file guard, and image support.
-//!
-//! pi-mono parity: ports `~/workspace/dots/env/.pi/agent/extensions/tools/read.ts`.
-//! Differences from pi's stock built-in:
-//! - line-numbered output (`N: content`)
-//! - directory listing folded in (no separate Ls round-trip needed)
-//! - `.env*` secret guard with example/sample/template exceptions
-//! - `~` expansion + leading `@` strip
-//! - image files returned as base64 image content blocks
-//! - per-line byte cap so a single absurd line can't blow the budget
-
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");

@@ -35,8 +35,6 @@ pub const ResourceLoader = struct {
     extended_theme_paths: []types.ResourcePath,
     extended_agents_paths: []types.ResourcePath,
 
-    /// Canonical ordered extension roots used for discovery.
-    /// Persisted so consumers can build shared `lua/` search paths.
     extension_roots: []types.StaticExtensionRoot = &.{},
 
     pub const Options = struct {

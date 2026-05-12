@@ -9,7 +9,6 @@ const oauth_mod = @import("oauth.zig");
 
 const log = std.log.scoped(.auth_storage);
 
-/// Credential store: memory mutex + backend file lock.
 pub const AuthStorage = struct {
     pub const ExtensionOAuthRefreshHook = struct {
         func: *const fn (
@@ -28,8 +27,7 @@ pub const AuthStorage = struct {
     fallback_resolver: ?*const fn (provider: []const u8) ?[]const u8 = null,
     extension_oauth_refresh_hook: ?ExtensionOAuthRefreshHook = null,
     load_error: bool = false,
-    /// Guards in-memory creds across TUI/login/agent threads.
-    /// Locked helpers must not relock; std.Io.Mutex is non-recursive.
+
     mutex: std.Io.Mutex = .init,
     io: std.Io = std.Options.debug_io,
 
@@ -97,7 +95,6 @@ pub const AuthStorage = struct {
         self.reloadLocked();
     }
 
-    /// Caller holds mutex, or storage is not shared yet.
     fn reloadLocked(self: *AuthStorage) void {
         const content = self.backend.readContent(self.allocator);
         defer if (content) |c| self.allocator.free(c);
@@ -117,7 +114,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Borrowed slices; dupe before the next mutation/refresh.
     pub fn get(self: *AuthStorage, provider: []const u8) ?types.AuthCredential {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -178,7 +174,6 @@ pub const AuthStorage = struct {
         return keys;
     }
 
-    /// Borrowed map; only inspect while mutation is impossible.
     pub fn getAll(self: *const AuthStorage) *const types.AuthStorageData {
         return &self.data;
     }
@@ -221,7 +216,6 @@ pub const AuthStorage = struct {
         self.extension_oauth_refresh_hook = hook;
     }
 
-    /// Availability check only; no OAuth refresh.
     pub fn hasAuth(self: *AuthStorage, provider: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -235,7 +229,6 @@ pub const AuthStorage = struct {
         return false;
     }
 
-    /// May refresh OAuth; returned slice is borrowed from storage.
     pub fn getApiKey(self: *AuthStorage, provider: []const u8) ?[]const u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -261,7 +254,6 @@ pub const AuthStorage = struct {
         return null;
     }
 
-    /// Backend lock spans reload → exchange → write; avoids peer refresh races.
     fn refreshOAuthLocked(self: *AuthStorage, provider: []const u8) ?[]const u8 {
         const oauth_provider = oauth_mod.findProvider(provider) orelse {
             log.warn("oauth refresh requested for unknown provider '{s}'", .{provider});
@@ -358,7 +350,6 @@ pub const AuthStorage = struct {
         }
     }
 
-    /// Caller already holds backend lock.
     fn persistInsideLock(self: *AuthStorage, arena_alloc: std.mem.Allocator) !void {
         const json = try json_write.toOwnedSlice(arena_alloc, &self.data, types.writeAuthJson);
         try self.backend.writeContent(json);

@@ -1,10 +1,3 @@
-//! Versioned semantic tool-result detail families.
-//!
-//! The public tool result envelope stays open (`details: json.Value`) so
-//! extensions can return arbitrary payloads. This module defines the small set
-//! of host-recognized, opt-in detail families that builtin and extension tools
-//! may use for richer host-owned presentation.
-
 const std = @import("std");
 const diff = @import("../../diff/document.zig");
 const diff_json = @import("../../diff/json.zig");
@@ -25,9 +18,6 @@ pub const DiffDetails = struct {
     }
 };
 
-/// Serialize a diff document into the open `AgentToolResult.details` envelope.
-/// Shape:
-/// `{ kind = "diff", version = 2, diff = <diff_json document> }`.
 pub fn diffToJsonValue(allocator: std.mem.Allocator, document: diff.DiffDocument) !std.json.Value {
     var obj: std.json.ObjectMap = .{};
     errdefer json_util.freeJsonValue(allocator, .{ .object = obj });
@@ -39,8 +29,6 @@ pub fn diffToJsonValue(allocator: std.mem.Allocator, document: diff.DiffDocument
     return .{ .object = obj };
 }
 
-/// Parse a recognized diff details envelope. Unknown kind/version/shape is an
-/// error so callers can fail open to generic text rendering.
 pub fn diffFromJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !DiffDetails {
     if (value != .object) return error.InvalidToolResultDetails;
     const obj = value.object;

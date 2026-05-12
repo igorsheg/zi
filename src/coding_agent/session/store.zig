@@ -8,19 +8,16 @@ const storage = @import("../../storage.zig");
 const agent_mod = @import("../../agent/root.zig");
 const zio_fs = @import("../../zio/root.zig").file;
 
-/// Metadata about a session file, for listing.
 pub const SessionInfo = struct {
     path: []const u8,
     session_id: []const u8,
     cwd: []const u8,
     timestamp: []const u8,
-    /// File mtime in ns-like stat units. Used for picker ordering so
-    /// recently active sessions appear first, even if they were
-    /// created long ago.
+
     modified_at: i128 = 0,
-    /// First user message text (preview/summary). Truncated to ~200 chars.
+
     first_message: []const u8,
-    /// Number of message entries.
+
     message_count: u32,
 };
 
@@ -60,23 +57,15 @@ pub const OpenSessionResult = struct {
     }
 };
 
-/// Facade over session writer/reader/context.
-/// Manages a single session's lifecycle: create, open, append, read, build context.
 pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     writer: writer_mod.SessionWriter,
-    /// Cache backing arena for parsed session-file data. We keep parsed
-    /// header/entries in an owned arena so cache invalidation is a single
-    /// arena teardown instead of per-field frees against whatever allocator
-    /// the session was created with (often the long-lived agent arena).
+
     cache_arena: ?std.heap.ArenaAllocator = null,
-    /// Cached entries from last read (for buildContext). Null until open() or first read.
+
     cached_entries: ?[]proto.SessionEntry = null,
     cached_header: ?proto.SessionHeader = null,
 
-    /// Create a new session. `session_dir` is the already-resolved directory
-    /// so callers that need custom placement can decide it before persistence
-    /// begins.
     pub fn create(allocator: std.mem.Allocator, session_dir: []const u8, project_cwd: []const u8) SessionStore {
         return .{
             .allocator = allocator,
@@ -84,15 +73,12 @@ pub const SessionStore = struct {
         };
     }
 
-    /// Create a new persisted session for a cwd using zi's canonical session directory layout.
     pub fn createForCwd(allocator: std.mem.Allocator, project_cwd: []const u8, agent_dir_override: ?[]const u8) !SessionStore {
         const session_dir = try storage.getSessionDirForCwd(allocator, project_cwd, agent_dir_override);
         defer allocator.free(session_dir);
         return SessionStore.create(allocator, session_dir, project_cwd);
     }
 
-    /// Create an ephemeral session (no disk persistence).
-    /// Used for --no-session sub-agents.
     pub fn createEphemeral(allocator: std.mem.Allocator) SessionStore {
         return .{
             .allocator = allocator,
@@ -100,8 +86,6 @@ pub const SessionStore = struct {
         };
     }
 
-    /// Open an existing session file.
-    /// Reads entries, seeds the writer for continuation.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SessionStore {
         var cache_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer cache_arena.deinit();
@@ -226,15 +210,11 @@ pub const SessionStore = struct {
         self.writer.appendLabel(target_id, label);
     }
 
-    /// Seed the fresh session with the runtime defaults that should survive resume.
     pub fn appendRuntimeDefaults(self: *SessionStore, provider: []const u8, model_id: []const u8, thinking_level: []const u8) void {
         self.appendModelChange(provider, model_id);
         self.appendThinkingLevelChange(thinking_level);
     }
 
-    /// Build the LLM context from this session's entries.
-    /// If the session was opened, uses cached entries.
-    /// Otherwise reads the file from disk.
     pub fn buildContext(self: *SessionStore, selection: context_mod.LeafSelection) !context_mod.SessionContext {
         return self.buildContextAlloc(self.allocator, selection);
     }
@@ -243,7 +223,6 @@ pub const SessionStore = struct {
         return self.buildContext(.current);
     }
 
-    /// Open a session file for resume and build the current branch context in one step.
     pub fn openForResume(allocator: std.mem.Allocator, session_path: []const u8) !OpenSessionResult {
         var store = try SessionStore.open(allocator, session_path);
         errdefer store.deinit();
@@ -285,13 +264,6 @@ pub const SessionStore = struct {
         return context_mod.buildBranchEntries(allocator, data.entries, selection);
     }
 
-    /// Build the current user-visible branch, including entries buffered in
-    /// memory before the first assistant response flushes the session file.
-    ///
-    /// `buildCurrentBranchAlloc` intentionally remains the persisted/cache
-    /// branch reader used by storage-oriented paths. Extension-facing session
-    /// APIs should use this method so read-after-write semantics are consistent
-    /// before and after flush.
     pub fn buildCurrentVisibleBranchAlloc(self: *SessionStore, allocator: std.mem.Allocator) ![]const proto.SessionEntry {
         const persisted = self.buildCurrentBranchAlloc(allocator) catch |err| switch (err) {
             error.FileNotFound => &.{},
@@ -326,7 +298,6 @@ pub const SessionStore = struct {
         return self.buildBranchEntriesAlloc(allocator, .current);
     }
 
-    /// Append a compaction entry and rebuild the current branch context.
     pub fn applyCompaction(
         self: *SessionStore,
         summary: []const u8,
@@ -339,8 +310,6 @@ pub const SessionStore = struct {
         return self.buildCurrentContext();
     }
 
-    /// Whether the latest compaction on the current branch has not yet been
-    /// followed by a successful assistant response with non-zero usage.
     pub fn contextUsageUnknownAfterCompaction(self: *SessionStore, allocator: std.mem.Allocator) bool {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -431,17 +400,12 @@ fn hasPostCompactionUsage(branch: []const proto.SessionEntry) bool {
     return false;
 }
 
-/// Find the most recent valid session file for a cwd.
-/// Scans the session directory for .jsonl files, validates headers,
-/// returns the path of the most recently modified valid session.
-/// pi-mono: session-manager.ts:476-489 (findMostRecentSession)
 pub fn findMostRecentSession(allocator: std.mem.Allocator, cwd: []const u8) !?[]const u8 {
     const session_dir = try storage.getSessionDirForCwd(allocator, cwd, null);
     defer allocator.free(session_dir);
     return findMostRecentSessionInDir(allocator, session_dir);
 }
 
-/// Find the most recent valid session in a specific directory.
 pub fn findMostRecentSessionInDir(allocator: std.mem.Allocator, dir_path: []const u8) !?[]const u8 {
     var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -479,8 +443,6 @@ pub fn findMostRecentSessionInDir(allocator: std.mem.Allocator, dir_path: []cons
     return best_path;
 }
 
-/// Check if a file starts with a valid session header.
-/// Reads only the first line (up to 4KB) to minimize I/O.
 fn isValidSessionFile(path: []const u8) bool {
     const file = std.Io.Dir.openFileAbsolute(std.Options.debug_io, path, .{}) catch return false;
     defer file.close(std.Options.debug_io);
@@ -507,17 +469,12 @@ fn isValidSessionFile(path: []const u8) bool {
     return id_val == .string;
 }
 
-/// List all valid sessions for a cwd.
-/// Returns metadata sorted by most recent first.
-/// Reads each file to extract header + first user message + message count.
 pub fn listSessions(allocator: std.mem.Allocator, cwd: []const u8) ![]SessionInfo {
     const session_dir = try storage.getSessionDirForCwd(allocator, cwd, null);
     defer allocator.free(session_dir);
     return listSessionsInDir(allocator, session_dir);
 }
 
-/// List all valid sessions in a specific directory.
-/// Returns metadata sorted by most recent first.
 pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) ![]SessionInfo {
     var dir = std.Io.Dir.openDirAbsolute(std.Options.debug_io, session_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return &.{},
@@ -564,8 +521,6 @@ pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) 
     return try results.toOwnedSlice(allocator);
 }
 
-/// Read a session file and extract listing metadata.
-/// Reads the full file but only JSON-parses the header and first user message.
 fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo {
     var input = zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 10 * 1024 * 1024 }) catch return null;
     defer input.deinit(allocator);
@@ -638,7 +593,6 @@ fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo 
     return result;
 }
 
-/// Extract user message text from a JSONL line. Returns truncated preview.
 fn extractUserMessageText(allocator: std.mem.Allocator, line: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{
         .allocate = .alloc_always,
@@ -670,7 +624,6 @@ fn extractUserMessageText(allocator: std.mem.Allocator, line: []const u8) ?[]con
     return null;
 }
 
-/// Truncate to ~200 chars, collapse whitespace, single line.
 fn truncatePreview(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
     const max_len = 200;
     const cap = @min(text.len, max_len) + 3;

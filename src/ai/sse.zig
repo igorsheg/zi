@@ -15,7 +15,6 @@ pub const EventHandler = struct {
     }
 };
 
-// W3C SSE: join data lines with `\n`, strip one trailing newline.
 pub const max_event_data_bytes: usize = 1024 * 1024;
 
 pub const SseParser = struct {

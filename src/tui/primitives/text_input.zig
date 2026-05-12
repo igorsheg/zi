@@ -17,11 +17,6 @@ const Key = keys_mod.Key;
 const Theme = theme_mod.Theme;
 const EditBuffer = edit_core.EditBuffer;
 
-/// OpenTUI-style single-line input renderable over zi's shared editable text core.
-///
-/// TextInput is the single-line policy/rendering layer. The actual UTF-8 text
-/// storage, cursor movement, grapheme-aware deletion, and line metrics live in
-/// the same buffer used by the multiline composer editor.
 pub const TextInput = struct {
     allocator: std.mem.Allocator,
     theme: *const Theme,

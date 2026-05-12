@@ -1,7 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
 
-/// pi-mono: settings-manager.ts:67 — includes "off" which ai.protocol.ThinkingLevel lacks
 pub const DefaultThinkingLevel = enum {
     off,
     minimal,
@@ -11,26 +10,22 @@ pub const DefaultThinkingLevel = enum {
     xhigh,
 };
 
-/// pi-mono: settings-manager.ts:69
 pub const SteeringMode = enum {
     all,
     one_at_a_time,
 };
 
-/// pi-mono: settings-manager.ts:70
 pub const FollowUpMode = enum {
     all,
     one_at_a_time,
 };
 
-/// pi-mono: settings-manager.ts:90
 pub const DoubleEscapeAction = enum {
     fork,
     tree,
     none,
 };
 
-/// pi-mono: settings-manager.ts:91
 pub const TreeFilterMode = enum {
     default,
     no_tools,
@@ -46,20 +41,17 @@ pub const SettingsScope = enum {
 
 pub const TransportSetting = ai.protocol.Transport;
 
-/// pi-mono: settings-manager.ts:7-11
 pub const CompactionSettings = struct {
     enabled: ?bool = null,
     reserve_tokens: ?i64 = null,
     keep_recent_tokens: ?i64 = null,
 };
 
-/// pi-mono: settings-manager.ts:13-16
 pub const BranchSummarySettings = struct {
     reserve_tokens: ?i64 = null,
     skip_prompt: ?bool = null,
 };
 
-/// pi-mono: settings-manager.ts:18-23
 pub const RetrySettings = struct {
     enabled: ?bool = null,
     max_retries: ?i64 = null,
@@ -67,19 +59,16 @@ pub const RetrySettings = struct {
     max_delay_ms: ?i64 = null,
 };
 
-/// pi-mono: settings-manager.ts:25-28
 pub const TerminalSettings = struct {
     show_images: ?bool = null,
     clear_on_shrink: ?bool = null,
 };
 
-/// pi-mono: settings-manager.ts:30-33
 pub const ImageSettings = struct {
     auto_resize: ?bool = null,
     block_images: ?bool = null,
 };
 
-/// pi-mono: settings-manager.ts:35-40
 pub const ThinkingBudgetsSettings = struct {
     minimal: ?i64 = null,
     low: ?i64 = null,
@@ -87,12 +76,10 @@ pub const ThinkingBudgetsSettings = struct {
     high: ?i64 = null,
 };
 
-/// pi-mono: settings-manager.ts:42-44
 pub const MarkdownSettings = struct {
     code_block_indent: ?[]const u8 = null,
 };
 
-/// pi-mono: settings-manager.ts:53-61
 pub const PackageSourceFilter = struct {
     source: []const u8,
     extensions: ?[]const []const u8 = null,
@@ -101,16 +88,11 @@ pub const PackageSourceFilter = struct {
     themes: ?[]const []const u8 = null,
 };
 
-/// pi-mono: settings-manager.ts:48-61
 pub const PackageSource = union(enum) {
     string: []const u8,
     filtered: PackageSourceFilter,
 };
 
-/// User-defined model entry from settings.json `models[]`.
-/// All string fields borrow from the parsed JSON arena.
-/// Validated and converted to `protocol.Model` at session init.
-/// pi-mono: settings-manager.ts:100 (models array in settings)
 pub const CustomModel = struct {
     id: []const u8,
     name: []const u8,
@@ -127,8 +109,6 @@ pub const CustomModel = struct {
     max_tokens: u64 = 4096,
 };
 
-/// All user-configurable settings. Every field is optional.
-/// pi-mono: settings-manager.ts:63-98
 pub const Settings = struct {
     last_changelog_version: ?[]const u8 = null,
     default_provider: ?[]const u8 = null,
@@ -167,20 +147,17 @@ pub const Settings = struct {
     models: ?[]const CustomModel = null,
 };
 
-/// pi-mono: settings-manager.ts:637-643
 pub const ResolvedCompactionSettings = struct {
     enabled: bool,
     reserve_tokens: i64,
     keep_recent_tokens: i64,
 };
 
-/// pi-mono: settings-manager.ts:645-649
 pub const ResolvedBranchSummarySettings = struct {
     reserve_tokens: i64,
     skip_prompt: bool,
 };
 
-/// pi-mono: settings-manager.ts derived from getRetrySettings
 pub const ResolvedRetrySettings = struct {
     enabled: bool,
     max_retries: i64,

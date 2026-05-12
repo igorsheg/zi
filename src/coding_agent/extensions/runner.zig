@@ -20,15 +20,6 @@ const system_command = @import("system_command.zig");
 
 const log = std.log.scoped(.zi_runner);
 
-/// Monotonic generation counter. Each reload creates a new generation.
-///
-/// Why: Extensions may cache pointers or references into the runner (e.g., tool
-/// registries, handler lists). When a reload occurs, the old runner is destroyed
-/// and a new one created with a higher generation number. Consumers that cache
-/// such pointers MUST check the generation to detect invalidation — this avoids
-/// use-after-free without requiring every consumer to subscribe to a lifecycle
-/// event. The generation is u64 to ensure monotonicity even across very long
-/// sessions (practically infinite).
 pub const Generation = u64;
 pub const AsyncOpId = u64;
 
@@ -574,21 +565,6 @@ pub const ExtensionBindingInfo = struct {
     session_file: ?[]const u8 = null,
 };
 
-/// Two-phase runtime lifecycle: stub → bound.
-///
-/// Extensions register during the "load" phase, where action methods like
-/// send_message would fail. The runtime starts as `.stub` and transitions to
-/// `.bound` only after AgentSession is fully constructed and can provide the
-/// concrete implementations. This prevents extensions from calling into
-/// session-dependent APIs during registration, when session state is incomplete.
-///
-/// The `.bound` variant carries opaque pointers (`*anyopaque`) to avoid circular
-/// imports in D1. Real types (AgentSession, ExtensionUIContext, etc.) get wired
-/// in later phases once the module dependency graph stabilizes.
-///
-/// ExtensionCommandContext seam exists from day one (per the spec's v2
-/// preparation), but v1 leaves `command_actions` null. This preserves the
-/// bind-time contract without requiring D2 refactors.
 pub const ExtensionRuntime = union(enum) {
     stub: void,
     bound: Bound,
@@ -598,10 +574,6 @@ pub const ExtensionRuntime = union(enum) {
         ui: ?*anyopaque = null,
         command_actions: ?*ExtensionCommandActions = null,
 
-        /// Context action seams used by tool/event `ctx.*` helpers.
-        /// Stored as function pointers here so extension modules can call
-        /// through them without importing `coding_agent.zig` and creating
-        /// a cycle.
         get_model: *const fn (session: *anyopaque) agent_protocol.Model,
         models_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator) ?std.json.Value = null,
         models_get_one: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, model_ref: []const u8) ?std.json.Value = null,
@@ -623,7 +595,7 @@ pub const ExtensionRuntime = union(enum) {
         ai_session_prompt: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, request: AiSessionPromptRequest, event_sink: ?AiSessionEventSink) anyerror!AiCompleteResult = null,
         session_note_append: ?*const fn (session: *anyopaque, kind: []const u8, title: ?[]const u8, body: []const u8, source_entry_id: ?[]const u8) anyerror!void = null,
         session_notes_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, kind: ?[]const u8, source_entry_id: ?[]const u8, limit: usize) ?std.json.Value = null,
-        /// `data` is borrowed for the call; durable implementations must clone it.
+
         session_artifact_append: ?*const fn (session: *anyopaque, owner_id: []const u8, kind: []const u8, key: ?[]const u8, title: ?[]const u8, data: std.json.Value) anyerror!void = null,
         session_artifacts_get: ?*const fn (session: *anyopaque, allocator: std.mem.Allocator, owner_id: []const u8, kind: ?[]const u8, key: ?[]const u8, limit: usize) ?std.json.Value = null,
         session_label_set: ?*const fn (session: *anyopaque, target_entry_id: []const u8, label: ?[]const u8) anyerror!void = null,
@@ -730,40 +702,6 @@ pub const SideAiSession = struct {
     }
 };
 
-/// ExtensionRunner — owned by AgentSession. One per generation.
-///
-/// The runner encapsulates all extension state for a single "generation" of the
-/// extension system. Each /reload creates a fresh runner (new generation),
-/// re-discovers extensions from disk, and re-loads them into a fresh Lua state.
-/// The old runner is destroyed only after the new one is bound and active,
-/// ensuring atomic swap semantics.
-///
-/// D1 scaffold only. Registries, Lua state, and event dispatch come in later
-/// phases. The struct shape is intentionally minimal to let D1 land
-/// independently while preserving the generation and runtime-bind contracts.
-/// Forward-declared runner cell — the "`ref: { current?: ExtensionRunner }`"
-/// pattern from pi-mono (sdk.ts:294). Exists to break a chicken-and-egg
-/// problem:
-///
-///   1. The `Agent` is constructed with `stream_fn`, `transform_context`,
-///      and `on_payload` closures that need to CALL INTO the runner.
-///   2. The runner, in turn, needs a live `AgentSession` (which owns
-///      the `Agent`) to flush its provider queue, bind ctx.ui, and
-///      emit `session_start`.
-///
-/// Without this cell, neither can be constructed first. With it,
-/// `sdk.createAgentSession` allocates an empty `ExtensionRunnerRef`
-/// up front, wires Agent closures against it, builds the session,
-/// builds the runner, and finally writes `ref.current = runner`.
-/// Closures that fire before that last step see `.current == null`
-/// and no-op gracefully (there are no extensions registered yet —
-/// the runner's own construction phase must not depend on itself).
-///
-/// Reload uses the same cell: the slot is re-assigned to the new
-/// generation atomically. Closures never re-capture a pointer — they
-/// dereference `ref.current` on every call. This is what makes a
-/// tool ctx wrapper from generation N safe to drop the moment the
-/// active slice swaps to generation N+1.
 pub const ExtensionRunnerRef = struct {
     current: ?*ExtensionRunner = null,
 
@@ -856,73 +794,25 @@ pub const ExtensionRunner = struct {
     allocator: std.mem.Allocator,
     io: std.Io = std.Options.debug_io,
 
-    /// Monotonic generation identifier. Never reused across reloads.
     generation: Generation,
 
-    /// Runtime state — starts as stub, transitions to bound once.
     runtime: ExtensionRuntime,
 
-    /// Tool registry — maps tool name → ToolDefinition. First-
-    /// registered-wins; populated during load, consumed by
-    /// AgentSession to build the active tool list. Owns every
-    /// entry's strings and JSON schema for the runner generation.
     tool_registry: registries.ToolRegistry,
 
-    /// Event registry — maps EventKind → ordered handler chain.
-    /// D2 stores subscriptions; D4 implements dispatch on top.
-    /// Handler `lua_ref` values are released when the Lua state is
-    /// closed during runner deinit, not per-entry here.
     event_registry: registries.EventRegistry,
 
-    /// Command registry — slash commands. v1 leaves this empty
-    /// (commands are v2) but the slot exists so the bind seam
-    /// (`ExtensionRuntime.Bound.command_actions`) has a target.
     command_registry: registries.CommandRegistry,
     keybinding_registry: registries.KeybindingRegistry,
 
-    /// Provider queue — pending custom-provider registrations that
-    /// arrived during the pre-bind load phase. Drained by
-    /// `bindRuntime` (D7) into the AI provider registry. v1 leaves
-    /// this empty; v3 wires `zi.provider`.
     provider_queue: registries.ProviderQueue,
 
-    /// Lua state for this generation. Borrowed (NOT owned) — the
-    /// state is constructed and owned by the SDK factory or the
-    /// test scaffold, and passed in via `attachLuaState`. The runner
-    /// uses it to dispatch Lua handlers from the agent's event
-    /// stream and to host the `zi.*` API table.
-    ///
-    /// Why borrowed instead of owned: the state's lifetime is tied
-    /// to the SDK bootstrap order — it must outlive any in-flight
-    /// agent stream that may be holding a coroutine reference. The
-    /// SDK owns it; the runner just dispatches against it.
-    ///
-    /// Null until `attachLuaState` is called. The dispatch helpers
-    /// in `event_bridge.zig` no-op when the state is missing, so
-    /// pre-bind registrations don't crash and runner-without-state
-    /// instances stay valid (they just can't dispatch).
     lua_state: ?*lua_runtime.LuaState = null,
 
-    /// Current Lua tool execution context. Host functions must require this
-    /// context when they start blocking child work so cancellation cannot be
-    /// silently dropped in the middle of a tool run.
     current_tool_execution: ?ToolExecutionContext = null,
 
-    /// Working directory of the parent agent. Published to Lua tools
-    /// via `ctx.cwd` so they can spawn child processes in the
-    /// right directory and resolve relative paths. Set once at
-    /// session bootstrap; static for the runner generation.
     cwd: []const u8 = ".",
 
-    /// Minimal scheduler state for one in-flight yieldable host call.
-    ///
-    /// Phase zi-0br / smallest zi-5w4 slice: only Lua tool execution may
-    /// suspend, and only via `zi.spawn`. Event handlers and spawn `on={...}`
-    /// callbacks still run non-yieldably. Because the agent thread is the sole
-    /// owner of `lua_state` and drives exactly one coroutine at a time, runner-
-    /// scoped state is enough for now. Later scheduler work (`zi-ilc`) can grow
-    /// this into a richer per-coroutine task table without changing the tool
-    /// execution contract landed here.
     current_spawn_request: ?SpawnRequest = null,
     current_spawn_result: ?SpawnOutcome = null,
 
@@ -942,89 +832,16 @@ pub const ExtensionRunner = struct {
     execution_context: ?LoadContext = null,
     _provider_registry: ?*ai.provider.Registry = null,
 
-    /// Identity of the thread that owns the `lua_state`.
-    ///
-    /// ## Threading contract
-    ///
-    /// `lua_State *` is non-reentrant: only one thread may make
-    /// any Lua C API call at a time, and Lua's GC bookkeeping
-    /// corrupts horribly when this is violated (the symptom is a
-    /// SIGSEGV inside `_sweeplist` or similar mark/sweep
-    /// internals — see git history if curious).
-    ///
-    /// zi enforces this contract via convention, not via locking:
-    ///
-    ///   - exactly one thread (the agent thread in interactive
-    ///     mode, or the test thread in unit tests) ever calls
-    ///     into Lua. That thread "owns" the lua_State for the
-    ///     entire runner generation.
-    ///
-    ///   - the TUI thread NEVER calls Lua.
-    ///
-    ///   - every Lua entry point (lua_tool.execute, event_bridge
-    ///     dispatch, before/afterToolCall hooks, render hook
-    ///     precompute) calls `assertOnLuaThread()` at entry.
-    ///     The first call claims ownership; subsequent calls
-    ///     verify the same thread is calling. Mismatched threads
-    ///     `@panic` with a clear message instead of corrupting
-    ///     the GC.
-    ///
-    /// `lua_owner_thread` is `0` when no thread has claimed
-    /// ownership yet (between `init` and the first Lua entry).
-    ///
-    /// Why no mutex: a mutex would let multiple threads call Lua
-    /// in turn, but it doesn't help us — Lua entry points can be
-    /// long-running (a Task tool holds the lock for the whole
-    /// child subprocess lifetime, multiple seconds). Any other
-    /// thread that tried to enter Lua during that time would
-    /// block, freezing the UI. The right architecture is "one
-    /// thread, no contention", which we get for free by having
-    /// the agent thread own everything and the TUI thread read
-    /// pre-computed data.
     lua_owner_thread: std.atomic.Value(std.Thread.Id) = .{ .raw = 0 },
 
-    /// Scratch arena for hook return values that the agent loop must
-    /// hold across a tool-call iteration. The agent's hook signatures
-    /// take no allocator, so the bridge needs a place to put owned
-    /// JSON values, content-block strings, and reason strings that
-    /// outlive the dispatch call but don't need to outlive the runner
-    /// generation.
-    ///
-    /// Lifetime: arena lives for the entire runner generation
-    /// (one session in v1 — reload destroys the runner). Allocations
-    /// pile up; for typical sessions (~thousands of tool calls,
-    /// hook results sized in hundreds of bytes) the working set is
-    /// well under a MiB. v2 will revisit if compaction-heavy or
-    /// long-running sessions stress this.
-    ///
-    /// Why not use the agent's loop arena: hooks fire from inside
-    /// the loop body but pi-mono's hook ABI doesn't pass the loop
-    /// allocator through, and bolting one on would mean changing
-    /// every embedder's hook signature. The runner-owned scratch is
-    /// the smallest seam.
     hook_arena: std.heap.ArenaAllocator,
 
-    /// Per-extension private Lua module root directories, keyed by
-    /// `state_owner_id`. Bundled extensions get `<extension>/lua`;
-    /// flat single-file extensions intentionally get no private root.
-    /// Later execution (tool, event, render) prepends the right root
-    /// to `package.path`.
     module_roots: std.StringHashMapUnmanaged([]const u8) = .empty,
 
-    /// Shared `lua/` search paths built from the canonical ordered
-    /// root list. Persisted so every execution entry point can
-    /// prepend the private root and restore the shared + default
-    /// package.path.
     shared_lua_paths: ?[]const u8 = null,
 
-    /// The default `package.path` captured at Lua state creation,
-    /// before any extension overrides. Preserves builtin/default
-    /// module resolution after shared and private roots.
     base_package_path: ?[]const u8 = null,
 
-    /// Borrowed builtin tool catalog used by the host-private builtin
-    /// extension bridge during load. Empty for sessions that provide
-    /// custom top-level tools instead of the default builtin set.
     builtin_tool_definitions: []const tool_def.ToolDefinition = &.{},
 
     pub fn init(allocator: std.mem.Allocator, generation: Generation) ExtensionRunner {
@@ -1042,34 +859,14 @@ pub const ExtensionRunner = struct {
         };
     }
 
-    /// Allocator backed by the hook scratch arena. Bridge code calls
-    /// this when it needs to produce memory that survives until the
-    /// runner is destroyed.
     pub fn hookAllocator(self: *ExtensionRunner) std.mem.Allocator {
         return self.hook_arena.allocator();
     }
 
-    /// Attach a borrowed Lua state. Called by the SDK factory once
-    /// it has constructed the LuaState and installed the `zi.*` API
-    /// table; the runner uses the state for handler dispatch but
-    /// does NOT own its lifetime. Caller must keep the state alive
-    /// for the runner's full lifetime.
     pub fn attachLuaState(self: *ExtensionRunner, state: *lua_runtime.LuaState) void {
         self.lua_state = state;
     }
 
-    /// Explicitly declare which thread owns `lua_state` from this
-    /// point forward (zi-wub.5/.6). MUST be called from the new
-    /// owning thread, before that thread makes any other lua call.
-    /// Overrides any prior owner pinned by the first-touch claim in
-    /// `assertOnLuaThread` (the first-touch claim is the phase 1
-    /// fallback; explicit bind is the phase 2 truth).
-    ///
-    /// Idempotent for the same tid. Calling from a different tid is
-    /// a hard rebind — used by flows that transfer ownership before
-    /// the new thread starts issuing lua calls. Interactive mode now
-    /// binds once on its long-lived agent owner thread at startup.
-    ///
     pub fn bindLuaOwnerThread(self: *ExtensionRunner, tid: std.Thread.Id) void {
         self.lua_owner_thread.store(tid, .release);
     }
@@ -1157,28 +954,6 @@ pub const ExtensionRunner = struct {
         };
     }
 
-    /// Assert that the current thread is allowed to call into
-    /// `lua_state`. Must be invoked at every Lua entry point
-    /// (lua_tool.execute, event_bridge dispatch, render hook
-    /// precompute, etc.) before any Lua C API call.
-    ///
-    /// Behavior (phase 1 — soft tracing, zi-wub.3):
-    ///   - First call ever: claims the current thread as the
-    ///     owner via an atomic compare-and-swap.
-    ///   - Subsequent calls from the same thread: no-op.
-    ///   - Subsequent calls from a different thread: log a warning
-    ///     once per unique offending tid (capped at 16) and CONTINUE.
-    ///     We deliberately do NOT panic yet because the first-touch
-    ///     claim may have pinned the wrong owner — phase 2
-    ///     (`bindLuaOwnerThread`, zi-wub.5/.6/.7) replaces the claim
-    ///     with an explicit bind from the agent thread, and only
-    ///     then is it safe to flip this to fatal.
-    ///
-    /// Why an assertion instead of a mutex: see the doc comment
-    /// on `lua_owner_thread`. The short version: locking would
-    /// freeze the UI behind long-running tools; "single owner
-    /// thread + cross-thread inboxes" gives us correctness AND
-    /// responsiveness for free.
     pub fn isOnLuaThread(self: *const ExtensionRunner) bool {
         const owner = self.lua_owner_thread.load(.acquire);
         return owner != 0 and owner == std.Thread.getCurrentId();
@@ -1223,13 +998,6 @@ pub const ExtensionRunner = struct {
         if (self.base_package_path) |p| self.allocator.free(p);
     }
 
-    /// Swap the runtime from stub to bound. Idempotent guard: errors if
-    /// already bound to prevent accidental double-binding.
-    ///
-    /// Called by AgentSession after construction, once all dependencies
-    /// (session store, agent core, optional UI) are available. The bound
-    /// pointers are opaque to avoid circular module dependencies; later
-    /// phases cast them to concrete types at use sites.
     pub fn bindRuntime(self: *ExtensionRunner, bound: ExtensionRuntime.Bound, provider_registry: *ai.provider.Registry) !void {
         if (self.runtime != .stub) return error.AlreadyBound;
         self.runtime = .{ .bound = bound };
@@ -1371,13 +1139,6 @@ pub const ExtensionRunner = struct {
         return self.current_tool_execution orelse std.debug.panic("{s}: missing active tool execution context", .{api_name});
     }
 
-    /// Dispatch an extension command by its visible invocation name.
-    ///
-    /// Thread contract: must run on the Lua-owning (agent) thread.
-    /// The handler is invoked in a fresh coroutine with `args` as the
-    /// first argument and a command context as the second. If the
-    /// handler yields, returns `error.UnexpectedYield` — command
-    /// bodies are not yieldable in this slice.
     pub fn dispatchKeybinding(self: *ExtensionRunner, id: []const u8) !void {
         self.assertOnLuaThread();
 
@@ -2184,10 +1945,6 @@ pub const ExtensionRunner = struct {
         return ptr[0..len];
     }
 
-    /// Record the private Lua module root for a bundled extension so
-    /// that later execution entry points can resolve namespaced modules
-    /// from `<extension>/lua`. Flat single-file extensions do not get a
-    /// synthetic private root; they use shared runtime `lua/` modules.
     pub fn recordModuleRoot(self: *ExtensionRunner, state_owner_id: []const u8, path: []const u8) !void {
         const root = try moduleRootFromExtensionPath(self.allocator, path) orelse return;
         errdefer self.allocator.free(root);
@@ -2196,13 +1953,6 @@ pub const ExtensionRunner = struct {
         try self.module_roots.put(self.allocator, key, root);
     }
 
-    /// Set Lua `package.path` for the execution context belonging to
-    /// `provenance`. Prepends the bundled extension's private `lua/`
-    /// root (if any), then shared runtime `lua/` roots, then the default
-    /// builtin paths.
-    /// Single-threaded: every entry point overwrites the path for
-    /// its own context, so nested callbacks naturally inherit the
-    /// current tool's module context.
     pub fn setModuleContext(self: *ExtensionRunner, state: *lua_runtime.LuaState, provenance: ?resource_types.ExtensionProvenance) void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);

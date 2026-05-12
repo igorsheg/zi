@@ -28,10 +28,6 @@ pub const TransformOptions = struct {
     decorators: []const Decorator = &.{},
 };
 
-/// Applies request-boundary payload transforms after a provider has built its
-/// canonical JSON bytes. The provider builder remains the source of truth;
-/// this layer owns the temporary parse tree, decorator mutation, optional
-/// `StreamOptions.on_payload` replacement clone, re-stringify, and cleanup.
 pub fn transformJsonPayload(
     allocator: std.mem.Allocator,
     canonical: []const u8,

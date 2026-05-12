@@ -1,15 +1,5 @@
 const std = @import("std");
 
-/// zi's owned concurrent work set.
-///
-/// Contract:
-/// - each task is an owned OS thread
-/// - `join` joins all owned work and closes the set
-/// - `cancel` joins owned threads; it is not preemptive
-/// - callers must pass cooperative cancellation/resource guards when work can
-///   block indefinitely
-///
-/// This is the only place new zio code should spawn scoped OS threads.
 pub const Group = struct {
     allocator: std.mem.Allocator,
     threads: std.ArrayList(std.Thread) = .empty,
@@ -19,6 +9,8 @@ pub const Group = struct {
         return .{ .allocator = allocator };
     }
 
+    // The group owns every spawned thread. No detach, no clever lifetime bargain,
+    // no mystery meat running after shutdown. Join or cancel clears the room.
     pub fn spawnThread(self: *Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.ConcurrentError!void {
         std.debug.assert(!self.closed);
         self.threads.ensureUnusedCapacity(self.allocator, 1) catch return error.ConcurrencyUnavailable;

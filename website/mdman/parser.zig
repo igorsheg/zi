@@ -1,13 +1,3 @@
-//! Minimal Markdown parser for man page generation.
-//!
-//! Supports: headings, paragraphs, bold, italic, code, code blocks,
-//! bullet lists, definition lists, and links.
-//!
-//! Usage:
-//!   var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-//!   defer arena.deinit();
-//!   const doc = try parse(arena.allocator(), source);
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -51,9 +41,6 @@ pub const Document = struct {
     nodes: []const Node,
 };
 
-/// Parse markdown source into a Document.
-/// All allocations use the provided allocator (typically an arena).
-/// Caller owns the allocator lifetime.
 pub fn parse(allocator: Allocator, source: []const u8) !Document {
     var p = Parser{ .allocator = allocator, .source = source, .pos = 0 };
     return p.parse();

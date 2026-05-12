@@ -7,16 +7,11 @@ const tool_def = @import("../tools/definition.zig");
 
 const log = std.log.scoped(.extensions);
 
-/// Max extension file size. 1 MiB is absurdly generous for a Lua
-/// script; anything larger is almost certainly a mistake (binary
-/// in the wrong dir, runaway generator). Capping here keeps the
-/// read path bounded without needing streaming.
 const MAX_EXTENSION_SIZE: usize = 1024 * 1024;
 
 pub const ExtensionSource = resource_types.ExtensionSource;
 pub const StaticExtensionRoot = resource_types.StaticExtensionRoot;
 
-/// Discovered extension descriptor. Strings owned by the allocator passed to discover().
 pub const LoadedExtension = struct {
     id: []const u8,
     path: []const u8,
@@ -24,13 +19,11 @@ pub const LoadedExtension = struct {
     provenance: resource_types.ExtensionProvenance,
 };
 
-/// Options for extension discovery.
 pub const DiscoverOptions = struct {
     allocator: std.mem.Allocator,
     roots: []const StaticExtensionRoot,
 };
 
-/// Track seen IDs within a source to avoid duplicates.
 const SeenIds = struct {
     ids: std.ArrayListUnmanaged([]const u8) = .empty,
 
@@ -53,9 +46,6 @@ const SeenIds = struct {
     }
 };
 
-/// Discover all extensions from the caller-provided canonical root list.
-/// Caller owns returned slice and all strings. Use freeExtensions() to clean up.
-/// Built-in extensions are handled as virtual roots.
 pub fn discover(opts: DiscoverOptions) ![]LoadedExtension {
     var results: std.ArrayListUnmanaged(LoadedExtension) = .empty;
     var seen: SeenIds = .{};
@@ -91,7 +81,6 @@ pub fn discover(opts: DiscoverOptions) ![]LoadedExtension {
     return results.toOwnedSlice(opts.allocator);
 }
 
-/// Free all strings and the slice itself.
 pub fn freeExtensions(allocator: std.mem.Allocator, list: []LoadedExtension) void {
     for (list) |ext| {
         allocator.free(ext.id);
@@ -110,7 +99,6 @@ fn extensionStateOwnerId(
     return std.fmt.allocPrint(allocator, "{s}::{s}", .{ runtime_root_id, extension_id });
 }
 
-/// Load a synthetic single-extension root. Error if path doesn't exist.
 fn loadSyntheticExtension(
     allocator: std.mem.Allocator,
     root: StaticExtensionRoot,
@@ -173,7 +161,6 @@ fn extensionIdFromSyntheticPath(path: []const u8) []const u8 {
     return basename;
 }
 
-/// Scan a directory for .lua files and foo/init.lua patterns.
 fn scanDirectory(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
@@ -223,7 +210,6 @@ fn scanDirectory(
     }
 }
 
-/// Add an extension to results, duplicating strings.
 fn addExtension(
     allocator: std.mem.Allocator,
     id: []const u8,
@@ -258,13 +244,6 @@ pub const LoadStats = struct {
     failed: u32 = 0,
 };
 
-/// Read each discovered extension file and execute it against `state`.
-/// Per-file read or Lua errors are logged and skipped — one broken
-/// extension does not prevent the others from loading. Returns a small
-/// stat bundle for the caller to log.
-///
-/// Caller must have already installed `zi.*` on the state (via
-/// `extensions/api_v3.zig:install`) before calling this.
 pub fn loadAll(
     allocator: std.mem.Allocator,
     state: *lua_runtime.LuaState,

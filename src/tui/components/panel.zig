@@ -7,11 +7,6 @@ const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
 const Theme = theme_mod.Theme;
 
-/// Reusable bordered panel chrome.
-///
-/// Panel owns only the frame drawing contract. Callers compose the body by
-/// rendering into the returned `body` region. This keeps modal/list/content
-/// components from each carrying their own border math.
 pub const Panel = struct {
     title: ?[]const u8 = null,
     border: Color,

@@ -19,12 +19,6 @@ pub const Kind = enum {
     @"error",
 };
 
-/// Status text primitive for short modal/status messages.
-///
-/// This is intentionally only presentation. Owners decide when a status exists
-/// and what it means; the primitive maps kind to theme color and uses the
-/// shared text layout layer for width-aware wrapping when callers give it
-/// multiple rows.
 pub const StatusText = struct {
     allocator: std.mem.Allocator,
     theme: *const Theme,

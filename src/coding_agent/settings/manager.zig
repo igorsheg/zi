@@ -7,7 +7,6 @@ const file_storage = @import("file_storage.zig");
 
 const log = std.log.scoped(.settings_manager);
 
-/// pi-mono: settings-manager.ts:226-958
 pub const SettingsManager = struct {
     allocator: std.mem.Allocator,
     storage: storage_mod.SettingsStorage,
@@ -29,8 +28,6 @@ pub const SettingsManager = struct {
     project_load_error: bool = false,
     errors: std.ArrayListUnmanaged(types.SettingsError),
 
-    /// File-backed settings manager.
-    /// pi-mono: settings-manager.ts:232-240
     pub fn create(allocator: std.mem.Allocator, cwd: []const u8, agent_dir_override: ?[]const u8) !SettingsManager {
         return createWithIo(allocator, std.Options.debug_io, cwd, agent_dir_override);
     }
@@ -41,14 +38,10 @@ pub const SettingsManager = struct {
         return fromStorageInternal(allocator, fs.asStorage(), true);
     }
 
-    /// From any storage backend.
-    /// pi-mono: settings-manager.ts:242-244
     pub fn fromStorage(allocator: std.mem.Allocator, storage: storage_mod.SettingsStorage) SettingsManager {
         return fromStorageInternal(allocator, storage, false);
     }
 
-    /// In-memory for tests. Optionally pre-populate with initial settings.
-    /// pi-mono: settings-manager.ts:246-257
     pub fn inMemory(allocator: std.mem.Allocator, initial: ?types.Settings) !SettingsManager {
         var mem = try allocator.create(storage_mod.InMemorySettingsStorage);
         mem.* = storage_mod.InMemorySettingsStorage.init(allocator);
@@ -700,19 +693,12 @@ pub const SettingsManager = struct {
         self.saveProjectSettings();
     }
 
-    /// Apply overrides on top of current effective settings (non-persisted).
-    /// pi-mono: settings-manager.ts:270-272
     pub fn applyOverrides(self: *SettingsManager, overrides: types.Settings) void {
         self.settings = json.deepMergeSettings(self.settings, overrides);
     }
 
-    /// No-op in zig (all writes are synchronous).
-    /// pi-mono: settings-manager.ts:954-958
     pub fn flush(_: *SettingsManager) void {}
 
-    /// Drain accumulated errors, returning the list and resetting it.
-    /// Caller does NOT own the returned slice memory — it points into the
-    /// ArrayList's backing buffer and is invalidated on next mutation.
     pub fn drainErrors(self: *SettingsManager) []const types.SettingsError {
         const items = self.errors.items;
         self.errors = .empty;

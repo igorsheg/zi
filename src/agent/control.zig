@@ -26,9 +26,7 @@ pub const QueuedMessageText = struct {
 pub const QueuedMessageSnapshot = struct {
     steering: []QueuedMessageText,
     follow_up: []QueuedMessageText,
-    /// Monotonically increasing per-RunControl. Consumers compare
-    /// versions to drop snapshots that are older than what they have
-    /// already applied. Version 0 is the initial pre-mutation state.
+
     version: u64 = 0,
 
     pub fn deinit(self: *QueuedMessageSnapshot, allocator: std.mem.Allocator) void {
@@ -49,10 +47,7 @@ const MessageStore = queue_mod.Queue(protocol.AgentMessage, .{
 pub const RunControl = struct {
     steering: MessageQueue,
     follow_up: MessageQueue,
-    /// Monotonically increasing counter that ticks on every user-visible
-    /// mutation (enqueue, drain, clear, atomic take+clear). Snapshot
-    /// consumers use it to drop stale snapshots that might be delivered
-    /// out of order when producers on different threads publish concurrently.
+
     version: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub const Options = struct {
@@ -280,9 +275,6 @@ const MessageQueue = struct {
         return snapshot;
     }
 
-    /// Atomic clone-and-clear: holds the mailbox mutex once across both
-    /// operations so producers enqueuing concurrently either show up in
-    /// the snapshot or land after the clear — never lost between them.
     fn takeSnapshotAndClear(self: *MessageQueue, allocator: std.mem.Allocator) []QueuedMessageText {
         var out: std.ArrayList(QueuedMessageText) = .empty;
         var success = false;

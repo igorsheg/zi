@@ -1,14 +1,3 @@
-//! Session-owned visible model catalog.
-//!
-//! Owns a deep-copied snapshot built from:
-//! - built-in generated models
-//! - settings custom models captured at init
-//! - active provider claims projected from `ai/provider.zig`
-//!
-//! The provider runtime registry and the model catalog stay separate
-//! owners. This registry mirrors the current visible catalog for model
-//! resolution, auth gating, session restore, and TUI publication.
-
 const std = @import("std");
 const protocol = @import("../ai/protocol.zig");
 const generated = @import("../ai/models_generated.zig");
@@ -19,10 +8,9 @@ const resolve_config_value = @import("auth/resolve_config_value.zig");
 
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
-    /// Stable settings-owned custom models captured at init.
+
     custom_models: []protocol.Model,
-    /// Current visible catalog. Rebuilt on the agent thread whenever the
-    /// active provider claim projection changes.
+
     models: []protocol.Model,
     auth: *auth_storage_mod.AuthStorage,
     provider_registry: ?*const provider_mod.Registry,
@@ -65,12 +53,10 @@ pub const ModelRegistry = struct {
         self.provider_registry = provider_registry;
     }
 
-    /// Stable slice until the next rebuild. Caller must not mutate.
     pub fn getAll(self: *const ModelRegistry) []const protocol.Model {
         return self.models;
     }
 
-    /// Exact `(provider, id)` match. Byte-exact on id.
     pub fn find(
         self: *const ModelRegistry,
         provider: protocol.Provider,
@@ -99,8 +85,6 @@ pub const ModelRegistry = struct {
         return null;
     }
 
-    /// Synchronous hasAuth check. Unlike pi-mono's async counterpart,
-    /// zi's AuthStorage is lock-protected and sync-friendly.
     pub fn hasConfiguredAuth(self: *const ModelRegistry, model: protocol.Model) bool {
         const provider_str = json_util.providerToString(model.provider);
         if (self.auth.hasAuth(provider_str)) return true;
@@ -113,8 +97,6 @@ pub const ModelRegistry = struct {
         return false;
     }
 
-    /// Caller-owned slice of models whose provider has configured auth.
-    /// Sync — no oauth refresh side effects.
     pub fn getAvailable(
         self: *const ModelRegistry,
         allocator: std.mem.Allocator,

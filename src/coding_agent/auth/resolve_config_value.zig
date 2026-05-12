@@ -3,11 +3,8 @@ const command_query = @import("../../lib/command_query.zig");
 
 const allocator = std.heap.page_allocator;
 
-/// Cache for shell command results. Process-lifetime cache matching pi-mono.
-/// Key: full config string including "!" prefix. Value: owned result or null on failure.
 var command_cache: std.StringHashMap(?[]const u8) = std.StringHashMap(?[]const u8).init(allocator);
 
-/// pi-mono source: packages/coding-agent/src/core/resolve-config-value.ts:17-23
 pub fn resolveConfigValue(config: []const u8) ?[]const u8 {
     if (config.len > 0 and config[0] == '!') {
         return executeCommand(config);
@@ -18,7 +15,6 @@ pub fn resolveConfigValue(config: []const u8) ?[]const u8 {
     return config;
 }
 
-/// pi-mono source: resolve-config-value.ts:91-97
 pub fn resolveConfigValueUncached(config: []const u8) ?[]const u8 {
     if (config.len > 0 and config[0] == '!') {
         return executeCommandUncached(config);
@@ -29,7 +25,6 @@ pub fn resolveConfigValueUncached(config: []const u8) ?[]const u8 {
     return config;
 }
 
-/// pi-mono source: resolve-config-value.ts:99-110
 pub fn resolveConfigValueOrError(config: []const u8) error{ResolveFailed}![]const u8 {
     return resolveConfigValueUncached(config) orelse error.ResolveFailed;
 }
@@ -45,7 +40,6 @@ pub fn clearCache() void {
     command_cache.clearRetainingCapacity();
 }
 
-/// pi-mono source: resolve-config-value.ts:115-125
 pub fn resolveHeaders(
     alloc: std.mem.Allocator,
     headers: ?std.json.ObjectMap,

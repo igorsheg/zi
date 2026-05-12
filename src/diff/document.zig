@@ -1,10 +1,3 @@
-//! Line-level diff component.
-//!
-//! Produces an arena-owned semantic diff document. The public model is
-//! block-oriented: replacements are first-class hunk blocks rather than a
-//! delete/insert side channel. Unified text, JSON, and TUI projections derive
-//! from this model.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 

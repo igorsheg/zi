@@ -1,5 +1,3 @@
-//! HTML output renderer.
-
 const std = @import("std");
 const parser = @import("parser.zig");
 const Node = parser.Node;
@@ -17,8 +15,6 @@ pub const Options = struct {
     markdown_url: ?[]const u8 = null,
 };
 
-/// Render a Document to HTML format.
-/// All allocations use the provided allocator (typically an arena).
 pub fn render(allocator: std.mem.Allocator, doc: Document, title: []const u8, options: Options) ![]const u8 {
     var buffer: std.ArrayListUnmanaged(u8) = .empty;
     const writer = buffer.writer(allocator);

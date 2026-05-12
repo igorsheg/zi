@@ -11,7 +11,6 @@ const json_api_limits = lua_runtime.JsonConvertLimits{
     .max_total_string_bytes = 16 * 1024 * 1024,
 };
 
-/// Pushes `zi.json`; JSON `null` decodes to Lua `nil`.
 pub fn install(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
     c.lua_createtable(L, 0, 2);

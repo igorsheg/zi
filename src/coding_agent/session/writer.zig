@@ -7,13 +7,6 @@ const json = @import("../../session/json.zig");
 const time_util = @import("../../lib/time_util.zig");
 const message_memory = @import("../../agent/message_memory.zig");
 
-/// Manages writing session entries to a JSONL file.
-/// Tracks leafId for tree structure and generates unique entry IDs.
-///
-/// Matches pi-mono's SessionManager persistence behavior:
-/// - Entries are buffered until the first assistant message appears
-/// - Once flushed, each new entry is appended immediately
-/// - This ensures crash durability after first meaningful exchange
 pub const SessionWriter = struct {
     allocator: std.mem.Allocator,
     session_id: []const u8,
@@ -25,17 +18,10 @@ pub const SessionWriter = struct {
     flushed: bool,
     has_assistant: bool,
     buffered_entries: std.ArrayListUnmanaged(proto.FileEntry),
-    /// Flushed entries appended after this writer was opened. Kept so
-    /// SessionStore can extend an already-parsed resume cache without
-    /// reparsing the whole JSONL file after every interaction.
+
     appended_entries: std.ArrayListUnmanaged(proto.SessionEntry),
     persist: bool,
 
-    /// Construct a new writer. `session_dir` is the already-resolved directory
-    /// for this session's files — the sdk layer computes it via
-    /// `sdk.resolveSessionDir` BEFORE reaching here so the extension layer can
-    /// override session placement before persistence starts. See
-    /// `docs/extensions.md`.
     pub fn init(allocator: std.mem.Allocator, session_dir: []const u8, cwd: []const u8) SessionWriter {
         var uuid_buf: [36]u8 = undefined;
         generateUuid(&uuid_buf);
@@ -78,8 +64,6 @@ pub const SessionWriter = struct {
         };
     }
 
-    /// Create an ephemeral writer that tracks state in memory but never writes to disk.
-    /// Used for --no-session sub-agents.
     pub fn initEphemeral(allocator: std.mem.Allocator) SessionWriter {
         var uuid_buf: [36]u8 = undefined;
         generateUuid(&uuid_buf);
@@ -101,10 +85,6 @@ pub const SessionWriter = struct {
         };
     }
 
-    /// Continue writing to an existing session file.
-    /// Seeds leaf_id so new entries chain from where the session left off.
-    /// Skips header creation — the file already has one.
-    /// Marks as already flushed (file exists on disk).
     pub fn initContinue(allocator: std.mem.Allocator, session_file: []const u8, session_id: []const u8, cwd: []const u8, leaf_id: ?[]const u8) SessionWriter {
         return .{
             .allocator = allocator,
@@ -142,9 +122,6 @@ pub const SessionWriter = struct {
         if (self.session_file.len > 0) self.allocator.free(self.session_file);
     }
 
-    /// Append a message entry. Matches pi-mono's message_end persistence:
-    /// - Buffers until first assistant message appears
-    /// - Then flushes all buffered entries + appends incrementally
     pub fn appendMessage(self: *SessionWriter, msg: agent.protocol.AgentMessage) ?[]const u8 {
         var owned_msg = message_memory.cloneMessage(self.allocator, msg) catch return null;
         errdefer message_memory.freeMessage(self.allocator, &owned_msg);
@@ -178,21 +155,14 @@ pub const SessionWriter = struct {
         return entry_id;
     }
 
-    /// Append a thinking level change entry.
     pub fn appendThinkingLevelChange(self: *SessionWriter, level: []const u8) void {
         self.appendEntry(.{ .thinking_level_change = .{ .thinking_level = level } });
     }
 
-    /// Append a model change entry.
     pub fn appendModelChange(self: *SessionWriter, provider: []const u8, model_id: []const u8) void {
         self.appendEntry(.{ .model_change = .{ .provider = provider, .model_id = model_id } });
     }
 
-    /// Append a compaction entry.
-    ///
-    /// `details` and `from_hook` are product contract fields persisted in the
-    /// CompactionEntry wire format. Callers must pass slices / values owned by
-    /// an allocator that outlives the writer's buffer/flush window.
     pub fn appendCompaction(
         self: *SessionWriter,
         summary: []const u8,
@@ -210,17 +180,14 @@ pub const SessionWriter = struct {
         } });
     }
 
-    /// Append a branch summary entry.
     pub fn appendBranchSummary(self: *SessionWriter, from_id: []const u8, summary: []const u8) void {
         self.appendEntry(.{ .branch_summary = .{ .from_id = from_id, .summary = summary } });
     }
 
-    /// Append a custom entry (extension state, NOT in LLM context).
     pub fn appendCustomEntry(self: *SessionWriter, custom_type: []const u8, data: ?std.json.Value) void {
         self.appendEntry(.{ .custom = .{ .custom_type = custom_type, .data = data } });
     }
 
-    /// Append a custom message entry (extension message, IN LLM context).
     pub fn appendCustomMessage(self: *SessionWriter, custom_type: []const u8, content: agent.protocol.AgentMessage.CustomContent, display: bool, details: ?std.json.Value) void {
         self.appendEntry(.{ .custom_message = .{
             .custom_type = custom_type,
@@ -230,7 +197,6 @@ pub const SessionWriter = struct {
         } });
     }
 
-    /// Append a label entry (bookmark on another entry).
     pub fn appendLabel(self: *SessionWriter, target_id: []const u8, label: ?[]const u8) void {
         const owned_target_id = self.allocator.dupe(u8, target_id) catch return;
         errdefer self.allocator.free(owned_target_id);
@@ -238,7 +204,6 @@ pub const SessionWriter = struct {
         self.appendEntry(.{ .label = .{ .target_id = owned_target_id, .label = owned_label } });
     }
 
-    /// Append a session info entry (display name, etc).
     pub fn appendSessionInfo(self: *SessionWriter, name: ?[]const u8) void {
         const owned_name = if (name) |value| self.allocator.dupe(u8, value) catch return else null;
         const was_flushed = self.flushed;
@@ -246,8 +211,6 @@ pub const SessionWriter = struct {
         self.appendEntry(.{ .session_info = .{ .name = owned_name } });
     }
 
-    /// Shared logic for appending any non-message entry type.
-    /// Non-message entries write immediately if flushed, otherwise buffer.
     fn appendEntry(self: *SessionWriter, entry_data: proto.SessionEntry.EntryType) void {
         const entry = self.createEntry(entry_data) orelse return;
 
@@ -259,7 +222,6 @@ pub const SessionWriter = struct {
         self.appendToFile(entry) catch {};
     }
 
-    /// Create a session entry and update tree state (leaf_id, ids).
     fn createEntry(self: *SessionWriter, entry_data: proto.SessionEntry.EntryType) ?proto.SessionEntry {
         const entry_id = self.generateId() catch return null;
         const entry_timestamp = time_util.isoTimestampNow(self.allocator) catch return null;
@@ -282,7 +244,6 @@ pub const SessionWriter = struct {
         return entry;
     }
 
-    /// Flush all buffered entries to disk (header + entries).
     fn flushAll(self: *SessionWriter) void {
         if (!self.persist) {
             self.flushed = true;
@@ -307,7 +268,6 @@ pub const SessionWriter = struct {
         self.buffered_entries.clearRetainingCapacity();
     }
 
-    /// Append a single entry to the already-flushed file.
     fn appendToFile(self: *SessionWriter, entry: proto.SessionEntry) !void {
         if (!self.persist) return;
         var out: std.Io.Writer.Allocating = .init(self.allocator);
@@ -320,7 +280,6 @@ pub const SessionWriter = struct {
         };
     }
 
-    /// Generate a unique 8-char hex ID, collision-checked.
     fn generateId(self: *SessionWriter) ![]const u8 {
         var buf: [4]u8 = undefined;
 
@@ -339,7 +298,6 @@ pub const SessionWriter = struct {
     }
 };
 
-/// Generate a UUID v4-like string (lowercase hex with dashes).
 fn freeBufferedFileEntry(allocator: std.mem.Allocator, entry: proto.FileEntry, session_id: []const u8) void {
     switch (entry) {
         .header => |header| {

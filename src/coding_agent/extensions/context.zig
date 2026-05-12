@@ -18,9 +18,6 @@ const ui_id_bytes: usize = limits.ui_id_bytes;
 const ui_text_bytes: usize = limits.ui_text_bytes;
 const truncated_marker = "\n... [extension UI text truncated] ...";
 
-/// Push the shared extension context table used by tool execution and
-/// event handlers. Tool-specific callers can add extra fields (e.g.
-/// `update`) after this returns.
 pub fn pushExtensionContext(
     L: *c.lua_State,
     runner: *runner_mod.ExtensionRunner,
@@ -302,7 +299,7 @@ fn ctxUiNotifyClear(L_opt: ?*c.lua_State) callconv(.c) c_int {
 
 fn ctxUiProgress(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
-    // ctx.ui.progress({ id=..., message=... }) publishes an in-flight notification.
+
     if (c.lua_type(L, 1) == c.LUA_TTABLE) {
         _ = c.lua_getfield(L, 1, "message");
         if (c.lua_type(L, -1) != c.LUA_TSTRING) {
@@ -2389,13 +2386,6 @@ fn ctxSystemPrompt(L_opt: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// Push the extension context table for command handlers.
-///
-/// Command handlers receive the same base context as tool/event
-/// handlers plus command-only fields. In this slice those fields
-/// are absent/nil because session-control actions are not yet safe
-/// inside command bodies (they may destroy the live runner while
-/// the coroutine is still executing).
 pub fn pushCommandContext(
     L: *c.lua_State,
     runner: *runner_mod.ExtensionRunner,

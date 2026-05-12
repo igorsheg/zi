@@ -39,7 +39,6 @@ pub fn telemetrySnapshot() TelemetrySnapshot {
     };
 }
 
-/// Result of reading a session file.
 pub const SessionData = struct {
     header: ?proto.SessionHeader,
     entries: []proto.SessionEntry,
@@ -53,8 +52,6 @@ pub const SessionData = struct {
     }
 };
 
-/// Parse a JSONL session file content into header + entries.
-/// All returned data is owned by the provided allocator.
 pub fn parseSessionContent(allocator: std.mem.Allocator, content: []const u8) !SessionData {
     var header: ?proto.SessionHeader = null;
     var entries: std.ArrayListUnmanaged(proto.SessionEntry) = .empty;
@@ -95,7 +92,6 @@ fn parseLine(
     }
 }
 
-/// Read and parse a session file from disk.
 pub fn readSessionFile(allocator: std.mem.Allocator, path: []const u8) !SessionData {
     const total_start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
     var input = try zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 100 * 1024 * 1024 });

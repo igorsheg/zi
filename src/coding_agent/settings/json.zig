@@ -7,8 +7,6 @@ const Writer = std.Io.Writer;
 const Value = std.json.Value;
 const ObjectMap = std.json.ObjectMap;
 
-/// Owns the memory backing string values in the returned Settings.
-/// Caller must keep alive as long as settings is used, then call deinit.
 pub const ParseResult = struct {
     settings: types.Settings,
     parsed: std.json.Parsed(Value),
@@ -18,10 +16,6 @@ pub const ParseResult = struct {
     }
 };
 
-/// Parse a JSON string into typed Settings.
-/// All allocated memory (string array slices, packages) lives in the parsed
-/// arena — calling `ParseResult.deinit()` frees everything.
-/// pi-mono: settings-manager.ts:291-302 (loadFromStorage parse path)
 pub fn parseSettingsJson(allocator: std.mem.Allocator, json_content: []const u8) !ParseResult {
     const parsed = try std.json.parseFromSlice(Value, allocator, json_content, .{});
     errdefer parsed.deinit();
@@ -237,8 +231,6 @@ fn parseMarkdown(obj: *const ObjectMap) types.MarkdownSettings {
     return m;
 }
 
-/// Extract a string array from a JSON value. Allocates the slice of pointers
-/// into the arena; the string data itself points into the parsed JSON tree.
 fn parseStringArray(arena: std.mem.Allocator, v: Value) !?[]const []const u8 {
     if (v != .array) return null;
     const items = v.array.items;
@@ -292,9 +284,6 @@ fn parsePackages(arena: std.mem.Allocator, v: Value) !?[]const types.PackageSour
     return result[0..idx];
 }
 
-/// Parse the `models` array from settings JSON into CustomModel entries.
-/// All string data borrows from the parsed JSON tree (arena-owned).
-/// Skips entries with missing required fields (id, api, provider, baseUrl).
 fn parseCustomModels(arena: std.mem.Allocator, v: Value) !?[]const types.CustomModel {
     if (v != .array) return null;
     const items = v.array.items;
@@ -361,11 +350,6 @@ fn jsonToFloat(v: Value) f64 {
     };
 }
 
-/// Deep merge: overrides take precedence over base.
-/// For nested structs, sub-fields merge (override non-null fields only).
-/// For primitives and arrays, override replaces entirely.
-/// Does not allocate — copies field values (pointers into existing memory).
-/// pi-mono: settings-manager.ts:100-129
 pub fn deepMergeSettings(base: types.Settings, overrides: types.Settings) types.Settings {
     var result = base;
 
@@ -477,7 +461,6 @@ pub fn deepMergeSettings(base: types.Settings, overrides: types.Settings) types.
     return result;
 }
 
-/// Serialize a raw JSON ObjectMap to a pretty-printed JSON string (2-space indent).
 pub fn serializeSettingsObject(allocator: std.mem.Allocator, object: ObjectMap) ![]const u8 {
     return std.json.Stringify.valueAlloc(
         allocator,
@@ -486,8 +469,6 @@ pub fn serializeSettingsObject(allocator: std.mem.Allocator, object: ObjectMap) 
     );
 }
 
-/// Write typed Settings as pretty-printed JSON.
-/// Only writes non-null fields.
 pub fn writeSettings(writer: *std.Io.Writer, settings: *const types.Settings) !void {
     var jw: Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
 
@@ -799,9 +780,6 @@ fn writeStringArray(jw: *Stringify, arr: []const []const u8) !void {
     try jw.endArray();
 }
 
-/// Apply a typed settings field value to a raw JSON object.
-/// Used during merge-on-write: only modified fields get written back.
-/// pi-mono: settings-manager.ts:451-479 (persistScopedSettings)
 pub fn applyTypedFieldToRaw(
     allocator: std.mem.Allocator,
     object: *ObjectMap,
@@ -971,9 +949,6 @@ pub fn applyTypedFieldToRaw(
     }
 }
 
-/// Apply a single nested field within a settings struct to the raw object.
-/// e.g., field=compaction, nested_key="enabled" → sets raw["compaction"]["enabled"]
-/// pi-mono: settings-manager.ts:464-471 (nested merge in persistScopedSettings)
 pub fn applyTypedNestedFieldToRaw(
     allocator: std.mem.Allocator,
     object: *ObjectMap,

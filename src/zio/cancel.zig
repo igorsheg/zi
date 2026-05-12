@@ -1,11 +1,5 @@
 const std = @import("std");
 
-/// Read-only cooperative cancellation token for one in-flight run.
-/// Passed through agent loop → provider → tool execution.
-/// All layers check `isAborted()` at cancellation points.
-///
-/// The signal is generation-scoped: when the owner starts a new run,
-/// stale signals from the previous run become aborted automatically.
 pub const Token = struct {
     controller: ?*Source,
     expected_generation: u64,
@@ -18,7 +12,6 @@ pub const Token = struct {
         none,
     };
 
-    /// Sentinel for "no abort signal" — never triggers.
     pub const none: Token = .{
         .controller = null,
         .expected_generation = 0,
@@ -37,11 +30,6 @@ pub const Token = struct {
         return self.expected_generation;
     }
 
-    /// Block until this run aborts, a caller-supplied predicate becomes
-    /// true, or the timeout expires.
-    ///
-    /// This is zi's wake-driven replacement for helper threads that used
-    /// to poll `isAborted()` with `sleep(100ms)`.
     pub fn waitUntil(
         self: Token,
         timeout_ns: ?u64,
@@ -51,8 +39,6 @@ pub const Token = struct {
         return self.waitUntilIo(std.Options.debug_io, timeout_ns, predicate, predicate_ctx);
     }
 
-    /// Same as `waitUntil`, but participates in the caller-provided `std.Io`
-    /// backend for clocks, sleep, mutex, and condition waits.
     pub fn waitUntilIo(
         self: Token,
         io: std.Io,
@@ -94,18 +80,12 @@ pub const Token = struct {
         }
     }
 
-    /// Wake threads blocked in `waitUntil` so they can re-check their
-    /// predicates. Used by helper shutdown paths in addition to abort.
     pub fn notifyWaiters(self: Token) void {
         const controller = self.controller orelse return;
         controller.notifyWaiters();
     }
 };
 
-/// Run-scoped abort controller.
-///
-/// One owner mutates it (`beginRun`, `requestAbort`); readers receive
-/// `Token` snapshots that stay valid for the lifetime of the run.
 pub const Source = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,

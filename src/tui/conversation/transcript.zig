@@ -412,12 +412,6 @@ pub const ToolExecutionRowModel = struct {
     }
 };
 
-/// State for a single tool execution within the transcript.
-/// Owns a stable row model plus presentation-local state (expansion,
-/// renderer caches, and retained renderer state).
-///
-/// Rendering uses optional ToolRenderer functions for per-tool formatting.
-/// Falls back to: bold(tool_name) for call, truncated text for result.
 pub const ToolExecution = struct {
     model: ToolExecutionRowModel = .{},
     expanded: bool = false,
@@ -674,7 +668,6 @@ pub const ToolExecution = struct {
         return @intCast(lines.len);
     }
 
-    /// Extract joined text from result content blocks.
     fn getResultText(self: *ToolExecution) ?[]u8 {
         const result = self.model.result orelse return null;
         var total_len: usize = 0;
@@ -806,31 +799,22 @@ fn deinitUserMessage(ctx: *anyopaque, allocator: std.mem.Allocator) void {
     allocator.destroy(um);
 }
 
-/// Scrollable retained transcript container with slice-native item storage.
-///
-/// Items are owned transcript renderables plus optional metadata used for
-/// retained reconciliation (`retained_item_id`) and keyed tool-row lookup
-/// (`tool_call_id`). The transcript owns retained item order, layout, scroll,
-/// and viewport rendering. Text selection is driven by the TUI selection
-/// controller through the selectable renderable protocol.
-/// Conversation semantics are projected into retained rows before they reach
-/// this container.
 pub const Transcript = struct {
     items: std.ArrayListUnmanaged(TranscriptItem) = .empty,
-    /// Fast lookup: tool_call_id → item index for retained tool-row updates.
+
     pending_tools: std.StringHashMapUnmanaged(usize) = .{},
-    /// Fast lookup: retained item_id → item index for retained reconciliation.
+
     retained_items: std.AutoHashMapUnmanaged(ItemId, usize) = .empty,
     layout: TranscriptLayout,
-    /// Parent-owned vertical gap inserted between transcript child items.
+
     child_gap_rows: u32 = 1,
 
     allocator: std.mem.Allocator,
     theme: *const theme_mod.Theme = undefined,
     hide_thinking_block: bool = false,
-    /// Cached viewport height for scroll clamping / sticky-end updates.
+
     last_visible_height: u32 = 0,
-    /// Cached from last render() call, used by clampScroll().
+
     last_render_width: u32 = 80,
     last_width_method: grapheme.WidthMethod = .wcwidth,
 
@@ -921,17 +905,14 @@ pub const Transcript = struct {
         self.noteItemMutated(index);
     }
 
-    /// Append an arbitrary transcript item.
     pub fn addItem(self: *Transcript, item: TranscriptItem) bool {
         return self.appendTranscriptItem(item);
     }
 
-    /// Append an arbitrary transcript renderable.
     pub fn addRenderable(self: *Transcript, renderable: TranscriptRenderable) void {
         _ = self.addItem(.{ .renderable = renderable });
     }
 
-    /// Remove a specific transcript renderable by identity.
     pub fn removeRenderable(self: *Transcript, renderable: TranscriptRenderable) void {
         var i: usize = 0;
         while (i < self.items.items.len) {
@@ -966,7 +947,6 @@ pub const Transcript = struct {
         }
     }
 
-    /// Remove all items and reset state. Used on session reset / /clear.
     pub fn clearAll(self: *Transcript) void {
         self.cancelSelection();
         for (self.items.items) |*item| item.deinit(self.allocator);
@@ -1104,10 +1084,6 @@ pub const Transcript = struct {
         return self.items.items[index].retained_semantic_version;
     }
 
-    /// O(1) check for the P2 retain short-circuit: is there already a
-    /// retained row for this item_id with exactly this semantic_version?
-    /// If true, callers may emit a metadata-only DesiredItem (row=null)
-    /// and skip the full row-build cost.
     pub fn hasRetainedMatch(self: *Transcript, item_id: ItemId, version: SemanticVersion) bool {
         const idx = self.retained_items.get(item_id) orelse return false;
         if (idx >= self.items.items.len) return false;
@@ -1120,7 +1096,6 @@ pub const Transcript = struct {
         return self.layout.follow_bottom;
     }
 
-    /// Clear any pending tool-result routing state.
     pub fn clearPendingToolRouting(self: *Transcript) void {
         self.pending_tools.clearRetainingCapacity();
     }
@@ -1130,7 +1105,6 @@ pub const Transcript = struct {
         tool_call_id: []const u8,
     };
 
-    /// Toggle expansion state on all tool executions.
     pub fn setToolOutputExpanded(self: *Transcript, expanded: bool) void {
         for (self.items.items, 0..) |*item, idx| {
             if (item.kind == .tool_execution) {
@@ -1402,14 +1376,12 @@ pub const Transcript = struct {
         }
     }
 
-    /// Total height of all items at the given width.
     pub fn totalHeight(self: *Transcript, width: u32) u32 {
         if (width == 0) return 0;
         self.ensureLayout(width);
         return self.layout.totalHeight();
     }
 
-    /// Scroll to bottom so last content is visible.
     pub fn scrollToBottom(self: *Transcript, width: u32, visible_height: u32) void {
         self.last_visible_height = visible_height;
         _ = self.totalHeight(width);
@@ -1434,7 +1406,6 @@ pub const Transcript = struct {
         self.layout.follow_bottom = follow_bottom and self.layout.viewport_offset == max_scroll;
     }
 
-    /// Clamp scroll offset against content height after shrink/layout changes.
     fn clampScroll(self: *Transcript) void {
         _ = self.totalHeight(self.last_render_width);
         self.layout.clampScroll(self.last_visible_height);
@@ -1470,7 +1441,6 @@ pub const Transcript = struct {
         return changed;
     }
 
-    /// Render visible items into the region, respecting scroll_offset.
     pub fn render(self: *Transcript, region: Region) void {
         const w = region.width;
         const h = region.height;

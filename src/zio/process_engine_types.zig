@@ -8,10 +8,6 @@ pub const EnvPair = struct {
 
 pub const StreamKind = enum { stdout, stderr };
 
-/// Engine event delivered synchronously to `EventSink.submit`.
-///
-/// `stdout`/`stderr` byte slices are temporary reader stack buffers. A sink that
-/// retains event data after `submit` returns must copy it first.
 pub const Event = union(enum) {
     stdout: []const u8,
     stderr: []const u8,

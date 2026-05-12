@@ -1,35 +1,23 @@
-//! Command registry — ordered aggregation of slash command defs with
-//! visible invocation name resolution.
-//!
-//! Registration always succeeds. Duplicate canonical names resolve into
-//! deterministic visible names (`x:1`, `x:2`, …) in registration order.
-//! Bare `x` is visible only when exactly one command with that canonical
-//! name exists.
-
 const std = @import("std");
 const tool_registry = @import("tool_registry.zig");
 
-/// Slash command definition.
 pub const CommandDef = struct {
-    /// Canonical command name without leading `/`. Owned.
     name: []const u8,
-    /// Visible invocation name (`x` or `x:1`). Owned, rebuilt on every
-    /// registry mutation to keep duplicate numbering truthful.
+
     visible_name: []const u8,
-    /// Short description for `/help`. Owned.
+
     description: []const u8,
-    /// Lua registry ref for the handler closure. The runner closes
-    /// the Lua state on deinit; individual unref calls are not needed.
+
     lua_ref: c_int,
-    /// Provenance — extension file path or "builtin". Borrowed.
+
     source: tool_registry.RegistrationSource,
 };
 
 pub const CommandRegistry = struct {
     allocator: std.mem.Allocator,
-    /// All registered commands in registration order.
+
     entries: std.ArrayListUnmanaged(CommandDef) = .empty,
-    /// Maps visible invocation name → index in `entries`.
+
     visible_index: std.StringHashMapUnmanaged(usize) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) CommandRegistry {
@@ -48,8 +36,6 @@ pub const CommandRegistry = struct {
         self.visible_index.deinit(self.allocator);
     }
 
-    /// Register a command. Always appends; duplicate canonical names
-    /// are resolved into visible invocation names at query time.
     pub fn register(self: *CommandRegistry, cmd: CommandDef) !void {
         const idx = self.entries.items.len;
         try self.entries.append(self.allocator, cmd);
@@ -62,7 +48,6 @@ pub const CommandRegistry = struct {
         try self.rebuildVisibleIndex();
     }
 
-    /// Look up a command by its visible invocation name.
     pub fn getByVisibleName(self: *const CommandRegistry, name: []const u8) ?*const CommandDef {
         const idx = self.visible_index.get(name) orelse return null;
         return &self.entries.items[idx];
@@ -85,8 +70,6 @@ pub const CommandRegistry = struct {
         description: []const u8,
     };
 
-    /// Fill `buf` with visible entries. Returns the number written
-    /// (capped at `buf.len`).
     pub fn visibleEntries(self: *const CommandRegistry, buf: []VisibleEntry) usize {
         const n = @min(buf.len, self.entries.items.len);
         for (self.entries.items[0..n], 0..) |entry, i| {

@@ -23,19 +23,8 @@ test "version line uses app metadata" {
     try std.testing.expectEqualStrings(expected, rendered);
 }
 
-/// Process-level runtime policy for the zi executable.
-///
-/// Keep this module small: it owns process-boundary choices that should be
-/// consistent across startup, not subsystem behavior. Focused runtime modules
-/// (`fs`, `process`, `mailbox`, ...) own behavior.
 pub const use_debug_allocator = false;
 
-/// Main process heap policy.
-///
-/// zi's interactive mode is long-lived and multi-threaded; the default process
-/// heap must stay fast and thread-safe even for `zig build run`. Use external
-/// leak tools / focused tests for deep allocator diagnostics rather than
-/// putting the whole TUI behind DebugAllocator bookkeeping.
 pub const MainHeap = struct {
     debug_allocator: if (use_debug_allocator) std.heap.DebugAllocator(.{}) else void = if (use_debug_allocator) .init else {},
 
@@ -53,9 +42,6 @@ pub const MainHeap = struct {
     }
 };
 
-/// Runtime capabilities captured at the process boundary and threaded through
-/// zi subsystems. Keep this small: it is a capability bag, not a service
-/// locator.
 pub const Caps = struct {
     io: std.Io,
     environ: *const std.process.Environ.Map,

@@ -1,6 +1,3 @@
-//! OpenAI chat/completions SSE provider.
-//! OpenRouter quirks live here; do not generalize without a registered model.
-
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const ai_models = @import("models.zig");
@@ -283,7 +280,6 @@ const ContentBlockState = struct {
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
     tool_args_parsed: std.json.Value = .null,
 
-    // OpenRouter encrypts reasoning in `reasoning_details`.
     thought_signature: ?[]const u8 = null,
 
     fn deinit(self: *ContentBlockState, allocator: std.mem.Allocator) void {
@@ -838,7 +834,6 @@ fn buildRequestJson(
                     .openai_completions => |compat| {
                         if (compat.thinking_format) |fmt| {
                             if (fmt == .openrouter) {
-                                // Omission lets providers choose reasoning.
                                 try jw.objectField("reasoning");
                                 try jw.beginObject();
                                 try jw.objectField("effort");

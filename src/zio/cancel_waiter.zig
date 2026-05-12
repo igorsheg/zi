@@ -1,11 +1,6 @@
 const std = @import("std");
 const cancel = @import("cancel.zig");
 
-/// Private bridge from `cancel.Token` to one local side effect.
-///
-/// This is not a generic guard. It owns exactly one waiter thread that blocks on
-/// a token, invokes one callback at most once on abort, and is always joined by
-/// `stop` before its state is freed.
 pub const Waiter = struct {
     state: ?*State = null,
     thread: ?std.Thread = null,

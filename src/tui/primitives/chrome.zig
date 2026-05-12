@@ -57,8 +57,7 @@ pub const Frame = struct {
     trailing: ?[]const u8 = null,
     border: BorderStyle = .rounded,
     tone: Tone = .neutral,
-    /// Optional escape hatch for existing components that already resolved their
-    /// border token. Prefer `tone` for new callers.
+
     color: ?Color = null,
 
     pub const Layout = struct {

@@ -12,17 +12,16 @@ pub const ToolSnippet = struct {
 };
 
 pub const Options = struct {
-    /// Loader-resolved custom system prompt, if present.
     custom_prompt: ?[]const u8 = null,
     tool_names: []const []const u8 = &.{},
     tool_snippets: []const ToolSnippet = &.{},
     guidelines: []const []const u8 = &.{},
-    /// Pre-formatted skills section, built from loader-owned skills.
+
     skills_section: ?[]const u8 = null,
-    /// Loader-resolved append-system-prompt content.
+
     append_system_prompt: []const []const u8 = &.{},
     cwd: []const u8 = ".",
-    /// Loader-resolved AGENTS/CLAUDE-style project context files.
+
     context_files: []const ContextFile = &.{},
 };
 
@@ -37,7 +36,6 @@ fn effectiveToolNames(tool_names: []const []const u8) []const []const u8 {
     return if (tool_names.len > 0) tool_names else default_tool_names[0..];
 }
 
-/// Normalize cwd: backslash → forward slash (pi-mono system-prompt.ts:40)
 fn normalizeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     const result = try allocator.dupe(u8, cwd);
     for (result) |*c| {
@@ -46,12 +44,6 @@ fn normalizeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     return result;
 }
 
-/// Build the system prompt following pi-mono's system-prompt.ts structure,
-/// while keeping zi branding and zi-local documentation references.
-///
-/// This is a pure builder over already-resolved inputs. Discovery/loading of
-/// custom prompts, append prompts, and AGENTS/CLAUDE context files belongs to
-/// `src/resources/loader.zig`, not to prompt-building callsites.
 pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();

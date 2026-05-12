@@ -1,5 +1,3 @@
-//! Extension keybinding registry — runtime extension-owned key claims.
-
 const std = @import("std");
 const keys = @import("../../../tui/terminal/keys.zig");
 const tool_registry = @import("tool_registry.zig");
@@ -7,17 +5,16 @@ const lua_runtime = @import("../lua_runtime.zig");
 const LuaRef = c_int;
 
 pub const KeybindingDef = struct {
-    /// Stable semantic id. Owned.
     id: []const u8,
-    /// Short description for hotkey help. Owned.
+
     description: []const u8,
-    /// Normalized trigger keys. Owned.
+
     keys: []keys.Key,
-    /// User-facing key labels, parallel to keys. Owned strings + slice.
+
     displays: []const []const u8,
-    /// Lua registry ref for handler closure.
+
     lua_ref: LuaRef,
-    /// Provenance — extension file path or "builtin". Borrowed.
+
     source: tool_registry.RegistrationSource,
 
     pub fn deinit(self: *KeybindingDef, allocator: std.mem.Allocator) void {
@@ -60,7 +57,6 @@ pub const KeybindingRegistry = struct {
         return self.entries.items;
     }
 
-    /// First claimant wins for a physical key inside this generation.
     pub fn matchKey(self: *const KeybindingRegistry, key: keys.Key) ?Match {
         for (self.entries.items) |*entry| {
             for (entry.keys, 0..) |candidate, i| {

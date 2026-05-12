@@ -1,51 +1,3 @@
-//! Event dispatch — walks the chains in `event_registry` and runs
-//! Lua handlers under the observer / mutable / transformable semantics
-//! described in `docs/extensions.md`.
-//!
-//! Three primitives, each generic over the event payload:
-//!
-//!   - `dispatchObserver(...)`     — fire-and-forget, return values
-//!     ignored. Used for lifecycle events (`agent_start`,
-//!     `message_end`, `tool_execution_*`, etc.).
-//!
-//!   - `dispatchCancellable(...) → CancelResult`
-//!     — chain runs in registration order; the first handler that
-//!     returns `{ block = true, reason = ... }` short-circuits and
-//!     the dispatcher returns the block result. Mutations to the
-//!     payload table by earlier handlers are visible to later ones
-//!     (the table is shared across the chain — Lua semantics).
-//!     Used for `tool_call`, `session_before_*`.
-//!
-//!   - `dispatchTransformable(...) → ?std.json.Value`
-//!     — each handler's return value replaces the payload for the
-//!     next handler. The final value is returned to zig as an owned
-//!     `std.json.Value`. Returning `nil` from a handler keeps the
-//!     prior value. Used for `tool_result`, `context`, `input`,
-//!     `before_provider_request`.
-//!
-//! Coroutine model: every handler runs in a fresh coroutine
-//! (`Coroutine.init`), even when it can't yield. This is the spec's
-//! §Lua Coroutine C-Call Model invariant — once host functions like
-//! `zi.spawn` and future yieldable host functions exist, they must yield, and
-//! `lua_resume` is the only way to call something that might. Using
-//! coroutines uniformly avoids a future migration where we'd have
-//! to rewrite the dispatcher.
-//!
-//! For D4 v1 a `LUA_YIELD` return surfaces as `error.UnexpectedYield`
-//! — no host function yields yet, so any yield is a bug. When E5
-//! introduces `zi.spawn`, this site grows the resume loop.
-//!
-//! Payload contract: the caller pushes the event payload onto the
-//! main Lua state's stack BEFORE invoking a dispatch primitive. The
-//! dispatcher copies it onto each handler's coroutine via
-//! `lua_xmove`, so the original stays put across the chain. The
-//! caller is responsible for popping it after dispatch returns.
-//!
-//! Why xmove from main → coroutine instead of building per-call:
-//! the agent integration (D5) will translate `AgentEvent` to a Lua
-//! table once per event, not once per handler. xmove lets us reuse
-//! that work across an arbitrary chain length.
-
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
@@ -73,10 +25,6 @@ pub const DispatchError = error{
     LimitExceeded,
 };
 
-/// Result of a cancellable dispatch. `blocked` is true when any
-/// handler returned `{ block = true }`. `reason` is the optional
-/// string from that same return table (owned by the supplied
-/// allocator); null when the handler omitted it.
 pub const CancelResult = struct {
     blocked: bool,
     reason: ?[]const u8 = null,
@@ -87,11 +35,6 @@ pub const CancelResult = struct {
     }
 };
 
-/// Walk the chain for `kind`, calling each handler with the payload
-/// at `payload_idx` on the main state. Return values are discarded.
-/// On a Lua-side error, logs and continues — observer handlers must
-/// not be able to break the chain via a thrown error (matches
-/// pi-mono's "broken extension is logged per-handler" doctrine).
 pub fn dispatchObserver(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
@@ -107,15 +50,6 @@ pub fn dispatchObserver(
     }
 }
 
-/// Walk the chain for `kind` until a handler returns
-/// `{ block = true, reason? = string }`. Returns `{ blocked = true,
-/// reason }` at the first such handler; otherwise `{ blocked = false }`
-/// after the chain completes.
-///
-/// Lua-side errors during a cancellable chain are NOT silently
-/// swallowed — they surface as `error.HandlerError`. Cancellable
-/// chains gate real behavior (tool execution); a broken handler
-/// failing open could let unsafe operations through.
 pub fn dispatchCancellable(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
@@ -165,20 +99,6 @@ pub fn dispatchCancellable(
     return .{ .blocked = false };
 }
 
-/// Walk the chain for `kind`, feeding each handler's non-nil return
-/// value as the payload for the next handler. Returns the final
-/// payload as an owned `std.json.Value` allocated from `allocator`.
-///
-/// If no handler is registered, returns the original payload (deep-
-/// cloned to the requested allocator). If every handler returns nil,
-/// likewise — the dispatch is the no-op identity.
-///
-/// Implementation note: between handlers we keep the "current
-/// payload" on the MAIN Lua stack at `payload_idx`. Each handler
-/// gets a copy via xmove; if it returns a non-nil value, we
-/// xmove that back to the main stack and `lua_replace` over the
-/// old payload. This keeps the working set small and reuses Lua's
-/// own GC for intermediate tables.
 pub fn dispatchTransformable(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
@@ -231,11 +151,6 @@ pub fn dispatchObserverHandler(
     return runOneHandler(state, runner, h, payload_idx);
 }
 
-/// Push the handler (resolved from the registry ref) onto the
-/// coroutine's stack, then xmove a copy of the main state's payload
-/// onto it. Stack on entry: main has payload at payload_idx.
-/// Stack on success: coroutine has [handler, payload], main is
-/// unchanged (xmove was preceded by lua_pushvalue).
 pub fn pushHandlerAndContextForBridge(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
@@ -269,8 +184,6 @@ fn pushHandlerAndContext(
     runner.setModuleContext(state, provenance);
 }
 
-/// One-shot handler runner used by dispatchObserver. Same shape as
-/// the cancellable/transformable inner loop but discards results.
 fn runOneHandler(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
@@ -303,9 +216,6 @@ fn runOneHandler(
 const testing = std.testing;
 const api_v3 = @import("api_v3.zig");
 
-/// Helper: register `n` handlers for `kind` via the public Lua API,
-/// each one mutating a global counter table so the tests can verify
-/// the chain ran in order.
 fn setupCounterChain(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner, kind_name: [:0]const u8) !void {
     api_v3.install(state, runner);
     try state.doString(

@@ -1,11 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
 
-/// Path-aware fuzzy ranking adapted from natecraddock/zf (MIT).
-///
-/// The algorithm prioritizes basename matches, supports strict path matching
-/// when query tokens contain separators, and can return highlight indices for
-/// matched characters.
 const sep = std.fs.path.sep;
 
 pub const Match = struct {

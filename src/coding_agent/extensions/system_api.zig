@@ -4,7 +4,6 @@ const runner_mod = @import("runner.zig");
 
 const c = lua_runtime.c;
 
-/// Lua `zi.system(argv, opts?)`: yieldable async command returning a result table.
 pub fn ziSystem(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);

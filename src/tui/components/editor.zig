@@ -72,9 +72,9 @@ pub const Editor = struct {
     text_fg: Color = Color.default,
     border_color: Color = Color.default,
     status_data: ?*const StatusData = null,
-    /// Working directory displayed in top border (borrowed, set by Interactive).
+
     cwd: []const u8 = "",
-    /// Git branch displayed in top border (fixed buffer, set by Interactive).
+
     git_branch_buf: [128]u8 = undefined,
     git_branch_len: u8 = 0,
     focused: bool = true,

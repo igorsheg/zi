@@ -1,10 +1,3 @@
-//! Write tool — create or overwrite a file with mkdir-p semantics.
-//!
-//! pi-mono parity: ports `create-file.ts`. Carries over the per-path
-//! mutex from the ts override via `lock_registry`: two concurrent
-//! writes to the same canonicalized path serialize. Deferred:
-//! - file-tracker change record for undo_edit (undo tool not yet ported)
-
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");

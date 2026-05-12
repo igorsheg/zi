@@ -40,8 +40,6 @@ pub const SidePromptEventSink = extension_runner_mod.AiSessionEventSink;
 pub const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 pub const ContextUsage = session_core.context_usage.ContextUsage;
 
-/// Borrowed point-in-time session statistics. String slices borrow from AgentSession
-/// and must not outlive the session they were read from.
 pub const SessionStats = struct {
     session_file: []const u8,
     session_id: []const u8,
@@ -69,7 +67,6 @@ pub const SessionStats = struct {
 const PendingExtensionUi = pending_extension_ui_mod.PendingExtensionUi;
 const session_proto = session_core.protocol;
 
-/// Composition root: agent runtime + store + tools + extension seams.
 pub const AgentSession = struct {
     core: *agent_session_core_mod.AgentSessionCore,
     agent: *Agent,
@@ -84,29 +81,24 @@ pub const AgentSession = struct {
     auth_storage: ?*auth_storage_mod.AuthStorage,
     settings_manager: ?*settings_manager_mod.SettingsManager = null,
     resource_loader: resources.ResourceLoader,
-    /// Borrowed; mutate only on the agent thread.
+
     model_registry: ?*model_registry_mod.ModelRegistry = null,
 
-    /// Current extension generation; swapped only on the agent thread.
     _extension_runner: ?*ExtensionRunner = null,
     _extension_runner_ref: *ExtensionRunnerRef,
 
-    /// Lua state owner; runner borrows it, so destroy runner first.
     _extension_lua_state: ?*lua_runtime.LuaState = null,
     pending_extension_ui: PendingExtensionUi,
     pending_tool_projection_refresh: bool = false,
 
-    /// Separate from persistence subscription; teardown order matters.
     _extension_subscription_token: ?SubscriptionToken = null,
 
-    /// Providers outlive Agent: streams may borrow registry entries.
     _owned_provider_bundle: ?*ai.provider_defaults.Bundle = null,
     _owned_system_prompt: []const u8 = "",
     _builtin_ctx: ?*builtin_util.BuiltinCtx = null,
-    /// True until first post-compaction assistant usage lands.
+
     context_usage_unknown_after_compaction: bool = false,
 
-    /// Agent-thread compaction seam; callbacks must not cross-block.
     compaction_hooks: @import("session/compaction_hooks.zig").CompactionHooks = .{},
 
     pub const RawEventHandler = struct {
@@ -206,7 +198,6 @@ pub const AgentSession = struct {
         };
     }
 
-    /// Test-only wrapper around the production bootstrap path.
     const TestInitOptions = struct {
         model: ai.protocol.Model,
         api_key: []const u8 = "",
@@ -255,12 +246,10 @@ pub const AgentSession = struct {
         });
     }
 
-    /// Agent-thread teardown: lua_close must run on the owner thread.
     pub fn deactivateLifecycleOnAgentThread(self: *AgentSession) void {
         self.deactivateLifecycle();
     }
 
-    /// Unsubscribe before destroy; events can re-enter extensions.
     pub fn shutdownLifecycleOnAgentThread(self: *AgentSession) void {
         self.deactivateLifecycleOnAgentThread();
         self.destroyExtensionRuntime();
@@ -289,7 +278,6 @@ pub const AgentSession = struct {
         self.refreshContextUsageStateFromStore();
     }
 
-    /// Agent-thread only. `/new` always switches to persisted storage.
     pub fn startNewSession(self: *AgentSession) !void {
         var new_store = try SessionStore.createForCwd(self.allocator, self.resource_loader.cwd, self.resource_loader.agent_dir);
         errdefer new_store.deinit();
@@ -304,7 +292,6 @@ pub const AgentSession = struct {
         );
     }
 
-    /// Hot path: do not reread JSONL for post-compaction state.
     pub fn getContextUsage(self: *const AgentSession) ?ContextUsage {
         const model = self.agent.modelValue();
         if (model.context_window == 0) return null;
@@ -342,7 +329,6 @@ pub const AgentSession = struct {
         self.context_usage_unknown_after_compaction = true;
     }
 
-    /// Agent-thread callbacks; must not wait on the TUI thread.
     pub fn setCompactionHooks(
         self: *AgentSession,
         hooks: @import("session/compaction_hooks.zig").CompactionHooks,
@@ -460,7 +446,6 @@ pub const AgentSession = struct {
         }
     }
 
-    /// Activate session-owned lifecycle seams once the session is pinned.
     pub fn activateLifecycle(self: *AgentSession) void {
         self.bindExtensionRuntime();
         self.wireSubscription();
@@ -584,7 +569,6 @@ pub const AgentSession = struct {
         try self.runUserContent(.{ .text = prompt_text });
     }
 
-    /// Run a new user message with explicit text/image content blocks.
     pub fn runUserContent(self: *AgentSession, user_content: ai.protocol.UserMessage.UserMessageContent) !void {
         self.flushPendingToolProjectionRefresh();
         self.wireSubscription();
@@ -623,10 +607,6 @@ pub const AgentSession = struct {
         }, self.allocator);
     }
 
-    /// Continue from loaded session context.
-    /// Expects initial_messages were seeded via Options.
-    /// If transcript ends with assistant (nothing to continue from),
-    /// returns NeedsPrompt so the caller can provide one.
     pub fn continueSession(self: *AgentSession) !void {
         self.flushPendingToolProjectionRefresh();
         self.wireSubscription();
@@ -898,10 +878,6 @@ pub const AgentSession = struct {
         return stats;
     }
 
-    /// Public accessor — the TUI layer uses this to wire the
-    /// runner into `Transcript.lua_runner` for render hook
-    /// dispatch. Returns null in modes without extensions or
-    /// when the runner failed to initialize.
     pub fn extensionRunner(self: *AgentSession) ?*ExtensionRunner {
         return self._extension_runner_ref.current;
     }
@@ -910,7 +886,6 @@ pub const AgentSession = struct {
         return self.session_store.writer.flushed;
     }
 
-    /// Event listener: forwards to user-provided handler, then persists.
     fn eventListener(event: protocol.AgentEvent, ctx: ?*anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(ctx));
 
@@ -2074,7 +2049,6 @@ test "AgentSession: thinking events emitted for thinking content" {
     try testing.expectEqual(@as(usize, 1), thinking_ends);
 }
 
-/// Per-call extension context; stack-owned, all pointers borrowed.
 pub const ExtensionContext = struct {
     session: *anyopaque,
 
@@ -2082,14 +2056,11 @@ pub const ExtensionContext = struct {
 
     has_ui: bool,
 
-    /// Non-null only mid-turn; yieldable host calls must poll it.
     signal: ?*anyopaque = null,
 
-    /// Opaque to avoid tui/extensions import cycles.
     ui: ?*anyopaque = null,
 };
 
-/// Command-only context; unsafe for tool/event mid-turn callbacks.
 pub const ExtensionCommandContext = struct {
     base: ExtensionContext,
 

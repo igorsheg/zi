@@ -10,13 +10,6 @@ const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
 const StatusData = status_data_mod.StatusData;
 const Theme = theme_mod.Theme;
 
-/// Type-erased editor interface for runtime editor swapping.
-///
-/// Matches pi-mono's EditorComponent surface where zi needs parity:
-/// text access/manipulation, history seeding, autocomplete wiring,
-/// appearance knobs, and submit/change callback seams. Interactive mode
-/// should use this interface instead of reaching around to a concrete
-/// editor for those capabilities.
 pub const EditorInterface = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

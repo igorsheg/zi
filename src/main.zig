@@ -5,7 +5,6 @@ const cli = @import("coding_agent/cli/root.zig");
 const runtime_app = @import("runtime/app.zig");
 const env = @import("env");
 
-/// Restore terminal on panic (raw mode, cursor, keyboard protocol).
 pub const panic = terminal_mod.panic;
 pub const std_options: std.Options = .{
     .logFn = logging.logFn,
@@ -17,12 +16,15 @@ pub fn main(init: std.process.Init) !void {
     env.setProcessEnvironment(init.environ_map);
     logging.setThreadLabel(.main);
 
+    // This is the front door. Keep it boring: build the command, wire the runtime, fire once.
+    // If policy leaks in here, somebody made a maze and handed the demon a shotgun.
     var main_heap: runtime_app.MainHeap = .{};
     defer main_heap.deinit();
 
     const heap_allocator = main_heap.allocator();
 
     const allocator = heap_allocator;
+    // Message memory crosses threads. Give it the SMP heap or enjoy haunted ownership bugs.
     const msg_allocator = std.heap.smp_allocator;
 
     var raw_args: std.ArrayListUnmanaged([]const u8) = .empty;

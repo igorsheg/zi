@@ -49,14 +49,11 @@ pub fn formatIsoTimestamp(allocator: std.mem.Allocator, epoch_seconds: i64) ![]u
     });
 }
 
-/// Parse an ISO 8601 timestamp ("YYYY-MM-DDTHH:MM:SS..." format) to epoch milliseconds.
-/// Returns 0 on parse failure.
 pub fn isoToEpochMs(timestamp: []const u8) i64 {
     const secs = parseIsoToEpochSeconds(timestamp) orelse return 0;
     return secs * 1000;
 }
 
-/// Format an ISO 8601 timestamp as relative time: "now", "2m", "1h", "3d", "2w", "1mo", "1y".
 pub fn relativeTimeLabel(iso_ts: []const u8) []const u8 {
     return relativeTimeLabelAt(iso_ts, std.Io.Timestamp.now(std.Options.debug_io, .real).toSeconds());
 }

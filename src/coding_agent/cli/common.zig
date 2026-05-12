@@ -45,9 +45,6 @@ pub fn parseToolAllowlist(
     return list.items;
 }
 
-/// Convert settings CustomModel entries to protocol.Model for ModelRegistry.
-/// Validation (known api, no provider shadowing, non-empty fields, unique ids)
-/// is handled by ModelRegistry.init — this is a thin format adapter.
 pub fn convertCustomModels(
     allocator: std.mem.Allocator,
     customs: ?[]const settings_mod.types.CustomModel,

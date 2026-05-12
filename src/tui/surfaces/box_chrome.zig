@@ -11,14 +11,10 @@ pub const Style = struct {
     dim: Color,
 };
 
-/// Compute total columns used by chrome (gutter + separator).
-/// With gutter:    "  42 │ " = gutter_width + 3 (space + │ + space)
-/// Without gutter: "│ "     = 2
 pub fn chromeWidth(gutter_width: u32) u32 {
     return if (gutter_width > 0) gutter_width + 3 else 2;
 }
 
-/// Draw ╭─[header] or ╭─ at row. Returns 1 (rows consumed).
 pub fn drawTop(region: Region, row: u32, header: ?[]const u8, style: Style) u32 {
     if (row >= region.height) return 0;
     var col: u32 = 0;
@@ -31,9 +27,6 @@ pub fn drawTop(region: Region, row: u32, header: ?[]const u8, style: Style) u32 
     return 1;
 }
 
-/// Draw a content line with optional right-aligned gutter.
-/// Layout: "{gutter} │ {text}" or "│ {text}"
-/// highlight=true: gutter+text at style.fg; false: everything at style.dim
 pub fn drawContentLine(region: Region, row: u32, gutter: ?[]const u8, gutter_width: u32, text: []const u8, style: Style, highlight: bool) u32 {
     if (row >= region.height) return 0;
     const text_color = if (highlight) style.fg else style.dim;
@@ -60,8 +53,6 @@ pub fn drawContentLine(region: Region, row: u32, gutter: ?[]const u8, gutter_wid
     return 1;
 }
 
-/// Draw elision marker: "    · ··· N more lines"
-/// Positioned to align with content (respects gutter_width).
 pub fn drawElision(region: Region, row: u32, count: u32, gutter_width: u32, style: Style) u32 {
     if (row >= region.height) return 0;
     var col: u32 = 0;
@@ -82,21 +73,16 @@ pub fn drawElision(region: Region, row: u32, count: u32, gutter_width: u32, styl
     return 1;
 }
 
-/// Draw ╰──── at row. Returns 1.
 pub fn drawBottom(region: Region, row: u32, style: Style) u32 {
     if (row >= region.height) return 0;
     _ = region.writeStr(0, row, "╰────", style.chrome, Color.default, .{});
     return 1;
 }
 
-/// Measure total height for box-chrome rendered content.
-/// top(1) + visible_lines + elision_markers + bottom(1)
 pub fn measureHeight(visible_lines: u32, gap_count: u32) u32 {
     return 1 + visible_lines + gap_count + 1;
 }
 
-/// Draw closed top border: ╭─ {left} ──── {right} ─╮
-/// Labels are optional. Fill with ─ between them.
 fn drawClosedTopBorder(region: Region, row: u32, left: ?[]const u8, right: ?[]const u8, style: Style) u32 {
     if (row >= region.height or region.width < 4) return 0;
     const w = region.width;
@@ -145,7 +131,6 @@ fn drawClosedTopBorder(region: Region, row: u32, left: ?[]const u8, right: ?[]co
     return 1;
 }
 
-/// Draw closed bottom border: ╰─────╯
 fn drawClosedBottomBorder(region: Region, row: u32, style: Style) u32 {
     if (row >= region.height or region.width < 4) return 0;
     const w = region.width;
@@ -163,7 +148,6 @@ fn drawClosedBottomBorder(region: Region, row: u32, style: Style) u32 {
     return 1;
 }
 
-/// Returns the width strictly inside a closed frame, excluding both borders.
 pub fn closedInnerWidth(total_width: u32) u32 {
     return if (total_width > 2) total_width - 2 else 1;
 }
@@ -200,9 +184,6 @@ pub const ClosedFrame = struct {
         return drawClosedBottomBorder(self.outer, self.outer.height - 1, style);
     }
 
-    /// Draw both side borders for a closed content row: │ ... │
-    /// `body_row` is indexed within the box body, so 0 is the first row
-    /// beneath the top border.
     pub fn drawBodyRow(self: ClosedFrame, body_row: u32, style: Style) u32 {
         if (self.outer.width == 0 or self.outer.height <= 2) return 0;
         if (body_row >= self.body.height) return 0;

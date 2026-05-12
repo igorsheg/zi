@@ -1,15 +1,3 @@
-//! Compaction executor.
-//!
-//! Orchestration / glue layer. Pure domain logic (cut-point selection,
-//! split-turn detection, file-op extraction, summarization-input
-//! serialization) lives in `compaction_prep.zig`. This file only:
-//!  - fans out to the pure prep module
-//!  - performs the LLM completion(s) needed to produce summaries
-//!  - composes the final summary (history + split-turn prefix + file-ops)
-//!  - mutates the session store via applyCompaction and refreshes agent context
-//!
-//! Keep it thin — pi-mono's `compact()` in compaction.ts is the reference.
-
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
@@ -255,9 +243,6 @@ test "compactor prepares from current branch including entries appended after ca
     const old_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxText("old answer")};
     _ = session.session_store.appendMessage(.{ .assistant = faux.fauxAssistantMessage(allocator, &old_content, .stop) }) orelse return error.TestUnexpectedResult;
 
-    // Populate the session store cache, then append more flushed entries. This
-    // recreates the resumed-session shape where readEntries() alone is stale and
-    // buildCurrentBranchAlloc() must merge writer.appended_entries.
     _ = try session.session_store.readEntries();
 
     _ = session.session_store.appendMessage(.{ .user = .{ .content = .{ .text = "new user" }, .timestamp = 3 } }) orelse return error.TestUnexpectedResult;
@@ -296,9 +281,6 @@ fn entryIdExists(entries: []const @import("../../session/protocol.zig").SessionE
     return false;
 }
 
-/// Build the persisted `details` JSON object — pi-mono shape
-/// `{ "readFiles": string[], "modifiedFiles": string[] }`. Allocates from the
-/// session's long-lived allocator so the value outlives any executor-local arena.
 fn buildDetailsJson(
     allocator: std.mem.Allocator,
     file_lists: prep.ComputedFileLists,

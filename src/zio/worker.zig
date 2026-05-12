@@ -2,22 +2,6 @@ const std = @import("std");
 const queue_mod = @import("queue.zig");
 const task_mod = @import("task.zig");
 
-/// A tiny typed worker-thread wrapper around `zio.queue.Queue`.
-///
-/// This owns only mechanics: thread spawn/join, queue wait/drain, and
-/// drained-request cleanup. Product semantics stay in the typed `Handler`.
-///
-/// Handler contract:
-///
-///   pub fn handle(self: *Handler, request: *Request) void
-///
-/// Request payloads that own memory should provide:
-///
-///   pub fn deinit(self: *Request, allocator: std.mem.Allocator) void
-///
-/// The queue also uses `.cleanup = .deinit` for undelivered queued items;
-/// this wrapper cleans only requests that were transferred to the worker by
-/// `drainInto`.
 pub fn Worker(
     comptime Request: type,
     comptime Handler: type,
@@ -73,8 +57,6 @@ pub fn Worker(
             self.tasks = group;
         }
 
-        /// Ordered shutdown: stop accepting new requests, let the worker drain
-        /// already queued requests, then join it.
         pub fn stop(self: *Self) void {
             self.queue.close();
             if (self.tasks) |*group| {

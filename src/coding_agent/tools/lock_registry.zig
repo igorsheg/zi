@@ -1,51 +1,9 @@
-//! Process-global keyed mutex registry for serializing concurrent
-//! access to shared resources (primarily file paths).
-//!
-//! Mirrors `~/.pi/agent/extensions/tools/lib/mutex.ts` from the user's
-//! custom pi config: a module-level `Map<key, Mutex>` keyed by the
-//! canonicalized form of a path so that two relative paths pointing at
-//! the same file share one lock.
-//!
-//! # Thread safety contract
-//!
-//! - `meta` guards the key→entry map and entry refcount mutations.
-//! - Each `Entry` owns its own `mu` for the actual mutual exclusion.
-//!
-//! RULE: NEVER hold `meta` while blocking on `entry.mu`. Doing so
-//! would let one thread's acquire serialize behind another thread's
-//! long-running critical section on an unrelated key.
-//!
-//! Lock order:
-//!   acquire: meta.lock → map lookup/insert → refcount++ → meta.unlock → entry.mu.lock
-//!   release: entry.mu.unlock → meta.lock → refcount-- → maybe free → meta.unlock
-//!
-//! # Canonicalization
-//!
-//! `canonicalizePath` tries `std.fs.realpath`, falling back to
-//! `std.fs.path.resolve` when the path does not exist yet (the
-//! create-file case). This matches the ts override's fallback from
-//! `realpathSync.native` to `path.resolve`.
-//!
-//! # Usage
-//!
-//! ```zig
-//! const lr = @import("lock_registry.zig");
-//! const entry = try lr.global().acquirePath(tmp_alloc, "/abs/path");
-//! defer lr.global().release(entry);
-//! // ... exclusive file work ...
-//! ```
-//!
-//! For synthetic keys (e.g. bash's per-repo git lock) use `acquireKey`
-//! directly — the caller is responsible for canonicalizing the base
-//! path component if cross-alias serialization matters.
-
 const std = @import("std");
 
 pub const Entry = struct {
     mu: std.Io.Mutex = .init,
     refcount: u32 = 0,
-    /// Owned by the registry's allocator; used by `release` to
-    /// remove the map entry when refcount hits zero.
+
     key: []const u8 = "",
 };
 
@@ -54,8 +12,6 @@ pub const Registry = struct {
     gpa: std.mem.Allocator,
     locks: std.StringHashMapUnmanaged(*Entry) = .empty,
 
-    /// Acquire an exclusive lock on `key`. Blocks until available.
-    /// Caller must pair with `release(entry)`.
     pub fn acquireKey(self: *Registry, key: []const u8) !*Entry {
         self.meta.lockUncancelable(std.Options.debug_io);
         const entry = blk: {
@@ -77,17 +33,12 @@ pub const Registry = struct {
         return entry;
     }
 
-    /// Canonicalize `path` and acquire a lock on the result. `tmp_alloc`
-    /// is used for the canonicalization scratch space only; the key
-    /// stored in the registry is owned by the registry's own allocator.
     pub fn acquirePath(self: *Registry, tmp_alloc: std.mem.Allocator, path: []const u8) !*Entry {
         const canon = try canonicalizePath(tmp_alloc, path);
         defer tmp_alloc.free(canon);
         return self.acquireKey(canon);
     }
 
-    /// Release a previously-acquired entry. Decrements refcount and
-    /// frees the entry when no other holders remain.
     pub fn release(self: *Registry, entry: *Entry) void {
         entry.mu.unlock(std.Options.debug_io);
 
@@ -103,15 +54,11 @@ pub const Registry = struct {
         }
     }
 
-    /// Release the hashmap backing storage. Only meaningful for
-    /// test-scoped registries — the process-global singleton is
-    /// never deinit'd. Asserts no outstanding locks.
     pub fn deinit(self: *Registry) void {
         std.debug.assert(self.locks.count() == 0);
         self.locks.deinit(self.gpa);
     }
 
-    /// Test-only: current number of tracked entries.
     pub fn liveEntryCount(self: *Registry) usize {
         self.meta.lockUncancelable(std.Options.debug_io);
         defer self.meta.unlock(std.Options.debug_io);
@@ -119,11 +66,6 @@ pub const Registry = struct {
     }
 };
 
-/// Canonicalize a path for use as a lock key. Uses `std.fs.realpath`
-/// when the path exists, falling back to `std.fs.path.resolve` when
-/// it doesn't (e.g. create-file on a not-yet-existing target).
-///
-/// Caller owns the returned slice.
 pub fn canonicalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, path, allocator)) |real_z| {
         defer allocator.free(real_z);
@@ -135,8 +77,6 @@ pub fn canonicalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 var g_registry: Registry = .{ .gpa = std.heap.page_allocator };
 
-/// Process-global registry. Never deinit'd; lives for the process
-/// lifetime. Matches the module-level `Map` in the ts override.
 pub fn global() *Registry {
     return &g_registry;
 }

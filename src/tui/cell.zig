@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// Terminal color for rendering.
 pub const Color = union(enum) {
     default_color,
     rgb24: struct {
@@ -10,7 +9,6 @@ pub const Color = union(enum) {
     },
     index: u8,
 
-    /// Terminal default color — renderer emits \x1b[39m / \x1b[49m.
     pub const default: Color = .default_color;
 
     pub fn eql(a: Color, b: Color) bool {
@@ -36,7 +34,6 @@ pub const Color = union(enum) {
     }
 };
 
-/// Text attributes as a packed struct for compact storage.
 pub const Attributes = packed struct(u8) {
     bold: bool = false,
     dim: bool = false,
@@ -54,10 +51,6 @@ pub const Attributes = packed struct(u8) {
     }
 };
 
-/// Grapheme content of a cell.
-/// Single codepoints (>99% of cells) are stored inline.
-/// Multi-codepoint clusters (emoji ZWJ sequences, combining marks) are stored
-/// as an index into a GraphemePool managed by the Buffer.
 pub const Grapheme = union(enum) {
     codepoint: u21,
     pooled: u32,
@@ -76,16 +69,14 @@ pub const Grapheme = union(enum) {
     }
 };
 
-/// The atomic rendering unit. Every screen position is a Cell.
 pub const Cell = struct {
     grapheme: Grapheme = .{ .codepoint = ' ' },
     fg: Color = Color.default,
     bg: Color = Color.default,
     attrs: Attributes = .{},
-    /// Display width: 1 = normal, 2 = wide char (CJK), 0 = continuation cell
-    /// (right half of a wide char — renderer skips these).
+
     width: u2 = 1,
-    /// Non-zero = hyperlink. Index into per-frame link table on the Buffer.
+
     link_id: u16 = 0,
 
     pub const blank: Cell = .{};
@@ -100,7 +91,6 @@ pub const Cell = struct {
     }
 };
 
-/// Cursor style for components that want a visible cursor.
 pub const CursorStyle = enum {
     block,
     underline,

@@ -1,7 +1,3 @@
-//! Ls tool — directory listing shadow that delegates to read's
-//! directory walk. Models call `ls` by habit; this answers without a
-//! second round-trip and steers them toward `read` for future calls.
-
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");

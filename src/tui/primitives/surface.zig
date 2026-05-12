@@ -128,13 +128,10 @@ pub const Buffer = struct {
         if (x >= self.width or y >= self.height) return;
         const idx = @as(usize, y) * @as(usize, self.width) + @as(usize, x);
 
-        // If replacing a continuation cell, clear the probable start cell to
-        // avoid stale wide/grapheme left halves after partial overwrites.
         if (self.cells[idx].width == 0 and x > 0) {
             self.cells[idx - 1] = Cell.blank;
         }
 
-        // If replacing a wide/grapheme start, clear its continuation cells.
         const old = self.cells[idx];
         if (old.width > 1) {
             var i: u32 = 1;
@@ -145,7 +142,6 @@ pub const Buffer = struct {
 
         self.cells[idx] = c;
 
-        // Install continuation cells for wide/grapheme starts.
         if (c.width > 1) {
             var i: u32 = 1;
             while (i < c.width and x + i < self.width) : (i += 1) {

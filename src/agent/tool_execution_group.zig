@@ -3,12 +3,6 @@ const zio = @import("../zio/root.zig");
 const protocol = @import("types.zig");
 const json_util = @import("../ai/json_util.zig");
 
-/// Agent-domain tool execution event stream.
-///
-/// This primitive owns the concurrency boundary for worker-thread tool calls and
-/// presents the agent loop with a single stream of live updates and final
-/// completions. The loop decides policy; this type owns scheduling, wakeup, and
-/// event ownership.
 pub const ToolExecutionEvent = union(enum) {
     update: ToolUpdate,
     completed: ToolCompletion,
@@ -90,15 +84,9 @@ pub const ToolExecutionGroup = struct {
     }
 
     pub fn emit(self: *ToolExecutionGroup, event: ToolExecutionEvent) void {
-        // `emit` is called from worker tasks while `cancel` may be running on the
-        // agent thread. Do not inspect `closed` here: the mailbox is the
-        // synchronized ownership boundary and cleans undelivered events after it
-        // is closed.
         self.events.send(event);
     }
 
-    /// Returns null after all worker completions have been observed and queued
-    /// updates have drained. Uses the mailbox wake pipe rather than sleep polling.
     pub fn next(self: *ToolExecutionGroup) !?ToolExecutionEvent {
         while (true) {
             var one: [1]ToolExecutionEvent = undefined;

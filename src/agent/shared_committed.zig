@@ -2,8 +2,6 @@ const std = @import("std");
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 
-/// A single committed chunk of messages. Owns its string data in an
-/// arena. Immutable once constructed. Refcounted.
 pub const CommittedSegment = struct {
     refs: std.atomic.Value(u32),
     arena: std.heap.ArenaAllocator,
@@ -54,20 +52,6 @@ pub const CommittedSegment = struct {
     }
 };
 
-/// A refcounted snapshot of the committed conversation. Cross-thread
-/// payload shape: each publish is a single retain() of the current
-/// SharedCommitted, with no deep copy.
-///
-/// Layout:
-/// - segments: refcounted chunks. Each commit appends one segment.
-///   Segments are immutable once created and live until every
-///   SharedCommitted that references them releases.
-/// - flat: shallow struct copies of every message across all segments,
-///   in order. Strings inside these structs still point into the
-///   respective segments' arenas — flat does NOT own the string data,
-///   segments do. Rebuilt on every construction (O(N) pointer-level
-///   copies, one-time per commit — dramatically cheaper than deep clone
-///   per publish).
 pub const SharedCommitted = struct {
     refs: std.atomic.Value(u32),
     segments: []*CommittedSegment,
@@ -78,10 +62,6 @@ pub const SharedCommitted = struct {
         return try constructFromSegments(parent_allocator, &.{});
     }
 
-    /// Build SharedCommitted from a flat slice of messages. Used on the
-    /// cold rebuild paths (truncateCommitted / setMessages / reset /
-    /// Agent.init with seed messages). Deep-copies messages into one
-    /// new segment.
     pub fn fromMessages(
         parent_allocator: std.mem.Allocator,
         messages: []const protocol.AgentMessage,
@@ -97,9 +77,6 @@ pub const SharedCommitted = struct {
         return constructFromSegments(parent_allocator, segs);
     }
 
-    /// Hot path: produce a new SharedCommitted that extends `old` with
-    /// the supplied message (deep-copied into a fresh segment). Caller
-    /// is responsible for releasing `old` after swapping.
     pub fn appendMessage(
         parent_allocator: std.mem.Allocator,
         old: *SharedCommitted,
@@ -108,9 +85,6 @@ pub const SharedCommitted = struct {
         return appendMessages(parent_allocator, old, &[_]protocol.AgentMessage{message});
     }
 
-    /// Append a batch of messages as one immutable segment and rebuild the
-    /// shallow flat view once. Long sessions pay O(history) per committed
-    /// batch instead of once per assistant/tool-result message.
     pub fn appendMessages(
         parent_allocator: std.mem.Allocator,
         old: *SharedCommitted,

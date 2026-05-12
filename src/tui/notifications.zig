@@ -1,7 +1,5 @@
 const std = @import("std");
 
-/// Core notification domain shared by zi-native flows and extension adapters.
-/// This module intentionally knows nothing about Lua or extension UI targets.
 pub const Level = enum { debug, info, warn, error_, success };
 
 pub const Lifetime = union(enum) {

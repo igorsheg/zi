@@ -1,29 +1,3 @@
-//! Lua 5.4 runtime wrapper — owned by ExtensionRunner.
-//!
-//! This module is the SOLE bridge between zig and `lua_State *`. Higher
-//! layers (loader, registries, hook dispatch) must go through `LuaState`
-//! and never touch the C API directly. Doing so keeps lifetime, error
-//! normalization, and the coroutine c-call discipline in one place.
-//!
-//! Scope (Phase B2):
-//!   - allocate / close `lua_State` with a zig-backed allocator
-//!   - open the standard libraries
-//!   - create coroutines (`lua_newthread`) and pin them via the registry
-//!   - resume / yield plumbing using `lua_resume` + `lua_yieldk`
-//!   - error normalization helpers
-//!
-//! Out of scope here (Phase D and beyond):
-//!   - the `zi.*` host API table
-//!   - tool / event / command registries
-//!   - the actual yieldable host functions (`zi.spawn`, `ctx.ui.*`)
-//!
-//! Coroutine c-call discipline (see `docs/extensions.md`): every tool
-//! execution and event handler runs in a
-//! dedicated coroutine. The infrastructure below assumes the same and
-//! never calls `lua_pcall` on a function that may yield. Yieldable host
-//! functions MUST use `lua_yieldk` with a continuation, otherwise Lua
-//! raises "attempt to yield across C-call boundary" at runtime.
-
 const std = @import("std");
 const limits = @import("limits.zig");
 
@@ -33,11 +7,6 @@ pub const c = @cImport({
     @cInclude("lualib.h");
 });
 
-/// Header prepended to every block so we can recover the original size on
-/// free / realloc. Lua's `lua_Alloc` contract gives us `osize` only when
-/// `ptr != NULL`; we still need an aligned block, so we over-allocate by
-/// `header_align` bytes and stash the size in the slot immediately before
-/// the user pointer.
 const header_align: usize = @alignOf(usize) * 2;
 const header_alignment: std.mem.Alignment = .fromByteUnits(header_align);
 
@@ -46,9 +15,6 @@ const BlockHeader = extern struct {
     _pad: usize = 0,
 };
 
-/// Userdata passed to `lua_newstate`. We need a stable pointer to the
-/// allocator across the Lua state's lifetime; `LuaState` stores it inline
-/// and hands its address to `lua_newstate`.
 const AllocatorUd = struct {
     allocator: std.mem.Allocator,
 };
@@ -107,19 +73,9 @@ pub const LuaError = error{
     InvalidCoroutineState,
 };
 
-/// Owned wrapper around `lua_State *`. Created with a zig allocator so the
-/// runner controls all Lua memory and can audit it via the same gpa as the
-/// rest of the agent.
-///
-/// One `LuaState` per `ExtensionRunner` generation. Closing the state
-/// releases EVERYTHING: registries, refs, compiled chunks, coroutines.
-/// The runner is responsible for ordering `deinit` so any zig-side state
-/// that points into Lua memory is dropped first.
 pub const LuaState = struct {
     allocator: std.mem.Allocator,
-    /// Heap-allocated so its address survives `LuaState` moves. The Lua
-    /// state stores this pointer as the alloc userdata for its entire
-    /// lifetime; if it dangled we'd corrupt every allocation.
+
     ud: *AllocatorUd,
     L: *c.lua_State,
 
@@ -139,9 +95,6 @@ pub const LuaState = struct {
         self.* = undefined;
     }
 
-    /// Compile + execute a chunk in the main thread. Use only for top-
-    /// level extension loading or simple, non-yielding tests. Anything
-    /// that may yield (`zi.spawn`, ui calls) MUST go through a coroutine.
     pub fn doString(self: *LuaState, src: []const u8, chunk_name: [:0]const u8) LuaError!void {
         const load_rc = c.luaL_loadbufferx(self.L, src.ptr, src.len, chunk_name.ptr, null);
         if (load_rc != c.LUA_OK) return mapLoadError(self.L, load_rc);
@@ -149,24 +102,11 @@ pub const LuaState = struct {
         if (call_rc != c.LUA_OK) return mapCallError(self.L, call_rc);
     }
 
-    /// Compile a chunk and leave the resulting function on the top of
-    /// the stack. The caller decides what to do with it (call now,
-    /// store via `luaL_ref`, etc.). Used by the extension loader to
-    /// capture factories without invoking them, so the loader can
-    /// hand a fresh `zi` table to each one.
     pub fn loadChunk(self: *LuaState, src: []const u8, chunk_name: [:0]const u8) LuaError!void {
         const rc = c.luaL_loadbufferx(self.L, src.ptr, src.len, chunk_name.ptr, null);
         if (rc != c.LUA_OK) return mapLoadError(self.L, rc);
     }
 
-    /// Push a C function as a closure with one upvalue (a light
-    /// userdata pointer). The C function reads the pointer back via
-    /// `lua_upvalueindex(1)`. This is the canonical way to give a
-    /// stateless C function access to per-state context (in our case
-    /// the `ExtensionRunner` it should mutate).
-    ///
-    /// The closure is left on top of the stack — caller stores it
-    /// wherever they want (global, table field, etc.).
     pub fn pushCClosureWithUserdata(
         self: *LuaState,
         func: c.lua_CFunction,
@@ -176,20 +116,6 @@ pub const LuaState = struct {
         c.lua_pushcclosure(self.L, func, 1);
     }
 
-    /// Configure Lua's `package.path` from explicit module roots.
-    ///
-    /// Builds the canonical `<dir>/?.lua;<dir>/?/init.lua` pair for
-    /// each search directory. Empty string entries are skipped.
-    /// Silently tolerates allocation failure (package.path stays at
-    /// the Lua default — extensions that use `require` will just
-    /// fail to find modules, which is caught by the loader's
-    /// per-extension error handling).
-    ///
-    /// The extension system follows a Neovim-style runtime layout:
-    /// bundled extensions put private modules under
-    /// `extensions/<id>/lua/`, and runtime roots can expose shared
-    /// modules under `<root>/lua/`. A bundled extension can require
-    /// `my_ext.render` from `extensions/my-ext/lua/my_ext/render.lua`.
     pub fn setPackagePath(self: *LuaState, dirs: []const []const u8) !void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -207,9 +133,6 @@ pub const LuaState = struct {
         c.lua_setfield(self.L, -2, "path");
     }
 
-    /// Set `package.path` to an already-built string. Used by
-    /// `ExtensionRunner.setModuleContext` when it has composed the
-    /// full private + shared + default path externally.
     pub fn setPackagePathRaw(self: *LuaState, path: []const u8) void {
         _ = c.lua_getglobal(self.L, "package");
         defer c.lua_pop(self.L, 1);
@@ -273,24 +196,6 @@ const presentation_truncated_marker = "... [truncated by zi presentation boundar
 const presentation_omitted_marker = "... [items omitted by zi presentation boundary] ...";
 const presentation_depth_marker = "... [depth limit reached by zi presentation boundary] ...";
 
-/// Read a Lua-stack value at the given (absolute or negative) index
-/// and produce an owned `std.json.Value`. Recursively walks tables.
-///
-/// Ownership: every string and every nested map/array is allocated
-/// from `allocator`. The returned value is COMPLETELY independent of
-/// the Lua state — the caller can collect it after the Lua stack
-/// unwinds, GCs, or the whole `lua_close` happens. This is the spec's
-/// §Ownership-and-Reload invariant: "Zig never stores pointers into
-/// Lua-managed memory."
-///
-/// Table ↔ JSON shape rule: a Lua table whose keys are exactly
-/// `1..#t` (a "sequence" in Lua parlance) becomes a JSON array.
-/// Anything else becomes an object with stringified keys. The
-/// detection uses `lua_rawlen` for the length and a single pass over
-/// the keys via `lua_next`. Mixed-shape tables (sparse arrays, or
-/// arrays with extra string keys) collapse to objects — JSON has no
-/// mixed shape, and this matches how pi-mono's TypeBox-driven
-/// schemas serialize today.
 pub fn luaValueToJson(
     L: *c.lua_State,
     index: c_int,
@@ -679,21 +584,6 @@ fn isSequence(L: *c.lua_State, table_idx: c_int, expected_len: usize) bool {
     return true;
 }
 
-/// Push a `std.json.Value` onto the Lua stack as the equivalent
-/// Lua type. The inverse of `luaValueToJson` — used by the event
-/// bridge to convert agent-side payloads (which carry
-/// `std.json.Value` for tool args, message content, etc.) into Lua
-/// tables that handlers can read.
-///
-/// Ownership: the pushed Lua values are independent copies. Strings
-/// are duplicated by Lua's own allocator (`lua_pushlstring` copies);
-/// nested tables are constructed inline. Caller may free the source
-/// `std.json.Value` immediately after the call returns.
-///
-/// On allocator failure (Lua's internal allocator is wired to the
-/// runner's gpa via `LuaState.init`), this returns
-/// `error.OutOfMemory` and the partial state is left on the stack
-/// for the caller to clean up via `lua_settop`.
 pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
     switch (value) {
         .null => c.lua_pushnil(L),
@@ -726,42 +616,19 @@ pub fn pushJsonValue(L: *c.lua_State, value: std.json.Value) ConvertError!void {
     }
 }
 
-/// Free a `std.json.Value` previously produced by `luaValueToJson`.
-/// Re-exported from `src/json/value.zig` — the extensions package
-/// can safely depend on the generic json module (no upward deps).
-/// Consumers historically imported this from `lua_runtime`; the
-/// re-export preserves their call sites.
 pub const freeJsonValue = @import("../../json/value.zig").freeJsonValue;
 
-/// A Lua thread (coroutine) pinned via the registry so the GC can't reap
-/// it while zig still needs to resume it. Tied to a parent `LuaState`;
-/// the parent owns the underlying memory and the registry slot.
 pub const Coroutine = struct {
     parent: *LuaState,
-    /// Registry reference (`LUA_REGISTRYINDEX` slot) keeping the thread
-    /// rooted. Released by `deinit` via `luaL_unref`.
+
     ref: c_int,
-    /// The coroutine's `lua_State *`. Borrowed from `parent`; do not
-    /// `lua_close` it directly.
+
     L: *c.lua_State,
 
-    /// Create a fresh coroutine with no body on its stack. Caller is
-    /// expected to push a function (and any initial args) before the
-    /// first `resume`.
     pub fn init(parent: *LuaState) LuaError!Coroutine {
         return initFrom(parent, parent.L);
     }
 
-    /// Like `init`, but allocates the new thread off `from_L` instead
-    /// of `parent.L`. Use this when you're called from inside a host
-    /// C function that's running on a coroutine — Lua API calls must
-    /// happen on the *currently executing* thread, not on the main
-    /// state, otherwise `lua_newthread` pushes onto a non-current
-    /// stack and the next `lua_resume` corrupts state.
-    ///
-    /// `parent` is still kept around so `deinit` has a known-alive
-    /// state to call `luaL_unref` on (the registry is global to the
-    /// shared global_State, so any thread works).
     pub fn initFrom(parent: *LuaState, from_L: *c.lua_State) LuaError!Coroutine {
         const L = c.lua_newthread(from_L) orelse return error.OutOfMemory;
         const ref = c.luaL_ref(from_L, c.LUA_REGISTRYINDEX);
@@ -776,10 +643,6 @@ pub const Coroutine = struct {
 
     pub const Status = enum { ok, yielded, finished };
 
-    /// Resume the coroutine with `nargs` already pushed onto its stack.
-    /// On `yielded`, the values yielded by Lua remain on the coroutine
-    /// stack and `nresults` reports how many. On `ok`/`finished`, the
-    /// final return values are on the stack.
     pub fn resumeWith(self: *Coroutine, nargs: c_int) LuaError!struct {
         status: Status,
         nresults: c_int,
@@ -821,10 +684,6 @@ fn mapError(L: *c.lua_State, err: LuaError) LuaError {
     return err;
 }
 
-/// Pop and discard the error message Lua leaves on the stack after a
-/// failed `lua_pcallk` / `lua_resume`. Higher layers will eventually
-/// capture this string into a structured tool result; for now we just
-/// keep the stack clean so subsequent operations behave.
 fn consumeErrorMessage(L: *c.lua_State) void {
     if (c.lua_gettop(L) > 0) c.lua_pop(L, 1);
 }

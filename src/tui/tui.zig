@@ -19,17 +19,6 @@ const Terminal = terminal_mod.Terminal;
 const Key = keys_mod.Key;
 const Region = buffer_mod.Region;
 
-/// Reusable TUI infrastructure — terminal, renderer, focus, overlays, layout tree.
-///
-/// Reusable TUI infrastructure: terminal, renderer, focus, overlays, root layout tree.
-///
-/// Interactive mode composes this with domain-specific state (editor, transcript,
-/// agent thread, event queue). Extensions interact through this interface.
-///
-/// Focus/cursor split:
-///   - FocusManager is source of truth for input routing and focus state.
-///   - Base-tree cursor placement is resolved from the root layout tree.
-///   - Overlay cursor bypasses the root tree (resolved from overlay layout).
 pub const TUI = struct {
     allocator: std.mem.Allocator,
     terminal: Terminal,
@@ -59,21 +48,14 @@ pub const TUI = struct {
         self.terminal.deinit();
     }
 
-    /// Set the focused component. Notifies old and new components via setFocused().
-    /// Matches pi-mono TUI.setFocus().
     pub fn setFocus(self: *TUI, target: ?Component) void {
         self.focus.setFocus(target);
     }
 
-    /// Route keyboard input to the focused component.
-    /// Returns true if the focused component consumed the key.
     pub fn handleInput(self: *TUI, key: Key) bool {
         return self.focus.handleInput(key);
     }
 
-    /// Show an overlay component. Saves current focus, sets focus to the overlay
-    /// (unless non_capturing), returns a handle for controlling it.
-    /// Matches pi-mono TUI.showOverlay().
     pub fn showOverlay(self: *TUI, comp: Component, options: OverlayOptions) OverlayHandle {
         const pre_focus = self.focus.current;
         const entry_id = self.overlays.showOverlayReturnId(comp, options, pre_focus);
@@ -87,9 +69,6 @@ pub const TUI = struct {
         return .{ .id = entry_id, .tui = self };
     }
 
-    /// Hide the topmost overlay and restore previous focus.
-    /// Matches pi-mono TUI.hideOverlay() — restores focus when the popped
-    /// overlay had focus, even if pre_focus is null.
     pub fn hideOverlay(self: *TUI) void {
         if (self.overlays.stack.items.len == 0) return;
         const top = self.overlays.stack.items[self.overlays.stack.items.len - 1];
@@ -149,8 +128,6 @@ pub const TUI = struct {
         return changed;
     }
 
-    /// Render the layout tree and overlays into the cell buffer.
-    /// Returns the cursor state (if any focused component reports one).
     pub fn render(self: *TUI) ?CursorState {
         const region = self.renderer.begin();
 
@@ -172,7 +149,6 @@ pub const TUI = struct {
         return null;
     }
 
-    /// Check for terminal resize. Returns true if size changed.
     pub fn checkResize(self: *TUI) bool {
         self.terminal.updateSize();
         if (self.terminal.width != self.renderer.width or self.terminal.height != self.renderer.height) {
@@ -183,8 +159,6 @@ pub const TUI = struct {
         return false;
     }
 
-    /// If the focused component lives in a visible overlay, compute its cursor
-    /// from the overlay's resolved position + component-relative cursor.
     fn overlayFocusCursor(self: *TUI) ?CursorState {
         const focused = self.focus.current orelse return null;
         for (self.overlays.stack.items) |*entry| {
@@ -208,14 +182,10 @@ pub const TUI = struct {
     }
 };
 
-/// Handle for controlling a specific overlay.
-/// Wired into TUI's focus management — hide/focus/unfocus update the FocusManager.
-/// Matches pi-mono's OverlayHandle interface.
 pub const OverlayHandle = struct {
     id: u64,
     tui: *TUI,
 
-    /// Permanently remove the overlay.
     pub fn hide(self: OverlayHandle) void {
         const entry = self.tui.overlays.findEntry(self.id) orelse return;
         const pre_focus = entry.pre_focus;
@@ -232,7 +202,6 @@ pub const OverlayHandle = struct {
         self.tui.dirty = true;
     }
 
-    /// Temporarily hide or show the overlay.
     pub fn setHidden(self: OverlayHandle, hidden: bool) void {
         const entry = self.tui.overlays.findEntry(self.id) orelse return;
         if (entry.hidden == hidden) return;
@@ -268,7 +237,6 @@ pub const OverlayHandle = struct {
         self.tui.dirty = true;
     }
 
-    /// Focus this overlay and bring it to the visual front.
     pub fn focus(self: OverlayHandle) void {
         const entry = self.tui.overlays.findEntry(self.id) orelse return;
         if (entry.hidden) return;
@@ -280,7 +248,6 @@ pub const OverlayHandle = struct {
         self.tui.dirty = true;
     }
 
-    /// Release focus to the previous target.
     pub fn unfocus(self: OverlayHandle) void {
         const entry = self.tui.overlays.findEntry(self.id) orelse return;
         const comp = entry.component;

@@ -15,7 +15,6 @@ pub const FileSettingsStorage = struct {
         .deinit = deinitImpl,
     };
 
-    /// pi-mono: settings-manager.ts:146-149
     pub fn init(
         allocator: std.mem.Allocator,
         cwd: []const u8,
@@ -70,9 +69,6 @@ pub const FileSettingsStorage = struct {
         };
     }
 
-    /// pi-mono: settings-manager.ts:178-206
-    /// Lock on read if file exists, lock on write if callback returns content.
-    /// Lazy directory creation — only when actually writing.
     fn withLockImpl(
         ptr: *anyopaque,
         scope: types.SettingsScope,

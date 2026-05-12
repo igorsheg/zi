@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// zi's small low-level machinery. Public surface is intentionally boring.
 pub const Io = std.Io;
 
 pub const cancel = @import("cancel.zig");
@@ -10,4 +9,6 @@ pub const worker = @import("worker.zig");
 pub const process = @import("process.zig");
 pub const file = @import("file.zig");
 
+// zio is a portability bunker, not a playground. Public callers get std.Io-shaped APIs;
+// platform filth stays behind these walls and comes out already washed.
 pub const default_io: Io = std.Options.debug_io;

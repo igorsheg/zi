@@ -33,7 +33,6 @@ pub fn parse(query: []const u8, opts: Options) Query {
     return query_mod.parse(query, opts);
 }
 
-/// Fuzzy match a query against text. Higher score is better.
 pub fn fuzzyMatch(query: []const u8, text: []const u8) FuzzyMatch {
     return match(query, text);
 }

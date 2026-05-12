@@ -1,10 +1,3 @@
-//! Extension API v3 Lua global surface.
-//!
-//! This file is the new public `zi` table installer.  It intentionally does
-//! exposes only the v3 registration group (`command`, `tool`, `provider`,
-//! `unprovider`, and `on`). Keep compatibility out of this file:
-//! if a name is not part of API v3, it does not get installed here.
-
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
@@ -19,7 +12,6 @@ const json_api = @import("json_api.zig");
 
 const c = lua_runtime.c;
 
-/// Install the API v3 `zi` table as a Lua global.
 pub fn install(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
     c.lua_createtable(L, 0, 9);

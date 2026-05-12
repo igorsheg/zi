@@ -2,10 +2,6 @@ const std = @import("std");
 
 pub const ascii_whitespace = &std.ascii.whitespace;
 
-/// Trim `cutset` from both ends of `text` and return an owned copy.
-///
-/// The returned slice is always allocated from `allocator`, even when the
-/// trimmed view is a subslice of a larger owned buffer.
 pub fn dupeTrimmed(
     allocator: std.mem.Allocator,
     text: []const u8,

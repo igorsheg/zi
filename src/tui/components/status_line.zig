@@ -18,11 +18,6 @@ const ShuffleText = shuffle_text_mod.ShuffleText;
 
 const default_shimmer_peak = Color.rgb(0xF2, 0xF1, 0xEF);
 
-/// Single TUI-owned composer for the status area.
-///
-/// Status semantics (primary messages, working state, extension statuses) are
-/// kept as data here and rendered as one presentation line. No caller should
-/// clear/replace the status slot to show loader/status behavior.
 pub const StatusLine = struct {
     allocator: std.mem.Allocator,
 
@@ -240,9 +235,6 @@ pub const StatusLine = struct {
 
 fn shimmerPeakColor(text_fg: Color) Color {
     return switch (text_fg) {
-        // The builtin themes intentionally use terminal-default text. That color is
-        // unknown to us, so it cannot be RGB-interpolated; use pi-mono's concrete
-        // off-white peak to preserve the smooth shimmer gradient.
         .default_color => default_shimmer_peak,
         else => text_fg,
     };

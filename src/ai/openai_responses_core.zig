@@ -1,6 +1,3 @@
-//! OpenAI Responses SSE core.
-//! Codex wrappers normalize their dialect before shared parsing.
-
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const json_util = @import("json_util.zig");
@@ -209,7 +206,7 @@ const ItemState = struct {
     tool_name: []const u8 = "",
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
     tool_args_parsed: std.json.Value = .null,
-    // Responses has both call_id and item id.
+
     tool_composite_id: []const u8 = "",
 
     fn deinit(self: *ItemState, allocator: std.mem.Allocator) void {

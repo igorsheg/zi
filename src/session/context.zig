@@ -5,7 +5,6 @@ const proto = @import("protocol.zig");
 const time_util = @import("../lib/time_util.zig");
 const context_usage = @import("context_usage.zig");
 
-/// Result of building session context from entries.
 pub const SessionContext = struct {
     messages: []agent.protocol.AgentMessage,
     thinking_level: []const u8,
@@ -67,11 +66,6 @@ pub fn buildBranchEntries(
     return out;
 }
 
-/// Build the session context from entries using tree traversal.
-/// Walks from leaf to root, collecting the path, then processes entries in order.
-/// Handles compaction entries along the path.
-///
-/// pi-mono source: packages/coding-agent/src/core/session-manager.ts:310-417
 pub fn buildSessionContext(
     allocator: std.mem.Allocator,
     entries: []const proto.SessionEntry,
@@ -145,8 +139,6 @@ pub fn buildSessionContext(
     };
 }
 
-/// Extract an AgentMessage from a session entry, if applicable.
-/// pi-mono source: session-manager.ts:373-383 (appendMessage in buildSessionContext)
 fn resolveLeafIndex(
     entries: []const proto.SessionEntry,
     by_id: *const std.StringHashMap(usize),
@@ -478,7 +470,6 @@ test "unknown leaf falls back to current context" {
     try expectAssistantTextAt(ctx, 1, "hi");
 }
 
-/// Convert provider union to string.
 fn providerToString(p: ai.protocol.Provider) []const u8 {
     return switch (p) {
         .amazon_bedrock => "amazon-bedrock",

@@ -1,11 +1,10 @@
 const std = @import("std");
 const keys_mod = @import("keys.zig");
 
-/// Terminal byte reassembler: split ESC protocols wait or time out.
 pub const InputBuffer = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
     allocator: std.mem.Allocator,
-    /// Deadline for lone/partial ESC; null means no pending protocol.
+
     flush_deadline_ns: ?i128 = null,
     timeout_ns: i128 = 10_000_000,
 
@@ -113,7 +112,6 @@ pub const InputBuffer = struct {
         }
     }
 
-    /// Timeout path: prefer a real Escape over deadlocking on Alt.
     fn flushRaw(
         self: *InputBuffer,
         on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
@@ -139,7 +137,6 @@ pub const InputBuffer = struct {
         }
     }
 
-    /// Consume kitty negotiation without stealing neighboring input bytes.
     pub fn consumeKittyResponse(self: *InputBuffer) bool {
         const prefix = "\x1b[?";
         const start = std.mem.indexOf(u8, self.buf.items, prefix) orelse return false;
@@ -190,7 +187,6 @@ fn classifyEscapeSequence(data: []const u8) SeqStatus {
     }
 }
 
-/// CSI final bytes are broad; do not wait for semantic recognition.
 fn classifyCsi(data: []const u8) SeqStatus {
     if (data.len < 3) return .incomplete;
 
@@ -212,7 +208,6 @@ fn classifyCsi(data: []const u8) SeqStatus {
     return .incomplete;
 }
 
-/// OSC may BEL-terminate; DCS/APC must use ST.
 fn classifyStringTerminated(data: []const u8, start: usize, allow_bel: bool) SeqStatus {
     var i = start;
     while (i < data.len) : (i += 1) {

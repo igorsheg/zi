@@ -1,8 +1,6 @@
 const std = @import("std");
 const tokens = @import("../themes/tokens.zig");
 
-/// A single styled text run inside a retained extension-rendered line.
-/// Pure data: no Lua state, callbacks, or extension runner pointers.
 pub const Span = struct {
     text: []const u8,
     fg: ?tokens.FgColor = null,
@@ -15,9 +13,6 @@ pub const Span = struct {
 
 pub const Line = []const Span;
 
-/// Arena-owned retained render document produced by an extension render hook on
-/// the Lua-owner thread. Consumers may measure/paint this immutable document
-/// without crossing into Lua.
 pub const RenderedToolResult = struct {
     arena: std.heap.ArenaAllocator,
     collapsed: []const Line,

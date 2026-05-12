@@ -1,8 +1,3 @@
-/// AgentEvent JSON serialization for --mode json output.
-/// Produces one JSON object per event, matching pi-mono's wire format.
-/// pi-mono: session.subscribe(event => JSON.stringify(event)) in print-mode.ts:82-86
-///
-/// Delegates message body serialization to session/json.zig (shared writers).
 const std = @import("std");
 const protocol = @import("types.zig");
 const session_json = @import("../session/json.zig");

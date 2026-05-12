@@ -9,9 +9,6 @@ pub fn HeadTailResult(comptime T: type) type {
     };
 }
 
-/// Split a slice into head + tail windows, truncating the middle when
-/// `items.len > max_items`. Like pi's helper, the budget is split evenly
-/// between head and tail using floor(max_items / 2).
 pub fn splitHeadTail(comptime T: type, items: []const T, max_items: usize) HeadTailResult(T) {
     if (items.len <= max_items) {
         return .{
@@ -36,9 +33,6 @@ fn appendJoined(out: *std.Io.Writer, lines: []const []const u8) !void {
     }
 }
 
-/// Append a head+tail truncation of `lines` to `out`. If the slice fits,
-/// all lines are written verbatim joined by `\n`. Otherwise the first and
-/// last halves are kept with a marker between them.
 pub fn appendHeadTail(
     out: *std.Io.Writer,
     lines: []const []const u8,
@@ -63,8 +57,6 @@ pub const FormatResult = struct {
     truncated_lines: usize,
 };
 
-/// Streaming fixed-memory line buffer with first-N head lines and last-M tail lines.
-/// Intended for tool output capture so we never retain unbounded stdout/stderr.
 pub const LineOutputBuffer = struct {
     const default_max_line_bytes: usize = 16 * 1024;
     const line_truncated_marker = "... [line truncated]";
@@ -99,9 +91,6 @@ pub const LineOutputBuffer = struct {
         self.pending.deinit(self.allocator);
     }
 
-    /// Add raw output bytes. Newlines terminate committed lines; a trailing
-    /// partial line is retained in `pending` until another chunk arrives or
-    /// `finishAlloc()` is called.
     pub fn addChunk(self: *LineOutputBuffer, chunk: []const u8) !void {
         var start: usize = 0;
         for (chunk, 0..) |byte, i| {
@@ -121,8 +110,6 @@ pub const LineOutputBuffer = struct {
         }
     }
 
-    /// Format only committed lines. Useful for streaming updates: partial
-    /// trailing lines stay buffered so future chunks can continue them.
     pub fn snapshotAlloc(self: *const LineOutputBuffer, allocator: std.mem.Allocator, comptime marker_fmt: []const u8) !FormatResult {
         return formatStateAlloc(
             allocator,
@@ -135,7 +122,6 @@ pub const LineOutputBuffer = struct {
         );
     }
 
-    /// Finalize any trailing partial line and return the formatted head+tail text.
     pub fn finishAlloc(self: *LineOutputBuffer, allocator: std.mem.Allocator, comptime marker_fmt: []const u8) !FormatResult {
         if (self.pending.items.len > 0) {
             try self.commitPendingLine();

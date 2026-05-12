@@ -9,10 +9,6 @@ const rendered_tool_result = @import("rendered_tool_result.zig");
 
 pub const SharedCommitted = shared_committed_mod.SharedCommitted;
 
-/// Cross-thread snapshot of conversation state. `committed` is a
-/// refcounted shared handle — retained on construction, released on
-/// deinit. The in-flight turn is still deep-cloned (single message,
-/// bounded cost).
 pub const RenderedToolRenderEntry = struct {
     tool_call_id: []u8,
     rendered_call: ?*rendered_tool_result.RenderedToolResult = null,

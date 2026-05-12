@@ -195,7 +195,6 @@ fn parseSs3(data: []const u8) ?ParseResult {
     return .{ .key = .{ .code = .escape }, .len = 1 };
 }
 
-/// CSI parser: tolerate xterm, modifyOtherKeys, kitty `u`.
 fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
     if (data.len < 3) return .{ .key = .{ .code = .escape }, .len = 1 };
 
@@ -326,7 +325,6 @@ fn parseCsi(data: []const u8, kitty_active: bool) ?ParseResult {
 
 const Modifiers = struct { ctrl: bool, alt: bool, shift: bool };
 
-/// Modifier value is xterm/kitty biased by 1; 0 means absent.
 fn decodeModifier(value: u16) Modifiers {
     if (value <= 1) return .{ .ctrl = false, .alt = false, .shift = false };
     const v = value - 1;
@@ -380,7 +378,6 @@ fn parseKittyU(codepoint: u16, modifier_raw: u16, seq_len: usize) ?ParseResult {
     return null;
 }
 
-/// Kitty release events hide in `modifier:event`; ignore repeats/up.
 fn extractEventType(params_slice: []const u8) u8 {
     const semi = std.mem.indexOfScalar(u8, params_slice, ';') orelse return 0;
     const mod_part = params_slice[semi + 1 ..];
@@ -400,7 +397,6 @@ fn parseNum(s: []const u8) u16 {
     return result;
 }
 
-/// SGR mouse uses 1-based coords; normalize to buffer coords.
 fn parseSgrMouse(data: []const u8) ?MouseResult {
     var i: usize = 3;
     while (i < data.len) : (i += 1) {

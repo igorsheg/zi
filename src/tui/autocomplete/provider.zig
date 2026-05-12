@@ -37,9 +37,6 @@ pub const Suggestions = struct {
     auto_accept_single_on_tab: bool = false,
 };
 
-/// Callback sink for delivering suggestions from provider to editor.
-/// Sync providers publish immediately in request(). Providers that perform
-/// incremental background work should defer publication until tick().
 pub const SuggestionSink = struct {
     ptr: *anyopaque,
     publish_fn: *const fn (ptr: *anyopaque, suggestions: ?Suggestions) void,
@@ -49,7 +46,6 @@ pub const SuggestionSink = struct {
     }
 };
 
-/// Vtable-based autocomplete provider interface.
 pub const AutocompleteProvider = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

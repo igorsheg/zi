@@ -10,8 +10,6 @@ const time_util = @import("../../lib/time_util.zig");
 const ListPicker = list_picker_mod.ListPicker;
 const SelectItem = select_list_mod.SelectItem;
 
-/// Owns all transient heap-backed data for one `/resume` overlay.
-/// The picker borrows from this flow; teardown is one arena drop.
 pub const ResumePickerFlow = struct {
     arena: std.heap.ArenaAllocator,
     rows: []Row = &.{},

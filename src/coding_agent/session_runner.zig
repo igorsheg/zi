@@ -35,7 +35,6 @@ pub const CompactionPolicy = struct {
     keep_recent_tokens: u64 = 20000,
 };
 
-/// Per-call compaction borrows; executor must not retain them.
 pub const CompactionRunContext = struct {
     custom_instructions: ?[]const u8 = null,
 };
@@ -69,7 +68,6 @@ pub const EventEmitter = struct {
     }
 };
 
-/// Recovery coordinator; never retain AgentSession across replacement.
 pub const SessionRunner = struct {
     retry_policy: RetryPolicy,
     compaction_policy: CompactionPolicy,
@@ -357,7 +355,6 @@ pub const SessionRunner = struct {
         if (self.lifecycle_hooks.on_retry_end) |cb| cb(event, self.lifecycle_hooks.ctx);
     }
 
-    /// Ignore stale pre-compaction usage after summary writes.
     fn shouldRunThresholdCompaction(self: *SessionRunner, session: *AgentSession) bool {
         if (!self.compaction_policy.enabled) return false;
         if (session.context_usage_unknown_after_compaction) return false;

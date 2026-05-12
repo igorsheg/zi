@@ -12,11 +12,6 @@ const ListPicker = list_picker_mod.ListPicker;
 const Selection = list_picker_mod.Selection;
 const SelectItem = select_list_mod.SelectItem;
 
-/// Owns one `/hotkeys` help picker.
-///
-/// Hotkey help is intentionally modeled as picker data: keybinding definitions
-/// become rows, search text, and callbacks. Rendering stays in ListPicker,
-/// SelectList, TextInput, Panel, and overlay primitives.
 pub const HotkeysFlow = struct {
     arena: std.heap.ArenaAllocator,
     items: []SelectItem = &.{},

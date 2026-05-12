@@ -1,12 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Low-level filesystem helpers for Zig 0.16 `std.Io`.
-///
-/// Higher-level storage modules own product paths and persistence policy; this
-/// module only centralizes byte-level file operations so callsites do not
-/// repeatedly hand-roll reader/writer setup, sentinel realpath handling, and
-/// atomic writes.
 pub const ReadOnlyBytesOptions = struct {
     max_bytes: usize,
     mmap_threshold: usize = 256 * 1024,
@@ -168,9 +162,6 @@ pub fn appendFile(
     try file.writePositionalAll(io, bytes, stat.size);
 }
 
-/// Returns a normal non-sentinel owned slice. Some std.Io realpath APIs return
-/// sentinel-terminated allocations whose exact allocation length differs from
-/// `slice.len`; duplicating avoids allocator/free mismatches at storage edges.
 pub fn realPathOwned(
     io: std.Io,
     allocator: std.mem.Allocator,

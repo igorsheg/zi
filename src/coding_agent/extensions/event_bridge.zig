@@ -1,30 +1,3 @@
-//! Bridge between the agent's `AgentEvent` stream and the
-//! extension `dispatch` primitives.
-//!
-//! ExtensionRunner subscribes to `agent.subscribe(...)`. Every
-//! AgentEvent that matches an `EventKind` we know about gets:
-//!
-//!   1. Translated to a Lua table on the runner's main state
-//!      (per-variant builder, see `pushPayloadFor*` functions).
-//!   2. Handed to `dispatch.dispatchObserver` (or the appropriate
-//!      semantics primitive) which walks the registered chain.
-//!   3. Popped from the main state when dispatch returns.
-//!
-//! Why a separate file from `runner.zig`: the runner has zero
-//! upward dependencies (only `std`, `registries`, `lua_runtime`).
-//! Routing AgentEvent requires importing `agent2/protocol.zig`,
-//! which would pollute the runner's import graph. Keeping the
-//! bridge in its own module preserves that isolation — any code
-//! that wants the runner without the agent can just import
-//! `runner.zig`.
-//!
-//! Scope (D5 v1): observer events ONLY. The cancellable and
-//! transformable events (`tool_call`, `tool_result`) flow through
-//! the agent loop's `BeforeToolCallHook` / `AfterToolCallHook`
-//! seams instead of the subscribe path — those need their own
-//! adapter functions that return values to the loop. Filed as
-//! follow-up; out of scope here.
-
 const std = @import("std");
 const agent_protocol = @import("../../agent/types.zig");
 const ai_protocol = @import("../../ai/protocol.zig");
@@ -69,9 +42,6 @@ pub const BeforeAgentStartResult = struct {
     }
 };
 
-/// Adapter matching `agent_protocol.AgentEventSink`. Pass this and
-/// a `*ExtensionRunner` as the ctx to `agent.subscribe`. The runner
-/// must already have `lua_state` attached or the bridge no-ops.
 pub fn agentEventSink(event: agent_protocol.AgentEvent, ctx: ?*anyopaque) void {
     const runner: *runner_mod.ExtensionRunner = @ptrCast(@alignCast(ctx.?));
     handleAgentEvent(runner, event) catch |err| {
@@ -79,13 +49,6 @@ pub fn agentEventSink(event: agent_protocol.AgentEvent, ctx: ?*anyopaque) void {
     };
 }
 
-/// Translate `event` to a Lua payload table on the runner's main
-/// state, then walk the appropriate handler chain. Caller is
-/// responsible for ensuring the runner has `lua_state` attached.
-///
-/// Returns `error.NoState` if the runner is detached — the agent
-/// sink swallows this so a half-constructed runner doesn't crash
-/// the agent thread.
 pub fn handleAgentEvent(
     runner: *runner_mod.ExtensionRunner,
     event: agent_protocol.AgentEvent,
@@ -121,11 +84,6 @@ fn observe(
     try dispatch.dispatchObserver(state, runner, kind, -1);
 }
 
-/// Same as `observe` but the builder takes the event payload too.
-/// Both `payload` and `builder` are `anytype` because each AgentEvent
-/// variant is an anonymous struct — there is no name we could write
-/// in a `*const fn` signature. The compiler monomorphizes per call
-/// site, which is the same code we'd write by hand.
 fn observeWith(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
@@ -410,10 +368,6 @@ pub fn dispatchSessionShutdown(
     try dispatchSessionLifecycle(.session_shutdown, current, if (next) |n| .{ .live = n } else null, reason, fork_parent_entry_id);
 }
 
-/// Dispatch `model_select` to the extension observer chain.
-/// Called from the successful model-change path in `AgentSession.trySetModel`.
-/// No-op if the runner has no lua_state or no handlers are registered.
-/// Observer failures are logged and swallowed per pi-mono doctrine.
 pub fn dispatchModelSelect(
     runner: *runner_mod.ExtensionRunner,
     model: agent_protocol.Model,
@@ -777,20 +731,6 @@ fn pushToolExecEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!v
     try lua_agent_serializers.pushAgentEventToLua(L, .{ .tool_execution_end = .{ .tool_call_id = payload.tool_call_id, .tool_name = payload.tool_name, .result = payload.result, .is_error = payload.is_error } });
 }
 
-/// Adapter matching `agent_protocol.BeforeToolCallHook.func`. Routes
-/// the agent's `tool_call` event through the cancellable dispatch
-/// chain. The runner pointer comes in as `hook_ctx`.
-///
-/// Behavior:
-///   - No `.tool_call` handlers registered → returns null (the loop
-///     uses prepared args unchanged, no allocation occurs).
-///   - Any handler returns `{ block = true, reason = ... }` →
-///     returns BeforeToolCallResult with block=true and the reason.
-///   - Otherwise → reads back `payload.args` (which handlers may
-///     have mutated in place via shared-table semantics) and
-///     returns it as the replacement args. Always cloning is
-///     simpler than detecting mutation; the cost is one
-///     deep-clone per tool call when extensions are loaded.
 pub fn beforeToolCall(
     ctx_arg: agent_protocol.BeforeToolCallContext,
     signal: abort_signal_mod.cancel.Token,
@@ -833,19 +773,6 @@ fn beforeToolCallImpl(
     return .{ .block = false, .reason = null, .args = new_args };
 }
 
-/// Adapter matching `agent_protocol.AfterToolCallHook.func`. Routes
-/// the agent's `tool_result` event through the transformable
-/// dispatch chain. Returns AfterToolCallResult with the (possibly
-/// rewritten) content and is_error flag.
-///
-/// Behavior:
-///   - No `.tool_result` handlers → returns null (loop keeps
-///     original content + is_error).
-///   - Otherwise → builds a payload table with the result fields,
-///     runs the chain, parses content + is_error from the final
-///     JSON, returns them. Content blocks are restricted to text
-///     in v1 — image rewrites would need their own builder/parser
-///     and are out of scope.
 pub fn afterToolCall(
     ctx_arg: agent_protocol.AfterToolCallContext,
     signal: abort_signal_mod.cancel.Token,
@@ -1062,7 +989,6 @@ fn pushInputPayload(L: *c.lua_State, text: []const u8, queued_kind: ?[]const u8)
     c.lua_setfield(L, -2, "queue_kind");
 }
 
-/// Push pi-mono-shaped `{ toolCall = {id, name}, toolName, input }` onto the stack.
 fn pushToolCallPayload(
     L: *c.lua_State,
     tool_call: ai_protocol.ToolCall,
@@ -1084,7 +1010,6 @@ fn pushToolCallPayload(
     c.lua_setfield(L, -2, "input");
 }
 
-/// Push pi-mono-shaped `{ toolCall = {id, name}, toolName, input, content = [...], details, isError }`.
 fn pushToolResultPayload(
     L: *c.lua_State,
     tool_call: ai_protocol.ToolCall,
@@ -1141,9 +1066,6 @@ fn pushToolResultPayload(
     c.lua_setfield(L, -2, "isError");
 }
 
-/// Parse a JSON array of `{type, text}` (text only in v1) into
-/// owned ContentBlocks. Strings are duped from the supplied
-/// allocator (the hook arena in the live path).
 fn parseContentArray(
     allocator: std.mem.Allocator,
     value: std.json.Value,

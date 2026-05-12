@@ -569,12 +569,12 @@ const TargetComponent = struct {
 fn applySlotOptions(options: *overlay_mod.OverlayOptions, slot: extension_ui.UiSlotOptions) void {
     if (slot.preset) |preset| options.* = preset.options(.{});
     if (slot.width) |v| applyWidth(options, v);
-    // Current overlay manager does not expose exact height; use height as a max-height constraint.
+
     if (slot.height) |v| applyMaxHeight(options, v);
     if (slot.min_width) |v| {
         if (fixedConstraint(v)) |n| options.min_width = n;
     }
-    // max_width is parsed and retained for v3, but OverlayOptions has no max_width field yet.
+
     if (slot.max_height) |v| applyMaxHeight(options, v);
     if (slot.anchor) |v| options.anchor = toOverlayAnchor(v);
     if (slot.backdrop) |v| options.backdrop = toOverlayBackdrop(v);
@@ -711,7 +711,6 @@ fn applyTextOptions(text: *TextComponent, t: extension_ui.UiNode.Text) void {
     text.scroll_offset = t.scroll_y;
     text.scroll_x = t.scroll_x;
     text.link = t.link;
-    // selectable is retained on extension_ui.UiNode.Text for future event/selection UX.
 }
 
 fn applyTextContent(state: *ExtensionUiState, text: *TextComponent, t: extension_ui.UiNode.Text) !void {
@@ -967,8 +966,7 @@ fn initMarkdown(state: *ExtensionUiState, t: extension_ui.UiNode.Text, width_met
     md.fg = styleFg(state.activeTheme(), t.style);
     md.bg = styleBg(t.style);
     md.attrs = styleAttrs(t.style);
-    // Markdown exposes symmetric padding only. Preserve text style padding when it is
-    // representable; asymmetric padding is rounded up so content is never clipped.
+
     md.padding_x = @max(edge(t.style.padding.left), edge(t.style.padding.right));
     md.padding_y = @max(edge(t.style.padding.top), edge(t.style.padding.bottom));
     md.scroll_offset = t.scroll_y;
@@ -978,15 +976,14 @@ fn initMarkdown(state: *ExtensionUiState, t: extension_ui.UiNode.Text, width_met
 fn measureMarkdown(state: *ExtensionUiState, t: extension_ui.UiNode.Text, width: u32, width_method: WidthMethod) u32 {
     var md = initMarkdown(state, t, width_method);
     defer md.deinit();
-    // Markdown owns wrapping during document rendering; extension Text wrap=none,
-    // max_lines, scroll_x, and align do not have compatible Markdown component knobs.
+
     return md.measure(width).preferred_height;
 }
 
 fn renderMarkdown(state: *ExtensionUiState, region: Region, t: extension_ui.UiNode.Text) void {
     var md = initMarkdown(state, t, region.buf.width_method);
     defer md.deinit();
-    // Caveat: max_lines, scroll_x, and align intentionally remain Text-only options.
+
     md.render(region);
 }
 
@@ -1799,8 +1796,6 @@ test "extension ui markdown text measures multiline height and maps scroll_y" {
     const measured_node = extension_ui.UiNode{ .text = .{ .format = .markdown, .text = "# Title\nBody" } };
     try std.testing.expectEqual(@as(u32, 3), measureUiNode(&state, measured_node, 20, .wcwidth));
 
-    // Markdown has no knobs for extension Text max_lines/scroll_x/align, but it does
-    // share the vertical scroll model through scroll_y -> Markdown.scroll_offset.
     const scrolled_node = extension_ui.UiNode{ .text = .{ .format = .markdown, .text = "# Title\nBody", .scroll_y = 2, .max_lines = 1, .scroll_x = 3, .@"align" = .right } };
     var buf = try Buffer.init(std.testing.allocator, 20, 1, .wcwidth);
     defer buf.deinit();

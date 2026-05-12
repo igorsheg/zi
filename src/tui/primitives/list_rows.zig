@@ -13,10 +13,9 @@ pub const SelectableRow = struct {
     label: []const u8,
     description: ?[]const u8 = null,
     selected: bool = false,
-    /// Display width of the widest visible label. Used to align descriptions.
+
     label_width: u32 = 0,
-    /// Match SelectList's historical behavior: descriptions appear only when
-    /// the containing region is wider than this threshold.
+
     description_min_width: u32 = 40,
     description_gap: u32 = 2,
 

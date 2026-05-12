@@ -7,47 +7,6 @@ const extension_ui = @import("extensions/ui.zig");
 const message_memory = @import("../agent/message_memory.zig");
 const queue_mod = @import("../zio/root.zig").queue;
 
-/// AgentRequest — mailbox payload for the TUI → agent mutation channel.
-///
-/// This is one of zi's two cross-thread mailbox-backed channels:
-/// request queue here (TUI → agent) and event queue in the TUI
-/// integration (agent/helper → TUI). See `docs/runtime.md`.
-///
-/// Direction:
-///
-///   TUI thread                       agent thread
-///   ──────────                       ────────────
-///   trySend/push(AgentRequest) ───▶  drainInto([])
-///                                    dispatch by tag
-///                                    publish result via UiEvent queue
-///
-/// Active request variants:
-///   - prompt
-///   - resume_session
-///   - new_session
-///   - set_model
-///   - set_model_by_pattern
-///   - set_thinking_level
-///   - refresh_status_snapshot
-///   - compact
-///   - shutdown
-///
-/// Queued-message submits (steering / follow-up) do NOT go through this
-/// inbox — they hit `RuntimeHost.enqueueQueuedText` on the agent's
-/// run-control mailbox directly from the TUI thread, so they become
-/// observable mid-stream without waiting for the owner loop to return
-/// from `runUserContent`. See `docs/runtime.md` on run-scoped controls.
-///
-/// Ordered agent teardown uses `.shutdown` as the in-band terminal request.
-/// `Interactive.deinit` enqueues that sentinel first so already-queued work
-/// drains in order, then closes the mailbox transport to stop future sends and
-/// wake the owner loop if it is idle.
-///
-/// Allocator rule (doctrine R3): every payload slice carried by an
-/// AgentRequest MUST be allocated from the thread-safe `msg_allocator`,
-/// not from the TUI-local state allocator or `agent_arena`. The
-/// agent-thread consumer frees with the same allocator after dispatch
-/// via `deinit`.
 pub const ExtensionOAuthLoginCallbacks = struct {
     on_auth: *const fn (url: []const u8, ctx: ?*anyopaque) void,
     on_progress: ?*const fn (msg: []const u8, ctx: ?*anyopaque) void = null,
@@ -148,15 +107,11 @@ pub const AgentRequest = union(enum) {
     set_model_by_pattern: struct { pattern: []const u8 },
     set_thinking_level: struct { level: @import("../agent/types.zig").ThinkingLevel },
     refresh_status_snapshot: void,
-    /// Manual compaction request — /compact. Mirrors pi-mono's
-    /// `agentSession.compact(customInstructions)`. Lifecycle runs through
-    /// the session-layer compaction owner path; results publish via
-    /// `UiEvent`/snapshots like any other request.
+
     compact: struct {
         custom_instructions: ?[]const u8 = null,
     },
-    /// Extension slash-command dispatch. Visible invocation name + args.
-    /// Owned strings (msg_allocator); deinit frees them.
+
     extension_command: struct {
         name: []const u8,
         args: []const u8,

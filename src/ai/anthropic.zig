@@ -830,7 +830,6 @@ fn writeAnthropicImageBlock(jw: *std.json.Stringify, img: protocol.ImageContent)
     try jw.endObject();
 }
 
-// Anthropic rejects tool `input:null`.
 fn parseToolArgs(state: *StreamState, json_str: []const u8) std.json.Value {
     _ = state.scratch.reset(.retain_capacity);
     const scratch = state.scratch.allocator();

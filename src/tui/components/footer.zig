@@ -11,7 +11,6 @@ const Region = buffer_mod.Region;
 const Measurement = component_mod.Measurement;
 const Component = component_mod.Component;
 
-/// Footer displaying keybinding hints.
 pub const Footer = struct {
     theme: ?*const theme_mod.Theme = null,
 

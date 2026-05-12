@@ -2,12 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const process_engine = @import("process_engine.zig");
 
-/// Small zio-owned long-running process supervisor.
-///
-/// This owns process/job mechanics only: ids, process threads, abort, stdin
-/// writes, stdout/stderr chunk forwarding, and lifecycle cleanup. Product
-/// layers provide a typed `EventSink` and translate events into their own
-/// domain messages.
 pub const EventKind = enum { stdout, stderr, exit };
 
 pub const Event = struct {
@@ -94,8 +88,6 @@ pub const Manager = struct {
         job.stop();
     }
 
-    /// Destroy a job that has already exited. Returns false if the id is
-    /// unknown or the process is still running.
     pub fn reap(self: *Manager, id: u64) bool {
         const job = self.jobs.get(id) orelse return false;
         if (!job.engine.isExited()) return false;
@@ -104,7 +96,6 @@ pub const Manager = struct {
         return true;
     }
 
-    /// Stop and destroy a job regardless of current state.
     pub fn remove(self: *Manager, id: u64) bool {
         const job = self.jobs.get(id) orelse return false;
         _ = self.jobs.remove(id);

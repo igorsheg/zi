@@ -1,23 +1,9 @@
-//! Grep tool — ripgrep wrapper with structured output and tight limits.
-//!
-//! pi-mono parity: ports `grep.ts`. Spawns `rg --json` and parses
-//! match/context events line by line. Differences from pi's stock built-in:
-//! - per-file match limit (10) so one noisy file can't blow the budget
-//! - 200-char line cap on every match line
-//! - ±1 lines of surrounding context (rg --context 1)
-//! - case-sensitive by default, override with `caseSensitive: false`
-//! - `literal: true` for fixed-string mode; otherwise rust-flavored regex
-
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const runtime_process = @import("../../zio/root.zig").process;
 
-/// Hard cap on matches we ever return to the model. Both collection
-/// and rendering enforce it; the constants used to be split (collect
-/// 200, advertise 100) which meant we could ship 200 results while
-/// claiming 100 — oracle review caught it. Single source of truth now.
 const MAX_TOTAL_MATCHES: usize = 100;
 const MAX_PER_FILE: usize = 10;
 const MAX_LINE_CHARS: usize = 200;

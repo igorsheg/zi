@@ -29,9 +29,6 @@ pub const StatusSnapshot = struct {
     context_window: u64,
 };
 
-/// Canonical session-owned model switch. Owns validation,
-/// in-memory state mutation, session persistence, and thinking-
-/// level reclamp for the new model's capabilities.
 pub fn trySetModel(self: anytype, model: ai.protocol.Model) ModelSwitchResult {
     const registry = self.model_registry orelse return .registry_unavailable;
     if (!registry.hasConfiguredAuth(model)) {

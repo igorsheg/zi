@@ -1,26 +1,3 @@
-//! Adapter that wraps a registered Lua tool as an `AgentTool`.
-//!
-//! When the agent dispatches a tool by name, this executor:
-//!   1. Spawns a fresh coroutine on the runner's Lua state.
-//!   2. Resolves the handler ref from the registry.
-//!   3. Pushes the tool args as a Lua table (via `pushJsonValue`).
-//!   4. Resumes the coroutine; parses the return into an
-//!      `AgentToolResult`.
-//!
-//! Accepted return shapes from the Lua handler:
-//!   - `string`                          → single text block, success
-//!   - `{ content = "string", is_error? = bool }`
-//!   - `{ content = { {type="text", text="..."} ... }, is_error? = bool }`
-//!   - `nil` or anything else            → empty success
-//!
-//! Ownership: the agent loop's `aa` arena is what we get as
-//! `allocator` here. Every owned slice in the returned result is
-//! duped from THAT allocator, so the loop can use the result for
-//! the rest of the iteration without us caring about lifetimes.
-//! The handler ref + runner pointer come from a per-tool
-//! `LuaToolCtx` allocated from the runner's allocator at build
-//! time — those live for the runner generation.
-
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
@@ -101,27 +78,14 @@ const partial_tool_result_limits = ToolResultLimits{
 
 const tool_result_truncated_marker = "\n... [extension tool result truncated at 64KiB] ...";
 
-/// Per-tool execution context. The `AgentTool.ctx` slot is one
-/// pointer; we use it to find the runner (for the lua_state),
-/// the handler ref, and the tool name (for routing render-hook
-/// dispatch back through `runner.tool_registry`).
 pub const LuaToolCtx = struct {
     runner: *runner_mod.ExtensionRunner,
     lua_ref: c_int,
     provenance: ?resource_types.ExtensionProvenance,
-    /// Borrowed from `ToolDefinition.name` in the runner's tool
-    /// registry. Lifetime matches the runner generation.
+
     name: []const u8,
 };
 
-/// Build an `AgentTool` from a registered ToolDefinition.
-///
-/// Borrows: `name`, `description`, `label`, `parameters` come from
-/// the registry entry, which the runner already owns. The returned
-/// AgentTool is only valid for the runner's generation.
-///
-/// Allocates: one `LuaToolCtx` from `allocator`. Caller does not
-/// need to free it explicitly — the runner generation owns it.
 pub fn buildAgentTool(
     _: std.mem.Allocator,
     runner: *runner_mod.ExtensionRunner,
@@ -818,9 +782,6 @@ fn emptyResult() AgentToolResult {
     return .{ .content = &.{}, .is_error = false };
 }
 
-/// Best-effort error result. Allocation failures fall back to an
-/// empty error so the agent loop never sees an exception from a
-/// tool that simply failed inside Lua.
 fn errorResult(allocator: std.mem.Allocator, message: []const u8) AgentToolResult {
     return textResult(allocator, message, true) catch .{
         .content = &.{},
@@ -828,33 +789,12 @@ fn errorResult(allocator: std.mem.Allocator, message: []const u8) AgentToolResul
     };
 }
 
-/// Read a Lua string at `idx` as a zig slice. The slice points
-/// into Lua-managed memory and is only valid until the value is
-/// popped — callers MUST dupe immediately if they need to hold it.
 fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
     var len: usize = 0;
     const ptr = c.lua_tolstring(L, idx, &len) orelse return &.{};
     return ptr[0..len];
 }
 
-/// `ctx.update(partial)` — Lua-callable that forwards a partial
-/// tool result back through the agent loop. Used by long-running
-/// tools (Task, Oracle, anything that wraps `zi.spawn`) to ui_publication
-/// progressive state to the TUI without waiting for `execute` to
-/// return.
-///
-/// Lua signature: `ctx.update({ content?, is_error?, details? })`
-///
-///   - `content`  optional content blocks (defaults to `{}`)
-///   - `is_error` optional bool flag
-///   - `details`  optional table; deep-cloned via luaValueToJson
-///
-/// Lifetime: every owned slice for the partial result is allocated
-/// from a stack-scoped arena that lives only for the duration of
-/// this call. The downstream `tool_execution_update` event handler
-/// (`interactive.zig` event-queue translator) deep-copies what it
-/// needs into its own allocator before this returns, so the arena
-/// is safe to drop.
 fn luaToolUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));

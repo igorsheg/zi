@@ -215,11 +215,9 @@ const StartupAction = union(enum) {
     },
 };
 
-/// Composition root: main-thread TUI + agent-thread runtime queues.
 pub const Interactive = struct {
-    /// TUI-thread allocator; do not free mailbox payloads with it.
     allocator: std.mem.Allocator,
-    /// Cross-thread mailbox allocator; producer/consumer frees must match.
+
     msg_allocator: std.mem.Allocator,
     io: std.Io,
     tui: TUI,
@@ -243,12 +241,12 @@ pub const Interactive = struct {
     conversation_projection: conversation_projection_mod.ProjectionState,
     resolver: ToolRendererResolver,
     status_data: StatusData,
-    /// Agent-written, TUI-freed; allocate with msg_allocator.
+
     last_published_status_snapshot: ?PublishedStatusSnapshot = null,
 
     last_conversation_publish_ns: u64 = 0,
     conversation_publish_dirty: bool = false,
-    /// Agent-thread dedupe only; TUI path is version-filtered downstream.
+
     last_published_queued_version: u64 = 0,
     runtime_host: RuntimeHost,
     loader_active: bool = false,
@@ -282,7 +280,7 @@ pub const Interactive = struct {
 
     auth_storage: *auth_storage_mod.AuthStorage,
     settings_manager: *settings_manager_mod.SettingsManager,
-    /// TUI-owned snapshot; never read agent registry from the TUI thread.
+
     model_catalog: []ai_protocol.Model = &.{},
     model_picker_flow: ?ModelPickerFlow = null,
     settings_picker: SimplePickerFlow = .{},
@@ -303,7 +301,7 @@ pub const Interactive = struct {
 
     snapshot_event_queue: UiSnapshotQueue,
     lifecycle_event_queue: UiLifecycleQueue,
-    /// TUI → agent owner inbox; close before joining agent thread.
+
     request_queue: RequestQueue,
     job_manager: job_manager_mod.JobManager,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
@@ -320,9 +318,9 @@ pub const Interactive = struct {
     tool_output_expanded: bool = false,
     hide_thinking_block: bool = false,
     greeter_dismissed: bool = false,
-    /// Buffers split terminal protocols; ESC timeout drives Alt vs Escape.
+
     input: input_buffer_mod.InputBuffer,
-    /// Kitty query deadline; null after negotiation settles.
+
     kitty_deadline_ns: ?i128 = null,
     mouse_capture: MouseCapture = .none,
     selection: SelectionController = .{},
@@ -492,7 +490,6 @@ pub const Interactive = struct {
         return self.publishLifecycleUiEvent(event);
     }
 
-    /// Main thread owns terminal state and all rendering.
     pub fn run(self: *Interactive) !void {
         try run_setup.prepareTerminal(self);
         run_setup.bindEditor(self);
@@ -1222,9 +1219,6 @@ pub const Interactive = struct {
         return runtime_loop.processRequests(self);
     }
 
-    /// Publish the current extension command list through the UI event
-    /// queue so the TUI thread can rebuild its own registry without reading
-    /// or mutating agent-owned runner state directly.
     pub fn publishExtensionCommandsUpdate(self: *Interactive) void {
         const commands = blk: {
             const runner = self.runtime_host.currentSession().extensionRunner() orelse break :blk self.msg_allocator.alloc(ui_event_mod.ExtensionCommandEntry, 0) catch return;
@@ -1352,10 +1346,6 @@ pub const Interactive = struct {
         self.extension_keybindings.clearRetainingCapacity();
     }
 
-    /// Agent-thread handler for `AgentRequest.compact`. The runner emits
-    /// `compaction_start`/`compaction_end` events which the TUI consumes
-    /// via `sessionEventCallback`; no direct mutation of agent-owned state
-    /// happens here. Failures still flow through `compaction_end`.
     pub fn handleManualCompactRequest(self: *Interactive, custom_instructions: ?[]const u8) void {
         _ = self.runtime_host.runCompaction(.manual, false, .{
             .custom_instructions = custom_instructions,
@@ -1377,13 +1367,6 @@ pub const Interactive = struct {
         session_requests_mod.handleForkSession(self, entry_id);
     }
 
-    /// Agent-thread handler for `AgentRequest.resume_session`.
-    /// Loads the session via `openSession` (agent_arena allocated),
-    /// binds the authoritative session state on the agent thread, and
-    /// then publishes semantic snapshots back to the TUI.
-    ///
-    /// Transcript rebuild stays on the TUI thread — this handler
-    /// does NOT touch `self.transcript`. That's .15's whole point.
     pub fn handleResumeSession(self: *Interactive, path: []const u8, restore_session_model: bool) void {
         session_requests_mod.handleResumeSession(self, path, restore_session_model);
     }
@@ -1400,10 +1383,6 @@ pub const Interactive = struct {
         conversation_publish.publishQueuedSnapshotIfChanged(self);
     }
 
-    /// Agent-thread handler for `AgentRequest.set_model` (zi-wub.16).
-    /// Delegates the canonical validation + mutation path to
-    /// `AgentSession.trySetModel`, then translates the typed outcome
-    /// into a TUI-owned event payload.
     pub fn handleSetModel(self: *Interactive, m: ai_protocol.Model) void {
         model_requests_mod.handleSetModel(self, m);
     }
@@ -1460,7 +1439,6 @@ pub const Interactive = struct {
         conversation_publish.publishForAgentEvent(self, event);
     }
 
-    /// Raw agent event callback — runs on the AGENT THREAD.
     pub fn agentEventCallback(event: AgentEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         self.publishConversationStateForAgentEvent(event);
@@ -1471,7 +1449,6 @@ pub const Interactive = struct {
         self.publishPendingExtensionUi();
     }
 
-    /// Session event callback — runs on the AGENT THREAD.
     pub fn sessionEventCallback(event: SessionEvent, ctx: ?*anyopaque) void {
         const self: *Interactive = @ptrCast(@alignCast(ctx));
         session_events_mod.handle(self, event);

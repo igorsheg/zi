@@ -1,7 +1,3 @@
-//! Registries module — re-exports the four storage primitives that
-//! every ExtensionRunner generation owns. Importing this file pulls
-//! the full set; importing individual files works too.
-
 pub const tool = @import("tool_registry.zig");
 pub const event = @import("event_registry.zig");
 pub const command = @import("command_registry.zig");

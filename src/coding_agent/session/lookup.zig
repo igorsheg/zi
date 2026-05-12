@@ -19,8 +19,6 @@ pub const Resolution = union(enum) {
     err: Diagnostic,
 };
 
-/// Resolve a session target for the current project into a concrete session path.
-/// Returned paths are owned by `allocator`.
 pub fn resolvePath(
     allocator: std.mem.Allocator,
     cwd: []const u8,

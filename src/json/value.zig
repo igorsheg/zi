@@ -1,20 +1,5 @@
-//! Generic helpers for building and walking `std.json.Value` trees.
-//!
-//! Home for JSON conveniences that are NOT tied to any particular
-//! domain (AI providers, sessions, settings). Domain-specific wire
-//! serializers live next to their types (`src/agent2/json.zig`,
-//! `src/session/json.zig`, `src/settings/json.zig`).
-//!
-//! Exposed via `src/json/root.zig` as `json.value.*`. Also re-exported
-//! from `src/ai/json_util.zig` for now so legacy call sites keep
-//! working — migrate on touch, don't chase the whole graph.
-
 const std = @import("std");
 
-/// Recursively clone a `std.json.Value` tree into `allocator`.
-/// Strings and object keys are duped — the returned tree has no
-/// borrowed references to the source. Safe to free the source
-/// immediately after.
 pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     switch (value) {
         .null => return .null,
@@ -43,11 +28,6 @@ pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.
     }
 }
 
-/// Recursively free all owned memory in a `std.json.Value` tree.
-/// Safe to call on a tree allocated by `cloneJsonValue` or the
-/// `lua_runtime` conversion path. NOT safe on values whose strings
-/// point into external buffers (e.g. raw stdlib parse output that
-/// lives in a parent arena) — in that case, drop the arena instead.
 pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     switch (value) {
         .string => |s| allocator.free(s),
@@ -70,9 +50,6 @@ pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
-/// Coerce a `std.json.Value` to an f64, treating ints as floats and
-/// anything else as 0. Used for deserializing cost/usage fields that
-/// stdlib may parse as either variant depending on the input form.
 pub fn jsonToFloat(v: std.json.Value) f64 {
     return switch (v) {
         .float => |f| f,
@@ -81,9 +58,6 @@ pub fn jsonToFloat(v: std.json.Value) f64 {
     };
 }
 
-/// Return the string payload of `v` if it is a `.string`, else null.
-/// Accepts an optional so chaining on `ObjectMap.get` is idiomatic:
-/// `json.value.asString(obj.get("key"))`.
 pub fn asString(v: ?std.json.Value) ?[]const u8 {
     const val = v orelse return null;
     return switch (val) {
@@ -92,8 +66,6 @@ pub fn asString(v: ?std.json.Value) ?[]const u8 {
     };
 }
 
-/// Return `v` as a u64 if it is a non-negative `.integer`, else null.
-/// Matches the "unsigned token count" shape used by provider protocols.
 pub fn asU64(v: ?std.json.Value) ?u64 {
     const val = v orelse return null;
     return switch (val) {
@@ -102,7 +74,6 @@ pub fn asU64(v: ?std.json.Value) ?u64 {
     };
 }
 
-/// Return the boolean payload of `v` if it is a `.bool`, else null.
 pub fn asBool(v: ?std.json.Value) ?bool {
     const val = v orelse return null;
     return switch (val) {
@@ -111,7 +82,6 @@ pub fn asBool(v: ?std.json.Value) ?bool {
     };
 }
 
-/// Return the `ObjectMap` payload of `v` if it is a `.object`, else null.
 pub fn asObject(v: ?std.json.Value) ?std.json.ObjectMap {
     const val = v orelse return null;
     return switch (val) {
@@ -120,7 +90,6 @@ pub fn asObject(v: ?std.json.Value) ?std.json.ObjectMap {
     };
 }
 
-/// Return the `Array` payload of `v` if it is a `.array`, else null.
 pub fn asArray(v: ?std.json.Value) ?std.json.Array {
     const val = v orelse return null;
     return switch (val) {

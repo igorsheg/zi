@@ -4,8 +4,6 @@ const agent = @import("../agent/root.zig");
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
 
-/// Session file header — first line of every JSONL session file.
-/// pi-mono source: packages/coding-agent/src/core/session-manager.ts:29-36
 pub const SessionHeader = struct {
     id: []const u8,
     timestamp: []const u8,
@@ -14,8 +12,6 @@ pub const SessionHeader = struct {
     parent_session: ?[]const u8 = null,
 };
 
-/// Session entry — every line after the header in a JSONL session file.
-/// pi-mono source: packages/coding-agent/src/core/session-manager.ts:43-146
 pub const SessionEntry = struct {
     id: []const u8,
     parent_id: ?[]const u8,
@@ -84,7 +80,6 @@ pub const SessionInfoEntry = struct {
     name: ?[]const u8 = null,
 };
 
-/// Raw file entry — either the header or a session entry.
 pub const FileEntry = union(enum) {
     header: SessionHeader,
     entry: SessionEntry,

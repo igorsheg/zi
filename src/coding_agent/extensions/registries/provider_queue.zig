@@ -1,17 +1,3 @@
-//! Provider queue — pre-bind provider registration operations awaiting bind.
-//!
-//! The extension lifecycle splits load/register from bind. During load the runner
-//! can truthfully accept provider register/unregister calls, but the live AI
-//! provider registry does not exist yet. This queue records those operations in
-//! order, and `ExtensionRunner.bindRuntime` replays them once the session-owned
-//! provider registry is available.
-//!
-//! Why an operation queue instead of mutating the live registry directly:
-//! queued transport and the live registry have different owners and lifetimes.
-//! The queue is generation-local, Lua-facing transport. The live registry is the
-//! host-owned runtime projection keyed by API. Keeping them separate avoids
-//! leaking host mutation semantics into pre-bind registration.
-
 const std = @import("std");
 const provider_mod = @import("../../../ai/provider.zig");
 

@@ -4,8 +4,6 @@ const keys_mod = @import("../terminal/keys.zig");
 const Component = view_mod.Component;
 const Key = keys_mod.Key;
 
-/// Component-identity-based focus manager.
-/// Source of truth for which component receives input and shows cursor.
 pub const FocusManager = struct {
     current: ?Component = null,
 

@@ -1,23 +1,3 @@
-//! OpenAI Codex Responses provider — ChatGPT backend endpoint at
-//! `https://chatgpt.com/backend-api/codex/responses`. Thin wrapper over
-//! `openai_responses_core`, identical in shape to `openai_responses.zig`;
-//! the only differences are the hard-coded base URL and the path.
-//!
-//! pi-mono source: `packages/ai/src/providers/openai-codex-responses.ts`
-//!
-//! ## Status (phase 4)
-//!
-//! Registered as `"openai-codex-responses"` in `Bundle.init`. Auth is a
-//! bearer token passed through `StreamOptions.api_key`, populated by
-//! `AuthStorage.getApiKey("openai-codex")` which auto-refreshes expired
-//! OAuth tokens. Extracts `chatgpt_account_id` from the JWT access
-//! token and sends it as the `chatgpt-account-id` request header.
-//! Also sends `originator: pi` and `OpenAI-Beta: responses=experimental`.
-//!
-//! Transport: `null`, `auto`, and `sse` use the SSE `/codex/responses`
-//! endpoint. `websocket` fails explicitly; the ChatGPT websocket beta is not
-//! implemented in this provider.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
@@ -146,17 +126,6 @@ fn acceptCodexTransport(
     }
 }
 
-/// Codex-specific request body builder. Passed to `CoreOptions.build_request`
-/// so the shared core uses it instead of `buildRequestJson`.
-///
-/// pi-mono: openai-codex-responses.ts:296-334
-///
-/// Key differences from the standard responses body:
-///   - `instructions` is a top-level field (system prompt excluded from `input`)
-///   - `text.verbosity: "medium"` (`"low"` when Codex fast mode is enabled)
-///   - `include: ["reasoning.encrypted_content"]`
-///   - `tool_choice: "auto"`, `parallel_tool_calls: true`
-///   - reasoning defaults to `effort: "low"`, `summary: "auto"`
 fn buildCodexRequestJson(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -255,8 +224,6 @@ fn buildCodexRequestJsonWithFastMode(
     out.* = allocating.toArrayList();
 }
 
-/// Extract chatgpt_account_id from a JWT access token.
-/// pi-mono: openai-codex-responses.ts:282-287
 fn extractAccountId(allocator: std.mem.Allocator, token: []const u8) ![]const u8 {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
@@ -379,10 +346,6 @@ fn osRelease() []const u8 {
     };
 }
 
-/// Bearer auth factory. Reads the access token from `StreamOptions.api_key`;
-/// phase 4 will populate that field from `AuthStorage` oauth credentials
-/// (PKCE access_token, refreshed on expiry). If absent, return `NoApiKey`
-/// so `streamCore` emits a clean error event instead of a silent no-op.
 const testing = std.testing;
 
 const codex_account_token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";

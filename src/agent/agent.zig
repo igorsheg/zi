@@ -29,11 +29,7 @@ pub const Agent = struct {
 
     listeners: std.ArrayList(Listener),
     next_listener_id: u64,
-    /// P3: authoritative committed history. Refcounted shared handle;
-    /// each publish retains this rather than deep-copying. Replaced
-    /// atomically on append/truncate/reset/setMessages (release old,
-    /// install new). Segments keep older snapshots alive for outstanding
-    /// published views.
+
     shared_committed: *SharedCommitted,
     in_flight: conversation_state.InFlightState,
 
@@ -62,7 +58,6 @@ pub const Agent = struct {
     default_stream_closure: ?*DefaultStreamClosure,
     state_pending_tool_calls: std.ArrayList([]const u8),
 
-    /// Monotonically increasing counter bumped only on semantic conversation mutations.
     conversation_version: std.atomic.Value(u64),
 
     is_running: std.atomic.Value(bool),
