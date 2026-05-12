@@ -67,7 +67,7 @@ pub fn Worker(
 
         pub fn start(self: *Self) !void {
             if (self.tasks != null) return;
-            var group = task_mod.Group.init(self.allocator, self.io);
+            var group = task_mod.Group.init(self.allocator);
             errdefer group.cancel();
             try group.spawnThread(run, .{self});
             self.tasks = group;

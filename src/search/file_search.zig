@@ -40,7 +40,7 @@ pub const Session = struct {
         shared.* = .{ .allocator = allocator, .io = io, .options = options };
         errdefer allocator.destroy(shared);
 
-        var tasks = Group.init(allocator, io);
+        var tasks = Group.init(allocator);
         errdefer tasks.cancel();
         try tasks.spawnThread(workerMain, .{shared});
         return .{ .shared = shared, .tasks = tasks };

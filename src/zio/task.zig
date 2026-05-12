@@ -3,30 +3,20 @@ const std = @import("std");
 /// zi's owned concurrent work set.
 ///
 /// Contract:
-/// - `async` is logical fan-out and may run inline on the active `std.Io` backend.
-/// - `concurrent` requires simultaneous progress and always uses an owned OS
-///   thread. Long-lived zi workers and child-pipe readers must not depend on an
-///   evented `std.Io` backend making progress on the TUI/control thread.
-/// - `wait` joins all owned work and closes the set.
-/// - `cancel` cancels `std.Io` async work and joins concurrent threads. Threads are
-///   not preempted; callers must pass cooperative cancellation/resource guards when
-///   the work can block indefinitely.
+/// - each task is an owned OS thread
+/// - `join` joins all owned work and closes the set
+/// - `cancel` joins owned threads; it is not preemptive
+/// - callers must pass cooperative cancellation/resource guards when work can
+///   block indefinitely
 ///
 /// This is the only place new zio code should spawn scoped OS threads.
 pub const Group = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
-    group: std.Io.Group = .init,
     threads: std.ArrayList(std.Thread) = .empty,
     closed: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) Group {
-        return .{ .allocator = allocator, .io = io };
-    }
-
-    pub fn startIo(self: *Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
-        std.debug.assert(!self.closed);
-        self.group.async(self.io, function, args);
+    pub fn init(allocator: std.mem.Allocator) Group {
+        return .{ .allocator = allocator };
     }
 
     pub fn spawnThread(self: *Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.ConcurrentError!void {
@@ -38,19 +28,14 @@ pub const Group = struct {
 
     pub fn join(self: *Group) std.Io.Cancelable!void {
         self.closed = true;
-        var io_result: std.Io.Cancelable!void = {};
-        self.group.await(self.io) catch |err| {
-            io_result = err;
-        };
         self.joinThreads();
         self.threads.deinit(self.allocator);
         self.threads = .empty;
-        return io_result;
+        return {};
     }
 
     pub fn cancel(self: *Group) void {
         self.closed = true;
-        self.group.cancel(self.io);
         self.joinThreads();
         self.threads.deinit(self.allocator);
         self.threads = .empty;
@@ -89,7 +74,7 @@ test "Group concurrent work makes simultaneous progress" {
     };
 
     var ctx = Ctx{};
-    var group = Group.init(std.testing.allocator, std.Options.debug_io);
+    var group = Group.init(std.testing.allocator);
 
     try group.spawnThread(Ctx.runA, .{&ctx});
     try group.spawnThread(Ctx.runB, .{&ctx});
@@ -99,21 +84,3 @@ test "Group concurrent work makes simultaneous progress" {
     try std.testing.expect(ctx.b_observed_a.load(.acquire));
 }
 
-test "Group owns async fan-out until wait" {
-    const Ctx = struct {
-        value: *std.atomic.Value(u32),
-        fn add(ctx: *@This(), amount: u32) void {
-            _ = ctx.value.fetchAdd(amount, .acq_rel);
-        }
-    };
-
-    var value = std.atomic.Value(u32).init(0);
-    var ctx: Ctx = .{ .value = &value };
-    var group = Group.init(std.testing.allocator, std.Options.debug_io);
-
-    group.startIo(Ctx.add, .{ &ctx, 2 });
-    group.startIo(Ctx.add, .{ &ctx, 3 });
-    try group.join();
-
-    try std.testing.expectEqual(@as(u32, 5), value.load(.acquire));
-}

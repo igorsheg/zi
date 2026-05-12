@@ -9,6 +9,5 @@ pub const task = @import("task.zig");
 pub const worker = @import("worker.zig");
 pub const process = @import("process.zig");
 pub const file = @import("file.zig");
-pub const fd = @import("fd.zig");
 
 pub const default_io: Io = std.Options.debug_io;

@@ -12,7 +12,7 @@ const partial_json = @import("../json/partial.zig");
 const replay = @import("openai_responses_replay.zig");
 const zio = @import("../zio/root.zig");
 const Token = zio.cancel.Token;
-const fd = zio.fd;
+const http_cancel = @import("http_cancel.zig");
 
 pub const AuthFactory = struct {
     ctx: ?*anyopaque = null,
@@ -142,7 +142,7 @@ pub fn streamCore(
     };
     defer req.deinit();
 
-    var abort_guard = fd.ShutdownOnCancel.start(options.io, options.signal, fd.httpRequestShutdownFd(&req)) catch |err| {
+    var abort_guard = http_cancel.ShutdownOnCancel.start(options.io, options.signal, http_cancel.requestShutdownFd(&req)) catch |err| {
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to start interrupt guard: {s}", .{@errorName(err)});
         return;
     };

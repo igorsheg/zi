@@ -36,7 +36,7 @@ pub const Engine = struct {
     pub fn start(self: *Engine) !void {
         if (self.started) return;
         std.debug.assert(!self.ready and !self.exited);
-        self.tasks = Group.init(std.heap.smp_allocator, self.io);
+        self.tasks = Group.init(std.heap.smp_allocator);
         errdefer self.tasks.cancel();
         try self.tasks.spawnThread(run, .{self});
         self.started = true;
@@ -156,7 +156,7 @@ pub const Engine = struct {
         self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
 
-        var readers = Group.init(std.heap.smp_allocator, self.io);
+        var readers = Group.init(std.heap.smp_allocator);
         defer readers.cancel();
 
         if (self.request.timeout_ms != null or !self.request.signal.isNone()) {

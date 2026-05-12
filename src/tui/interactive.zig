@@ -475,7 +475,7 @@ pub const Interactive = struct {
 
     fn startAgentThread(self: *Interactive) !void {
         if (self.agent_tasks != null) return;
-        var tasks = zio.task.Group.init(self.allocator, self.io);
+        var tasks = zio.task.Group.init(self.allocator);
         errdefer tasks.cancel();
         try tasks.spawnThread(runtime_loop.agentThread, .{self});
         self.agent_tasks = tasks;
