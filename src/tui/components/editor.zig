@@ -1070,6 +1070,12 @@ test "Editor undo restores autocomplete application as one edit" {
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
     defer registry.deinit();
+    registry.register(.{
+        .name = try testing.allocator.dupe(u8, "model"),
+        .description = try testing.allocator.dupe(u8, "test command"),
+        .source = .extension,
+        .action = .extension,
+    });
 
     var provider = autocomplete_mod.SlashCommandProvider.init(&registry);
     var editor = Editor.init(testing.allocator, .wcwidth);
@@ -1115,6 +1121,12 @@ test "Editor autocomplete confirm respects disable-submit and stays undoable" {
 
     var registry = slash_commands_mod.CommandRegistry.init(testing.allocator);
     defer registry.deinit();
+    registry.register(.{
+        .name = try testing.allocator.dupe(u8, "model"),
+        .description = try testing.allocator.dupe(u8, "test command"),
+        .source = .extension,
+        .action = .extension,
+    });
 
     var provider = autocomplete_mod.SlashCommandProvider.init(&registry);
     var editor = Editor.init(testing.allocator, .wcwidth);

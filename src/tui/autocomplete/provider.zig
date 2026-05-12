@@ -1128,6 +1128,15 @@ fn hasItem(items: []const SelectItem, value: []const u8) bool {
     return false;
 }
 
+fn registerTestSlashCommand(reg: *CommandRegistry, name: []const u8) !void {
+    try reg.dynamic.append(reg.allocator, .{
+        .name = try reg.allocator.dupe(u8, name),
+        .description = try reg.allocator.dupe(u8, "test command"),
+        .source = .extension,
+        .action = .extension,
+    });
+}
+
 fn drainAsyncProvider(provider: *CombinedAutocompleteProvider, sink: SuggestionSink) bool {
     var now_ns: i128 = 0;
     var attempts: usize = 0;
@@ -1142,6 +1151,7 @@ fn drainAsyncProvider(provider: *CombinedAutocompleteProvider, sink: SuggestionS
 test "SlashCommandProvider covers activation, filtering, and apply" {
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
+    try registerTestSlashCommand(&reg, "model");
     var provider = SlashCommandProvider.init(&reg);
 
     var filtered = TestSink{};
