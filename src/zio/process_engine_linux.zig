@@ -395,7 +395,8 @@ fn drainEventFd(fd: std.posix.fd_t) void {
 
 fn triggerWake(fd: std.posix.fd_t) void {
     var value: u64 = 1;
-    _ = std.posix.write(fd, std.mem.asBytes(&value)) catch {};
+    const bytes = std.mem.asBytes(&value);
+    _ = linux.write(fd, bytes.ptr, bytes.len);
 }
 
 fn syscallResult(rc: usize) !usize {
