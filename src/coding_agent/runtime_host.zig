@@ -1602,6 +1602,23 @@ test "runtime host auto compaction runs once and resets context usage after comp
     try testing.expect(collector.compaction_ends.items[0].success);
     try testing.expectEqual(@as(?u64, 512), host.currentSession().getContextUsage().?.tokens);
 
+    // The post-compaction provider call must be built from the rebuilt compacted
+    // agent context, not from the oversized pre-compaction transcript. If this
+    // regresses, the provider reports the same large usage again and threshold
+    // compaction loops on every prompt.
+    try testing.expect(fp.captured_contexts.items.len >= 3);
+    const post_compaction_context = fp.captured_contexts.items[2];
+    try testing.expect(post_compaction_context.messages.len >= 2);
+    switch (post_compaction_context.messages[0]) {
+        .user => |user| {
+            const text = user.content.blocks[0].text.text;
+            try testing.expect(std.mem.indexOf(u8, text, "history summary") != null);
+            try testing.expect(std.mem.indexOf(u8, text, "old user") == null);
+            try testing.expect(std.mem.indexOf(u8, text, "old answer") == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     try testing.expectEqual(RunOutcome.success, try host.runUserContent(.{ .text = "continue again" }));
     try testing.expectEqual(@as(usize, 1), collector.compaction_starts.items.len);
     try testing.expectEqual(@as(usize, 4), fp.call_count);

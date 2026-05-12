@@ -6,6 +6,7 @@ const json_util = @import("../ai/json_util.zig");
 const session_event_mod = @import("session_event.zig");
 const classifier = @import("session_error_classifier.zig");
 const context_usage = @import("../session/context_usage.zig");
+const time_util = @import("../lib/time_util.zig");
 
 pub const RunOutcome = enum {
     success,
@@ -359,13 +360,42 @@ pub const SessionRunner = struct {
     /// Ignore stale pre-compaction usage after summary writes.
     fn shouldRunThresholdCompaction(self: *SessionRunner, session: *AgentSession) bool {
         if (!self.compaction_policy.enabled) return false;
-        if (session.session_store.contextUsageUnknownAfterCompaction(session.allocator)) return false;
+        if (session.context_usage_unknown_after_compaction) return false;
         const messages = session.agent.messages();
         if (messages.len == 0) return false;
+
+        const compaction_timestamp = latestCompactionTimestamp(session);
+        if (latestAssistantMessage(session)) |assistant| {
+            if (compaction_timestamp) |ts| {
+                if (assistant.timestamp <= ts) return false;
+            }
+        }
+
         const estimate = context_usage.estimateContextTokens(messages);
+        if (estimate.last_usage_index) |usage_index| {
+            if (compaction_timestamp) |ts| {
+                const usage_message = messages[usage_index];
+                if (usage_message == .assistant and usage_message.assistant.timestamp <= ts) return false;
+            }
+        }
         const context_window = session.agent.modelValue().context_window;
         if (context_window <= self.compaction_policy.reserve_tokens) return false;
         return estimate.tokens > context_window - self.compaction_policy.reserve_tokens;
+    }
+
+    fn latestCompactionTimestamp(session: *AgentSession) ?i64 {
+        var arena = std.heap.ArenaAllocator.init(session.allocator);
+        defer arena.deinit();
+
+        const branch = session.session_store.buildCurrentBranchAlloc(arena.allocator()) catch return null;
+        var i: usize = branch.len;
+        while (i > 0) {
+            i -= 1;
+            if (branch[i].entry == .compaction) {
+                return time_util.isoToEpochMs(branch[i].timestamp);
+            }
+        }
+        return null;
     }
 
     fn notifyCompactionStart(self: *SessionRunner, emitter: EventEmitter, event: CompactionStart) void {

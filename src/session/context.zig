@@ -123,7 +123,7 @@ pub fn buildSessionContext(
                 found_first_kept = true;
             }
             if (found_first_kept) {
-                if (extractMessageForKeptCompactionPrefix(&entry)) |msg| try messages.append(allocator, msg);
+                if (extractMessage(&entry)) |msg| try messages.append(allocator, msg);
             }
         }
 
@@ -157,25 +157,6 @@ fn resolveLeafIndex(
         .before_first => null,
         .entry_id => |entry_id| by_id.get(entry_id) orelse if (entries.len > 0) entries.len - 1 else null,
     };
-}
-
-fn extractMessageForKeptCompactionPrefix(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage {
-    var msg = extractMessage(entry) orelse return null;
-    // Kept messages were produced before the compaction checkpoint. Their
-    // assistant usage describes the pre-compaction prompt and must not seed
-    // future context usage estimates; otherwise the context count appears not
-    // to reset and threshold auto-compaction can retrigger on every prompt.
-    if (msg == .assistant) {
-        msg.assistant.usage = .{
-            .input = 0,
-            .output = 0,
-            .cache_read = 0,
-            .cache_write = 0,
-            .total_tokens = 0,
-            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
-        };
-    }
-    return msg;
 }
 
 fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage {
@@ -406,7 +387,7 @@ test "compaction emits latest summary, kept messages, and later messages" {
     try expectAssistantTextAt(ctx, 4, "response3");
 }
 
-test "compaction clears stale assistant usage on kept pre-compaction messages" {
+test "compaction preserves kept pre-compaction assistant usage like pi-mono" {
     var arena = testArena();
     defer arena.deinit();
     var entries = [_]proto.SessionEntry{
@@ -421,10 +402,10 @@ test "compaction clears stale assistant usage on kept pre-compaction messages" {
 
     const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
     try std.testing.expectEqual(@as(usize, 4), ctx.messages.len);
-    try std.testing.expectEqual(@as(u64, 0), ctx.messages[2].assistant.usage.total_tokens);
+    try std.testing.expectEqual(@as(u64, 195_000), ctx.messages[2].assistant.usage.total_tokens);
 
     const estimate = context_usage.estimateContextTokens(ctx.messages);
-    try std.testing.expect(estimate.tokens < 195_000);
+    try std.testing.expect(estimate.tokens >= 195_000);
 }
 
 test "branch summary appears only on selected branch" {

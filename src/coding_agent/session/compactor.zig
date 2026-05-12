@@ -331,11 +331,6 @@ fn generateHistorySummary(
     policy: CompactionPolicy,
     custom_instructions: ?[]const u8,
 ) ![]const u8 {
-    if (messages.len == 0 and previous_summary != null) {
-        return try allocator.dupe(u8, previous_summary.?);
-    }
-    if (messages.len == 0) return try allocator.dupe(u8, "No prior history.");
-
     const conversation = try prep.serializeConversation(allocator, messages);
     const template = if (previous_summary != null) update_summarization_prompt else initial_summarization_prompt;
     const base = if (custom_instructions) |ci| try std.fmt.allocPrint(
@@ -354,7 +349,7 @@ fn generateHistorySummary(
         .{ conversation, base },
     );
 
-    const max_tokens: u32 = @intCast(@max(@divTrunc(policy.reserve_tokens * 4, 5), 1024));
+    const max_tokens: u32 = @intCast(@divTrunc(policy.reserve_tokens * 4, 5));
     return try session.completeUserText(allocator, summarization_system_prompt, prompt_text, max_tokens);
 }
 
@@ -370,6 +365,6 @@ fn generateTurnPrefixSummary(
         "<conversation>\n{s}\n</conversation>\n\n{s}",
         .{ conversation, turn_prefix_summarization_prompt },
     );
-    const max_tokens: u32 = @intCast(@max(@divTrunc(policy.reserve_tokens, 2), 512));
+    const max_tokens: u32 = @intCast(@divTrunc(policy.reserve_tokens, 2));
     return try session.completeUserText(allocator, summarization_system_prompt, prompt_text, max_tokens);
 }
