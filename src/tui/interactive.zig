@@ -30,6 +30,7 @@ const input_buffer_mod = @import("terminal/input_buffer.zig");
 const queues_mod = @import("interactive/runtime/queues.zig");
 const zio = @import("../zio/root.zig");
 const queue_mod = zio.queue;
+const command_query = @import("../lib/command_query.zig");
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const model_flow = @import("interactive/model_flow.zig");
 const resume_picker_flow_mod = @import("interactive/resume_picker_flow.zig");
@@ -39,7 +40,6 @@ const ui_event_handler_mod = @import("interactive/ui_event_handler.zig");
 const session_requests_mod = @import("interactive/session_requests.zig");
 const model_requests_mod = @import("interactive/model_requests.zig");
 const session_events_mod = @import("interactive/session_events.zig");
-const runtime_process = @import("../zio/root.zig").process;
 const session_flow = @import("interactive/session_flow.zig");
 const conversation_publish = @import("interactive/conversation_publish.zig");
 const key_flow_mod = @import("interactive/key_flow.zig");
@@ -802,24 +802,14 @@ pub const Interactive = struct {
     }
 
     fn detectGitBranch(self: *Interactive) void {
-        var result = runtime_process.run(self.allocator, self.io, .{
+        const branch = command_query.stdout(self.allocator, self.io, .{
             .argv = &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
-            .stdout_limit = .limited(256),
-            .stderr = .ignore,
-        }) catch return;
-        defer result.deinit(self.allocator);
-
-        const completed = switch (result) {
-            .completed => |completed| completed,
-            .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return,
-        };
-        switch (completed.term) {
-            .exited => |code| if (code != 0) return,
-            else => return,
-        }
-
-        const branch = std.mem.trimEnd(u8, completed.stdout, " \t\n\r");
-        if (branch.len > 0) self.active_editor.setGitBranch(branch);
+            .timeout_ms = 1000,
+            .max_stdout_bytes = 256,
+            .trim = true,
+        }) orelse return;
+        defer self.allocator.free(branch);
+        self.active_editor.setGitBranch(branch);
     }
 
     fn nextLoopDeadlineNs(self: *Interactive, now_ns: i128) ?i128 {

@@ -2,7 +2,9 @@ const builtin = @import("builtin");
 const std = @import("std");
 pub const Token = @import("cancel.zig").Token;
 const cancel = @import("cancel.zig");
+const cancel_waiter = @import("cancel_waiter.zig");
 const process_engine = @import("process_engine.zig");
+const runtime_env = @import("env");
 pub const Jobs = @import("job.zig");
 
 pub const default_max_output_bytes: usize = 1024 * 1024;
@@ -97,6 +99,22 @@ pub const RunError = error{
 };
 
 pub fn commandExists(allocator: std.mem.Allocator, io: std.Io, command: []const u8) bool {
+    if (builtin.os.tag == .windows) return commandExistsByProbe(allocator, io, command);
+    if (command.len == 0) return false;
+    if (std.mem.indexOfAny(u8, command, "/\\") != null) return executablePathExists(allocator, io, command);
+
+    const path_value = runtime_env.get("PATH") orelse return false;
+    var it = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = std.fs.path.join(allocator, &.{ dir, command }) catch continue;
+        defer allocator.free(candidate);
+        if (executablePathExists(allocator, io, candidate)) return true;
+    }
+    return false;
+}
+
+fn commandExistsByProbe(allocator: std.mem.Allocator, io: std.Io, command: []const u8) bool {
     var result = run(allocator, io, .{
         .argv = &.{ command, "--version" },
         .stdout = .ignore,
@@ -176,57 +194,27 @@ pub fn runInherit(io: std.Io, options: InheritOptions) RunError!std.process.Chil
     }) catch return error.SpawnFailed;
 
     var abort_ctx = InheritAbortCtx{
-        .io = io,
-        .signal = options.signal,
         .child_id = child.id.?,
         .process_group = options.kill_scope == .process_group,
     };
-    const abort_thread = if (!options.signal.isNone())
-        std.Thread.spawn(.{}, InheritAbortCtx.wait, .{&abort_ctx}) catch {
-            killChild(child.id.?, options.kill_scope == .process_group, .KILL);
-            _ = child.wait(io) catch null;
-            return error.SpawnFailed;
-        }
-    else
-        null;
-    defer if (abort_thread) |thread| {
-        abort_ctx.mutex.lockUncancelable(io);
-        abort_ctx.done = true;
-        abort_ctx.mutex.unlock(io);
-        options.signal.notifyWaiters();
-        thread.join();
+    var abort_waiter = cancel_waiter.Waiter.start(io, options.signal, .{ .ptr = @ptrCast(&abort_ctx), .call = InheritAbortCtx.abort }) catch {
+        killChild(child.id.?, options.kill_scope == .process_group, .KILL);
+        _ = child.wait(io) catch null;
+        return error.SpawnFailed;
     };
+    defer abort_waiter.stop();
 
     const term = child.wait(io) catch return error.WaitFailed;
-    abort_ctx.mutex.lockUncancelable(io);
-    abort_ctx.done = true;
-    abort_ctx.mutex.unlock(io);
     return term;
 }
 
 const InheritAbortCtx = struct {
-    io: std.Io,
-    signal: Token,
     child_id: std.process.Child.Id,
     process_group: bool,
-    mutex: std.Io.Mutex = .init,
-    done: bool = false,
 
-    fn wait(self: *@This()) void {
-        const result = self.signal.waitUntilIo(self.io, null, isDone, self);
-        if (result != .aborted) return;
-
-        self.mutex.lockUncancelable(self.io);
-        const done = self.done;
-        self.mutex.unlock(self.io);
-        if (!done) killChild(self.child_id, self.process_group, .TERM);
-    }
-
-    fn isDone(ctx: ?*anyopaque) bool {
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.done;
+    fn abort(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        killChild(self.child_id, self.process_group, .TERM);
     }
 };
 
@@ -406,6 +394,20 @@ const Capture = struct {
 
 fn tooLong(len: usize, limit: std.Io.Limit) bool {
     return if (limit.toInt()) |n| len > n else false;
+}
+
+fn executablePathExists(allocator: std.mem.Allocator, io: std.Io, path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{ .allow_directory = false }) catch return false;
+        file.close(io);
+    } else {
+        const file = std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false }) catch return false;
+        file.close(io);
+    }
+
+    const path_z = allocator.dupeZ(u8, path) catch return false;
+    defer allocator.free(path_z);
+    return std.c.access(path_z.ptr, std.c.X_OK) == 0;
 }
 
 fn childPgid(scope: KillScope) ?std.process.Child.Id {

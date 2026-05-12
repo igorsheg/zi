@@ -142,7 +142,7 @@ pub fn streamCore(
     };
     defer req.deinit();
 
-    var abort_guard = http_cancel.ShutdownOnCancel.start(options.io, options.signal, http_cancel.requestShutdownFd(&req)) catch |err| {
+    var abort_guard = http_cancel.ShutdownOnCancel.start(options.io, options.signal, &req) catch |err| {
         emitError(allocator, callback, callback_ctx, model, core.provider_label, "failed to start interrupt guard: {s}", .{@errorName(err)});
         return;
     };

@@ -29,6 +29,7 @@ const agent_session_core_mod = @import("agent_session/core.zig");
 const extension_ui = @import("extensions/ui.zig");
 const session_event_mod = @import("session_event.zig");
 const zio = @import("../zio/root.zig");
+const cancel_waiter = @import("../zio/cancel_waiter.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -688,44 +689,22 @@ pub const AgentSession = struct {
     };
 
     const LinkedSideAbort = struct {
-        state: ?*State = null,
-        thread: ?std.Thread = null,
+        waiter: cancel_waiter.Waiter = .{},
 
-        const State = struct {
-            done: std.atomic.Value(bool) = .init(false),
-            core: *agent_session_core_mod.AgentSessionCore,
-        };
-
-        fn start(signal: zio.cancel.Token, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
+        fn start(io: std.Io, signal: zio.cancel.Token, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
             if (signal.isNone()) return .{};
-            const state = std.heap.page_allocator.create(State) catch return .{};
-            state.* = .{ .core = core };
-            const thread = std.Thread.spawn(.{}, watch, .{ signal, state }) catch {
-                std.heap.page_allocator.destroy(state);
-                return .{};
-            };
-            return .{
-                .state = state,
-                .thread = thread,
-            };
+            const waiter = cancel_waiter.Waiter.start(io, signal, .{ .ptr = @ptrCast(core), .call = abort }) catch return .{};
+            return .{ .waiter = waiter };
         }
 
         fn stop(self: *LinkedSideAbort) void {
-            const state = self.state orelse return;
-            state.done.store(true, .release);
-            if (self.thread) |thread| thread.detach();
+            self.waiter.stop();
             self.* = .{};
         }
 
-        fn watch(signal: zio.cancel.Token, state: *State) void {
-            defer std.heap.page_allocator.destroy(state);
-            while (!state.done.load(.acquire)) {
-                if (signal.isAborted()) {
-                    state.core.abort();
-                    return;
-                }
-                std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
-            }
+        fn abort(ptr: *anyopaque) void {
+            const core: *agent_session_core_mod.AgentSessionCore = @ptrCast(@alignCast(ptr));
+            core.abort();
         }
     };
 
@@ -753,7 +732,7 @@ pub const AgentSession = struct {
         if (request.signal.isAborted()) return .cancelled;
 
         const side_core = try self.ensureSideCore(side);
-        var abort_link = LinkedSideAbort.start(request.signal, side_core);
+        var abort_link = LinkedSideAbort.start(self._stream_closure.io, request.signal, side_core);
         defer abort_link.stop();
 
         var event_ctx = SideAgentEventContext{ .sink = event_sink };

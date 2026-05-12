@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const runtime_process = @import("../../zio/root.zig").process;
+const command_query = @import("../../lib/command_query.zig");
 
 const supported_image_mime_types = [_][]const u8{
     "image/png",
@@ -12,6 +13,7 @@ const supported_image_mime_types = [_][]const u8{
 const max_clipboard_image_bytes = 50 * 1024 * 1024;
 const clipboard_list_timeout_ms = 1000;
 const clipboard_read_timeout_ms = 3000;
+const clipboard_write_timeout_ms = 3000;
 
 const macos_clipboard = if (builtin.os.tag == .macos) struct {
     extern fn zi_clipboard_write_text(bytes: [*]const u8, len: usize) bool;
@@ -206,24 +208,12 @@ fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ?[]
 }
 
 fn runCommandCaptureTimeout(allocator: std.mem.Allocator, argv: []const []const u8, timeout_ms: ?u64) ?[]u8 {
-    var result = runtime_process.run(allocator, std.Options.debug_io, .{
+    return command_query.stdout(allocator, std.Options.debug_io, .{
         .argv = argv,
-        .timeout_ms = timeout_ms,
-        .stdout_limit = .limited(max_clipboard_image_bytes),
-        .stderr = .ignore,
-    }) catch return null;
-    defer result.deinit(allocator);
-
-    const completed = switch (result) {
-        .completed => |completed| completed,
-        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return null,
-    };
-    switch (completed.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-    if (completed.stdout.len == 0) return null;
-    return allocator.dupe(u8, completed.stdout) catch null;
+        .timeout_ms = timeout_ms orelse clipboard_read_timeout_ms,
+        .max_stdout_bytes = max_clipboard_image_bytes,
+        .trim = false,
+    });
 }
 
 fn selectPreferredImageMimeType(types_text: []const u8) ?[]const u8 {
@@ -262,6 +252,7 @@ fn copyViaCommand(argv: []const []const u8, text: []const u8) bool {
     var result = runtime_process.run(std.heap.page_allocator, std.Options.debug_io, .{
         .argv = argv,
         .stdin = .{ .bytes = text },
+        .timeout_ms = clipboard_write_timeout_ms,
         .stdout = .ignore,
         .stderr = .ignore,
     }) catch return false;

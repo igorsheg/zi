@@ -1,6 +1,5 @@
 const std = @import("std");
-const string_util = @import("../../lib/string_util.zig");
-const runtime_process = @import("../../zio/root.zig").process;
+const command_query = @import("../../lib/command_query.zig");
 
 const allocator = std.heap.page_allocator;
 
@@ -85,29 +84,12 @@ fn executeCommandUncached(config: []const u8) ?[]const u8 {
     const command = config[1..];
     if (command.len == 0) return null;
 
-    var result = runtime_process.run(allocator, std.Options.debug_io, .{
+    return command_query.stdout(allocator, std.Options.debug_io, .{
         .argv = &.{ "/bin/sh", "-c", command },
-        .stdout_limit = .limited(50 * 1024),
-        .stderr = .ignore,
-    }) catch return null;
-    defer result.deinit(allocator);
-
-    const completed = switch (result) {
-        .completed => |completed| completed,
-        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return null,
-    };
-    switch (completed.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-
-    const trimmed = string_util.dupeTrimmed(allocator, completed.stdout, &std.ascii.whitespace) catch return null;
-    errdefer allocator.free(trimmed);
-    if (trimmed.len == 0) {
-        return null;
-    }
-
-    return trimmed;
+        .timeout_ms = 5000,
+        .max_stdout_bytes = 50 * 1024,
+        .trim = true,
+    });
 }
 
 test "shell command returns trimmed stdout" {

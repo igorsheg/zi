@@ -14,6 +14,7 @@ test {
     _ = @import("logging.zig");
     _ = @import("ai/root.zig");
     _ = @import("json/root.zig");
+    _ = @import("lib/command_query.zig");
     _ = @import("coding_agent/auth/root.zig");
     _ = @import("coding_agent/settings/root.zig");
     _ = @import("coding_agent/cli/root.zig");

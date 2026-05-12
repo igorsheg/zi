@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("process_engine_types.zig");
+const cancel_waiter = @import("cancel_waiter.zig");
 
 pub const EnvPair = types.EnvPair;
 pub const StreamKind = types.StreamKind;
@@ -26,8 +27,7 @@ pub const Engine = struct {
     timed_out: bool = false,
     aborted: bool = false,
     kq: ?std.posix.fd_t = null,
-    cancel_thread: ?std.Thread = null,
-    cancel_waiter_stop: bool = false,
+    cancel_waiter: cancel_waiter.Waiter = .{},
 
     pub const StopReason = enum { requested, timeout, abort };
 
@@ -173,16 +173,10 @@ pub const Engine = struct {
         if (kq < 0) return error.KqueueFailed;
         self.mutex.lockUncancelable(self.io);
         self.kq = kq;
-        self.cancel_waiter_stop = false;
         self.mutex.unlock(self.io);
-        if (!self.request.signal.isNone()) self.cancel_thread = try std.Thread.spawn(.{}, cancelWaiter, .{self});
+        self.cancel_waiter = try cancel_waiter.Waiter.start(self.io, self.request.signal, .{ .ptr = @ptrCast(self), .call = onCancel });
         defer {
-            self.mutex.lockUncancelable(self.io);
-            self.cancel_waiter_stop = true;
-            self.mutex.unlock(self.io);
-            self.request.signal.notifyWaiters();
-            if (self.cancel_thread) |thread| thread.join();
-            self.cancel_thread = null;
+            self.cancel_waiter.stop();
 
             self.mutex.lockUncancelable(self.io);
             self.kq = null;
@@ -304,23 +298,14 @@ pub const Engine = struct {
         self.mutex.unlock(self.io);
     }
 
-    fn cancelWaiter(self: *Engine) void {
-        const result = self.request.signal.waitUntilIo(self.io, null, cancelWaiterDone, self);
-        if (result == .aborted) {
-            self.mutex.lockUncancelable(self.io);
-            self.aborted = true;
-            self.stop_requested = true;
-            const kq = self.kq;
-            self.mutex.unlock(self.io);
-            if (kq) |fd| triggerWake(fd);
-        }
-    }
-
-    fn cancelWaiterDone(ctx: ?*anyopaque) bool {
-        const self: *Engine = @ptrCast(@alignCast(ctx.?));
+    fn onCancel(ptr: *anyopaque) void {
+        const self: *Engine = @ptrCast(@alignCast(ptr));
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.cancel_waiter_stop;
+        self.aborted = true;
+        self.stop_requested = true;
+        const kq = self.kq;
+        self.mutex.unlock(self.io);
+        if (kq) |fd| triggerWake(fd);
     }
 };
 
