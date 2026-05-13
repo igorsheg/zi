@@ -18,8 +18,6 @@ pub const CommandRegistry = struct {
 
     entries: std.ArrayListUnmanaged(CommandDef) = .empty,
 
-    visible_index: std.StringHashMapUnmanaged(usize) = .empty,
-
     pub fn init(allocator: std.mem.Allocator) CommandRegistry {
         return .{ .allocator = allocator };
     }
@@ -31,9 +29,6 @@ pub const CommandRegistry = struct {
             self.allocator.free(entry.description);
         }
         self.entries.deinit(self.allocator);
-        var it = self.visible_index.iterator();
-        while (it.next()) |kv| self.allocator.free(kv.key_ptr.*);
-        self.visible_index.deinit(self.allocator);
     }
 
     pub fn register(self: *CommandRegistry, cmd: CommandDef) !void {
@@ -49,8 +44,10 @@ pub const CommandRegistry = struct {
     }
 
     pub fn getByVisibleName(self: *const CommandRegistry, name: []const u8) ?*const CommandDef {
-        const idx = self.visible_index.get(name) orelse return null;
-        return &self.entries.items[idx];
+        for (self.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.visible_name, name)) return entry;
+        }
+        return null;
     }
 
     pub fn count(self: *const CommandRegistry) usize {
@@ -62,7 +59,7 @@ pub const CommandRegistry = struct {
     }
 
     pub fn visibleCount(self: *const CommandRegistry) usize {
-        return self.visible_index.count();
+        return self.entries.items.len;
     }
 
     pub const VisibleEntry = struct {
@@ -114,28 +111,10 @@ pub const CommandRegistry = struct {
             try new_names.append(self.allocator, visible_name);
         }
 
-        var new_index: std.StringHashMapUnmanaged(usize) = .empty;
-        errdefer {
-            var it = new_index.iterator();
-            while (it.next()) |kv| self.allocator.free(kv.key_ptr.*);
-            new_index.deinit(self.allocator);
-        }
-
-        for (new_names.items, 0..) |visible_name, i| {
-            const key = try self.allocator.dupe(u8, visible_name);
-            errdefer self.allocator.free(key);
-            try new_index.put(self.allocator, key, i);
-        }
-
         for (self.entries.items, new_names.items) |*entry, visible_name| {
             self.allocator.free(entry.visible_name);
             entry.visible_name = visible_name;
         }
-
-        var old_it = self.visible_index.iterator();
-        while (old_it.next()) |kv| self.allocator.free(kv.key_ptr.*);
-        self.visible_index.deinit(self.allocator);
-        self.visible_index = new_index;
     }
 };
 
