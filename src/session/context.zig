@@ -47,23 +47,16 @@ pub fn buildBranchEntries(
 
     const idx = resolveLeafIndex(entries, &by_id, selection) orelse return &.{};
 
-    var rev: std.ArrayList(proto.SessionEntry) = .empty;
-    defer rev.deinit(allocator);
+    var path: std.ArrayList(proto.SessionEntry) = .empty;
+    errdefer path.deinit(allocator);
     var current: ?usize = idx;
     while (current) |cur| {
-        try rev.append(allocator, entries[cur]);
+        try path.append(allocator, entries[cur]);
         current = if (entries[cur].parent_id) |pid| by_id.get(pid) else null;
     }
 
-    const out = try allocator.alloc(proto.SessionEntry, rev.items.len);
-    var src_i = rev.items.len;
-    var dst_i: usize = 0;
-    while (src_i > 0) {
-        src_i -= 1;
-        out[dst_i] = rev.items[src_i];
-        dst_i += 1;
-    }
-    return out;
+    std.mem.reverse(proto.SessionEntry, path.items);
+    return try path.toOwnedSlice(allocator);
 }
 
 pub fn buildSessionContext(
