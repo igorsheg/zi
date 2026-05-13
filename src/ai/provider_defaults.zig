@@ -30,18 +30,17 @@ pub const Bundle = struct {
         var oac = openai_completions.OpenAICompletionsProvider.init(allocator);
         try registry.register("openai-completions", oac.provider(), null);
 
-        try registry.register("openai-responses", openaiResponsesProvider(self), null);
-
-        var ocx = openai_codex.OpenAICodexProvider.init(allocator);
-        try registry.register("openai-codex-responses", ocx.provider(), null);
-
         self.* = .{
             .allocator = allocator,
             .registry = registry,
             .anthropic_prov = anth,
             .openai_completions_prov = oac,
-            .openai_codex_prov = ocx,
+            .openai_codex_prov = openai_codex.OpenAICodexProvider.init(allocator),
         };
+
+        try registry.register("openai-responses", openaiResponsesProvider(self), null);
+
+        try registry.register("openai-codex-responses", self.openai_codex_prov.provider(), null);
         return self;
     }
 
