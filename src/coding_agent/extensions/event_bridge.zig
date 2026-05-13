@@ -58,42 +58,28 @@ pub fn handleAgentEvent(
     runner.assertOnLuaThread();
 
     switch (event) {
-        .agent_start => try observe(state, runner, .agent_start, pushAgentStart),
-        .agent_end => |e| try observeWith(state, runner, .agent_end, e, pushAgentEnd),
-        .turn_start => try observe(state, runner, .turn_start, pushTurnStart),
-        .turn_end => |e| try observeWith(state, runner, .turn_end, e, pushTurnEnd),
-        .message_start => |e| try observeWith(state, runner, .message_start, e, pushMessageStart),
-        .message_update => |e| try observeWith(state, runner, .message_update, e, pushMessageUpdate),
-        .message_end => |e| try observeWith(state, runner, .message_end, e, pushMessageEnd),
-        .tool_execution_start => |e| try observeWith(state, runner, .tool_execution_start, e, pushToolExecStart),
-        .tool_execution_update => |e| try observeWith(state, runner, .tool_execution_update, e, pushToolExecUpdate),
-        .tool_execution_end => |e| try observeWith(state, runner, .tool_execution_end, e, pushToolExecEnd),
+        .agent_start => try observeAgentEvent(state, runner, .agent_start, .agent_start),
+        .agent_end => |e| try observeAgentEvent(state, runner, .agent_end, .{ .agent_end = .{ .messages = e.messages } }),
+        .turn_start => try observeAgentEvent(state, runner, .turn_start, .turn_start),
+        .turn_end => |e| try observeAgentEvent(state, runner, .turn_end, .{ .turn_end = .{ .message = e.message, .tool_results = e.tool_results } }),
+        .message_start => |e| try observeAgentEvent(state, runner, .message_start, .{ .message_start = .{ .message = e.message } }),
+        .message_update => |e| try observeAgentEvent(state, runner, .message_update, .{ .message_update = .{ .message = e.message, .assistant_message_event = e.assistant_message_event } }),
+        .message_end => |e| try observeAgentEvent(state, runner, .message_end, .{ .message_end = .{ .message = e.message } }),
+        .tool_execution_start => |e| try observeAgentEvent(state, runner, .tool_execution_start, .{ .tool_execution_start = .{ .tool_call_id = e.tool_call_id, .tool_name = e.tool_name, .args = e.args } }),
+        .tool_execution_update => |e| try observeAgentEvent(state, runner, .tool_execution_update, .{ .tool_execution_update = .{ .tool_call_id = e.tool_call_id, .tool_name = e.tool_name, .args = e.args, .partial_result = e.partial_result } }),
+        .tool_execution_end => |e| try observeAgentEvent(state, runner, .tool_execution_end, .{ .tool_execution_end = .{ .tool_call_id = e.tool_call_id, .tool_name = e.tool_name, .result = e.result, .is_error = e.is_error } }),
     }
 }
 
-fn observe(
+fn observeAgentEvent(
     state: *lua_runtime.LuaState,
     runner: *runner_mod.ExtensionRunner,
     kind: event_registry.EventKind,
-    builder: *const fn (*c.lua_State) lua_runtime.ConvertError!void,
+    lua_event: agent_protocol.AgentEvent,
 ) !void {
     if (runner.event_registry.handlers(kind).len == 0) return;
 
-    try builder(state.L);
-    defer c.lua_pop(state.L, 1);
-    try dispatch.dispatchObserver(state, runner, kind, -1);
-}
-
-fn observeWith(
-    state: *lua_runtime.LuaState,
-    runner: *runner_mod.ExtensionRunner,
-    kind: event_registry.EventKind,
-    payload: anytype,
-    builder: anytype,
-) !void {
-    if (runner.event_registry.handlers(kind).len == 0) return;
-
-    try builder(state.L, payload);
+    try lua_agent_serializers.pushAgentEventToLua(state.L, lua_event);
     defer c.lua_pop(state.L, 1);
     try dispatch.dispatchObserver(state, runner, kind, -1);
 }
@@ -689,46 +675,6 @@ fn sessionLifecycleReasonString(reason: SessionLifecycleReason) []const u8 {
         .exit => "exit",
         .fork => "fork",
     };
-}
-
-fn pushAgentStart(L: *c.lua_State) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .agent_start);
-}
-
-fn pushAgentEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .{ .agent_end = .{ .messages = payload.messages } });
-}
-
-fn pushTurnStart(L: *c.lua_State) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .turn_start);
-}
-
-fn pushTurnEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .{ .turn_end = .{ .message = payload.message, .tool_results = payload.tool_results } });
-}
-
-fn pushMessageStart(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .{ .message_start = .{ .message = payload.message } });
-}
-
-fn pushMessageUpdate(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .{ .message_update = .{ .message = payload.message, .assistant_message_event = payload.assistant_message_event } });
-}
-
-fn pushMessageEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .{ .message_end = .{ .message = payload.message } });
-}
-
-fn pushToolExecStart(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .{ .tool_execution_start = .{ .tool_call_id = payload.tool_call_id, .tool_name = payload.tool_name, .args = payload.args } });
-}
-
-fn pushToolExecUpdate(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .{ .tool_execution_update = .{ .tool_call_id = payload.tool_call_id, .tool_name = payload.tool_name, .args = payload.args, .partial_result = payload.partial_result } });
-}
-
-fn pushToolExecEnd(L: *c.lua_State, payload: anytype) lua_runtime.ConvertError!void {
-    try lua_agent_serializers.pushAgentEventToLua(L, .{ .tool_execution_end = .{ .tool_call_id = payload.tool_call_id, .tool_name = payload.tool_name, .result = payload.result, .is_error = payload.is_error } });
 }
 
 pub fn beforeToolCall(
