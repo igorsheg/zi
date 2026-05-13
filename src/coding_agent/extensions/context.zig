@@ -662,28 +662,11 @@ fn readChromeField(arena: std.mem.Allocator, L: *c.lua_State, sidx: c_int) !exte
 }
 
 fn readBorderStyleField(L: *c.lua_State, idx: c_int) !extension_ui.BorderStyle {
-    _ = c.lua_getfield(L, idx, "border");
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .rounded;
-    const value = luaString(L, -1) orelse return .rounded;
-    if (std.mem.eql(u8, value, "rounded")) return .rounded;
-    if (std.mem.eql(u8, value, "square")) return .square;
-    return error.InvalidUiBorderStyle;
+    return readEnumField(extension_ui.BorderStyle, L, idx, "border", .rounded, error.InvalidUiBorderStyle);
 }
 
 fn readToneField(L: *c.lua_State, idx: c_int, default: extension_ui.Tone) !extension_ui.Tone {
-    _ = c.lua_getfield(L, idx, "tone");
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return default;
-    const value = luaString(L, -1) orelse return default;
-    if (std.mem.eql(u8, value, "neutral")) return .neutral;
-    if (std.mem.eql(u8, value, "muted")) return .muted;
-    if (std.mem.eql(u8, value, "info")) return .info;
-    if (std.mem.eql(u8, value, "success")) return .success;
-    if (std.mem.eql(u8, value, "warning")) return .warning;
-    if (std.mem.eql(u8, value, "danger")) return .danger;
-    if (std.mem.eql(u8, value, "accent")) return .accent;
-    return error.InvalidUiTone;
+    return readEnumField(extension_ui.Tone, L, idx, "tone", default, error.InvalidUiTone);
 }
 
 fn readEnumField(comptime T: type, L: *c.lua_State, idx: c_int, field: [:0]const u8, default: T, invalid: anyerror) !T {
