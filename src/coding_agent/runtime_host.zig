@@ -762,8 +762,6 @@ fn thinkingLevelToString(level: agent_mod.protocol.ThinkingLevel) []const u8 {
 
 const testing = std.testing;
 const faux = ai.faux;
-const resources = @import("resources/root.zig");
-
 const LifecycleCollector = struct {
     allocator: std.mem.Allocator,
     retry_starts: std.ArrayListUnmanaged(RetryStart) = .empty,

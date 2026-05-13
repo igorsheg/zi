@@ -3,7 +3,8 @@ const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
 const session_runtime = @import("session/root.zig");
 const session_core = @import("../session/root.zig");
-const resources = @import("resources/root.zig");
+const ResourceLoader = @import("resources/loader.zig").ResourceLoader;
+const resource_types = @import("resources/types.zig");
 const tool_def = @import("tools/definition.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
 const builtin_util = @import("tools/util.zig");
@@ -124,7 +125,7 @@ pub const StreamClosure = struct {
 
 pub const PreparedDeps = struct {
     session_store: SessionStore,
-    resource_loader: resources.ResourceLoader,
+    resource_loader: ResourceLoader,
     stream_closure: *StreamClosure,
     system_prompt: []const u8,
     tools: []const agent_mod.protocol.AgentTool,
@@ -171,7 +172,7 @@ pub const ExtensionRuntimeBundle = struct {
 
 pub const ReloadExtensionOptions = struct {
     model: ai.protocol.Model,
-    resource_loader: resources.ResourceLoader,
+    resource_loader: ResourceLoader,
     io: std.Io = std.Options.debug_io,
     settings_manager: ?*settings_manager_mod.SettingsManager = null,
     tools: ?[]const tool_def.ToolDefinition = null,
@@ -241,9 +242,9 @@ pub const PrepareOptions = struct {
     api_key: []const u8 = "",
     cwd: []const u8,
     io: std.Io = std.Options.debug_io,
-    resource_loader: ?resources.ResourceLoader = null,
+    resource_loader: ?ResourceLoader = null,
     system_prompt: ?[]const u8 = null,
-    context_files: []const resources.types.AgentsFile = &.{},
+    context_files: []const resource_types.AgentsFile = &.{},
     extension_paths: []const []const u8 = &.{},
     agent_dir_override: ?[]const u8 = null,
     max_tokens: ?u64 = 4096,
@@ -268,7 +269,7 @@ pub fn prepareSessionDeps(
         try SessionStore.createForCwd(allocator, options.cwd, options.agent_dir_override);
     errdefer session_store.deinit();
 
-    const resource_loader = options.resource_loader orelse try resources.ResourceLoader.init(allocator, .{
+    const resource_loader = options.resource_loader orelse try ResourceLoader.init(allocator, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
         .settings_manager = options.settings_manager,
@@ -560,7 +561,7 @@ pub fn buildAgentTools(
 
 fn customizeSystemPrompt(
     allocator: std.mem.Allocator,
-    resource_loader: resources.ResourceLoader,
+    resource_loader: ResourceLoader,
     definitions: []const tool_def.ToolDefinition,
     runner: ?*ExtensionRunner,
     base_system_prompt: []const u8,
@@ -583,7 +584,7 @@ fn customizeSystemPrompt(
 
 pub fn buildSystemPrompt(
     allocator: std.mem.Allocator,
-    resource_loader: resources.ResourceLoader,
+    resource_loader: ResourceLoader,
     definitions: []const tool_def.ToolDefinition,
 ) ![]const u8 {
     const prompt_inputs = resource_loader.getPromptInputs();
@@ -656,7 +657,7 @@ const ExtensionRuntime = struct {
 
 fn buildExtensionRuntime(
     allocator: std.mem.Allocator,
-    resource_loader: resources.ResourceLoader,
+    resource_loader: ResourceLoader,
     io: std.Io,
     builtin_definitions: []const tool_def.ToolDefinition,
     has_custom_tools: bool,
@@ -833,11 +834,11 @@ test "system prompt is built from ResourceLoader-owned inputs" {
     const agent_dir = try agent_tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
     defer allocator.free(agent_dir);
 
-    const context_files = [_]resources.types.AgentsFile{.{
+    const context_files = [_]resource_types.AgentsFile{.{
         .path = "AGENTS.md",
         .content = "project guidance from loader",
     }};
-    var resource_loader = try resources.ResourceLoader.init(allocator, .{
+    var resource_loader = try ResourceLoader.init(allocator, .{
         .cwd = cwd,
         .agent_dir_override = agent_dir,
         .system_prompt = "custom prompt from loader",

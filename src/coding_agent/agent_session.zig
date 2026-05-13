@@ -8,7 +8,7 @@ const session_runtime = @import("session/root.zig");
 const session_core = @import("../session/root.zig");
 const tool_def = @import("tools/definition.zig");
 const builtin_util = @import("tools/util.zig");
-const resources = @import("resources/root.zig");
+const ResourceLoader = @import("resources/loader.zig").ResourceLoader;
 const auth_storage_mod = @import("auth/storage.zig");
 const settings_manager_mod = @import("settings/manager.zig");
 const settings_types_mod = @import("settings/types.zig");
@@ -80,7 +80,7 @@ pub const AgentSession = struct {
     _stream_closure: *StreamClosure,
     auth_storage: ?*auth_storage_mod.AuthStorage,
     settings_manager: ?*settings_manager_mod.SettingsManager = null,
-    resource_loader: resources.ResourceLoader,
+    resource_loader: ResourceLoader,
 
     model_registry: ?*model_registry_mod.ModelRegistry = null,
 
@@ -202,7 +202,7 @@ pub const AgentSession = struct {
         model: ai.protocol.Model,
         api_key: []const u8 = "",
         cwd: []const u8,
-        resource_loader: resources.ResourceLoader,
+        resource_loader: ResourceLoader,
         max_tokens: ?u64 = 4096,
         tools: ?[]const tool_def.ToolDefinition = null,
         registry: ?*ai.provider.Registry = null,
@@ -1110,8 +1110,8 @@ test "trySetModel rejects unauthed model without mutating state or session" {
 
 const faux = ai.faux;
 
-fn createTestResourceLoader(allocator: std.mem.Allocator, cwd: []const u8) resources.ResourceLoader {
-    return resources.ResourceLoader.init(allocator, .{
+fn createTestResourceLoader(allocator: std.mem.Allocator, cwd: []const u8) ResourceLoader {
+    return ResourceLoader.init(allocator, .{
         .cwd = cwd,
         .agent_dir_override = "/tmp/zi-test-agent-empty",
     }) catch @panic("OOM");
@@ -1121,8 +1121,8 @@ fn createTestResourceLoaderWithAgentDir(
     allocator: std.mem.Allocator,
     cwd: []const u8,
     agent_dir: []const u8,
-) resources.ResourceLoader {
-    return resources.ResourceLoader.init(allocator, .{
+) ResourceLoader {
+    return ResourceLoader.init(allocator, .{
         .cwd = cwd,
         .agent_dir_override = agent_dir,
     }) catch @panic("OOM");

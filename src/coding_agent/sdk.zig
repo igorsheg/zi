@@ -5,7 +5,7 @@ const storage = @import("../storage.zig");
 const agent_session_mod = @import("agent_session.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
 const model_registry_mod = @import("model_registry.zig");
-const resources = @import("resources/root.zig");
+const resource_types = @import("resources/types.zig");
 const tool_def = @import("tools/definition.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const settings_manager_mod = @import("settings/manager.zig");
@@ -24,7 +24,7 @@ pub const CreateOptions = struct {
 
     system_prompt: ?[]const u8 = null,
 
-    context_files: []const resources.types.AgentsFile = &.{},
+    context_files: []const resource_types.AgentsFile = &.{},
 
     extension_paths: []const []const u8 = &.{},
     agent_dir_override: ?[]const u8 = null,
