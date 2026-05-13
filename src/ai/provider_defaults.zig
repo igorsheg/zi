@@ -24,22 +24,17 @@ pub const Bundle = struct {
         registry.* = provider_mod.Registry.init(allocator);
         errdefer registry.deinit();
 
-        var anth = anthropic.AnthropicProvider.init(allocator);
-        try registry.register("anthropic-messages", anth.provider(), null);
-
-        var oac = openai_completions.OpenAICompletionsProvider.init(allocator);
-        try registry.register("openai-completions", oac.provider(), null);
-
         self.* = .{
             .allocator = allocator,
             .registry = registry,
-            .anthropic_prov = anth,
-            .openai_completions_prov = oac,
+            .anthropic_prov = anthropic.AnthropicProvider.init(allocator),
+            .openai_completions_prov = openai_completions.OpenAICompletionsProvider.init(allocator),
             .openai_codex_prov = openai_codex.OpenAICodexProvider.init(allocator),
         };
 
+        try registry.register("anthropic-messages", self.anthropic_prov.provider(), null);
+        try registry.register("openai-completions", self.openai_completions_prov.provider(), null);
         try registry.register("openai-responses", openaiResponsesProvider(self), null);
-
         try registry.register("openai-codex-responses", self.openai_codex_prov.provider(), null);
         return self;
     }
