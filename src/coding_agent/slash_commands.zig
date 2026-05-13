@@ -28,7 +28,33 @@ pub const SlashCommand = struct {
     action: CommandAction,
 };
 
-pub const BUILTIN_COMMANDS = [_]SlashCommand{};
+fn builtinMarker(_: []const u8, _: *CommandContext) anyerror!void {}
+
+pub const BUILTIN_COMMANDS = [_]SlashCommand{
+    .{ .name = "model", .description = "Select model", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "compact", .description = "Compact session context", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "new", .description = "Start a new session", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "clear", .description = "Clear conversation", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "quit", .description = "Quit zi", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "resume", .description = "Resume a different session", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "fork", .description = "Create a new fork from a previous message", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "tree", .description = "Navigate session tree", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "export", .description = "Export session", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "import", .description = "Import and resume a session from a JSONL file", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "copy", .description = "Copy last agent message to clipboard", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "name", .description = "Set session display name", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "session", .description = "Show session info and stats", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "hotkeys", .description = "Show all keyboard shortcuts", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "memory", .description = "Show memory telemetry", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "logs", .description = "Show log path or write a log snapshot", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "settings", .description = "Open settings menu", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "login", .description = "Login with OAuth provider", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "logout", .description = "Logout from OAuth provider", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "reload", .description = "Reload keybindings, extensions, skills, prompts, and themes", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "share", .description = "Share session as a secret GitHub gist", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "changelog", .description = "Show changelog entries", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+    .{ .name = "scoped-models", .description = "Enable/disable models for Ctrl+P cycling", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+};
 
 pub const CommandRegistry = struct {
     builtins: []const SlashCommand,
@@ -85,12 +111,16 @@ pub const CommandRegistry = struct {
     }
 };
 
-test "CommandRegistry starts without builtin commands" {
+test "CommandRegistry finds builtin commands" {
     var reg = CommandRegistry.init(std.testing.allocator);
     defer reg.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), reg.count());
-    try std.testing.expect(reg.findCommand("quit") == null);
+    try std.testing.expect(reg.count() > 0);
+    const quit = reg.findCommand("quit").?;
+    try std.testing.expectEqualStrings("quit", quit.name);
+    try std.testing.expectEqualStrings("Quit zi", quit.description.?);
+    try std.testing.expect(reg.findCommand("model") != null);
+    try std.testing.expect(reg.findCommand("settings") != null);
     try std.testing.expect(reg.findCommand("nonexistent") == null);
 }
 
@@ -126,6 +156,6 @@ test "CommandRegistry dynamic commands provide command names" {
     });
 
     const found = reg.findCommand("quit").?;
-    try std.testing.expectEqual(Source.extension, found.source);
-    try std.testing.expectEqualStrings("Extension quit", found.description.?);
+    try std.testing.expectEqual(Source.builtin, found.source);
+    try std.testing.expectEqualStrings("Quit zi", found.description.?);
 }
