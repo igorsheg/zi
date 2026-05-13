@@ -21,6 +21,7 @@ pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
         .name = "write",
         .description = DESCRIPTION,
         .label = "Create File",
+        .display_call = "path",
         .parameters = util.parseSchema(SCHEMA),
         .prompt_snippet = "Create or overwrite files",
         .prompt_guidelines = &.{"Use write only for new files or complete rewrites."},

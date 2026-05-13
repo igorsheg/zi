@@ -32,6 +32,7 @@ pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
         .name = "read",
         .description = DESCRIPTION,
         .label = "Read",
+        .display_call = "path",
         .parameters = util.parseSchema(SCHEMA),
         .prompt_snippet = "Read file contents",
         .prompt_guidelines = &.{"Use read to examine files instead of cat or sed."},

@@ -1150,13 +1150,41 @@ fn buildToolExecutionRowModel(
     return model;
 }
 
+fn jsonFieldString(value: std.json.Value, field: []const u8) ?[]const u8 {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return null,
+    };
+    return switch (obj.get(field) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn buildCallSummary(allocator: std.mem.Allocator, args: std.json.Value, field: ?[]const u8) !?[]u8 {
+    const name = field orelse return null;
+    const value = jsonFieldString(args, name) orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const first_line = if (std.mem.indexOfScalar(u8, trimmed, '\n')) |idx| trimmed[0..idx] else trimmed;
+    const max: usize = 512;
+    return try allocator.dupe(u8, first_line[0..@min(first_line.len, max)]);
+}
+
 fn createToolExecutionRowParts(
     allocator: std.mem.Allocator,
     resolver: ToolRendererResolver,
     model: *transcript_mod.ToolExecutionRowModel,
     theme: *const Theme,
 ) !TranscriptItem {
-    const renderer = resolver.resolve(model.tool_name orelse return error.InvalidToolExecutionRowModel);
+    const display = resolver.resolveDisplay(model.tool_name orelse return error.InvalidToolExecutionRowModel);
+    const renderer = display.renderer;
+    if (display.label) |label| {
+        if (model.tool_label == null) model.tool_label = try allocator.dupe(u8, label);
+    }
+    if (display.display_call) |field| {
+        if (model.call_summary == null) model.call_summary = try buildCallSummary(allocator, model.args, field);
+    }
     const te = try allocator.create(transcript_mod.ToolExecution);
     errdefer allocator.destroy(te);
     te.* = .{

@@ -24,6 +24,7 @@ pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
         .name = "bash",
         .description = DESCRIPTION,
         .label = "Bash",
+        .display_call = "cmd",
         .parameters = util.parseSchema(bash_schema),
         .prompt_snippet = "Execute bash commands",
         .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },

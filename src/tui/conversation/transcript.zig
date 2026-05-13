@@ -347,6 +347,8 @@ const TranscriptLayout = struct {
 pub const ToolExecutionRowModel = struct {
     tool_call_id: ?[]u8 = null,
     tool_name: ?[]u8 = null,
+    tool_label: ?[]u8 = null,
+    call_summary: ?[]u8 = null,
     args: std.json.Value = .null,
     args_json_source: ?[]u8 = null,
     result: ?AgentToolResult = null,
@@ -368,6 +370,18 @@ pub const ToolExecutionRowModel = struct {
             null;
         errdefer if (tool_name) |owned| allocator.free(owned);
 
+        const tool_label = if (self.tool_label) |tool_label|
+            try allocator.dupe(u8, tool_label)
+        else
+            null;
+        errdefer if (tool_label) |owned| allocator.free(owned);
+
+        const call_summary = if (self.call_summary) |call_summary|
+            try allocator.dupe(u8, call_summary)
+        else
+            null;
+        errdefer if (call_summary) |owned| allocator.free(owned);
+
         const args = try json_util.cloneJsonValue(allocator, self.args);
         errdefer json_util.freeJsonValue(allocator, args);
 
@@ -386,6 +400,8 @@ pub const ToolExecutionRowModel = struct {
         return .{
             .tool_call_id = tool_call_id,
             .tool_name = tool_name,
+            .tool_label = tool_label,
+            .call_summary = call_summary,
             .args = args,
             .args_json_source = args_json_source,
             .result = result,
@@ -400,6 +416,8 @@ pub const ToolExecutionRowModel = struct {
         if (self.result) |result| result.free(allocator);
         json_util.freeJsonValue(allocator, self.args);
         if (self.args_json_source) |source| allocator.free(source);
+        if (self.call_summary) |summary| allocator.free(summary);
+        if (self.tool_label) |label| allocator.free(label);
         if (self.tool_name) |tool_name| allocator.free(tool_name);
         if (self.tool_call_id) |tool_call_id| allocator.free(tool_call_id);
         self.* = .{};
@@ -586,7 +604,12 @@ pub const ToolExecution = struct {
     }
 
     fn renderCallDefault(self: *ToolExecution, region: Region) void {
-        _ = region.writeStr(0, 0, self.model.tool_name orelse "", self.theme.fg(.tool_title), Color.default, .{ .bold = true });
+        const title = self.model.tool_label orelse self.model.tool_name orelse "";
+        var x = region.writeStr(0, 0, title, self.theme.fg(.tool_title), Color.default, .{ .bold = true });
+        if (self.model.call_summary) |summary| if (summary.len > 0 and x < region.width) {
+            x += region.writeStr(x, 0, " ", self.theme.fg(.muted), Color.default, .{});
+            if (x < region.width) _ = region.writeStr(x, 0, summary, self.theme.fg(.muted), Color.default, .{});
+        };
     }
 
     fn renderResultFromOffset(self: *ToolExecution, region: Region, skip_rows: u32) void {

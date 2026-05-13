@@ -31,6 +31,7 @@ pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
         .name = "find",
         .description = DESCRIPTION,
         .label = "Find Files",
+        .display_call = "filePattern",
         .parameters = util.parseSchema(SCHEMA),
         .prompt_snippet = "Find files by glob pattern (respects .gitignore)",
         .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },

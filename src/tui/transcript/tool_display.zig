@@ -64,23 +64,35 @@ pub const ToolRenderContext = struct {
 pub const Registration = struct {
     tool_name: []const u8,
     renderer: ToolRenderer,
+    label: ?[]const u8 = null,
+    display_call: ?[]const u8 = null,
+};
+
+pub const ToolDisplay = struct {
+    renderer: ToolRenderer = .{},
+    label: ?[]const u8 = null,
+    display_call: ?[]const u8 = null,
 };
 
 pub const ToolRendererResolver = struct {
     ctx: ?*anyopaque = null,
-    resolve_fn: *const fn (ctx: ?*anyopaque, tool_name: []const u8) ToolRenderer,
+    resolve_fn: *const fn (ctx: ?*anyopaque, tool_name: []const u8) ToolDisplay,
 
     pub fn resolve(self: *const ToolRendererResolver, tool_name: []const u8) ToolRenderer {
+        return self.resolveDisplay(tool_name).renderer;
+    }
+
+    pub fn resolveDisplay(self: *const ToolRendererResolver, tool_name: []const u8) ToolDisplay {
         return self.resolve_fn(self.ctx, tool_name);
     }
 
     pub fn fromStatic(entries: *const []const Registration) ToolRendererResolver {
         const S = struct {
-            fn resolveStatic(ctx: ?*anyopaque, tool_name: []const u8) ToolRenderer {
+            fn resolveStatic(ctx: ?*anyopaque, tool_name: []const u8) ToolDisplay {
                 const slice_ptr: *const []const Registration = @ptrCast(@alignCast(ctx.?));
                 for (slice_ptr.*) |entry| {
                     if (std.mem.eql(u8, entry.tool_name, tool_name)) {
-                        return entry.renderer;
+                        return .{ .renderer = entry.renderer, .label = entry.label, .display_call = entry.display_call };
                     }
                 }
                 return .{};
@@ -93,7 +105,7 @@ pub const ToolRendererResolver = struct {
 pub const empty_resolver = ToolRendererResolver{
     .ctx = null,
     .resolve_fn = struct {
-        fn resolveNone(_: ?*anyopaque, _: []const u8) ToolRenderer {
+        fn resolveNone(_: ?*anyopaque, _: []const u8) ToolDisplay {
             return .{};
         }
     }.resolveNone,

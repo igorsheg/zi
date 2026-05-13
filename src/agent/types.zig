@@ -238,6 +238,7 @@ pub const AgentTool = struct {
     name: []const u8,
     description: []const u8,
     label: []const u8,
+    display_call: ?[]const u8 = null,
     parameters: std.json.Value,
 
     ctx: ?*anyopaque = null,

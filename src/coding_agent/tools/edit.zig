@@ -36,6 +36,7 @@ pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
         .name = "edit",
         .description = DESCRIPTION,
         .label = "Edit File",
+        .display_call = "path",
         .parameters = util.parseSchema(SCHEMA),
         .prompt_snippet = "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
         .prompt_guidelines = &.{

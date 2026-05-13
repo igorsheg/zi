@@ -107,6 +107,7 @@ pub fn buildAgentTool(
         .name = ext_tool.name,
         .description = ext_tool.description,
         .label = ext_tool.label,
+        .display_call = ext_tool.display_call,
         .parameters = ext_tool.parameters,
         .ctx = @ptrCast(ctx),
         .execute = &execute,

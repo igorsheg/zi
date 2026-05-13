@@ -19,6 +19,7 @@ pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
         .name = "ls",
         .description = DESCRIPTION,
         .label = "List Directory",
+        .display_call = "path",
         .parameters = util.parseSchema(SCHEMA),
         .prompt_snippet = "List directory contents",
         .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },

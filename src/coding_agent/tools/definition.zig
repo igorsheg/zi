@@ -32,6 +32,7 @@ pub const ToolDefinition = struct {
     name: []const u8,
     label: []const u8,
     description: []const u8,
+    display_call: ?[]const u8 = null,
     parameters: std.json.Value,
     prompt_snippet: ?[]const u8 = null,
     prompt_guidelines: []const []const u8 = &.{},
@@ -49,6 +50,12 @@ pub fn cloneOwned(allocator: std.mem.Allocator, def: ToolDefinition) !ToolDefini
 
     const description = try allocator.dupe(u8, def.description);
     errdefer allocator.free(description);
+
+    const display_call = if (def.display_call) |field|
+        try allocator.dupe(u8, field)
+    else
+        null;
+    errdefer if (display_call) |field| allocator.free(field);
 
     const parameters = try json_value.cloneJsonValue(allocator, def.parameters);
     errdefer json_value.freeJsonValue(allocator, parameters);
@@ -79,6 +86,7 @@ pub fn cloneOwned(allocator: std.mem.Allocator, def: ToolDefinition) !ToolDefini
         .name = name,
         .label = label,
         .description = description,
+        .display_call = display_call,
         .parameters = parameters,
         .prompt_snippet = prompt_snippet,
         .prompt_guidelines = prompt_guidelines,
@@ -93,6 +101,7 @@ pub fn freeOwned(allocator: std.mem.Allocator, def: *ToolDefinition) void {
     allocator.free(def.name);
     allocator.free(def.label);
     allocator.free(def.description);
+    if (def.display_call) |field| allocator.free(field);
     if (def.prompt_snippet) |snippet| allocator.free(snippet);
     for (def.prompt_guidelines) |guideline| allocator.free(guideline);
     if (def.prompt_guidelines.len > 0) allocator.free(def.prompt_guidelines);
@@ -106,6 +115,7 @@ pub fn toAgentTool(def: *const ToolDefinition) protocol.AgentTool {
             .name = def.name,
             .description = def.description,
             .label = def.label,
+            .display_call = def.display_call,
             .parameters = def.parameters,
             .ctx = impl.ctx,
             .affinity = .worker_thread,

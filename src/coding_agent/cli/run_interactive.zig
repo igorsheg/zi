@@ -15,6 +15,7 @@ const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
 const common = @import("common.zig");
 const context_mod = @import("context.zig");
+const agent_protocol = @import("../../agent/root.zig").protocol;
 
 const ResolvedStartupAction = union(enum) {
     none,
@@ -27,6 +28,31 @@ const ResolvedStartupAction = union(enum) {
         restore_session_model: bool = true,
     },
 };
+
+fn builtinRenderer(name: []const u8) tool_display.ToolRenderer {
+    if (std.mem.eql(u8, name, "bash")) return builtin_renderers.bash_renderer;
+    if (std.mem.eql(u8, name, "read")) return builtin_renderers.read_renderer;
+    if (std.mem.eql(u8, name, "write")) return builtin_renderers.write_renderer;
+    if (std.mem.eql(u8, name, "edit")) return builtin_renderers.edit_renderer;
+    if (std.mem.eql(u8, name, "patch")) return builtin_renderers.patch_renderer;
+    if (std.mem.eql(u8, name, "grep")) return builtin_renderers.grep_renderer;
+    if (std.mem.eql(u8, name, "find")) return builtin_renderers.find_renderer;
+    if (std.mem.eql(u8, name, "ls")) return builtin_renderers.ls_renderer;
+    return .{};
+}
+
+fn buildToolDisplayEntries(allocator: std.mem.Allocator, tools: []const agent_protocol.AgentTool) ![]const tool_display.Registration {
+    var entries = try allocator.alloc(tool_display.Registration, tools.len);
+    for (tools, 0..) |tool, i| {
+        entries[i] = .{
+            .tool_name = tool.name,
+            .renderer = builtinRenderer(tool.name),
+            .label = tool.label,
+            .display_call = tool.display_call,
+        };
+    }
+    return entries;
+}
 
 const StartupResolution = union(enum) {
     ok: ResolvedStartupAction,
@@ -104,16 +130,8 @@ pub fn run(
     session_ptr.* = try sdk.createAgentSession(ctx.allocator, session_create_options);
     errdefer session_ptr.deinit();
 
-    const static_entries: []const tool_display.Registration = &.{
-        .{ .tool_name = "bash", .renderer = builtin_renderers.bash_renderer },
-        .{ .tool_name = "read", .renderer = builtin_renderers.read_renderer },
-        .{ .tool_name = "write", .renderer = builtin_renderers.write_renderer },
-        .{ .tool_name = "edit", .renderer = builtin_renderers.edit_renderer },
-        .{ .tool_name = "patch", .renderer = builtin_renderers.patch_renderer },
-        .{ .tool_name = "grep", .renderer = builtin_renderers.grep_renderer },
-        .{ .tool_name = "find", .renderer = builtin_renderers.find_renderer },
-        .{ .tool_name = "ls", .renderer = builtin_renderers.ls_renderer },
-    };
+    const static_entries = try buildToolDisplayEntries(ctx.allocator, session_ptr.tools);
+    defer ctx.allocator.free(static_entries);
     const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
     const retry_settings = runtime.settings_manager.getRetrySettings();
     const compaction_settings = runtime.settings_manager.getCompactionSettings();

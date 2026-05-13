@@ -75,6 +75,9 @@ A tool is visible to the model. Keep it narrow.
 `label`
 : Optional UI label. Defaults to `name`.
 
+`display.call`
+: Optional string naming one top-level argument field to show in the transcript tool-call header. Zi owns rendering: the header remains one line, uses host styling, and updates as streamed tool-call args arrive. Example: `display = { call = "query" }` renders `Finder <query>` for a tool labeled `Finder`. Missing or empty fields render only the label.
+
 `prompt_snippet`
 : Optional prompt metadata.
 

@@ -33,6 +33,7 @@ pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
         .name = "grep",
         .description = DESCRIPTION,
         .label = "Grep",
+        .display_call = "pattern",
         .parameters = util.parseSchema(SCHEMA),
         .prompt_snippet = "Search file contents for patterns (respects .gitignore)",
         .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },

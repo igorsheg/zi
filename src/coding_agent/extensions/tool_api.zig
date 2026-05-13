@@ -27,6 +27,7 @@ pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.InvalidName => "field 'name' must be a string",
             error.InvalidDescription => "field 'description' must be a string",
             error.InvalidLabel => "field 'label' must be a string",
+            error.InvalidDisplay => "field 'display.call' must be a string",
             error.InvalidPromptSnippet => "field 'prompt_snippet' must be a string",
             error.InvalidPromptGuidelines => "field 'prompt_guidelines' must be an array of strings",
             error.InvalidParameters => "field 'parameters' must be a table",
@@ -66,6 +67,7 @@ const BuildError = error{
     MissingExecute,
     InvalidName,
     InvalidLabel,
+    InvalidDisplay,
     InvalidDescription,
     InvalidPromptSnippet,
     InvalidPromptGuidelines,
@@ -94,6 +96,9 @@ fn buildExtensionTool(
         break :blk try a.dupe(u8, name);
     };
     errdefer a.free(label);
+
+    const display_call = try optionalDisplayCall(L, 1, a, error.InvalidDisplay);
+    errdefer if (display_call) |field| a.free(field);
 
     const prompt_snippet = try optionalString(L, 1, "prompt_snippet", a, error.InvalidPromptSnippet);
     errdefer if (prompt_snippet) |s| a.free(s);
@@ -127,6 +132,7 @@ fn buildExtensionTool(
         .name = name,
         .label = label,
         .description = description,
+        .display_call = display_call,
         .parameters = parameters,
         .prompt_snippet = prompt_snippet,
         .prompt_guidelines = prompt_guidelines,
@@ -134,6 +140,29 @@ fn buildExtensionTool(
         .source = currentRegistrationSource(runner),
         .owned = true,
     };
+}
+
+fn optionalDisplayCall(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+    invalid_err: BuildError,
+) BuildError!?[]const u8 {
+    _ = c.lua_getfield(L, table_idx, "display");
+    defer c.lua_pop(L, 1);
+    const display_type = c.lua_type(L, -1);
+    if (display_type == c.LUA_TNIL) return null;
+    if (display_type != c.LUA_TTABLE) return invalid_err;
+    _ = c.lua_getfield(L, -1, "call");
+    defer c.lua_pop(L, 1);
+    const call_type = c.lua_type(L, -1);
+    if (call_type == c.LUA_TNIL) return null;
+    if (call_type != c.LUA_TSTRING) return invalid_err;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return invalid_err;
+    const slice = ptr[0..len];
+    if (!std.unicode.utf8ValidateSlice(slice)) return error.InvalidUtf8;
+    return try allocator.dupe(u8, slice);
 }
 
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
