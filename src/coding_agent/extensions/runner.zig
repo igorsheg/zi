@@ -1065,7 +1065,7 @@ pub const ExtensionRunner = struct {
 
     fn drainQueuedProviders(self: *ExtensionRunner) !bool {
         const registry = self._provider_registry orelse return false;
-        const drained = self.provider_queue.drain();
+        const drained = try self.provider_queue.drain();
         defer self.allocator.free(drained);
 
         var projection_changed = false;

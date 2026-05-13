@@ -46,8 +46,8 @@ pub const ProviderQueue = struct {
         try self.pending.append(self.allocator, .{ .unregister = op });
     }
 
-    pub fn drain(self: *ProviderQueue) []PendingProviderOperation {
-        return self.pending.toOwnedSlice(self.allocator) catch &.{};
+    pub fn drain(self: *ProviderQueue) ![]PendingProviderOperation {
+        return try self.pending.toOwnedSlice(self.allocator);
     }
 
     pub fn count(self: *const ProviderQueue) usize {
@@ -75,7 +75,7 @@ test "ProviderQueue preserves ordered register/unregister operations" {
 
     try testing.expectEqual(@as(usize, 2), q.count());
 
-    const drained = q.drain();
+    const drained = try q.drain();
     defer {
         for (drained) |*op| op.deinit(testing.allocator);
         testing.allocator.free(drained);
