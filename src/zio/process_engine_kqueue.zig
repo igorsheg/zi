@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process_common = @import("process_common.zig");
+const process_env = @import("process_env.zig");
 const types = @import("process_engine_types.zig");
 const cancel_waiter = @import("cancel_waiter.zig");
 
@@ -126,18 +127,12 @@ pub const Engine = struct {
     fn run(self: *Engine) void {
         comptime std.debug.assert(builtin.os.tag == .macos or builtin.os.tag == .ios or builtin.os.tag == .visionos);
 
-        var env_map_storage: ?std.process.Environ.Map = null;
+        var env_map_storage = process_env.buildMap(std.heap.page_allocator, self.request.env, self.request.clear_env) catch {
+            _ = self.sink.submit(self.sink.ptr, .spawn_failed);
+            self.markExited();
+            return;
+        };
         defer if (env_map_storage) |*env_map| env_map.deinit();
-        if (self.request.env.len > 0 or self.request.clear_env) {
-            env_map_storage = std.process.Environ.Map.init(std.heap.page_allocator);
-            for (self.request.env) |pair| {
-                env_map_storage.?.put(pair.key, pair.value) catch {
-                    _ = self.sink.submit(self.sink.ptr, .spawn_failed);
-                    self.markExited();
-                    return;
-                };
-            }
-        }
 
         var child = std.process.spawn(self.io, .{
             .argv = self.request.argv,

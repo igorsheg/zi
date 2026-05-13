@@ -5,6 +5,7 @@ const cancel = @import("cancel.zig");
 const cancel_waiter = @import("cancel_waiter.zig");
 const process_common = @import("process_common.zig");
 const process_engine = @import("process_engine.zig");
+const process_env = @import("process_env.zig");
 const runtime_env = @import("env");
 pub const Jobs = @import("job.zig");
 
@@ -182,7 +183,7 @@ pub const InheritOptions = struct {
 pub fn runInherit(io: std.Io, options: InheritOptions) RunError!std.process.Child.Term {
     if (options.argv.len == 0) return error.EmptyArgv;
     if (options.stdin == .bytes) return error.InvalidStdio;
-    var env_map_storage = buildEnvMap(std.heap.smp_allocator, options.env, options.clear_env) catch return error.EnvironmentBuildFailed;
+    var env_map_storage = process_env.buildMap(std.heap.smp_allocator, options.env, options.clear_env) catch return error.EnvironmentBuildFailed;
     defer if (env_map_storage) |*env_map| env_map.deinit();
     var child = std.process.spawn(io, .{
         .argv = options.argv,
@@ -416,14 +417,6 @@ fn childPgid(scope: KillScope) ?std.process.Child.Id {
     return null;
 }
 
-fn buildEnvMap(allocator: std.mem.Allocator, env: []const EnvPair, clear_env: bool) !?std.process.Environ.Map {
-    if (env.len == 0 and !clear_env) return null;
-    var map = std.process.Environ.Map.init(allocator);
-    errdefer map.deinit();
-    for (env) |pair| try map.put(pair.key, pair.value);
-    return map;
-}
-
 fn skipShellProcessTestsIfUnsupported() !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 }
@@ -444,6 +437,36 @@ test "process.run captures both output streams without mixing them" {
     };
     try std.testing.expectEqualSlices(u8, "out", completed.stdout);
     try std.testing.expectEqualSlices(u8, "err", completed.stderr);
+}
+
+test "process.run env overlays inherited environment" {
+    try skipShellProcessTestsIfUnsupported();
+    var result = try runShell("printf '%s:%s' \"$PATH\" \"$ZI_PROCESS_TEST_ENV\"", .{
+        .argv = &.{},
+        .env = &.{.{ .key = "ZI_PROCESS_TEST_ENV", .value = "overlay" }},
+    });
+    defer result.deinit(std.testing.allocator);
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, completed.stdout, "/"));
+    try std.testing.expect(std.mem.endsWith(u8, completed.stdout, ":overlay"));
+}
+
+test "process.run clear_env starts from empty environment" {
+    try skipShellProcessTestsIfUnsupported();
+    var result = try runShell("if [ -z \"${HOME+x}\" ]; then printf clear; else printf inherited; fi; printf ':%s' \"$ZI_PROCESS_TEST_ENV\"", .{
+        .argv = &.{},
+        .clear_env = true,
+        .env = &.{.{ .key = "ZI_PROCESS_TEST_ENV", .value = "explicit" }},
+    });
+    defer result.deinit(std.testing.allocator);
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
+    try std.testing.expectEqualSlices(u8, "clear:explicit", completed.stdout);
 }
 
 test "process.run returns immediately when command exits before timeout" {
