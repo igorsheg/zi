@@ -1,5 +1,4 @@
 const std = @import("std");
-const registries = @import("registries/root.zig");
 const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../../zio/root.zig");
 const agent_protocol = @import("../../agent/types.zig");
@@ -17,6 +16,15 @@ const auth_types = @import("../auth/types.zig");
 const request_mod = @import("../request.zig");
 const extension_ui = @import("ui.zig");
 const system_command = @import("system_command.zig");
+const ToolRegistry = @import("registries/tool_registry.zig").ToolRegistry;
+const event_registry_mod = @import("registries/event_registry.zig");
+const EventRegistry = event_registry_mod.EventRegistry;
+const EventKind = event_registry_mod.EventKind;
+const CommandRegistry = @import("registries/command_registry.zig").CommandRegistry;
+const keybinding_registry_mod = @import("registries/keybinding_registry.zig");
+const KeybindingRegistry = keybinding_registry_mod.KeybindingRegistry;
+const KeybindingDef = keybinding_registry_mod.KeybindingDef;
+const ProviderQueue = @import("registries/provider_queue.zig").ProviderQueue;
 
 const log = std.log.scoped(.zi_runner);
 
@@ -787,14 +795,14 @@ pub const ExtensionRunner = struct {
 
     runtime: ExtensionRuntime,
 
-    tool_registry: registries.ToolRegistry,
+    tool_registry: ToolRegistry,
 
-    event_registry: registries.EventRegistry,
+    event_registry: EventRegistry,
 
-    command_registry: registries.CommandRegistry,
-    keybinding_registry: registries.KeybindingRegistry,
+    command_registry: CommandRegistry,
+    keybinding_registry: KeybindingRegistry,
 
-    provider_queue: registries.ProviderQueue,
+    provider_queue: ProviderQueue,
 
     lua_state: ?*lua_runtime.LuaState = null,
 
@@ -838,11 +846,11 @@ pub const ExtensionRunner = struct {
             .allocator = allocator,
             .generation = generation,
             .runtime = .{ .stub = {} },
-            .tool_registry = registries.ToolRegistry.init(allocator),
-            .event_registry = registries.EventRegistry.init(allocator),
-            .command_registry = registries.CommandRegistry.init(allocator),
-            .keybinding_registry = registries.KeybindingRegistry.init(allocator),
-            .provider_queue = registries.ProviderQueue.init(allocator),
+            .tool_registry = ToolRegistry.init(allocator),
+            .event_registry = EventRegistry.init(allocator),
+            .command_registry = CommandRegistry.init(allocator),
+            .keybinding_registry = KeybindingRegistry.init(allocator),
+            .provider_queue = ProviderQueue.init(allocator),
             .loaded_extensions = .empty,
             .hook_arena = std.heap.ArenaAllocator.init(allocator),
         };
@@ -1132,7 +1140,7 @@ pub const ExtensionRunner = struct {
         self.assertOnLuaThread();
 
         const state = self.lua_state orelse return error.MissingLuaState;
-        var kb_opt: ?*const registries.keybinding.KeybindingDef = null;
+        var kb_opt: ?*const KeybindingDef = null;
         for (self.keybinding_registry.items()) |*entry| {
             if (std.mem.eql(u8, entry.id, id)) {
                 kb_opt = entry;
@@ -1180,7 +1188,7 @@ pub const ExtensionRunner = struct {
 
     pub fn dispatchJobEvent(self: *ExtensionRunner, event: extension_ui.JobEvent) !void {
         self.assertOnLuaThread();
-        const kind: registries.event.EventKind = switch (event.kind) {
+        const kind: EventKind = switch (event.kind) {
             .stdout => .job_stdout,
             .stderr => .job_stderr,
             .exit => .job_exit,
