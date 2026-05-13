@@ -6,6 +6,7 @@ const util = @import("util.zig");
 const runtime_process = @import("../../zio/root.zig").process;
 
 const MAX_CAPTURE_BYTES: usize = 50 * 1024;
+const STREAM_UPDATE_INTERVAL_MS: i128 = 100;
 
 const bash_schema =
     \\{"type":"object","properties":{"cmd":{"type":"string","description":"The shell command to execute."},"cwd":{"type":"string","description":"Working directory for the command (absolute path). Defaults to workspace root."},"timeout":{"type":"number","description":"Timeout in seconds."}},"required":["cmd"]}
@@ -42,9 +43,7 @@ fn execute(
     update_ctx: ?*anyopaque,
 ) protocol.AgentToolExecution {
     _ = tool_call_id;
-    _ = on_update;
-    _ = update_ctx;
-    return .{ .ready = executeSync(raw_ctx, allocator, args, signal) };
+    return .{ .ready = executeSync(raw_ctx, allocator, args, signal, on_update, update_ctx) };
 }
 
 fn executeSync(
@@ -52,6 +51,8 @@ fn executeSync(
     allocator: std.mem.Allocator,
     args: std.json.Value,
     signal: protocol.Token,
+    on_update: ?protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
 ) protocol.AgentToolResult {
     const ctx: *util.BuiltinCtx = @ptrCast(@alignCast(raw_ctx orelse
         return util.errorResult(allocator, "bash tool: missing context")));
@@ -71,7 +72,7 @@ fn executeSync(
         return util.errorf(allocator, "working directory does not exist: {s}", .{effective_cwd});
     };
 
-    return runCommand(allocator, ctx.io, command, effective_cwd, extractTimeout(args), signal);
+    return runCommand(allocator, ctx.io, command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
 }
 
 fn runCommand(
@@ -81,11 +82,22 @@ fn runCommand(
     cwd: []const u8,
     timeout_secs: ?u64,
     signal: protocol.Token,
+    on_update: ?protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
 ) protocol.AgentToolResult {
     const shell_argv: []const []const u8 = if (std.Io.Dir.accessAbsolute(io, "/bin/bash", .{}))
         &.{ "/bin/bash", "-c", command }
     else |_|
         &.{ "/bin/sh", "-c", command };
+
+    var emitter = StreamEmitter{
+        .allocator = allocator,
+        .io = io,
+        .command = command,
+        .on_update = on_update,
+        .update_ctx = update_ctx,
+    };
+    defer emitter.deinit();
 
     var proc_result = runtime_process.run(allocator, io, .{
         .argv = shell_argv,
@@ -94,14 +106,95 @@ fn runCommand(
         .signal = signal,
         .stdout_limit = .limited(MAX_CAPTURE_BYTES),
         .stderr_limit = .limited(MAX_CAPTURE_BYTES),
+        .on_chunk = if (on_update != null) .{ .ctx = @ptrCast(&emitter), .func = StreamEmitter.callback } else null,
     }) catch return util.errorResult(allocator, "command error: failed to run command");
     defer proc_result.deinit(allocator);
+    emitter.flush();
 
     const is_error, const tail = classifyResult(proc_result, signal, timeout_secs);
     const transcript = formatResult(allocator, command, proc_result, tail) catch
         return util.errorResult(allocator, "bash tool: alloc failed");
 
     return ownedUtf8TextResult(allocator, transcript, is_error);
+}
+
+const StreamEmitter = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command: []const u8,
+    on_update: ?protocol.AgentToolUpdateCallback,
+    update_ctx: ?*anyopaque,
+    stdout: std.ArrayList(u8) = .empty,
+    stderr: std.ArrayList(u8) = .empty,
+    last_emit_ms: i128 = 0,
+    mutex: std.Io.Mutex = .init,
+
+    fn deinit(self: *StreamEmitter) void {
+        self.stdout.deinit(self.allocator);
+        self.stderr.deinit(self.allocator);
+    }
+
+    fn callback(raw: ?*anyopaque, kind: runtime_process.StreamKind, bytes: []const u8) void {
+        const self: *StreamEmitter = @ptrCast(@alignCast(raw.?));
+        self.onChunk(kind, bytes);
+    }
+
+    fn onChunk(self: *StreamEmitter, kind: runtime_process.StreamKind, bytes: []const u8) void {
+        if (self.on_update == null or bytes.len == 0) return;
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const list = switch (kind) {
+            .stdout => &self.stdout,
+            .stderr => &self.stderr,
+        };
+        appendBounded(self.allocator, list, bytes, MAX_CAPTURE_BYTES) catch return;
+
+        const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        if (now_ms - self.last_emit_ms < STREAM_UPDATE_INTERVAL_MS) return;
+        self.last_emit_ms = now_ms;
+        self.emitLocked();
+    }
+
+    fn flush(self: *StreamEmitter) void {
+        if (self.on_update == null) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.emitLocked();
+    }
+
+    fn emitLocked(self: *StreamEmitter) void {
+        const cb = self.on_update orelse return;
+        const result = self.makePartialResult() catch return;
+        defer result.free(self.allocator);
+        cb(result, self.update_ctx);
+    }
+
+    fn makePartialResult(self: *StreamEmitter) !protocol.AgentToolResult {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "$ ");
+        try out.appendSlice(self.allocator, self.command);
+        try out.appendSlice(self.allocator, "\n\n");
+        try appendCaptured(self.allocator, &out, self.stdout.items, self.stderr.items);
+        return ownedUtf8TextResult(self.allocator, try out.toOwnedSlice(self.allocator), false);
+    }
+};
+
+fn appendBounded(allocator: std.mem.Allocator, list: *std.ArrayList(u8), bytes: []const u8, limit: usize) !void {
+    if (limit == 0) return;
+    if (bytes.len >= limit) {
+        try list.resize(allocator, limit);
+        @memcpy(list.items, bytes[bytes.len - limit ..]);
+        return;
+    }
+    try list.appendSlice(allocator, bytes);
+    if (list.items.len > limit) {
+        const excess = list.items.len - limit;
+        std.mem.copyForwards(u8, list.items[0..limit], list.items[excess..]);
+        try list.resize(allocator, limit);
+    }
 }
 
 fn classifyResult(result: runtime_process.RunResult, signal: protocol.Token, timeout_secs: ?u64) struct { bool, []const u8 } {
@@ -215,6 +308,8 @@ test "runCommand returns stdout and stderr" {
         "/tmp",
         5,
         protocol.Token.none,
+        null,
+        null,
     );
 
     try std.testing.expect(!result.is_error);
@@ -234,6 +329,8 @@ test "runCommand exits naturally before timeout" {
         "/tmp",
         5,
         protocol.Token.none,
+        null,
+        null,
     );
     const elapsed = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds() - start;
 
@@ -254,6 +351,8 @@ test "runCommand true returns immediately before long timeout" {
         "/tmp",
         10,
         protocol.Token.none,
+        null,
+        null,
     );
     const elapsed = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds() - start;
 
@@ -272,8 +371,44 @@ test "runCommand reports timeout" {
         "/tmp",
         1,
         protocol.Token.none,
+        null,
+        null,
     );
 
     try std.testing.expect(result.is_error);
     try expectTextBlockContains(result, "timed out");
+}
+
+test "runCommand emits partial updates while preserving final result" {
+    const Collector = struct {
+        saw_first: bool = false,
+        updates: usize = 0,
+
+        fn onUpdate(result: protocol.AgentToolResult, raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.updates += 1;
+            if (result.content.len == 0 or result.content[0] != .text) return;
+            if (std.mem.indexOf(u8, result.content[0].text.text, "first") != null) self.saw_first = true;
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var collector = Collector{};
+
+    const result = runCommand(
+        arena.allocator(),
+        std.Options.debug_io,
+        "printf first; sleep 0.2; printf second",
+        "/tmp",
+        5,
+        protocol.Token.none,
+        Collector.onUpdate,
+        @ptrCast(&collector),
+    );
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(collector.updates > 0);
+    try std.testing.expect(collector.saw_first);
+    try expectTextBlockContains(result, "firstsecond");
 }

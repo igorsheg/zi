@@ -39,6 +39,7 @@ pub const RunOptions = struct {
     timeout_ms: ?u64 = null,
     kill_scope: KillScope = .process_group,
     signal: Token = Token.none,
+    on_chunk: ?ChunkCallback = null,
 };
 
 pub const StreamOptions = struct {
@@ -148,7 +149,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: RunOptions) RunErr
         .timeout_ms = options.timeout_ms,
         .kill_scope = options.kill_scope,
         .signal = options.signal,
-        .on_chunk = null,
+        .on_chunk = options.on_chunk,
     }, options.stdout == .capture, options.stderr == .capture);
 }
 
@@ -435,6 +436,40 @@ test "process.run captures both output streams without mixing them" {
         .completed => |x| x,
         else => return error.UnexpectedProcessError,
     };
+    try std.testing.expectEqualSlices(u8, "out", completed.stdout);
+    try std.testing.expectEqualSlices(u8, "err", completed.stderr);
+}
+
+test "process.run streams chunks while preserving captured output" {
+    try skipShellProcessTestsIfUnsupported();
+    const Collector = struct {
+        stdout_seen: bool = false,
+        stderr_seen: bool = false,
+
+        fn onChunk(raw: ?*anyopaque, kind: StreamKind, bytes: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (kind) {
+                .stdout => {
+                    if (std.mem.indexOf(u8, bytes, "out") != null) self.stdout_seen = true;
+                },
+                .stderr => {
+                    if (std.mem.indexOf(u8, bytes, "err") != null) self.stderr_seen = true;
+                },
+            }
+        }
+    };
+    var collector = Collector{};
+    var result = try runShell("printf out; printf err >&2", .{
+        .argv = &.{},
+        .on_chunk = .{ .ctx = @ptrCast(&collector), .func = Collector.onChunk },
+    });
+    defer result.deinit(std.testing.allocator);
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
+    try std.testing.expect(collector.stdout_seen);
+    try std.testing.expect(collector.stderr_seen);
     try std.testing.expectEqualSlices(u8, "out", completed.stdout);
     try std.testing.expectEqualSlices(u8, "err", completed.stderr);
 }
