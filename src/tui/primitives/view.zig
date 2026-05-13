@@ -22,8 +22,7 @@ pub const Component = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        render: *const fn (ptr: *anyopaque, region: Region) void,
-        render_slice: ?*const fn (ptr: *anyopaque, region: Region, first_row: u32) void,
+        render_slice: *const fn (ptr: *anyopaque, region: Region, first_row: u32) void,
         handle_input: *const fn (ptr: *anyopaque, key: Key) bool,
         measure: *const fn (ptr: *anyopaque, width: u32) Measurement,
         cursor_state: *const fn (ptr: *anyopaque) ?CursorState,
@@ -35,13 +34,14 @@ pub const Component = struct {
 
     pub fn init(comptime T: type, ptr: *T) Component {
         const gen = struct {
-            fn render(erased: *anyopaque, region: Region) void {
-                const self: *T = @ptrCast(@alignCast(erased));
-                self.render(region);
-            }
             fn renderSlice(erased: *anyopaque, region: Region, first_row: u32) void {
                 const self: *T = @ptrCast(@alignCast(erased));
                 self.renderSlice(region, first_row);
+            }
+            fn renderFull(erased: *anyopaque, region: Region, first_row: u32) void {
+                _ = first_row;
+                const self: *T = @ptrCast(@alignCast(erased));
+                self.render(region);
             }
             fn handleInput(erased: *anyopaque, key: Key) bool {
                 const self: *T = @ptrCast(@alignCast(erased));
@@ -91,8 +91,7 @@ pub const Component = struct {
         return .{
             .ptr = @ptrCast(ptr),
             .vtable = &.{
-                .render = gen.render,
-                .render_slice = if (@hasDecl(T, "renderSlice")) gen.renderSlice else null,
+                .render_slice = if (@hasDecl(T, "renderSlice")) gen.renderSlice else gen.renderFull,
                 .handle_input = gen.handleInput,
                 .measure = gen.measure,
                 .cursor_state = gen.cursorState,
@@ -109,13 +108,11 @@ pub const Component = struct {
     }
 
     pub fn render(self: Component, region: Region) void {
-        self.vtable.render(self.ptr, region);
+        self.renderSlice(region, 0);
     }
 
-    pub fn renderSlice(self: Component, region: Region, first_row: u32) bool {
-        const render_slice = self.vtable.render_slice orelse return false;
-        render_slice(self.ptr, region, first_row);
-        return true;
+    pub fn renderSlice(self: Component, region: Region, first_row: u32) void {
+        self.vtable.render_slice(self.ptr, region, first_row);
     }
 
     pub fn handleInput(self: Component, key: Key) bool {
@@ -159,7 +156,7 @@ test "component defaults animation hooks for static components" {
     const erased = Component.init(StaticComp, &comp);
     try std.testing.expectEqual(@as(?i128, null), erased.nextAnimationDeadline(123));
     try std.testing.expect(!erased.tickAnimation(123));
-    try std.testing.expect(!erased.renderSlice(undefined, 1));
+    erased.renderSlice(undefined, 1);
 }
 
 test "component dispatches optional renderSlice hook" {
@@ -179,7 +176,7 @@ test "component dispatches optional renderSlice hook" {
 
     var comp = SliceComp{};
     const erased = Component.init(SliceComp, &comp);
-    try std.testing.expect(erased.renderSlice(undefined, 7));
+    erased.renderSlice(undefined, 7);
     try std.testing.expect(comp.called);
     try std.testing.expectEqual(@as(u32, 7), comp.first_row);
 }

@@ -487,22 +487,13 @@ pub fn listSessionsInDir(allocator: std.mem.Allocator, session_dir: []const u8) 
         }
     }
 
-    const items = results.items;
-    if (items.len > 1) {
-        for (1..items.len) |i| {
-            const key = items[i];
-            var j: usize = i;
-            while (j > 0) {
-                if (items[j - 1].modified_at < key.modified_at) {
-                    items[j] = items[j - 1];
-                    j -= 1;
-                } else break;
-            }
-            items[j] = key;
-        }
-    }
+    std.sort.pdq(SessionInfo, results.items, {}, newerSessionFirst);
 
     return try results.toOwnedSlice(allocator);
+}
+
+fn newerSessionFirst(_: void, a: SessionInfo, b: SessionInfo) bool {
+    return a.modified_at > b.modified_at;
 }
 
 fn scanSessionFile(allocator: std.mem.Allocator, path: []const u8) ?SessionInfo {

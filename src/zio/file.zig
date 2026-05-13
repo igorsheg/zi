@@ -123,7 +123,7 @@ pub fn writeFileTruncate(
     bytes: []const u8,
 ) !void {
     if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
     var buf: [4096]u8 = undefined;
     var writer = file.writer(io, &buf);
@@ -167,7 +167,5 @@ pub fn realPathOwned(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) ![]u8 {
-    const real_z = try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
-    defer allocator.free(real_z);
-    return try allocator.dupe(u8, real_z);
+    return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
 }

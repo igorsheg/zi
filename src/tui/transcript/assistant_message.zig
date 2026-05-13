@@ -304,7 +304,7 @@ fn renderComponentSlice(comp: Component, region: Region, first_row: u32) void {
         comp.render(region);
         return;
     }
-    _ = comp.renderSlice(region, first_row);
+    comp.renderSlice(region, first_row);
 }
 
 const testing = std.testing;

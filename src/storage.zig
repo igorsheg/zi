@@ -79,6 +79,7 @@ pub const LockedFile = struct {
         const stat = dir.stat(self.io) catch return false;
         const now = @as(i128, @intCast(std.Io.Timestamp.now(self.io, .real).toNanoseconds()));
         const age_ns = now - @as(i128, @intCast(stat.mtime.toNanoseconds()));
+        if (age_ns < 0) return true;
         return age_ns > stale_threshold_ns;
     }
 
