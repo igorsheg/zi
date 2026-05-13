@@ -48,10 +48,10 @@ pub const ConvertToLlmHook = struct {
         allocator: std.mem.Allocator,
         messages: []const AgentMessage,
         ctx: ?*anyopaque,
-    ) []const ai.protocol.Message,
+    ) error{OutOfMemory}![]const ai.protocol.Message,
     ctx: ?*anyopaque = null,
 
-    pub fn call(self: ConvertToLlmHook, allocator: std.mem.Allocator, messages: []const AgentMessage) []const ai.protocol.Message {
+    pub fn call(self: ConvertToLlmHook, allocator: std.mem.Allocator, messages: []const AgentMessage) error{OutOfMemory}![]const ai.protocol.Message {
         return self.func(allocator, messages, self.ctx);
     }
 };

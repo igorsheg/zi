@@ -152,7 +152,7 @@ pub fn contextGet(self: anytype, allocator: std.mem.Allocator, max_messages: usi
     const aa = arena.allocator();
 
     const session_context = self.session_store.buildContextAlloc(aa, .current) catch return null;
-    const llm_messages = message_conversion.convertToLlm(aa, session_context.messages, null);
+    const llm_messages = message_conversion.convertToLlm(aa, session_context.messages, null) catch return null;
 
     var obj: std.json.ObjectMap = .{};
     obj.put(allocator, allocator.dupe(u8, "system_prompt") catch return null, .{ .string = allocator.dupe(u8, self.agent.systemPrompt()) catch return null }) catch return null;

@@ -16,52 +16,52 @@ pub fn convertToLlm(
     allocator: std.mem.Allocator,
     messages: []const protocol.AgentMessage,
     _: ?*anyopaque,
-) []const ai.protocol.Message {
+) error{OutOfMemory}![]const ai.protocol.Message {
     var result: std.ArrayList(ai.protocol.Message) = .empty;
     for (messages) |msg| {
         switch (msg) {
-            .user => |u| result.append(allocator, .{ .user = u }) catch continue,
-            .assistant => |a| result.append(allocator, .{ .assistant = a }) catch continue,
-            .tool_result => |t| result.append(allocator, .{ .tool_result = t }) catch continue,
+            .user => |u| try result.append(allocator, .{ .user = u }),
+            .assistant => |a| try result.append(allocator, .{ .assistant = a }),
+            .tool_result => |t| try result.append(allocator, .{ .tool_result = t }),
             .compaction_summary => |cs| {
                 const text = std.fmt.allocPrint(
                     allocator,
                     "{s}{s}{s}",
                     .{ COMPACTION_SUMMARY_PREFIX, cs.summary, COMPACTION_SUMMARY_SUFFIX },
-                ) catch continue;
-                const blocks = allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1) catch continue;
+                );
+                const blocks = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1);
                 blocks[0] = .{ .text = .{ .text = text } };
-                result.append(allocator, .{ .user = .{
+                try result.append(allocator, .{ .user = .{
                     .content = .{ .blocks = blocks },
                     .timestamp = cs.timestamp,
-                } }) catch continue;
+                } });
             },
             .branch_summary => |bs| {
                 const text = std.fmt.allocPrint(
                     allocator,
                     "{s}{s}{s}",
                     .{ BRANCH_SUMMARY_PREFIX, bs.summary, BRANCH_SUMMARY_SUFFIX },
-                ) catch continue;
-                const blocks = allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1) catch continue;
+                );
+                const blocks = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1);
                 blocks[0] = .{ .text = .{ .text = text } };
-                result.append(allocator, .{ .user = .{
+                try result.append(allocator, .{ .user = .{
                     .content = .{ .blocks = blocks },
                     .timestamp = bs.timestamp,
-                } }) catch continue;
+                } });
             },
             .custom => |c| {
                 const user_content: ai.protocol.UserMessage.UserMessageContent = switch (c.content) {
                     .text => |t| blk: {
-                        const blocks = allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1) catch continue;
+                        const blocks = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, 1);
                         blocks[0] = .{ .text = .{ .text = t } };
                         break :blk .{ .blocks = blocks };
                     },
                     .blocks => |b| .{ .blocks = b },
                 };
-                result.append(allocator, .{ .user = .{
+                try result.append(allocator, .{ .user = .{
                     .content = user_content,
                     .timestamp = c.timestamp,
-                } }) catch continue;
+                } });
             },
         }
     }
@@ -91,7 +91,7 @@ test "convertToLlm passes through user and assistant messages" {
         } },
     };
 
-    const result = convertToLlm(alloc, messages, null);
+    const result = try convertToLlm(alloc, messages, null);
     try testing.expectEqual(@as(usize, 2), result.len);
     try testing.expect(result[0] == .user);
     try testing.expect(result[1] == .assistant);
@@ -107,7 +107,7 @@ test "convertToLlm wraps summary entries as user messages" {
         .{ .branch_summary = .{ .summary = "Tried approach X", .from_id = "abc", .timestamp = 2 } },
     };
 
-    const result = convertToLlm(alloc, messages, null);
+    const result = try convertToLlm(alloc, messages, null);
     try testing.expectEqual(@as(usize, 2), result.len);
     for (result) |message| try testing.expect(message == .user);
 
@@ -131,7 +131,7 @@ test "convertToLlm converts custom text to user message" {
         .{ .custom = .{ .custom_type = "skill", .content = .{ .text = "Do X" }, .display = true, .timestamp = 1 } },
     };
 
-    const result = convertToLlm(alloc, messages, null);
+    const result = try convertToLlm(alloc, messages, null);
     try testing.expectEqual(@as(usize, 1), result.len);
     try testing.expect(result[0] == .user);
     try testing.expectEqualStrings("Do X", result[0].user.content.blocks[0].text.text);
@@ -161,7 +161,7 @@ test "convertToLlm preserves mixed message order" {
         .{ .custom = .{ .custom_type = "ext", .content = .{ .text = "Custom content" }, .timestamp = 4 } },
     };
 
-    const result = convertToLlm(alloc, messages, null);
+    const result = try convertToLlm(alloc, messages, null);
     try testing.expectEqual(@as(usize, 5), result.len);
     try testing.expect(result[0] == .user);
     try testing.expect(result[1] == .user);

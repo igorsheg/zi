@@ -657,13 +657,13 @@ pub fn defaultConvertToLlm(
     allocator: std.mem.Allocator,
     messages: []const protocol.AgentMessage,
     _: ?*anyopaque,
-) []const ai.protocol.Message {
+) error{OutOfMemory}![]const ai.protocol.Message {
     var result: std.ArrayList(ai.protocol.Message) = .empty;
     for (messages) |msg| {
         switch (msg) {
-            .user => |u| result.append(allocator, .{ .user = u }) catch continue,
-            .assistant => |a| result.append(allocator, .{ .assistant = a }) catch continue,
-            .tool_result => |t| result.append(allocator, .{ .tool_result = t }) catch continue,
+            .user => |u| try result.append(allocator, .{ .user = u }),
+            .assistant => |a| try result.append(allocator, .{ .assistant = a }),
+            .tool_result => |t| try result.append(allocator, .{ .tool_result = t }),
             .compaction_summary, .branch_summary, .custom => {},
         }
     }

@@ -268,7 +268,7 @@ fn streamAssistantResponse(
         messages = hook.call(turn_allocator, messages, signal);
     }
 
-    const llm_messages = config.convert_to_llm.call(turn_allocator, messages);
+    const llm_messages = config.convert_to_llm.call(turn_allocator, messages) catch return null;
 
     const llm_context = ai.protocol.Context{
         .system_prompt = if (system_prompt.len > 0) system_prompt else null,
