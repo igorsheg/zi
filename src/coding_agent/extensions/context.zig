@@ -624,7 +624,8 @@ fn readStyleTable(arena: std.mem.Allocator, L: *c.lua_State, sidx: c_int) !exten
     style.flex_grow = readFloatField(L, sidx, "flex_grow", style.flex_grow);
     style.gap = readFloatField(L, sidx, "gap", style.gap);
     style.chrome = try readChromeField(arena, L, sidx);
-    style.padding = .{ .top = readFloatField(L, sidx, "padding", 0), .right = readFloatField(L, sidx, "padding", 0), .bottom = readFloatField(L, sidx, "padding", 0), .left = readFloatField(L, sidx, "padding", 0) };
+    const padding = readFloatField(L, sidx, "padding", 0);
+    style.padding = .{ .top = padding, .right = padding, .bottom = padding, .left = padding };
     style.width = readConstraintField(L, sidx, "width");
     style.height = readConstraintField(L, sidx, "height");
     if (try readOptionalStringFieldLimit(std.heap.c_allocator, L, sidx, "flex_direction", 16)) |dir| {
