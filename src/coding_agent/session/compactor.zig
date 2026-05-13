@@ -98,7 +98,7 @@ fn execute(
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const path = try session.session_store.buildCurrentBranchAlloc(allocator);
+    const path = try session.session_store.buildBranchEntriesAlloc(allocator, .current);
     if (path.len == 0) return error.NothingToCompact;
 
     const settings: prep.CompactionSettings = .{

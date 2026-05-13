@@ -151,7 +151,7 @@ pub fn contextGet(self: anytype, allocator: std.mem.Allocator, max_messages: usi
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const session_context = self.session_store.buildCurrentContextAlloc(aa) catch return null;
+    const session_context = self.session_store.buildContextAlloc(aa, .current) catch return null;
     const llm_messages = message_conversion.convertToLlm(aa, session_context.messages, null);
 
     var obj: std.json.ObjectMap = .{};

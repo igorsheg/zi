@@ -1475,7 +1475,7 @@ test "runtime host auto compaction runs once and resets context usage after comp
     kept_assistant.usage.input = 121_000;
     _ = session.session_store.appendMessage(.{ .assistant = kept_assistant }) orelse return error.TestUnexpectedResult;
 
-    const initial_context = try session.session_store.buildCurrentContext();
+    const initial_context = try session.session_store.buildContextAlloc(session.session_store.allocator, .current);
     try session.agent.setMessages(initial_context.messages);
 
     var collector = LifecycleCollector{ .allocator = allocator };

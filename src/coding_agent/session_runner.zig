@@ -384,7 +384,7 @@ pub const SessionRunner = struct {
         var arena = std.heap.ArenaAllocator.init(session.allocator);
         defer arena.deinit();
 
-        const branch = session.session_store.buildCurrentBranchAlloc(arena.allocator()) catch return null;
+        const branch = session.session_store.buildBranchEntriesAlloc(arena.allocator(), .current) catch return null;
         var i: usize = branch.len;
         while (i > 0) {
             i -= 1;

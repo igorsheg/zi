@@ -215,14 +215,6 @@ pub const SessionStore = struct {
         self.appendThinkingLevelChange(thinking_level);
     }
 
-    pub fn buildContext(self: *SessionStore, selection: context_mod.LeafSelection) !context_mod.SessionContext {
-        return self.buildContextAlloc(self.allocator, selection);
-    }
-
-    pub fn buildCurrentContext(self: *SessionStore) !context_mod.SessionContext {
-        return self.buildContext(.current);
-    }
-
     pub fn openForResume(allocator: std.mem.Allocator, session_path: []const u8) !OpenSessionResult {
         var store = try SessionStore.open(allocator, session_path);
         errdefer store.deinit();
@@ -230,7 +222,7 @@ pub const SessionStore = struct {
         var context_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer context_arena.deinit();
 
-        const ctx = try store.buildCurrentContextAlloc(context_arena.allocator());
+        const ctx = try store.buildContextAlloc(context_arena.allocator(), .current);
         return .{
             .store = store,
             .context_arena = context_arena,
@@ -250,10 +242,6 @@ pub const SessionStore = struct {
         return context_mod.buildSessionContext(allocator, data.entries, selection);
     }
 
-    pub fn buildCurrentContextAlloc(self: *SessionStore, allocator: std.mem.Allocator) !context_mod.SessionContext {
-        return self.buildContextAlloc(allocator, .current);
-    }
-
     pub fn buildBranchEntriesAlloc(self: *SessionStore, allocator: std.mem.Allocator, selection: context_mod.LeafSelection) ![]const proto.SessionEntry {
         if (self.cached_entries) |entries| {
             const merged = try self.cachedEntriesWithAppends(allocator, entries);
@@ -265,7 +253,7 @@ pub const SessionStore = struct {
     }
 
     pub fn buildCurrentVisibleBranchAlloc(self: *SessionStore, allocator: std.mem.Allocator) ![]const proto.SessionEntry {
-        const persisted = self.buildCurrentBranchAlloc(allocator) catch |err| switch (err) {
+        const persisted = self.buildBranchEntriesAlloc(allocator, .current) catch |err| switch (err) {
             error.FileNotFound => &.{},
             else => return err,
         };
@@ -294,10 +282,6 @@ pub const SessionStore = struct {
         return visible;
     }
 
-    pub fn buildCurrentBranchAlloc(self: *SessionStore, allocator: std.mem.Allocator) ![]const proto.SessionEntry {
-        return self.buildBranchEntriesAlloc(allocator, .current);
-    }
-
     pub fn applyCompaction(
         self: *SessionStore,
         summary: []const u8,
@@ -307,13 +291,13 @@ pub const SessionStore = struct {
         from_hook: ?bool,
     ) !context_mod.SessionContext {
         self.appendCompaction(summary, first_kept_entry_id, tokens_before, details, from_hook);
-        return self.buildCurrentContext();
+        return self.buildContextAlloc(self.allocator, .current);
     }
 
     pub fn contextUsageUnknownAfterCompaction(self: *SessionStore, allocator: std.mem.Allocator) bool {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const branch = self.buildCurrentBranchAlloc(arena.allocator()) catch return false;
+        const branch = self.buildBranchEntriesAlloc(arena.allocator(), .current) catch return false;
         if (context_mod.getLatestCompactionEntry(branch) == null) return false;
         return !hasPostCompactionUsage(branch);
     }
@@ -798,7 +782,7 @@ test "flushed sessions persist large appended messages" {
     try std.testing.expectEqual(@as(usize, large_text.len), opened.messages[2].assistant.content[0].text.text.len);
     try expectUserText(opened.messages[3], "after large");
 
-    const branch = try opened.store.?.buildCurrentBranchAlloc(std.testing.allocator);
+    const branch = try opened.store.?.buildBranchEntriesAlloc(std.testing.allocator, .current);
     defer std.testing.allocator.free(branch);
     try std.testing.expectEqualStrings(large_id_copy, branch[branch.len - 2].id);
     try std.testing.expectEqualStrings(large_id_copy, branch[branch.len - 1].parent_id.?);
@@ -835,7 +819,7 @@ test "applyCompaction stores artifact fields and rebuilds compacted context" {
     try std.testing.expectEqualStrings("second", rebuilt.messages[1].user.content.text);
 
     _ = store.appendMessage(testUserMessage("third", 3));
-    const rebuilt_with_later = try store.buildCurrentContext();
+    const rebuilt_with_later = try store.buildContextAlloc(store.allocator, .current);
     try std.testing.expectEqual(@as(usize, 3), rebuilt_with_later.messages.len);
     try std.testing.expectEqualStrings("third", rebuilt_with_later.messages[2].user.content.text);
 }

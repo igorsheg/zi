@@ -1224,7 +1224,7 @@ fn testAssistantMessageWithUsage(
 }
 
 fn syncMessagesFromStore(session: *AgentSession) !void {
-    const context = try session.session_store.buildCurrentContext();
+    const context = try session.session_store.buildContextAlloc(session.session_store.allocator, .current);
     try session.agent.setMessages(context.messages);
     session.refreshContextUsageStateFromStore();
 }
