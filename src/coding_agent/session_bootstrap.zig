@@ -9,7 +9,7 @@ const tool_def = @import("tools/definition.zig");
 const builtin_tools_mod = @import("tools/builtins.zig");
 const builtin_util = @import("tools/util.zig");
 const system_prompt_mod = @import("system_prompt.zig");
-const skills = @import("skills/root.zig");
+const skills_format = @import("skills/format.zig");
 const auth_storage_mod = @import("auth/storage.zig");
 const resolve_config_value = @import("auth/resolve_config_value.zig");
 const settings_manager_mod = @import("settings/manager.zig");
@@ -598,7 +598,7 @@ pub fn buildSystemPrompt(
     defer allocator.free(prompt_guidelines);
 
     const skills_section: ?[]const u8 = if (hasToolNamed(definitions, "read"))
-        skills.format.formatSkillsForPrompt(allocator, resource_loader.getSkills().skills) catch null
+        skills_format.formatSkillsForPrompt(allocator, resource_loader.getSkills().skills) catch null
     else
         null;
     defer if (skills_section) |section| allocator.free(section);

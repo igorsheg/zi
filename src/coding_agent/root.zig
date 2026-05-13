@@ -9,7 +9,6 @@ pub const system_prompt = @import("system_prompt.zig");
 pub const slash_commands = @import("slash_commands.zig");
 pub const auth = @import("auth/root.zig");
 pub const settings = @import("settings/root.zig");
-pub const skills = @import("skills/root.zig");
 pub const cli = @import("cli/root.zig");
 pub const session = @import("session/root.zig");
 pub const model_registry = @import("model_registry.zig");

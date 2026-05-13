@@ -4,7 +4,8 @@ const extension_loader = @import("../extensions/loader.zig");
 const tool_def = @import("../tools/definition.zig");
 const extension_runner = @import("../extensions/runner.zig");
 const lua_runtime = @import("../extensions/lua_runtime.zig");
-const skills = @import("../skills/root.zig");
+const skills_loader = @import("../skills/loader.zig");
+const skills_types = @import("../skills/types.zig");
 const settings_manager_mod = @import("../settings/manager.zig");
 const settings_types = @import("../settings/types.zig");
 const theme_json = @import("../../themes/json.zig");
@@ -224,13 +225,13 @@ pub const ResourceLoader = struct {
             extended_paths[i] = entry.path;
         }
 
-        const loaded = try skills.loader.loadSkills(self.allocator, .{
+        const loaded = try skills_loader.loadSkills(self.allocator, .{
             .cwd = self.cwd,
             .agent_dir = self.agent_dir,
             .skill_paths = extended_paths,
             .include_defaults = true,
         });
-        defer skills.types.deinitLoadResult(self.allocator, loaded);
+        defer skills_types.deinitLoadResult(self.allocator, loaded);
 
         self.skills = .{
             .skills = try copyLoadedSkills(self.allocator, loaded.skills),
@@ -877,7 +878,7 @@ fn freeLoadedExtensions(allocator: std.mem.Allocator, extensions: []const types.
     if (extensions.len > 0) allocator.free(extensions);
 }
 
-fn copyLoadedSkills(allocator: std.mem.Allocator, loaded: []const skills.types.Skill) ![]types.Skill {
+fn copyLoadedSkills(allocator: std.mem.Allocator, loaded: []const skills_types.Skill) ![]types.Skill {
     const out = try allocator.alloc(types.Skill, loaded.len);
     var i: usize = 0;
     errdefer {
