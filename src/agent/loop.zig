@@ -20,15 +20,24 @@ pub fn runAgentLoop(
 ) void {
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (prompts) |p| {
-        new_messages.append(run_allocator, p) catch return;
+        new_messages.append(run_allocator, p) catch |err| {
+            emitLoopAllocationFailure(event_sink, event_ctx, "append prompt to new messages", err);
+            return;
+        };
     }
 
     var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (context.messages) |m| {
-        ctx_messages.append(run_allocator, m) catch return;
+        ctx_messages.append(run_allocator, m) catch |err| {
+            emitLoopAllocationFailure(event_sink, event_ctx, "append context message", err);
+            return;
+        };
     }
     for (prompts) |p| {
-        ctx_messages.append(run_allocator, p) catch return;
+        ctx_messages.append(run_allocator, p) catch |err| {
+            emitLoopAllocationFailure(event_sink, event_ctx, "append prompt to context", err);
+            return;
+        };
     }
 
     event_sink(.agent_start, event_ctx);
@@ -68,7 +77,10 @@ pub fn runAgentLoopContinue(
     var new_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     var ctx_messages: std.ArrayListUnmanaged(protocol.AgentMessage) = .empty;
     for (context.messages) |m| {
-        ctx_messages.append(run_allocator, m) catch return;
+        ctx_messages.append(run_allocator, m) catch |err| {
+            emitLoopAllocationFailure(event_sink, event_ctx, "append continuation context message", err);
+            return;
+        };
     }
 
     event_sink(.agent_start, event_ctx);
@@ -135,20 +147,32 @@ fn runLoop(
                 for (pending_messages) |msg| {
                     event_sink(.{ .message_start = .{ .message = msg } }, event_ctx);
                     event_sink(.{ .message_end = .{ .message = msg } }, event_ctx);
-                    ctx_messages.append(run_allocator, msg) catch {};
-                    new_messages.append(run_allocator, msg) catch {};
+                    ctx_messages.append(run_allocator, msg) catch |err| {
+                        traceWrite(trace, "EXIT: failed to append pending message to context: {s}\n", .{@errorName(err)});
+                        event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+                        return;
+                    };
+                    new_messages.append(run_allocator, msg) catch |err| {
+                        traceWrite(trace, "EXIT: failed to append pending message to new messages: {s}\n", .{@errorName(err)});
+                        event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+                        return;
+                    };
                 }
                 pending_messages = &.{};
             }
 
             traceWrite(trace, "STREAM: start model={s}\n", .{config.model.id});
-            const assistant_msg = streamAssistantResponse(run_allocator, turn_allocator, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt) orelse {
+            const assistant_msg = streamAssistantResponse(run_allocator, turn_allocator, ctx_messages, config, signal, event_sink, event_ctx, llm_tools.items, context.system_prompt, trace) orelse {
                 traceWrite(trace, "EXIT: stream returned null (no final message)\n", .{});
                 event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
                 return;
             };
 
-            new_messages.append(run_allocator, .{ .assistant = assistant_msg }) catch {};
+            new_messages.append(run_allocator, .{ .assistant = assistant_msg }) catch |err| {
+                traceWrite(trace, "EXIT: failed to append assistant message to new messages: {s}\n", .{@errorName(err)});
+                event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+                return;
+            };
             traceWrite(trace, "STREAM: done stop_reason={s} content_blocks={d}\n", .{
                 @tagName(assistant_msg.stop_reason),
                 assistant_msg.content.len,
@@ -179,7 +203,11 @@ fn runLoop(
 
             var tool_results: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage) = .empty;
             if (has_more_tool_calls) {
-                executeToolCalls(run_allocator, turn_allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx);
+                if (!executeToolCalls(run_allocator, turn_allocator, ctx_messages, new_messages, &tool_results, assistant_msg, context.tools orelse &.{}, config, context.system_prompt, signal, event_sink, event_ctx)) {
+                    traceWrite(trace, "EXIT: tool execution state allocation failed\n", .{});
+                    event_sink(.{ .agent_end = .{ .messages = new_messages.items } }, event_ctx);
+                    return;
+                }
                 traceWrite(trace, "TOOLS: executed results={d}\n", .{tool_results.items.len});
 
                 if (isAborted(signal)) {
@@ -233,6 +261,7 @@ fn streamAssistantResponse(
     event_ctx: ?*anyopaque,
     llm_tools: []const ai.protocol.Tool,
     system_prompt: []const u8,
+    trace: ?std.Io.File,
 ) ?ai.protocol.AssistantMessage {
     var messages: []const protocol.AgentMessage = ctx_messages.items;
     if (config.transform_context) |hook| {
@@ -272,9 +301,22 @@ fn streamAssistantResponse(
 
     const assistant_msg = bridge.final_message orelse return null;
 
-    ctx_messages.append(run_allocator, .{ .assistant = assistant_msg }) catch {};
+    ctx_messages.append(run_allocator, .{ .assistant = assistant_msg }) catch |err| {
+        traceWrite(trace, "STREAM: failed to append assistant message to context: {s}\n", .{@errorName(err)});
+        return null;
+    };
 
     return assistant_msg;
+}
+
+fn emitLoopAllocationFailure(
+    event_sink: protocol.AgentEventSink,
+    event_ctx: ?*anyopaque,
+    operation: []const u8,
+    err: anyerror,
+) void {
+    std.log.scoped(.zi_agent_loop).err("{s}: {s}", .{ operation, @errorName(err) });
+    event_sink(.{ .agent_end = .{ .messages = &.{} } }, event_ctx);
 }
 
 fn emitAbortedToolEnd(
@@ -406,7 +448,7 @@ fn executeToolCalls(
     signal: Token,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
-) void {
+) bool {
     const tool_phase_messages = message_memory.cloneMessages(turn_allocator, ctx_messages.items) catch ctx_messages.items;
     var worker_group = tool_execution_group.ToolExecutionGroup.init(std.heap.page_allocator, config.io) catch null;
     defer if (worker_group) |*group| group.deinit();
@@ -416,7 +458,7 @@ fn executeToolCalls(
 
     for (assistant_msg.content) |block| switch (block) {
         .tool_call => |tc| {
-            if (isAborted(signal)) return;
+            if (isAborted(signal)) return true;
 
             event_sink(.{ .tool_execution_start = .{
                 .tool_call_id = tc.id,
@@ -427,7 +469,7 @@ fn executeToolCalls(
             const tool = findTool(tools, tc.name);
             if (tool == null) {
                 const err_msg = std.fmt.allocPrint(turn_allocator, "Tool {s} not found", .{tc.name}) catch "Tool not found";
-                appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx);
+                if (!appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx)) return false;
                 continue;
             }
 
@@ -435,14 +477,14 @@ fn executeToolCalls(
             const prepared_args = if (t.prepare_arguments) |prep_fn|
                 prep_fn(turn_allocator, tc.arguments) catch |err| {
                     const err_msg = std.fmt.allocPrint(turn_allocator, "Tool {s} argument preparation failed: {s}", .{ tc.name, @errorName(err) }) catch "Tool argument preparation failed";
-                    appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx);
+                    if (!appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx)) return false;
                     continue;
                 }
             else
                 tc.arguments;
 
             if (validateToolArguments(turn_allocator, t.parameters, prepared_args, "arguments")) |err_msg| {
-                appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx);
+                if (!appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx)) return false;
                 continue;
             }
 
@@ -461,12 +503,12 @@ fn executeToolCalls(
                 if (hook.call(hook_ctx, signal)) |before_result| {
                     if (before_result.block) {
                         const reason = before_result.reason orelse "Tool execution was blocked";
-                        appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, reason, event_sink, event_ctx);
+                        if (!appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, reason, event_sink, event_ctx)) return false;
                         continue;
                     }
                     if (before_result.args) |replacement| {
                         if (validateToolArguments(turn_allocator, t.parameters, replacement, "arguments")) |err_msg| {
-                            appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx);
+                            if (!appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx)) return false;
                             continue;
                         }
                         effective_args = replacement;
@@ -478,7 +520,10 @@ fn executeToolCalls(
                 .tool_call = tc,
                 .tool = t,
                 .effective_args = effective_args,
-            }) catch {};
+            }) catch |err| {
+                std.log.scoped(.zi_agent_loop).err("append prepared tool call failed: {s}", .{@errorName(err)});
+                return false;
+            };
         },
         else => {},
     };
@@ -528,7 +573,7 @@ fn executeToolCalls(
         if (isAborted(signal)) {
             if (worker_group) |*group| group.cancel();
             emitAbortedPreparedCalls(prepared_calls.items, event_sink, event_ctx, turn_allocator);
-            return;
+            return true;
         }
 
         if (findNextAgentThreadCall(prepared_calls.items)) |inline_index| {
@@ -553,7 +598,7 @@ fn executeToolCalls(
             if (isAborted(signal)) {
                 if (worker_group) |*group| group.cancel();
                 emitAbortedPreparedCalls(prepared_calls.items, event_sink, event_ctx, turn_allocator);
-                return;
+                return true;
             }
             prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
             prepared.finalized = true;
@@ -582,7 +627,7 @@ fn executeToolCalls(
         break;
     }
 
-    emitPreparedToolResultMessagesInSourceOrder(run_allocator, ctx_messages, new_messages, tool_results, prepared_calls.items, event_sink, event_ctx);
+    return emitPreparedToolResultMessagesInSourceOrder(run_allocator, ctx_messages, new_messages, tool_results, prepared_calls.items, event_sink, event_ctx);
 }
 
 fn appendImmediateError(
@@ -593,7 +638,7 @@ fn appendImmediateError(
     msg: []const u8,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
-) void {
+) bool {
     const err_tool_result = makeAgentToolTextResult(turn_allocator, msg, true);
     const err_result = makeErrorToolResult(run_allocator, tc.id, tc.name, msg);
     emitToolExecutionEnd(event_sink, event_ctx, tc, true, err_tool_result);
@@ -603,7 +648,11 @@ fn appendImmediateError(
         .effective_args = tc.arguments,
         .finalized = true,
         .result_message = err_result,
-    }) catch {};
+    }) catch |err| {
+        std.log.scoped(.zi_agent_loop).err("append immediate tool error failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    return true;
 }
 
 fn countFinalizedPreparedCalls(prepared_calls: []const PreparedToolCall) usize {
@@ -622,14 +671,24 @@ fn emitPreparedToolResultMessagesInSourceOrder(
     prepared_calls: []const PreparedToolCall,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
-) void {
+) bool {
     for (prepared_calls) |prepared| {
         const tool_result_msg = prepared.result_message orelse continue;
         emitToolResultMessage(event_sink, event_ctx, tool_result_msg);
-        ctx_messages.append(allocator, .{ .tool_result = tool_result_msg }) catch {};
-        new_messages.append(allocator, .{ .tool_result = tool_result_msg }) catch {};
-        tool_results.append(allocator, tool_result_msg) catch {};
+        ctx_messages.append(allocator, .{ .tool_result = tool_result_msg }) catch |err| {
+            std.log.scoped(.zi_agent_loop).err("append tool result to context failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        new_messages.append(allocator, .{ .tool_result = tool_result_msg }) catch |err| {
+            std.log.scoped(.zi_agent_loop).err("append tool result to new messages failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        tool_results.append(allocator, tool_result_msg) catch |err| {
+            std.log.scoped(.zi_agent_loop).err("append turn tool result failed: {s}", .{@errorName(err)});
+            return false;
+        };
     }
+    return true;
 }
 
 fn finalizeReadyWorkerCompletions(
@@ -1120,7 +1179,7 @@ test "parallel worker updates stream live before completion-ordered finalization
     var collector = Collector{ .allocator = std.testing.allocator };
     defer collector.events.deinit(std.testing.allocator);
 
-    executeToolCalls(
+    try std.testing.expect(executeToolCalls(
         run_arena.allocator(),
         turn_arena.allocator(),
         &ctx_messages,
@@ -1133,7 +1192,7 @@ test "parallel worker updates stream live before completion-ordered finalization
         Token.none,
         Collector.emit,
         @ptrCast(&collector),
-    );
+    ));
 
     try std.testing.expectEqual(@as(usize, 3), collector.events.items.len);
     var saw_update = false;
@@ -1236,7 +1295,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
     defer collector.starts.deinit(std.testing.allocator);
     defer collector.ends.deinit(std.testing.allocator);
 
-    executeToolCalls(
+    try std.testing.expect(executeToolCalls(
         run_arena.allocator(),
         turn_arena.allocator(),
         &ctx_messages,
@@ -1249,7 +1308,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
         signal,
         Collector.emit,
         @ptrCast(&collector),
-    );
+    ));
 
     try std.testing.expectEqual(@as(usize, 2), collector.starts.items.len);
     try std.testing.expectEqual(@as(usize, 2), collector.ends.items.len);

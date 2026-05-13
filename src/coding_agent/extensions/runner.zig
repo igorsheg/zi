@@ -203,7 +203,7 @@ fn cloneAssistantMessageEvent(allocator: std.mem.Allocator, event: ai.protocol.A
         .thinking_end => |e| .{ .thinking_end = .{ .content_index = e.content_index, .content = try allocator.dupe(u8, e.content), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
         .toolcall_start => |e| .{ .toolcall_start = .{ .content_index = e.content_index, .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
         .toolcall_delta => |e| .{ .toolcall_delta = .{ .content_index = e.content_index, .delta = try allocator.dupe(u8, e.delta), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
-        .toolcall_end => |e| .{ .toolcall_end = .{ .content_index = e.content_index, .tool_call = try cloneToolCall(allocator, e.tool_call), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
+        .toolcall_end => |e| .{ .toolcall_end = .{ .content_index = e.content_index, .tool_call = try agent_message_memory.cloneToolCall(allocator, e.tool_call), .partial = try agent_message_memory.cloneAssistantMessage(allocator, e.partial) } },
         .done => |e| .{ .done = .{ .reason = e.reason, .message = try agent_message_memory.cloneAssistantMessage(allocator, e.message) } },
         .@"error" => |e| .{ .@"error" = .{ .reason = e.reason, .@"error" = try agent_message_memory.cloneAssistantMessage(allocator, e.@"error") } },
     };
@@ -236,23 +236,12 @@ fn freeAssistantMessageEvent(allocator: std.mem.Allocator, event: *ai.protocol.A
             agent_message_memory.freeAssistantMessage(allocator, &e.partial);
         },
         .toolcall_end => |*e| {
-            freeToolCall(allocator, e.tool_call);
+            agent_message_memory.freeToolCall(allocator, e.tool_call);
             agent_message_memory.freeAssistantMessage(allocator, &e.partial);
         },
         .done => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.message),
         .@"error" => |*e| agent_message_memory.freeAssistantMessage(allocator, &e.@"error"),
     }
-}
-
-fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) !ai.protocol.ToolCall {
-    return .{ .id = try allocator.dupe(u8, tool_call.id), .name = try allocator.dupe(u8, tool_call.name), .arguments = try ai.json_util.cloneJsonValue(allocator, tool_call.arguments), .thought_signature = if (tool_call.thought_signature) |sig| try allocator.dupe(u8, sig) else null };
-}
-
-fn freeToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    ai.json_util.freeJsonValue(allocator, tool_call.arguments);
-    if (tool_call.thought_signature) |sig| allocator.free(sig);
 }
 
 pub const SystemEnvPair = struct {

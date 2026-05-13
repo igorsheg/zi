@@ -411,9 +411,9 @@ pub fn writeUsage(jw: *Stringify, usage: ai.protocol.Usage) !void {
 pub fn parseFileEntry(allocator: std.mem.Allocator, line: []const u8) !proto.FileEntry {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    const obj = parsed.value.object;
+    const obj = try expectObject(parsed.value);
 
-    const type_str = obj.get("type").?.string;
+    const type_str = try requiredString(obj, "type");
     if (std.mem.eql(u8, type_str, "session")) {
         return .{ .header = try parseHeader(allocator, obj) };
     }
@@ -422,71 +422,68 @@ pub fn parseFileEntry(allocator: std.mem.Allocator, line: []const u8) !proto.Fil
 
 fn parseHeader(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !proto.SessionHeader {
     return .{
-        .id = try allocator.dupe(u8, obj.get("id").?.string),
-        .timestamp = try allocator.dupe(u8, obj.get("timestamp").?.string),
-        .cwd = try allocator.dupe(u8, obj.get("cwd").?.string),
-        .version = if (obj.get("version")) |v| @intCast(v.integer) else 1,
-        .parent_session = if (obj.get("parentSession")) |v| try allocator.dupe(u8, v.string) else null,
+        .id = try allocator.dupe(u8, try requiredString(obj, "id")),
+        .timestamp = try allocator.dupe(u8, try requiredString(obj, "timestamp")),
+        .cwd = try allocator.dupe(u8, try requiredString(obj, "cwd")),
+        .version = if (obj.get("version")) |v| @intCast(try expectInteger(v)) else 1,
+        .parent_session = if (try optionalString(obj, "parentSession")) |v| try allocator.dupe(u8, v) else null,
     };
 }
 
 fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: []const u8) !proto.SessionEntry {
-    const id = try allocator.dupe(u8, obj.get("id").?.string);
-    const parent_id = if (obj.get("parentId")) |v| switch (v) {
-        .string => |s| try allocator.dupe(u8, s),
-        else => null,
-    } else null;
-    const timestamp = try allocator.dupe(u8, obj.get("timestamp").?.string);
+    const id = try allocator.dupe(u8, try requiredString(obj, "id"));
+    errdefer allocator.free(id);
+    const parent_id = if (try optionalString(obj, "parentId")) |v| try allocator.dupe(u8, v) else null;
+    errdefer if (parent_id) |value| allocator.free(value);
+    const timestamp = try allocator.dupe(u8, try requiredString(obj, "timestamp"));
+    errdefer allocator.free(timestamp);
 
     const entry: proto.SessionEntry.EntryType = if (std.mem.eql(u8, type_str, "message"))
-        .{ .message = .{ .message = try parseAgentMessage(allocator, obj.get("message").?) } }
+        .{ .message = .{ .message = try parseAgentMessage(allocator, try requiredValue(obj, "message")) } }
     else if (std.mem.eql(u8, type_str, "thinking_level_change"))
         .{ .thinking_level_change = .{
-            .thinking_level = try allocator.dupe(u8, obj.get("thinkingLevel").?.string),
+            .thinking_level = try allocator.dupe(u8, try requiredString(obj, "thinkingLevel")),
         } }
     else if (std.mem.eql(u8, type_str, "model_change"))
         .{ .model_change = .{
-            .provider = try allocator.dupe(u8, obj.get("provider").?.string),
-            .model_id = try allocator.dupe(u8, obj.get("modelId").?.string),
+            .provider = try allocator.dupe(u8, try requiredString(obj, "provider")),
+            .model_id = try allocator.dupe(u8, try requiredString(obj, "modelId")),
         } }
     else if (std.mem.eql(u8, type_str, "compaction"))
         .{ .compaction = .{
-            .summary = try allocator.dupe(u8, obj.get("summary").?.string),
-            .first_kept_entry_id = try allocator.dupe(u8, obj.get("firstKeptEntryId").?.string),
-            .tokens_before = @intCast(obj.get("tokensBefore").?.integer),
+            .summary = try allocator.dupe(u8, try requiredString(obj, "summary")),
+            .first_kept_entry_id = try allocator.dupe(u8, try requiredString(obj, "firstKeptEntryId")),
+            .tokens_before = @intCast(try requiredInteger(obj, "tokensBefore")),
             .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
-            .from_hook = if (obj.get("fromHook")) |v| v.bool else null,
+            .from_hook = try optionalBool(obj, "fromHook"),
         } }
     else if (std.mem.eql(u8, type_str, "branch_summary"))
         .{ .branch_summary = .{
-            .from_id = try allocator.dupe(u8, obj.get("fromId").?.string),
-            .summary = try allocator.dupe(u8, obj.get("summary").?.string),
+            .from_id = try allocator.dupe(u8, try requiredString(obj, "fromId")),
+            .summary = try allocator.dupe(u8, try requiredString(obj, "summary")),
             .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
-            .from_hook = if (obj.get("fromHook")) |v| v.bool else null,
+            .from_hook = try optionalBool(obj, "fromHook"),
         } }
     else if (std.mem.eql(u8, type_str, "custom"))
         .{ .custom = .{
-            .custom_type = try allocator.dupe(u8, obj.get("customType").?.string),
+            .custom_type = try allocator.dupe(u8, try requiredString(obj, "customType")),
             .data = if (obj.get("data")) |d| try json_util.cloneJsonValue(allocator, d) else null,
         } }
     else if (std.mem.eql(u8, type_str, "custom_message"))
         .{ .custom_message = .{
-            .custom_type = try allocator.dupe(u8, obj.get("customType").?.string),
-            .content = try parseCustomContent(allocator, obj.get("content").?),
+            .custom_type = try allocator.dupe(u8, try requiredString(obj, "customType")),
+            .content = try parseCustomContent(allocator, try requiredValue(obj, "content")),
             .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
-            .display = obj.get("display").?.bool,
+            .display = try requiredBool(obj, "display"),
         } }
     else if (std.mem.eql(u8, type_str, "label"))
         .{ .label = .{
-            .target_id = try allocator.dupe(u8, obj.get("targetId").?.string),
-            .label = if (obj.get("label")) |v| switch (v) {
-                .string => |s| try allocator.dupe(u8, s),
-                else => null,
-            } else null,
+            .target_id = try allocator.dupe(u8, try requiredString(obj, "targetId")),
+            .label = if (try optionalString(obj, "label")) |v| try allocator.dupe(u8, v) else null,
         } }
     else if (std.mem.eql(u8, type_str, "session_info"))
         .{ .session_info = .{
-            .name = if (obj.get("name")) |v| try allocator.dupe(u8, v.string) else null,
+            .name = if (try optionalString(obj, "name")) |v| try allocator.dupe(u8, v) else null,
         } }
     else
         return error.UnknownEntryType;
@@ -500,8 +497,8 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: [
 }
 
 fn parseAgentMessage(allocator: std.mem.Allocator, value: std.json.Value) !agent.protocol.AgentMessage {
-    const obj = value.object;
-    const role = obj.get("role").?.string;
+    const obj = try expectObject(value);
+    const role = try requiredString(obj, "role");
 
     if (std.mem.eql(u8, role, "user")) {
         return .{ .user = try parseUserMessage(allocator, obj) };
@@ -525,6 +522,68 @@ fn parseAgentMessage(allocator: std.mem.Allocator, value: std.json.Value) !agent
         return .{ .custom = try parseCustomAgentMessage(allocator, obj) };
     }
     return error.UnknownMessageRole;
+}
+
+fn requiredValue(obj: std.json.ObjectMap, field: []const u8) !std.json.Value {
+    return obj.get(field) orelse error.MissingField;
+}
+
+fn requiredString(obj: std.json.ObjectMap, field: []const u8) ![]const u8 {
+    return try expectString(try requiredValue(obj, field));
+}
+
+fn optionalString(obj: std.json.ObjectMap, field: []const u8) !?[]const u8 {
+    const value = obj.get(field) orelse return null;
+    return switch (value) {
+        .null => null,
+        .string => |s| s,
+        else => error.InvalidFieldType,
+    };
+}
+
+fn requiredInteger(obj: std.json.ObjectMap, field: []const u8) !i64 {
+    return try expectInteger(try requiredValue(obj, field));
+}
+
+fn requiredBool(obj: std.json.ObjectMap, field: []const u8) !bool {
+    return try expectBool(try requiredValue(obj, field));
+}
+
+fn optionalBool(obj: std.json.ObjectMap, field: []const u8) !?bool {
+    const value = obj.get(field) orelse return null;
+    return switch (value) {
+        .null => null,
+        .bool => |b| b,
+        else => error.InvalidFieldType,
+    };
+}
+
+fn expectObject(value: std.json.Value) !std.json.ObjectMap {
+    return switch (value) {
+        .object => |obj| obj,
+        else => error.InvalidFieldType,
+    };
+}
+
+fn expectString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        else => error.InvalidFieldType,
+    };
+}
+
+fn expectInteger(value: std.json.Value) !i64 {
+    return switch (value) {
+        .integer => |i| i,
+        else => error.InvalidFieldType,
+    };
+}
+
+fn expectBool(value: std.json.Value) !bool {
+    return switch (value) {
+        .bool => |b| b,
+        else => error.InvalidFieldType,
+    };
 }
 
 fn parseUserMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !ai.protocol.UserMessage {
@@ -854,6 +913,36 @@ test "header wire format round-trips parent session and version" {
     try std.testing.expectEqualStrings("/tmp", h.cwd);
     try std.testing.expectEqual(@as(u32, 3), h.version);
     try std.testing.expectEqualStrings("parent-uuid", h.parent_session.?);
+}
+
+test "parser rejects missing or non-string file entry type" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.MissingField, parseFileEntry(allocator,
+        \\{"id":"s","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}
+    ));
+    try std.testing.expectError(error.InvalidFieldType, parseFileEntry(allocator,
+        \\{"type":1,"id":"s","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}
+    ));
+}
+
+test "parser rejects session header with missing id" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.MissingField, parseFileEntry(allocator,
+        \\{"type":"session","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/tmp"}
+    ));
+}
+
+test "parser rejects message with missing or non-string role" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.MissingField, parseFileEntry(allocator,
+        \\{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:00.000Z","message":{"content":"hi","timestamp":1}}
+    ));
+    try std.testing.expectError(error.InvalidFieldType, parseFileEntry(allocator,
+        \\{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:00.000Z","message":{"role":1,"content":"hi","timestamp":1}}
+    ));
 }
 
 test "assistant message round-trips normalized failure metadata" {

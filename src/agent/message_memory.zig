@@ -101,7 +101,7 @@ fn cloneBranchSummaryMessage(
     };
 }
 
-fn cloneTextContent(allocator: std.mem.Allocator, text: ai.protocol.TextContent) !ai.protocol.TextContent {
+pub fn cloneTextContent(allocator: std.mem.Allocator, text: ai.protocol.TextContent) !ai.protocol.TextContent {
     const text_copy = try allocator.dupe(u8, text.text);
     errdefer allocator.free(text_copy);
     const signature_copy = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null;
@@ -111,12 +111,12 @@ fn cloneTextContent(allocator: std.mem.Allocator, text: ai.protocol.TextContent)
     };
 }
 
-fn freeTextContent(allocator: std.mem.Allocator, text: ai.protocol.TextContent) void {
+pub fn freeTextContent(allocator: std.mem.Allocator, text: ai.protocol.TextContent) void {
     allocator.free(text.text);
     if (text.text_signature) |signature| allocator.free(signature);
 }
 
-fn cloneThinkingContent(allocator: std.mem.Allocator, thinking: ai.protocol.ThinkingContent) !ai.protocol.ThinkingContent {
+pub fn cloneThinkingContent(allocator: std.mem.Allocator, thinking: ai.protocol.ThinkingContent) !ai.protocol.ThinkingContent {
     const thinking_copy = try allocator.dupe(u8, thinking.thinking);
     errdefer allocator.free(thinking_copy);
     const signature_copy = if (thinking.thinking_signature) |signature| try allocator.dupe(u8, signature) else null;
@@ -127,12 +127,12 @@ fn cloneThinkingContent(allocator: std.mem.Allocator, thinking: ai.protocol.Thin
     };
 }
 
-fn freeThinkingContent(allocator: std.mem.Allocator, thinking: ai.protocol.ThinkingContent) void {
+pub fn freeThinkingContent(allocator: std.mem.Allocator, thinking: ai.protocol.ThinkingContent) void {
     allocator.free(thinking.thinking);
     if (thinking.thinking_signature) |signature| allocator.free(signature);
 }
 
-fn cloneImageContent(allocator: std.mem.Allocator, image: ai.protocol.ImageContent) !ai.protocol.ImageContent {
+pub fn cloneImageContent(allocator: std.mem.Allocator, image: ai.protocol.ImageContent) !ai.protocol.ImageContent {
     const data = try allocator.dupe(u8, image.data);
     errdefer allocator.free(data);
     const mime_type = try allocator.dupe(u8, image.mime_type);
@@ -142,12 +142,12 @@ fn cloneImageContent(allocator: std.mem.Allocator, image: ai.protocol.ImageConte
     };
 }
 
-fn freeImageContent(allocator: std.mem.Allocator, image: ai.protocol.ImageContent) void {
+pub fn freeImageContent(allocator: std.mem.Allocator, image: ai.protocol.ImageContent) void {
     allocator.free(image.data);
     allocator.free(image.mime_type);
 }
 
-fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) !ai.protocol.ToolCall {
+pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) !ai.protocol.ToolCall {
     const id = try allocator.dupe(u8, tool_call.id);
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, tool_call.name);
@@ -163,7 +163,7 @@ fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) 
     };
 }
 
-fn freeToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) void {
+pub fn freeToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     json_util.freeJsonValue(allocator, tool_call.arguments);
@@ -194,21 +194,21 @@ fn cloneUserBlocks(
     return cloned;
 }
 
-fn freeUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.UserMessageContent.Block) void {
+pub fn freeUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.UserMessageContent.Block) void {
     switch (block) {
         .text => |text| freeTextContent(allocator, text),
         .image => |image| freeImageContent(allocator, image),
     }
 }
 
-fn cloneUserMessage(allocator: std.mem.Allocator, message: ai.protocol.UserMessage) !ai.protocol.UserMessage {
+pub fn cloneUserMessage(allocator: std.mem.Allocator, message: ai.protocol.UserMessage) !ai.protocol.UserMessage {
     return .{
         .content = try cloneUserContent(allocator, message.content),
         .timestamp = message.timestamp,
     };
 }
 
-fn freeUserMessage(allocator: std.mem.Allocator, message: *ai.protocol.UserMessage) void {
+pub fn freeUserMessage(allocator: std.mem.Allocator, message: *ai.protocol.UserMessage) void {
     freeUserContent(allocator, &message.content);
 }
 
@@ -305,7 +305,7 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, message: ai.protocol.
     };
 }
 
-fn freeAssistantContentBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) void {
+pub fn freeAssistantContentBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) void {
     switch (block) {
         .text => |text| freeTextContent(allocator, text),
         .thinking => |thinking| freeThinkingContent(allocator, thinking),
@@ -363,7 +363,7 @@ pub fn cloneToolResultMessage(allocator: std.mem.Allocator, message: ai.protocol
     };
 }
 
-fn freeToolResultContentBlock(allocator: std.mem.Allocator, block: ai.protocol.ToolResultMessage.ContentBlock) void {
+pub fn freeToolResultContentBlock(allocator: std.mem.Allocator, block: ai.protocol.ToolResultMessage.ContentBlock) void {
     switch (block) {
         .text => |text| freeTextContent(allocator, text),
         .image => |image| freeImageContent(allocator, image),
@@ -403,14 +403,18 @@ fn cloneCustomMessage(allocator: std.mem.Allocator, message: protocol.AgentMessa
     };
 }
 
-fn freeCustomMessage(allocator: std.mem.Allocator, message: *protocol.AgentMessage.CustomMessage) void {
-    allocator.free(message.custom_type);
-    switch (message.content) {
+pub fn freeCustomContent(allocator: std.mem.Allocator, content: protocol.AgentMessage.CustomContent) void {
+    switch (content) {
         .text => |text| allocator.free(text),
         .blocks => |blocks| {
             for (blocks) |block| freeUserBlock(allocator, block);
             allocator.free(blocks);
         },
     }
+}
+
+fn freeCustomMessage(allocator: std.mem.Allocator, message: *protocol.AgentMessage.CustomMessage) void {
+    allocator.free(message.custom_type);
+    freeCustomContent(allocator, message.content);
     if (message.details) |details| json_util.freeJsonValue(allocator, details);
 }

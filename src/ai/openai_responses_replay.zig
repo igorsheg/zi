@@ -1,6 +1,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const json_util = @import("json_util.zig");
+const message_memory = @import("../agent/message_memory.zig");
 
 pub const ConvertOptions = struct {
     include_system_prompt: bool = true,
@@ -59,7 +60,7 @@ pub fn transformMessages(
                 try flushPendingSyntheticToolResults(allocator, &result, pending_tool_calls.items, existing_tool_result_ids.items);
                 pending_tool_calls.clearRetainingCapacity();
                 existing_tool_result_ids.clearRetainingCapacity();
-                try result.append(allocator, .{ .user = try cloneUserMessage(allocator, u) });
+                try result.append(allocator, .{ .user = try message_memory.cloneUserMessage(allocator, u) });
             },
             .assistant => |a| {
                 try flushPendingSyntheticToolResults(allocator, &result, pending_tool_calls.items, existing_tool_result_ids.items);
@@ -477,16 +478,16 @@ fn transformAssistantMessage(
         .thinking => |thinking| {
             if (thinking.redacted orelse false) {
                 if (!same_model) continue;
-                try content.append(allocator, .{ .thinking = try cloneThinkingContent(allocator, thinking) });
+                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) });
                 continue;
             }
             if (same_model and thinking.thinking_signature != null) {
-                try content.append(allocator, .{ .thinking = try cloneThinkingContent(allocator, thinking) });
+                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) });
                 continue;
             }
             if (std.mem.trim(u8, thinking.thinking, &std.ascii.whitespace).len == 0) continue;
             if (same_model) {
-                try content.append(allocator, .{ .thinking = try cloneThinkingContent(allocator, thinking) });
+                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) });
             } else {
                 try content.append(allocator, .{ .text = .{
                     .text = try allocator.dupe(u8, thinking.thinking),
@@ -496,7 +497,7 @@ fn transformAssistantMessage(
         },
         .text => |text| {
             if (same_model) {
-                try content.append(allocator, .{ .text = try cloneTextContent(allocator, text) });
+                try content.append(allocator, .{ .text = try message_memory.cloneTextContent(allocator, text) });
             } else {
                 try content.append(allocator, .{ .text = .{
                     .text = try allocator.dupe(u8, text.text),
@@ -548,8 +549,8 @@ fn transformToolResultMessage(
     errdefer content.deinit(allocator);
 
     for (tool_result.content) |block| switch (block) {
-        .text => |text| try content.append(allocator, .{ .text = try cloneTextContent(allocator, text) }),
-        .image => |image| try content.append(allocator, .{ .image = try cloneImageContent(allocator, image) }),
+        .text => |text| try content.append(allocator, .{ .text = try message_memory.cloneTextContent(allocator, text) }),
+        .image => |image| try content.append(allocator, .{ .image = try message_memory.cloneImageContent(allocator, image) }),
     };
 
     return .{
@@ -826,46 +827,6 @@ fn sanitizeTextAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8
     return json_util.utf8LossyAlloc(allocator, text);
 }
 
-fn cloneUserMessage(allocator: std.mem.Allocator, user: protocol.UserMessage) !protocol.UserMessage {
-    return .{
-        .content = switch (user.content) {
-            .text => |text| .{ .text = try allocator.dupe(u8, text) },
-            .blocks => |blocks| blk: {
-                const cloned = try allocator.alloc(protocol.UserMessage.UserMessageContent.Block, blocks.len);
-                errdefer allocator.free(cloned);
-                for (blocks, 0..) |block, i| cloned[i] = switch (block) {
-                    .text => |text| .{ .text = try cloneTextContent(allocator, text) },
-                    .image => |image| .{ .image = try cloneImageContent(allocator, image) },
-                };
-                break :blk .{ .blocks = cloned };
-            },
-        },
-        .timestamp = user.timestamp,
-    };
-}
-
-fn cloneTextContent(allocator: std.mem.Allocator, text: protocol.TextContent) !protocol.TextContent {
-    return .{
-        .text = try allocator.dupe(u8, text.text),
-        .text_signature = if (text.text_signature) |sig| try allocator.dupe(u8, sig) else null,
-    };
-}
-
-fn cloneThinkingContent(allocator: std.mem.Allocator, thinking: protocol.ThinkingContent) !protocol.ThinkingContent {
-    return .{
-        .thinking = try allocator.dupe(u8, thinking.thinking),
-        .thinking_signature = if (thinking.thinking_signature) |sig| try allocator.dupe(u8, sig) else null,
-        .redacted = thinking.redacted,
-    };
-}
-
-fn cloneImageContent(allocator: std.mem.Allocator, image: protocol.ImageContent) !protocol.ImageContent {
-    return .{
-        .data = try allocator.dupe(u8, image.data),
-        .mime_type = try allocator.dupe(u8, image.mime_type),
-    };
-}
-
 fn deinitMessageList(allocator: std.mem.Allocator, messages: []protocol.Message) void {
     for (messages) |msg| deinitMessage(allocator, msg);
 }
@@ -879,16 +840,8 @@ fn deinitMessage(allocator: std.mem.Allocator, msg: protocol.Message) void {
 }
 
 fn deinitUserMessage(allocator: std.mem.Allocator, user: protocol.UserMessage) void {
-    switch (user.content) {
-        .text => |text| allocator.free(text),
-        .blocks => |blocks| {
-            for (blocks) |block| switch (block) {
-                .text => |text| deinitTextContent(allocator, text),
-                .image => |image| deinitImageContent(allocator, image),
-            };
-            allocator.free(blocks);
-        },
-    }
+    var owned = user;
+    message_memory.freeUserMessage(allocator, &owned);
 }
 
 fn deinitAssistantMessage(allocator: std.mem.Allocator, assistant: protocol.AssistantMessage) void {
@@ -897,49 +850,16 @@ fn deinitAssistantMessage(allocator: std.mem.Allocator, assistant: protocol.Assi
 }
 
 fn deinitToolResultMessage(allocator: std.mem.Allocator, tool_result: protocol.ToolResultMessage) void {
-    allocator.free(tool_result.tool_call_id);
-    allocator.free(tool_result.tool_name);
-    deinitToolResultContentList(allocator, tool_result.content);
-    allocator.free(tool_result.content);
-    if (tool_result.details) |details| json_util.freeJsonValue(allocator, details);
-    if (tool_result.presentation) |presentation| json_util.freeJsonValue(allocator, presentation);
+    var owned = tool_result;
+    message_memory.freeToolResultMessage(allocator, &owned);
 }
 
 fn deinitAssistantContentList(allocator: std.mem.Allocator, content: []const protocol.AssistantMessage.AssistantContentBlock) void {
-    for (content) |block| switch (block) {
-        .text => |text| deinitTextContent(allocator, text),
-        .thinking => |thinking| deinitThinkingContent(allocator, thinking),
-        .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
-    };
+    for (content) |block| message_memory.freeAssistantContentBlock(allocator, block);
 }
 
 fn deinitToolResultContentList(allocator: std.mem.Allocator, content: []const protocol.ToolResultMessage.ContentBlock) void {
-    for (content) |block| switch (block) {
-        .text => |text| deinitTextContent(allocator, text),
-        .image => |image| deinitImageContent(allocator, image),
-    };
-}
-
-fn deinitTextContent(allocator: std.mem.Allocator, text: protocol.TextContent) void {
-    allocator.free(text.text);
-    if (text.text_signature) |sig| allocator.free(sig);
-}
-
-fn deinitThinkingContent(allocator: std.mem.Allocator, thinking: protocol.ThinkingContent) void {
-    allocator.free(thinking.thinking);
-    if (thinking.thinking_signature) |sig| allocator.free(sig);
-}
-
-fn deinitImageContent(allocator: std.mem.Allocator, image: protocol.ImageContent) void {
-    allocator.free(image.data);
-    allocator.free(image.mime_type);
-}
-
-fn deinitToolCall(allocator: std.mem.Allocator, tool_call: protocol.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    json_util.freeJsonValue(allocator, tool_call.arguments);
-    if (tool_call.thought_signature) |sig| allocator.free(sig);
+    for (content) |block| message_memory.freeToolResultContentBlock(allocator, block);
 }
 
 fn deinitResponsesInputItemList(allocator: std.mem.Allocator, items: []ResponsesInputItem) void {

@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
-const agent = @import("../../agent/root.zig");
+const message_memory = @import("../../agent/message_memory.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
 const zio_fs = @import("../../zio/root.zig").file;
@@ -131,7 +131,10 @@ fn freeSessionEntry(allocator: std.mem.Allocator, entry: proto.SessionEntry) voi
 
 fn freeEntryType(allocator: std.mem.Allocator, entry: proto.SessionEntry.EntryType) void {
     switch (entry) {
-        .message => |msg| freeAgentMessage(allocator, msg.message),
+        .message => |msg| {
+            var message = msg.message;
+            message_memory.freeMessage(allocator, &message);
+        },
         .thinking_level_change => |tc| allocator.free(tc.thinking_level),
         .model_change => |mc| {
             allocator.free(mc.provider);
@@ -153,7 +156,7 @@ fn freeEntryType(allocator: std.mem.Allocator, entry: proto.SessionEntry.EntryTy
         },
         .custom_message => |cm| {
             allocator.free(cm.custom_type);
-            freeCustomContent(allocator, cm.content);
+            message_memory.freeCustomContent(allocator, cm.content);
             if (cm.details) |details| ai.json_util.freeJsonValue(allocator, details);
         },
         .label => |l| {
@@ -163,123 +166,6 @@ fn freeEntryType(allocator: std.mem.Allocator, entry: proto.SessionEntry.EntryTy
         .session_info => |info| {
             if (info.name) |name| allocator.free(name);
         },
-    }
-}
-
-fn freeAgentMessage(allocator: std.mem.Allocator, msg: agent.protocol.AgentMessage) void {
-    switch (msg) {
-        .user => |u| freeUserMessage(allocator, u),
-        .assistant => |a| freeAssistantMessage(allocator, a),
-        .tool_result => |tr| freeToolResultMessage(allocator, tr),
-        .compaction_summary => |summary| allocator.free(summary.summary),
-        .branch_summary => |summary| {
-            allocator.free(summary.summary);
-            allocator.free(summary.from_id);
-        },
-        .custom => |custom| {
-            allocator.free(custom.custom_type);
-            freeCustomContent(allocator, custom.content);
-            if (custom.details) |details| ai.json_util.freeJsonValue(allocator, details);
-        },
-    }
-}
-
-fn freeUserMessage(allocator: std.mem.Allocator, msg: ai.protocol.UserMessage) void {
-    switch (msg.content) {
-        .text => |text| allocator.free(text),
-        .blocks => |blocks| {
-            for (blocks) |block| switch (block) {
-                .text => |t| {
-                    allocator.free(t.text);
-                    if (t.text_signature) |sig| allocator.free(sig);
-                },
-                .image => |img| {
-                    allocator.free(img.data);
-                    allocator.free(img.mime_type);
-                },
-            };
-            allocator.free(blocks);
-        },
-    }
-}
-
-fn freeAssistantMessage(allocator: std.mem.Allocator, msg: ai.protocol.AssistantMessage) void {
-    for (msg.content) |block| switch (block) {
-        .text => |t| {
-            allocator.free(t.text);
-            if (t.text_signature) |sig| allocator.free(sig);
-        },
-        .thinking => |thinking| {
-            allocator.free(thinking.thinking);
-            if (thinking.thinking_signature) |sig| allocator.free(sig);
-        },
-        .tool_call => |call| {
-            allocator.free(call.id);
-            allocator.free(call.name);
-            ai.json_util.freeJsonValue(allocator, call.arguments);
-            if (call.thought_signature) |sig| allocator.free(sig);
-        },
-    };
-    allocator.free(msg.content);
-    freeApi(allocator, msg.api);
-    freeProvider(allocator, msg.provider);
-    allocator.free(msg.model);
-    if (msg.response_id) |response_id| allocator.free(response_id);
-    if (msg.error_message) |error_message| allocator.free(error_message);
-    if (msg.failure) |failure| {
-        if (failure.provider_code) |provider_code| allocator.free(provider_code);
-        if (failure.provider_type) |provider_type| allocator.free(provider_type);
-    }
-}
-
-fn freeToolResultMessage(allocator: std.mem.Allocator, msg: ai.protocol.ToolResultMessage) void {
-    allocator.free(msg.tool_call_id);
-    allocator.free(msg.tool_name);
-    for (msg.content) |block| switch (block) {
-        .text => |t| {
-            allocator.free(t.text);
-            if (t.text_signature) |sig| allocator.free(sig);
-        },
-        .image => |img| {
-            allocator.free(img.data);
-            allocator.free(img.mime_type);
-        },
-    };
-    allocator.free(msg.content);
-    if (msg.details) |details| ai.json_util.freeJsonValue(allocator, details);
-    if (msg.presentation) |presentation| ai.json_util.freeJsonValue(allocator, presentation);
-}
-
-fn freeCustomContent(allocator: std.mem.Allocator, content: agent.protocol.AgentMessage.CustomContent) void {
-    switch (content) {
-        .text => |text| allocator.free(text),
-        .blocks => |blocks| {
-            for (blocks) |block| switch (block) {
-                .text => |t| {
-                    allocator.free(t.text);
-                    if (t.text_signature) |sig| allocator.free(sig);
-                },
-                .image => |img| {
-                    allocator.free(img.data);
-                    allocator.free(img.mime_type);
-                },
-            };
-            allocator.free(blocks);
-        },
-    }
-}
-
-fn freeApi(allocator: std.mem.Allocator, api: ai.protocol.Api) void {
-    switch (api) {
-        .custom => |value| allocator.free(value),
-        else => {},
-    }
-}
-
-fn freeProvider(allocator: std.mem.Allocator, provider: ai.protocol.Provider) void {
-    switch (provider) {
-        .custom => |value| allocator.free(value),
-        else => {},
     }
 }
 
