@@ -2,6 +2,8 @@ const std = @import("std");
 const queue_mod = @import("queue.zig");
 const task_mod = @import("task.zig");
 
+const log = std.log.scoped(.zio_worker);
+
 pub fn Worker(
     comptime Request: type,
     comptime Handler: type,
@@ -60,7 +62,7 @@ pub fn Worker(
         pub fn stop(self: *Self) void {
             self.queue.close();
             if (self.tasks) |*group| {
-                group.join() catch {};
+                group.join() catch |err| log.warn("worker task join failed: {}", .{err});
                 self.tasks = null;
             }
         }

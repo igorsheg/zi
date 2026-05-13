@@ -4,6 +4,8 @@ const Group = @import("task.zig").Group;
 const fd_util = @import("fd.zig");
 const types = @import("process_engine_types.zig");
 
+const log = std.log.scoped(.zio_process_blocking);
+
 pub const EnvPair = types.EnvPair;
 pub const StreamKind = types.StreamKind;
 pub const Event = types.Event;
@@ -44,7 +46,7 @@ pub const Engine = struct {
 
     pub fn join(self: *Engine) void {
         if (!self.started) return;
-        self.tasks.join() catch {};
+        self.tasks.join() catch |err| log.warn("process engine task join failed: {}", .{err});
         self.started = false;
     }
 
@@ -162,7 +164,7 @@ pub const Engine = struct {
         if (self.request.timeout_ms != null or !self.request.signal.isNone()) {
             readers.spawnThread(timeoutWatcher, .{self}) catch {
                 self.terminateOwnedChild(child.id.?);
-                _ = child.wait(self.io) catch null;
+                waitChildLogged(self.io, &child, "timeout watcher start failure");
                 self.markExited();
                 _ = self.sink.submit(self.sink.ptr, .spawn_failed);
                 return;
@@ -171,7 +173,7 @@ pub const Engine = struct {
 
         readers.spawnThread(terminationWatcher, .{ self, child.id.? }) catch {
             self.terminateOwnedChild(child.id.?);
-            _ = child.wait(self.io) catch null;
+            waitChildLogged(self.io, &child, "termination watcher start failure");
             self.markExited();
             _ = self.sink.submit(self.sink.ptr, .spawn_failed);
             return;
@@ -181,7 +183,7 @@ pub const Engine = struct {
 
         if (child.stdout) |stdout_file| {
             child.stdout = null;
-            fd_util.setNonblocking(stdout_file.handle) catch {};
+            setNonblockingLogged(stdout_file.handle, "stdout");
             readers.spawnThread(readPipe, .{ self, stdout_file, StreamKind.stdout }) catch {
                 stdout_file.close(self.io);
                 self.handleStartFailure(&child, &readers);
@@ -190,7 +192,7 @@ pub const Engine = struct {
         }
         if (child.stderr) |stderr_file| {
             child.stderr = null;
-            fd_util.setNonblocking(stderr_file.handle) catch {};
+            setNonblockingLogged(stderr_file.handle, "stderr");
             readers.spawnThread(readPipe, .{ self, stderr_file, StreamKind.stderr }) catch {
                 stderr_file.close(self.io);
                 self.handleStartFailure(&child, &readers);
@@ -200,7 +202,10 @@ pub const Engine = struct {
 
         if (self.request.close_stdin_before_wait) self.waitForCloseStdin(&child);
 
-        const term = child.wait(self.io) catch null;
+        const term = child.wait(self.io) catch |err| blk: {
+            log.warn("child wait failed: {}", .{err});
+            break :blk null;
+        };
         self.mutex.lockUncancelable(self.io);
         self.child_id = null;
         self.stdin_file = null;
@@ -208,7 +213,7 @@ pub const Engine = struct {
         self.condition.broadcast(self.io);
         self.mutex.unlock(self.io);
 
-        readers.join() catch {};
+        readers.join() catch |err| log.warn("process reader task join failed: {}", .{err});
 
         _ = self.sink.submit(self.sink.ptr, .{ .exit = term });
     }
@@ -246,8 +251,8 @@ pub const Engine = struct {
             child.stderr = null;
         }
         if (child.id) |pid| self.terminateOwnedChild(pid);
-        readers.join() catch {};
-        _ = child.wait(self.io) catch null;
+        readers.join() catch |err| log.warn("process reader task join after start failure failed: {}", .{err});
+        waitChildLogged(self.io, child, "start failure cleanup");
         self.mutex.lockUncancelable(self.io);
         self.child_id = null;
         self.stdin_file = null;
@@ -334,3 +339,11 @@ pub const Engine = struct {
         }
     }
 };
+
+fn waitChildLogged(io: std.Io, child: *std.process.Child, context: []const u8) void {
+    _ = child.wait(io) catch |err| log.warn("child wait failed during {s}: {}", .{ context, err });
+}
+
+fn setNonblockingLogged(fd: std.posix.fd_t, stream_name: []const u8) void {
+    fd_util.setNonblocking(fd) catch |err| log.warn("failed to set {s} pipe nonblocking: {}", .{ stream_name, err });
+}
