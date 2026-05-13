@@ -54,8 +54,6 @@ pub const Agent = struct {
     transport: ?ai.protocol.Transport,
     max_retry_delay_ms: ?u64,
     tool_execution: protocol.ToolExecutionMode,
-    default_stream_bundle: ?*ai.provider_defaults.Bundle,
-    default_stream_closure: ?*DefaultStreamClosure,
     state_pending_tool_calls: std.ArrayList([]const u8),
 
     conversation_version: std.atomic.Value(u64),
@@ -74,7 +72,7 @@ pub const Agent = struct {
         io: std.Io = std.Options.debug_io,
         convert_to_llm: ?protocol.ConvertToLlmHook = null,
         transform_context: ?protocol.TransformContextHook = null,
-        stream_fn: ?protocol.StreamHook = null,
+        stream_fn: protocol.StreamHook,
         before_tool_call: ?protocol.BeforeToolCallHook = null,
         after_tool_call: ?protocol.AfterToolCallHook = null,
         on_payload: ?protocol.OnPayloadHook = null,
@@ -112,27 +110,6 @@ pub const Agent = struct {
             null;
         errdefer if (owned_session_id) |session_id| allocator.free(session_id);
 
-        var default_stream_bundle: ?*ai.provider_defaults.Bundle = null;
-        errdefer if (default_stream_bundle) |bundle| bundle.deinit();
-        var default_stream_closure: ?*DefaultStreamClosure = null;
-        errdefer if (default_stream_closure) |closure| allocator.destroy(closure);
-
-        const stream_fn = if (options.stream_fn) |stream_fn|
-            stream_fn
-        else blk: {
-            const bundle = try ai.provider_defaults.Bundle.init(allocator);
-            default_stream_bundle = bundle;
-
-            const closure = try allocator.create(DefaultStreamClosure);
-            closure.* = .{ .registry = &bundle.registry, .io = options.io };
-            default_stream_closure = closure;
-
-            break :blk protocol.StreamHook{
-                .func = &DefaultStreamClosure.streamFn,
-                .ctx = @ptrCast(closure),
-            };
-        };
-
         return .{
             .allocator = allocator,
             .history_arena = history_arena,
@@ -149,7 +126,7 @@ pub const Agent = struct {
             .io = options.io,
             .convert_to_llm = options.convert_to_llm orelse defaultConvertToLlmHook(),
             .transform_context = options.transform_context,
-            .stream_fn = stream_fn,
+            .stream_fn = options.stream_fn,
             .before_tool_call = options.before_tool_call,
             .after_tool_call = options.after_tool_call,
             .on_payload = options.on_payload,
@@ -159,8 +136,6 @@ pub const Agent = struct {
             .transport = options.transport,
             .max_retry_delay_ms = options.max_retry_delay_ms,
             .tool_execution = options.tool_execution,
-            .default_stream_bundle = default_stream_bundle,
-            .default_stream_closure = default_stream_closure,
             .state_pending_tool_calls = .empty,
             .conversation_version = std.atomic.Value(u64).init(0),
             .is_running = std.atomic.Value(bool).init(false),
@@ -177,8 +152,6 @@ pub const Agent = struct {
         self.runtime_arena.deinit();
         self.history_arena.deinit();
         if (self.session_id) |session_id| self.allocator.free(session_id);
-        if (self.default_stream_closure) |closure| self.allocator.destroy(closure);
-        if (self.default_stream_bundle) |bundle| bundle.deinit();
         self.* = undefined;
     }
 
@@ -674,68 +647,6 @@ pub fn defaultConvertToLlmHook() protocol.ConvertToLlmHook {
     return .{ .func = &defaultConvertToLlm, .ctx = null };
 }
 
-const DefaultStreamClosure = struct {
-    registry: *ai.provider.Registry,
-    io: std.Io,
-
-    fn streamFn(
-        ctx: ?*anyopaque,
-        allocator: std.mem.Allocator,
-        model: protocol.Model,
-        context: ai.protocol.Context,
-        options: ai.protocol.SimpleStreamOptions,
-        callback: ai.provider.EventCallback,
-        callback_ctx: ?*anyopaque,
-    ) void {
-        const self: *const DefaultStreamClosure = @ptrCast(@alignCast(ctx.?));
-        const api_str = ai.provider.apiToString(model.api);
-        const provider_str = ai.json_util.providerToString(model.provider);
-        const prov = self.registry.getForModel(api_str, provider_str) orelse {
-            emitMissingProviderError(allocator, model, api_str, callback, callback_ctx);
-            return;
-        };
-        var opts = options;
-        opts.base.io = self.io;
-        prov.streamSimple(allocator, model, context, opts, callback, callback_ctx);
-    }
-};
-
-fn emitMissingProviderError(
-    allocator: std.mem.Allocator,
-    model: protocol.Model,
-    api_str: []const u8,
-    callback: ai.provider.EventCallback,
-    callback_ctx: ?*anyopaque,
-) void {
-    const err_message = std.fmt.allocPrint(allocator, "No provider registered for API {s}", .{api_str}) catch "No provider registered for requested API";
-    callback(.{ .@"error" = .{
-        .reason = .@"error",
-        .@"error" = .{
-            .content = &.{},
-            .api = model.api,
-            .provider = model.provider,
-            .model = model.id,
-            .usage = .{
-                .input = 0,
-                .output = 0,
-                .cache_read = 0,
-                .cache_write = 0,
-                .total_tokens = 0,
-                .cost = .{
-                    .input = 0,
-                    .output = 0,
-                    .cache_read = 0,
-                    .cache_write = 0,
-                    .total = 0,
-                },
-            },
-            .stop_reason = .@"error",
-            .error_message = err_message,
-            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
-        },
-    } }, callback_ctx);
-}
-
 fn makeAssistantMessage() protocol.AssistantMessage {
     return .{
         .content = &.{
@@ -794,8 +705,22 @@ fn testModel() protocol.Model {
 }
 
 fn initTestAgent() !Agent {
-    return Agent.init(testing.allocator, .{ .model = testModel() });
+    return Agent.init(testing.allocator, .{ .model = testModel(), .stream_fn = testStreamHook() });
 }
+
+fn testStreamHook() protocol.StreamHook {
+    return .{ .func = testStream, .ctx = null };
+}
+
+fn testStream(
+    _: ?*anyopaque,
+    _: std.mem.Allocator,
+    _: protocol.Model,
+    _: ai.protocol.Context,
+    _: ai.protocol.SimpleStreamOptions,
+    _: ai.provider.EventCallback,
+    _: ?*anyopaque,
+) void {}
 
 test "conversation view keeps current turn separate until turn_end" {
     var agent = try initTestAgent();
@@ -854,6 +779,7 @@ test "truncateCommitted drops tail and bumps version" {
     var agent = try Agent.init(testing.allocator, .{
         .model = testModel(),
         .messages = &initial_messages,
+        .stream_fn = testStreamHook(),
     });
     defer agent.deinit();
 
@@ -934,54 +860,6 @@ test "state reflects assistant streaming and pending tool lifecycle" {
     agent.processEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
     state = agent.state();
     try testing.expect(state.streaming_message == null);
-}
-
-test "default stream fallback emits assistant error lifecycle without panic" {
-    var missing_model = testModel();
-    missing_model.id = "missing-model";
-    missing_model.name = "missing-model";
-    missing_model.api = .{ .custom = "missing-api" };
-    missing_model.provider = .{ .custom = "missing-provider" };
-
-    var agent = try Agent.init(testing.allocator, .{ .model = missing_model });
-    defer agent.deinit();
-
-    const Collector = struct {
-        saw_assistant_start: bool = false,
-        saw_assistant_end: bool = false,
-        saw_agent_end: bool = false,
-
-        fn onEvent(event: protocol.AgentEvent, raw_ctx: ?*anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
-            switch (event) {
-                .message_start => |payload| {
-                    if (payload.message == .assistant) self.saw_assistant_start = true;
-                },
-                .message_end => |payload| {
-                    if (payload.message == .assistant) self.saw_assistant_end = true;
-                },
-                .agent_end => self.saw_agent_end = true,
-                else => {},
-            }
-        }
-    };
-
-    var collector = Collector{};
-    _ = agent.subscribe(Collector.onEvent, @ptrCast(&collector));
-
-    const prompt = [_]protocol.AgentMessage{
-        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } },
-    };
-    try agent.prompt(&prompt);
-
-    const state = agent.state();
-    try testing.expect(collector.saw_assistant_start);
-    try testing.expect(collector.saw_assistant_end);
-    try testing.expect(collector.saw_agent_end);
-    try testing.expectEqual(@as(usize, 2), state.messages.len);
-    try testing.expect(state.messages[1] == .assistant);
-    try testing.expectEqual(ai.protocol.StopReason.@"error", state.messages[1].assistant.stop_reason);
-    try testing.expect(state.error_message != null);
 }
 
 test "conversation_version tracks committed, in-flight, and turn commit mutations" {
