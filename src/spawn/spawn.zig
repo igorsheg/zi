@@ -22,16 +22,19 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
     var tmp_dir_path: ?[]const u8 = null;
     var tmp_file_path: ?[]const u8 = null;
     defer {
-        if (tmp_file_path) |p| std.Io.Dir.deleteFileAbsolute(config.io, p) catch {};
-        if (tmp_dir_path) |d| std.Io.Dir.deleteDirAbsolute(config.io, d) catch {};
+        if (tmp_file_path) |p| std.Io.Dir.deleteFileAbsolute(config.io, p) catch |err| log.debug("failed to delete temp prompt file {s}: {s}", .{ p, @errorName(err) });
+        if (tmp_dir_path) |d| std.Io.Dir.deleteDirAbsolute(config.io, d) catch |err| log.debug("failed to delete temp prompt dir {s}: {s}", .{ d, @errorName(err) });
     }
     if (config.argv_override == null) {
         if (config.append_system_prompt) |asp| {
-            if (writeTempPrompt(config.io, allocator, asp)) |tmp| {
-                tmp_dir_path = tmp.dir;
-                tmp_file_path = tmp.path;
-                built.argv.appendSlice(allocator, &.{ "--append-system-prompt", tmp.path }) catch {};
-            } else |_| {}
+            const tmp = writeTempPrompt(config.io, allocator, asp) catch |err| {
+                return failSpawn(&result, allocator, "failed to write temporary system prompt", err);
+            };
+            tmp_dir_path = tmp.dir;
+            tmp_file_path = tmp.path;
+            built.argv.appendSlice(allocator, &.{ "--append-system-prompt", tmp.path }) catch |err| {
+                return failSpawn(&result, allocator, "failed to append temporary system prompt argv", err);
+            };
         }
         const task_arg = std.fmt.allocPrint(allocator, "Task: {s}", .{config.task}) catch {
             result.exit_code = 1;
@@ -42,7 +45,9 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
             result.exit_code = 1;
             return result;
         };
-        built.argv.append(allocator, task_arg) catch {};
+        built.argv.append(allocator, task_arg) catch |err| {
+            return failSpawn(&result, allocator, "failed to append task argv", err);
+        };
     }
 
     if (trace_file) |f| {
@@ -146,7 +151,7 @@ const JsonlCtx = struct {
         {
             self.mutex.lockUncancelable(self.config.io);
             defer self.mutex.unlock(self.config.io);
-            self.decoder.feed(bytes, self.sink()) catch {};
+            self.decoder.feed(bytes, self.sink()) catch |err| self.markError("failed to decode child JSONL", err);
         }
         if (self.config.on_wait) |cb| cb(self.config.on_wait_ctx);
     }
@@ -171,7 +176,19 @@ const JsonlCtx = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.result.error_message == null) self.result.error_message = self.allocator.dupe(u8, "child emitted an oversized JSONL line") catch null;
     }
+
+    fn markError(self: *@This(), comptime message: []const u8, err: anyerror) void {
+        log.warn("{s}: {s}", .{ message, @errorName(err) });
+        if (self.result.error_message == null) self.result.error_message = self.allocator.dupe(u8, message) catch null;
+    }
 };
+
+fn failSpawn(result: *types.SpawnResult, allocator: std.mem.Allocator, comptime message: []const u8, err: anyerror) types.SpawnResult {
+    log.warn("{s}: {s}", .{ message, @errorName(err) });
+    result.exit_code = 1;
+    result.error_message = allocator.dupe(u8, message) catch null;
+    return result.*;
+}
 
 fn processLine(line: []const u8, result: *types.SpawnResult, config: types.SpawnConfig) void {
     if (line.len == 0) return;
