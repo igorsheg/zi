@@ -112,7 +112,10 @@ pub fn renderRowsSlice(rows: []const Row, region: Region, first_row: u32) void {
     if (first_row >= rows.len) return;
     var y: u32 = 0;
     var idx: usize = @intCast(first_row);
-    while (idx < rows.len and y < region.height) : ({ idx += 1; y += 1; }) {
+    while (idx < rows.len and y < region.height) : ({
+        idx += 1;
+        y += 1;
+    }) {
         renderRow(rows[idx], region, y);
     }
 }

@@ -42,12 +42,17 @@ pub fn contentSegments(arena: std.mem.Allocator, gutter: ?[]const u8, gutter_wid
             try segs.append(arena, .{ .x = col, .text = g, .style = draw(text_color) });
             col += g_len;
         } else col += gutter_width;
-        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
-        try segs.append(arena, .{ .x = col, .text = "│", .style = draw(style.chrome) }); col += 1;
-        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " });
+        col += 1;
+        try segs.append(arena, .{ .x = col, .text = "│", .style = draw(style.chrome) });
+        col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " });
+        col += 1;
     } else {
-        try segs.append(arena, .{ .x = col, .text = "│", .style = draw(style.chrome) }); col += 1;
-        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = "│", .style = draw(style.chrome) });
+        col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " });
+        col += 1;
     }
     try segs.append(arena, .{ .x = col, .text = text, .style = draw(text_color) });
     return try segs.toOwnedSlice(arena);
@@ -58,12 +63,17 @@ pub fn elisionSegments(arena: std.mem.Allocator, count: u32, gutter_width: u32, 
     var col: u32 = 0;
     if (gutter_width > 0) {
         col += gutter_width;
-        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
-        try segs.append(arena, .{ .x = col, .text = "·", .style = draw(style.chrome) }); col += 1;
-        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " });
+        col += 1;
+        try segs.append(arena, .{ .x = col, .text = "·", .style = draw(style.chrome) });
+        col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " });
+        col += 1;
     } else {
-        try segs.append(arena, .{ .x = col, .text = "·", .style = draw(style.chrome) }); col += 1;
-        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = "·", .style = draw(style.chrome) });
+        col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " });
+        col += 1;
     }
     const hint = try std.fmt.allocPrint(arena, "··· {d} more lines", .{count});
     try segs.append(arena, .{ .x = col, .text = hint, .style = draw(style.dim) });

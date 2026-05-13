@@ -1864,7 +1864,7 @@ test "ToolExecution owns doc across result replacement" {
     , .{ .allocate = .alloc_always });
     defer parsed.deinit();
 
-    var content = [_]AgentToolResult.ContentBlock{ .{ .text = .{ .text = "content" } } };
+    var content = [_]AgentToolResult.ContentBlock{.{ .text = .{ .text = "content" } }};
     try setTestToolExecutionState(&transcript, tool, true, true, .{ .content = &content, .presentation = parsed.value, .is_error = false }, false, false);
     try testing.expect(tool.doc != null);
 

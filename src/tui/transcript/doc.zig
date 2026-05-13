@@ -16,8 +16,14 @@ const Segment = layout_mod.Segment;
 const Row = layout_mod.Row;
 
 pub fn isDoc(value: std.json.Value) bool {
-    const obj = switch (value) { .object => |o| o, else => return false };
-    const schema = switch (obj.get("schema") orelse return false) { .string => |s| s, else => return false };
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return false,
+    };
+    const schema = switch (obj.get("schema") orelse return false) {
+        .string => |s| s,
+        else => return false,
+    };
     return std.mem.eql(u8, schema, "zi.doc.v1");
 }
 
@@ -84,7 +90,10 @@ pub const Doc = struct {
         errdefer self.layout_arena.deinit();
 
         const obj = value.object;
-        const json_blocks = switch (obj.get("blocks") orelse return error.InvalidDoc) { .array => |a| a.items, else => return error.InvalidDoc };
+        const json_blocks = switch (obj.get("blocks") orelse return error.InvalidDoc) {
+            .array => |a| a.items,
+            else => return error.InvalidDoc,
+        };
         self.blocks = try parseBlocks(self.arena.allocator(), json_blocks, 0);
         return self;
     }
@@ -134,7 +143,10 @@ fn parseBlocks(arena: Allocator, values: []const std.json.Value, base_indent_col
 }
 
 fn parseBlock(arena: Allocator, value: std.json.Value, base_indent_cols: u32) ParseError!?Block {
-    const obj = switch (value) { .object => |o| o, else => return null };
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return null,
+    };
     const typ = stringField(obj, "type") orelse return null;
     const indent_cols = base_indent_cols + intField(obj, "indent", 0) * 2;
 
@@ -155,9 +167,15 @@ fn parseBlock(arena: Allocator, value: std.json.Value, base_indent_cols: u32) Pa
         return if (std.mem.eql(u8, typ, "markdown")) .{ .markdown = parsed } else .{ .text = parsed };
     }
     if (std.mem.eql(u8, typ, "group")) {
-        const json_blocks = switch (obj.get("blocks") orelse return null) { .array => |a| a.items, else => return null };
+        const json_blocks = switch (obj.get("blocks") orelse return null) {
+            .array => |a| a.items,
+            else => return null,
+        };
         const max_blocks = if (obj.get("collapsed")) |c| blk: {
-            const co = switch (c) { .object => |o| o, else => break :blk null };
+            const co = switch (c) {
+                .object => |o| o,
+                else => break :blk null,
+            };
             break :blk intField(co, "max_blocks", 0);
         } else null;
         return .{ .group = .{
@@ -170,7 +188,10 @@ fn parseBlock(arena: Allocator, value: std.json.Value, base_indent_cols: u32) Pa
 }
 
 fn parseSpans(arena: Allocator, value: std.json.Value) ParseError![]const Span {
-    const items = switch (value) { .array => |a| a.items, else => return &.{} };
+    const items = switch (value) {
+        .array => |a| a.items,
+        else => return &.{},
+    };
     var spans: std.ArrayListUnmanaged(Span) = .empty;
     try spans.ensureTotalCapacity(arena, items.len);
     for (items) |item| if (try parseSpan(arena, item)) |span| try spans.append(arena, span);
@@ -178,7 +199,10 @@ fn parseSpans(arena: Allocator, value: std.json.Value) ParseError![]const Span {
 }
 
 fn parseSpan(arena: Allocator, value: std.json.Value) ParseError!?Span {
-    const obj = switch (value) { .object => |o| o, else => return null };
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return null,
+    };
     const text = stringField(obj, "text") orelse return null;
     return .{ .text = try arena.dupe(u8, text), .style = parseStyle(obj.get("style")), .link = if (stringField(obj, "link")) |l| try arena.dupe(u8, l) else null };
 }
@@ -278,7 +302,10 @@ fn drawStyle(style: Style, theme: *const theme_mod.Theme) layout_mod.Style {
 }
 
 fn parseStyle(value: ?std.json.Value) Style {
-    const obj = switch (value orelse return .{}) { .object => |o| o, else => return .{} };
+    const obj = switch (value orelse return .{}) {
+        .object => |o| o,
+        else => return .{},
+    };
     return .{ .role = parseRole(stringField(obj, "role")), .attrs = .{ .bold = boolField(obj, "bold"), .dim = boolField(obj, "dim"), .italic = boolField(obj, "italic"), .underline = boolField(obj, "underline") } };
 }
 
@@ -307,9 +334,25 @@ fn fg(theme: *const theme_mod.Theme, role: Role) Color {
     };
 }
 
-fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 { return switch (obj.get(key) orelse return null) { .string => |s| s, else => null }; }
-fn boolField(obj: std.json.ObjectMap, key: []const u8) bool { return switch (obj.get(key) orelse return false) { .bool => |b| b, else => false }; }
-fn intField(obj: std.json.ObjectMap, key: []const u8, default: u32) u32 { return switch (obj.get(key) orelse return default) { .integer => |i| if (i >= 0) @intCast(i) else default, .float => |f| if (f >= 0) @intFromFloat(f) else default, else => default }; }
+fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    return switch (obj.get(key) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+fn boolField(obj: std.json.ObjectMap, key: []const u8) bool {
+    return switch (obj.get(key) orelse return false) {
+        .bool => |b| b,
+        else => false,
+    };
+}
+fn intField(obj: std.json.ObjectMap, key: []const u8, default: u32) u32 {
+    return switch (obj.get(key) orelse return default) {
+        .integer => |i| if (i >= 0) @intCast(i) else default,
+        .float => |f| if (f >= 0) @intFromFloat(f) else default,
+        else => default,
+    };
+}
 
 const testing = std.testing;
 fn parseDocValue(allocator: Allocator, text: []const u8) !std.json.Parsed(std.json.Value) {

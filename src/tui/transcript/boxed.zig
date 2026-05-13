@@ -206,7 +206,10 @@ pub const OwnedSurface = struct {
             col += @intCast(txt.len);
         }
         if (stats.removed > 0) {
-            if (col > 0) { try segs.append(arena, .{ .x = col, .text = " " }); col += 1; }
+            if (col > 0) {
+                try segs.append(arena, .{ .x = col, .text = " " });
+                col += 1;
+            }
             const txt = try std.fmt.allocPrint(arena, "-{d}", .{stats.removed});
             try segs.append(arena, .{ .x = col, .text = txt, .style = .{ .fg = palette.removed.fg, .attrs = .{ .bold = true } } });
         }
@@ -222,7 +225,6 @@ pub const OwnedSurface = struct {
             .context => palette.context,
         };
     }
-
 };
 
 fn styleEql(a: box_chrome.Style, b: box_chrome.Style) bool {
