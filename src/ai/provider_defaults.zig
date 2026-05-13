@@ -11,9 +11,9 @@ pub const Bundle = struct {
     allocator: std.mem.Allocator,
     registry: *provider_mod.Registry,
 
-    anthropic_prov: *anthropic.AnthropicProvider,
-    openai_completions_prov: *openai_completions.OpenAICompletionsProvider,
-    openai_codex_prov: *openai_codex.OpenAICodexProvider,
+    anthropic_prov: anthropic.AnthropicProvider,
+    openai_completions_prov: openai_completions.OpenAICompletionsProvider,
+    openai_codex_prov: openai_codex.OpenAICodexProvider,
 
     pub fn init(allocator: std.mem.Allocator) !*Bundle {
         const self = try allocator.create(Bundle);
@@ -24,21 +24,15 @@ pub const Bundle = struct {
         registry.* = provider_mod.Registry.init(allocator);
         errdefer registry.deinit();
 
-        const anth = try allocator.create(anthropic.AnthropicProvider);
-        errdefer allocator.destroy(anth);
-        anth.* = anthropic.AnthropicProvider.init(allocator);
+        var anth = anthropic.AnthropicProvider.init(allocator);
         try registry.register("anthropic-messages", anth.provider(), null);
 
-        const oac = try allocator.create(openai_completions.OpenAICompletionsProvider);
-        errdefer allocator.destroy(oac);
-        oac.* = openai_completions.OpenAICompletionsProvider.init(allocator);
+        var oac = openai_completions.OpenAICompletionsProvider.init(allocator);
         try registry.register("openai-completions", oac.provider(), null);
 
         try registry.register("openai-responses", openaiResponsesProvider(self), null);
 
-        const ocx = try allocator.create(openai_codex.OpenAICodexProvider);
-        errdefer allocator.destroy(ocx);
-        ocx.* = openai_codex.OpenAICodexProvider.init(allocator);
+        var ocx = openai_codex.OpenAICodexProvider.init(allocator);
         try registry.register("openai-codex-responses", ocx.provider(), null);
 
         self.* = .{
@@ -54,9 +48,6 @@ pub const Bundle = struct {
     pub fn deinit(self: *Bundle) void {
         self.registry.deinit();
         self.allocator.destroy(self.registry);
-        self.allocator.destroy(self.openai_codex_prov);
-        self.allocator.destroy(self.openai_completions_prov);
-        self.allocator.destroy(self.anthropic_prov);
         self.allocator.destroy(self);
     }
 };
