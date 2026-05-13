@@ -9,7 +9,7 @@ const openai_codex = @import("openai_codex.zig");
 
 pub const Bundle = struct {
     allocator: std.mem.Allocator,
-    registry: *provider_mod.Registry,
+    registry: provider_mod.Registry,
 
     anthropic_prov: anthropic.AnthropicProvider,
     openai_completions_prov: openai_completions.OpenAICompletionsProvider,
@@ -19,29 +19,24 @@ pub const Bundle = struct {
         const self = try allocator.create(Bundle);
         errdefer allocator.destroy(self);
 
-        const registry = try allocator.create(provider_mod.Registry);
-        errdefer allocator.destroy(registry);
-        registry.* = provider_mod.Registry.init(allocator);
-        errdefer registry.deinit();
-
         self.* = .{
             .allocator = allocator,
-            .registry = registry,
+            .registry = provider_mod.Registry.init(allocator),
             .anthropic_prov = anthropic.AnthropicProvider.init(allocator),
             .openai_completions_prov = openai_completions.OpenAICompletionsProvider.init(allocator),
             .openai_codex_prov = openai_codex.OpenAICodexProvider.init(allocator),
         };
+        errdefer self.registry.deinit();
 
-        try registry.register("anthropic-messages", self.anthropic_prov.provider(), null);
-        try registry.register("openai-completions", self.openai_completions_prov.provider(), null);
-        try registry.register("openai-responses", openaiResponsesProvider(self), null);
-        try registry.register("openai-codex-responses", self.openai_codex_prov.provider(), null);
+        try self.registry.register("anthropic-messages", self.anthropic_prov.provider(), null);
+        try self.registry.register("openai-completions", self.openai_completions_prov.provider(), null);
+        try self.registry.register("openai-responses", openaiResponsesProvider(self), null);
+        try self.registry.register("openai-codex-responses", self.openai_codex_prov.provider(), null);
         return self;
     }
 
     pub fn deinit(self: *Bundle) void {
         self.registry.deinit();
-        self.allocator.destroy(self.registry);
         self.allocator.destroy(self);
     }
 };

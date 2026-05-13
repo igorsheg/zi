@@ -297,7 +297,7 @@ pub fn prepareSessionDeps(
     const registry: *ai.provider.Registry = options.registry orelse blk: {
         const bundle = try ai.provider_defaults.Bundle.init(allocator);
         owned_provider_bundle = bundle;
-        break :blk bundle.registry;
+        break :blk &bundle.registry;
     };
     errdefer if (owned_provider_bundle) |bundle| bundle.deinit();
 

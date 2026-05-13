@@ -124,7 +124,7 @@ pub const Agent = struct {
             default_stream_bundle = bundle;
 
             const closure = try allocator.create(DefaultStreamClosure);
-            closure.* = .{ .registry = bundle.registry, .io = options.io };
+            closure.* = .{ .registry = &bundle.registry, .io = options.io };
             default_stream_closure = closure;
 
             break :blk protocol.StreamHook{
