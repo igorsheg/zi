@@ -81,7 +81,7 @@ pub fn buildSessionContext(
             .model_change => |m| model = .{ .provider = m.provider, .model_id = m.model_id },
             .message => |msg| {
                 switch (msg.message) {
-                    .assistant => |a| model = .{ .provider = providerToString(a.provider), .model_id = a.model },
+                    .assistant => |a| model = .{ .provider = ai.json_util.providerToString(a.provider), .model_id = a.model },
                     else => {},
                 }
             },
@@ -463,31 +463,3 @@ test "unknown leaf falls back to current context" {
     try expectAssistantTextAt(ctx, 1, "hi");
 }
 
-fn providerToString(p: ai.protocol.Provider) []const u8 {
-    return switch (p) {
-        .amazon_bedrock => "amazon-bedrock",
-        .anthropic => "anthropic",
-        .google => "google",
-        .google_gemini_cli => "google-gemini-cli",
-        .google_antigravity => "google-antigravity",
-        .google_vertex => "google-vertex",
-        .openai => "openai",
-        .azure_openai_responses => "azure-openai-responses",
-        .openai_codex => "openai-codex",
-        .github_copilot => "github-copilot",
-        .xai => "xai",
-        .groq => "groq",
-        .cerebras => "cerebras",
-        .openrouter => "openrouter",
-        .vercel_ai_gateway => "vercel-ai-gateway",
-        .zai => "zai",
-        .mistral => "mistral",
-        .minimax => "minimax",
-        .minimax_cn => "minimax-cn",
-        .huggingface => "huggingface",
-        .opencode => "opencode",
-        .opencode_go => "opencode-go",
-        .kimi_coding => "kimi-coding",
-        .custom => |s| s,
-    };
-}
