@@ -1219,29 +1219,25 @@ fn toolResultMessageAsAgentToolResult(
 }
 
 fn committedMessageSemanticVersion(message: agent_protocol.AgentMessage) transcript_mod.SemanticVersion {
-    var hasher = std.hash.Wyhash.init(0x434f_4d4d_56455231);
-    hasher.update("committed_message_semantic");
+    var hasher = projectionHasher(0x434f_4d4d_56455231, "committed_message_semantic");
     hashAgentMessage(&hasher, message);
     return hasher.final();
 }
 
 fn activeAssistantId(message: agent_protocol.AssistantMessage) transcript_mod.ItemId {
-    var hasher = std.hash.Wyhash.init(0x41435449_56454944);
-    hasher.update("active_assistant");
+    var hasher = projectionHasher(0x41435449_56454944, "active_assistant");
     std.hash.autoHash(&hasher, message.timestamp);
     return @enumFromInt(hasher.final());
 }
 
 fn activeAssistantSemanticVersion(message: agent_protocol.AssistantMessage) transcript_mod.SemanticVersion {
-    var hasher = std.hash.Wyhash.init(0x41435449_56455652);
-    hasher.update("active_assistant_semantic");
+    var hasher = projectionHasher(0x41435449_56455652, "active_assistant_semantic");
     hashAssistantMessage(&hasher, message);
     return hasher.final();
 }
 
 fn committedMessageId(index: usize, message: agent_protocol.AgentMessage) transcript_mod.ItemId {
-    var hasher = std.hash.Wyhash.init(0x434f_4e56_534e_4150);
-    hasher.update("committed_message");
+    var hasher = projectionHasher(0x434f_4e56_534e_4150, "committed_message");
     std.hash.autoHash(&hasher, index);
     std.hash.autoHash(&hasher, messageTagCode(message));
     std.hash.autoHash(&hasher, messageTimestamp(message));
@@ -1249,22 +1245,19 @@ fn committedMessageId(index: usize, message: agent_protocol.AgentMessage) transc
 }
 
 fn queuedUserMessageId(kind: QueuedUserMessageKind, ordinal: usize) transcript_mod.ItemId {
-    var hasher = std.hash.Wyhash.init(0x5155_4555_4549_4401);
-    hasher.update("queued_user_message");
+    var hasher = projectionHasher(0x5155_4555_4549_4401, "queued_user_message");
     std.hash.autoHash(&hasher, @intFromEnum(kind));
     std.hash.autoHash(&hasher, ordinal);
     return @enumFromInt(hasher.final());
 }
 
 fn queuedUserMessageSemanticVersion(text: []const u8) transcript_mod.SemanticVersion {
-    var hasher = std.hash.Wyhash.init(0x5155_4555_4556_4552);
-    hasher.update(text);
+    var hasher = projectionHasher(0x5155_4555_4556_4552, text);
     return hasher.final();
 }
 
 fn toolExecutionId(tool_call_id: []const u8) transcript_mod.ItemId {
-    var hasher = std.hash.Wyhash.init(0x544f4f4c_45584944);
-    hasher.update("tool_execution");
+    var hasher = projectionHasher(0x544f4f4c_45584944, "tool_execution");
     hasher.update(tool_call_id);
     return @enumFromInt(hasher.final());
 }
@@ -1275,8 +1268,7 @@ fn committedToolCallSemanticVersion(
     result_message: ?agent_protocol.ToolResultMessage,
     retry_attempt: u32,
 ) transcript_mod.SemanticVersion {
-    var hasher = std.hash.Wyhash.init(0x544f4f4c_43565352);
-    hasher.update("committed_tool_call_semantic");
+    var hasher = projectionHasher(0x544f4f4c_43565352, "committed_tool_call_semantic");
     hasher.update(tool_call.id);
     hasher.update(tool_call.name);
     hashJsonValue(&hasher, tool_call.arguments);
@@ -1300,8 +1292,7 @@ fn committedToolCallSemanticVersion(
 }
 
 fn toolExecutionSemanticVersion(tool: conversation_state_mod.ToolExecution) transcript_mod.SemanticVersion {
-    var hasher = std.hash.Wyhash.init(0x544f4f4c_45585652);
-    hasher.update("tool_execution_semantic");
+    var hasher = projectionHasher(0x544f4f4c_45585652, "tool_execution_semantic");
     hasher.update(tool.tool_call_id);
     hasher.update(tool.tool_name);
     hashJsonValue(&hasher, tool.args);
@@ -1330,6 +1321,12 @@ fn toolExecutionSemanticVersion(tool: conversation_state_mod.ToolExecution) tran
         }
     }
     return hasher.final();
+}
+
+fn projectionHasher(comptime seed: u64, namespace: []const u8) std.hash.Wyhash {
+    var hasher = std.hash.Wyhash.init(seed);
+    hasher.update(namespace);
+    return hasher;
 }
 
 fn messageTagCode(message: agent_protocol.AgentMessage) u8 {
