@@ -147,11 +147,14 @@ pub const SessionWriter = struct {
 
         if (!self.flushed) {
             self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return null;
-            self.flushAll();
+            self.flushAll() catch return null;
             return entry_id;
         }
 
-        self.appendToFile(entry) catch return null;
+        self.appendToFile(entry) catch {
+            self.flushed = false;
+            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return null;
+        };
         return entry_id;
     }
 
@@ -215,11 +218,14 @@ pub const SessionWriter = struct {
         const entry = self.createEntry(entry_data) orelse return;
 
         if (!self.persist or !self.flushed) {
-            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch {};
+            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return;
             return;
         }
 
-        self.appendToFile(entry) catch {};
+        self.appendToFile(entry) catch {
+            self.flushed = false;
+            self.buffered_entries.append(self.allocator, .{ .entry = entry }) catch return;
+        };
     }
 
     fn createEntry(self: *SessionWriter, entry_data: proto.SessionEntry.EntryType) ?proto.SessionEntry {
@@ -244,25 +250,25 @@ pub const SessionWriter = struct {
         return entry;
     }
 
-    fn flushAll(self: *SessionWriter) void {
+    fn flushAll(self: *SessionWriter) !void {
         if (!self.persist) {
             self.flushed = true;
             self.buffered_entries.clearRetainingCapacity();
             return;
         }
-        const file = std.Io.Dir.createFileAbsolute(std.Options.debug_io, self.session_file, .{}) catch return;
+        const file = try std.Io.Dir.createFileAbsolute(std.Options.debug_io, self.session_file, .{});
         defer file.close(std.Options.debug_io);
 
         var buf: [4096]u8 = undefined;
         var fw = file.writer(std.Options.debug_io, &buf);
         for (self.buffered_entries.items) |fe| {
             switch (fe) {
-                .header => |h| json.writeHeader(&fw.interface, h) catch continue,
-                .entry => |e| json.writeEntry(&fw.interface, e) catch continue,
+                .header => |h| try json.writeHeader(&fw.interface, h),
+                .entry => |e| try json.writeEntry(&fw.interface, e),
             }
-            fw.interface.writeAll("\n") catch {};
+            try fw.interface.writeAll("\n");
         }
-        fw.end() catch {};
+        try fw.end();
         self.flushed = true;
         for (self.buffered_entries.items) |entry| freeBufferedFileEntry(self.allocator, entry, self.session_id);
         self.buffered_entries.clearRetainingCapacity();
