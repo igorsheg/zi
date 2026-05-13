@@ -77,26 +77,12 @@ pub const AiSessionPromptRequest = struct {
 };
 
 pub const AiCompleteStreamEvent = union(enum) {
-    agent_start,
-    agent_end,
-    turn_start,
-    turn_end,
-    tool_execution_start: struct { tool_call_id: []const u8, tool_name: []const u8, input: std.json.Value },
-    tool_execution_update: struct { tool_call_id: []const u8, tool_name: []const u8, input: std.json.Value },
-    tool_execution_end: struct { tool_call_id: []const u8, tool_name: []const u8, result: agent_protocol.AgentToolResult, is_error: bool },
     err: []const u8,
     events_dropped: usize,
     agent_event: agent_protocol.AgentEvent,
 
     pub fn clone(self: AiCompleteStreamEvent, allocator: std.mem.Allocator) !AiCompleteStreamEvent {
         return switch (self) {
-            .agent_start => .agent_start,
-            .agent_end => .agent_end,
-            .turn_start => .turn_start,
-            .turn_end => .turn_end,
-            .tool_execution_start => |v| .{ .tool_execution_start = .{ .tool_call_id = try allocator.dupe(u8, v.tool_call_id), .tool_name = try allocator.dupe(u8, v.tool_name), .input = try ai.json_util.cloneJsonValue(allocator, v.input) } },
-            .tool_execution_update => |v| .{ .tool_execution_update = .{ .tool_call_id = try allocator.dupe(u8, v.tool_call_id), .tool_name = try allocator.dupe(u8, v.tool_name), .input = try ai.json_util.cloneJsonValue(allocator, v.input) } },
-            .tool_execution_end => |v| .{ .tool_execution_end = .{ .tool_call_id = try allocator.dupe(u8, v.tool_call_id), .tool_name = try allocator.dupe(u8, v.tool_name), .result = try v.result.clone(allocator), .is_error = v.is_error } },
             .err => |msg| .{ .err = try allocator.dupe(u8, msg) },
             .events_dropped => |n| .{ .events_dropped = n },
             .agent_event => |e| .{ .agent_event = try cloneAgentEvent(allocator, e) },
@@ -105,24 +91,9 @@ pub const AiCompleteStreamEvent = union(enum) {
 
     pub fn deinit(self: *AiCompleteStreamEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .tool_execution_start => |v| {
-                allocator.free(v.tool_call_id);
-                allocator.free(v.tool_name);
-                ai.json_util.freeJsonValue(allocator, v.input);
-            },
-            .tool_execution_update => |v| {
-                allocator.free(v.tool_call_id);
-                allocator.free(v.tool_name);
-                ai.json_util.freeJsonValue(allocator, v.input);
-            },
-            .tool_execution_end => |v| {
-                allocator.free(v.tool_call_id);
-                allocator.free(v.tool_name);
-                v.result.free(allocator);
-            },
             .err => |msg| allocator.free(msg),
             .agent_event => |*e| freeAgentEvent(allocator, e),
-            .agent_start, .agent_end, .turn_start, .turn_end, .events_dropped => {},
+            .events_dropped => {},
         }
         self.* = undefined;
     }
@@ -1466,13 +1437,6 @@ pub const ExtensionRunner = struct {
 
     fn aiCompleteEventName(event: AiCompleteStreamEvent) [:0]const u8 {
         return switch (event) {
-            .agent_start => "agent_start",
-            .agent_end => "agent_end",
-            .turn_start => "turn_start",
-            .turn_end => "turn_end",
-            .tool_execution_start => "tool_execution_start",
-            .tool_execution_update => "tool_execution_update",
-            .tool_execution_end => "tool_execution_end",
             .err => "error",
             .events_dropped => "events_dropped",
             .agent_event => |e| @tagName(e),
@@ -1489,17 +1453,6 @@ pub const ExtensionRunner = struct {
         _ = lua_runtime.c.lua_pushlstring(L, name.ptr, name.len);
         lua_runtime.c.lua_setfield(L, -2, "type");
         switch (event) {
-            .tool_execution_start => |v| pushToolStreamEventFields(L, v.tool_call_id, v.tool_name, v.input),
-            .tool_execution_update => |v| pushToolStreamEventFields(L, v.tool_call_id, v.tool_name, v.input),
-            .tool_execution_end => |v| {
-                pushToolNameIdFields(L, v.tool_call_id, v.tool_name);
-                pushToolResultTable(L, v.result);
-                lua_runtime.c.lua_setfield(L, -2, "result");
-                lua_runtime.c.lua_pushboolean(L, if (v.is_error) 1 else 0);
-                lua_runtime.c.lua_setfield(L, -2, "is_error");
-                lua_runtime.c.lua_pushboolean(L, if (v.is_error) 1 else 0);
-                lua_runtime.c.lua_setfield(L, -2, "isError");
-            },
             .err => |msg| {
                 _ = lua_runtime.c.lua_pushlstring(L, msg.ptr, msg.len);
                 lua_runtime.c.lua_setfield(L, -2, "error");
@@ -1508,68 +1461,8 @@ pub const ExtensionRunner = struct {
                 lua_runtime.c.lua_pushinteger(L, @intCast(n));
                 lua_runtime.c.lua_setfield(L, -2, "count");
             },
-            .agent_start, .agent_end, .turn_start => {},
-            .turn_end => {
-                pushTextMessageTable(L, "assistant", "");
-                lua_runtime.c.lua_setfield(L, -2, "message");
-            },
             .agent_event => unreachable,
         }
-    }
-
-    fn pushTextMessageTable(L: *lua_runtime.c.lua_State, role: []const u8, text: []const u8) void {
-        lua_runtime.c.lua_createtable(L, 0, 2);
-        _ = lua_runtime.c.lua_pushlstring(L, role.ptr, role.len);
-        lua_runtime.c.lua_setfield(L, -2, "role");
-        _ = lua_runtime.c.lua_pushlstring(L, text.ptr, text.len);
-        lua_runtime.c.lua_setfield(L, -2, "text");
-    }
-
-    fn pushToolNameIdFields(L: *lua_runtime.c.lua_State, tool_call_id: []const u8, tool_name: []const u8) void {
-        _ = lua_runtime.c.lua_pushlstring(L, tool_call_id.ptr, tool_call_id.len);
-        lua_runtime.c.lua_setfield(L, -2, "tool_call_id");
-        _ = lua_runtime.c.lua_pushlstring(L, tool_call_id.ptr, tool_call_id.len);
-        lua_runtime.c.lua_setfield(L, -2, "toolCallId");
-        _ = lua_runtime.c.lua_pushlstring(L, tool_name.ptr, tool_name.len);
-        lua_runtime.c.lua_setfield(L, -2, "tool_name");
-        _ = lua_runtime.c.lua_pushlstring(L, tool_name.ptr, tool_name.len);
-        lua_runtime.c.lua_setfield(L, -2, "toolName");
-    }
-
-    fn pushToolStreamEventFields(L: *lua_runtime.c.lua_State, tool_call_id: []const u8, tool_name: []const u8, input: std.json.Value) void {
-        pushToolNameIdFields(L, tool_call_id, tool_name);
-        lua_runtime.pushJsonValue(L, input) catch lua_runtime.c.lua_pushnil(L);
-        lua_runtime.c.lua_setfield(L, -2, "input");
-        lua_runtime.pushJsonValue(L, input) catch lua_runtime.c.lua_pushnil(L);
-        lua_runtime.c.lua_setfield(L, -2, "args");
-    }
-
-    fn pushToolResultTable(L: *lua_runtime.c.lua_State, result: agent_protocol.AgentToolResult) void {
-        lua_runtime.c.lua_createtable(L, 0, 3);
-        lua_runtime.c.lua_createtable(L, @intCast(result.content.len), 0);
-        for (result.content, 0..) |block, i| {
-            lua_runtime.c.lua_createtable(L, 0, 2);
-            switch (block) {
-                .text => |text| {
-                    _ = lua_runtime.c.lua_pushliteral(L, "text");
-                    lua_runtime.c.lua_setfield(L, -2, "type");
-                    _ = lua_runtime.c.lua_pushlstring(L, text.text.ptr, text.text.len);
-                    lua_runtime.c.lua_setfield(L, -2, "text");
-                },
-                .image => |image| {
-                    _ = lua_runtime.c.lua_pushliteral(L, "image");
-                    lua_runtime.c.lua_setfield(L, -2, "type");
-                    _ = lua_runtime.c.lua_pushlstring(L, image.mime_type.ptr, image.mime_type.len);
-                    lua_runtime.c.lua_setfield(L, -2, "mime_type");
-                },
-            }
-            lua_runtime.c.lua_rawseti(L, -2, @intCast(i + 1));
-        }
-        lua_runtime.c.lua_setfield(L, -2, "content");
-        lua_runtime.pushJsonValue(L, result.details) catch lua_runtime.c.lua_pushnil(L);
-        lua_runtime.c.lua_setfield(L, -2, "details");
-        lua_runtime.c.lua_pushboolean(L, if (result.is_error) 1 else 0);
-        lua_runtime.c.lua_setfield(L, -2, "is_error");
     }
 
     pub fn resumeAsync(self: *ExtensionRunner, id: AsyncOpId, incoming_result: AsyncResult) !void {
@@ -2253,26 +2146,31 @@ test "ExtensionRunner owns populated registries until deinit" {
     try std.testing.expectEqual(@as(usize, 1), runner.provider_queue.count());
 }
 
-test "side ai tool stream events clone and free owned payloads" {
+test "side ai stream events clone canonical agent payloads" {
     const allocator = std.testing.allocator;
     const blocks = [_]agent_protocol.AgentToolResult.ContentBlock{.{ .text = .{ .text = "ok" } }};
-    const event = AiCompleteStreamEvent{ .tool_execution_end = .{
+    const event = AiCompleteStreamEvent{ .agent_event = .{ .tool_execution_end = .{
         .tool_call_id = "call-1",
         .tool_name = "read",
         .result = .{ .content = &blocks, .details = .null, .presentation = .null, .is_error = false },
         .is_error = false,
-    } };
+    } } };
     var cloned = try event.clone(allocator);
     defer cloned.deinit(allocator);
-    try std.testing.expect(cloned == .tool_execution_end);
-    try std.testing.expectEqualStrings("call-1", cloned.tool_execution_end.tool_call_id);
-    try std.testing.expectEqualStrings("read", cloned.tool_execution_end.tool_name);
-    try std.testing.expectEqualStrings("ok", cloned.tool_execution_end.result.content[0].text.text);
+    try std.testing.expect(cloned == .agent_event);
+    try std.testing.expect(cloned.agent_event == .tool_execution_end);
+    try std.testing.expectEqualStrings("call-1", cloned.agent_event.tool_execution_end.tool_call_id);
+    try std.testing.expectEqualStrings("read", cloned.agent_event.tool_execution_end.tool_name);
+    try std.testing.expectEqualStrings("ok", cloned.agent_event.tool_execution_end.result.content[0].text.text);
 }
 
-test "side ai lifecycle stream events clone without allocation" {
+test "side ai stream events do not define alternate agent lifecycle payloads" {
     const allocator = std.testing.allocator;
-    const events = [_]AiCompleteStreamEvent{ .agent_start, .agent_end, .turn_start, .turn_end };
+    const events = [_]AiCompleteStreamEvent{
+        .{ .agent_event = .{ .agent_start = {} } },
+        .{ .agent_event = .{ .agent_end = .{ .messages = &.{} } } },
+        .{ .agent_event = .{ .turn_start = {} } },
+    };
     for (events) |event| {
         var cloned = try event.clone(allocator);
         defer cloned.deinit(allocator);

@@ -342,7 +342,7 @@ local result = ctx.ai.complete({
 })
 ```
 
-Stream event tables use the normalized message lifecycle shape: `type = "message_start", message = {...}`, `type = "message_update", message = {...}, assistantMessageEvent = {...}`, and `type = "message_end", message = {...}`. For streamed text, read `event.assistantMessageEvent.delta` when `event.assistantMessageEvent.type == "text_delta"`. Error and backpressure events may be delivered as `type = "error", error = "..."` or `type = "events_dropped", count = n`.
+Stream event tables use the same agent event shape zi uses internally: `type = "message_start", message = {...}`, `type = "message_update", message = {...}, assistantMessageEvent = {...}`, and `type = "message_end", message = {...}`. For streamed text, read `event.assistantMessageEvent.delta` when `event.assistantMessageEvent.type == "text_delta"`. Error and backpressure events may be delivered as `type = "error", error = "..."` or `type = "events_dropped", count = n`.
 
 
 `ctx.ai.session(options)`
@@ -377,7 +377,7 @@ side:dispose() -- releases in-memory state early
 
 `side:prompt(...)` returns the same result shape as `ctx.ai.complete` and commits successful turns to that side session's typed in-memory transcript. Side sessions do not mutate the main transcript. zi runs prompts through a managed in-process side agent; `tools = nil` or `{}` means no tools, while `tools = { ... }` is fail-fast validated against the parent session's available tools. Nested extension loading remains disabled. Session-wide `on` callbacks and per-prompt `on` callbacks are both delivered through the parent extension runner on the Lua thread.
 
-Side event tables include lifecycle events (`agent_start`, `agent_end`, `turn_start`, `turn_end`), message events (`message_start`, `message_update`, `message_end`), tool events (`tool_execution_start`, `tool_execution_update`, `tool_execution_end`), `error`, and `events_dropped`. Message events include a JSON-compatible `message` table; `message_update` also includes `assistantMessageEvent` with normalized stream details (`text_delta`, `thinking_delta`, `toolcall_delta`, etc.). Tool events include compatibility aliases such as `tool_name`/`toolName`, `tool_call_id`/`toolCallId`, `input`/`args`, and `is_error`/`isError`.
+Side event tables include lifecycle events (`agent_start`, `agent_end`, `turn_start`, `turn_end`), message events (`message_start`, `message_update`, `message_end`), tool events (`tool_execution_start`, `tool_execution_update`, `tool_execution_end`), `error`, and `events_dropped`. Agent-backed events use the same shape as zi's internal `AgentEvent`: message events include a JSON-compatible `message` table; `message_update` also includes `assistantMessageEvent` with normalized stream details (`text_delta`, `thinking_delta`, `toolcall_delta`, etc.); tool events include `tool_call_id`, `tool_name`, `args`, and for `tool_execution_update` optional `partialResult`. Camel-case aliases such as `toolCallId`, `toolName`, and `isError` may be present for Lua ergonomics, but they are aliases over the same event, not a second schema.
 
 Results:
 
