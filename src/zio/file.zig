@@ -144,7 +144,7 @@ pub fn writeFileAtomic(
     var writer = atomic_file.file.writer(io, &buf);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
-    try atomic_file.finish(io);
+    try atomic_file.replace(io);
 }
 
 pub fn appendFile(

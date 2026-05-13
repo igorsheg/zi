@@ -43,7 +43,7 @@ pub const LockedFile = struct {
     }
 
     pub fn writeContent(self: *const LockedFile, content: []const u8) !void {
-        try zio_fs.writeFileTruncate(self.io, self.path, content);
+        try zio_fs.writeFileAtomic(self.io, self.path, content, .fromMode(0o600));
     }
 
     pub fn acquireLock(self: *const LockedFile) bool {
@@ -70,7 +70,7 @@ pub const LockedFile = struct {
     }
 
     pub fn releaseLock(self: *const LockedFile) void {
-        std.Io.Dir.cwd().deleteDir(self.io, self.lock_path) catch {};
+        std.Io.Dir.cwd().deleteDir(self.io, self.lock_path) catch |err| log.warn("failed to release lock {s}: {}", .{ self.lock_path, err });
     }
 
     fn isLockStale(self: *const LockedFile) bool {
@@ -83,7 +83,7 @@ pub const LockedFile = struct {
     }
 
     fn breakLock(self: *const LockedFile) void {
-        std.Io.Dir.cwd().deleteDir(self.io, self.lock_path) catch {};
+        std.Io.Dir.cwd().deleteDir(self.io, self.lock_path) catch |err| log.warn("failed to break stale lock {s}: {}", .{ self.lock_path, err });
     }
 };
 
