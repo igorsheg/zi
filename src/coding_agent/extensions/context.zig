@@ -624,46 +624,19 @@ fn concatSpansText(arena: std.mem.Allocator, spans: []const extension_ui.TextSpa
 }
 
 fn readTextWrapField(L: *c.lua_State, idx: c_int) !extension_ui.TextWrap {
-    _ = c.lua_getfield(L, idx, "wrap");
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .word;
-    const value = luaString(L, -1) orelse return .word;
-    if (std.mem.eql(u8, value, "none")) return .none;
-    if (std.mem.eql(u8, value, "char")) return .char;
-    if (std.mem.eql(u8, value, "word")) return .word;
-    return error.InvalidTextWrap;
+    return readEnumField(extension_ui.TextWrap, L, idx, "wrap", .word, error.InvalidTextWrap);
 }
 
 fn readTextAlignField(L: *c.lua_State, idx: c_int) !extension_ui.TextAlign {
-    _ = c.lua_getfield(L, idx, "align");
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .left;
-    const value = luaString(L, -1) orelse return .left;
-    if (std.mem.eql(u8, value, "left")) return .left;
-    if (std.mem.eql(u8, value, "center")) return .center;
-    if (std.mem.eql(u8, value, "right")) return .right;
-    return error.InvalidTextAlign;
+    return readEnumField(extension_ui.TextAlign, L, idx, "align", .left, error.InvalidTextAlign);
 }
 
 fn readTextOverflowField(L: *c.lua_State, idx: c_int) !extension_ui.TextOverflow {
-    _ = c.lua_getfield(L, idx, "overflow");
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .clip;
-    const value = luaString(L, -1) orelse return .clip;
-    if (std.mem.eql(u8, value, "clip")) return .clip;
-    if (std.mem.eql(u8, value, "ellipsis")) return .ellipsis;
-    return error.InvalidTextOverflow;
+    return readEnumField(extension_ui.TextOverflow, L, idx, "overflow", .clip, error.InvalidTextOverflow);
 }
 
 fn readTextFormatField(L: *c.lua_State, idx: c_int) !extension_ui.TextFormat {
-    _ = c.lua_getfield(L, idx, "format");
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .plain;
-    const value = luaString(L, -1) orelse return .plain;
-    if (std.mem.eql(u8, value, "plain")) return .plain;
-    if (std.mem.eql(u8, value, "ansi")) return .ansi;
-    if (std.mem.eql(u8, value, "markdown")) return .markdown;
-    return error.InvalidTextFormat;
+    return readEnumField(extension_ui.TextFormat, L, idx, "format", .plain, error.InvalidTextFormat);
 }
 
 fn readStyleField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int) !extension_ui.Style {
@@ -743,6 +716,17 @@ fn readToneField(L: *c.lua_State, idx: c_int, default: extension_ui.Tone) !exten
     if (std.mem.eql(u8, value, "danger")) return .danger;
     if (std.mem.eql(u8, value, "accent")) return .accent;
     return error.InvalidUiTone;
+}
+
+fn readEnumField(comptime T: type, L: *c.lua_State, idx: c_int, field: [:0]const u8, default: T, invalid: anyerror) !T {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return default;
+    const value = luaString(L, -1) orelse return default;
+    inline for (@typeInfo(T).@"enum".fields) |enum_field| {
+        if (std.mem.eql(u8, value, enum_field.name)) return @field(T, enum_field.name);
+    }
+    return invalid;
 }
 
 fn hasField(L: *c.lua_State, idx: c_int, field: [:0]const u8) bool {
