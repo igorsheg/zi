@@ -49,7 +49,7 @@ const Handler = struct {
     pub fn handle(self: *Handler, request: *Request) void {
         log.debug("starting ai completion id={d} model={s}", .{ request.id, request.model.id });
         var result = extension_runner.AsyncResult{ .ai_complete = self.complete(request) };
-        log.debug("finished ai completion id={d} status={s}", .{ request.id, @tagName(result.ai_complete) });
+        log.debug("finished ai completion id={d} status={s}", .{ request.id, @tagName(result.ai_complete.status) });
         const sink = self.result_sink orelse {
             log.warn("missing ai completion result sink id={d}", .{request.id});
             result.deinit(self.allocator);
@@ -90,9 +90,9 @@ const Handler = struct {
             .on_event_ctx = if (request.stream_events) @ptrCast(&fanout) else null,
         });
         return switch (result) {
-            .completed => |completed| .{ .completed = .{ .text = completed.text } },
-            .err => |msg| .{ .err = msg },
-            .cancelled => .cancelled,
+            .completed => |completed| extension_runner.AiCompleteResult.completedText(self.allocator, completed.text) catch extension_runner.AiCompleteResult.errMessage(self.allocator, "failed to allocate ai completion result") catch extension_runner.AiCompleteResult.cancelledResult(self.allocator),
+            .err => |msg| extension_runner.AiCompleteResult.errMessage(self.allocator, msg) catch extension_runner.AiCompleteResult.cancelledResult(self.allocator),
+            .cancelled => extension_runner.AiCompleteResult.cancelledResult(self.allocator),
         };
     }
 };
@@ -197,6 +197,6 @@ test "ai completion worker thread enqueues faux provider result" {
     var result = out[0];
     defer result.deinit(allocator);
     try testing.expect(result == .ai_complete);
-    try testing.expect(result.ai_complete == .completed);
-    try testing.expectEqualStrings("worker summary", result.ai_complete.completed.text);
+    try testing.expect(result.ai_complete.status == .completed);
+    try testing.expectEqualStrings("worker summary", result.ai_complete.status.completed.text);
 }

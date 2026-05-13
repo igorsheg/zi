@@ -2098,7 +2098,7 @@ test "extension command resumes after ai completion result" {
     try testing.expectEqual(runner_mod.AsyncKind.ai_complete, pending.kind);
     try testing.expectEqualStrings("test-provider/test-model", capture.model orelse return error.MissingModelOverride);
     try testing.expectEqual(agent_protocol.ThinkingLevel.low, capture.reasoning orelse return error.MissingReasoningOverride);
-    try runner.resumeAsync(1, .{ .ai_complete = .{ .completed = .{ .text = try testing.allocator.dupe(u8, "world") } } });
+    try runner.resumeAsync(1, .{ .ai_complete = try runner_mod.AiCompleteResult.completedText(testing.allocator, "world") });
     try testing.expectEqual(@as(usize, 0), runner.pending_async.count());
 
     _ = c.lua_getglobal(state.L, "_ai_complete_result");

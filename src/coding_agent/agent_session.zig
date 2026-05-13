@@ -2,7 +2,6 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
 const agent_impl = @import("../agent/agent.zig");
-const agent_message_memory = @import("../agent/message_memory.zig");
 const control_mod = @import("../agent/control.zig");
 const session_runtime = @import("session/root.zig");
 const session_core = @import("../session/root.zig");
@@ -590,7 +589,7 @@ pub const AgentSession = struct {
         try prompts.append(self.allocator, user_msg);
         try prompts.appendSlice(self.allocator, before.messages);
         var prompt_result = try self.core.prompt(prompts.items);
-        prompt_result.deinit(self.allocator);
+        prompt_result.deinit();
     }
 
     fn dispatchBeforeAgentStart(self: *AgentSession) !event_bridge.BeforeAgentStartResult {
@@ -618,7 +617,7 @@ pub const AgentSession = struct {
         defer self.agent.replaceRuntimeInputs(previous_system_prompt, self.tools);
         if (before.messages.len > 0) {
             var prompt_result = try self.core.prompt(before.messages);
-            prompt_result.deinit(self.allocator);
+            prompt_result.deinit();
             return;
         }
 
@@ -626,7 +625,7 @@ pub const AgentSession = struct {
             error.CannotContinueFromAssistant => return error.NeedsPrompt,
             else => return err,
         };
-        continue_result.deinit(self.allocator);
+        continue_result.deinit();
     }
 
     pub fn runAiCompletePrompt(
@@ -654,9 +653,9 @@ pub const AgentSession = struct {
             .on_event_ctx = if (forwarder != null) @ptrCast(&forwarder.?) else null,
         });
         return switch (result) {
-            .completed => |completed| .{ .completed = .{ .text = completed.text } },
-            .err => |msg| .{ .err = msg },
-            .cancelled => .cancelled,
+            .completed => |completed| try extension_runner_mod.AiCompleteResult.completedText(allocator, completed.text),
+            .err => |msg| try extension_runner_mod.AiCompleteResult.errMessage(allocator, msg),
+            .cancelled => extension_runner_mod.AiCompleteResult.cancelledResult(allocator),
         };
     }
 
@@ -709,7 +708,7 @@ pub const AgentSession = struct {
 
         side.running = true;
         defer side.running = false;
-        if (request.signal.isAborted()) return .cancelled;
+        if (request.signal.isAborted()) return extension_runner_mod.AiCompleteResult.cancelledResult(allocator);
 
         const side_core = try self.ensureSideCore(side);
         var abort_link = LinkedSideAbort.start(self._stream_closure.io, request.signal, side_core);
@@ -725,30 +724,18 @@ pub const AgentSession = struct {
         } }};
         side.abort_requested = false;
         var prompt_result = try side_core.prompt(&prompt);
-        defer prompt_result.deinit(allocator);
-        switch (prompt_result) {
-            .cancelled => return .cancelled,
-            .err => |err| return .{ .err = try allocator.dupe(u8, err.message) },
+        defer prompt_result.deinit();
+        switch (prompt_result.status) {
+            .cancelled => return extension_runner_mod.AiCompleteResult.cancelledResult(allocator),
+            .err => |err| return try extension_runner_mod.AiCompleteResult.errMessage(allocator, err.message),
             .completed => |completed| {
+                var temp_arena = std.heap.ArenaAllocator.init(allocator);
+                defer temp_arena.deinit();
+                const temp_allocator = temp_arena.allocator();
                 const assistant = completed.message.assistant;
-                const text = try assistantText(allocator, assistant);
-                errdefer allocator.free(text);
-                var owned_message = try agent_message_memory.cloneMessage(allocator, completed.message);
-                errdefer agent_message_memory.freeMessage(allocator, &owned_message);
-                const owned_messages = try agent_message_memory.cloneMessages(allocator, completed.messages);
-                errdefer agent_message_memory.freeMessages(allocator, owned_messages);
-                const owned_tool_results = try allocator.alloc(protocol.ToolResultMessage, completed.tool_results.len);
-                var built: usize = 0;
-                errdefer {
-                    for (owned_tool_results[0..built]) |*tr| agent_message_memory.freeToolResultMessage(allocator, tr);
-                    allocator.free(owned_tool_results);
-                }
-                for (completed.tool_results, 0..) |tr, i| {
-                    owned_tool_results[i] = try agent_message_memory.cloneToolResultMessage(allocator, tr);
-                    built += 1;
-                }
+                const text = try assistantText(temp_allocator, assistant);
                 try side.replaceMessages(self.allocator, side_core.messages());
-                return .{ .completed = .{ .text = text, .message = owned_message, .messages = owned_messages, .tool_results = owned_tool_results, .context_usage = completed.context_usage } };
+                return try extension_runner_mod.AiCompleteResult.completed(allocator, .{ .text = text, .message = completed.message, .messages = completed.messages, .tool_results = completed.tool_results, .context_usage = completed.context_usage });
             },
         }
     }

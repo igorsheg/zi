@@ -332,61 +332,66 @@ pub const AiSessionEventSink = struct {
     emit: *const fn (ptr: *anyopaque, event: AiCompleteStreamEvent) void,
 };
 
-pub const AiCompleteResult = union(enum) {
-    completed: Completed,
-    err: []const u8,
-    cancelled,
+pub const AiCompleteResult = struct {
+    arena: std.heap.ArenaAllocator,
+    status: Status,
+
+    pub const Status = union(enum) {
+        completed: Completed,
+        err: []const u8,
+        cancelled,
+    };
 
     pub const Completed = struct {
         text: []const u8,
         message: ?agent_protocol.AgentMessage = null,
-        messages: []agent_protocol.AgentMessage = &.{},
-        tool_results: []agent_protocol.ToolResultMessage = &.{},
+        messages: []const agent_protocol.AgentMessage = &.{},
+        tool_results: []const agent_protocol.ToolResultMessage = &.{},
         context_usage: ?session_core.context_usage.ContextUsage = null,
     };
 
+    pub fn completed(allocator: std.mem.Allocator, value: Completed) !AiCompleteResult {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+        var out = Completed{ .text = try arena_allocator.dupe(u8, value.text), .context_usage = value.context_usage };
+        if (value.message) |message| out.message = try agent_message_memory.cloneMessage(arena_allocator, message);
+        out.messages = if (value.messages.len > 0) try agent_message_memory.cloneMessages(arena_allocator, value.messages) else &.{};
+        if (value.tool_results.len > 0) {
+            const tool_results = try arena_allocator.alloc(agent_protocol.ToolResultMessage, value.tool_results.len);
+            for (value.tool_results, 0..) |tr, i| tool_results[i] = try agent_message_memory.cloneToolResultMessage(arena_allocator, tr);
+            out.tool_results = tool_results;
+        }
+        return .{ .arena = arena, .status = .{ .completed = out } };
+    }
+
+    pub fn completedText(allocator: std.mem.Allocator, text: []const u8) !AiCompleteResult {
+        return completed(allocator, .{ .text = text });
+    }
+
+    pub fn errMessage(allocator: std.mem.Allocator, message: []const u8) !AiCompleteResult {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+        const owned_message = try arena_allocator.dupe(u8, message);
+        return .{ .arena = arena, .status = .{ .err = owned_message } };
+    }
+
+    pub fn cancelledResult(allocator: std.mem.Allocator) AiCompleteResult {
+        return .{ .arena = std.heap.ArenaAllocator.init(allocator), .status = .cancelled };
+    }
+
     pub fn clone(self: AiCompleteResult, allocator: std.mem.Allocator) !AiCompleteResult {
-        return switch (self) {
-            .completed => |completed| blk: {
-                var out = Completed{ .text = try allocator.dupe(u8, completed.text), .context_usage = completed.context_usage };
-                errdefer allocator.free(out.text);
-                if (completed.message) |message| out.message = try agent_message_memory.cloneMessage(allocator, message);
-                errdefer if (out.message) |*message| agent_message_memory.freeMessage(allocator, message);
-                out.messages = try agent_message_memory.cloneMessages(allocator, completed.messages);
-                errdefer agent_message_memory.freeMessages(allocator, out.messages);
-                if (completed.tool_results.len > 0) {
-                    out.tool_results = try allocator.alloc(agent_protocol.ToolResultMessage, completed.tool_results.len);
-                    var built: usize = 0;
-                    errdefer {
-                        for (out.tool_results[0..built]) |*tr| agent_message_memory.freeToolResultMessage(allocator, tr);
-                        allocator.free(out.tool_results);
-                    }
-                    for (completed.tool_results, 0..) |tr, i| {
-                        out.tool_results[i] = try agent_message_memory.cloneToolResultMessage(allocator, tr);
-                        built += 1;
-                    }
-                }
-                break :blk .{ .completed = out };
-            },
-            .err => |msg| .{ .err = try allocator.dupe(u8, msg) },
-            .cancelled => .cancelled,
+        return switch (self.status) {
+            .completed => |value| try completed(allocator, value),
+            .err => |msg| try errMessage(allocator, msg),
+            .cancelled => cancelledResult(allocator),
         };
     }
 
     pub fn deinit(self: *AiCompleteResult, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .completed => |*completed| {
-                allocator.free(completed.text);
-                if (completed.message) |*message| agent_message_memory.freeMessage(allocator, message);
-                agent_message_memory.freeMessages(allocator, completed.messages);
-                if (completed.tool_results.len > 0) {
-                    for (completed.tool_results) |*tr| agent_message_memory.freeToolResultMessage(allocator, tr);
-                    allocator.free(completed.tool_results);
-                }
-            },
-            .err => |msg| allocator.free(msg),
-            .cancelled => {},
-        }
+        _ = allocator;
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -2120,9 +2125,11 @@ test "async requests and results own cloned payloads" {
     try std.testing.expectEqualStrings("KEY", request.env[0].key);
     try std.testing.expectEqualStrings("VALUE", request.env[0].value);
 
-    var result = try (AsyncResult{ .ai_complete = .{ .completed = .{ .text = "done" } } }).clone(allocator);
+    var source = try AiCompleteResult.completedText(allocator, "done");
+    defer source.deinit(allocator);
+    var result = try (AsyncResult{ .ai_complete = source }).clone(allocator);
     defer result.deinit(allocator);
-    try std.testing.expectEqualStrings("done", result.ai_complete.completed.text);
+    try std.testing.expectEqualStrings("done", result.ai_complete.status.completed.text);
 }
 
 test "dispatchOAuthGetApiKey executes the claim callback on the lua-owning thread" {

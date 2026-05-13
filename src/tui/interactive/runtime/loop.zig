@@ -194,7 +194,7 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
             var result = try session.runAiSessionAgentPrompt(self.msg_allocator, request, .{ .ptr = @ptrCast(&event_queue), .emit = SidePromptEventQueue.emit });
             errdefer result.deinit(self.msg_allocator);
             if (event_queue.dropped > 0) try deliverAiSessionPromptEvent(self, owned_start.id, .{ .events_dropped = event_queue.dropped });
-            switch (result) {
+            switch (result.status) {
                 .completed => {},
                 .err => |msg| try deliverAiSessionPromptEvent(self, owned_start.id, .{ .err = msg }),
                 .cancelled => {},

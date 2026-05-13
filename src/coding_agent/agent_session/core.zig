@@ -9,52 +9,77 @@ pub const Agent = agent_root.Agent;
 pub const SubscriptionToken = agent_impl.SubscriptionToken;
 pub const ContextUsage = session_core.context_usage.ContextUsage;
 
-pub const AgentPromptResult = union(enum) {
-    completed: Completed,
-    err: Err,
-    cancelled: Cancelled,
+pub const AgentPromptResult = struct {
+    arena: std.heap.ArenaAllocator,
+    status: Status,
+
+    pub const Status = union(enum) {
+        completed: Completed,
+        err: Err,
+        cancelled: Cancelled,
+    };
 
     pub const Completed = struct {
         message: protocol.AgentMessage,
-        messages: []protocol.AgentMessage,
-        tool_results: []protocol.ToolResultMessage,
+        messages: []const protocol.AgentMessage,
+        tool_results: []const protocol.ToolResultMessage,
         context_usage: ?ContextUsage = null,
 
-        pub fn deinit(self: *Completed, allocator: std.mem.Allocator) void {
-            message_memory.freeMessage(allocator, &self.message);
-            message_memory.freeMessages(allocator, self.messages);
-            for (self.tool_results) |*tr| message_memory.freeToolResultMessage(allocator, tr);
-            if (self.tool_results.len > 0) allocator.free(self.tool_results);
-            self.* = undefined;
-        }
     };
 
     pub const Err = struct {
         message: []const u8,
-        partial_messages: []protocol.AgentMessage = &.{},
+        partial_messages: []const protocol.AgentMessage = &.{},
 
-        pub fn deinit(self: *Err, allocator: std.mem.Allocator) void {
-            allocator.free(self.message);
-            message_memory.freeMessages(allocator, self.partial_messages);
-            self.* = undefined;
-        }
     };
 
     pub const Cancelled = struct {
-        messages: []protocol.AgentMessage = &.{},
+        messages: []const protocol.AgentMessage = &.{},
 
-        pub fn deinit(self: *Cancelled, allocator: std.mem.Allocator) void {
-            message_memory.freeMessages(allocator, self.messages);
-            self.* = undefined;
-        }
     };
 
-    pub fn deinit(self: *AgentPromptResult, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .completed => |*completed| completed.deinit(allocator),
-            .err => |*err| err.deinit(allocator),
-            .cancelled => |*cancelled| cancelled.deinit(allocator),
-        }
+    pub fn completed(allocator: std.mem.Allocator, value: Completed) !AgentPromptResult {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        const message = try message_memory.cloneMessage(arena_allocator, value.message);
+        const messages = if (value.messages.len > 0) try message_memory.cloneMessages(arena_allocator, value.messages) else &.{};
+        const tool_results = if (value.tool_results.len > 0) blk: {
+            const out = try arena_allocator.alloc(protocol.ToolResultMessage, value.tool_results.len);
+            for (value.tool_results, 0..) |tool_result, i| out[i] = try message_memory.cloneToolResultMessage(arena_allocator, tool_result);
+            break :blk out;
+        } else &.{};
+
+        return .{ .arena = arena, .status = .{ .completed = .{
+            .message = message,
+            .messages = messages,
+            .tool_results = tool_results,
+            .context_usage = value.context_usage,
+        } } };
+    }
+
+    pub fn errMessage(allocator: std.mem.Allocator, message: []const u8, partial_messages: []const protocol.AgentMessage) !AgentPromptResult {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+        return .{ .arena = arena, .status = .{ .err = .{
+            .message = try arena_allocator.dupe(u8, message),
+            .partial_messages = if (partial_messages.len > 0) try message_memory.cloneMessages(arena_allocator, partial_messages) else &.{},
+        } } };
+    }
+
+    pub fn cancelledResult(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage) !AgentPromptResult {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_allocator = arena.allocator();
+        return .{ .arena = arena, .status = .{ .cancelled = .{
+            .messages = if (messages.len > 0) try message_memory.cloneMessages(arena_allocator, messages) else &.{},
+        } } };
+    }
+
+    pub fn deinit(self: *AgentPromptResult) void {
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -113,24 +138,22 @@ pub const AgentSessionCore = struct {
     }
 
     fn resultFromAgent(self: *AgentSessionCore) !AgentPromptResult {
-        const allocator = self.allocator;
         const agent_messages = self.agent.messages();
-        if (self.agent.isAbortRequested()) return .{ .cancelled = .{ .messages = try message_memory.cloneMessages(allocator, agent_messages) } };
-        if (self.agent.errorMessage()) |msg| return .{ .err = .{ .message = try allocator.dupe(u8, msg), .partial_messages = try message_memory.cloneMessages(allocator, agent_messages) } };
-        const assistant = self.agent.latestAssistant() orelse return .{ .err = .{ .message = try allocator.dupe(u8, "agent finished without an assistant response"), .partial_messages = try message_memory.cloneMessages(allocator, agent_messages) } };
-        var message: protocol.AgentMessage = try message_memory.cloneMessage(allocator, .{ .assistant = assistant });
-        errdefer message_memory.freeMessage(allocator, &message);
-        const cloned_messages = try message_memory.cloneMessages(allocator, agent_messages);
-        errdefer message_memory.freeMessages(allocator, cloned_messages);
+        if (self.agent.isAbortRequested()) return try AgentPromptResult.cancelledResult(self.allocator, agent_messages);
+        if (self.agent.errorMessage()) |msg| return try AgentPromptResult.errMessage(self.allocator, msg, agent_messages);
+        const assistant = self.agent.latestAssistant() orelse return try AgentPromptResult.errMessage(self.allocator, "agent finished without an assistant response", agent_messages);
+
         var tool_results = std.ArrayList(protocol.ToolResultMessage).empty;
-        errdefer {
-            for (tool_results.items) |*tr| message_memory.freeToolResultMessage(allocator, tr);
-            tool_results.deinit(allocator);
-        }
+        defer tool_results.deinit(self.allocator);
         for (agent_messages) |m| switch (m) {
-            .tool_result => |tr| try tool_results.append(allocator, try message_memory.cloneToolResultMessage(allocator, tr)),
+            .tool_result => |tr| try tool_results.append(self.allocator, tr),
             else => {},
         };
-        return .{ .completed = .{ .message = message, .messages = cloned_messages, .tool_results = try tool_results.toOwnedSlice(allocator), .context_usage = self.contextUsage() } };
+        return try AgentPromptResult.completed(self.allocator, .{
+            .message = .{ .assistant = assistant },
+            .messages = agent_messages,
+            .tool_results = tool_results.items,
+            .context_usage = self.contextUsage(),
+        });
     }
 };

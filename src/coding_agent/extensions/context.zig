@@ -2007,7 +2007,7 @@ fn pushLuaTextMessage(L: *c.lua_State, role: []const u8, text: []const u8) void 
 
 fn pushAiCompleteResult(L: *c.lua_State, result: runner_mod.AiCompleteResult) void {
     c.lua_createtable(L, 0, 10);
-    switch (result) {
+    switch (result.status) {
         .completed => |completed| {
             _ = c.lua_pushlstring(L, "completed", "completed".len);
             c.lua_setfield(L, -2, "status");
