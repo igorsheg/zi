@@ -45,24 +45,15 @@ pub fn publishLifecycle(self: *Interactive, event: UiEvent) bool {
 
 fn coalescePendingSnapshot(self: *Interactive, event: UiEvent) void {
     const dropped = switch (event) {
-        .conversation_snapshot => self.snapshot_event_queue.dropMatching(isConversationSnapshot, null),
-        .queued_snapshot => self.snapshot_event_queue.dropMatching(isQueuedSnapshot, null),
-        .status_snapshot => self.snapshot_event_queue.dropMatching(isStatusSnapshot, null),
+        .conversation_snapshot, .queued_snapshot, .status_snapshot => self.snapshot_event_queue.dropMatching(sameEventTag, @constCast(&event)),
         else => 0,
     };
     self.snapshot_coalesced_dropped += dropped;
 }
 
-fn isConversationSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
-    return item.* == .conversation_snapshot;
-}
-
-fn isQueuedSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
-    return item.* == .queued_snapshot;
-}
-
-fn isStatusSnapshot(item: *const UiEvent, _: ?*anyopaque) bool {
-    return item.* == .status_snapshot;
+fn sameEventTag(item: *const UiEvent, ctx: ?*anyopaque) bool {
+    const target: *const UiEvent = @ptrCast(@alignCast(ctx.?));
+    return std.meta.activeTag(item.*) == std.meta.activeTag(target.*);
 }
 
 pub fn logStats(comptime label: []const u8, stats: anytype) void {
