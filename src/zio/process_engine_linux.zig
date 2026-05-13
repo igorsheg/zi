@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const process_common = @import("process_common.zig");
 const types = @import("process_engine_types.zig");
 const cancel_waiter = @import("cancel_waiter.zig");
 
@@ -147,7 +148,7 @@ pub const Engine = struct {
             .stdin = if (self.request.stdin) .pipe else .ignore,
             .stdout = if (self.request.stdout) .pipe else .ignore,
             .stderr = if (self.request.stderr) .pipe else .ignore,
-            .pgid = if (self.request.process_group and supportsProcessGroups()) 0 else null,
+            .pgid = if (self.request.process_group and process_common.supportsProcessGroups()) 0 else null,
         }) catch {
             _ = self.sink.submit(self.sink.ptr, .spawn_failed);
             self.markExited();
@@ -162,7 +163,7 @@ pub const Engine = struct {
         self.mutex.unlock(self.io);
 
         self.runLoop(&child) catch {
-            if (child.id) |pid| killChild(pid, self.request.process_group, .KILL);
+            if (child.id) |pid| process_common.killChild(pid, self.request.process_group, .KILL);
             _ = child.wait(self.io) catch null;
             _ = self.sink.submit(self.sink.ptr, .spawn_failed);
             self.markExited();
@@ -234,7 +235,7 @@ pub const Engine = struct {
                     },
                     .kill_grace => {
                         if (kill_grace_fd) |fd| drainTimerFd(fd);
-                        if (process_alive or stdout_open or stderr_open) killChild(child_pid, self.request.process_group, .KILL);
+                        if (process_alive or stdout_open or stderr_open) process_common.killChild(child_pid, self.request.process_group, .KILL);
                     },
                     .stdout => if (stdout_file) |file| {
                         if (!self.drain(file, .stdout)) {
@@ -264,7 +265,7 @@ pub const Engine = struct {
             if (control.close_stdin) self.closeChildStdin(child);
             if (control.should_stop and !stopping) {
                 stopping = true;
-                killChild(child_pid, self.request.process_group, .TERM);
+                process_common.killChild(child_pid, self.request.process_group, .TERM);
                 const fd = try timerFd(100);
                 kill_grace_fd = fd;
                 try registerFd(epfd, fd, .kill_grace);
@@ -408,17 +409,4 @@ fn syscallResult(rc: usize) !usize {
 
 fn closeFd(fd: std.posix.fd_t) void {
     _ = std.c.close(fd);
-}
-
-fn supportsProcessGroups() bool {
-    return builtin.os.tag != .windows and builtin.os.tag != .wasi;
-}
-
-fn killChild(child_id: std.process.Child.Id, process_group: bool, sig: std.posix.SIG) void {
-    if (process_group and supportsProcessGroups()) {
-        const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(child_id));
-        std.posix.kill(group_pid, sig) catch {};
-    } else {
-        std.posix.kill(child_id, sig) catch {};
-    }
 }

@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Token = @import("cancel.zig").Token;
 const cancel = @import("cancel.zig");
 const cancel_waiter = @import("cancel_waiter.zig");
+const process_common = @import("process_common.zig");
 const process_engine = @import("process_engine.zig");
 const runtime_env = @import("env");
 pub const Jobs = @import("job.zig");
@@ -198,7 +199,7 @@ pub fn runInherit(io: std.Io, options: InheritOptions) RunError!std.process.Chil
         .process_group = options.kill_scope == .process_group,
     };
     var abort_waiter = cancel_waiter.Waiter.start(io, options.signal, .{ .ptr = @ptrCast(&abort_ctx), .call = InheritAbortCtx.abort }) catch {
-        killChild(child.id.?, options.kill_scope == .process_group, .KILL);
+        process_common.killChild(child.id.?, options.kill_scope == .process_group, .KILL);
         _ = child.wait(io) catch null;
         return error.SpawnFailed;
     };
@@ -214,7 +215,7 @@ const InheritAbortCtx = struct {
 
     fn abort(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        killChild(self.child_id, self.process_group, .TERM);
+        process_common.killChild(self.child_id, self.process_group, .TERM);
     }
 };
 
@@ -415,15 +416,6 @@ fn childPgid(scope: KillScope) ?std.process.Child.Id {
     return null;
 }
 
-fn killChild(child_id: std.process.Child.Id, process_group: bool, sig: std.posix.SIG) void {
-    if (process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(child_id));
-        std.posix.kill(group_pid, sig) catch {};
-    } else {
-        std.posix.kill(child_id, sig) catch {};
-    }
-}
-
 fn buildEnvMap(allocator: std.mem.Allocator, env: []const EnvPair, clear_env: bool) !?std.process.Environ.Map {
     if (env.len == 0 and !clear_env) return null;
     var map = std.process.Environ.Map.init(allocator);
@@ -432,12 +424,11 @@ fn buildEnvMap(allocator: std.mem.Allocator, env: []const EnvPair, clear_env: bo
     return map;
 }
 
-const shell_argv: []const []const u8 = if (builtin.os.tag == .windows) &.{ "cmd.exe", "/c" } else &.{ "/bin/sh", "-c" };
 fn skipShellProcessTestsIfUnsupported() !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 }
 fn runShell(script: []const u8, options: RunOptions) !RunResult {
-    var argv = [_][]const u8{ shell_argv[0], shell_argv[1], script };
+    var argv = [_][]const u8{ process_common.shell_argv[0], process_common.shell_argv[1], script };
     var o = options;
     o.argv = &argv;
     return run(std.testing.allocator, std.Options.debug_io, o);

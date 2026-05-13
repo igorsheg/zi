@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const process_common = @import("process_common.zig");
 const Group = @import("task.zig").Group;
 const fd_util = @import("fd.zig");
 const types = @import("process_engine_types.zig");
@@ -140,7 +140,7 @@ pub const Engine = struct {
             .stdin = if (self.request.stdin) .pipe else .ignore,
             .stdout = if (self.request.stdout) .pipe else .ignore,
             .stderr = if (self.request.stderr) .pipe else .ignore,
-            .pgid = if (self.request.process_group and supportsProcessGroups()) 0 else null,
+            .pgid = if (self.request.process_group and process_common.supportsProcessGroups()) 0 else null,
         }) catch {
             _ = self.sink.submit(self.sink.ptr, .spawn_failed);
             self.markExited();
@@ -302,12 +302,12 @@ pub const Engine = struct {
     }
 
     fn terminateOwnedChild(self: *Engine, child_id: std.process.Child.Id) void {
-        killChild(child_id, self.request.process_group, .TERM);
+        process_common.killChild(child_id, self.request.process_group, .TERM);
         self.io.sleep(.fromMilliseconds(100), .awake) catch {};
         self.mutex.lockUncancelable(self.io);
         const still_current = self.child_id == child_id and !self.exited;
         self.mutex.unlock(self.io);
-        if (still_current) killChild(child_id, self.request.process_group, .KILL);
+        if (still_current) process_common.killChild(child_id, self.request.process_group, .KILL);
     }
 
     fn readPipe(self: *Engine, file: std.Io.File, kind: StreamKind) void {
@@ -334,16 +334,3 @@ pub const Engine = struct {
         }
     }
 };
-
-fn supportsProcessGroups() bool {
-    return builtin.os.tag != .windows and builtin.os.tag != .wasi;
-}
-
-fn killChild(child_id: std.process.Child.Id, process_group: bool, sig: std.posix.SIG) void {
-    if (process_group and supportsProcessGroups()) {
-        const group_pid: std.posix.pid_t = -@as(std.posix.pid_t, @intCast(child_id));
-        std.posix.kill(group_pid, sig) catch {};
-    } else {
-        std.posix.kill(child_id, sig) catch {};
-    }
-}
