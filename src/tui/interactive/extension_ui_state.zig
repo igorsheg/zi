@@ -136,7 +136,7 @@ pub const ExtensionUiState = struct {
 
     pub fn applyFrame(self: *ExtensionUiState, frame: extension_ui.UiFrame) void {
         frame.validate() catch return;
-        const key = makeFrameKey(self.allocator, frame.state_owner_id, frame.view, frame.node) catch return;
+        const key = makeNodeKey(self.allocator, frame.state_owner_id, frame.view, frame.node) catch return;
         errdefer self.allocator.free(key);
         if (self.frames.getEntry(key)) |entry| {
             if (frame.generation < entry.value_ptr.frame.generation) {
@@ -164,7 +164,7 @@ pub const ExtensionUiState = struct {
     }
 
     fn findFrame(self: *ExtensionUiState, owner: []const u8, view: []const u8, node: []const u8) ?extension_ui.UiFrame {
-        const key = makeFrameKey(self.allocator, owner, view, node) catch return null;
+        const key = makeNodeKey(self.allocator, owner, view, node) catch return null;
         defer self.allocator.free(key);
         const rec = self.frames.get(key) orelse return null;
         return rec.frame;
@@ -288,7 +288,7 @@ fn clearFramesForView(self: *ExtensionUiState, owner: []const u8, view: []const 
 }
 
 fn syncInputState(self: *ExtensionUiState, owner: []const u8, view: []const u8, id: []const u8, value: []const u8) !void {
-    const key = try makeInputKey(self.allocator, owner, view, id);
+    const key = try makeNodeKey(self.allocator, owner, view, id);
     errdefer self.allocator.free(key);
     if (self.input_states.getEntry(key)) |entry| {
         if (!std.mem.eql(u8, entry.value_ptr.text(), value)) {
@@ -304,7 +304,7 @@ fn syncInputState(self: *ExtensionUiState, owner: []const u8, view: []const u8, 
 }
 
 fn inputState(self: *ExtensionUiState, owner: []const u8, view: []const u8, id: []const u8, fallback: []const u8) !*TextInput {
-    const key = try makeInputKey(self.allocator, owner, view, id);
+    const key = try makeNodeKey(self.allocator, owner, view, id);
     errdefer self.allocator.free(key);
     if (self.input_states.getEntry(key)) |entry| {
         self.allocator.free(key);
@@ -1340,15 +1340,11 @@ fn edge(v: f32) u32 {
 }
 
 fn makeViewKey(allocator: std.mem.Allocator, owner: []const u8, id: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "{s}\x1f{s}", .{ owner, id });
+    return std.fmt.allocPrint(allocator, "{s}\x1f{s}", .{ owner, id });
 }
 
-fn makeFrameKey(allocator: std.mem.Allocator, owner: []const u8, view: []const u8, node: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ owner, view, node });
-}
-
-fn makeInputKey(allocator: std.mem.Allocator, owner: []const u8, view: []const u8, node: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ owner, view, node });
+fn makeNodeKey(allocator: std.mem.Allocator, owner: []const u8, view: []const u8, node: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ owner, view, node });
 }
 
 fn bufferContainsText(buf: *Buffer, needle: []const u8) !bool {
