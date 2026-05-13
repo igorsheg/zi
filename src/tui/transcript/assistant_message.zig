@@ -300,10 +300,6 @@ fn deinitRenderBlocksList(blocks: *std.ArrayListUnmanaged(AssistantMessage.Rende
 }
 
 fn renderComponentSlice(comp: Component, region: Region, first_row: u32) void {
-    if (first_row == 0) {
-        comp.render(region);
-        return;
-    }
     comp.renderSlice(region, first_row);
 }
 
