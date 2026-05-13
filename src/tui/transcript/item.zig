@@ -4,7 +4,7 @@ const surface_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 const grapheme = @import("../grapheme.zig");
 const text_mod = @import("../components/text.zig");
-const markdown_mod = @import("../components/markdown.zig");
+const markdown_mod = @import("markdown.zig");
 const theme_mod = @import("../theme.zig");
 
 const Measurement = component_mod.Measurement;

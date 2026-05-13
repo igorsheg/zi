@@ -24,9 +24,6 @@ pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.MissingParameters => "missing required field 'parameters'",
             error.MissingExecute => "missing required field 'execute'",
             error.InvalidExecute => "field 'execute' must be a function",
-            error.InvalidRenderCall => "field 'render_call' must be a function",
-            error.InvalidRenderResult => "field 'render_result' must be a function",
-            error.InvalidExpandedChanged => "field 'on_expanded_changed' must be a function",
             error.InvalidName => "field 'name' must be a string",
             error.InvalidDescription => "field 'description' must be a string",
             error.InvalidLabel => "field 'label' must be a string",
@@ -51,9 +48,6 @@ pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
             built.source.id,
         });
         if (built.impl == .lua) c.luaL_unref(L, c.LUA_REGISTRYINDEX, built.impl.lua);
-        if (built.render_call_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
-        if (built.render_result_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
-        if (built.on_expanded_changed_ref) |r| c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
         freeBuiltTool(runner.allocator, &built);
         c.lua_pushboolean(L, 0);
         return 1;
@@ -77,9 +71,6 @@ const BuildError = error{
     InvalidPromptGuidelines,
     InvalidParameters,
     InvalidExecute,
-    InvalidRenderCall,
-    InvalidRenderResult,
-    InvalidExpandedChanged,
     OutOfMemory,
     UnsupportedLuaType,
     InvalidUtf8,
@@ -121,61 +112,16 @@ fn buildExtensionTool(
     };
     errdefer lua_runtime.freeJsonValue(a, parameters);
 
-    var has_render_call = false;
-    _ = c.lua_getfield(L, 1, "render_call");
-    if (c.lua_type(L, -1) == c.LUA_TFUNCTION) {
-        has_render_call = true;
-    } else if (c.lua_type(L, -1) != c.LUA_TNIL) {
-        c.lua_pop(L, 1);
-        return error.InvalidRenderCall;
-    }
-
-    var has_render_result = false;
-    _ = c.lua_getfield(L, 1, "render_result");
-    if (c.lua_type(L, -1) == c.LUA_TFUNCTION) {
-        has_render_result = true;
-    } else if (c.lua_type(L, -1) != c.LUA_TNIL) {
-        c.lua_pop(L, 2);
-        return error.InvalidRenderResult;
-    }
-    var has_on_expanded_changed = false;
-    _ = c.lua_getfield(L, 1, "on_expanded_changed");
-    if (c.lua_type(L, -1) == c.LUA_TFUNCTION) {
-        has_on_expanded_changed = true;
-    } else if (c.lua_type(L, -1) != c.LUA_TNIL) {
-        c.lua_pop(L, 3);
-        return error.InvalidExpandedChanged;
-    }
-
     _ = c.lua_getfield(L, 1, "execute");
     if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 4);
+        c.lua_pop(L, 1);
         return error.MissingExecute;
     }
     if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
-        c.lua_pop(L, 4);
+        c.lua_pop(L, 1);
         return error.InvalidExecute;
     }
     const execute_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
-
-    const on_expanded_changed_ref: ?c_int = if (has_on_expanded_changed)
-        c.luaL_ref(L, c.LUA_REGISTRYINDEX)
-    else blk: {
-        c.lua_pop(L, 1);
-        break :blk null;
-    };
-    const render_result_ref: ?c_int = if (has_render_result)
-        c.luaL_ref(L, c.LUA_REGISTRYINDEX)
-    else blk: {
-        c.lua_pop(L, 1);
-        break :blk null;
-    };
-    const render_call_ref: ?c_int = if (has_render_call)
-        c.luaL_ref(L, c.LUA_REGISTRYINDEX)
-    else blk: {
-        c.lua_pop(L, 1);
-        break :blk null;
-    };
 
     return .{
         .name = name,
@@ -186,9 +132,6 @@ fn buildExtensionTool(
         .prompt_guidelines = prompt_guidelines,
         .impl = .{ .lua = execute_ref },
         .source = currentRegistrationSource(runner),
-        .render_call_ref = render_call_ref,
-        .render_result_ref = render_result_ref,
-        .on_expanded_changed_ref = on_expanded_changed_ref,
         .owned = true,
     };
 }

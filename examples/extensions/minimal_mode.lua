@@ -12,17 +12,6 @@ return function(zi)
       },
       required = { "path" },
     },
-    render_call = function(args)
-      local path = args.path or "..."
-      return {
-        lines = {
-          {
-            { text = "read ", fg = "toolTitle", bold = true },
-            { text = path, fg = "accent" },
-          },
-        },
-      }
-    end,
     execute = function(params, ctx)
       local path = params.path or ""
       local cwd = (ctx and ctx.cwd) or "."
@@ -58,27 +47,14 @@ return function(zi)
       return {
         content = { { type = "text", text = table.concat(selected, "\n") } },
         details = { path = path, lines = #lines, offset = start_line, limit = params.limit },
+        presentation = {
+          schema = "zi.doc.v1",
+          blocks = {
+            { type = "line", spans = { { text = "read ", style = { role = "muted" } }, { text = path, style = { role = "accent", bold = true } } } },
+            { type = "text", text = table.concat(selected, "\n"), collapsed_lines = 0 },
+          },
+        },
       }
-    end,
-    render_result = function(result, ctx)
-      if not ctx.expanded then
-        -- Minimal mode: collapsed output intentionally consumes no result rows.
-        return ""
-      end
-
-      local text = result.content and result.content[1] and result.content[1].text or ""
-      local lines = {
-        { { text = "read ", fg = "muted" }, { text = tostring(result.details and result.details.path or ""), fg = "accent", bold = true } },
-      }
-      for line in string.gmatch(text, "([^\n]*)\n?") do
-        if line == "" and #lines > 1 then break end
-        if #lines >= 21 then
-          lines[#lines + 1] = { { text = "... more", fg = "muted", dim = true } }
-          break
-        end
-        lines[#lines + 1] = { { text = line, fg = "toolOutput" } }
-      end
-      return { lines = lines }
     end,
   })
 end

@@ -1,6 +1,7 @@
 const std = @import("std");
-const excerpt_mod = @import("../excerpt.zig");
-const box_chrome = @import("box_chrome.zig");
+const excerpt_mod = @import("excerpt.zig");
+const box_chrome = @import("chrome.zig");
+const layout_mod = @import("layout.zig");
 const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 
@@ -51,13 +52,16 @@ pub const OwnedSurface = struct {
     gutter_width: u32 = 0,
     collapsed_visible_lines: u32 = 0,
     collapsed_gap_count: u32 = 0,
+    layout: layout_mod.Retained,
+    layout_palette: ?Palette = null,
 
     pub fn init(allocator: Allocator) OwnedSurface {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .layout = layout_mod.Retained.init(allocator) };
     }
 
     pub fn deinit(self: *OwnedSurface) void {
         self.clear();
+        self.layout.deinit();
         self.rows.deinit(self.allocator);
         self.owned_texts.deinit(self.allocator);
         self.owned_gutters.deinit(self.allocator);
@@ -86,6 +90,8 @@ pub const OwnedSurface = struct {
         self.gutter_width = 0;
         self.collapsed_visible_lines = 0;
         self.collapsed_gap_count = 0;
+        self.layout.invalidate();
+        self.layout_palette = null;
     }
 
     pub fn setHeaderOwned(self: *OwnedSurface, header: []u8) void {
@@ -134,7 +140,7 @@ pub const OwnedSurface = struct {
     }
 
     pub fn renderSlice(
-        self: *const OwnedSurface,
+        self: *OwnedSurface,
         region: Region,
         palette: Palette,
         expanded: bool,
@@ -145,34 +151,41 @@ pub const OwnedSurface = struct {
 
         const total_height = self.measure(expanded);
         if (first_row >= total_height) return;
+        self.ensureLayout(palette, expanded) catch return;
+        self.layout.renderSlice(region, first_row);
+    }
 
-        const row_end = first_row +| region.height;
-        var virtual_row: u32 = 0;
-
-        if (self.stats) |stats| {
-            self.maybeDrawStats(region, first_row, row_end, &virtual_row, stats, palette);
-        }
-        self.maybeDrawTop(region, first_row, row_end, &virtual_row, palette.base);
-
+    fn ensureLayout(self: *OwnedSurface, palette: Palette, expanded: bool) !void {
+        const key: layout_mod.Key = .{ .width = 0, .expanded = expanded };
+        if (self.layout.matches(key) and paletteEql(self.layout_palette, palette)) return;
+        const arena = self.layout.reset();
+        var builder = layout_mod.Builder.init(arena);
+        if (self.stats) |stats| try appendStats(&builder, stats, palette);
+        try builder.appendRow(try box_chrome.topSegments(arena, self.header, palette.base));
         if (expanded or self.collapsed_items.items.len == 0) {
-            for (self.rows.items) |row| {
-                self.maybeDrawSurfaceRow(region, first_row, row_end, &virtual_row, row, palette);
-            }
+            for (self.rows.items) |row| try self.appendSurfaceRow(&builder, row, palette);
         } else {
             for (self.collapsed_items.items) |item| switch (item) {
                 .span => |span| {
                     var idx: usize = span.start;
-                    while (idx < span.end) : (idx += 1) {
-                        self.maybeDrawSurfaceRow(region, first_row, row_end, &virtual_row, self.rows.items[idx], palette);
-                    }
+                    while (idx < span.end) : (idx += 1) try self.appendSurfaceRow(&builder, self.rows.items[idx], palette);
                 },
-                .gap => |count| self.maybeDrawExcerptGap(region, first_row, row_end, &virtual_row, count, palette.base),
+                .gap => |count| try builder.appendRow(try box_chrome.elisionSegments(arena, count, self.gutter_width, palette.base)),
             };
         }
+        try builder.appendRow(try box_chrome.bottomSegments(arena, palette.base));
+        if (self.notice) |notice| try builder.appendRow(try box_chrome.noticeSegments(arena, notice, palette.base));
+        self.layout.setRows(key, try builder.toOwnedRows());
+        self.layout_palette = palette;
+    }
 
-        self.maybeDrawBottom(region, first_row, row_end, &virtual_row, palette.base);
-        if (self.notice) |notice| {
-            self.maybeDrawNotice(region, first_row, row_end, &virtual_row, notice, palette.base);
+    fn appendSurfaceRow(self: *const OwnedSurface, builder: *layout_mod.Builder, row: Row, palette: Palette) !void {
+        const arena = builder.allocator;
+        if (row.is_elision) {
+            try builder.appendRow(try box_chrome.elisionSegments(arena, row.elision_count, self.gutter_width, palette.base));
+        } else {
+            const style = lineStyle(palette, row.style);
+            try builder.appendRow(try box_chrome.contentSegments(arena, row.gutter, self.gutter_width, row.text, style, row.highlight or row.style != .none));
         }
     }
 
@@ -181,6 +194,24 @@ pub const OwnedSurface = struct {
             return @intCast(self.rows.items.len);
         }
         return self.collapsed_visible_lines;
+    }
+
+    fn appendStats(builder: *layout_mod.Builder, stats: Stats, palette: Palette) !void {
+        const arena = builder.allocator;
+        var segs: std.ArrayListUnmanaged(layout_mod.Segment) = .empty;
+        var col: u32 = 0;
+        if (stats.added > 0) {
+            const txt = try std.fmt.allocPrint(arena, "+{d}", .{stats.added});
+            try segs.append(arena, .{ .x = col, .text = txt, .style = .{ .fg = palette.added.fg, .attrs = .{ .bold = true } } });
+            col += @intCast(txt.len);
+        }
+        if (stats.removed > 0) {
+            if (col > 0) { try segs.append(arena, .{ .x = col, .text = " " }); col += 1; }
+            const txt = try std.fmt.allocPrint(arena, "-{d}", .{stats.removed});
+            try segs.append(arena, .{ .x = col, .text = txt, .style = .{ .fg = palette.removed.fg, .attrs = .{ .bold = true } } });
+        }
+        if (segs.items.len == 0) try segs.append(arena, .{ .x = 0, .text = "no changes", .style = .{ .fg = palette.base.dim } });
+        try builder.appendRow(try segs.toOwnedSlice(arena));
     }
 
     fn lineStyle(palette: Palette, style: LineStyle) box_chrome.Style {
@@ -192,85 +223,16 @@ pub const OwnedSurface = struct {
         };
     }
 
-    fn screenRow(first_row: u32, row_end: u32, virtual_row: u32) ?u32 {
-        if (virtual_row < first_row or virtual_row >= row_end) return null;
-        return virtual_row - first_row;
-    }
-
-    fn maybeDrawStats(self: *const OwnedSurface, region: Region, first_row: u32, row_end: u32, virtual_row: *u32, stats: Stats, palette: Palette) void {
-        _ = self;
-        if (screenRow(first_row, row_end, virtual_row.*)) |screen_row| {
-            var col: u32 = 0;
-            if (stats.added > 0) {
-                var buf: [16]u8 = undefined;
-                const txt = std.fmt.bufPrint(&buf, "+{d}", .{stats.added}) catch "+?";
-                col += region.writeStr(col, screen_row, txt, palette.added.fg, Color.default, .{ .bold = true });
-            }
-            if (stats.removed > 0) {
-                if (col > 0) col += region.writeStr(col, screen_row, " ", Color.default, Color.default, .{});
-                var buf: [16]u8 = undefined;
-                const txt = std.fmt.bufPrint(&buf, "-{d}", .{stats.removed}) catch "-?";
-                col += region.writeStr(col, screen_row, txt, palette.removed.fg, Color.default, .{ .bold = true });
-            }
-            if (col == 0) {
-                _ = region.writeStr(0, screen_row, "no changes", palette.base.dim, Color.default, .{});
-            }
-        }
-        virtual_row.* += 1;
-    }
-
-    fn maybeDrawTop(self: *const OwnedSurface, region: Region, first_row: u32, row_end: u32, virtual_row: *u32, style: box_chrome.Style) void {
-        if (screenRow(first_row, row_end, virtual_row.*)) |screen_row| {
-            _ = box_chrome.drawTop(region, screen_row, self.header, style);
-        }
-        virtual_row.* += 1;
-    }
-
-    fn maybeDrawSurfaceRow(self: *const OwnedSurface, region: Region, first_row: u32, row_end: u32, virtual_row: *u32, row: Row, palette: Palette) void {
-        if (screenRow(first_row, row_end, virtual_row.*)) |screen_row| {
-            if (row.is_elision) {
-                _ = box_chrome.drawElision(region, screen_row, row.elision_count, self.gutter_width, palette.base);
-            } else {
-                const style = lineStyle(palette, row.style);
-                _ = box_chrome.drawContentLine(
-                    region,
-                    screen_row,
-                    row.gutter,
-                    self.gutter_width,
-                    row.text,
-                    style,
-                    row.highlight or row.style != .none,
-                );
-            }
-        }
-        virtual_row.* += 1;
-    }
-
-    fn maybeDrawExcerptGap(self: *const OwnedSurface, region: Region, first_row: u32, row_end: u32, virtual_row: *u32, count: u32, style: box_chrome.Style) void {
-        if (screenRow(first_row, row_end, virtual_row.*)) |screen_row| {
-            _ = box_chrome.drawElision(region, screen_row, count, self.gutter_width, style);
-        }
-        virtual_row.* += 1;
-    }
-
-    fn maybeDrawBottom(self: *const OwnedSurface, region: Region, first_row: u32, row_end: u32, virtual_row: *u32, style: box_chrome.Style) void {
-        _ = self;
-        if (screenRow(first_row, row_end, virtual_row.*)) |screen_row| {
-            _ = box_chrome.drawBottom(region, screen_row, style);
-        }
-        virtual_row.* += 1;
-    }
-
-    fn maybeDrawNotice(self: *const OwnedSurface, region: Region, first_row: u32, row_end: u32, virtual_row: *u32, notice: []const u8, style: box_chrome.Style) void {
-        _ = self;
-        if (screenRow(first_row, row_end, virtual_row.*)) |screen_row| {
-            _ = region.writeStr(0, screen_row, "[", style.dim, Color.default, .{});
-            const after_bracket = region.writeStr(1, screen_row, notice, style.dim, Color.default, .{});
-            _ = region.writeStr(1 + after_bracket, screen_row, "]", style.dim, Color.default, .{});
-        }
-        virtual_row.* += 1;
-    }
 };
+
+fn styleEql(a: box_chrome.Style, b: box_chrome.Style) bool {
+    return a.chrome.eql(b.chrome) and a.fg.eql(b.fg) and a.dim.eql(b.dim);
+}
+
+fn paletteEql(a_opt: ?Palette, b: Palette) bool {
+    const a = a_opt orelse return false;
+    return styleEql(a.base, b.base) and styleEql(a.added, b.added) and styleEql(a.removed, b.removed) and styleEql(a.context, b.context);
+}
 
 const testing = std.testing;
 const Buffer = buffer_mod.Buffer;

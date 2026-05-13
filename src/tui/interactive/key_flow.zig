@@ -89,34 +89,7 @@ pub fn handle(self: anytype, key: Key) void {
 
     if (keybindings.matches(.app_toggle_tools, key)) {
         self.tool_output_expanded = !self.tool_output_expanded;
-        const events = self.transcript.collectToolExpansionEvents(self.allocator) catch &.{};
-        defer if (events.len > 0) self.allocator.free(events);
         self.transcript.setToolOutputExpanded(self.tool_output_expanded);
-        for (events) |event| {
-            const tool_name = self.msg_allocator.dupe(u8, event.tool_name) catch continue;
-            const tool_call_id = self.msg_allocator.dupe(u8, event.tool_call_id) catch {
-                self.msg_allocator.free(tool_name);
-                continue;
-            };
-            switch (self.request_queue.trySend(.{ .tool_expanded_changed = .{
-                .tool_name = tool_name,
-                .tool_call_id = tool_call_id,
-                .expanded = self.tool_output_expanded,
-            } })) {
-                .ok => {},
-                .dropped => unreachable,
-                .full => |rejected| {
-                    var failed = rejected;
-                    failed.deinit(self.msg_allocator);
-                    break;
-                },
-                .closed, .oom => |rejected| {
-                    var failed = rejected;
-                    failed.deinit(self.msg_allocator);
-                    break;
-                },
-            }
-        }
         self.tui.dirty = true;
         return;
     }

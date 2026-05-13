@@ -108,14 +108,13 @@ return function(zi)
         return {
           content = { { type = "text", text = prefix .. message } },
           details = { tool = name, prefix = prefix },
+          presentation = {
+            schema = "zi.doc.v1",
+            blocks = {
+              { type = "line", spans = { { text = "↩ ", style = { role = "muted" } }, { text = prefix .. message } } },
+            },
+          },
         }
-      end,
-      render_call = function(args, ctx)
-        return { lines = { { { text = name, fg = "accent" }, { text = " echo", fg = "muted" } } } }
-      end,
-      render_result = function(result, ctx)
-        local text = result.content and result.content[1] and result.content[1].text or ""
-        return { lines = { { { text = "↩ ", fg = "muted" }, { text = text, fg = "text" } } } }
       end,
     })
     if ok then registered[name] = true end

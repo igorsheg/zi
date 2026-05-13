@@ -3,10 +3,10 @@ const component_mod = @import("../primitives/view.zig");
 const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
 const grapheme = @import("../grapheme.zig");
-const markdown_mod = @import("../components/markdown.zig");
-const assistant_message_mod = @import("../components/assistant_message.zig");
-const user_message_mod = @import("../components/user_message.zig");
-const tool_display_mod = @import("tool_display.zig");
+const markdown_mod = @import("../transcript/markdown.zig");
+const assistant_message_mod = @import("../transcript/assistant_message.zig");
+const user_message_mod = @import("../transcript/user_message.zig");
+const tool_display_mod = @import("../transcript/tool_display.zig");
 const agent_mod = @import("../../agent/root.zig");
 const agent_protocol = agent_mod.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
@@ -14,9 +14,9 @@ const json_util = @import("../../ai/json_util.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const display_wrap_mod = @import("../wrap/display.zig");
-const rendered_tool_result_view = @import("rendered_tool_result.zig");
+const tool_doc = @import("../transcript/doc.zig");
 const selection_mod = @import("../selection/mod.zig");
-const transcript_item_mod = @import("transcript_item.zig");
+const transcript_item_mod = @import("../transcript/item.zig");
 
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
@@ -350,8 +350,6 @@ pub const ToolExecutionRowModel = struct {
     args: std.json.Value = .null,
     args_json_source: ?[]u8 = null,
     result: ?AgentToolResult = null,
-    rendered_call: ?*rendered_tool_result_view.RenderedToolResult = null,
-    rendered_result: ?*rendered_tool_result_view.RenderedToolResult = null,
     is_partial: bool = true,
     is_error: bool = false,
     execution_started: bool = false,
@@ -391,8 +389,6 @@ pub const ToolExecutionRowModel = struct {
             .args = args,
             .args_json_source = args_json_source,
             .result = result,
-            .rendered_call = null,
-            .rendered_result = null,
             .is_partial = self.is_partial,
             .is_error = self.is_error,
             .execution_started = self.execution_started,
@@ -402,8 +398,6 @@ pub const ToolExecutionRowModel = struct {
 
     pub fn deinit(self: *ToolExecutionRowModel, allocator: std.mem.Allocator) void {
         if (self.result) |result| result.free(allocator);
-        if (self.rendered_call) |rendered| rendered.deinit(allocator);
-        if (self.rendered_result) |rendered| rendered.deinit(allocator);
         json_util.freeJsonValue(allocator, self.args);
         if (self.args_json_source) |source| allocator.free(source);
         if (self.tool_name) |tool_name| allocator.free(tool_name);
@@ -423,11 +417,13 @@ pub const ToolExecution = struct {
     measured_content_width: u32 = 0,
     measured_width_method: grapheme.WidthMethod = .wcwidth,
     measured_result_height: u32 = 0,
+    doc: ?*tool_doc.Doc = null,
 
     pub fn deinit(self: *ToolExecution) void {
         if (self.renderer.deinit_state) |deinit_fn| {
             if (self.renderer_state) |state| deinit_fn(state, self.allocator);
         }
+        if (self.doc) |doc| doc.deinit(self.allocator);
         self.model.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -467,7 +463,12 @@ pub const ToolExecution = struct {
         }
 
         self.model.deinit(self.allocator);
+        if (self.doc) |doc| doc.deinit(self.allocator);
+        self.doc = null;
         self.model = owned_model;
+        if (self.model.result) |result| if (tool_doc.isDoc(result.presentation)) {
+            self.doc = tool_doc.Doc.parse(self.allocator, result.presentation) catch null;
+        };
         self.measured_content_width = 0;
         self.measured_result_height = 0;
         self.notifyArgsChanged();
@@ -479,10 +480,6 @@ pub const ToolExecution = struct {
         self.expanded = expanded;
         self.measured_content_width = 0;
         self.measured_result_height = 0;
-        if (self.renderer.expanded_changed) |changed_fn| {
-            var ctx = self.makeStateContext();
-            changed_fn(&ctx);
-        }
     }
 
     fn notifyArgsChanged(self: *ToolExecution) void {
@@ -580,10 +577,6 @@ pub const ToolExecution = struct {
     }
 
     fn renderCall(self: *ToolExecution, region: Region) void {
-        if (self.model.rendered_call) |rendered| {
-            rendered_tool_result_view.renderSlice(rendered, region, self.theme, self.expanded, 0);
-            return;
-        }
         if (self.renderer.render_call) |render_fn| {
             var ctx = self.makeRenderContext(region);
             render_fn(&ctx);
@@ -602,8 +595,8 @@ pub const ToolExecution = struct {
 
         if (self.model.result == null) return;
 
-        if (self.model.rendered_result) |rendered| {
-            rendered_tool_result_view.renderSlice(rendered, region, self.theme, self.expanded, skip_rows);
+        if (self.doc) |doc| {
+            doc.renderSlice(self.allocator, region, self.theme, self.expanded, skip_rows);
             return;
         }
 
@@ -646,7 +639,7 @@ pub const ToolExecution = struct {
 
     fn measureResult(self: *ToolExecution, width: u32) u32 {
         if (self.model.result == null) return 0;
-        if (self.model.rendered_result) |rendered| return rendered_tool_result_view.measure(rendered, self.expanded);
+        if (self.doc) |doc| return doc.measure(self.allocator, width, self.expanded, self.width_method);
         if (self.renderer.measure_result) |measure_fn| {
             var ctx = self.makeMeasureContext(width);
             return measure_fn(&ctx);
@@ -1100,11 +1093,6 @@ pub const Transcript = struct {
         self.pending_tools.clearRetainingCapacity();
     }
 
-    pub const ToolExpansionEvent = struct {
-        tool_name: []const u8,
-        tool_call_id: []const u8,
-    };
-
     pub fn setToolOutputExpanded(self: *Transcript, expanded: bool) void {
         for (self.items.items, 0..) |*item, idx| {
             if (item.kind == .tool_execution) {
@@ -1113,19 +1101,6 @@ pub const Transcript = struct {
                 self.noteItemMutated(idx);
             }
         }
-    }
-
-    pub fn collectToolExpansionEvents(self: *Transcript, allocator: std.mem.Allocator) ![]ToolExpansionEvent {
-        var events: std.ArrayList(ToolExpansionEvent) = .empty;
-        errdefer events.deinit(allocator);
-        for (self.items.items) |*item| {
-            if (item.kind != .tool_execution) continue;
-            const te: *ToolExecution = @ptrCast(@alignCast(item.deinit_ctx.?));
-            const tool_name = te.model.tool_name orelse continue;
-            const tool_call_id = te.model.tool_call_id orelse continue;
-            try events.append(allocator, .{ .tool_name = tool_name, .tool_call_id = tool_call_id });
-        }
-        return events.toOwnedSlice(allocator);
     }
 
     pub fn shouldStartSelection(self: *Transcript, bounds: Rect, point: Point) bool {
@@ -1875,6 +1850,26 @@ test "tool execution model replacement preserves pending routing by tool_call_id
     try setTestToolExecutionState(&transcript, tool, false, true, .{ .content = &partial_content, .is_error = false }, true, false);
 
     try testing.expectEqual(tool_idx, transcript.findToolExecutionIndex("tool-1").?);
+}
+
+test "ToolExecution owns doc across result replacement" {
+    var transcript = Transcript.init(testing.allocator);
+    defer transcript.deinit();
+
+    const tool_idx = try appendTestToolExecutionRow(&transcript, "tool-1", "unknown", .{});
+    const tool = transcript.toolExecutionAt(tool_idx).?;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"schema":"zi.doc.v1","blocks":[{"type":"line","spans":[{"text":"doc result"}]}]}
+    , .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    var content = [_]AgentToolResult.ContentBlock{ .{ .text = .{ .text = "content" } } };
+    try setTestToolExecutionState(&transcript, tool, true, true, .{ .content = &content, .presentation = parsed.value, .is_error = false }, false, false);
+    try testing.expect(tool.doc != null);
+
+    try setTestToolExecutionState(&transcript, tool, true, true, .{ .content = &content, .is_error = false }, false, false);
+    try testing.expect(tool.doc == null);
 }
 
 test "Transcript keeps manual scroll anchored when assistant grows" {

@@ -1,7 +1,7 @@
 const std = @import("std");
 const tool_display_mod = @import("../tool_display.zig");
-const boxed_surface = @import("../../surfaces/boxed.zig");
-const excerpt_mod = @import("../../excerpt.zig");
+const boxed_surface = @import("../boxed.zig");
+const excerpt_mod = @import("../excerpt.zig");
 const buffer_mod = @import("../../primitives/surface.zig");
 const cell_mod = @import("../../cell.zig");
 const theme_mod = @import("../../theme.zig");
@@ -86,7 +86,7 @@ fn builtinResultChanged(ctx: *const ToolStateContext) void {
 }
 
 fn makePalette(ctx: *const ToolRenderContext) boxed_surface.Palette {
-    const base: @import("../../surfaces/box_chrome.zig").Style = .{
+    const base: @import("../chrome.zig").Style = .{
         .chrome = ctx.theme.fg(.dim),
         .fg = if (ctx.is_error) ctx.theme.fg(.@"error") else ctx.theme.fg(.tool_output),
         .dim = ctx.theme.fg(.dim),

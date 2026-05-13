@@ -81,12 +81,6 @@ A tool is visible to the model. Keep it narrow.
 `prompt_guidelines`
 : Optional array of prompt guidance bullets.
 
-`render_call(args, ctx)`
-: Optional call-slot renderer.
-
-`render_result(result, ctx)`
-: Optional result-slot renderer.
-
 Tool result:
 
 ```lua
@@ -100,7 +94,73 @@ Tool result:
 }
 ```
 
-`content` is model-visible and tightly bounded. `details` is small JSON metadata. `presentation` is extension-owned UI state for `render_result`; zi may truncate or omit oversized values and mark the object with reserved `__zi_*` fields.
+`content` is model-visible and tightly bounded. `details` is small JSON metadata. `presentation` is bounded semantic transcript UI data. Zi renders `presentation.schema = "zi.doc.v1"` natively from document blocks; invalid or unknown presentation falls back to plain `content` rendering. Zi may truncate or omit oversized presentation values and mark the object with reserved `__zi_*` fields.
+
+`zi.doc.v1` presentation uses generic document fragments instead of extension render callbacks:
+
+```lua
+presentation = {
+  schema = "zi.doc.v1",
+  blocks = {
+    {
+      type = "line",
+      spans = {
+        { text = "Finder", style = { role = "title", bold = true } },
+        { text = " search query", style = { role = "muted" } },
+      },
+    },
+    {
+      type = "line",
+      indent = 1,
+      marker = { text = "✓", style = { role = "success" } },
+      spans = {
+        { text = "grep", style = { role = "accent" } },
+        { text = " search complete", style = { role = "muted" } },
+      },
+    },
+    { type = "markdown", text = "## Summary\n\nFound the rendering path.", collapsed_lines = 12 },
+  },
+}
+```
+
+Use `require("zi.doc")` to build ordinary `zi.doc.v1` tables:
+
+```lua
+local doc = require("zi.doc")
+
+presentation = doc.fragment({
+  doc.line({ doc.span("Finder", "title", { bold = true }), doc.span(" search query", "muted") }),
+  doc.step("done", "grep", "search complete"),
+  doc.markdown(summary, { collapsed_lines = 12 }),
+  doc.group({ doc.line({ doc.span("nested", "muted") }) }, { indent = 1, max_blocks = 4 }),
+})
+```
+
+Supported block types are `line`, `text`, `markdown`, `group`, and `separator`.
+
+`line`
+: One terminal row made from `spans`, optional `marker`, and optional `indent`.
+
+`text`
+: Wrapped plain text. `collapsed_lines = 0` is valid and shows only the truncation marker when collapsed and content exists.
+
+`markdown`
+: Wrapped markdown rendered through zi's native transcript markdown renderer. It is still durable data, not a callback.
+
+`group`
+: Nested blocks with optional `indent` and `collapsed = { max_blocks = N }`. `max_blocks = 0` is valid.
+
+`separator`
+: A horizontal separator row.
+
+Spans support `text`, `style`, and reserved `link`. Supported style roles are `normal`, `muted`, `title`, `accent`, `success`, `warning`, `danger`, and `code`. Roles are semantic; themes choose colors.
+
+Boundaries:
+
+- `presentation.schema = "zi.doc.v1"` is for durable transcript scrollback. It is data, not a callback API.
+- `ctx.ui.render(...)` is for retained interactive extension UI.
+- `ctx.ui.frame(...)` / surfaces are for arbitrary visual output.
+- `content` remains the model-visible tool result text.
 
 ## Commands
 

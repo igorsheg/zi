@@ -16,6 +16,7 @@ const storage = @import("../storage.zig");
 const extension_api = @import("extensions/api_v3.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const lua_runtime = @import("extensions/lua_runtime.zig");
+const builtin_lua = @import("extensions/builtin_lua.zig");
 const lua_tool_mod = @import("extensions/lua_tool.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
 const c = lua_runtime.c;
@@ -676,6 +677,7 @@ fn buildExtensionRuntime(
     runner_ptr.builtin_tool_definitions = if (has_custom_tools) &.{} else builtin_definitions;
     runner_ptr.attachLuaState(state_ptr);
     extension_api.install(state_ptr, runner_ptr);
+    try builtin_lua.install(state_ptr);
 
     _ = c.lua_getglobal(state_ptr.L, "package");
     defer c.lua_pop(state_ptr.L, 1);

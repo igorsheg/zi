@@ -5,7 +5,7 @@ The TUI subsystem is organized by depth: small primitives at the bottom, reusabl
 - `primitives/` — terminal-agnostic building blocks: geometry, surfaces, views, layout, focus, overlays.
 - `terminal/` — terminal adapters: keys, input buffering, ANSI output, clipboard, file descriptors.
 - `wrap/` — text wrapping primitives. `wrap/display.zig` is the canonical display-width wrapper.
-- `surfaces/` — reusable drawing infrastructure above `primitives/surface.zig`: box chrome and boxed rendered surfaces.
+- `transcript/` — retained transcript rendering core: item protocol, row/segment layout, document fragments, boxed/chrome variants.
 - `markdown/` — markdown parsing and rendering into TUI spans/surfaces.
 - `components/` — reusable visual modules built on `primitives`: text, editor, messages, pickers, panels, overlays, status text.
 - `editor/` — editor internals and the editor interface (`buffer`, `layout`, `navigation`, `render`, `autocomplete`, `interface`, `view`).

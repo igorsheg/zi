@@ -47,5 +47,4 @@ test {
     _ = @import("coding_agent/extensions/system_worker.zig");
     _ = @import("coding_agent/extensions/loader.zig");
     _ = @import("coding_agent/extensions/lua_tool.zig");
-    _ = @import("coding_agent/extensions/lua_renderer.zig");
 }

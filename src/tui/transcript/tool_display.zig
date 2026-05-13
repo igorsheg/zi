@@ -13,7 +13,6 @@ pub const ToolRenderer = struct {
     deinit_state: ?*const fn (state: *anyopaque, allocator: std.mem.Allocator) void = null,
     args_changed: ?*const fn (ctx: *const ToolStateContext) void = null,
     result_changed: ?*const fn (ctx: *const ToolStateContext) void = null,
-    expanded_changed: ?*const fn (ctx: *const ToolStateContext) void = null,
 };
 
 pub const ToolStateContext = struct {

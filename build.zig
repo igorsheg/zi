@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
+    build_options.addOption([]const u8, "embedded_zi_doc_lua", readBuildFile(b, "lua/zi/doc.lua"));
 
     const self_docs_generated = generateSelfDocsModule(b);
 
@@ -171,6 +172,10 @@ fn generateSelfDocsModule(b: *std.Build) std.Build.LazyPath {
 
     const wf = b.addWriteFiles();
     return wf.add("self_docs_embedded.zig", out.written());
+}
+
+fn readBuildFile(b: *std.Build, rel_path: []const u8) []const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, b.pathFromRoot(rel_path), b.allocator, .limited(1024 * 1024)) catch @panic("read build file failed");
 }
 
 fn parseDocMeta(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !DocMeta {

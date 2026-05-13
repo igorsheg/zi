@@ -1139,25 +1139,6 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\    end
         \\    return { content = { { type = "text", text = "Unknown action" } }, is_error = true, details = details("list", "unknown action") }
         \\  end,
-        \\  render_result = function(result, ctx)
-        \\    local d = result.details
-        \\    if d.action == "list" then
-        \\      if #d.todos == 0 then return { lines = { { { text = "No todos", fg = "muted", dim = true } } } } end
-        \\      local lines = { { { text = tostring(#d.todos) .. " todo(s):", fg = "muted" } } }
-        \\      local limit = ctx.expanded and #d.todos or math.min(#d.todos, 5)
-        \\      for i = 1, limit do
-        \\        local todo = d.todos[i]
-        \\        lines[#lines + 1] = {
-        \\          { text = todo.done and "✓ " or "○ ", fg = todo.done and "success" or "muted" },
-        \\          { text = "#" .. tostring(todo.id) .. " ", fg = "accent" },
-        \\          { text = todo.text, fg = todo.done and "muted" or "text", dim = todo.done },
-        \\        }
-        \\      end
-        \\      return { lines = lines }
-        \\    end
-        \\    local text = result.content and result.content[1] and result.content[1].text or ""
-        \\    return { lines = { { { text = "✓ ", fg = "success" }, { text = text, fg = "muted" } } } }
-        \\  end,
         \\})
         \\
         \\zi.command({

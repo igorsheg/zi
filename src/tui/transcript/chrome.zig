@@ -1,6 +1,7 @@
 const std = @import("std");
 const buffer_mod = @import("../primitives/surface.zig");
 const cell_mod = @import("../cell.zig");
+const layout = @import("layout.zig");
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -10,6 +11,76 @@ pub const Style = struct {
     fg: Color,
     dim: Color,
 };
+
+fn draw(fg_color: Color) layout.Style {
+    return .{ .fg = fg_color, .bg = Color.default, .attrs = .{} };
+}
+
+pub fn topSegments(arena: std.mem.Allocator, header: ?[]const u8, style: Style) ![]const layout.Segment {
+    var segs: std.ArrayListUnmanaged(layout.Segment) = .empty;
+    var col: u32 = 0;
+    try segs.append(arena, .{ .x = col, .text = "╭─", .style = draw(style.chrome) });
+    col += 2;
+    if (header) |h| {
+        try segs.append(arena, .{ .x = col, .text = "[", .style = draw(style.chrome) });
+        col += 1;
+        try segs.append(arena, .{ .x = col, .text = h, .style = draw(style.fg) });
+        col += @intCast(h.len);
+        try segs.append(arena, .{ .x = col, .text = "]", .style = draw(style.chrome) });
+    }
+    return try segs.toOwnedSlice(arena);
+}
+
+pub fn contentSegments(arena: std.mem.Allocator, gutter: ?[]const u8, gutter_width: u32, text: []const u8, style: Style, highlight: bool) ![]const layout.Segment {
+    var segs: std.ArrayListUnmanaged(layout.Segment) = .empty;
+    const text_color = if (highlight) style.fg else style.dim;
+    var col: u32 = 0;
+    if (gutter_width > 0) {
+        if (gutter) |g| {
+            const g_len = @min(@as(u32, @intCast(g.len)), gutter_width);
+            col += gutter_width - g_len;
+            try segs.append(arena, .{ .x = col, .text = g, .style = draw(text_color) });
+            col += g_len;
+        } else col += gutter_width;
+        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = "│", .style = draw(style.chrome) }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+    } else {
+        try segs.append(arena, .{ .x = col, .text = "│", .style = draw(style.chrome) }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+    }
+    try segs.append(arena, .{ .x = col, .text = text, .style = draw(text_color) });
+    return try segs.toOwnedSlice(arena);
+}
+
+pub fn elisionSegments(arena: std.mem.Allocator, count: u32, gutter_width: u32, style: Style) ![]const layout.Segment {
+    var segs: std.ArrayListUnmanaged(layout.Segment) = .empty;
+    var col: u32 = 0;
+    if (gutter_width > 0) {
+        col += gutter_width;
+        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = "·", .style = draw(style.chrome) }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+    } else {
+        try segs.append(arena, .{ .x = col, .text = "·", .style = draw(style.chrome) }); col += 1;
+        try segs.append(arena, .{ .x = col, .text = " " }); col += 1;
+    }
+    const hint = try std.fmt.allocPrint(arena, "··· {d} more lines", .{count});
+    try segs.append(arena, .{ .x = col, .text = hint, .style = draw(style.dim) });
+    return try segs.toOwnedSlice(arena);
+}
+
+pub fn bottomSegments(arena: std.mem.Allocator, style: Style) ![]const layout.Segment {
+    return try arena.dupe(layout.Segment, &.{.{ .x = 0, .text = "╰────", .style = draw(style.chrome) }});
+}
+
+pub fn noticeSegments(arena: std.mem.Allocator, notice: []const u8, style: Style) ![]const layout.Segment {
+    return try arena.dupe(layout.Segment, &.{
+        .{ .x = 0, .text = "[", .style = draw(style.dim) },
+        .{ .x = 1, .text = notice, .style = draw(style.dim) },
+        .{ .x = 1 + @as(u32, @intCast(notice.len)), .text = "]", .style = draw(style.dim) },
+    });
+}
 
 pub fn chromeWidth(gutter_width: u32) u32 {
     return if (gutter_width > 0) gutter_width + 3 else 2;

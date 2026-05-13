@@ -7,6 +7,7 @@ const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const parser_mod = @import("../markdown/parser.zig");
 const render_mod = @import("../markdown/render.zig");
+const layout_mod = @import("layout.zig");
 
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -30,7 +31,7 @@ pub const Markdown = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     content_buf: std.ArrayListUnmanaged(u8) = .empty,
-    cached_lines: ?[]const RenderedLine = null,
+    cached_rows: ?[]const layout_mod.Row = null,
     cached_width: u32 = 0,
     cached_content_len: usize = 0,
     cached_width_method: grapheme_mod.WidthMethod = .wcwidth,
@@ -80,7 +81,7 @@ pub const Markdown = struct {
     }
 
     pub fn invalidate(self: *Markdown) void {
-        self.cached_lines = null;
+        self.cached_rows = null;
     }
 
     pub fn component(self: *Markdown) component_mod.Component {
@@ -92,10 +93,10 @@ pub const Markdown = struct {
         if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
 
         const content_width = if (width > self.padding_x * 2) width - self.padding_x * 2 else 1;
-        const rendered = self.getRenderedLines(content_width, self.width_method) orelse return .{ .min_height = 1, .preferred_height = 1 };
+        const rendered = self.getLayoutRows(content_width, self.width_method) orelse return .{ .min_height = 1, .preferred_height = 1 };
         return .{
             .min_height = 1,
-            .preferred_height = @as(u32, @intCast(rendered.len)) + self.padding_y * 2,
+            .preferred_height = @intCast(rendered.len),
         };
     }
 
@@ -111,48 +112,13 @@ pub const Markdown = struct {
 
         const content_width = if (w > self.padding_x * 2) w - self.padding_x * 2 else 1;
         const width_method = region.buf.width_method;
-        const rendered = self.getRenderedLines(content_width, width_method) orelse return;
-
-        if (!self.bg.eql(Color.default)) {
-            region.fill(0, 0, w, h, .{
-                .grapheme = .{ .codepoint = ' ' },
-                .fg = self.fg,
-                .bg = self.bg,
-            });
-        }
-
-        var row: u32 = 0;
-        var virtual_row: u32 = self.scroll_offset + first_row;
-        while (row < h) {
-            if (virtual_row < self.padding_y) {
-                virtual_row += 1;
-                row += 1;
-                continue;
-            }
-
-            const line_idx = virtual_row - self.padding_y;
-            if (line_idx >= rendered.len) break;
-
-            var col: u32 = self.padding_x;
-            for (rendered[line_idx].spans) |span| {
-                if (span.text.len == 0) continue;
-                if (!span.bg.eql(Color.default)) {
-                    region.fill(col, row, @intCast(grapheme_mod.strWidth(span.text, width_method)), 1, .{
-                        .grapheme = .{ .codepoint = ' ' },
-                        .bg = span.bg,
-                    });
-                }
-                const effective_bg = if (span.bg.eql(Color.default)) self.bg else span.bg;
-                col += region.writeStr(col, row, span.text, span.fg, effective_bg, span.attrs);
-            }
-
-            row += 1;
-            virtual_row += 1;
-        }
+        const rendered = self.getLayoutRows(content_width, width_method) orelse return;
+        if (!self.bg.eql(Color.default)) region.fill(0, 0, w, h, .{ .grapheme = .{ .codepoint = ' ' }, .fg = self.fg, .bg = self.bg });
+        layout_mod.renderRowsSlice(rendered, region, self.scroll_offset + first_row);
     }
 
-    fn getRenderedLines(self: *Markdown, content_width: u32, width_method: grapheme_mod.WidthMethod) ?[]const RenderedLine {
-        if (self.cached_lines) |cached| {
+    fn getLayoutRows(self: *Markdown, content_width: u32, width_method: grapheme_mod.WidthMethod) ?[]const layout_mod.Row {
+        if (self.cached_rows) |cached| {
             if (self.cached_width == content_width and self.cached_content_len == self.content.len and self.cached_width_method == width_method) {
                 return cached;
             }
@@ -173,11 +139,29 @@ pub const Markdown = struct {
             return null;
         };
 
-        self.cached_lines = built;
+        var rows: std.ArrayListUnmanaged(layout_mod.Row) = .empty;
+        var pad: u32 = 0;
+        while (pad < self.padding_y) : (pad += 1) rows.append(arena, .{}) catch return null;
+        for (built) |line| {
+            var segments: std.ArrayListUnmanaged(layout_mod.Segment) = .empty;
+            var col = self.padding_x;
+            for (line.spans) |span| {
+                if (span.text.len == 0) continue;
+                const effective_bg = if (span.bg.eql(Color.default)) self.bg else span.bg;
+                segments.append(arena, .{ .x = col, .text = span.text, .style = .{ .fg = span.fg, .bg = effective_bg, .attrs = span.attrs } }) catch return null;
+                col += @intCast(grapheme_mod.strWidth(span.text, width_method));
+            }
+            const owned_segments = segments.toOwnedSlice(arena) catch return null;
+            rows.append(arena, .{ .segments = owned_segments }) catch return null;
+        }
+        pad = 0;
+        while (pad < self.padding_y) : (pad += 1) rows.append(arena, .{}) catch return null;
+
+        self.cached_rows = rows.toOwnedSlice(arena) catch return null;
         self.cached_width = content_width;
         self.cached_content_len = self.content.len;
         self.cached_width_method = width_method;
-        return built;
+        return self.cached_rows;
     }
 };
 

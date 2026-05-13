@@ -18,10 +18,7 @@ const session_event_mod = @import("session_event.zig");
 const extension_runner_mod = @import("extensions/runner.zig");
 const request_mod = @import("request.zig");
 const event_bridge = @import("extensions/event_bridge.zig");
-const lua_renderer = @import("extensions/lua_renderer.zig");
 const session_bootstrap = @import("session_bootstrap.zig");
-
-const max_committed_rendered_tool_entries_per_snapshot: usize = 16;
 
 pub const QueueKind = control_mod.QueueKind;
 pub const EnqueueResult = control_mod.EnqueueResult;
@@ -170,11 +167,6 @@ pub const RuntimeHost = struct {
     pub fn dispatchExtensionUiEvent(self: *RuntimeHost, event: extension_ui.UiEvent) !void {
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchUiEvent(event);
-    }
-
-    pub fn dispatchToolExpandedChanged(self: *RuntimeHost, tool_name: []const u8, tool_call_id: []const u8, expanded: bool) !void {
-        const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
-        try runner.dispatchToolExpandedChanged(tool_name, tool_call_id, expanded);
     }
 
     pub fn deliverExtensionAsyncEvent(self: *RuntimeHost, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) !void {
@@ -492,7 +484,6 @@ pub const RuntimeHost = struct {
     ) bool {
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
-        self.attachExtensionRenderedResults(&view) catch {};
 
         const envelope = conversation_state.ConversationSnapshotEnvelope{
             .session_generation = self.session_generation,
@@ -501,89 +492,6 @@ pub const RuntimeHost = struct {
         };
         if (!publisher.publish(envelope)) return false;
         return true;
-    }
-
-    fn attachExtensionRenderedResults(self: *RuntimeHost, view: *conversation_state.ConversationView) !void {
-        const runner = self.session.extensionRunner() orelse return;
-        if (!runner.isOnLuaThread()) return;
-
-        if (view.in_flight) |*turn| {
-            for (turn.tool_executions) |*tool| {
-                if (tool.rendered_call == null) {
-                    tool.rendered_call = lua_renderer.dispatchRenderCall(self.msg_allocator, runner, .{
-                        .tool_name = tool.tool_name,
-                        .args = tool.args,
-                        .width = 120,
-                    });
-                }
-                const result = tool.result orelse continue;
-                if (tool.rendered_result != null) continue;
-                tool.rendered_result = lua_renderer.dispatchRenderResultFromResult(self.msg_allocator, runner, .{
-                    .tool_name = tool.tool_name,
-                    .args = tool.args,
-                    .result = result,
-                    .width = 120,
-                    .is_error = tool.is_error,
-                });
-            }
-        }
-
-        var rendered: std.ArrayList(conversation_state.RenderedToolRenderEntry) = .empty;
-        errdefer {
-            for (rendered.items) |*entry| entry.deinit(self.msg_allocator);
-            rendered.deinit(self.msg_allocator);
-        }
-
-        var remaining_committed_renders = max_committed_rendered_tool_entries_per_snapshot;
-        var message_index = view.committed.flat.len;
-        while (message_index > 0 and remaining_committed_renders > 0) {
-            message_index -= 1;
-            const message = view.committed.flat[message_index];
-            if (message != .assistant) continue;
-            const assistant = message.assistant;
-
-            var block_index = assistant.content.len;
-            while (block_index > 0 and remaining_committed_renders > 0) {
-                block_index -= 1;
-                const block = assistant.content[block_index];
-                if (block != .tool_call) continue;
-                const call = block.tool_call;
-                const result_message = findCommittedToolResultMessage(view.committed.flat[message_index + 1 ..], call.id);
-                var rendered_call = lua_renderer.dispatchRenderCall(self.msg_allocator, runner, .{
-                    .tool_name = call.name,
-                    .args = call.arguments,
-                    .width = 120,
-                });
-                errdefer if (rendered_call) |r| r.deinit(self.msg_allocator);
-
-                var rendered_result = if (result_message) |tool_result| blk: {
-                    const agent_result = toolResultMessageAsAgentToolResult(tool_result);
-                    break :blk lua_renderer.dispatchRenderResultFromResult(self.msg_allocator, runner, .{
-                        .tool_name = tool_result.tool_name,
-                        .args = call.arguments,
-                        .result = agent_result,
-                        .width = 120,
-                        .is_error = tool_result.is_error,
-                    });
-                } else null;
-                errdefer if (rendered_result) |r| r.deinit(self.msg_allocator);
-
-                if (rendered_call == null and rendered_result == null) continue;
-                const tool_call_id = try self.msg_allocator.dupe(u8, call.id);
-                errdefer self.msg_allocator.free(tool_call_id);
-
-                try rendered.append(self.msg_allocator, .{
-                    .tool_call_id = tool_call_id,
-                    .rendered_call = rendered_call,
-                    .rendered_result = rendered_result,
-                });
-                rendered_call = null;
-                rendered_result = null;
-                remaining_committed_renders -= 1;
-            }
-        }
-
-        view.rendered_tool_renders = try rendered.toOwnedSlice(self.msg_allocator);
     }
 
     fn findCommittedToolResultMessage(

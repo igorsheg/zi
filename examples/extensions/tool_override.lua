@@ -72,7 +72,6 @@ return function(zi)
       }
     end,
 
-    -- No render_result on purpose: zi's product contract preserves the
-    -- same-name builtin renderer fallback for builtin-like overrides.
+    -- No presentation on purpose: same-name builtin renderer fallback remains native.
   })
 end

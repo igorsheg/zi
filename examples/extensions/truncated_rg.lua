@@ -86,21 +86,6 @@ return function(zi)
       },
       required = { "pattern" },
     },
-    render_call = function(args)
-      local lines = {
-        {
-          { text = "rg ", fg = "toolTitle", bold = true },
-          { text = '"' .. tostring(args.pattern or "") .. '"', fg = "accent" },
-        },
-      }
-      if args.path then
-        lines[1][#lines[1] + 1] = { text = " in " .. args.path, fg = "muted" }
-      end
-      if args.glob then
-        lines[1][#lines[1] + 1] = { text = " --glob " .. args.glob, fg = "dim" }
-      end
-      return { lines = lines }
-    end,
     execute = function(params, ctx)
       local output, err = run_rg(params, ctx and ctx.cwd or ".")
       if err then
@@ -149,42 +134,14 @@ return function(zi)
           truncation = trunc,
           fullOutputPath = full_path,
         },
+        presentation = {
+          schema = "zi.doc.v1",
+          blocks = {
+            { type = "line", spans = { { text = tostring(match_count) .. " matches", style = { role = "success", bold = true } }, { text = trunc.truncated and " truncated" or "", style = { role = "warning" } } } },
+            { type = "text", text = text, collapsed_lines = 20 },
+          },
+        },
       }
-    end,
-    render_result = function(result, ctx)
-      local d = result.details or {}
-      if d.error then
-        return { lines = { { { text = d.error, fg = "error" } } } }
-      end
-      if not d.matchCount or d.matchCount == 0 then
-        return { lines = { { { text = "No matches found", fg = "dim" } } } }
-      end
-
-      local first = {
-        { text = tostring(d.matchCount) .. " matches", fg = "success", bold = true },
-      }
-      if d.truncation and d.truncation.truncated then
-        first[#first + 1] = { text = " truncated", fg = "warning" }
-      end
-
-      local lines = { first }
-      if ctx.expanded then
-        local text = result.content and result.content[1] and result.content[1].text or ""
-        local shown = 0
-        for line in string.gmatch(text, "([^\n]*)\n?") do
-          if line == "" and shown > 0 then break end
-          if shown >= 20 then
-            lines[#lines + 1] = { { text = "... more output", fg = "muted", dim = true } }
-            break
-          end
-          lines[#lines + 1] = { { text = line, fg = "toolOutput" } }
-          shown = shown + 1
-        end
-        if d.fullOutputPath then
-          lines[#lines + 1] = { { text = "Full output: " .. d.fullOutputPath, fg = "dim", dim = true } }
-        end
-      end
-      return { lines = lines }
     end,
   })
 end

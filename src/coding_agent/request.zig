@@ -140,11 +140,6 @@ pub const AgentRequest = union(enum) {
         id: extension_runner.AsyncOpId,
         event: extension_runner.AiCompleteStreamEvent,
     },
-    tool_expanded_changed: struct {
-        tool_name: []const u8,
-        tool_call_id: []const u8,
-        expanded: bool,
-    },
     shutdown: void,
 
     pub fn deinit(self: *AgentRequest, allocator: std.mem.Allocator) void {
@@ -172,10 +167,6 @@ pub const AgentRequest = union(enum) {
             },
             .extension_async_result => |*async_result| async_result.result.deinit(allocator),
             .extension_async_event => |*async_event| async_event.event.deinit(allocator),
-            .tool_expanded_changed => |event| {
-                allocator.free(event.tool_name);
-                allocator.free(event.tool_call_id);
-            },
             .shutdown => {},
         }
     }

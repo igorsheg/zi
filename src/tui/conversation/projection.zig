@@ -5,12 +5,12 @@ const control_mod = @import("../../agent/control.zig");
 const agent_protocol = agent_root.protocol;
 const AgentToolResult = agent_protocol.AgentToolResult;
 const transcript_mod = @import("transcript.zig");
-const transcript_item_mod = @import("transcript_item.zig");
-const tool_display_mod = @import("tool_display.zig");
+const transcript_item_mod = @import("../transcript/item.zig");
+const tool_display_mod = @import("../transcript/tool_display.zig");
 const editor_iface_mod = @import("../edit/interface.zig");
-const markdown_mod = @import("../components/markdown.zig");
-const assistant_message_component_mod = @import("../components/assistant_message.zig");
-const user_message_component_mod = @import("../components/user_message.zig");
+const markdown_mod = @import("../transcript/markdown.zig");
+const assistant_message_component_mod = @import("../transcript/assistant_message.zig");
+const user_message_component_mod = @import("../transcript/user_message.zig");
 const theme_mod = @import("../theme.zig");
 const themes_builtin = @import("../../themes/builtin.zig");
 const buffer_mod = @import("../primitives/surface.zig");
@@ -19,7 +19,6 @@ const editor_mod = @import("../components/editor.zig");
 const conversation_state_mod = @import("../../agent/conversation_state.zig");
 const message_memory = @import("../../agent/message_memory.zig");
 const json_util = @import("../../ai/json_util.zig");
-const rendered_tool_result_view = @import("rendered_tool_result.zig");
 const grapheme = @import("../grapheme.zig");
 
 const Transcript = transcript_mod.Transcript;
@@ -624,7 +623,6 @@ fn appendCommittedDesiredItems(
                             tool_call,
                             assistant,
                             findCommittedToolResultMessage(committed_slice[idx + 1 ..], tool_call.id),
-                            view.view.rendered_tool_renders,
                             options,
                         ),
                     );
@@ -786,7 +784,6 @@ fn buildCommittedToolCallDesiredItem(
     tool_call: agent_protocol.ToolCall,
     assistant: agent_protocol.AssistantMessage,
     result_message: ?agent_protocol.ToolResultMessage,
-    rendered_entries: []conversation_state_mod.RenderedToolRenderEntry,
     options: RebuildOptions,
 ) !DesiredItem {
     const item_id = toolExecutionId(tool_call.id);
@@ -794,14 +791,12 @@ fn buildCommittedToolCallDesiredItem(
     if (transcript.hasRetainedMatch(item_id, semantic_version)) {
         return .{ .item_id = item_id, .semantic_version = semantic_version };
     }
-    const rendered = findRenderedToolRender(rendered_entries, tool_call.id);
     var row = try createCommittedToolCallRow(
         allocator,
         resolver,
         tool_call,
         assistant,
         result_message,
-        rendered,
         options.retry_attempt,
         options.theme,
     );
@@ -870,7 +865,6 @@ fn createCommittedToolCallRow(
     tool_call: agent_protocol.ToolCall,
     assistant: agent_protocol.AssistantMessage,
     result_message: ?agent_protocol.ToolResultMessage,
-    rendered: RenderedToolRender,
     retry_attempt: u32,
     theme: *const Theme,
 ) !TranscriptItem {
@@ -900,8 +894,6 @@ fn createCommittedToolCallRow(
         true,
         false,
         result,
-        rendered.rendered_call,
-        rendered.rendered_result,
         result_message,
         false,
         if (result_message) |message| message.is_error else is_error,
@@ -941,28 +933,6 @@ fn findCommittedToolResultMessage(
         if (std.mem.eql(u8, tool_result.tool_call_id, tool_call_id)) return tool_result;
     }
     return null;
-}
-
-const RenderedToolRender = struct {
-    rendered_call: ?*rendered_tool_result_view.RenderedToolResult = null,
-    rendered_result: ?*rendered_tool_result_view.RenderedToolResult = null,
-};
-
-fn findRenderedToolRender(
-    entries: []conversation_state_mod.RenderedToolRenderEntry,
-    tool_call_id: []const u8,
-) RenderedToolRender {
-    for (entries) |*entry| {
-        if (!std.mem.eql(u8, entry.tool_call_id, tool_call_id)) continue;
-        const rendered = RenderedToolRender{
-            .rendered_call = entry.rendered_call,
-            .rendered_result = entry.rendered_result,
-        };
-        entry.rendered_call = null;
-        entry.rendered_result = null;
-        return rendered;
-    }
-    return .{};
 }
 
 fn extractUserMessageText(
@@ -1133,17 +1103,12 @@ fn createToolExecutionRow(
         tool_execution.args_complete,
         tool_execution.execution_started,
         tool_execution.result,
-        tool_execution.rendered_call,
-        tool_execution.rendered_result,
         null,
         tool_execution.is_partial,
         tool_execution.is_error,
     );
     defer model.deinit(allocator);
-    const row = try createToolExecutionRowParts(allocator, resolver, &model, theme);
-    tool_execution.rendered_call = null;
-    tool_execution.rendered_result = null;
-    return row;
+    return createToolExecutionRowParts(allocator, resolver, &model, theme);
 }
 
 fn buildToolExecutionRowModel(
@@ -1155,8 +1120,6 @@ fn buildToolExecutionRowModel(
     args_complete: bool,
     execution_started: bool,
     result: ?AgentToolResult,
-    rendered_call: ?*rendered_tool_result_view.RenderedToolResult,
-    rendered_result: ?*rendered_tool_result_view.RenderedToolResult,
     result_message: ?agent_protocol.ToolResultMessage,
     is_partial: bool,
     is_error: bool,
@@ -1183,9 +1146,7 @@ fn buildToolExecutionRowModel(
     } else if (result) |value| {
         model.result = try value.clone(allocator);
     }
-    model.rendered_call = rendered_call;
     if (model.result) |*owned| owned.is_error = model.is_error;
-    if (model.result != null) model.rendered_result = rendered_result;
     return model;
 }
 

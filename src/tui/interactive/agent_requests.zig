@@ -140,17 +140,6 @@ pub fn processWithBuffer(self: anytype, comptime AgentRequest: type, submitExten
                     req.* = .{ .refresh_status_snapshot = {} };
                     self.publishPendingExtensionUi();
                 },
-                .tool_expanded_changed => |event| {
-                    idle_processed = true;
-                    if (self.runtime_host.currentSession().extensionRunner()) |runner| {
-                        runner.async_dispatcher = submitExtensionAsyncFromRunner(self);
-                    }
-                    self.runtime_host.dispatchToolExpandedChanged(event.tool_name, event.tool_call_id, event.expanded) catch |err| {
-                        const msg = self.msg_allocator.dupe(u8, @errorName(err)) catch continue;
-                        _ = self.publishLifecycleUiEvent(.{ .error_message = .{ .message = msg } });
-                    };
-                    self.publishPendingExtensionUi();
-                },
                 .shutdown => {
                     req.deinit(self.msg_allocator);
                     self.discardAgentRequests(buf[i + 1 .. n]);

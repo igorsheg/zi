@@ -195,39 +195,6 @@ return function(zi)
         details = details("list", "unknown action: " .. tostring(action)),
       }
     end,
-    render_result = function(result, ctx)
-      local d = result.details
-      if not d then return result.content and result.content[1] and result.content[1].text or "" end
-      if d.error then return { lines = { { { text = "Error: " .. d.error, fg = "error" } } } } end
-
-      if d.action == "list" then
-        if #d.todos == 0 then return { lines = { { { text = "No todos", fg = "muted", dim = true } } } } end
-        local lines = { { { text = tostring(#d.todos) .. " todo(s):", fg = "muted" } } }
-        local limit = ctx.expanded and #d.todos or math.min(#d.todos, 5)
-        for i = 1, limit do
-          local todo = d.todos[i]
-          lines[#lines + 1] = {
-            { text = todo.done and "✓ " or "○ ", fg = todo.done and "success" or "muted" },
-            { text = "#" .. tostring(todo.id) .. " ", fg = "accent" },
-            { text = todo.text, fg = todo.done and "muted" or "text", dim = todo.done },
-          }
-        end
-        if not ctx.expanded and #d.todos > 5 then
-          lines[#lines + 1] = { { text = "... " .. tostring(#d.todos - 5) .. " more", fg = "muted", dim = true } }
-        end
-        return { lines = lines }
-      end
-
-      if d.action == "add" then
-        local added = d.todos[#d.todos]
-        if added then
-          return { lines = { { { text = "✓ Added ", fg = "success" }, { text = "#" .. tostring(added.id) .. " ", fg = "accent" }, { text = added.text, fg = "muted" } } } }
-        end
-      end
-
-      local text = result.content and result.content[1] and result.content[1].text or ""
-      return { lines = { { { text = "✓ ", fg = "success" }, { text = text, fg = "muted" } } } }
-    end,
   })
 
   zi.on("session_start", function(_, ctx)
