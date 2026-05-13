@@ -479,29 +479,11 @@ fn readNotifyLevelField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !exten
 }
 
 fn readAnchorField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiAnchor {
-    _ = c.lua_getfield(L, idx, field.ptr);
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
-    const value = luaString(L, -1) orelse return null;
-    if (std.mem.eql(u8, value, "center")) return .center;
-    if (std.mem.eql(u8, value, "top_left")) return .top_left;
-    if (std.mem.eql(u8, value, "top_right")) return .top_right;
-    if (std.mem.eql(u8, value, "bottom_left")) return .bottom_left;
-    if (std.mem.eql(u8, value, "bottom_right")) return .bottom_right;
-    if (std.mem.eql(u8, value, "top_center")) return .top_center;
-    if (std.mem.eql(u8, value, "bottom_center")) return .bottom_center;
-    return error.InvalidUiAnchor;
+    return readOptionalEnumField(extension_ui.UiAnchor, L, idx, field, error.InvalidUiAnchor);
 }
 
 fn readBackdropField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiBackdrop {
-    _ = c.lua_getfield(L, idx, field.ptr);
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
-    const value = luaString(L, -1) orelse return null;
-    if (std.mem.eql(u8, value, "none")) return .none;
-    if (std.mem.eql(u8, value, "dim")) return .dim;
-    if (std.mem.eql(u8, value, "fill")) return .fill;
-    return error.InvalidUiBackdrop;
+    return readOptionalEnumField(extension_ui.UiBackdrop, L, idx, field, error.InvalidUiBackdrop);
 }
 
 fn readOverlayPresetField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiOverlayPreset {
@@ -513,13 +495,7 @@ fn readOverlayPresetField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?ex
 }
 
 fn readLifetimeField(L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiLifetime {
-    _ = c.lua_getfield(L, idx, field.ptr);
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
-    const value = luaString(L, -1) orelse return null;
-    if (std.mem.eql(u8, value, "until_input")) return .until_input;
-    if (std.mem.eql(u8, value, "manual")) return .manual;
-    return error.InvalidUiLifetime;
+    return readOptionalEnumField(extension_ui.UiLifetime, L, idx, field, error.InvalidUiLifetime);
 }
 
 fn luaString(L: *c.lua_State, idx: c_int) ?[]const u8 {
@@ -529,15 +505,7 @@ fn luaString(L: *c.lua_State, idx: c_int) ?[]const u8 {
 }
 
 fn readFrameFormatField(L: *c.lua_State, idx: c_int) !extension_ui.FrameFormat {
-    _ = c.lua_getfield(L, idx, "format");
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return .rgba8888;
-    var len: usize = 0;
-    const ptr = c.lua_tolstring(L, -1, &len) orelse return .rgba8888;
-    const value = ptr[0..len];
-    if (std.mem.eql(u8, value, "rgba8888")) return .rgba8888;
-    if (std.mem.eql(u8, value, "halfblock_rgb")) return .halfblock_rgb;
-    return error.InvalidFrameFormat;
+    return readEnumField(extension_ui.FrameFormat, L, idx, "format", .rgba8888, error.InvalidFrameFormat);
 }
 
 fn readOptionalNodeField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int, field: [:0]const u8) !?extension_ui.UiNode {
@@ -723,6 +691,17 @@ fn readEnumField(comptime T: type, L: *c.lua_State, idx: c_int, field: [:0]const
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) != c.LUA_TSTRING) return default;
     const value = luaString(L, -1) orelse return default;
+    inline for (@typeInfo(T).@"enum".fields) |enum_field| {
+        if (std.mem.eql(u8, value, enum_field.name)) return @field(T, enum_field.name);
+    }
+    return invalid;
+}
+
+fn readOptionalEnumField(comptime T: type, L: *c.lua_State, idx: c_int, field: [:0]const u8, invalid: anyerror) !?T {
+    _ = c.lua_getfield(L, idx, field.ptr);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    const value = luaString(L, -1) orelse return null;
     inline for (@typeInfo(T).@"enum".fields) |enum_field| {
         if (std.mem.eql(u8, value, enum_field.name)) return @field(T, enum_field.name);
     }
