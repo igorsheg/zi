@@ -24,7 +24,7 @@ pub fn convertToLlm(
             .assistant => |a| try result.append(allocator, .{ .assistant = a }),
             .tool_result => |t| try result.append(allocator, .{ .tool_result = t }),
             .compaction_summary => |cs| {
-                const text = std.fmt.allocPrint(
+                const text = try std.fmt.allocPrint(
                     allocator,
                     "{s}{s}{s}",
                     .{ COMPACTION_SUMMARY_PREFIX, cs.summary, COMPACTION_SUMMARY_SUFFIX },
@@ -37,7 +37,7 @@ pub fn convertToLlm(
                 } });
             },
             .branch_summary => |bs| {
-                const text = std.fmt.allocPrint(
+                const text = try std.fmt.allocPrint(
                     allocator,
                     "{s}{s}{s}",
                     .{ BRANCH_SUMMARY_PREFIX, bs.summary, BRANCH_SUMMARY_SUFFIX },
