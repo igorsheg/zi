@@ -8,6 +8,11 @@ pub const Candidate = struct {
     is_directory: bool,
 };
 
+const RankedCandidate = struct {
+    candidate: Candidate,
+    score: f64,
+};
+
 pub const Options = struct {
     base_dir: []const u8,
     query: []const u8 = "",
@@ -29,7 +34,7 @@ pub const Session = struct {
         io: std.Io,
         options: Options,
         mutex: std.Io.Mutex = .init,
-        results: std.ArrayList(Candidate) = .empty,
+        results: std.ArrayList(RankedCandidate) = .empty,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -57,8 +62,8 @@ pub const Session = struct {
     pub fn drain(self: *Session, allocator: std.mem.Allocator, out: *std.ArrayList(Candidate)) !void {
         self.shared.mutex.lockUncancelable(self.shared.io);
         defer self.shared.mutex.unlock(self.shared.io);
-        for (self.shared.results.items) |candidate| {
-            try out.append(allocator, candidate);
+        for (self.shared.results.items) |ranked| {
+            try out.append(allocator, ranked.candidate);
         }
         self.shared.results.clearRetainingCapacity();
     }
@@ -138,7 +143,14 @@ fn searchDirCancellable(
     if (options.read_gitignore) {
         _ = try ignore_stack.tryPushDir(allocator, io, root, "");
     }
-    try walkDir(allocator, io, root, "", 0, options, cancelled, &ignore_stack, out);
+    if (hasQuery(options.query)) {
+        var ranked = std.ArrayList(RankedCandidate).empty;
+        defer ranked.deinit(allocator);
+        try walkDirRanked(allocator, io, root, "", 0, options, cancelled, &ignore_stack, &ranked);
+        for (ranked.items) |item| try out.append(allocator, item.candidate);
+    } else {
+        try walkDir(allocator, io, root, "", 0, options, cancelled, &ignore_stack, out);
+    }
 }
 
 fn walkDir(
@@ -173,7 +185,7 @@ fn walkDir(
         const rel_path = try joinRel(allocator, rel_dir, entry.name);
         if (ignore_stack.shouldIgnore(rel_path, is_directory)) continue;
         const include = if (is_directory) options.include_dirs else options.include_files;
-        if (include and matches(options.query, rel_path, is_directory)) {
+        if (include) {
             try out.append(allocator, .{ .relative_path = rel_path, .is_directory = is_directory });
         }
 
@@ -184,6 +196,54 @@ fn walkDir(
             defer ignore_stack.popTo(allocator, mark);
             if (options.read_gitignore) _ = ignore_stack.tryPushDir(allocator, io, child, rel_path) catch false;
             try walkDir(allocator, io, child, rel_path, depth + 1, options, cancelled, ignore_stack, out);
+        }
+    }
+}
+
+fn walkDirRanked(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_dir: []const u8,
+    depth: usize,
+    options: Options,
+    cancelled: *const std.atomic.Value(bool),
+    ignore_stack: *file_ignore.Stack,
+    out: *std.ArrayList(RankedCandidate),
+) !void {
+    if (cancelled.load(.acquire)) return;
+    if (depth > options.max_depth) return;
+
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (cancelled.load(.monotonic)) return;
+        if (entry.name.len == 0) continue;
+        if (options.exclude_git and std.mem.eql(u8, entry.name, ".git")) continue;
+        if (!options.include_hidden and entry.name[0] == '.') continue;
+
+        var is_directory = entry.kind == .directory;
+        if (!is_directory and entry.kind == .sym_link) {
+            const stat: ?std.Io.File.Stat = dir.statFile(io, entry.name, .{}) catch null;
+            if (stat) |value| is_directory = value.kind == .directory;
+        }
+
+        const rel_path = try joinRel(allocator, rel_dir, entry.name);
+        if (ignore_stack.shouldIgnore(rel_path, is_directory)) continue;
+
+        const include = if (is_directory) options.include_dirs else options.include_files;
+        if (include) {
+            if (rankCandidate(options.query, rel_path, is_directory)) |score| {
+                try offerRanked(allocator, out, options.max_results, .{ .candidate = .{ .relative_path = rel_path, .is_directory = is_directory }, .score = score });
+            }
+        }
+
+        if (is_directory) {
+            var child = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer child.close(io);
+            const mark = ignore_stack.mark();
+            defer ignore_stack.popTo(allocator, mark);
+            if (options.read_gitignore) _ = ignore_stack.tryPushDir(allocator, io, child, rel_path) catch false;
+            try walkDirRanked(allocator, io, child, rel_path, depth + 1, options, cancelled, ignore_stack, out);
         }
     }
 }
@@ -216,12 +276,18 @@ fn walkDirShared(
         if (ignore_stack.shouldIgnore(rel_path, is_directory)) continue;
 
         const include = if (is_directory) options.include_dirs else options.include_files;
-        if (include and matches(options.query, rel_path, is_directory)) {
+        if (include and !hasQuery(options.query)) {
             shared.mutex.lockUncancelable(shared.io);
             const can_append = shared.results.items.len < options.max_results;
-            if (can_append) try shared.results.append(shared.allocator, .{ .relative_path = rel_path, .is_directory = is_directory });
+            if (can_append) try shared.results.append(shared.allocator, .{ .candidate = .{ .relative_path = rel_path, .is_directory = is_directory }, .score = 0 });
             shared.mutex.unlock(shared.io);
             if (!can_append) return;
+        } else if (include) {
+            if (rankCandidate(options.query, rel_path, is_directory)) |score| {
+                shared.mutex.lockUncancelable(shared.io);
+                try offerRanked(shared.allocator, &shared.results, options.max_results, .{ .candidate = .{ .relative_path = rel_path, .is_directory = is_directory }, .score = score });
+                shared.mutex.unlock(shared.io);
+            }
         }
 
         if (is_directory) {
@@ -235,13 +301,32 @@ fn walkDirShared(
     }
 }
 
-fn matches(query: []const u8, rel_path: []const u8, is_directory: bool) bool {
+fn hasQuery(query: []const u8) bool {
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
-    if (trimmed.len == 0) return true;
-    const m = path_search.rankWithOptions(trimmed, rel_path, .{});
-    if (!m.matches) return false;
-    _ = is_directory;
-    return true;
+    return trimmed.len != 0;
+}
+
+fn rankCandidate(query: []const u8, rel_path: []const u8, is_directory: bool) ?f64 {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) return 0;
+    const m = path_search.rankCandidate(trimmed, .{ .path = rel_path, .is_directory = is_directory });
+    return if (m.matches) m.score else null;
+}
+
+fn offerRanked(allocator: std.mem.Allocator, out: *std.ArrayList(RankedCandidate), max_results: usize, item: RankedCandidate) !void {
+    if (max_results == 0) return;
+    var insert_at: usize = 0;
+    while (insert_at < out.items.len and rankedLess(out.items[insert_at], item)) : (insert_at += 1) {}
+    if (out.items.len >= max_results and insert_at >= max_results) return;
+    try out.insert(allocator, insert_at, item);
+    if (out.items.len > max_results) _ = out.pop();
+}
+
+fn rankedLess(a: RankedCandidate, b: RankedCandidate) bool {
+    if (a.score < b.score) return true;
+    if (a.score > b.score) return false;
+    if (a.candidate.is_directory != b.candidate.is_directory) return a.candidate.is_directory;
+    return std.mem.lessThan(u8, a.candidate.relative_path, b.candidate.relative_path);
 }
 
 fn joinRel(allocator: std.mem.Allocator, rel_dir: []const u8, name: []const u8) ![]const u8 {
@@ -298,4 +383,34 @@ test "native file search honors root gitignore negation for scoped dirs" {
         try std.testing.expect(!std.mem.startsWith(u8, c.relative_path, "node_modules/"));
     }
     try std.testing.expect(saw_serverless_portal);
+}
+
+test "native file search ranks before truncating queried results" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "aaa");
+    try tmp.dir.writeFile(io, .{ .sub_path = "aaa/mainframe_notes.txt", .data = "" });
+    try tmp.dir.createDirPath(io, "zzz");
+    try tmp.dir.writeFile(io, .{ .sub_path = "zzz/main.zig", .data = "" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out = std.ArrayList(Candidate).empty;
+    try searchDir(arena.allocator(), io, tmp.dir, .{ .base_dir = "", .query = "main", .max_results = 1, .include_dirs = false }, &out);
+
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("zzz/main.zig", out.items[0].relative_path);
+}
+
+test "ranked offer keeps best candidate regardless of insertion order" {
+    var list = std.ArrayList(RankedCandidate).empty;
+    defer list.deinit(std.testing.allocator);
+
+    try offerRanked(std.testing.allocator, &list, 1, .{ .candidate = .{ .relative_path = "weak", .is_directory = false }, .score = 10 });
+    try offerRanked(std.testing.allocator, &list, 1, .{ .candidate = .{ .relative_path = "best", .is_directory = false }, .score = 1 });
+
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqualStrings("best", list.items[0].candidate.relative_path);
 }

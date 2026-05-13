@@ -57,6 +57,17 @@ pub fn filterCandidates(query: []const u8, candidates: []const Candidate, out_in
     return filterCandidatesWithOptions(query, candidates, out_indices, .{});
 }
 
+pub fn rankCandidate(query: []const u8, candidate: Candidate) Match {
+    return rankCandidateWithOptions(query, candidate, .{});
+}
+
+pub fn rankCandidateWithOptions(query: []const u8, candidate: Candidate, opts: Options) Match {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    const match = rankWithOptions(trimmed, candidate.path, opts);
+    if (!match.matches or trimmed.len == 0) return match;
+    return .{ .matches = true, .score = adjustedCandidateScore(trimmed, candidate, match.score, opts) };
+}
+
 pub fn filterWithOptions(query: []const u8, paths: []const []const u8, out_indices: []usize, opts: Options) usize {
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed.len == 0) {
@@ -97,11 +108,11 @@ pub fn filterCandidatesWithOptions(query: []const u8, candidates: []const Candid
     for (candidates, 0..) |candidate, idx| {
         if (count >= out_indices.len or count >= scores_buf.len) break;
 
-        const match = rankWithOptions(trimmed, candidate.path, opts);
+        const match = rankCandidateWithOptions(trimmed, candidate, opts);
         if (!match.matches) continue;
 
         out_indices[count] = idx;
-        scores_buf[count] = adjustedCandidateScore(trimmed, candidate, match.score, opts);
+        scores_buf[count] = match.score;
         count += 1;
     }
 
