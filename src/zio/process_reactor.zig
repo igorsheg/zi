@@ -194,6 +194,7 @@ pub const Reactor = struct {
             group.join() catch |err| log.warn("process reactor join failed: {}", .{err});
             self.tasks = null;
         }
+        self.events.close();
     }
 
     pub fn spawn(self: *Reactor, request: SpawnRequest) !void {
@@ -306,7 +307,7 @@ pub const Reactor = struct {
             .closed, .full, .oom => |returned| {
                 current = returned;
                 current.deinit(self.allocator);
-                false;
+                return false;
             },
         };
     }

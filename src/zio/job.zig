@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const process_engine = @import("process_engine.zig");
+const process_reactor = @import("process_reactor.zig");
+const task = @import("task.zig");
+const logging = @import("../logging.zig");
 
 pub const EventKind = enum { ready, stdout, stderr, exit };
 
@@ -49,111 +51,131 @@ pub const Manager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     sink: EventSink,
-    jobs: std.AutoHashMapUnmanaged(u64, *Job) = .empty,
+    jobs: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    mutex: std.Io.Mutex = .init,
+    reactor: ?process_reactor.Reactor = null,
+    pump: ?task.Group = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, sink: EventSink) Manager {
         return .{ .allocator = allocator, .io = io, .sink = sink };
     }
 
     pub fn deinit(self: *Manager) void {
-        var it = self.jobs.iterator();
-        while (it.next()) |entry| destroyJob(self, entry.value_ptr.*);
+        self.stopPump();
+        if (self.reactor) |*reactor| reactor.deinit();
         self.jobs.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn start(self: *Manager, id: u64, request: StartRequest) !void {
         var owned_request = request;
-        errdefer owned_request.deinit(self.allocator);
+        defer owned_request.deinit(self.allocator);
+        try self.ensureReactor();
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.jobs.contains(id)) return error.DuplicateJob;
-        const job = try self.allocator.create(Job);
-        errdefer self.allocator.destroy(job);
-        job.* = .{
-            .id = id,
-            .allocator = self.allocator,
-            .sink = self.sink,
-            .request = owned_request,
-        };
-        job.engine = process_engine.Engine.init(self.io, .{
-            .argv = job.request.argv,
-            .cwd = job.request.cwd,
-            .process_group = true,
-        }, .{ .ptr = @ptrCast(job), .submit = Job.submitChildEvent });
-        owned_request = .{ .argv = &.{} };
-        errdefer job.deinit(self.allocator);
-        try self.jobs.put(self.allocator, id, job);
+        try self.jobs.put(self.allocator, id, {});
         errdefer _ = self.jobs.remove(id);
-        try job.engine.start();
+
+        try self.reactor.?.spawn(.{
+            .id = id,
+            .argv = owned_request.argv,
+            .cwd = owned_request.cwd,
+            .process_group = true,
+            .stdin = true,
+            .stdout = true,
+            .stderr = true,
+        });
     }
 
     pub fn stop(self: *Manager, id: u64) void {
-        const job = self.jobs.get(id) orelse return;
-        job.stop();
-    }
-
-    pub fn reap(self: *Manager, id: u64) bool {
-        const job = self.jobs.get(id) orelse return false;
-        if (!job.engine.isExited()) return false;
-        _ = self.jobs.remove(id);
-        self.destroyJob(job);
-        return true;
+        self.mutex.lockUncancelable(self.io);
+        const exists = self.jobs.contains(id);
+        self.mutex.unlock(self.io);
+        if (!exists) return;
+        if (self.reactor) |*reactor| reactor.kill(id) catch {};
     }
 
     pub fn remove(self: *Manager, id: u64) bool {
-        const job = self.jobs.get(id) orelse return false;
-        _ = self.jobs.remove(id);
-        self.destroyJob(job);
-        return true;
+        self.mutex.lockUncancelable(self.io);
+        const removed = self.jobs.remove(id);
+        self.mutex.unlock(self.io);
+        if (removed) if (self.reactor) |*reactor| reactor.kill(id) catch {};
+        return removed;
     }
 
     pub fn write(self: *Manager, id: u64, data: []const u8) !void {
-        const job = self.jobs.get(id) orelse return error.UnknownJob;
-        try job.write(data);
-    }
-
-    fn destroyJob(self: *Manager, job: *Job) void {
-        job.stop();
-        job.engine.join();
-        job.deinit(self.allocator);
-        self.allocator.destroy(job);
-    }
-};
-
-const Job = struct {
-    id: u64,
-    allocator: std.mem.Allocator,
-    sink: EventSink,
-    request: StartRequest,
-    engine: process_engine.Engine = undefined,
-
-    fn deinit(self: *Job, allocator: std.mem.Allocator) void {
-        self.request.deinit(allocator);
-        self.* = undefined;
-    }
-
-    fn stop(self: *Job) void {
-        self.engine.stop();
-    }
-
-    fn write(self: *Job, data: []const u8) !void {
-        return self.engine.write(data) catch |err| switch (err) {
-            error.ProcessNotReady => error.JobNotReady,
+        self.mutex.lockUncancelable(self.io);
+        const exists = self.jobs.contains(id);
+        self.mutex.unlock(self.io);
+        if (!exists) return error.UnknownJob;
+        const reactor = &(self.reactor orelse return error.UnknownJob);
+        return reactor.write(id, data) catch |err| switch (err) {
+            error.ReactorStopped => error.JobNotReady,
             else => err,
         };
     }
 
-    fn submitChildEvent(ptr: *anyopaque, event: process_engine.Event) bool {
-        const self: *Job = @ptrCast(@alignCast(ptr));
+    fn ensureReactor(self: *Manager) !void {
+        if (self.reactor == null) self.reactor = try process_reactor.Reactor.initIo(self.allocator, self.io);
+        try self.reactor.?.start();
+        if (self.pump == null) {
+            var group = task.Group.init(self.allocator);
+            errdefer group.cancel();
+            try group.spawnThread(pumpEvents, .{self});
+            self.pump = group;
+        }
+    }
+
+    fn stopPump(self: *Manager) void {
+        if (self.reactor) |*reactor| reactor.stop();
+        if (self.pump) |*group| {
+            group.join() catch {};
+            self.pump = null;
+        }
+    }
+
+    fn pumpEvents(self: *Manager) void {
+        logging.setThreadLabel(.process_reactor);
+        while (true) {
+            var batch: [32]process_reactor.Event = undefined;
+            const reactor = &(self.reactor orelse return);
+            const count = reactor.drainEvents(&batch);
+            if (count == 0) {
+                _ = reactor.waitEvents(100) catch false;
+                if (reactor.events.stats().state == .closed and reactor.events.pendingDepth() == 0) return;
+                continue;
+            }
+            for (batch[0..count]) |*event| {
+                defer event.deinit(self.allocator);
+                self.forwardEvent(event.*);
+            }
+        }
+    }
+
+    fn forwardEvent(self: *Manager, event: process_reactor.Event) void {
         var owned: Event = switch (event) {
-            .ready => .{ .id = self.id, .kind = .ready },
-            .stdout => |bytes| .{ .id = self.id, .kind = .stdout, .data = self.allocator.dupe(u8, bytes) catch return false },
-            .stderr => |bytes| .{ .id = self.id, .kind = .stderr, .data = self.allocator.dupe(u8, bytes) catch return false },
-            .spawn_failed => .{ .id = self.id, .kind = .exit, .code = null },
-            .exit => |term| .{ .id = self.id, .kind = .exit, .code = exitCode(term) },
+            .ready => |id| .{ .id = id, .kind = .ready },
+            .stdout => |out| .{ .id = out.id, .kind = .stdout, .data = self.allocator.dupe(u8, out.bytes) catch return },
+            .stderr => |out| .{ .id = out.id, .kind = .stderr, .data = self.allocator.dupe(u8, out.bytes) catch return },
+            .exit => |exit| blk: {
+                self.markExited(exit.id);
+                break :blk .{ .id = exit.id, .kind = .exit, .code = exitCode(exit.term) };
+            },
+            .spawn_failed => |id| blk: {
+                self.markExited(id);
+                break :blk .{ .id = id, .kind = .exit, .code = null };
+            },
         };
-        if (self.sink.submit(self.sink.ptr, owned)) return true;
+        if (self.sink.submit(self.sink.ptr, owned)) return;
         owned.deinit(self.allocator);
-        return false;
+    }
+
+    fn markExited(self: *Manager, id: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        _ = self.jobs.remove(id);
+        self.mutex.unlock(self.io);
     }
 
     fn exitCode(term: ?std.process.Child.Term) ?i64 {
