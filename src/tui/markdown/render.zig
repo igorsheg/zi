@@ -29,6 +29,11 @@ const FlatText = struct {
     runs: []const FlatRun,
 };
 
+const FlatTableCell = struct {
+    flat: FlatText,
+    alignment: ast.Alignment,
+};
+
 pub fn renderDocument(
     doc: ast.Document,
     width: u32,
@@ -271,21 +276,27 @@ fn renderTable(
 
     var natural_widths = try arena.alloc(u32, num_cols);
     var min_word_widths = try arena.alloc(u32, num_cols);
+    const header_cells = try arena.alloc(FlatTableCell, num_cols);
+    const body_cells = try arena.alloc(FlatTableCell, num_cols * table.rows.len);
     @memset(natural_widths, 1);
     @memset(min_word_widths, 1);
 
-    for (table.header, 0..) |cell, i| {
-        const flat = try flattenInlines(cell.inlines, .{
+    for (0..num_cols) |i| {
+        const inlines = if (i < table.header.len) table.header[i].inlines else &.{};
+        const flat = try flattenInlines(inlines, .{
             .fg = base_style.fg,
             .bg = base_style.bg,
             .attrs = mergeAttrs(base_style.attrs, .{ .bold = true }),
         }, theme, arena);
+        header_cells[i] = .{ .flat = flat, .alignment = table.alignments[i] };
         natural_widths[i] = flatWidth(flat, width_method);
         min_word_widths[i] = longestWordWidth(flat.text, 30, width_method);
     }
-    for (table.rows) |row| {
-        for (row.cells, 0..) |cell, i| {
-            const flat = try flattenInlines(cell.inlines, base_style, theme, arena);
+    for (table.rows, 0..) |row, row_idx| {
+        for (0..num_cols) |i| {
+            const inlines = if (i < row.cells.len) row.cells[i].inlines else &.{};
+            const flat = try flattenInlines(inlines, base_style, theme, arena);
+            body_cells[row_idx * num_cols + i] = .{ .flat = flat, .alignment = table.alignments[i] };
             natural_widths[i] = @max(natural_widths[i], flatWidth(flat, width_method));
             min_word_widths[i] = @max(min_word_widths[i], longestWordWidth(flat.text, 30, width_method));
         }
@@ -298,14 +309,15 @@ fn renderTable(
 
     try lines.append(arena, .{ .spans = try borderLine("┌─", "─┬─", "─┐", column_widths, theme, arena) });
 
-    const header_rows = try renderTableRow(table.header, column_widths, table.alignments, theme, base_style, true, arena, width_method);
+    const header_rows = try renderFlatTableRow(header_cells, column_widths, theme, base_style, arena, width_method);
     try lines.appendSlice(arena, header_rows);
 
     const separator = try borderLine("├─", "─┼─", "─┤", column_widths, theme, arena);
     try lines.append(arena, .{ .spans = separator });
 
-    for (table.rows, 0..) |row, row_idx| {
-        const row_lines = try renderTableRow(row.cells, column_widths, table.alignments, theme, base_style, false, arena, width_method);
+    for (table.rows, 0..) |_, row_idx| {
+        const row_start = row_idx * num_cols;
+        const row_lines = try renderFlatTableRow(body_cells[row_start .. row_start + num_cols], column_widths, theme, base_style, arena, width_method);
         try lines.appendSlice(arena, row_lines);
         if (row_idx + 1 < table.rows.len) {
             try lines.append(arena, .{ .spans = separator });
@@ -349,13 +361,11 @@ fn renderTableFallback(
     return try renderBlocks(blocks.items, width, theme, base_style, "  ", arena, width_method);
 }
 
-fn renderTableRow(
-    cells: []const ast.TableCell,
+fn renderFlatTableRow(
+    cells: []const FlatTableCell,
     column_widths: []const u32,
-    alignments: []const ast.Alignment,
     theme: *const theme_mod.Theme,
     base_style: ast.Style,
-    header: bool,
     arena: std.mem.Allocator,
     width_method: grapheme_mod.WidthMethod,
 ) std.mem.Allocator.Error![]const RenderedLine {
@@ -364,15 +374,9 @@ fn renderTableRow(
     var max_lines: usize = 1;
 
     for (0..num_cols) |i| {
-        const style = if (header)
-            ast.Style{ .fg = base_style.fg, .bg = base_style.bg, .attrs = mergeAttrs(base_style.attrs, .{ .bold = true }) }
-        else
-            base_style;
-        const inlines = if (i < cells.len) cells[i].inlines else &.{};
-        const flat = try flattenInlines(inlines, style, theme, arena);
-        const wrapped = try wrapFlatTextToSpans(flat, column_widths[i], arena, width_method);
+        const wrapped = try wrapFlatTextToSpans(cells[i].flat, column_widths[i], arena, width_method);
         if (wrapped.len > max_lines) max_lines = wrapped.len;
-        cell_line_sets[i] = try alignCellLines(wrapped, column_widths[i], alignments[i], arena, width_method);
+        cell_line_sets[i] = try alignCellLines(wrapped, column_widths[i], cells[i].alignment, arena, width_method);
     }
 
     var rows: std.ArrayListUnmanaged(RenderedLine) = .empty;
@@ -546,10 +550,9 @@ fn appendLink(
     };
     try appendInlineContent(link.label, link_style, theme, text, runs, arena);
 
-    const label_text = try inlinePlainText(link.label, arena);
     const href_for_compare = if (std.mem.startsWith(u8, link.href, "mailto:")) link.href[7..] else link.href;
     const should_append_url = switch (link.kind) {
-        .explicit => !(std.mem.eql(u8, label_text, link.href) or std.mem.eql(u8, label_text, href_for_compare)),
+        .explicit => !(inlinePlainTextEql(link.label, link.href) or inlinePlainTextEql(link.label, href_for_compare)),
         else => false,
     };
     if (should_append_url) {
@@ -560,6 +563,35 @@ fn appendLink(
             .attrs = base_style.attrs,
         }, arena);
     }
+}
+
+fn inlinePlainTextEql(inlines: []const ast.Inline, expected: []const u8) bool {
+    var offset: usize = 0;
+    if (!inlinePlainTextEqlAt(inlines, expected, &offset)) return false;
+    return offset == expected.len;
+}
+
+fn inlinePlainTextEqlAt(inlines: []const ast.Inline, expected: []const u8, offset: *usize) bool {
+    for (inlines) |node| {
+        switch (node) {
+            .text, .code => |slice| {
+                if (offset.* + slice.len > expected.len) return false;
+                if (!std.mem.eql(u8, expected[offset.* .. offset.* + slice.len], slice)) return false;
+                offset.* += slice.len;
+            },
+            .line_break => {
+                if (offset.* >= expected.len or expected[offset.*] != '\n') return false;
+                offset.* += 1;
+            },
+            .strong, .emphasis, .strikethrough => |children| {
+                if (!inlinePlainTextEqlAt(children, expected, offset)) return false;
+            },
+            .link => |nested| {
+                if (!inlinePlainTextEqlAt(nested.label, expected, offset)) return false;
+            },
+        }
+    }
+    return true;
 }
 
 fn inlinePlainText(inlines: []const ast.Inline, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
