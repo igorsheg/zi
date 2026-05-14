@@ -1,6 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("process_reactor_types.zig");
-const engine_backend = @import("process_reactor_engine.zig");
+
+const backend = switch (builtin.os.tag) {
+    .macos, .ios, .visionos => @import("process_reactor_kqueue.zig"),
+    else => @import("process_reactor_engine.zig"),
+};
 
 pub const ProcessId = types.ProcessId;
 pub const EnvPair = types.EnvPair;
@@ -8,7 +13,7 @@ pub const SpawnRequest = types.SpawnRequest;
 pub const WriteRequest = types.WriteRequest;
 pub const Request = types.Request;
 pub const Event = types.Event;
-pub const Reactor = engine_backend.Reactor;
+pub const Reactor = backend.Reactor;
 
 test "process reactor request and event payloads own memory" {
     const allocator = std.testing.allocator;
