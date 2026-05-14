@@ -7,12 +7,22 @@ pub const Deadline = struct {
         return .{ .ns = nowNs(io) + @as(i128, @intCast(ms)) * std.time.ns_per_ms };
     }
 
+    pub fn afterNs(io: std.Io, ns: u64) Deadline {
+        return .{ .ns = nowNs(io) + @as(i128, @intCast(ns)) };
+    }
+
     pub fn expired(self: Deadline, io: std.Io) bool {
         return self.ns <= nowNs(io);
     }
 
     pub fn remainingMs(self: Deadline, io: std.Io, max_ms: i32) i32 {
         return remainingMsFromNow(self.ns, nowNs(io), max_ms);
+    }
+
+    pub fn remainingNs(self: Deadline, io: std.Io) i96 {
+        const now_ns = nowNs(io);
+        if (self.ns <= now_ns) return 0;
+        return @intCast(self.ns - now_ns);
     }
 };
 

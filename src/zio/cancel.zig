@@ -1,5 +1,6 @@
 const std = @import("std");
 const wake = @import("wake.zig");
+const deadline = @import("deadline.zig");
 
 pub const Token = struct {
     controller: ?*Source,
@@ -67,10 +68,7 @@ pub const Token = struct {
             return if (timeout_ns == null) .none else .timeout;
         };
 
-        const deadline_ns: ?i128 = if (timeout_ns) |timeout|
-            @as(i128, @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds())) + @as(i128, @intCast(timeout))
-        else
-            null;
+        const wait_deadline = if (timeout_ns) |timeout| deadline.Deadline.afterNs(io, timeout) else null;
 
         controller.mutex.lockUncancelable(io);
         defer controller.mutex.unlock(io);
@@ -81,10 +79,9 @@ pub const Token = struct {
                 if (pred(predicate_ctx)) return .predicate;
             }
 
-            if (deadline_ns) |deadline| {
-                const now = @as(i128, @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds()));
-                if (now >= deadline) return .timeout;
-                const remaining = @as(i96, @intCast(deadline - now));
+            if (wait_deadline) |limit| {
+                if (limit.expired(io)) return .timeout;
+                const remaining = limit.remainingNs(io);
                 controller.mutex.unlock(io);
                 io.sleep(.fromNanoseconds(remaining), .awake) catch {};
                 controller.mutex.lockUncancelable(io);
