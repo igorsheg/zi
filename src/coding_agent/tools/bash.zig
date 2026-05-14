@@ -3,7 +3,8 @@ const protocol = @import("../../agent/types.zig");
 const json_util = @import("../../ai/json_util.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
-const runtime_process = @import("../../zio/root.zig").process;
+const zio = @import("../../zio/root.zig");
+const runtime_process = zio.process;
 
 const MAX_CAPTURE_BYTES: usize = 50 * 1024;
 const STREAM_UPDATE_INTERVAL_MS: i128 = 100;
@@ -151,7 +152,7 @@ const StreamEmitter = struct {
         };
         appendBounded(self.allocator, list, bytes, MAX_CAPTURE_BYTES) catch return;
 
-        const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        const now_ms = @divFloor(zio.deadline.nowNs(self.io), std.time.ns_per_ms);
         if (now_ms - self.last_emit_ms < STREAM_UPDATE_INTERVAL_MS) return;
         self.last_emit_ms = now_ms;
         self.emitLocked();
