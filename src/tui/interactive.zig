@@ -547,7 +547,7 @@ pub const Interactive = struct {
                 self.cancelTranscriptSelection();
             }
 
-            const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+            const now_ns = zio.deadline.nowNs(std.Options.debug_io);
             if (self.tui.tickAnimations(now_ns)) {
                 self.tui.dirty = true;
             }
@@ -641,7 +641,7 @@ pub const Interactive = struct {
 
     fn maybeLogMemory(self: *Interactive, label: []const u8) void {
         if (!self.memory_log_enabled) return;
-        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(self.io, .awake).toNanoseconds()));
+        const now_ns = zio.deadline.nowNs(self.io);
         if (self.last_memory_log_ns != 0 and now_ns - self.last_memory_log_ns < memory_telemetry.log_interval_ns) return;
         self.last_memory_log_ns = now_ns;
         memory_telemetry.log(self, label);
