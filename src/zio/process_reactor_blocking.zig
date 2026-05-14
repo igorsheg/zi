@@ -5,9 +5,10 @@ const process_env = @import("process_env.zig");
 const task_mod = @import("task.zig");
 const logging = @import("../logging.zig");
 const types = @import("process_reactor_types.zig");
+const common = @import("process_reactor_common.zig");
 
 const log = std.log.scoped(.zio_process_reactor);
-const Stream = enum { stdout, stderr };
+const Stream = common.Stream;
 
 pub const Reactor = struct {
     allocator: std.mem.Allocator,
@@ -215,15 +216,7 @@ pub const Reactor = struct {
     }
 
     fn publish(self: *Reactor, event: types.Event) bool {
-        var current = event;
-        return switch (self.events.trySend(current)) {
-            .ok, .dropped => true,
-            .closed, .full, .oom => |returned| {
-                current = returned;
-                current.deinit(self.allocator);
-                return false;
-            },
-        };
+        return common.publishEvent(self.allocator, &self.events, event);
     }
 
     fn destroyProcesses(self: *Reactor) void {
@@ -338,11 +331,7 @@ const Process = struct {
         while (true) {
             const n = std.posix.read(file.handle, &buf) catch break;
             if (n == 0) break;
-            const bytes = self.reactor.allocator.dupe(u8, buf[0..n]) catch break;
-            _ = self.reactor.publish(switch (stream) {
-                .stdout => .{ .stdout = .{ .id = self.id, .bytes = bytes } },
-                .stderr => .{ .stderr = .{ .id = self.id, .bytes = bytes } },
-            });
+            _ = common.publishOutput(self.reactor.allocator, &self.reactor.events, self.id, stream, buf[0..n]) catch break;
         }
         switch (stream) {
             .stdout => self.stdout_open.store(false, .release),

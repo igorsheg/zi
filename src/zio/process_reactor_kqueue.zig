@@ -1,15 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process_common = @import("process_common.zig");
-const process_env = @import("process_env.zig");
 const logging = @import("../logging.zig");
 const types = @import("process_reactor_types.zig");
+const common = @import("process_reactor_common.zig");
 
 const log = std.log.scoped(.zio_process_reactor);
 const posix = std.posix;
 
 const WatchKind = enum(u3) { requests, stdout, stderr, process, timeout, kill_grace, cancel };
-const Stream = enum { stdout, stderr };
+const Stream = common.Stream;
 
 pub const Reactor = struct {
     allocator: std.mem.Allocator,
@@ -267,12 +267,7 @@ pub const Reactor = struct {
             }
             return;
         }
-        const bytes = try self.allocator.dupe(u8, buf[0..n]);
-        const event: types.Event = switch (stream) {
-            .stdout => .{ .stdout = .{ .id = process.id, .bytes = bytes } },
-            .stderr => .{ .stderr = .{ .id = process.id, .bytes = bytes } },
-        };
-        _ = self.publish(event);
+        _ = try common.publishOutput(self.allocator, &self.events, process.id, stream, buf[0..n]);
     }
 
     fn reapFinished(self: *Reactor) void {
@@ -301,15 +296,7 @@ pub const Reactor = struct {
     }
 
     fn publish(self: *Reactor, event: types.Event) bool {
-        var current = event;
-        return switch (self.events.trySend(current)) {
-            .ok, .dropped => true,
-            .closed, .full, .oom => |returned| {
-                current = returned;
-                current.deinit(self.allocator);
-                return false;
-            },
-        };
+        return common.publishEvent(self.allocator, &self.events, event);
     }
 
     fn destroyProcesses(self: *Reactor) void {
@@ -343,35 +330,17 @@ const Process = struct {
     term: ?std.process.Child.Term = null,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, request: types.SpawnRequest) !Process {
-        var owned = try request.clone(allocator);
-        errdefer owned.deinit(allocator);
-        var env_map_storage = process_env.buildMap(std.heap.page_allocator, owned.env, owned.clear_env) catch return error.EnvironmentBuildFailed;
-        defer if (env_map_storage) |*env_map| env_map.deinit();
-        var child = try std.process.spawn(io, .{
-            .argv = owned.argv,
-            .cwd = if (owned.cwd) |cwd| .{ .path = cwd } else .inherit,
-            .environ_map = if (env_map_storage) |*env_map| env_map else null,
-            .stdin = if (owned.stdin) .pipe else .ignore,
-            .stdout = if (owned.stdout) .pipe else .ignore,
-            .stderr = if (owned.stderr) .pipe else .ignore,
-            .pgid = if (owned.process_group and process_common.supportsProcessGroups()) 0 else null,
-        });
-        const stdin_file = child.stdin;
-        const stdout_file = child.stdout;
-        const stderr_file = child.stderr;
-        child.stdin = null;
-        child.stdout = null;
-        child.stderr = null;
+        const spawned = try common.SpawnedChild.init(allocator, io, request);
         return .{
-            .id = owned.id,
-            .request = owned,
-            .child = child,
-            .pid = child.id.?,
-            .stdin_file = stdin_file,
-            .stdout_file = stdout_file,
-            .stderr_file = stderr_file,
-            .stdout_open = stdout_file != null,
-            .stderr_open = stderr_file != null,
+            .id = spawned.request.id,
+            .request = spawned.request,
+            .child = spawned.child,
+            .pid = spawned.pid,
+            .stdin_file = spawned.stdin_file,
+            .stdout_file = spawned.stdout_file,
+            .stderr_file = spawned.stderr_file,
+            .stdout_open = spawned.stdout_file != null,
+            .stderr_open = spawned.stderr_file != null,
         };
     }
 
@@ -385,27 +354,22 @@ const Process = struct {
 
     fn forceReap(self: *Process, io: std.Io) void {
         if (!self.process_alive) return;
-        process_common.killChild(self.pid, self.request.process_group, .KILL);
-        _ = self.child.wait(io) catch null;
-        self.process_alive = false;
+        common.forceReap(io, &self.child, self.pid, self.request.process_group, &self.process_alive);
     }
 
     fn closeStdin(self: *Process, io: std.Io) void {
-        if (self.stdin_file) |file| file.close(io);
-        self.stdin_file = null;
+        common.closeFile(io, &self.stdin_file);
     }
 
     fn closeStdout(self: *Process, io: std.Io) void {
         // Closing the fd removes its EVFILT_READ watch from this kqueue on Darwin.
-        if (self.stdout_file) |file| file.close(io);
-        self.stdout_file = null;
+        common.closeFile(io, &self.stdout_file);
         self.stdout_open = false;
     }
 
     fn closeStderr(self: *Process, io: std.Io) void {
         // Closing the fd removes its EVFILT_READ watch from this kqueue on Darwin.
-        if (self.stderr_file) |file| file.close(io);
-        self.stderr_file = null;
+        common.closeFile(io, &self.stderr_file);
         self.stderr_open = false;
     }
 };

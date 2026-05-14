@@ -4,13 +4,14 @@ const process_common = @import("process_common.zig");
 const process_env = @import("process_env.zig");
 const logging = @import("../logging.zig");
 const types = @import("process_reactor_types.zig");
+const common = @import("process_reactor_common.zig");
 
 const log = std.log.scoped(.zio_process_reactor);
 const linux = std.os.linux;
 const posix = std.posix;
 
 const WatchKind = enum(u3) { requests, stdout, stderr, process, timeout, kill_grace, cancel };
-const Stream = enum { stdout, stderr };
+const Stream = common.Stream;
 const Watch = struct { kind: WatchKind, id: types.ProcessId };
 
 pub const Reactor = struct {
@@ -266,12 +267,7 @@ pub const Reactor = struct {
             }
             return;
         }
-        const bytes = try self.allocator.dupe(u8, buf[0..n]);
-        const event: types.Event = switch (stream) {
-            .stdout => .{ .stdout = .{ .id = process.id, .bytes = bytes } },
-            .stderr => .{ .stderr = .{ .id = process.id, .bytes = bytes } },
-        };
-        _ = self.publish(event);
+        _ = try common.publishOutput(self.allocator, &self.events, process.id, stream, buf[0..n]);
     }
 
     fn reapFinished(self: *Reactor) void {
@@ -300,15 +296,7 @@ pub const Reactor = struct {
     }
 
     fn publish(self: *Reactor, event: types.Event) bool {
-        var current = event;
-        return switch (self.events.trySend(current)) {
-            .ok, .dropped => true,
-            .closed, .full, .oom => |returned| {
-                current = returned;
-                current.deinit(self.allocator);
-                return false;
-            },
-        };
+        return common.publishEvent(self.allocator, &self.events, event);
     }
 
     fn destroyProcesses(self: *Reactor) void {
