@@ -13,6 +13,7 @@ const tool_display_mod = @import("../../transcript/tool_display.zig");
 const ai_complete_worker_mod = @import("../../../coding_agent/extensions/ai_complete_worker.zig");
 const system_worker_mod = @import("../../../coding_agent/extensions/system_worker.zig");
 const job_manager_mod = @import("job_manager.zig");
+const conversation_publish = @import("../conversation_publish.zig");
 const log = std.log.scoped(.tui_interactive);
 
 const Interactive = @import("../../interactive.zig").Interactive;
@@ -34,6 +35,7 @@ pub const AgentRuntime = struct {
     snapshot_event_queue: *queues_mod.UiSnapshotQueue,
     lifecycle_event_queue: *queues_mod.UiLifecycleQueue,
     snapshot_coalesced_dropped: *usize,
+    last_published_queued_version: *u64,
     resolver: *tool_display_mod.ToolRendererResolver,
     ai_complete_worker: *?ai_complete_worker_mod.AiCompleteWorker,
     system_worker: *?system_worker_mod.SystemWorker,
@@ -51,6 +53,7 @@ pub const AgentRuntime = struct {
             .snapshot_event_queue = &self.snapshot_event_queue,
             .lifecycle_event_queue = &self.lifecycle_event_queue,
             .snapshot_coalesced_dropped = &self.snapshot_coalesced_dropped,
+            .last_published_queued_version = &self.last_published_queued_version,
             .resolver = &self.resolver,
             .ai_complete_worker = &self.ai_complete_worker,
             .system_worker = &self.system_worker,
@@ -124,10 +127,10 @@ pub const AgentRuntime = struct {
         self.ui().handleResumeSession(path, restore_session_model);
     }
     pub fn publishConversationState(self: *AgentRuntime) bool {
-        return self.ui().publishConversationState();
+        return conversation_publish.publishConversationStateWithPublisher(self.conversationPublisher());
     }
     pub fn publishQueuedSnapshotIfChanged(self: *AgentRuntime) void {
-        self.ui().publishQueuedSnapshotIfChanged();
+        conversation_publish.publishQueuedSnapshotIfChangedWithPublisher(self.conversationPublisher());
     }
     pub fn handleSetModel(self: *AgentRuntime, m: anytype) void {
         self.ui().handleSetModel(m);
@@ -165,7 +168,24 @@ pub const AgentRuntime = struct {
             .dropped => unreachable,
         }
     }
+
+    fn conversationPublisher(self: *AgentRuntime) conversation_publish.Publisher {
+        return .{
+            .runtime_host = self.runtime_host,
+            .publish_snapshot = &publishConversationSnapshotFromRuntime,
+            .publish_ctx = @ptrCast(self),
+            .last_published_queued_version = self.last_published_queued_version,
+        };
+    }
 };
+
+fn publishConversationSnapshotFromRuntime(ctx: ?*anyopaque, event: conversation_publish.Publisher.UiSnapshot) bool {
+    const self: *AgentRuntime = @ptrCast(@alignCast(ctx.?));
+    return switch (event) {
+        .conversation => |snapshot| self.publishSnapshotUiEvent(.{ .conversation_snapshot = snapshot }),
+        .queued => |snapshot| self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot }),
+    };
+}
 
 fn sameEventTag(item: *const UiEvent, ctx: ?*anyopaque) bool {
     const target: *const UiEvent = @ptrCast(@alignCast(ctx.?));
