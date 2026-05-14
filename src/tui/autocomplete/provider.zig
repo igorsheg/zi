@@ -2,6 +2,7 @@ const std = @import("std");
 const search = @import("../../search/root.zig");
 const select_list_mod = @import("../components/select_list.zig");
 const slash_commands_mod = @import("../../coding_agent/slash_commands.zig");
+const deadline = @import("../../zio/root.zig").deadline;
 
 const SelectItem = select_list_mod.SelectItem;
 const CommandRegistry = slash_commands_mod.CommandRegistry;
@@ -622,7 +623,7 @@ pub const CombinedAutocompleteProvider = struct {
         self.async_search.is_quoted_prefix = plan.is_quoted_prefix;
         self.async_search.refresh_mode = plan.refresh_mode;
         self.async_search.auto_accept_single_on_tab = plan.auto_accept_single_on_tab;
-        self.async_search.debounce_until_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + if (plan.refresh_mode == .force) @as(i128, 0) else attachment_debounce_ns;
+        self.async_search.debounce_until_ns = deadline.nowNs(std.Options.debug_io) + if (plan.refresh_mode == .force) @as(i128, 0) else attachment_debounce_ns;
         self.async_search.phase = if (plan.refresh_mode == .force) .scanning else .debouncing;
         if (plan.refresh_mode == .force) {
             _ = self.startAsyncSearchProcess();
