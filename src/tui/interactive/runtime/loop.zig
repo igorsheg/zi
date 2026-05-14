@@ -34,7 +34,6 @@ pub const submitExtensionAsyncFromRunner = extensionAsyncDispatcher;
 pub const dispatchExtensionOAuthRefresh = dispatchExtensionOAuthRefreshViaRequestQueue;
 
 pub const AgentRuntime = struct {
-    ui_ptr: *anyopaque,
     msg_allocator: std.mem.Allocator,
     runtime_host: *RuntimeHost,
     request_queue: *coding_agent_mod.RequestQueue,
@@ -54,7 +53,6 @@ pub const AgentRuntime = struct {
 
     pub fn init(self: *Interactive) AgentRuntime {
         return .{
-            .ui_ptr = @ptrCast(self),
             .msg_allocator = self.msg_allocator,
             .runtime_host = &self.runtime_host,
             .request_queue = &self.request_queue,
@@ -75,10 +73,6 @@ pub const AgentRuntime = struct {
     pub fn deinit(self: *AgentRuntime) void {
         for (self.extension_deferred_user_prompts.items) |prompt| self.msg_allocator.free(prompt);
         self.extension_deferred_user_prompts.deinit(self.msg_allocator);
-    }
-
-    fn ui(self: *AgentRuntime) *Interactive {
-        return @ptrCast(@alignCast(self.ui_ptr));
     }
 
     pub fn publishLifecycleUiEvent(self: *AgentRuntime, event: UiEvent) bool {
@@ -144,10 +138,10 @@ pub const AgentRuntime = struct {
         conversation_publish.publishQueuedSnapshotIfChangedWithPublisher(self.conversationPublisher());
     }
     pub fn handleSetModel(self: *AgentRuntime, m: anytype) void {
-        self.ui().handleSetModel(m);
+        self.enqueueUiOwnerRequest(.{ .set_model_pattern = self.msg_allocator.dupe(u8, m.id) catch return });
     }
     pub fn handleSetModelPattern(self: *AgentRuntime, pattern: []const u8) void {
-        self.ui().handleSetModelPattern(pattern);
+        self.enqueueUiOwnerRequest(.{ .set_model_pattern = self.msg_allocator.dupe(u8, pattern) catch return });
     }
     pub fn publishThemeSnapshot(self: *AgentRuntime) void {
         theme_flow.publishSnapshotWithPublisher(self.runtime_host, self);
@@ -159,7 +153,7 @@ pub const AgentRuntime = struct {
         model_requests_mod.publishStatusSnapshotWithPublisher(self.modelSnapshotPublisher());
     }
     pub fn handleSetThinkingLevel(self: *AgentRuntime, level: anytype) void {
-        self.ui().handleSetThinkingLevel(level);
+        self.enqueueUiOwnerRequest(.{ .set_thinking_level = level });
     }
     pub fn discardAgentRequests(self: *AgentRuntime, requests: []AgentRequest) void {
         discardRequests(self.msg_allocator, requests);

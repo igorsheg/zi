@@ -101,13 +101,16 @@ pub const UiOwnerRequest = union(enum) {
     new_session,
     fork_session: []const u8,
     resume_session: struct { path: []const u8, restore_session_model: bool },
+    set_model_pattern: []const u8,
+    set_thinking_level: agent_protocol.ThinkingLevel,
 
     pub fn deinit(self: *UiOwnerRequest, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .manual_compact => |instructions| if (instructions) |bytes| allocator.free(bytes),
             .fork_session => |entry_id| allocator.free(entry_id),
             .resume_session => |payload| allocator.free(payload.path),
-            .new_session => {},
+            .set_model_pattern => |pattern| allocator.free(pattern),
+            .new_session, .set_thinking_level => {},
         }
         self.* = undefined;
     }
@@ -633,6 +636,8 @@ pub const Interactive = struct {
             .new_session => self.handleNewSession(),
             .fork_session => |entry_id| self.handleForkSession(entry_id),
             .resume_session => |payload| self.handleResumeSession(payload.path, payload.restore_session_model),
+            .set_model_pattern => |pattern| self.handleSetModelPattern(pattern),
+            .set_thinking_level => |level| self.handleSetThinkingLevel(level),
         };
         self.tui.dirty = true;
         return true;
