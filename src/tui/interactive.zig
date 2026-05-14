@@ -1209,11 +1209,11 @@ pub const Interactive = struct {
     }
 
     pub fn discardAgentRequests(self: *Interactive, requests: []AgentRequest) void {
-        runtime_loop.discardRequests(self, requests);
+        runtime_loop.discardRequests(self.msg_allocator, requests);
     }
 
     pub fn discardQueuedAgentRequests(self: *Interactive) void {
-        runtime_loop.discardQueuedRequests(self);
+        runtime_loop.discardQueuedRequests(self.msg_allocator, &self.request_queue);
     }
 
     fn processAgentRequests(self: *Interactive) bool {

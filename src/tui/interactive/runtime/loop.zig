@@ -13,6 +13,7 @@ const tool_display_mod = @import("../../transcript/tool_display.zig");
 const ai_complete_worker_mod = @import("../../../coding_agent/extensions/ai_complete_worker.zig");
 const system_worker_mod = @import("../../../coding_agent/extensions/system_worker.zig");
 const job_manager_mod = @import("job_manager.zig");
+const log = std.log.scoped(.tui_interactive);
 
 const Interactive = @import("../../interactive.zig").Interactive;
 const TerminalSystemQueue = @import("../../interactive.zig").TerminalSystemQueue;
@@ -68,32 +69,108 @@ pub const AgentRuntime = struct {
     }
 
     pub fn publishLifecycleUiEvent(self: *AgentRuntime, event: UiEvent) bool {
-        return self.ui().publishLifecycleUiEvent(event);
+        switch (self.lifecycle_event_queue.trySend(event)) {
+            .ok => return true,
+            .dropped => unreachable,
+            .closed, .full, .oom => |rejected| {
+                var failed = rejected;
+                defer failed.deinit(self.msg_allocator);
+                log.warn("lifecycle queue rejected ui event", .{});
+                return false;
+            },
+        }
     }
 
     pub fn publishSnapshotUiEvent(self: *AgentRuntime, event: UiEvent) bool {
-        return self.ui().publishSnapshotUiEvent(event);
+        self.coalescePendingSnapshot(event);
+        switch (self.snapshot_event_queue.trySend(event)) {
+            .ok => return true,
+            .dropped => return false,
+            .closed, .full, .oom => |rejected| {
+                var failed = rejected;
+                failed.deinit(self.msg_allocator);
+                return false;
+            },
+        }
     }
 
-    pub fn publishExtensionCommandsUpdate(self: *AgentRuntime) void { self.ui().publishExtensionCommandsUpdate(); }
-    pub fn publishExtensionKeybindingsSnapshot(self: *AgentRuntime) void { self.ui().publishExtensionKeybindingsSnapshot(); }
-    pub fn publishPendingExtensionUi(self: *AgentRuntime) void { self.ui().publishPendingExtensionUi(); }
-    pub fn handleManualCompactRequest(self: *AgentRuntime, custom_instructions: ?[]const u8) void { self.ui().handleManualCompactRequest(custom_instructions); }
-    pub fn handleNewSession(self: *AgentRuntime) void { self.ui().handleNewSession(); }
-    pub fn handleForkSession(self: *AgentRuntime, entry_id: []const u8) void { self.ui().handleForkSession(entry_id); }
-    pub fn handleResumeSession(self: *AgentRuntime, path: []const u8, restore_session_model: bool) void { self.ui().handleResumeSession(path, restore_session_model); }
-    pub fn publishConversationState(self: *AgentRuntime) bool { return self.ui().publishConversationState(); }
-    pub fn publishQueuedSnapshotIfChanged(self: *AgentRuntime) void { self.ui().publishQueuedSnapshotIfChanged(); }
-    pub fn handleSetModel(self: *AgentRuntime, m: anytype) void { self.ui().handleSetModel(m); }
-    pub fn handleSetModelPattern(self: *AgentRuntime, pattern: []const u8) void { self.ui().handleSetModelPattern(pattern); }
-    pub fn publishThemeSnapshot(self: *AgentRuntime) void { self.ui().publishThemeSnapshot(); }
-    pub fn publishVisibleModelsSnapshot(self: *AgentRuntime) void { self.ui().publishVisibleModelsSnapshot(); }
-    pub fn publishStatusSnapshot(self: *AgentRuntime) void { self.ui().publishStatusSnapshot(); }
-    pub fn handleSetThinkingLevel(self: *AgentRuntime, level: anytype) void { self.ui().handleSetThinkingLevel(level); }
-    pub fn discardAgentRequests(self: *AgentRuntime, requests: []AgentRequest) void { discardRequests(self.ui(), requests); }
-    pub fn discardQueuedAgentRequests(self: *AgentRuntime) void { discardQueuedRequests(self.ui()); }
-    pub fn enqueueTerminalSystem(self: *AgentRuntime, id: extension_runner_mod.AsyncOpId, request: extension_runner_mod.SystemRequest) !void { try self.ui().enqueueTerminalSystem(id, request); }
+    fn coalescePendingSnapshot(self: *AgentRuntime, event: UiEvent) void {
+        const dropped = switch (event) {
+            .conversation_snapshot, .queued_snapshot, .status_snapshot => self.snapshot_event_queue.dropMatching(sameEventTag, @constCast(&event)),
+            else => 0,
+        };
+        self.snapshot_coalesced_dropped.* += dropped;
+    }
+
+    pub fn publishExtensionCommandsUpdate(self: *AgentRuntime) void {
+        self.ui().publishExtensionCommandsUpdate();
+    }
+    pub fn publishExtensionKeybindingsSnapshot(self: *AgentRuntime) void {
+        self.ui().publishExtensionKeybindingsSnapshot();
+    }
+    pub fn publishPendingExtensionUi(self: *AgentRuntime) void {
+        self.ui().publishPendingExtensionUi();
+    }
+    pub fn handleManualCompactRequest(self: *AgentRuntime, custom_instructions: ?[]const u8) void {
+        self.ui().handleManualCompactRequest(custom_instructions);
+    }
+    pub fn handleNewSession(self: *AgentRuntime) void {
+        self.ui().handleNewSession();
+    }
+    pub fn handleForkSession(self: *AgentRuntime, entry_id: []const u8) void {
+        self.ui().handleForkSession(entry_id);
+    }
+    pub fn handleResumeSession(self: *AgentRuntime, path: []const u8, restore_session_model: bool) void {
+        self.ui().handleResumeSession(path, restore_session_model);
+    }
+    pub fn publishConversationState(self: *AgentRuntime) bool {
+        return self.ui().publishConversationState();
+    }
+    pub fn publishQueuedSnapshotIfChanged(self: *AgentRuntime) void {
+        self.ui().publishQueuedSnapshotIfChanged();
+    }
+    pub fn handleSetModel(self: *AgentRuntime, m: anytype) void {
+        self.ui().handleSetModel(m);
+    }
+    pub fn handleSetModelPattern(self: *AgentRuntime, pattern: []const u8) void {
+        self.ui().handleSetModelPattern(pattern);
+    }
+    pub fn publishThemeSnapshot(self: *AgentRuntime) void {
+        self.ui().publishThemeSnapshot();
+    }
+    pub fn publishVisibleModelsSnapshot(self: *AgentRuntime) void {
+        self.ui().publishVisibleModelsSnapshot();
+    }
+    pub fn publishStatusSnapshot(self: *AgentRuntime) void {
+        self.ui().publishStatusSnapshot();
+    }
+    pub fn handleSetThinkingLevel(self: *AgentRuntime, level: anytype) void {
+        self.ui().handleSetThinkingLevel(level);
+    }
+    pub fn discardAgentRequests(self: *AgentRuntime, requests: []AgentRequest) void {
+        discardRequests(self.msg_allocator, requests);
+    }
+    pub fn discardQueuedAgentRequests(self: *AgentRuntime) void {
+        discardQueuedRequests(self.msg_allocator, self.request_queue);
+    }
+    pub fn enqueueTerminalSystem(self: *AgentRuntime, id: extension_runner_mod.AsyncOpId, request: extension_runner_mod.SystemRequest) !void {
+        const cloned = try request.clone(self.msg_allocator);
+        switch (self.terminal_system_queue.trySend(.{ .id = id, .system = cloned })) {
+            .ok => {},
+            .full, .closed, .oom => |rejected| {
+                var failed = rejected;
+                failed.deinit(self.msg_allocator);
+                return error.TerminalSystemQueueUnavailable;
+            },
+            .dropped => unreachable,
+        }
+    }
 };
+
+fn sameEventTag(item: *const UiEvent, ctx: ?*anyopaque) bool {
+    const target: *const UiEvent = @ptrCast(@alignCast(ctx.?));
+    return std.meta.activeTag(item.*) == std.meta.activeTag(target.*);
+}
 
 pub fn enqueueShutdown(self: *Interactive) void {
     switch (self.request_queue.trySend(.{ .shutdown = {} })) {
@@ -103,16 +180,16 @@ pub fn enqueueShutdown(self: *Interactive) void {
 }
 
 // Agent thread mutates session and extension state. UI code sends requests through queues.
-pub fn discardRequests(self: *Interactive, requests: []AgentRequest) void {
-    for (requests) |*req| req.deinit(self.msg_allocator);
+pub fn discardRequests(allocator: std.mem.Allocator, requests: []AgentRequest) void {
+    for (requests) |*req| req.deinit(allocator);
 }
 
-pub fn discardQueuedRequests(self: *Interactive) void {
+pub fn discardQueuedRequests(allocator: std.mem.Allocator, request_queue: *coding_agent_mod.RequestQueue) void {
     var buf: [16]AgentRequest = undefined;
     while (true) {
-        const n = self.request_queue.drainInto(&buf);
+        const n = request_queue.drainInto(&buf);
         if (n == 0) return;
-        discardRequests(self, buf[0..n]);
+        discardRequests(allocator, buf[0..n]);
     }
 }
 
