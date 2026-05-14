@@ -28,7 +28,6 @@ const agent_session_core_mod = @import("agent_session/core.zig");
 const extension_ui = @import("extensions/ui.zig");
 const session_event_mod = @import("session_event.zig");
 const zio = @import("../zio/root.zig");
-const cancel_waiter = @import("../zio/cancel_waiter.zig");
 
 const protocol = agent_mod.protocol;
 const Agent = agent_mod.Agent;
@@ -668,16 +667,22 @@ pub const AgentSession = struct {
     };
 
     const LinkedSideAbort = struct {
-        waiter: cancel_waiter.Waiter = .{},
+        token: zio.cancel.Token = zio.cancel.Token.none,
+        node: ?*zio.cancel.Token.CallbackNode = null,
 
         fn start(io: std.Io, signal: zio.cancel.Token, core: *agent_session_core_mod.AgentSessionCore) LinkedSideAbort {
+            _ = io;
             if (signal.isNone()) return .{};
-            const waiter = cancel_waiter.Waiter.start(io, signal, .{ .ptr = @ptrCast(core), .call = abort }) catch return .{};
-            return .{ .waiter = waiter };
+            const node = std.heap.page_allocator.create(zio.cancel.Token.CallbackNode) catch return .{};
+            signal.registerCallback(node, .{ .ptr = @ptrCast(core), .call = abort });
+            return .{ .token = signal, .node = node };
         }
 
         fn stop(self: *LinkedSideAbort) void {
-            self.waiter.stop();
+            if (self.node) |node| {
+                self.token.unregisterCallback(node);
+                std.heap.page_allocator.destroy(node);
+            }
             self.* = .{};
         }
 

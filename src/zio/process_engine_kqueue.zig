@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const process_common = @import("process_common.zig");
 const process_env = @import("process_env.zig");
 const types = @import("process_engine_types.zig");
-const cancel_waiter = @import("cancel_waiter.zig");
 const logging = @import("../logging.zig");
 
 pub const EnvPair = types.EnvPair;
@@ -12,7 +11,7 @@ pub const Event = types.Event;
 pub const EventSink = types.EventSink;
 pub const StartRequest = types.StartRequest;
 
-const Watch = enum(usize) { stdout = 1, stderr = 2, process = 3, timeout = 4, kill_grace = 5, wake = 6 };
+const Watch = enum(usize) { stdout = 1, stderr = 2, process = 3, timeout = 4, kill_grace = 5, wake = 6, cancel = 7 };
 
 pub const Engine = struct {
     io: std.Io,
@@ -30,7 +29,6 @@ pub const Engine = struct {
     timed_out: bool = false,
     aborted: bool = false,
     kq: ?std.posix.fd_t = null,
-    cancel_waiter: cancel_waiter.Waiter = .{},
 
     pub const StopReason = enum { requested, timeout, abort };
 
@@ -172,10 +170,8 @@ pub const Engine = struct {
         self.mutex.lockUncancelable(self.io);
         self.kq = kq;
         self.mutex.unlock(self.io);
-        self.cancel_waiter = try cancel_waiter.Waiter.start(self.io, self.request.signal, .{ .ptr = @ptrCast(self), .call = onCancel });
+        const cancel_fd = try self.request.signal.ensureWake();
         defer {
-            self.cancel_waiter.stop();
-
             self.mutex.lockUncancelable(self.io);
             self.kq = null;
             self.mutex.unlock(self.io);
@@ -193,6 +189,7 @@ pub const Engine = struct {
         try registerProcess(kq, child_pid);
         if (stdout_file) |file| try registerRead(kq, file.handle, .stdout);
         if (stderr_file) |file| try registerRead(kq, file.handle, .stderr);
+        if (cancel_fd) |fd| try registerRead(kq, fd, .cancel);
         try registerUser(kq);
         if (self.request.timeout_ms) |ms| try registerTimer(kq, .timeout, ms);
 
@@ -210,6 +207,15 @@ pub const Engine = struct {
                 const which: Watch = @enumFromInt(ev.udata);
                 switch (which) {
                     .wake => {},
+                    .cancel => {
+                        self.request.signal.acknowledgeWake();
+                        if (self.request.signal.isAborted()) {
+                            self.mutex.lockUncancelable(self.io);
+                            self.aborted = true;
+                            self.stop_requested = true;
+                            self.mutex.unlock(self.io);
+                        }
+                    },
                     .timeout => {
                         self.mutex.lockUncancelable(self.io);
                         self.timed_out = true;
@@ -296,15 +302,6 @@ pub const Engine = struct {
         self.mutex.unlock(self.io);
     }
 
-    fn onCancel(ptr: *anyopaque) void {
-        const self: *Engine = @ptrCast(@alignCast(ptr));
-        self.mutex.lockUncancelable(self.io);
-        self.aborted = true;
-        self.stop_requested = true;
-        const kq = self.kq;
-        self.mutex.unlock(self.io);
-        if (kq) |fd| triggerWake(fd);
-    }
 };
 
 fn registerProcess(kq: std.posix.fd_t, pid: std.process.Child.Id) !void {

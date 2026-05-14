@@ -2,7 +2,6 @@ const builtin = @import("builtin");
 const std = @import("std");
 pub const Token = @import("cancel.zig").Token;
 const cancel = @import("cancel.zig");
-const cancel_waiter = @import("cancel_waiter.zig");
 const process_common = @import("process_common.zig");
 const process_engine = @import("process_engine.zig");
 const process_env = @import("process_env.zig");
@@ -200,12 +199,9 @@ pub fn runInherit(io: std.Io, options: InheritOptions) RunError!std.process.Chil
         .child_id = child.id.?,
         .process_group = options.kill_scope == .process_group,
     };
-    var abort_waiter = cancel_waiter.Waiter.start(io, options.signal, .{ .ptr = @ptrCast(&abort_ctx), .call = InheritAbortCtx.abort }) catch {
-        process_common.killChild(child.id.?, options.kill_scope == .process_group, .KILL);
-        _ = child.wait(io) catch null;
-        return error.SpawnFailed;
-    };
-    defer abort_waiter.stop();
+    var abort_node: Token.CallbackNode = undefined;
+    options.signal.registerCallback(&abort_node, .{ .ptr = @ptrCast(&abort_ctx), .call = InheritAbortCtx.abort });
+    defer options.signal.unregisterCallback(&abort_node);
 
     const term = child.wait(io) catch return error.WaitFailed;
     return term;

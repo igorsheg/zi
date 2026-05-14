@@ -18,6 +18,18 @@ pub const Token = struct {
         .expected_generation = 0,
     };
 
+    pub const Callback = struct {
+        ptr: *anyopaque,
+        call: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub const CallbackNode = struct {
+        next: ?*CallbackNode = null,
+        token: Token = Token.none,
+        callback: Callback,
+        registered: bool = false,
+    };
+
     // Token validity is the Source generation, not only the aborted flag.
     pub fn isAborted(self: Token) bool {
         const controller = self.controller orelse return false;
@@ -92,9 +104,30 @@ pub const Token = struct {
         return controller.wakeReadFd();
     }
 
+    pub fn ensureWake(self: Token) !?std.posix.fd_t {
+        const controller = self.controller orelse return null;
+        return try controller.ensureWake();
+    }
+
     pub fn acknowledgeWake(self: Token) void {
         const controller = self.controller orelse return;
         controller.acknowledgeWake();
+    }
+
+    pub fn registerCallback(self: Token, node: *CallbackNode, callback: Callback) void {
+        const controller = self.controller orelse return;
+        controller.mutex.lockUncancelable(std.Options.debug_io);
+        defer controller.mutex.unlock(std.Options.debug_io);
+        if (controller.generation.load(.acquire) != self.expected_generation) return;
+        node.* = .{ .token = self, .callback = callback, .registered = true, .next = controller.callbacks };
+        controller.callbacks = node;
+    }
+
+    pub fn unregisterCallback(self: Token, node: *CallbackNode) void {
+        const controller = self.controller orelse return;
+        controller.mutex.lockUncancelable(std.Options.debug_io);
+        defer controller.mutex.unlock(std.Options.debug_io);
+        controller.unlinkCallbackLocked(node);
     }
 };
 
@@ -104,6 +137,7 @@ pub const Source = struct {
     aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
     wake_pipe: ?wake.Pipe = null,
+    callbacks: ?*Token.CallbackNode = null,
 
     pub fn deinit(self: *Source) void {
         if (self.wake_pipe) |*pipe| pipe.deinit();
@@ -116,6 +150,7 @@ pub const Source = struct {
         defer self.mutex.unlock(std.Options.debug_io);
 
         self.aborted.store(true, .release);
+        self.invokeCallbacksLocked();
         const next_generation = self.generation.load(.acquire) + 1;
         self.generation.store(next_generation, .release);
         self.condition.broadcast(std.Options.debug_io);
@@ -136,8 +171,12 @@ pub const Source = struct {
     }
 
     pub fn requestAbort(self: *Source) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
         self.aborted.store(true, .release);
-        self.notifyWaiters();
+        self.condition.broadcast(std.Options.debug_io);
+        self.signalWakeLocked(std.Options.debug_io);
+        self.invokeCallbacksLocked();
+        self.mutex.unlock(std.Options.debug_io);
     }
 
     pub fn notifyWaiters(self: *Source) void {
@@ -172,6 +211,28 @@ pub const Source = struct {
 
     fn signalWakeLocked(self: *Source, io: std.Io) void {
         if (self.wake_pipe) |pipe| _ = pipe.signal(io);
+    }
+
+    fn invokeCallbacksLocked(self: *Source) void {
+        var node = self.callbacks;
+        while (node) |current| : (node = current.next) {
+            if (current.registered and current.token.expected_generation == self.generation.load(.acquire)) {
+                current.callback.call(current.callback.ptr);
+            }
+        }
+    }
+
+    fn unlinkCallbackLocked(self: *Source, node: *Token.CallbackNode) void {
+        var link = &self.callbacks;
+        while (link.*) |current| {
+            if (current == node) {
+                link.* = current.next;
+                node.registered = false;
+                node.next = null;
+                return;
+            }
+            link = &current.next;
+        }
     }
 
     pub fn isAborted(self: *const Source) bool {
@@ -237,4 +298,28 @@ test "Source exposes pollable cancellation wake" {
     token.acknowledgeWake();
     pfd[0].revents = 0;
     try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&pfd, 0));
+}
+
+test "Token cancellation callbacks run without helper threads and unregister cleanly" {
+    const Ctx = struct {
+        count: u32 = 0,
+        fn callback(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.count += 1;
+        }
+    };
+
+    var source = Source{};
+    defer source.deinit();
+    const token = source.beginRun();
+    var ctx = Ctx{};
+    var node: Token.CallbackNode = undefined;
+
+    token.registerCallback(&node, .{ .ptr = @ptrCast(&ctx), .call = Ctx.callback });
+    source.requestAbort();
+    try std.testing.expectEqual(@as(u32, 1), ctx.count);
+
+    token.unregisterCallback(&node);
+    source.requestAbort();
+    try std.testing.expectEqual(@as(u32, 1), ctx.count);
 }
