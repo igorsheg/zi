@@ -203,7 +203,7 @@ fn sendUserMessageFromExtension(
     text: []const u8,
     opts: extension_runner_mod.SendUserMessageOptions,
 ) anyerror!extension_runner_mod.SendUserMessageResult {
-    const self: *@import("../interactive.zig").Interactive = @ptrCast(@alignCast(ctx));
+    const self: *@import("runtime/loop.zig").AgentRuntime = @ptrCast(@alignCast(ctx));
     const streaming = self.runtime_host.currentSession().agent.isStreaming();
     const target = switch (opts.target) {
         .auto => if (streaming) extension_runner_mod.UserMessageTarget.steering else .prompt,

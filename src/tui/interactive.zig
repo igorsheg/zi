@@ -94,7 +94,7 @@ pub const TerminalSystemRequest = struct {
         self.* = undefined;
     }
 };
-const TerminalSystemQueue = queue_mod.Queue(TerminalSystemRequest, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } }, .wakeup = .pipe });
+pub const TerminalSystemQueue = queue_mod.Queue(TerminalSystemRequest, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } }, .wakeup = .pipe });
 const UiSnapshotQueue = queues_mod.UiSnapshotQueue;
 const UiLifecycleQueue = queues_mod.UiLifecycleQueue;
 const PublishedStatusSnapshot = status_snapshot_mod.PublishedStatusSnapshot;
@@ -268,7 +268,6 @@ pub const Interactive = struct {
     logs_overlay: ScrollTextOverlay,
     extension_keybindings: std.ArrayListUnmanaged(ui_event_mod.ExtensionKeybindingEntry) = .empty,
     extension_command_actions: extension_runner_mod.ExtensionCommandActions = undefined,
-    extension_deferred_user_prompts: std.ArrayListUnmanaged([]u8) = .empty,
 
     resume_picker_flow: ?ResumePickerFlow = null,
     resume_picker_generation: u64 = 0,
@@ -302,6 +301,7 @@ pub const Interactive = struct {
     lifecycle_event_queue: UiLifecycleQueue,
 
     request_queue: RequestQueue,
+    agent_runtime: ?runtime_loop.AgentRuntime = null,
     job_manager: job_manager_mod.JobManager,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
     session_event_token: ?RuntimeHost.EventSubscriptionToken = null,
@@ -433,8 +433,7 @@ pub const Interactive = struct {
         if (self.autocomplete_provider_bound) self.autocomplete_provider.deinit();
         self.clearExtensionKeybindings();
         self.extension_keybindings.deinit(self.allocator);
-        for (self.extension_deferred_user_prompts.items) |prompt| self.msg_allocator.free(prompt);
-        self.extension_deferred_user_prompts.deinit(self.msg_allocator);
+        if (self.agent_runtime) |*agent_runtime| agent_runtime.deinit();
         self.command_registry.deinit();
         self.runtime_host.deinit();
         if (self.last_published_status_snapshot) |*snapshot| {
@@ -473,9 +472,10 @@ pub const Interactive = struct {
 
     fn startAgentThread(self: *Interactive) !void {
         if (self.agent_tasks != null) return;
+        self.agent_runtime = runtime_loop.AgentRuntime.init(self);
         var tasks = zio.task.Group.init(self.allocator);
         errdefer tasks.cancel();
-        try tasks.spawnThread(runtime_loop.agentThread, .{self});
+        try tasks.spawnThread(runtime_loop.agentThread, .{&self.agent_runtime.?});
         self.agent_tasks = tasks;
     }
 
