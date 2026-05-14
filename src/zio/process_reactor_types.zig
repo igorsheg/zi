@@ -1,10 +1,12 @@
 const std = @import("std");
 const queue_mod = @import("queue.zig");
-const process_engine = @import("process_engine.zig");
 
 pub const ProcessId = u64;
 
-pub const EnvPair = process_engine.EnvPair;
+pub const EnvPair = struct {
+    key: []const u8,
+    value: []const u8,
+};
 
 pub const SpawnRequest = struct {
     id: ProcessId,

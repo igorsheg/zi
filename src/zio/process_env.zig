@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const runtime_env = @import("env");
-const types = @import("process_engine_types.zig");
+const types = @import("process_reactor_types.zig");
 
 pub const EnvPair = types.EnvPair;
 

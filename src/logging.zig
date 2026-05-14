@@ -34,7 +34,6 @@ pub const ThreadLabel = enum {
     session_index,
     zio_worker,
     process_reactor,
-    process_engine,
     batch,
     @"test",
 };
