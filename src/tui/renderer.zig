@@ -4,6 +4,7 @@ const ansi = @import("terminal/ansi.zig");
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("primitives/surface.zig");
 const grapheme_mod = @import("grapheme.zig");
+const deadline = @import("../zio/root.zig").deadline;
 const Cell = cell_mod.Cell;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
@@ -14,7 +15,7 @@ const min_retained_output_capacity: usize = 2 * 1024 * 1024;
 const max_retained_output_capacity: usize = 8 * 1024 * 1024;
 
 fn nowUs() i64 {
-    const ns = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
+    const ns = deadline.nowNs(std.Options.debug_io);
     return @intCast(@divTrunc(ns, 1000));
 }
 
