@@ -173,7 +173,10 @@ pub const Reactor = struct {
             for (batch[0..count]) |*request| {
                 defer request.deinit(self.allocator);
                 switch (request.*) {
-                    .spawn => |spawn_request| self.handleSpawn(kq, spawn_request) catch |err| log.warn("spawn request failed: {}", .{err}),
+                    .spawn => |spawn_request| self.handleSpawn(kq, spawn_request) catch |err| {
+                        log.warn("spawn request failed id={d}: {}", .{ spawn_request.id, err });
+                        _ = self.publish(.{ .spawn_failed = spawn_request.id });
+                    },
                     .write => |write_request| self.handleWrite(write_request),
                     .close_stdin => |id| self.handleCloseStdin(id),
                     .stop => |id| self.handleStop(id),
@@ -191,6 +194,7 @@ pub const Reactor = struct {
             _ = self.publish(.{ .spawn_failed = request.id });
             return;
         };
+        errdefer process.forceReap(self.io);
         errdefer process.deinit(self.allocator, self.io);
 
         try registerProcess(kq, process.pid, encode(.process, process.id));
@@ -377,6 +381,13 @@ const Process = struct {
         self.closeStderr(io);
         self.request.deinit(allocator);
         self.* = undefined;
+    }
+
+    fn forceReap(self: *Process, io: std.Io) void {
+        if (!self.process_alive) return;
+        process_common.killChild(self.pid, self.request.process_group, .KILL);
+        _ = self.child.wait(io) catch null;
+        self.process_alive = false;
     }
 
     fn closeStdin(self: *Process, io: std.Io) void {

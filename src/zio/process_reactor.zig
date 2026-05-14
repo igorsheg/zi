@@ -72,3 +72,53 @@ test "process reactor stop wakes idle backend" {
     try reactor.start();
     reactor.stop();
 }
+
+test "process reactor publishes spawn_failed for duplicate process id" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    var reactor = try Reactor.init(std.testing.allocator);
+    defer reactor.deinit();
+    try reactor.start();
+    try reactor.spawn(.{ .id = 11, .argv = &.{ "/bin/sh", "-c", "sleep 1" } });
+
+    var saw_ready = false;
+    var attempts: usize = 0;
+    while (attempts < 100 and !saw_ready) : (attempts += 1) {
+        var batch: [8]Event = undefined;
+        const count = reactor.drainEvents(&batch);
+        if (count == 0) {
+            _ = try reactor.waitEvents(100);
+            continue;
+        }
+        for (batch[0..count]) |*event| {
+            defer event.deinit(std.testing.allocator);
+            switch (event.*) {
+                .ready => |id| saw_ready = saw_ready or id == 11,
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_ready);
+
+    try reactor.spawn(.{ .id = 11, .argv = &.{ "/bin/sh", "-c", "printf duplicate" } });
+
+    var saw_spawn_failed = false;
+    attempts = 0;
+    while (attempts < 100 and !saw_spawn_failed) : (attempts += 1) {
+        var batch: [8]Event = undefined;
+        const count = reactor.drainEvents(&batch);
+        if (count == 0) {
+            _ = try reactor.waitEvents(100);
+            continue;
+        }
+        for (batch[0..count]) |*event| {
+            defer event.deinit(std.testing.allocator);
+            switch (event.*) {
+                .spawn_failed => |id| saw_spawn_failed = saw_spawn_failed or id == 11,
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_spawn_failed);
+    try reactor.kill(11);
+}
