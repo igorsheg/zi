@@ -86,6 +86,7 @@ pub const RuntimeHost = struct {
     next_extension_generation: extension_runner_mod.Generation,
     session_generation: u64 = 1,
     extension_oauth_refresh_dispatcher: ?ExtensionOAuthRefreshDispatcher = null,
+    owner_thread: std.atomic.Value(std.Thread.Id) = .{ .raw = 0 },
 
     pub const AgentEventHandler = struct {
         func: *const fn (event: agent_mod.protocol.AgentEvent, ctx: ?*anyopaque) void,
@@ -139,7 +140,24 @@ pub const RuntimeHost = struct {
     }
 
     // RuntimeHost owns AgentSession and extension Lua. UI threads communicate by queue.
+    pub fn bindOwnerThread(self: *RuntimeHost, tid: std.Thread.Id) void {
+        self.owner_thread.store(tid, .release);
+    }
+
+    pub fn assertOnOwnerThread(self: *RuntimeHost) void {
+        const tid = std.Thread.getCurrentId();
+        const prev = self.owner_thread.cmpxchgStrong(0, tid, .acq_rel, .acquire);
+        const owner = prev orelse tid;
+        if (owner != tid) {
+            std.debug.panic(
+                "[zi-wub.8] RuntimeHost touched from wrong thread: this={d} owner={d}",
+                .{ tid, owner },
+            );
+        }
+    }
+
     pub fn shutdownCurrentSessionOnAgentThread(self: *RuntimeHost) void {
+        self.assertOnOwnerThread();
         self.shutdownSessionLifecycle(.exit, null, null);
     }
 
@@ -148,26 +166,31 @@ pub const RuntimeHost = struct {
     }
 
     pub fn dispatchExtensionCommand(self: *RuntimeHost, name: []const u8, args: []const u8) !void {
+        self.assertOnOwnerThread();
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchCommand(name, args);
     }
 
     pub fn dispatchExtensionKeybinding(self: *RuntimeHost, id: []const u8) !void {
+        self.assertOnOwnerThread();
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchKeybinding(id);
     }
 
     pub fn dispatchExtensionJobEvent(self: *RuntimeHost, event: extension_ui.JobEvent) !void {
+        self.assertOnOwnerThread();
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchJobEvent(event);
     }
 
     pub fn dispatchExtensionUiEvent(self: *RuntimeHost, event: extension_ui.UiEvent) !void {
+        self.assertOnOwnerThread();
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         try runner.dispatchUiEvent(event);
     }
 
     pub fn deliverExtensionAsyncEvent(self: *RuntimeHost, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) !void {
+        self.assertOnOwnerThread();
         var original = event;
         defer original.deinit(self.msg_allocator);
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
@@ -176,6 +199,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn deliverExtensionAsyncResult(self: *RuntimeHost, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) !void {
+        self.assertOnOwnerThread();
         var original = result;
         defer original.deinit(self.msg_allocator);
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
@@ -200,6 +224,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn reloadExtensionsOnAgentThread(self: *RuntimeHost) !void {
+        self.assertOnOwnerThread();
         if (self.session.agent.isStreaming() or self.session.agent.hasQueuedMessages()) return error.SessionBusy;
         if (self.session.extensionRunner()) |runner| {
             if (!runner.isReloadIdle()) return error.SessionBusy;
@@ -220,11 +245,13 @@ pub const RuntimeHost = struct {
     }
 
     pub fn dispatchExtensionOAuthLogin(self: *RuntimeHost, provider_id: []const u8, callbacks: request_mod.ExtensionOAuthLoginCallbacks) !request_mod.ExtensionOAuthLoginResponse.Result {
+        self.assertOnOwnerThread();
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         return runner.dispatchOAuthLogin(provider_id, callbacks, self.msg_allocator);
     }
 
     pub fn dispatchExtensionOAuthRefresh(self: *RuntimeHost, provider_id: []const u8, credential: auth_types.OAuthCredential, allocator: std.mem.Allocator) !oauth_mod.ExchangeResult {
+        self.assertOnOwnerThread();
         const runner = self.session.extensionRunner() orelse return error.MissingExtensionRunner;
         if (runner.isOnLuaThread()) {
             return runner.dispatchOAuthRefresh(provider_id, credential, allocator);
@@ -302,6 +329,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn restoreQueuedMessagesOnAgentThread(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
+        self.assertOnOwnerThread();
         return self.session.restoreQueuedMessagesOnAgentThread(allocator);
     }
 
@@ -310,6 +338,7 @@ pub const RuntimeHost = struct {
         kind: control_mod.QueueKind,
         text: []const u8,
     ) control_mod.EnqueueResult {
+        self.assertOnOwnerThread();
         const message: agent_mod.protocol.AgentMessage = .{ .user = .{
             .content = .{ .text = text },
             .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
@@ -325,6 +354,7 @@ pub const RuntimeHost = struct {
         kind: []const u8,
         data: ?std.json.Value,
     ) !extension_runner_mod.AppendEntryResult {
+        self.assertOnOwnerThread();
         const owned_kind = try self.session_allocator.dupe(u8, kind);
         errdefer self.session_allocator.free(owned_kind);
         const owned_data = if (data) |value| try json_util.cloneJsonValue(self.session_allocator, value) else null;
@@ -337,6 +367,7 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         message: extension_runner_mod.ExtensionCustomMessage,
     ) !extension_runner_mod.SendMessageResult {
+        self.assertOnOwnerThread();
         const owned_kind = try self.session_allocator.dupe(u8, message.kind);
         errdefer self.session_allocator.free(owned_kind);
         const text = message.text orelse "";
@@ -353,6 +384,7 @@ pub const RuntimeHost = struct {
         message: extension_runner_mod.ExtensionCustomMessage,
         opts: extension_runner_mod.SendMessageOptions,
     ) !extension_runner_mod.SendMessageResult {
+        self.assertOnOwnerThread();
         if (!message.include_in_context) {
             if (opts.mode != null) return error.Unsupported;
             return self.appendExtensionCustomMessage(message);
@@ -414,6 +446,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn takeQueuedMessagesAndClear(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {
+        self.assertOnOwnerThread();
         return self.session.restoreQueuedMessagesOnAgentThread(allocator);
     }
 
@@ -434,6 +467,7 @@ pub const RuntimeHost = struct {
     };
 
     pub fn newSession(self: *RuntimeHost) !void {
+        self.assertOnOwnerThread();
         var create_options = self.create_options;
         create_options.cwd = self.session.resource_loader.cwd;
         create_options.model = self.session.agent.modelValue();
@@ -456,6 +490,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn forkSession(self: *RuntimeHost, entry_id: []const u8) !void {
+        self.assertOnOwnerThread();
         var create_options = self.create_options;
         create_options.cwd = self.session.resource_loader.cwd;
         create_options.model = self.session.agent.modelValue();
@@ -495,6 +530,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn resumeSession(self: *RuntimeHost, path: []const u8, restore_session_model: bool) !ResumeResult {
+        self.assertOnOwnerThread();
         var loaded = try agent_session_mod.SessionStore.openForResume(self.session_allocator, path);
         defer loaded.deinit();
 
@@ -538,6 +574,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn runUserContent(self: *RuntimeHost, content: ai.protocol.UserMessage.UserMessageContent) !RunOutcome {
+        self.assertOnOwnerThread();
         const runner = self.session.extensionRunner();
         if (runner) |extension_runner| {
             if (content == .text) {
@@ -553,6 +590,7 @@ pub const RuntimeHost = struct {
     }
 
     pub fn continueTurn(self: *RuntimeHost) !RunOutcome {
+        self.assertOnOwnerThread();
         return self.runner.continueTurn(self.session, self.runnerEventEmitter());
     }
 
@@ -562,6 +600,7 @@ pub const RuntimeHost = struct {
         will_retry: bool,
         run_ctx: session_runner.CompactionRunContext,
     ) !CompactionResult {
+        self.assertOnOwnerThread();
         return self.runner.runCompaction(self.session, self.runnerEventEmitter(), reason, will_retry, run_ctx);
     }
 

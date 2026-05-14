@@ -303,6 +303,7 @@ fn dispatchExtensionOAuthRefreshViaRequestQueue(
 
 fn agentThreadFn(self: *AgentRuntime) void {
     logging.setThreadLabel(.agent);
+    self.runtime_host.bindOwnerThread(std.Thread.getCurrentId());
 
     if (self.runtime_host.currentSession().extensionRunner()) |runner| {
         runner.bindLuaOwnerThread(std.Thread.getCurrentId());
