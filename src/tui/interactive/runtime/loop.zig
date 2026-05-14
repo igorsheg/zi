@@ -15,6 +15,7 @@ const system_worker_mod = @import("../../../coding_agent/extensions/system_worke
 const job_manager_mod = @import("job_manager.zig");
 
 const Interactive = @import("../../interactive.zig").Interactive;
+const TerminalSystemQueue = @import("../../interactive.zig").TerminalSystemQueue;
 const AgentRequest = coding_agent_mod.AgentRequest;
 const ExtensionRunner = coding_agent_mod.ExtensionRunner;
 
@@ -35,7 +36,7 @@ pub const AgentRuntime = struct {
     resolver: *tool_display_mod.ToolRendererResolver,
     ai_complete_worker: *?ai_complete_worker_mod.AiCompleteWorker,
     system_worker: *?system_worker_mod.SystemWorker,
-    terminal_system_queue: *Interactive.TerminalSystemQueue,
+    terminal_system_queue: *TerminalSystemQueue,
     job_manager: *job_manager_mod.JobManager,
     extension_command_actions: extension_runner_mod.ExtensionCommandActions = undefined,
     extension_deferred_user_prompts: std.ArrayListUnmanaged([]u8) = .empty,
@@ -89,8 +90,8 @@ pub const AgentRuntime = struct {
     pub fn publishVisibleModelsSnapshot(self: *AgentRuntime) void { self.ui().publishVisibleModelsSnapshot(); }
     pub fn publishStatusSnapshot(self: *AgentRuntime) void { self.ui().publishStatusSnapshot(); }
     pub fn handleSetThinkingLevel(self: *AgentRuntime, level: anytype) void { self.ui().handleSetThinkingLevel(level); }
-    pub fn discardAgentRequests(self: *AgentRuntime, requests: []AgentRequest) void { discardRequests(self, requests); }
-    pub fn discardQueuedAgentRequests(self: *AgentRuntime) void { discardQueuedRequests(self); }
+    pub fn discardAgentRequests(self: *AgentRuntime, requests: []AgentRequest) void { discardRequests(self.ui(), requests); }
+    pub fn discardQueuedAgentRequests(self: *AgentRuntime) void { discardQueuedRequests(self.ui()); }
     pub fn enqueueTerminalSystem(self: *AgentRuntime, id: extension_runner_mod.AsyncOpId, request: extension_runner_mod.SystemRequest) !void { try self.ui().enqueueTerminalSystem(id, request); }
 };
 
@@ -115,7 +116,7 @@ pub fn discardQueuedRequests(self: *Interactive) void {
     }
 }
 
-pub fn processRequests(self: *Interactive) bool {
+pub fn processRequests(self: anytype) bool {
     return agent_requests_mod.processWithBuffer(self, AgentRequest, &extensionAsyncDispatcher);
 }
 
@@ -261,7 +262,7 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
                 var failed = worker_request;
                 failed.deinit(self.msg_allocator);
             };
-            const worker = if (self.ai_complete_worker) |*worker| worker else return error.AiCompleteWorkerUnavailable;
+            const worker = if (self.ai_complete_worker.*) |*worker| worker else return error.AiCompleteWorkerUnavailable;
             try worker.submit(worker_request);
             submitted = true;
         },
@@ -294,7 +295,7 @@ fn submitExtensionAsyncFromRunnerFn(ptr: *anyopaque, runner: *ExtensionRunner, s
                         var failed = cloned;
                         failed.deinit(self.msg_allocator);
                     };
-                    const worker = if (self.system_worker) |*worker| worker else return error.SystemWorkerUnavailable;
+                    const worker = if (self.system_worker.*) |*worker| worker else return error.SystemWorkerUnavailable;
                     try worker.submit(.{ .id = owned_start.id, .system = cloned });
                     submitted = true;
                 },
