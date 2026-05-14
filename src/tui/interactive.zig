@@ -392,8 +392,8 @@ pub const Interactive = struct {
         }
         self.login_cancel.deinit();
         self.session_index_worker.stop();
-        if (self.ai_complete_worker) |*worker| worker.worker.stop();
-        if (self.system_worker) |*worker| worker.worker.stop();
+        if (self.ai_complete_worker) |*worker| worker.worker.stopMode(.cancel_current);
+        if (self.system_worker) |*worker| worker.worker.stopMode(.cancel_current);
         self.terminal_system_queue.clear();
 
         if (self.agent_tasks) |*tasks| {

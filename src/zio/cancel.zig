@@ -99,6 +99,12 @@ pub const Token = struct {
         controller.notifyWaiters();
     }
 
+    pub fn requestAbort(self: Token) void {
+        const controller = self.controller orelse return;
+        if (controller.generation.load(.acquire) != self.expected_generation) return;
+        controller.requestAbort();
+    }
+
     pub fn wakeReadFd(self: Token) ?std.posix.fd_t {
         const controller = self.controller orelse return null;
         return controller.wakeReadFd();
@@ -322,4 +328,17 @@ test "Token cancellation callbacks run without helper threads and unregister cle
     token.unregisterCallback(&node);
     source.requestAbort();
     try std.testing.expectEqual(@as(u32, 1), ctx.count);
+}
+
+test "Token.requestAbort aborts only the matching generation" {
+    var source = Source{};
+    defer source.deinit();
+    const first = source.beginRun();
+    const second = source.beginRun();
+
+    first.requestAbort();
+    try std.testing.expect(!second.isAborted());
+
+    second.requestAbort();
+    try std.testing.expect(second.isAborted());
 }

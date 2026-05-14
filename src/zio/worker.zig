@@ -5,6 +5,12 @@ const logging = @import("../logging.zig");
 
 const log = std.log.scoped(.zio_worker);
 
+pub const StopMode = enum {
+    graceful,
+    cancel_current,
+    immediate,
+};
+
 pub fn Worker(
     comptime Request: type,
     comptime Handler: type,
@@ -45,7 +51,7 @@ pub fn Worker(
         }
 
         pub fn deinit(self: *Self) void {
-            self.stop();
+            self.stopMode(.cancel_current);
             self.queue.deinit();
             if (@hasDecl(Handler, "deinit")) {
                 self.handler.deinit();
@@ -62,7 +68,30 @@ pub fn Worker(
         }
 
         pub fn stop(self: *Self) void {
-            self.queue.close();
+            self.stopMode(.graceful);
+        }
+
+        pub fn stopMode(self: *Self, mode: StopMode) void {
+            switch (mode) {
+                .graceful => self.queue.close(),
+                .cancel_current => {
+                    self.queue.close();
+                    self.cancelCurrent();
+                },
+                .immediate => {
+                    self.queue.closeImmediate();
+                    self.cancelCurrent();
+                },
+            }
+
+            self.joinStopped();
+        }
+
+        fn cancelCurrent(self: *Self) void {
+            if (@hasDecl(Handler, "cancelCurrent")) self.handler.cancelCurrent();
+        }
+
+        fn joinStopped(self: *Self) void {
             if (self.tasks) |*group| {
                 const start_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
                 group.join() catch |err| log.warn("worker task join failed: {}", .{err});
@@ -168,6 +197,10 @@ pub fn Pool(
             for (&self.workers) |*worker| worker.stop();
         }
 
+        pub fn stopMode(self: *Self, mode: StopMode) void {
+            for (&self.workers) |*worker| worker.stopMode(mode);
+        }
+
         pub fn trySend(self: *Self, request: Request) QueueType.TrySendResult {
             var current = request;
             var attempts: usize = 0;
@@ -188,4 +221,51 @@ pub fn Pool(
             return .{ .full = current };
         }
     };
+}
+
+test "Worker stopMode cancel_current invokes handler cancellation hook" {
+    const Request = struct { value: u8 };
+    const Handler = struct {
+        pub const thread_label = .zio_worker;
+        cancel_count: *std.atomic.Value(u32),
+
+        fn handle(_: *@This(), _: *Request) void {}
+
+        fn cancelCurrent(self: *@This()) void {
+            _ = self.cancel_count.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var cancel_count = std.atomic.Value(u32).init(0);
+    var worker = try Worker(Request, Handler, .{ .wakeup = .pipe }).init(std.testing.allocator, .{ .cancel_count = &cancel_count });
+    defer worker.queue.deinit();
+
+    try worker.start();
+    worker.stopMode(.cancel_current);
+
+    try std.testing.expectEqual(@as(u32, 1), cancel_count.load(.acquire));
+}
+
+test "Worker stopMode immediate closes and cleans pending work" {
+    const Request = struct {
+        value: u8,
+        cleaned: *std.atomic.Value(u32),
+
+        pub fn deinit(self: *@This(), _: std.mem.Allocator) void {
+            _ = self.cleaned.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Handler = struct {
+        fn handle(_: *@This(), _: *Request) void {}
+    };
+
+    var cleaned = std.atomic.Value(u32).init(0);
+    var worker = try Worker(Request, Handler, .{ .cleanup = .deinit, .wakeup = .pipe }).init(std.testing.allocator, .{});
+    defer worker.queue.deinit();
+
+    try std.testing.expectEqual(.ok, worker.trySend(.{ .value = 1, .cleaned = &cleaned }));
+    worker.stopMode(.immediate);
+
+    try std.testing.expect(worker.queue.isDrained());
+    try std.testing.expectEqual(@as(u32, 1), cleaned.load(.acquire));
 }

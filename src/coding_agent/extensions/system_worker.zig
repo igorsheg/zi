@@ -28,8 +28,13 @@ const Handler = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     result_sink: ?ResultSink = null,
+    mutex: std.Io.Mutex = .init,
+    current_signal: zio.cancel.Token = zio.cancel.Token.none,
 
     pub fn handle(self: *Handler, request: *Request) void {
+        self.setCurrentSignal(request.system.signal);
+        defer self.setCurrentSignal(zio.cancel.Token.none);
+
         log.debug("starting system command id={d} argv0={s}", .{ request.id, if (request.system.argv.len > 0) request.system.argv[0] else "" });
         var result = extension_runner.AsyncResult{ .system = self.runSystem(request.system) };
         log.debug("finished system command id={d} status={s}", .{ request.id, @tagName(result.system) });
@@ -42,6 +47,19 @@ const Handler = struct {
             log.warn("failed to publish system result id={d}", .{request.id});
             result.deinit(self.allocator);
         }
+    }
+
+    pub fn cancelCurrent(self: *Handler) void {
+        self.mutex.lockUncancelable(self.io);
+        const signal = self.current_signal;
+        self.mutex.unlock(self.io);
+        signal.requestAbort();
+    }
+
+    fn setCurrentSignal(self: *Handler, signal: zio.cancel.Token) void {
+        self.mutex.lockUncancelable(self.io);
+        self.current_signal = signal;
+        self.mutex.unlock(self.io);
     }
 
     fn runSystem(self: *Handler, request: extension_runner.SystemRequest) extension_runner.SystemResult {

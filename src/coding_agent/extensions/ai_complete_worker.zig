@@ -47,8 +47,13 @@ const Handler = struct {
 
     allocator: std.mem.Allocator,
     result_sink: ?ResultSink = null,
+    mutex: std.Io.Mutex = .init,
+    current_signal: zio.cancel.Token = zio.cancel.Token.none,
 
     pub fn handle(self: *Handler, request: *Request) void {
+        self.setCurrentSignal(request.signal);
+        defer self.setCurrentSignal(zio.cancel.Token.none);
+
         log.debug("starting ai completion id={d} model={s}", .{ request.id, request.model.id });
         var result = extension_runner.AsyncResult{ .ai_complete = self.complete(request) };
         log.debug("finished ai completion id={d} status={s}", .{ request.id, @tagName(result.ai_complete.status) });
@@ -61,6 +66,19 @@ const Handler = struct {
             log.warn("failed to publish ai completion result id={d}", .{request.id});
             result.deinit(self.allocator);
         }
+    }
+
+    pub fn cancelCurrent(self: *Handler) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        const signal = self.current_signal;
+        self.mutex.unlock(std.Options.debug_io);
+        signal.requestAbort();
+    }
+
+    fn setCurrentSignal(self: *Handler, signal: zio.cancel.Token) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        self.current_signal = signal;
+        self.mutex.unlock(std.Options.debug_io);
     }
 
     const EventFanout = struct {
