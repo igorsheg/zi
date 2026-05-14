@@ -3,13 +3,13 @@ const std = @import("std");
 pub const Token = @import("cancel.zig").Token;
 const cancel = @import("cancel.zig");
 const process_common = @import("process_common.zig");
-const process_engine = @import("process_engine.zig");
+const process_reactor = @import("process_reactor.zig");
 const process_env = @import("process_env.zig");
 const runtime_env = @import("env");
 pub const Jobs = @import("job.zig");
 
 pub const default_max_output_bytes: usize = 1024 * 1024;
-pub const EnvPair = process_engine.EnvPair;
+pub const EnvPair = process_reactor.EnvPair;
 pub const StreamKind = enum { stdout, stderr };
 
 pub const KillScope = enum { child, process_group };
@@ -234,12 +234,13 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
     });
     defer capture.deinit();
 
-    var event_queue = OwnedProcessEventQueue.initIo(allocator, io) catch return error.SpawnFailed;
-    defer event_queue.deinit();
+    var reactor = process_reactor.Reactor.initIo(allocator, io) catch return error.SpawnFailed;
+    defer reactor.deinit();
+    capture.reactor = &reactor;
 
-    var sink = OwnedProcessEventSink{ .allocator = allocator, .queue = &event_queue };
-
-    var engine = process_engine.Engine.init(io, .{
+    reactor.start() catch return error.SpawnFailed;
+    reactor.spawn(.{
+        .id = 1,
         .argv = options.argv,
         .cwd = cwd,
         .env = options.env,
@@ -248,37 +249,31 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         .stdin = options.stdin == .bytes,
         .stdout = true,
         .stderr = true,
-        .close_stdin_before_wait = options.stdin == .bytes,
         .timeout_ms = options.timeout_ms,
         .signal = options.signal,
-    }, .{ .ptr = @ptrCast(&sink), .submit = OwnedProcessEventSink.submit });
-    capture.engine = &engine;
-
-    engine.start() catch return error.SpawnFailed;
+    }) catch return error.SpawnFailed;
     if (options.stdin == .bytes) {
-        try waitProcessReady(allocator, &event_queue, &capture);
-        engine.write(options.stdin.bytes) catch {};
-        engine.closeStdin();
+        try waitProcessReady(allocator, &reactor, &capture);
+        reactor.write(1, options.stdin.bytes) catch {};
+        reactor.closeStdin(1) catch {};
     }
 
-    while (!capture.isTerminal() or event_queue.pendingDepth() > 0) {
-        var batch: [16]OwnedProcessEvent = undefined;
-        const count = event_queue.drainInto(&batch);
+    while (!capture.isTerminal() or reactor.events.pendingDepth() > 0) {
+        var batch: [16]process_reactor.Event = undefined;
+        const count = reactor.drainEvents(&batch);
         if (count == 0) {
-            _ = event_queue.waitReadable(100) catch false;
+            _ = reactor.waitEvents(100) catch false;
             continue;
         }
-        for (batch[0..count]) |*owned| {
-            defer owned.deinit(allocator);
-            _ = Capture.submit(@ptrCast(&capture), owned.event);
+        for (batch[0..count]) |*event| {
+            defer event.deinit(allocator);
+            capture.submitEvent(event.*);
         }
     }
 
-    engine.join();
-
     const outcome = capture.outcome();
-    if (engine.didTimeout()) return capture.finishPartial(.timed_out, "timed out");
-    if (engine.didAbort() or options.signal.isAborted()) return capture.finishPartial(.aborted, "aborted");
+    if (capture.timed_out) return capture.finishPartial(.timed_out, "timed out");
+    if (capture.aborted or options.signal.isAborted()) return capture.finishPartial(.aborted, "aborted");
     if (outcome == .stdout_too_long) return capture.finishPartial(.stdout_too_long, "stdout exceeded output limit");
     if (outcome == .stderr_too_long) return capture.finishPartial(.stderr_too_long, "stderr exceeded output limit");
     if (outcome == .spawn_failed) return error.SpawnFailed;
@@ -290,75 +285,22 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
     return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
 }
 
-fn waitProcessReady(allocator: std.mem.Allocator, event_queue: *OwnedProcessEventQueue, capture: *Capture) RunError!void {
+fn waitProcessReady(allocator: std.mem.Allocator, reactor: *process_reactor.Reactor, capture: *Capture) RunError!void {
     while (!capture.isTerminal()) {
-        var batch: [16]OwnedProcessEvent = undefined;
-        const count = event_queue.drainInto(&batch);
+        var batch: [16]process_reactor.Event = undefined;
+        const count = reactor.drainEvents(&batch);
         if (count == 0) {
-            _ = event_queue.waitReadable(100) catch false;
+            _ = reactor.waitEvents(100) catch false;
             continue;
         }
-        for (batch[0..count]) |*owned| {
-            defer owned.deinit(allocator);
-            if (owned.event == .ready) return;
-            _ = Capture.submit(@ptrCast(capture), owned.event);
+        for (batch[0..count]) |*event| {
+            defer event.deinit(allocator);
+            if (event.* == .ready) return;
+            capture.submitEvent(event.*);
         }
     }
     return error.SpawnFailed;
 }
-
-const OwnedProcessEvent = struct {
-    event: process_engine.Event,
-
-    fn clone(allocator: std.mem.Allocator, event: process_engine.Event) !OwnedProcessEvent {
-        return .{ .event = switch (event) {
-            .ready => .ready,
-            .stdout => |bytes| .{ .stdout = try allocator.dupe(u8, bytes) },
-            .stderr => |bytes| .{ .stderr = try allocator.dupe(u8, bytes) },
-            .exit => |term| .{ .exit = term },
-            .spawn_failed => .spawn_failed,
-        } };
-    }
-
-    fn deinit(self: *OwnedProcessEvent, allocator: std.mem.Allocator) void {
-        switch (self.event) {
-            .stdout => |bytes| allocator.free(bytes),
-            .stderr => |bytes| allocator.free(bytes),
-            .ready, .exit, .spawn_failed => {},
-        }
-        self.* = undefined;
-    }
-};
-
-fn cleanupOwnedProcessEvent(item: *anyopaque, allocator: std.mem.Allocator) void {
-    const event: *OwnedProcessEvent = @ptrCast(@alignCast(item));
-    event.deinit(allocator);
-}
-
-const OwnedProcessEventQueue = @import("queue.zig").Queue(OwnedProcessEvent, .{
-    .cleanup = .{ .custom = cleanupOwnedProcessEvent },
-    .policy = .{ .bounded = .{ .capacity = 256, .on_full = .reject } },
-    .wakeup = .pipe,
-});
-
-const OwnedProcessEventSink = struct {
-    allocator: std.mem.Allocator,
-    queue: *OwnedProcessEventQueue,
-
-    fn submit(ptr: *anyopaque, event: process_engine.Event) bool {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        const owned = OwnedProcessEvent.clone(self.allocator, event) catch return false;
-        return switch (self.queue.trySend(owned)) {
-            .ok => true,
-            .dropped => true,
-            .closed, .full, .oom => |returned| {
-                var failed = returned;
-                failed.deinit(self.allocator);
-                return false;
-            },
-        };
-    }
-};
 
 const CaptureOutcome = enum { none, spawn_failed, stdout_too_long, stderr_too_long };
 
@@ -371,8 +313,10 @@ const Capture = struct {
     store_stdout: bool,
     store_stderr: bool,
     on_chunk: ?ChunkCallback,
-    engine: ?*process_engine.Engine = null,
+    reactor: ?*process_reactor.Reactor = null,
     term: ?std.process.Child.Term = null,
+    timed_out: bool = false,
+    aborted: bool = false,
     failure: CaptureOutcome = .none,
 
     const Config = struct {
@@ -399,23 +343,24 @@ const Capture = struct {
         self.stderr.deinit(self.allocator);
     }
 
-    fn submit(ptr: *anyopaque, event: process_engine.Event) bool {
-        const self: *Capture = @ptrCast(@alignCast(ptr));
-
+    fn submitEvent(self: *Capture, event: process_reactor.Event) void {
         switch (event) {
-            .stdout => |bytes| if (self.on_chunk) |cb| cb.call(.stdout, bytes),
-            .stderr => |bytes| if (self.on_chunk) |cb| cb.call(.stderr, bytes),
+            .stdout => |out| if (self.on_chunk) |cb| cb.call(.stdout, out.bytes),
+            .stderr => |out| if (self.on_chunk) |cb| cb.call(.stderr, out.bytes),
             .ready, .exit, .spawn_failed => {},
         }
 
         switch (event) {
-            .stdout => |bytes| self.appendCaptured(.stdout, bytes),
-            .stderr => |bytes| self.appendCaptured(.stderr, bytes),
+            .stdout => |out| self.appendCaptured(.stdout, out.bytes),
+            .stderr => |out| self.appendCaptured(.stderr, out.bytes),
             .ready => {},
-            .exit => |term| self.term = term,
+            .exit => |exit| {
+                self.term = exit.term;
+                self.timed_out = exit.timed_out;
+                self.aborted = exit.aborted;
+            },
             .spawn_failed => self.failure = .spawn_failed,
         }
-        return true;
     }
 
     fn appendCaptured(self: *Capture, kind: StreamKind, bytes: []const u8) void {
@@ -435,11 +380,11 @@ const Capture = struct {
 
         if (kind == .stdout and bytes.len > allowed) {
             self.failure = .stdout_too_long;
-            if (self.engine) |engine| engine.stop();
+            if (self.reactor) |reactor| reactor.kill(1) catch {};
         }
         if (kind == .stderr and bytes.len > allowed) {
             self.failure = .stderr_too_long;
-            if (self.engine) |engine| engine.stop();
+            if (self.reactor) |reactor| reactor.kill(1) catch {};
         }
     }
 

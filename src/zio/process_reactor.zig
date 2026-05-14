@@ -115,7 +115,12 @@ pub const Event = union(enum) {
     spawn_failed: ProcessId,
 
     pub const Output = struct { id: ProcessId, bytes: []const u8 };
-    pub const Exit = struct { id: ProcessId, term: ?std.process.Child.Term };
+    pub const Exit = struct {
+        id: ProcessId,
+        term: ?std.process.Child.Term,
+        timed_out: bool = false,
+        aborted: bool = false,
+    };
 
     pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -365,7 +370,12 @@ const Process = struct {
             .ready => .{ .ready = self.id },
             .stdout => |bytes| .{ .stdout = .{ .id = self.id, .bytes = reactor.allocator.dupe(u8, bytes) catch return false } },
             .stderr => |bytes| .{ .stderr = .{ .id = self.id, .bytes = reactor.allocator.dupe(u8, bytes) catch return false } },
-            .exit => |term| .{ .exit = .{ .id = self.id, .term = term } },
+            .exit => |term| .{ .exit = .{
+                .id = self.id,
+                .term = term,
+                .timed_out = self.engine.didTimeout(),
+                .aborted = self.engine.didAbort(),
+            } },
             .spawn_failed => .{ .spawn_failed = self.id },
         };
         return reactor.publish(owned);
