@@ -16,9 +16,11 @@ pub const Cleanup = union(enum) {
 pub const FullBehavior = enum {
     reject,
     drop_newest,
+    drop_oldest,
 };
 
-// Reject returns ownership to the caller. drop_newest consumes through queue cleanup.
+// Reject returns ownership to the caller. drop_newest consumes the incoming item through
+// queue cleanup. drop_oldest consumes the oldest queued item, then enqueues the incoming item.
 pub const QueuePolicy = union(enum) {
     unbounded,
     bounded: struct {
@@ -195,18 +197,24 @@ pub fn Queue(comptime T: type, comptime config: Config) type {
                 .unbounded => {},
                 .bounded => |bounded| {
                     if (self.queue.len >= bounded.capacity) {
-                        return switch (bounded.on_full) {
-                            .reject => blk: {
+                        switch (bounded.on_full) {
+                            .reject => {
                                 self.rejected_count += 1;
-                                break :blk .{ .full = item };
+                                return .{ .full = item };
                             },
-                            .drop_newest => blk: {
+                            .drop_newest => {
                                 self.dropped_count += 1;
                                 var mutable = item;
                                 Self.cleanupItem(&mutable, self.allocator);
-                                break :blk .dropped;
+                                return .dropped;
                             },
-                        };
+                            .drop_oldest => {
+                                self.dropped_count += 1;
+                                Self.cleanupItem(self.queue.itemPtr(0), self.allocator);
+                                self.queue.head = @mod(self.queue.head + 1, self.queue.capacity());
+                                self.queue.len -= 1;
+                            },
+                        }
                     }
                 },
             }
@@ -574,6 +582,28 @@ test "Queue bounded policies make rejection vs drop explicit and preserve cleanu
     const n = drop_box.drainInto(&out);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u32, 11), out[0].value);
+
+    CleanupState.cleaned = 0;
+    var drop_oldest_box = try Queue(Msg, .{
+        .cleanup = .{ .custom = &CleanupState.cleanup },
+        .policy = .{ .bounded = .{ .capacity = 2, .on_full = .drop_oldest } },
+    }).init(std.testing.allocator);
+    defer drop_oldest_box.deinit();
+
+    try std.testing.expectEqual(.ok, drop_oldest_box.trySend(.{ .value = 21 }));
+    try std.testing.expectEqual(.ok, drop_oldest_box.trySend(.{ .value = 22 }));
+    try std.testing.expectEqual(.ok, drop_oldest_box.trySend(.{ .value = 23 }));
+    const drop_oldest_stats = drop_oldest_box.stats();
+    try std.testing.expectEqual(@as(usize, 2), drop_oldest_stats.pending_depth);
+    try std.testing.expectEqual(@as(usize, 1), drop_oldest_stats.dropped_count);
+    try std.testing.expectEqual(@as(usize, 2), drop_oldest_stats.high_water_depth);
+    try std.testing.expectEqual(@as(usize, 3), drop_oldest_stats.send_count);
+    try std.testing.expectEqual(@as(usize, 1), CleanupState.cleaned);
+
+    const m = drop_oldest_box.drainInto(&out);
+    try std.testing.expectEqual(@as(usize, 2), m);
+    try std.testing.expectEqual(@as(u32, 22), out[0].value);
+    try std.testing.expectEqual(@as(u32, 23), out[1].value);
 }
 
 test "Queue dropMatching cleans matches and preserves FIFO order" {

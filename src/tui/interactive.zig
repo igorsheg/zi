@@ -1,5 +1,4 @@
 const std = @import("std");
-const posix = std.posix;
 const cell_mod = @import("cell.zig");
 const buffer_mod = @import("primitives/surface.zig");
 const renderer_mod = @import("renderer.zig");
@@ -829,6 +828,7 @@ pub const Interactive = struct {
         input_ready: bool = false,
         snapshot_ready: bool = false,
         lifecycle_ready: bool = false,
+        terminal_system_ready: bool = false,
     };
 
     fn waitForLoopReadiness(self: *Interactive) LoopReadiness {
@@ -839,36 +839,36 @@ pub const Interactive = struct {
         else
             idle_wait_timeout_ms;
 
-        var pfds = [4]posix.pollfd{
-            .{
-                .fd = self.tui.terminal.fd_in,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = self.snapshot_event_queue.wakeReadFd().?,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = self.lifecycle_event_queue.wakeReadFd().?,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = self.terminal_system_queue.wakeReadFd().?,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
+        const Callbacks = struct {
+            fn input(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
+                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
+                out.input_ready = ready.read;
+            }
+            fn snapshot(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
+                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
+                out.snapshot_ready = ready.read;
+            }
+            fn lifecycle(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
+                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
+                out.lifecycle_ready = ready.read;
+            }
+            fn terminalSystem(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
+                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
+                out.terminal_system_ready = ready.read;
+            }
         };
 
-        const ready = posix.poll(&pfds, timeout_ms) catch return .{};
-        if (ready <= 0) return .{};
-        return .{
-            .input_ready = pfds[0].revents & posix.POLL.IN != 0,
-            .snapshot_ready = pfds[1].revents & posix.POLL.IN != 0,
-            .lifecycle_ready = pfds[2].revents & posix.POLL.IN != 0,
+        var readiness = LoopReadiness{};
+        const interest = zio.loop.Interest{ .read = true };
+        const sources = [_]zio.loop.Source{
+            .{ .fd = self.tui.terminal.fd_in, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.input } },
+            .{ .fd = self.snapshot_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.snapshot } },
+            .{ .fd = self.lifecycle_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.lifecycle } },
+            .{ .fd = self.terminal_system_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.terminalSystem } },
         };
+
+        _ = zio.loop.runSources(self.allocator, &sources, timeout_ms) catch return .{};
+        return readiness;
     }
 
     fn renderFrame(self: *Interactive) void {

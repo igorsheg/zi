@@ -8,6 +8,7 @@ pub const task = @import("task.zig");
 pub const worker = @import("worker.zig");
 pub const process = @import("process.zig");
 pub const file = @import("file.zig");
+pub const loop = @import("loop.zig");
 
 // zio is the portability boundary. Public APIs keep std.Io shape; OS engines stay here.
 pub const default_io: Io = std.Options.debug_io;

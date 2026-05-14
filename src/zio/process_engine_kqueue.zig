@@ -4,6 +4,7 @@ const process_common = @import("process_common.zig");
 const process_env = @import("process_env.zig");
 const types = @import("process_engine_types.zig");
 const cancel_waiter = @import("cancel_waiter.zig");
+const logging = @import("../logging.zig");
 
 pub const EnvPair = types.EnvPair;
 pub const StreamKind = types.StreamKind;
@@ -126,6 +127,7 @@ pub const Engine = struct {
 
     fn run(self: *Engine) void {
         comptime std.debug.assert(builtin.os.tag == .macos or builtin.os.tag == .ios or builtin.os.tag == .visionos);
+        logging.setThreadLabel(.process_engine);
 
         var env_map_storage = process_env.buildMap(std.heap.page_allocator, self.request.env, self.request.clear_env) catch {
             _ = self.sink.submit(self.sink.ptr, .spawn_failed);

@@ -23,6 +23,8 @@ pub const Request = struct {
 };
 
 const Handler = struct {
+    pub const thread_label = .system_worker;
+
     allocator: std.mem.Allocator,
     io: std.Io,
     result_sink: ?ResultSink = null,

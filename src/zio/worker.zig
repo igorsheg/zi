@@ -1,6 +1,7 @@
 const std = @import("std");
 const queue_mod = @import("queue.zig");
 const task_mod = @import("task.zig");
+const logging = @import("../logging.zig");
 
 const log = std.log.scoped(.zio_worker);
 
@@ -62,7 +63,12 @@ pub fn Worker(
         pub fn stop(self: *Self) void {
             self.queue.close();
             if (self.tasks) |*group| {
+                const start_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
                 group.join() catch |err| log.warn("worker task join failed: {}", .{err});
+                const elapsed_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds() - start_ns;
+                if (elapsed_ns > std.time.ns_per_s) {
+                    log.warn("worker stop waited {d}ms for current handler to finish", .{@divFloor(elapsed_ns, std.time.ns_per_ms)});
+                }
                 self.tasks = null;
             }
         }
@@ -76,6 +82,12 @@ pub fn Worker(
         }
 
         fn run(self: *Self) void {
+            if (@hasDecl(Handler, "thread_label")) {
+                logging.setThreadLabel(Handler.thread_label);
+            } else {
+                logging.setThreadLabel(.zio_worker);
+            }
+
             var batch: [8]Request = undefined;
             while (true) {
                 _ = self.queue.waitReadable(-1) catch false;

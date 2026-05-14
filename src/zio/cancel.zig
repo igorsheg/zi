@@ -1,4 +1,5 @@
 const std = @import("std");
+const wake = @import("wake.zig");
 
 pub const Token = struct {
     controller: ?*Source,
@@ -85,6 +86,16 @@ pub const Token = struct {
         const controller = self.controller orelse return;
         controller.notifyWaiters();
     }
+
+    pub fn wakeReadFd(self: Token) ?std.posix.fd_t {
+        const controller = self.controller orelse return null;
+        return controller.wakeReadFd();
+    }
+
+    pub fn acknowledgeWake(self: Token) void {
+        const controller = self.controller orelse return;
+        controller.acknowledgeWake();
+    }
 };
 
 pub const Source = struct {
@@ -92,6 +103,12 @@ pub const Source = struct {
     condition: std.Io.Condition = .init,
     aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+    wake_pipe: ?wake.Pipe = null,
+
+    pub fn deinit(self: *Source) void {
+        if (self.wake_pipe) |*pipe| pipe.deinit();
+        self.* = .{};
+    }
 
     // beginRun invalidates old tokens and wakes waiters before returning the new token.
     pub fn beginRun(self: *Source) Token {
@@ -102,6 +119,7 @@ pub const Source = struct {
         const next_generation = self.generation.load(.acquire) + 1;
         self.generation.store(next_generation, .release);
         self.condition.broadcast(std.Options.debug_io);
+        self.signalWakeLocked(std.Options.debug_io);
         self.aborted.store(false, .release);
 
         return .{
@@ -128,6 +146,32 @@ pub const Source = struct {
 
     pub fn notifyWaitersIo(self: *Source, io: std.Io) void {
         self.condition.broadcast(io);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.signalWakeLocked(io);
+    }
+
+    pub fn ensureWake(self: *Source) !std.posix.fd_t {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        if (self.wake_pipe == null) self.wake_pipe = try wake.Pipe.init();
+        return self.wake_pipe.?.readFd();
+    }
+
+    pub fn wakeReadFd(self: *Source) ?std.posix.fd_t {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        return if (self.wake_pipe) |pipe| pipe.readFd() else null;
+    }
+
+    pub fn acknowledgeWake(self: *Source) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        if (self.wake_pipe) |pipe| pipe.drain();
+    }
+
+    fn signalWakeLocked(self: *Source, io: std.Io) void {
+        if (self.wake_pipe) |pipe| _ = pipe.signal(io);
     }
 
     pub fn isAborted(self: *const Source) bool {
@@ -176,4 +220,21 @@ test "Token.waitUntil wakes for abort without polling" {
     controller.requestAbort();
     thread.join();
     try std.testing.expectEqual(.aborted, result);
+}
+
+test "Source exposes pollable cancellation wake" {
+    var source = Source{};
+    defer source.deinit();
+    const token = source.beginRun();
+    const fd = try source.ensureWake();
+
+    var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&pfd, 0));
+
+    source.requestAbort();
+    pfd[0].revents = 0;
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&pfd, 0));
+    token.acknowledgeWake();
+    pfd[0].revents = 0;
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&pfd, 0));
 }

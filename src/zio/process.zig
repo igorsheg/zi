@@ -229,7 +229,7 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         .dir => return error.InvalidStdio,
     };
 
-    var capture = Capture.init(allocator, io, .{
+    var capture = Capture.init(allocator, .{
         .stdout_limit = options.stdout_limit,
         .stderr_limit = options.stderr_limit,
         .store_stdout = store_stdout,
@@ -237,6 +237,11 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         .on_chunk = options.on_chunk,
     });
     defer capture.deinit();
+
+    var event_queue = OwnedProcessEventQueue.initIo(allocator, io) catch return error.SpawnFailed;
+    defer event_queue.deinit();
+
+    var sink = OwnedProcessEventSink{ .allocator = allocator, .queue = &event_queue };
 
     var engine = process_engine.Engine.init(io, .{
         .argv = options.argv,
@@ -250,7 +255,7 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         .close_stdin_before_wait = options.stdin == .bytes,
         .timeout_ms = options.timeout_ms,
         .signal = options.signal,
-    }, .{ .ptr = @ptrCast(&capture), .submit = Capture.submit });
+    }, .{ .ptr = @ptrCast(&sink), .submit = OwnedProcessEventSink.submit });
     capture.engine = &engine;
 
     engine.start() catch return error.SpawnFailed;
@@ -261,6 +266,19 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         }
         engine.write(options.stdin.bytes) catch {};
         engine.closeStdin();
+    }
+
+    while (!engine.isExited() or event_queue.pendingDepth() > 0) {
+        var batch: [16]OwnedProcessEvent = undefined;
+        const count = event_queue.drainInto(&batch);
+        if (count == 0) {
+            _ = event_queue.waitReadable(100) catch false;
+            continue;
+        }
+        for (batch[0..count]) |*owned| {
+            defer owned.deinit(allocator);
+            _ = Capture.submit(@ptrCast(&capture), owned.event);
+        }
     }
 
     engine.join();
@@ -279,12 +297,62 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
     return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
 }
 
+const OwnedProcessEvent = struct {
+    event: process_engine.Event,
+
+    fn clone(allocator: std.mem.Allocator, event: process_engine.Event) !OwnedProcessEvent {
+        return .{ .event = switch (event) {
+            .stdout => |bytes| .{ .stdout = try allocator.dupe(u8, bytes) },
+            .stderr => |bytes| .{ .stderr = try allocator.dupe(u8, bytes) },
+            .exit => |term| .{ .exit = term },
+            .spawn_failed => .spawn_failed,
+        } };
+    }
+
+    fn deinit(self: *OwnedProcessEvent, allocator: std.mem.Allocator) void {
+        switch (self.event) {
+            .stdout => |bytes| allocator.free(bytes),
+            .stderr => |bytes| allocator.free(bytes),
+            .exit, .spawn_failed => {},
+        }
+        self.* = undefined;
+    }
+};
+
+fn cleanupOwnedProcessEvent(item: *anyopaque, allocator: std.mem.Allocator) void {
+    const event: *OwnedProcessEvent = @ptrCast(@alignCast(item));
+    event.deinit(allocator);
+}
+
+const OwnedProcessEventQueue = @import("queue.zig").Queue(OwnedProcessEvent, .{
+    .cleanup = .{ .custom = cleanupOwnedProcessEvent },
+    .policy = .{ .bounded = .{ .capacity = 256, .on_full = .reject } },
+    .wakeup = .pipe,
+});
+
+const OwnedProcessEventSink = struct {
+    allocator: std.mem.Allocator,
+    queue: *OwnedProcessEventQueue,
+
+    fn submit(ptr: *anyopaque, event: process_engine.Event) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const owned = OwnedProcessEvent.clone(self.allocator, event) catch return false;
+        return switch (self.queue.trySend(owned)) {
+            .ok => true,
+            .dropped => true,
+            .closed, .full, .oom => |returned| {
+                var failed = returned;
+                failed.deinit(self.allocator);
+                return false;
+            },
+        };
+    }
+};
+
 const CaptureOutcome = enum { none, spawn_failed, stdout_too_long, stderr_too_long };
 
 const Capture = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
-    mutex: std.Io.Mutex = .init,
     stdout: std.ArrayList(u8) = .empty,
     stderr: std.ArrayList(u8) = .empty,
     stdout_limit: std.Io.Limit,
@@ -304,10 +372,9 @@ const Capture = struct {
         on_chunk: ?ChunkCallback,
     };
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Capture {
+    fn init(allocator: std.mem.Allocator, config: Config) Capture {
         return .{
             .allocator = allocator,
-            .io = io,
             .stdout_limit = config.stdout_limit,
             .stderr_limit = config.stderr_limit,
             .store_stdout = config.store_stdout,
@@ -323,46 +390,52 @@ const Capture = struct {
 
     fn submit(ptr: *anyopaque, event: process_engine.Event) bool {
         const self: *Capture = @ptrCast(@alignCast(ptr));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
 
         switch (event) {
-            .stdout => |bytes| self.append(.stdout, bytes),
-            .stderr => |bytes| self.append(.stderr, bytes),
+            .stdout => |bytes| if (self.on_chunk) |cb| cb.call(.stdout, bytes),
+            .stderr => |bytes| if (self.on_chunk) |cb| cb.call(.stderr, bytes),
+            .exit, .spawn_failed => {},
+        }
+
+        switch (event) {
+            .stdout => |bytes| self.appendCaptured(.stdout, bytes),
+            .stderr => |bytes| self.appendCaptured(.stderr, bytes),
             .exit => |term| self.term = term,
             .spawn_failed => self.failure = .spawn_failed,
         }
         return true;
     }
 
-    fn append(self: *Capture, kind: StreamKind, bytes: []const u8) void {
-        if (self.on_chunk) |cb| cb.call(kind, bytes);
-        if (kind == .stdout and !self.store_stdout and self.on_chunk == null) return;
-        if (kind == .stderr and !self.store_stderr and self.on_chunk == null) return;
+    fn appendCaptured(self: *Capture, kind: StreamKind, bytes: []const u8) void {
+        if (kind == .stdout and !self.store_stdout) return;
+        if (kind == .stderr and !self.store_stderr) return;
         const list = switch (kind) {
             .stdout => &self.stdout,
             .stderr => &self.stderr,
         };
-        list.appendSlice(self.allocator, bytes) catch return;
-        if (kind == .stdout and tooLong(list.items.len, self.stdout_limit)) {
+        const limit = switch (kind) {
+            .stdout => self.stdout_limit,
+            .stderr => self.stderr_limit,
+        };
+        const allowed = remainingCapacity(list.items.len, limit);
+        const clipped = bytes[0..@min(bytes.len, allowed)];
+        if (clipped.len > 0) list.appendSlice(self.allocator, clipped) catch return;
+
+        if (kind == .stdout and bytes.len > allowed) {
             self.failure = .stdout_too_long;
             if (self.engine) |engine| engine.stop();
         }
-        if (kind == .stderr and tooLong(list.items.len, self.stderr_limit)) {
+        if (kind == .stderr and bytes.len > allowed) {
             self.failure = .stderr_too_long;
             if (self.engine) |engine| engine.stop();
         }
     }
 
     fn outcome(self: *Capture) CaptureOutcome {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         return self.failure;
     }
 
     fn takeStdout(self: *Capture, store: bool) ![]u8 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         if (!store) return self.allocator.dupe(u8, "");
         const out = try self.stdout.toOwnedSlice(self.allocator);
         self.stdout = .empty;
@@ -370,8 +443,6 @@ const Capture = struct {
     }
 
     fn takeStderr(self: *Capture, store: bool) ![]u8 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         if (!store) return self.allocator.dupe(u8, "");
         const out = try self.stderr.toOwnedSlice(self.allocator);
         self.stderr = .empty;
@@ -395,8 +466,8 @@ const Capture = struct {
     }
 };
 
-fn tooLong(len: usize, limit: std.Io.Limit) bool {
-    return if (limit.toInt()) |n| len > n else false;
+fn remainingCapacity(len: usize, limit: std.Io.Limit) usize {
+    return if (limit.toInt()) |n| n -| len else std.math.maxInt(usize);
 }
 
 fn executablePathExists(allocator: std.mem.Allocator, io: std.Io, path: []const u8) bool {

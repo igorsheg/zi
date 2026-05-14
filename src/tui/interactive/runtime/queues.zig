@@ -12,7 +12,7 @@ pub const ui_lifecycle_queue_capacity: usize = 64;
 // Snapshot traffic is lossy. Lifecycle traffic rejects overload so callers keep ownership.
 pub const UiSnapshotQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
-    .policy = .{ .bounded = .{ .capacity = ui_snapshot_queue_capacity, .on_full = .drop_newest } },
+    .policy = .{ .bounded = .{ .capacity = ui_snapshot_queue_capacity, .on_full = .drop_oldest } },
     .wakeup = .pipe,
 });
 
@@ -22,7 +22,7 @@ pub const UiLifecycleQueue = queue_mod.Queue(UiEvent, .{
     .wakeup = .pipe,
 });
 
-test "UiSnapshotQueue drops newest snapshot traffic when bounded" {
+test "UiSnapshotQueue drops oldest snapshot traffic when bounded" {
     const themes_builtin = @import("../../../themes/builtin.zig");
     var q = try UiSnapshotQueue.init(std.testing.allocator);
     defer q.deinit();
@@ -31,12 +31,12 @@ test "UiSnapshotQueue drops newest snapshot traffic when bounded" {
     while (sent < ui_snapshot_queue_capacity) : (sent += 1) {
         try std.testing.expectEqual(.ok, q.trySend(.{ .theme_changed = themes_builtin.dark().* }));
     }
-    try std.testing.expectEqual(.dropped, q.trySend(.{ .theme_changed = themes_builtin.light().* }));
+    try std.testing.expectEqual(.ok, q.trySend(.{ .theme_changed = themes_builtin.light().* }));
 
     const stats = q.stats();
     try std.testing.expectEqual(@as(usize, ui_snapshot_queue_capacity), stats.pending_depth);
     try std.testing.expectEqual(@as(usize, 1), stats.dropped_count);
-    try std.testing.expectEqual(@as(usize, ui_snapshot_queue_capacity), stats.send_count);
+    try std.testing.expectEqual(@as(usize, ui_snapshot_queue_capacity + 1), stats.send_count);
 }
 
 test "UiLifecycleQueue rejects overload and keeps wake semantics" {

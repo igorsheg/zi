@@ -4,6 +4,7 @@ const process_env = @import("process_env.zig");
 const Group = @import("task.zig").Group;
 const fd_util = @import("fd.zig");
 const types = @import("process_engine_types.zig");
+const logging = @import("../logging.zig");
 
 const log = std.log.scoped(.zio_process_blocking);
 
@@ -123,6 +124,8 @@ pub const Engine = struct {
     }
 
     fn run(self: *Engine) void {
+        logging.setThreadLabel(.process_engine);
+
         var env_map_storage = process_env.buildMap(std.heap.page_allocator, self.request.env, self.request.clear_env) catch {
             _ = self.sink.submit(self.sink.ptr, .spawn_failed);
             self.markExited();

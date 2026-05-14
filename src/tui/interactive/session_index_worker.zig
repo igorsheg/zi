@@ -27,6 +27,8 @@ pub const Request = union(enum) {
 };
 
 const Handler = struct {
+    pub const thread_label = .session_index;
+
     allocator: std.mem.Allocator,
     publish_fn: ?PublishFn = null,
     publish_ctx: ?*anyopaque = null,

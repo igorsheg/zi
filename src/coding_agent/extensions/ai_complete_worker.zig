@@ -43,6 +43,8 @@ pub const Request = struct {
 };
 
 const Handler = struct {
+    pub const thread_label = .ai_worker;
+
     allocator: std.mem.Allocator,
     result_sink: ?ResultSink = null,
 

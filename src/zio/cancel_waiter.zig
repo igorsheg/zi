@@ -1,5 +1,6 @@
 const std = @import("std");
 const cancel = @import("cancel.zig");
+const logging = @import("../logging.zig");
 
 pub const Waiter = struct {
     state: ?*State = null,
@@ -38,6 +39,7 @@ pub const Waiter = struct {
     }
 
     fn run(io: std.Io, state: *State) void {
+        logging.setThreadLabel(.cancel_waiter);
         const result = state.token.waitUntilIo(io, null, stopped, state);
         if (result != .aborted) return;
         if (state.stopped.load(.acquire)) return;

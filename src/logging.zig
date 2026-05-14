@@ -29,6 +29,12 @@ pub const ThreadLabel = enum {
     tui,
     agent,
     login,
+    system_worker,
+    ai_worker,
+    session_index,
+    zio_worker,
+    process_engine,
+    cancel_waiter,
     batch,
     @"test",
 };
