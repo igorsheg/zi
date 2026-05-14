@@ -65,3 +65,10 @@ test "process reactor emits ready stdout and exit events" {
     try std.testing.expect(saw_stdout);
     try std.testing.expect(saw_exit);
 }
+
+test "process reactor stop wakes idle backend" {
+    var reactor = try Reactor.init(std.testing.allocator);
+    defer reactor.deinit();
+    try reactor.start();
+    reactor.stop();
+}

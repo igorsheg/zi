@@ -52,7 +52,6 @@ pub const Reactor = struct {
     pub fn stop(self: *Reactor) void {
         self.requests.close();
         if (self.thread) |thread| {
-            self.wake();
             thread.join();
             self.thread = null;
         }
@@ -319,11 +318,6 @@ pub const Reactor = struct {
         }
         self.processes.clearRetainingCapacity();
     }
-
-    fn wake(self: *Reactor) void {
-        const kq = self.kq orelse return;
-        triggerUser(kq, encode(.requests, 0));
-    }
 };
 
 const Process = struct {
@@ -391,12 +385,14 @@ const Process = struct {
     }
 
     fn closeStdout(self: *Process, io: std.Io) void {
+        // Closing the fd removes its EVFILT_READ watch from this kqueue on Darwin.
         if (self.stdout_file) |file| file.close(io);
         self.stdout_file = null;
         self.stdout_open = false;
     }
 
     fn closeStderr(self: *Process, io: std.Io) void {
+        // Closing the fd removes its EVFILT_READ watch from this kqueue on Darwin.
         if (self.stderr_file) |file| file.close(io);
         self.stderr_file = null;
         self.stderr_open = false;
@@ -447,16 +443,4 @@ fn registerTimer(kq: posix.fd_t, id: types.ProcessId, kind: WatchKind, ms: u64) 
         .udata = encode(kind, id),
     }};
     _ = try std.Io.Kqueue.kevent(kq, &changes, &.{}, null);
-}
-
-fn triggerUser(kq: posix.fd_t, udata: usize) void {
-    const changes = [1]posix.Kevent{.{
-        .ident = udata,
-        .filter = std.c.EVFILT.USER,
-        .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.CLEAR,
-        .fflags = std.c.NOTE.TRIGGER,
-        .data = 0,
-        .udata = udata,
-    }};
-    _ = std.Io.Kqueue.kevent(kq, &changes, &.{}, null) catch {};
 }
