@@ -20,6 +20,9 @@ pub fn Worker(
         if (config.wakeup != .pipe) {
             @compileError("Worker requires queue wakeup=.pipe");
         }
+        if (!config.cross_thread) {
+            @compileError("Worker queue config must set cross_thread=true");
+        }
         if (!@hasDecl(Handler, "handle")) {
             @compileError("Worker Handler must declare handle(self, request)");
         }
@@ -237,7 +240,7 @@ test "Worker stopMode cancel_current invokes handler cancellation hook" {
     };
 
     var cancel_count = std.atomic.Value(u32).init(0);
-    var worker = try Worker(Request, Handler, .{ .wakeup = .pipe }).init(std.testing.allocator, .{ .cancel_count = &cancel_count });
+    var worker = try Worker(Request, Handler, .{ .policy = .{ .bounded = .{ .capacity = 4, .on_full = .reject } }, .wakeup = .pipe, .cross_thread = true }).init(std.testing.allocator, .{ .cancel_count = &cancel_count });
     defer worker.queue.deinit();
 
     try worker.start();
@@ -260,7 +263,7 @@ test "Worker stopMode immediate closes and cleans pending work" {
     };
 
     var cleaned = std.atomic.Value(u32).init(0);
-    var worker = try Worker(Request, Handler, .{ .cleanup = .deinit, .wakeup = .pipe }).init(std.testing.allocator, .{});
+    var worker = try Worker(Request, Handler, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 4, .on_full = .reject } }, .wakeup = .pipe, .cross_thread = true }).init(std.testing.allocator, .{});
     defer worker.queue.deinit();
 
     try std.testing.expectEqual(.ok, worker.trySend(.{ .value = 1, .cleaned = &cleaned }));

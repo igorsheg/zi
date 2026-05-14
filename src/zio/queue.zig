@@ -33,6 +33,7 @@ pub const Config = struct {
     cleanup: Cleanup = .none,
     policy: QueuePolicy = .unbounded,
     wakeup: Wakeup = .none,
+    cross_thread: bool = false,
 };
 
 pub const State = enum {
@@ -484,7 +485,11 @@ fn validateConfig(comptime T: type, comptime config: Config) void {
     }
 
     switch (config.policy) {
-        .unbounded => {},
+        .unbounded => {
+            if (config.cross_thread) {
+                @compileError("cross_thread Queue requires an explicit bounded policy");
+            }
+        },
         .bounded => |bounded| {
             if (bounded.capacity == 0) {
                 @compileError("bounded Queue capacity must be > 0");

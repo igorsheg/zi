@@ -162,6 +162,7 @@ const WorkerImpl = blocking_worker_mod.Worker(Request, Handler, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } },
     .wakeup = .pipe,
+    .cross_thread = true,
 });
 
 pub const SessionIndexWorker = struct {

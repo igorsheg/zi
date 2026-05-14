@@ -121,6 +121,7 @@ const WorkerPool = blocking_worker_mod.Pool(Request, Handler, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } },
     .wakeup = .pipe,
+    .cross_thread = true,
 }, 2);
 
 pub const AiCompleteWorker = struct {

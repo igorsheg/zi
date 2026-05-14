@@ -14,12 +14,14 @@ pub const UiSnapshotQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = ui_snapshot_queue_capacity, .on_full = .drop_oldest } },
     .wakeup = .pipe,
+    .cross_thread = true,
 });
 
 pub const UiLifecycleQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = ui_lifecycle_queue_capacity, .on_full = .reject } },
     .wakeup = .pipe,
+    .cross_thread = true,
 });
 
 test "UiSnapshotQueue drops oldest snapshot traffic when bounded" {

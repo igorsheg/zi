@@ -146,10 +146,12 @@ pub const RequestQueue = queue_mod.Queue(Request, .{
     .cleanup = .{ .custom = cleanupRequest },
     .policy = .{ .bounded = .{ .capacity = 256, .on_full = .reject } },
     .wakeup = .pipe,
+    .cross_thread = true,
 });
 
 pub const EventQueue = queue_mod.Queue(Event, .{
     .cleanup = .{ .custom = cleanupEvent },
     .policy = .{ .bounded = .{ .capacity = 1024, .on_full = .reject } },
     .wakeup = .pipe,
+    .cross_thread = true,
 });

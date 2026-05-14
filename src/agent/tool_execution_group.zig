@@ -49,7 +49,9 @@ fn cleanupEvent(item: *anyopaque, allocator: std.mem.Allocator) void {
 
 const EventQueue = zio.queue.Queue(ToolExecutionEvent, .{
     .cleanup = .{ .custom = cleanupEvent },
+    .policy = .{ .bounded = .{ .capacity = 64, .on_full = .reject } },
     .wakeup = .pipe,
+    .cross_thread = true,
 });
 
 pub const ToolExecutionGroup = struct {

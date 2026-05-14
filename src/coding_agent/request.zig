@@ -178,6 +178,7 @@ pub const RequestQueue = queue_mod.Queue(AgentRequest, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = request_queue_capacity, .on_full = .reject } },
     .wakeup = .pipe,
+    .cross_thread = true,
 });
 
 test "RequestQueue preserves ordered API requests and owned payload boundaries" {

@@ -94,7 +94,7 @@ pub const TerminalSystemRequest = struct {
         self.* = undefined;
     }
 };
-pub const TerminalSystemQueue = queue_mod.Queue(TerminalSystemRequest, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } }, .wakeup = .pipe });
+pub const TerminalSystemQueue = queue_mod.Queue(TerminalSystemRequest, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } }, .wakeup = .pipe, .cross_thread = true });
 const UiSnapshotQueue = queues_mod.UiSnapshotQueue;
 const UiLifecycleQueue = queues_mod.UiLifecycleQueue;
 const PublishedStatusSnapshot = status_snapshot_mod.PublishedStatusSnapshot;
