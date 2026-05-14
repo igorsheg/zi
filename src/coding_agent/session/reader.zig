@@ -3,7 +3,8 @@ const ai = @import("../../ai/root.zig");
 const message_memory = @import("../../agent/message_memory.zig");
 const proto = @import("../../session/protocol.zig");
 const json = @import("../../session/json.zig");
-const zio_fs = @import("../../zio/root.zig").file;
+const zio = @import("../../zio/root.zig");
+const zio_fs = zio.file;
 
 pub const TelemetrySnapshot = struct {
     read_count: u64 = 0,
@@ -93,14 +94,14 @@ fn parseLine(
 }
 
 pub fn readSessionFile(allocator: std.mem.Allocator, path: []const u8) !SessionData {
-    const total_start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
+    const total_start = zio.deadline.nowNs(std.Options.debug_io);
     var input = try zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 100 * 1024 * 1024 });
     defer input.deinit(allocator);
     const content = input.bytes();
 
-    const parse_start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
+    const parse_start = zio.deadline.nowNs(std.Options.debug_io);
     const data = try parseSessionContent(allocator, content);
-    const parse_end = std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds();
+    const parse_end = zio.deadline.nowNs(std.Options.debug_io);
     const total_end = parse_end;
 
     const parse_ns: u64 = @intCast(@max(parse_end - parse_start, 0));
