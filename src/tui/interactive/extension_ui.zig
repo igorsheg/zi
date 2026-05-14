@@ -5,27 +5,6 @@ const overlay_mod = @import("../primitives/overlay.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
 
-pub fn publishPending(self: *Interactive) void {
-    const render_updates = self.runtime_host.takePendingExtensionRenderUpdates(self.msg_allocator);
-    if (render_updates.len > 0) {
-        _ = self.publishLifecycleUiEvent(.{ .extension_ui_rendered = .{ .updates = render_updates } });
-    } else {
-        self.msg_allocator.free(render_updates);
-    }
-    const frame_updates = self.runtime_host.takePendingExtensionFrameUpdates(self.msg_allocator);
-    if (frame_updates.len > 0) {
-        _ = self.publishLifecycleUiEvent(.{ .extension_ui_framed = .{ .updates = frame_updates } });
-    } else {
-        self.msg_allocator.free(frame_updates);
-    }
-    const actions = self.runtime_host.takePendingExtensionEditorActions(self.msg_allocator);
-    if (actions.len > 0) {
-        _ = self.publishLifecycleUiEvent(.{ .extension_editor_actions = .{ .actions = actions } });
-    } else {
-        self.msg_allocator.free(actions);
-    }
-}
-
 pub fn applyRenderUpdates(self: *Interactive, updates: []const extension_ui.RenderSpec) void {
     for (updates) |update| {
         if (update.notification) |notification| {

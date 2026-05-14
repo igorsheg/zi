@@ -17,6 +17,7 @@ const conversation_publish = @import("../conversation_publish.zig");
 const model_requests_mod = @import("../model_requests.zig");
 const theme_flow = @import("../theme_flow.zig");
 const status_snapshot_mod = @import("../status_snapshot.zig");
+const extension_publish = @import("../extension_publish.zig");
 const log = std.log.scoped(.tui_interactive);
 
 const Interactive = @import("../../interactive.zig").Interactive;
@@ -111,13 +112,13 @@ pub const AgentRuntime = struct {
     }
 
     pub fn publishExtensionCommandsUpdate(self: *AgentRuntime) void {
-        self.ui().publishExtensionCommandsUpdate();
+        extension_publish.publishCommandsUpdate(self.extensionPublisher());
     }
     pub fn publishExtensionKeybindingsSnapshot(self: *AgentRuntime) void {
-        self.ui().publishExtensionKeybindingsSnapshot();
+        extension_publish.publishKeybindingsSnapshot(self.extensionPublisher());
     }
     pub fn publishPendingExtensionUi(self: *AgentRuntime) void {
-        self.ui().publishPendingExtensionUi();
+        extension_publish.publishPendingUi(self.extensionPublisher());
     }
     pub fn handleManualCompactRequest(self: *AgentRuntime, custom_instructions: ?[]const u8) void {
         self.ui().handleManualCompactRequest(custom_instructions);
@@ -189,6 +190,15 @@ pub const AgentRuntime = struct {
             .runtime_host = self.runtime_host,
             .last_published_status_snapshot = self.last_published_status_snapshot,
             .publish_snapshot = &publishSnapshotUiEventFromRuntime,
+            .publish_lifecycle = &publishLifecycleUiEventFromRuntime,
+            .ctx = @ptrCast(self),
+        };
+    }
+
+    fn extensionPublisher(self: *AgentRuntime) extension_publish.Publisher {
+        return .{
+            .msg_allocator = self.msg_allocator,
+            .runtime_host = self.runtime_host,
             .publish_lifecycle = &publishLifecycleUiEventFromRuntime,
             .ctx = @ptrCast(self),
         };

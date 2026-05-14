@@ -62,6 +62,7 @@ const run_setup = @import("interactive/run_setup.zig");
 const startup_flow = @import("interactive/startup_flow.zig");
 const extension_ui_state_mod = @import("interactive/extension_ui_state.zig");
 const extension_ui_flow = @import("interactive/extension_ui.zig");
+const extension_publish = @import("interactive/extension_publish.zig");
 const status_data_mod = @import("status_data.zig");
 const clipboard_mod = @import("terminal/clipboard.zig");
 const agent_ui_event_mod = @import("interactive/agent_ui_event.zig");
@@ -1221,70 +1222,11 @@ pub const Interactive = struct {
     }
 
     pub fn publishExtensionCommandsUpdate(self: *Interactive) void {
-        const commands = blk: {
-            const runner = self.runtime_host.currentSession().extensionRunner() orelse break :blk self.msg_allocator.alloc(ui_event_mod.ExtensionCommandEntry, 0) catch return;
-            const items = runner.command_registry.items();
-            var owned = self.msg_allocator.alloc(ui_event_mod.ExtensionCommandEntry, items.len) catch return;
-            var built: usize = 0;
-            errdefer {
-                for (owned[0..built]) |cmd| {
-                    self.msg_allocator.free(cmd.name);
-                    self.msg_allocator.free(cmd.description);
-                }
-                self.msg_allocator.free(owned);
-            }
-            for (items) |entry| {
-                owned[built] = .{
-                    .name = self.msg_allocator.dupe(u8, entry.visible_name) catch return,
-                    .description = self.msg_allocator.dupe(u8, entry.description) catch {
-                        self.msg_allocator.free(owned[built].name);
-                        return;
-                    },
-                };
-                built += 1;
-            }
-            break :blk owned;
-        };
-        _ = self.publishLifecycleUiEvent(.{ .extension_commands_updated = .{ .commands = commands } });
-        self.publishExtensionKeybindingsSnapshot();
+        extension_publish.publishCommandsUpdate(self.extensionPublisher());
     }
 
     pub fn publishExtensionKeybindingsSnapshot(self: *Interactive) void {
-        const extension_bindings = blk: {
-            const runner = self.runtime_host.currentSession().extensionRunner() orelse break :blk self.msg_allocator.alloc(ui_event_mod.ExtensionKeybindingEntry, 0) catch return;
-            var count: usize = 0;
-            for (runner.keybinding_registry.items()) |entry| count += entry.keys.len;
-            var owned = self.msg_allocator.alloc(ui_event_mod.ExtensionKeybindingEntry, count) catch return;
-            var built: usize = 0;
-            errdefer {
-                for (owned[0..built]) |kb| {
-                    self.msg_allocator.free(kb.id);
-                    self.msg_allocator.free(kb.description);
-                    self.msg_allocator.free(kb.display);
-                }
-                self.msg_allocator.free(owned);
-            }
-            for (runner.keybinding_registry.items()) |entry| {
-                for (entry.keys, 0..) |key, i| {
-                    owned[built] = .{
-                        .id = self.msg_allocator.dupe(u8, entry.id) catch return,
-                        .description = self.msg_allocator.dupe(u8, entry.description) catch {
-                            self.msg_allocator.free(owned[built].id);
-                            return;
-                        },
-                        .key = key,
-                        .display = self.msg_allocator.dupe(u8, entry.displays[i]) catch {
-                            self.msg_allocator.free(owned[built].id);
-                            self.msg_allocator.free(owned[built].description);
-                            return;
-                        },
-                    };
-                    built += 1;
-                }
-            }
-            break :blk owned;
-        };
-        _ = self.publishLifecycleUiEvent(.{ .extension_keybindings_updated = .{ .keybindings = extension_bindings } });
+        extension_publish.publishKeybindingsSnapshot(self.extensionPublisher());
     }
 
     pub fn notify(self: *Interactive, spec: notifications.Spec) void {
@@ -1292,7 +1234,21 @@ pub const Interactive = struct {
     }
 
     pub fn publishPendingExtensionUi(self: *Interactive) void {
-        extension_ui_flow.publishPending(self);
+        extension_publish.publishPendingUi(self.extensionPublisher());
+    }
+
+    fn extensionPublisher(self: *Interactive) extension_publish.Publisher {
+        return .{
+            .msg_allocator = self.msg_allocator,
+            .runtime_host = &self.runtime_host,
+            .publish_lifecycle = &publishExtensionLifecycleFromInteractive,
+            .ctx = @ptrCast(self),
+        };
+    }
+
+    fn publishExtensionLifecycleFromInteractive(ctx: ?*anyopaque, event: UiEvent) bool {
+        const self: *Interactive = @ptrCast(@alignCast(ctx.?));
+        return self.publishLifecycleUiEvent(event);
     }
 
     pub fn applyExtensionEditorActions(self: *Interactive, actions: []const @import("../coding_agent/extensions/ui.zig").EditorAction) void {
