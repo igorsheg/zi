@@ -22,6 +22,8 @@ const log = std.log.scoped(.tui_interactive);
 
 const Interactive = @import("../../interactive.zig").Interactive;
 const TerminalSystemQueue = @import("../../interactive.zig").TerminalSystemQueue;
+const UiOwnerRequest = @import("../../interactive.zig").UiOwnerRequest;
+const UiOwnerRequestQueue = @import("../../interactive.zig").UiOwnerRequestQueue;
 const AgentRequest = coding_agent_mod.AgentRequest;
 const ExtensionRunner = coding_agent_mod.ExtensionRunner;
 
@@ -45,6 +47,7 @@ pub const AgentRuntime = struct {
     ai_complete_worker: *?ai_complete_worker_mod.AiCompleteWorker,
     system_worker: *?system_worker_mod.SystemWorker,
     terminal_system_queue: *TerminalSystemQueue,
+    ui_owner_request_queue: *UiOwnerRequestQueue,
     job_manager: *job_manager_mod.JobManager,
     extension_command_actions: extension_runner_mod.ExtensionCommandActions = undefined,
     extension_deferred_user_prompts: std.ArrayListUnmanaged([]u8) = .empty,
@@ -64,6 +67,7 @@ pub const AgentRuntime = struct {
             .ai_complete_worker = &self.ai_complete_worker,
             .system_worker = &self.system_worker,
             .terminal_system_queue = &self.terminal_system_queue,
+            .ui_owner_request_queue = &self.ui_owner_request_queue,
             .job_manager = &self.job_manager,
         };
     }
@@ -121,16 +125,17 @@ pub const AgentRuntime = struct {
         extension_publish.publishPendingUi(self.extensionPublisher());
     }
     pub fn handleManualCompactRequest(self: *AgentRuntime, custom_instructions: ?[]const u8) void {
-        self.ui().handleManualCompactRequest(custom_instructions);
+        const owned = if (custom_instructions) |bytes| self.msg_allocator.dupe(u8, bytes) catch return else null;
+        self.enqueueUiOwnerRequest(.{ .manual_compact = owned });
     }
     pub fn handleNewSession(self: *AgentRuntime) void {
-        self.ui().handleNewSession();
+        self.enqueueUiOwnerRequest(.new_session);
     }
     pub fn handleForkSession(self: *AgentRuntime, entry_id: []const u8) void {
-        self.ui().handleForkSession(entry_id);
+        self.enqueueUiOwnerRequest(.{ .fork_session = self.msg_allocator.dupe(u8, entry_id) catch return });
     }
     pub fn handleResumeSession(self: *AgentRuntime, path: []const u8, restore_session_model: bool) void {
-        self.ui().handleResumeSession(path, restore_session_model);
+        self.enqueueUiOwnerRequest(.{ .resume_session = .{ .path = self.msg_allocator.dupe(u8, path) catch return, .restore_session_model = restore_session_model } });
     }
     pub fn publishConversationState(self: *AgentRuntime) bool {
         return conversation_publish.publishConversationStateWithPublisher(self.conversationPublisher());
@@ -202,6 +207,16 @@ pub const AgentRuntime = struct {
             .publish_lifecycle = &publishLifecycleUiEventFromRuntime,
             .ctx = @ptrCast(self),
         };
+    }
+
+    fn enqueueUiOwnerRequest(self: *AgentRuntime, request: UiOwnerRequest) void {
+        switch (self.ui_owner_request_queue.trySend(request)) {
+            .ok, .dropped => {},
+            .full, .closed, .oom => |rejected| {
+                var failed = rejected;
+                failed.deinit(self.msg_allocator);
+            },
+        }
     }
 };
 

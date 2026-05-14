@@ -96,6 +96,23 @@ pub const TerminalSystemRequest = struct {
     }
 };
 pub const TerminalSystemQueue = queue_mod.Queue(TerminalSystemRequest, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } }, .wakeup = .pipe, .cross_thread = true });
+pub const UiOwnerRequest = union(enum) {
+    manual_compact: ?[]const u8,
+    new_session,
+    fork_session: []const u8,
+    resume_session: struct { path: []const u8, restore_session_model: bool },
+
+    pub fn deinit(self: *UiOwnerRequest, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .manual_compact => |instructions| if (instructions) |bytes| allocator.free(bytes),
+            .fork_session => |entry_id| allocator.free(entry_id),
+            .resume_session => |payload| allocator.free(payload.path),
+            .new_session => {},
+        }
+        self.* = undefined;
+    }
+};
+pub const UiOwnerRequestQueue = queue_mod.Queue(UiOwnerRequest, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 32, .on_full = .reject } }, .wakeup = .pipe, .cross_thread = true });
 const UiSnapshotQueue = queues_mod.UiSnapshotQueue;
 const UiLifecycleQueue = queues_mod.UiLifecycleQueue;
 const PublishedStatusSnapshot = status_snapshot_mod.PublishedStatusSnapshot;
@@ -276,6 +293,7 @@ pub const Interactive = struct {
     ai_complete_worker: ?ai_complete_worker_mod.AiCompleteWorker = null,
     system_worker: ?system_worker_mod.SystemWorker = null,
     terminal_system_queue: TerminalSystemQueue,
+    ui_owner_request_queue: UiOwnerRequestQueue,
 
     auth_storage: *auth_storage_mod.AuthStorage,
     settings_manager: *settings_manager_mod.SettingsManager,
@@ -363,6 +381,7 @@ pub const Interactive = struct {
             .lifecycle_event_queue = try UiLifecycleQueue.initIo(msg_allocator, io),
             .request_queue = try RequestQueue.initIo(msg_allocator, io),
             .terminal_system_queue = try TerminalSystemQueue.initIo(msg_allocator, io),
+            .ui_owner_request_queue = try UiOwnerRequestQueue.initIo(msg_allocator, io),
             .job_manager = undefined,
             .session_index_worker = try session_index_worker_mod.SessionIndexWorker.init(msg_allocator),
             .auth_storage = auth_storage,
@@ -396,6 +415,7 @@ pub const Interactive = struct {
         if (self.ai_complete_worker) |*worker| worker.worker.stopMode(.cancel_current);
         if (self.system_worker) |*worker| worker.worker.stopMode(.cancel_current);
         self.terminal_system_queue.clear();
+        self.ui_owner_request_queue.clear();
 
         if (self.agent_tasks) |*tasks| {
             if (self.is_streaming) self.runtime_host.abortCurrentRun();
@@ -455,6 +475,7 @@ pub const Interactive = struct {
         if (self.system_worker) |*worker| worker.deinit();
         self.system_worker = null;
         self.terminal_system_queue.deinit();
+        self.ui_owner_request_queue.deinit();
         self.job_manager.deinit();
         self.snapshot_event_queue.deinit();
         self.lifecycle_event_queue.deinit();
@@ -528,6 +549,8 @@ pub const Interactive = struct {
                 input_ready = readiness.input_ready;
                 if (readiness.snapshot_ready) self.snapshot_event_queue.wait();
                 if (readiness.lifecycle_ready) self.lifecycle_event_queue.wait();
+                if (readiness.terminal_system_ready) self.terminal_system_queue.wait();
+                if (readiness.ui_owner_request_ready) self.ui_owner_request_queue.wait();
             } else {
                 should_wait = true;
                 input_ready = true;
@@ -536,6 +559,7 @@ pub const Interactive = struct {
             self.drainUiEvents();
             if (!self.running) break;
 
+            if (self.processPendingUiOwnerRequests()) continue;
             if (self.processPendingTerminalSystem()) continue;
 
             if (input_ready and self.processTerminalInput()) continue;
@@ -595,6 +619,21 @@ pub const Interactive = struct {
             var failed = result;
             failed.deinit(self.msg_allocator);
         }
+        self.tui.dirty = true;
+        return true;
+    }
+
+    fn processPendingUiOwnerRequests(self: *Interactive) bool {
+        var buf: [4]UiOwnerRequest = undefined;
+        const n = self.ui_owner_request_queue.drainInto(&buf);
+        if (n == 0) return false;
+        defer for (buf[0..n]) |*request| request.deinit(self.msg_allocator);
+        for (buf[0..n]) |request| switch (request) {
+            .manual_compact => |instructions| self.handleManualCompactRequest(instructions),
+            .new_session => self.handleNewSession(),
+            .fork_session => |entry_id| self.handleForkSession(entry_id),
+            .resume_session => |payload| self.handleResumeSession(payload.path, payload.restore_session_model),
+        };
         self.tui.dirty = true;
         return true;
     }
@@ -831,6 +870,7 @@ pub const Interactive = struct {
         snapshot_ready: bool = false,
         lifecycle_ready: bool = false,
         terminal_system_ready: bool = false,
+        ui_owner_request_ready: bool = false,
     };
 
     fn waitForLoopReadiness(self: *Interactive) LoopReadiness {
@@ -858,6 +898,10 @@ pub const Interactive = struct {
                 const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
                 out.terminal_system_ready = ready.read;
             }
+            fn uiOwnerRequest(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
+                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
+                out.ui_owner_request_ready = ready.read;
+            }
         };
 
         var readiness = LoopReadiness{};
@@ -867,6 +911,7 @@ pub const Interactive = struct {
             .{ .fd = self.snapshot_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.snapshot } },
             .{ .fd = self.lifecycle_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.lifecycle } },
             .{ .fd = self.terminal_system_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.terminalSystem } },
+            .{ .fd = self.ui_owner_request_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.uiOwnerRequest } },
         };
 
         _ = zio.loop.runSources(self.allocator, &sources, timeout_ms) catch return .{};
