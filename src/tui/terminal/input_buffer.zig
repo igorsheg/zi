@@ -1,5 +1,6 @@
 const std = @import("std");
 const keys_mod = @import("keys.zig");
+const deadline = @import("../../zio/root.zig").deadline;
 
 pub const InputBuffer = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -37,8 +38,8 @@ pub const InputBuffer = struct {
         on_seq: *const fn (seq: []const u8, ctx: *anyopaque) void,
         ctx: *anyopaque,
     ) void {
-        if (self.flush_deadline_ns) |deadline| {
-            if (@as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) >= deadline) {
+        if (self.flush_deadline_ns) |flush_deadline_ns| {
+            if (deadline.nowNs(std.Options.debug_io) >= flush_deadline_ns) {
                 self.flush_deadline_ns = null;
                 if (self.buf.items.len > 0) {
                     self.flushRaw(on_seq, ctx);
@@ -88,7 +89,7 @@ pub const InputBuffer = struct {
             }
             if (self.buf.items[0] == 0x1b and self.buf.items.len < 6) {
                 if (std.mem.startsWith(u8, "\x1b[200~", self.buf.items)) {
-                    self.flush_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + self.timeout_ns;
+                    self.setFlushDeadline();
                     return;
                 }
             }
@@ -101,7 +102,7 @@ pub const InputBuffer = struct {
                         self.consume(len);
                     },
                     .incomplete => {
-                        self.flush_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + self.timeout_ns;
+                        self.setFlushDeadline();
                         return;
                     },
                 }
@@ -135,6 +136,10 @@ pub const InputBuffer = struct {
             std.mem.copyForwards(u8, self.buf.items[0..], self.buf.items[n..]);
             self.buf.items.len -= n;
         }
+    }
+
+    fn setFlushDeadline(self: *InputBuffer) void {
+        self.flush_deadline_ns = deadline.Deadline.afterNs(std.Options.debug_io, @intCast(self.timeout_ns)).ns;
     }
 
     pub fn consumeKittyResponse(self: *InputBuffer) bool {
