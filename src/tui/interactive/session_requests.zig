@@ -2,6 +2,10 @@ const std = @import("std");
 
 const log = std.log.scoped(.zi_interactive);
 
+fn refreshToolDisplayResolver(self: anytype) void {
+    self.resolver.ctx = @ptrCast(self.runtime_host.currentSession());
+}
+
 pub fn handleNewSession(self: anytype) void {
     self.runtime_host.newSession() catch |err| {
         const msg = switch (err) {
@@ -11,6 +15,7 @@ pub fn handleNewSession(self: anytype) void {
         _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
         return;
     };
+    refreshToolDisplayResolver(self);
     self.publishExtensionCommandsUpdate();
     self.publishThemeSnapshot();
     self.publishVisibleModelsSnapshot();
@@ -31,6 +36,7 @@ pub fn handleForkSession(self: anytype, entry_id: []const u8) void {
         _ = self.publishLifecycleUiEvent(.{ .session_new_failed = .{ .message = msg } });
         return;
     };
+    refreshToolDisplayResolver(self);
     self.publishExtensionCommandsUpdate();
     self.publishThemeSnapshot();
     self.publishVisibleModelsSnapshot();
@@ -55,6 +61,7 @@ pub fn handleResumeSession(self: anytype, path: []const u8, restore_session_mode
     };
 
     const restore_warning = result.restore_warning;
+    refreshToolDisplayResolver(self);
 
     self.publishExtensionCommandsUpdate();
     self.publishThemeSnapshot();

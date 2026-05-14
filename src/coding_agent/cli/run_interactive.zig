@@ -15,7 +15,6 @@ const runtime_mod = @import("runtime.zig");
 const result = @import("result.zig");
 const common = @import("common.zig");
 const context_mod = @import("context.zig");
-const agent_protocol = @import("../../agent/root.zig").protocol;
 
 const ResolvedStartupAction = union(enum) {
     none,
@@ -41,17 +40,18 @@ fn builtinRenderer(name: []const u8) tool_display.ToolRenderer {
     return .{};
 }
 
-fn buildToolDisplayEntries(allocator: std.mem.Allocator, tools: []const agent_protocol.AgentTool) ![]const tool_display.Registration {
-    var entries = try allocator.alloc(tool_display.Registration, tools.len);
-    for (tools, 0..) |tool, i| {
-        entries[i] = .{
-            .tool_name = tool.name,
-            .renderer = builtinRenderer(tool.name),
-            .label = tool.label,
-            .display_call = tool.display_call,
-        };
+fn resolveSessionToolDisplay(ctx: ?*anyopaque, tool_name: []const u8) tool_display.ToolDisplay {
+    const session: *sdk.AgentSession = @ptrCast(@alignCast(ctx.?));
+    for (session.tools) |tool| {
+        if (std.mem.eql(u8, tool.name, tool_name)) {
+            return .{
+                .renderer = builtinRenderer(tool.name),
+                .label = tool.label,
+                .display_call = tool.display_call,
+            };
+        }
     }
-    return entries;
+    return .{ .renderer = builtinRenderer(tool_name) };
 }
 
 const StartupResolution = union(enum) {
@@ -130,9 +130,7 @@ pub fn run(
     session_ptr.* = try sdk.createAgentSession(ctx.allocator, session_create_options);
     errdefer session_ptr.deinit();
 
-    const static_entries = try buildToolDisplayEntries(ctx.allocator, session_ptr.tools);
-    defer ctx.allocator.free(static_entries);
-    const resolver = tool_display.ToolRendererResolver.fromStatic(&static_entries);
+    const resolver = tool_display.ToolRendererResolver{ .ctx = @ptrCast(session_ptr), .resolve_fn = resolveSessionToolDisplay };
     const retry_settings = runtime.settings_manager.getRetrySettings();
     const compaction_settings = runtime.settings_manager.getCompactionSettings();
     const runtime_host = try coding_agent_mod.RuntimeHost.init(session_ptr, ctx.allocator, ctx.msg_allocator, session_create_options, .{
