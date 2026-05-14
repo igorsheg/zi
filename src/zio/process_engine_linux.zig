@@ -93,20 +93,6 @@ pub const Engine = struct {
         return self.exited;
     }
 
-    pub fn waitReady(self: *Engine, timeout_ms: u64) bool {
-        var waited: u64 = 0;
-        while (waited <= timeout_ms) : (waited += 1) {
-            self.mutex.lockUncancelable(self.io);
-            const ready = self.ready;
-            const exited = self.exited;
-            self.mutex.unlock(self.io);
-            if (ready) return true;
-            if (exited) return false;
-            self.io.sleep(.fromMilliseconds(1), .awake) catch {};
-        }
-        return false;
-    }
-
     pub fn write(self: *Engine, data: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         const file = self.stdin_file orelse {
@@ -156,6 +142,7 @@ pub const Engine = struct {
         self.stdin_file = child.stdin;
         self.ready = true;
         self.mutex.unlock(self.io);
+        _ = self.sink.submit(self.sink.ptr, .ready);
 
         self.runLoop(&child) catch {
             if (child.id) |pid| process_common.killChild(pid, self.request.process_group, .KILL);

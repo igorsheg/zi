@@ -256,10 +256,7 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
 
     engine.start() catch return error.SpawnFailed;
     if (options.stdin == .bytes) {
-        if (!engine.waitReady(5000)) {
-            engine.join();
-            return error.SpawnFailed;
-        }
+        try waitProcessReady(allocator, &event_queue, &capture);
         engine.write(options.stdin.bytes) catch {};
         engine.closeStdin();
     }
@@ -293,11 +290,29 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
     return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
 }
 
+fn waitProcessReady(allocator: std.mem.Allocator, event_queue: *OwnedProcessEventQueue, capture: *Capture) RunError!void {
+    while (!capture.isTerminal()) {
+        var batch: [16]OwnedProcessEvent = undefined;
+        const count = event_queue.drainInto(&batch);
+        if (count == 0) {
+            _ = event_queue.waitReadable(100) catch false;
+            continue;
+        }
+        for (batch[0..count]) |*owned| {
+            defer owned.deinit(allocator);
+            if (owned.event == .ready) return;
+            _ = Capture.submit(@ptrCast(capture), owned.event);
+        }
+    }
+    return error.SpawnFailed;
+}
+
 const OwnedProcessEvent = struct {
     event: process_engine.Event,
 
     fn clone(allocator: std.mem.Allocator, event: process_engine.Event) !OwnedProcessEvent {
         return .{ .event = switch (event) {
+            .ready => .ready,
             .stdout => |bytes| .{ .stdout = try allocator.dupe(u8, bytes) },
             .stderr => |bytes| .{ .stderr = try allocator.dupe(u8, bytes) },
             .exit => |term| .{ .exit = term },
@@ -309,7 +324,7 @@ const OwnedProcessEvent = struct {
         switch (self.event) {
             .stdout => |bytes| allocator.free(bytes),
             .stderr => |bytes| allocator.free(bytes),
-            .exit, .spawn_failed => {},
+            .ready, .exit, .spawn_failed => {},
         }
         self.* = undefined;
     }
@@ -390,12 +405,13 @@ const Capture = struct {
         switch (event) {
             .stdout => |bytes| if (self.on_chunk) |cb| cb.call(.stdout, bytes),
             .stderr => |bytes| if (self.on_chunk) |cb| cb.call(.stderr, bytes),
-            .exit, .spawn_failed => {},
+            .ready, .exit, .spawn_failed => {},
         }
 
         switch (event) {
             .stdout => |bytes| self.appendCaptured(.stdout, bytes),
             .stderr => |bytes| self.appendCaptured(.stderr, bytes),
+            .ready => {},
             .exit => |term| self.term = term,
             .spawn_failed => self.failure = .spawn_failed,
         }

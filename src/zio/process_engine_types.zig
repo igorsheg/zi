@@ -9,6 +9,7 @@ pub const EnvPair = struct {
 pub const StreamKind = enum { stdout, stderr };
 
 pub const Event = union(enum) {
+    ready,
     stdout: []const u8,
     stderr: []const u8,
     exit: ?std.process.Child.Term,

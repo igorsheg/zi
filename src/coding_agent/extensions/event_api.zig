@@ -78,6 +78,7 @@ pub fn parseEventKind(name: []const u8) ?event_registry.EventKind {
         .{ .name = "job_stdout", .kind = .job_stdout },
         .{ .name = "job_stderr", .kind = .job_stderr },
         .{ .name = "job_exit", .kind = .job_exit },
+        .{ .name = "job_ready", .kind = .job_ready },
         .{ .name = "model_select", .kind = .model_select },
         .{ .name = "ui", .kind = .ui },
     };

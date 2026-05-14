@@ -37,6 +37,7 @@ pub const EventKind = enum {
     job_stdout,
     job_stderr,
     job_exit,
+    job_ready,
     job_json,
 
     model_select,
@@ -142,7 +143,7 @@ test "EventRegistry subscribes in order and dispatches correct chain" {
 }
 
 test "EventKind reserves the v3 event surface" {
-    try testing.expectEqual(@as(usize, 34), @typeInfo(EventKind).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 35), @typeInfo(EventKind).@"enum".fields.len);
 }
 
 test "EventKind.semantics matches spec" {

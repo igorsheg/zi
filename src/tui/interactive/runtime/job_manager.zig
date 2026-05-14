@@ -119,6 +119,7 @@ pub const JobManager = struct {
         const ext_event = extension_ui.JobEvent{
             .id = event.id,
             .kind = switch (event.kind) {
+                .ready => .ready,
                 .stdout => .stdout,
                 .stderr => .stderr,
                 .exit => .exit,

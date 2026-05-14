@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const process_engine = @import("process_engine.zig");
 
-pub const EventKind = enum { stdout, stderr, exit };
+pub const EventKind = enum { ready, stdout, stderr, exit };
 
 pub const OwnedEvent = struct {
     id: u64,
@@ -145,6 +145,7 @@ const Job = struct {
     fn submitChildEvent(ptr: *anyopaque, event: process_engine.Event) bool {
         const self: *Job = @ptrCast(@alignCast(ptr));
         var owned: Event = switch (event) {
+            .ready => .{ .id = self.id, .kind = .ready },
             .stdout => |bytes| .{ .id = self.id, .kind = .stdout, .data = self.allocator.dupe(u8, bytes) catch return false },
             .stderr => |bytes| .{ .id = self.id, .kind = .stderr, .data = self.allocator.dupe(u8, bytes) catch return false },
             .spawn_failed => .{ .id = self.id, .kind = .exit, .code = null },
@@ -209,6 +210,15 @@ const TestSink = struct {
         }
         return false;
     }
+
+    fn hasKind(self: *TestSink, id: u64, kind: EventKind) bool {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        for (self.events.items) |event| {
+            if (event.id == id and event.kind == kind) return true;
+        }
+        return false;
+    }
 };
 
 fn waitUntil(comptime pred: fn (*TestSink) bool, sink: *TestSink) !void {
@@ -246,21 +256,6 @@ fn startCommandJob(manager: *Manager, id: u64, args: []const []const u8) !void {
     try manager.start(id, .{ .argv = try ownedArgv(args) });
 }
 
-fn writeWhenReady(manager: *Manager, id: u64, data: []const u8) !void {
-    var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
-        manager.write(id, data) catch |err| switch (err) {
-            error.JobNotReady => {
-                std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
-                continue;
-            },
-            else => return err,
-        };
-        return;
-    }
-    return error.Timeout;
-}
-
 test "zio job forwards stdout chunks and successful exit" {
     var sink = TestSink{ .allocator = testing.allocator };
     defer sink.deinit();
@@ -288,7 +283,12 @@ test "zio job writes to child stdin after the process is ready" {
     defer manager.deinit();
 
     try startShellJob(&manager, 2, "IFS= read -r line; printf 'got:%s\\n' \"$line\"");
-    try writeWhenReady(&manager, 2, "doom\n");
+    try waitUntil(struct {
+        fn pred(s: *TestSink) bool {
+            return s.hasKind(2, .ready);
+        }
+    }.pred, &sink);
+    try manager.write(2, "doom\n");
 
     try waitUntil(struct {
         fn pred(s: *TestSink) bool {

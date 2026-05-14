@@ -1165,6 +1165,7 @@ pub const ExtensionRunner = struct {
     pub fn dispatchJobEvent(self: *ExtensionRunner, event: extension_ui.JobEvent) !void {
         self.assertOnLuaThread();
         const kind: EventKind = switch (event.kind) {
+            .ready => .job_ready,
             .stdout => .job_stdout,
             .stderr => .job_stderr,
             .exit => .job_exit,
