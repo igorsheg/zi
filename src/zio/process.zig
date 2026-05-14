@@ -229,8 +229,8 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
     var capture = Capture.init(allocator, .{
         .stdout_limit = options.stdout_limit,
         .stderr_limit = options.stderr_limit,
-        .store_stdout = store_stdout,
-        .store_stderr = store_stderr,
+        .stdout_policy = streamCapturePolicy(store_stdout, options.on_chunk != null),
+        .stderr_policy = streamCapturePolicy(store_stderr, options.on_chunk != null),
         .on_chunk = options.on_chunk,
     });
     defer capture.deinit();
@@ -281,10 +281,32 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
     if (outcome == .spawn_failed) return error.SpawnFailed;
 
     const term = capture.term orelse return error.WaitFailed;
-    const stdout = try capture.takeStdout(store_stdout);
+    const stdout = try capture.takeStdout();
     errdefer allocator.free(stdout);
-    const stderr = try capture.takeStderr(store_stderr);
+    const stderr = try capture.takeStderr();
     return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
+}
+
+const StreamCapturePolicy = enum {
+    ignore,
+    capture_bounded,
+    stream_only,
+    stream_and_capture_bounded,
+
+    fn stores(self: StreamCapturePolicy) bool {
+        return self == .capture_bounded or self == .stream_and_capture_bounded;
+    }
+
+    fn streams(self: StreamCapturePolicy) bool {
+        return self == .stream_only or self == .stream_and_capture_bounded;
+    }
+};
+
+fn streamCapturePolicy(store: bool, emit_chunks: bool) StreamCapturePolicy {
+    if (store and emit_chunks) return .stream_and_capture_bounded;
+    if (store) return .capture_bounded;
+    if (emit_chunks) return .stream_only;
+    return .ignore;
 }
 
 fn waitProcessReady(allocator: std.mem.Allocator, reactor: *process_reactor.Reactor, capture: *Capture) RunError!void {
@@ -312,8 +334,8 @@ const Capture = struct {
     stderr: std.ArrayList(u8) = .empty,
     stdout_limit: std.Io.Limit,
     stderr_limit: std.Io.Limit,
-    store_stdout: bool,
-    store_stderr: bool,
+    stdout_policy: StreamCapturePolicy,
+    stderr_policy: StreamCapturePolicy,
     on_chunk: ?ChunkCallback,
     reactor: ?*process_reactor.Reactor = null,
     term: ?std.process.Child.Term = null,
@@ -324,8 +346,8 @@ const Capture = struct {
     const Config = struct {
         stdout_limit: std.Io.Limit,
         stderr_limit: std.Io.Limit,
-        store_stdout: bool,
-        store_stderr: bool,
+        stdout_policy: StreamCapturePolicy,
+        stderr_policy: StreamCapturePolicy,
         on_chunk: ?ChunkCallback,
     };
 
@@ -334,8 +356,8 @@ const Capture = struct {
             .allocator = allocator,
             .stdout_limit = config.stdout_limit,
             .stderr_limit = config.stderr_limit,
-            .store_stdout = config.store_stdout,
-            .store_stderr = config.store_stderr,
+            .stdout_policy = config.stdout_policy,
+            .stderr_policy = config.stderr_policy,
             .on_chunk = config.on_chunk,
         };
     }
@@ -347,8 +369,8 @@ const Capture = struct {
 
     fn submitEvent(self: *Capture, event: process_reactor.Event) void {
         switch (event) {
-            .stdout => |out| if (self.on_chunk) |cb| cb.call(.stdout, out.bytes),
-            .stderr => |out| if (self.on_chunk) |cb| cb.call(.stderr, out.bytes),
+            .stdout => |out| if (self.stdout_policy.streams()) if (self.on_chunk) |cb| cb.call(.stdout, out.bytes),
+            .stderr => |out| if (self.stderr_policy.streams()) if (self.on_chunk) |cb| cb.call(.stderr, out.bytes),
             .ready, .output_dropped, .exit, .spawn_failed => {},
         }
 
@@ -371,8 +393,8 @@ const Capture = struct {
     }
 
     fn appendCaptured(self: *Capture, kind: StreamKind, bytes: []const u8) void {
-        if (kind == .stdout and !self.store_stdout) return;
-        if (kind == .stderr and !self.store_stderr) return;
+        const capture_policy = self.policy(kind);
+        if (!capture_policy.stores()) return;
         const list = switch (kind) {
             .stdout => &self.stdout,
             .stderr => &self.stderr,
@@ -395,6 +417,13 @@ const Capture = struct {
         }
     }
 
+    fn policy(self: *const Capture, kind: StreamKind) StreamCapturePolicy {
+        return switch (kind) {
+            .stdout => self.stdout_policy,
+            .stderr => self.stderr_policy,
+        };
+    }
+
     fn outcome(self: *Capture) CaptureOutcome {
         return self.failure;
     }
@@ -403,24 +432,24 @@ const Capture = struct {
         return self.term != null or self.failure == .spawn_failed;
     }
 
-    fn takeStdout(self: *Capture, store: bool) ![]u8 {
-        if (!store) return self.allocator.dupe(u8, "");
+    fn takeStdout(self: *Capture) ![]u8 {
+        if (!self.stdout_policy.stores()) return self.allocator.dupe(u8, "");
         const out = try self.stdout.toOwnedSlice(self.allocator);
         self.stdout = .empty;
         return out;
     }
 
-    fn takeStderr(self: *Capture, store: bool) ![]u8 {
-        if (!store) return self.allocator.dupe(u8, "");
+    fn takeStderr(self: *Capture) ![]u8 {
+        if (!self.stderr_policy.stores()) return self.allocator.dupe(u8, "");
         const out = try self.stderr.toOwnedSlice(self.allocator);
         self.stderr = .empty;
         return out;
     }
 
     fn finishPartial(self: *Capture, comptime tag: std.meta.Tag(RunResult), msg: []const u8) RunError!RunResult {
-        const stdout = try self.takeStdout(true);
+        const stdout = try self.takeStdout();
         errdefer self.allocator.free(stdout);
-        const stderr = try self.takeStderr(true);
+        const stderr = try self.takeStderr();
         errdefer self.allocator.free(stderr);
         const message = self.allocator.dupe(u8, msg) catch return error.OutOfMemory;
         const p = Partial{ .stdout = stdout, .stderr = stderr, .message = message };
