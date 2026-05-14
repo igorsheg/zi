@@ -1,6 +1,7 @@
 const std = @import("std");
 const queue_mod = @import("queue.zig");
 const task_mod = @import("task.zig");
+const deadline = @import("deadline.zig");
 const logging = @import("../logging.zig");
 
 const log = std.log.scoped(.zio_worker);
@@ -96,9 +97,9 @@ pub fn Worker(
 
         fn joinStopped(self: *Self) void {
             if (self.tasks) |*group| {
-                const start_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
+                const start_ns = deadline.nowNs(self.io);
                 group.join() catch |err| log.warn("worker task join failed: {}", .{err});
-                const elapsed_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds() - start_ns;
+                const elapsed_ns = deadline.nowNs(self.io) - start_ns;
                 if (elapsed_ns > std.time.ns_per_s) {
                     log.warn("worker stop waited {d}ms for current handler to finish", .{@divFloor(elapsed_ns, std.time.ns_per_ms)});
                 }
