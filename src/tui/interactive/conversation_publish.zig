@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_mod = @import("../../agent/root.zig");
 const coding_agent_mod = @import("../../coding_agent/root.zig");
+const deadline = @import("../../zio/root.zig").deadline;
 
 const Interactive = @import("../interactive.zig").Interactive;
 const AgentEvent = agent_mod.protocol.AgentEvent;
@@ -75,7 +76,7 @@ pub fn publishForAgentEvent(self: *Interactive, event: AgentEvent) void {
 }
 
 fn monotonicNowNs() u64 {
-    return @intCast(@as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())));
+    return @intCast(deadline.nowNs(std.Options.debug_io));
 }
 
 fn flushPendingConversationPublish(self: *Interactive) void {
