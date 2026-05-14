@@ -4,6 +4,7 @@ const editor_iface_mod = @import("../edit/interface.zig");
 const autocomplete_mod = @import("../autocomplete/provider.zig");
 const runtime_loop = @import("runtime/loop.zig");
 const composer_flow = @import("composer_flow.zig");
+const deadline = @import("../../zio/root.zig").deadline;
 
 const Interactive = @import("../interactive.zig").Interactive;
 const EditorInterface = editor_iface_mod.EditorInterface;
@@ -17,7 +18,7 @@ pub fn prepareTerminal(self: *Interactive) !void {
     self.tui.terminal.enableModifyOtherKeys();
     self.tui.terminal.queryKittyProtocol();
     self.tui.terminal.enableMouseTracking();
-    self.kitty_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + 150_000_000;
+    self.kitty_deadline_ns = deadline.Deadline.afterNs(std.Options.debug_io, 150_000_000).ns;
 }
 
 pub fn suspendTerminalForExternalProcess(self: *Interactive) void {
@@ -41,7 +42,7 @@ pub fn resumeTerminalAfterExternalProcess(self: *Interactive) !void {
     self.tui.terminal.clearScreen();
     self.tui.renderer.forceRedraw();
     self.tui.dirty = true;
-    self.kitty_deadline_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds())) + 150_000_000;
+    self.kitty_deadline_ns = deadline.Deadline.afterNs(std.Options.debug_io, 150_000_000).ns;
 }
 
 pub fn bindEditor(self: *Interactive) void {
