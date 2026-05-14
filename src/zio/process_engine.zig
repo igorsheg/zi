@@ -1,13 +1,7 @@
-const builtin = @import("builtin");
-
 const blocking = @import("process_engine_blocking.zig");
-const linux = @import("process_engine_linux.zig");
 const types = @import("process_engine_types.zig");
 
-const backend = switch (builtin.os.tag) {
-    .linux => linux,
-    else => blocking,
-};
+const backend = blocking;
 
 pub const EnvPair = types.EnvPair;
 pub const StreamKind = types.StreamKind;
