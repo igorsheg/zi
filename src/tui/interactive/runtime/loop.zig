@@ -1,11 +1,13 @@
 const std = @import("std");
 const logging = @import("../../../logging.zig");
+const agent_mod = @import("../../../agent/root.zig");
 const coding_agent_mod = @import("../../../coding_agent/root.zig");
 const request_mod = @import("../../../coding_agent/request.zig");
 const auth_types = @import("../../../coding_agent/auth/types.zig");
 const oauth_mod = @import("../../../coding_agent/auth/oauth.zig");
 const extension_runner_mod = @import("../../../coding_agent/extensions/runner.zig");
 const agent_requests_mod = @import("../agent_requests.zig");
+const session_requests_mod = @import("../session_requests.zig");
 const RuntimeHost = @import("../../../coding_agent/runtime_host.zig").RuntimeHost;
 const UiEvent = @import("../../ui_event.zig").UiEvent;
 const queues_mod = @import("queues.zig");
@@ -22,8 +24,6 @@ const log = std.log.scoped(.tui_interactive);
 
 const Interactive = @import("../../interactive.zig").Interactive;
 const TerminalSystemQueue = @import("../../interactive.zig").TerminalSystemQueue;
-const UiOwnerRequest = @import("../../interactive.zig").UiOwnerRequest;
-const UiOwnerRequestQueue = @import("../../interactive.zig").UiOwnerRequestQueue;
 const AgentRequest = coding_agent_mod.AgentRequest;
 const ExtensionRunner = coding_agent_mod.ExtensionRunner;
 
@@ -46,7 +46,6 @@ pub const AgentRuntime = struct {
     ai_complete_worker: *?ai_complete_worker_mod.AiCompleteWorker,
     system_worker: *?system_worker_mod.SystemWorker,
     terminal_system_queue: *TerminalSystemQueue,
-    ui_owner_request_queue: *UiOwnerRequestQueue,
     job_manager: *job_manager_mod.JobManager,
     extension_command_actions: extension_runner_mod.ExtensionCommandActions = undefined,
     extension_deferred_user_prompts: std.ArrayListUnmanaged([]u8) = .empty,
@@ -65,7 +64,6 @@ pub const AgentRuntime = struct {
             .ai_complete_worker = &self.ai_complete_worker,
             .system_worker = &self.system_worker,
             .terminal_system_queue = &self.terminal_system_queue,
-            .ui_owner_request_queue = &self.ui_owner_request_queue,
             .job_manager = &self.job_manager,
         };
     }
@@ -119,17 +117,25 @@ pub const AgentRuntime = struct {
         extension_publish.publishPendingUi(self.extensionPublisher());
     }
     pub fn handleManualCompactRequest(self: *AgentRuntime, custom_instructions: ?[]const u8) void {
-        const owned = if (custom_instructions) |bytes| self.msg_allocator.dupe(u8, bytes) catch return else null;
-        self.enqueueUiOwnerRequest(.{ .manual_compact = owned });
+        _ = self.runtime_host.runCompaction(.manual, false, .{
+            .custom_instructions = custom_instructions,
+        }) catch {
+            self.publishStatusSnapshot();
+            return;
+        };
+        self.publishStatusSnapshot();
+        if (!self.publishConversationState()) {
+            log.warn("snapshot queue dropped post-compaction conversation state", .{});
+        }
     }
     pub fn handleNewSession(self: *AgentRuntime) void {
-        self.enqueueUiOwnerRequest(.new_session);
+        session_requests_mod.handleNewSession(self);
     }
     pub fn handleForkSession(self: *AgentRuntime, entry_id: []const u8) void {
-        self.enqueueUiOwnerRequest(.{ .fork_session = self.msg_allocator.dupe(u8, entry_id) catch return });
+        session_requests_mod.handleForkSession(self, entry_id);
     }
     pub fn handleResumeSession(self: *AgentRuntime, path: []const u8, restore_session_model: bool) void {
-        self.enqueueUiOwnerRequest(.{ .resume_session = .{ .path = self.msg_allocator.dupe(u8, path) catch return, .restore_session_model = restore_session_model } });
+        session_requests_mod.handleResumeSession(self, path, restore_session_model);
     }
     pub fn publishConversationState(self: *AgentRuntime) bool {
         return conversation_publish.publishConversationStateWithPublisher(self.conversationPublisher());
@@ -138,10 +144,10 @@ pub const AgentRuntime = struct {
         conversation_publish.publishQueuedSnapshotIfChangedWithPublisher(self.conversationPublisher());
     }
     pub fn handleSetModel(self: *AgentRuntime, m: anytype) void {
-        self.enqueueUiOwnerRequest(.{ .set_model_pattern = self.msg_allocator.dupe(u8, m.id) catch return });
+        model_requests_mod.handleSetModel(self, m);
     }
     pub fn handleSetModelPattern(self: *AgentRuntime, pattern: []const u8) void {
-        self.enqueueUiOwnerRequest(.{ .set_model_pattern = self.msg_allocator.dupe(u8, pattern) catch return });
+        model_requests_mod.handleSetModelPattern(self, pattern);
     }
     pub fn publishThemeSnapshot(self: *AgentRuntime) void {
         theme_flow.publishSnapshotWithPublisher(self.runtime_host, self);
@@ -153,7 +159,7 @@ pub const AgentRuntime = struct {
         model_requests_mod.publishStatusSnapshotWithPublisher(self.modelSnapshotPublisher());
     }
     pub fn handleSetThinkingLevel(self: *AgentRuntime, level: anytype) void {
-        self.enqueueUiOwnerRequest(.{ .set_thinking_level = level });
+        model_requests_mod.handleSetThinkingLevel(self, level);
     }
     pub fn discardAgentRequests(self: *AgentRuntime, requests: []AgentRequest) void {
         discardRequests(self.msg_allocator, requests);
@@ -177,7 +183,8 @@ pub const AgentRuntime = struct {
     fn conversationPublisher(self: *AgentRuntime) conversation_publish.Publisher {
         return .{
             .runtime_host = self.runtime_host,
-            .publish_snapshot = &publishConversationSnapshotFromRuntime,
+            .publish_conversation = &publishConversationSnapshotFromRuntime,
+            .publish_queued = &publishQueuedSnapshotFromRuntime,
             .publish_ctx = @ptrCast(self),
             .last_published_queued_version = self.last_published_queued_version,
         };
@@ -202,16 +209,6 @@ pub const AgentRuntime = struct {
             .ctx = @ptrCast(self),
         };
     }
-
-    fn enqueueUiOwnerRequest(self: *AgentRuntime, request: UiOwnerRequest) void {
-        switch (self.ui_owner_request_queue.trySend(request)) {
-            .ok, .dropped => {},
-            .full, .closed, .oom => |rejected| {
-                var failed = rejected;
-                failed.deinit(self.msg_allocator);
-            },
-        }
-    }
 };
 
 fn publishSnapshotUiEventFromRuntime(ctx: ?*anyopaque, event: UiEvent) bool {
@@ -224,12 +221,14 @@ fn publishLifecycleUiEventFromRuntime(ctx: ?*anyopaque, event: UiEvent) bool {
     return self.publishLifecycleUiEvent(event);
 }
 
-fn publishConversationSnapshotFromRuntime(ctx: ?*anyopaque, event: conversation_publish.Publisher.UiSnapshot) bool {
+fn publishConversationSnapshotFromRuntime(ctx: ?*anyopaque, envelope: agent_mod.conversation_state.ConversationSnapshotEnvelope) bool {
     const self: *AgentRuntime = @ptrCast(@alignCast(ctx.?));
-    return switch (event) {
-        .conversation => |snapshot| self.publishSnapshotUiEvent(.{ .conversation_snapshot = snapshot }),
-        .queued => |snapshot| self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot }),
-    };
+    return self.publishSnapshotUiEvent(.{ .conversation_snapshot = envelope });
+}
+
+fn publishQueuedSnapshotFromRuntime(ctx: ?*anyopaque, snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot) bool {
+    const self: *AgentRuntime = @ptrCast(@alignCast(ctx.?));
+    return self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot });
 }
 
 fn sameEventTag(item: *const UiEvent, ctx: ?*anyopaque) bool {

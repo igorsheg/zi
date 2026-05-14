@@ -4,39 +4,34 @@ const coding_agent_mod = @import("../../coding_agent/root.zig");
 
 const Interactive = @import("../interactive.zig").Interactive;
 const AgentEvent = agent_mod.protocol.AgentEvent;
-const ConversationSnapshotPublisher = coding_agent_mod.ConversationSnapshotPublisher;
+const SyncSnapshotSink = coding_agent_mod.SyncSnapshotSink;
 
 const soft_conversation_publish_cadence_ns: u64 = 33 * std.time.ns_per_ms;
 
 pub const Publisher = struct {
     runtime_host: *coding_agent_mod.RuntimeHost,
-    publish_snapshot: *const fn (ctx: ?*anyopaque, event: UiSnapshot) bool,
+    publish_conversation: *const fn (ctx: ?*anyopaque, envelope: agent_mod.conversation_state.ConversationSnapshotEnvelope) bool,
+    publish_queued: *const fn (ctx: ?*anyopaque, snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot) bool,
     publish_ctx: ?*anyopaque,
     last_published_queued_version: *u64,
-
-    pub const UiSnapshot = union(enum) {
-        conversation: agent_mod.conversation_state.ConversationSnapshotEnvelope,
-        queued: coding_agent_mod.runtime_host.QueuedMessageSnapshot,
-    };
 };
 
 pub fn publisherForInteractive(self: *Interactive) Publisher {
     return .{
         .runtime_host = &self.runtime_host,
-        .publish_snapshot = &publishSnapshotToInteractive,
+        .publish_conversation = &publishConversationSnapshotToInteractive,
+        .publish_queued = &publishQueuedSnapshotToInteractive,
         .publish_ctx = @ptrCast(self),
         .last_published_queued_version = &self.last_published_queued_version,
     };
 }
 
 pub fn publishConversationStateWithPublisher(publisher: Publisher) bool {
-    var stable = publisher;
-    return stable.runtime_host.publishConversationState(conversationSnapshotPublisher(&stable));
+    return publisher.runtime_host.publishConversationState(snapshotSink(publisher));
 }
 
 pub fn publishQueuedSnapshotWithPublisher(publisher: Publisher) bool {
-    var stable = publisher;
-    return stable.runtime_host.publishQueuedSnapshot(queuedSnapshotPublisher(&stable));
+    return publisher.runtime_host.publishQueuedSnapshot(snapshotSink(publisher));
 }
 
 pub fn publishQueuedSnapshotIfChangedWithPublisher(publisher: Publisher) void {
@@ -103,34 +98,20 @@ fn maybePublishSoftConversation(self: *Interactive) void {
     self.conversation_publish_dirty = false;
 }
 
-fn conversationSnapshotPublisher(publisher: *const Publisher) ConversationSnapshotPublisher {
+fn snapshotSink(publisher: Publisher) SyncSnapshotSink {
     return .{
-        .func = &publishConversationSnapshotToUi,
-        .ctx = @ptrCast(@constCast(publisher)),
+        .ctx = publisher.publish_ctx,
+        .publish_conversation = publisher.publish_conversation,
+        .publish_queued = publisher.publish_queued,
     };
 }
 
-fn queuedSnapshotPublisher(publisher: *const Publisher) coding_agent_mod.runtime_host.QueuedSnapshotPublisher {
-    return .{
-        .func = &publishQueuedSnapshotToUi,
-        .ctx = @ptrCast(@constCast(publisher)),
-    };
-}
-
-fn publishConversationSnapshotToUi(envelope: agent_mod.conversation_state.ConversationSnapshotEnvelope, ctx: ?*anyopaque) bool {
-    const publisher: *const Publisher = @ptrCast(@alignCast(ctx.?));
-    return publisher.publish_snapshot(publisher.publish_ctx, .{ .conversation = envelope });
-}
-
-fn publishQueuedSnapshotToUi(snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot, ctx: ?*anyopaque) bool {
-    const publisher: *const Publisher = @ptrCast(@alignCast(ctx.?));
-    return publisher.publish_snapshot(publisher.publish_ctx, .{ .queued = snapshot });
-}
-
-fn publishSnapshotToInteractive(ctx: ?*anyopaque, event: Publisher.UiSnapshot) bool {
+fn publishConversationSnapshotToInteractive(ctx: ?*anyopaque, envelope: agent_mod.conversation_state.ConversationSnapshotEnvelope) bool {
     const self: *Interactive = @ptrCast(@alignCast(ctx.?));
-    return switch (event) {
-        .conversation => |snapshot| self.publishSnapshotUiEvent(.{ .conversation_snapshot = snapshot }),
-        .queued => |snapshot| self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot }),
-    };
+    return self.publishSnapshotUiEvent(.{ .conversation_snapshot = envelope });
+}
+
+fn publishQueuedSnapshotToInteractive(ctx: ?*anyopaque, snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot) bool {
+    const self: *Interactive = @ptrCast(@alignCast(ctx.?));
+    return self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot });
 }

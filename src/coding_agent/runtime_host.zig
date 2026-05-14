@@ -40,20 +40,17 @@ pub const CompactionExecutor = session_runner.CompactionExecutor;
 pub const LifecycleHooks = session_runner.LifecycleHooks;
 pub const Options = session_runner.Options;
 
-pub const ConversationSnapshotPublisher = struct {
-    func: *const fn (envelope: conversation_state.ConversationSnapshotEnvelope, ctx: ?*anyopaque) bool,
+pub const SyncSnapshotSink = struct {
     ctx: ?*anyopaque = null,
+    publish_conversation: *const fn (ctx: ?*anyopaque, envelope: conversation_state.ConversationSnapshotEnvelope) bool,
+    publish_queued: *const fn (ctx: ?*anyopaque, snapshot: control_mod.QueuedMessageSnapshot) bool,
 
-    pub fn publish(self: ConversationSnapshotPublisher, envelope: conversation_state.ConversationSnapshotEnvelope) bool {
-        return self.func(envelope, self.ctx);
+    pub fn conversation(self: SyncSnapshotSink, envelope: conversation_state.ConversationSnapshotEnvelope) bool {
+        return self.publish_conversation(self.ctx, envelope);
     }
-};
-pub const QueuedSnapshotPublisher = struct {
-    func: *const fn (snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) bool,
-    ctx: ?*anyopaque = null,
 
-    pub fn publish(self: QueuedSnapshotPublisher, snapshot: control_mod.QueuedMessageSnapshot) bool {
-        return self.func(snapshot, self.ctx);
+    pub fn queued(self: SyncSnapshotSink, snapshot: control_mod.QueuedMessageSnapshot) bool {
+        return self.publish_queued(self.ctx, snapshot);
     }
 };
 
@@ -570,7 +567,7 @@ pub const RuntimeHost = struct {
 
     pub fn publishConversationState(
         self: *RuntimeHost,
-        publisher: ConversationSnapshotPublisher,
+        sink: SyncSnapshotSink,
     ) bool {
         var view = self.session.agent.cloneConversationView(self.msg_allocator) catch return false;
         errdefer view.deinit(self.msg_allocator);
@@ -580,7 +577,7 @@ pub const RuntimeHost = struct {
             .conversation_version = self.session.agent.currentConversationVersion(),
             .view = view,
         };
-        if (!publisher.publish(envelope)) return false;
+        if (!sink.conversation(envelope)) return false;
         return true;
     }
 
@@ -607,12 +604,12 @@ pub const RuntimeHost = struct {
 
     pub fn publishQueuedSnapshot(
         self: *RuntimeHost,
-        publisher: QueuedSnapshotPublisher,
+        sink: SyncSnapshotSink,
     ) bool {
         var snapshot = self.session.cloneQueuedMessageSnapshot(self.msg_allocator) catch return false;
         errdefer snapshot.deinit(self.msg_allocator);
 
-        if (!publisher.publish(snapshot)) return false;
+        if (!sink.queued(snapshot)) return false;
         return true;
     }
 
@@ -1286,13 +1283,13 @@ test "runtime host publishes committed view and queued snapshots independently" 
     defer if (published_queued) |*snapshot| snapshot.deinit(testing.allocator);
 
     const Capture = struct {
-        fn publishSnapshot(envelope: conversation_state.ConversationSnapshotEnvelope, ctx: ?*anyopaque) bool {
+        fn publishSnapshot(ctx: ?*anyopaque, envelope: conversation_state.ConversationSnapshotEnvelope) bool {
             const out: *?conversation_state.ConversationSnapshotEnvelope = @ptrCast(@alignCast(ctx.?));
             out.* = envelope;
             return true;
         }
 
-        fn publishQueued(snapshot: control_mod.QueuedMessageSnapshot, ctx: ?*anyopaque) bool {
+        fn publishQueued(ctx: ?*anyopaque, snapshot: control_mod.QueuedMessageSnapshot) bool {
             const out: *?control_mod.QueuedMessageSnapshot = @ptrCast(@alignCast(ctx.?));
             out.* = snapshot;
             return true;
@@ -1308,12 +1305,14 @@ test "runtime host publishes committed view and queued snapshots independently" 
     } }));
 
     try testing.expect(host.publishConversationState(.{
-        .func = &Capture.publishSnapshot,
         .ctx = @ptrCast(&published_snapshot),
+        .publish_conversation = &Capture.publishSnapshot,
+        .publish_queued = &Capture.publishQueued,
     }));
     try testing.expect(host.publishQueuedSnapshot(.{
-        .func = &Capture.publishQueued,
         .ctx = @ptrCast(&published_queued),
+        .publish_conversation = &Capture.publishSnapshot,
+        .publish_queued = &Capture.publishQueued,
     }));
 
     try testing.expect(published_snapshot != null);
