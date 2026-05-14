@@ -1,9 +1,15 @@
 const theme_mod = @import("../theme.zig");
+const coding_agent_mod = @import("../../coding_agent/root.zig");
+const UiEvent = @import("../ui_event.zig").UiEvent;
 
 const Interactive = @import("../interactive.zig").Interactive;
 
 pub fn publishSnapshot(self: *Interactive) void {
-    _ = self.publishSnapshotUiEvent(.{ .theme_changed = self.runtime_host.selectedTheme() });
+    publishSnapshotWithPublisher(&self.runtime_host, self);
+}
+
+pub fn publishSnapshotWithPublisher(runtime_host: *coding_agent_mod.RuntimeHost, publisher: anytype) void {
+    _ = publisher.publishSnapshotUiEvent(.{ .theme_changed = runtime_host.selectedTheme() });
 }
 
 pub fn apply(self: *Interactive, theme: theme_mod.Theme) void {

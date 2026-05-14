@@ -14,6 +14,9 @@ const ai_complete_worker_mod = @import("../../../coding_agent/extensions/ai_comp
 const system_worker_mod = @import("../../../coding_agent/extensions/system_worker.zig");
 const job_manager_mod = @import("job_manager.zig");
 const conversation_publish = @import("../conversation_publish.zig");
+const model_requests_mod = @import("../model_requests.zig");
+const theme_flow = @import("../theme_flow.zig");
+const status_snapshot_mod = @import("../status_snapshot.zig");
 const log = std.log.scoped(.tui_interactive);
 
 const Interactive = @import("../../interactive.zig").Interactive;
@@ -36,6 +39,7 @@ pub const AgentRuntime = struct {
     lifecycle_event_queue: *queues_mod.UiLifecycleQueue,
     snapshot_coalesced_dropped: *usize,
     last_published_queued_version: *u64,
+    last_published_status_snapshot: *?status_snapshot_mod.PublishedStatusSnapshot,
     resolver: *tool_display_mod.ToolRendererResolver,
     ai_complete_worker: *?ai_complete_worker_mod.AiCompleteWorker,
     system_worker: *?system_worker_mod.SystemWorker,
@@ -54,6 +58,7 @@ pub const AgentRuntime = struct {
             .lifecycle_event_queue = &self.lifecycle_event_queue,
             .snapshot_coalesced_dropped = &self.snapshot_coalesced_dropped,
             .last_published_queued_version = &self.last_published_queued_version,
+            .last_published_status_snapshot = &self.last_published_status_snapshot,
             .resolver = &self.resolver,
             .ai_complete_worker = &self.ai_complete_worker,
             .system_worker = &self.system_worker,
@@ -139,13 +144,13 @@ pub const AgentRuntime = struct {
         self.ui().handleSetModelPattern(pattern);
     }
     pub fn publishThemeSnapshot(self: *AgentRuntime) void {
-        self.ui().publishThemeSnapshot();
+        theme_flow.publishSnapshotWithPublisher(self.runtime_host, self);
     }
     pub fn publishVisibleModelsSnapshot(self: *AgentRuntime) void {
-        self.ui().publishVisibleModelsSnapshot();
+        model_requests_mod.publishVisibleModelsSnapshotWithPublisher(self.modelSnapshotPublisher());
     }
     pub fn publishStatusSnapshot(self: *AgentRuntime) void {
-        self.ui().publishStatusSnapshot();
+        model_requests_mod.publishStatusSnapshotWithPublisher(self.modelSnapshotPublisher());
     }
     pub fn handleSetThinkingLevel(self: *AgentRuntime, level: anytype) void {
         self.ui().handleSetThinkingLevel(level);
@@ -177,7 +182,28 @@ pub const AgentRuntime = struct {
             .last_published_queued_version = self.last_published_queued_version,
         };
     }
+
+    fn modelSnapshotPublisher(self: *AgentRuntime) model_requests_mod.SnapshotPublisher {
+        return .{
+            .msg_allocator = self.msg_allocator,
+            .runtime_host = self.runtime_host,
+            .last_published_status_snapshot = self.last_published_status_snapshot,
+            .publish_snapshot = &publishSnapshotUiEventFromRuntime,
+            .publish_lifecycle = &publishLifecycleUiEventFromRuntime,
+            .ctx = @ptrCast(self),
+        };
+    }
 };
+
+fn publishSnapshotUiEventFromRuntime(ctx: ?*anyopaque, event: UiEvent) bool {
+    const self: *AgentRuntime = @ptrCast(@alignCast(ctx.?));
+    return self.publishSnapshotUiEvent(event);
+}
+
+fn publishLifecycleUiEventFromRuntime(ctx: ?*anyopaque, event: UiEvent) bool {
+    const self: *AgentRuntime = @ptrCast(@alignCast(ctx.?));
+    return self.publishLifecycleUiEvent(event);
+}
 
 fn publishConversationSnapshotFromRuntime(ctx: ?*anyopaque, event: conversation_publish.Publisher.UiSnapshot) bool {
     const self: *AgentRuntime = @ptrCast(@alignCast(ctx.?));
