@@ -1,6 +1,5 @@
 const std = @import("std");
 const net = std.Io.net;
-const posix = std.posix;
 
 const log = std.log.scoped(.callback_server);
 const zio = @import("../../zio/root.zig");
@@ -39,24 +38,13 @@ pub fn waitForCallback(
     };
     defer server.deinit(std.Options.debug_io);
 
-    const cancel_fd = signal.wakeReadFd();
     while (!signal.isAborted()) {
-        var pfd = [1]posix.pollfd{.{
-            .fd = server.socket.handle,
-            .events = posix.POLL.IN,
-            .revents = undefined,
-        }};
-        var pfds_with_cancel = [2]posix.pollfd{
-            pfd[0],
-            .{ .fd = cancel_fd orelse -1, .events = posix.POLL.IN, .revents = 0 },
-        };
-        const ready = if (cancel_fd != null) posix.poll(&pfds_with_cancel, -1) catch continue else posix.poll(&pfd, 500) catch continue;
-        if (ready == 0) continue;
-        if (cancel_fd != null and pfds_with_cancel[1].revents & posix.POLL.IN != 0) {
+        const readiness = waitReadiness(allocator, server.socket.handle, signal) catch continue;
+        if (readiness.cancel_ready) {
             signal.acknowledgeWake();
             return .cancelled;
         }
-        if (cancel_fd != null) pfd[0] = pfds_with_cancel[0];
+        if (!readiness.server_ready) continue;
 
         const stream = server.accept(std.Options.debug_io) catch continue;
         defer stream.close(std.Options.debug_io);
@@ -87,6 +75,40 @@ pub fn waitForCallback(
     }
 
     return .cancelled;
+}
+
+const CallbackReadiness = struct {
+    server_ready: bool = false,
+    cancel_ready: bool = false,
+};
+
+fn waitReadiness(allocator: std.mem.Allocator, server_fd: std.posix.fd_t, signal: zio.cancel.Token) !CallbackReadiness {
+    const Callbacks = struct {
+        fn server(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
+            const out: *CallbackReadiness = @ptrCast(@alignCast(ptr.?));
+            out.server_ready = ready.read;
+        }
+        fn cancel(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
+            const out: *CallbackReadiness = @ptrCast(@alignCast(ptr.?));
+            out.cancel_ready = ready.read;
+        }
+    };
+
+    var readiness = CallbackReadiness{};
+    const interest = zio.loop.Interest{ .read = true };
+    if (signal.wakeReadFd()) |cancel_fd| {
+        const sources = [_]zio.loop.Source{
+            .{ .fd = server_fd, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.server } },
+            .{ .fd = cancel_fd, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.cancel } },
+        };
+        _ = try zio.loop.runSources(allocator, &sources, -1);
+    } else {
+        const sources = [_]zio.loop.Source{
+            .{ .fd = server_fd, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.server } },
+        };
+        _ = try zio.loop.runSources(allocator, &sources, 500);
+    }
+    return readiness;
 }
 
 fn sendResponse(stream: net.Stream, status: []const u8, body: []const u8) void {
