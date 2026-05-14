@@ -357,7 +357,7 @@ fn publishNotifyFromArgs(L: *c.lua_State) !void {
     const progress = if (opts_idx != 0) readBoolField(L, opts_idx, "progress", false) else false;
     const ttl_ms = if (opts_idx != 0) readOptionalU32Field(L, opts_idx, "ttl_ms") orelse readOptionalSecondsAsMsField(L, opts_idx, "ttl") else null;
     const lifetime = notifyLifetime(ttl_ms, progress, done);
-    const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+    const now_ns = abort_signal_mod.deadline.nowNs(std.Options.debug_io);
 
     const notify = extension_ui.NotifySpec{ .state_owner_id = try aa.dupe(u8, stateOwnerFromUpvalue(L)), .generation = runner.generation, .id = id, .message = try aa.dupe(u8, message), .group = group, .title = title, .annote = annote, .level = level, .progress = progress, .done = done, .clear = clear, .created_ns = now_ns, .updated_ns = now_ns, .lifetime = lifetime };
     const spec = extension_ui.RenderSpec{ .state_owner_id = notify.state_owner_id, .generation = notify.generation, .id = notify.id, .slot = .notification, .order = 0, .remove = notify.clear, .root = null, .notification = notify };
