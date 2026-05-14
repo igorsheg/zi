@@ -319,6 +319,10 @@ pub fn extractQueuedMessageText(msg: protocol.AgentMessage) ?[]const u8 {
                 break :blk null;
             },
         },
+        .custom => |custom| switch (custom.content) {
+            .text => |text| text,
+            .blocks => null,
+        },
         else => null,
     };
 }
@@ -343,6 +347,24 @@ test "RunControl snapshots queued steering and follow-up messages" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.follow_up.len);
     try std.testing.expectEqualStrings("steer", snapshot.steering[0].text);
     try std.testing.expectEqualStrings("follow", snapshot.follow_up[0].text);
+}
+
+test "RunControl snapshots queued custom message text" {
+    var run_control = try RunControl.init(std.testing.allocator, .{});
+    defer run_control.deinit();
+
+    try std.testing.expectEqual(.ok, run_control.enqueue(.steering, .{ .custom = .{
+        .custom_type = "test.custom",
+        .content = .{ .text = "custom steer" },
+        .display = true,
+        .timestamp = 1,
+    } }));
+
+    var snapshot = run_control.snapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.steering.len);
+    try std.testing.expectEqualStrings("custom steer", snapshot.steering[0].text);
 }
 
 test "RunControl one-at-a-time drain preserves later steering messages" {

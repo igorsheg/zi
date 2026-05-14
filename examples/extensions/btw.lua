@@ -291,8 +291,11 @@ local function inject_summary(ctx)
   end
   local msg = "Summary of my BTW side conversation:\n\n" .. tostring(result.text or "")
   if ctx.send_user_message then
-    local slot = (ctx.is_idle and ctx.is_idle()) and "prompt" or "follow_up"
-    ctx.send_user_message(msg, { slot = target })
+    if ctx.is_idle and ctx.is_idle() then
+      ctx.send_user_message(msg)
+    else
+      ctx.send_user_message(msg, { mode = "followup" })
+    end
     reset(ctx)
     close_overlay(ctx)
   elseif ctx.editor and ctx.editor.set_text then

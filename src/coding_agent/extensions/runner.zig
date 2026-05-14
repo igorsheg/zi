@@ -685,25 +685,73 @@ pub const ExtensionRunnerRef = struct {
     }
 };
 
-pub const UserMessageTarget = enum {
-    auto,
-    prompt,
-    steering,
-    follow_up,
+pub const UserMessageMode = enum {
+    now,
+    steer,
+    followup,
 };
 
-pub const SendUserMessageOptions = struct {
-    target: UserMessageTarget = .auto,
-};
-
-pub const SendUserMessageResult = enum {
+pub const SendUserMessageStatus = enum {
     submitted,
     queued,
 };
 
+pub const SendUserMessageResult = struct {
+    status: SendUserMessageStatus,
+    mode: UserMessageMode,
+};
+
+pub const MessageMode = enum {
+    now,
+    steer,
+    followup,
+};
+
+/// Borrowed custom message payload passed from an extension context action to the
+/// runtime host. All slices and `data` are valid only for the duration of the
+/// ExtensionCommandActions.send_message call. Hosts must clone anything they
+/// persist, queue, or retain beyond the call.
+pub const ExtensionCustomMessage = struct {
+    kind: []const u8,
+    text: ?[]const u8 = null,
+    display: bool = true,
+    data: ?std.json.Value = null,
+    include_in_context: bool = false,
+};
+
+pub const SendMessageOptions = struct {
+    mode: ?MessageMode = null,
+};
+
+pub const SendMessageStatus = enum {
+    stored,
+    submitted,
+    queued,
+};
+
+pub const SendMessageResult = struct {
+    status: SendMessageStatus,
+    /// Borrowed from the active session store. Valid only for the duration of
+    /// the ExtensionCommandActions.send_message call; Lua bindings copy it
+    /// before returning to extension code.
+    entry_id: ?[]const u8 = null,
+};
+
+pub const AppendEntryResult = struct {
+    /// Borrowed from the active session store. Valid only for the duration of
+    /// the ExtensionCommandActions.append_entry call; Lua bindings copy it
+    /// before returning to extension code.
+    entry_id: []const u8,
+};
+
 pub const ExtensionCommandActions = struct {
     ctx: *anyopaque,
-    send_user_message: *const fn (ctx: *anyopaque, text: []const u8, opts: SendUserMessageOptions) anyerror!SendUserMessageResult,
+    /// `text` is borrowed for the duration of the call.
+    send_user_message: *const fn (ctx: *anyopaque, text: []const u8, mode: UserMessageMode) anyerror!SendUserMessageResult,
+    /// `message` and nested JSON values are borrowed for the duration of the call.
+    send_message: *const fn (ctx: *anyopaque, message: ExtensionCustomMessage, opts: SendMessageOptions) anyerror!SendMessageResult,
+    /// `kind` and `data` are borrowed for the duration of the call.
+    append_entry: *const fn (ctx: *anyopaque, kind: []const u8, data: ?std.json.Value) anyerror!AppendEntryResult,
 };
 
 pub const SpawnRequest = struct {
@@ -1927,14 +1975,28 @@ fn testBound(session: *anyopaque) ExtensionRuntime.Bound {
 fn testSendUserMessage(
     ctx: *anyopaque,
     text: []const u8,
-    opts: SendUserMessageOptions,
+    mode: UserMessageMode,
 ) anyerror!SendUserMessageResult {
     _ = ctx;
     _ = text;
-    return switch (opts.target) {
-        .follow_up => .queued,
-        else => .submitted,
-    };
+    return .{ .status = if (mode == .followup) .queued else .submitted, .mode = mode };
+}
+
+fn testSendMessage(
+    ctx: *anyopaque,
+    message: ExtensionCustomMessage,
+    opts: SendMessageOptions,
+) anyerror!SendMessageResult {
+    _ = ctx;
+    _ = message;
+    return .{ .status = if (opts.mode == .followup) .queued else .stored, .entry_id = "test-entry" };
+}
+
+fn testAppendEntry(ctx: *anyopaque, kind: []const u8, data: ?std.json.Value) anyerror!AppendEntryResult {
+    _ = ctx;
+    _ = kind;
+    _ = data;
+    return .{ .entry_id = "test-entry" };
 }
 
 test "ExtensionRunner stores command actions on bound runtime" {
@@ -1950,11 +2012,15 @@ test "ExtensionRunner stores command actions on bound runtime" {
     var actions = ExtensionCommandActions{
         .ctx = @ptrCast(&action_ctx),
         .send_user_message = &testSendUserMessage,
+        .send_message = &testSendMessage,
+        .append_entry = &testAppendEntry,
     };
 
     runner.setCommandActions(&actions);
     try std.testing.expect(runner.runtime.bound.command_actions.? == &actions);
-    try std.testing.expectEqual(SendUserMessageResult.queued, try actions.send_user_message(actions.ctx, "hello", .{ .target = .follow_up }));
+    const sent = try actions.send_user_message(actions.ctx, "hello", .followup);
+    try std.testing.expectEqual(SendUserMessageStatus.queued, sent.status);
+    try std.testing.expectEqual(UserMessageMode.followup, sent.mode);
 
     runner.setCommandActions(null);
     try std.testing.expect(runner.runtime.bound.command_actions == null);

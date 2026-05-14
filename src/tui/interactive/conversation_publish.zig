@@ -30,11 +30,13 @@ pub fn publisherForInteractive(self: *Interactive) Publisher {
 }
 
 pub fn publishConversationStateWithPublisher(publisher: Publisher) bool {
-    return publisher.runtime_host.publishConversationState(conversationSnapshotPublisher(publisher));
+    var stable = publisher;
+    return stable.runtime_host.publishConversationState(conversationSnapshotPublisher(&stable));
 }
 
 pub fn publishQueuedSnapshotWithPublisher(publisher: Publisher) bool {
-    return publisher.runtime_host.publishQueuedSnapshot(queuedSnapshotPublisher(publisher));
+    var stable = publisher;
+    return stable.runtime_host.publishQueuedSnapshot(queuedSnapshotPublisher(&stable));
 }
 
 pub fn publishQueuedSnapshotIfChangedWithPublisher(publisher: Publisher) void {
@@ -101,17 +103,17 @@ fn maybePublishSoftConversation(self: *Interactive) void {
     self.conversation_publish_dirty = false;
 }
 
-fn conversationSnapshotPublisher(publisher: Publisher) ConversationSnapshotPublisher {
+fn conversationSnapshotPublisher(publisher: *const Publisher) ConversationSnapshotPublisher {
     return .{
         .func = &publishConversationSnapshotToUi,
-        .ctx = @ptrCast(@constCast(&publisher)),
+        .ctx = @ptrCast(@constCast(publisher)),
     };
 }
 
-fn queuedSnapshotPublisher(publisher: Publisher) coding_agent_mod.runtime_host.QueuedSnapshotPublisher {
+fn queuedSnapshotPublisher(publisher: *const Publisher) coding_agent_mod.runtime_host.QueuedSnapshotPublisher {
     return .{
         .func = &publishQueuedSnapshotToUi,
-        .ctx = @ptrCast(@constCast(&publisher)),
+        .ctx = @ptrCast(@constCast(publisher)),
     };
 }
 

@@ -1,3 +1,4 @@
+const std = @import("std");
 const request_mod = @import("../../coding_agent/request.zig");
 const oauth_mod = @import("../../coding_agent/auth/oauth.zig");
 const extension_runner_mod = @import("../../coding_agent/extensions/runner.zig");
@@ -166,6 +167,8 @@ fn bindExtensionCommandActions(self: anytype) void {
     self.extension_command_actions = .{
         .ctx = @ptrCast(self),
         .send_user_message = &sendUserMessageFromExtension,
+        .send_message = &sendMessageFromExtension,
+        .append_entry = &appendEntryFromExtension,
     };
     runner.setCommandActions(&self.extension_command_actions);
 }
@@ -201,35 +204,53 @@ fn flushDeferredUserPrompts(self: anytype) bool {
 fn sendUserMessageFromExtension(
     ctx: *anyopaque,
     text: []const u8,
-    opts: extension_runner_mod.SendUserMessageOptions,
+    mode: extension_runner_mod.UserMessageMode,
 ) anyerror!extension_runner_mod.SendUserMessageResult {
     const self: *@import("runtime/loop.zig").AgentRuntime = @ptrCast(@alignCast(ctx));
     const streaming = self.runtime_host.currentSession().agent.isStreaming();
-    const target = switch (opts.target) {
-        .auto => if (streaming) extension_runner_mod.UserMessageTarget.steering else .prompt,
-        else => opts.target,
-    };
-
-    switch (target) {
-        .auto => unreachable,
-        .steering, .follow_up => {
-            const queue_kind: @import("../../coding_agent/runtime_host.zig").QueueKind = switch (target) {
-                .steering => .steering,
-                .follow_up => .follow_up,
-                else => unreachable,
-            };
-            return switch (self.runtime_host.enqueueQueuedText(queue_kind, text)) {
-                .ok => .queued,
-                .closed => error.AgentUnavailable,
-                .oom => error.OutOfMemory,
-            };
-        },
-        .prompt => {
+    switch (mode) {
+        .now => {
             if (streaming) return error.AgentBusy;
             const text_copy = try self.msg_allocator.dupe(u8, text);
             errdefer self.msg_allocator.free(text_copy);
             try self.extension_deferred_user_prompts.append(self.msg_allocator, text_copy);
-            return .submitted;
+            return .{ .status = .submitted, .mode = .now };
+        },
+        .steer, .followup => {
+            if (!streaming) {
+                const text_copy = try self.msg_allocator.dupe(u8, text);
+                errdefer self.msg_allocator.free(text_copy);
+                try self.extension_deferred_user_prompts.append(self.msg_allocator, text_copy);
+                return .{ .status = .submitted, .mode = mode };
+            }
+            const queue_kind: @import("../../coding_agent/runtime_host.zig").QueueKind = switch (mode) {
+                .steer => .steering,
+                .followup => .follow_up,
+                .now => unreachable,
+            };
+            return switch (self.runtime_host.enqueueQueuedText(queue_kind, text)) {
+                .ok => .{ .status = .queued, .mode = mode },
+                .closed => error.AgentUnavailable,
+                .oom => error.OutOfMemory,
+            };
         },
     }
+}
+
+fn sendMessageFromExtension(
+    ctx: *anyopaque,
+    message: extension_runner_mod.ExtensionCustomMessage,
+    opts: extension_runner_mod.SendMessageOptions,
+) anyerror!extension_runner_mod.SendMessageResult {
+    const self: *@import("runtime/loop.zig").AgentRuntime = @ptrCast(@alignCast(ctx));
+    return try self.runtime_host.sendExtensionCustomMessage(message, opts);
+}
+
+fn appendEntryFromExtension(
+    ctx: *anyopaque,
+    kind: []const u8,
+    data: ?std.json.Value,
+) anyerror!extension_runner_mod.AppendEntryResult {
+    const self: *@import("runtime/loop.zig").AgentRuntime = @ptrCast(@alignCast(ctx));
+    return try self.runtime_host.appendExtensionEntry(kind, data);
 }

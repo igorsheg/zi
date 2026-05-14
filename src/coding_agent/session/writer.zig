@@ -191,12 +191,13 @@ pub const SessionWriter = struct {
         self.appendEntry(.{ .custom = .{ .custom_type = custom_type, .data = data } });
     }
 
-    pub fn appendCustomMessage(self: *SessionWriter, custom_type: []const u8, content: agent.protocol.AgentMessage.CustomContent, display: bool, details: ?std.json.Value) void {
+    pub fn appendCustomMessage(self: *SessionWriter, custom_type: []const u8, content: agent.protocol.AgentMessage.CustomContent, display: bool, details: ?std.json.Value, include_in_context: bool) void {
         self.appendEntry(.{ .custom_message = .{
             .custom_type = custom_type,
             .content = content,
             .display = display,
             .details = details,
+            .include_in_context = include_in_context,
         } });
     }
 

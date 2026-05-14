@@ -337,7 +337,7 @@ fn messageFromEntryForCompaction(entry: SessionEntry) ?AgentMessage {
             .from_id = bs.from_id,
             .timestamp = 0,
         } },
-        .custom_message => |cm| AgentMessage{ .custom = .{
+        .custom_message => |cm| if (!cm.include_in_context) null else AgentMessage{ .custom = .{
             .custom_type = cm.custom_type,
             .content = cm.content,
             .display = cm.display,

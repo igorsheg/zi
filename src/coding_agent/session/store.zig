@@ -200,9 +200,9 @@ pub const SessionStore = struct {
         self.writer.appendCustomEntry(custom_type, data);
     }
 
-    pub fn appendCustomMessage(self: *SessionStore, custom_type: []const u8, content: agent_mod.protocol.AgentMessage.CustomContent, display: bool, details: ?std.json.Value) void {
+    pub fn appendCustomMessage(self: *SessionStore, custom_type: []const u8, content: agent_mod.protocol.AgentMessage.CustomContent, display: bool, details: ?std.json.Value, include_in_context: bool) void {
         self.invalidateCache();
-        self.writer.appendCustomMessage(custom_type, content, display, details);
+        self.writer.appendCustomMessage(custom_type, content, display, details, include_in_context);
     }
 
     pub fn appendLabel(self: *SessionStore, target_id: []const u8, label: ?[]const u8) void {

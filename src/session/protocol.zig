@@ -69,6 +69,7 @@ pub const CustomMessageEntry = struct {
     content: agent.protocol.AgentMessage.CustomContent,
     details: ?std.json.Value = null,
     display: bool,
+    include_in_context: bool = true,
 };
 
 pub const LabelEntry = struct {

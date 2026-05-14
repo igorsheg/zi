@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
+const message_memory = @import("../agent/message_memory.zig");
 const control_mod = @import("../agent/control.zig");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
@@ -320,6 +321,95 @@ pub const RuntimeHost = struct {
             .steering => self.session.agent.steer(message),
             .follow_up => self.session.agent.followUp(message),
         };
+    }
+
+    pub fn appendExtensionEntry(
+        self: *RuntimeHost,
+        kind: []const u8,
+        data: ?std.json.Value,
+    ) !extension_runner_mod.AppendEntryResult {
+        const owned_kind = try self.session_allocator.dupe(u8, kind);
+        errdefer self.session_allocator.free(owned_kind);
+        const owned_data = if (data) |value| try json_util.cloneJsonValue(self.session_allocator, value) else null;
+        self.session.session_store.appendCustomEntry(owned_kind, owned_data);
+        const entry_id = self.session.session_store.currentEntryId() orelse "";
+        return .{ .entry_id = entry_id };
+    }
+
+    pub fn appendExtensionCustomMessage(
+        self: *RuntimeHost,
+        message: extension_runner_mod.ExtensionCustomMessage,
+    ) !extension_runner_mod.SendMessageResult {
+        const owned_kind = try self.session_allocator.dupe(u8, message.kind);
+        errdefer self.session_allocator.free(owned_kind);
+        const text = message.text orelse "";
+        const owned_text = try self.session_allocator.dupe(u8, text);
+        errdefer self.session_allocator.free(owned_text);
+        const owned_details = if (message.data) |value| try json_util.cloneJsonValue(self.session_allocator, value) else null;
+        self.session.session_store.appendCustomMessage(owned_kind, .{ .text = owned_text }, message.display, owned_details, message.include_in_context);
+        const entry_id = self.session.session_store.currentEntryId();
+        return .{ .status = .stored, .entry_id = entry_id };
+    }
+
+    pub fn sendExtensionCustomMessage(
+        self: *RuntimeHost,
+        message: extension_runner_mod.ExtensionCustomMessage,
+        opts: extension_runner_mod.SendMessageOptions,
+    ) !extension_runner_mod.SendMessageResult {
+        if (!message.include_in_context) {
+            if (opts.mode != null) return error.Unsupported;
+            return self.appendExtensionCustomMessage(message);
+        }
+
+        const mode = opts.mode orelse return self.appendExtensionCustomMessage(message);
+
+        var agent_message = try self.extensionCustomAgentMessage(message);
+        defer message_memory.freeMessage(self.session_allocator, &agent_message);
+        const running = self.session.agent.isRunning();
+        return switch (mode) {
+            .now => blk: {
+                if (running) return error.AgentBusy;
+                try self.session.agent.prompt(&.{agent_message});
+                break :blk .{ .status = .submitted, .entry_id = null };
+            },
+            .steer => blk: {
+                if (!running) {
+                    try self.session.agent.prompt(&.{agent_message});
+                    break :blk .{ .status = .submitted, .entry_id = null };
+                }
+                break :blk switch (self.session.agent.steer(agent_message)) {
+                    .ok => .{ .status = .queued, .entry_id = null },
+                    .closed => error.AgentUnavailable,
+                    .oom => error.OutOfMemory,
+                };
+            },
+            .followup => blk: {
+                if (!running) {
+                    try self.session.agent.prompt(&.{agent_message});
+                    break :blk .{ .status = .submitted, .entry_id = null };
+                }
+                break :blk switch (self.session.agent.followUp(agent_message)) {
+                    .ok => .{ .status = .queued, .entry_id = null },
+                    .closed => error.AgentUnavailable,
+                    .oom => error.OutOfMemory,
+                };
+            },
+        };
+    }
+
+    fn extensionCustomAgentMessage(
+        self: *RuntimeHost,
+        message: extension_runner_mod.ExtensionCustomMessage,
+    ) !agent_mod.protocol.AgentMessage {
+        const details = if (message.data) |value| try json_util.cloneJsonValue(self.session_allocator, value) else null;
+        errdefer if (details) |d| json_util.freeJsonValue(self.session_allocator, d);
+        return .{ .custom = .{
+            .custom_type = try self.session_allocator.dupe(u8, message.kind),
+            .content = .{ .text = try self.session_allocator.dupe(u8, message.text orelse "") },
+            .display = message.display,
+            .details = details,
+            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        } };
     }
 
     pub fn snapshotQueuedMessages(self: *RuntimeHost, allocator: std.mem.Allocator) !QueuedMessageSnapshot {

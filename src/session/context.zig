@@ -148,6 +148,7 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
     switch (entry.entry) {
         .message => |m| return m.message,
         .custom_message => |cm| {
+            if (!cm.include_in_context) return null;
             return .{ .custom = .{
                 .custom_type = cm.custom_type,
                 .content = cm.content,
@@ -229,6 +230,17 @@ fn testThinkingLevel(id: []const u8, parent_id: ?[]const u8, level: []const u8) 
 fn testModelChange(id: []const u8, parent_id: ?[]const u8, provider: []const u8, model_id: []const u8) proto.SessionEntry {
     return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{
         .model_change = .{ .provider = provider, .model_id = model_id },
+    } };
+}
+
+fn testCustomMessage(id: []const u8, parent_id: ?[]const u8, text: []const u8, include_in_context: bool) proto.SessionEntry {
+    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{
+        .custom_message = .{
+            .custom_type = "test.custom",
+            .content = .{ .text = text },
+            .display = true,
+            .include_in_context = include_in_context,
+        },
     } };
 }
 
@@ -463,3 +475,18 @@ test "unknown leaf falls back to current context" {
     try expectAssistantTextAt(ctx, 1, "hi");
 }
 
+test "custom messages only enter context when included" {
+    var arena = testArena();
+    defer arena.deinit();
+    var entries = [_]proto.SessionEntry{
+        testMsg(arena.allocator(), "1", null, .user, "hello"),
+        testCustomMessage("2", "1", "hidden", false),
+        testCustomMessage("3", "2", "visible", true),
+    };
+
+    const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
+    try std.testing.expectEqual(@as(usize, 2), ctx.messages.len);
+    try expectUserTextAt(ctx, 0, "hello");
+    try std.testing.expect(ctx.messages[1] == .custom);
+    try std.testing.expectEqualStrings("visible", ctx.messages[1].custom.content.text);
+}

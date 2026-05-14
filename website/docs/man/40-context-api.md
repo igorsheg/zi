@@ -55,7 +55,13 @@ Most tools, commands, and events receive `ctx`.
 : Request abort on the active run.
 
 `ctx.send_user_message(text, opts?)`
-: Inject a user message into the main chat through the same host paths as typed input. When the session is idle, the default target submits a new prompt after the current extension handler returns. When the session is streaming, the default target queues steering text for the active run. `opts.target` may be `"prompt"`, `"steering"`, `"follow_up"`, or `"auto"` (default). The call returns `{ status = "submitted" }` for an idle prompt enqueue or `{ status = "queued" }` for a run-control queue. This API is intentionally not a session-control shortcut: it does not reload, fork, or replace the live runner.
+: Inject a text-only user message into the main chat through the same host paths as typed input. With no mode, the session must be idle; the message submits after the current extension handler returns and starts a turn. During an active run, pass `opts.mode = "steer"` to queue before the next model call, or `opts.mode = "followup"` to queue after the run drains. The call returns `{ status = "submitted" | "queued", mode = "now" | "steer" | "followup" }`. This API is intentionally not a session-control shortcut: it does not reload, fork, or replace the live runner.
+
+`ctx.send_message(message, opts?)`
+: Send an extension-owned custom message. `message.kind` is required. `message.text`, `message.display`, `message.data`, and `message.include_in_context` are optional. With no mode, zi stores a `custom_message` session entry and renders it when `display` is true; it is not model-visible unless `include_in_context = true`. With `include_in_context = true`, `opts.mode = "now"` submits immediately when idle, `"steer"` queues before the next model call during an active run, and `"followup"` queues after the run drains. Scheduled custom messages enter the agent loop as `AgentMessage.custom` and are persisted by the normal message lifecycle.
+
+`ctx.append_entry(kind, data?)`
+: Append durable extension-owned data to the session log. Entries are not chat messages and are not model-visible. Use this for replayable extension state and breadcrumbs.
 
 `ctx.update(partial_result)`
 : Update the current in-flight tool preview. The final tool return remains authoritative.

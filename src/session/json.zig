@@ -121,6 +121,8 @@ pub fn writeEntry(writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
             }
             try jw.objectField("display");
             try jw.write(cm.display);
+            try jw.objectField("includeInContext");
+            try jw.write(cm.include_in_context);
         },
         .label => |l| {
             try jw.objectField("targetId");
@@ -475,6 +477,7 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: [
             .content = try parseCustomContent(allocator, try requiredValue(obj, "content")),
             .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
             .display = try requiredBool(obj, "display"),
+            .include_in_context = (try optionalBool(obj, "includeInContext")) orelse true,
         } }
     else if (std.mem.eql(u8, type_str, "label"))
         .{ .label = .{
