@@ -2,6 +2,7 @@ const std = @import("std");
 const env = @import("env");
 const system_command = @import("../../coding_agent/extensions/system_command.zig");
 const run_setup = @import("run_setup.zig");
+const deadline = @import("../../zio/root.zig").deadline;
 
 pub const Options = struct {
     cwd: ?[]const u8 = null,
@@ -68,7 +69,7 @@ pub fn editText(self: anytype, initial_text: []const u8, opts: Options) Result {
 
 fn makeTempPath(allocator: std.mem.Allocator, io: std.Io, suffix: []const u8) ![]u8 {
     const tmp_dir = env.get("TMPDIR") orelse "/tmp";
-    const ns = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    const ns = deadline.nowNs(io);
     return std.fmt.allocPrint(allocator, "{s}/zi-editor-{d}{s}", .{ tmp_dir, ns, suffix });
 }
 
