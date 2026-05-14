@@ -7,6 +7,7 @@ const text_component_mod = @import("../components/text.zig");
 const notifications = @import("../notifications.zig");
 const overlay_mod = @import("../primitives/overlay.zig");
 const chrome_mod = @import("../primitives/chrome.zig");
+const deadline = @import("../../zio/root.zig").deadline;
 const Interactive = @import("../interactive.zig").Interactive;
 const Component = component_mod.Component;
 const Region = buffer_mod.Region;
@@ -33,7 +34,7 @@ pub const NotificationComponent = struct {
         const allocator = self.interactive.allocator;
         var ordered = orderedNotifications(self.interactive, allocator) catch return;
         defer allocator.free(ordered);
-        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+        const now_ns = deadline.nowNs(std.Options.debug_io);
         const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
         const visible = @min(ordered.len, region.height);
         const start = ordered.len - visible;
