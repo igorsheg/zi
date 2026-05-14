@@ -73,7 +73,8 @@ pub fn start(self: *Interactive, provider_id: []const u8) void {
         return;
     };
 
-    self.login_cancelled.store(false, .release);
+    const signal = self.login_cancel.beginRun();
+    _ = self.login_cancel.ensureWake() catch {};
 
     self.status_line.setPrimary("starting login...", self.theme.fg(.muted));
     self.tui.dirty = true;
@@ -85,6 +86,7 @@ pub fn start(self: *Interactive, provider_id: []const u8) void {
     login_ctx.* = .{
         .interactive = self,
         .provider = provider,
+        .signal = signal,
     };
 
     var tasks = zio.task.Group.init(self.allocator);
@@ -111,6 +113,7 @@ fn onPickerCancel(ctx: ?*anyopaque) void {
 const Context = struct {
     interactive: *Interactive,
     provider: oauth_mod.OAuthProvider,
+    signal: zio.cancel.Token,
 };
 
 fn threadFn(ctx: *Context) void {
@@ -118,6 +121,7 @@ fn threadFn(ctx: *Context) void {
 
     const self = ctx.interactive;
     const provider = ctx.provider;
+    const signal = ctx.signal;
     self.msg_allocator.destroy(ctx);
 
     const result: oauth_mod.LoginResult = if (!provider.kind.usesExtensionLogin())
@@ -129,7 +133,7 @@ fn threadFn(ctx: *Context) void {
                 .on_progress = &onProgress,
                 .ctx = @ptrCast(self),
             },
-            &self.login_cancelled,
+            signal,
         )
     else blk: {
         var response: request_mod.ExtensionOAuthLoginResponse = .{};

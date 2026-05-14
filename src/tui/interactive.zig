@@ -296,7 +296,7 @@ pub const Interactive = struct {
     login_picker_entries: [8]oauth_mod.ProviderListEntry = undefined,
     login_picker_count: usize = 0,
     login_tasks: ?zio.task.Group = null,
-    login_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    login_cancel: zio.cancel.Source = .{},
 
     snapshot_event_queue: UiSnapshotQueue,
     lifecycle_event_queue: UiLifecycleQueue,
@@ -386,10 +386,11 @@ pub const Interactive = struct {
 
     pub fn deinit(self: *Interactive) void {
         if (self.login_tasks) |*tasks| {
-            self.login_cancelled.store(true, .release);
+            self.login_cancel.requestAbort();
             tasks.join() catch {};
             self.login_tasks = null;
         }
+        self.login_cancel.deinit();
         self.session_index_worker.stop();
         if (self.ai_complete_worker) |*worker| worker.worker.stop();
         if (self.system_worker) |*worker| worker.worker.stop();

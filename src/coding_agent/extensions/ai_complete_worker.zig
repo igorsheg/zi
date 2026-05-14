@@ -99,25 +99,25 @@ const Handler = struct {
     }
 };
 
-const WorkerImpl = blocking_worker_mod.Worker(Request, Handler, .{
+const WorkerPool = blocking_worker_mod.Pool(Request, Handler, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } },
     .wakeup = .pipe,
-});
+}, 2);
 
 pub const AiCompleteWorker = struct {
     allocator: std.mem.Allocator,
-    worker: WorkerImpl,
+    worker: WorkerPool,
 
     pub fn init(allocator: std.mem.Allocator) !AiCompleteWorker {
         return .{
             .allocator = allocator,
-            .worker = try WorkerImpl.init(allocator, .{ .allocator = allocator }),
+            .worker = try WorkerPool.init(allocator, .{ .allocator = allocator }),
         };
     }
 
     pub fn setResultSink(self: *AiCompleteWorker, result_sink: ResultSink) void {
-        self.worker.handler.result_sink = result_sink;
+        for (&self.worker.workers) |*worker| worker.handler.result_sink = result_sink;
     }
 
     pub fn deinit(self: *AiCompleteWorker) void {

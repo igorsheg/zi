@@ -3,6 +3,7 @@ const net = std.Io.net;
 const posix = std.posix;
 
 const log = std.log.scoped(.callback_server);
+const zio = @import("../../zio/root.zig");
 
 pub const CallbackResult = union(enum) {
     success: struct {
@@ -29,7 +30,7 @@ pub fn waitForCallback(
     port: u16,
     path: []const u8,
     expected_state: []const u8,
-    cancelled: *const std.atomic.Value(bool),
+    signal: zio.cancel.Token,
 ) CallbackResult {
     const address = net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
     var server = address.listen(std.Options.debug_io, .{ .reuse_address = true }) catch |err| {
@@ -38,14 +39,24 @@ pub fn waitForCallback(
     };
     defer server.deinit(std.Options.debug_io);
 
-    while (!cancelled.load(.acquire)) {
+    const cancel_fd = signal.wakeReadFd();
+    while (!signal.isAborted()) {
         var pfd = [1]posix.pollfd{.{
             .fd = server.socket.handle,
             .events = posix.POLL.IN,
             .revents = undefined,
         }};
-        const ready = posix.poll(&pfd, 500) catch continue;
+        var pfds_with_cancel = [2]posix.pollfd{
+            pfd[0],
+            .{ .fd = cancel_fd orelse -1, .events = posix.POLL.IN, .revents = 0 },
+        };
+        const ready = if (cancel_fd != null) posix.poll(&pfds_with_cancel, -1) catch continue else posix.poll(&pfd, 500) catch continue;
         if (ready == 0) continue;
+        if (cancel_fd != null and pfds_with_cancel[1].revents & posix.POLL.IN != 0) {
+            signal.acknowledgeWake();
+            return .cancelled;
+        }
+        if (cancel_fd != null) pfd[0] = pfds_with_cancel[0];
 
         const stream = server.accept(std.Options.debug_io) catch continue;
         defer stream.close(std.Options.debug_io);

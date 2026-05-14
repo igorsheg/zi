@@ -71,27 +71,27 @@ const Handler = struct {
     }
 };
 
-const WorkerImpl = blocking_worker_mod.Worker(Request, Handler, .{
+const WorkerPool = blocking_worker_mod.Pool(Request, Handler, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } },
     .wakeup = .pipe,
-});
+}, 4);
 
 pub const SystemWorker = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    worker: WorkerImpl,
+    worker: WorkerPool,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !SystemWorker {
         return .{
             .allocator = allocator,
             .io = io,
-            .worker = try WorkerImpl.initIo(allocator, io, .{ .allocator = allocator, .io = io }),
+            .worker = try WorkerPool.initIo(allocator, io, .{ .allocator = allocator, .io = io }),
         };
     }
 
     pub fn setResultSink(self: *SystemWorker, result_sink: ResultSink) void {
-        self.worker.handler.result_sink = result_sink;
+        for (&self.worker.workers) |*worker| worker.handler.result_sink = result_sink;
     }
 
     pub fn deinit(self: *SystemWorker) void {

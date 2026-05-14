@@ -53,7 +53,7 @@ pub fn handle(self: anytype, key: Key) void {
         }
 
         if (self.login_tasks != null) {
-            self.login_cancelled.store(true, .release);
+            self.login_cancel.requestAbort();
             return;
         }
         if (self.retry_waiting) {

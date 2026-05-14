@@ -268,7 +268,7 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         engine.closeStdin();
     }
 
-    while (!engine.isExited() or event_queue.pendingDepth() > 0) {
+    while (!capture.isTerminal() or event_queue.pendingDepth() > 0) {
         var batch: [16]OwnedProcessEvent = undefined;
         const count = event_queue.drainInto(&batch);
         if (count == 0) {
@@ -433,6 +433,10 @@ const Capture = struct {
 
     fn outcome(self: *Capture) CaptureOutcome {
         return self.failure;
+    }
+
+    fn isTerminal(self: *Capture) bool {
+        return self.term != null or self.failure == .spawn_failed;
     }
 
     fn takeStdout(self: *Capture, store: bool) ![]u8 {

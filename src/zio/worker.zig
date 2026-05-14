@@ -23,6 +23,7 @@ pub fn Worker(
 
     return struct {
         const Self = @This();
+        pub const QueueType = Queue;
 
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -110,6 +111,81 @@ pub fn Worker(
             if (@hasDecl(Request, "deinit")) {
                 request.deinit(allocator);
             }
+        }
+    };
+}
+
+pub fn Pool(
+    comptime Request: type,
+    comptime Handler: type,
+    comptime config: queue_mod.Config,
+    comptime count: usize,
+) type {
+    comptime std.debug.assert(count > 0);
+    const WorkerImpl = Worker(Request, Handler, config);
+
+    return struct {
+        const Self = @This();
+        pub const QueueType = WorkerImpl.QueueType;
+
+        allocator: std.mem.Allocator,
+        workers: [count]WorkerImpl,
+        next: usize = 0,
+
+        pub fn init(allocator: std.mem.Allocator, handler: Handler) !Self {
+            return initIo(allocator, std.Options.debug_io, handler);
+        }
+
+        pub fn initIo(allocator: std.mem.Allocator, io: std.Io, handler: Handler) !Self {
+            var workers: [count]WorkerImpl = undefined;
+            var initialized: usize = 0;
+            errdefer {
+                for (workers[0..initialized]) |*worker| worker.deinit();
+            }
+            while (initialized < count) : (initialized += 1) {
+                workers[initialized] = try WorkerImpl.initIo(allocator, io, handler);
+            }
+            return .{ .allocator = allocator, .workers = workers };
+        }
+
+        pub fn deinit(self: *Self) void {
+            for (&self.workers) |*worker| worker.deinit();
+            self.* = undefined;
+        }
+
+        pub fn start(self: *Self) !void {
+            var started: usize = 0;
+            errdefer {
+                for (self.workers[0..started]) |*worker| worker.stop();
+            }
+            for (&self.workers) |*worker| {
+                try worker.start();
+                started += 1;
+            }
+        }
+
+        pub fn stop(self: *Self) void {
+            for (&self.workers) |*worker| worker.stop();
+        }
+
+        pub fn trySend(self: *Self, request: Request) QueueType.TrySendResult {
+            var current = request;
+            var attempts: usize = 0;
+            while (attempts < count) : (attempts += 1) {
+                const index = (self.next + attempts) % count;
+                switch (self.workers[index].trySend(current)) {
+                    .ok => {
+                        self.next = (index + 1) % count;
+                        return .ok;
+                    },
+                    .dropped => {
+                        self.next = (index + 1) % count;
+                        return .dropped;
+                    },
+                    .full, .closed, .oom => |returned| current = returned,
+                }
+            }
+            return .{ .full = current };
         }
     };
 }
