@@ -33,6 +33,7 @@ pub const ThreadLabel = enum {
     ai_worker,
     session_index,
     zio_worker,
+    process_reactor,
     process_engine,
     batch,
     @"test",

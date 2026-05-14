@@ -7,6 +7,7 @@ pub const queue = @import("queue.zig");
 pub const task = @import("task.zig");
 pub const worker = @import("worker.zig");
 pub const process = @import("process.zig");
+pub const process_reactor = @import("process_reactor.zig");
 pub const file = @import("file.zig");
 pub const loop = @import("loop.zig");
 
