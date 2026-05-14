@@ -1,4 +1,5 @@
 const keys_mod = @import("../terminal/keys.zig");
+const deadline_mod = @import("../../zio/root.zig").deadline;
 
 const Interactive = @import("../interactive.zig").Interactive;
 
@@ -27,7 +28,7 @@ pub fn process(self: *Interactive) bool {
 
 pub fn finishKittyNegotiationIfDue(self: *Interactive) void {
     if (self.kitty_deadline_ns) |deadline| {
-        if (@as(i128, @intCast(@import("std").Io.Timestamp.now(@import("std").Options.debug_io, .awake).toNanoseconds())) >= deadline) {
+        if (deadline_mod.nowNs(@import("std").Options.debug_io) >= deadline) {
             self.tui.terminal.enableModifyOtherKeys();
             self.kitty_deadline_ns = null;
             if (self.input.buf.items.len > 0) {
