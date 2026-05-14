@@ -6,6 +6,7 @@ const status_data_mod = @import("../status_data.zig");
 const theme_mod = @import("../theme.zig");
 const shimmer_mod = @import("../shimmer.zig");
 const shuffle_text_mod = @import("../shuffle_text.zig");
+const zio_deadline = @import("../../zio/root.zig").deadline;
 
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
@@ -241,9 +242,7 @@ fn shimmerPeakColor(text_fg: Color) Color {
 }
 
 fn currentMs() u64 {
-    const ms = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds();
-    if (ms <= 0) return 0;
-    return @intCast(ms);
+    return @intCast(@divFloor(zio_deadline.nowNs(std.Options.debug_io), std.time.ns_per_ms));
 }
 
 fn nsToMs(ns: i128) u64 {
