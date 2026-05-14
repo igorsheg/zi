@@ -880,11 +880,8 @@ pub const Interactive = struct {
 
     fn waitForLoopReadiness(self: *Interactive) LoopReadiness {
         const idle_wait_timeout_ms: i32 = 50;
-        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
-        const timeout_ms: i32 = if (self.nextLoopDeadlineNs(now_ns)) |deadline|
-            if (deadline <= now_ns) 0 else @intCast(@divFloor(deadline - now_ns + 999_999, 1_000_000))
-        else
-            idle_wait_timeout_ms;
+        const now_ns = zio.deadline.nowNs(self.io);
+        const timeout_ms = zio.deadline.timeoutUntil(self.nextLoopDeadlineNs(now_ns), now_ns, idle_wait_timeout_ms);
 
         const Callbacks = struct {
             fn input(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
