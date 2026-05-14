@@ -17,6 +17,7 @@ const display_wrap_mod = @import("../wrap/display.zig");
 const tool_doc = @import("../transcript/doc.zig");
 const selection_mod = @import("../selection/mod.zig");
 const transcript_item_mod = @import("../transcript/item.zig");
+const zio_deadline = @import("../../zio/root.zig").deadline;
 
 const Measurement = component_mod.Measurement;
 const Region = buffer_mod.Region;
@@ -1153,7 +1154,7 @@ pub const Transcript = struct {
         if (needs_begin) {
             if (!self.beginSelection(bounds.width, bounds.height, anchor_local.x, anchor_local.y)) return false;
         }
-        const now_ns = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+        const now_ns = zio_deadline.nowNs(std.Options.debug_io);
         _ = self.updateSelection(bounds.width, bounds.height, focus.local_x, focus.local_y, focus.zone, now_ns);
         return self.hasSelection(bounds.width);
     }
