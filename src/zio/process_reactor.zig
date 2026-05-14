@@ -4,6 +4,7 @@ const types = @import("process_reactor_types.zig");
 
 const backend = switch (builtin.os.tag) {
     .macos, .ios, .visionos => @import("process_reactor_kqueue.zig"),
+    .linux => @import("process_reactor_linux.zig"),
     else => @import("process_reactor_engine.zig"),
 };
 
