@@ -6,6 +6,7 @@ const task_mod = @import("task.zig");
 const logging = @import("../logging.zig");
 const types = @import("process_reactor_types.zig");
 const common = @import("process_reactor_common.zig");
+const deadline = @import("deadline.zig");
 
 const log = std.log.scoped(.zio_process_reactor);
 const Stream = common.Stream;
@@ -341,23 +342,25 @@ const Process = struct {
     }
 
     fn watchControl(self: *Process) void {
-        const start = std.Io.Timestamp.now(self.reactor.io, .awake).toMilliseconds();
+        const timeout_deadline = if (self.request.timeout_ms) |ms| deadline.Deadline.afterMs(self.reactor.io, ms) else null;
         while (!self.child_exited.load(.acquire)) {
+            var sleep_ms: i32 = 10;
             if (self.request.signal.isAborted()) {
                 self.aborted.store(true, .release);
                 self.stop_requested.store(true, .release);
             }
-            if (self.request.timeout_ms) |ms| {
-                const now = std.Io.Timestamp.now(self.reactor.io, .awake).toMilliseconds();
-                if (now - start >= ms) {
+            if (timeout_deadline) |limit| {
+                if (limit.expired(self.reactor.io)) {
                     self.timed_out.store(true, .release);
                     self.stop_requested.store(true, .release);
+                } else {
+                    sleep_ms = limit.remainingMs(self.reactor.io, 10);
                 }
             }
             if (self.stop_requested.load(.acquire) and !self.stopping.swap(true, .acq_rel)) {
                 process_common.killChild(self.pid, self.request.process_group, .TERM);
             }
-            self.reactor.io.sleep(.fromMilliseconds(10), .awake) catch {};
+            if (sleep_ms > 0) self.reactor.io.sleep(.fromMilliseconds(@intCast(sleep_ms)), .awake) catch {};
         }
     }
 };
