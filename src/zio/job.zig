@@ -4,7 +4,7 @@ const process_reactor = @import("process_reactor.zig");
 const task = @import("task.zig");
 const logging = @import("../logging.zig");
 
-pub const EventKind = enum { ready, stdout, stderr, exit };
+pub const EventKind = enum { ready, stdout, stderr, output_dropped, exit };
 
 pub const OwnedEvent = struct {
     id: u64,
@@ -159,6 +159,7 @@ pub const Manager = struct {
             .ready => |id| .{ .id = id, .kind = .ready },
             .stdout => |out| .{ .id = out.id, .kind = .stdout, .data = self.allocator.dupe(u8, out.bytes) catch return },
             .stderr => |out| .{ .id = out.id, .kind = .stderr, .data = self.allocator.dupe(u8, out.bytes) catch return },
+            .output_dropped => |dropped| .{ .id = dropped.id, .kind = .output_dropped, .code = @intCast(dropped.count) },
             .exit => |exit| blk: {
                 self.markExited(exit.id);
                 break :blk .{ .id = exit.id, .kind = .exit, .code = exitCode(exit.term) };

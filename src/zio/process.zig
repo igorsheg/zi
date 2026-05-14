@@ -72,6 +72,7 @@ pub const RunResult = union(enum) {
     timed_out: Partial,
     stdout_too_long: Partial,
     stderr_too_long: Partial,
+    output_dropped: Partial,
     aborted: Partial,
 
     pub fn deinit(self: *RunResult, allocator: std.mem.Allocator) void {
@@ -80,7 +81,7 @@ pub const RunResult = union(enum) {
                 allocator.free(x.stdout);
                 allocator.free(x.stderr);
             },
-            .timed_out, .stdout_too_long, .stderr_too_long, .aborted => |x| {
+            .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => |x| {
                 allocator.free(x.stdout);
                 allocator.free(x.stderr);
                 allocator.free(x.message);
@@ -276,6 +277,7 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
     if (capture.aborted or options.signal.isAborted()) return capture.finishPartial(.aborted, "aborted");
     if (outcome == .stdout_too_long) return capture.finishPartial(.stdout_too_long, "stdout exceeded output limit");
     if (outcome == .stderr_too_long) return capture.finishPartial(.stderr_too_long, "stderr exceeded output limit");
+    if (outcome == .output_dropped) return capture.finishPartial(.output_dropped, "process output events dropped");
     if (outcome == .spawn_failed) return error.SpawnFailed;
 
     const term = capture.term orelse return error.WaitFailed;
@@ -302,7 +304,7 @@ fn waitProcessReady(allocator: std.mem.Allocator, reactor: *process_reactor.Reac
     return error.SpawnFailed;
 }
 
-const CaptureOutcome = enum { none, spawn_failed, stdout_too_long, stderr_too_long };
+const CaptureOutcome = enum { none, spawn_failed, stdout_too_long, stderr_too_long, output_dropped };
 
 const Capture = struct {
     allocator: std.mem.Allocator,
@@ -347,13 +349,18 @@ const Capture = struct {
         switch (event) {
             .stdout => |out| if (self.on_chunk) |cb| cb.call(.stdout, out.bytes),
             .stderr => |out| if (self.on_chunk) |cb| cb.call(.stderr, out.bytes),
-            .ready, .exit, .spawn_failed => {},
+            .ready, .output_dropped, .exit, .spawn_failed => {},
         }
 
         switch (event) {
             .stdout => |out| self.appendCaptured(.stdout, out.bytes),
             .stderr => |out| self.appendCaptured(.stderr, out.bytes),
             .ready => {},
+            .output_dropped => |dropped| {
+                _ = dropped;
+                self.failure = .output_dropped;
+                if (self.reactor) |reactor| reactor.kill(1) catch {};
+            },
             .exit => |exit| {
                 self.term = exit.term;
                 self.timed_out = exit.timed_out;
@@ -421,6 +428,7 @@ const Capture = struct {
             .timed_out => .{ .timed_out = p },
             .stdout_too_long => .{ .stdout_too_long = p },
             .stderr_too_long => .{ .stderr_too_long = p },
+            .output_dropped => .{ .output_dropped = p },
             .aborted => .{ .aborted = p },
             else => unreachable,
         };

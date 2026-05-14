@@ -116,7 +116,7 @@ fn executeSync(
         .completed => |completed| completed,
         .timed_out => return util.errorResult(allocator, "grep timed out"),
         .aborted => return util.errorResult(allocator, "grep aborted"),
-        .stdout_too_long, .stderr_too_long => |err| return util.errorf(allocator, "grep error: {s}", .{err.message}),
+        .stdout_too_long, .stderr_too_long, .output_dropped => |err| return util.errorf(allocator, "grep error: {s}", .{err.message}),
     };
     const exited_code: u8 = switch (completed.term) {
         .exited => |c| c,

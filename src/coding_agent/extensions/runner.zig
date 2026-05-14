@@ -1168,6 +1168,7 @@ pub const ExtensionRunner = struct {
             .ready => .job_ready,
             .stdout => .job_stdout,
             .stderr => .job_stderr,
+            .output_dropped => .job_output_dropped,
             .exit => .job_exit,
             .json => .job_json,
         };

@@ -109,10 +109,12 @@ pub const Event = union(enum) {
     ready: ProcessId,
     stdout: Output,
     stderr: Output,
+    output_dropped: OutputDropped,
     exit: Exit,
     spawn_failed: ProcessId,
 
     pub const Output = struct { id: ProcessId, bytes: []const u8 };
+    pub const OutputDropped = struct { id: ProcessId, count: usize };
     pub const Exit = struct {
         id: ProcessId,
         term: ?std.process.Child.Term,
@@ -124,7 +126,7 @@ pub const Event = union(enum) {
         switch (self.*) {
             .stdout => |out| allocator.free(out.bytes),
             .stderr => |out| allocator.free(out.bytes),
-            .ready, .exit, .spawn_failed => {},
+            .ready, .output_dropped, .exit, .spawn_failed => {},
         }
         self.* = undefined;
     }

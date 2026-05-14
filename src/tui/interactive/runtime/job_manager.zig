@@ -122,6 +122,7 @@ pub const JobManager = struct {
                 .ready => .ready,
                 .stdout => .stdout,
                 .stderr => .stderr,
+                .output_dropped => .output_dropped,
                 .exit => .exit,
             },
             .data = event.data,

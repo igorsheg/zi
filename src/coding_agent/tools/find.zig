@@ -93,7 +93,7 @@ fn executeSync(
         .completed => |completed| completed,
         .timed_out => return util.errorResult(allocator, "find timed out"),
         .aborted => return util.errorResult(allocator, "find aborted"),
-        .stdout_too_long, .stderr_too_long => |err| return util.errorf(allocator, "find error: {s}", .{err.message}),
+        .stdout_too_long, .stderr_too_long, .output_dropped => |err| return util.errorf(allocator, "find error: {s}", .{err.message}),
     };
     const code: u8 = switch (completed.term) {
         .exited => |c| c,

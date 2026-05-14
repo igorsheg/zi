@@ -60,15 +60,32 @@ pub fn forceReap(io: std.Io, child: *std.process.Child, pid: std.process.Child.I
 }
 
 pub fn publishEvent(allocator: std.mem.Allocator, queue: *types.EventQueue, event: types.Event) bool {
-    var current = event;
-    return switch (queue.trySend(current)) {
-        .ok, .dropped => true,
-        .closed, .full, .oom => |returned| {
-            current = returned;
+    switch (queue.trySend(event)) {
+        .ok, .dropped => return true,
+        .closed, .oom => |returned| {
+            var current = returned;
             current.deinit(allocator);
             return false;
         },
-    };
+        .full => |returned| {
+            if (isTerminal(returned)) {
+                const dropped = queue.dropMatching(isOutputEvent, null);
+                if (dropped > 0) {
+                    switch (queue.trySend(returned)) {
+                        .ok, .dropped => return true,
+                        .closed, .full, .oom => |retry_returned| {
+                            var current = retry_returned;
+                            current.deinit(allocator);
+                            return false;
+                        },
+                    }
+                }
+            }
+            var current = returned;
+            current.deinit(allocator);
+            return false;
+        },
+    }
 }
 
 pub fn publishOutput(allocator: std.mem.Allocator, queue: *types.EventQueue, id: types.ProcessId, stream: Stream, bytes: []const u8) !bool {
@@ -77,5 +94,33 @@ pub fn publishOutput(allocator: std.mem.Allocator, queue: *types.EventQueue, id:
         .stdout => .{ .stdout = .{ .id = id, .bytes = owned } },
         .stderr => .{ .stderr = .{ .id = id, .bytes = owned } },
     };
-    return publishEvent(allocator, queue, event);
+    switch (queue.trySend(event)) {
+        .ok, .dropped => return true,
+        .closed, .oom => |returned| {
+            var current = returned;
+            current.deinit(allocator);
+            return false;
+        },
+        .full => |returned| {
+            var current = returned;
+            current.deinit(allocator);
+            const dropped = queue.dropMatching(isOutputEvent, null);
+            if (dropped == 0) return false;
+            return publishEvent(allocator, queue, .{ .output_dropped = .{ .id = id, .count = dropped + 1 } });
+        },
+    }
+}
+
+fn isTerminal(event: types.Event) bool {
+    return switch (event) {
+        .ready, .exit, .spawn_failed => true,
+        .stdout, .stderr, .output_dropped => false,
+    };
+}
+
+fn isOutputEvent(item: *const types.Event, _: ?*anyopaque) bool {
+    return switch (item.*) {
+        .stdout, .stderr, .output_dropped => true,
+        .ready, .exit, .spawn_failed => false,
+    };
 }

@@ -211,6 +211,7 @@ fn classifyResult(result: runtime_process.RunResult, signal: protocol.Token, tim
         } else .{ true, "command timed out" },
         .stdout_too_long => .{ true, "stdout exceeded output limit" },
         .stderr_too_long => .{ true, "stderr exceeded output limit" },
+        .output_dropped => .{ true, "process output events dropped" },
         .aborted => .{ true, "command aborted" },
     };
 }
@@ -239,7 +240,7 @@ fn formatResult(
                 try out.appendSlice(allocator, "\n\ncommand terminated");
             }
         },
-        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => |partial| {
+        .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => |partial| {
             try appendCaptured(allocator, &out, partial.stdout, partial.stderr);
             if (partial.message.len > 0) {
                 try out.appendSlice(allocator, "\n\n");

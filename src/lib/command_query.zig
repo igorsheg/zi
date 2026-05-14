@@ -22,7 +22,7 @@ pub fn stdout(allocator: std.mem.Allocator, io: std.Io, options: Options) ?[]u8 
 
     const completed = switch (result) {
         .completed => |completed| completed,
-        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return null,
+        .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => return null,
     };
     switch (completed.term) {
         .exited => |code| if (code != 0) return null,
@@ -49,7 +49,7 @@ pub fn succeeds(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
 
     const completed = switch (result) {
         .completed => |completed| completed,
-        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return false,
+        .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => return false,
     };
     return switch (completed.term) {
         .exited => |code| code == 0,

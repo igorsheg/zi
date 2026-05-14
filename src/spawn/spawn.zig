@@ -94,7 +94,7 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
             result.stderr_output.appendSlice(allocator, timeout.stderr) catch {};
             result.error_message = allocator.dupe(u8, timeout.message) catch null;
         },
-        .stdout_too_long, .stderr_too_long, .aborted => |err| {
+        .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => |err| {
             result.exit_code = 1;
             if (proc_result == .aborted) result.cancelled = true;
             result.error_message = allocator.dupe(u8, err.message) catch null;

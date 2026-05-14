@@ -541,7 +541,7 @@ pub const UiEvent = struct {
     }
 };
 
-pub const JobEventKind = enum { ready, stdout, stderr, exit, json };
+pub const JobEventKind = enum { ready, stdout, stderr, output_dropped, exit, json };
 
 pub const JobEvent = struct {
     id: u64,

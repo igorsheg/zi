@@ -110,7 +110,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, request: Request) Result {
     return switch (proc_result) {
         .completed => |completed| completedResult(allocator, completed, request.text),
         .timed_out => |timeout| timeoutResult(allocator, timeout, request.text),
-        .stdout_too_long, .stderr_too_long, .aborted => |err| partialErrorResult(allocator, err, request.text),
+        .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => |err| partialErrorResult(allocator, err, request.text),
     };
 }
 

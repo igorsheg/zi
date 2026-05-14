@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("process_reactor_types.zig");
+const common = @import("process_reactor_common.zig");
 
 const backend = switch (builtin.os.tag) {
     .macos, .ios, .visionos => @import("process_reactor_kqueue.zig"),
@@ -57,7 +58,7 @@ test "process reactor emits ready stdout and exit events" {
                 .ready => |id| saw_ready = saw_ready or id == 7,
                 .stdout => |out| saw_stdout = saw_stdout or (out.id == 7 and std.mem.eql(u8, out.bytes, "reactor")),
                 .exit => |exit| saw_exit = saw_exit or (exit.id == 7 and exit.term != null),
-                .stderr, .spawn_failed => {},
+                .stderr, .output_dropped, .spawn_failed => {},
             }
         }
     }
@@ -122,4 +123,28 @@ test "process reactor publishes spawn_failed for duplicate process id" {
     }
     try std.testing.expect(saw_spawn_failed);
     try reactor.kill(11);
+}
+
+test "process reactor terminal events displace queued output under backpressure" {
+    var events = try types.EventQueue.init(std.testing.allocator);
+    defer events.deinit();
+
+    for (0..1024) |i| {
+        try std.testing.expect(try common.publishOutput(std.testing.allocator, &events, 1, .stdout, if (i == 0) "first" else "chunk"));
+    }
+    try std.testing.expect(try common.publishOutput(std.testing.allocator, &events, 1, .stdout, "overflow"));
+    try std.testing.expect(common.publishEvent(std.testing.allocator, &events, .{ .exit = .{ .id = 1, .term = .{ .exited = 0 } } }));
+
+    var saw_exit = false;
+    var saw_output_dropped = false;
+    var batch: [1024]Event = undefined;
+    const count = events.drainInto(&batch);
+    for (batch[0..count]) |*event| {
+        defer event.deinit(std.testing.allocator);
+        if (event.* == .exit) saw_exit = true;
+        if (event.* == .output_dropped) saw_output_dropped = true;
+    }
+    try std.testing.expect(saw_exit);
+    try std.testing.expect(saw_output_dropped);
+    try std.testing.expect(events.stats().dropped_count > 0);
 }

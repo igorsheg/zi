@@ -249,7 +249,7 @@ fn copyViaCommand(argv: []const []const u8, text: []const u8) bool {
 
     const completed = switch (result) {
         .completed => |completed| completed,
-        .timed_out, .stdout_too_long, .stderr_too_long, .aborted => return false,
+        .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => return false,
     };
     return switch (completed.term) {
         .exited => |code| code == 0,
