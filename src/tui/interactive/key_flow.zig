@@ -1,6 +1,7 @@
 const std = @import("std");
 const keybindings = @import("../keybindings.zig");
 const keys_mod = @import("../terminal/keys.zig");
+const deadline = @import("../../zio/root.zig").deadline;
 
 const Key = keys_mod.Key;
 const log = std.log.scoped(.extension_ui_input);
@@ -43,7 +44,7 @@ pub fn handle(self: anytype, key: Key) void {
     }
 
     if (keybindings.matches(.app_clear, key)) {
-        const now = @as(i128, @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds()));
+        const now = deadline.nowNs(std.Options.debug_io);
 
         if (self.composerHasPendingInput()) {
             self.clearComposerDraft();
