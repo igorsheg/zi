@@ -91,24 +91,28 @@ pub const JobManager = struct {
 
     fn submitEvent(ptr: *anyopaque, event: zio_job.Event) bool {
         const state: *State = @ptrCast(@alignCast(ptr));
-        if (event.kind == .stdout) {
+        var owned = event;
+        if (owned.kind == .stdout) {
             state.mutex.lockUncancelable(std.Options.debug_io);
             defer state.mutex.unlock(std.Options.debug_io);
-            if (state.adapters.getPtr(event.id)) |adapter| {
-                if (event.data) |data| adapter.accept(state, event.id, data) catch return false;
+            if (state.adapters.getPtr(owned.id)) |adapter| {
+                if (owned.data) |data| adapter.accept(state, owned.id, data) catch return false;
+                owned.deinit(state.allocator);
                 return true;
             }
         }
-        if (event.kind == .exit) {
+        if (owned.kind == .exit) {
             state.mutex.lockUncancelable(std.Options.debug_io);
-            if (state.adapters.fetchRemove(event.id)) |entry| {
+            if (state.adapters.fetchRemove(owned.id)) |entry| {
                 var adapter = entry.value;
-                adapter.finish(state, event.id);
+                adapter.finish(state, owned.id);
                 adapter.deinit(state.allocator);
             }
             state.mutex.unlock(std.Options.debug_io);
         }
-        return submitJobEvent(state, event);
+        if (!submitJobEvent(state, owned)) return false;
+        owned.deinit(state.allocator);
+        return true;
     }
 
     fn submitJobEvent(state: *State, event: zio_job.Event) bool {

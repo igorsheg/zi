@@ -4,13 +4,13 @@ const process_engine = @import("process_engine.zig");
 
 pub const EventKind = enum { stdout, stderr, exit };
 
-pub const Event = struct {
+pub const OwnedEvent = struct {
     id: u64,
     kind: EventKind,
     data: ?[]const u8 = null,
     code: ?i64 = null,
 
-    pub fn clone(self: Event, allocator: std.mem.Allocator) !Event {
+    pub fn clone(self: OwnedEvent, allocator: std.mem.Allocator) !OwnedEvent {
         return .{
             .id = self.id,
             .kind = self.kind,
@@ -19,15 +19,18 @@ pub const Event = struct {
         };
     }
 
-    pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *OwnedEvent, allocator: std.mem.Allocator) void {
         if (self.data) |data| allocator.free(data);
         self.* = undefined;
     }
 };
 
+pub const Event = OwnedEvent;
+
 pub const EventSink = struct {
     ptr: *anyopaque,
-    submit: *const fn (ptr: *anyopaque, event: Event) bool,
+    // submit consumes event only when it returns true. When false, ownership remains with caller.
+    submit: *const fn (ptr: *anyopaque, event: OwnedEvent) bool,
 };
 
 pub const StartRequest = struct {
@@ -141,12 +144,15 @@ const Job = struct {
 
     fn submitChildEvent(ptr: *anyopaque, event: process_engine.Event) bool {
         const self: *Job = @ptrCast(@alignCast(ptr));
-        return switch (event) {
-            .stdout => |bytes| self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .stdout, .data = bytes }),
-            .stderr => |bytes| self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .stderr, .data = bytes }),
-            .spawn_failed => self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .exit, .code = null }),
-            .exit => |term| self.sink.submit(self.sink.ptr, .{ .id = self.id, .kind = .exit, .code = exitCode(term) }),
+        var owned: Event = switch (event) {
+            .stdout => |bytes| .{ .id = self.id, .kind = .stdout, .data = self.allocator.dupe(u8, bytes) catch return false },
+            .stderr => |bytes| .{ .id = self.id, .kind = .stderr, .data = self.allocator.dupe(u8, bytes) catch return false },
+            .spawn_failed => .{ .id = self.id, .kind = .exit, .code = null },
+            .exit => |term| .{ .id = self.id, .kind = .exit, .code = exitCode(term) },
         };
+        if (self.sink.submit(self.sink.ptr, owned)) return true;
+        owned.deinit(self.allocator);
+        return false;
     }
 
     fn exitCode(term: ?std.process.Child.Term) ?i64 {
@@ -171,14 +177,9 @@ const TestSink = struct {
 
     fn sink(ptr: *anyopaque, event: Event) bool {
         const self: *TestSink = @ptrCast(@alignCast(ptr));
-        const cloned = event.clone(self.allocator) catch return false;
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
-        self.events.append(self.allocator, cloned) catch {
-            var failed = cloned;
-            failed.deinit(self.allocator);
-            return false;
-        };
+        self.events.append(self.allocator, event) catch return false;
         return true;
     }
 
