@@ -9,7 +9,7 @@ node_modules/
 website/.zig-cache/
 website/zig-out/
 website/public/
-.zi/hf-sessions
+.zi/hf-sessions/
 .zi/specs
 .standup/
 scripts/standup.ts
