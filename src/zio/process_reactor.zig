@@ -68,6 +68,65 @@ test "process reactor emits ready stdout and exit events" {
     try std.testing.expect(saw_exit);
 }
 
+test "process reactor owns multiple children in one backend loop" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const child_count = 4;
+    var reactor = try Reactor.init(std.testing.allocator);
+    defer reactor.deinit();
+    try reactor.start();
+
+    const child_ids = [_][]const u8{ "1", "2", "3", "4" };
+    for (0..child_count) |i| {
+        const id: ProcessId = @intCast(i + 1);
+        try reactor.spawn(.{ .id = id, .argv = &.{ "/bin/sh", "-c", "printf child-$0", child_ids[i] } });
+    }
+
+    var ready: [child_count]bool = .{false} ** child_count;
+    var stdout: [child_count]bool = .{false} ** child_count;
+    var exited: [child_count]bool = .{false} ** child_count;
+    var attempts: usize = 0;
+    while (attempts < 200 and !(allTrue(&ready) and allTrue(&stdout) and allTrue(&exited))) : (attempts += 1) {
+        var batch: [16]Event = undefined;
+        const count = reactor.drainEvents(&batch);
+        if (count == 0) {
+            _ = try reactor.waitEvents(100);
+            continue;
+        }
+        for (batch[0..count]) |*event| {
+            defer event.deinit(std.testing.allocator);
+            switch (event.*) {
+                .ready => |id| mark(&ready, id),
+                .stdout => |out| {
+                    if (out.id >= 1 and out.id <= child_count) {
+                        const expected = try std.fmt.allocPrint(std.testing.allocator, "child-{d}", .{out.id});
+                        defer std.testing.allocator.free(expected);
+                        if (std.mem.eql(u8, out.bytes, expected)) mark(&stdout, out.id);
+                    }
+                },
+                .exit => |exit| {
+                    if (exit.term != null) mark(&exited, exit.id);
+                },
+                .stderr, .output_dropped, .spawn_failed => {},
+            }
+        }
+    }
+
+    try std.testing.expect(allTrue(&ready));
+    try std.testing.expect(allTrue(&stdout));
+    try std.testing.expect(allTrue(&exited));
+}
+
+fn mark(values: []bool, id: ProcessId) void {
+    if (id == 0 or id > values.len) return;
+    values[@intCast(id - 1)] = true;
+}
+
+fn allTrue(values: []const bool) bool {
+    for (values) |value| if (!value) return false;
+    return true;
+}
+
 test "process reactor stop wakes idle backend" {
     var reactor = try Reactor.init(std.testing.allocator);
     defer reactor.deinit();
