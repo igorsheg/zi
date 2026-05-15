@@ -12,6 +12,11 @@ pub const StopMode = enum {
     immediate,
 };
 
+// Worker cancellation is handler-owned. stopMode(.cancel_current) and .immediate
+// close the queue and call Handler.cancelCurrent() when present. Handlers that run
+// interruptible work must keep the active cancellation token/request handle in
+// handler-owned synchronized state; Worker only tracks borrowed diagnostics.
+
 pub const State = struct {
     running: bool,
     current_request: ?usize,

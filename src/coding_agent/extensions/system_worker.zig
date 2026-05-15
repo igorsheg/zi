@@ -176,3 +176,56 @@ test "system worker publishes command result" {
     try testing.expect(result.system == .completed);
     try testing.expectEqualStrings("worker", result.system.completed.stdout);
 }
+
+test "system worker deinit cancels active command" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const Sink = struct {
+        mutex: std.Io.Mutex = .init,
+        result: ?extension_runner.AsyncResult = null,
+
+        fn submit(ptr: *anyopaque, id: extension_runner.AsyncOpId, result: extension_runner.AsyncResult) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (id != 77) return false;
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
+            self.result = result;
+            return true;
+        }
+    };
+
+    var controller = zio.cancel.Source{};
+    const signal = controller.beginRun();
+    var sink = Sink{};
+    var worker = try SystemWorker.init(allocator, std.Options.debug_io);
+    worker.setResultSink(.{ .ptr = @ptrCast(&sink), .submit = &Sink.submit });
+    try worker.start();
+
+    const argv = try allocator.dupe([]const u8, &.{
+        try allocator.dupe(u8, "/bin/sh"),
+        try allocator.dupe(u8, "-c"),
+        try allocator.dupe(u8, "sleep 10"),
+    });
+    try worker.submit(.{ .id = 77, .system = .{ .argv = argv, .signal = signal } });
+
+    var spins: usize = 0;
+    while (worker.worker.workers[0].state().current_request == null and spins < 100) : (spins += 1) {
+        std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try testing.expect(worker.worker.workers[0].state().current_request != null);
+    worker.worker.stopMode(.cancel_current);
+    worker.deinit();
+
+    try testing.expect(signal.isAborted());
+    sink.mutex.lockUncancelable(std.Options.debug_io);
+    var result = sink.result orelse {
+        sink.mutex.unlock(std.Options.debug_io);
+        return error.MissingSystemResult;
+    };
+    sink.result = null;
+    sink.mutex.unlock(std.Options.debug_io);
+    defer result.deinit(allocator);
+    try testing.expect(result == .system);
+    try testing.expect(result.system == .err);
+}
