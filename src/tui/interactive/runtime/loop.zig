@@ -96,7 +96,7 @@ pub const AgentRuntime = struct {
     }
 
     pub fn publishSnapshotUiEvent(self: *AgentRuntime, event: UiEvent) bool {
-        self.coalescePendingSnapshot(event);
+        self.snapshot_coalesced_dropped.* += queues_mod.coalesceSnapshot(self.snapshot_event_queue, event);
         switch (self.snapshot_event_queue.trySend(event)) {
             .ok => return true,
             .dropped => return false,
@@ -106,14 +106,6 @@ pub const AgentRuntime = struct {
                 return false;
             },
         }
-    }
-
-    fn coalescePendingSnapshot(self: *AgentRuntime, event: UiEvent) void {
-        const dropped = switch (event) {
-            .conversation_snapshot, .queued_snapshot, .status_snapshot => self.snapshot_event_queue.dropMatching(sameEventTag, @constCast(&event)),
-            else => 0,
-        };
-        self.snapshot_coalesced_dropped.* += dropped;
     }
 
     pub fn publishExtensionCommandsUpdate(self: *AgentRuntime) void {
@@ -238,11 +230,6 @@ fn publishConversationSnapshotFromRuntime(ctx: ?*anyopaque, envelope: agent_mod.
 fn publishQueuedSnapshotFromRuntime(ctx: ?*anyopaque, snapshot: coding_agent_mod.runtime_host.QueuedMessageSnapshot) bool {
     const self: *AgentRuntime = @ptrCast(@alignCast(ctx.?));
     return self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot });
-}
-
-fn sameEventTag(item: *const UiEvent, ctx: ?*anyopaque) bool {
-    const target: *const UiEvent = @ptrCast(@alignCast(ctx.?));
-    return std.meta.activeTag(item.*) == std.meta.activeTag(target.*);
 }
 
 pub fn enqueueShutdown(self: *Interactive) void {
