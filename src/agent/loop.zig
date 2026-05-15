@@ -777,6 +777,10 @@ fn finalizePreparedToolCall(
     const final_presentation = result.presentation;
     var final_is_error = result.is_error;
 
+    if (config.tool_side_effects) |hook| {
+        hook.call(result.side_effects);
+    }
+
     if (config.after_tool_call) |hook| {
         const hook_ctx = protocol.AfterToolCallContext{
             .assistant_message = assistant_msg,
@@ -802,6 +806,7 @@ fn finalizePreparedToolCall(
         .details = final_details,
         .presentation = final_presentation,
         .is_error = final_is_error,
+        .side_effects = result.side_effects,
     };
 
     var trm_content: std.ArrayListUnmanaged(ai.protocol.ToolResultMessage.ContentBlock) = .empty;

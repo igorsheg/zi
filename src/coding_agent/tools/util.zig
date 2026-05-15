@@ -18,10 +18,8 @@ pub const BuiltinCtx = struct {
     session_id: []const u8 = "",
     image_auto_resize: bool = true,
     observations: observations.Store = observations.Store.init(std.heap.page_allocator),
-    observation_events: observations.PendingEvents = observations.PendingEvents.init(std.heap.page_allocator),
 
     pub fn deinit(self: *BuiltinCtx, allocator: std.mem.Allocator) void {
-        self.observation_events.deinit(allocator);
         self.observations.deinit(allocator);
         if (self.owns_cwd) allocator.free(self.cwd);
         self.* = undefined;

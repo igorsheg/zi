@@ -16,6 +16,7 @@ const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 pub const agentEventSink = agentEventSinkFromRunnerRef;
 pub const beforeToolCall = beforeToolCallFromRunnerRef;
 pub const afterToolCall = afterToolCallFromToolHookCtx;
+pub const toolSideEffects = toolSideEffectsFromToolHookCtx;
 
 pub const ToolHookCtx = struct {
     runner_ref: *ExtensionRunnerRef,
@@ -101,13 +102,18 @@ fn afterToolCallFromToolHookCtx(
     ctx: ?*anyopaque,
 ) ?protocol.AfterToolCallResult {
     const hook_ctx: *ToolHookCtx = @ptrCast(@alignCast(ctx.?));
-    if (hook_ctx.builtin_ctx) |builtin| {
-        builtin.observation_events.drainApply(&builtin.observations) catch |err| {
-            std.log.scoped(.zi_tools).warn("observation event apply failed: {s}", .{@errorName(err)});
-        };
-    }
     const runner = hook_ctx.runner_ref.current orelse return null;
     return event_bridge.afterToolCall(ctx_arg, signal, @ptrCast(runner));
+}
+
+fn toolSideEffectsFromToolHookCtx(side_effects: []const protocol.ToolSideEffect, ctx: ?*anyopaque) void {
+    const hook_ctx: *ToolHookCtx = @ptrCast(@alignCast(ctx.?));
+    const builtin = hook_ctx.builtin_ctx orelse return;
+    for (side_effects) |effect| {
+        builtin.observations.applySideEffect(effect) catch |err| {
+            std.log.scoped(.zi_tools).warn("tool side effect apply failed: {s}", .{@errorName(err)});
+        };
+    }
 }
 
 fn runtimeGetModel(session_ptr: *anyopaque) protocol.Model {

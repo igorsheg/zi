@@ -152,6 +152,7 @@ pub const AgentSession = struct {
         const tool_hook_ctx = allocator.create(runtime_binding.ToolHookCtx) catch @panic("OOM");
         tool_hook_ctx.* = .{ .runner_ref = prepared.extension_runner_ref, .builtin_ctx = prepared.builtin_ctx };
         const after_tool_hook: ?protocol.AfterToolCallHook = .{ .func = &runtime_binding.afterToolCall, .ctx = @ptrCast(tool_hook_ctx) };
+        const tool_side_effects_hook: ?protocol.ToolSideEffectsHook = .{ .func = &runtime_binding.toolSideEffects, .ctx = @ptrCast(tool_hook_ctx) };
 
         const core = allocator.create(agent_session_core_mod.AgentSessionCore) catch @panic("OOM");
         core.* = agent_session_core_mod.AgentSessionCore.init(allocator, .{
@@ -167,6 +168,7 @@ pub const AgentSession = struct {
             .get_api_key = null,
             .before_tool_call = before_tool_hook,
             .after_tool_call = after_tool_hook,
+            .tool_side_effects = tool_side_effects_hook,
         }) catch @panic("OOM");
         const context_usage_unknown_after_compaction = prepared.session_store.contextUsageUnknownAfterCompaction(allocator);
 
@@ -795,6 +797,7 @@ pub const AgentSession = struct {
             .session_id = self.session_store.sessionId(),
             .before_tool_call = .{ .func = &runtime_binding.beforeToolCall, .ctx = @ptrCast(self._extension_runner_ref) },
             .after_tool_call = .{ .func = &runtime_binding.afterToolCall, .ctx = @ptrCast(self._tool_hook_ctx) },
+            .tool_side_effects = .{ .func = &runtime_binding.toolSideEffects, .ctx = @ptrCast(self._tool_hook_ctx) },
         });
         side.core = core;
         return core;

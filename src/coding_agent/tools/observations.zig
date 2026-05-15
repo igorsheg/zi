@@ -1,10 +1,34 @@
 const std = @import("std");
+const protocol = @import("../../agent/types.zig");
 const zio_fs = @import("../../zio/root.zig").file;
 
 pub const HASH_HEX_LEN: usize = 64;
 pub const MAX_OBSERVATIONS: usize = 2048;
 
 pub const Source = enum { read, grep, edit, write, patch, compaction_restore };
+
+fn sourceFromSideEffect(source: protocol.FileObservationEvent.Source) Source {
+    return switch (source) {
+        .read => .read,
+        .write => .write,
+        .edit => .edit,
+        .patch => .patch,
+        .compaction_restore => .compaction_restore,
+    };
+}
+
+pub fn sideEffectFromBytes(allocator: std.mem.Allocator, path: []const u8, stat: std.Io.File.Stat, bytes: []const u8, source: protocol.FileObservationEvent.Source) !protocol.ToolSideEffect {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    return .{ .observe_file = .{ .path = try allocator.dupe(u8, path), .size = stat.size, .mtime_ns = stat.mtime.nanoseconds, .hash = digest, .source = source } };
+}
+
+pub fn sideEffectFromFile(allocator: std.mem.Allocator, path: []const u8, source: protocol.FileObservationEvent.Source) !protocol.ToolSideEffect {
+    const stat = try std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{});
+    var input = try zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 16 * 1024 * 1024 });
+    defer input.deinit(allocator);
+    return sideEffectFromBytes(allocator, path, stat, input.bytes(), source);
+}
 
 pub const Observation = struct {
     path: []const u8,
@@ -30,53 +54,6 @@ pub const Event = struct {
     pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         self.* = undefined;
-    }
-};
-
-pub const PendingEvents = struct {
-    mu: std.Io.Mutex = .init,
-    allocator: std.mem.Allocator,
-    events: std.ArrayListUnmanaged(Event) = .empty,
-
-    pub fn init(allocator: std.mem.Allocator) PendingEvents {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *PendingEvents, _: std.mem.Allocator) void {
-        self.mu.lockUncancelable(std.Options.debug_io);
-        defer self.mu.unlock(std.Options.debug_io);
-        for (self.events.items) |*event| event.deinit(self.allocator);
-        self.events.deinit(self.allocator);
-        self.events = .empty;
-    }
-
-    pub fn recordBytes(self: *PendingEvents, _: std.mem.Allocator, path: []const u8, stat: std.Io.File.Stat, bytes: []const u8, source: Source) !void {
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.Blake3.hash(bytes, &digest, .{});
-        const owned_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(owned_path);
-        self.mu.lockUncancelable(std.Options.debug_io);
-        defer self.mu.unlock(std.Options.debug_io);
-        try self.events.append(self.allocator, .{ .path = owned_path, .size = stat.size, .mtime_ns = stat.mtime.nanoseconds, .hash = digest, .source = source });
-    }
-
-    pub fn recordFile(self: *PendingEvents, allocator: std.mem.Allocator, path: []const u8, source: Source) !void {
-        const stat = try std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{});
-        var input = try zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 16 * 1024 * 1024 });
-        defer input.deinit(allocator);
-        try self.recordBytes(allocator, path, stat, input.bytes(), source);
-    }
-
-    pub fn drainApply(self: *PendingEvents, store: *Store) !void {
-        self.mu.lockUncancelable(std.Options.debug_io);
-        var drained = self.events;
-        self.events = .empty;
-        self.mu.unlock(std.Options.debug_io);
-        defer {
-            for (drained.items) |*event| event.deinit(self.allocator);
-            drained.deinit(self.allocator);
-        }
-        for (drained.items) |event| try store.applyEvent(event);
     }
 };
 
@@ -119,6 +96,16 @@ pub const Store = struct {
         self.mu.lockUncancelable(std.Options.debug_io);
         defer self.mu.unlock(std.Options.debug_io);
         try self.recordHashLocked(event.path, event.size, event.mtime_ns, event.hash, event.source);
+    }
+
+    pub fn applySideEffect(self: *Store, effect: protocol.ToolSideEffect) !void {
+        switch (effect) {
+            .observe_file => |event| {
+                self.mu.lockUncancelable(std.Options.debug_io);
+                defer self.mu.unlock(std.Options.debug_io);
+                try self.recordHashLocked(event.path, event.size, event.mtime_ns, event.hash, sourceFromSideEffect(event.source));
+            },
+        }
     }
 
     pub fn recordFile(self: *Store, allocator: std.mem.Allocator, path: []const u8, source: Source) !void {

@@ -142,6 +142,7 @@ pub const AgentToolResult = struct {
     details: std.json.Value = .null,
     presentation: std.json.Value = .null,
     is_error: bool = false,
+    side_effects: []const ToolSideEffect = &.{},
 
     pub const ContentBlock = union(enum) {
         text: TextContent,
@@ -182,12 +183,19 @@ pub const AgentToolResult = struct {
         const details = try json_util.cloneJsonValue(allocator, self.details);
         errdefer json_util.freeJsonValue(allocator, details);
         const presentation = try json_util.cloneJsonValue(allocator, self.presentation);
+        errdefer json_util.freeJsonValue(allocator, presentation);
+        const side_effects = try allocator.alloc(ToolSideEffect, self.side_effects.len);
+        errdefer allocator.free(side_effects);
+        for (self.side_effects, 0..) |effect, i| {
+            side_effects[i] = try effect.clone(allocator);
+        }
 
         return .{
             .content = content,
             .details = details,
             .presentation = presentation,
             .is_error = self.is_error,
+            .side_effects = side_effects,
         };
     }
 
@@ -205,6 +213,42 @@ pub const AgentToolResult = struct {
         allocator.free(self.content);
         json_util.freeJsonValue(allocator, self.details);
         json_util.freeJsonValue(allocator, self.presentation);
+        for (self.side_effects) |effect| effect.free(allocator);
+        allocator.free(self.side_effects);
+    }
+};
+
+pub const ToolSideEffect = union(enum) {
+    observe_file: FileObservationEvent,
+
+    pub fn clone(self: ToolSideEffect, allocator: std.mem.Allocator) !ToolSideEffect {
+        return switch (self) {
+            .observe_file => |event| .{ .observe_file = try event.clone(allocator) },
+        };
+    }
+
+    pub fn free(self: ToolSideEffect, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .observe_file => |event| event.free(allocator),
+        }
+    }
+};
+
+pub const FileObservationEvent = struct {
+    path: []const u8,
+    size: u64,
+    mtime_ns: i96,
+    hash: [32]u8,
+    source: Source,
+
+    pub const Source = enum { read, write, edit, patch, compaction_restore };
+
+    pub fn clone(self: FileObservationEvent, allocator: std.mem.Allocator) !FileObservationEvent {
+        return .{ .path = try allocator.dupe(u8, self.path), .size = self.size, .mtime_ns = self.mtime_ns, .hash = self.hash, .source = self.source };
+    }
+
+    pub fn free(self: FileObservationEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
     }
 };
 
@@ -343,6 +387,15 @@ pub const AfterToolCallHook = struct {
     }
 };
 
+pub const ToolSideEffectsHook = struct {
+    func: *const fn (side_effects: []const ToolSideEffect, hook_ctx: ?*anyopaque) void,
+    ctx: ?*anyopaque = null,
+
+    pub fn call(self: ToolSideEffectsHook, side_effects: []const ToolSideEffect) void {
+        return self.func(side_effects, self.ctx);
+    }
+};
+
 pub const OnPayloadHook = struct {
     func: *const fn (allocator: std.mem.Allocator, payload: std.json.Value, model: Model, ctx: ?*anyopaque) std.json.Value,
     ctx: ?*anyopaque = null,
@@ -372,6 +425,7 @@ pub const AgentLoopConfig = struct {
     tool_execution: ToolExecutionMode = .parallel,
     before_tool_call: ?BeforeToolCallHook = null,
     after_tool_call: ?AfterToolCallHook = null,
+    tool_side_effects: ?ToolSideEffectsHook = null,
     on_payload: ?OnPayloadHook = null,
 
     io: std.Io = std.Options.debug_io,

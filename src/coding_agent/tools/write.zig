@@ -91,7 +91,7 @@ fn executeSync(
         return util.errorf(allocator, "write tool: failed to write: {s}", .{@errorName(err)});
     };
 
-    ctx.observation_events.recordFile(allocator, resolved, .write) catch {};
+    const observe_effect = observations.sideEffectFromFile(allocator, resolved, .write) catch null;
 
     var line_count: usize = 1;
     for (content) |c| {
@@ -110,8 +110,15 @@ fn executeSync(
     util.jsonPutBool(&details_obj, allocator, "created", is_new) catch return util.ownedTextResult(allocator, msg, false);
     util.jsonPutBool(&details_obj, allocator, "overwrote", !is_new) catch return util.ownedTextResult(allocator, msg, false);
     util.jsonPutInt(&details_obj, allocator, "line_count", @intCast(line_count)) catch return util.ownedTextResult(allocator, msg, false);
-    if (ctx.observations.getHash(resolved)) |hash| util.jsonPutOwnedString(&details_obj, allocator, "hash", observations.hashHex(allocator, hash) catch return util.ownedTextResult(allocator, msg, false)) catch return util.ownedTextResult(allocator, msg, false);
+    if (observe_effect) |effect| switch (effect) {
+        .observe_file => |event| util.jsonPutOwnedString(&details_obj, allocator, "hash", observations.hashHex(allocator, event.hash) catch return util.ownedTextResult(allocator, msg, false)) catch return util.ownedTextResult(allocator, msg, false),
+    };
     var result = util.ownedTextResult(allocator, msg, false);
     result.details = .{ .object = details_obj };
+    if (observe_effect) |effect| {
+        const side_effects = allocator.alloc(protocol.ToolSideEffect, 1) catch return result;
+        side_effects[0] = effect;
+        result.side_effects = side_effects;
+    }
     return result;
 }

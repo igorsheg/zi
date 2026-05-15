@@ -224,7 +224,7 @@ fn lessThanStrings(_: void, a: []const u8, b: []const u8) bool {
 
 fn readTextFile(
     allocator: std.mem.Allocator,
-    ctx: *util.BuiltinCtx,
+    _: *util.BuiltinCtx,
     path: []const u8,
     range: ?[2]i64,
 ) protocol.AgentToolResult {
@@ -233,7 +233,7 @@ fn readTextFile(
     defer input.deinit(allocator);
     const raw = input.bytes();
     const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch null;
-    if (stat) |s| ctx.observation_events.recordBytes(allocator, path, s, raw, .read) catch {};
+    const observe_effect = if (stat) |s| observations.sideEffectFromBytes(allocator, path, s, raw, .read) catch null else null;
 
     var total_lines: usize = 1;
     for (raw) |byte| {
@@ -301,9 +301,16 @@ fn readTextFile(
     util.jsonPutInt(&details_obj, allocator, "total_lines", @intCast(total_lines)) catch return util.ownedTextResult(allocator, out, false);
     util.jsonPutBool(&details_obj, allocator, "truncated", bytes_written >= MAX_FILE_BYTES or end < total_lines) catch return util.ownedTextResult(allocator, out, false);
     util.jsonPutString(&details_obj, allocator, "line_hash_scheme", "zi-line-v1") catch return util.ownedTextResult(allocator, out, false);
-    if (ctx.observations.getHash(path)) |hash| util.jsonPutOwnedString(&details_obj, allocator, "observation_hash", observations.hashHex(allocator, hash) catch return util.ownedTextResult(allocator, out, false)) catch return util.ownedTextResult(allocator, out, false);
+    if (observe_effect) |effect| switch (effect) {
+        .observe_file => |event| util.jsonPutOwnedString(&details_obj, allocator, "observation_hash", observations.hashHex(allocator, event.hash) catch return util.ownedTextResult(allocator, out, false)) catch return util.ownedTextResult(allocator, out, false),
+    };
     var result = util.ownedTextResult(allocator, out, false);
     result.details = .{ .object = details_obj };
+    if (observe_effect) |effect| {
+        const side_effects = allocator.alloc(protocol.ToolSideEffect, 1) catch return result;
+        side_effects[0] = effect;
+        result.side_effects = side_effects;
+    }
     return result;
 }
 

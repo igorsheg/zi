@@ -95,7 +95,7 @@ fn executeSync(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator, args: std.jso
     const final_bytes = if (ending == .crlf) restoreCrlf(allocator, new_content) catch return util.errorResult(allocator, "alloc failed") else allocator.dupe(u8, new_content) catch return util.errorResult(allocator, "alloc failed");
     defer allocator.free(final_bytes);
     file_mutation.atomicWrite(resolved, final_bytes, stat.permissions) catch return util.errorResult(allocator, "edit tool: write failed");
-    ctx.observation_events.recordFile(allocator, resolved, .edit) catch {};
+    const observe_effect = observations.sideEffectFromFile(allocator, resolved, .edit) catch null;
 
     const inputs = [_]diff_mod.Input{.{ .old_path = std.fs.path.basename(resolved), .new_path = std.fs.path.basename(resolved), .old_text = normalized, .new_text = new_content }};
     var doc = diff_mod.buildDocument(allocator, &inputs, .{}) catch |err| return util.errorf(allocator, "diff failed: {s}", .{@errorName(err)});
@@ -118,7 +118,13 @@ fn executeSync(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator, args: std.jso
         return util.errorResult(allocator, "alloc failed");
     };
     blocks[0] = .{ .text = .{ .text = unified } };
-    return .{ .content = blocks, .details = details };
+    var result = protocol.AgentToolResult{ .content = blocks, .details = details };
+    if (observe_effect) |effect| {
+        const side_effects = allocator.alloc(protocol.ToolSideEffect, 1) catch return result;
+        side_effects[0] = effect;
+        result.side_effects = side_effects;
+    }
+    return result;
 }
 
 fn parseOps(allocator: std.mem.Allocator, args: std.json.Value) !std.ArrayList(EditOp) {

@@ -115,13 +115,20 @@ fn executeSync(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator, _: []const u8
     };
 
     commitPlan(plan.items) catch |err| return util.errorf(allocator, "patch commit failed: {s}", .{@errorName(err)});
+    var side_effects: std.ArrayList(protocol.ToolSideEffect) = .empty;
+    errdefer {
+        for (side_effects.items) |effect| effect.free(allocator);
+        side_effects.deinit(allocator);
+    }
     for (plan.items) |c| switch (c.tag) {
-        .add, .update => ctx.observation_events.recordFile(allocator, c.path, .patch) catch {},
-        .move => ctx.observation_events.recordFile(allocator, c.dest_path.?, .patch) catch {},
+        .add, .update => if (observations.sideEffectFromFile(allocator, c.path, .patch)) |effect| side_effects.append(allocator, effect) catch {} else |_| {},
+        .move => if (observations.sideEffectFromFile(allocator, c.dest_path.?, .patch)) |effect| side_effects.append(allocator, effect) catch {} else |_| {},
         .delete => {},
     };
 
-    return patchDiffResult(allocator, plan.items);
+    var result = patchDiffResult(allocator, plan.items);
+    result.side_effects = side_effects.toOwnedSlice(allocator) catch &.{};
+    return result;
 }
 
 fn parsePatch(allocator: std.mem.Allocator, raw_text: []const u8) !std.ArrayList(Hunk) {
