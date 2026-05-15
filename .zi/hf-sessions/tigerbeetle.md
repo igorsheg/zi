@@ -929,6 +929,8 @@ Priority: medium.
 
 ## 12. Make process output memory bounded by design
 
+Status: completed end-to-end. `src/zio/process.zig` already enforces capture limits before append, supports `.fail` and `.truncate` overflow, and separates capture policy from streaming policy (`ignore`, `capture_bounded`, `stream_only`, `stream_and_capture_bounded`). This pass locked the behavior with tests: limit failures retain at most the configured prefix while reporting total observed bytes and truncation, and stream-only output delivers chunks without retaining bytes in the result. Non-retained streams now still report `total_bytes` so callers can observe output volume without paying storage cost. Gates: `zig fmt src/zio/process.zig`; `zig build test`.
+
 Current `Capture.append()` appends bytes, then checks limit:
 
 ```zig

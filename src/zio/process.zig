@@ -496,14 +496,14 @@ const Capture = struct {
     }
 
     fn takeStdout(self: *Capture) !CapturedStream {
-        if (!self.stdout_policy.stores()) return emptyCapturedStream(self.allocator);
+        if (!self.stdout_policy.stores()) return .{ .bytes = try self.allocator.dupe(u8, ""), .total_bytes = self.stdout_total_bytes, .truncated = false };
         const out = try self.stdout.toOwnedSlice(self.allocator);
         self.stdout = .empty;
         return .{ .bytes = out, .total_bytes = self.stdout_total_bytes, .truncated = self.stdout_truncated };
     }
 
     fn takeStderr(self: *Capture) !CapturedStream {
-        if (!self.stderr_policy.stores()) return emptyCapturedStream(self.allocator);
+        if (!self.stderr_policy.stores()) return .{ .bytes = try self.allocator.dupe(u8, ""), .total_bytes = self.stderr_total_bytes, .truncated = false };
         const out = try self.stderr.toOwnedSlice(self.allocator);
         self.stderr = .empty;
         return .{ .bytes = out, .total_bytes = self.stderr_total_bytes, .truncated = self.stderr_truncated };
@@ -709,6 +709,36 @@ test "process.run reports output limit as typed partial" {
         else => return error.UnexpectedProcessCompletion,
     };
     try std.testing.expect(std.mem.indexOf(u8, failed.message, "stdout exceeded output limit") != null);
+    try std.testing.expect(failed.stdout.bytes.len <= 3);
+    try std.testing.expectEqual(@as(usize, 6), failed.stdout.total_bytes);
+    try std.testing.expect(failed.stdout.truncated);
+}
+
+test "process.run streams without retaining output when capture is disabled" {
+    try skipShellProcessTestsIfUnsupported();
+    const Collector = struct {
+        stdout_bytes: usize = 0,
+
+        fn onChunk(raw: ?*anyopaque, kind: StreamKind, bytes: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (kind == .stdout) self.stdout_bytes += bytes.len;
+        }
+    };
+    var collector = Collector{};
+    var result = try runShell("printf abcdef", .{
+        .argv = &.{},
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .on_chunk = .{ .ctx = @ptrCast(&collector), .func = Collector.onChunk },
+    });
+    defer result.deinit(std.testing.allocator);
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
+    try std.testing.expectEqual(@as(usize, 6), collector.stdout_bytes);
+    try std.testing.expectEqual(@as(usize, 0), completed.stdout.bytes.len);
+    try std.testing.expectEqual(@as(usize, 6), completed.stdout.total_bytes);
 }
 
 test "process.run can truncate captured output without killing child" {
