@@ -17,6 +17,8 @@ pub const Stdin = union(enum) { ignore, inherit, bytes: []const u8 };
 pub const Output = enum { ignore, inherit, capture };
 
 pub const ChunkCallback = struct {
+    // Called by the process.run()/stream() owner loop after capture state is
+    // updated. Reactor/process threads must not invoke this callback directly.
     ctx: ?*anyopaque = null,
     func: *const fn (ctx: ?*anyopaque, kind: StreamKind, bytes: []const u8) void,
 

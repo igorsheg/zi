@@ -9,6 +9,9 @@ const ai_completion = @import("../ai_completion.zig");
 const log = std.log.scoped(.ai_complete_worker);
 
 pub const ResultSink = struct {
+    // Cross-thread sink. Implementations must enqueue or otherwise hand off the
+    // result/event to its owner thread; they must not mutate UI/runtime owner
+    // state directly from the worker thread.
     ptr: *anyopaque,
     submit: *const fn (ptr: *anyopaque, id: extension_runner.AsyncOpId, result: extension_runner.AsyncResult) bool,
     submit_event: ?*const fn (ptr: *anyopaque, id: extension_runner.AsyncOpId, event: extension_runner.AiCompleteStreamEvent) bool = null,

@@ -8,6 +8,8 @@ const ui_event_mod = @import("../ui_event.zig");
 const UiEvent = ui_event_mod.UiEvent;
 
 pub const PublishFn = *const fn (ctx: ?*anyopaque, event: UiEvent) bool;
+// Cross-thread publisher. Implementations must enqueue UiEvent for the UI owner
+// thread and must not mutate Interactive state directly from the worker thread.
 
 pub const Request = union(enum) {
     warm_resume_sessions: struct {

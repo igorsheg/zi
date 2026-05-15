@@ -6,6 +6,7 @@ const request_mod = @import("../../../coding_agent/request.zig");
 const auth_types = @import("../../../coding_agent/auth/types.zig");
 const oauth_mod = @import("../../../coding_agent/auth/oauth.zig");
 const extension_runner_mod = @import("../../../coding_agent/extensions/runner.zig");
+const extension_ui = @import("../../../coding_agent/extensions/ui.zig");
 const agent_requests_mod = @import("../agent_requests.zig");
 const session_requests_mod = @import("../session_requests.zig");
 const RuntimeHost = @import("../../../coding_agent/runtime_host.zig").RuntimeHost;
@@ -32,6 +33,14 @@ pub const submitExtensionAsyncResult = submitExtensionAsyncResultFn;
 pub const submitExtensionAiCompleteEvent = submitExtensionAiCompleteEventFn;
 pub const submitExtensionAsyncFromRunner = extensionAsyncDispatcher;
 pub const dispatchExtensionOAuthRefresh = dispatchExtensionOAuthRefreshViaRequestQueue;
+
+pub const CrossThreadUiSinks = struct {
+    // Narrow cross-thread sink handle. Worker/job/session-index threads may enqueue
+    // owner-thread events through these queues, but must not receive *Interactive.
+    msg_allocator: std.mem.Allocator,
+    request_queue: *coding_agent_mod.RequestQueue,
+    lifecycle_event_queue: *queues_mod.UiLifecycleQueue,
+};
 
 pub const AgentRuntime = struct {
     msg_allocator: std.mem.Allocator,
@@ -324,26 +333,50 @@ fn agentThreadFn(self: *AgentRuntime) void {
 }
 
 fn submitExtensionAsyncResultFn(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) bool {
-    const self: *Interactive = @ptrCast(@alignCast(ptr));
-    switch (self.request_queue.trySend(.{ .extension_async_result = .{ .id = id, .result = result } })) {
+    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ptr));
+    switch (sink.request_queue.trySend(.{ .extension_async_result = .{ .id = id, .result = result } })) {
         .ok, .dropped => return true,
         .full, .closed, .oom => |rejected| {
             var failed = rejected;
-            failed.deinit(self.msg_allocator);
+            failed.deinit(sink.msg_allocator);
             return false;
         },
     }
 }
 fn submitExtensionAiCompleteEventFn(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) bool {
-    const self: *Interactive = @ptrCast(@alignCast(ptr));
-    switch (self.request_queue.trySend(.{ .extension_async_event = .{ .id = id, .event = event } })) {
+    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ptr));
+    switch (sink.request_queue.trySend(.{ .extension_async_event = .{ .id = id, .event = event } })) {
         .ok, .dropped => return true,
         .full, .closed, .oom => |rejected| {
             var failed = rejected;
-            failed.deinit(self.msg_allocator);
+            failed.deinit(sink.msg_allocator);
             return false;
         },
     }
+}
+
+pub fn publishLifecycleUiEventFromSink(ctx: ?*anyopaque, event: UiEvent) bool {
+    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ctx.?));
+    switch (sink.lifecycle_event_queue.trySend(event)) {
+        .ok => return true,
+        .dropped => unreachable,
+        .closed, .full, .oom => |rejected| {
+            var failed = rejected;
+            failed.deinit(sink.msg_allocator);
+            return false;
+        },
+    }
+}
+
+pub fn publishJobUiFrameFromSink(ptr: *anyopaque, frame: extension_ui.UiFrame) bool {
+    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ptr));
+    const updates = sink.msg_allocator.alloc(extension_ui.UiFrame, 1) catch {
+        var failed = frame;
+        failed.deinit(sink.msg_allocator);
+        return false;
+    };
+    updates[0] = frame;
+    return publishLifecycleUiEventFromSink(@ptrCast(sink), .{ .extension_ui_framed = .{ .updates = updates } });
 }
 
 pub fn extensionAsyncDispatcher(self: *AgentRuntime) extension_runner_mod.AsyncDispatcher {

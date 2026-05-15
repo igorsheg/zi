@@ -74,7 +74,6 @@ const autocomplete_mod = @import("autocomplete/provider.zig");
 const keybindings = @import("keybindings.zig");
 const slash_commands_mod = @import("../coding_agent/slash_commands.zig");
 const request_mod = @import("../coding_agent/request.zig");
-const extension_ui = @import("../coding_agent/extensions/ui.zig");
 const notifications = @import("notifications.zig");
 const notifications_flow = @import("interactive/notifications.zig");
 const CombinedAutocompleteProvider = autocomplete_mod.CombinedAutocompleteProvider;
@@ -302,6 +301,7 @@ pub const Interactive = struct {
     lifecycle_event_queue: UiLifecycleQueue,
 
     request_queue: RequestQueue,
+    cross_thread_sinks: runtime_loop.CrossThreadUiSinks = undefined,
     agent_runtime: ?runtime_loop.AgentRuntime = null,
     job_manager: job_manager_mod.JobManager,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
@@ -480,18 +480,22 @@ pub const Interactive = struct {
         self.agent_tasks = tasks;
     }
 
+    fn bindCrossThreadSinks(self: *Interactive) void {
+        self.cross_thread_sinks = .{
+            .msg_allocator = self.msg_allocator,
+            .request_queue = &self.request_queue,
+            .lifecycle_event_queue = &self.lifecycle_event_queue,
+        };
+    }
+
     fn startSessionIndexWorker(self: *Interactive) !void {
-        self.session_index_worker.setPublisher(&publishSessionIndexUiEvent, @ptrCast(self));
+        self.session_index_worker.setPublisher(&runtime_loop.publishLifecycleUiEventFromSink, @ptrCast(&self.cross_thread_sinks));
         try self.session_index_worker.start();
         self.session_index_worker.warmResumeSessions(self.cwd) catch {};
     }
 
-    fn publishSessionIndexUiEvent(ctx: ?*anyopaque, event: UiEvent) bool {
-        const self: *Interactive = @ptrCast(@alignCast(ctx.?));
-        return self.publishLifecycleUiEvent(event);
-    }
-
     pub fn run(self: *Interactive) !void {
+        self.bindCrossThreadSinks();
         try run_setup.prepareTerminal(self);
         run_setup.bindEditor(self);
         run_setup.bindRuntimeEvents(self);
@@ -500,11 +504,11 @@ pub const Interactive = struct {
         try self.startAgentThread();
         try self.startSessionIndexWorker();
         if (self.ai_complete_worker) |*worker| {
-            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &runtime_loop.submitExtensionAsyncResult, .submit_event = &runtime_loop.submitExtensionAiCompleteEvent });
+            worker.setResultSink(.{ .ptr = @ptrCast(&self.cross_thread_sinks), .submit = &runtime_loop.submitExtensionAsyncResult, .submit_event = &runtime_loop.submitExtensionAiCompleteEvent });
             try worker.start();
         }
         if (self.system_worker) |*worker| {
-            worker.setResultSink(.{ .ptr = @ptrCast(self), .submit = &runtime_loop.submitExtensionAsyncResult });
+            worker.setResultSink(.{ .ptr = @ptrCast(&self.cross_thread_sinks), .submit = &runtime_loop.submitExtensionAsyncResult });
             try worker.start();
         }
 
@@ -513,7 +517,7 @@ pub const Interactive = struct {
         run_setup.bindAutocomplete(self);
         run_setup.mountInitialTree(self);
 
-        self.job_manager.setFrameSink(.{ .ptr = @ptrCast(self), .submit = &publishJobUiFrame });
+        self.job_manager.setFrameSink(.{ .ptr = @ptrCast(&self.cross_thread_sinks), .submit = &runtime_loop.publishJobUiFrameFromSink });
 
         self.publishPendingExtensionUi();
 
@@ -592,7 +596,7 @@ pub const Interactive = struct {
         defer request.deinit(self.msg_allocator);
 
         const result = self.runTerminalSystem(request.system);
-        if (!runtime_loop.submitExtensionAsyncResult(@ptrCast(self), request.id, .{ .system = result })) {
+        if (!runtime_loop.submitExtensionAsyncResult(@ptrCast(&self.cross_thread_sinks), request.id, .{ .system = result })) {
             var failed = result;
             failed.deinit(self.msg_allocator);
         }
@@ -670,17 +674,6 @@ pub const Interactive = struct {
 
     pub fn publishLifecycleUiEvent(self: *Interactive, event: UiEvent) bool {
         return event_flow.publishLifecycle(self, event);
-    }
-
-    fn publishJobUiFrame(ptr: *anyopaque, frame: extension_ui.UiFrame) bool {
-        const self: *Interactive = @ptrCast(@alignCast(ptr));
-        const updates = self.msg_allocator.alloc(extension_ui.UiFrame, 1) catch {
-            var failed = frame;
-            failed.deinit(self.msg_allocator);
-            return false;
-        };
-        updates[0] = frame;
-        return self.publishLifecycleUiEvent(.{ .extension_ui_framed = .{ .updates = updates } });
     }
 
     pub fn handleKey(self: *Interactive, key: Key) void {

@@ -8,6 +8,9 @@ const extension_runner = @import("runner.zig");
 const log = std.log.scoped(.system_worker);
 
 pub const ResultSink = struct {
+    // Cross-thread sink. Implementations must enqueue or otherwise hand off the
+    // result to its owner thread; they must not mutate UI/runtime owner state
+    // directly from the worker thread.
     ptr: *anyopaque,
     submit: *const fn (ptr: *anyopaque, id: extension_runner.AsyncOpId, result: extension_runner.AsyncResult) bool,
 };

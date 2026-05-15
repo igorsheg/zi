@@ -9,6 +9,9 @@ const jsonl = json_root.jsonl;
 const json_value = json_root.value;
 
 pub const FrameSink = struct {
+    // Cross-thread sink. Called from the job manager/process pump path; it must
+    // enqueue frame updates for the UI owner thread and must not mutate UI state
+    // directly.
     ptr: *anyopaque,
     submit: *const fn (ptr: *anyopaque, frame: extension_ui.UiFrame) bool,
 };
