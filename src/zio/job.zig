@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const deadline = @import("deadline.zig");
 const process_reactor = @import("process_reactor.zig");
 const task = @import("task.zig");
 const logging = @import("../logging.zig");
@@ -192,6 +193,7 @@ const testing = std.testing;
 const TestSink = struct {
     allocator: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
     events: std.ArrayList(Event) = .empty,
 
     fn deinit(self: *TestSink) void {
@@ -204,6 +206,7 @@ const TestSink = struct {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
         self.events.append(self.allocator, event) catch return false;
+        self.condition.broadcast(std.Options.debug_io);
         return true;
     }
 
@@ -242,16 +245,45 @@ const TestSink = struct {
         }
         return false;
     }
-};
 
-fn waitUntil(comptime pred: fn (*TestSink) bool, sink: *TestSink) !void {
-    var i: usize = 0;
-    while (i < 200) : (i += 1) {
-        if (pred(sink)) return;
-        std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+    fn waitUntil(self: *TestSink, comptime pred: fn (*const TestSink) bool, timeout_ms: u64) !void {
+        const limit = deadline.Deadline.afterMs(std.Options.debug_io, timeout_ms);
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        while (!pred(self)) {
+            if (limit.expired(std.Options.debug_io)) return error.Timeout;
+            self.condition.waitUncancelable(std.Options.debug_io, &self.mutex);
+        }
     }
-    return error.Timeout;
-}
+
+    fn containsLocked(self: *const TestSink, kind: EventKind, needle: []const u8) bool {
+        for (self.events.items) |event| {
+            if (event.kind == kind and event.data != null and std.mem.indexOf(u8, event.data.?, needle) != null) return true;
+        }
+        return false;
+    }
+
+    fn exitCodeLocked(self: *const TestSink, id: u64) ?i64 {
+        for (self.events.items) |event| {
+            if (event.id == id and event.kind == .exit) return event.code;
+        }
+        return null;
+    }
+
+    fn hasExitLocked(self: *const TestSink, id: u64) bool {
+        for (self.events.items) |event| {
+            if (event.id == id and event.kind == .exit) return true;
+        }
+        return false;
+    }
+
+    fn hasKindLocked(self: *const TestSink, id: u64, kind: EventKind) bool {
+        for (self.events.items) |event| {
+            if (event.id == id and event.kind == kind) return true;
+        }
+        return false;
+    }
+};
 
 fn testManager(sink: *TestSink) Manager {
     return Manager.init(testing.allocator, std.Options.debug_io, .{ .ptr = @ptrCast(sink), .submit = &TestSink.sink });
@@ -287,16 +319,16 @@ test "zio job forwards stdout chunks and successful exit" {
 
     try startShellJob(&manager, 1, "printf hello");
 
-    try waitUntil(struct {
-        fn pred(s: *TestSink) bool {
-            return s.contains(.stdout, "hello");
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.containsLocked(.stdout, "hello");
         }
-    }.pred, &sink);
-    try waitUntil(struct {
-        fn pred(s: *TestSink) bool {
-            return s.exitCode(1) == 0;
+    }.pred, 2000);
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.exitCodeLocked(1) == 0;
         }
-    }.pred, &sink);
+    }.pred, 2000);
 }
 
 test "zio job writes to child stdin after the process is ready" {
@@ -306,23 +338,23 @@ test "zio job writes to child stdin after the process is ready" {
     defer manager.deinit();
 
     try startShellJob(&manager, 2, "IFS= read -r line; printf 'got:%s\\n' \"$line\"");
-    try waitUntil(struct {
-        fn pred(s: *TestSink) bool {
-            return s.hasKind(2, .ready);
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.hasKindLocked(2, .ready);
         }
-    }.pred, &sink);
+    }.pred, 2000);
     try manager.write(2, "doom\n");
 
-    try waitUntil(struct {
-        fn pred(s: *TestSink) bool {
-            return s.contains(.stdout, "got:doom");
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.containsLocked(.stdout, "got:doom");
         }
-    }.pred, &sink);
-    try waitUntil(struct {
-        fn pred(s: *TestSink) bool {
-            return s.exitCode(2) == 0;
+    }.pred, 2000);
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.exitCodeLocked(2) == 0;
         }
-    }.pred, &sink);
+    }.pred, 2000);
 }
 
 test "zio job stop terminates a running child" {
@@ -332,14 +364,18 @@ test "zio job stop terminates a running child" {
     defer manager.deinit();
 
     try startCommandJob(&manager, 3, &.{ "/bin/sleep", "100" });
-    std.Options.debug_io.sleep(.fromMilliseconds(30), .awake) catch {};
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.hasKindLocked(3, .ready);
+        }
+    }.pred, 2000);
     manager.stop(3);
 
-    try waitUntil(struct {
-        fn pred(s: *TestSink) bool {
-            return s.hasExit(3);
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.hasExitLocked(3);
         }
-    }.pred, &sink);
+    }.pred, 2000);
 }
 
 test "zio job stop escalates children that ignore TERM" {
@@ -351,12 +387,16 @@ test "zio job stop escalates children that ignore TERM" {
     defer manager.deinit();
 
     try startShellJob(&manager, 4, "trap '' TERM; while :; do sleep 1; done");
-    std.Options.debug_io.sleep(.fromMilliseconds(30), .awake) catch {};
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.hasKindLocked(4, .ready);
+        }
+    }.pred, 2000);
     manager.stop(4);
 
-    try waitUntil(struct {
-        fn pred(s: *TestSink) bool {
-            return s.hasExit(4);
+    try sink.waitUntil(struct {
+        fn pred(s: *const TestSink) bool {
+            return s.hasExitLocked(4);
         }
-    }.pred, &sink);
+    }.pred, 2000);
 }

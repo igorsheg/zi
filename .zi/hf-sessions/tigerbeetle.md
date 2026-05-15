@@ -876,6 +876,8 @@ Priority: medium.
 
 ## 11. Replace sleep-loop readiness with condition/wake/event
 
+Status: completed end-to-end for the current job/process readiness surface. `src/zio/job.zig` already receives explicit `.ready` events from `process_reactor`; tests now wait on `TestSink.condition` signaled by event delivery instead of polling with 10ms sleeps, and stop tests wait for `.ready` before writing/stopping children. This makes readiness event-driven at the job boundary and removes the remaining `zio.job` sleep-loop readiness helpers. Gates: `zig build test`.
+
 Current examples:
 
 `process_engine_linux.zig` / `kqueue.zig`:
