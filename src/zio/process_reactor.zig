@@ -117,6 +117,64 @@ test "process reactor owns multiple children in one backend loop" {
     try std.testing.expect(allTrue(&exited));
 }
 
+test "process reactor handles mixed child lifecycle in one backend loop" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    var reactor = try Reactor.init(std.testing.allocator);
+    defer reactor.deinit();
+    try reactor.start();
+
+    try reactor.spawn(.{ .id = 1, .argv = &.{ "/bin/sh", "-c", "printf fast" } });
+    try reactor.spawn(.{ .id = 2, .argv = &.{ "/bin/sh", "-c", "cat" }, .stdin = true });
+    try reactor.spawn(.{ .id = 3, .argv = &.{ "/bin/sh", "-c", "sleep 5" }, .timeout_ms = 100 });
+
+    var ready: [3]bool = .{false} ** 3;
+    var stdout: [3]bool = .{false} ** 3;
+    var exited: [3]bool = .{false} ** 3;
+    var timed_out = false;
+    var wrote_stdin = false;
+
+    var attempts: usize = 0;
+    while (attempts < 200 and !(allTrue(&ready) and allTrue(&stdout) and allTrue(&exited) and timed_out)) : (attempts += 1) {
+        var batch: [16]Event = undefined;
+        const count = reactor.drainEvents(&batch);
+        if (count == 0) {
+            _ = try reactor.waitEvents(100);
+            continue;
+        }
+        for (batch[0..count]) |*event| {
+            defer event.deinit(std.testing.allocator);
+            switch (event.*) {
+                .ready => |id| {
+                    mark(&ready, id);
+                    if (id == 2 and !wrote_stdin) {
+                        try reactor.write(2, "stdin-child");
+                        try reactor.closeStdin(2);
+                        wrote_stdin = true;
+                    }
+                },
+                .stdout => |out| {
+                    if (out.id == 1 and std.mem.eql(u8, out.bytes, "fast")) mark(&stdout, out.id);
+                    if (out.id == 2 and std.mem.eql(u8, out.bytes, "stdin-child")) mark(&stdout, out.id);
+                },
+                .exit => |exit| {
+                    mark(&exited, exit.id);
+                    if (exit.id == 3 and exit.timed_out) {
+                        timed_out = true;
+                        stdout[2] = true;
+                    }
+                },
+                .stderr, .output_dropped, .spawn_failed => {},
+            }
+        }
+    }
+
+    try std.testing.expect(allTrue(&ready));
+    try std.testing.expect(allTrue(&stdout));
+    try std.testing.expect(allTrue(&exited));
+    try std.testing.expect(timed_out);
+}
+
 fn mark(values: []bool, id: ProcessId) void {
     if (id == 0 or id > values.len) return;
     values[@intCast(id - 1)] = true;
