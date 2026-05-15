@@ -61,6 +61,7 @@ pub const FauxProvider = struct {
     captured_contexts: std.ArrayListUnmanaged(protocol.Context),
     call_count: usize,
     allocator: std.mem.Allocator,
+    block_until_cancel: bool = false,
 
     const vtable: ai_provider.Provider.VTable = .{
         .stream = streamImpl,
@@ -89,6 +90,10 @@ pub const FauxProvider = struct {
             @panic("FauxProvider.setResponses: allocation failed");
     }
 
+    pub fn setBlockUntilCancel(self: *FauxProvider, value: bool) void {
+        self.block_until_cancel = value;
+    }
+
     pub fn provider(self: *FauxProvider) ai_provider.Provider {
         return .{
             .ptr = @ptrCast(self),
@@ -105,13 +110,31 @@ pub const FauxProvider = struct {
         allocator: std.mem.Allocator,
         _: protocol.Model,
         context: protocol.Context,
-        _: protocol.StreamOptions,
+        options: protocol.StreamOptions,
         callback: ai_provider.EventCallback,
         callback_ctx: ?*anyopaque,
     ) void {
         const self = getSelf(ptr);
         self.call_count += 1;
         self.captured_contexts.append(self.allocator, context) catch {};
+
+        if (self.block_until_cancel) {
+            while (!options.signal.isAborted()) {
+                std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+            }
+            const err_msg: protocol.AssistantMessage = .{
+                .content = &.{},
+                .api = FAUX_API,
+                .provider = FAUX_PROVIDER,
+                .model = FAUX_MODEL_ID,
+                .usage = DEFAULT_USAGE,
+                .stop_reason = .aborted,
+                .error_message = "aborted",
+                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+            };
+            callback(.{ .@"error" = .{ .reason = .aborted, .@"error" = err_msg } }, callback_ctx);
+            return;
+        }
 
         if (self.responses.items.len == 0) {
             const err_msg: protocol.AssistantMessage = .{

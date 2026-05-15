@@ -226,3 +226,69 @@ test "ai completion worker thread enqueues faux provider result" {
     try testing.expect(result.ai_complete.status == .completed);
     try testing.expectEqualStrings("worker summary", result.ai_complete.status.completed.text);
 }
+
+test "ai completion worker stop cancels active provider request" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var faux_provider = ai.faux.FauxProvider.init(allocator);
+    defer faux_provider.deinit();
+    faux_provider.setBlockUntilCancel(true);
+
+    const Queue = queue_mod.Queue(extension_runner.AsyncResult, .{
+        .cleanup = .deinit,
+        .policy = .{ .bounded = .{ .capacity = 4, .on_full = .reject } },
+        .wakeup = .pipe,
+    });
+    const Sink = struct {
+        queue: *Queue,
+
+        fn submit(ptr: *anyopaque, id: extension_runner.AsyncOpId, result: extension_runner.AsyncResult) bool {
+            _ = id;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return switch (self.queue.trySend(result)) {
+                .ok, .dropped => true,
+                .full, .closed, .oom => |rejected| {
+                    var failed = rejected;
+                    failed.deinit(std.testing.allocator);
+                    return false;
+                },
+            };
+        }
+    };
+
+    var controller = zio.cancel.Source{};
+    const signal = controller.beginRun();
+    var queue = try Queue.init(allocator);
+    defer queue.deinit();
+    var sink = Sink{ .queue = &queue };
+    var worker = try AiCompleteWorker.init(allocator);
+    worker.setResultSink(.{ .ptr = @ptrCast(&sink), .submit = &Sink.submit });
+    try worker.start();
+
+    try worker.submit(.{
+        .id = 9,
+        .provider = faux_provider.provider(),
+        .model = ai.faux.fauxModel(),
+        .prompt = try allocator.dupe(u8, "block"),
+        .signal = signal,
+    });
+
+    var spins: usize = 0;
+    while (worker.worker.workers[0].state().current_request == null and worker.worker.workers[1].state().current_request == null and spins < 100) : (spins += 1) {
+        std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try testing.expect(worker.worker.workers[0].state().current_request != null or worker.worker.workers[1].state().current_request != null);
+    worker.worker.stopMode(.cancel_current);
+
+    try testing.expect(signal.isAborted());
+    _ = try queue.waitReadable(5_000);
+    var out: [1]extension_runner.AsyncResult = undefined;
+    const count = queue.drainInto(&out);
+    try testing.expectEqual(@as(usize, 1), count);
+    var result = out[0];
+    defer result.deinit(allocator);
+    try testing.expect(result == .ai_complete);
+    try testing.expect(result.ai_complete.status == .err);
+    worker.deinit();
+}
