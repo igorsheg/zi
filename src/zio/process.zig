@@ -15,6 +15,7 @@ pub const StreamKind = enum { stdout, stderr };
 pub const KillScope = enum { child, process_group };
 pub const Stdin = union(enum) { ignore, inherit, bytes: []const u8 };
 pub const Output = enum { ignore, inherit, capture };
+pub const OutputOverflow = enum { fail, truncate };
 
 pub const ChunkCallback = struct {
     // Called by the process.run()/stream() owner loop after capture state is
@@ -37,6 +38,8 @@ pub const RunOptions = struct {
     stderr: Output = .capture,
     stdout_limit: std.Io.Limit = .limited(default_max_output_bytes),
     stderr_limit: std.Io.Limit = .limited(default_max_output_bytes),
+    stdout_overflow: OutputOverflow = .fail,
+    stderr_overflow: OutputOverflow = .fail,
     timeout_ms: ?u64 = null,
     kill_scope: KillScope = .process_group,
     signal: Token = Token.none,
@@ -51,21 +54,29 @@ pub const StreamOptions = struct {
     stdin: Stdin = .ignore,
     stdout_limit: std.Io.Limit = .limited(default_max_output_bytes),
     stderr_limit: std.Io.Limit = .limited(default_max_output_bytes),
+    stdout_overflow: OutputOverflow = .fail,
+    stderr_overflow: OutputOverflow = .fail,
     timeout_ms: ?u64 = null,
     kill_scope: KillScope = .process_group,
     signal: Token = Token.none,
     on_chunk: ?ChunkCallback = null,
 };
 
+pub const CapturedStream = struct {
+    bytes: []u8,
+    total_bytes: usize = 0,
+    truncated: bool = false,
+};
+
 pub const Completed = struct {
     term: std.process.Child.Term,
-    stdout: []u8,
-    stderr: []u8,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
 };
 
 pub const Partial = struct {
-    stdout: []u8,
-    stderr: []u8,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
     message: []u8,
 };
 
@@ -80,12 +91,12 @@ pub const RunResult = union(enum) {
     pub fn deinit(self: *RunResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .completed => |x| {
-                allocator.free(x.stdout);
-                allocator.free(x.stderr);
+                allocator.free(x.stdout.bytes);
+                allocator.free(x.stderr.bytes);
             },
             .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => |x| {
-                allocator.free(x.stdout);
-                allocator.free(x.stderr);
+                allocator.free(x.stdout.bytes);
+                allocator.free(x.stderr.bytes);
                 allocator.free(x.message);
             },
         }
@@ -148,6 +159,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: RunOptions) RunErr
         .stdin = options.stdin,
         .stdout_limit = if (options.stdout == .capture) options.stdout_limit else .limited(0),
         .stderr_limit = if (options.stderr == .capture) options.stderr_limit else .limited(0),
+        .stdout_overflow = options.stdout_overflow,
+        .stderr_overflow = options.stderr_overflow,
         .timeout_ms = options.timeout_ms,
         .kill_scope = options.kill_scope,
         .signal = options.signal,
@@ -166,7 +179,7 @@ fn runInheritCaptureUnsupported(allocator: std.mem.Allocator, io: std.Io, option
         .kill_scope = options.kill_scope,
         .signal = options.signal,
     });
-    return .{ .completed = .{ .term = term, .stdout = try allocator.dupe(u8, ""), .stderr = try allocator.dupe(u8, "") } };
+    return .{ .completed = .{ .term = term, .stdout = try emptyCapturedStream(allocator), .stderr = try emptyCapturedStream(allocator) } };
 }
 
 pub fn stream(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions) RunError!RunResult {
@@ -231,6 +244,8 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
     var capture = Capture.init(allocator, .{
         .stdout_limit = options.stdout_limit,
         .stderr_limit = options.stderr_limit,
+        .stdout_overflow = options.stdout_overflow,
+        .stderr_overflow = options.stderr_overflow,
         .stdout_policy = streamCapturePolicy(store_stdout, options.on_chunk != null),
         .stderr_policy = streamCapturePolicy(store_stderr, options.on_chunk != null),
     });
@@ -283,9 +298,13 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
 
     const term = capture.term orelse return error.WaitFailed;
     const stdout = try capture.takeStdout();
-    errdefer allocator.free(stdout);
+    errdefer allocator.free(stdout.bytes);
     const stderr = try capture.takeStderr();
     return .{ .completed = .{ .term = term, .stdout = stdout, .stderr = stderr } };
+}
+
+fn emptyCapturedStream(allocator: std.mem.Allocator) !CapturedStream {
+    return .{ .bytes = try allocator.dupe(u8, ""), .total_bytes = 0, .truncated = false };
 }
 
 const StreamCapturePolicy = enum {
@@ -343,8 +362,14 @@ const Capture = struct {
     allocator: std.mem.Allocator,
     stdout: std.ArrayList(u8) = .empty,
     stderr: std.ArrayList(u8) = .empty,
+    stdout_total_bytes: usize = 0,
+    stderr_total_bytes: usize = 0,
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
     stdout_limit: std.Io.Limit,
     stderr_limit: std.Io.Limit,
+    stdout_overflow: OutputOverflow,
+    stderr_overflow: OutputOverflow,
     stdout_policy: StreamCapturePolicy,
     stderr_policy: StreamCapturePolicy,
     reactor: ?*process_reactor.Reactor = null,
@@ -356,6 +381,8 @@ const Capture = struct {
     const Config = struct {
         stdout_limit: std.Io.Limit,
         stderr_limit: std.Io.Limit,
+        stdout_overflow: OutputOverflow,
+        stderr_overflow: OutputOverflow,
         stdout_policy: StreamCapturePolicy,
         stderr_policy: StreamCapturePolicy,
     };
@@ -365,6 +392,8 @@ const Capture = struct {
             .allocator = allocator,
             .stdout_limit = config.stdout_limit,
             .stderr_limit = config.stderr_limit,
+            .stdout_overflow = config.stdout_overflow,
+            .stderr_overflow = config.stderr_overflow,
             .stdout_policy = config.stdout_policy,
             .stderr_policy = config.stderr_policy,
         };
@@ -404,6 +433,10 @@ const Capture = struct {
 
     fn appendCaptured(self: *Capture, kind: StreamKind, bytes: []const u8) void {
         const capture_policy = self.policy(kind);
+        switch (kind) {
+            .stdout => self.stdout_total_bytes += bytes.len,
+            .stderr => self.stderr_total_bytes += bytes.len,
+        }
         if (!capture_policy.stores()) return;
         const list = switch (kind) {
             .stdout => &self.stdout,
@@ -413,17 +446,37 @@ const Capture = struct {
             .stdout => self.stdout_limit,
             .stderr => self.stderr_limit,
         };
+        const overflow = switch (kind) {
+            .stdout => self.stdout_overflow,
+            .stderr => self.stderr_overflow,
+        };
+        const limit_len = limit.toInt() orelse std.math.maxInt(usize);
         const allowed = remainingCapacity(list.items.len, limit);
-        const clipped = bytes[0..@min(bytes.len, allowed)];
-        if (clipped.len > 0) list.appendSlice(self.allocator, clipped) catch return;
 
-        if (kind == .stdout and bytes.len > allowed) {
-            self.failure = .stdout_too_long;
-            if (self.reactor) |reactor| reactor.kill(1) catch {};
+        if (overflow == .truncate) {
+            appendRollingTail(self.allocator, list, bytes, limit_len) catch return;
+        } else {
+            const clipped = bytes[0..@min(bytes.len, allowed)];
+            if (clipped.len > 0) list.appendSlice(self.allocator, clipped) catch return;
         }
-        if (kind == .stderr and bytes.len > allowed) {
-            self.failure = .stderr_too_long;
-            if (self.reactor) |reactor| reactor.kill(1) catch {};
+
+        if (bytes.len > allowed) {
+            switch (kind) {
+                .stdout => {
+                    self.stdout_truncated = true;
+                    if (self.stdout_overflow == .fail) {
+                        self.failure = .stdout_too_long;
+                        if (self.reactor) |reactor| reactor.kill(1) catch {};
+                    }
+                },
+                .stderr => {
+                    self.stderr_truncated = true;
+                    if (self.stderr_overflow == .fail) {
+                        self.failure = .stderr_too_long;
+                        if (self.reactor) |reactor| reactor.kill(1) catch {};
+                    }
+                },
+            }
         }
     }
 
@@ -442,25 +495,25 @@ const Capture = struct {
         return self.term != null or self.failure == .spawn_failed;
     }
 
-    fn takeStdout(self: *Capture) ![]u8 {
-        if (!self.stdout_policy.stores()) return self.allocator.dupe(u8, "");
+    fn takeStdout(self: *Capture) !CapturedStream {
+        if (!self.stdout_policy.stores()) return emptyCapturedStream(self.allocator);
         const out = try self.stdout.toOwnedSlice(self.allocator);
         self.stdout = .empty;
-        return out;
+        return .{ .bytes = out, .total_bytes = self.stdout_total_bytes, .truncated = self.stdout_truncated };
     }
 
-    fn takeStderr(self: *Capture) ![]u8 {
-        if (!self.stderr_policy.stores()) return self.allocator.dupe(u8, "");
+    fn takeStderr(self: *Capture) !CapturedStream {
+        if (!self.stderr_policy.stores()) return emptyCapturedStream(self.allocator);
         const out = try self.stderr.toOwnedSlice(self.allocator);
         self.stderr = .empty;
-        return out;
+        return .{ .bytes = out, .total_bytes = self.stderr_total_bytes, .truncated = self.stderr_truncated };
     }
 
     fn finishPartial(self: *Capture, comptime tag: std.meta.Tag(RunResult), msg: []const u8) RunError!RunResult {
         const stdout = try self.takeStdout();
-        errdefer self.allocator.free(stdout);
+        errdefer self.allocator.free(stdout.bytes);
         const stderr = try self.takeStderr();
-        errdefer self.allocator.free(stderr);
+        errdefer self.allocator.free(stderr.bytes);
         const message = self.allocator.dupe(u8, msg) catch return error.OutOfMemory;
         const p = Partial{ .stdout = stdout, .stderr = stderr, .message = message };
         return switch (tag) {
@@ -473,6 +526,21 @@ const Capture = struct {
         };
     }
 };
+
+fn appendRollingTail(allocator: std.mem.Allocator, list: *std.ArrayList(u8), bytes: []const u8, limit: usize) !void {
+    if (limit == 0) return;
+    if (bytes.len >= limit) {
+        try list.resize(allocator, limit);
+        @memcpy(list.items, bytes[bytes.len - limit ..]);
+        return;
+    }
+    try list.appendSlice(allocator, bytes);
+    if (list.items.len > limit) {
+        const excess = list.items.len - limit;
+        std.mem.copyForwards(u8, list.items[0..limit], list.items[excess..]);
+        try list.resize(allocator, limit);
+    }
+}
 
 fn remainingCapacity(len: usize, limit: std.Io.Limit) usize {
     return if (limit.toInt()) |n| n -| len else std.math.maxInt(usize);
@@ -515,8 +583,8 @@ test "process.run captures both output streams without mixing them" {
         .completed => |x| x,
         else => return error.UnexpectedProcessError,
     };
-    try std.testing.expectEqualSlices(u8, "out", completed.stdout);
-    try std.testing.expectEqualSlices(u8, "err", completed.stderr);
+    try std.testing.expectEqualSlices(u8, "out", completed.stdout.bytes);
+    try std.testing.expectEqualSlices(u8, "err", completed.stderr.bytes);
 }
 
 test "process.run streams chunks while preserving captured output" {
@@ -549,8 +617,8 @@ test "process.run streams chunks while preserving captured output" {
     };
     try std.testing.expect(collector.stdout_seen);
     try std.testing.expect(collector.stderr_seen);
-    try std.testing.expectEqualSlices(u8, "out", completed.stdout);
-    try std.testing.expectEqualSlices(u8, "err", completed.stderr);
+    try std.testing.expectEqualSlices(u8, "out", completed.stdout.bytes);
+    try std.testing.expectEqualSlices(u8, "err", completed.stderr.bytes);
 }
 
 test "process.run env overlays inherited environment" {
@@ -564,8 +632,8 @@ test "process.run env overlays inherited environment" {
         .completed => |x| x,
         else => return error.UnexpectedProcessError,
     };
-    try std.testing.expect(std.mem.startsWith(u8, completed.stdout, "/"));
-    try std.testing.expect(std.mem.endsWith(u8, completed.stdout, ":overlay"));
+    try std.testing.expect(std.mem.startsWith(u8, completed.stdout.bytes, "/"));
+    try std.testing.expect(std.mem.endsWith(u8, completed.stdout.bytes, ":overlay"));
 }
 
 test "process.run clear_env starts from empty environment" {
@@ -580,7 +648,7 @@ test "process.run clear_env starts from empty environment" {
         .completed => |x| x,
         else => return error.UnexpectedProcessError,
     };
-    try std.testing.expectEqualSlices(u8, "clear:explicit", completed.stdout);
+    try std.testing.expectEqualSlices(u8, "clear:explicit", completed.stdout.bytes);
 }
 
 test "process.run returns immediately when command exits before timeout" {
@@ -605,8 +673,8 @@ test "process.run drains large stdout and stderr concurrently" {
         .completed => |x| x,
         else => return error.UnexpectedProcessError,
     };
-    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stdout.len);
-    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stderr.len);
+    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stdout.bytes.len);
+    try std.testing.expectEqual(@as(usize, 2048 * 64), completed.stderr.bytes.len);
 }
 
 test "process.run writes stdin then closes the child pipe" {
@@ -617,7 +685,7 @@ test "process.run writes stdin then closes the child pipe" {
         .completed => |x| x,
         else => return error.UnexpectedProcessError,
     };
-    try std.testing.expectEqualSlices(u8, "hello stdin", completed.stdout);
+    try std.testing.expectEqualSlices(u8, "hello stdin", completed.stdout.bytes);
 }
 
 test "process.run timeout preserves output emitted before termination" {
@@ -628,8 +696,8 @@ test "process.run timeout preserves output emitted before termination" {
         .timed_out => |x| x,
         else => return error.UnexpectedProcessCompletion,
     };
-    try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "before") != null);
-    try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "after") == null);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout.bytes, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout.bytes, "after") == null);
 }
 
 test "process.run reports output limit as typed partial" {
@@ -641,6 +709,24 @@ test "process.run reports output limit as typed partial" {
         else => return error.UnexpectedProcessCompletion,
     };
     try std.testing.expect(std.mem.indexOf(u8, failed.message, "stdout exceeded output limit") != null);
+}
+
+test "process.run can truncate captured output without killing child" {
+    try skipShellProcessTestsIfUnsupported();
+    var result = try runShell("printf abcdef; exit 7", .{
+        .argv = &.{},
+        .stdout_limit = .limited(3),
+        .stdout_overflow = .truncate,
+    });
+    defer result.deinit(std.testing.allocator);
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
+    try std.testing.expectEqualSlices(u8, "def", completed.stdout.bytes);
+    try std.testing.expectEqual(@as(usize, 6), completed.stdout.total_bytes);
+    try std.testing.expect(completed.stdout.truncated);
+    try std.testing.expectEqual(@as(u8, 7), completed.term.exited);
 }
 
 test "process.run aborts a blocked child promptly" {
@@ -693,7 +779,7 @@ test "process.run times out when background descendant inherits stdout" {
         .timed_out => |x| x,
         else => return error.UnexpectedProcessCompletion,
     };
-    try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout, "done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out.stdout.bytes, "done") != null);
     try std.testing.expect(elapsed < 1000);
 }
 
@@ -707,6 +793,6 @@ test "process.run completes when background descendant redirects stdio" {
         .completed => |x| x,
         else => return error.UnexpectedProcessError,
     };
-    try std.testing.expectEqualSlices(u8, "done", completed.stdout);
+    try std.testing.expectEqualSlices(u8, "done", completed.stdout.bytes);
     try std.testing.expect(elapsed < 500);
 }

@@ -99,7 +99,7 @@ fn executeSync(
         .exited => |c| c,
         else => 2,
     };
-    const stdout = completed.stdout;
+    const stdout = completed.stdout.bytes;
 
     var paths: std.ArrayList([]const u8) = .empty;
     defer {

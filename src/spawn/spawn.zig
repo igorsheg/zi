@@ -87,18 +87,18 @@ pub fn ziSpawn(config: types.SpawnConfig) types.SpawnResult {
                 .exited => |code| code,
                 else => 1,
             };
-            result.stderr_output.appendSlice(allocator, completed.stderr) catch {};
+            result.stderr_output.appendSlice(allocator, completed.stderr.bytes) catch {};
         },
         .timed_out => |timeout| {
             result.exit_code = 1;
-            result.stderr_output.appendSlice(allocator, timeout.stderr) catch {};
+            result.stderr_output.appendSlice(allocator, timeout.stderr.bytes) catch {};
             result.error_message = allocator.dupe(u8, timeout.message) catch null;
         },
         .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => |err| {
             result.exit_code = 1;
             if (proc_result == .aborted) result.cancelled = true;
             result.error_message = allocator.dupe(u8, err.message) catch null;
-            result.stderr_output.appendSlice(allocator, err.stderr) catch {};
+            result.stderr_output.appendSlice(allocator, err.stderr.bytes) catch {};
             if (trace_file) |f| traceWrite(config.io, f, "--- spawn FAILED to launch: {s}\n", .{err.message});
             return result;
         },

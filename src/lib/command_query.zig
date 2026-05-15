@@ -30,9 +30,9 @@ pub fn stdout(allocator: std.mem.Allocator, io: std.Io, options: Options) ?[]u8 
     }
 
     const bytes = if (options.trim)
-        std.mem.trim(u8, completed.stdout, &std.ascii.whitespace)
+        std.mem.trim(u8, completed.stdout.bytes, &std.ascii.whitespace)
     else
-        completed.stdout;
+        completed.stdout.bytes;
     if (bytes.len == 0) return null;
     return allocator.dupe(u8, bytes) catch null;
 }

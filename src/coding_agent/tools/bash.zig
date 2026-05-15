@@ -1,12 +1,14 @@
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
 const json_util = @import("../../ai/json_util.zig");
+const storage = @import("../../storage.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const zio = @import("../../zio/root.zig");
 const runtime_process = zio.process;
 
 const MAX_CAPTURE_BYTES: usize = 50 * 1024;
+const MAX_DISPLAY_BYTES: usize = 12 * 1024;
 const STREAM_UPDATE_INTERVAL_MS: i128 = 100;
 
 const bash_schema =
@@ -73,12 +75,12 @@ fn executeSync(
         return util.errorf(allocator, "working directory does not exist: {s}", .{effective_cwd});
     };
 
-    return runCommand(allocator, ctx.io, command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
+    return runCommand(allocator, ctx, command, effective_cwd, extractTimeout(args), signal, on_update, update_ctx);
 }
 
 fn runCommand(
     allocator: std.mem.Allocator,
-    io: std.Io,
+    ctx: *util.BuiltinCtx,
     command: []const u8,
     cwd: []const u8,
     timeout_secs: ?u64,
@@ -86,6 +88,7 @@ fn runCommand(
     on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
 ) protocol.AgentToolResult {
+    const io = ctx.io;
     const shell_argv: []const []const u8 = if (std.Io.Dir.accessAbsolute(io, "/bin/bash", .{}))
         &.{ "/bin/bash", "-c", command }
     else |_|
@@ -94,6 +97,8 @@ fn runCommand(
     var emitter = StreamEmitter{
         .allocator = allocator,
         .io = io,
+        .cwd = ctx.cwd,
+        .session_id = ctx.session_id,
         .command = command,
         .on_update = on_update,
         .update_ctx = update_ctx,
@@ -105,15 +110,18 @@ fn runCommand(
         .cwd = .{ .path = cwd },
         .timeout_ms = if (timeout_secs) |secs| secs * std.time.ms_per_s else null,
         .signal = signal,
-        .stdout_limit = .limited(MAX_CAPTURE_BYTES),
-        .stderr_limit = .limited(MAX_CAPTURE_BYTES),
-        .on_chunk = if (on_update != null) .{ .ctx = @ptrCast(&emitter), .func = StreamEmitter.callback } else null,
+        .stdout_limit = .limited(MAX_DISPLAY_BYTES),
+        .stderr_limit = .limited(MAX_DISPLAY_BYTES),
+        .stdout_overflow = .truncate,
+        .stderr_overflow = .truncate,
+        .on_chunk = .{ .ctx = @ptrCast(&emitter), .func = StreamEmitter.callback },
     }) catch return util.errorResult(allocator, "command error: failed to run command");
     defer proc_result.deinit(allocator);
     emitter.flush();
+    emitter.closeArtifact();
 
     const is_error, const tail = classifyResult(proc_result, signal, timeout_secs);
-    const transcript = formatResult(allocator, command, proc_result, tail) catch
+    const transcript = formatResult(allocator, command, proc_result, tail, emitter.artifactPath()) catch
         return util.errorResult(allocator, "bash tool: alloc failed");
 
     return ownedUtf8TextResult(allocator, transcript, is_error);
@@ -122,15 +130,21 @@ fn runCommand(
 const StreamEmitter = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    cwd: []const u8,
+    session_id: []const u8,
     command: []const u8,
     on_update: ?protocol.AgentToolUpdateCallback,
     update_ctx: ?*anyopaque,
     stdout: std.ArrayList(u8) = .empty,
     stderr: std.ArrayList(u8) = .empty,
+    artifact: OutputArtifact = .{},
     last_emit_ms: i128 = 0,
     mutex: std.Io.Mutex = .init,
 
     fn deinit(self: *StreamEmitter) void {
+        self.closeArtifact();
+        if (self.artifact.path) |path| self.allocator.free(path);
+        self.artifact.cache.deinit(self.allocator);
         self.stdout.deinit(self.allocator);
         self.stderr.deinit(self.allocator);
     }
@@ -141,10 +155,14 @@ const StreamEmitter = struct {
     }
 
     fn onChunk(self: *StreamEmitter, kind: runtime_process.StreamKind, bytes: []const u8) void {
-        if (self.on_update == null or bytes.len == 0) return;
+        if (bytes.len == 0) return;
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+
+        self.artifact.addChunk(self.allocator, self.io, self.cwd, self.session_id, kind, bytes) catch {};
+
+        if (self.on_update == null) return;
 
         const list = switch (kind) {
             .stdout => &self.stdout,
@@ -172,6 +190,14 @@ const StreamEmitter = struct {
         cb(result, self.update_ctx);
     }
 
+    fn closeArtifact(self: *StreamEmitter) void {
+        self.artifact.close(self.io);
+    }
+
+    fn artifactPath(self: *const StreamEmitter) ?[]const u8 {
+        return self.artifact.visiblePath();
+    }
+
     fn makePartialResult(self: *StreamEmitter) !protocol.AgentToolResult {
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(self.allocator);
@@ -180,6 +206,86 @@ const StreamEmitter = struct {
         try out.appendSlice(self.allocator, "\n\n");
         try appendCaptured(self.allocator, &out, self.stdout.items, self.stderr.items);
         return ownedUtf8TextResult(self.allocator, try out.toOwnedSlice(self.allocator), false);
+    }
+};
+
+const OutputArtifact = struct {
+    const create_after_bytes: usize = MAX_CAPTURE_BYTES;
+
+    path: ?[]u8 = null,
+    file: ?std.Io.File = null,
+    cache: std.ArrayList(u8) = .empty,
+    total_bytes: usize = 0,
+    last_kind: ?runtime_process.StreamKind = null,
+    visible: bool = false,
+
+    fn addChunk(self: *OutputArtifact, allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, session_id: []const u8, kind: runtime_process.StreamKind, bytes: []const u8) !void {
+        self.total_bytes += bytes.len;
+        if (self.total_bytes > create_after_bytes) self.visible = true;
+
+        if (self.file == null and self.total_bytes > create_after_bytes) {
+            try self.open(allocator, io, cwd, session_id);
+            if (self.cache.items.len > 0) {
+                try self.file.?.writeStreamingAll(io, self.cache.items);
+                self.cache.clearRetainingCapacity();
+            }
+        }
+
+        if (self.file) |file| {
+            try self.writeLabeled(io, file, kind, bytes);
+        } else {
+            try self.appendLabeled(allocator, kind, bytes);
+        }
+    }
+
+    fn visiblePath(self: *const OutputArtifact) ?[]const u8 {
+        return if (self.visible) self.path else null;
+    }
+
+    fn close(self: *OutputArtifact, io: std.Io) void {
+        if (self.file) |file| {
+            file.close(io);
+            self.file = null;
+        }
+    }
+
+    fn open(self: *OutputArtifact, allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, session_id: []const u8) !void {
+        const session_dir = try storage.getSessionDirForCwd(allocator, cwd, null);
+        defer allocator.free(session_dir);
+        const artifact_dir = try std.fs.path.join(allocator, &.{ session_dir, "artifacts" });
+        defer allocator.free(artifact_dir);
+        try std.Io.Dir.cwd().createDirPath(io, artifact_dir);
+
+        const sid = if (session_id.len > 0) session_id else "no-session";
+        const now = std.Io.Clock.real.now(io).toMilliseconds();
+        const path = try std.fmt.allocPrint(allocator, "{s}/bash-{s}-{d}.log", .{ artifact_dir, sid, now });
+        errdefer allocator.free(path);
+        const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+        self.path = path;
+        self.file = file;
+    }
+
+    fn appendLabeled(self: *OutputArtifact, allocator: std.mem.Allocator, kind: runtime_process.StreamKind, bytes: []const u8) !void {
+        if (self.last_kind == null or self.last_kind.? != kind) {
+            try self.cache.appendSlice(allocator, labelFor(kind));
+            self.last_kind = kind;
+        }
+        try self.cache.appendSlice(allocator, bytes);
+    }
+
+    fn writeLabeled(self: *OutputArtifact, io: std.Io, file: std.Io.File, kind: runtime_process.StreamKind, bytes: []const u8) !void {
+        if (self.last_kind == null or self.last_kind.? != kind) {
+            try file.writeStreamingAll(io, labelFor(kind));
+            self.last_kind = kind;
+        }
+        try file.writeStreamingAll(io, bytes);
+    }
+
+    fn labelFor(kind: runtime_process.StreamKind) []const u8 {
+        return switch (kind) {
+            .stdout => "\n[stdout]\n",
+            .stderr => "\n[stderr]\n",
+        };
     }
 };
 
@@ -222,6 +328,7 @@ fn formatResult(
     command: []const u8,
     result: runtime_process.RunResult,
     tail: []const u8,
+    artifact_path: ?[]const u8,
 ) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -232,7 +339,8 @@ fn formatResult(
 
     switch (result) {
         .completed => |completed| {
-            try appendCaptured(allocator, &out, completed.stdout, completed.stderr);
+            try appendCaptured(allocator, &out, completed.stdout.bytes, completed.stderr.bytes);
+            try appendTruncationNotice(allocator, &out, completed.stdout, completed.stderr, artifact_path);
             if (completed.term == .exited and completed.term.exited != 0) {
                 const msg = try std.fmt.allocPrint(allocator, "\n\nexit code {d}", .{completed.term.exited});
                 defer allocator.free(msg);
@@ -242,7 +350,8 @@ fn formatResult(
             }
         },
         .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => |partial| {
-            try appendCaptured(allocator, &out, partial.stdout, partial.stderr);
+            try appendCaptured(allocator, &out, partial.stdout.bytes, partial.stderr.bytes);
+            try appendTruncationNotice(allocator, &out, partial.stdout, partial.stderr, artifact_path);
             if (partial.message.len > 0) {
                 try out.appendSlice(allocator, "\n\n");
                 try out.appendSlice(allocator, partial.message);
@@ -254,6 +363,27 @@ fn formatResult(
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+fn appendTruncationNotice(allocator: std.mem.Allocator, out: *std.ArrayList(u8), stdout: runtime_process.CapturedStream, stderr: runtime_process.CapturedStream, artifact_path: ?[]const u8) !void {
+    if (!stdout.truncated and !stderr.truncated) return;
+    try out.appendSlice(allocator, "\n\n[output truncated");
+    if (stdout.truncated) {
+        const msg = try std.fmt.allocPrint(allocator, ": stdout kept {d} of {d} bytes", .{ stdout.bytes.len, stdout.total_bytes });
+        defer allocator.free(msg);
+        try out.appendSlice(allocator, msg);
+    }
+    if (stderr.truncated) {
+        const msg = try std.fmt.allocPrint(allocator, "{s}stderr kept {d} of {d} bytes", .{ if (stdout.truncated) ", " else ": ", stderr.bytes.len, stderr.total_bytes });
+        defer allocator.free(msg);
+        try out.appendSlice(allocator, msg);
+    }
+    if (artifact_path) |path| {
+        const msg = try std.fmt.allocPrint(allocator, "; full output: {s}", .{path});
+        defer allocator.free(msg);
+        try out.appendSlice(allocator, msg);
+    }
+    try out.appendSlice(allocator, "]");
 }
 
 fn appendCaptured(allocator: std.mem.Allocator, out: *std.ArrayList(u8), stdout: []const u8, stderr: []const u8) !void {
@@ -299,13 +429,18 @@ fn expectTextBlockContains(result: protocol.AgentToolResult, needle_text: []cons
     try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, needle_text) != null);
 }
 
+fn testCtx() util.BuiltinCtx {
+    return .{ .cwd = "/tmp", .io = std.Options.debug_io, .session_id = "test-session" };
+}
+
 test "runCommand returns stdout and stderr" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var ctx = testCtx();
 
     const result = runCommand(
         arena.allocator(),
-        std.Options.debug_io,
+        &ctx,
         "printf out; printf err 1>&2",
         "/tmp",
         5,
@@ -322,11 +457,12 @@ test "runCommand returns stdout and stderr" {
 test "runCommand exits naturally before timeout" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var ctx = testCtx();
 
     const start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds();
     const result = runCommand(
         arena.allocator(),
-        std.Options.debug_io,
+        &ctx,
         "sleep 0.1; printf done",
         "/tmp",
         5,
@@ -344,11 +480,12 @@ test "runCommand exits naturally before timeout" {
 test "runCommand true returns immediately before long timeout" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var ctx = testCtx();
 
     const start = std.Io.Timestamp.now(std.Options.debug_io, .awake).toMilliseconds();
     const result = runCommand(
         arena.allocator(),
-        std.Options.debug_io,
+        &ctx,
         "true",
         "/tmp",
         10,
@@ -365,10 +502,11 @@ test "runCommand true returns immediately before long timeout" {
 test "runCommand reports timeout" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var ctx = testCtx();
 
     const result = runCommand(
         arena.allocator(),
-        std.Options.debug_io,
+        &ctx,
         "sleep 2",
         "/tmp",
         1,
@@ -397,10 +535,11 @@ test "runCommand emits partial updates while preserving final result" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var collector = Collector{};
+    var ctx = testCtx();
 
     const result = runCommand(
         arena.allocator(),
-        std.Options.debug_io,
+        &ctx,
         "printf first; sleep 0.2; printf second",
         "/tmp",
         5,
@@ -413,4 +552,36 @@ test "runCommand emits partial updates while preserving final result" {
     try std.testing.expect(collector.updates > 0);
     try std.testing.expect(collector.saw_first);
     try expectTextBlockContains(result, "firstsecond");
+}
+
+test "runCommand preserves full truncated output in artifact" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx = testCtx();
+
+    const result = runCommand(
+        arena.allocator(),
+        &ctx,
+        "yes x | head -c 110000",
+        "/tmp",
+        5,
+        protocol.Token.none,
+        null,
+        null,
+    );
+
+    try std.testing.expect(!result.is_error);
+    try expectTextBlockContains(result, "output truncated");
+    try expectTextBlockContains(result, "full output:");
+    const text = result.content[0].text.text;
+    const marker = "; full output: ";
+    const start = (std.mem.indexOf(u8, text, marker) orelse return error.MissingArtifactPath) + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, ']') orelse return error.MissingArtifactPath;
+    const path = text[start..end];
+    defer std.Io.Dir.deleteFileAbsolute(std.Options.debug_io, path) catch {};
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(data);
+    try std.testing.expect(std.mem.indexOf(u8, data, "[stdout]") != null);
+    try std.testing.expect(data.len >= 110000);
 }

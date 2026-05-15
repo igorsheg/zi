@@ -123,13 +123,17 @@ fn runTerminal(allocator: std.mem.Allocator, io: std.Io, request: Request) Resul
         .kill_scope = .child,
         .signal = request.signal,
     }) catch |err| return errorResult(allocator, @errorName(err));
-    return completedResult(allocator, .{ .term = term, .stdout = &.{}, .stderr = &.{} }, request.text);
+    return completedResult(allocator, .{
+        .term = term,
+        .stdout = .{ .bytes = @constCast(&.{}), .total_bytes = 0, .truncated = false },
+        .stderr = .{ .bytes = @constCast(&.{}), .total_bytes = 0, .truncated = false },
+    }, request.text);
 }
 
 fn completedResult(allocator: std.mem.Allocator, completed: process.Completed, text: bool) Result {
-    const stdout = cloneOutput(allocator, completed.stdout, text) catch return errorResult(allocator, "failed to allocate stdout");
+    const stdout = cloneOutput(allocator, completed.stdout.bytes, text) catch return errorResult(allocator, "failed to allocate stdout");
     errdefer allocator.free(stdout);
-    const stderr = cloneOutput(allocator, completed.stderr, text) catch return errorResult(allocator, "failed to allocate stderr");
+    const stderr = cloneOutput(allocator, completed.stderr.bytes, text) catch return errorResult(allocator, "failed to allocate stderr");
     return .{ .completed = .{
         .code = switch (completed.term) {
             .exited => |code| code,
@@ -147,18 +151,18 @@ fn completedResult(allocator: std.mem.Allocator, completed: process.Completed, t
 }
 
 fn timeoutResult(allocator: std.mem.Allocator, timeout: process.Partial, text: bool) Result {
-    const stdout = cloneOutput(allocator, timeout.stdout, text) catch return errorResult(allocator, "failed to allocate stdout");
+    const stdout = cloneOutput(allocator, timeout.stdout.bytes, text) catch return errorResult(allocator, "failed to allocate stdout");
     errdefer allocator.free(stdout);
-    const stderr = cloneOutput(allocator, timeout.stderr, text) catch return errorResult(allocator, "failed to allocate stderr");
+    const stderr = cloneOutput(allocator, timeout.stderr.bytes, text) catch return errorResult(allocator, "failed to allocate stderr");
     errdefer allocator.free(stderr);
     const message = allocator.dupe(u8, timeout.message) catch return errorResult(allocator, "timed out");
     return .{ .timeout = .{ .stdout = stdout, .stderr = stderr, .message = message } };
 }
 
 fn partialErrorResult(allocator: std.mem.Allocator, failed: process.Partial, text: bool) Result {
-    const stdout = cloneOutput(allocator, failed.stdout, text) catch return errorResult(allocator, "failed to allocate stdout");
+    const stdout = cloneOutput(allocator, failed.stdout.bytes, text) catch return errorResult(allocator, "failed to allocate stdout");
     errdefer allocator.free(stdout);
-    const stderr = cloneOutput(allocator, failed.stderr, text) catch return errorResult(allocator, "failed to allocate stderr");
+    const stderr = cloneOutput(allocator, failed.stderr.bytes, text) catch return errorResult(allocator, "failed to allocate stderr");
     errdefer allocator.free(stderr);
     const message = allocator.dupe(u8, failed.message) catch return errorResult(allocator, "process failed");
     return .{ .err = .{ .message = message, .stdout = stdout, .stderr = stderr } };
