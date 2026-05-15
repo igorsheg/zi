@@ -24,18 +24,15 @@ pub const AgentPromptResult = struct {
         messages: []const protocol.AgentMessage,
         tool_results: []const protocol.ToolResultMessage,
         context_usage: ?ContextUsage = null,
-
     };
 
     pub const Err = struct {
         message: []const u8,
         partial_messages: []const protocol.AgentMessage = &.{},
-
     };
 
     pub const Cancelled = struct {
         messages: []const protocol.AgentMessage = &.{},
-
     };
 
     pub fn completed(allocator: std.mem.Allocator, value: Completed) !AgentPromptResult {
