@@ -31,6 +31,8 @@ pub const QueuePolicy = union(enum) {
 
 pub const Config = struct {
     cleanup: Cleanup = .none,
+    // Cross-thread queues must override this with an explicit bounded policy.
+    // Unbounded is allowed only for local owner-thread queues.
     policy: QueuePolicy = .unbounded,
     wakeup: Wakeup = .none,
     cross_thread: bool = false,
@@ -538,6 +540,28 @@ test "Queue ring storage preserves FIFO across partial drains and wraparound" {
     try std.testing.expectEqual(@as(usize, 14), stats.send_count);
     try std.testing.expectEqual(@as(usize, 0), stats.wake_count);
     try std.testing.expectEqual(State.active, queue.lifecycleState());
+}
+
+test "Queue permits local unbounded queues but cross-thread queues are bounded" {
+    const Msg = struct { value: u32 };
+
+    var local = try Queue(Msg, .{ .policy = .unbounded }).init(std.testing.allocator);
+    defer local.deinit();
+    try std.testing.expectEqual(.ok, local.trySend(.{ .value = 1 }));
+    try std.testing.expectEqual(.ok, local.trySend(.{ .value = 2 }));
+
+    var cross_thread = try Queue(Msg, .{
+        .policy = .{ .bounded = .{ .capacity = 1, .on_full = .reject } },
+        .wakeup = .pipe,
+        .cross_thread = true,
+    }).init(std.testing.allocator);
+    defer cross_thread.deinit();
+    try std.testing.expectEqual(.ok, cross_thread.trySend(.{ .value = 1 }));
+    const rejected = cross_thread.trySend(.{ .value = 2 });
+    switch (rejected) {
+        .full => |returned| try std.testing.expectEqual(@as(u32, 2), returned.value),
+        else => return error.ExpectedFull,
+    }
 }
 
 test "Queue bounded policies make rejection vs drop explicit and preserve cleanup ownership" {
