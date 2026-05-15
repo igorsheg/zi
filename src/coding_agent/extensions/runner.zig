@@ -1,6 +1,7 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const abort_signal = @import("../../zio/root.zig");
+const zio = @import("../../zio/root.zig");
 const agent_protocol = @import("../../agent/types.zig");
 const agent_message_memory = @import("../../agent/message_memory.zig");
 const agent_session_core_mod = @import("../agent_session/core.zig");
@@ -475,6 +476,99 @@ pub const JobStartRequest = struct {
     }
 };
 
+pub const ToolJob = struct {
+    id: u64,
+    reactor: *zio.process_reactor.Reactor,
+    pending: std.ArrayListUnmanaged(extension_ui.JobEvent) = .empty,
+    exited: bool = false,
+
+    pub fn start(allocator: std.mem.Allocator, io: std.Io, id: u64, request: JobStartRequest, signal: abort_signal.cancel.Token) !ToolJob {
+        const reactor = try allocator.create(zio.process_reactor.Reactor);
+        errdefer allocator.destroy(reactor);
+        reactor.* = try zio.process_reactor.Reactor.initIo(allocator, io);
+        errdefer reactor.deinit();
+        try reactor.start();
+        try reactor.spawn(.{
+            .id = id,
+            .argv = request.argv,
+            .cwd = request.cwd,
+            .process_group = true,
+            .stdin = true,
+            .stdout = true,
+            .stderr = true,
+            .signal = signal,
+        });
+        return .{ .id = id, .reactor = reactor };
+    }
+
+    pub fn deinit(self: *ToolJob, allocator: std.mem.Allocator) void {
+        self.reactor.kill(self.id) catch {};
+        self.reactor.deinit();
+        allocator.destroy(self.reactor);
+        for (self.pending.items) |*event| event.deinit(allocator);
+        self.pending.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn write(self: *ToolJob, bytes: []const u8) !void {
+        try self.reactor.write(self.id, bytes);
+    }
+
+    pub fn stop(self: *ToolJob) !void {
+        try self.reactor.kill(self.id);
+    }
+
+    pub fn next(self: *ToolJob, allocator: std.mem.Allocator, wait_ms: u64) !?extension_ui.JobEvent {
+        if (self.pending.items.len == 0) {
+            try self.drain(allocator);
+            if (self.pending.items.len == 0 and !self.exited) {
+                _ = try self.reactor.waitEvents(@intCast(@min(wait_ms, @as(u64, @intCast(std.math.maxInt(i32))))));
+                try self.drain(allocator);
+            }
+        }
+        if (self.pending.items.len == 0) return null;
+        return self.pending.orderedRemove(0);
+    }
+
+    fn drain(self: *ToolJob, allocator: std.mem.Allocator) !void {
+        var batch: [16]zio.process_reactor.Event = undefined;
+        const count = self.reactor.drainEvents(&batch);
+        for (batch[0..count]) |*event| {
+            defer event.deinit(allocator);
+            if (try self.convertEvent(allocator, event.*)) |job_event| {
+                try self.pending.append(allocator, job_event);
+            }
+        }
+    }
+
+    fn convertEvent(self: *ToolJob, allocator: std.mem.Allocator, event: zio.process_reactor.Event) !?extension_ui.JobEvent {
+        return switch (event) {
+            .ready => |id| if (id == self.id) .{ .id = id, .kind = .ready } else null,
+            .stdout => |out| if (out.id == self.id) .{ .id = out.id, .kind = .stdout, .data = try allocator.dupe(u8, out.bytes) } else null,
+            .stderr => |out| if (out.id == self.id) .{ .id = out.id, .kind = .stderr, .data = try allocator.dupe(u8, out.bytes) } else null,
+            .output_dropped => |drop| if (drop.id == self.id) .{ .id = drop.id, .kind = .output_dropped, .code = @intCast(drop.count) } else null,
+            .spawn_failed => |id| if (id == self.id) blk: {
+                self.exited = true;
+                break :blk .{ .id = id, .kind = .exit, .code = null, .is_error = true };
+            } else null,
+            .exit => |exit| if (exit.id == self.id) blk: {
+                self.exited = true;
+                break :blk .{ .id = exit.id, .kind = .exit, .code = jobExitCode(exit.term), .is_error = exit.timed_out or exit.aborted };
+            } else null,
+        };
+    }
+};
+
+fn jobExitCode(term: ?std.process.Child.Term) ?i64 {
+    const t = term orelse return null;
+    return switch (t) {
+        .exited => |code| @intCast(code),
+        .signal => |sig| @intCast(@intFromEnum(sig)),
+        .stopped => |sig| @intCast(@intFromEnum(sig)),
+        .unknown => |code| @intCast(code),
+    };
+}
+
 pub const AsyncDispatcher = struct {
     ptr: *anyopaque,
     submit: *const fn (ptr: *anyopaque, runner: *ExtensionRunner, start: AsyncStart) anyerror!void,
@@ -842,6 +936,7 @@ pub const ExtensionRunner = struct {
     current_async_start: ?AsyncStart = null,
     pending_async: std.AutoHashMapUnmanaged(AsyncOpId, PendingAsync) = .empty,
     completed_async: std.AutoHashMapUnmanaged(AsyncOpId, AsyncResult) = .empty,
+    tool_jobs: std.AutoHashMapUnmanaged(u64, ToolJob) = .empty,
     async_dispatcher: ?AsyncDispatcher = null,
     enable_test_async: bool = false,
     next_side_ai_session_id: u64 = 1,
@@ -999,6 +1094,7 @@ pub const ExtensionRunner = struct {
 
     pub fn deinit(self: *ExtensionRunner) void {
         self.clearAsyncState();
+        self.clearToolJobs();
         self.provider_queue.deinit();
         self.keybinding_registry.deinit();
         self.command_registry.deinit();
@@ -1017,6 +1113,13 @@ pub const ExtensionRunner = struct {
         self.module_roots.deinit(self.allocator);
         if (self.shared_lua_paths) |p| self.allocator.free(p);
         if (self.base_package_path) |p| self.allocator.free(p);
+    }
+
+    pub fn clearToolJobs(self: *ExtensionRunner) void {
+        var it = self.tool_jobs.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.tool_jobs.deinit(self.allocator);
+        self.tool_jobs = .empty;
     }
 
     pub fn bindRuntime(self: *ExtensionRunner, bound: ExtensionRuntime.Bound, provider_registry: *ai.provider.Registry) !void {

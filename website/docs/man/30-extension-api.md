@@ -48,6 +48,9 @@ The API is plain Lua. Tables in, tables out. Keep names exact and results small.
 `zi.job.stop(id_or_job)`
 : Request job termination.
 
+`zi.job.next(id_or_job, opts?)`
+: Drain one tool-scoped job event, optionally waiting up to `opts.timeout_ms`. Returns `nil` when no event is ready.
+
 `zi.json.encode(value)`
 : Encode a JSON-compatible Lua value.
 
@@ -348,9 +351,11 @@ Interceptors should return semantic data only. Do not depend on transport struct
 
 ## Jobs
 
-`zi.job.start({ argv, cwd?, stdout? })` starts a long-running host job.
+`zi.job.start({ argv, cwd?, stdout? })` starts a host job.
 
-By default, stdout/stderr/exit are delivered through job events.
+In interactive command execution, stdout/stderr/exit are delivered through job events.
+
+In model-visible tool execution, jobs are scoped to the current tool call. Use `zi.job.next(job, { timeout_ms = 250 })` to drain stdout/stderr/exit completions from the owning tool coroutine and call `ctx.update(...)` for progress. Tool-scoped jobs are cleaned up when they exit, when `zi.job.stop` is called, or when the extension runner is destroyed.
 
 `stdout = { mode = "json_lines", max_line_bytes? }` parses stdout as JSONL and emits `job_json`.
 

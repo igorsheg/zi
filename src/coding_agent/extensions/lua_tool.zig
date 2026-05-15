@@ -2014,6 +2014,52 @@ test "extension job events dispatch to lua observers" {
     try testing.expectEqualStrings("7:hello:exit=0", ptr[0..len]);
 }
 
+test "extension job next drains tool scoped process events without interactive dispatcher" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 43);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api_v3.install(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    try state.doString(
+        \\job_out = ""
+        \\zi.command({
+        \\  name = "job-next",
+        \\  handler = function(_, ctx)
+        \\    local job = zi.job.start({ argv = { "/bin/sh", "-c", "printf out; printf err >&2" }, cwd = ctx.cwd })
+        \\    while true do
+        \\      local ev = zi.job.next(job, { timeout_ms = 100 })
+        \\      if ev then
+        \\        job_out = job_out .. ev.type .. ":" .. tostring(ev.data or ev.code or "") .. "|"
+        \\        if ev.type == "exit" then break end
+        \\      end
+        \\    end
+        \\  end,
+        \\})
+    , "register_job_next_command");
+    runner.endLoadContext();
+
+    try runner.dispatchCommand("job-next", "");
+
+    _ = c.lua_getglobal(state.L, "job_out");
+    defer c.lua_pop(state.L, 1);
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(state.L, -1, &len) orelse return error.MissingJobOut;
+    const out = ptr[0..len];
+    try testing.expect(std.mem.indexOf(u8, out, "stdout:out|") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "stderr:err|") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "exit:0|") != null);
+}
+
 test "extension ui events dispatch to lua observers" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
