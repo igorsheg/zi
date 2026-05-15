@@ -12,6 +12,11 @@ pub const StopMode = enum {
     immediate,
 };
 
+pub const State = struct {
+    running: bool,
+    current_request: ?usize,
+};
+
 pub fn Worker(
     comptime Request: type,
     comptime Handler: type,
@@ -40,6 +45,8 @@ pub fn Worker(
         queue: Queue,
         handler: Handler,
         tasks: ?task_mod.Group = null,
+        current_request: std.atomic.Value(usize) = .init(0),
+        handled_count: std.atomic.Value(usize) = .init(0),
 
         pub fn init(allocator: std.mem.Allocator, handler: Handler) !Self {
             return initIo(allocator, std.Options.debug_io, handler);
@@ -101,7 +108,7 @@ pub fn Worker(
                 group.join() catch |err| log.warn("worker task join failed: {}", .{err});
                 const elapsed_ns = deadline.nowNs(self.io) - start_ns;
                 if (elapsed_ns > std.time.ns_per_s) {
-                    log.warn("worker stop waited {d}ms for current handler to finish", .{@divFloor(elapsed_ns, std.time.ns_per_ms)});
+                    log.warn("worker stop waited {d}ms for handler to finish last_current_request={?d}", .{ @divFloor(elapsed_ns, std.time.ns_per_ms), self.state().current_request });
                 }
                 self.tasks = null;
             }
@@ -113,6 +120,14 @@ pub fn Worker(
 
         pub fn stats(self: *Self) Queue.Stats {
             return self.queue.stats();
+        }
+
+        pub fn state(self: *Self) State {
+            const current = self.current_request.load(.acquire);
+            return .{
+                .running = self.tasks != null,
+                .current_request = if (current == 0) null else current,
+            };
         }
 
         fn run(self: *Self) void {
@@ -131,7 +146,10 @@ pub fn Worker(
                     if (count == 0) break;
 
                     for (batch[0..count]) |*request| {
+                        const request_ordinal = self.handled_count.fetchAdd(1, .acq_rel) + 1;
+                        self.current_request.store(request_ordinal, .release);
                         self.handler.handle(request);
+                        self.current_request.store(0, .release);
                         cleanupDrained(request, self.allocator);
                     }
                 }
@@ -272,4 +290,39 @@ test "Worker stopMode immediate closes and cleans pending work" {
 
     try std.testing.expect(worker.queue.isDrained());
     try std.testing.expectEqual(@as(u32, 1), cleaned.load(.acquire));
+}
+
+test "Worker tracks current request while handler runs" {
+    const Request = struct { value: u8 };
+    const Handler = struct {
+        entered: *std.atomic.Value(bool),
+        release: *std.atomic.Value(bool),
+
+        fn handle(self: *@This(), _: *Request) void {
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+
+    var entered = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    var worker = try Worker(Request, Handler, .{ .policy = .{ .bounded = .{ .capacity = 4, .on_full = .reject } }, .wakeup = .pipe, .cross_thread = true }).init(std.testing.allocator, .{ .entered = &entered, .release = &release });
+    defer worker.deinit();
+
+    try worker.start();
+    try std.testing.expectEqual(.ok, worker.trySend(.{ .value = 1 }));
+    while (!entered.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+
+    try std.testing.expectEqual(@as(?usize, 1), worker.state().current_request);
+    release.store(true, .release);
+
+    var spins: usize = 0;
+    while (worker.state().current_request != null and spins < 10_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(@as(?usize, null), worker.state().current_request);
 }
