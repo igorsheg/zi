@@ -15,6 +15,7 @@ pub const StopMode = enum {
 pub const State = struct {
     running: bool,
     current_request: ?usize,
+    current_label: []const u8,
 };
 
 pub fn Worker(
@@ -47,6 +48,8 @@ pub fn Worker(
         tasks: ?task_mod.Group = null,
         current_request: std.atomic.Value(usize) = .init(0),
         handled_count: std.atomic.Value(usize) = .init(0),
+        current_label: [128]u8 = undefined,
+        current_label_len: std.atomic.Value(usize) = .init(0),
 
         pub fn init(allocator: std.mem.Allocator, handler: Handler) !Self {
             return initIo(allocator, std.Options.debug_io, handler);
@@ -108,7 +111,8 @@ pub fn Worker(
                 group.join() catch |err| log.warn("worker task join failed: {}", .{err});
                 const elapsed_ns = deadline.nowNs(self.io) - start_ns;
                 if (elapsed_ns > std.time.ns_per_s) {
-                    log.warn("worker stop waited {d}ms for handler to finish last_current_request={?d}", .{ @divFloor(elapsed_ns, std.time.ns_per_ms), self.state().current_request });
+                    const current = self.state();
+                    log.warn("worker stop waited {d}ms for handler to finish last_current_request={?d} label={s}", .{ @divFloor(elapsed_ns, std.time.ns_per_ms), current.current_request, current.current_label });
                 }
                 self.tasks = null;
             }
@@ -124,9 +128,11 @@ pub fn Worker(
 
         pub fn state(self: *Self) State {
             const current = self.current_request.load(.acquire);
+            const label_len = self.current_label_len.load(.acquire);
             return .{
                 .running = self.tasks != null,
                 .current_request = if (current == 0) null else current,
+                .current_label = self.current_label[0..@min(label_len, self.current_label.len)],
             };
         }
 
@@ -148,7 +154,9 @@ pub fn Worker(
                     for (batch[0..count]) |*request| {
                         const request_ordinal = self.handled_count.fetchAdd(1, .acq_rel) + 1;
                         self.current_request.store(request_ordinal, .release);
+                        self.setCurrentLabel(request);
                         self.handler.handle(request);
+                        self.current_label_len.store(0, .release);
                         self.current_request.store(0, .release);
                         cleanupDrained(request, self.allocator);
                     }
@@ -162,6 +170,19 @@ pub fn Worker(
             if (@hasDecl(Request, "deinit")) {
                 request.deinit(allocator);
             }
+        }
+
+        fn setCurrentLabel(self: *Self, request: *Request) void {
+            const label = requestLabel(&self.handler, request);
+            const len = @min(label.len, self.current_label.len);
+            if (len > 0) @memcpy(self.current_label[0..len], label[0..len]);
+            self.current_label_len.store(len, .release);
+        }
+
+        fn requestLabel(handler: *Handler, request: *Request) []const u8 {
+            if (@hasDecl(Handler, "requestLabel")) return handler.requestLabel(request);
+            if (@hasDecl(Request, "workerLabel")) return request.workerLabel();
+            return "";
         }
     };
 }
@@ -293,7 +314,13 @@ test "Worker stopMode immediate closes and cleans pending work" {
 }
 
 test "Worker tracks current request while handler runs" {
-    const Request = struct { value: u8 };
+    const Request = struct {
+        value: u8,
+
+        fn workerLabel(_: *const @This()) []const u8 {
+            return "test-request";
+        }
+    };
     const Handler = struct {
         entered: *std.atomic.Value(bool),
         release: *std.atomic.Value(bool),
@@ -318,6 +345,7 @@ test "Worker tracks current request while handler runs" {
     }
 
     try std.testing.expectEqual(@as(?usize, 1), worker.state().current_request);
+    try std.testing.expectEqualStrings("test-request", worker.state().current_label);
     release.store(true, .release);
 
     var spins: usize = 0;
@@ -325,4 +353,5 @@ test "Worker tracks current request while handler runs" {
         std.Thread.yield() catch {};
     }
     try std.testing.expectEqual(@as(?usize, null), worker.state().current_request);
+    try std.testing.expectEqualStrings("", worker.state().current_label);
 }

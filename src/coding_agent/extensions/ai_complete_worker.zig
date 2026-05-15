@@ -27,6 +27,11 @@ pub const Request = struct {
     signal: zio.cancel.Token = zio.cancel.Token.none,
     stream_events: bool = false,
 
+    pub fn workerLabel(self: *const Request) []const u8 {
+        _ = self;
+        return "ai_complete";
+    }
+
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
         if (self.system_prompt) |value| allocator.free(value);

@@ -18,6 +18,13 @@ pub const Request = union(enum) {
         cwd: []u8,
     },
 
+    pub fn workerLabel(self: *const Request) []const u8 {
+        return switch (self.*) {
+            .warm_resume_sessions => "session_index warm",
+            .list_resume_sessions => "session_index list",
+        };
+    }
+
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .warm_resume_sessions => |r| allocator.free(r.cwd),

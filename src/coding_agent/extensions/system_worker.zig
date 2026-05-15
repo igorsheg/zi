@@ -16,6 +16,11 @@ pub const Request = struct {
     id: extension_runner.AsyncOpId,
     system: extension_runner.SystemRequest,
 
+    pub fn workerLabel(self: *const Request) []const u8 {
+        _ = self;
+        return "system";
+    }
+
     pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
         self.system.deinit(allocator);
         self.* = undefined;
