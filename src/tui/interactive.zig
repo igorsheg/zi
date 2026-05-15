@@ -825,12 +825,12 @@ pub const Interactive = struct {
         snapshot_ready: bool = false,
         lifecycle_ready: bool = false,
         terminal_system_ready: bool = false,
+        timer_ready: bool = false,
     };
 
     fn waitForLoopReadiness(self: *Interactive) LoopReadiness {
         const idle_wait_timeout_ms: i32 = 50;
         const now_ns = zio.deadline.nowNs(self.io);
-        const timeout_ms = zio.deadline.timeoutUntil(self.nextLoopDeadlineNs(now_ns), now_ns, idle_wait_timeout_ms);
 
         const Callbacks = struct {
             fn input(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
@@ -849,18 +849,26 @@ pub const Interactive = struct {
                 const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
                 out.terminal_system_ready = ready.read;
             }
+            fn timer(ptr: ?*anyopaque) void {
+                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
+                out.timer_ready = true;
+            }
         };
 
         var readiness = LoopReadiness{};
         const interest = zio.loop.Interest{ .read = true };
-        const sources = [_]zio.loop.Source{
-            .{ .fd = self.tui.terminal.fd_in, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.input } },
-            .{ .fd = self.snapshot_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.snapshot } },
-            .{ .fd = self.lifecycle_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.lifecycle } },
-            .{ .fd = self.terminal_system_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.terminalSystem } },
-        };
+        var loop = zio.loop.Loop.init(self.allocator);
+        defer loop.deinit();
 
-        _ = zio.loop.runSources(self.allocator, &sources, timeout_ms) catch return .{};
+        _ = loop.register(.{ .fd = self.tui.terminal.fd_in, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.input } }) catch return .{};
+        _ = loop.register(.{ .fd = self.snapshot_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.snapshot } }) catch return .{};
+        _ = loop.register(.{ .fd = self.lifecycle_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.lifecycle } }) catch return .{};
+        _ = loop.register(.{ .fd = self.terminal_system_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.terminalSystem } }) catch return .{};
+        if (self.nextLoopDeadlineNs(now_ns)) |deadline_ns| {
+            _ = loop.addTimerAt(deadline_ns, .{ .ptr = @ptrCast(&readiness), .call = Callbacks.timer }) catch return .{};
+        }
+
+        _ = loop.runOnce(self.io, idle_wait_timeout_ms) catch return .{};
         return readiness;
     }
 

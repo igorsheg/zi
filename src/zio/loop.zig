@@ -1,5 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
+const deadline = @import("deadline.zig");
+const timer = @import("timer.zig");
 
 pub const Interest = packed struct {
     read: bool = false,
@@ -25,12 +27,14 @@ pub const Source = struct {
 pub const Loop = struct {
     allocator: std.mem.Allocator,
     sources: std.ArrayList(Source) = .empty,
+    timers: timer.Queue,
 
     pub fn init(allocator: std.mem.Allocator) Loop {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .timers = timer.Queue.init(allocator) };
     }
 
     pub fn deinit(self: *Loop) void {
+        self.timers.deinit();
         self.sources.deinit(self.allocator);
         self.* = undefined;
     }
@@ -47,10 +51,27 @@ pub const Loop = struct {
 
     pub fn clear(self: *Loop) void {
         self.sources.clearRetainingCapacity();
+        self.timers.clear();
     }
 
-    pub fn runOnce(self: *Loop, timeout_ms: i32) !usize {
-        return runSources(self.allocator, self.sources.items, timeout_ms);
+    pub fn addTimerAt(self: *Loop, deadline_ns: i128, callback: timer.Callback) !timer.Handle {
+        return self.timers.addAt(deadline_ns, callback);
+    }
+
+    pub fn addTimerAfterMs(self: *Loop, io: std.Io, ms: u64, callback: timer.Callback) !timer.Handle {
+        return self.timers.addAfterMs(io, ms, callback);
+    }
+
+    pub fn cancelTimer(self: *Loop, handle: timer.Handle) void {
+        self.timers.cancel(handle);
+    }
+
+    pub fn runOnce(self: *Loop, io: std.Io, timeout_ms: i32) !usize {
+        const now_ns = deadline.nowNs(io);
+        const poll_timeout_ms = self.timers.timeoutMs(now_ns, timeout_ms);
+        var dispatched = try runSources(self.allocator, self.sources.items, poll_timeout_ms);
+        dispatched += self.timers.fireExpired(deadline.nowNs(io));
+        return dispatched;
     }
 };
 
@@ -120,6 +141,24 @@ test "Loop dispatches readable fd callbacks" {
     });
 
     try std.testing.expect(pipe.signal(std.Options.debug_io));
-    try std.testing.expectEqual(@as(usize, 1), try loop.runOnce(0));
+    try std.testing.expectEqual(@as(usize, 1), try loop.runOnce(std.Options.debug_io, 0));
+    try std.testing.expect(ctx.called);
+}
+
+test "Loop dispatches timer callbacks" {
+    const Ctx = struct {
+        called: bool = false,
+        fn onTimer(ptr: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.called = true;
+        }
+    };
+
+    var ctx = Ctx{};
+    var loop = Loop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    _ = try loop.addTimerAt(deadline.nowNs(std.Options.debug_io), .{ .ptr = @ptrCast(&ctx), .call = Ctx.onTimer });
+    try std.testing.expectEqual(@as(usize, 1), try loop.runOnce(std.Options.debug_io, 50));
     try std.testing.expect(ctx.called);
 }

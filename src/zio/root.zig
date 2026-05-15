@@ -4,6 +4,7 @@ pub const Io = std.Io;
 
 pub const cancel = @import("cancel.zig");
 pub const deadline = @import("deadline.zig");
+pub const timer = @import("timer.zig");
 pub const queue = @import("queue.zig");
 pub const task = @import("task.zig");
 pub const worker = @import("worker.zig");
