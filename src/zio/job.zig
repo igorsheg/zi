@@ -56,6 +56,16 @@ pub const Manager = struct {
     mutex: std.Io.Mutex = .init,
     reactor: ?process_reactor.Reactor = null,
     pump: ?task.Group = null,
+    stats_data: Stats = .{},
+
+    pub const Stats = struct {
+        active_jobs: usize = 0,
+        started_jobs: usize = 0,
+        exited_jobs: usize = 0,
+        stdout_bytes: usize = 0,
+        stderr_bytes: usize = 0,
+        output_dropped_events: usize = 0,
+    };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, sink: EventSink) Manager {
         return .{ .allocator = allocator, .io = io, .sink = sink };
@@ -78,6 +88,8 @@ pub const Manager = struct {
         if (self.jobs.contains(id)) return error.DuplicateJob;
         try self.jobs.put(self.allocator, id, {});
         errdefer _ = self.jobs.remove(id);
+        self.stats_data.active_jobs = self.jobs.count();
+        self.stats_data.started_jobs += 1;
 
         try self.reactor.?.spawn(.{
             .id = id,
@@ -101,6 +113,7 @@ pub const Manager = struct {
     pub fn remove(self: *Manager, id: u64) bool {
         self.mutex.lockUncancelable(self.io);
         const removed = self.jobs.remove(id);
+        if (removed) self.stats_data.active_jobs = self.jobs.count();
         self.mutex.unlock(self.io);
         if (removed) if (self.reactor) |*reactor| reactor.kill(id) catch {};
         return removed;
@@ -156,6 +169,7 @@ pub const Manager = struct {
     }
 
     fn forwardEvent(self: *Manager, event: process_reactor.Event) void {
+        self.recordEvent(event);
         var owned: Event = switch (event) {
             .ready => |id| .{ .id = id, .kind = .ready },
             .stdout => |out| .{ .id = out.id, .kind = .stdout, .data = self.allocator.dupe(u8, out.bytes) catch return },
@@ -176,8 +190,26 @@ pub const Manager = struct {
 
     fn markExited(self: *Manager, id: u64) void {
         self.mutex.lockUncancelable(self.io);
-        _ = self.jobs.remove(id);
+        if (self.jobs.remove(id)) self.stats_data.exited_jobs += 1;
+        self.stats_data.active_jobs = self.jobs.count();
         self.mutex.unlock(self.io);
+    }
+
+    fn recordEvent(self: *Manager, event: process_reactor.Event) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        switch (event) {
+            .stdout => |out| self.stats_data.stdout_bytes += out.bytes.len,
+            .stderr => |out| self.stats_data.stderr_bytes += out.bytes.len,
+            .output_dropped => self.stats_data.output_dropped_events += 1,
+            else => {},
+        }
+    }
+
+    pub fn stats(self: *Manager) Stats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.stats_data;
     }
 
     fn exitCode(term: ?std.process.Child.Term) ?i64 {
@@ -329,6 +361,11 @@ test "zio job forwards stdout chunks and successful exit" {
             return s.exitCodeLocked(1) == 0;
         }
     }.pred, 2000);
+    const stats = manager.stats();
+    try std.testing.expectEqual(@as(usize, 1), stats.started_jobs);
+    try std.testing.expectEqual(@as(usize, 1), stats.exited_jobs);
+    try std.testing.expectEqual(@as(usize, 0), stats.active_jobs);
+    try std.testing.expectEqual(@as(usize, 5), stats.stdout_bytes);
 }
 
 test "zio job writes to child stdin after the process is ready" {

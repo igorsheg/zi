@@ -22,7 +22,7 @@ pub const ShutdownOnCancel = struct {
 
     fn startFd(token: cancel.Token, target: ?posix.fd_t) !ShutdownOnCancel {
         if (token.isNone() or target == null) return .{};
-        const state = try std.heap.page_allocator.create(State);
+        const state = try std.heap.smp_allocator.create(State);
         state.* = .{ .target = target.? };
         token.registerCallback(&state.node, .{ .ptr = @ptrCast(state), .call = abort });
         return .{ .state = state, .token = token };
@@ -31,7 +31,7 @@ pub const ShutdownOnCancel = struct {
     pub fn stop(self: *ShutdownOnCancel) void {
         if (self.state) |state| {
             self.token.unregisterCallback(&state.node);
-            std.heap.page_allocator.destroy(state);
+            std.heap.smp_allocator.destroy(state);
         }
         self.* = .{};
     }

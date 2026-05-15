@@ -2,6 +2,7 @@ const std = @import("std");
 const path_search = @import("path.zig");
 const file_ignore = @import("file_ignore.zig");
 const Group = @import("../zio/task.zig").Group;
+const logging = @import("../logging.zig");
 
 pub const Candidate = struct {
     relative_path: []const u8,
@@ -77,6 +78,7 @@ pub const Session = struct {
     }
 
     fn workerMain(shared: *Shared) void {
+        logging.setThreadLabel(.search_worker);
         searchToShared(shared) catch {
             shared.failed.store(true, .release);
         };

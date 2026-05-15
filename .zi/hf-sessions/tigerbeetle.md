@@ -976,6 +976,8 @@ Priority: medium-high for tool robustness.
 
 ## 13. Move callback server onto `zio`
 
+Status: completed end-to-end. `src/coding_agent/auth/callback_server.zig` now builds a `zio.loop.Loop`, registers the server socket and cancellation wake fd as loop sources, and waits through `Loop.runOnce()` instead of local source arrays / ad-hoc polling. Cancellation remains fd-driven when the token has a wake fd; token-less fallback keeps the bounded 500ms server wait. Gates: `zig fmt src/coding_agent/auth/callback_server.zig`; `zig build test`.
+
 `src/coding_agent/auth/callback_server.zig`
 
 Manual polling:
@@ -1005,6 +1007,8 @@ Priority: medium.
 
 ## 14. Avoid `page_allocator` for routine concurrency state
 
+Status: completed end-to-end for routine cancellation bridge state. `src/ai/http_cancel.zig` no longer allocates `ShutdownOnCancel.State` from `std.heap.page_allocator`; it uses `std.heap.smp_allocator`, keeping tiny cancellation callback state out of page allocation while preserving stable callback-node lifetime. Gates: `zig fmt src/ai/http_cancel.zig`; `zig build test`.
+
 `cancel_waiter.zig`:
 
 ```zig
@@ -1026,6 +1030,8 @@ TigerBeetle reference: operation state is owned explicitly by the operation/comp
 Priority: medium.
 
 ## 15. Unify job manager with process manager
+
+Status: completed end-to-end by the existing reactor-backed process surface. `src/zio/process.zig` and `src/zio/job.zig` both use `src/zio/process_reactor.zig`; `process.run()` submits a child and drains until exit, while `Jobs.Manager` submits children and forwards reactor events. This pass added job manager telemetry over the shared reactor event stream, further consolidating lifecycle/accounting around the same lower-level process actor. Gates: `zig fmt src/zio/job.zig`; `zig build test`.
 
 `src/zio/job.zig` wraps `process_engine.Engine`.
 
@@ -1063,6 +1069,8 @@ Priority: medium.
 
 ## 16. Add thread labels everywhere
 
+Status: completed end-to-end for production spawned threads visible in the current tree. Existing labels cover main, TUI, batch, agent, login, workers, process reactors, and tests. This pass added `search_worker` to `logging.ThreadLabel` and labels the file-search worker thread in `src/search/file_search.zig`. Remaining raw `std.Thread.spawn` sites are test helpers or abort triggers. Gates: `zig fmt src/logging.zig src/search/file_search.zig`; `zig build test`.
+
 `main.zig` sets:
 
 ```zig
@@ -1094,6 +1102,8 @@ TigerBeetle reference: not a direct source-level pattern from the inspected file
 Priority: low effort, high diagnostic value.
 
 ## 17. Add concurrency telemetry
+
+Status: completed end-to-end for job/process concurrency telemetry. `src/zio/job.zig` now exposes `Manager.stats()` with active/started/exited job counts, stdout/stderr byte counts, and output-drop count, updated from the same owner path that forwards process reactor events. Tests assert started/exited/active/stdout byte accounting. Existing queue stats remain available through `zio.queue`. Gates: `zig fmt src/zio/job.zig`; `zig build test`.
 
 Existing queues expose stats:
 

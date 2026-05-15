@@ -96,17 +96,15 @@ fn waitReadiness(allocator: std.mem.Allocator, server_fd: std.posix.fd_t, signal
 
     var readiness = CallbackReadiness{};
     const interest = zio.loop.Interest{ .read = true };
+    var loop = zio.loop.Loop.init(allocator);
+    defer loop.deinit();
+
+    _ = try loop.register(.{ .fd = server_fd, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.server } });
     if (signal.wakeReadFd()) |cancel_fd| {
-        const sources = [_]zio.loop.Source{
-            .{ .fd = server_fd, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.server } },
-            .{ .fd = cancel_fd, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.cancel } },
-        };
-        _ = try zio.loop.runSources(allocator, &sources, -1);
+        _ = try loop.register(.{ .fd = cancel_fd, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.cancel } });
+        _ = try loop.runOnce(std.Options.debug_io, -1);
     } else {
-        const sources = [_]zio.loop.Source{
-            .{ .fd = server_fd, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.server } },
-        };
-        _ = try zio.loop.runSources(allocator, &sources, 500);
+        _ = try loop.runOnce(std.Options.debug_io, 500);
     }
     return readiness;
 }
