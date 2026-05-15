@@ -1,8 +1,10 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
 
 const json_api_limits = lua_runtime.JsonConvertLimits{
     .max_depth = 64,
@@ -41,7 +43,7 @@ fn ziJsonEncode(L_opt: ?*c.lua_State) callconv(.c) c_int {
     };
 
     const written = out.written();
-    _ = c.lua_pushlstring(L, written.ptr, written.len);
+    Lua.init(L).pushString(written);
     return 1;
 }
 
@@ -49,7 +51,7 @@ fn ziJsonDecode(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
-    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
+    if (Lua.init(L).typeOf(1) != .string) {
         return luaError(L, "zi.json.decode: expected string");
     }
     var len: usize = 0;
@@ -72,22 +74,15 @@ fn ziJsonDecode(L_opt: ?*c.lua_State) callconv(.c) c_int {
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch "lua error";
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseErrorFmt(Lua.init(L), fmt, args);
 }
 
 const testing = std.testing;

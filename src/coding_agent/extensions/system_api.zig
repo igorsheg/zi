@@ -1,8 +1,11 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
+const TableBuilder = lua_helpers.TableBuilder;
 
 pub fn ziSystem(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
@@ -174,59 +177,44 @@ fn optionalSystemEnv(allocator: std.mem.Allocator, L: *c.lua_State, table_idx: c
 fn pushSystemResult(L: *c.lua_State, result: runner_mod.SystemResult) void {
     switch (result) {
         .completed => |completed| {
-            c.lua_createtable(L, 0, 5);
-            pushLiteralField(L, "status", "completed");
+            const table = TableBuilder.create(Lua.init(L), 0, 5);
+            table.stringZ("status", "completed");
             if (completed.code) |code| c.lua_pushinteger(L, @intCast(code)) else c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "code");
+            table.setFieldFromTop("code");
             if (completed.signal) |signal| c.lua_pushinteger(L, @intCast(signal)) else c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "signal");
-            pushStringField(L, "stdout", completed.stdout);
-            pushStringField(L, "stderr", completed.stderr);
+            table.setFieldFromTop("signal");
+            table.string("stdout", completed.stdout);
+            table.string("stderr", completed.stderr);
         },
         .timeout => |timeout| {
-            c.lua_createtable(L, 0, 4);
-            pushLiteralField(L, "status", "timeout");
-            pushStringField(L, "error", timeout.message);
-            pushStringField(L, "stdout", timeout.stdout);
-            pushStringField(L, "stderr", timeout.stderr);
+            const table = TableBuilder.create(Lua.init(L), 0, 4);
+            table.stringZ("status", "timeout");
+            table.string("error", timeout.message);
+            table.string("stdout", timeout.stdout);
+            table.string("stderr", timeout.stderr);
         },
         .err => |err| {
-            c.lua_createtable(L, 0, 4);
-            pushLiteralField(L, "status", "error");
-            pushStringField(L, "error", err.message);
-            pushStringField(L, "stdout", err.stdout);
-            pushStringField(L, "stderr", err.stderr);
+            const table = TableBuilder.create(Lua.init(L), 0, 4);
+            table.stringZ("status", "error");
+            table.string("error", err.message);
+            table.string("stdout", err.stdout);
+            table.string("stderr", err.stderr);
         },
     }
 }
 
 fn pushSystemError(L: *c.lua_State, message: []const u8) void {
-    c.lua_createtable(L, 0, 4);
-    pushLiteralField(L, "status", "error");
-    pushStringField(L, "error", message);
-    pushLiteralField(L, "stdout", "");
-    pushLiteralField(L, "stderr", "");
-}
-
-fn pushLiteralField(L: *c.lua_State, field: [:0]const u8, value: [:0]const u8) void {
-    _ = c.lua_pushstring(L, value.ptr);
-    c.lua_setfield(L, -2, field.ptr);
-}
-
-fn pushStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void {
-    _ = c.lua_pushlstring(L, value.ptr, value.len);
-    c.lua_setfield(L, -2, field.ptr);
+    const table = TableBuilder.create(Lua.init(L), 0, 4);
+    table.stringZ("status", "error");
+    table.string("error", message);
+    table.stringZ("stdout", "");
+    table.stringZ("stderr", "");
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }
 
 fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch "lua error";
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseErrorFmt(Lua.init(L), fmt, args);
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const agent_protocol = @import("../../agent/types.zig");
 const spawn_types = @import("../../spawn/types.zig");
@@ -8,6 +9,8 @@ const ai = @import("../../ai/root.zig");
 const limits = @import("limits.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
+const TableBuilder = lua_helpers.TableBuilder;
 const log = std.log.scoped(.zi_api);
 
 const spawn_pending_events: usize = limits.spawn_pending_events;
@@ -388,125 +391,101 @@ pub fn eventTrampoline(
 }
 
 pub fn pushToolResultAsSpawnResult(L: *c.lua_State, result: agent_protocol.AgentToolResult) void {
-    c.lua_createtable(L, 0, 11);
+    const table = TableBuilder.create(Lua.init(L), 0, 11);
 
-    c.lua_pushinteger(L, if (result.is_error) 1 else 0);
-    c.lua_setfield(L, -2, "exit_code");
+    table.int("exit_code", @as(i32, if (result.is_error) 1 else 0));
 
     if (result.details == .object) {
         const obj = result.details.object;
         if (obj.get("stop_reason")) |v| if (v == .string) {
-            _ = c.lua_pushlstring(L, v.string.ptr, v.string.len);
-            c.lua_setfield(L, -2, "stop_reason");
+            table.string("stop_reason", v.string);
         };
         if (obj.get("model")) |v| if (v == .string) {
-            _ = c.lua_pushlstring(L, v.string.ptr, v.string.len);
-            c.lua_setfield(L, -2, "model");
+            table.string("model", v.string);
         };
         if (obj.get("cancelled")) |v| if (v == .bool) {
-            c.lua_pushboolean(L, if (v.bool) 1 else 0);
-            c.lua_setfield(L, -2, "cancelled");
+            table.boolean("cancelled", v.bool);
         };
         if (obj.get("usage")) |usage| {
             lua_runtime.pushJsonValue(L, usage) catch c.lua_createtable(L, 0, 0);
-            c.lua_setfield(L, -2, "usage");
+            table.setFieldFromTop("usage");
         } else {
             c.lua_createtable(L, 0, 0);
-            c.lua_setfield(L, -2, "usage");
+            table.setFieldFromTop("usage");
         }
     } else {
         c.lua_createtable(L, 0, 0);
-        c.lua_setfield(L, -2, "usage");
+        table.setFieldFromTop("usage");
     }
 
-    c.lua_pushboolean(L, if (result.is_error) 1 else 0);
-    c.lua_setfield(L, -2, "is_error");
+    table.boolean("is_error", result.is_error);
 
     c.lua_createtable(L, @intCast(result.content.len), 0);
+    const content_table = TableBuilder.atTop(Lua.init(L));
     var content_i: c.lua_Integer = 1;
     var text: []const u8 = "";
     for (result.content) |block| {
         switch (block) {
             .text => |tb| {
                 if (text.len == 0) text = tb.text;
-                c.lua_createtable(L, 0, 2);
-                _ = c.lua_pushlstring(L, "text".ptr, 4);
-                c.lua_setfield(L, -2, "type");
-                _ = c.lua_pushlstring(L, tb.text.ptr, tb.text.len);
-                c.lua_setfield(L, -2, "text");
-                c.lua_rawseti(L, -2, content_i);
+                const block_table = TableBuilder.create(Lua.init(L), 0, 2);
+                block_table.stringZ("type", "text");
+                block_table.string("text", tb.text);
+                content_table.rawSetArrayFromTop(@intCast(content_i));
                 content_i += 1;
             },
             else => {},
         }
     }
-    c.lua_setfield(L, -2, "content");
+    table.setFieldFromTop("content");
 
     if (result.details != .null) {
         lua_runtime.pushJsonValue(L, result.details) catch c.lua_pushnil(L);
-        c.lua_setfield(L, -2, "details");
+        table.setFieldFromTop("details");
     }
     if (result.presentation != .null) {
         lua_runtime.pushJsonValue(L, result.presentation) catch c.lua_pushnil(L);
-        c.lua_setfield(L, -2, "presentation");
+        table.setFieldFromTop("presentation");
     }
 
-    _ = c.lua_pushlstring(L, text.ptr, text.len);
-    c.lua_setfield(L, -2, "output");
-    _ = c.lua_pushlstring(L, text.ptr, text.len);
-    c.lua_setfield(L, -2, "final_text");
-    _ = c.lua_pushlstring(L, "".ptr, 0);
-    c.lua_setfield(L, -2, "stderr");
+    table.string("output", text);
+    table.string("final_text", text);
+    table.stringZ("stderr", "");
     if (result.details != .object or result.details.object.get("cancelled") == null) {
-        c.lua_pushboolean(L, 0);
-        c.lua_setfield(L, -2, "cancelled");
+        table.boolean("cancelled", false);
     }
 }
 
 pub fn pushSpawnResult(L: *c.lua_State, result: spawn_types.SpawnResult) void {
-    c.lua_createtable(L, 0, 11);
+    const table = TableBuilder.create(Lua.init(L), 0, 11);
 
-    c.lua_pushinteger(L, @intCast(result.exit_code));
-    c.lua_setfield(L, -2, "exit_code");
+    table.int("exit_code", result.exit_code);
 
     if (result.stop_reason) |sr| {
-        _ = c.lua_pushlstring(L, sr.ptr, sr.len);
-        c.lua_setfield(L, -2, "stop_reason");
+        table.string("stop_reason", sr);
     }
     if (result.error_message) |em| {
-        _ = c.lua_pushlstring(L, em.ptr, em.len);
-        c.lua_setfield(L, -2, "error_message");
+        table.string("error_message", em);
     }
     if (result.model) |m| {
-        _ = c.lua_pushlstring(L, m.ptr, m.len);
-        c.lua_setfield(L, -2, "model");
+        table.string("model", m);
     }
 
-    _ = c.lua_pushlstring(L, result.output.items.ptr, result.output.items.len);
-    c.lua_setfield(L, -2, "final_text");
+    table.string("final_text", result.output.items);
 
-    _ = c.lua_pushlstring(L, result.stderr_output.items.ptr, result.stderr_output.items.len);
-    c.lua_setfield(L, -2, "stderr");
+    table.string("stderr", result.stderr_output.items);
 
-    c.lua_pushboolean(L, if (result.cancelled) 1 else 0);
-    c.lua_setfield(L, -2, "cancelled");
+    table.boolean("cancelled", result.cancelled);
 
-    c.lua_createtable(L, 0, 7);
-    c.lua_pushinteger(L, @intCast(result.usage.input));
-    c.lua_setfield(L, -2, "input");
-    c.lua_pushinteger(L, @intCast(result.usage.output));
-    c.lua_setfield(L, -2, "output");
-    c.lua_pushinteger(L, @intCast(result.usage.cache_read));
-    c.lua_setfield(L, -2, "cache_read");
-    c.lua_pushinteger(L, @intCast(result.usage.cache_write));
-    c.lua_setfield(L, -2, "cache_write");
-    c.lua_pushinteger(L, @intCast(result.usage.context_tokens));
-    c.lua_setfield(L, -2, "total_tokens");
-    c.lua_pushnumber(L, result.usage.cost);
-    c.lua_setfield(L, -2, "cost");
-    c.lua_pushinteger(L, @intCast(result.usage.turns));
-    c.lua_setfield(L, -2, "turns");
-    c.lua_setfield(L, -2, "usage");
+    const usage = TableBuilder.create(Lua.init(L), 0, 7);
+    usage.int("input", result.usage.input);
+    usage.int("output", result.usage.output);
+    usage.int("cache_read", result.usage.cache_read);
+    usage.int("cache_write", result.usage.cache_write);
+    usage.int("total_tokens", result.usage.context_tokens);
+    usage.number("cost", result.usage.cost);
+    usage.int("turns", result.usage.turns);
+    table.setFieldFromTop("usage");
 }
 
 test "spawn event fanout bounds pending events and tracks drops" {
@@ -524,12 +503,9 @@ test "spawn event fanout bounds pending events and tracks drops" {
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }

@@ -1,15 +1,18 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const event_registry = @import("registries/event_registry.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
 
 pub fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
+    const lua = Lua.init(L);
     const runner = runnerFromUpvalue(L);
 
-    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
+    if (lua.typeOf(1) != .string) {
         return luaError(L, "zi.on: expected event name as first argument");
     }
     var name_len: usize = 0;
@@ -22,24 +25,23 @@ pub fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return 0;
     };
 
-    if (c.lua_type(L, 2) != c.LUA_TFUNCTION) {
+    if (lua.typeOf(2) != .function) {
         return luaError(L, "zi.on: expected handler function as second argument");
     }
 
-    c.lua_pushvalue(L, 2);
-    const handler_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
-    if (handler_ref == c.LUA_REFNIL or handler_ref == c.LUA_NOREF) {
+    var handler_ref = lua_helpers.RegistryRef.takeValueAt(lua, 2) catch {
         return luaError(L, "zi.on: failed to capture handler reference");
-    }
+    };
+    errdefer handler_ref.release(lua);
 
     runner.event_registry.subscribe(kind, .{
-        .lua_ref = handler_ref,
+        .lua_ref = handler_ref.value,
         .source_id = currentEventSourceId(runner),
         .provenance = currentEventProvenance(runner),
     }) catch {
-        c.luaL_unref(L, c.LUA_REGISTRYINDEX, handler_ref);
         return luaError(L, "zi.on: subscribe failed");
     };
+    handler_ref.value = c.LUA_NOREF;
 
     return 0;
 }
@@ -100,12 +102,9 @@ fn currentEventSourceId(runner: *const runner_mod.ExtensionRunner) []const u8 {
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }

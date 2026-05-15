@@ -5,6 +5,7 @@ const abort_signal_mod = @import("../../zio/root.zig");
 const json_util = @import("../../ai/json_util.zig");
 const resource_types = @import("../resources/types.zig");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const context_mod = @import("context.zig");
 const lua_agent_serializers = @import("lua_agent_serializers.zig");
@@ -12,6 +13,8 @@ const dispatch = @import("dispatch.zig");
 const event_registry = @import("registries/event_registry.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
+const TableBuilder = lua_helpers.TableBuilder;
 const log = std.log.scoped(.zi_bridge);
 
 pub const InputMiddlewareResult = union(enum) {
@@ -121,12 +124,11 @@ fn dispatchSemanticMessageForState(
                     try pushSemanticMessagePayload(state.L, "tool_call", entry_id, null);
                     defer c.lua_pop(state.L, 1);
                     const msg_idx = semanticMessageTableIndex(state.L, -1);
-                    _ = c.lua_pushlstring(state.L, call.id.ptr, call.id.len);
-                    c.lua_setfield(state.L, msg_idx, "tool_call_id");
-                    _ = c.lua_pushlstring(state.L, call.name.ptr, call.name.len);
-                    c.lua_setfield(state.L, msg_idx, "tool_name");
+                    const msg_table = TableBuilder{ .lua = Lua.init(state.L), .index = msg_idx };
+                    msg_table.string("tool_call_id", call.id);
+                    msg_table.string("tool_name", call.name);
                     try lua_runtime.pushJsonValue(state.L, call.arguments);
-                    c.lua_setfield(state.L, msg_idx, "args");
+                    msg_table.setFieldFromTop("args");
                     c.lua_pop(state.L, 1);
                     try dispatch.dispatchObserver(state, runner, .message, -1);
                 },
@@ -142,16 +144,14 @@ fn dispatchSemanticMessageForState(
             try pushSemanticMessagePayload(state.L, "tool_result", entry_id, null);
             defer c.lua_pop(state.L, 1);
             const msg_idx = semanticMessageTableIndex(state.L, -1);
-            _ = c.lua_pushlstring(state.L, tr.tool_call_id.ptr, tr.tool_call_id.len);
-            c.lua_setfield(state.L, msg_idx, "tool_call_id");
-            _ = c.lua_pushlstring(state.L, tr.tool_name.ptr, tr.tool_name.len);
-            c.lua_setfield(state.L, msg_idx, "tool_name");
-            c.lua_pushboolean(state.L, if (tr.is_error) 1 else 0);
-            c.lua_setfield(state.L, msg_idx, "is_error");
+            const msg_table = TableBuilder{ .lua = Lua.init(state.L), .index = msg_idx };
+            msg_table.string("tool_call_id", tr.tool_call_id);
+            msg_table.string("tool_name", tr.tool_name);
+            msg_table.boolean("is_error", tr.is_error);
             try pushToolResultTextField(state, msg_idx, tr);
             if (tr.details) |details| {
                 try lua_runtime.pushJsonValue(state.L, details);
-                c.lua_setfield(state.L, msg_idx, "details");
+                msg_table.setFieldFromTop("details");
             }
             c.lua_pop(state.L, 1);
             try dispatch.dispatchObserver(state, runner, .message, -1);
@@ -161,19 +161,15 @@ fn dispatchSemanticMessageForState(
 }
 
 fn pushSemanticMessagePayload(L: *c.lua_State, role: []const u8, entry_id: []const u8, text: ?[]const u8) !void {
-    c.lua_createtable(L, 0, 2);
-    _ = c.lua_pushlstring(L, "message".ptr, "message".len);
-    c.lua_setfield(L, -2, "type");
-    c.lua_createtable(L, 0, 7);
-    _ = c.lua_pushlstring(L, role.ptr, role.len);
-    c.lua_setfield(L, -2, "role");
-    _ = c.lua_pushlstring(L, entry_id.ptr, entry_id.len);
-    c.lua_setfield(L, -2, "entry_id");
+    const payload = TableBuilder.create(Lua.init(L), 0, 2);
+    payload.stringZ("type", "message");
+    const message = TableBuilder.create(Lua.init(L), 0, 7);
+    message.string("role", role);
+    message.string("entry_id", entry_id);
     if (text) |value| {
-        _ = c.lua_pushlstring(L, value.ptr, value.len);
-        c.lua_setfield(L, -2, "text");
+        message.string("text", value);
     }
-    c.lua_setfield(L, -2, "message");
+    payload.setFieldFromTop("message");
 }
 
 fn semanticMessageTableIndex(L: *c.lua_State, payload_idx: c_int) c_int {
@@ -186,14 +182,12 @@ fn pushUserTextField(L: *c.lua_State, payload_idx: c_int, user: ai_protocol.User
     defer c.lua_pop(L, 1);
     switch (user.content) {
         .text => |text| {
-            _ = c.lua_pushlstring(L, text.ptr, text.len);
-            c.lua_setfield(L, msg_idx, "text");
+            (TableBuilder{ .lua = Lua.init(L), .index = msg_idx }).string("text", text);
         },
         .blocks => |blocks| {
             for (blocks) |block| switch (block) {
                 .text => |text| {
-                    _ = c.lua_pushlstring(L, text.text.ptr, text.text.len);
-                    c.lua_setfield(L, msg_idx, "text");
+                    (TableBuilder{ .lua = Lua.init(L), .index = msg_idx }).string("text", text.text);
                     return;
                 },
                 .image => {},
@@ -213,8 +207,7 @@ fn pushToolResultTextField(state: *lua_runtime.LuaState, msg_idx: c_int, tr: ai_
         .image => {},
     };
     if (text.items.len == 0) return;
-    _ = c.lua_pushlstring(state.L, text.items.ptr, text.items.len);
-    c.lua_setfield(state.L, msg_idx, "text");
+    (TableBuilder{ .lua = Lua.init(state.L), .index = msg_idx }).string("text", text.items);
 }
 
 pub const SessionLifecycleReason = enum { startup, new, @"resume", exit, fork };
@@ -383,22 +376,20 @@ fn pushModelSelectPayload(
     previous_model: ?agent_protocol.Model,
     source: []const u8,
 ) !void {
-    c.lua_createtable(L, 0, 4);
-    _ = c.lua_pushlstring(L, "model_select".ptr, "model_select".len);
-    c.lua_setfield(L, -2, "type");
+    const table = TableBuilder.create(Lua.init(L), 0, 4);
+    table.stringZ("type", "model_select");
 
     context_mod.pushModel(L, model);
-    c.lua_setfield(L, -2, "model");
+    table.setFieldFromTop("model");
 
     if (previous_model) |pm| {
         context_mod.pushModel(L, pm);
     } else {
         c.lua_pushnil(L);
     }
-    c.lua_setfield(L, -2, "previous_model");
+    table.setFieldFromTop("previous_model");
 
-    _ = c.lua_pushlstring(L, source.ptr, source.len);
-    c.lua_setfield(L, -2, "source");
+    table.string("source", source);
 }
 
 pub fn dispatchBeforeAgentStart(
@@ -575,32 +566,30 @@ fn pushSessionLifecyclePayload(
     related: ?LifecyclePeer,
     fork_parent_entry_id: ?[]const u8,
 ) !void {
-    c.lua_createtable(L, 0, if (fork_parent_entry_id != null and reason == .fork) 5 else 4);
+    const table = TableBuilder.create(Lua.init(L), 0, if (fork_parent_entry_id != null and reason == .fork) 5 else 4);
 
     const event_type = switch (kind) {
         .session_start => "session_start",
         .session_shutdown => "session_shutdown",
         else => unreachable,
     };
-    _ = c.lua_pushlstring(L, event_type.ptr, event_type.len);
-    c.lua_setfield(L, -2, "type");
+    table.string("type", event_type);
 
     const reason_str = sessionLifecycleReasonString(reason);
-    _ = c.lua_pushlstring(L, reason_str.ptr, reason_str.len);
-    c.lua_setfield(L, -2, "reason");
+    table.string("reason", reason_str);
 
     if (provenance) |prov| {
         context_mod.pushBinding(L, prov, current.runner.generation, current.workspace_id, current.session_id, current.session_file);
     } else {
         c.lua_pushnil(L);
     }
-    c.lua_setfield(L, -2, "binding");
+    table.setFieldFromTop("binding");
 
     if (provenance) |prov| {
         if (related) |peer| {
             if (peer.findLoadedExtensionById(prov.extension_id)) |peer_provenance| {
                 context_mod.pushBinding(L, peer_provenance, peer.generation(), peer.workspaceId(), peer.sessionId(), peer.sessionFile());
-                c.lua_setfield(L, -2, switch (kind) {
+                table.setFieldFromTop(switch (kind) {
                     .session_start => "previous",
                     .session_shutdown => "next",
                     else => unreachable,
@@ -611,8 +600,7 @@ fn pushSessionLifecyclePayload(
 
     if (fork_parent_entry_id) |id| {
         if (reason == .fork) {
-            _ = c.lua_pushlstring(L, id.ptr, id.len);
-            c.lua_setfield(L, -2, "fork_parent_entry_id");
+            table.string("fork_parent_entry_id", id);
         }
     }
 }
@@ -623,24 +611,19 @@ fn pushSessionBeforeSwitchPayload(
     current: SessionLifecycleContext,
     next: ?SessionLifecycleContext,
 ) !void {
-    c.lua_createtable(L, 0, 3);
-
-    _ = c.lua_pushlstring(L, "session_before_switch".ptr, "session_before_switch".len);
-    c.lua_setfield(L, -2, "type");
+    const table = TableBuilder.create(Lua.init(L), 0, 3);
+    table.stringZ("type", "session_before_switch");
 
     const reason_str = sessionLifecycleReasonString(reason);
-    _ = c.lua_pushlstring(L, reason_str.ptr, reason_str.len);
-    c.lua_setfield(L, -2, "reason");
+    table.string("reason", reason_str);
 
     if (current.session_file) |path| {
-        _ = c.lua_pushlstring(L, path.ptr, path.len);
-        c.lua_setfield(L, -2, "current_session_file");
+        table.string("current_session_file", path);
     }
 
     if (next) |peer| {
         if (peer.session_file) |path| {
-            _ = c.lua_pushlstring(L, path.ptr, path.len);
-            c.lua_setfield(L, -2, "target_session_file");
+            table.string("target_session_file", path);
         }
     }
 }
@@ -650,20 +633,13 @@ fn pushSessionBeforeForkPayload(
     current: SessionLifecycleContext,
     entry_id: []const u8,
 ) !void {
-    c.lua_createtable(L, 0, 3);
-
-    _ = c.lua_pushlstring(L, "session_before_fork".ptr, "session_before_fork".len);
-    c.lua_setfield(L, -2, "type");
-
-    _ = c.lua_pushlstring(L, "fork".ptr, "fork".len);
-    c.lua_setfield(L, -2, "reason");
-
-    _ = c.lua_pushlstring(L, entry_id.ptr, entry_id.len);
-    c.lua_setfield(L, -2, "entry_id");
+    const table = TableBuilder.create(Lua.init(L), 0, 3);
+    table.stringZ("type", "session_before_fork");
+    table.stringZ("reason", "fork");
+    table.string("entry_id", entry_id);
 
     if (current.session_file) |path| {
-        _ = c.lua_pushlstring(L, path.ptr, path.len);
-        c.lua_setfield(L, -2, "current_session_file");
+        table.string("current_session_file", path);
     }
 }
 

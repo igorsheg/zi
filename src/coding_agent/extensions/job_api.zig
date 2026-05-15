@@ -1,11 +1,14 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const extension_ui = @import("ui.zig");
 const limits = @import("limits.zig");
 const zio = @import("../../zio/root.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
+const TableBuilder = lua_helpers.TableBuilder;
 
 pub fn install(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
@@ -50,9 +53,7 @@ pub fn ziJobStart(L_opt: ?*c.lua_State) callconv(.c) c_int {
             return luaErrorFmt(L, "zi.job.start: {s}", .{@errorName(err)});
         };
     }
-    c.lua_createtable(L, 0, 1);
-    c.lua_pushinteger(L, @intCast(id));
-    c.lua_setfield(L, -2, "id");
+    TableBuilder.create(Lua.init(L), 0, 1).int("id", id);
     return 1;
 }
 
@@ -219,10 +220,9 @@ fn readNextWaitMs(L: *c.lua_State, idx: c_int) !u64 {
 }
 
 fn pushJobEvent(L: *c.lua_State, event: extension_ui.JobEvent) void {
-    c.lua_createtable(L, 0, 7);
-    c.lua_pushinteger(L, @intCast(event.id));
-    c.lua_setfield(L, -2, "id");
-    pushLiteralField(L, "type", switch (event.kind) {
+    const table = TableBuilder.create(Lua.init(L), 0, 7);
+    table.int("id", event.id);
+    table.stringZ("type", switch (event.kind) {
         .ready => "ready",
         .stdout => "stdout",
         .stderr => "stderr",
@@ -230,7 +230,7 @@ fn pushJobEvent(L: *c.lua_State, event: extension_ui.JobEvent) void {
         .exit => "exit",
         .json => "json",
     });
-    pushLiteralField(L, "kind", switch (event.kind) {
+    table.stringZ("kind", switch (event.kind) {
         .ready => "ready",
         .stdout => "stdout",
         .stderr => "stderr",
@@ -238,23 +238,11 @@ fn pushJobEvent(L: *c.lua_State, event: extension_ui.JobEvent) void {
         .exit => "exit",
         .json => "json",
     });
-    if (event.data) |data| {
-        _ = c.lua_pushlstring(L, data.ptr, data.len);
-    } else c.lua_pushnil(L);
-    c.lua_setfield(L, -2, "data");
+    table.optionalString("data", event.data);
     if (event.code) |code| c.lua_pushinteger(L, @intCast(code)) else c.lua_pushnil(L);
-    c.lua_setfield(L, -2, "code");
-    c.lua_pushboolean(L, if (event.is_error) 1 else 0);
-    c.lua_setfield(L, -2, "is_error");
-    if (event.error_message) |msg| {
-        _ = c.lua_pushlstring(L, msg.ptr, msg.len);
-    } else c.lua_pushnil(L);
-    c.lua_setfield(L, -2, "error_message");
-}
-
-fn pushLiteralField(L: *c.lua_State, field: [:0]const u8, value: [:0]const u8) void {
-    _ = c.lua_pushstring(L, value.ptr);
-    c.lua_setfield(L, -2, field.ptr);
+    table.setFieldFromTop("code");
+    table.boolean("is_error", event.is_error);
+    table.optionalString("error_message", event.error_message);
 }
 
 fn readId(L: *c.lua_State, idx: c_int) ?u64 {
@@ -269,20 +257,13 @@ fn readId(L: *c.lua_State, idx: c_int) ?u64 {
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch "lua error";
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseErrorFmt(Lua.init(L), fmt, args);
 }

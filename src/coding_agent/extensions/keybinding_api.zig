@@ -1,17 +1,20 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const keybinding_registry = @import("registries/keybinding_registry.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const keys_mod = @import("../../tui/terminal/keys.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
 
 pub fn ziRegisterKeybinding(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
+    const lua = Lua.init(L);
     const runner = runnerFromUpvalue(L);
 
-    if (c.lua_type(L, 1) != c.LUA_TTABLE) {
+    if (lua.typeOf(1) != .table) {
         return luaError(L, "keybinding: expected a table argument");
     }
 
@@ -34,7 +37,7 @@ pub fn ziRegisterKeybinding(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return luaError(L, "keybinding: registry insert failed");
     };
 
-    c.lua_pushboolean(L, 1);
+    lua.pushBool(true);
     return 1;
 }
 
@@ -167,12 +170,9 @@ fn currentRegistrationSource(runner: *const runner_mod.ExtensionRunner) tool_reg
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }

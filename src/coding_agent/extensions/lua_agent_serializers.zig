@@ -3,32 +3,30 @@ const agent_protocol = @import("../../agent/types.zig");
 const ai = @import("../../ai/root.zig");
 const session_core = @import("../../session/root.zig");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
+const TableBuilder = lua_helpers.TableBuilder;
 
 fn pushStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void {
-    _ = c.lua_pushlstring(L, value.ptr, value.len);
-    c.lua_setfield(L, -2, field.ptr);
+    TableBuilder.atTop(Lua.init(L)).string(field, value);
 }
 
 fn pushOptionalStringField(L: *c.lua_State, field: [:0]const u8, value: ?[]const u8) void {
-    if (value) |s| _ = c.lua_pushlstring(L, s.ptr, s.len) else c.lua_pushnil(L);
-    c.lua_setfield(L, -2, field.ptr);
+    TableBuilder.atTop(Lua.init(L)).optionalString(field, value);
 }
 
 fn pushBoolField(L: *c.lua_State, field: [:0]const u8, value: bool) void {
-    c.lua_pushboolean(L, if (value) 1 else 0);
-    c.lua_setfield(L, -2, field.ptr);
+    TableBuilder.atTop(Lua.init(L)).boolean(field, value);
 }
 
 fn pushIntField(L: *c.lua_State, field: [:0]const u8, value: anytype) void {
-    c.lua_pushinteger(L, @intCast(value));
-    c.lua_setfield(L, -2, field.ptr);
+    TableBuilder.atTop(Lua.init(L)).int(field, value);
 }
 
 fn pushNumberField(L: *c.lua_State, field: [:0]const u8, value: f64) void {
-    c.lua_pushnumber(L, value);
-    c.lua_setfield(L, -2, field.ptr);
+    TableBuilder.atTop(Lua.init(L)).number(field, value);
 }
 
 fn apiToString(api: ai.protocol.Api) []const u8 {

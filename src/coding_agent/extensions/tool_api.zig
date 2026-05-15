@@ -1,19 +1,22 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const tool_def = @import("../tools/definition.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
 const log = std.log.scoped(.zi_api);
 
 pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const api_name = "zi.tool";
 
     const L = L_opt.?;
+    const lua = Lua.init(L);
     const runner = runnerFromUpvalue(L);
 
-    if (c.lua_type(L, 1) != c.LUA_TTABLE) {
+    if (lua.typeOf(1) != .table) {
         return luaErrorFmt(L, "{s}: expected spec table", .{api_name});
     }
 
@@ -50,13 +53,13 @@ pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
         });
         if (built.impl == .lua) c.luaL_unref(L, c.LUA_REGISTRYINDEX, built.impl.lua);
         freeBuiltTool(runner.allocator, &built);
-        c.lua_pushboolean(L, 0);
+        lua.pushBool(false);
         return 1;
     }
 
     runner.notifyToolProjectionChanged();
 
-    c.lua_pushboolean(L, 1);
+    lua.pushBool(true);
     return 1;
 }
 
@@ -264,28 +267,19 @@ fn currentRegistrationSource(runner: *const runner_mod.ExtensionRunner) tool_reg
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch "lua error";
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseErrorFmt(Lua.init(L), fmt, args);
 }
 
 fn luaApiError(L: *c.lua_State, api_name: []const u8, detail: []const u8) c_int {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrintZ(&buf, "{s}: {s}", .{ api_name, detail }) catch "lua error";
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }

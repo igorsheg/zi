@@ -1,10 +1,13 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const command_registry = @import("registries/command_registry.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
+const FieldReader = lua_helpers.FieldReader;
 
 pub fn ziCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const api_name = "zi.command";
@@ -12,7 +15,8 @@ pub fn ziCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
-    if (c.lua_type(L, 1) != c.LUA_TTABLE) {
+    const lua = Lua.init(L);
+    if (lua.typeOf(1) != .table) {
         return luaErrorFmt(L, "{s}: expected spec table", .{api_name});
     }
 
@@ -39,7 +43,7 @@ fn registerCommandDef(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, cmd_
         return luaErrorFmt(L, "{s}: registry insert failed", .{api_name});
     };
 
-    c.lua_pushboolean(L, 1);
+    Lua.init(L).pushBool(true);
     return 1;
 }
 
@@ -56,65 +60,41 @@ fn buildCommandDef(
     runner: *runner_mod.ExtensionRunner,
 ) RegisterCommandError!command_registry.CommandDef {
     const a = runner.allocator;
+    const fields = FieldReader.init(Lua.init(L), 1);
 
     var name: ?[]const u8 = null;
     var description: ?[]const u8 = null;
+    var handler_ref = lua_helpers.RegistryRef{};
     defer {
         if (name) |n| a.free(n);
         if (description) |d| a.free(d);
+        handler_ref.release(Lua.init(L));
     }
 
-    _ = c.lua_getfield(L, 1, "name");
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) {
-        c.lua_pop(L, 1);
-        return error.MissingName;
-    }
-    var name_len: usize = 0;
-    const name_ptr = c.lua_tolstring(L, -1, &name_len).?;
-    name = a.dupe(u8, name_ptr[0..name_len]) catch return error.OutOfMemory;
-    c.lua_pop(L, 1);
-
-    _ = c.lua_getfield(L, 1, "description");
-    if (c.lua_type(L, -1) == c.LUA_TSTRING) {
-        var desc_len: usize = 0;
-        const desc_ptr = c.lua_tolstring(L, -1, &desc_len).?;
-        description = a.dupe(u8, desc_ptr[0..desc_len]) catch {
-            c.lua_pop(L, 1);
-            return error.OutOfMemory;
-        };
-        c.lua_pop(L, 1);
-    } else if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 1);
-        description = a.dupe(u8, "") catch return error.OutOfMemory;
-    } else {
-        c.lua_pop(L, 1);
-        return error.InvalidDescription;
-    }
-
-    _ = c.lua_getfield(L, 1, "handler");
-    if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 1);
-        return error.MissingHandler;
-    }
-    if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
-        c.lua_pop(L, 1);
-        return error.InvalidHandler;
-    }
-    const handler_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+    name = fields.requiredString(a, "name") catch return error.MissingName;
+    description = fields.stringOrDefault(a, "description", "") catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidDescription,
+    };
+    handler_ref = fields.functionRef("handler") catch |err| return switch (err) {
+        error.MissingField => error.MissingHandler,
+        error.InvalidRegistryRef => error.OutOfMemory,
+        else => error.InvalidHandler,
+    };
 
     const owned_name = name.?;
     const result = command_registry.CommandDef{
         .name = owned_name,
         .visible_name = a.dupe(u8, owned_name) catch {
-            c.luaL_unref(L, c.LUA_REGISTRYINDEX, handler_ref);
             return error.OutOfMemory;
         },
         .description = description.?,
-        .lua_ref = handler_ref,
+        .lua_ref = handler_ref.value,
         .source = currentRegistrationSource(runner),
     };
     name = null;
     description = null;
+    handler_ref.value = c.LUA_NOREF;
     return result;
 }
 
@@ -124,28 +104,19 @@ fn currentRegistrationSource(runner: *const runner_mod.ExtensionRunner) tool_reg
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn luaErrorFmt(L: *c.lua_State, comptime fmt: []const u8, args: anytype) c_int {
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, fmt, args) catch "lua error";
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseErrorFmt(Lua.init(L), fmt, args);
 }
 
 fn luaApiError(L: *c.lua_State, api_name: []const u8, detail: []const u8) c_int {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrintZ(&buf, "{s}: {s}", .{ api_name, detail }) catch "lua error";
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }

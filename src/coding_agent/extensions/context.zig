@@ -1,5 +1,6 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const lua_agent_serializers = @import("lua_agent_serializers.zig");
 const resource_types = @import("../resources/types.zig");
@@ -12,6 +13,8 @@ const ai_provider = @import("../../ai/provider.zig");
 const abort_signal_mod = @import("../../zio/root.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
+const TableBuilder = lua_helpers.TableBuilder;
 const limits = @import("limits.zig");
 
 const ui_id_bytes: usize = limits.ui_id_bytes;
@@ -23,101 +26,88 @@ pub fn pushExtensionContext(
     runner: *runner_mod.ExtensionRunner,
     provenance: ?resource_types.ExtensionProvenance,
 ) !void {
-    c.lua_createtable(L, 0, 14);
+    const table = TableBuilder.create(Lua.init(L), 0, 14);
 
-    _ = c.lua_pushlstring(L, runner.cwd.ptr, runner.cwd.len);
-    c.lua_setfield(L, -2, "cwd");
+    table.string("cwd", runner.cwd);
 
     const has_ui = switch (runner.runtime) {
         .bound => |bound| bound.publish_render != null or bound.publish_frame != null,
         .stub => false,
     };
-    c.lua_pushboolean(L, if (has_ui) 1 else 0);
-    c.lua_setfield(L, -2, "has_ui");
+    table.boolean("has_ui", has_ui);
 
     pushUiApi(L, runner, provenance);
-    c.lua_setfield(L, -2, "ui");
+    table.setFieldFromTop("ui");
 
     pushEditorApi(L, runner, provenance);
-    c.lua_setfield(L, -2, "editor");
+    table.setFieldFromTop("editor");
 
-    c.lua_pushnil(L);
-    c.lua_setfield(L, -2, "signal");
+    table.nil("signal");
 
     pushSessionApi(L, runner, provenance);
-    c.lua_setfield(L, -2, "session");
+    table.setFieldFromTop("session");
 
     pushAiApi(L, runner);
-    c.lua_setfield(L, -2, "ai");
+    table.setFieldFromTop("ai");
 
     pushContextBinding(L, runner, provenance);
-    c.lua_setfield(L, -2, "binding");
+    table.setFieldFromTop("binding");
 
     pushExtensionInfo(L, runner, provenance);
-    c.lua_setfield(L, -2, "extension");
+    table.setFieldFromTop("extension");
 
     if (runner.enable_test_async) {
         pushMethod(L, runner, &ctxTestAsync);
-        c.lua_setfield(L, -2, "__test_async");
+        table.setFieldFromTop("__test_async");
     }
 
     switch (runner.runtime) {
         .bound => |bound| {
             pushModelsApi(L, runner);
-            c.lua_setfield(L, -2, "models");
+            table.setFieldFromTop("models");
 
             pushMethod(L, runner, &ctxIsIdle);
-            c.lua_setfield(L, -2, "is_idle");
+            table.setFieldFromTop("is_idle");
 
             pushMethod(L, runner, &ctxAbort);
-            c.lua_setfield(L, -2, "abort");
+            table.setFieldFromTop("abort");
 
             pushMethod(L, runner, &ctxSendUserMessage);
-            c.lua_setfield(L, -2, "send_user_message");
+            table.setFieldFromTop("send_user_message");
 
             pushMethod(L, runner, &ctxSendMessage);
-            c.lua_setfield(L, -2, "send_message");
+            table.setFieldFromTop("send_message");
 
             pushMethod(L, runner, &ctxAppendEntry);
-            c.lua_setfield(L, -2, "append_entry");
+            table.setFieldFromTop("append_entry");
 
             pushMethod(L, runner, &ctxHasPendingMessages);
-            c.lua_setfield(L, -2, "has_pending_messages");
+            table.setFieldFromTop("has_pending_messages");
 
             if (bound.shutdown != null) {
                 pushMethod(L, runner, &ctxShutdown);
             } else {
                 c.lua_pushnil(L);
             }
-            c.lua_setfield(L, -2, "shutdown");
+            table.setFieldFromTop("shutdown");
 
             pushMethod(L, runner, &ctxContextUsage);
-            c.lua_setfield(L, -2, "context_usage");
+            table.setFieldFromTop("context_usage");
 
             pushMethod(L, runner, &ctxSystemPrompt);
-            c.lua_setfield(L, -2, "system_prompt");
+            table.setFieldFromTop("system_prompt");
         },
         .stub => {
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "models");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "is_idle");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "abort");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "send_user_message");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "send_message");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "append_entry");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "has_pending_messages");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "shutdown");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "context_usage");
-            c.lua_pushnil(L);
-            c.lua_setfield(L, -2, "system_prompt");
+            table.nil("models");
+            table.nil("is_idle");
+            table.nil("abort");
+            table.nil("send_user_message");
+            table.nil("send_message");
+            table.nil("append_entry");
+            table.nil("has_pending_messages");
+            table.nil("shutdown");
+            table.nil("context_usage");
+            table.nil("system_prompt");
         },
     }
 }
@@ -136,16 +126,11 @@ fn pushExtensionInfo(
         return;
     };
 
-    c.lua_createtable(L, 0, 4);
-    pushContextStringField(L, "id", info.id);
-    pushContextStringField(L, "source", info.source);
-    pushContextStringField(L, "entry", info.entry_path);
-    pushContextStringField(L, "root", info.root_path);
-}
-
-fn pushContextStringField(L: *c.lua_State, field: [:0]const u8, value: []const u8) void {
-    _ = c.lua_pushlstring(L, value.ptr, value.len);
-    c.lua_setfield(L, -2, field.ptr);
+    const table = TableBuilder.create(Lua.init(L), 0, 4);
+    table.string("id", info.id);
+    table.string("source", info.source);
+    table.string("entry", info.entry_path);
+    table.string("root", info.root_path);
 }
 
 fn pushUiApi(
@@ -167,17 +152,17 @@ fn pushUiApi(
         return;
     }
 
-    c.lua_createtable(L, 0, 5);
+    const table = TableBuilder.create(Lua.init(L), 0, 5);
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiRender);
-    c.lua_setfield(L, -2, "render");
+    table.setFieldFromTop("render");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiFrame);
-    c.lua_setfield(L, -2, "frame");
+    table.setFieldFromTop("frame");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotify);
-    c.lua_setfield(L, -2, "notify");
+    table.setFieldFromTop("notify");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotifyClear);
-    c.lua_setfield(L, -2, "notify_clear");
+    table.setFieldFromTop("notify_clear");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiProgress);
-    c.lua_setfield(L, -2, "progress");
+    table.setFieldFromTop("progress");
 }
 
 fn pushEditorApi(
@@ -199,13 +184,13 @@ fn pushEditorApi(
         return;
     }
 
-    c.lua_createtable(L, 0, 3);
+    const table = TableBuilder.create(Lua.init(L), 0, 3);
     pushUiMethod(L, runner, prov.state_owner_id, &ctxEditorSetText);
-    c.lua_setfield(L, -2, "set_text");
+    table.setFieldFromTop("set_text");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxEditorInsertText);
-    c.lua_setfield(L, -2, "insert_text");
+    table.setFieldFromTop("insert_text");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxEditorClear);
-    c.lua_setfield(L, -2, "clear");
+    table.setFieldFromTop("clear");
 }
 
 fn pushUiMethod(
@@ -220,8 +205,7 @@ fn pushUiMethod(
 }
 
 fn stateRunnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
-    return @ptrCast(@alignCast(ud.?));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }
 
 fn stateOwnerFromUpvalue(L: *c.lua_State) []const u8 {
@@ -2221,16 +2205,15 @@ fn pushContextUsage(L: *c.lua_State, usage: session_core.context_usage.ContextUs
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const ud = c.lua_touserdata(L, c.lua_upvalueindex(1));
-    return @ptrCast(@alignCast(ud.?));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }
 
 fn ctxIsIdle(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
     switch (runner.runtime) {
-        .bound => |bound| c.lua_pushboolean(L, if (bound.is_idle(bound.session)) 1 else 0),
-        .stub => c.lua_pushboolean(L, 1),
+        .bound => |bound| Lua.init(L).pushBool(bound.is_idle(bound.session)),
+        .stub => Lua.init(L).pushBool(true),
     }
     return 1;
 }

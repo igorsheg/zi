@@ -1,10 +1,13 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
+const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const ai = @import("../../ai/root.zig");
 const oauth_mod = @import("../auth/oauth.zig");
 
 const c = lua_runtime.c;
+const Lua = lua_helpers.Lua;
+const FieldReader = lua_helpers.FieldReader;
 
 const RegisterProviderError = error{
     MissingName,
@@ -115,7 +118,7 @@ pub fn ziProvider(L_opt: ?*c.lua_State) callconv(.c) c_int {
         rejected.deinit(runner.allocator);
     }
 
-    c.lua_pushboolean(L, if (accepted) 1 else 0);
+    Lua.init(L).pushBool(accepted);
     return 1;
 }
 
@@ -123,7 +126,7 @@ pub fn ziUnprovider(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
 
-    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
+    if (Lua.init(L).typeOf(1) != .string) {
         return luaError(L, "zi.unprovider: expected provider name string as first argument");
     }
 
@@ -141,7 +144,7 @@ pub fn ziUnprovider(L_opt: ?*c.lua_State) callconv(.c) c_int {
         });
     };
 
-    c.lua_pushboolean(L, if (removed) 1 else 0);
+    Lua.init(L).pushBool(removed);
     return 1;
 }
 
@@ -256,17 +259,13 @@ fn requireProviderFieldString(
     missing_err: RegisterProviderError,
     invalid_err: RegisterProviderError,
 ) RegisterProviderError![]const u8 {
-    _ = c.lua_getfield(L, table_idx, field.ptr);
-    defer c.lua_pop(L, 1);
-
-    return switch (c.lua_type(L, -1)) {
-        c.LUA_TNIL => missing_err,
-        c.LUA_TSTRING => blk: {
-            var len: usize = 0;
-            const ptr = c.lua_tolstring(L, -1, &len) orelse return invalid_err;
-            break :blk allocator.dupe(u8, ptr[0..len]) catch return error.OutOfMemory;
+    return FieldReader.init(Lua.init(L), table_idx).requiredString(allocator, field) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.WrongType => {
+            _ = c.lua_getfield(L, table_idx, field.ptr);
+            defer c.lua_pop(L, 1);
+            return if (c.lua_type(L, -1) == c.LUA_TNIL) missing_err else invalid_err;
         },
-        else => invalid_err,
     };
 }
 
@@ -277,17 +276,9 @@ fn optionalProviderFieldString(
     allocator: std.mem.Allocator,
     invalid_err: RegisterProviderError,
 ) RegisterProviderError!?[]const u8 {
-    _ = c.lua_getfield(L, table_idx, field.ptr);
-    defer c.lua_pop(L, 1);
-
-    return switch (c.lua_type(L, -1)) {
-        c.LUA_TNIL => null,
-        c.LUA_TSTRING => blk: {
-            var len: usize = 0;
-            const ptr = c.lua_tolstring(L, -1, &len) orelse return invalid_err;
-            break :blk allocator.dupe(u8, ptr[0..len]) catch return error.OutOfMemory;
-        },
-        else => invalid_err,
+    return FieldReader.init(Lua.init(L), table_idx).optionalString(allocator, field) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.WrongType => return invalid_err,
     };
 }
 
@@ -692,12 +683,9 @@ fn lstring(L: *c.lua_State, idx: c_int) []const u8 {
 }
 
 fn luaError(L: *c.lua_State, msg: [:0]const u8) c_int {
-    _ = c.lua_pushstring(L, msg.ptr);
-    _ = c.lua_error(L);
-    return 0;
+    return lua_helpers.raiseError(Lua.init(L), msg);
 }
 
 fn runnerFromUpvalue(L: *c.lua_State) *runner_mod.ExtensionRunner {
-    const raw = c.lua_touserdata(L, c.lua_upvalueindex(1)) orelse unreachable;
-    return @ptrCast(@alignCast(raw));
+    return lua_helpers.ptrFromUpvalue(runner_mod.ExtensionRunner, Lua.init(L), 1);
 }
