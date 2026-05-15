@@ -231,7 +231,6 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         .stderr_limit = options.stderr_limit,
         .stdout_policy = streamCapturePolicy(store_stdout, options.on_chunk != null),
         .stderr_policy = streamCapturePolicy(store_stderr, options.on_chunk != null),
-        .on_chunk = options.on_chunk,
     });
     defer capture.deinit();
 
@@ -254,7 +253,7 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         .signal = options.signal,
     }) catch return error.SpawnFailed;
     if (options.stdin == .bytes) {
-        try waitProcessReady(allocator, &reactor, &capture);
+        try waitProcessReady(allocator, &reactor, &capture, options.on_chunk);
         reactor.write(1, options.stdin.bytes) catch {};
         reactor.closeStdin(1) catch {};
     }
@@ -268,7 +267,7 @@ fn runEngine(allocator: std.mem.Allocator, io: std.Io, options: StreamOptions, s
         }
         for (batch[0..count]) |*event| {
             defer event.deinit(allocator);
-            capture.submitEvent(event.*);
+            if (capture.submitEvent(event.*)) |chunk| deliverChunk(options.on_chunk, chunk);
         }
     }
 
@@ -309,7 +308,7 @@ fn streamCapturePolicy(store: bool, emit_chunks: bool) StreamCapturePolicy {
     return .ignore;
 }
 
-fn waitProcessReady(allocator: std.mem.Allocator, reactor: *process_reactor.Reactor, capture: *Capture) RunError!void {
+fn waitProcessReady(allocator: std.mem.Allocator, reactor: *process_reactor.Reactor, capture: *Capture, on_chunk: ?ChunkCallback) RunError!void {
     while (!capture.isTerminal()) {
         var batch: [16]process_reactor.Event = undefined;
         const count = reactor.drainEvents(&batch);
@@ -320,10 +319,20 @@ fn waitProcessReady(allocator: std.mem.Allocator, reactor: *process_reactor.Reac
         for (batch[0..count]) |*event| {
             defer event.deinit(allocator);
             if (event.* == .ready) return;
-            capture.submitEvent(event.*);
+            if (capture.submitEvent(event.*)) |chunk| deliverChunk(on_chunk, chunk);
         }
     }
     return error.SpawnFailed;
+}
+
+const ChunkDelivery = struct {
+    kind: StreamKind,
+    bytes: []const u8,
+};
+
+fn deliverChunk(on_chunk: ?ChunkCallback, chunk: ChunkDelivery) void {
+    const cb = on_chunk orelse return;
+    cb.call(chunk.kind, chunk.bytes);
 }
 
 const CaptureOutcome = enum { none, spawn_failed, stdout_too_long, stderr_too_long, output_dropped };
@@ -336,7 +345,6 @@ const Capture = struct {
     stderr_limit: std.Io.Limit,
     stdout_policy: StreamCapturePolicy,
     stderr_policy: StreamCapturePolicy,
-    on_chunk: ?ChunkCallback,
     reactor: ?*process_reactor.Reactor = null,
     term: ?std.process.Child.Term = null,
     timed_out: bool = false,
@@ -348,7 +356,6 @@ const Capture = struct {
         stderr_limit: std.Io.Limit,
         stdout_policy: StreamCapturePolicy,
         stderr_policy: StreamCapturePolicy,
-        on_chunk: ?ChunkCallback,
     };
 
     fn init(allocator: std.mem.Allocator, config: Config) Capture {
@@ -358,7 +365,6 @@ const Capture = struct {
             .stderr_limit = config.stderr_limit,
             .stdout_policy = config.stdout_policy,
             .stderr_policy = config.stderr_policy,
-            .on_chunk = config.on_chunk,
         };
     }
 
@@ -367,16 +373,17 @@ const Capture = struct {
         self.stderr.deinit(self.allocator);
     }
 
-    fn submitEvent(self: *Capture, event: process_reactor.Event) void {
+    fn submitEvent(self: *Capture, event: process_reactor.Event) ?ChunkDelivery {
+        var delivery: ?ChunkDelivery = null;
         switch (event) {
-            .stdout => |out| if (self.stdout_policy.streams()) if (self.on_chunk) |cb| cb.call(.stdout, out.bytes),
-            .stderr => |out| if (self.stderr_policy.streams()) if (self.on_chunk) |cb| cb.call(.stderr, out.bytes),
-            .ready, .output_dropped, .exit, .spawn_failed => {},
-        }
-
-        switch (event) {
-            .stdout => |out| self.appendCaptured(.stdout, out.bytes),
-            .stderr => |out| self.appendCaptured(.stderr, out.bytes),
+            .stdout => |out| {
+                self.appendCaptured(.stdout, out.bytes);
+                if (self.stdout_policy.streams()) delivery = .{ .kind = .stdout, .bytes = out.bytes };
+            },
+            .stderr => |out| {
+                self.appendCaptured(.stderr, out.bytes);
+                if (self.stderr_policy.streams()) delivery = .{ .kind = .stderr, .bytes = out.bytes };
+            },
             .ready => {},
             .output_dropped => |dropped| {
                 _ = dropped;
@@ -390,6 +397,7 @@ const Capture = struct {
             },
             .spawn_failed => self.failure = .spawn_failed,
         }
+        return delivery;
     }
 
     fn appendCaptured(self: *Capture, kind: StreamKind, bytes: []const u8) void {
