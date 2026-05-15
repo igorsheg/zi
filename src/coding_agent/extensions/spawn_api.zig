@@ -2,6 +2,7 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 const agent_protocol = @import("../../agent/types.zig");
 const spawn_types = @import("../../spawn/types.zig");
 const spawn_mod = @import("../../spawn/spawn.zig");
@@ -14,6 +15,17 @@ const TableBuilder = lua_helpers.TableBuilder;
 const log = std.log.scoped(.zi_api);
 
 const spawn_pending_events: usize = limits.spawn_pending_events;
+
+pub const export_spawn = api_export.Export{
+    .name = "spawn",
+    .kind = .function,
+    .install = installSpawnExport,
+};
+
+fn installSpawnExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    state.pushCClosureWithUserdata(ziSpawn, runner);
+    c.lua_setfield(state.L, -2, export_spawn.name.ptr);
+}
 
 pub fn ziSpawn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;

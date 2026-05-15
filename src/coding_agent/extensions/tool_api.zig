@@ -2,12 +2,24 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const tool_def = @import("../tools/definition.zig");
 
 const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
 const log = std.log.scoped(.zi_api);
+
+pub const export_tool = api_export.Export{
+    .name = "tool",
+    .kind = .function,
+    .install = installToolExport,
+};
+
+fn installToolExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    state.pushCClosureWithUserdata(ziTool, runner);
+    c.lua_setfield(state.L, -2, export_tool.name.ptr);
+}
 
 pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const api_name = "zi.tool";

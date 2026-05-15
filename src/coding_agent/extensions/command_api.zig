@@ -2,12 +2,24 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 const command_registry = @import("registries/command_registry.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 
 const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
 const FieldReader = lua_helpers.FieldReader;
+
+pub const export_command = api_export.Export{
+    .name = "command",
+    .kind = .function,
+    .install = installCommandExport,
+};
+
+fn installCommandExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    state.pushCClosureWithUserdata(ziCommand, runner);
+    c.lua_setfield(state.L, -2, export_command.name.ptr);
+}
 
 pub fn ziCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const api_name = "zi.command";

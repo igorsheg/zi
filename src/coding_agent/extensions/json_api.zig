@@ -2,9 +2,16 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 
 const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
+
+pub const export_json = api_export.Export{
+    .name = "json",
+    .kind = .table,
+    .install = installJsonExport,
+};
 
 const json_api_limits = lua_runtime.JsonConvertLimits{
     .max_depth = 64,
@@ -13,7 +20,12 @@ const json_api_limits = lua_runtime.JsonConvertLimits{
     .max_total_string_bytes = 16 * 1024 * 1024,
 };
 
-pub fn install(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+fn installJsonExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    pushJsonTable(state, runner);
+    c.lua_setfield(state.L, -2, export_json.name.ptr);
+}
+
+fn pushJsonTable(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
     c.lua_createtable(L, 0, 2);
 
@@ -92,7 +104,7 @@ test "zi.json encode and decode round trip Lua values" {
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 1);
     defer runner.deinit();
-    install(&state, &runner);
+    pushJsonTable(&state, &runner);
     c.lua_setglobal(state.L, "zi_json");
 
     try state.doString(
@@ -111,7 +123,7 @@ test "zi.json decode maps null fields to nil" {
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 1);
     defer runner.deinit();
-    install(&state, &runner);
+    pushJsonTable(&state, &runner);
     c.lua_setglobal(state.L, "zi_json");
 
     try state.doString(
@@ -127,7 +139,7 @@ test "zi.json encode rejects unsupported Lua values" {
     defer state.deinit();
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 1);
     defer runner.deinit();
-    install(&state, &runner);
+    pushJsonTable(&state, &runner);
     c.lua_setglobal(state.L, "zi_json");
 
     try state.doString(

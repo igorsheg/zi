@@ -2,12 +2,35 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 const ai = @import("../../ai/root.zig");
 const oauth_mod = @import("../auth/oauth.zig");
 
 const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
 const FieldReader = lua_helpers.FieldReader;
+
+pub const export_provider = api_export.Export{
+    .name = "provider",
+    .kind = .function,
+    .install = installProviderExport,
+};
+
+pub const export_unprovider = api_export.Export{
+    .name = "unprovider",
+    .kind = .function,
+    .install = installUnproviderExport,
+};
+
+fn installProviderExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    state.pushCClosureWithUserdata(ziProvider, runner);
+    c.lua_setfield(state.L, -2, export_provider.name.ptr);
+}
+
+fn installUnproviderExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    state.pushCClosureWithUserdata(ziUnprovider, runner);
+    c.lua_setfield(state.L, -2, export_unprovider.name.ptr);
+}
 
 const RegisterProviderError = error{
     MissingName,

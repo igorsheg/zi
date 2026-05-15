@@ -2,10 +2,22 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 
 const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
 const TableBuilder = lua_helpers.TableBuilder;
+
+pub const export_system = api_export.Export{
+    .name = "system",
+    .kind = .function,
+    .install = installSystemExport,
+};
+
+fn installSystemExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    state.pushCClosureWithUserdata(ziSystem, runner);
+    c.lua_setfield(state.L, -2, export_system.name.ptr);
+}
 
 pub fn ziSystem(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;

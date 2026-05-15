@@ -2,10 +2,22 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 const event_registry = @import("registries/event_registry.zig");
 
 const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
+
+pub const export_on = api_export.Export{
+    .name = "on",
+    .kind = .function,
+    .install = installOnExport,
+};
+
+fn installOnExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    state.pushCClosureWithUserdata(ziOn, runner);
+    c.lua_setfield(state.L, -2, export_on.name.ptr);
+}
 
 pub fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;

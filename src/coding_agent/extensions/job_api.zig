@@ -2,6 +2,7 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 const extension_ui = @import("ui.zig");
 const limits = @import("limits.zig");
 const zio = @import("../../zio/root.zig");
@@ -10,7 +11,18 @@ const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
 const TableBuilder = lua_helpers.TableBuilder;
 
-pub fn install(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+pub const export_job = api_export.Export{
+    .name = "job",
+    .kind = .table,
+    .install = installJobExport,
+};
+
+fn installJobExport(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
+    pushJobTable(state, runner);
+    c.lua_setfield(state.L, -2, export_job.name.ptr);
+}
+
+fn pushJobTable(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
     c.lua_createtable(L, 0, 4);
     state.pushCClosureWithUserdata(ziJobStart, runner);

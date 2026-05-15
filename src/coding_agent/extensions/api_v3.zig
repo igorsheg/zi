@@ -1,6 +1,7 @@
 const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const runner_mod = @import("runner.zig");
+const api_export = @import("api_export.zig");
 const command_api = @import("command_api.zig");
 const tool_api = @import("tool_api.zig");
 const provider_api = @import("provider_api.zig");
@@ -12,54 +13,32 @@ const json_api = @import("json_api.zig");
 
 const c = lua_runtime.c;
 
+pub const Export = api_export.Export;
+pub const ExportKind = api_export.Kind;
+
+pub const exports = [_]Export{
+    command_api.export_command,
+    tool_api.export_tool,
+    provider_api.export_provider,
+    provider_api.export_unprovider,
+    event_api.export_on,
+    system_api.export_system,
+    spawn_api.export_spawn,
+    job_api.export_job,
+    json_api.export_json,
+};
+
 pub fn install(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     const L = state.L;
-    c.lua_createtable(L, 0, 9);
+    c.lua_createtable(L, 0, exports.len);
 
-    installRegistrationGroup(state, runner);
-    installProcessGroup(state, runner);
-    installDataGroup(state, runner);
+    for (exports) |exp| {
+        const before = c.lua_gettop(L);
+        exp.install(state, runner);
+        std.debug.assert(c.lua_gettop(L) == before);
+    }
 
     c.lua_setglobal(L, "zi");
-}
-
-fn installRegistrationGroup(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
-    const L = state.L;
-
-    state.pushCClosureWithUserdata(command_api.ziCommand, runner);
-    c.lua_setfield(L, -2, "command");
-
-    state.pushCClosureWithUserdata(tool_api.ziTool, runner);
-    c.lua_setfield(L, -2, "tool");
-
-    state.pushCClosureWithUserdata(provider_api.ziProvider, runner);
-    c.lua_setfield(L, -2, "provider");
-
-    state.pushCClosureWithUserdata(provider_api.ziUnprovider, runner);
-    c.lua_setfield(L, -2, "unprovider");
-
-    state.pushCClosureWithUserdata(event_api.ziOn, runner);
-    c.lua_setfield(L, -2, "on");
-}
-
-fn installProcessGroup(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
-    const L = state.L;
-
-    state.pushCClosureWithUserdata(system_api.ziSystem, runner);
-    c.lua_setfield(L, -2, "system");
-
-    state.pushCClosureWithUserdata(spawn_api.ziSpawn, runner);
-    c.lua_setfield(L, -2, "spawn");
-
-    job_api.install(state, runner);
-    c.lua_setfield(L, -2, "job");
-}
-
-fn installDataGroup(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
-    const L = state.L;
-
-    json_api.install(state, runner);
-    c.lua_setfield(L, -2, "json");
 }
 
 const testing = std.testing;
@@ -97,44 +76,30 @@ test "api v3 installs exactly the public zi global groups" {
     defer runner.deinit();
 
     install(&state, &runner);
+
+    const L = state.L;
+    _ = c.lua_getglobal(L, "zi");
+    defer c.lua_pop(L, 1);
+    try testing.expectEqual(c.LUA_TTABLE, c.lua_type(L, -1));
+
+    for (exports) |exp| {
+        _ = c.lua_getfield(L, -1, exp.name.ptr);
+        defer c.lua_pop(L, 1);
+        try testing.expectEqual(expectedLuaType(exp.kind), c.lua_type(L, -1));
+    }
+
+    try expectNoExtraZiGlobals(L, -1);
+
     try state.doString(
-        \\local expected = {
-        \\  command = true,
-        \\  tool = true,
-        \\  provider = true,
-        \\  unprovider = true,
-        \\  on = true,
-        \\  system = true,
-        \\  spawn = true,
-        \\  job = true,
-        \\  json = true,
-        \\}
-        \\for k, _ in pairs(zi) do
-        \\  assert(expected[k], "unexpected zi global: " .. tostring(k))
-        \\end
-        \\for k, _ in pairs(expected) do
-        \\  assert(zi[k] ~= nil, "missing zi global: " .. tostring(k))
-        \\end
-        \\assert(type(zi.command) == "function")
-        \\assert(type(zi.tool) == "function")
-        \\assert(type(zi.provider) == "function")
-        \\assert(type(zi.unprovider) == "function")
-        \\assert(type(zi.on) == "function")
-        \\assert(type(zi.system) == "function")
-        \\assert(type(zi.spawn) == "function")
-        \\assert(type(zi.job) == "table")
         \\assert(type(zi.job.start) == "function")
         \\assert(type(zi.job.write) == "function")
         \\assert(type(zi.job.stop) == "function")
-        \\assert(type(zi.json) == "table")
+        \\assert(type(zi.job.next) == "function")
         \\assert(type(zi.json.encode) == "function")
         \\assert(type(zi.json.decode) == "function")
         \\local expected_json = { encode = true, decode = true }
         \\for k, _ in pairs(zi.json) do
         \\  assert(expected_json[k], "unexpected zi.json field: " .. tostring(k))
-        \\end
-        \\for k, _ in pairs(expected_json) do
-        \\  assert(zi.json[k] ~= nil, "missing zi.json field: " .. tostring(k))
         \\end
         \\local legacy = {
         \\  "register_" .. "tool",
@@ -148,6 +113,32 @@ test "api v3 installs exactly the public zi global groups" {
         \\  assert(zi[name] == nil, "legacy API exposed: " .. name)
         \\end
     , "api_v3_perimeter");
+}
+
+fn expectedLuaType(kind: ExportKind) c_int {
+    return switch (kind) {
+        .function => c.LUA_TFUNCTION,
+        .table => c.LUA_TTABLE,
+    };
+}
+
+fn expectNoExtraZiGlobals(L: *c.lua_State, table_idx: c_int) !void {
+    const abs_idx = c.lua_absindex(L, table_idx);
+    c.lua_pushnil(L);
+    while (c.lua_next(L, abs_idx) != 0) {
+        defer c.lua_pop(L, 1);
+        try testing.expectEqual(c.LUA_TSTRING, c.lua_type(L, -2));
+        var len: usize = 0;
+        const ptr = c.lua_tolstring(L, -2, &len) orelse return error.InvalidZiGlobalName;
+        try testing.expect(exportNameInManifest(ptr[0..len]));
+    }
+}
+
+fn exportNameInManifest(name: []const u8) bool {
+    for (exports) |exp| {
+        if (std.mem.eql(u8, exp.name, name)) return true;
+    }
+    return false;
 }
 
 test "api v3 json group reports v3 diagnostic names" {
