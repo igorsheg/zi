@@ -3,6 +3,7 @@ const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const api_export = @import("api_export.zig");
+const lua_schema = @import("lua_schema.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 const tool_def = @import("../tools/definition.zig");
 
@@ -46,6 +47,7 @@ pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.InvalidPromptSnippet => "field 'prompt_snippet' must be a string",
             error.InvalidPromptGuidelines => "field 'prompt_guidelines' must be an array of strings",
             error.InvalidParameters => "field 'parameters' must be a table",
+            error.UnknownField => "spec contains an unknown field",
             error.OutOfMemory => "out of memory",
             error.UnsupportedLuaType => "parameter schema contains an unsupported value",
             error.InvalidUtf8 => "parameter schema contains invalid UTF-8",
@@ -87,6 +89,7 @@ const BuildError = error{
     InvalidPromptSnippet,
     InvalidPromptGuidelines,
     InvalidParameters,
+    UnknownField,
     InvalidExecute,
     OutOfMemory,
     UnsupportedLuaType,
@@ -98,52 +101,60 @@ fn buildExtensionTool(
     runner: *runner_mod.ExtensionRunner,
 ) BuildError!tool_registry.ToolDefinition {
     const a = runner.allocator;
+    const spec = lua_schema.Table.init(Lua.init(L), a, 1);
 
-    const name = try requireString(L, 1, "name", a, error.MissingName, error.InvalidName);
+    spec.rejectUnknownFields(&.{
+        "name",
+        "label",
+        "description",
+        "display",
+        "parameters",
+        "execute",
+        "prompt_snippet",
+        "prompt_guidelines",
+    }) catch |err| return mapSchemaError(err, error.UnknownField, error.UnknownField);
+
+    const name = spec.requiredString("name") catch |err| return mapSchemaError(err, error.MissingName, error.InvalidName);
     errdefer a.free(name);
 
-    const description = try requireString(L, 1, "description", a, error.MissingDescription, error.InvalidDescription);
+    const description = spec.requiredString("description") catch |err| return mapSchemaError(err, error.MissingDescription, error.InvalidDescription);
     errdefer a.free(description);
 
     const label = blk: {
-        const opt = try optionalString(L, 1, "label", a, error.InvalidLabel);
+        const opt = spec.optionalString("label") catch |err| return mapSchemaError(err, error.InvalidLabel, error.InvalidLabel);
         if (opt) |s| break :blk s;
-        break :blk try a.dupe(u8, name);
+        break :blk a.dupe(u8, name) catch return error.OutOfMemory;
     };
     errdefer a.free(label);
 
     const display_call = try optionalDisplayCall(L, 1, a, error.InvalidDisplay);
     errdefer if (display_call) |field| a.free(field);
 
-    const prompt_snippet = try optionalString(L, 1, "prompt_snippet", a, error.InvalidPromptSnippet);
+    const prompt_snippet = spec.optionalString("prompt_snippet") catch |err| return mapSchemaError(err, error.InvalidPromptSnippet, error.InvalidPromptSnippet);
     errdefer if (prompt_snippet) |s| a.free(s);
 
-    const prompt_guidelines = try optionalStringArray(L, 1, "prompt_guidelines", a, error.InvalidPromptGuidelines);
+    const prompt_guidelines = spec.optionalStringArray("prompt_guidelines") catch |err| return mapSchemaError(err, error.InvalidPromptGuidelines, error.InvalidPromptGuidelines);
     errdefer freeStringArray(a, prompt_guidelines);
 
-    _ = c.lua_getfield(L, 1, "parameters");
-    defer c.lua_pop(L, 1);
-    if (c.lua_type(L, -1) == c.LUA_TNIL) return error.MissingParameters;
-    if (c.lua_type(L, -1) != c.LUA_TTABLE) return error.InvalidParameters;
-    var parameters_budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
-    const parameters = lua_runtime.luaValueToJsonLimited(L, -1, a, &parameters_budget) catch |err| switch (err) {
-        error.LimitExceeded => return error.InvalidParameters,
-        else => |e| return e,
+    const parameters = spec.requiredJsonTable("parameters", lua_runtime.default_json_convert_limits) catch |err| switch (err) {
+        error.MissingField => return error.MissingParameters,
+        error.WrongType, error.LimitExceeded => return error.InvalidParameters,
+        error.UnsupportedLuaType => return error.UnsupportedLuaType,
+        error.InvalidUtf8 => return error.InvalidUtf8,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidParameters,
     };
     errdefer lua_runtime.freeJsonValue(a, parameters);
 
-    _ = c.lua_getfield(L, 1, "execute");
-    if (c.lua_type(L, -1) == c.LUA_TNIL) {
-        c.lua_pop(L, 1);
-        return error.MissingExecute;
-    }
-    if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
-        c.lua_pop(L, 1);
-        return error.InvalidExecute;
-    }
-    const execute_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
+    var execute_ref = spec.requiredFunctionRef("execute") catch |err| switch (err) {
+        error.MissingField => return error.MissingExecute,
+        error.WrongType => return error.InvalidExecute,
+        error.InvalidRegistryRef, error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidExecute,
+    };
+    errdefer execute_ref.release(Lua.init(L));
 
-    return .{
+    const result = tool_registry.ToolDefinition{
         .name = name,
         .label = label,
         .description = description,
@@ -151,9 +162,21 @@ fn buildExtensionTool(
         .parameters = parameters,
         .prompt_snippet = prompt_snippet,
         .prompt_guidelines = prompt_guidelines,
-        .impl = .{ .lua = execute_ref },
+        .impl = .{ .lua = execute_ref.value },
         .source = currentRegistrationSource(runner),
         .owned = true,
+    };
+    execute_ref.value = c.LUA_NOREF;
+    return result;
+}
+
+fn mapSchemaError(err: lua_schema.Error, missing_err: BuildError, invalid_err: BuildError) BuildError {
+    return switch (err) {
+        error.MissingField => missing_err,
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidUtf8 => error.InvalidUtf8,
+        error.UnsupportedLuaType => error.UnsupportedLuaType,
+        else => invalid_err,
     };
 }
 
@@ -182,90 +205,6 @@ fn optionalDisplayCall(
 
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {
     tool_def.freeOwned(allocator, tool);
-}
-
-fn requireString(
-    L: *c.lua_State,
-    table_idx: c_int,
-    field: [:0]const u8,
-    allocator: std.mem.Allocator,
-    missing_err: BuildError,
-    invalid_err: BuildError,
-) BuildError![]const u8 {
-    _ = c.lua_getfield(L, table_idx, field.ptr);
-    defer c.lua_pop(L, 1);
-
-    switch (c.lua_type(L, -1)) {
-        c.LUA_TNIL => return missing_err,
-        c.LUA_TSTRING => {
-            var len: usize = 0;
-            const ptr = c.lua_tolstring(L, -1, &len) orelse return error.InvalidUtf8;
-            return allocator.dupe(u8, ptr[0..len]) catch return error.OutOfMemory;
-        },
-        else => return invalid_err,
-    }
-}
-
-fn optionalString(
-    L: *c.lua_State,
-    table_idx: c_int,
-    field: [:0]const u8,
-    allocator: std.mem.Allocator,
-    invalid_err: BuildError,
-) BuildError!?[]const u8 {
-    _ = c.lua_getfield(L, table_idx, field.ptr);
-    defer c.lua_pop(L, 1);
-
-    switch (c.lua_type(L, -1)) {
-        c.LUA_TNIL => return null,
-        c.LUA_TSTRING => {
-            var len: usize = 0;
-            const ptr = c.lua_tolstring(L, -1, &len) orelse return error.InvalidUtf8;
-            return allocator.dupe(u8, ptr[0..len]) catch return error.OutOfMemory;
-        },
-        else => return invalid_err,
-    }
-}
-
-fn optionalStringArray(
-    L: *c.lua_State,
-    table_idx: c_int,
-    field: [:0]const u8,
-    allocator: std.mem.Allocator,
-    invalid_err: BuildError,
-) BuildError![]const []const u8 {
-    _ = c.lua_getfield(L, table_idx, field.ptr);
-    defer c.lua_pop(L, 1);
-
-    switch (c.lua_type(L, -1)) {
-        c.LUA_TNIL => return &.{},
-        c.LUA_TTABLE => {},
-        else => return invalid_err,
-    }
-
-    const len = c.lua_rawlen(L, -1);
-    if (len == 0) return &.{};
-
-    const arr = allocator.alloc([]const u8, len) catch return error.OutOfMemory;
-    var built: usize = 0;
-    errdefer {
-        for (arr[0..built]) |s| allocator.free(s);
-        allocator.free(arr);
-    }
-
-    var i: c.lua_Integer = 1;
-    while (@as(usize, @intCast(i)) <= len) : (i += 1) {
-        _ = c.lua_rawgeti(L, -1, i);
-        defer c.lua_pop(L, 1);
-        if (c.lua_type(L, -1) != c.LUA_TSTRING) return invalid_err;
-
-        var s_len: usize = 0;
-        const ptr = c.lua_tolstring(L, -1, &s_len) orelse return error.InvalidUtf8;
-        arr[built] = allocator.dupe(u8, ptr[0..s_len]) catch return error.OutOfMemory;
-        built += 1;
-    }
-
-    return arr;
 }
 
 fn freeStringArray(allocator: std.mem.Allocator, arr: []const []const u8) void {

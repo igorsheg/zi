@@ -3,12 +3,12 @@ const lua_runtime = @import("lua_runtime.zig");
 const lua_helpers = @import("lua_helpers.zig");
 const runner_mod = @import("runner.zig");
 const api_export = @import("api_export.zig");
+const lua_schema = @import("lua_schema.zig");
 const command_registry = @import("registries/command_registry.zig");
 const tool_registry = @import("registries/tool_registry.zig");
 
 const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
-const FieldReader = lua_helpers.FieldReader;
 
 pub const export_command = api_export.Export{
     .name = "command",
@@ -36,6 +36,7 @@ pub fn ziCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return luaApiError(L, api_name, switch (err) {
             error.MissingName => "missing required field 'name' (string)",
             error.InvalidDescription => "field 'description' must be a string",
+            error.UnknownField => "spec contains an unknown field",
             error.MissingHandler => "missing required field 'handler' (function)",
             error.InvalidHandler => "field 'handler' must be a function",
             error.OutOfMemory => "out of memory",
@@ -63,6 +64,7 @@ const RegisterCommandError = error{
     OutOfMemory,
     MissingName,
     InvalidDescription,
+    UnknownField,
     MissingHandler,
     InvalidHandler,
 };
@@ -72,42 +74,41 @@ fn buildCommandDef(
     runner: *runner_mod.ExtensionRunner,
 ) RegisterCommandError!command_registry.CommandDef {
     const a = runner.allocator;
-    const fields = FieldReader.init(Lua.init(L), 1);
+    const spec = lua_schema.Table.init(Lua.init(L), a, 1);
 
-    var name: ?[]const u8 = null;
-    var description: ?[]const u8 = null;
-    var handler_ref = lua_helpers.RegistryRef{};
-    defer {
-        if (name) |n| a.free(n);
-        if (description) |d| a.free(d);
-        handler_ref.release(Lua.init(L));
-    }
+    spec.rejectUnknownFields(&.{ "name", "description", "handler" }) catch |err| return mapSchemaError(err, error.UnknownField, error.UnknownField);
 
-    name = fields.requiredString(a, "name") catch return error.MissingName;
-    description = fields.stringOrDefault(a, "description", "") catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.InvalidDescription,
+    const name = spec.requiredString("name") catch |err| return mapSchemaError(err, error.MissingName, error.MissingName);
+    errdefer a.free(name);
+
+    const description = (spec.optionalString("description") catch |err| return mapSchemaError(err, error.InvalidDescription, error.InvalidDescription)) orelse a.dupe(u8, "") catch return error.OutOfMemory;
+    errdefer a.free(description);
+
+    var handler_ref = spec.requiredFunctionRef("handler") catch |err| switch (err) {
+        error.MissingField => return error.MissingHandler,
+        error.WrongType => return error.InvalidHandler,
+        error.InvalidRegistryRef, error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidHandler,
     };
-    handler_ref = fields.functionRef("handler") catch |err| return switch (err) {
-        error.MissingField => error.MissingHandler,
-        error.InvalidRegistryRef => error.OutOfMemory,
-        else => error.InvalidHandler,
-    };
+    errdefer handler_ref.release(Lua.init(L));
 
-    const owned_name = name.?;
     const result = command_registry.CommandDef{
-        .name = owned_name,
-        .visible_name = a.dupe(u8, owned_name) catch {
-            return error.OutOfMemory;
-        },
-        .description = description.?,
+        .name = name,
+        .visible_name = a.dupe(u8, name) catch return error.OutOfMemory,
+        .description = description,
         .lua_ref = handler_ref.value,
         .source = currentRegistrationSource(runner),
     };
-    name = null;
-    description = null;
     handler_ref.value = c.LUA_NOREF;
     return result;
+}
+
+fn mapSchemaError(err: lua_schema.Error, missing_err: RegisterCommandError, invalid_err: RegisterCommandError) RegisterCommandError {
+    return switch (err) {
+        error.MissingField => missing_err,
+        error.OutOfMemory => error.OutOfMemory,
+        else => invalid_err,
+    };
 }
 
 fn currentRegistrationSource(runner: *const runner_mod.ExtensionRunner) tool_registry.RegistrationSource {
