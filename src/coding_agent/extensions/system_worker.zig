@@ -229,3 +229,49 @@ test "system worker deinit cancels active command" {
     try testing.expect(result == .system);
     try testing.expect(result.system == .err);
 }
+
+test "system worker pool runs independent commands concurrently" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const Sink = struct {
+        mutex: std.Io.Mutex = .init,
+        count: usize = 0,
+
+        fn submit(ptr: *anyopaque, _: extension_runner.AsyncOpId, result: extension_runner.AsyncResult) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutex.lockUncancelable(std.Options.debug_io);
+            defer self.mutex.unlock(std.Options.debug_io);
+            var owned = result;
+            owned.deinit(std.testing.allocator);
+            self.count += 1;
+            return true;
+        }
+    };
+
+    var controller_a = zio.cancel.Source{};
+    var controller_b = zio.cancel.Source{};
+    const signal_a = controller_a.beginRun();
+    const signal_b = controller_b.beginRun();
+    var sink = Sink{};
+    var worker = try SystemWorker.init(allocator, std.Options.debug_io);
+    worker.setResultSink(.{ .ptr = @ptrCast(&sink), .submit = &Sink.submit });
+    try worker.start();
+
+    const argv_a = try allocator.dupe([]const u8, &.{ try allocator.dupe(u8, "/bin/sh"), try allocator.dupe(u8, "-c"), try allocator.dupe(u8, "sleep 10") });
+    const argv_b = try allocator.dupe([]const u8, &.{ try allocator.dupe(u8, "/bin/sh"), try allocator.dupe(u8, "-c"), try allocator.dupe(u8, "sleep 10") });
+    try worker.submit(.{ .id = 101, .system = .{ .argv = argv_a, .signal = signal_a } });
+    try worker.submit(.{ .id = 102, .system = .{ .argv = argv_b, .signal = signal_b } });
+
+    var spins: usize = 0;
+    while ((worker.worker.workers[0].state().current_request == null or worker.worker.workers[1].state().current_request == null) and spins < 100) : (spins += 1) {
+        std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try testing.expect(worker.worker.workers[0].state().current_request != null);
+    try testing.expect(worker.worker.workers[1].state().current_request != null);
+
+    worker.worker.stopMode(.cancel_current);
+    try testing.expect(signal_a.isAborted());
+    try testing.expect(signal_b.isAborted());
+    worker.deinit();
+}

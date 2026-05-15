@@ -360,3 +360,43 @@ test "Worker tracks current request while handler runs" {
     try std.testing.expectEqual(@as(?usize, null), worker.state().current_request);
     try std.testing.expectEqualStrings("", worker.state().current_label);
 }
+
+test "Pool runs independent requests concurrently" {
+    const Request = struct { value: u8 };
+    const Handler = struct {
+        active: *std.atomic.Value(u32),
+        max_active: *std.atomic.Value(u32),
+        release: *std.atomic.Value(bool),
+
+        fn handle(self: *@This(), _: *Request) void {
+            const current = self.active.fetchAdd(1, .acq_rel) + 1;
+            var observed = self.max_active.load(.acquire);
+            while (current > observed) {
+                if (self.max_active.cmpxchgWeak(observed, current, .acq_rel, .acquire)) |next| {
+                    observed = next;
+                } else break;
+            }
+            while (!self.release.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+            _ = self.active.fetchSub(1, .acq_rel);
+        }
+    };
+
+    var active = std.atomic.Value(u32).init(0);
+    var max_active = std.atomic.Value(u32).init(0);
+    var release = std.atomic.Value(bool).init(false);
+    var pool = try Pool(Request, Handler, .{ .policy = .{ .bounded = .{ .capacity = 1, .on_full = .reject } }, .wakeup = .pipe, .cross_thread = true }, 2).init(std.testing.allocator, .{ .active = &active, .max_active = &max_active, .release = &release });
+    defer pool.deinit();
+
+    try pool.start();
+    try std.testing.expectEqual(.ok, pool.trySend(.{ .value = 1 }));
+    try std.testing.expectEqual(.ok, pool.trySend(.{ .value = 2 }));
+
+    var spins: usize = 0;
+    while (max_active.load(.acquire) < 2 and spins < 10_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqual(@as(u32, 2), max_active.load(.acquire));
+    release.store(true, .release);
+}

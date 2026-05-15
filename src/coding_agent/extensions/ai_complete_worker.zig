@@ -292,3 +292,74 @@ test "ai completion worker stop cancels active provider request" {
     try testing.expect(result.ai_complete.status == .err);
     worker.deinit();
 }
+
+test "ai completion worker pool runs independent provider requests concurrently" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var faux_provider_a = ai.faux.FauxProvider.init(allocator);
+    defer faux_provider_a.deinit();
+    faux_provider_a.setBlockUntilCancel(true);
+    var faux_provider_b = ai.faux.FauxProvider.init(allocator);
+    defer faux_provider_b.deinit();
+    faux_provider_b.setBlockUntilCancel(true);
+
+    const Queue = queue_mod.Queue(extension_runner.AsyncResult, .{
+        .cleanup = .deinit,
+        .policy = .{ .bounded = .{ .capacity = 4, .on_full = .reject } },
+        .wakeup = .pipe,
+    });
+    const Sink = struct {
+        queue: *Queue,
+
+        fn submit(ptr: *anyopaque, _: extension_runner.AsyncOpId, result: extension_runner.AsyncResult) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return switch (self.queue.trySend(result)) {
+                .ok, .dropped => true,
+                .full, .closed, .oom => |rejected| {
+                    var failed = rejected;
+                    failed.deinit(std.testing.allocator);
+                    return false;
+                },
+            };
+        }
+    };
+
+    var controller_a = zio.cancel.Source{};
+    var controller_b = zio.cancel.Source{};
+    const signal_a = controller_a.beginRun();
+    const signal_b = controller_b.beginRun();
+    var queue = try Queue.init(allocator);
+    defer queue.deinit();
+    var sink = Sink{ .queue = &queue };
+    var worker = try AiCompleteWorker.init(allocator);
+    worker.setResultSink(.{ .ptr = @ptrCast(&sink), .submit = &Sink.submit });
+    try worker.start();
+
+    try worker.submit(.{ .id = 201, .provider = faux_provider_a.provider(), .model = ai.faux.fauxModel(), .prompt = try allocator.dupe(u8, "block-a"), .signal = signal_a });
+    try worker.submit(.{ .id = 202, .provider = faux_provider_b.provider(), .model = ai.faux.fauxModel(), .prompt = try allocator.dupe(u8, "block-b"), .signal = signal_b });
+
+    var spins: usize = 0;
+    while ((worker.worker.workers[0].state().current_request == null or worker.worker.workers[1].state().current_request == null) and spins < 100) : (spins += 1) {
+        std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try testing.expect(worker.worker.workers[0].state().current_request != null);
+    try testing.expect(worker.worker.workers[1].state().current_request != null);
+    worker.worker.stopMode(.cancel_current);
+    try testing.expect(signal_a.isAborted());
+    try testing.expect(signal_b.isAborted());
+
+    _ = try queue.waitReadable(5_000);
+    var out: [2]extension_runner.AsyncResult = undefined;
+    var count: usize = 0;
+    while (count < 2) {
+        count += queue.drainInto(out[count..]);
+        if (count < 2) _ = try queue.waitReadable(5_000);
+    }
+    for (out[0..count]) |*result| {
+        defer result.deinit(allocator);
+        try testing.expect(result.* == .ai_complete);
+        try testing.expect(result.ai_complete.status == .err);
+    }
+    worker.deinit();
+}
