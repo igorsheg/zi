@@ -15,7 +15,12 @@ const ExtensionRunnerRef = extension_runner_mod.ExtensionRunnerRef;
 
 pub const agentEventSink = agentEventSinkFromRunnerRef;
 pub const beforeToolCall = beforeToolCallFromRunnerRef;
-pub const afterToolCall = afterToolCallFromRunnerRef;
+pub const afterToolCall = afterToolCallFromToolHookCtx;
+
+pub const ToolHookCtx = struct {
+    runner_ref: *ExtensionRunnerRef,
+    builtin_ctx: ?*@import("../tools/util.zig").BuiltinCtx,
+};
 
 pub fn bind(self: *AgentSession, runner: *ExtensionRunner) void {
     if (runner.isBound()) return;
@@ -90,13 +95,18 @@ fn beforeToolCallFromRunnerRef(
     return event_bridge.beforeToolCall(ctx_arg, signal, @ptrCast(runner));
 }
 
-fn afterToolCallFromRunnerRef(
+fn afterToolCallFromToolHookCtx(
     ctx_arg: protocol.AfterToolCallContext,
     signal: @import("../../zio/root.zig").cancel.Token,
     ctx: ?*anyopaque,
 ) ?protocol.AfterToolCallResult {
-    const ref: *ExtensionRunnerRef = @ptrCast(@alignCast(ctx.?));
-    const runner = ref.current orelse return null;
+    const hook_ctx: *ToolHookCtx = @ptrCast(@alignCast(ctx.?));
+    if (hook_ctx.builtin_ctx) |builtin| {
+        builtin.observation_events.drainApply(&builtin.observations) catch |err| {
+            std.log.scoped(.zi_tools).warn("observation event apply failed: {s}", .{@errorName(err)});
+        };
+    }
+    const runner = hook_ctx.runner_ref.current orelse return null;
     return event_bridge.afterToolCall(ctx_arg, signal, @ptrCast(runner));
 }
 

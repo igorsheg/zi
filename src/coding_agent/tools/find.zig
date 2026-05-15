@@ -159,5 +159,13 @@ fn executeSync(
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "find alloc failed");
-    return util.ownedTextResult(allocator, out, false);
+    var details_obj: std.json.ObjectMap = .{};
+    errdefer details_obj.deinit(allocator);
+    util.jsonPutString(&details_obj, allocator, "pattern", pattern) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "total", @intCast(total)) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "offset", @intCast(offset)) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "limit", @intCast(limit)) catch return util.ownedTextResult(allocator, out, false);
+    var result = util.ownedTextResult(allocator, out, false);
+    result.details = .{ .object = details_obj };
+    return result;
 }

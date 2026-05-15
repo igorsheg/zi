@@ -5,6 +5,8 @@ const util = @import("util.zig");
 const output_buffer = @import("output_buffer.zig");
 const image = @import("../../image/root.zig");
 const zio_fs = @import("../../zio/root.zig").file;
+const anchors = @import("anchors.zig");
+const observations = @import("observations.zig");
 
 const MAX_LINES: usize = 500;
 const MAX_FILE_BYTES: usize = util.Limits.text_result_bytes;
@@ -22,7 +24,7 @@ const DESCRIPTION =
     "- By default, this tool returns the first 500 lines. To read more, call it multiple times with different read_ranges.\n" ++
     "- Use the Grep tool to find specific content in large files or files with long lines.\n" ++
     "- If you are unsure of the correct file path, use the glob tool to look up filenames by glob pattern.\n" ++
-    "- The contents are returned with each line prefixed by its line number. For example, if a file has contents \"abc\\n\", you will receive \"1: abc\\n\". For directories, entries are returned one per line (without line numbers) with a trailing \"/\" for subdirectories.\n" ++
+    "- Text file lines are returned with edit anchors in the form LINE:HASH: text. Use these anchors with the edit tool. For directories, entries are returned one per line (without line numbers) with a trailing \"/\" for subdirectories.\n" ++
     "- This tool can read images (such as PNG, JPEG, and GIF files) and present them to the model visually.\n" ++
     "- When possible, call this tool in parallel for all files you will want to read.\n" ++
     "      - Avoid tiny repeated slices (e.g., 50‑line chunks). If you need more context from the same file, read a larger range or the full default window instead.";
@@ -93,7 +95,7 @@ fn executeSync(
         return readImage(allocator, resolved, mime, .{ .auto_resize = ctx.image_auto_resize });
     }
 
-    return readTextFile(allocator, resolved, util.getIntPair(args, "read_range"));
+    return readTextFile(allocator, ctx, resolved, util.getIntPair(args, "read_range"));
 }
 
 fn sniffImageMime(path: []const u8) !?image.Mime {
@@ -203,7 +205,17 @@ fn readDirectory(allocator: std.mem.Allocator, path: []const u8) protocol.AgentT
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "directory listing alloc failed");
-    return util.ownedTextResult(allocator, out, false);
+    var details_obj: std.json.ObjectMap = .{};
+    errdefer details_obj.deinit(allocator);
+    util.jsonPutString(&details_obj, allocator, "kind", "directory") catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutString(&details_obj, allocator, "path", path) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutBool(&details_obj, allocator, "raw_filesystem_listing", true) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "entries_returned", @intCast(@min(names.items.len, MAX_DIR_ENTRIES))) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "entries_scanned", @intCast(scanned)) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutBool(&details_obj, allocator, "scan_stopped", scanned >= MAX_DIR_SCAN_ENTRIES) catch return util.ownedTextResult(allocator, out, false);
+    var result = util.ownedTextResult(allocator, out, false);
+    result.details = .{ .object = details_obj };
+    return result;
 }
 
 fn lessThanStrings(_: void, a: []const u8, b: []const u8) bool {
@@ -212,6 +224,7 @@ fn lessThanStrings(_: void, a: []const u8, b: []const u8) bool {
 
 fn readTextFile(
     allocator: std.mem.Allocator,
+    ctx: *util.BuiltinCtx,
     path: []const u8,
     range: ?[2]i64,
 ) protocol.AgentToolResult {
@@ -219,6 +232,8 @@ fn readTextFile(
         return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
     defer input.deinit(allocator);
     const raw = input.bytes();
+    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch null;
+    if (stat) |s| ctx.observation_events.recordBytes(allocator, path, s, raw, .read) catch {};
 
     var total_lines: usize = 1;
     for (raw) |byte| {
@@ -251,13 +266,16 @@ fn readTextFile(
             bytes_written += 1;
         }
         first = false;
+        const anchor_line = std.mem.trimEnd(u8, line, "\r");
         if (line.len > MAX_LINE_BYTES) {
             const kept = line[0..MAX_LINE_BYTES];
-            aw.writer.print("{d}: {s}... (line truncated)", .{ line_no, kept }) catch break;
-            bytes_written += std.fmt.count("{d}: ", .{line_no}) + kept.len + "... (line truncated)".len;
+            anchors.write(&aw.writer, line_no, anchor_line) catch break;
+            aw.writer.print(" {s}... (line truncated)", .{kept}) catch break;
+            bytes_written += std.fmt.count("{d}:0000: ", .{line_no}) + kept.len + "... (line truncated)".len;
         } else {
-            aw.writer.print("{d}: {s}", .{ line_no, line }) catch break;
-            bytes_written += std.fmt.count("{d}: ", .{line_no}) + line.len;
+            anchors.write(&aw.writer, line_no, anchor_line) catch break;
+            aw.writer.print(" {s}", .{line}) catch break;
+            bytes_written += std.fmt.count("{d}:0000: ", .{line_no}) + line.len;
         }
         if (bytes_written >= MAX_FILE_BYTES) {
             aw.writer.writeAll("\n... [output truncated, 64KB limit reached] ...") catch {};
@@ -274,7 +292,19 @@ fn readTextFile(
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "read alloc failed");
-    return util.ownedTextResult(allocator, out, false);
+    var details_obj: std.json.ObjectMap = .{};
+    errdefer details_obj.deinit(allocator);
+    util.jsonPutString(&details_obj, allocator, "kind", "file") catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutString(&details_obj, allocator, "path", path) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "start_line", @intCast(start)) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "end_line", @intCast(end)) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "total_lines", @intCast(total_lines)) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutBool(&details_obj, allocator, "truncated", bytes_written >= MAX_FILE_BYTES or end < total_lines) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutString(&details_obj, allocator, "line_hash_scheme", "zi-line-v1") catch return util.ownedTextResult(allocator, out, false);
+    if (ctx.observations.getHash(path)) |hash| util.jsonPutOwnedString(&details_obj, allocator, "observation_hash", observations.hashHex(allocator, hash) catch return util.ownedTextResult(allocator, out, false)) catch return util.ownedTextResult(allocator, out, false);
+    var result = util.ownedTextResult(allocator, out, false);
+    result.details = .{ .object = details_obj };
+    return result;
 }
 
 fn usizeFromI64(v: i64) usize {
@@ -320,12 +350,14 @@ test "readTextFile numbers requested ranges and caps oversized lines" {
     const path = try tmpPath(allocator, &tmp, "story.txt");
     defer allocator.free(path);
 
-    const result = readTextFile(allocator, path, .{ 2, 3 });
+    var ctx: util.BuiltinCtx = .{ .cwd = "" };
+    defer ctx.deinit(allocator);
+    const result = readTextFile(allocator, &ctx, path, .{ 2, 3 });
     defer result.free(allocator);
     const text = try expectOnlyText(result);
 
-    try std.testing.expect(std.mem.startsWith(u8, text, "2: "));
-    try std.testing.expect(std.mem.indexOf(u8, text, "... (line truncated)\n3: third") != null);
+    try std.testing.expect(std.mem.startsWith(u8, text, "2:"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "... (line truncated)\n3:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "showing lines 2-3 of 5") != null);
 }
 

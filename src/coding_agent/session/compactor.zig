@@ -5,6 +5,7 @@ const coding_agent = @import("../root.zig");
 const prep = @import("compaction_prep.zig");
 const hooks_mod = @import("compaction_hooks.zig");
 const session_runner = @import("../session_runner.zig");
+const observations = @import("../tools/observations.zig");
 
 const AgentSession = coding_agent.AgentSession;
 const CompactionPolicy = session_runner.CompactionPolicy;
@@ -180,7 +181,7 @@ fn execute(
     const details_value: std.json.Value = if (from_hook)
         if (details_from_hook) |d| try ai.json_util.cloneJsonValue(session.allocator, d) else .null
     else
-        try buildDetailsJson(session.allocator, file_lists);
+        try buildDetailsJson(session.allocator, file_lists, if (session._builtin_ctx) |b| &b.observations else null);
     const details_arg: ?std.json.Value = if (details_value == .null) null else details_value;
 
     const new_context = try session.session_store.applyCompaction(
@@ -284,6 +285,7 @@ fn entryIdExists(entries: []const @import("../../session/protocol.zig").SessionE
 fn buildDetailsJson(
     allocator: std.mem.Allocator,
     file_lists: prep.ComputedFileLists,
+    observation_store: ?*observations.Store,
 ) !std.json.Value {
     var obj: std.json.ObjectMap = .{};
     errdefer obj.deinit(allocator);
@@ -301,7 +303,14 @@ fn buildDetailsJson(
     }
 
     try obj.put(allocator, try allocator.dupe(u8, "readFiles"), .{ .array = read_arr });
+    read_arr = .init(allocator);
     try obj.put(allocator, try allocator.dupe(u8, "modifiedFiles"), .{ .array = mod_arr });
+    mod_arr = .init(allocator);
+    var obs_arr: std.json.Array = .init(allocator);
+    errdefer obs_arr.deinit();
+    if (observation_store) |store| try store.appendJsonArray(allocator, &obs_arr);
+    try obj.put(allocator, try allocator.dupe(u8, "tool_observations"), .{ .array = obs_arr });
+    obs_arr = .init(allocator);
     return .{ .object = obj };
 }
 

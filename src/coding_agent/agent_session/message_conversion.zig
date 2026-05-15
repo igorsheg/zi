@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
 const agent_mod = @import("../../agent/root.zig");
+const tool_invariants = @import("../session/tool_invariants.zig");
 
 const protocol = agent_mod.protocol;
 
@@ -17,8 +18,10 @@ pub fn convertToLlm(
     messages: []const protocol.AgentMessage,
     _: ?*anyopaque,
 ) error{OutOfMemory}![]const ai.protocol.Message {
+    const projection = try tool_invariants.providerSafeProjection(allocator, messages);
+    defer allocator.free(projection.messages);
     var result: std.ArrayList(ai.protocol.Message) = .empty;
-    for (messages) |msg| {
+    for (projection.messages) |msg| {
         switch (msg) {
             .user => |u| try result.append(allocator, .{ .user = u }),
             .assistant => |a| try result.append(allocator, .{ .assistant = a }),

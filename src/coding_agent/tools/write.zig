@@ -3,6 +3,8 @@ const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const lock_registry = @import("lock_registry.zig");
+const file_mutation = @import("file_mutation.zig");
+const observations = @import("observations.zig");
 
 const SCHEMA =
     \\{"type":"object","properties":{"path":{"type":"string","description":"The absolute path of the file to be created (must be absolute, not relative)."},"content":{"type":"string","description":"The content for the file."}},"required":["path","content"]}
@@ -68,24 +70,28 @@ fn executeSync(
     defer lock_registry.global().release(lock_entry);
 
     var is_new = false;
-    std.Io.Dir.cwd().access(std.Options.debug_io, resolved, .{}) catch {
-        is_new = true;
+    std.Io.Dir.cwd().access(std.Options.debug_io, resolved, .{}) catch |err| {
+        if (err == error.FileNotFound) {
+            is_new = true;
+        } else {
+            return util.errorf(allocator, "write tool: failed to inspect target: {s}", .{@errorName(err)});
+        }
     };
 
-    if (std.fs.path.dirname(resolved)) |parent| {
-        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, parent) catch |err|
-            return util.errorf(allocator, "write tool: failed to create parent dir: {s}", .{@errorName(err)});
-    }
+    const permissions = if (!is_new) blk: {
+        const validation = ctx.observations.validateFile(allocator, resolved) catch .path_not_comparable;
+        switch (validation) {
+            .ok, .refreshed_metadata => {},
+            else => return util.errorf(allocator, "{s}: {s}", .{ observations.validationMessage(validation, "write", resolved), resolved }),
+        }
+        break :blk file_mutation.statPermissions(resolved);
+    } else null;
 
-    const file = std.Io.Dir.cwd().createFile(std.Options.debug_io, resolved, .{ .truncate = true }) catch |err|
-        return util.errorf(allocator, "write tool: failed to create file: {s}", .{@errorName(err)});
-    defer file.close(std.Options.debug_io);
-    var write_buf: [4096]u8 = undefined;
-    var file_writer = file.writer(std.Options.debug_io, &write_buf);
-    file_writer.interface.writeAll(content) catch |err|
+    file_mutation.atomicWrite(resolved, content, permissions) catch |err| {
         return util.errorf(allocator, "write tool: failed to write: {s}", .{@errorName(err)});
-    file_writer.interface.flush() catch |err|
-        return util.errorf(allocator, "write tool: failed to write: {s}", .{@errorName(err)});
+    };
+
+    ctx.observation_events.recordFile(allocator, resolved, .write) catch {};
 
     var line_count: usize = 1;
     for (content) |c| {
@@ -98,5 +104,14 @@ fn executeSync(
         std.fs.path.basename(resolved),
         line_count,
     }) catch return util.errorResult(allocator, "write tool: alloc failed");
-    return util.ownedTextResult(allocator, msg, false);
+    var details_obj: std.json.ObjectMap = .{};
+    errdefer details_obj.deinit(allocator);
+    util.jsonPutString(&details_obj, allocator, "path", resolved) catch return util.ownedTextResult(allocator, msg, false);
+    util.jsonPutBool(&details_obj, allocator, "created", is_new) catch return util.ownedTextResult(allocator, msg, false);
+    util.jsonPutBool(&details_obj, allocator, "overwrote", !is_new) catch return util.ownedTextResult(allocator, msg, false);
+    util.jsonPutInt(&details_obj, allocator, "line_count", @intCast(line_count)) catch return util.ownedTextResult(allocator, msg, false);
+    if (ctx.observations.getHash(resolved)) |hash| util.jsonPutOwnedString(&details_obj, allocator, "hash", observations.hashHex(allocator, hash) catch return util.ownedTextResult(allocator, msg, false)) catch return util.ownedTextResult(allocator, msg, false);
+    var result = util.ownedTextResult(allocator, msg, false);
+    result.details = .{ .object = details_obj };
+    return result;
 }

@@ -84,6 +84,7 @@ pub const AgentSession = struct {
 
     _extension_runner: ?*ExtensionRunner = null,
     _extension_runner_ref: *ExtensionRunnerRef,
+    _tool_hook_ctx: *runtime_binding.ToolHookCtx,
 
     _extension_lua_state: ?*lua_runtime.LuaState = null,
     pending_extension_ui: PendingExtensionUi,
@@ -148,10 +149,9 @@ pub const AgentSession = struct {
             .func = &runtime_binding.beforeToolCall,
             .ctx = @ptrCast(prepared.extension_runner_ref),
         };
-        const after_tool_hook: ?protocol.AfterToolCallHook = .{
-            .func = &runtime_binding.afterToolCall,
-            .ctx = @ptrCast(prepared.extension_runner_ref),
-        };
+        const tool_hook_ctx = allocator.create(runtime_binding.ToolHookCtx) catch @panic("OOM");
+        tool_hook_ctx.* = .{ .runner_ref = prepared.extension_runner_ref, .builtin_ctx = prepared.builtin_ctx };
+        const after_tool_hook: ?protocol.AfterToolCallHook = .{ .func = &runtime_binding.afterToolCall, .ctx = @ptrCast(tool_hook_ctx) };
 
         const core = allocator.create(agent_session_core_mod.AgentSessionCore) catch @panic("OOM");
         core.* = agent_session_core_mod.AgentSessionCore.init(allocator, .{
@@ -170,7 +170,7 @@ pub const AgentSession = struct {
         }) catch @panic("OOM");
         const context_usage_unknown_after_compaction = prepared.session_store.contextUsageUnknownAfterCompaction(allocator);
 
-        return .{
+        var session = @This(){
             .core = core,
             .agent = &core.agent,
             .session_store = prepared.session_store,
@@ -191,9 +191,26 @@ pub const AgentSession = struct {
             .context_usage_unknown_after_compaction = context_usage_unknown_after_compaction,
             ._extension_runner = prepared.extension_runner,
             ._extension_runner_ref = prepared.extension_runner_ref,
+            ._tool_hook_ctx = tool_hook_ctx,
             ._extension_lua_state = prepared.extension_lua_state,
             .pending_extension_ui = PendingExtensionUi.init(allocator),
         };
+        restoreToolObservationsFromLatestCompaction(&session) catch |err| {
+            std.log.scoped(.zi_tools).warn("tool observation restore failed: {s}", .{@errorName(err)});
+        };
+        return session;
+    }
+
+    fn restoreToolObservationsFromLatestCompaction(self: *@This()) !void {
+        const ctx = self._builtin_ctx orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const branch = self.session_store.buildBranchEntriesAlloc(arena.allocator(), .current) catch return;
+        const compaction = session_core.context.getLatestCompactionEntry(branch) orelse return;
+        const details = compaction.details orelse return;
+        if (details != .object) return;
+        const arr = details.object.get("tool_observations") orelse return;
+        try ctx.observations.restoreJsonArray(self.allocator, arr);
     }
 
     const TestInitOptions = struct {
@@ -365,6 +382,7 @@ pub const AgentSession = struct {
         self.deactivateLifecycle();
         self.destroyExtensionRuntime();
         self.pending_extension_ui.deinit();
+        self.allocator.destroy(self._tool_hook_ctx);
         self.allocator.destroy(self._stream_closure);
         self.allocator.destroy(self._extension_runner_ref);
         self.agent_event_listeners.deinit(self.allocator);
@@ -776,7 +794,7 @@ pub const AgentSession = struct {
             .stream_fn = .{ .func = &StreamClosure.streamFn, .ctx = @ptrCast(self._stream_closure) },
             .session_id = self.session_store.sessionId(),
             .before_tool_call = .{ .func = &runtime_binding.beforeToolCall, .ctx = @ptrCast(self._extension_runner_ref) },
-            .after_tool_call = .{ .func = &runtime_binding.afterToolCall, .ctx = @ptrCast(self._extension_runner_ref) },
+            .after_tool_call = .{ .func = &runtime_binding.afterToolCall, .ctx = @ptrCast(self._tool_hook_ctx) },
         });
         side.core = core;
         return core;

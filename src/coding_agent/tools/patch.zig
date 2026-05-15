@@ -8,6 +8,8 @@ const diff_mod = @import("../../diff/document.zig");
 const diff_unified = @import("../../diff/unified.zig");
 const tool_result_details = @import("result_details.zig");
 const json_value = @import("../../json/value.zig");
+const observations = @import("observations.zig");
+const file_mutation = @import("file_mutation.zig");
 
 const SCHEMA =
     \\{"type":"object","properties":{"patchText":{"type":"string","description":"The full apply_patch text, including *** Begin Patch and *** End Patch markers."}},"required":["patchText"]}
@@ -101,7 +103,23 @@ fn executeSync(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator, _: []const u8
         previous_lock_path = p;
     }
 
+    for (plan.items) |c| switch (c.tag) {
+        .add => {},
+        .update, .delete, .move => {
+            const validation = ctx.observations.validateFile(allocator, c.path) catch .path_not_comparable;
+            switch (validation) {
+                .ok, .refreshed_metadata => {},
+                else => return util.errorf(allocator, "patch rejected: {s}: {s}", .{ observations.validationMessage(validation, "patch", c.path), c.path }),
+            }
+        },
+    };
+
     commitPlan(plan.items) catch |err| return util.errorf(allocator, "patch commit failed: {s}", .{@errorName(err)});
+    for (plan.items) |c| switch (c.tag) {
+        .add, .update => ctx.observation_events.recordFile(allocator, c.path, .patch) catch {},
+        .move => ctx.observation_events.recordFile(allocator, c.dest_path.?, .patch) catch {},
+        .delete => {},
+    };
 
     return patchDiffResult(allocator, plan.items);
 }
@@ -561,30 +579,39 @@ fn truncateOwnedText(allocator: std.mem.Allocator, owned: []u8) ![]u8 {
 }
 
 fn commitPlan(plan: []const PlanChange) !void {
-    for (plan) |c| switch (c.tag) {
-        .add => {
-            if (std.fs.path.dirname(c.path)) |p| try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, p);
-            try writeFileAtomic(c.path, c.new_content.?, null);
-        },
-        .delete => try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, c.path),
-        .update => try writeFileAtomic(c.path, c.new_content.?, c.permissions),
-        .move => {
-            if (std.fs.path.dirname(c.dest_path.?)) |p| try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, p);
-            try writeFileAtomic(c.dest_path.?, c.new_content.?, c.permissions);
-            try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, c.path);
-        },
-    };
+    var committed: usize = 0;
+    errdefer rollbackCommitted(plan[0..committed]);
+    for (plan) |c| {
+        switch (c.tag) {
+            .add => {
+                try file_mutation.atomicWrite(c.path, c.new_content.?, null);
+            },
+            .delete => try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, c.path),
+            .update => try file_mutation.atomicWrite(c.path, c.new_content.?, c.permissions),
+            .move => {
+                try file_mutation.atomicWrite(c.dest_path.?, c.new_content.?, c.permissions);
+                try std.Io.Dir.cwd().deleteFile(std.Options.debug_io, c.path);
+            },
+        }
+        committed += 1;
+    }
 }
 
-fn writeFileAtomic(path: []const u8, content: []const u8, permissions: ?std.Io.File.Permissions) !void {
-    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(std.Options.debug_io, path, .{ .permissions = permissions orelse .fromMode(0o666), .replace = true });
-    defer atomic_file.deinit(std.Options.debug_io);
-    var buf: [4096]u8 = undefined;
-    var writer = atomic_file.file.writer(std.Options.debug_io, &buf);
-    try writer.interface.writeAll(content);
-    try writer.interface.flush();
-    try atomic_file.file.sync(std.Options.debug_io);
-    try atomic_file.replace(std.Options.debug_io);
+fn rollbackCommitted(committed: []const PlanChange) void {
+    var i = committed.len;
+    while (i > 0) {
+        i -= 1;
+        const c = committed[i];
+        switch (c.tag) {
+            .add => std.Io.Dir.cwd().deleteFile(std.Options.debug_io, c.path) catch {},
+            .delete => file_mutation.atomicWrite(c.path, c.old_content.?, c.permissions) catch {},
+            .update => file_mutation.atomicWrite(c.path, c.old_content.?, c.permissions) catch {},
+            .move => {
+                if (c.dest_path) |dest| std.Io.Dir.cwd().deleteFile(std.Options.debug_io, dest) catch {};
+                file_mutation.atomicWrite(c.path, c.old_content.?, c.permissions) catch {};
+            },
+        }
+    }
 }
 
 test "parse heredoc apply_patch update" {

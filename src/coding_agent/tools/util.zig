@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol = @import("../../agent/types.zig");
+const observations = @import("observations.zig");
 
 pub const Limits = struct {
     pub const text_result_bytes: usize = 64 * 1024;
@@ -16,8 +17,12 @@ pub const BuiltinCtx = struct {
     io: std.Io = std.Options.debug_io,
     session_id: []const u8 = "",
     image_auto_resize: bool = true,
+    observations: observations.Store = observations.Store.init(std.heap.page_allocator),
+    observation_events: observations.PendingEvents = observations.PendingEvents.init(std.heap.page_allocator),
 
     pub fn deinit(self: *BuiltinCtx, allocator: std.mem.Allocator) void {
+        self.observation_events.deinit(allocator);
+        self.observations.deinit(allocator);
         if (self.owns_cwd) allocator.free(self.cwd);
         self.* = undefined;
     }
@@ -70,6 +75,33 @@ pub fn errorf(
         return errorResult(allocator, "(error formatting failure)");
     defer allocator.free(msg);
     return errorResult(allocator, msg);
+}
+
+pub fn jsonPutString(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    const owned_value = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned_value);
+    try obj.put(allocator, owned_key, .{ .string = owned_value });
+}
+
+pub fn jsonPutOwnedString(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, owned_value: []u8) !void {
+    errdefer allocator.free(owned_value);
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    try obj.put(allocator, owned_key, .{ .string = owned_value });
+}
+
+pub fn jsonPutInt(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: i64) !void {
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    try obj.put(allocator, owned_key, .{ .integer = value });
+}
+
+pub fn jsonPutBool(obj: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: bool) !void {
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    try obj.put(allocator, owned_key, .{ .bool = value });
 }
 
 pub fn getString(args: std.json.Value, key: []const u8) ?[]const u8 {

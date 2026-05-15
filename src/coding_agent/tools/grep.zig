@@ -3,6 +3,7 @@ const protocol = @import("../../agent/types.zig");
 const tool_def = @import("definition.zig");
 const util = @import("util.zig");
 const runtime_process = @import("../../zio/root.zig").process;
+const anchors = @import("anchors.zig");
 
 const MAX_TOTAL_MATCHES: usize = 100;
 const MAX_PER_FILE: usize = 10;
@@ -93,6 +94,11 @@ fn executeSync(
     argv.append(allocator, "--hidden") catch return util.errorResult(allocator, "alloc failed");
     argv.append(allocator, "--context") catch return util.errorResult(allocator, "alloc failed");
     argv.append(allocator, "1") catch return util.errorResult(allocator, "alloc failed");
+    argv.append(allocator, "--max-filesize") catch return util.errorResult(allocator, "alloc failed");
+    argv.append(allocator, "1M") catch return util.errorResult(allocator, "alloc failed");
+    argv.append(allocator, "--max-columns") catch return util.errorResult(allocator, "alloc failed");
+    argv.append(allocator, "500") catch return util.errorResult(allocator, "alloc failed");
+    argv.append(allocator, "--max-columns-preview") catch return util.errorResult(allocator, "alloc failed");
     if (!case_sensitive) argv.append(allocator, "--ignore-case") catch return util.errorResult(allocator, "alloc failed");
     if (literal) argv.append(allocator, "--fixed-strings") catch return util.errorResult(allocator, "alloc failed");
     if (glob) |g| {
@@ -127,7 +133,7 @@ fn executeSync(
         return util.errorf(allocator, "ripgrep exited with code {d}", .{exited_code});
     }
 
-    return parseRgJson(allocator, stdout, search_path);
+    return parseRgJson(allocator, ctx, stdout, search_path);
 }
 
 const RgEvent = struct {
@@ -139,9 +145,11 @@ const RgEvent = struct {
 
 fn parseRgJson(
     allocator: std.mem.Allocator,
+    ctx: *util.BuiltinCtx,
     stdout: []const u8,
     base_path: []const u8,
 ) protocol.AgentToolResult {
+    _ = ctx;
     var events: std.ArrayList(RgEvent) = .empty;
     defer {
         for (events.items) |e| {
@@ -233,7 +241,6 @@ fn parseRgJson(
             current_file = ev.file_path;
             if (!first_file) w.writeAll("\n") catch break;
             first_file = false;
-
             if (current_display_owned) |buf| {
                 allocator.free(buf);
                 current_display_owned = null;
@@ -268,7 +275,8 @@ fn parseRgJson(
             ev.line_text;
         const ellipsis = if (ev.line_text.len > MAX_LINE_CHARS) "..." else "";
 
-        w.print("{s}:{d}: {s}{s}\n", .{ current_display, ev.line_number, text_show, ellipsis }) catch break;
+        const marker: []const u8 = if (ev.kind == .match) "> " else "  ";
+        w.print("{s}{s}:{d}:{x:0>4}: {s}{s}\n", .{ marker, current_display, ev.line_number, anchors.hashLine(std.mem.trimEnd(u8, ev.line_text, "\r\n")), text_show, ellipsis }) catch break;
     }
 
     if (total_matches >= MAX_TOTAL_MATCHES) {
@@ -280,5 +288,14 @@ fn parseRgJson(
 
     const out = aw.toOwnedSlice() catch
         return util.errorResult(allocator, "grep alloc failed");
-    return util.ownedTextResult(allocator, out, false);
+    var details_obj: std.json.ObjectMap = .{};
+    errdefer details_obj.deinit(allocator);
+    util.jsonPutString(&details_obj, allocator, "base_path", base_path) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "total_matches", @intCast(total_matches)) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutBool(&details_obj, allocator, "stopped_at_total_limit", total_matches >= MAX_TOTAL_MATCHES) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutInt(&details_obj, allocator, "files_at_per_file_limit", @intCast(files_at_limit)) catch return util.ownedTextResult(allocator, out, false);
+    util.jsonPutString(&details_obj, allocator, "line_hash_scheme", "zi-line-v1") catch return util.ownedTextResult(allocator, out, false);
+    var result = util.ownedTextResult(allocator, out, false);
+    result.details = .{ .object = details_obj };
+    return result;
 }

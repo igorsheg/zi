@@ -33,7 +33,8 @@ pub fn build(allocator: std.mem.Allocator, cwd: []const u8, options: BuildOption
     errdefer allocator.destroy(ctx);
     const owned_cwd = try allocator.dupe(u8, cwd);
     errdefer allocator.free(owned_cwd);
-    ctx.* = .{ .cwd = owned_cwd, .owns_cwd = true, .io = options.io, .image_auto_resize = options.image_auto_resize };
+    const observations = @import("observations.zig");
+    ctx.* = .{ .cwd = owned_cwd, .owns_cwd = true, .io = options.io, .image_auto_resize = options.image_auto_resize, .observations = observations.Store.init(allocator), .observation_events = observations.PendingEvents.init(allocator) };
 
     var definitions = try allocator.alloc(tool_def.ToolDefinition, 8);
     definitions[0] = bash_tool.definition(ctx);
