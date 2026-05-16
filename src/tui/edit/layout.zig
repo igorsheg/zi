@@ -136,7 +136,7 @@ fn appendWrappedSlices(
 
         if (segment.next_start >= line_text.len) break;
 
-        logical_col_start += @intCast(grapheme_mod.strWidth(line_text[start..segment.next_start], width_method));
+        logical_col_start += segment.width_cols;
         start = segment.next_start;
         current_kind = .wrapped_continuation;
         current_text_col = continuation_text_col;
