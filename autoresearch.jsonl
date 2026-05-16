@@ -1,1 +1,2 @@
 {"name":"tui-edit-text-layout-throughput","metricUnit":"ms","type":"config","metricName":"layout_ms","bestDirection":"lower"}
+{"description":"{\"asi\":{\"hypothesis\":\"baseline TUI editor/plain-text layout benchmark before optimization\"},\"metrics\":{\"edit_lines\":720,\"text_lines\":361},\"summary\":\"Baseline for editor visual-line layout plus reusable text word/char wrapping workload.\"}","run":1,"timestamp":1778950210000,"metric":514.174,"metrics":{},"commit":"e3a4ab1","status":"keep","segment":0}

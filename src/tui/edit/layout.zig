@@ -129,7 +129,7 @@ fn appendWrappedSlices(
             .byte_end = base_start + @as(u32, @intCast(segment.end)),
             .logical_line = logical_line,
             .logical_col_start = logical_col_start,
-            .width_cols = @intCast(grapheme_mod.strWidth(line_text[segment.start..segment.end], width_method)),
+            .width_cols = segment.width_cols,
             .text_col = current_text_col,
             .kind = current_kind,
         });
