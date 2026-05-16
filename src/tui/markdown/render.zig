@@ -668,8 +668,19 @@ fn wrapWithPrefix(prefix: []const Span, prefix_width: u32, flat: FlatText, total
 }
 
 fn reconstructSpans(start: usize, end: usize, flat: FlatText, arena: std.mem.Allocator) ![]const Span {
+    if (flat.runs.len == 1) {
+        const run = flat.runs[0];
+        const s = @max(run.start, start);
+        const e = @min(run.end, end);
+        if (s >= e) return &.{};
+        const spans = try arena.alloc(Span, 1);
+        spans[0] = .{ .text = flat.text[s..e], .fg = run.style.fg, .bg = run.style.bg, .attrs = run.style.attrs };
+        return spans;
+    }
+
     var spans: std.ArrayListUnmanaged(Span) = .empty;
     errdefer spans.deinit(arena);
+    try spans.ensureTotalCapacity(arena, @min(flat.runs.len, 4));
     for (flat.runs) |run| {
         if (run.end <= start) continue;
         if (run.start >= end) break;

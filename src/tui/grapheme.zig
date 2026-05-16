@@ -112,6 +112,8 @@ pub fn nextGraphemeBoundary(text: []const u8, byte_offset: usize, method: WidthM
 }
 
 pub fn strWidth(text: []const u8, method: WidthMethod) usize {
+    if (asciiPrintableWidth(text)) |width| return width;
+
     var cols: usize = 0;
     var start: usize = 0;
     while (start < text.len) {
@@ -122,7 +124,19 @@ pub fn strWidth(text: []const u8, method: WidthMethod) usize {
     return cols;
 }
 
+fn asciiPrintableWidth(text: []const u8) ?usize {
+    for (text) |c| {
+        if (c < 0x20 or c > 0x7E) return null;
+    }
+    return text.len;
+}
+
 pub fn sliceToWidth(text: []const u8, max_cols: usize, method: WidthMethod) []const u8 {
+    if (asciiPrintableWidth(text)) |width| {
+        if (width <= max_cols) return text;
+        return text[0..max_cols];
+    }
+
     var cols: usize = 0;
     var start: usize = 0;
     while (start < text.len) {

@@ -37,18 +37,6 @@ pub fn nextSegment(
         if (line_begin >= line.len) return null;
     }
 
-    const remaining_width = grapheme.strWidth(line[line_begin..], width_method);
-    if (remaining_width <= max_width) {
-        const raw_end = line.len;
-        const end = applyTrim(line, line_begin, raw_end, options);
-        return .{
-            .start = line_begin,
-            .end = end,
-            .next_start = raw_end,
-            .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
-        };
-    }
-
     var current_start = line_begin;
     var current_width: usize = 0;
 
@@ -65,7 +53,7 @@ pub fn nextSegment(
                     .start = line_begin,
                     .end = end,
                     .next_start = current_start,
-                    .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
+                    .width_cols = @intCast(current_width),
                 };
             }
 
@@ -88,7 +76,7 @@ pub fn nextSegment(
                     .start = line_begin,
                     .end = end,
                     .next_start = next_start,
-                    .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
+                    .width_cols = @intCast(current_width),
                 };
             }
 
@@ -97,7 +85,7 @@ pub fn nextSegment(
                 .start = line_begin,
                 .end = end,
                 .next_start = current_start,
-                .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
+                .width_cols = @intCast(current_width),
             };
         }
 
@@ -110,7 +98,7 @@ pub fn nextSegment(
         .start = line_begin,
         .end = end,
         .next_start = current_start,
-        .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
+        .width_cols = @intCast(current_width),
     };
 }
 
