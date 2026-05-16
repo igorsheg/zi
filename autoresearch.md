@@ -11,11 +11,11 @@ Optimize TUI markdown/transcript wrapping and rendering throughput for large ass
 `./autoresearch.sh` — outputs `METRIC render_ms=...` and `METRIC rows=...`.
 
 ## Files in Scope
-- `stui/wrap/` — text wrapping segment and display-width logic.
-- `stui/markdown/` — markdown parse/render into spans and rendered lines.
-- `stui/transcript/` — retained transcript Markdown layout and assistant message rendering.
-- `stui/components/text.zig` — plain text rendering if benchmark evidence points there.
-- `stui/primitives/` — surface/layout primitives only when directly required by render path.
+- `src/tui/wrap/` — text wrapping segment and display-width logic.
+- `src/tui/markdown/` — markdown parse/render into spans and rendered lines.
+- `src/tui/transcript/` — retained transcript Markdown layout and assistant message rendering.
+- `src/tui/components/text.zig` — plain text rendering if benchmark evidence points there.
+- `src/tui/primitives/` — surface/layout primitives only when directly required by render path.
 - `src/tui_render_bench.zig` — benchmark workload.
 - `autoresearch.sh`, `autoresearch.checks.sh`, `autoresearch.md`, `autoresearch.ideas.md`, `autoresearch.jsonl` — experiment artifacts.
 
