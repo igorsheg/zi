@@ -54,6 +54,7 @@ fn buildVirtualLines(buffer: *const EditBuffer, config: LayoutConfig, allocator:
     errdefer lines.deinit(allocator);
 
     const items = buffer.text();
+    try lines.ensureTotalCapacity(allocator, estimateVirtualLineCapacity(items.len, config.width_cols));
     const first_text_width = if (config.width_cols > config.first_line_text_col)
         config.width_cols - config.first_line_text_col
     else
@@ -103,6 +104,11 @@ fn buildVirtualLines(buffer: *const EditBuffer, config: LayoutConfig, allocator:
     return try lines.toOwnedSlice(allocator);
 }
 
+fn estimateVirtualLineCapacity(text_len: usize, width_cols: u32) usize {
+    if (text_len == 0) return 1;
+    return @max(@as(usize, 1), text_len / @max(@as(usize, width_cols), 1) + 2);
+}
+
 fn appendWrappedSlices(
     out: *std.ArrayList(VirtualLine),
     line_text: []const u8,
@@ -129,14 +135,17 @@ fn appendWrappedSlices(
             .byte_end = base_start + @as(u32, @intCast(segment.end)),
             .logical_line = logical_line,
             .logical_col_start = logical_col_start,
-            .width_cols = @intCast(grapheme_mod.strWidth(line_text[segment.start..segment.end], width_method)),
+            .width_cols = segment.width_cols,
             .text_col = current_text_col,
             .kind = current_kind,
         });
 
         if (segment.next_start >= line_text.len) break;
 
-        logical_col_start += @intCast(grapheme_mod.strWidth(line_text[start..segment.next_start], width_method));
+        // Editor layout uses default SegmentOptions, which preserve separator bytes:
+        // the measured segment covers the same byte range used for logical column advancement.
+        std.debug.assert(segment.next_start == segment.end);
+        logical_col_start += segment.width_cols;
         start = segment.next_start;
         current_kind = .wrapped_continuation;
         current_text_col = continuation_text_col;

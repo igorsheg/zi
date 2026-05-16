@@ -164,6 +164,7 @@ fn wrapLogicalLines(text: []const u8, allocator: std.mem.Allocator, max_width: ?
 
     var lines: std.ArrayListUnmanaged(Line) = .empty;
     errdefer lines.deinit(allocator);
+    try lines.ensureTotalCapacity(allocator, estimateLineCapacity(text.len, max_width));
 
     if (text.len == 0) {
         try lines.append(allocator, .{ .start = 0, .end = 0 });
@@ -200,6 +201,7 @@ fn wrapLogicalLinesWithBreaks(text: []const u8, allocator: std.mem.Allocator, ma
 
     var lines: std.ArrayListUnmanaged(Line) = .empty;
     errdefer lines.deinit(allocator);
+    try lines.ensureTotalCapacity(allocator, estimateLineCapacity(text.len, max_width));
 
     if (text.len == 0) {
         try lines.append(allocator, .{ .start = 0, .end = 0 });
@@ -221,6 +223,12 @@ fn wrapLogicalLinesWithBreaks(text: []const u8, allocator: std.mem.Allocator, ma
     }
 
     return try lines.toOwnedSlice(allocator);
+}
+
+fn estimateLineCapacity(text_len: usize, max_width: ?u32) usize {
+    if (text_len == 0) return 1;
+    const width = if (max_width) |w| @max(@as(usize, w), 1) else text_len;
+    return @max(@as(usize, 1), text_len / width + 2);
 }
 
 fn appendCharWrappedLine(lines: *std.ArrayListUnmanaged(Line), allocator: std.mem.Allocator, text: []const u8, line_start: usize, line_end: usize, max_width: u32, width_method: grapheme.WidthMethod) !void {

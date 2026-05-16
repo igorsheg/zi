@@ -42,9 +42,8 @@ pub fn nextSegment(
 
     while (current_start < line.len) {
         const token = nextToken(line, current_start);
-        const token_text = token.text(line);
-        const token_width = grapheme.strWidth(token_text, width_method);
-        const token_is_whitespace = isAllWhitespace(token_text);
+        const token_width = token.width(line, width_method);
+        const token_is_whitespace = isWhitespace(line[token.start]);
 
         if (token_width > max_width) {
             if (current_width > 0) {
@@ -105,31 +104,33 @@ pub fn nextSegment(
 pub const Token = struct {
     start: usize,
     end: usize,
+    ascii_printable: bool,
 
     pub fn text(self: Token, line: []const u8) []const u8 {
         return line[self.start..self.end];
     }
+
+    pub fn width(self: Token, line: []const u8, width_method: grapheme.WidthMethod) usize {
+        if (self.ascii_printable) return self.end - self.start;
+        return grapheme.strWidth(self.text(line), width_method);
+    }
 };
 
 pub fn nextToken(line: []const u8, start: usize) Token {
-    if (start >= line.len) return .{ .start = start, .end = start };
+    if (start >= line.len) return .{ .start = start, .end = start, .ascii_printable = true };
     const is_ws = isWhitespace(line[start]);
     var pos = start;
+    var ascii_printable = true;
     while (pos < line.len) : (pos += 1) {
-        if (isWhitespace(line[pos]) != is_ws) break;
+        const c = line[pos];
+        if (isWhitespace(c) != is_ws) break;
+        if (c < 0x20 or c > 0x7E) ascii_printable = false;
     }
-    return .{ .start = start, .end = pos };
+    return .{ .start = start, .end = pos, .ascii_printable = ascii_printable };
 }
 
 pub fn isWhitespace(c: u8) bool {
     return c == ' ' or c == '\t';
-}
-
-pub fn isAllWhitespace(s: []const u8) bool {
-    for (s) |c| {
-        if (!isWhitespace(c)) return false;
-    }
-    return true;
 }
 
 pub fn skipWhitespace(line: []const u8, start: usize) usize {
@@ -190,4 +191,11 @@ test "nextSegment preserve policy keeps separator bytes on previous line" {
 
     const seg2 = nextSegment("hello world", seg1.next_start, 5, true, .{}, .wcwidth).?;
     try testing.expectEqualStrings("world", seg2.text("hello world"));
+}
+
+test "token width fast path matches grapheme width for printable ascii" {
+    const text = "plain ascii token";
+    const token = nextToken(text, 0);
+    try testing.expect(token.ascii_printable);
+    try testing.expectEqual(grapheme.strWidth(token.text(text), .wcwidth), token.width(text, .wcwidth));
 }
