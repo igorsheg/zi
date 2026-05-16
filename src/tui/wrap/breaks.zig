@@ -53,7 +53,7 @@ pub fn nextSegment(
                     .start = line_begin,
                     .end = end,
                     .next_start = current_start,
-                    .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
+                    .width_cols = @intCast(current_width),
                 };
             }
 
@@ -76,7 +76,7 @@ pub fn nextSegment(
                     .start = line_begin,
                     .end = end,
                     .next_start = next_start,
-                    .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
+                    .width_cols = @intCast(current_width),
                 };
             }
 
@@ -85,7 +85,7 @@ pub fn nextSegment(
                 .start = line_begin,
                 .end = end,
                 .next_start = current_start,
-                .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
+                .width_cols = @intCast(current_width),
             };
         }
 
@@ -98,7 +98,7 @@ pub fn nextSegment(
         .start = line_begin,
         .end = end,
         .next_start = current_start,
-        .width_cols = @intCast(grapheme.strWidth(line[line_begin..end], width_method)),
+        .width_cols = @intCast(current_width),
     };
 }
 
