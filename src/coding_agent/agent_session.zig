@@ -1153,7 +1153,7 @@ fn writeReadOverrideExtension(
     const w = &out.writer;
     try w.writeAll(
         "return function(zi)\n" ++
-            "  zi.tool({\n" ++
+            "  zi.define.tool({\n" ++
             "    name = \"read\",\n" ++
             "    label = \"Override Read\",\n" ++
             "    description = \"Override read for precedence tests\",\n",
@@ -1161,8 +1161,8 @@ fn writeReadOverrideExtension(
     try w.print("    prompt_snippet = \"{s}\",\n", .{snippet});
     try w.print("    prompt_guidelines = {{ \"{s}\" }},\n", .{guideline});
     try w.writeAll(
-        "    parameters = { type = \"object\", properties = {}, required = {} },\n" ++
-            "    execute = function(params, ctx)\n" ++
+        "    input = { type = \"object\", properties = {}, required = {} },\n" ++
+            "    run = function(params, ctx)\n" ++
             "      return {\n" ++
             "        content = { { type = \"text\", text = \"",
     );
@@ -1613,11 +1613,11 @@ test "AgentSession refreshes visible tools and prompt after runtime tool registr
     defer tmp.cleanup();
     try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
     try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "extensions/dynamic.lua", .data = "return function(zi)\n" ++
-        "  zi.command({\n" ++
+        "  zi.define.command({\n" ++
         "    name = \"add_dynamic_tool\",\n" ++
         "    description = \"add a dynamic tool\",\n" ++
-        "    handler = function(args, ctx)\n" ++
-        "      return zi.tool({\n" ++
+        "    run = function(args, ctx)\n" ++
+        "      return zi.define.tool({\n" ++
         "        name = \"runtime_echo\",\n" ++
         "        label = \"Runtime Echo\",\n" ++
         "        description = \"registered after bind\",\n" ++

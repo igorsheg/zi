@@ -73,11 +73,11 @@ return function(zi)
     return output, "rg failed: " .. tostring(reason or code)
   end
 
-  zi.tool({
+  zi.define.tool({
     name = "rg_demo",
     label = "ripgrep demo",
     description = "Search with ripgrep. Output is bounded to 2000 lines or 50 KiB; truncated full output is saved to a temp file.",
-    parameters = {
+    input = {
       type = "object",
       properties = {
         pattern = { type = "string", description = "Search pattern (regex)" },
@@ -86,8 +86,8 @@ return function(zi)
       },
       required = { "pattern" },
     },
-    execute = function(params, ctx)
-      local output, err = run_rg(params, ctx and ctx.cwd or ".")
+    run = function(ctx, params)
+      local output, err = run_rg(params, ctx and ctx.env.cwd or ".")
       if err then
         return {
           content = { { type = "text", text = err .. "\n" .. (output or "") } },

@@ -129,7 +129,7 @@ local function policy_message(content, details)
 end
 
 return function(zi)
-  zi.on("before_agent_start", function(event, ctx)
+  zi.define.event("before_agent_start", function(ctx, event)
     local now = os.time()
     local night_key = get_night_key(now)
     local label = quiet_hours_label()
@@ -181,7 +181,7 @@ return function(zi)
     return nil
   end)
 
-  zi.on("tool_call", function(event, ctx)
+  zi.define.event("tool_call", function(ctx, event)
     local now = os.time()
     if not is_quiet_hours(now) then
       confirmed_night_key = nil
@@ -212,7 +212,7 @@ return function(zi)
     }
   end)
 
-  zi.on("tool_result", function(event, ctx)
+  zi.define.event("tool_result", function(ctx, event)
     if lower(event.toolName) ~= "bash" then return nil end
     if tool_call_id(event) ~= last_confirmation_tool_call_id then return nil end
 

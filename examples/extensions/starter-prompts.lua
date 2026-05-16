@@ -1,18 +1,18 @@
 local function overlay(ctx, id, title, lines)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
   local children = {}
   for _, line in ipairs(lines or {}) do children[#children + 1] = { type = "text", text = tostring(line) } end
-  ctx.ui.render({ id = id, slot = { kind = "overlay", width = "70%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = children } })
+  ctx.ui.view.set({ id = id, slot = { kind = "overlay", width = "70%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = children } })
 end
 
-zi.on("ui", function(event, ctx)
-  if event.action == "close" and ctx and ctx.ui and ctx.ui.render then ctx.ui.render({ id = event.view, remove = true }) end
+zi.define.event("ui", function(ctx, event)
+  if event.action == "close" and ctx and ctx.ui and ctx.ui.view.set then ctx.ui.view.set({ id = event.view, remove = true }) end
 end)
 
-zi.command({
+zi.define.command({
   name = "starter-prompts",
   description = "Show starter prompts in a v3 overlay",
-  handler = function(_, ctx)
+  run = function(ctx, _)
     overlay(ctx, "starter-prompts", "Starter prompts", {
       "• Explain this codebase",
       "• Find a small bug and fix it",

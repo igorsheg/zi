@@ -3,16 +3,16 @@
 -- full parity also needs branch/message reads, extension model completion,
 -- notification/working UI, and async command cancellation.
 return function(zi)
-  zi.command({
+  zi.define.command({
     name = "qna",
     description = "Copy a question prompt into the editor.",
-    handler = function(args, ctx)
+    run = function(ctx, args)
       local question = args
       if question == nil or question == "" then
         question = "What should we do next?"
       end
 
-      ctx.editor.set_text("Question: " .. tostring(question) .. "\n\nAnswer: ")
+      ctx.composer.set_text("Question: " .. tostring(question) .. "\n\nAnswer: ")
     end,
   })
 end

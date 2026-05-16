@@ -30,7 +30,7 @@ local busy = false
 local side = nil
 
 local function has_ui(ctx)
-  return ctx and ctx.ui and ctx.ui.render
+  return ctx and ctx.ui and ctx.ui.view.set
 end
 
 local function trim(s)
@@ -112,7 +112,7 @@ end
 
 local function render(ctx)
   if not has_ui(ctx) then return end
-  ctx.ui.render({
+  ctx.ui.view.set({
     id = VIEW_ID,
     slot = { kind = "overlay", preset = "ivy" },
     focus = true,
@@ -135,7 +135,7 @@ local function render(ctx)
 end
 
 local function close_overlay(ctx)
-  if has_ui(ctx) then ctx.ui.render({ id = VIEW_ID, remove = true }) end
+  if has_ui(ctx) then ctx.ui.view.set({ id = VIEW_ID, remove = true }) end
 end
 
 local function ensure_side(ctx)
@@ -290,16 +290,16 @@ local function inject_summary(ctx)
     return
   end
   local msg = "Summary of my BTW side conversation:\n\n" .. tostring(result.text or "")
-  if ctx.send_user_message then
-    if ctx.is_idle and ctx.is_idle() then
-      ctx.send_user_message(msg)
+  if ctx.chat.send_user then
+    if ctx.control.is_idle and ctx.control.is_idle() then
+      ctx.chat.send_user(msg)
     else
-      ctx.send_user_message(msg, { mode = "followup" })
+      ctx.chat.send_user(msg, { mode = "followup" })
     end
     reset(ctx)
     close_overlay(ctx)
-  elseif ctx.editor and ctx.editor.set_text then
-    ctx.editor.set_text(msg)
+  elseif ctx.composer and ctx.composer.set_text then
+    ctx.composer.set_text(msg)
     status = "Summary placed in editor."
     render(ctx)
   else
@@ -308,10 +308,10 @@ local function inject_summary(ctx)
   end
 end
 
-zi.command({
+zi.define.command({
   name = "btw",
   description = "Open a BTW side-chat overlay. `/btw <text>` asks immediately; `/btw inject` summarizes into main chat.",
-  handler = function(args, ctx)
+  run = function(ctx, args)
     load_thread(ctx)
     local arg = trim(args or "")
     if arg == "reset" then
@@ -331,7 +331,7 @@ zi.command({
   end,
 })
 
-zi.on("ui", function(event, ctx)
+zi.define.event("ui", function(ctx, event)
   if event.view ~= VIEW_ID then return nil end
   if event.action == "close" then
     draft = tostring(event.value or draft or "")
@@ -348,17 +348,17 @@ zi.on("ui", function(event, ctx)
   end
 end)
 
-zi.on("session_start", function(_, ctx)
+zi.define.event("session_start", function(ctx, _)
   load_thread(ctx)
   if side then side:dispose(); side = nil end
 end)
 
-zi.on("session_tree", function(_, ctx)
+zi.define.event("session_tree", function(ctx, _)
   load_thread(ctx)
   if side then side:dispose(); side = nil end
   render(ctx)
 end)
 
-zi.on("session_shutdown", function()
+zi.define.event("session_shutdown", function()
   if side then side:dispose(); side = nil end
 end)

@@ -18,37 +18,37 @@ The API is plain Lua. Tables in, tables out. Keep names exact and results small.
 
 ## `zi` table
 
-`zi.tool(spec)`
+`zi.define.tool(spec)`
 : Register a model-visible tool. Duplicate names are ignored; returns `false`.
 
-`zi.command(spec)`
+`zi.define.command(spec)`
 : Register an interactive slash command. Duplicate names get resolved invocation names.
 
-`zi.provider(name, config)`
+`zi.define.provider(name, config)`
 : Register a provider/model claim. Existing claims are not replaced unless owned by this source.
 
 `zi.unprovider(name)`
 : Remove this extension's provider claim.
 
-`zi.on(event_name, handler)`
+`zi.define.event(event_name, handler)`
 : Register an observer or interceptor.
 
-`zi.system(argv, opts?)`
+`ctx.process.run(argv, opts?)`
 : Run an argv command through zi's async scheduler.
 
-`zi.spawn(opts)`
+`ctx.agent.run(opts)`
 : Run delegated child zi work through batch JSON mode.
 
-`zi.job.start(opts)`
+`ctx.process.start(opts)`
 : Start a host job. Returns `{ id }`.
 
-`zi.job.write(id_or_job, data)`
+`ctx.process.job(id_or_job, data)`
 : Write to job stdin.
 
-`zi.job.stop(id_or_job)`
+`ctx.process.job(id_or_job)`
 : Request job termination.
 
-`zi.job.next(id_or_job, opts?)`
+`ctx.process.next(id_or_job, opts?)`
 : Drain one tool-scoped job event, optionally waiting up to `opts.timeout_ms`. Returns `nil` when no event is ready.
 
 `zi.json.encode(value)`
@@ -61,7 +61,7 @@ The API is plain Lua. Tables in, tables out. Keep names exact and results small.
 
 A tool is visible to the model. Keep it narrow.
 
-`zi.tool(spec)` accepts:
+`zi.define.tool(spec)` accepts:
 
 `name`
 : Required string. Model-visible id and collision key.
@@ -164,15 +164,15 @@ Spans support `text`, `style`, and reserved `link`. Supported style roles are `n
 Boundaries:
 
 - `presentation.schema = "zi.doc.v1"` is for durable transcript scrollback. It is data, not a callback API.
-- `ctx.ui.render(...)` is for retained interactive extension UI.
-- `ctx.ui.frame(...)` / surfaces are for arbitrary visual output.
+- `ctx.ui.view.set(...)` is for retained interactive extension UI.
+- `ctx.ui.surface.frame(...)` / surfaces are for arbitrary visual output.
 - `content` remains the model-visible tool result text.
 
 ## Commands
 
 Commands are direct user actions.
 
-`zi.command(spec)` accepts:
+`zi.define.command(spec)` accepts:
 
 `name`
 : Required string. Slash command name without `/`.
@@ -185,11 +185,11 @@ Commands are direct user actions.
 
 ```lua
 return function(zi)
-  zi.command({
+  zi.define.command({
     name = "hello",
     description = "Show a greeting.",
-    handler = function(args, ctx)
-      ctx.ui.render({
+    handler = function(ctx, args)
+      ctx.ui.view.set({
         id = "hello-command",
         slot = { kind = "overlay", preset = "centered" },
         focus = true,
@@ -219,12 +219,12 @@ Built-ins stay TUI-local when they need immediate UI/session behavior. Extension
 
 Overlay slots accept semantic presets with explicit fields as overrides: `preset = "ivy"` renders a full-width bottom sheet, `preset = "centered"` renders a modal dialog, and `preset = "top_toast"` renders a small top-right overlay. For example: `slot = { kind = "overlay", preset = "ivy", max_height = "55%" }`.
 
-`ctx.ui.render({ focus = true, slot = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. The top ordered overlay owns capture, overlay options, key routing, and input routing; lower overlays remain visible but do not receive key/input events through it. Capturing overlays receive v3 `ui` key events and prevent editor input until they close or re-render without focus. `input` nodes inside a focused overlay are edited by the TUI itself; each edit emits a structured `ui` event with `type = "change"`, `node`, `value`, and optional `action`, and Enter emits `type = "submit"`. Extensions should update their own state from those events and re-render the input value. Set `slot = { kind = "overlay", lifetime = "until_input" }` to dismiss the top overlay after a routed key/input event; the default/manual lifetime keeps it until explicit removal. Overlays without `focus = true`, including status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
+`ctx.ui.view.set({ focus = true, slot = { kind = "overlay" }, ... })` requests keyboard capture for that overlay. The top ordered overlay owns capture, overlay options, key routing, and input routing; lower overlays remain visible but do not receive key/input events through it. Capturing overlays receive v4 `ui` key events and prevent editor input until they close or re-render without focus. `input` nodes inside a focused overlay are edited by the TUI itself; each edit emits a structured `ui` event with `type = "change"`, `node`, `value`, and optional `action`, and Enter emits `type = "submit"`. Extensions should update their own state from those events and re-render the input value. Set `slot = { kind = "overlay", lifetime = "until_input" }` to dismiss the top overlay after a routed key/input event; the default/manual lifetime keeps it until explicit removal. Overlays without `focus = true`, including status views, remain visible but non-capturing; transcript scrolling and editor input continue to use the existing app focus.
 
-Notifications use the fidget-style API instead of `ctx.ui.render` slots:
+Notifications use the fidget-style API instead of `ctx.ui.view.set` slots:
 
 ```lua
-ctx.ui.notify("Ready for input", {
+ctx.ui.notify.show("Ready for input", {
   id = "agent-ready",     -- replacement key
   group = "agent",        -- compact left label when no title is set
   level = "info",         -- debug/info/warn/error/success
@@ -234,10 +234,10 @@ ctx.ui.notify("Ready for input", {
   done = false,
 })
 
-ctx.ui.notify_clear("agent-ready")
+ctx.ui.notify.clear("agent-ready")
 ```
 
-Notifications render as a quiet bottom-right stack, replacing previous entries with the same id. Use them for transient liveness and status; use `ctx.ui.render` for structured/persistent surfaces.
+Notifications render as a quiet bottom-right stack, replacing previous entries with the same id. Use them for transient liveness and status; use `ctx.ui.view.set` for structured/persistent surfaces.
 
 UI render trees support `view`, `text`, `input`, `chip`, `progress`, `separator`, and `surface` nodes. Visual frame chrome is composed on `view.style.chrome`; top-level render specs describe placement/focus only. The full text-node API, including wrapping, spans, ANSI/Markdown formats, links, and selection hints, is documented in [Context](context.html#ui-text-nodes). `surface` remains available for framebuffer graphs.
 
@@ -245,7 +245,7 @@ UI render trees support `view`, `text`, `input`, `chip`, `progress`, `separator`
 
 Providers describe visible model/provider choices. Use events to rewrite requests.
 
-`zi.provider(name, config)` supports:
+`zi.define.provider(name, config)` supports:
 
 `api`
 : Required for custom provider names. Built-in provider overrides may infer it.
@@ -276,7 +276,7 @@ Extensions own claims, not provider runtime pointers or credential persistence.
 
 ## Events
 
-`zi.on(name, handler)` registers an observer or interceptor. Handlers receive `(event, ctx)`.
+`zi.define.event(name, handler)` registers an observer or interceptor. Handlers receive `(event, ctx)`.
 
 Observer events are post-commit. Return values are ignored.
 
@@ -339,7 +339,7 @@ Event names:
 : Pre/post tree navigation events.
 
 `ui`
-: Key interactions from focused v3 UI views. Handlers receive `{ type = "key", view, node?, action?, key?, ctrl, alt, shift }`. Use `ctx.ui.render({ id = event.view, remove = true })` to close views.
+: Key interactions from focused v4 UI views. Handlers receive `{ type = "key", view, node?, action?, key?, ctrl, alt, shift }`. Use `ctx.ui.view.set({ id = event.view, remove = true })` to close views.
 
 `job_stdout`, `job_stderr`, `job_exit`, `job_json`
 : Job output and exit lifecycle events.
@@ -351,15 +351,15 @@ Interceptors should return semantic data only. Do not depend on transport struct
 
 ## Jobs
 
-`zi.job.start({ argv, cwd?, stdout? })` starts a host job.
+`ctx.process.start({ argv, cwd?, stdout? })` starts a host job.
 
 In interactive command execution, stdout/stderr/exit are delivered through job events.
 
-In model-visible tool execution, jobs are scoped to the current tool call. Use `zi.job.next(job, { timeout_ms = 250 })` to drain stdout/stderr/exit completions from the owning tool coroutine and call `ctx.update(...)` for progress. Tool-scoped jobs are cleaned up when they exit, when `zi.job.stop` is called, or when the extension runner is destroyed.
+In model-visible tool execution, jobs are scoped to the current tool call. Use `ctx.process.next(job, { timeout_ms = 250 })` to drain stdout/stderr/exit completions from the owning tool coroutine and call `ctx.update(...)` for progress. Tool-scoped jobs are cleaned up when they exit, when `ctx.process.stop` is called, or when the extension runner is destroyed.
 
 `stdout = { mode = "json_lines", max_line_bytes? }` parses stdout as JSONL and emits `job_json`.
 
-`stdout = { mode = "ui_frame", view = "doom-workbench", node = "doom-surface", protocol = "zi-halfblock-rgb-v1", max_frame_bytes? }` publishes half-block RGB records to a v3 `surface` node.
+`stdout = { mode = "ui_frame", view = "doom-workbench", node = "doom-surface", protocol = "zi-halfblock-rgb-v1", max_frame_bytes? }` publishes half-block RGB records to a v4 `surface` node.
 
 `zi-halfblock-rgb-v1` records look like:
 

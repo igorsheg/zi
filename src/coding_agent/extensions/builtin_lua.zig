@@ -2,6 +2,16 @@ const std = @import("std");
 const lua_runtime = @import("lua_runtime.zig");
 const build_options = @import("build_options");
 
+pub const v4_doc_surface = [_][]const u8{
+    "zi.doc.fragment",
+    "zi.doc.span",
+    "zi.doc.marker",
+    "zi.doc.step",
+    "zi.doc.is_fragment",
+    "zi.doc.validate",
+    "zi.doc.to_markdown",
+};
+
 pub fn install(state: *lua_runtime.LuaState) lua_runtime.LuaError!void {
     try preload(state, "zi.doc", build_options.embedded_zi_doc_lua);
 }

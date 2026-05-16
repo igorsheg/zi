@@ -15,19 +15,19 @@ local function notify(ctx, message, opts)
   if not (ctx and ctx.ui and ctx.ui.notify) then return end
   opts = opts or {}
   if opts.level then opts.level = normalize_level(opts.level) end
-  ctx.ui.notify(tostring(message or ""), opts)
+  ctx.ui.notify.show(tostring(message or ""), opts)
 end
 
 local function sleep(zi, seconds)
-  -- zi.system is yieldable, so the TUI can paint each intermediate update.
-  zi.system({ "/bin/sleep", tostring(seconds or 0.25) }, { timeout_ms = 2000, max_stdout_bytes = 1, max_stderr_bytes = 256 })
+  -- ctx.process.run is yieldable, so the TUI can paint each intermediate update.
+  ctx.process.run({ "/bin/sleep", tostring(seconds or 0.25) }, { timeout_ms = 2000, max_stdout_bytes = 1, max_stderr_bytes = 256 })
 end
 
 return function(zi)
-  zi.command({
+  zi.define.command({
     name = "notify-demo",
     description = "Show a burst of fidget-style notifications: groups, levels, annotations, and replacement by id.",
-    handler = function(_, ctx)
+    run = function(ctx, _)
       notify(ctx, "debug detail, dimmed", {
         id = "notify-demo-debug",
         group = "demo",
@@ -67,10 +67,10 @@ return function(zi)
     end,
   })
 
-  zi.command({
+  zi.define.command({
     name = "notify-progress",
     description = "Animate a keyed progress notification through progress and done states.",
-    handler = function(_, ctx)
+    run = function(ctx, _)
       notify(ctx, "preparing workspace", {
         id = "notify-demo-progress",
         group = "workspace",
@@ -108,10 +108,10 @@ return function(zi)
     end,
   })
 
-  zi.command({
+  zi.define.command({
     name = "notify-clear",
     description = "Clear notifications created by /notify-demo and /notify-progress.",
-    handler = function(_, ctx)
+    run = function(ctx, _)
       local ids = {
         "notify-demo-debug",
         "notify-demo-info",

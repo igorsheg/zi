@@ -25,6 +25,7 @@ const CommandRegistry = @import("registries/command_registry.zig").CommandRegist
 const keybinding_registry_mod = @import("registries/keybinding_registry.zig");
 const KeybindingRegistry = keybinding_registry_mod.KeybindingRegistry;
 const KeybindingDef = keybinding_registry_mod.KeybindingDef;
+const ActionRegistry = @import("registries/action_registry.zig").ActionRegistry;
 const ProviderQueue = @import("registries/provider_queue.zig").ProviderQueue;
 
 const log = std.log.scoped(.zi_runner);
@@ -916,6 +917,7 @@ pub const ExtensionRunner = struct {
     tool_registry: ToolRegistry,
 
     event_registry: EventRegistry,
+    action_registry: ActionRegistry,
 
     command_registry: CommandRegistry,
     keybinding_registry: KeybindingRegistry,
@@ -967,6 +969,7 @@ pub const ExtensionRunner = struct {
             .runtime = .{ .stub = {} },
             .tool_registry = ToolRegistry.init(allocator),
             .event_registry = EventRegistry.init(allocator),
+            .action_registry = ActionRegistry.init(allocator),
             .command_registry = CommandRegistry.init(allocator),
             .keybinding_registry = KeybindingRegistry.init(allocator),
             .provider_queue = ProviderQueue.init(allocator),
@@ -1099,6 +1102,7 @@ pub const ExtensionRunner = struct {
         self.keybinding_registry.deinit();
         self.command_registry.deinit();
         self.event_registry.deinit();
+        self.action_registry.deinit();
         self.tool_registry.deinit();
         self.loaded_extensions.deinit(self.allocator);
         for (self.loaded_extension_infos.items) |info| info.deinit(self.allocator);
@@ -1332,11 +1336,13 @@ pub const ExtensionRunner = struct {
 
     pub fn dispatchUiEvent(self: *ExtensionRunner, event: extension_ui.UiEvent) !void {
         self.assertOnLuaThread();
-        if (self.event_registry.handlers(.ui).len == 0) return;
         const state = self.lua_state orelse return error.MissingLuaState;
         pushUiEventPayload(state.L, event);
         defer lua_runtime.c.lua_pop(state.L, 1);
         try dispatch_mod.dispatchObserver(state, self, .ui, -1);
+        if (event.action) |action| {
+            if (self.action_registry.get(action)) |handler| try dispatch_mod.dispatchObserverHandler(state, self, handler, -1);
+        }
     }
 
     pub fn reserveJobId(self: *ExtensionRunner) u64 {
@@ -1361,12 +1367,11 @@ pub const ExtensionRunner = struct {
             return error.InvalidHandlerRef;
         }
 
-        _ = lua_runtime.c.lua_pushlstring(co.L, args.ptr, args.len);
-
         context_mod.pushCommandContext(co.L, self, cmd.source.provenance) catch {
-            lua_runtime.c.lua_pop(co.L, 2);
+            lua_runtime.c.lua_pop(co.L, 1);
             return error.ContextPushFailed;
         };
+        _ = lua_runtime.c.lua_pushlstring(co.L, args.ptr, args.len);
 
         self.setModuleContext(state, cmd.source.provenance);
         const had_tool_execution = self.current_tool_execution != null;

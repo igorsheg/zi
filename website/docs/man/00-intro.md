@@ -69,5 +69,5 @@ Markdown pages live next to the HTML pages. If a link ends in `.html`, the match
 - [Agent context](agent-context.html) — `AGENTS.md` and `CLAUDE.md`
 - [Extensions](extensions.html) — extension files, loading, lifecycle
 - [API](api.html) — tools, commands, providers, events, jobs, JSON
-- [Context](context.html) — `ctx.ui`, `ctx.editor`, `ctx.session`, `ctx.models`, `ctx.ai`
+- [Context](context.html) — `ctx.ui`, `ctx.composer`, `ctx.session`, `ctx.models`, `ctx.ai`
 - [Guidance](guidance.html) — rules for useful extensions

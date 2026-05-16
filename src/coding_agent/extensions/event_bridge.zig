@@ -1013,7 +1013,7 @@ fn parseContentArray(
 }
 
 const testing = std.testing;
-const api_v3 = @import("api_v3.zig");
+const api_v4 = @import("api_v4.zig");
 
 const BridgeTestHost = struct {
     state: lua_runtime.LuaState,
@@ -1033,7 +1033,7 @@ const BridgeTestHost = struct {
 
     fn attachAndInstallZi(self: *BridgeTestHost) void {
         self.runner.attachLuaState(&self.state);
-        api_v3.install(&self.state, &self.runner);
+        api_v4.install(&self.state, &self.runner);
     }
 };
 
@@ -1065,7 +1065,7 @@ test "semantic message event exposes assistant text and tool calls" {
 
     try state.doString(
         \\_semantic = {}
-        \\zi.on("message", function(event, ctx)
+        \\zi.define.event("message", function(ctx, event)
         \\  table.insert(_semantic, event.message.entry_id .. ":" .. event.message.role .. ":" .. (event.message.text or event.message.tool_name or ""))
         \\end)
     , "subscribe_semantic_message");
@@ -1104,11 +1104,11 @@ test "before_agent_start transforms system prompt and exposes options" {
     const runner = &host.runner;
 
     try state.doString(
-        \\zi.on("before_agent_start", function(event, ctx)
+        \\zi.define.event("before_agent_start", function(ctx, event)
         \\  local opts = event.system_prompt_options
         \\  event.system_prompt = event.system_prompt .. " " .. opts.selected_tools[1] .. " " .. opts.skills[1].name
         \\end)
-        \\zi.on("before_agent_start", function(event, ctx)
+        \\zi.define.event("before_agent_start", function(ctx, event)
         \\  return { system_prompt = event.system_prompt .. " marker" }
         \\end)
     , "subscribe_before_agent_start");
@@ -1129,7 +1129,7 @@ test "input middleware transforms text before agent submission" {
     const runner = &host.runner;
 
     try state.doString(
-        \\zi.on("input", function(event, ctx)
+        \\zi.define.event("input", function(ctx, event)
         \\  if string.sub(event.text, 1, 7) == "?quick " then
         \\    return { action = "transform", text = "Brief: " .. string.sub(event.text, 8) }
         \\  end
@@ -1148,7 +1148,7 @@ test "input middleware handled action stops agent submission" {
     const runner = &host.runner;
 
     try state.doString(
-        \\zi.on("input", function(event, ctx)
+        \\zi.define.event("input", function(ctx, event)
         \\  if event.text == "ping" then return { action = "handled" } end
         \\end)
     , "subscribe_input_handled");
@@ -1166,7 +1166,7 @@ test "beforeToolCall blocks tool execution when handler returns block=true" {
     const runner = &host.runner;
 
     try state.doString(
-        \\zi.on("tool_call", function(event, ctx)
+        \\zi.define.event("tool_call", function(ctx, event)
         \\  if event.toolName == "Bash" and event.input.command == "rm -rf /" then
         \\    return { block = true, reason = "nope" }
         \\  end
@@ -1200,7 +1200,7 @@ test "beforeToolCall returns mutated args when handler rewrites them" {
     const runner = &host.runner;
 
     try state.doString(
-        \\zi.on("tool_call", function(event, ctx)
+        \\zi.define.event("tool_call", function(ctx, event)
         \\  event.input.command = "echo safe"
         \\end)
     , "subscribe");
@@ -1236,7 +1236,7 @@ test "afterToolCall transforms result content via transformable chain" {
     const runner = &host.runner;
 
     try state.doString(
-        \\zi.on("tool_result", function(event, ctx)
+        \\zi.define.event("tool_result", function(ctx, event)
         \\  return {
         \\    tool_call = event.tool_call,
         \\    tool_name = event.tool_name,
@@ -1328,7 +1328,7 @@ test "dispatchModelSelect exposes model, previous_model, and source" {
         \\_seen_model = nil
         \\_seen_prev = nil
         \\_seen_source = nil
-        \\zi.on("model_select", function(event, ctx)
+        \\zi.define.event("model_select", function(ctx, event)
         \\  _seen_model = event.model.id
         \\  _seen_prev = event.previous_model and event.previous_model.id or nil
         \\  _seen_source = event.source

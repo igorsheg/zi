@@ -379,7 +379,7 @@ fn sourceKindString(source: ExtensionSource) []const u8 {
     };
 }
 
-const api_v3 = @import("api_v3.zig");
+const api_v4 = @import("api_v4.zig");
 const dispatch_mod = @import("dispatch.zig");
 
 fn runtimeRoot(source: ExtensionSource, path: []const u8) StaticExtensionRoot {
@@ -410,7 +410,7 @@ fn expectLoadStats(stats: LoadStats, attempted: u32, loaded: u32, failed: u32) !
 
 fn installLoaderTestRuntime(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner) void {
     runner.attachLuaState(state);
-    api_v3.install(state, runner);
+    api_v4.install(state, runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 }
 
@@ -516,7 +516,7 @@ test "loadAll stamps provenance on top-level registrations outside factory" {
     try tmp.dir.createDir(std.Options.debug_io, "extensions", .default_dir);
     var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     const top_level_src =
-        "zi.on(\"message_end\", function() end)\n" ++
+        "zi.define.event(\"message_end\", function() end)\n" ++
         "return function(zi)\n" ++
         "end\n";
     try ext_dir.writeFile(std.Options.debug_io, .{ .sub_path = "toplevel.lua", .data = top_level_src });
@@ -622,7 +622,7 @@ test "shared lua root resolves before later root in canonical order" {
     try shared_buf.print(allocator, "{s}/?.lua;{s}/?/init.lua", .{ shared_path, shared_path });
     runner.shared_lua_paths = try allocator.dupe(u8, shared_buf.items);
 
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
     runner.bindLuaOwnerThread(std.Thread.getCurrentId());
 
     const stats = loadAll(allocator, &state, &runner, exts, &.{});
@@ -643,7 +643,7 @@ test "event handler dispatch inherits extension module context for require" {
     try evt_dir.createDirPath(std.Options.debug_io, "lua/evt");
     try evt_dir.writeFile(std.Options.debug_io, .{ .sub_path = "lua/evt/helper.lua", .data = "_evt_helper_loaded = true\n" });
     const ext_src =
-        "zi.on(\"message_end\", function(event, ctx)\n" ++
+        "zi.define.event(\"message_end\", function(ctx, event)\n" ++
         "  require(\"evt.helper\")\n" ++
         "end)\n" ++
         "return function(zi) end\n";
@@ -741,11 +741,11 @@ test "user extension wins precedence over builtin with same name" {
     var ext_dir = try tmp.dir.openDir(std.Options.debug_io, "extensions", .{});
     const user_src =
         "return function(zi)\n" ++
-        "  zi.tool({\n" ++
+        "  zi.define.tool({\n" ++
         "    name = \"bash\",\n" ++
         "    description = \"user bash\",\n" ++
-        "    parameters = { type = \"object\", properties = {} },\n" ++
-        "    execute = function(params, ctx)\n" ++
+        "    input = { type = \"object\", properties = {} },\n" ++
+        "    run = function(ctx, params)\n" ++
         "      return { ok = true }\n" ++
         "    end,\n" ++
         "  })\n" ++

@@ -51,13 +51,13 @@ Need: ask a side-channel model question
 : Use `ctx.ai.complete`.
 
 Need: expose a model/provider
-: Use `zi.provider`.
+: Use `zi.define.provider`.
 
 Need: run a bounded OS command
-: Use `zi.system`.
+: Use `ctx.process.run`.
 
 Need: delegate to a child zi run
-: Use `zi.spawn`.
+: Use `ctx.agent.run`.
 
 ## Patterns
 
@@ -65,11 +65,11 @@ A tool has one job. If it cannot be described in one sentence, split it.
 
 ```lua
 return function(zi)
-  zi.tool({
+  zi.define.tool({
     name = "project_status",
     description = "Summarize project status.",
     parameters = { type = "object", properties = {} },
-    execute = function(params, ctx)
+    execute = function(ctx, params)
       return { content = { { type = "text", text = "No status provider configured." } } }
     end,
   })
@@ -80,12 +80,12 @@ A command is direct user intent. It should be safe to run when a person asks for
 
 ```lua
 return function(zi)
-  zi.command({
+  zi.define.command({
     name = "note",
     description = "Save a session note.",
-    handler = function(args, ctx)
+    handler = function(ctx, args)
       local ok = ctx.session.append_note({ kind = "manual", body = tostring(args or "") })
-      if ctx.ui then ctx.ui.notify(ok and "note saved" or "note failed", { id = "note", level = ok and "success" or "error" }) end
+      if ctx.ui then ctx.ui.notify.show(ok and "note saved" or "note failed", { id = "note", level = ok and "success" or "error" }) end
     end,
   })
 end
@@ -94,7 +94,7 @@ end
 A message observer can attach durable memory without touching raw JSONL or UI rows.
 
 ```lua
-zi.on("message", function(event, ctx)
+zi.define.event("message", function(ctx, event)
   local message = event.message or {}
   if message.role == "user" and message.text and message.text:match("decision") then
     ctx.session.label(message.entry_id, "decision")
@@ -110,10 +110,10 @@ end)
 An event is for policy or reaction. Keep it easy to explain later.
 
 ```lua
-zi.on("message", function(event, ctx)
+zi.define.event("message", function(ctx, event)
   local message = event.message or {}
   if message.role == "assistant" and ctx.ui then
-    ctx.ui.notify("assistant replied", { id = "assistant-replied", level = "info" })
+    ctx.ui.notify.show("assistant replied", { id = "assistant-replied", level = "info" })
   end
 end)
 ```
@@ -161,7 +161,7 @@ end)
 : Durable labels and entry lookup.
 
 `git_status.lua`
-: `zi.system` with report output.
+: `ctx.process.run` with report output.
 
 `message.lua`
 : Short feedback.

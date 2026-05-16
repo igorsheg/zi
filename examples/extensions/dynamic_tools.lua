@@ -13,12 +13,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
 end
 
 local function ui_status_spec(ctx, spec)
@@ -27,13 +27,13 @@ local function ui_status_spec(ctx, spec)
 end
 
 local function ui_progress_spec(ctx, spec)
-  if not (ctx and ctx.ui and ctx.ui.render and spec) then return end
-  ctx.ui.render({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
+  if not (ctx and ctx.ui and ctx.ui.view.set and spec) then return end
+  ctx.ui.view.set({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
 end
 
 local function ui_report_spec(ctx, spec)
@@ -55,12 +55,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id,
     slot = "status",
     root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } },
@@ -68,8 +68,8 @@ local function ui_status(ctx, id, text, tone)
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id or "report",
     slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" },
     keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
@@ -90,20 +90,20 @@ return function(zi)
 
   local function register_echo_tool(name, label, prefix)
     if registered[name] then return false end
-    local ok = zi.tool({
+    local ok = zi.define.tool({
       name = name,
       label = label,
       description = "Echo a message with prefix: " .. prefix,
       prompt_snippet = "Echo back user-provided text with the " .. prefix .. " prefix",
       prompt_guidelines = { "Use dynamically registered echo tools when the user asks for exact echo output." },
-      parameters = {
+      input = {
         type = "object",
         properties = {
           message = { type = "string", description = "Message to echo" },
         },
         required = { "message" },
       },
-      execute = function(params, ctx)
+      run = function(ctx, params)
         local message = params.message or ""
         return {
           content = { { type = "text", text = prefix .. message } },
@@ -121,17 +121,17 @@ return function(zi)
     return ok
   end
 
-  zi.on("session_start", function(_, ctx)
+  zi.define.event("session_start", function(ctx, _)
     register_echo_tool("echo_session", "Echo Session", "[session] ")
   end)
 
-  zi.command({
+  zi.define.command({
     name = "add-echo-tool",
     description = "Register a new echo tool dynamically: /add-echo-tool <tool_name>",
-    handler = function(args, ctx)
+    run = function(ctx, args)
       local tool_name = normalize_tool_name(args)
       if not tool_name then
-        if ctx and ctx.ui and ctx.ui.render then
+        if ctx and ctx.ui and ctx.ui.view.set then
           ui_report_spec(ctx, {
             id = "dynamic-tools-usage",
             title = "Dynamic tools",
@@ -143,7 +143,7 @@ return function(zi)
       end
 
       local created = register_echo_tool(tool_name, "Echo " .. tool_name, "[" .. tool_name .. "] ")
-      if ctx and ctx.ui and ctx.ui.render then
+      if ctx and ctx.ui and ctx.ui.view.set then
         ui_report_spec(ctx, {
           id = "dynamic-tools-result",
           title = "Dynamic tools",

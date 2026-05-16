@@ -5,7 +5,7 @@ const tool_registry = @import("registries/tool_registry.zig");
 const agent_protocol = @import("../../agent/types.zig");
 const abort_signal_mod = @import("../../zio/root.zig");
 const ai = @import("../../ai/root.zig");
-const api_v3 = @import("api_v3.zig");
+const api_v4 = @import("api_v4.zig");
 const spawn_api = @import("spawn_api.zig");
 const context_mod = @import("context.zig");
 const resource_types = @import("../resources/types.zig");
@@ -375,12 +375,12 @@ fn prepareHandlerCoroutine(
         return error.HandlerNotAFunction;
     }
 
-    try lua_runtime.pushJsonValue(co.L, args);
-
     try context_mod.pushExtensionContext(co.L, runner, provenance);
     c.lua_pushlightuserdata(co.L, runner);
     c.lua_pushcclosure(co.L, &luaToolUpdate, 1);
     c.lua_setfield(co.L, -2, "update");
+
+    try lua_runtime.pushJsonValue(co.L, args);
 
     runner.setModuleContext(state, provenance);
 }
@@ -1014,33 +1014,32 @@ test "lua tool ctx exposes binding from tool provenance" {
         .system_prompt = &testGetSystemPrompt,
         .get_binding_info = &testGetBindingInfo,
     }, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
 
     try state.doString(
-        \\zi.tool({
+        \\zi.define.tool({
         \\  name = "binding",
         \\  description = "binding",
-        \\  parameters = { type = "object", properties = {} },
-        \\  execute = function(args, ctx)
-        \\    assert(ctx.binding ~= nil)
-        \\    assert(ctx.editor == nil)
-        \\    assert(ctx["st" .. "ate"] == nil)
+        \\  input = { type = "object", properties = {} },
+        \\  run = function(ctx, args)
+        \\    assert(ctx.env ~= nil)
+        \\    assert(ctx.composer == nil)
+        \\    assert(type(ctx["st" .. "ate"]) == "table")
         \\    assert(ctx["get_" .. "context_usage"] == nil)
         \\    assert(ctx["get_" .. "system_prompt"] == nil)
-        \\    assert(type(ctx.context_usage) == "function")
-        \\    assert(type(ctx.system_prompt) == "function")
+        \\    assert(ctx.context_usage == nil)
+        \\    assert(ctx.system_prompt == nil)
         \\    return {
         \\      details = {
-        \\        runtime_root_id = ctx.binding.runtime_root_id,
-        \\        state_owner_id = ctx.binding.state_owner_id,
-        \\        generation_id = ctx.binding.generation_id,
-        \\        namespace_id = ctx.binding.namespace_id,
-        \\        workspace_id = ctx.binding.workspace_id,
-        \\        session_id = ctx.binding.session_id,
-        \\        session_file = ctx.binding.session_file,
+        \\        state_owner_id = ctx.env.state_owner_id,
+        \\        generation_id = ctx.env.generation_id,
+        \\        namespace_id = ctx.env.namespace_id,
+        \\        workspace_id = ctx.env.workspace_id,
+        \\        session_id = ctx.env.session_id,
+        \\        session_file = ctx.env.session_file,
         \\      },
         \\    }
         \\  end,
@@ -1064,7 +1063,6 @@ test "lua tool ctx exposes binding from tool provenance" {
 
     try testing.expect(!result.is_error);
     try testing.expect(result.details == .object);
-    try testing.expectEqualStrings("root-123", result.details.object.get("runtime_root_id").?.string);
     try testing.expectEqualStrings("state-123", result.details.object.get("state_owner_id").?.string);
     try testing.expectEqual(@as(i64, 7), result.details.object.get("generation_id").?.integer);
     try testing.expectEqualStrings("state-123::7", result.details.object.get("namespace_id").?.string);
@@ -1109,11 +1107,11 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  return nil
         \\end
         \\
-        \\zi.tool({
+        \\zi.define.tool({
         \\  name = "todo",
         \\  label = "Todo",
         \\  description = "Manage a todo list",
-        \\  parameters = {
+        \\  input = {
         \\    type = "object",
         \\    properties = {
         \\      action = { type = "string", enum = { "list", "add", "toggle", "clear" } },
@@ -1122,7 +1120,7 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\    },
         \\    required = { "action" },
         \\  },
-        \\  execute = function(params, ctx)
+        \\  run = function(ctx, params)
         \\    local action = params.action
         \\    if action == "list" then
         \\      return { content = { { type = "text", text = list_text() } }, details = details("list") }
@@ -1142,11 +1140,11 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  end,
         \\})
         \\
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "todos",
         \\  description = "Show todos",
-        \\  handler = function(_, ctx)
-        \\    ctx.ui.render({ id = "todos" })
+        \\  run = function(ctx, _)
+        \\    ctx.ui.view.set({ id = "todos" })
         \\  end,
         \\})
     , "todo-fixture");
@@ -1574,15 +1572,15 @@ test "extension command context exposes read-only session ui_publication" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "session-ui_publication",
         \\  description = "session-ui_publication",
-        \\  handler = function(_, ctx)
+        \\  run = function(ctx, _)
         \\    local info = ctx.session.info()
         \\    assert(info.id == "session-test")
         \\    assert(info.cwd == "/tmp/project")
@@ -1670,15 +1668,15 @@ test "extension command context exposes model catalog and lookup" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "model-ui_publication",
         \\  description = "model-ui_publication",
-        \\  handler = function(_, ctx)
+        \\  run = function(ctx, _)
         \\    assert(ctx.model == nil)
         \\    assert(ctx.models.current().id == "test-model")
         \\    assert(ctx.models.current().max_tokens == 1024)
@@ -1708,28 +1706,28 @@ test "extension command context publishes host-owned editor buffer actions" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "editor-actions",
         \\  description = "editor-actions",
-        \\  handler = function(_, ctx)
-        \\    assert(ctx["st" .. "ate"] == nil)
+        \\  run = function(ctx, _)
+        \\    assert(type(ctx["st" .. "ate"]) == "table")
         \\    assert(ctx["get_" .. "context_usage"] == nil)
         \\    assert(ctx["get_" .. "system_prompt"] == nil)
-        \\    assert(type(ctx.context_usage) == "function")
-        \\    assert(type(ctx.system_prompt) == "function")
+        \\    assert(ctx.context_usage == nil)
+        \\    assert(ctx.system_prompt == nil)
         \\    assert(ctx.ui["set_" .. "editor_text"] == nil)
         \\    assert(ctx.ui["paste_" .. "to_editor"] == nil)
         \\    assert(ctx.ui["clear_" .. "editor_text"] == nil)
         \\    assert(ctx.ui["get_" .. "editor_text"] == nil)
-        \\    assert(ctx.editor ~= nil)
+        \\    assert(ctx.composer ~= nil)
         \\    local seen = {}
-        \\    for k, v in pairs(ctx.editor) do
-        \\      assert(type(v) == "function")
+        \\    for k, v in pairs(ctx.composer) do
+        \\      assert(type(v) == "function" or k == "capabilities")
         \\      seen[k] = true
         \\    end
         \\    assert(seen.set_text and seen.insert_text and seen.clear)
@@ -1737,9 +1735,9 @@ test "extension command context publishes host-owned editor buffer actions" {
         \\    local count = 0
         \\    for _ in pairs(seen) do count = count + 1 end
         \\    assert(count == 3)
-        \\    ctx.editor.set_text("hello")
-        \\    ctx.editor.insert_text(" world")
-        \\    ctx.editor.clear()
+        \\    ctx.composer.set_text("hello")
+        \\    ctx.composer.insert_text(" world")
+        \\    ctx.composer.clear()
         \\  end,
         \\})
     , "register_editor_action_command");
@@ -1757,7 +1755,7 @@ test "extension command context publishes host-owned editor buffer actions" {
     try testing.expectEqual(@as(usize, 0), store.editor_actions.items.len);
 }
 
-test "ctx.ui v3 exposes render frame and notifications" {
+test "ctx.ui v4 exposes retained view, surface frame, and notifications" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1770,41 +1768,135 @@ test "ctx.ui v3 exposes render frame and notifications" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
-        \\  name = "ui-v3-perimeter",
-        \\  description = "ui-v3-perimeter",
-        \\  handler = function(_, ctx)
-        \\    assert(ctx.has_ui == true)
+        \\zi.define.command({
+        \\  name = "ui-v4-perimeter",
+        \\  description = "ui-v4-perimeter",
+        \\  run = function(ctx, _)
+        \\    assert(ctx.capabilities().ui == true)
+        \\    assert(ctx["c" .. "wd"] == nil)
+        \\    assert(ctx["has" .. "_ui"] == nil)
+        \\    assert(ctx["ed" .. "itor"] == nil)
+        \\    assert(ctx.binding == nil)
+        \\    assert(ctx.extension == nil)
+        \\    assert(ctx["is" .. "_idle"] == nil)
+        \\    assert(ctx["ab" .. "ort"] == nil)
+        \\    assert(ctx["send" .. "_user_message"] == nil)
+        \\    assert(ctx["send" .. "_message"] == nil)
+        \\    assert(ctx["append" .. "_entry"] == nil)
+        \\    assert(ctx["has" .. "_pending_messages"] == nil)
         \\    assert(ctx.ui ~= nil)
         \\    local seen = {}
         \\    local count = 0
         \\    for k, v in pairs(ctx.ui) do
         \\      seen[k] = true
         \\      count = count + 1
-        \\      assert(type(v) == "function")
+        \\      assert(type(v) == "function" or k == "capabilities" or k == "view" or k == "surface" or k == "notify")
         \\    end
-        \\    assert(count == 5)
-        \\    assert(seen.render and seen.frame and seen.notify and seen.notify_clear and seen.progress)
-        \\    ctx.ui.render({ id = "demo" })
-        \\    ctx.ui.frame({ id = "demo" })
-        \\    ctx.ui.notify("demo", { id = "notify" })
-        \\    ctx.ui.render("not-a-table")
-        \\    ctx.ui.frame(nil)
+        \\    assert(count == 4)
+        \\    assert(seen.view and seen.surface and seen.notify and seen.capabilities)
+        \\    ctx.ui.view.set({ id = "demo" })
+        \\    ctx.ui.surface.frame({ id = "demo" })
+        \\    ctx.ui.notify.show({ id = "notify", message = "demo" })
+        \\    ctx.ui.view.set("not-a-table")
+        \\    ctx.ui.surface.frame(nil)
         \\  end,
         \\})
-    , "register_ui_v3_perimeter_command");
+    , "register_ui_v4_perimeter_command");
 
-    try runner.dispatchCommand("ui-v3-perimeter", "");
+    try runner.dispatchCommand("ui-v4-perimeter", "");
     try testing.expectEqual(@as(usize, 2), store.render_count);
     try testing.expectEqual(@as(usize, 1), store.frame_count);
 }
 
-test "extension command resumes after zi.system result" {
+test "api v4 section 10 conformance surface and negative drift" {
+    var store = TestStateStore{ .allocator = testing.allocator };
+    defer store.deinit();
+
+    var state = try lua_runtime.LuaState.init(testing.allocator);
+    defer state.deinit();
+    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 55);
+    defer runner.deinit();
+    runner.attachLuaState(&state);
+    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
+    var provider_registry = ai.provider.Registry.init(testing.allocator);
+    defer provider_registry.deinit();
+    try bindTestRuntime(&runner, &store, &provider_registry);
+    api_v4.install(&state, &runner);
+
+    runner.beginLoadContext(testLoadSource());
+    defer runner.endLoadContext();
+    try state.doString(
+        \\local function assert_error(fn)
+        \\  local ok = pcall(fn)
+        \\  assert(not ok, "expected error")
+        \\end
+        \\local zi_required = {
+        \\  "version", "extension", "define", "json", "schema", "doc",
+        \\}
+        \\for _, k in ipairs(zi_required) do assert(zi[k] ~= nil, k) end
+        \\for _, k in ipairs({"command","tool","keybinding","provider","event","action"}) do assert(type(zi.define[k]) == "function", k) end
+        \\for _, k in ipairs({"encode","decode"}) do assert(type(zi.json[k]) == "function", k) end
+        \\for _, k in ipairs({"object","string","number","integer","boolean","array","enum"}) do assert(type(zi.schema[k]) == "function", k) end
+        \\for _, k in ipairs({"schema","version","fragment","span","line","text","markdown","group","marker","step","is_fragment","validate","to_markdown"}) do assert(zi.doc[k] ~= nil, "doc." .. k) end
+        \\for _, k in ipairs({"command","tool","provider","unprovider","on","action","keybinding","system","spawn","job"}) do assert(zi[k] == nil, "old zi." .. k) end
+        \\assert_error(function() zi.define.command({ name = "bad", desc = "bad", handler = function() end }) end)
+        \\assert_error(function() zi.define.tool({ name = "bad", description = "bad", parameters = {}, execute = function() end }) end)
+        \\assert_error(function() zi.define.keybinding({ id = "bad", key = "f8", handler = function() end }) end)
+        \\local s = zi.schema.object({ properties = {}, required = {} })
+        \\assert(type(s.properties) == "table" and type(s.required) == "table")
+        \\zi.define.action("accept", function(ctx, event) _action_seen = event.action end)
+        \\zi.define.command({
+        \\  name = "v4-conformance",
+        \\  description = "v4-conformance",
+        \\  run = function(ctx, input)
+        \\    _v4_step = "forbidden roots"
+        \\    for _, path in ipairs({"cwd","binding","extension","send_user_message","send_message","append_entry","has_pending_messages"}) do assert(ctx[path] == nil, path) end
+        \\    assert(ctx.ai.stream == nil)
+        \\    assert(ctx.events.on == nil)
+        \\    assert(ctx.control.shutdown == nil)
+        \\    assert(ctx.ui.render == nil and ctx.ui.clear == nil and ctx.ui.frame == nil and ctx.ui.input == nil and ctx.ui.progress == nil)
+        \\    assert(ctx.ui.view.patch == nil)
+        \\    _v4_step = "caps"
+        \\    local caps = ctx.capabilities()
+        \\    for _, k in ipairs({"ui","composer","surface","process","ai","agent","session","state","models","keybinding"}) do assert(type(caps[k]) == "boolean", k) end
+        \\    assert(caps.input == nil and caps.shutdown == nil)
+        \\    local ui_caps = ctx.ui.capabilities()
+        \\    for _, k in ipairs({"view","notify","progress","surface","focus","color","markdown","ansi"}) do assert(type(ui_caps[k]) == "boolean", k) end
+        \\    assert(ui_caps.input == nil)
+        \\    _v4_step = "positive ui"
+        \\    ctx.ui.view.set({ id = "panel", slot = "overlay", root = { type = "view", style = { gap = 1 }, children = { { type = "text", text = "ok" } } } })
+        \\    ctx.ui.notify.show({ id = "smoke", message = "ok", annotation = "v4", ttl_ms = 1000 })
+        \\    ctx.ui.notify.update("smoke", { done = true })
+        \\    ctx.ui.notify.clear("smoke")
+        \\    _v4_step = "negative notify"
+        \\    assert_error(function() ctx.ui.notify.show("hello", {}) end)
+        \\    assert_error(function() ctx.ui.notify.show({ message = "hello", annote = "bad" }) end)
+        \\    assert_error(function() ctx.ui.notify.show({ message = "hello", ttl = 1 }) end)
+        \\    _v4_step = "negative slots"
+        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "notification" }) end)
+        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "editor.border.top" }) end)
+        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "editor.border.bottom" }) end)
+        \\    _v4_step = "negative style"
+        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "overlay", root = { type = "view", style = { flex_direction = "row" } } }) end)
+        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "overlay", root = { type = "view", style = { flex_grow = 1 } } }) end)
+        \\    _v4_step = "negative process"
+        \\    assert_error(function() ctx.process.run({ "/bin/true" }, { stdio = "terminal" }) end)
+        \\    assert_error(function() ctx.process.start({ argv = { "/bin/true" }, stdout = { mode = "events" } }) end)
+        \\    assert_error(function() ctx.process.start({ argv = { "/bin/true" }, stdout = { mode = "ui_frame" } }) end)
+        \\  end,
+        \\})
+    , "v4_conformance_register");
+    try runner.dispatchCommand("v4-conformance", "");
+    try runner.dispatchUiEvent(.{ .state_owner_id = "state-123", .generation = 55, .view = "panel", .action = "accept" });
+    try state.doString("assert(_action_seen == 'accept')", "v4_action_verify");
+}
+
+test "extension command resumes after system result" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1853,16 +1945,16 @@ test "extension command resumes after zi.system result" {
         if (capture.env_value) |value| testing.allocator.free(value);
     }
     runner.async_dispatcher = .{ .ptr = @ptrCast(&capture), .submit = &Capture.submit };
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "system-test",
         \\  description = "system-test",
-        \\  handler = function(_, ctx)
-        \\    local result = zi.system({ "/bin/sh", "-c", "cat" }, { cwd = ctx.cwd, stdin = "hello", env = { FOO = "bar" }, timeout_ms = 1234, stdio = "capture" })
+        \\  run = function(ctx, _)
+        \\    local result = ctx.process.run({ "/bin/sh", "-c", "cat" }, { cwd = ctx.env.cwd, stdin = "hello", env = { FOO = "bar" }, timeout_ms = 1234 })
         \\    _system_result = result.status .. ":" .. result.code .. ":" .. result.stdout .. ":" .. result.stderr
         \\  end,
         \\})
@@ -1956,16 +2048,16 @@ test "extension job API starts writes and stops through dispatcher" {
         .job_write = &Capture.write,
         .job_stop = &Capture.stop,
     };
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "job-api",
-        \\  handler = function(_, ctx)
-        \\    local job = zi.job.start({ argv = { "/bin/cat" }, cwd = ctx.cwd, stdout = { mode = "ui_frame", view = "doom-workbench", node = "doom-demo", protocol = "zi-rgba-frame-v1" } })
-        \\    zi.job.write(job, "KEY left\n")
-        \\    zi.job.stop(job.id)
+        \\  run = function(ctx, _)
+        \\    local job = ctx.process.start({ argv = { "/bin/cat" }, cwd = ctx.env.cwd, stdout = { mode = "chunks" } })
+        \\    job.write( "KEY left\n")
+        \\    job.stop()
         \\  end,
         \\})
     , "register_job_api_command");
@@ -1975,7 +2067,7 @@ test "extension job API starts writes and stops through dispatcher" {
     try testing.expectEqual(@as(?u64, 1), capture.started_id);
     try testing.expectEqualStrings("/bin/cat", capture.argv0 orelse return error.MissingJobArgv);
     try testing.expectEqualStrings(".", capture.cwd orelse return error.MissingJobCwd);
-    try testing.expectEqualStrings("doom-demo", capture.stdout_surface orelse return error.MissingJobStdoutSurface);
+    try testing.expect(capture.stdout_surface == null);
     try testing.expectEqual(@as(?u64, 1), capture.wrote_id);
     try testing.expectEqualStrings("KEY left\n", capture.wrote_data orelse return error.MissingJobWrite);
     try testing.expectEqual(@as(?u64, 1), capture.stopped_id);
@@ -1994,14 +2086,14 @@ test "extension job events dispatch to lua observers" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
         \\job_seen = ""
-        \\zi.on("job_stdout", function(event) job_seen = job_seen .. event.id .. ":" .. event.data end)
-        \\zi.on("job_exit", function(event) job_seen = job_seen .. ":exit=" .. event.code end)
+        \\zi.define.event("job_stdout", function(ctx, event) job_seen = job_seen .. event.id .. ":" .. event.data end)
+        \\zi.define.event("job_exit", function(ctx, event) job_seen = job_seen .. ":exit=" .. event.code end)
     , "register_job_event_handlers");
 
     try runner.dispatchJobEvent(.{ .id = 7, .kind = .stdout, .data = "hello" });
@@ -2027,17 +2119,17 @@ test "extension job next drains tool scoped process events without interactive d
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     try state.doString(
         \\job_out = ""
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "job-next",
-        \\  handler = function(_, ctx)
-        \\    local job = zi.job.start({ argv = { "/bin/sh", "-c", "printf out; printf err >&2" }, cwd = ctx.cwd })
+        \\  run = function(ctx, _)
+        \\    local job = ctx.process.start({ argv = { "/bin/sh", "-c", "printf out; printf err >&2" }, cwd = ctx.env.cwd })
         \\    while true do
-        \\      local ev = zi.job.next(job, { timeout_ms = 100 })
+        \\      local ev = job.next( { timeout_ms = 100 })
         \\      if ev then
         \\        job_out = job_out .. ev.type .. ":" .. tostring(ev.data or ev.code or "") .. "|"
         \\        if ev.type == "exit" then break end
@@ -2073,13 +2165,13 @@ test "extension ui events dispatch to lua observers" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
         \\ui_seen = ""
-        \\zi.on("ui", function(event) ui_seen = event.type .. ":" .. event.view .. ":" .. event.key .. ":" .. event.action .. ":" .. tostring(event.ctrl) end)
+        \\zi.define.event("ui", function(ctx, event) ui_seen = event.type .. ":" .. event.view .. ":" .. event.key .. ":" .. event.action .. ":" .. tostring(event.ctrl) end)
     , "register_ui_event_handler");
 
     try runner.dispatchUiEvent(.{ .state_owner_id = "owner", .generation = 7, .view = "demo", .type = .key, .action = "close", .key = "escape", .ctrl = true });
@@ -2124,15 +2216,15 @@ test "extension command resumes after ai completion result" {
     var capture = Capture{};
     defer if (capture.model) |model| testing.allocator.free(model);
     runner.async_dispatcher = .{ .ptr = @ptrCast(&capture), .submit = &Capture.submit };
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "ai-complete-test",
         \\  description = "ai-complete-test",
-        \\  handler = function(_, ctx)
+        \\  run = function(ctx, _)
         \\    local result = ctx.ai.complete({ model = ctx.models.current(), reasoning = "low", prompt = "hello", system_prompt = "system", max_tokens = 12 })
         \\    _ai_complete_result = result.status .. ":" .. result.text
         \\  end,
@@ -2169,15 +2261,15 @@ test "extension command resumes after yieldable host result" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "async-test",
         \\  description = "async-test",
-        \\  handler = function(_, ctx)
+        \\  run = function(ctx, _)
         \\    local first = ctx.__test_async()
         \\    local second = ctx.__test_async()
         \\    _async_result = first .. ":" .. second
@@ -2212,15 +2304,15 @@ test "extension command rejects arbitrary coroutine yield" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "bad-yield",
         \\  description = "bad-yield",
-        \\  handler = function() coroutine.yield() end,
+        \\  run = function() coroutine.yield() end,
         \\})
     , "register_bad_yield_command");
 
@@ -2240,16 +2332,16 @@ test "ctx.ui.notify publishes notification render" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
     try state.doString(
-        \\zi.command({
+        \\zi.define.command({
         \\  name = "ui-notify",
         \\  description = "ui-notify",
-        \\  handler = function(_, ctx)
-        \\    ctx.ui.notify("Ready for input", { id = "agent-ready", group = "agent", level = "success", annote = "until input" })
+        \\  run = function(ctx, _)
+        \\    ctx.ui.notify.show({ id = "agent-ready", message = "Ready for input", group = "agent", level = "success", annotation = "until input" })
         \\  end,
         \\})
     , "ui_notify");
@@ -2263,7 +2355,7 @@ test "ctx.ui.notify publishes notification render" {
     try testing.expectEqual(@as(?u32, 5000), store.render_specs.items[0].notification.?.ttlMs());
 }
 
-test "todo command can call ctx.ui.render perimeter" {
+test "todo command can call ui render perimeter" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -2276,7 +2368,7 @@ test "todo command can call ctx.ui.render perimeter" {
     var provider_registry = ai.provider.Registry.init(testing.allocator);
     defer provider_registry.deinit();
     try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
     try loadTodoFixture(&state, &runner);
 
     const ext_tool = runner.tool_registry.get("todo").?.*;
@@ -2305,7 +2397,7 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         var provider_registry = ai.provider.Registry.init(testing.allocator);
         defer provider_registry.deinit();
         try bindTestRuntime(&runner, &store, &provider_registry);
-        api_v3.install(&state, &runner);
+        api_v4.install(&state, &runner);
         try loadTodoFixture(&state, &runner);
 
         const ext_tool = runner.tool_registry.get("todo").?.*;
@@ -2327,7 +2419,7 @@ test "todo fixture keeps ephemeral Lua locals within one extension generation" {
         var provider_registry = ai.provider.Registry.init(testing.allocator);
         defer provider_registry.deinit();
         try bindTestRuntime(&runner, &store, &provider_registry);
-        api_v3.install(&state, &runner);
+        api_v4.install(&state, &runner);
         try loadTodoFixture(&state, &runner);
 
         const ext_tool = runner.tool_registry.get("todo").?.*;
@@ -2348,36 +2440,36 @@ test "lua tool execution maps Lua return shapes and runtime errors to AgentToolR
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
     runner.attachLuaState(&state);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     try state.doString(
-        \\zi.tool({
+        \\zi.define.tool({
         \\  name = "echo",
         \\  description = "echo",
-        \\  parameters = { type = "object", properties = {} },
-        \\  execute = function(args) return "hello " .. (args.who or "world") end,
+        \\  input = { type = "object", properties = {} },
+        \\  run = function(ctx, args) return "hello " .. (args.who or "world") end,
         \\})
-        \\zi.tool({
+        \\zi.define.tool({
         \\  name = "system_echo",
         \\  description = "system echo",
-        \\  parameters = { type = "object", properties = {} },
-        \\  execute = function(args)
-        \\    local a = zi.system({ "/bin/sh", "-c", "printf tool" })
-        \\    local b = zi.system({ "/bin/sh", "-c", "printf -- -system" })
+        \\  input = { type = "object", properties = {} },
+        \\  run = function(ctx, args)
+        \\    local a = ctx.process.run({ "/bin/sh", "-c", "printf tool" })
+        \\    local b = ctx.process.run({ "/bin/sh", "-c", "printf -- -system" })
         \\    return a.stdout .. b.stdout
         \\  end,
         \\})
-        \\zi.tool({
+        \\zi.define.tool({
         \\  name = "fail",
         \\  description = "always fails",
-        \\  parameters = { type = "object", properties = {} },
-        \\  execute = function(args) return { content = { { type = "text", text = "boom" } }, is_error = true } end,
+        \\  input = { type = "object", properties = {} },
+        \\  run = function(args) return { content = { { type = "text", text = "boom" } }, is_error = true } end,
         \\})
-        \\zi.tool({
+        \\zi.define.tool({
         \\  name = "explode",
         \\  description = "raises",
-        \\  parameters = { type = "object", properties = {} },
-        \\  execute = function(args) error("kaboom") end,
+        \\  input = { type = "object", properties = {} },
+        \\  run = function(args) error("kaboom") end,
         \\})
     , "register_result_shape_tools");
 
@@ -2434,14 +2526,14 @@ test "lua tool cpu loop aborts through debug hook" {
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
     runner.attachLuaState(&state);
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     try state.doString(
-        \\zi.tool({
+        \\zi.define.tool({
         \\  name = "spin",
         \\  description = "spin",
-        \\  parameters = { type = "object", properties = {} },
-        \\  execute = function(args) while true do end end,
+        \\  input = { type = "object", properties = {} },
+        \\  run = function(args) while true do end end,
         \\})
     , "register_spin_tool");
 

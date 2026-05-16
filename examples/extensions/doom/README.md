@@ -1,10 +1,10 @@
 # DOOM extension example
 
-Play DOOM in a zi v3 UI overlay with a retained `surface` node.
+Play DOOM in a zi v4 UI overlay with a retained `surface` node.
 
 This is intentionally split in two:
 
-- `init.lua` is the zi extension. It renders an overlay with a retained `surface` node, starts a helper job, and forwards v3 UI key events to helper stdin.
+- `init.lua` is the zi extension. It renders an overlay with a retained `surface` node, starts a helper job, and forwards v4 UI key events to helper stdin.
 - `helper/zi-doom-helper.js` owns the DOOM engine. It loads the `doomgeneric` WebAssembly build, ticks at ~35 FPS, converts DOOM's framebuffer into terminal half-block cells, and streams those cells over stdout using zi's `zi-halfblock-rgb-v1` protocol.
 
 The frame protocol is:
@@ -50,6 +50,6 @@ On first run the helper downloads the shareware `doom1.wad` into this directory.
 ## What this demonstrates
 
 - Lua extensions can orchestrate native/host jobs without owning rendering internals.
-- zi can decode a continuous binary stdout stream and publish frames into v3 UI nodes.
-- High-frequency UI can be composed out of `ctx.ui.render`, `ctx.ui.frame`, v3 `ui` events, and `zi.job`.
+- zi can decode a continuous binary stdout stream and publish frames into v4 UI nodes.
+- High-frequency UI can be composed out of `ctx.ui.view.set`, `ctx.ui.surface.frame`, v4 `ui` events, and `ctx.process`.
 - Helpers can stream `zi-halfblock-rgb-v1` records for zi to publish into UI frame nodes.

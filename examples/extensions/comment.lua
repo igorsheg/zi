@@ -13,12 +13,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
 end
 
 local function ui_status_spec(ctx, spec)
@@ -27,13 +27,13 @@ local function ui_status_spec(ctx, spec)
 end
 
 local function ui_progress_spec(ctx, spec)
-  if not (ctx and ctx.ui and ctx.ui.render and spec) then return end
-  ctx.ui.render({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
+  if not (ctx and ctx.ui and ctx.ui.view.set and spec) then return end
+  ctx.ui.view.set({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
 end
 
 local function ui_report_spec(ctx, spec)
@@ -55,12 +55,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id,
     slot = "status",
     root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } },
@@ -68,8 +68,8 @@ local function ui_status(ctx, id, text, tone)
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id or "report",
     slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" },
     keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
@@ -146,8 +146,8 @@ local function edit_with_editor(initial_text, ctx)
   if #argv == 0 then error("No editor configured. Set $VISUAL or $EDITOR.") end
   argv[#argv + 1] = tmp
 
-  local result = zi.system(argv, {
-    cwd = ctx.cwd,
+  local result = ctx.process.run(argv, {
+    cwd = ctx.env.cwd,
     stdio = "terminal",
   })
 
@@ -161,11 +161,11 @@ local function edit_with_editor(initial_text, ctx)
   return edited
 end
 
-zi.command({
+zi.define.command({
   name = "comment",
   description = "Open the last assistant message in $EDITOR and load the result into the editor",
-  handler = function(_, ctx)
-    if not ctx.has_ui then
+  run = function(ctx, _)
+    if not ctx.capabilities().ui then
       if ctx.ui then ui_toast(ctx, "comment requires interactive mode", { kind = "error" }) end
       return
     end
@@ -182,7 +182,7 @@ zi.command({
       return
     end
 
-    ctx.editor.set_text(edited_or_err)
+    ctx.composer.set_text(edited_or_err)
     ui_toast(ctx, "Loaded edited quoted assistant text into the editor", { kind = "info" })
   end,
 })

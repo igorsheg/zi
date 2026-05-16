@@ -10,6 +10,7 @@ const posix = std.posix;
 
 const WatchKind = enum(u3) { requests, stdout, stderr, process, timeout, kill_grace, cancel };
 const Stream = common.Stream;
+const ProcessState = enum { active, stopping, draining, exited };
 
 pub const Reactor = struct {
     allocator: std.mem.Allocator,
@@ -50,6 +51,7 @@ pub const Reactor = struct {
     }
 
     pub fn stop(self: *Reactor) void {
+        self.submit(.shutdown) catch {};
         self.requests.close();
         if (self.thread) |thread| {
             thread.join();
@@ -111,6 +113,11 @@ pub const Reactor = struct {
 
     fn run(self: *Reactor) void {
         logging.setThreadLabel(.process_reactor);
+        const caller_io = self.io;
+        var thread_io_state = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer self.io = caller_io;
+        defer thread_io_state.deinit();
+        self.io = thread_io_state.io();
         const kq = std.c.kqueue();
         if (kq < 0) {
             log.warn("kqueue create failed", .{});
@@ -128,13 +135,15 @@ pub const Reactor = struct {
             return;
         };
 
-        while (!self.shutting_down or self.processes.count() > 0) {
+        while (!self.shutting_down) {
             var events: [32]posix.Kevent = undefined;
-            const n = std.Io.Kqueue.kevent(kq, &.{}, &events, null) catch |err| {
+            var timeout = posix.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+            const n = std.Io.Kqueue.kevent(kq, &.{}, &events, &timeout) catch |err| {
                 log.warn("kqueue wait failed: {}", .{err});
                 break;
             };
             for (events[0..n]) |ev| self.handleKevent(kq, ev) catch |err| log.warn("process reactor event failed: {}", .{err});
+            self.drainRequests(kq) catch |err| log.warn("process reactor request drain failed: {}", .{err});
             self.applyControl(kq) catch |err| log.warn("process reactor control failed: {}", .{err});
         }
         self.destroyProcesses();
@@ -171,13 +180,18 @@ pub const Reactor = struct {
             const count = self.requests.drainInto(&batch);
             if (count == 0) break;
             for (batch[0..count]) |*request| {
-                defer request.deinit(self.allocator);
                 switch (request.*) {
-                    .spawn => |spawn_request| self.handleSpawn(kq, spawn_request) catch |err| {
-                        log.warn("spawn request failed id={d}: {}", .{ spawn_request.id, err });
-                        _ = self.publish(.{ .spawn_failed = spawn_request.id });
+                    .spawn => |spawn_request| {
+                        defer request.deinit(self.allocator);
+                        self.handleSpawn(kq, spawn_request) catch |err| {
+                            log.warn("spawn request failed id={d}: {}", .{ spawn_request.id, err });
+                            _ = self.publish(.{ .spawn_failed = spawn_request.id });
+                        };
                     },
-                    .write => |write_request| self.handleWrite(write_request),
+                    .write => |write_request| {
+                        defer request.deinit(self.allocator);
+                        self.handleWrite(write_request);
+                    },
                     .close_stdin => |id| self.handleCloseStdin(id),
                     .stop => |id| self.handleStop(id),
                     .shutdown => self.shutting_down = true,
@@ -230,12 +244,14 @@ pub const Reactor = struct {
         var it = self.processes.iterator();
         while (it.next()) |entry| {
             const process = entry.value_ptr.*;
+            if (self.shutting_down and process.state == .active) process.stop_requested = true;
             if (!process.stop_requested and process.request.signal.isAborted()) {
                 process.aborted = true;
                 process.stop_requested = true;
             }
             if (process.stop_requested and !process.stopping) {
                 process.stopping = true;
+                process.state = .stopping;
                 process_common.killChild(process.pid, process.request.process_group, .TERM);
                 if (!process.kill_grace_armed) {
                     try registerTimer(kq, process.id, .kill_grace, 100);
@@ -250,6 +266,7 @@ pub const Reactor = struct {
         if (!process.process_alive) return;
         process.term = process.child.wait(self.io) catch null;
         process.process_alive = false;
+        process.state = .draining;
         process.closeStdin(self.io);
     }
 
@@ -288,6 +305,7 @@ pub const Reactor = struct {
                 if (self.processes.fetchRemove(id)) |entry| {
                     const process = entry.value;
                     _ = self.publish(.{ .exit = .{ .id = process.id, .term = process.term, .timed_out = process.timed_out, .aborted = process.aborted } });
+                    process.state = .exited;
                     process.deinit(self.allocator, self.io);
                     self.allocator.destroy(process);
                 }
@@ -303,7 +321,7 @@ pub const Reactor = struct {
         var it = self.processes.iterator();
         while (it.next()) |entry| {
             const process = entry.value_ptr.*;
-            if (process.process_alive) process_common.killChild(process.pid, process.request.process_group, .KILL);
+            process.forceReap(self.io);
             process.deinit(self.allocator, self.io);
             self.allocator.destroy(process);
         }
@@ -321,6 +339,7 @@ const Process = struct {
     stderr_file: ?std.Io.File,
     stdout_open: bool,
     stderr_open: bool,
+    state: ProcessState = .active,
     process_alive: bool = true,
     stop_requested: bool = false,
     stopping: bool = false,

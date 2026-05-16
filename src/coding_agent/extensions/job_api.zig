@@ -39,48 +39,82 @@ pub fn ziJobStart(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
     var request = parseStartRequest(runner.allocator, L) catch |err| {
-        return luaErrorFmt(L, "zi.job.start: invalid request: {s}", .{@errorName(err)});
+        return luaErrorFmt(L, "ctx.process.start: invalid request: {s}", .{@errorName(err)});
     };
     const id = runner.reserveJobId();
     if (runner.async_dispatcher) |dispatcher| {
         const start = dispatcher.job_start orelse {
             request.deinit(runner.allocator);
-            return luaError(L, "zi.job.start: job dispatcher unavailable");
+            return luaError(L, "ctx.process.start: job dispatcher unavailable");
         };
         start(dispatcher.ptr, runner, id, request) catch |err| {
-            return luaErrorFmt(L, "zi.job.start: {s}", .{@errorName(err)});
+            return luaErrorFmt(L, "ctx.process.start: {s}", .{@errorName(err)});
         };
     } else {
         defer request.deinit(runner.allocator);
         switch (request.stdout) {
             .events, .json_lines => {},
-            .ui_frame => return luaError(L, "zi.job.start: ui_frame stdout requires interactive execution"),
+            .ui_frame => return luaError(L, "ctx.process.start: ui_frame stdout requires interactive execution"),
         }
         const signal: zio.cancel.Token = if (runner.current_tool_execution) |exec| exec.signal else zio.cancel.Token.none;
         var job = runner_mod.ToolJob.start(runner.allocator, runner.io, id, request, signal) catch |err| {
-            return luaErrorFmt(L, "zi.job.start: {s}", .{@errorName(err)});
+            return luaErrorFmt(L, "ctx.process.start: {s}", .{@errorName(err)});
         };
         errdefer job.deinit(runner.allocator);
         runner.tool_jobs.put(runner.allocator, id, job) catch |err| {
-            return luaErrorFmt(L, "zi.job.start: {s}", .{@errorName(err)});
+            return luaErrorFmt(L, "ctx.process.start: {s}", .{@errorName(err)});
         };
     }
-    TableBuilder.create(Lua.init(L), 0, 1).int("id", id);
+    const table = TableBuilder.create(Lua.init(L), 0, 4);
+    table.int("id", id);
+    c.lua_pushlightuserdata(L, runner);
+    c.lua_pushinteger(L, @intCast(id));
+    c.lua_pushcclosure(L, jobWriteMethod, 2);
+    c.lua_setfield(L, -2, "write");
+    c.lua_pushlightuserdata(L, runner);
+    c.lua_pushinteger(L, @intCast(id));
+    c.lua_pushcclosure(L, jobStopMethod, 2);
+    c.lua_setfield(L, -2, "stop");
+    c.lua_pushlightuserdata(L, runner);
+    c.lua_pushinteger(L, @intCast(id));
+    c.lua_pushcclosure(L, jobNextMethod, 2);
+    c.lua_setfield(L, -2, "next");
     return 1;
+}
+
+fn jobWriteMethod(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    c.lua_pushvalue(L, c.lua_upvalueindex(2));
+    c.lua_insert(L, 1);
+    return ziJobWrite(L);
+}
+
+fn jobStopMethod(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    c.lua_pushvalue(L, c.lua_upvalueindex(2));
+    c.lua_insert(L, 1);
+    return ziJobStop(L);
+}
+
+fn jobNextMethod(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    c.lua_pushvalue(L, c.lua_upvalueindex(2));
+    c.lua_insert(L, 1);
+    return ziJobNext(L);
 }
 
 pub fn ziJobWrite(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
-    const id = readId(L, 1) orelse return luaError(L, "zi.job.write: expected id");
+    const id = readId(L, 1) orelse return luaError(L, "job.write: expected id");
     var len: usize = 0;
-    const ptr = c.lua_tolstring(L, 2, &len) orelse return luaError(L, "zi.job.write: expected data string");
+    const ptr = c.lua_tolstring(L, 2, &len) orelse return luaError(L, "job.write: expected data string");
     if (runner.tool_jobs.getPtr(id)) |job| {
-        job.write(ptr[0..len]) catch |err| return luaErrorFmt(L, "zi.job.write: {s}", .{@errorName(err)});
+        job.write(ptr[0..len]) catch |err| return luaErrorFmt(L, "job.write: {s}", .{@errorName(err)});
     } else {
-        const dispatcher = runner.async_dispatcher orelse return luaError(L, "zi.job.write: unknown job");
-        const write = dispatcher.job_write orelse return luaError(L, "zi.job.write: unsupported");
-        write(dispatcher.ptr, runner, id, ptr[0..len]) catch |err| return luaErrorFmt(L, "zi.job.write: {s}", .{@errorName(err)});
+        const dispatcher = runner.async_dispatcher orelse return luaError(L, "job.write: unknown job");
+        const write = dispatcher.job_write orelse return luaError(L, "job.write: unsupported");
+        write(dispatcher.ptr, runner, id, ptr[0..len]) catch |err| return luaErrorFmt(L, "job.write: {s}", .{@errorName(err)});
     }
     return 0;
 }
@@ -88,15 +122,15 @@ pub fn ziJobWrite(L_opt: ?*c.lua_State) callconv(.c) c_int {
 pub fn ziJobStop(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
-    const id = readId(L, 1) orelse return luaError(L, "zi.job.stop: expected id");
+    const id = readId(L, 1) orelse return luaError(L, "job.stop: expected id");
     if (runner.tool_jobs.fetchRemove(id)) |kv| {
         var job = kv.value;
         job.stop() catch {};
         job.deinit(runner.allocator);
     } else {
-        const dispatcher = runner.async_dispatcher orelse return luaError(L, "zi.job.stop: unknown job");
-        const stop = dispatcher.job_stop orelse return luaError(L, "zi.job.stop: unsupported");
-        stop(dispatcher.ptr, runner, id) catch |err| return luaErrorFmt(L, "zi.job.stop: {s}", .{@errorName(err)});
+        const dispatcher = runner.async_dispatcher orelse return luaError(L, "job.stop: unknown job");
+        const stop = dispatcher.job_stop orelse return luaError(L, "job.stop: unsupported");
+        stop(dispatcher.ptr, runner, id) catch |err| return luaErrorFmt(L, "job.stop: {s}", .{@errorName(err)});
     }
     return 0;
 }
@@ -104,10 +138,10 @@ pub fn ziJobStop(L_opt: ?*c.lua_State) callconv(.c) c_int {
 pub fn ziJobNext(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
-    const id = readId(L, 1) orelse return luaError(L, "zi.job.next: expected id");
-    const wait_ms = readNextWaitMs(L, 2) catch return luaError(L, "zi.job.next: invalid options");
-    const job = runner.tool_jobs.getPtr(id) orelse return luaError(L, "zi.job.next: unknown job");
-    var event = job.next(runner.allocator, wait_ms) catch |err| return luaErrorFmt(L, "zi.job.next: {s}", .{@errorName(err)});
+    const id = readId(L, 1) orelse return luaError(L, "job.next: expected id");
+    const wait_ms = readNextWaitMs(L, 2) catch return luaError(L, "job.next: invalid options");
+    const job = runner.tool_jobs.getPtr(id) orelse return luaError(L, "job.next: unknown job");
+    var event = job.next(runner.allocator, wait_ms) catch |err| return luaErrorFmt(L, "job.next: {s}", .{@errorName(err)});
     if (event) |*ev| {
         defer ev.deinit(runner.allocator);
         pushJobEvent(L, ev.*);
@@ -162,9 +196,10 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
     defer c.lua_pop(L, 1);
     if (c.lua_type(L, -1) == c.LUA_TTABLE) {
         const stdout_idx = c.lua_absindex(L, -1);
-        const mode = try readStringField(allocator, L, stdout_idx, "mode", "events");
+        const mode = try readStringField(allocator, L, stdout_idx, "mode", "chunks");
         defer allocator.free(mode);
-        if (std.mem.eql(u8, mode, "ui_frame")) {
+        if (std.mem.eql(u8, mode, "ui_frame") or std.mem.eql(u8, mode, "events")) return error.InvalidOptions;
+        if (false) {
             const protocol = try readStringField(allocator, L, stdout_idx, "protocol", "zi-rgba-frame-v1");
             defer allocator.free(protocol);
             const format: extension_ui.FrameFormat = if (std.mem.eql(u8, protocol, "zi-rgba-frame-v1"))
@@ -196,7 +231,7 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
             request.stdout = .{ .json_lines = .{
                 .max_line_bytes = @min(@as(usize, @intCast(raw_max_line_bytes)), 16 * 1024 * 1024),
             } };
-        } else if (!std.mem.eql(u8, mode, "events")) {
+        } else if (!std.mem.eql(u8, mode, "chunks")) {
             return error.InvalidOptions;
         }
     }

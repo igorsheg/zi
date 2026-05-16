@@ -13,12 +13,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
 end
 
 local function ui_status_spec(ctx, spec)
@@ -27,13 +27,13 @@ local function ui_status_spec(ctx, spec)
 end
 
 local function ui_progress_spec(ctx, spec)
-  if not (ctx and ctx.ui and ctx.ui.render and spec) then return end
-  ctx.ui.render({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
+  if not (ctx and ctx.ui and ctx.ui.view.set and spec) then return end
+  ctx.ui.view.set({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
 end
 
 local function ui_report_spec(ctx, spec)
@@ -55,12 +55,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id,
     slot = "status",
     root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } },
@@ -68,8 +68,8 @@ local function ui_status(ctx, id, text, tone)
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id or "report",
     slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" },
     keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
@@ -82,17 +82,17 @@ end
 -- Product-equivalent to pi-mono model-status.ts: observe model_select,
 -- message on explicit model changes, and keep a keyed status item current.
 
-zi.on("model_select", function(event, ctx)
+zi.define.event("model_select", function(ctx, event)
   local model = event.model or {}
   local provider = model.provider or "unknown"
   local id = model.id or "unknown"
   local next_model = provider .. "/" .. id
 
   if ctx.ui then
-    if event.source ~= "restore" and ctx.ui.render then
+    if event.source ~= "restore" and ctx.ui.view.set then
       ui_toast(ctx, "Model: " .. next_model, "info")
     end
-    if ctx.ui.render then
+    if ctx.ui.view.set then
       ui_status_spec(ctx, { id = "model", text = "🤖 " .. id })
     end
   end

@@ -38,7 +38,7 @@ test {
     _ = @import("coding_agent/extensions/system_command.zig");
     _ = @import("coding_agent/extensions/lua_runtime.zig");
     _ = @import("coding_agent/extensions/runner.zig");
-    _ = @import("coding_agent/extensions/api_v3.zig");
+    _ = @import("coding_agent/extensions/api_v4.zig");
     _ = @import("coding_agent/extensions/dispatch.zig");
     _ = @import("coding_agent/extensions/event_bridge.zig");
     _ = @import("coding_agent/extensions/system_worker.zig");

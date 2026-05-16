@@ -13,11 +13,11 @@ return function(zi)
     return false
   end
 
-  zi.tool({
+  zi.define.tool({
     name = "read",
     label = "read (audited)",
     description = "Read a file with a small sensitive-path gate. This intentionally overrides the builtin read tool while preserving the builtin read renderer by same-name inheritance.",
-    parameters = {
+    input = {
       type = "object",
       properties = {
         path = { type = "string", description = "Path to read" },
@@ -26,7 +26,7 @@ return function(zi)
       },
       required = { "path" },
     },
-    execute = function(params, ctx)
+    run = function(ctx, params)
       local path = params.path or ""
       if is_blocked(path) then
         return {
@@ -36,7 +36,7 @@ return function(zi)
         }
       end
 
-      local cwd = (ctx and ctx.cwd) or "."
+      local cwd = (ctx and ctx.env.cwd) or "."
       local absolute = path
       if not string.match(path, "^/") then
         absolute = cwd .. "/" .. path

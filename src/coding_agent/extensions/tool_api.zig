@@ -23,7 +23,7 @@ fn installToolExport(state: *lua_runtime.LuaState, runner: *runner_mod.Extension
 }
 
 pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const api_name = "zi.tool";
+    const api_name = "zi.define.tool";
 
     const L = L_opt.?;
     const lua = Lua.init(L);
@@ -37,9 +37,9 @@ pub fn ziTool(L_opt: ?*c.lua_State) callconv(.c) c_int {
         return luaApiError(L, api_name, switch (err) {
             error.MissingName => "missing required field 'name'",
             error.MissingDescription => "missing required field 'description'",
-            error.MissingParameters => "missing required field 'parameters'",
-            error.MissingExecute => "missing required field 'execute'",
-            error.InvalidExecute => "field 'execute' must be a function",
+            error.MissingParameters => "missing required field 'input'",
+            error.MissingExecute => "missing required field 'run'",
+            error.InvalidExecute => "field 'run' must be a function",
             error.InvalidName => "field 'name' must be a string",
             error.InvalidDescription => "field 'description' must be a string",
             error.InvalidLabel => "field 'label' must be a string",
@@ -108,10 +108,9 @@ fn buildExtensionTool(
         "label",
         "description",
         "display",
-        "parameters",
-        "execute",
-        "prompt_snippet",
-        "prompt_guidelines",
+        "input",
+        "run",
+        "prompt",
     }) catch |err| return mapSchemaError(err, error.UnknownField, error.UnknownField);
 
     const name = spec.requiredString("name") catch |err| return mapSchemaError(err, error.MissingName, error.InvalidName);
@@ -136,7 +135,7 @@ fn buildExtensionTool(
     const prompt_guidelines = spec.optionalStringArray("prompt_guidelines") catch |err| return mapSchemaError(err, error.InvalidPromptGuidelines, error.InvalidPromptGuidelines);
     errdefer freeStringArray(a, prompt_guidelines);
 
-    const parameters = spec.requiredJsonTable("parameters", lua_runtime.default_json_convert_limits) catch |err| switch (err) {
+    const parameters = spec.requiredJsonTable("input", lua_runtime.default_json_convert_limits) catch |err| switch (err) {
         error.MissingField => return error.MissingParameters,
         error.WrongType, error.LimitExceeded => return error.InvalidParameters,
         error.UnsupportedLuaType => return error.UnsupportedLuaType,
@@ -146,7 +145,7 @@ fn buildExtensionTool(
     };
     errdefer lua_runtime.freeJsonValue(a, parameters);
 
-    var execute_ref = spec.requiredFunctionRef("execute") catch |err| switch (err) {
+    var execute_ref = spec.requiredFunctionRef("run") catch |err| switch (err) {
         error.MissingField => return error.MissingExecute,
         error.WrongType => return error.InvalidExecute,
         error.InvalidRegistryRef, error.OutOfMemory => return error.OutOfMemory,

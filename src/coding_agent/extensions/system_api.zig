@@ -23,9 +23,9 @@ pub fn ziSystem(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
     var request = parseSystemRequest(runner.allocator, L) catch |err| {
-        return luaErrorFmt(L, "zi.system: invalid request: {s}", .{@errorName(err)});
+        return luaErrorFmt(L, "ctx.process.run: invalid request: {s}", .{@errorName(err)});
     };
-    request.signal = runner.requireToolExecution("zi.system").signal;
+    request.signal = runner.requireToolExecution("ctx.process.run").signal;
     const id = runner.beginSystemAsync(request);
     return c.lua_yieldk(L, 0, @intCast(id), ziSystemContinue);
 }
@@ -57,7 +57,7 @@ fn parseSystemRequest(allocator: std.mem.Allocator, L: *c.lua_State) SystemParse
     var argv_built: usize = 0;
     errdefer {
         for (argv[0..argv_built]) |arg| allocator.free(arg);
-        allocator.free(argv);
+        if (argv_built != 0) allocator.free(argv);
     }
     var i: c.lua_Integer = 1;
     while (@as(usize, @intCast(i)) <= argv_len) : (i += 1) {
@@ -71,6 +71,7 @@ fn parseSystemRequest(allocator: std.mem.Allocator, L: *c.lua_State) SystemParse
     }
 
     var request = runner_mod.SystemRequest{ .argv = argv };
+    argv_built = 0;
     errdefer request.deinit(allocator);
 
     if (c.lua_type(L, 2) == c.LUA_TNONE or c.lua_type(L, 2) == c.LUA_TNIL) return request;
@@ -84,7 +85,7 @@ fn parseSystemRequest(allocator: std.mem.Allocator, L: *c.lua_State) SystemParse
     request.max_stderr_bytes = optionalSystemUsizeField(L, opts_idx, "max_stderr_bytes", 1024 * 1024) catch return error.InvalidOptions;
     request.clear_env = optionalSystemBoolField(L, opts_idx, "clear_env", false) catch return error.InvalidOptions;
     request.text = optionalSystemBoolField(L, opts_idx, "text", true) catch return error.InvalidOptions;
-    request.stdio = optionalSystemStdioField(L, opts_idx, "stdio") catch return error.InvalidOptions;
+    if (hasField(L, opts_idx, "stdio")) return error.InvalidOptions;
     if (request.stdio == .terminal) {
         if (request.stdin != null) return error.InvalidOptions;
         if (request.timeout_ms != null) return error.InvalidOptions;

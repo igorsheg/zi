@@ -22,7 +22,7 @@ fn installCommandExport(state: *lua_runtime.LuaState, runner: *runner_mod.Extens
 }
 
 pub fn ziCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
-    const api_name = "zi.command";
+    const api_name = "zi.define.command";
 
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
@@ -37,8 +37,8 @@ pub fn ziCommand(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.MissingName => "missing required field 'name' (string)",
             error.InvalidDescription => "field 'description' must be a string",
             error.UnknownField => "spec contains an unknown field",
-            error.MissingHandler => "missing required field 'handler' (function)",
-            error.InvalidHandler => "field 'handler' must be a function",
+            error.MissingHandler => "missing required field 'run' (function)",
+            error.InvalidHandler => "field 'run' must be a function",
             error.OutOfMemory => "out of memory",
         });
     };
@@ -76,7 +76,7 @@ fn buildCommandDef(
     const a = runner.allocator;
     const spec = lua_schema.Table.init(Lua.init(L), a, 1);
 
-    spec.rejectUnknownFields(&.{ "name", "description", "handler" }) catch |err| return mapSchemaError(err, error.UnknownField, error.UnknownField);
+    spec.rejectUnknownFields(&.{ "name", "title", "description", "input", "run" }) catch |err| return mapSchemaError(err, error.UnknownField, error.UnknownField);
 
     const name = spec.requiredString("name") catch |err| return mapSchemaError(err, error.MissingName, error.MissingName);
     errdefer a.free(name);
@@ -84,7 +84,7 @@ fn buildCommandDef(
     const description = (spec.optionalString("description") catch |err| return mapSchemaError(err, error.InvalidDescription, error.InvalidDescription)) orelse a.dupe(u8, "") catch return error.OutOfMemory;
     errdefer a.free(description);
 
-    var handler_ref = spec.requiredFunctionRef("handler") catch |err| switch (err) {
+    var handler_ref = spec.requiredFunctionRef("run") catch |err| switch (err) {
         error.MissingField => return error.MissingHandler,
         error.WrongType => return error.InvalidHandler,
         error.InvalidRegistryRef, error.OutOfMemory => return error.OutOfMemory,

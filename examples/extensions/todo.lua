@@ -13,12 +13,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
 end
 
 local function ui_status_spec(ctx, spec)
@@ -27,13 +27,13 @@ local function ui_status_spec(ctx, spec)
 end
 
 local function ui_progress_spec(ctx, spec)
-  if not (ctx and ctx.ui and ctx.ui.render and spec) then return end
-  ctx.ui.render({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
+  if not (ctx and ctx.ui and ctx.ui.view.set and spec) then return end
+  ctx.ui.view.set({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
 end
 
 local function ui_report_spec(ctx, spec)
@@ -55,12 +55,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id,
     slot = "status",
     root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } },
@@ -68,8 +68,8 @@ local function ui_status(ctx, id, text, tone)
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id or "report",
     slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" },
     keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
@@ -125,11 +125,11 @@ return function(zi)
     return nil
   end
 
-  zi.tool({
+  zi.define.tool({
     name = "todo",
     label = "Todo",
     description = "Manage a todo list. Actions: list, add (text), toggle (id), clear",
-    parameters = {
+    input = {
       type = "object",
       properties = {
         action = { type = "string", enum = { "list", "add", "toggle", "clear" } },
@@ -138,7 +138,7 @@ return function(zi)
       },
       required = { "action" },
     },
-    execute = function(params, ctx)
+    run = function(ctx, params)
       hydrate(ctx)
       local action = params.action
       if action == "list" then
@@ -197,20 +197,20 @@ return function(zi)
     end,
   })
 
-  zi.on("session_start", function(_, ctx)
+  zi.define.event("session_start", function(ctx, _)
     hydrate(ctx)
   end)
 
-  zi.on("session_tree", function(_, ctx)
+  zi.define.event("session_tree", function(ctx, _)
     hydrate(ctx)
   end)
 
-  zi.command({
+  zi.define.command({
     name = "todos",
     description = "Show all todos on the current session branch",
-    handler = function(_, ctx)
+    run = function(ctx, _)
       hydrate(ctx)
-      if ctx and ctx.ui and ctx.ui.render then
+      if ctx and ctx.ui and ctx.ui.view.set then
         ui_report_spec(ctx, {
           id = "todos",
           title = "Todos",

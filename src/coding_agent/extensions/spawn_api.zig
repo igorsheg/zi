@@ -84,7 +84,7 @@ fn ziSpawnContinue(L_opt: ?*c.lua_State, status: c_int, ctx: c.lua_KContext) cal
     _ = ctx;
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
-    const outcome = runner.current_spawn_result orelse return luaError(L, "zi.spawn: missing resume result");
+    const outcome = runner.current_spawn_result orelse return luaError(L, "ctx.agent.run: missing resume result");
     defer runner.current_spawn_result = null;
 
     pushToolResultAsSpawnResult(L, outcome.result);
@@ -103,7 +103,7 @@ fn buildSpawnRequest(
     err_buf: *[256]u8,
 ) ZiSpawnError!?runner_mod.SpawnRequest {
     if (c.lua_type(L, 1) != c.LUA_TTABLE) {
-        return writeErr(err_buf, "zi.spawn: expected opts table as first argument");
+        return writeErr(err_buf, "ctx.agent.run: expected opts table as first argument");
     }
 
     var arena = std.heap.ArenaAllocator.init(runner.allocator);
@@ -111,19 +111,19 @@ fn buildSpawnRequest(
     const aa = arena.allocator();
 
     const task = readSpawnString(L, 1, "task", aa) catch |err| switch (err) {
-        error.Missing => return writeErr(err_buf, "zi.spawn: 'task' is required (string)"),
-        error.WrongType => return writeErr(err_buf, "zi.spawn: 'task' must be a string"),
-        error.OutOfMemory => return writeErr(err_buf, "zi.spawn: out of memory"),
-    } orelse return writeErr(err_buf, "zi.spawn: 'task' is required (string)");
+        error.Missing => return writeErr(err_buf, "ctx.agent.run: 'task' is required (string)"),
+        error.WrongType => return writeErr(err_buf, "ctx.agent.run: 'task' must be a string"),
+        error.OutOfMemory => return writeErr(err_buf, "ctx.agent.run: out of memory"),
+    } orelse return writeErr(err_buf, "ctx.agent.run: 'task' is required (string)");
 
     const model = readOptionalSpawnString(L, 1, "model", aa) catch
-        return writeErr(err_buf, "zi.spawn: 'model' must be a string");
+        return writeErr(err_buf, "ctx.agent.run: 'model' must be a string");
     const tools = readOptionalSpawnString(L, 1, "tools", aa) catch
-        return writeErr(err_buf, "zi.spawn: 'tools' must be a string");
+        return writeErr(err_buf, "ctx.agent.run: 'tools' must be a string");
     const system_append = readOptionalSpawnString(L, 1, "system_append", aa) catch
-        return writeErr(err_buf, "zi.spawn: 'system_append' must be a string");
+        return writeErr(err_buf, "ctx.agent.run: 'system_append' must be a string");
     const cwd_opt = readOptionalSpawnString(L, 1, "cwd", aa) catch
-        return writeErr(err_buf, "zi.spawn: 'cwd' must be a string");
+        return writeErr(err_buf, "ctx.agent.run: 'cwd' must be a string");
 
     _ = c.lua_getfield(L, 1, "on");
     const on_type = c.lua_type(L, -1);
@@ -135,28 +135,28 @@ fn buildSpawnRequest(
         while (c.lua_next(L, -2) != 0) {
             if (c.lua_type(L, -2) != c.LUA_TSTRING) {
                 c.lua_pop(L, 3);
-                return writeErr(err_buf, "zi.spawn: 'on' keys must be event-name strings");
+                return writeErr(err_buf, "ctx.agent.run: 'on' keys must be event-name strings");
             }
             if (c.lua_type(L, -1) != c.LUA_TFUNCTION) {
                 c.lua_pop(L, 3);
-                return writeErr(err_buf, "zi.spawn: 'on' values must be functions");
+                return writeErr(err_buf, "ctx.agent.run: 'on' values must be functions");
             }
             c.lua_pop(L, 1);
         }
         callbacks_ref = c.luaL_ref(L, c.LUA_REGISTRYINDEX);
     } else {
         c.lua_pop(L, 1);
-        return writeErr(err_buf, "zi.spawn: 'on' must be a table");
+        return writeErr(err_buf, "ctx.agent.run: 'on' must be a table");
     }
 
-    const exec = runner.requireToolExecution("zi.spawn");
+    const exec = runner.requireToolExecution("ctx.agent.run");
     return .{
-        .task = runner.allocator.dupe(u8, task) catch return writeErr(err_buf, "zi.spawn: out of memory"),
+        .task = runner.allocator.dupe(u8, task) catch return writeErr(err_buf, "ctx.agent.run: out of memory"),
         .signal = exec.signal,
-        .model = if (model) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
-        .tools = if (tools) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
-        .append_system_prompt = if (system_append) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "zi.spawn: out of memory") else null,
-        .cwd = runner.allocator.dupe(u8, cwd_opt orelse ".") catch return writeErr(err_buf, "zi.spawn: out of memory"),
+        .model = if (model) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "ctx.agent.run: out of memory") else null,
+        .tools = if (tools) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "ctx.agent.run: out of memory") else null,
+        .append_system_prompt = if (system_append) |v| runner.allocator.dupe(u8, v) catch return writeErr(err_buf, "ctx.agent.run: out of memory") else null,
+        .cwd = runner.allocator.dupe(u8, cwd_opt orelse ".") catch return writeErr(err_buf, "ctx.agent.run: out of memory"),
         .callbacks_ref = callbacks_ref,
         .source_L = L,
         .continuation_ctx = 0,
@@ -394,7 +394,7 @@ pub fn eventTrampoline(
         if (c.lua_type(L, -1) == c.LUA_TSTRING) {
             var len: usize = 0;
             if (c.lua_tolstring(L, -1, &len)) |msg| {
-                log.warn("zi.spawn 'on.{s}' handler error: {s}", .{ kind, msg[0..len] });
+                log.warn("ctx.agent.run 'on.{s}' handler error: {s}", .{ kind, msg[0..len] });
             }
         }
         c.lua_pop(L, 1);

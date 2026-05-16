@@ -9,7 +9,7 @@ const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
 
 pub const export_on = api_export.Export{
-    .name = "on",
+    .name = "event",
     .kind = .function,
     .install = installOnExport,
 };
@@ -25,24 +25,24 @@ pub fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const runner = runnerFromUpvalue(L);
 
     if (lua.typeOf(1) != .string) {
-        return luaError(L, "zi.on: expected event name as first argument");
+        return luaError(L, "zi.define.event: expected event name as first argument");
     }
     var name_len: usize = 0;
-    const name_ptr = c.lua_tolstring(L, 1, &name_len) orelse return luaError(L, "zi.on: invalid event name");
+    const name_ptr = c.lua_tolstring(L, 1, &name_len) orelse return luaError(L, "zi.define.event: invalid event name");
     const event_name = name_ptr[0..name_len];
 
     const kind = parseEventKind(event_name) orelse {
-        _ = c.lua_pushfstring(L, "zi.on: unknown event '%s'", name_ptr);
+        _ = c.lua_pushfstring(L, "zi.define.event: unknown event '%s'", name_ptr);
         _ = c.lua_error(L);
         return 0;
     };
 
     if (lua.typeOf(2) != .function) {
-        return luaError(L, "zi.on: expected handler function as second argument");
+        return luaError(L, "zi.define.event: expected handler function as second argument");
     }
 
     var handler_ref = lua_helpers.RegistryRef.takeValueAt(lua, 2) catch {
-        return luaError(L, "zi.on: failed to capture handler reference");
+        return luaError(L, "zi.define.event: failed to capture handler reference");
     };
     errdefer handler_ref.release(lua);
 
@@ -51,7 +51,7 @@ pub fn ziOn(L_opt: ?*c.lua_State) callconv(.c) c_int {
         .source_id = currentEventSourceId(runner),
         .provenance = currentEventProvenance(runner),
     }) catch {
-        return luaError(L, "zi.on: subscribe failed");
+        return luaError(L, "zi.define.event: subscribe failed");
     };
     handler_ref.value = c.LUA_NOREF;
 

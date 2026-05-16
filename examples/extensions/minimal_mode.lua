@@ -1,9 +1,9 @@
 return function(zi)
-  zi.tool({
+  zi.define.tool({
     name = "read",
     label = "read (minimal)",
     description = "Read a text file with minimal collapsed presentation and fuller expanded presentation.",
-    parameters = {
+    input = {
       type = "object",
       properties = {
         path = { type = "string", description = "Path to read" },
@@ -12,9 +12,9 @@ return function(zi)
       },
       required = { "path" },
     },
-    execute = function(params, ctx)
+    run = function(ctx, params)
       local path = params.path or ""
-      local cwd = (ctx and ctx.cwd) or "."
+      local cwd = (ctx and ctx.env.cwd) or "."
       local absolute = path
       if not string.match(path, "^/") then
         absolute = cwd .. "/" .. path

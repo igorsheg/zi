@@ -1071,8 +1071,8 @@ fn makeLifecycleLoggerSource(
         "  f:close()\n" ++
         "end\n" ++
         "return function(zi)\n" ++
-        "  zi.on(\"session_start\", function(event, ctx) write_event(event, ctx, \"previous\") end)\n" ++
-        "  zi.on(\"session_shutdown\", function(event, ctx) write_event(event, ctx, \"next\") end)\n" ++
+        "  zi.define.event(\"session_start\", function(event, ctx) write_event(event, ctx, \"previous\") end)\n" ++
+        "  zi.define.event(\"session_shutdown\", function(event, ctx) write_event(event, ctx, \"next\") end)\n" ++
         "end\n";
 
     return std.fmt.allocPrint(allocator, template, .{ log_path, extension_name });
@@ -1766,7 +1766,7 @@ test "runtime host blocks session replacement and fork when extension vetoes" {
             try tmp.dir.createDirPath(std.Options.debug_io, ".zi/extensions");
             const lua_src = try std.fmt.allocPrint(allocator,
                 \\return function(zi)
-                \\  zi.on("{s}", function(event, ctx)
+                \\  zi.define.event("{s}", function(event, ctx)
                 \\    return {{ block = true, reason = "test-block" }}
                 \\  end)
                 \\end
@@ -1813,14 +1813,14 @@ test "runtime host forkSession emits fork_parent_entry_id in lifecycle payloads"
 
     const lua_src = try std.fmt.allocPrint(allocator,
         \\return function(zi)
-        \\  zi.on("session_shutdown", function(event, ctx)
+        \\  zi.define.event("session_shutdown", function(event, ctx)
         \\    if event.reason == "fork" then
         \\      local f = assert(io.open("{s}", "a"))
         \\      f:write((event.fork_parent_entry_id or "MISSING") .. "|shutdown\n")
         \\      f:close()
         \\    end
         \\  end)
-        \\  zi.on("session_start", function(event, ctx)
+        \\  zi.define.event("session_start", function(event, ctx)
         \\    if event.reason == "fork" then
         \\      local f = assert(io.open("{s}", "a"))
         \\      f:write((event.fork_parent_entry_id or "MISSING") .. "|start\n")

@@ -11,6 +11,9 @@ const extension_ui = @import("ui.zig");
 const request_mod = @import("../request.zig");
 const ai_provider = @import("../../ai/provider.zig");
 const abort_signal_mod = @import("../../zio/root.zig");
+const system_api = @import("system_api.zig");
+const spawn_api = @import("spawn_api.zig");
+const job_api = @import("job_api.zig");
 
 const c = lua_runtime.c;
 const Lua = lua_helpers.Lua;
@@ -26,23 +29,34 @@ pub fn pushExtensionContext(
     runner: *runner_mod.ExtensionRunner,
     provenance: ?resource_types.ExtensionProvenance,
 ) !void {
-    const table = TableBuilder.create(Lua.init(L), 0, 14);
+    const table = TableBuilder.create(Lua.init(L), 0, 10);
 
-    table.string("cwd", runner.cwd);
+    c.lua_pushcfunction(L, ctxCapabilities);
+    table.setFieldFromTop("capabilities");
 
-    const has_ui = switch (runner.runtime) {
-        .bound => |bound| bound.publish_render != null or bound.publish_frame != null,
-        .stub => false,
-    };
-    table.boolean("has_ui", has_ui);
+    pushEnvApi(L, runner, provenance);
+    table.setFieldFromTop("env");
 
     pushUiApi(L, runner, provenance);
     table.setFieldFromTop("ui");
 
-    pushEditorApi(L, runner, provenance);
-    table.setFieldFromTop("editor");
+    pushComposerApi(L, runner, provenance);
+    table.setFieldFromTop("composer");
 
-    table.nil("signal");
+    pushEventsApi(L);
+    table.setFieldFromTop("events");
+
+    pushLogApi(L);
+    table.setFieldFromTop("log");
+
+    pushProcessApi(L, runner);
+    table.setFieldFromTop("process");
+
+    pushAgentApi(L, runner);
+    table.setFieldFromTop("agent");
+
+    pushStateApi(L);
+    table.setFieldFromTop("state");
 
     pushSessionApi(L, runner, provenance);
     table.setFieldFromTop("session");
@@ -50,65 +64,107 @@ pub fn pushExtensionContext(
     pushAiApi(L, runner);
     table.setFieldFromTop("ai");
 
-    pushContextBinding(L, runner, provenance);
-    table.setFieldFromTop("binding");
-
-    pushExtensionInfo(L, runner, provenance);
-    table.setFieldFromTop("extension");
-
     if (runner.enable_test_async) {
         pushMethod(L, runner, &ctxTestAsync);
         table.setFieldFromTop("__test_async");
     }
 
     switch (runner.runtime) {
-        .bound => |bound| {
+        .bound => {
             pushModelsApi(L, runner);
             table.setFieldFromTop("models");
 
-            pushMethod(L, runner, &ctxIsIdle);
-            table.setFieldFromTop("is_idle");
+            pushControlApi(L, runner, true);
+            table.setFieldFromTop("control");
 
-            pushMethod(L, runner, &ctxAbort);
-            table.setFieldFromTop("abort");
-
-            pushMethod(L, runner, &ctxSendUserMessage);
-            table.setFieldFromTop("send_user_message");
-
-            pushMethod(L, runner, &ctxSendMessage);
-            table.setFieldFromTop("send_message");
-
-            pushMethod(L, runner, &ctxAppendEntry);
-            table.setFieldFromTop("append_entry");
-
-            pushMethod(L, runner, &ctxHasPendingMessages);
-            table.setFieldFromTop("has_pending_messages");
-
-            if (bound.shutdown != null) {
-                pushMethod(L, runner, &ctxShutdown);
-            } else {
-                c.lua_pushnil(L);
-            }
-            table.setFieldFromTop("shutdown");
-
-            pushMethod(L, runner, &ctxContextUsage);
-            table.setFieldFromTop("context_usage");
-
-            pushMethod(L, runner, &ctxSystemPrompt);
-            table.setFieldFromTop("system_prompt");
+            pushChatApi(L, runner, true);
+            table.setFieldFromTop("chat");
         },
         .stub => {
             table.nil("models");
-            table.nil("is_idle");
-            table.nil("abort");
-            table.nil("send_user_message");
-            table.nil("send_message");
-            table.nil("append_entry");
-            table.nil("has_pending_messages");
-            table.nil("shutdown");
-            table.nil("context_usage");
-            table.nil("system_prompt");
+            pushControlApi(L, runner, false);
+            table.setFieldFromTop("control");
+            pushChatApi(L, runner, false);
+            table.setFieldFromTop("chat");
         },
+    }
+}
+
+fn pushEnvApi(
+    L: *c.lua_State,
+    runner: *runner_mod.ExtensionRunner,
+    provenance: ?resource_types.ExtensionProvenance,
+) void {
+    const table = TableBuilder.create(Lua.init(L), 0, 4);
+    const binding = switch (runner.runtime) {
+        .bound => |bound| bound.get_binding_info(bound.session),
+        .stub => runner_mod.ExtensionBindingInfo{ .workspace_id = runner.cwd, .session_id = "", .session_file = null },
+    };
+    table.string("cwd", runner.cwd);
+    table.string("workspace_id", binding.workspace_id);
+    table.string("session_id", binding.session_id);
+    table.string("session_file", binding.session_file orelse "");
+    if (provenance) |prov| {
+        table.string("extension_id", prov.state_owner_id);
+        table.string("state_owner_id", prov.state_owner_id);
+        var ns_buf: [256]u8 = undefined;
+        const ns = std.fmt.bufPrint(&ns_buf, "{s}::{d}", .{ prov.state_owner_id, runner.generation }) catch prov.state_owner_id;
+        table.string("namespace_id", ns);
+        if (runner.findLoadedExtensionInfoByStateOwner(prov.state_owner_id)) |info| {
+            table.string("extension_root", info.root_path);
+        } else {
+            table.string("extension_root", "");
+        }
+    } else {
+        table.string("extension_id", "");
+        table.string("state_owner_id", "");
+        table.string("namespace_id", "");
+        table.string("extension_root", "");
+    }
+    table.int("generation_id", @as(i64, @intCast(runner.generation)));
+}
+
+fn pushControlApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, available: bool) void {
+    const table = TableBuilder.create(Lua.init(L), 0, 4);
+    if (available) {
+        pushMethod(L, runner, &ctxIsIdle);
+        table.setFieldFromTop("is_idle");
+        pushMethod(L, runner, &ctxIsIdle);
+        table.setFieldFromTop("wait_for_idle");
+        pushMethod(L, runner, &ctxAbort);
+        table.setFieldFromTop("abort");
+    } else {
+        table.nil("is_idle");
+        table.nil("wait_for_idle");
+        table.nil("abort");
+    }
+    c.lua_createtable(L, 0, 3);
+    c.lua_pushboolean(L, 0);
+    c.lua_setfield(L, -2, "cancelled");
+    c.lua_pushnil(L);
+    c.lua_setfield(L, -2, "reason");
+    c.lua_pushcfunction(L, ctxSignalThrowIfCancelled);
+    c.lua_setfield(L, -2, "throw_if_cancelled");
+    table.setFieldFromTop("signal");
+}
+
+fn ctxSignalThrowIfCancelled(_: ?*c.lua_State) callconv(.c) c_int {
+    return 0;
+}
+
+fn pushChatApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, available: bool) void {
+    const table = TableBuilder.create(Lua.init(L), 0, 3);
+    if (available) {
+        pushMethod(L, runner, &ctxSendUserMessage);
+        table.setFieldFromTop("send_user");
+        pushMethod(L, runner, &ctxSendMessage);
+        table.setFieldFromTop("send_custom");
+        pushMethod(L, runner, &ctxHasPendingMessages);
+        table.setFieldFromTop("has_pending");
+    } else {
+        table.nil("send_user");
+        table.nil("send_custom");
+        table.nil("has_pending");
     }
 }
 
@@ -152,20 +208,58 @@ fn pushUiApi(
         return;
     }
 
-    const table = TableBuilder.create(Lua.init(L), 0, 5);
+    const table = TableBuilder.create(Lua.init(L), 0, 9);
+    c.lua_pushcfunction(L, ctxUiCapabilities);
+    table.setFieldFromTop("capabilities");
+    c.lua_createtable(L, 0, 3);
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiRender);
-    table.setFieldFromTop("render");
-    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiFrame);
-    table.setFieldFromTop("frame");
-    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotify);
-    table.setFieldFromTop("notify");
+    c.lua_setfield(L, -2, "set");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotifyClear);
-    table.setFieldFromTop("notify_clear");
+    c.lua_setfield(L, -2, "remove");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotifyClear);
+    c.lua_setfield(L, -2, "clear");
+    table.setFieldFromTop("view");
+
+    c.lua_createtable(L, 0, 5);
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotifyShow);
+    c.lua_setfield(L, -2, "show");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotifyUpdate);
+    c.lua_setfield(L, -2, "update");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotifyClear);
+    c.lua_setfield(L, -2, "clear");
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiNotifyClearGroup);
+    c.lua_setfield(L, -2, "clear_group");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxUiProgress);
-    table.setFieldFromTop("progress");
+    c.lua_setfield(L, -2, "progress");
+    table.setFieldFromTop("notify");
+
+    c.lua_createtable(L, 0, 1);
+    pushUiMethod(L, runner, prov.state_owner_id, &ctxUiFrame);
+    c.lua_setfield(L, -2, "frame");
+    table.setFieldFromTop("surface");
 }
 
-fn pushEditorApi(
+fn ctxCapabilities(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    c.lua_createtable(L, 0, 10);
+    inline for (.{ "ui", "composer", "surface", "process", "ai", "agent", "session", "state", "models", "keybinding" }) |name| {
+        c.lua_pushboolean(L, 1);
+        c.lua_setfield(L, -2, name);
+    }
+    return 1;
+}
+
+fn ctxUiCapabilities(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    c.lua_createtable(L, 0, 8);
+    inline for (.{ "view", "notify", "progress", "surface", "focus", "color", "markdown", "ansi" }) |name| {
+        c.lua_pushboolean(L, 1);
+        c.lua_setfield(L, -2, name);
+    }
+    return 1;
+}
+
+fn pushComposerApi(
     L: *c.lua_State,
     runner: *runner_mod.ExtensionRunner,
     provenance: ?resource_types.ExtensionProvenance,
@@ -191,6 +285,75 @@ fn pushEditorApi(
     table.setFieldFromTop("insert_text");
     pushUiMethod(L, runner, prov.state_owner_id, &ctxEditorClear);
     table.setFieldFromTop("clear");
+}
+
+fn pushEventsApi(L: *c.lua_State) void {
+    c.lua_createtable(L, 0, 1);
+    c.lua_pushcfunction(L, ctxEventsEmit);
+    c.lua_setfield(L, -2, "emit");
+}
+
+fn pushLogApi(L: *c.lua_State) void {
+    c.lua_createtable(L, 0, 4);
+    c.lua_pushcfunction(L, ctxLogNoop);
+    c.lua_setfield(L, -2, "debug");
+    c.lua_pushcfunction(L, ctxLogNoop);
+    c.lua_setfield(L, -2, "info");
+    c.lua_pushcfunction(L, ctxLogNoop);
+    c.lua_setfield(L, -2, "warn");
+    c.lua_pushcfunction(L, ctxLogNoop);
+    c.lua_setfield(L, -2, "error");
+}
+
+fn ctxEventsEmit(_: ?*c.lua_State) callconv(.c) c_int { return 0; }
+fn ctxLogNoop(_: ?*c.lua_State) callconv(.c) c_int { return 0; }
+
+fn pushProcessApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
+    c.lua_createtable(L, 0, 3);
+    c.lua_pushlightuserdata(L, runner);
+    c.lua_pushcclosure(L, system_api.ziSystem, 1);
+    c.lua_setfield(L, -2, "run");
+    c.lua_pushlightuserdata(L, runner);
+    c.lua_pushcclosure(L, job_api.ziJobStart, 1);
+    c.lua_setfield(L, -2, "start");
+    c.lua_pushcfunction(L, ctxProcessJob);
+    c.lua_setfield(L, -2, "job");
+}
+
+fn pushAgentApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
+    c.lua_createtable(L, 0, 1);
+    c.lua_pushlightuserdata(L, runner);
+    c.lua_pushcclosure(L, spawn_api.ziSpawn, 1);
+    c.lua_setfield(L, -2, "run");
+}
+
+fn ctxProcessJob(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    c.lua_createtable(L, 0, 2);
+    c.lua_pushcfunction(L, ctxLogNoop);
+    c.lua_setfield(L, -2, "write");
+    c.lua_pushcfunction(L, ctxLogNoop);
+    c.lua_setfield(L, -2, "stop");
+    return 1;
+}
+
+fn pushStateApi(L: *c.lua_State) void {
+    c.lua_createtable(L, 0, 4);
+    c.lua_pushcfunction(L, ctxStateNoop);
+    c.lua_setfield(L, -2, "get");
+    c.lua_pushcfunction(L, ctxStateNoop);
+    c.lua_setfield(L, -2, "set");
+    c.lua_pushcfunction(L, ctxStateNoop);
+    c.lua_setfield(L, -2, "delete");
+    c.lua_pushcfunction(L, ctxStateList);
+    c.lua_setfield(L, -2, "list");
+}
+
+fn ctxStateNoop(_: ?*c.lua_State) callconv(.c) c_int { return 0; }
+fn ctxStateList(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    c.lua_createtable(L, 0, 0);
+    return 1;
 }
 
 fn pushUiMethod(
@@ -254,19 +417,45 @@ fn publishEditorActionFromArgs(L: *c.lua_State, kind: extension_ui.EditorActionK
 
 fn ctxUiRender(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
-    publishRenderFromArgs(L) catch {};
+    publishRenderFromArgs(L) catch |err| return extensionActionError(L, "ctx.ui.view.set", err);
     return 0;
 }
 
 fn ctxUiFrame(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
-    publishFrameFromArgs(L) catch {};
+    publishFrameFromArgs(L) catch |err| return extensionActionError(L, "ctx.ui.surface.frame", err);
     return 0;
 }
 
-fn ctxUiNotify(L_opt: ?*c.lua_State) callconv(.c) c_int {
+fn ctxUiNotifyShow(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
-    publishNotifyFromArgs(L) catch {};
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return extensionActionError(L, "ctx.ui.notify.show", error.InvalidArgument);
+    publishNotifyFromArgs(L) catch |err| return extensionActionError(L, "ctx.ui.notify.show", err);
+    return 0;
+}
+
+fn ctxUiNotifyUpdate(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    if (c.lua_type(L, 1) == c.LUA_TSTRING and c.lua_type(L, 2) == c.LUA_TTABLE) {
+        c.lua_pushvalue(L, 1);
+        c.lua_setfield(L, 2, "id");
+        c.lua_replace(L, 1);
+    }
+    publishNotifyFromArgs(L) catch |err| return extensionActionError(L, "ctx.ui.notify.update", err);
+    return 0;
+}
+
+fn ctxUiNotifyClearGroup(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    if (c.lua_type(L, 1) == c.LUA_TSTRING) {
+        c.lua_createtable(L, 0, 2);
+        c.lua_pushvalue(L, 1);
+        c.lua_setfield(L, -2, "group");
+        c.lua_pushboolean(L, 1);
+        c.lua_setfield(L, -2, "clear");
+        c.lua_replace(L, 1);
+    }
+    publishNotifyFromArgs(L) catch |err| return extensionActionError(L, "ctx.ui.notify.clear_group", err);
     return 0;
 }
 
@@ -278,16 +467,14 @@ fn ctxUiNotifyClear(L_opt: ?*c.lua_State) callconv(.c) c_int {
         c.lua_setfield(L, -2, "id");
         c.lua_pushboolean(L, 1);
         c.lua_setfield(L, -2, "clear");
-        _ = c.lua_pushliteral(L, "");
         c.lua_replace(L, 1);
-        c.lua_replace(L, 2);
     } else if (c.lua_type(L, 1) == c.LUA_TTABLE) {
         c.lua_pushboolean(L, 1);
         c.lua_setfield(L, 1, "clear");
         _ = c.lua_pushliteral(L, "");
         c.lua_insert(L, 1);
     }
-    publishNotifyFromArgs(L) catch {};
+    publishNotifyFromArgs(L) catch |err| return extensionActionError(L, "ctx.ui.notify.clear", err);
     return 0;
 }
 
@@ -304,12 +491,12 @@ fn ctxUiProgress(L_opt: ?*c.lua_State) callconv(.c) c_int {
         c.lua_pushboolean(L, 1);
         c.lua_setfield(L, -2, "progress");
         c.lua_remove(L, 1);
-        publishNotifyFromArgs(L) catch {};
+        publishNotifyFromArgs(L) catch |err| return extensionActionError(L, "ctx.ui.notify.progress", err);
     }
     c.lua_createtable(L, 0, 3);
-    pushUiMethod(L, stateRunnerFromUpvalue(L), stateOwnerFromUpvalue(L), &ctxUiNotify);
+    pushUiMethod(L, stateRunnerFromUpvalue(L), stateOwnerFromUpvalue(L), &ctxUiNotifyShow);
     c.lua_setfield(L, -2, "update");
-    pushUiMethod(L, stateRunnerFromUpvalue(L), stateOwnerFromUpvalue(L), &ctxUiNotify);
+    pushUiMethod(L, stateRunnerFromUpvalue(L), stateOwnerFromUpvalue(L), &ctxUiNotifyShow);
     c.lua_setfield(L, -2, "finish");
     pushUiMethod(L, stateRunnerFromUpvalue(L), stateOwnerFromUpvalue(L), &ctxUiNotifyClear);
     c.lua_setfield(L, -2, "clear");
@@ -328,18 +515,21 @@ fn publishNotifyFromArgs(L: *c.lua_State) !void {
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const message = if (c.lua_type(L, 1) == c.LUA_TSTRING) luaString(L, 1) orelse "" else "";
-    const opts_idx: c_int = if (c.lua_type(L, 2) == c.LUA_TTABLE) c.lua_absindex(L, 2) else 0;
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return error.InvalidArgument;
+    const opts_idx: c_int = c.lua_absindex(L, 1);
+    if (hasField(L, opts_idx, "annote")) return error.InvalidArgument;
+    if (hasField(L, opts_idx, "ttl")) return error.InvalidArgument;
+    const message = try readStringFieldLimit(aa, L, opts_idx, "message", "", ui_text_bytes);
     const fallback_id = if (message.len > 0) message else "notification";
     const id = if (opts_idx != 0) try readStringFieldLimit(aa, L, opts_idx, "id", fallback_id, ui_id_bytes) else try aa.dupe(u8, fallback_id[0..@min(fallback_id.len, ui_id_bytes)]);
     const level = if (opts_idx != 0) try readNotifyLevelField(L, opts_idx, "level") else extension_ui.NotifyLevel.info;
     const group = if (opts_idx != 0) try readOptionalStringFieldLimit(aa, L, opts_idx, "group", ui_id_bytes) else null;
     const title = if (opts_idx != 0) try readOptionalStringFieldLimit(aa, L, opts_idx, "title", ui_text_bytes) else null;
-    const annote = if (opts_idx != 0) try readOptionalStringFieldLimit(aa, L, opts_idx, "annote", ui_text_bytes) else null;
+    const annote = if (opts_idx != 0) try readOptionalStringFieldLimit(aa, L, opts_idx, "annotation", ui_text_bytes) else null;
     const clear = if (opts_idx != 0) readBoolField(L, opts_idx, "clear", false) else false;
     const done = if (opts_idx != 0) readBoolField(L, opts_idx, "done", false) else false;
     const progress = if (opts_idx != 0) readBoolField(L, opts_idx, "progress", false) else false;
-    const ttl_ms = if (opts_idx != 0) readOptionalU32Field(L, opts_idx, "ttl_ms") orelse readOptionalSecondsAsMsField(L, opts_idx, "ttl") else null;
+    const ttl_ms = if (opts_idx != 0) readOptionalU32Field(L, opts_idx, "ttl_ms") else null;
     const lifetime = notifyLifetime(ttl_ms, progress, done);
     const now_ns = abort_signal_mod.deadline.nowNs(std.Options.debug_io);
 
@@ -453,9 +643,9 @@ fn parseSlotKindField(L: *c.lua_State, idx: c_int) !extension_ui.UiSlot {
 fn parseSlotKind(value: []const u8) !extension_ui.UiSlot {
     if (std.mem.eql(u8, value, "overlay")) return .overlay;
     if (std.mem.eql(u8, value, "status")) return .status;
-    if (std.mem.eql(u8, value, "notification")) return .notification;
-    if (std.mem.eql(u8, value, "editor.border.top")) return .editor_border_top;
-    if (std.mem.eql(u8, value, "editor.border.bottom")) return .editor_border_bottom;
+    if (std.mem.eql(u8, value, "notification")) return error.InvalidUiSlot;
+    if (std.mem.eql(u8, value, "editor.border.top")) return error.InvalidUiSlot;
+    if (std.mem.eql(u8, value, "editor.border.bottom")) return error.InvalidUiSlot;
     return error.InvalidUiSlot;
 }
 
@@ -615,17 +805,15 @@ fn readOptionalStyleField(arena: std.mem.Allocator, L: *c.lua_State, idx: c_int,
 fn readStyleTable(arena: std.mem.Allocator, L: *c.lua_State, sidx: c_int) !extension_ui.Style {
     var style: extension_ui.Style = .{};
     if (hasField(L, sidx, "border")) return error.InvalidUiStyleBorder;
-    style.flex_grow = readFloatField(L, sidx, "flex_grow", style.flex_grow);
+    inline for (.{ "flex_direction", "flex_grow", "margin", "z_index", "position", "flex_wrap", "flex_shrink", "flex_basis" }) |field| {
+        if (hasField(L, sidx, field)) return error.InvalidArgument;
+    }
     style.gap = readFloatField(L, sidx, "gap", style.gap);
     style.chrome = try readChromeField(arena, L, sidx);
     const padding = readFloatField(L, sidx, "padding", 0);
     style.padding = .{ .top = padding, .right = padding, .bottom = padding, .left = padding };
     style.width = readConstraintField(L, sidx, "width");
     style.height = readConstraintField(L, sidx, "height");
-    if (try readOptionalStringFieldLimit(std.heap.c_allocator, L, sidx, "flex_direction", 16)) |dir| {
-        defer std.heap.c_allocator.free(dir);
-        if (std.mem.eql(u8, dir, "row")) style.flex_direction = .row;
-    }
     if (try readOptionalStringFieldLimit(std.heap.c_allocator, L, sidx, "tone", 16)) |tone| {
         defer std.heap.c_allocator.free(tone);
         if (std.mem.eql(u8, tone, "muted")) style.tone = .muted else if (std.mem.eql(u8, tone, "info")) style.tone = .info else if (std.mem.eql(u8, tone, "success")) style.tone = .success else if (std.mem.eql(u8, tone, "warning")) style.tone = .warning else if (std.mem.eql(u8, tone, "danger")) style.tone = .danger else if (std.mem.eql(u8, tone, "accent")) style.tone = .accent;
@@ -902,6 +1090,10 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, provenan
     c.lua_setfield(L, -2, "messages");
     pushMethod(L, runner, &ctxSessionContext);
     c.lua_setfield(L, -2, "context");
+    pushMethod(L, runner, &ctxSessionContext);
+    c.lua_setfield(L, -2, "model_context");
+    pushMethod(L, runner, &ctxAppendEntry);
+    c.lua_setfield(L, -2, "append_entry");
     pushMethod(L, runner, &ctxSessionAppendNote);
     c.lua_setfield(L, -2, "append_note");
     pushMethod(L, runner, &ctxSessionNotes);
@@ -2231,10 +2423,10 @@ fn ctxAbort(L_opt: ?*c.lua_State) callconv(.c) c_int {
 fn ctxSendUserMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
-    if (c.lua_type(L, 1) != c.LUA_TSTRING) return c.luaL_error(L, "ctx.send_user_message: expected text string");
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) return c.luaL_error(L, "ctx.chat.send_user: expected text string");
 
     var len: usize = 0;
-    const ptr = c.lua_tolstring(L, 1, &len) orelse return c.luaL_error(L, "ctx.send_user_message: expected text string");
+    const ptr = c.lua_tolstring(L, 1, &len) orelse return c.luaL_error(L, "ctx.chat.send_user: expected text string");
     const text = ptr[0..len];
 
     var mode: runner_mod.UserMessageMode = .now;
@@ -2243,28 +2435,28 @@ fn ctxSendUserMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
         defer c.lua_pop(L, 1);
         if (c.lua_type(L, -1) == c.LUA_TSTRING) {
             var mode_len: usize = 0;
-            const mode_ptr = c.lua_tolstring(L, -1, &mode_len) orelse return c.luaL_error(L, "ctx.send_user_message: expected mode string");
+            const mode_ptr = c.lua_tolstring(L, -1, &mode_len) orelse return c.luaL_error(L, "ctx.chat.send_user: expected mode string");
             const mode_text = mode_ptr[0..mode_len];
             mode = if (std.mem.eql(u8, mode_text, "steer"))
                 .steer
             else if (std.mem.eql(u8, mode_text, "followup"))
                 .followup
             else
-                return c.luaL_error(L, "ctx.send_user_message: unknown mode");
+                return c.luaL_error(L, "ctx.chat.send_user: unknown mode");
         } else {
             _ = c.lua_getfield(L, 2, "target");
             defer c.lua_pop(L, 1);
-            if (c.lua_type(L, -1) != c.LUA_TNIL) return c.luaL_error(L, "ctx.send_user_message: unknown option target");
+            if (c.lua_type(L, -1) != c.LUA_TNIL) return c.luaL_error(L, "ctx.chat.send_user: unknown option target");
         }
     }
 
     const actions = switch (runner.runtime) {
-        .bound => |bound| bound.command_actions orelse return c.luaL_error(L, "ctx.send_user_message: unavailable in this host"),
-        .stub => return c.luaL_error(L, "ctx.send_user_message: unavailable before runtime bind"),
+        .bound => |bound| bound.command_actions orelse return c.luaL_error(L, "ctx.chat.send_user: unavailable in this host"),
+        .stub => return c.luaL_error(L, "ctx.chat.send_user: unavailable before runtime bind"),
     };
 
     const result = actions.send_user_message(actions.ctx, text, mode) catch |err| {
-        return extensionActionError(L, "ctx.send_user_message", err);
+        return extensionActionError(L, "ctx.chat.send_user", err);
     };
 
     c.lua_createtable(L, 0, 2);
@@ -2287,13 +2479,13 @@ fn ctxSendUserMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
 fn ctxSendMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
-    if (c.lua_type(L, 1) != c.LUA_TTABLE) return c.luaL_error(L, "ctx.send_message: expected message table");
+    if (c.lua_type(L, 1) != c.LUA_TTABLE) return c.luaL_error(L, "ctx.chat.send_custom: expected message table");
     const msg_idx = c.lua_absindex(L, 1);
 
     _ = c.lua_getfield(L, msg_idx, "kind");
-    if (c.lua_type(L, -1) != c.LUA_TSTRING) return c.luaL_error(L, "ctx.send_message: expected kind string");
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return c.luaL_error(L, "ctx.chat.send_custom: expected kind string");
     var kind_len: usize = 0;
-    const kind_ptr = c.lua_tolstring(L, -1, &kind_len) orelse return c.luaL_error(L, "ctx.send_message: expected kind string");
+    const kind_ptr = c.lua_tolstring(L, -1, &kind_len) orelse return c.luaL_error(L, "ctx.chat.send_custom: expected kind string");
     const kind = kind_ptr[0..kind_len];
     c.lua_pop(L, 1);
 
@@ -2301,7 +2493,7 @@ fn ctxSendMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
     _ = c.lua_getfield(L, msg_idx, "text");
     if (c.lua_type(L, -1) == c.LUA_TSTRING) {
         var text_len: usize = 0;
-        const text_ptr = c.lua_tolstring(L, -1, &text_len) orelse return c.luaL_error(L, "ctx.send_message: expected text string");
+        const text_ptr = c.lua_tolstring(L, -1, &text_len) orelse return c.luaL_error(L, "ctx.chat.send_custom: expected text string");
         text = text_ptr[0..text_len];
     }
     c.lua_pop(L, 1);
@@ -2320,7 +2512,7 @@ fn ctxSendMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
     _ = c.lua_getfield(L, msg_idx, "data");
     if (c.lua_type(L, -1) != c.LUA_TNIL) {
         var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
-        data = lua_runtime.luaValueToJsonLimited(L, -1, runner.allocator, &budget) catch return c.luaL_error(L, "ctx.send_message: invalid data");
+        data = lua_runtime.luaValueToJsonLimited(L, -1, runner.allocator, &budget) catch return c.luaL_error(L, "ctx.chat.send_custom: invalid data");
     }
     c.lua_pop(L, 1);
     defer if (data) |*v| json_util.freeJsonValue(runner.allocator, v.*);
@@ -2331,17 +2523,17 @@ fn ctxSendMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
         defer c.lua_pop(L, 1);
         if (c.lua_type(L, -1) == c.LUA_TSTRING) {
             var mode_len: usize = 0;
-            const mode_ptr = c.lua_tolstring(L, -1, &mode_len) orelse return c.luaL_error(L, "ctx.send_message: expected mode string");
+            const mode_ptr = c.lua_tolstring(L, -1, &mode_len) orelse return c.luaL_error(L, "ctx.chat.send_custom: expected mode string");
             const mode_text = mode_ptr[0..mode_len];
-            opts.mode = if (std.mem.eql(u8, mode_text, "now")) .now else if (std.mem.eql(u8, mode_text, "steer")) .steer else if (std.mem.eql(u8, mode_text, "followup")) .followup else return c.luaL_error(L, "ctx.send_message: unknown mode");
+            opts.mode = if (std.mem.eql(u8, mode_text, "now")) .now else if (std.mem.eql(u8, mode_text, "steer")) .steer else if (std.mem.eql(u8, mode_text, "followup")) .followup else return c.luaL_error(L, "ctx.chat.send_custom: unknown mode");
         }
     }
 
     const actions = switch (runner.runtime) {
-        .bound => |bound| bound.command_actions orelse return c.luaL_error(L, "ctx.send_message: unavailable in this host"),
-        .stub => return c.luaL_error(L, "ctx.send_message: unavailable before runtime bind"),
+        .bound => |bound| bound.command_actions orelse return c.luaL_error(L, "ctx.chat.send_custom: unavailable in this host"),
+        .stub => return c.luaL_error(L, "ctx.chat.send_custom: unavailable before runtime bind"),
     };
-    const result = actions.send_message(actions.ctx, .{ .kind = kind, .text = text, .display = display, .data = data, .include_in_context = include_in_context }, opts) catch |err| return extensionActionError(L, "ctx.send_message", err);
+    const result = actions.send_message(actions.ctx, .{ .kind = kind, .text = text, .display = display, .data = data, .include_in_context = include_in_context }, opts) catch |err| return extensionActionError(L, "ctx.chat.send_custom", err);
 
     c.lua_createtable(L, 0, 2);
     const status = switch (result.status) {
@@ -2361,21 +2553,21 @@ fn ctxSendMessage(L_opt: ?*c.lua_State) callconv(.c) c_int {
 fn ctxAppendEntry(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     const runner = runnerFromUpvalue(L);
-    if (c.lua_type(L, 1) != c.LUA_TSTRING) return c.luaL_error(L, "ctx.append_entry: expected kind string");
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) return c.luaL_error(L, "ctx.session.append_entry: expected kind string");
     var kind_len: usize = 0;
-    const kind_ptr = c.lua_tolstring(L, 1, &kind_len) orelse return c.luaL_error(L, "ctx.append_entry: expected kind string");
+    const kind_ptr = c.lua_tolstring(L, 1, &kind_len) orelse return c.luaL_error(L, "ctx.session.append_entry: expected kind string");
     const kind = kind_ptr[0..kind_len];
     var data: ?std.json.Value = null;
     if (c.lua_type(L, 2) != c.LUA_TNONE and c.lua_type(L, 2) != c.LUA_TNIL) {
         var budget = lua_runtime.JsonConvertBudget{ .limits = lua_runtime.default_json_convert_limits };
-        data = lua_runtime.luaValueToJsonLimited(L, 2, runner.allocator, &budget) catch return c.luaL_error(L, "ctx.append_entry: invalid data");
+        data = lua_runtime.luaValueToJsonLimited(L, 2, runner.allocator, &budget) catch return c.luaL_error(L, "ctx.session.append_entry: invalid data");
     }
     defer if (data) |*v| json_util.freeJsonValue(runner.allocator, v.*);
     const actions = switch (runner.runtime) {
-        .bound => |bound| bound.command_actions orelse return c.luaL_error(L, "ctx.append_entry: unavailable in this host"),
-        .stub => return c.luaL_error(L, "ctx.append_entry: unavailable before runtime bind"),
+        .bound => |bound| bound.command_actions orelse return c.luaL_error(L, "ctx.session.append_entry: unavailable in this host"),
+        .stub => return c.luaL_error(L, "ctx.session.append_entry: unavailable before runtime bind"),
     };
-    const result = actions.append_entry(actions.ctx, kind, data) catch |err| return extensionActionError(L, "ctx.append_entry", err);
+    const result = actions.append_entry(actions.ctx, kind, data) catch |err| return extensionActionError(L, "ctx.session.append_entry", err);
     c.lua_createtable(L, 0, 2);
     _ = c.lua_pushliteral(L, "appended");
     c.lua_setfield(L, -2, "status");
@@ -2392,9 +2584,9 @@ fn extensionActionError(L: *c.lua_State, prefix: []const u8, err: anyerror) c_in
         error.Unsupported => "unsupported mode",
         else => @errorName(err),
     };
-    if (std.mem.eql(u8, prefix, "ctx.send_user_message")) return c.luaL_error(L, "ctx.send_user_message: %s", reason.ptr);
-    if (std.mem.eql(u8, prefix, "ctx.send_message")) return c.luaL_error(L, "ctx.send_message: %s", reason.ptr);
-    if (std.mem.eql(u8, prefix, "ctx.append_entry")) return c.luaL_error(L, "ctx.append_entry: %s", reason.ptr);
+    if (std.mem.eql(u8, prefix, "ctx.chat.send_user")) return c.luaL_error(L, "ctx.chat.send_user: %s", reason.ptr);
+    if (std.mem.eql(u8, prefix, "ctx.chat.send_custom")) return c.luaL_error(L, "ctx.chat.send_custom: %s", reason.ptr);
+    if (std.mem.eql(u8, prefix, "ctx.session.append_entry")) return c.luaL_error(L, "ctx.session.append_entry: %s", reason.ptr);
     return c.luaL_error(L, "extension action failed: %s", reason.ptr);
 }
 

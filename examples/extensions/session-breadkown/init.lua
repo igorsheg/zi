@@ -1,6 +1,6 @@
 return function(zi)
 -- session-breadkown: Zi-native port of pi's session-breakdown dashboard.
--- Uses API v3 only: zi.command, zi.on, zi.system, zi.json, ctx.ui.render, ctx.ui.frame.
+-- Uses API v4 only: zi.define.command, zi.define.event, ctx.process.run, zi.json, ctx.ui.view.set, ctx.ui.surface.frame.
 
 local VIEW = "session-breadkown"
 local GRAPH = "session-breadkown-graph"
@@ -74,13 +74,13 @@ local function toast(ctx, text, tone)
   if ctx and ctx.ui and ctx.ui.notify then
     local level = tone or "info"
     if level == "danger" then level = "error" end
-    ctx.ui.notify(tostring(text or ""), { id = VIEW .. "-notice", level = level })
+    ctx.ui.notify.show(tostring(text or ""), { id = VIEW .. "-notice", level = level })
   end
 end
 
 local function helper_path(ctx)
   if ctx.extension and ctx.extension.root then return ctx.extension.root .. "/helper.py" end
-  return (ctx.cwd or ".") .. "/examples/session-breadkown/helper.py"
+  return (ctx.env.cwd or ".") .. "/examples/session-breadkown/helper.py"
 end
 
 local function selected_range()
@@ -391,7 +391,7 @@ local function tab_header_spans(days, requested_metric, metric, view)
 end
 
 local function render(ctx)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
   if not state.data then return end
   local range = selected_range(); if not range then return end
   local days = current_range()
@@ -430,7 +430,7 @@ local function render(ctx)
   if below_legend then children[#children + 1] = below_legend end
   children[#children + 1] = { type = "text", text = table_text(range, view, metric), wrap = "none" }
   local root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1, gap = 1 }, children = children }
-  ctx.ui.render({
+  ctx.ui.view.set({
     id = VIEW,
     slot = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" },
     focus = true,
@@ -443,23 +443,23 @@ local function render(ctx)
     },
     root = root,
   })
-  if view ~= "dow" and ctx.ui.frame then ctx.ui.frame({ view = VIEW, node = GRAPH, width = gw, height = gh, format = "halfblock_rgb", data = frame }) end
+  if view ~= "dow" and ctx.ui.surface.frame then ctx.ui.surface.frame({ view = VIEW, node = GRAPH, width = gw, height = gh, format = "halfblock_rgb", data = frame }) end
   state.open = true
 end
 
 local function close(ctx)
   state.open = false
-  if ctx and ctx.ui and ctx.ui.render then ctx.ui.render({ id = VIEW, remove = true }) end
+  if ctx and ctx.ui and ctx.ui.view.set then ctx.ui.view.set({ id = VIEW, remove = true }) end
 end
 
 local function load_data(ctx)
   state.busy = true
-  if ctx.ui and ctx.ui.render then
-    ctx.ui.render({ id = VIEW, slot = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" }, root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "progress", label = "Analyzing ~/.zi/agent/sessions…" } } } })
+  if ctx.ui and ctx.ui.view.set then
+    ctx.ui.view.set({ id = VIEW, slot = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" }, root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "progress", label = "Analyzing ~/.zi/agent/sessions…" } } } })
   end
-  -- zi.system keeps this example small. A streaming zi.job loader would improve
+  -- ctx.process.run keeps this example small. A streaming ctx.process loader would improve
   -- progress on very large histories, but would add more helper/Lua plumbing.
-  local result = zi.system({ "/usr/bin/env", "python3", helper_path(ctx) }, { timeout_ms = 60000, max_stdout_bytes = 16 * 1024 * 1024, max_stderr_bytes = 1024 * 1024 })
+  local result = ctx.process.run({ "/usr/bin/env", "python3", helper_path(ctx) }, { timeout_ms = 60000, max_stdout_bytes = 16 * 1024 * 1024, max_stderr_bytes = 1024 * 1024 })
   state.busy = false
   if result.status ~= "completed" or result.code ~= 0 then
     toast(ctx, "session-breadkown failed: " .. tostring(result.stderr or result.error or result.status), "danger")
@@ -477,19 +477,19 @@ local function load_data(ctx)
 end
 
 local function command_handler(_, ctx)
-  if not ctx.has_ui or not ctx.ui or not ctx.ui.render then return end
+  if not ctx.capabilities().ui or not ctx.ui or not ctx.ui.view.set then return end
   if not load_data(ctx) then return end
   render(ctx)
 end
 
 local function register_command(name)
-  zi.command({ name = name, description = "Interactive breakdown of Zi session usage (7/30/90d, graph + model/cwd/day/time views).", handler = command_handler })
+  zi.define.command({ name = name, description = "Interactive breakdown of Zi session usage (7/30/90d, graph + model/cwd/day/time views).", handler = command_handler })
 end
 
 register_command("session-breadkown")
 register_command("session-breakdown")
 
-zi.on("ui", function(event, ctx)
+zi.define.event("ui", function(ctx, event)
   if event.view ~= VIEW then return end
   local action = event.action or event.key
   if action == "close" or action == "q" or action == "escape" then close(ctx); return end
@@ -506,5 +506,5 @@ zi.on("ui", function(event, ctx)
   render(ctx)
 end)
 
-zi.on("session_shutdown", function(_, ctx) close(ctx) end)
+zi.define.event("session_shutdown", function(ctx, _) close(ctx) end)
 end

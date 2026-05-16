@@ -176,10 +176,10 @@ fn pushHandlerAndContext(
         return error.HandlerError;
     }
 
+    try context_mod.pushExtensionContext(co.L, runner, provenance);
+
     c.lua_pushvalue(state.L, payload_idx);
     c.lua_xmove(state.L, co.L, 1);
-
-    try context_mod.pushExtensionContext(co.L, runner, provenance);
 
     runner.setModuleContext(state, provenance);
 }
@@ -214,10 +214,10 @@ fn runOneHandler(
 }
 
 const testing = std.testing;
-const api_v3 = @import("api_v3.zig");
+const api_v4 = @import("api_v4.zig");
 
 fn setupCounterChain(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRunner, kind_name: [:0]const u8) !void {
-    api_v3.install(state, runner);
+    api_v4.install(state, runner);
     try state.doString(
         \\_test_counters = {}
     , "init_counters");
@@ -313,9 +313,9 @@ test "dispatchObserver runs handlers in order and continues after errors" {
     try setupCounterChain(&state, &runner, "message_end");
 
     try state.doString(
-        \\zi.on("message_end", function(event, ctx) table.insert(_test_counters, "a:" .. event.name) end)
-        \\zi.on("message_end", function(event, ctx) error("boom") end)
-        \\zi.on("message_end", function(event, ctx) table.insert(_test_counters, "c:" .. event.name) end)
+        \\zi.define.event("message_end", function(ctx, event) table.insert(_test_counters, "a:" .. event.name) end)
+        \\zi.define.event("message_end", function(ctx, event) error("boom") end)
+        \\zi.define.event("message_end", function(ctx, event) table.insert(_test_counters, "c:" .. event.name) end)
     , "subscribe");
 
     c.lua_createtable(state.L, 0, 1);
@@ -344,29 +344,28 @@ test "dispatch paths expose binding from handler provenance" {
     var dummy: u8 = 0;
     try bindTestRuntime(&runner, &provider_registry, &dummy);
 
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
     runner.beginLoadContext(testLoadSource());
     defer runner.endLoadContext();
 
     try state.doString(
-        \\zi.on("message_end", function(event, ctx)
-        \\  assert(ctx.binding ~= nil)
-        \\  assert(ctx.binding.runtime_root_id == "root-123")
-        \\  assert(ctx.binding.state_owner_id == "state-123")
-        \\  assert(ctx.binding.generation_id == 7)
-        \\  assert(ctx.binding.namespace_id == "state-123::7")
-        \\  assert(ctx.binding.workspace_id == "/workspace")
-        \\  assert(ctx.binding.session_id == "session-123")
-        \\  assert(ctx.binding.session_file == "/workspace/.zi/sessions/session-123.jsonl")
+        \\zi.define.event("message_end", function(ctx, event)
+        \\  assert(ctx.env ~= nil)
+        \\  assert(ctx.env.state_owner_id == "state-123")
+        \\  assert(tonumber(ctx.env.generation_id) == 7)
+        \\  assert(ctx.env.namespace_id == "state-123::7")
+        \\  assert(ctx.env.workspace_id == "/workspace")
+        \\  assert(ctx.env.session_id == "session-123")
+        \\  assert(ctx.env.session_file == "/workspace/.zi/sessions/session-123.jsonl")
         \\end)
-        \\zi.on("tool_call", function(event, ctx)
-        \\  assert(ctx.binding ~= nil)
-        \\  assert(ctx.binding.namespace_id == "state-123::7")
-        \\  return { block = true, reason = ctx.binding.session_id }
+        \\zi.define.event("tool_call", function(ctx, event)
+        \\  assert(ctx.env ~= nil)
+        \\  assert(ctx.env.namespace_id == "state-123::7")
+        \\  return { block = true, reason = ctx.env.session_id }
         \\end)
-        \\zi.on("tool_result", function(event, ctx)
-        \\  assert(ctx.binding ~= nil)
-        \\  return { namespace_id = ctx.binding.namespace_id, session_file = ctx.binding.session_file }
+        \\zi.define.event("tool_result", function(ctx, event)
+        \\  assert(ctx.env ~= nil)
+        \\  return { namespace_id = ctx.env.namespace_id, session_file = ctx.env.session_file }
         \\end)
     , "binding_dispatch");
 
@@ -400,15 +399,15 @@ test "dispatchCancellable stops at first block=true" {
     try setupCounterChain(&state, &runner, "tool_call");
 
     try state.doString(
-        \\zi.on("tool_call", function(event, ctx)
+        \\zi.define.event("tool_call", function(ctx, event)
         \\  table.insert(_test_counters, "first")
         \\  -- no return → fall through
         \\end)
-        \\zi.on("tool_call", function(event, ctx)
+        \\zi.define.event("tool_call", function(ctx, event)
         \\  table.insert(_test_counters, "second")
         \\  return { block = true, reason = "danger" }
         \\end)
-        \\zi.on("tool_call", function(event, ctx)
+        \\zi.define.event("tool_call", function(ctx, event)
         \\  table.insert(_test_counters, "third (should NOT run)")
         \\end)
     , "subscribe");
@@ -438,11 +437,11 @@ test "dispatchCancellable returns blocked=false when chain falls through" {
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
 
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     try state.doString(
-        \\zi.on("tool_call", function(event, ctx) end)
-        \\zi.on("tool_call", function(event, ctx) return nil end)
+        \\zi.define.event("tool_call", function(ctx, event) end)
+        \\zi.define.event("tool_call", function(ctx, event) return nil end)
     , "subscribe");
 
     c.lua_createtable(state.L, 0, 0);
@@ -460,16 +459,16 @@ test "dispatchTransformable feeds each handler's return into the next" {
     var runner = runner_mod.ExtensionRunner.init(testing.allocator, 0);
     defer runner.deinit();
 
-    api_v3.install(&state, &runner);
+    api_v4.install(&state, &runner);
 
     try state.doString(
-        \\zi.on("tool_result", function(event, ctx)
+        \\zi.define.event("tool_result", function(ctx, event)
         \\  return { counter = (event.counter or 0) + 1, label = event.label }
         \\end)
-        \\zi.on("tool_result", function(event, ctx)
+        \\zi.define.event("tool_result", function(ctx, event)
         \\  return { counter = event.counter + 1, label = event.label .. "!" }
         \\end)
-        \\zi.on("tool_result", function(event, ctx)
+        \\zi.define.event("tool_result", function(ctx, event)
         \\  -- no return → identity
         \\end)
     , "subscribe");

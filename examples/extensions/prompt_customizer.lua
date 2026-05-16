@@ -1,7 +1,7 @@
 -- Prompt customizer example: mutate the system prompt at agent runtime build.
 -- Ask: "Is the prompt customizer extension active? Answer from your system prompt."
 
-zi.on("before_agent_start", function(event, ctx)
+zi.define.event("before_agent_start", function(ctx, event)
   local opts = event.system_prompt_options or {}
   local tools = opts.selected_tools or {}
   local skills = opts.skills or {}

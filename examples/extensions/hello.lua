@@ -1,15 +1,15 @@
 return function(zi)
-  zi.tool({
+  zi.define.tool({
     name = "greet",
     label = "Greeting",
     description = "Generate a friendly greeting for a named person.",
-    parameters = {
+    input = {
       type = "object",
       properties = {
         name = { type = "string", description = "Name to greet; defaults to world." },
       },
     },
-    execute = function(params)
+    run = function(params)
       local name = params and params.name or "world"
       return {
         content = { { type = "text", text = "Hello, " .. tostring(name) .. "!" } },

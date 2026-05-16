@@ -1,5 +1,5 @@
 return function(zi)
--- DOOM helper-backed framebuffer demo using v3 ctx.ui.render/frame.
+-- DOOM helper-backed framebuffer demo using v3 ctx.ui.view.set/frame.
 
 local view_id = "doom-workbench"
 local node_id = "doom-demo"
@@ -8,7 +8,7 @@ local width, height = 100, 31
 
 local function extension_root(ctx)
   if ctx.extension and ctx.extension.root then return ctx.extension.root end
-  return (ctx.cwd or ".") .. "/examples/extensions/doom"
+  return (ctx.env.cwd or ".") .. "/examples/extensions/doom"
 end
 
 local function helper_path(ctx) return extension_root(ctx) .. "/helper/zi-doom-helper.js" end
@@ -20,17 +20,17 @@ local function toast(ctx, text, tone)
   if ctx and ctx.ui and ctx.ui.notify then
     local level = tone or "info"
     if level == "danger" then level = "error" end
-    ctx.ui.notify(tostring(text or ""), { id = "doom-notice", group = "doom", level = level })
+    ctx.ui.notify.show(tostring(text or ""), { id = "doom-notice", group = "doom", level = level })
   end
 end
 
 local function close(ctx)
-  if current_job then zi.job.stop(current_job.id); current_job = nil end
-  if ctx and ctx.ui and ctx.ui.render then ctx.ui.render({ id = view_id, remove = true }) end
+  if current_job then ctx.process.job(current_job.id); current_job = nil end
+  if ctx and ctx.ui and ctx.ui.view.set then ctx.ui.view.set({ id = view_id, remove = true }) end
 end
 
 local function render_workbench(ctx)
-  ctx.ui.render({
+  ctx.ui.view.set({
     id = view_id,
     slot = { kind = "overlay", width = "92%", max_height = "90%", anchor = "center", backdrop = "dim" },
     focus = true,
@@ -45,39 +45,39 @@ local function render_workbench(ctx)
       { type = "surface", id = node_id, style = { width = width, height = height } },
     } },
   })
-  ctx.ui.frame({ view = view_id, node = node_id, width = width, height = height, format = "halfblock_rgb", data = boot_frame(width, height) })
+  ctx.ui.surface.frame({ view = view_id, node = node_id, width = width, height = height, format = "halfblock_rgb", data = boot_frame(width, height) })
 end
 
-zi.on("ui", function(event, ctx)
+zi.define.event("ui", function(ctx, event)
   if event.view ~= view_id then return end
   if event.action == "close" or event.key == "escape" or event.key == "q" then close(ctx); return end
-  if current_job and event.key then zi.job.write(current_job.id, "KEY " .. event.key .. "\n") end
+  if current_job and event.key then ctx.process.job(current_job.id, "KEY " .. event.key .. "\n") end
 end)
 
-zi.on("job_stderr", function(event, ctx)
+zi.define.event("job_stderr", function(ctx, event)
   if current_job and event.id == current_job.id and event.data and #event.data > 0 then toast(ctx, event.data:sub(1, 240), "warning") end
 end)
 
-zi.on("job_exit", function(event, ctx)
+zi.define.event("job_exit", function(ctx, event)
   if not current_job or event.id ~= current_job.id then return end
   current_job = nil
   toast(ctx, "DOOM helper stopped", "info")
 end)
 
-zi.on("session_shutdown", function(_, ctx) close(ctx) end)
+zi.define.event("session_shutdown", function(ctx, _) close(ctx) end)
 
-zi.command({
+zi.define.command({
   name = "doom",
-  description = "Play DOOM in a zi v3 UI workbench. Optional: /doom /path/to/doom1.wad",
-  handler = function(args, ctx)
-    if not ctx.has_ui or not ctx.ui or not ctx.ui.render or not ctx.ui.frame then return end
+  description = "Play DOOM in a zi v4 UI workbench. Optional: /doom /path/to/doom1.wad",
+  run = function(ctx, args)
+    if not ctx.capabilities().ui or not ctx.ui or not ctx.ui.view.set or not ctx.ui.surface.frame then return end
     close(ctx)
     render_workbench(ctx)
     local argv = { "/usr/bin/env", "node", helper_path(ctx) }
     local wad = trim(args)
     if is_dangerous_wad_path(wad) then toast(ctx, "Refusing to use a directory as a WAD path", "error"); return end
     if wad ~= "" then argv[#argv + 1] = "--wad"; argv[#argv + 1] = wad end
-    current_job = zi.job.start({ argv = argv, cwd = extension_root(ctx), stdout = { mode = "ui_frame", view = view_id, node = node_id, state_owner_id = ctx.binding and ctx.binding.state_owner_id or nil, protocol = "zi-halfblock-rgb-v1", max_frame_bytes = width * height * 6 + 64 } })
+    current_job = ctx.process.start({ argv = argv, cwd = extension_root(ctx), stdout = { mode = "ui_frame", view = view_id, node = node_id, state_owner_id = ctx.binding and ctx.binding.state_owner_id or nil, protocol = "zi-halfblock-rgb-v1", max_frame_bytes = width * height * 6 + 64 } })
     toast(ctx, "DOOM helper started", "success")
   end,
 })

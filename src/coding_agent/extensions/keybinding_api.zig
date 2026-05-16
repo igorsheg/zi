@@ -24,8 +24,8 @@ pub fn ziRegisterKeybinding(L_opt: ?*c.lua_State) callconv(.c) c_int {
             error.InvalidDescription => "keybinding: \"description\" must be a string",
             error.MissingKey => "keybinding: missing required field \"key\" or \"keys\"",
             error.InvalidKey => "keybinding: key specs must be strings like \"ctrl+f\"",
-            error.MissingHandler => "keybinding: missing required field \"handler\" (function)",
-            error.InvalidHandler => "keybinding: \"handler\" must be a function",
+            error.MissingHandler => "keybinding: missing required field \"run\" (function)",
+            error.InvalidHandler => "keybinding: \"run\" must be a function",
             error.OutOfMemory => "keybinding: out of memory",
         });
     };
@@ -118,6 +118,12 @@ fn buildKeybindingDef(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) Regi
     if (parsed_keys.items.len == 0) return error.MissingKey;
 
     _ = c.lua_getfield(L, 1, "handler");
+    if (c.lua_type(L, -1) != c.LUA_TNIL) {
+        c.lua_pop(L, 1);
+        return error.InvalidHandler;
+    }
+    c.lua_pop(L, 1);
+    _ = c.lua_getfield(L, 1, "run");
     if (c.lua_type(L, -1) == c.LUA_TNIL) {
         c.lua_pop(L, 1);
         return error.MissingHandler;

@@ -13,3 +13,6 @@ website/public/
 .zi/specs
 .standup/
 scripts/standup.ts
+
+autoresearch*.jsonl
+autoresearch*.sh

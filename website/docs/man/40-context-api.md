@@ -18,10 +18,10 @@ Most tools, commands, and events receive `ctx`.
 
 ## Fields
 
-`ctx.cwd`
+`ctx.env.cwd`
 : Current working directory.
 
-`ctx.has_ui`
+`ctx.capabilities().ui`
 : Whether UI APIs are available.
 
 `ctx.binding`
@@ -33,7 +33,7 @@ Most tools, commands, and events receive `ctx`.
 `ctx.ui`
 : Host-owned UI API, or `nil`.
 
-`ctx.editor`
+`ctx.composer`
 : Host-owned editor draft API, or `nil`.
 
 `ctx.session`
@@ -48,25 +48,25 @@ Most tools, commands, and events receive `ctx`.
 `ctx.signal`
 : Cancellation signal, or `nil`.
 
-`ctx.is_idle()`
+`ctx.control.is_idle()`
 : Return whether the active session is idle.
 
-`ctx.abort()`
+`ctx.control.abort()`
 : Request abort on the active run.
 
-`ctx.send_user_message(text, opts?)`
+`ctx.chat.send_user(text, opts?)`
 : Inject a text-only user message into the main chat through the same host paths as typed input. With no mode, the session must be idle; the message submits after the current extension handler returns and starts a turn. During an active run, pass `opts.mode = "steer"` to queue before the next model call, or `opts.mode = "followup"` to queue after the run drains. The call returns `{ status = "submitted" | "queued", mode = "now" | "steer" | "followup" }`. This API is intentionally not a session-control shortcut: it does not reload, fork, or replace the live runner.
 
-`ctx.send_message(message, opts?)`
+`ctx.chat.send_custom(message, opts?)`
 : Send an extension-owned custom message. `message.kind` is required. `message.text`, `message.display`, `message.data`, and `message.include_in_context` are optional. With no mode, zi stores a `custom_message` session entry and renders it when `display` is true; it is not model-visible unless `include_in_context = true`. With `include_in_context = true`, `opts.mode = "now"` submits immediately when idle, `"steer"` queues before the next model call during an active run, and `"followup"` queues after the run drains. Scheduled custom messages enter the agent loop as `AgentMessage.custom` and are persisted by the normal message lifecycle.
 
-`ctx.append_entry(kind, data?)`
+`ctx.session.append_entry(kind, data?)`
 : Append durable extension-owned data to the session log. Entries are not chat messages and are not model-visible. Use this for replayable extension state and breadcrumbs.
 
 `ctx.update(partial_result)`
 : Update the current in-flight tool preview. The final tool return remains authoritative.
 
-`ctx.has_pending_messages()`
+`ctx.chat.has_pending()`
 : Return whether the session has queued messages.
 
 `ctx.shutdown()`
@@ -80,22 +80,22 @@ Most tools, commands, and events receive `ctx`.
 
 ## UI
 
-`ctx.ui` publishes host-owned UI intent. Extensions describe views; zi owns placement, focus, and redraw. API v3 exposes three methods:
+`ctx.ui` publishes host-owned UI intent. Extensions describe views; zi owns placement, focus, and redraw. API v4 exposes three methods:
 
-`ctx.ui.render(spec)`
-: Publish, update, or remove a retained UI contribution. `spec.id` is required; together with the extension owner it identifies the contribution to replace or remove. `spec.slot` is one of `status`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim", lifetime = "manual" }`. Set `spec.remove = true` to clear a contribution. Replacement/removal clears owned input state and surface frames. `spec.root` is a node tree (`view`, `text`, `input`, `chip`, `progress`, `separator`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.on("ui", ...)`. Overlay stack policy is top-only: the top ordered overlay owns focus, overlay options, key routing, and input routing. `lifetime = "until_input"` dismisses the top overlay after a routed key or input event; `manual` keeps it until explicit removal.
+`ctx.ui.view.set(spec)`
+: Publish, update, or remove a retained UI contribution. `spec.id` is required; together with the extension owner it identifies the contribution to replace or remove. `spec.slot` is one of `status`, `overlay`, `editor.border.top`, or `editor.border.bottom`; it may also be a table such as `{ kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim", lifetime = "manual" }`. Set `spec.remove = true` to clear a contribution. Replacement/removal clears owned input state and surface frames. `spec.root` is a node tree (`view`, `text`, `input`, `chip`, `progress`, `separator`, or `surface`). `spec.keys` declares key bindings that are delivered through `zi.define.event("ui", ...)`. Overlay stack policy is top-only: the top ordered overlay owns focus, overlay options, key routing, and input routing. `lifetime = "until_input"` dismisses the top overlay after a routed key or input event; `manual` keeps it until explicit removal.
 
-`ctx.ui.frame(spec)`
+`ctx.ui.surface.frame(spec)`
 : Publish a frame for a `surface` node in an existing render tree. `spec.view` names the render view id, `spec.node` names the surface node id, and `spec.data` contains frame bytes. Supported formats include `rgba8888` and `halfblock_rgb`. `surface` remains the node type for framebuffer graphs and other pixel/cell-frame visuals.
 
-`ctx.ui.notify(message, opts?)`
+`ctx.ui.notify.show(message, opts?)`
 : Publish or update a fidget-style notification in the bottom-right notification stack. `opts.id` is the replacement key. `opts.level` is `debug`, `info`, `warn`, `error`, or `success`; `opts.group`, `opts.title`, `opts.annote`, `opts.progress`, and `opts.done` shape the compact row. Repeated identical messages with the same id collapse as `(Nx)`. Done notifications linger briefly by default; set `ttl` seconds or `ttl_ms` to control expiry.
 
-`ctx.ui.notify_clear(id_or_opts)`
+`ctx.ui.notify.clear(id_or_opts)`
 : Remove a retained notification by id.
 
-`ctx.ui.progress(opts)`
-: Start a progress notification (`opts.id`, `opts.message`, `opts.group`, `opts.title`) with an animated spinner. Update the same progress row by calling `ctx.ui.notify(next_message, { id = opts.id, progress = true })`; finish with `{ done = true }`.
+`ctx.ui.notify.progress(opts)`
+: Start a progress notification (`opts.id`, `opts.message`, `opts.group`, `opts.title`) with an animated spinner. Update the same progress row by calling `ctx.ui.notify.show(next_message, { id = opts.id, progress = true })`; finish with `{ done = true }`.
 
 ### UI input nodes
 
@@ -124,7 +124,7 @@ Input nodes are first-class fields for focused overlays. Zi owns editing mechani
 Example:
 
 ```lua
-ctx.ui.render({
+ctx.ui.view.set({
   id = "rename-session",
   slot = { kind = "overlay", width = "50%", anchor = "center", backdrop = "dim" },
   focus = true,
@@ -133,7 +133,7 @@ ctx.ui.render({
   } },
 })
 
-zi.on("ui", function(event, ctx)
+zi.define.event("ui", function(ctx, event)
   if event.action == "rename.change" then
     state.name = event.value or ""
     -- re-render with state.name
@@ -184,7 +184,7 @@ Style colors accept names such as `red`, `green`, `yellow`, `blue`, `magenta`, `
 Dashboard text example:
 
 ```lua
-ctx.ui.render({
+ctx.ui.view.set({
   id = "session-breakdown",
   slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center" },
   root = { type = "view", style = { chrome = { kind = "frame", title = "Session breakdown", border = "rounded", tone = "muted" }, padding = 1, gap = 1 }, children = {
@@ -201,9 +201,9 @@ ctx.ui.render({
 Example:
 
 ```lua
-ctx.ui.notify("Hello from zi", { id = "hello", level = "info" })
+ctx.ui.notify.show("Hello from zi", { id = "hello", level = "info" })
 
-ctx.ui.render({
+ctx.ui.view.set({
   id = "panel",
   slot = { kind = "overlay", width = "70%", anchor = "center", backdrop = "dim" },
   keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
@@ -212,31 +212,31 @@ ctx.ui.render({
   } },
 })
 
-zi.on("ui", function(event, ctx)
+zi.define.event("ui", function(ctx, event)
   if event.view == "panel" and event.action == "close" then
-    ctx.ui.render({ id = "panel", remove = true })
+    ctx.ui.view.set({ id = "panel", remove = true })
   end
 end)
 ```
 
 ## Editor
 
-`ctx.editor` is available when zi can update the host-owned editor draft. It exposes exactly these methods:
+`ctx.composer` is available when zi can update the host-owned editor draft. It exposes exactly these methods:
 
-`ctx.editor.set_text(text)`
+`ctx.composer.set_text(text)`
 : Replace editor text.
 
-`ctx.editor.insert_text(text)`
+`ctx.composer.insert_text(text)`
 : Insert text at the editor cursor.
 
-`ctx.editor.clear()`
+`ctx.composer.clear()`
 : Clear editor text.
 
 There is no synchronous editor text getter.
 
 ## State
 
-Extension-scoped state maps are not part of API v3. Use Lua locals for extension-ephemeral state. Durable extension state should be represented explicitly as session artifacts. Use `ctx.session.append_artifact` for extension-owned JSON state, or notes/labels for human-readable annotations and entry bookmarks.
+Extension-scoped state maps are not part of API v4. Use Lua locals for extension-ephemeral state. Durable extension state should be represented explicitly as session artifacts. Use `ctx.session.append_artifact` for extension-owned JSON state, or notes/labels for human-readable annotations and entry bookmarks.
 
 ## Session
 
@@ -285,7 +285,7 @@ Extension-scoped state maps are not part of API v3. Use Lua locals for extension
 Use durable ids for memory that should be inspectable later.
 
 ```lua
-zi.on("message", function(event, ctx)
+zi.define.event("message", function(ctx, event)
   local message = event.message or {}
   if message.role == "user" and message.text and message.text:match("decision") then
     ctx.session.label(message.entry_id, "decision")
@@ -332,7 +332,7 @@ ctx.ai.complete({
 
 `reasoning` may be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or a boolean.
 
-Optional streaming callbacks may be passed as `on = function(event)` or as a table keyed by event type. Callbacks run on the extension Lua thread while `ctx.ai.complete` is waiting for the final result. They must be non-yielding (do not call yieldable APIs such as `ctx.ai.complete`, `zi.system`, or coroutine yield from them).
+Optional streaming callbacks may be passed as `on = function(event)` or as a table keyed by event type. Callbacks run on the extension Lua thread while `ctx.ai.complete` is waiting for the final result. They must be non-yielding (do not call yieldable APIs such as `ctx.ai.complete`, `ctx.process.run`, or coroutine yield from them).
 
 ```lua
 local result = ctx.ai.complete({
@@ -401,15 +401,15 @@ side:messages({ limit = 100, include_tools = true }) -- typed, JSON-compatible s
 side:is_busy()   -- true while the side agent is running a prompt
 ```
 
-`ctx.ai.complete`, `ctx.ai.session`, and `zi.spawn` remain distinct: complete is one-shot, session is a multi-turn in-process side agent, and spawn delegates to an isolated child zi task.
+`ctx.ai.complete`, `ctx.ai.session`, and `ctx.agent.run` remain distinct: complete is one-shot, session is a multi-turn in-process side agent, and spawn delegates to an isolated child zi task.
 
 ## System commands
 
-`zi.system(argv, opts?)` runs an OS command from an argv array. It is yieldable. Call it from tools or commands, not extension load code.
+`ctx.process.run(argv, opts?)` runs an OS command from an argv array. It is yieldable. Call it from tools or commands, not extension load code.
 
 ```lua
-local result = zi.system({ "git", "status", "--short" }, {
-  cwd = ctx.cwd,
+local result = ctx.process.run({ "git", "status", "--short" }, {
+  cwd = ctx.env.cwd,
   timeout_ms = 5000,
 })
 ```
@@ -417,7 +417,7 @@ local result = zi.system({ "git", "status", "--short" }, {
 There is no shell string form. Use a shell explicitly when needed:
 
 ```lua
-zi.system({ "/bin/sh", "-c", "echo $HOME" })
+ctx.process.run({ "/bin/sh", "-c", "echo $HOME" })
 ```
 
 Options:
@@ -460,15 +460,15 @@ Non-zero exits are `status = "completed"`; inspect `code`.
 
 ## Spawn
 
-`zi.spawn(opts)` runs a child zi task through batch JSON mode and returns a tool-shaped result. Use it for real delegation, not ordinary helper logic.
+`ctx.agent.run(opts)` runs a child zi task through batch JSON mode and returns a tool-shaped result. Use it for real delegation, not ordinary helper logic.
 
 ```lua
-local result = zi.spawn({
+local result = ctx.agent.run({
   task = "inspect the API surface",
   model = "optional-model",
   tools = "bash,read,grep",
   system_append = "extra child-agent guidance",
-  cwd = ctx.cwd,
+  cwd = ctx.env.cwd,
   on = {
     message = function(event) end,
   },
@@ -497,6 +497,6 @@ Fields:
 
 Caveats:
 
-- `zi.spawn` is yieldable
+- `ctx.agent.run` is yieldable
 - callbacks in `on` must not yield
 - abort forwarding depends on the execution context

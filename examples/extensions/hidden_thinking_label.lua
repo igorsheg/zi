@@ -13,12 +13,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
 end
 
 local function ui_status_spec(ctx, spec)
@@ -27,13 +27,13 @@ local function ui_status_spec(ctx, spec)
 end
 
 local function ui_progress_spec(ctx, spec)
-  if not (ctx and ctx.ui and ctx.ui.render and spec) then return end
-  ctx.ui.render({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
+  if not (ctx and ctx.ui and ctx.ui.view.set and spec) then return end
+  ctx.ui.view.set({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
 end
 
 local function ui_report_spec(ctx, spec)
@@ -55,12 +55,12 @@ local function ui_toast(ctx, text, tone)
   end
   if opts.level == "warning" then opts.level = "warn" end
   if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify(tostring(text or ""), opts)
+  ctx.ui.notify.show(tostring(text or ""), opts)
 end
 
 local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id,
     slot = "status",
     root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } },
@@ -68,8 +68,8 @@ local function ui_status(ctx, id, text, tone)
 end
 
 local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.render) then return end
-  ctx.ui.render({
+  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
+  ctx.ui.view.set({
     id = id or "report",
     slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" },
     keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
@@ -86,24 +86,24 @@ local DEFAULT_LABEL = "Pondering..."
 local label = DEFAULT_LABEL
 
 local function apply_label(ctx)
-  if ctx.ui and ctx.ui.render then
+  if ctx.ui and ctx.ui.view.set then
     ui_status_spec(ctx, { id = "thinking", text = label })
   end
 end
 
-zi.on("session_start", function(_, ctx)
+zi.define.event("session_start", function(ctx, _)
   apply_label(ctx)
 end)
 
-zi.command({
+zi.define.command({
   name = "thinking-label",
   description = "Set the thinking status label. Use without args to reset.",
-  handler = function(args, ctx)
+  run = function(ctx, args)
     local next_label = (args or ""):match("^%s*(.-)%s*$")
     if next_label == "" then
       label = DEFAULT_LABEL
       apply_label(ctx)
-      if ctx.ui and ctx.ui.render then
+      if ctx.ui and ctx.ui.view.set then
         ui_toast(ctx, "Thinking status reset to: " .. DEFAULT_LABEL, { kind = "info" })
       end
       return
@@ -111,7 +111,7 @@ zi.command({
 
     label = next_label
     apply_label(ctx)
-    if ctx.ui and ctx.ui.render then
+    if ctx.ui and ctx.ui.view.set then
       ui_toast(ctx, "Thinking status set to: " .. label, { kind = "info" })
     end
   end,
