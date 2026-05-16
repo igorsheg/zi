@@ -25,6 +25,7 @@ pub fn wordWrap(text: []const u8, max_width: usize, allocator: std.mem.Allocator
 
     var lines: std.ArrayListUnmanaged(Line) = .empty;
     errdefer lines.deinit(allocator);
+    try lines.ensureTotalCapacity(allocator, estimateLineCapacity(text.len, max_width));
 
     if (text.len == 0) {
         try lines.append(allocator, .{ .start = 0, .end = 0 });
@@ -53,6 +54,11 @@ pub fn wordWrap(text: []const u8, max_width: usize, allocator: std.mem.Allocator
     }
 
     return try lines.toOwnedSlice(allocator);
+}
+
+fn estimateLineCapacity(text_len: usize, max_width: usize) usize {
+    if (text_len == 0) return 1;
+    return @max(@as(usize, 1), text_len / @max(max_width, 1) + 2);
 }
 
 fn wrapSingleLine(
