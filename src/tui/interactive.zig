@@ -258,6 +258,18 @@ fn formatTuiDiagnostics(allocator: std.mem.Allocator, self: *Interactive) ![]u8 
     try formatQueueStats(writer, "session_index", self.session_index_worker.stats());
     try writer.writeAll("\n");
 
+    try writer.writeAll("Wake Sources\n");
+    const wake_sources = self.collectWakeSources();
+    for (wake_sources) |source| {
+        try writer.print("{s}: fd={d} interest=read\n", .{ source.name(), source.fd });
+    }
+    if (self.nextLoopDeadlineNs(zio.deadline.nowNs(self.io))) |deadline_ns| {
+        try writer.print("deadline: due_ns={d}\n", .{deadline_ns});
+    } else {
+        try writer.writeAll("deadline: none\n");
+    }
+    try writer.writeAll("\n");
+
     const rs = self.tui.renderer.stats;
     try writer.writeAll("Renderer Stats\n");
     try writer.print("frames: {d}\n", .{rs.frames});
@@ -924,6 +936,15 @@ pub const Interactive = struct {
     const WakeSource = struct {
         kind: WakeSourceKind,
         fd: std.posix.fd_t,
+
+        fn name(self: WakeSource) []const u8 {
+            return switch (self.kind) {
+                .terminal_input => "terminal_input",
+                .snapshot_events => "snapshot_events",
+                .lifecycle_events => "lifecycle_events",
+                .terminal_system => "terminal_system",
+            };
+        }
     };
 
     const WakeSourceCallback = struct {
