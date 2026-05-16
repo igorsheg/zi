@@ -145,6 +145,7 @@ pub const Markdown = struct {
         while (pad < self.padding_y) : (pad += 1) rows.append(arena, .{}) catch return null;
         for (built) |line| {
             var segments: std.ArrayListUnmanaged(layout_mod.Segment) = .empty;
+            segments.ensureTotalCapacity(arena, line.spans.len) catch return null;
             var col = self.padding_x;
             for (line.spans) |span| {
                 if (span.text.len == 0) continue;
