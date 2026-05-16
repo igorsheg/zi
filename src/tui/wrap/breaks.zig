@@ -42,8 +42,7 @@ pub fn nextSegment(
 
     while (current_start < line.len) {
         const token = nextToken(line, current_start);
-        const token_text = token.text(line);
-        const token_width = grapheme.strWidth(token_text, width_method);
+        const token_width = token.width(line, width_method);
         const token_is_whitespace = isWhitespace(line[token.start]);
 
         if (token_width > max_width) {
@@ -105,20 +104,29 @@ pub fn nextSegment(
 pub const Token = struct {
     start: usize,
     end: usize,
+    ascii_printable: bool,
 
     pub fn text(self: Token, line: []const u8) []const u8 {
         return line[self.start..self.end];
     }
+
+    pub fn width(self: Token, line: []const u8, width_method: grapheme.WidthMethod) usize {
+        if (self.ascii_printable) return self.end - self.start;
+        return grapheme.strWidth(self.text(line), width_method);
+    }
 };
 
 pub fn nextToken(line: []const u8, start: usize) Token {
-    if (start >= line.len) return .{ .start = start, .end = start };
+    if (start >= line.len) return .{ .start = start, .end = start, .ascii_printable = true };
     const is_ws = isWhitespace(line[start]);
     var pos = start;
+    var ascii_printable = true;
     while (pos < line.len) : (pos += 1) {
-        if (isWhitespace(line[pos]) != is_ws) break;
+        const c = line[pos];
+        if (isWhitespace(c) != is_ws) break;
+        if (c < 0x20 or c > 0x7E) ascii_printable = false;
     }
-    return .{ .start = start, .end = pos };
+    return .{ .start = start, .end = pos, .ascii_printable = ascii_printable };
 }
 
 pub fn isWhitespace(c: u8) bool {
