@@ -17,6 +17,7 @@ const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
 const RequestMode = autocomplete_mod.RequestMode;
 const EditBuffer = buffer_mod.EditBuffer;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 
 pub const InputOutcome = union(enum) {
     unhandled,
@@ -110,7 +111,7 @@ pub const AutocompleteSession = struct {
 
     pub fn measure(self: *const AutocompleteSession, width: u32) Measurement {
         if (!self.active or self.list.items.len == 0) {
-            return .{ .min_height = 0, .preferred_height = 0 };
+            return measurement(0, 0);
         }
         return self.list.measure(width);
     }

@@ -13,6 +13,7 @@ const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
 const Region = buffer_mod.Region;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 
 pub const Span = render_mod.Span;
 pub const RenderedLine = render_mod.RenderedLine;
@@ -89,11 +90,11 @@ pub const Markdown = struct {
     }
 
     pub fn measure(self: *Markdown, width: u32) Measurement {
-        if (self.content.len == 0) return .{ .min_height = 0, .preferred_height = 0 };
-        if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
+        if (self.content.len == 0) return measurement(0, 0);
+        if (width == 0) return measurement(1, 1);
 
         const content_width = if (width > self.padding_x * 2) width - self.padding_x * 2 else 1;
-        const rendered = self.getLayoutRows(content_width, self.width_method) orelse return .{ .min_height = 1, .preferred_height = 1 };
+        const rendered = self.getLayoutRows(content_width, self.width_method) orelse return measurement(1, 1);
         return .{
             .min_height = 1,
             .preferred_height = @intCast(rendered.len),

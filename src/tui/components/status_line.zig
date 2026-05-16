@@ -12,6 +12,7 @@ const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const StatusData = status_data_mod.StatusData;
 const Theme = theme_mod.Theme;
 const Shimmer = shimmer_mod.Config;
@@ -132,7 +133,7 @@ pub const StatusLine = struct {
     pub fn measure(self: *StatusLine, width: u32) Measurement {
         _ = self;
         _ = width;
-        return .{ .min_height = 1, .preferred_height = 1 };
+        return measurement(1, 1);
     }
 
     pub fn component(self: *StatusLine) Component {

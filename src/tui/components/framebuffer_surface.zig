@@ -8,6 +8,7 @@ const extension_ui = @import("../../coding_agent/extensions/ui.zig");
 const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
 
@@ -48,13 +49,13 @@ pub const FramebufferSurface = struct {
     }
 
     pub fn measure(self: *FramebufferSurface, width: u32) Measurement {
-        const frame = self.frame orelse return .{ .min_height = 0, .preferred_height = 0 };
-        if (width == 0 or frame.width == 0 or frame.height == 0) return .{ .min_height = 0, .preferred_height = 0 };
+        const frame = self.frame orelse return measurement(0, 0);
+        if (width == 0 or frame.width == 0 or frame.height == 0) return measurement(0, 0);
         const rows = switch (frame.format) {
             .rgba8888 => scaledRows(frame.width, frame.height, width),
             .halfblock_rgb => frame.height,
         };
-        return .{ .min_height = @min(rows, 1), .preferred_height = rows };
+        return measurement(@min(rows, 1), rows);
     }
 
     pub fn render(self: *FramebufferSurface, region: Region) void {

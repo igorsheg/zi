@@ -11,6 +11,7 @@ const edit_core = @import("../edit/root.zig");
 const Color = cell_mod.Color;
 const CursorState = component_mod.CursorState;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Component = component_mod.Component;
 const Region = surface_mod.Region;
 const Key = keys_mod.Key;
@@ -148,7 +149,7 @@ pub const TextInput = struct {
     }
 
     pub fn measure(_: *TextInput, _: u32) Measurement {
-        return .{ .min_height = 1, .preferred_height = 1 };
+        return measurement(1, 1);
     }
 
     pub fn cursorState(self: *TextInput) ?CursorState {

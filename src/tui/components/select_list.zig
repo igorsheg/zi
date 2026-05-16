@@ -12,6 +12,7 @@ const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
 const Key = keys_mod.Key;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Theme = theme_mod.Theme;
 const Buffer = buffer_mod.Buffer;
 
@@ -161,7 +162,7 @@ pub const SelectList = struct {
     }
 
     pub fn measure(self: *const SelectList, _: u32) Measurement {
-        if (self.items.len == 0) return .{ .min_height = 1, .preferred_height = 1 };
+        if (self.items.len == 0) return measurement(1, 1);
         const len: u32 = @intCast(self.items.len);
         const visible = @min(len, self.max_visible);
         const scroll_indicator: u32 = if (len > self.max_visible) 1 else 0;

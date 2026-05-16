@@ -5,6 +5,7 @@ const cell_mod = @import("../cell.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Region = buffer_mod.Region;
 const Cell = cell_mod.Cell;
 const Color = cell_mod.Color;
@@ -438,7 +439,7 @@ const TestComponent = struct {
     }
 
     pub fn measure(self: *@This(), _: u32) Measurement {
-        return .{ .min_height = 1, .preferred_height = self.preferred_height };
+        return measurement(1, self.preferred_height);
     }
 
     pub fn component(self: *@This()) Component {

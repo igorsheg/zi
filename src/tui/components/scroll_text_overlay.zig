@@ -13,6 +13,7 @@ const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Key = keys_mod.Key;
 
 pub const ScrollTextOverlay = struct {
@@ -66,7 +67,7 @@ pub const ScrollTextOverlay = struct {
     pub fn measure(self: *ScrollTextOverlay, width: u32) Measurement {
         const inner_width = if (width > 2) width - 2 else 1;
         const body = self.text.measure(inner_width);
-        return .{ .min_height = 5, .preferred_height = body.preferred_height + 4 };
+        return measurement(5, body.preferred_height + 4);
     }
 
     pub fn setFocused(self: *ScrollTextOverlay, focused: bool) void {

@@ -9,6 +9,7 @@ const themes_builtin = @import("../../themes/builtin.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
 const Theme = theme_mod.Theme;
@@ -55,13 +56,13 @@ pub const StatusText = struct {
     }
 
     pub fn measure(self: *StatusText, width: u32) Measurement {
-        if (self.text.len == 0) return .{ .min_height = 0, .preferred_height = 0 };
-        if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
+        if (self.text.len == 0) return measurement(0, 0);
+        if (width == 0) return measurement(1, 1);
         const lines = text_layout.wrapLines(self.text, width, .word, self.allocator, self.width_method) catch
-            return .{ .min_height = 1, .preferred_height = 1 };
+            return measurement(1, 1);
         defer self.allocator.free(lines);
         const h: u32 = @intCast(lines.len);
-        return .{ .min_height = 1, .preferred_height = h };
+        return measurement(1, h);
     }
 
     pub fn component(self: *StatusText) Component {

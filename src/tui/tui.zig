@@ -9,6 +9,7 @@ const keys_mod = @import("terminal/keys.zig");
 const buffer_mod = @import("primitives/surface.zig");
 
 const Component = component_mod.Component;
+const measurement = component_mod.measurement;
 const CursorState = component_mod.CursorState;
 const Stack = stack_mod.Stack;
 const OverlayManager = overlay_mod.OverlayManager;
@@ -287,7 +288,7 @@ const DummyComp = struct {
     pub fn render(_: *DummyComp, _: Region) void {}
 
     pub fn measure(self: *DummyComp, _: u32) component_mod.Measurement {
-        return .{ .min_height = 1, .preferred_height = self.height };
+        return measurement(1, self.height);
     }
 
     pub fn handleInput(self: *DummyComp, _: Key) bool {

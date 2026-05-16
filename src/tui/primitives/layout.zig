@@ -8,6 +8,7 @@ const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
 const Component = view_mod.Component;
 const Measurement = view_mod.Measurement;
+const measurement = view_mod.measurement;
 const CursorState = view_mod.CursorState;
 const Key = keys_mod.Key;
 
@@ -149,7 +150,7 @@ pub const Stack = struct {
         for (self.children.items) |child| {
             total += self.childDesiredHeight(child, width);
         }
-        return .{ .min_height = if (self.children.items.len > 0) 1 else 0, .preferred_height = total };
+        return measurement(if (self.children.items.len > 0) 1 else 0, total);
     }
 
     pub fn handleInput(self: *Stack, key: Key) bool {
@@ -321,7 +322,7 @@ const TestComponent = struct {
 
     pub fn measure(self: *TestComponent, width: u32) Measurement {
         _ = width;
-        return .{ .min_height = 1, .preferred_height = self.height };
+        return measurement(1, self.height);
     }
 
     pub fn handleInput(self: *TestComponent, _: Key) bool {
@@ -345,7 +346,7 @@ const AnimatedComp = struct {
 
     pub fn render(_: *@This(), _: Region) void {}
     pub fn measure(self: *@This(), _: u32) Measurement {
-        return .{ .min_height = 1, .preferred_height = self.height };
+        return measurement(1, self.height);
     }
     pub fn nextAnimationDeadline(self: *@This(), _: i128) ?i128 {
         return self.deadline_ns;

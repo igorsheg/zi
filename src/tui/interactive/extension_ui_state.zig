@@ -17,6 +17,7 @@ const themes_builtin = @import("../../themes/builtin.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Region = buffer_mod.Region;
 const Buffer = buffer_mod.Buffer;
 const Cell = cell_mod.Cell;
@@ -552,13 +553,13 @@ const TargetComponent = struct {
     }
 
     pub fn measure(self: *TargetComponent, width: u32) Measurement {
-        const ordered = self.orderedViews() catch return .{ .min_height = 0, .preferred_height = 0 };
+        const ordered = self.orderedViews() catch return measurement(0, 0);
         defer self.state.allocator.free(ordered);
         var total: u32 = 0;
         for (ordered) |view| {
             if (view.root) |root| total += measureNode(self.state, root, width, self.width_method);
         }
-        return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
+        return measurement(if (total > 0) 1 else 0, total);
     }
 
     fn orderedViews(self: *TargetComponent) ![]*SlotContribution {

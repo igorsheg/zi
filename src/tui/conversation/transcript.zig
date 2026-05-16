@@ -20,6 +20,7 @@ const transcript_item_mod = @import("../transcript/item.zig");
 const zio_deadline = @import("../../zio/root.zig").deadline;
 
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Region = buffer_mod.Region;
 const Color = cell_mod.Color;
 const Point = selection_mod.Point;
@@ -294,6 +295,20 @@ const TranscriptLayout = struct {
         return self.heights.total();
     }
 
+    fn assertInvariants(self: *const TranscriptLayout) void {
+        std.debug.assert(self.heights.tree.items.len == self.items.items.len + 1 or (self.items.items.len == 0 and self.heights.tree.items.len == 0));
+
+        var expected_dirty_count: usize = 0;
+        var expected_total: u32 = 0;
+        for (self.items.items) |item| {
+            if (item.dirty) expected_dirty_count += 1;
+            expected_total +%= item.cached_height;
+        }
+
+        std.debug.assert(self.dirty_count == expected_dirty_count);
+        std.debug.assert(self.heights.total() == expected_total);
+    }
+
     fn scrollOffset(self: *const TranscriptLayout) u32 {
         return self.viewport_offset;
     }
@@ -523,7 +538,7 @@ pub const ToolExecution = struct {
     const padding_y: u32 = 0;
 
     pub fn measure(self: *ToolExecution, width: u32) Measurement {
-        if (width == 0) return .{ .min_height = 0, .preferred_height = 0 };
+        if (width == 0) return measurement(0, 0);
         const content_w = if (width > 2) width - 2 else 1;
         const result_h = self.measureResult(content_w);
         self.measured_content_width = content_w;
@@ -533,7 +548,7 @@ pub const ToolExecution = struct {
         h += 1;
         h += result_h;
         h += padding_y;
-        return .{ .min_height = 1, .preferred_height = @max(1, h) };
+        return measurement(1, @max(1, h));
     }
 
     pub fn render(self: *ToolExecution, region: Region) void {
@@ -862,10 +877,36 @@ pub const Transcript = struct {
     fn ensureLayout(self: *Transcript, width: u32) void {
         self.last_render_width = width;
         self.layout.ensureMeasured(@ptrCast(self), width, measureLayoutItem);
+        self.assertInvariants();
     }
 
     fn syncScrollAfterLayout(self: *Transcript) void {
         self.layout.clampScroll(self.last_visible_height);
+        self.assertInvariants();
+        std.debug.assert(self.layout.scrollOffset() <= self.layout.maxScrollOffset(self.last_visible_height));
+    }
+
+    fn assertInvariants(self: *const Transcript) void {
+        self.layout.assertInvariants();
+        std.debug.assert(self.layout.items.items.len == self.items.items.len);
+
+        var pending_it = self.pending_tools.iterator();
+        while (pending_it.next()) |entry| {
+            const idx = entry.value_ptr.*;
+            std.debug.assert(idx < self.items.items.len);
+            const item = self.items.items[idx];
+            std.debug.assert(item.tool_call_id != null);
+            std.debug.assert(std.mem.eql(u8, item.tool_call_id.?, entry.key_ptr.*));
+        }
+
+        var retained_it = self.retained_items.iterator();
+        while (retained_it.next()) |entry| {
+            const idx = entry.value_ptr.*;
+            std.debug.assert(idx < self.items.items.len);
+            const item = self.items.items[idx];
+            std.debug.assert(item.retained_item_id != null);
+            std.debug.assert(item.retained_item_id.? == entry.key_ptr.*);
+        }
     }
 
     pub fn setChildGapRows(self: *Transcript, rows: u32) void {
@@ -908,6 +949,7 @@ pub const Transcript = struct {
             };
         }
         self.noteAppendedItem();
+        self.assertInvariants();
         return true;
     }
 
@@ -955,6 +997,7 @@ pub const Transcript = struct {
         self.layout.removeItem(index);
         self.reindexMaps(index);
         self.clampScroll();
+        self.assertInvariants();
     }
 
     pub fn truncateFrom(self: *Transcript, start_index: usize) void {
@@ -972,6 +1015,7 @@ pub const Transcript = struct {
         self.retained_items.clearRetainingCapacity();
         self.last_visible_height = 0;
         self.layout.clear();
+        self.assertInvariants();
     }
 
     pub fn assistantMessageAt(self: *Transcript, index: usize) ?*assistant_message_mod.AssistantMessage {
@@ -995,6 +1039,7 @@ pub const Transcript = struct {
             _ = self.pending_tools.remove(tool_call_id);
             item.tool_call_id = null;
         }
+        self.assertInvariants();
     }
 
     fn reindexMaps(self: *Transcript, _: usize) void {
@@ -1055,6 +1100,7 @@ pub const Transcript = struct {
         }
         self.remeasureItem(insert_index);
         self.syncScrollAfterLayout();
+        self.assertInvariants();
         return true;
     }
 
@@ -1075,6 +1121,7 @@ pub const Transcript = struct {
         if (item.tool_call_id) |tool_call_id| self.pending_tools.put(self.allocator, tool_call_id, index) catch {};
         old_item.deinit(self.allocator);
         self.noteItemMutated(index);
+        self.assertInvariants();
         return true;
     }
 
@@ -1094,6 +1141,7 @@ pub const Transcript = struct {
         self.layout.heights.rebuild(self.layout.items.items) catch return;
         self.reindexMaps(@min(from_index, to_index));
         self.clampScroll();
+        self.assertInvariants();
     }
 
     pub fn retainedItemSemanticVersionAt(self: *Transcript, index: usize) ?SemanticVersion {
@@ -1115,6 +1163,7 @@ pub const Transcript = struct {
 
     pub fn clearPendingToolRouting(self: *Transcript) void {
         self.pending_tools.clearRetainingCapacity();
+        self.assertInvariants();
     }
 
     pub fn setToolOutputExpanded(self: *Transcript, expanded: bool) void {
@@ -1403,16 +1452,20 @@ pub const Transcript = struct {
         const max_scroll = self.layout.maxScrollOffset(visible_height);
         self.layout.viewport_offset = @min(offset, max_scroll);
         self.layout.follow_bottom = follow_bottom and self.layout.viewport_offset == max_scroll;
+        self.assertInvariants();
+        std.debug.assert(self.layout.scrollOffset() <= self.layout.maxScrollOffset(self.last_visible_height));
     }
 
     fn clampScroll(self: *Transcript) void {
         _ = self.totalHeight(self.last_render_width);
         self.layout.clampScroll(self.last_visible_height);
+        self.assertInvariants();
+        std.debug.assert(self.layout.scrollOffset() <= self.layout.maxScrollOffset(self.last_visible_height));
     }
 
     pub fn measure(self: *Transcript, width: u32) Measurement {
         const total = self.totalHeight(width);
-        return .{ .min_height = 1, .preferred_height = total };
+        return measurement(1, total);
     }
 
     pub fn component(self: *Transcript) component_mod.Component {
@@ -1617,7 +1670,7 @@ const TestLineRenderable = struct {
 
     pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
         const h: u32 = @intCast(self.lines.len);
-        return .{ .min_height = if (h > 0) 1 else 0, .preferred_height = h };
+        return measurement(if (h > 0) 1 else 0, h);
     }
 
     pub fn renderable(self: *@This()) TranscriptRenderable {
@@ -1639,7 +1692,7 @@ const TestBoxRenderable = struct {
     }
 
     pub fn measure(self: *@This(), _: u32) component_mod.Measurement {
-        return .{ .min_height = if (self.height > 0) 1 else 0, .preferred_height = self.height };
+        return measurement(if (self.height > 0) 1 else 0, self.height);
     }
 
     pub fn renderable(self: *@This()) TranscriptRenderable {
@@ -1653,7 +1706,7 @@ const IdentityRenderable = struct {
     pub fn renderSlice(_: *@This(), _: Region, _: u32) void {}
 
     pub fn measure(_: *@This(), _: u32) component_mod.Measurement {
-        return .{ .min_height = 1, .preferred_height = 1 };
+        return measurement(1, 1);
     }
 
     pub fn renderable(self: *@This()) TranscriptRenderable {

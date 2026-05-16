@@ -12,6 +12,7 @@ const Interactive = @import("../interactive.zig").Interactive;
 const Component = component_mod.Component;
 const Region = buffer_mod.Region;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Color = cell_mod.Color;
 const Attributes = cell_mod.Attributes;
 const TextComponent = text_component_mod.Text;
@@ -26,7 +27,7 @@ pub const NotificationComponent = struct {
 
     pub fn measure(self: *NotificationComponent, _: u32) Measurement {
         const count = self.interactive.notification_center.records.count();
-        return .{ .min_height = if (count > 0) 1 else 0, .preferred_height = @intCast(@min(count, 12)) };
+        return measurement(if (count > 0) 1 else 0, @intCast(@min(count, 12)));
     }
 
     pub fn render(self: *NotificationComponent, region: Region) void {

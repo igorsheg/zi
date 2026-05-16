@@ -8,6 +8,7 @@ const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Shimmer = shimmer_mod.Config;
 
 pub const Loader = struct {
@@ -61,7 +62,7 @@ pub const Loader = struct {
     }
 
     pub fn measure(_: *Loader, _: u32) Measurement {
-        return .{ .min_height = 2, .preferred_height = 2 };
+        return measurement(2, 2);
     }
 
     pub fn component(self: *Loader) Component {

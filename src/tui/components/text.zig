@@ -9,6 +9,7 @@ const Attributes = cell_mod.Attributes;
 const Region = buffer_mod.Region;
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const grapheme = @import("../grapheme.zig");
 const Line = text_layout.Line;
 pub const WrapMode = text_layout.WrapMode;
@@ -129,15 +130,15 @@ pub const Text = struct {
     }
 
     pub fn measure(self: *Text, width: u32) Measurement {
-        if (self.content.len == 0) return .{ .min_height = 0, .preferred_height = 0 };
-        if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
+        if (self.content.len == 0) return measurement(0, 0);
+        if (width == 0) return measurement(1, 1);
 
         const layout = self.getLayout(self.contentWidth(width), self.width_method) orelse
-            return .{ .min_height = 1, .preferred_height = 1 };
-        const lines = layout.lines orelse return .{ .min_height = 1, .preferred_height = 1 };
+            return measurement(1, 1);
+        const lines = layout.lines orelse return measurement(1, 1);
 
         const total = text_layout.measureLineCount(lines, self.padding_y, self.max_lines);
-        return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
+        return measurement(if (total > 0) 1 else 0, total);
     }
 
     pub fn component(self: *Text) Component {

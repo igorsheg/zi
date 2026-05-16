@@ -9,6 +9,7 @@ const themes_builtin = @import("../../themes/builtin.zig");
 
 const Component = component_mod.Component;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Region = buffer_mod.Region;
 
 pub const AssistantRowModel = struct {
@@ -213,7 +214,7 @@ pub const AssistantMessage = struct {
     }
 
     pub fn measure(self: *AssistantMessage, width: u32) Measurement {
-        if (width == 0) return .{ .min_height = 1, .preferred_height = 1 };
+        if (width == 0) return measurement(1, 1);
         var total: u32 = 0;
         var seen_visible = false;
         for (self.render_blocks.items) |*block| {
@@ -223,7 +224,7 @@ pub const AssistantMessage = struct {
             total += h;
             seen_visible = true;
         }
-        return .{ .min_height = if (total > 0) 1 else 0, .preferred_height = total };
+        return measurement(if (total > 0) 1 else 0, total);
     }
 
     pub fn render(self: *AssistantMessage, region: Region) void {

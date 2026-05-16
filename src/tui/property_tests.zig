@@ -5,6 +5,7 @@ const buffer_mod = @import("primitives/surface.zig");
 const transcript_mod = @import("conversation/transcript.zig");
 
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Region = buffer_mod.Region;
 const Transcript = transcript_mod.Transcript;
 const TranscriptItem = transcript_mod.TranscriptItem;
@@ -15,7 +16,7 @@ const FixedRow = struct {
     height: u32,
 
     pub fn measure(self: *FixedRow, _: u32) Measurement {
-        return .{ .min_height = 1, .preferred_height = self.height };
+        return measurement(1, self.height);
     }
 
     pub fn renderSlice(_: *FixedRow, _: Region, _: u32) void {}

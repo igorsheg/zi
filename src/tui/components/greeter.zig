@@ -9,6 +9,7 @@ const themes_builtin = @import("../../themes/builtin.zig");
 const Color = cell_mod.Color;
 const Region = buffer_mod.Region;
 const Measurement = component_mod.Measurement;
+const measurement = component_mod.measurement;
 const Component = component_mod.Component;
 const Theme = theme_mod.Theme;
 
@@ -80,7 +81,7 @@ pub const Greeter = struct {
     }
 
     pub fn measure(_: *Greeter, _: u32) Measurement {
-        return .{ .min_height = 5, .preferred_height = 5 };
+        return measurement(5, 5);
     }
 
     pub fn component(self: *Greeter) Component {

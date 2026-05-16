@@ -5,10 +5,17 @@ const status_data_mod = @import("../status_data.zig");
 const theme_mod = @import("../theme.zig");
 
 const Component = component_mod.Component;
+const measurement = component_mod.measurement;
 const Color = cell_mod.Color;
 const AutocompleteProvider = autocomplete_mod.AutocompleteProvider;
 const StatusData = status_data_mod.StatusData;
 const Theme = theme_mod.Theme;
+
+fn requireEditorDecl(comptime T: type, comptime name: []const u8) void {
+    if (!@hasDecl(T, name)) {
+        @compileError(@typeName(T) ++ " used as EditorInterface must implement " ++ name);
+    }
+}
 
 pub const EditorInterface = struct {
     ptr: *anyopaque,
@@ -42,6 +49,30 @@ pub const EditorInterface = struct {
     };
 
     pub fn init(comptime T: type, ptr: *T) EditorInterface {
+        comptime {
+            requireEditorDecl(T, "getText");
+            requireEditorDecl(T, "getExpandedText");
+            requireEditorDecl(T, "setText");
+            requireEditorDecl(T, "insertTextAtCursor");
+            requireEditorDecl(T, "handlePaste");
+            requireEditorDecl(T, "clear");
+            requireEditorDecl(T, "clearHistory");
+            requireEditorDecl(T, "addToHistory");
+            requireEditorDecl(T, "setOnSubmit");
+            requireEditorDecl(T, "setOnChange");
+            requireEditorDecl(T, "setAutocompleteProvider");
+            requireEditorDecl(T, "setTheme");
+            requireEditorDecl(T, "setStatusData");
+            requireEditorDecl(T, "setCwd");
+            requireEditorDecl(T, "setGitBranch");
+            requireEditorDecl(T, "setBorderColor");
+            requireEditorDecl(T, "setPaddingX");
+            requireEditorDecl(T, "setAutocompleteMaxVisible");
+            requireEditorDecl(T, "setMaxVisibleLines");
+            requireEditorDecl(T, "setSubmitDisabled");
+            requireEditorDecl(T, "component");
+        }
+
         const gen = struct {
             fn getText(erased: *anyopaque) []const u8 {
                 const self: *T = @ptrCast(@alignCast(erased));
@@ -353,7 +384,7 @@ pub const MockEditor = struct {
 
     pub fn render(_: *MockEditor, _: Region) void {}
     pub fn measure(_: *MockEditor, _: u32) component_mod.Measurement {
-        return .{ .min_height = 1, .preferred_height = 3 };
+        return measurement(1, 3);
     }
 
     pub fn component(self: *MockEditor) Component {

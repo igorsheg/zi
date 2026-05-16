@@ -11,6 +11,11 @@ pub const Measurement = struct {
     preferred_height: u32,
 };
 
+pub fn measurement(min_height: u32, preferred_height: u32) Measurement {
+    std.debug.assert(min_height <= preferred_height);
+    return .{ .min_height = min_height, .preferred_height = preferred_height };
+}
+
 pub const CursorState = struct {
     x: u32,
     y: u32,
@@ -33,6 +38,15 @@ pub const Component = struct {
     };
 
     pub fn init(comptime T: type, ptr: *T) Component {
+        comptime {
+            if (!@hasDecl(T, "measure")) {
+                @compileError(@typeName(T) ++ " used as Component must implement measure(width) Measurement");
+            }
+            if (!@hasDecl(T, "render") and !@hasDecl(T, "renderSlice")) {
+                @compileError(@typeName(T) ++ " used as Component must implement render(region) or renderSlice(region, first_row)");
+            }
+        }
+
         const gen = struct {
             fn renderSlice(erased: *anyopaque, region: Region, first_row: u32) void {
                 const self: *T = @ptrCast(@alignCast(erased));
@@ -148,7 +162,7 @@ test "component defaults animation hooks for static components" {
     const StaticComp = struct {
         pub fn render(_: *@This(), _: Region) void {}
         pub fn measure(_: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = 1 };
+            return measurement(1, 1);
         }
     };
 
@@ -170,7 +184,7 @@ test "component dispatches optional renderSlice hook" {
             self.first_row = first_row;
         }
         pub fn measure(_: *@This(), _: u32) Measurement {
-            return .{ .min_height = 1, .preferred_height = 1 };
+            return measurement(1, 1);
         }
     };
 
