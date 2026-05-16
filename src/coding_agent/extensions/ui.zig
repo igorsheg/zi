@@ -572,7 +572,7 @@ pub const JobEvent = struct {
     }
 };
 
-test "ui v3 render spec clone owns node tree" {
+test "ui render spec clone owns node tree" {
     const testing = std.testing;
     const child = UiNode{ .text = .{ .id = "child", .text = "hello", .style = .{ .tone = .info } } };
     const root = UiNode{ .view = .{ .id = "root-node", .style = .{ .flex_direction = .row, .gap = 1 }, .children = @constCast(&[_]UiNode{child}) } };
@@ -587,7 +587,7 @@ test "ui v3 render spec clone owns node tree" {
     try testing.expectEqual(@as(usize, 1), cloned.keys.len);
 }
 
-test "ui v3 text span clone owns spans" {
+test "ui text span clone owns spans" {
     const testing = std.testing;
     const spans = [_]TextSpan{
         .{ .text = "hello", .style = .{ .tone = .accent, .fg = Color.rgb(255, 0, 0), .bold = true }, .link = "https://span.test" },
@@ -608,7 +608,7 @@ test "ui v3 text span clone owns spans" {
     try testing.expect(cloned.text.selectable);
 }
 
-test "ui v3 render spec clone owns keys" {
+test "ui render spec clone owns keys" {
     const testing = std.testing;
     const spec = RenderSpec{ .state_owner_id = "owner", .generation = 1, .id = "view", .keys = @constCast(&[_]KeyBinding{ .{ .key = "escape", .action = "close" }, .{ .key = "q", .action = "close" } }) };
     var cloned = try RenderSpec.clone(testing.allocator, spec);
@@ -619,7 +619,7 @@ test "ui v3 render spec clone owns keys" {
     try testing.expectEqualStrings("q", cloned.keys[1].key);
 }
 
-test "ui v3 event clone owns payload" {
+test "ui event clone owns payload" {
     const testing = std.testing;
     var cloned = try UiEvent.clone(testing.allocator, .{ .state_owner_id = "owner", .generation = 2, .view = "demo", .node = "root", .action = "close", .key = "escape", .ctrl = true });
     defer cloned.deinit(testing.allocator);
@@ -632,7 +632,7 @@ test "ui v3 event clone owns payload" {
     try testing.expectEqual(@as(?[]const u8, null), cloned.value);
 }
 
-test "ui v3 input clone owns strings" {
+test "ui input clone owns strings" {
     const testing = std.testing;
     var cloned = try UiNode.clone(testing.allocator, .{ .input = .{ .id = "name", .value = "zi", .placeholder = "filter", .style = .{ .tone = .accent }, .on_input = "typing", .on_change = "rename", .on_submit = "accept" } });
     defer cloned.deinit(testing.allocator);
@@ -644,7 +644,7 @@ test "ui v3 input clone owns strings" {
     try testing.expectEqualStrings("accept", cloned.input.on_submit.?);
 }
 
-test "ui v3 event clone owns input value" {
+test "ui event clone owns input value" {
     const testing = std.testing;
     var cloned = try UiEvent.clone(testing.allocator, .{ .state_owner_id = "owner", .generation = 2, .view = "demo", .node = "name", .type = .change, .action = "rename", .value = "zi" });
     defer cloned.deinit(testing.allocator);
@@ -652,7 +652,7 @@ test "ui v3 event clone owns input value" {
     try testing.expectEqualStrings("zi", cloned.value.?);
 }
 
-test "ui v3 frame byte validation" {
+test "ui frame byte validation" {
     const testing = std.testing;
     const rgba = FrameSpec{ .state_owner_id = "owner", .generation = 1, .view = "v", .node = "n", .width = 2, .height = 2, .format = .rgba8888, .data = &[_]u8{0} ** 16 };
     try rgba.validate();

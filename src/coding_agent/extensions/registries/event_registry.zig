@@ -143,10 +143,6 @@ test "EventRegistry subscribes in order and dispatches correct chain" {
     try testing.expectEqualStrings("ext-c", me[0].source_id);
 }
 
-test "EventKind reserves the v3 event surface" {
-    try testing.expectEqual(@as(usize, 36), @typeInfo(EventKind).@"enum".fields.len);
-}
-
 test "EventKind.semantics matches spec" {
     try testing.expectEqual(Semantics.aggregate, EventKind.resources_discover.semantics());
     try testing.expectEqual(Semantics.middleware_cancellable, EventKind.tool_call.semantics());

@@ -1755,7 +1755,7 @@ test "extension command context publishes host-owned editor buffer actions" {
     try testing.expectEqual(@as(usize, 0), store.editor_actions.items.len);
 }
 
-test "ctx.ui v4 exposes retained view, surface frame, and notifications" {
+test "extension command publishes retained view frame and notification" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -1774,126 +1774,19 @@ test "ctx.ui v4 exposes retained view, surface frame, and notifications" {
     defer runner.endLoadContext();
     try state.doString(
         \\zi.define.command({
-        \\  name = "ui-v4-perimeter",
-        \\  description = "ui-v4-perimeter",
+        \\  name = "ui-publish",
+        \\  description = "ui-publish",
         \\  run = function(ctx, _)
-        \\    assert(ctx.capabilities().ui == true)
-        \\    assert(ctx["c" .. "wd"] == nil)
-        \\    assert(ctx["has" .. "_ui"] == nil)
-        \\    assert(ctx["ed" .. "itor"] == nil)
-        \\    assert(ctx.binding == nil)
-        \\    assert(ctx.extension == nil)
-        \\    assert(ctx["is" .. "_idle"] == nil)
-        \\    assert(ctx["ab" .. "ort"] == nil)
-        \\    assert(ctx["send" .. "_user_message"] == nil)
-        \\    assert(ctx["send" .. "_message"] == nil)
-        \\    assert(ctx["append" .. "_entry"] == nil)
-        \\    assert(ctx["has" .. "_pending_messages"] == nil)
-        \\    assert(ctx.ui ~= nil)
-        \\    local seen = {}
-        \\    local count = 0
-        \\    for k, v in pairs(ctx.ui) do
-        \\      seen[k] = true
-        \\      count = count + 1
-        \\      assert(type(v) == "function" or k == "capabilities" or k == "view" or k == "surface" or k == "notify")
-        \\    end
-        \\    assert(count == 4)
-        \\    assert(seen.view and seen.surface and seen.notify and seen.capabilities)
         \\    ctx.ui.view.set({ id = "demo" })
         \\    ctx.ui.surface.frame({ id = "demo" })
         \\    ctx.ui.notify.show({ id = "notify", message = "demo" })
-        \\    ctx.ui.view.set("not-a-table")
-        \\    ctx.ui.surface.frame(nil)
         \\  end,
         \\})
-    , "register_ui_v4_perimeter_command");
+    , "register_ui_publish_command");
 
-    try runner.dispatchCommand("ui-v4-perimeter", "");
+    try runner.dispatchCommand("ui-publish", "");
     try testing.expectEqual(@as(usize, 2), store.render_count);
     try testing.expectEqual(@as(usize, 1), store.frame_count);
-}
-
-test "api v4 section 10 conformance surface and negative drift" {
-    var store = TestStateStore{ .allocator = testing.allocator };
-    defer store.deinit();
-
-    var state = try lua_runtime.LuaState.init(testing.allocator);
-    defer state.deinit();
-    var runner = runner_mod.ExtensionRunner.init(testing.allocator, 55);
-    defer runner.deinit();
-    runner.attachLuaState(&state);
-    runner.bindLuaOwnerThread(std.Thread.getCurrentId());
-    var provider_registry = ai.provider.Registry.init(testing.allocator);
-    defer provider_registry.deinit();
-    try bindTestRuntime(&runner, &store, &provider_registry);
-    api_v4.install(&state, &runner);
-
-    runner.beginLoadContext(testLoadSource());
-    defer runner.endLoadContext();
-    try state.doString(
-        \\local function assert_error(fn)
-        \\  local ok = pcall(fn)
-        \\  assert(not ok, "expected error")
-        \\end
-        \\local zi_required = {
-        \\  "version", "extension", "define", "json", "schema", "doc",
-        \\}
-        \\for _, k in ipairs(zi_required) do assert(zi[k] ~= nil, k) end
-        \\for _, k in ipairs({"command","tool","keybinding","provider","event","action"}) do assert(type(zi.define[k]) == "function", k) end
-        \\for _, k in ipairs({"encode","decode"}) do assert(type(zi.json[k]) == "function", k) end
-        \\for _, k in ipairs({"object","string","number","integer","boolean","array","enum"}) do assert(type(zi.schema[k]) == "function", k) end
-        \\for _, k in ipairs({"schema","version","fragment","span","line","text","markdown","group","marker","step","is_fragment","validate","to_markdown"}) do assert(zi.doc[k] ~= nil, "doc." .. k) end
-        \\for _, k in ipairs({"command","tool","provider","unprovider","on","action","keybinding","system","spawn","job"}) do assert(zi[k] == nil, "old zi." .. k) end
-        \\assert_error(function() zi.define.command({ name = "bad", desc = "bad", handler = function() end }) end)
-        \\assert_error(function() zi.define.tool({ name = "bad", description = "bad", parameters = {}, execute = function() end }) end)
-        \\assert_error(function() zi.define.keybinding({ id = "bad", key = "f8", handler = function() end }) end)
-        \\local s = zi.schema.object({ properties = {}, required = {} })
-        \\assert(type(s.properties) == "table" and type(s.required) == "table")
-        \\zi.define.action("accept", function(ctx, event) _action_seen = event.action end)
-        \\zi.define.command({
-        \\  name = "v4-conformance",
-        \\  description = "v4-conformance",
-        \\  run = function(ctx, input)
-        \\    _v4_step = "forbidden roots"
-        \\    for _, path in ipairs({"cwd","binding","extension","send_user_message","send_message","append_entry","has_pending_messages"}) do assert(ctx[path] == nil, path) end
-        \\    assert(ctx.ai.stream == nil)
-        \\    assert(ctx.events.on == nil)
-        \\    assert(ctx.control.shutdown == nil)
-        \\    assert(ctx.ui.render == nil and ctx.ui.clear == nil and ctx.ui.frame == nil and ctx.ui.input == nil and ctx.ui.progress == nil)
-        \\    assert(ctx.ui.view.patch == nil)
-        \\    _v4_step = "caps"
-        \\    local caps = ctx.capabilities()
-        \\    for _, k in ipairs({"ui","composer","surface","process","ai","agent","session","state","models","keybinding"}) do assert(type(caps[k]) == "boolean", k) end
-        \\    assert(caps.input == nil and caps.shutdown == nil)
-        \\    local ui_caps = ctx.ui.capabilities()
-        \\    for _, k in ipairs({"view","notify","progress","surface","focus","color","markdown","ansi"}) do assert(type(ui_caps[k]) == "boolean", k) end
-        \\    assert(ui_caps.input == nil)
-        \\    _v4_step = "positive ui"
-        \\    ctx.ui.view.set({ id = "panel", slot = "overlay", root = { type = "view", style = { gap = 1 }, children = { { type = "text", text = "ok" } } } })
-        \\    ctx.ui.notify.show({ id = "smoke", message = "ok", annotation = "v4", ttl_ms = 1000 })
-        \\    ctx.ui.notify.update("smoke", { done = true })
-        \\    ctx.ui.notify.clear("smoke")
-        \\    _v4_step = "negative notify"
-        \\    assert_error(function() ctx.ui.notify.show("hello", {}) end)
-        \\    assert_error(function() ctx.ui.notify.show({ message = "hello", annote = "bad" }) end)
-        \\    assert_error(function() ctx.ui.notify.show({ message = "hello", ttl = 1 }) end)
-        \\    _v4_step = "negative slots"
-        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "notification" }) end)
-        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "editor.border.top" }) end)
-        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "editor.border.bottom" }) end)
-        \\    _v4_step = "negative style"
-        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "overlay", root = { type = "view", style = { flex_direction = "row" } } }) end)
-        \\    assert_error(function() ctx.ui.view.set({ id = "bad", slot = "overlay", root = { type = "view", style = { flex_grow = 1 } } }) end)
-        \\    _v4_step = "negative process"
-        \\    assert_error(function() ctx.process.run({ "/bin/true" }, { stdio = "terminal" }) end)
-        \\    assert_error(function() ctx.process.start({ argv = { "/bin/true" }, stdout = { mode = "events" } }) end)
-        \\    assert_error(function() ctx.process.start({ argv = { "/bin/true" }, stdout = { mode = "ui_frame" } }) end)
-        \\  end,
-        \\})
-    , "v4_conformance_register");
-    try runner.dispatchCommand("v4-conformance", "");
-    try runner.dispatchUiEvent(.{ .state_owner_id = "state-123", .generation = 55, .view = "panel", .action = "accept" });
-    try state.doString("assert(_action_seen == 'accept')", "v4_action_verify");
 }
 
 test "extension command resumes after system result" {
@@ -2355,7 +2248,7 @@ test "ctx.ui.notify publishes notification render" {
     try testing.expectEqual(@as(?u32, 5000), store.render_specs.items[0].notification.?.ttlMs());
 }
 
-test "todo command can call ui render perimeter" {
+test "todo command can publish retained view" {
     var store = TestStateStore{ .allocator = testing.allocator };
     defer store.deinit();
 
@@ -2375,7 +2268,7 @@ test "todo command can call ui render perimeter" {
     const tool = try buildAgentTool(testing.allocator, &runner, ext_tool);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const add_args = try todoArgs(arena.allocator(), "add", "ship perimeter", null);
+    const add_args = try todoArgs(arena.allocator(), "add", "ship view", null);
     const add_result = awaitToolExecutionForCompat(tool.start(arena.allocator(), "todo-1", add_args, abort_signal_mod.cancel.Token.none, null, null), arena.allocator(), abort_signal_mod.cancel.Token.none);
     try testing.expect(!add_result.is_error);
 

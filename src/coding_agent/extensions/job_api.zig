@@ -198,34 +198,7 @@ fn parseStartRequest(allocator: std.mem.Allocator, L: *c.lua_State) !runner_mod.
         const stdout_idx = c.lua_absindex(L, -1);
         const mode = try readStringField(allocator, L, stdout_idx, "mode", "chunks");
         defer allocator.free(mode);
-        if (std.mem.eql(u8, mode, "ui_frame") or std.mem.eql(u8, mode, "events")) return error.InvalidOptions;
-        if (false) {
-            const protocol = try readStringField(allocator, L, stdout_idx, "protocol", "zi-rgba-frame-v1");
-            defer allocator.free(protocol);
-            const format: extension_ui.FrameFormat = if (std.mem.eql(u8, protocol, "zi-rgba-frame-v1"))
-                .rgba8888
-            else if (std.mem.eql(u8, protocol, "zi-halfblock-rgb-v1"))
-                .halfblock_rgb
-            else
-                return error.InvalidOptions;
-            const runner = runnerFromUpvalue(L);
-            const source = runner.currentLoadSource();
-            const view = try readStringField(allocator, L, stdout_idx, "view", "default");
-            errdefer allocator.free(view);
-            const node = try readStringField(allocator, L, stdout_idx, "node", "surface");
-            errdefer allocator.free(node);
-            const default_state_owner_id = if (source) |src| src.provenance.state_owner_id else "job";
-            const state_owner_id = try readStringField(allocator, L, stdout_idx, "state_owner_id", default_state_owner_id);
-            errdefer allocator.free(state_owner_id);
-            request.stdout = .{ .ui_frame = .{
-                .view = view,
-                .node = node,
-                .state_owner_id = state_owner_id,
-                .generation = runner.generation,
-                .format = format,
-                .max_frame_bytes = @min(@as(usize, @intCast(readIntegerField(L, stdout_idx, "max_frame_bytes", limits.frame_bytes))), limits.frame_bytes),
-            } };
-        } else if (std.mem.eql(u8, mode, "json_lines")) {
+        if (std.mem.eql(u8, mode, "json_lines")) {
             const raw_max_line_bytes = readIntegerField(L, stdout_idx, "max_line_bytes", 1024 * 1024);
             if (raw_max_line_bytes <= 0) return error.InvalidOptions;
             request.stdout = .{ .json_lines = .{
