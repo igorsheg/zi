@@ -44,7 +44,7 @@ pub fn nextSegment(
         const token = nextToken(line, current_start);
         const token_text = token.text(line);
         const token_width = grapheme.strWidth(token_text, width_method);
-        const token_is_whitespace = isAllWhitespace(token_text);
+        const token_is_whitespace = isWhitespace(line[token.start]);
 
         if (token_width > max_width) {
             if (current_width > 0) {
