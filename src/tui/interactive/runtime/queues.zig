@@ -3,6 +3,7 @@ const posix = std.posix;
 
 const queue_mod = @import("../../../zio/root.zig").queue;
 const ui_event_mod = @import("../../ui_event.zig");
+const extension_runner_mod = @import("../../../coding_agent/extensions/runner.zig");
 
 const UiEvent = ui_event_mod.UiEvent;
 
@@ -20,6 +21,23 @@ pub const UiSnapshotQueue = queue_mod.Queue(UiEvent, .{
 pub const UiLifecycleQueue = queue_mod.Queue(UiEvent, .{
     .cleanup = .deinit,
     .policy = .{ .bounded = .{ .capacity = ui_lifecycle_queue_capacity, .on_full = .reject } },
+    .wakeup = .pipe,
+    .cross_thread = true,
+});
+
+pub const TerminalSystemRequest = struct {
+    id: extension_runner_mod.AsyncOpId,
+    system: extension_runner_mod.SystemRequest,
+
+    pub fn deinit(self: *TerminalSystemRequest, allocator: std.mem.Allocator) void {
+        self.system.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const TerminalSystemQueue = queue_mod.Queue(TerminalSystemRequest, .{
+    .cleanup = .deinit,
+    .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } },
     .wakeup = .pipe,
     .cross_thread = true,
 });

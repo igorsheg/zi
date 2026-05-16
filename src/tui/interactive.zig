@@ -28,7 +28,6 @@ const editor_iface_mod = @import("edit/interface.zig");
 const input_buffer_mod = @import("terminal/input_buffer.zig");
 const queues_mod = @import("interactive/runtime/queues.zig");
 const zio = @import("../zio/root.zig");
-const queue_mod = zio.queue;
 const command_query = @import("../lib/command_query.zig");
 const model_picker_flow_mod = @import("interactive/model_picker_flow.zig");
 const model_flow = @import("interactive/model_flow.zig");
@@ -85,16 +84,8 @@ const SelectItem = select_list_mod.SelectItem;
 const SimplePickerFlow = simple_picker_flow_mod.SimplePickerFlow;
 const ScrollTextOverlay = scroll_text_overlay_mod.ScrollTextOverlay;
 
-pub const TerminalSystemRequest = struct {
-    id: extension_runner_mod.AsyncOpId,
-    system: extension_runner_mod.SystemRequest,
-
-    pub fn deinit(self: *TerminalSystemRequest, allocator: std.mem.Allocator) void {
-        self.system.deinit(allocator);
-        self.* = undefined;
-    }
-};
-pub const TerminalSystemQueue = queue_mod.Queue(TerminalSystemRequest, .{ .cleanup = .deinit, .policy = .{ .bounded = .{ .capacity = 8, .on_full = .reject } }, .wakeup = .pipe, .cross_thread = true });
+const TerminalSystemRequest = queues_mod.TerminalSystemRequest;
+const TerminalSystemQueue = queues_mod.TerminalSystemQueue;
 const UiSnapshotQueue = queues_mod.UiSnapshotQueue;
 const UiLifecycleQueue = queues_mod.UiLifecycleQueue;
 const PublishedStatusSnapshot = status_snapshot_mod.PublishedStatusSnapshot;
@@ -473,7 +464,21 @@ pub const Interactive = struct {
 
     fn startAgentThread(self: *Interactive) !void {
         if (self.agent_tasks != null) return;
-        self.agent_runtime = runtime_loop.AgentRuntime.init(self);
+        self.agent_runtime = runtime_loop.AgentRuntime.init(.{
+            .msg_allocator = self.msg_allocator,
+            .runtime_host = &self.runtime_host,
+            .request_queue = &self.request_queue,
+            .snapshot_event_queue = &self.snapshot_event_queue,
+            .lifecycle_event_queue = &self.lifecycle_event_queue,
+            .snapshot_coalesced_dropped = &self.snapshot_coalesced_dropped,
+            .last_published_queued_version = &self.last_published_queued_version,
+            .last_published_status_snapshot = &self.last_published_status_snapshot,
+            .resolver = &self.resolver,
+            .ai_complete_worker = &self.ai_complete_worker,
+            .system_worker = &self.system_worker,
+            .terminal_system_queue = &self.terminal_system_queue,
+            .job_manager = &self.job_manager,
+        });
         var tasks = zio.task.Group.init(self.allocator);
         errdefer tasks.cancel();
         try tasks.spawnThread(runtime_loop.agentThread, .{&self.agent_runtime.?});

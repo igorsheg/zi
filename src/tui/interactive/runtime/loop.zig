@@ -23,10 +23,9 @@ const status_snapshot_mod = @import("../status_snapshot.zig");
 const extension_publish = @import("../extension_publish.zig");
 const log = std.log.scoped(.tui_interactive);
 
-const Interactive = @import("../../interactive.zig").Interactive;
-const TerminalSystemQueue = @import("../../interactive.zig").TerminalSystemQueue;
 const AgentRequest = coding_agent_mod.AgentRequest;
 const ExtensionRunner = coding_agent_mod.ExtensionRunner;
+const TerminalSystemQueue = queues_mod.TerminalSystemQueue;
 
 pub const agentThread = agentThreadFn;
 pub const submitExtensionAsyncResult = submitExtensionAsyncResultFn;
@@ -59,21 +58,37 @@ pub const AgentRuntime = struct {
     extension_command_actions: extension_runner_mod.ExtensionCommandActions = undefined,
     extension_deferred_user_prompts: std.ArrayListUnmanaged([]u8) = .empty,
 
-    pub fn init(self: *Interactive) AgentRuntime {
+    pub const Config = struct {
+        msg_allocator: std.mem.Allocator,
+        runtime_host: *RuntimeHost,
+        request_queue: *coding_agent_mod.RequestQueue,
+        snapshot_event_queue: *queues_mod.UiSnapshotQueue,
+        lifecycle_event_queue: *queues_mod.UiLifecycleQueue,
+        snapshot_coalesced_dropped: *usize,
+        last_published_queued_version: *u64,
+        last_published_status_snapshot: *?status_snapshot_mod.PublishedStatusSnapshot,
+        resolver: *tool_display_mod.ToolRendererResolver,
+        ai_complete_worker: *?ai_complete_worker_mod.AiCompleteWorker,
+        system_worker: *?system_worker_mod.SystemWorker,
+        terminal_system_queue: *TerminalSystemQueue,
+        job_manager: *job_manager_mod.JobManager,
+    };
+
+    pub fn init(config: Config) AgentRuntime {
         return .{
-            .msg_allocator = self.msg_allocator,
-            .runtime_host = &self.runtime_host,
-            .request_queue = &self.request_queue,
-            .snapshot_event_queue = &self.snapshot_event_queue,
-            .lifecycle_event_queue = &self.lifecycle_event_queue,
-            .snapshot_coalesced_dropped = &self.snapshot_coalesced_dropped,
-            .last_published_queued_version = &self.last_published_queued_version,
-            .last_published_status_snapshot = &self.last_published_status_snapshot,
-            .resolver = &self.resolver,
-            .ai_complete_worker = &self.ai_complete_worker,
-            .system_worker = &self.system_worker,
-            .terminal_system_queue = &self.terminal_system_queue,
-            .job_manager = &self.job_manager,
+            .msg_allocator = config.msg_allocator,
+            .runtime_host = config.runtime_host,
+            .request_queue = config.request_queue,
+            .snapshot_event_queue = config.snapshot_event_queue,
+            .lifecycle_event_queue = config.lifecycle_event_queue,
+            .snapshot_coalesced_dropped = config.snapshot_coalesced_dropped,
+            .last_published_queued_version = config.last_published_queued_version,
+            .last_published_status_snapshot = config.last_published_status_snapshot,
+            .resolver = config.resolver,
+            .ai_complete_worker = config.ai_complete_worker,
+            .system_worker = config.system_worker,
+            .terminal_system_queue = config.terminal_system_queue,
+            .job_manager = config.job_manager,
         };
     }
 
@@ -232,7 +247,7 @@ fn publishQueuedSnapshotFromRuntime(ctx: ?*anyopaque, snapshot: coding_agent_mod
     return self.publishSnapshotUiEvent(.{ .queued_snapshot = snapshot });
 }
 
-pub fn enqueueShutdown(self: *Interactive) void {
+pub fn enqueueShutdown(self: anytype) void {
     switch (self.request_queue.trySend(.{ .shutdown = {} })) {
         .ok, .dropped => {},
         .closed, .full, .oom => {},
@@ -263,14 +278,14 @@ fn dispatchExtensionOAuthRefreshViaRequestQueue(
     result_allocator: std.mem.Allocator,
     ctx: ?*anyopaque,
 ) oauth_mod.ExchangeResult {
-    const self: *Interactive = @ptrCast(@alignCast(ctx.?));
+    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ctx.?));
     var response: request_mod.ExtensionOAuthRefreshResponse = .{};
-    const provider_copy = self.msg_allocator.dupe(u8, provider_id) catch return .{ .err = "out of memory" };
-    const credential_copy = auth_types.cloneOAuthCredential(self.msg_allocator, credential) catch {
-        self.msg_allocator.free(provider_copy);
+    const provider_copy = sink.msg_allocator.dupe(u8, provider_id) catch return .{ .err = "out of memory" };
+    const credential_copy = auth_types.cloneOAuthCredential(sink.msg_allocator, credential) catch {
+        sink.msg_allocator.free(provider_copy);
         return .{ .err = "out of memory" };
     };
-    switch (self.request_queue.trySend(.{ .extension_oauth_refresh = .{
+    switch (sink.request_queue.trySend(.{ .extension_oauth_refresh = .{
         .provider_id = provider_copy,
         .credential = credential_copy,
         .result_allocator = result_allocator,
@@ -279,12 +294,12 @@ fn dispatchExtensionOAuthRefreshViaRequestQueue(
         .ok => {},
         .full => |rejected| {
             var req = rejected;
-            req.deinit(self.msg_allocator);
+            req.deinit(sink.msg_allocator);
             return .{ .err = "refresh request queue is full" };
         },
         .closed => |rejected| {
             var req = rejected;
-            req.deinit(self.msg_allocator);
+            req.deinit(sink.msg_allocator);
             return .{ .err = "refresh request queue is closed" };
         },
         .oom => return .{ .err = "out of memory" },
