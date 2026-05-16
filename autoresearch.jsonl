@@ -1,0 +1,1 @@
+{"type":"config","bestDirection":"lower","metricUnit":"ms","metricName":"render_ms","name":"tui-render-throughput"}
