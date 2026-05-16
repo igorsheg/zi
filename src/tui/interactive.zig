@@ -191,6 +191,87 @@ fn formatSessionInfo(allocator: std.mem.Allocator, session: *const AgentSession)
     return out.toOwnedSlice();
 }
 
+fn formatQueueStats(writer: *std.Io.Writer, name: []const u8, stats: anytype) !void {
+    try writer.print("{s}: pending={d} high_water={d} sent={d} rejected={d} dropped={d} wakes={d} state={s}\n", .{
+        name,
+        stats.pending_depth,
+        stats.high_water_depth,
+        stats.send_count,
+        stats.rejected_count,
+        stats.dropped_count,
+        stats.wake_count,
+        @tagName(stats.state),
+    });
+}
+
+fn formatTuiDiagnostics(allocator: std.mem.Allocator, self: *Interactive) ![]u8 {
+    _ = self.transcript.totalHeight(self.last_render_width);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("TUI Diagnostics\n\n");
+
+    try writer.writeAll("Owner State\n");
+    try writer.print("running: {}\n", .{self.running});
+    try writer.print("dirty: {}\n", .{self.tui.dirty});
+    try writer.print("terminal: {d}x{d}\n", .{ self.tui.width(), self.tui.height() });
+    try writer.print("renderer: {d}x{d} force_redraw={}\n", .{ self.tui.renderer.width, self.tui.renderer.height, self.tui.renderer.force_redraw });
+    try writer.print("input_buffer: bytes={d} flush_deadline={} kitty_deadline={}\n", .{ self.input.buf.items.len, self.input.flush_deadline_ns != null, self.kitty_deadline_ns != null });
+    try writer.writeAll("\n");
+
+    try writer.writeAll("Focus / Overlays\n");
+    if (self.tui.focus.current) |focused| {
+        try writer.print("focus: ptr=0x{x} vtable=0x{x}\n", .{ @intFromPtr(focused.ptr), @intFromPtr(focused.vtable) });
+    } else {
+        try writer.writeAll("focus: none\n");
+    }
+    var visible_overlays: usize = 0;
+    var capturing_overlays: usize = 0;
+    for (self.tui.overlays.stack.items) |entry| {
+        if (!entry.hidden) visible_overlays += 1;
+        if (!entry.hidden and !entry.options.non_capturing) capturing_overlays += 1;
+    }
+    try writer.print("overlays: total={d} visible={d} capturing={d}\n", .{ self.tui.overlays.stack.items.len, visible_overlays, capturing_overlays });
+    try writer.print("root_children: {d}\n", .{self.tui.root.children.items.len});
+    try writer.writeAll("\n");
+
+    try writer.writeAll("Transcript\n");
+    try writer.print("items: {d}\n", .{self.transcript.items.items.len});
+    try writer.print("layout_items: {d}\n", .{self.transcript.layout.items.items.len});
+    try writer.print("layout_width: {d}\n", .{self.transcript.layout.layout_width});
+    try writer.print("dirty_layout_items: {d}\n", .{self.transcript.layout.dirty_count});
+    try writer.print("total_height: {d}\n", .{self.transcript.layout.totalHeight()});
+    try writer.print("scroll_offset: {d}\n", .{self.transcript.scrollOffset()});
+    try writer.print("last_visible_height: {d}\n", .{self.transcript.last_visible_height});
+    try writer.print("follow_bottom: {}\n", .{self.transcript.isFollowingBottom()});
+    try writer.print("pending_tools: {d}\n", .{self.transcript.pending_tools.count()});
+    try writer.print("retained_items: {d}\n", .{self.transcript.retained_items.count()});
+    try writer.writeAll("\n");
+
+    try writer.writeAll("Queues\n");
+    try formatQueueStats(writer, "snapshot", self.snapshot_event_queue.stats());
+    try formatQueueStats(writer, "lifecycle", self.lifecycle_event_queue.stats());
+    try formatQueueStats(writer, "request", self.request_queue.stats());
+    try formatQueueStats(writer, "terminal_system", self.terminal_system_queue.stats());
+    try formatQueueStats(writer, "session_index", self.session_index_worker.stats());
+    try writer.writeAll("\n");
+
+    const rs = self.tui.renderer.stats;
+    try writer.writeAll("Renderer Stats\n");
+    try writer.print("frames: {d}\n", .{rs.frames});
+    try writer.print("cells_scanned: {d}\n", .{rs.cells_scanned});
+    try writer.print("cells_changed: {d}\n", .{rs.cells_changed});
+    try writer.print("cursor_moves: {d}\n", .{rs.cursor_moves});
+    try writer.print("style_changes: fg={d} bg={d} attr={d}\n", .{ rs.fg_changes, rs.bg_changes, rs.attr_changes });
+    try writer.print("graphemes_written: {d}\n", .{rs.graphemes_written});
+    try writer.print("bytes_emitted: {d}\n", .{rs.bytes_emitted});
+    try writer.print("timing_us: render={d} write={d}\n", .{ rs.render_us, rs.write_us });
+
+    return out.toOwnedSlice();
+}
+
 const ClipboardImageReader = *const fn (allocator: std.mem.Allocator) ?[]u8;
 
 const StartupAction = union(enum) {
@@ -1006,6 +1087,7 @@ pub const Interactive = struct {
             .settings => self.showSettingsPicker(),
             .hotkeys => self.showHotkeysOverlay(),
             .memory => self.showMemoryTelemetry(),
+            .tui => self.showTuiDiagnostics(),
             .session => self.showSessionInfo(),
             .logs => self.showLogs(args),
         }
@@ -1069,6 +1151,18 @@ pub const Interactive = struct {
 
         self.addTextTranscriptItem(content, .accent, "memory telemetry added to transcript");
         memory_telemetry.log(self, "slash");
+        self.tui.dirty = true;
+    }
+
+    fn showTuiDiagnostics(self: *Interactive) void {
+        const content = formatTuiDiagnostics(self.allocator, self) catch {
+            self.status_line.setPrimary("TUI diagnostics unavailable", self.theme.fg(.@"error"));
+            self.tui.dirty = true;
+            return;
+        };
+        defer self.allocator.free(content);
+
+        self.addTextTranscriptItem(content, .accent, "TUI diagnostics added to transcript");
         self.tui.dirty = true;
     }
 
