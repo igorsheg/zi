@@ -133,13 +133,6 @@ pub fn isWhitespace(c: u8) bool {
     return c == ' ' or c == '\t';
 }
 
-pub fn isAllWhitespace(s: []const u8) bool {
-    for (s) |c| {
-        if (!isWhitespace(c)) return false;
-    }
-    return true;
-}
-
 pub fn skipWhitespace(line: []const u8, start: usize) usize {
     var pos = start;
     while (pos < line.len and isWhitespace(line[pos])) : (pos += 1) {}
@@ -198,4 +191,11 @@ test "nextSegment preserve policy keeps separator bytes on previous line" {
 
     const seg2 = nextSegment("hello world", seg1.next_start, 5, true, .{}, .wcwidth).?;
     try testing.expectEqualStrings("world", seg2.text("hello world"));
+}
+
+test "token width fast path matches grapheme width for printable ascii" {
+    const text = "plain ascii token";
+    const token = nextToken(text, 0);
+    try testing.expect(token.ascii_printable);
+    try testing.expectEqual(grapheme.strWidth(token.text(text), .wcwidth), token.width(text, .wcwidth));
 }

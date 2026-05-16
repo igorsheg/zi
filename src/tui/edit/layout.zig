@@ -142,6 +142,9 @@ fn appendWrappedSlices(
 
         if (segment.next_start >= line_text.len) break;
 
+        // Editor layout uses default SegmentOptions, which preserve separator bytes:
+        // the measured segment covers the same byte range used for logical column advancement.
+        std.debug.assert(segment.next_start == segment.end);
         logical_col_start += segment.width_cols;
         start = segment.next_start;
         current_kind = .wrapped_continuation;
