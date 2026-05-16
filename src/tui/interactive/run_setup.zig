@@ -62,7 +62,7 @@ pub fn bindRuntimeEvents(self: *Interactive) void {
     self.session_event_token = self.runtime_host.subscribeEvents(&Interactive.sessionEventCallback, @ptrCast(self));
     self.runtime_host.setExtensionOAuthRefreshDispatcher(.{
         .func = &runtime_loop.dispatchExtensionOAuthRefresh,
-        .ctx = @ptrCast(&self.cross_thread_sinks),
+        .ctx = @ptrCast(&self.ui_ingress),
     });
 }
 

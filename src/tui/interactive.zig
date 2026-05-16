@@ -292,7 +292,7 @@ pub const Interactive = struct {
     lifecycle_event_queue: UiLifecycleQueue,
 
     request_queue: RequestQueue,
-    cross_thread_sinks: runtime_loop.CrossThreadUiSinks = undefined,
+    ui_ingress: runtime_loop.UiIngress = undefined,
     agent_runtime: ?runtime_loop.AgentRuntime = null,
     job_manager: job_manager_mod.JobManager,
     agent_event_token: ?RuntimeHost.AgentEventSubscriptionToken = null,
@@ -485,8 +485,8 @@ pub const Interactive = struct {
         self.agent_tasks = tasks;
     }
 
-    fn bindCrossThreadSinks(self: *Interactive) void {
-        self.cross_thread_sinks = .{
+    fn bindUiIngress(self: *Interactive) void {
+        self.ui_ingress = .{
             .msg_allocator = self.msg_allocator,
             .request_queue = &self.request_queue,
             .lifecycle_event_queue = &self.lifecycle_event_queue,
@@ -494,13 +494,13 @@ pub const Interactive = struct {
     }
 
     fn startSessionIndexWorker(self: *Interactive) !void {
-        self.session_index_worker.setPublisher(&runtime_loop.publishLifecycleUiEventFromSink, @ptrCast(&self.cross_thread_sinks));
+        self.session_index_worker.setPublisher(&runtime_loop.publishLifecycleUiEventFromIngress, @ptrCast(&self.ui_ingress));
         try self.session_index_worker.start();
         self.session_index_worker.warmResumeSessions(self.cwd) catch {};
     }
 
     pub fn run(self: *Interactive) !void {
-        self.bindCrossThreadSinks();
+        self.bindUiIngress();
         try run_setup.prepareTerminal(self);
         run_setup.bindEditor(self);
         run_setup.bindRuntimeEvents(self);
@@ -509,11 +509,11 @@ pub const Interactive = struct {
         try self.startAgentThread();
         try self.startSessionIndexWorker();
         if (self.ai_complete_worker) |*worker| {
-            worker.setResultSink(.{ .ptr = @ptrCast(&self.cross_thread_sinks), .submit = &runtime_loop.submitExtensionAsyncResult, .submit_event = &runtime_loop.submitExtensionAiCompleteEvent });
+            worker.setResultSink(.{ .ptr = @ptrCast(&self.ui_ingress), .submit = &runtime_loop.submitExtensionAsyncResult, .submit_event = &runtime_loop.submitExtensionAiCompleteEvent });
             try worker.start();
         }
         if (self.system_worker) |*worker| {
-            worker.setResultSink(.{ .ptr = @ptrCast(&self.cross_thread_sinks), .submit = &runtime_loop.submitExtensionAsyncResult });
+            worker.setResultSink(.{ .ptr = @ptrCast(&self.ui_ingress), .submit = &runtime_loop.submitExtensionAsyncResult });
             try worker.start();
         }
 
@@ -522,7 +522,7 @@ pub const Interactive = struct {
         run_setup.bindAutocomplete(self);
         run_setup.mountInitialTree(self);
 
-        self.job_manager.setFrameSink(.{ .ptr = @ptrCast(&self.cross_thread_sinks), .submit = &runtime_loop.publishJobUiFrameFromSink });
+        self.job_manager.setFrameSink(.{ .ptr = @ptrCast(&self.ui_ingress), .submit = &runtime_loop.publishJobUiFrameFromIngress });
 
         self.publishPendingExtensionUi();
 
@@ -601,7 +601,7 @@ pub const Interactive = struct {
         defer request.deinit(self.msg_allocator);
 
         const result = self.runTerminalSystem(request.system);
-        if (!runtime_loop.submitExtensionAsyncResult(@ptrCast(&self.cross_thread_sinks), request.id, .{ .system = result })) {
+        if (!runtime_loop.submitExtensionAsyncResult(@ptrCast(&self.ui_ingress), request.id, .{ .system = result })) {
             var failed = result;
             failed.deinit(self.msg_allocator);
         }

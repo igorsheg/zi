@@ -33,9 +33,9 @@ pub const submitExtensionAiCompleteEvent = submitExtensionAiCompleteEventFn;
 pub const submitExtensionAsyncFromRunner = extensionAsyncDispatcher;
 pub const dispatchExtensionOAuthRefresh = dispatchExtensionOAuthRefreshViaRequestQueue;
 
-pub const CrossThreadUiSinks = struct {
-    // Narrow cross-thread sink handle. Worker/job/session-index threads may enqueue
-    // owner-thread events through these queues, but must not receive *Interactive.
+pub const UiIngress = struct {
+    // Narrow worker-to-UI ingress handle. Worker/job/session-index threads may
+    // enqueue owner-thread work through these queues, but must not receive *Interactive.
     msg_allocator: std.mem.Allocator,
     request_queue: *coding_agent_mod.RequestQueue,
     lifecycle_event_queue: *queues_mod.UiLifecycleQueue,
@@ -278,14 +278,14 @@ fn dispatchExtensionOAuthRefreshViaRequestQueue(
     result_allocator: std.mem.Allocator,
     ctx: ?*anyopaque,
 ) oauth_mod.ExchangeResult {
-    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ctx.?));
+    const ingress: *UiIngress = @ptrCast(@alignCast(ctx.?));
     var response: request_mod.ExtensionOAuthRefreshResponse = .{};
-    const provider_copy = sink.msg_allocator.dupe(u8, provider_id) catch return .{ .err = "out of memory" };
-    const credential_copy = auth_types.cloneOAuthCredential(sink.msg_allocator, credential) catch {
-        sink.msg_allocator.free(provider_copy);
+    const provider_copy = ingress.msg_allocator.dupe(u8, provider_id) catch return .{ .err = "out of memory" };
+    const credential_copy = auth_types.cloneOAuthCredential(ingress.msg_allocator, credential) catch {
+        ingress.msg_allocator.free(provider_copy);
         return .{ .err = "out of memory" };
     };
-    switch (sink.request_queue.trySend(.{ .extension_oauth_refresh = .{
+    switch (ingress.request_queue.trySend(.{ .extension_oauth_refresh = .{
         .provider_id = provider_copy,
         .credential = credential_copy,
         .result_allocator = result_allocator,
@@ -294,12 +294,12 @@ fn dispatchExtensionOAuthRefreshViaRequestQueue(
         .ok => {},
         .full => |rejected| {
             var req = rejected;
-            req.deinit(sink.msg_allocator);
+            req.deinit(ingress.msg_allocator);
             return .{ .err = "refresh request queue is full" };
         },
         .closed => |rejected| {
             var req = rejected;
-            req.deinit(sink.msg_allocator);
+            req.deinit(ingress.msg_allocator);
             return .{ .err = "refresh request queue is closed" };
         },
         .oom => return .{ .err = "out of memory" },
@@ -335,50 +335,50 @@ fn agentThreadFn(self: *AgentRuntime) void {
 }
 
 fn submitExtensionAsyncResultFn(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, result: extension_runner_mod.AsyncResult) bool {
-    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ptr));
-    switch (sink.request_queue.trySend(.{ .extension_async_result = .{ .id = id, .result = result } })) {
+    const ingress: *UiIngress = @ptrCast(@alignCast(ptr));
+    switch (ingress.request_queue.trySend(.{ .extension_async_result = .{ .id = id, .result = result } })) {
         .ok, .dropped => return true,
         .full, .closed, .oom => |rejected| {
             var failed = rejected;
-            failed.deinit(sink.msg_allocator);
+            failed.deinit(ingress.msg_allocator);
             return false;
         },
     }
 }
 fn submitExtensionAiCompleteEventFn(ptr: *anyopaque, id: extension_runner_mod.AsyncOpId, event: extension_runner_mod.AiCompleteStreamEvent) bool {
-    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ptr));
-    switch (sink.request_queue.trySend(.{ .extension_async_event = .{ .id = id, .event = event } })) {
+    const ingress: *UiIngress = @ptrCast(@alignCast(ptr));
+    switch (ingress.request_queue.trySend(.{ .extension_async_event = .{ .id = id, .event = event } })) {
         .ok, .dropped => return true,
         .full, .closed, .oom => |rejected| {
             var failed = rejected;
-            failed.deinit(sink.msg_allocator);
+            failed.deinit(ingress.msg_allocator);
             return false;
         },
     }
 }
 
-pub fn publishLifecycleUiEventFromSink(ctx: ?*anyopaque, event: UiEvent) bool {
-    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ctx.?));
-    switch (sink.lifecycle_event_queue.trySend(event)) {
+pub fn publishLifecycleUiEventFromIngress(ctx: ?*anyopaque, event: UiEvent) bool {
+    const ingress: *UiIngress = @ptrCast(@alignCast(ctx.?));
+    switch (ingress.lifecycle_event_queue.trySend(event)) {
         .ok => return true,
         .dropped => unreachable,
         .closed, .full, .oom => |rejected| {
             var failed = rejected;
-            failed.deinit(sink.msg_allocator);
+            failed.deinit(ingress.msg_allocator);
             return false;
         },
     }
 }
 
-pub fn publishJobUiFrameFromSink(ptr: *anyopaque, frame: extension_ui.UiFrame) bool {
-    const sink: *CrossThreadUiSinks = @ptrCast(@alignCast(ptr));
-    const updates = sink.msg_allocator.alloc(extension_ui.UiFrame, 1) catch {
+pub fn publishJobUiFrameFromIngress(ptr: *anyopaque, frame: extension_ui.UiFrame) bool {
+    const ingress: *UiIngress = @ptrCast(@alignCast(ptr));
+    const updates = ingress.msg_allocator.alloc(extension_ui.UiFrame, 1) catch {
         var failed = frame;
-        failed.deinit(sink.msg_allocator);
+        failed.deinit(ingress.msg_allocator);
         return false;
     };
     updates[0] = frame;
-    return publishLifecycleUiEventFromSink(@ptrCast(sink), .{ .extension_ui_framed = .{ .updates = updates } });
+    return publishLifecycleUiEventFromIngress(@ptrCast(ingress), .{ .extension_ui_framed = .{ .updates = updates } });
 }
 
 pub fn extensionAsyncDispatcher(self: *AgentRuntime) extension_runner_mod.AsyncDispatcher {
