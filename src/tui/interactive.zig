@@ -914,27 +914,63 @@ pub const Interactive = struct {
         timer_ready: bool = false,
     };
 
+    const WakeSourceKind = enum {
+        terminal_input,
+        snapshot_events,
+        lifecycle_events,
+        terminal_system,
+    };
+
+    const WakeSource = struct {
+        kind: WakeSourceKind,
+        fd: std.posix.fd_t,
+    };
+
+    const WakeSourceCallback = struct {
+        readiness: *LoopReadiness,
+        kind: WakeSourceKind,
+
+        fn onReady(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (!ready.read) return;
+            switch (self.kind) {
+                .terminal_input => self.readiness.input_ready = true,
+                .snapshot_events => self.readiness.snapshot_ready = true,
+                .lifecycle_events => self.readiness.lifecycle_ready = true,
+                .terminal_system => self.readiness.terminal_system_ready = true,
+            }
+        }
+    };
+
+    const wake_source_count = 4;
+
+    fn collectWakeSources(self: *Interactive) [wake_source_count]WakeSource {
+        return .{
+            .{ .kind = .terminal_input, .fd = self.tui.terminal.fd_in },
+            .{ .kind = .snapshot_events, .fd = self.snapshot_event_queue.wakeReadFd().? },
+            .{ .kind = .lifecycle_events, .fd = self.lifecycle_event_queue.wakeReadFd().? },
+            .{ .kind = .terminal_system, .fd = self.terminal_system_queue.wakeReadFd().? },
+        };
+    }
+
+    fn registerWakeSources(self: *Interactive, loop: *zio.loop.Loop, readiness: *LoopReadiness, callbacks: *[wake_source_count]WakeSourceCallback) !void {
+        const sources = self.collectWakeSources();
+        const interest = zio.loop.Interest{ .read = true };
+        for (sources, 0..) |source, i| {
+            callbacks[i] = .{ .readiness = readiness, .kind = source.kind };
+            _ = try loop.register(.{
+                .fd = source.fd,
+                .interest = interest,
+                .callback = .{ .ptr = @ptrCast(&callbacks[i]), .call = WakeSourceCallback.onReady },
+            });
+        }
+    }
+
     fn waitForLoopReadiness(self: *Interactive) LoopReadiness {
         const idle_wait_timeout_ms: i32 = 50;
         const now_ns = zio.deadline.nowNs(self.io);
 
         const Callbacks = struct {
-            fn input(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
-                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
-                out.input_ready = ready.read;
-            }
-            fn snapshot(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
-                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
-                out.snapshot_ready = ready.read;
-            }
-            fn lifecycle(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
-                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
-                out.lifecycle_ready = ready.read;
-            }
-            fn terminalSystem(ptr: ?*anyopaque, ready: zio.loop.Ready) void {
-                const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
-                out.terminal_system_ready = ready.read;
-            }
             fn timer(ptr: ?*anyopaque) void {
                 const out: *LoopReadiness = @ptrCast(@alignCast(ptr.?));
                 out.timer_ready = true;
@@ -942,14 +978,11 @@ pub const Interactive = struct {
         };
 
         var readiness = LoopReadiness{};
-        const interest = zio.loop.Interest{ .read = true };
+        var wake_callbacks: [wake_source_count]WakeSourceCallback = undefined;
         var loop = zio.loop.Loop.init(self.allocator);
         defer loop.deinit();
 
-        _ = loop.register(.{ .fd = self.tui.terminal.fd_in, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.input } }) catch return .{};
-        _ = loop.register(.{ .fd = self.snapshot_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.snapshot } }) catch return .{};
-        _ = loop.register(.{ .fd = self.lifecycle_event_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.lifecycle } }) catch return .{};
-        _ = loop.register(.{ .fd = self.terminal_system_queue.wakeReadFd().?, .interest = interest, .callback = .{ .ptr = @ptrCast(&readiness), .call = Callbacks.terminalSystem } }) catch return .{};
+        self.registerWakeSources(&loop, &readiness, &wake_callbacks) catch return .{};
         if (self.nextLoopDeadlineNs(now_ns)) |deadline_ns| {
             _ = loop.addTimerAt(deadline_ns, .{ .ptr = @ptrCast(&readiness), .call = Callbacks.timer }) catch return .{};
         }
