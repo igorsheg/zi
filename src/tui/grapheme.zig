@@ -132,6 +132,11 @@ fn asciiPrintableWidth(text: []const u8) ?usize {
 }
 
 pub fn sliceToWidth(text: []const u8, max_cols: usize, method: WidthMethod) []const u8 {
+    if (asciiPrintableWidth(text)) |width| {
+        if (width <= max_cols) return text;
+        return text[0..max_cols];
+    }
+
     var cols: usize = 0;
     var start: usize = 0;
     while (start < text.len) {
