@@ -680,6 +680,7 @@ fn reconstructSpans(start: usize, end: usize, flat: FlatText, arena: std.mem.All
 
     var spans: std.ArrayListUnmanaged(Span) = .empty;
     errdefer spans.deinit(arena);
+    try spans.ensureTotalCapacity(arena, @min(flat.runs.len, 4));
     for (flat.runs) |run| {
         if (run.end <= start) continue;
         if (run.start >= end) break;
