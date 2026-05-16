@@ -205,7 +205,7 @@ fn formatQueueStats(writer: *std.Io.Writer, name: []const u8, stats: anytype) !v
 }
 
 fn formatTuiDiagnostics(allocator: std.mem.Allocator, self: *Interactive) ![]u8 {
-    _ = self.transcript.totalHeight(self.last_render_width);
+    const transcript_total_height = self.transcript.totalHeight(self.transcript.last_render_width);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -242,7 +242,7 @@ fn formatTuiDiagnostics(allocator: std.mem.Allocator, self: *Interactive) ![]u8 
     try writer.print("layout_items: {d}\n", .{self.transcript.layout.items.items.len});
     try writer.print("layout_width: {d}\n", .{self.transcript.layout.layout_width});
     try writer.print("dirty_layout_items: {d}\n", .{self.transcript.layout.dirty_count});
-    try writer.print("total_height: {d}\n", .{self.transcript.layout.totalHeight()});
+    try writer.print("total_height: {d}\n", .{transcript_total_height});
     try writer.print("scroll_offset: {d}\n", .{self.transcript.scrollOffset()});
     try writer.print("last_visible_height: {d}\n", .{self.transcript.last_visible_height});
     try writer.print("follow_bottom: {}\n", .{self.transcript.isFollowingBottom()});
