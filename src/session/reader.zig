@@ -6,17 +6,11 @@ const max_session_file_bytes: usize = 100 * 1024 * 1024;
 
 pub const ReadPolicy = enum {
     strict,
+    /// Accept a trailing line that was cut off during append. Semantic errors
+    /// on a complete-looking final record are still rejected.
     allow_final_partial_line,
 };
 
-/// Arena-owned parsed session log.
-///
-/// Owner: `SessionLog` owns all header and entry memory through `arena`.
-/// Ingress: complete file bytes through `parseContent` or a file path through
-/// `readFile`.
-/// Egress: validated header and append-order entries.
-/// Bounds: `readFile` limits file bytes; validation rejects duplicate IDs,
-/// missing headers, future versions, and unknown parents.
 pub const SessionLog = struct {
     arena: std.heap.ArenaAllocator,
     header: proto.SessionHeader,
@@ -58,7 +52,7 @@ pub fn parseContent(allocator: std.mem.Allocator, content: []const u8, policy: R
 
         if (line.len > 0) {
             const file_entry = json.parseFileEntry(aa, line) catch |err| switch (policy) {
-                .allow_final_partial_line => if (final_without_newline) break else return err,
+                .allow_final_partial_line => if (final_without_newline and err == error.SyntaxError) break else return err,
                 .strict => return err,
             };
             switch (file_entry) {

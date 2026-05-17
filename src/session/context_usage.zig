@@ -92,9 +92,8 @@ pub fn estimateTokens(message: agent.protocol.AgentMessage) u64 {
     switch (message) {
         .user => |u| switch (u.content) {
             .text => |t| chars += t.len,
-            .blocks => |blocks| for (blocks) |block| switch (block) {
-                .text => |t| chars += t.text.len,
-                else => {},
+            .blocks => |blocks| {
+                for (blocks) |block| chars += estimateUserContentBlock(block);
             },
         },
         .assistant => |a| {
@@ -106,9 +105,8 @@ pub fn estimateTokens(message: agent.protocol.AgentMessage) u64 {
         },
         .custom => |c| switch (c.content) {
             .text => |t| chars += t.len,
-            .blocks => |blocks| for (blocks) |block| switch (block) {
-                .text => |t| chars += t.text.len,
-                .image => chars += 4800,
+            .blocks => |blocks| {
+                for (blocks) |block| chars += estimateUserContentBlock(block);
             },
         },
         .tool_result => |tr| {
@@ -120,8 +118,14 @@ pub fn estimateTokens(message: agent.protocol.AgentMessage) u64 {
         .branch_summary => |bs| chars += bs.summary.len,
         .compaction_summary => |cs| chars += cs.summary.len,
     }
-
     return @intCast(@divTrunc(chars + 3, 4));
+}
+
+fn estimateUserContentBlock(block: ai.protocol.UserMessage.UserMessageContent.Block) usize {
+    return switch (block) {
+        .text => |t| t.text.len,
+        .image => 4800,
+    };
 }
 
 fn getAssistantUsage(message: agent.protocol.AgentMessage) ?ai.protocol.Usage {
@@ -183,7 +187,7 @@ fn estimateJsonStringSize(s: []const u8) usize {
 
 fn countPrint(comptime fmt: []const u8, args: anytype) usize {
     var buf: [128]u8 = undefined;
-    return (std.fmt.bufPrint(&buf, fmt, args) catch return 0).len;
+    return (std.fmt.bufPrint(&buf, fmt, args) catch return buf.len).len;
 }
 
 const testing = std.testing;

@@ -49,7 +49,7 @@ pub fn buildBranchEntries(
         try by_id.put(entry.id, idx);
     }
 
-    const idx = resolveLeafIndex(entries, &by_id, selection) orelse return allocator.alloc(proto.SessionEntry, 0);
+    const idx = (try resolveLeafIndex(entries, &by_id, selection)) orelse return allocator.alloc(proto.SessionEntry, 0);
 
     var path: std.ArrayList(proto.SessionEntry) = .empty;
     errdefer path.deinit(allocator);
@@ -105,7 +105,7 @@ pub fn buildSessionContext(
         try messages.append(allocator, .{ .compaction_summary = .{
             .summary = cd.summary,
             .tokens_before = cd.tokens_before,
-            .timestamp = isoToEpochMs(path[compaction_path_pos.?].timestamp),
+            .timestamp = try parseSessionTimestampMs(path[compaction_path_pos.?].timestamp),
         } });
 
         const compaction_pos = compaction_path_pos.?;
@@ -116,18 +116,18 @@ pub fn buildSessionContext(
                 found_first_kept = true;
             }
             if (found_first_kept) {
-                if (extractMessage(&entry)) |msg| try messages.append(allocator, msg);
+                if (try extractMessage(&entry)) |msg| try messages.append(allocator, msg);
             }
         }
 
         if (compaction_pos + 1 < path.len) {
             for (path[compaction_pos + 1 ..]) |entry| {
-                if (extractMessage(&entry)) |msg| try messages.append(allocator, msg);
+                if (try extractMessage(&entry)) |msg| try messages.append(allocator, msg);
             }
         }
     } else {
         for (path) |entry| {
-            if (extractMessage(&entry)) |msg| try messages.append(allocator, msg);
+            if (try extractMessage(&entry)) |msg| try messages.append(allocator, msg);
         }
     }
 
@@ -142,15 +142,15 @@ fn resolveLeafIndex(
     entries: []const proto.SessionEntry,
     by_id: *const std.StringHashMap(usize),
     selection: LeafSelection,
-) ?usize {
+) !?usize {
     return switch (selection) {
         .current => if (entries.len > 0) entries.len - 1 else null,
         .before_first => null,
-        .entry_id => |entry_id| by_id.get(entry_id) orelse if (entries.len > 0) entries.len - 1 else null,
+        .entry_id => |entry_id| by_id.get(entry_id) orelse return error.UnknownLeafEntryId,
     };
 }
 
-fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage {
+fn extractMessage(entry: *const proto.SessionEntry) !?agent.protocol.AgentMessage {
     switch (entry.entry) {
         .message => |m| return m.message,
         .custom_message => |cm| {
@@ -160,7 +160,7 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
                 .content = cm.content,
                 .display = cm.display,
                 .details = cm.details,
-                .timestamp = isoToEpochMs(entry.timestamp),
+                .timestamp = try parseSessionTimestampMs(entry.timestamp),
             } };
         },
         .branch_summary => |bs| {
@@ -168,7 +168,7 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
                 return .{ .branch_summary = .{
                     .summary = bs.summary,
                     .from_id = bs.from_id,
-                    .timestamp = isoToEpochMs(entry.timestamp),
+                    .timestamp = try parseSessionTimestampMs(entry.timestamp),
                 } };
             }
             return null;
@@ -177,8 +177,8 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
     }
 }
 
-fn isoToEpochMs(timestamp: []const u8) i64 {
-    const secs = parseIsoToEpochSeconds(timestamp) orelse return 0;
+fn parseSessionTimestampMs(timestamp: []const u8) !i64 {
+    const secs = parseIsoToEpochSeconds(timestamp) orelse return error.InvalidSessionTimestamp;
     return secs * 1000;
 }
 
@@ -529,7 +529,7 @@ test "complex branch selection combines compaction and branch summaries" {
     try expectUserTextAt(ctx_branch, 4, "better approach");
 }
 
-test "unknown leaf falls back to current context" {
+test "unknown leaf is rejected" {
     var arena = testArena();
     defer arena.deinit();
     var entries = [_]proto.SessionEntry{
@@ -537,10 +537,7 @@ test "unknown leaf falls back to current context" {
         testMsg(arena.allocator(), "2", "1", .assistant, "hi"),
     };
 
-    const ctx = try buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "nonexistent" });
-    try std.testing.expectEqual(@as(usize, 2), ctx.messages.len);
-    try expectUserTextAt(ctx, 0, "hello");
-    try expectAssistantTextAt(ctx, 1, "hi");
+    try std.testing.expectError(error.UnknownLeafEntryId, buildSessionContext(arena.allocator(), &entries, .{ .entry_id = "nonexistent" }));
 }
 
 test "custom messages only enter context when included" {

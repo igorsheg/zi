@@ -44,6 +44,8 @@ pub const Store = struct {
     }
 
     pub fn append(self: *Store, io: std.Io, entry: proto.SessionEntry) !void {
+        try self.validateAppend(io, entry);
+
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
 
@@ -62,6 +64,23 @@ pub const Store = struct {
 
     pub fn readAll(self: *const Store, allocator: std.mem.Allocator, io: std.Io) !reader.SessionLog {
         return reader.readFile(allocator, io, self.path, .strict);
+    }
+
+    fn validateAppend(self: *const Store, io: std.Io, entry: proto.SessionEntry) !void {
+        if (entry.id.len == 0) return error.EmptyEntryId;
+
+        var log = try self.readAll(self.allocator, io);
+        defer log.deinit();
+
+        var parent_seen = entry.parent_id == null;
+        for (log.entries) |existing| {
+            if (std.mem.eql(u8, existing.id, entry.id)) return error.DuplicateEntryId;
+            if (entry.parent_id) |parent_id| {
+                if (parent_id.len == 0) return error.EmptyParentEntryId;
+                if (std.mem.eql(u8, existing.id, parent_id)) parent_seen = true;
+            }
+        }
+        if (!parent_seen) return error.UnknownParentEntryId;
     }
 };
 
