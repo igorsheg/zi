@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const zio_fs = @import("zio/file.zig");
-
 const log = std.log.scoped(.storage);
 
 const stale_threshold_ns: i128 = 30 * std.time.ns_per_s;
@@ -33,7 +31,7 @@ pub const LockedFile = struct {
     }
 
     pub fn readContent(self: *const LockedFile, allocator: std.mem.Allocator) ?[]const u8 {
-        return zio_fs.readFileAlloc(self.io, allocator, self.path, .limited(max_file_size)) catch |err| switch (err) {
+        return std.Io.Dir.cwd().readFileAlloc(self.io, self.path, allocator, .limited(max_file_size)) catch |err| switch (err) {
             error.FileNotFound => null,
             else => {
                 log.warn("failed to read {s}: {}", .{ self.path, err });
@@ -43,7 +41,13 @@ pub const LockedFile = struct {
     }
 
     pub fn writeContent(self: *const LockedFile, content: []const u8) !void {
-        try zio_fs.writeFileAtomic(self.io, self.path, content, .fromMode(0o600));
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path});
+        defer self.allocator.free(tmp_path);
+
+        const file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .truncate = true, .permissions = .fromMode(0o600) });
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, content);
+        try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), self.path, self.io);
     }
 
     pub fn acquireLock(self: *const LockedFile) bool {

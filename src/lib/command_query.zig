@@ -1,6 +1,4 @@
 const std = @import("std");
-const process = @import("../zio/root.zig").process;
-
 pub const Options = struct {
     argv: []const []const u8,
     cwd: std.process.Child.Cwd = .inherit,
@@ -10,48 +8,44 @@ pub const Options = struct {
 };
 
 pub fn stdout(allocator: std.mem.Allocator, io: std.Io, options: Options) ?[]u8 {
-    var result = process.run(allocator, io, .{
+    const result = std.process.run(allocator, io, .{
         .argv = options.argv,
         .cwd = options.cwd,
-        .timeout_ms = options.timeout_ms,
         .stdout_limit = .limited(options.max_stdout_bytes),
-        .stderr = .ignore,
-        .kill_scope = .process_group,
+        .stderr_limit = .limited(0),
+        .timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(options.timeout_ms * std.time.ns_per_ms)), .clock = .awake } },
     }) catch return null;
-    defer result.deinit(allocator);
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
 
-    const completed = switch (result) {
-        .completed => |completed| completed,
-        .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => return null,
-    };
-    switch (completed.term) {
+    switch (result.term) {
         .exited => |code| if (code != 0) return null,
         else => return null,
     }
 
     const bytes = if (options.trim)
-        std.mem.trim(u8, completed.stdout.bytes, &std.ascii.whitespace)
+        std.mem.trim(u8, result.stdout, &std.ascii.whitespace)
     else
-        completed.stdout.bytes;
+        result.stdout;
     if (bytes.len == 0) return null;
     return allocator.dupe(u8, bytes) catch null;
 }
 
 pub fn succeeds(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, timeout_ms: u64) bool {
-    var result = process.run(allocator, io, .{
+    const result = std.process.run(allocator, io, .{
         .argv = argv,
-        .timeout_ms = timeout_ms,
-        .stdout = .ignore,
-        .stderr = .ignore,
-        .kill_scope = .child,
+        .stdout_limit = .limited(0),
+        .stderr_limit = .limited(0),
+        .timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(timeout_ms * std.time.ns_per_ms)), .clock = .awake } },
     }) catch return false;
-    defer result.deinit(allocator);
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
 
-    const completed = switch (result) {
-        .completed => |completed| completed,
-        .timed_out, .stdout_too_long, .stderr_too_long, .output_dropped, .aborted => return false,
-    };
-    return switch (completed.term) {
+    return switch (result.term) {
         .exited => |code| code == 0,
         else => false,
     };

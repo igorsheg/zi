@@ -1,5 +1,5 @@
-const abort_signal_mod = @import("../zio/root.zig");
 const std = @import("std");
+const cancel = @import("../runtime/cancel.zig");
 
 pub const Api = union(enum) {
     openai_completions,
@@ -79,11 +79,13 @@ pub const Transport = enum {
     auto,
 };
 
+pub const CancelToken = cancel.Token;
+
 pub const StreamOptions = struct {
     io: std.Io = std.Options.debug_io,
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
-    signal: abort_signal_mod.cancel.Token = abort_signal_mod.cancel.Token.none,
+    signal: CancelToken = CancelToken.none,
     api_key: ?[]const u8 = null,
 
     transport: ?Transport = null,

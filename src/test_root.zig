@@ -9,7 +9,6 @@ test {
 
     std.Io.Threaded.global_single_threaded.allocator = std.heap.smp_allocator;
     logging.setThreadLabel(.@"test");
-    _ = @import("zio/root.zig");
     _ = @import("storage.zig");
     _ = @import("logging.zig");
     _ = @import("ai/root.zig");
@@ -17,5 +16,4 @@ test {
     _ = @import("lib/command_query.zig");
     _ = @import("agent/root.zig");
     _ = @import("search/root.zig");
-    _ = @import("spawn/root.zig");
 }

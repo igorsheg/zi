@@ -7,8 +7,7 @@ const provider_failure = @import("provider_failure.zig");
 const request_transform = @import("request_transform.zig");
 const partial_json = @import("../json/partial.zig");
 const replay = @import("openai_responses_replay.zig");
-const zio = @import("../zio/root.zig");
-const Token = zio.cancel.Token;
+const Token = protocol.CancelToken;
 const http_cancel = @import("http_cancel.zig");
 
 pub const AuthFactory = struct {

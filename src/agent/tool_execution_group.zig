@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("../zio/root.zig");
 const protocol = @import("types.zig");
 const json_util = @import("../ai/json_util.zig");
 
@@ -42,36 +41,31 @@ pub const ToolCompletion = struct {
     }
 };
 
-fn cleanupEvent(item: *anyopaque, allocator: std.mem.Allocator) void {
-    const event: *ToolExecutionEvent = @ptrCast(@alignCast(item));
-    event.deinit(allocator);
-}
-
-const EventQueue = zio.queue.Queue(ToolExecutionEvent, .{
-    .cleanup = .{ .custom = cleanupEvent },
-    .policy = .{ .bounded = .{ .capacity = 64, .on_full = .reject } },
-    .wakeup = .pipe,
-    .cross_thread = true,
-});
-
 pub const ToolExecutionGroup = struct {
     allocator: std.mem.Allocator,
-    tasks: zio.task.Group,
-    events: EventQueue,
+    threads: std.ArrayList(std.Thread),
+    events: std.ArrayList(ToolExecutionEvent),
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    io: std.Io,
     pending_workers: usize = 0,
     closed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !ToolExecutionGroup {
         return .{
             .allocator = allocator,
-            .tasks = zio.task.Group.init(allocator),
-            .events = try EventQueue.initIo(allocator, io),
+            .threads = .empty,
+            .events = .empty,
+            .io = io,
         };
     }
 
     pub fn deinit(self: *ToolExecutionGroup) void {
         self.cancel();
-        self.events.deinit();
+        for (self.threads.items) |thread| thread.join();
+        self.threads.deinit(self.allocator);
+        for (self.events.items) |*event| event.deinit(self.allocator);
+        self.events.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -79,33 +73,47 @@ pub const ToolExecutionGroup = struct {
         self: *ToolExecutionGroup,
         function: anytype,
         args: std.meta.ArgsTuple(@TypeOf(function)),
-    ) std.Io.ConcurrentError!void {
+    ) !void {
         std.debug.assert(!self.closed);
-        try self.tasks.spawnThread(function, args);
+        const thread = try std.Thread.spawn(.{}, function, args);
+        try self.threads.append(self.allocator, thread);
         self.pending_workers += 1;
     }
 
     pub fn emit(self: *ToolExecutionGroup, event: ToolExecutionEvent) void {
-        self.events.send(event);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closed) {
+            var mutable = event;
+            mutable.deinit(self.allocator);
+            return;
+        }
+        self.events.append(self.allocator, event) catch {
+            var mutable = event;
+            mutable.deinit(self.allocator);
+            return;
+        };
+        self.condition.signal(self.io);
     }
 
     pub fn next(self: *ToolExecutionGroup) !?ToolExecutionEvent {
         while (true) {
-            var one: [1]ToolExecutionEvent = undefined;
-            if (self.events.drainInto(&one) > 0) {
-                if (one[0] == .completed and self.pending_workers > 0) self.pending_workers -= 1;
-                return one[0];
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.events.items.len > 0) {
+                const event = self.events.orderedRemove(0);
+                if (event == .completed and self.pending_workers > 0) self.pending_workers -= 1;
+                return event;
             }
             if (self.pending_workers == 0) return null;
-            _ = try self.events.waitReadable(100);
+            self.condition.waitUncancelable(self.io, &self.mutex);
         }
     }
 
     pub fn cancel(self: *ToolExecutionGroup) void {
         if (self.closed) return;
         self.closed = true;
-        self.tasks.cancel();
-        self.events.closeMode(.immediate);
         self.pending_workers = 0;
+        self.condition.broadcast(self.io);
     }
 };

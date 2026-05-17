@@ -1,5 +1,4 @@
 const std = @import("std");
-const queue_mod = @import("../zio/root.zig").queue;
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 
@@ -37,12 +36,6 @@ pub const QueuedMessageSnapshot = struct {
         self.* = undefined;
     }
 };
-
-const MessageStore = queue_mod.Queue(protocol.AgentMessage, .{
-    .cleanup = .{ .custom = cleanupAgentMessage },
-    .policy = .unbounded,
-    .wakeup = .none,
-});
 
 pub const RunControl = struct {
     steering: MessageQueue,
@@ -163,47 +156,41 @@ pub const RunControl = struct {
 };
 
 const MessageQueue = struct {
-    queue: MessageStore,
+    items: std.ArrayList(protocol.AgentMessage),
     mode: QueueMode,
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator, mode: QueueMode) !MessageQueue {
         return .{
-            .queue = try MessageStore.init(allocator),
+            .items = .empty,
             .mode = mode,
             .allocator = allocator,
         };
     }
 
     fn deinit(self: *MessageQueue) void {
-        self.queue.deinit();
+        self.clear();
+        self.items.deinit(self.allocator);
         self.* = undefined;
     }
 
     fn enqueue(self: *MessageQueue, message: protocol.AgentMessage) EnqueueResult {
         const owned = message_memory.cloneMessage(self.allocator, message) catch return .oom;
-        switch (self.queue.trySend(owned)) {
-            .ok => return .ok,
-            .dropped, .full => unreachable,
-            .closed => |returned| {
-                var mutable = returned;
-                message_memory.freeMessage(self.allocator, &mutable);
-                return .closed;
-            },
-            .oom => |returned| {
-                var mutable = returned;
-                message_memory.freeMessage(self.allocator, &mutable);
-                return .oom;
-            },
-        }
+        self.items.append(self.allocator, owned) catch {
+            var mutable = owned;
+            message_memory.freeMessage(self.allocator, &mutable);
+            return .oom;
+        };
+        return .ok;
     }
 
     fn hasItems(self: *MessageQueue) bool {
-        return self.queue.pendingDepth() > 0;
+        return self.items.items.len > 0;
     }
 
     fn clear(self: *MessageQueue) void {
-        self.queue.clear();
+        for (self.items.items) |*message| message_memory.freeMessage(self.allocator, message);
+        self.items.clearRetainingCapacity();
     }
 
     fn visitPending(
@@ -211,38 +198,25 @@ const MessageQueue = struct {
         visitor: *const fn (item: *const protocol.AgentMessage, ctx: ?*anyopaque) anyerror!void,
         ctx: ?*anyopaque,
     ) !void {
-        try self.queue.visitPending(visitor, ctx);
+        for (self.items.items) |*item| try visitor(item, ctx);
     }
 
     fn drain(self: *MessageQueue, arena: std.mem.Allocator) []const protocol.AgentMessage {
         const target_count = switch (self.mode) {
-            .all => self.queue.pendingDepth(),
-            .one_at_a_time => @min(@as(usize, 1), self.queue.pendingDepth()),
+            .all => self.items.items.len,
+            .one_at_a_time => @min(@as(usize, 1), self.items.items.len),
         };
         if (target_count == 0) return &.{};
 
         const cloned = arena.alloc(protocol.AgentMessage, target_count) catch return &.{};
         var out_len: usize = 0;
-        var remaining = target_count;
-        var buf: [8]protocol.AgentMessage = undefined;
-
-        while (remaining > 0) {
-            const take = @min(remaining, buf.len);
-            const drained = self.queue.drainInto(buf[0..take]);
-            if (drained == 0) break;
-
-            for (buf[0..drained]) |item| {
-                cloned[out_len] = message_memory.cloneMessage(arena, item) catch {
-                    var dropped = item;
-                    message_memory.freeMessage(self.allocator, &dropped);
-                    continue;
-                };
-                out_len += 1;
-                var mutable = item;
-                message_memory.freeMessage(self.allocator, &mutable);
-            }
-            remaining -= drained;
+        for (self.items.items[0..target_count]) |*item| {
+            cloned[out_len] = message_memory.cloneMessage(arena, item.*) catch continue;
+            out_len += 1;
+            message_memory.freeMessage(self.allocator, item);
         }
+        std.mem.copyForwards(protocol.AgentMessage, self.items.items[0 .. self.items.items.len - target_count], self.items.items[target_count..]);
+        self.items.shrinkRetainingCapacity(self.items.items.len - target_count);
 
         return cloned[0..out_len];
     }
@@ -269,7 +243,7 @@ const MessageQueue = struct {
         };
 
         var ctx = SnapshotCtx{ .allocator = allocator, .out = &out };
-        self.queue.visitPending(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
+        self.visitPending(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
         const snapshot = out.toOwnedSlice(allocator) catch return &.{};
         success = true;
         return snapshot;
@@ -284,17 +258,13 @@ const MessageQueue = struct {
         };
 
         var ctx = SnapshotCtx{ .allocator = allocator, .out = &out };
-        self.queue.visitAndClear(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
+        self.visitPending(snapshotVisit, @ptrCast(&ctx)) catch return &.{};
+        self.clear();
         const snapshot = out.toOwnedSlice(allocator) catch return &.{};
         success = true;
         return snapshot;
     }
 };
-
-fn cleanupAgentMessage(item_ptr: *anyopaque, allocator: std.mem.Allocator) void {
-    const message: *protocol.AgentMessage = @ptrCast(@alignCast(item_ptr));
-    message_memory.freeMessage(allocator, message);
-}
 
 pub fn extractQueuedMessageText(msg: protocol.AgentMessage) ?[]const u8 {
     return switch (msg) {

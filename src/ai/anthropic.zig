@@ -1,5 +1,4 @@
-const zio = @import("../zio/root.zig");
-const Token = zio.cancel.Token;
+const Token = protocol.CancelToken;
 const http_cancel = @import("http_cancel.zig");
 const std = @import("std");
 const protocol = @import("protocol.zig");

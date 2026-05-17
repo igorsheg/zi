@@ -15,7 +15,7 @@ pub const ToolResultMessage = ai.protocol.ToolResultMessage;
 pub const Usage = ai.protocol.Usage;
 pub const StopReason = ai.protocol.StopReason;
 pub const StreamOptions = ai.protocol.StreamOptions;
-pub const Token = @import("../zio/root.zig").cancel.Token;
+pub const Token = @import("../runtime/cancel.zig").Token;
 pub const SimpleStreamOptions = ai.protocol.SimpleStreamOptions;
 
 pub const StreamHook = struct {

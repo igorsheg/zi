@@ -1,5 +1,5 @@
-const abort_signal_mod = @import("../zio/root.zig");
-const Token = abort_signal_mod.cancel.Token;
+const cancel = @import("../runtime/cancel.zig");
+const Token = cancel.Token;
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("types.zig");
@@ -450,7 +450,7 @@ fn executeToolCalls(
     event_ctx: ?*anyopaque,
 ) bool {
     const tool_phase_messages = message_memory.cloneMessages(turn_allocator, ctx_messages.items) catch ctx_messages.items;
-    var worker_group = tool_execution_group.ToolExecutionGroup.init(std.heap.page_allocator, config.io) catch null;
+    var worker_group: ?tool_execution_group.ToolExecutionGroup = tool_execution_group.ToolExecutionGroup.init(std.heap.page_allocator, config.io) catch null;
     defer if (worker_group) |*group| group.deinit();
 
     var prepared_calls: std.ArrayListUnmanaged(PreparedToolCall) = .empty;
@@ -1259,7 +1259,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
         }
     };
     const Aborter = struct {
-        fn run(controller: *abort_signal_mod.cancel.Source) void {
+        fn run(controller: *cancel.Source) void {
             std.Options.debug_io.sleep(.fromNanoseconds(@intCast(5 * std.time.ns_per_ms)), .awake) catch {};
             controller.requestAbort();
         }
@@ -1284,7 +1284,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
         .{ .name = "two", .description = "", .label = "Two", .parameters = .null, .ctx = @ptrCast(&tool_ctx), .affinity = .worker_thread, .execute = &Exec.run },
     };
 
-    var controller = abort_signal_mod.cancel.Source{};
+    var controller = cancel.Source{};
     const signal = controller.beginRun();
     const aborter = try std.Thread.spawn(.{}, Aborter.run, .{&controller});
     defer aborter.join();

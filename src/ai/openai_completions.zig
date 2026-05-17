@@ -8,8 +8,7 @@ const request_transform = @import("request_transform.zig");
 const json_util = @import("json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const json_value = @import("../json/value.zig");
-const zio = @import("../zio/root.zig");
-const Token = zio.cancel.Token;
+const Token = protocol.CancelToken;
 const http_cancel = @import("http_cancel.zig");
 const env_api_keys = @import("env_api_keys.zig");
 
