@@ -305,8 +305,12 @@ fn pushLogApi(L: *c.lua_State) void {
     c.lua_setfield(L, -2, "error");
 }
 
-fn ctxEventsEmit(_: ?*c.lua_State) callconv(.c) c_int { return 0; }
-fn ctxLogNoop(_: ?*c.lua_State) callconv(.c) c_int { return 0; }
+fn ctxEventsEmit(_: ?*c.lua_State) callconv(.c) c_int {
+    return 0;
+}
+fn ctxLogNoop(_: ?*c.lua_State) callconv(.c) c_int {
+    return 0;
+}
 
 fn pushProcessApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner) void {
     c.lua_createtable(L, 0, 3);
@@ -349,7 +353,9 @@ fn pushStateApi(L: *c.lua_State) void {
     c.lua_setfield(L, -2, "list");
 }
 
-fn ctxStateNoop(_: ?*c.lua_State) callconv(.c) c_int { return 0; }
+fn ctxStateNoop(_: ?*c.lua_State) callconv(.c) c_int {
+    return 0;
+}
 fn ctxStateList(L_opt: ?*c.lua_State) callconv(.c) c_int {
     const L = L_opt.?;
     c.lua_createtable(L, 0, 0);

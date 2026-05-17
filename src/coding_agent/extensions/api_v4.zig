@@ -142,4 +142,3 @@ fn ziDefineAction(L_opt: ?*c.lua_State) callconv(.c) c_int {
     handler_ref.value = c.LUA_NOREF;
     return 0;
 }
-
