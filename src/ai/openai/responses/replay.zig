@@ -520,7 +520,7 @@ fn transformAssistantMessage(
             try content.append(allocator, .{ .tool_call = .{
                 .id = id,
                 .name = try allocator.dupe(u8, tool_call.name),
-                .arguments = try json_value.cloneJsonValue(allocator, tool_call.arguments),
+                .arguments = try json_value.OwnedValue.clone(allocator, tool_call.arguments.borrowed()),
                 .thought_signature = if (!same_model) null else if (tool_call.thought_signature) |sig| try allocator.dupe(u8, sig) else null,
             } });
         },
@@ -558,8 +558,8 @@ fn transformToolResultMessage(
         .tool_call_id = try getMappedToolCallId(allocator, tool_id_map, tool_result.tool_call_id),
         .tool_name = try allocator.dupe(u8, tool_result.tool_name),
         .content = try content.toOwnedSlice(allocator),
-        .details = if (tool_result.details) |details| try json_value.cloneJsonValue(allocator, details) else null,
-        .presentation = if (tool_result.presentation) |presentation| try json_value.cloneJsonValue(allocator, presentation) else null,
+        .details = if (tool_result.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null,
+        .presentation = if (tool_result.presentation) |presentation| try json_value.OwnedValue.clone(allocator, presentation.borrowed()) else null,
         .is_error = tool_result.is_error,
         .timestamp = tool_result.timestamp,
     };

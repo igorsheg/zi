@@ -4,11 +4,9 @@ const json_value = @import("../json/value.zig");
 const protocol = @import("protocol.zig");
 
 pub const Decorator = struct {
-    /// Mutates an object payload in place. Return true when the payload changed.
-    /// Use only the provided allocator for inserted JSON values.
     func: *const fn (
         allocator: std.mem.Allocator,
-        payload: *std.json.Value,
+        payload: *json_value.OwnedValue,
         model: *const protocol.Model,
         ctx: ?*anyopaque,
     ) anyerror!bool,
@@ -17,7 +15,7 @@ pub const Decorator = struct {
     pub fn call(
         self: Decorator,
         allocator: std.mem.Allocator,
-        payload: *std.json.Value,
+        payload: *json_value.OwnedValue,
         model: *const protocol.Model,
     ) !bool {
         return self.func(allocator, payload, model, self.ctx);
@@ -41,7 +39,7 @@ pub fn transformJsonPayload(
     defer arena.deinit();
     const temp = arena.allocator();
 
-    var payload = try std.json.parseFromSliceLeaky(std.json.Value, temp, canonical, .{ .allocate = .alloc_always });
+    var payload = try std.json.parseFromSliceLeaky(json_value.OwnedValue, temp, canonical, .{ .allocate = .alloc_always });
     if (payload != .object) return error.NonObjectPayload;
 
     var changed = false;
@@ -49,7 +47,7 @@ pub fn transformJsonPayload(
         changed = try decorator.call(temp, &payload, options.model) or changed;
     }
 
-    var replacement: ?std.json.Value = null;
+    var replacement: ?json_value.OwnedValue = null;
     defer if (replacement) |value| json_value.freeJsonValue(allocator, value);
 
     const final_payload = blk: {
@@ -99,7 +97,7 @@ test "request transform applies provider decorators to canonical json" {
     const AddMetadata = struct {
         fn decorate(
             allocator: std.mem.Allocator,
-            payload: *std.json.Value,
+            payload: *json_value.OwnedValue,
             _: *const protocol.Model,
             _: ?*anyopaque,
         ) !bool {
@@ -120,7 +118,7 @@ test "request transform applies provider decorators to canonical json" {
 test "request transform clones replacements before stringifying" {
     const model = testModel();
     const Replace = struct {
-        fn replace(allocator: std.mem.Allocator, payload: std.json.Value, _: *const protocol.Model, _: ?*anyopaque) ?std.json.Value {
+        fn replace(allocator: std.mem.Allocator, payload: json_value.BorrowedValue, _: *const protocol.Model, _: ?*anyopaque) ?json_value.OwnedValue {
             _ = payload;
             return .{ .string = allocator.dupe(u8, "replacement") catch return null };
         }

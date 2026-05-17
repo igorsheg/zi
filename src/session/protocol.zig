@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
+const json_value = @import("../json/value.zig");
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
 
@@ -48,26 +49,26 @@ pub const CompactionEntry = struct {
     summary: []const u8,
     first_kept_entry_id: []const u8,
     tokens_before: u64,
-    details: ?std.json.Value = null,
+    details: ?json_value.OwnedValue = null,
     from_hook: ?bool = null,
 };
 
 pub const BranchSummaryEntry = struct {
     from_id: []const u8,
     summary: []const u8,
-    details: ?std.json.Value = null,
+    details: ?json_value.OwnedValue = null,
     from_hook: ?bool = null,
 };
 
 pub const CustomEntry = struct {
     custom_type: []const u8,
-    data: ?std.json.Value = null,
+    data: ?json_value.OwnedValue = null,
 };
 
 pub const CustomMessageEntry = struct {
     custom_type: []const u8,
     content: agent.protocol.AgentMessage.CustomContent,
-    details: ?std.json.Value = null,
+    details: ?json_value.OwnedValue = null,
     display: bool,
     include_in_context: bool = true,
 };

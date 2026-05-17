@@ -19,13 +19,13 @@ pub const ToolUpdate = struct {
     prepared_index: usize,
     tool_call_id: []const u8,
     tool_name: []const u8,
-    args: std.json.Value,
+    args: json_value.OwnedValue,
     partial_result: protocol.AgentToolResult,
 
     pub fn deinit(self: *ToolUpdate, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
-        json_value.freeJsonValue(allocator, self.args);
+        self.args.deinit();
         self.partial_result.free(allocator);
         self.* = undefined;
     }

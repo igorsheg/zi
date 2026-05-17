@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_value = @import("../../json/value.zig");
 const protocol = @import("../protocol.zig");
 
 fn supportsAdaptiveThinking(model_id: []const u8) bool {
@@ -50,10 +51,10 @@ fn adjustMaxTokensForThinking(
 }
 
 pub const AnthropicMetadataContext = struct {
-    metadata: ?std.json.Value,
+    metadata: ?json_value.BorrowedValue,
 };
 
-pub fn anthropicMetadataUserId(metadata: ?std.json.Value) ?[]const u8 {
+pub fn anthropicMetadataUserId(metadata: ?json_value.BorrowedValue) ?[]const u8 {
     const value = metadata orelse return null;
     if (value != .object) return null;
     const user_id = value.object.get("user_id") orelse return null;
@@ -63,7 +64,7 @@ pub fn anthropicMetadataUserId(metadata: ?std.json.Value) ?[]const u8 {
 
 pub fn addAnthropicMetadata(
     allocator: std.mem.Allocator,
-    payload: *std.json.Value,
+    payload: *json_value.OwnedValue,
     _: *const protocol.Model,
     ctx: ?*anyopaque,
 ) !bool {

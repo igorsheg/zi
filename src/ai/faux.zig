@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_value = @import("../json/value.zig");
 const protocol = @import("protocol.zig");
 const ai_provider = @import("provider.zig");
 
@@ -34,7 +35,7 @@ pub fn fauxText(text: []const u8) protocol.AssistantMessage.AssistantContentBloc
     return .{ .text = .{ .text = text } };
 }
 
-pub fn fauxToolCall(name: []const u8, id: []const u8, arguments: std.json.Value) protocol.AssistantMessage.AssistantContentBlock {
+pub fn fauxToolCall(name: []const u8, id: []const u8, arguments: json_value.OwnedValue) protocol.AssistantMessage.AssistantContentBlock {
     return .{ .tool_call = .{ .id = id, .name = name, .arguments = arguments } };
 }
 

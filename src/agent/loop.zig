@@ -335,7 +335,7 @@ fn emitAbortedToolEnd(
 const PreparedToolCall = struct {
     tool_call: ai.protocol.ToolCall,
     tool: ?protocol.AgentTool,
-    effective_args: std.json.Value,
+    effective_args: json_value.OwnedValue,
     finalized: bool = false,
     result_message: ?ai.protocol.ToolResultMessage = null,
     worker_started: bool = false,
@@ -349,13 +349,13 @@ const WorkerExecution = struct {
     prepared_index: usize,
     tool_call_id: []const u8,
     tool_name: []const u8,
-    args: std.json.Value,
+    args: json_value.OwnedValue,
     signal: Token,
 
     fn deinit(self: *WorkerExecution) void {
         self.group.allocator.free(self.tool_call_id);
         self.group.allocator.free(self.tool_name);
-        json_value.freeJsonValue(self.group.allocator, self.args);
+        self.args.deinit();
         self.arena.deinit();
         self.owner_allocator.destroy(self);
     }
@@ -372,7 +372,7 @@ const WorkerExecution = struct {
         const execution = tool.start(
             self.arena.allocator(),
             prepared.tool_call.id,
-            prepared.effective_args,
+            prepared.effective_args.borrowed(),
             self.signal,
             &workerUpdateCallback,
             @ptrCast(self),
@@ -413,7 +413,7 @@ fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaq
         allocator.free(tool_call_id);
         return;
     };
-    const args = json_value.cloneJsonValue(allocator, worker.args) catch {
+    var args = json_value.OwnedValue.clone(allocator, worker.args.borrowed()) catch {
         allocator.free(tool_call_id);
         allocator.free(tool_name);
         return;
@@ -421,7 +421,7 @@ fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaq
     const owned = partial_result.clone(allocator) catch {
         allocator.free(tool_call_id);
         allocator.free(tool_name);
-        json_value.freeJsonValue(allocator, args);
+        args.deinit();
         return;
     };
 
@@ -462,7 +462,7 @@ fn executeToolCalls(
             event_sink(.{ .tool_execution_start = .{
                 .tool_call_id = tc.id,
                 .tool_name = tc.name,
-                .args = tc.arguments,
+                .args = tc.arguments.borrowed(),
             } }, event_ctx);
 
             const tool = findTool(tools, tc.name);
@@ -474,15 +474,15 @@ fn executeToolCalls(
 
             const t = tool.?;
             const prepared_args = if (t.prepare_arguments) |prep_fn|
-                prep_fn(turn_allocator, tc.arguments) catch |err| {
+                prep_fn(turn_allocator, tc.arguments.borrowed()) catch |err| {
                     const err_msg = std.fmt.allocPrint(turn_allocator, "Tool {s} argument preparation failed: {s}", .{ tc.name, @errorName(err) }) catch "Tool argument preparation failed";
                     if (!appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx)) return false;
                     continue;
                 }
             else
-                tc.arguments;
+                json_value.OwnedValue.clone(turn_allocator, tc.arguments.borrowed()) catch json_value.OwnedValue.nullValue();
 
-            if (validateToolArguments(turn_allocator, t.parameters, prepared_args, "arguments")) |err_msg| {
+            if (validateToolArguments(turn_allocator, t.parameters, prepared_args.borrowed(), "arguments")) |err_msg| {
                 if (!appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx)) return false;
                 continue;
             }
@@ -492,7 +492,7 @@ fn executeToolCalls(
                 const hook_ctx = protocol.BeforeToolCallContext{
                     .assistant_message = assistant_msg,
                     .tool_call = tc,
-                    .args = prepared_args,
+                    .args = prepared_args.borrowed(),
                     .context = .{
                         .system_prompt = system_prompt,
                         .messages = tool_phase_messages,
@@ -506,7 +506,7 @@ fn executeToolCalls(
                         continue;
                     }
                     if (before_result.args) |replacement| {
-                        if (validateToolArguments(turn_allocator, t.parameters, replacement, "arguments")) |err_msg| {
+                        if (validateToolArguments(turn_allocator, t.parameters, replacement.borrowed(), "arguments")) |err_msg| {
                             if (!appendImmediateError(run_allocator, turn_allocator, &prepared_calls, tc, err_msg, event_sink, event_ctx)) return false;
                             continue;
                         }
@@ -542,7 +542,7 @@ fn executeToolCalls(
                     std.heap.page_allocator.destroy(worker);
                     continue;
                 };
-                const args = json_value.cloneJsonValue(group.allocator, prepared.tool_call.arguments) catch {
+                const args = json_value.OwnedValue.clone(group.allocator, prepared.effective_args.borrowed()) catch {
                     group.allocator.free(tool_call_id);
                     group.allocator.free(tool_name);
                     std.heap.page_allocator.destroy(worker);
@@ -582,13 +582,13 @@ fn executeToolCalls(
                 .sink_ctx = event_ctx,
                 .tool_call_id = prepared.tool_call.id,
                 .tool_name = prepared.tool_call.name,
-                .args = prepared.tool_call.arguments,
+                .args = prepared.tool_call.arguments.borrowed(),
             };
             const tool = prepared.tool orelse continue;
             const execution = tool.start(
                 turn_allocator,
                 prepared.tool_call.id,
-                prepared.effective_args,
+                prepared.effective_args.borrowed(),
                 signal,
                 &bridge_mod.UpdateBridge.callback,
                 @ptrCast(&update_bridge),
@@ -734,7 +734,7 @@ fn emitWorkerUpdate(
 
     const tool_call_id = allocator.dupe(u8, update.tool_call_id) catch update.tool_call_id;
     const tool_name = allocator.dupe(u8, update.tool_name) catch update.tool_name;
-    const args = json_value.cloneJsonValue(allocator, update.args) catch update.args;
+    const args = json_value.cloneJsonValue(allocator, update.args.borrowed()) catch update.args.borrowed();
     const partial_result = update.partial_result.clone(allocator) catch update.partial_result;
 
     event_sink(.{ .tool_execution_update = .{
@@ -784,7 +784,7 @@ fn finalizePreparedToolCall(
         const hook_ctx = protocol.AfterToolCallContext{
             .assistant_message = assistant_msg,
             .tool_call = prepared.tool_call,
-            .args = prepared.effective_args,
+            .args = prepared.effective_args.borrowed(),
             .result = result,
             .is_error = result.is_error,
             .context = .{
@@ -865,8 +865,8 @@ fn findTool(tools: []const protocol.AgentTool, name: []const u8) ?protocol.Agent
 
 fn validateToolArguments(
     allocator: std.mem.Allocator,
-    schema: std.json.Value,
-    args: std.json.Value,
+    schema: json_value.BorrowedValue,
+    args: json_value.BorrowedValue,
     path: []const u8,
 ) ?[]const u8 {
     return validateSchemaValue(allocator, schema, args, path) catch |err| blk: {
@@ -997,7 +997,7 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = &.{},
-        .details = .{ .object = .{} },
+        .details = json_value.OwnedValue.adopt(allocator, .{ .object = .{} }),
         .is_error = true,
         .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
@@ -1007,7 +1007,7 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = &.{},
-        .details = .{ .object = .{} },
+        .details = json_value.OwnedValue.adopt(allocator, .{ .object = .{} }),
         .is_error = true,
         .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
@@ -1016,7 +1016,7 @@ fn makeErrorToolResult(allocator: std.mem.Allocator, tool_call_id: []const u8, t
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .content = content,
-        .details = .{ .object = .{} },
+        .details = json_value.OwnedValue.adopt(allocator, .{ .object = .{} }),
         .is_error = true,
         .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
     };
@@ -1067,8 +1067,10 @@ test "synthetic tool results own copied text" {
     defer {
         allocator.free(error_result.content[0].text.text);
         allocator.free(error_result.content);
-        var details = error_result.details.?.object;
-        details.deinit(allocator);
+        if (error_result.details) |details| {
+            var owned_details = details;
+            owned_details.deinit();
+        }
     }
 
     try std.testing.expectEqual(@as(usize, 1), error_result.content.len);
@@ -1161,8 +1163,8 @@ test "parallel worker updates stream live before completion-ordered finalization
     var first_ctx = ToolCtx{ .which = .first };
     var second_ctx = ToolCtx{ .which = .second };
     const assistant_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
-        .{ .tool_call = .{ .id = "call-1", .name = "one", .arguments = .null } },
-        .{ .tool_call = .{ .id = "call-2", .name = "two", .arguments = .null } },
+        .{ .tool_call = .{ .id = "call-1", .name = "one", .arguments = json_value.OwnedValue.nullValue() } },
+        .{ .tool_call = .{ .id = "call-2", .name = "two", .arguments = json_value.OwnedValue.nullValue() } },
     };
     const assistant_msg: ai.protocol.AssistantMessage = .{
         .content = &assistant_content,
@@ -1277,8 +1279,8 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
 
     var tool_ctx = ToolCtx{};
     const assistant_content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
-        .{ .tool_call = .{ .id = "call-1", .name = "one", .arguments = .null } },
-        .{ .tool_call = .{ .id = "call-2", .name = "two", .arguments = .null } },
+        .{ .tool_call = .{ .id = "call-1", .name = "one", .arguments = json_value.OwnedValue.nullValue() } },
+        .{ .tool_call = .{ .id = "call-2", .name = "two", .arguments = json_value.OwnedValue.nullValue() } },
     };
     const assistant_msg: ai.protocol.AssistantMessage = .{
         .content = &assistant_content,

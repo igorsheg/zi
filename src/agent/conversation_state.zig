@@ -70,7 +70,7 @@ pub const ApplyEventResult = struct {
 pub const ToolExecution = struct {
     tool_call_id: []u8,
     tool_name: []u8,
-    args: std.json.Value,
+    args: json_value.OwnedValue,
     args_json_source: ?[]u8 = null,
     args_complete: bool = false,
     execution_started: bool = false,
@@ -84,8 +84,8 @@ pub const ToolExecution = struct {
         errdefer allocator.free(tool_call_id);
         const tool_name = try allocator.dupe(u8, self.tool_name);
         errdefer allocator.free(tool_name);
-        const args = try json_value.cloneJsonValue(allocator, self.args);
-        errdefer json_value.freeJsonValue(allocator, args);
+        var args = try json_value.OwnedValue.clone(allocator, self.args.borrowed());
+        errdefer args.deinit();
         const args_json_source = if (self.args_json_source) |source|
             try allocator.dupe(u8, source)
         else
@@ -119,7 +119,8 @@ pub const ToolExecution = struct {
     pub fn deinit(self: *ToolExecution, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
-        json_value.freeJsonValue(allocator, self.args);
+        var args = self.args;
+        args.deinit();
         if (self.args_json_source) |source| allocator.free(source);
         if (self.result) |result| result.free(allocator);
         if (self.result_message) |*result_message| message_memory.freeToolResultMessage(allocator, result_message);
@@ -266,8 +267,8 @@ pub const InFlightState = struct {
 
     pub fn syncToolCall(self: *InFlightState, tool_call: ai.protocol.ToolCall, args_complete: bool, delta: ?[]const u8) void {
         const tool = self.ensureTool(tool_call.id, tool_call.name) orelse return;
-        json_value.freeJsonValue(self.allocator, tool.args);
-        tool.args = json_value.cloneJsonValue(self.allocator, tool_call.arguments) catch .null;
+        tool.args.deinit();
+        tool.args = json_value.OwnedValue.clone(self.allocator, tool_call.arguments.borrowed()) catch json_value.OwnedValue.nullValue();
         if (delta) |bytes| {
             const combined = if (tool.args_json_source) |source|
                 appendBytesOwned(self.allocator, source, bytes) catch return
@@ -276,8 +277,8 @@ pub const InFlightState = struct {
             if (tool.args_json_source) |source| self.allocator.free(source);
             tool.args_json_source = combined;
             if (bytes.len != 0 or combined.len != 0) {
-                json_value.freeJsonValue(self.allocator, tool.args);
-                tool.args = partial_json.parseStreaming(self.allocator, combined) catch .null;
+                tool.args.deinit();
+                tool.args = json_value.OwnedValue.adopt(self.allocator, partial_json.parseStreaming(self.allocator, combined) catch .null);
             }
         } else if (args_complete) {
             if (tool.args_json_source) |source| self.allocator.free(source);
@@ -286,10 +287,10 @@ pub const InFlightState = struct {
         tool.args_complete = tool.args_complete or args_complete;
     }
 
-    pub fn markExecutionStarted(self: *InFlightState, tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value) void {
+    pub fn markExecutionStarted(self: *InFlightState, tool_call_id: []const u8, tool_name: []const u8, args: json_value.BorrowedValue) void {
         const tool = self.ensureTool(tool_call_id, tool_name) orelse return;
-        json_value.freeJsonValue(self.allocator, tool.args);
-        tool.args = json_value.cloneJsonValue(self.allocator, args) catch .null;
+        tool.args.deinit();
+        tool.args = json_value.OwnedValue.clone(self.allocator, args) catch json_value.OwnedValue.nullValue();
         if (tool.args_json_source) |source| self.allocator.free(source);
         tool.args_json_source = null;
         tool.execution_started = true;
@@ -369,7 +370,7 @@ pub const InFlightState = struct {
         self.tool_executions.append(self.allocator, .{
             .tool_call_id = owned_id,
             .tool_name = owned_name,
-            .args = .null,
+            .args = json_value.OwnedValue.nullValue(),
         }) catch return null;
 
         return &self.tool_executions.items[self.tool_executions.items.len - 1];

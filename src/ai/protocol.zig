@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_value = @import("../json/value.zig");
 const cancel = @import("../runtime/cancel.zig");
 const runtime_env = @import("../runtime/env.zig");
 
@@ -199,18 +200,16 @@ pub const StreamOptions = struct {
 
     headers: ?[]const Header = null,
 
-    metadata: ?std.json.Value = null,
+    metadata: ?json_value.BorrowedValue = null,
 
     request_transform: ?RequestTransform = null,
 };
 
 pub const RequestTransform = struct {
-    /// Narrow authority to replace a provider request payload during request construction.
-    /// Returned values are borrowed by the provider and cloned before retention.
-    func: *const fn (allocator: std.mem.Allocator, payload: std.json.Value, model: *const Model, ctx: ?*anyopaque) ?std.json.Value,
+    func: *const fn (allocator: std.mem.Allocator, payload: json_value.BorrowedValue, model: *const Model, ctx: ?*anyopaque) ?json_value.OwnedValue,
     ctx: ?*anyopaque = null,
 
-    pub fn apply(self: RequestTransform, allocator: std.mem.Allocator, payload: std.json.Value, model: *const Model) ?std.json.Value {
+    pub fn apply(self: RequestTransform, allocator: std.mem.Allocator, payload: json_value.BorrowedValue, model: *const Model) ?json_value.OwnedValue {
         return self.func(allocator, payload, model, self.ctx);
     }
 };
@@ -265,9 +264,8 @@ pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
 
-    arguments: std.json.Value,
-
     thought_signature: ?[]const u8 = null,
+    arguments: json_value.OwnedValue,
 };
 
 pub const AgentToolCall = ToolCall;
@@ -356,8 +354,8 @@ pub const ToolResultMessage = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     content: []const ContentBlock,
-    details: ?std.json.Value = null,
-    presentation: ?std.json.Value = null,
+    details: ?json_value.OwnedValue = null,
+    presentation: ?json_value.OwnedValue = null,
     is_error: bool,
 
     timestamp: i64,
@@ -378,7 +376,7 @@ pub const Tool = struct {
     name: []const u8,
     description: []const u8,
 
-    parameters: std.json.Value,
+    parameters: json_value.BorrowedValue,
 };
 
 pub const Context = struct {

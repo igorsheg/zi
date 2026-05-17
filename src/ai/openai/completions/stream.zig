@@ -516,7 +516,7 @@ fn dupErrorCode(allocator: std.mem.Allocator, value: std.json.Value) error{OutOf
     };
 }
 
-fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: std.json.Value) error{OutOfMemory}!?[]const u8 {
+fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: json_value.BorrowedValue) error{OutOfMemory}!?[]const u8 {
     if (metadata != .object) return null;
     const raw = metadata.object.get("raw") orelse return null;
     return switch (raw) {

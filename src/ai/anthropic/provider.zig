@@ -343,16 +343,16 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, sink: ai_provider.Stre
     if (parsed != .object) return;
     const obj = parsed.object;
 
-    const event_type = json_value.asString(obj.get("type")) orelse return;
+    const event_type = json_value.optionalString(obj.get("type")) orelse return;
 
     if (std.mem.eql(u8, event_type, "message_start")) {
-        const message = json_value.asObject(obj.get("message")) orelse return;
-        const usage = json_value.asObject(message.get("usage")) orelse return;
+        const message = json_value.optionalObject(obj.get("message")) orelse return;
+        const usage = json_value.optionalObject(message.get("usage")) orelse return;
         updateUsageFromObject(&state.message.usage, usage);
     } else if (std.mem.eql(u8, event_type, "content_block_start")) {
-        const block_json = json_value.asObject(obj.get("content_block")) orelse return;
-        const block_type = json_value.asString(block_json.get("type")) orelse "text";
-        const index = json_value.asU64(obj.get("index")) orelse state.content_blocks.items.len;
+        const block_json = json_value.optionalObject(obj.get("content_block")) orelse return;
+        const block_type = json_value.optionalString(block_json.get("type")) orelse "text";
+        const index = json_value.optionalU64(obj.get("index")) orelse state.content_blocks.items.len;
 
         if (std.mem.eql(u8, block_type, "text")) {
             const block = ContentBlockState.init(.text, index);
@@ -364,38 +364,38 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, sink: ai_provider.Stre
             sink.emit(.{ .thinking_start = .{ .content_index = state.content_blocks.items.len - 1 } });
         } else if (std.mem.eql(u8, block_type, "tool_use")) {
             var block = ContentBlockState.init(.tool_call, index);
-            const tool_id = try state.allocator.dupe(u8, json_value.asString(block_json.get("id")) orelse "");
-            const tool_name = try state.allocator.dupe(u8, json_value.asString(block_json.get("name")) orelse "");
+            const tool_id = try state.allocator.dupe(u8, json_value.optionalString(block_json.get("id")) orelse "");
+            const tool_name = try state.allocator.dupe(u8, json_value.optionalString(block_json.get("name")) orelse "");
             block.tool_call = .{
                 .id = tool_id,
                 .name = tool_name,
-                .arguments = .null,
+                .arguments = json_value.OwnedValue.nullValue(),
                 .thought_signature = null,
             };
             try state.content_blocks.append(state.allocator, block);
             sink.emit(.{ .toolcall_start = .{ .content_index = state.content_blocks.items.len - 1 } });
         }
     } else if (std.mem.eql(u8, event_type, "content_block_delta")) {
-        const delta_obj = json_value.asObject(obj.get("delta")) orelse return;
-        const delta_type = json_value.asString(delta_obj.get("type")) orelse return;
-        const index = json_value.asU64(obj.get("index")) orelse return;
+        const delta_obj = json_value.optionalObject(obj.get("delta")) orelse return;
+        const delta_type = json_value.optionalString(delta_obj.get("type")) orelse return;
+        const index = json_value.optionalU64(obj.get("index")) orelse return;
         if (index >= state.content_blocks.items.len) return;
         const block = &state.content_blocks.items[index];
 
         if (std.mem.eql(u8, delta_type, "text_delta")) {
-            const text = json_value.asString(delta_obj.get("text")) orelse return;
+            const text = json_value.optionalString(delta_obj.get("text")) orelse return;
             const old_len = block.text.items.len;
             try block.text.appendSlice(state.allocator, text);
             const text_val = block.text.items[old_len..];
             sink.emit(.{ .text_delta = .{ .content_index = index, .delta = text_val } });
         } else if (std.mem.eql(u8, delta_type, "thinking_delta")) {
-            const thinking = json_value.asString(delta_obj.get("thinking")) orelse return;
+            const thinking = json_value.optionalString(delta_obj.get("thinking")) orelse return;
             const old_len = block.thinking.items.len;
             try block.thinking.appendSlice(state.allocator, thinking);
             const thinking_val = block.thinking.items[old_len..];
             sink.emit(.{ .thinking_delta = .{ .content_index = index, .delta = thinking_val } });
         } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
-            const partial = json_value.asString(delta_obj.get("partial_json")) orelse return;
+            const partial = json_value.optionalString(delta_obj.get("partial_json")) orelse return;
             if (block.tool_call) |*tc| {
                 const old_len = block.text.items.len;
                 try block.text.appendSlice(state.allocator, partial);
@@ -405,7 +405,7 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, sink: ai_provider.Stre
             }
         }
     } else if (std.mem.eql(u8, event_type, "content_block_stop")) {
-        const index = json_value.asU64(obj.get("index")) orelse return;
+        const index = json_value.optionalU64(obj.get("index")) orelse return;
         if (index >= state.content_blocks.items.len) return;
 
         const block = &state.content_blocks.items[index];
@@ -426,8 +426,8 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, sink: ai_provider.Stre
             },
         }
     } else if (std.mem.eql(u8, event_type, "message_delta")) {
-        if (json_value.asObject(obj.get("delta"))) |delta_obj| {
-            if (json_value.asString(delta_obj.get("stop_reason"))) |reason| {
+        if (json_value.optionalObject(obj.get("delta"))) |delta_obj| {
+            if (json_value.optionalString(delta_obj.get("stop_reason"))) |reason| {
                 if (std.mem.eql(u8, reason, "end_turn")) {
                     state.stop_reason = .end_turn;
                 } else if (std.mem.eql(u8, reason, "max_tokens")) {
@@ -437,13 +437,13 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, sink: ai_provider.Stre
                 }
             }
         }
-        if (json_value.asObject(obj.get("usage"))) |usage| {
+        if (json_value.optionalObject(obj.get("usage"))) |usage| {
             updateUsageFromObject(&state.message.usage, usage);
         }
     } else if (std.mem.eql(u8, event_type, "error")) {
-        const err_obj = json_value.asObject(obj.get("error")) orelse return;
-        const err_type = json_value.asString(err_obj.get("type"));
-        const err_msg = json_value.asString(err_obj.get("message")) orelse "unknown error";
+        const err_obj = json_value.optionalObject(obj.get("error")) orelse return;
+        const err_type = json_value.optionalString(err_obj.get("type"));
+        const err_msg = json_value.optionalString(err_obj.get("message")) orelse "unknown error";
         const failure_kind = provider_failure.classifyProviderFailure(err_type, null, err_msg);
         const failure: protocol.NormalizedFailure = .{
             .kind = failure_kind,
@@ -454,10 +454,10 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, sink: ai_provider.Stre
 }
 
 fn updateUsageFromObject(usage: *protocol.Usage, obj: std.json.ObjectMap) void {
-    if (json_value.asU64(obj.get("input_tokens"))) |n| usage.input = n;
-    if (json_value.asU64(obj.get("output_tokens"))) |n| usage.output = n;
-    if (json_value.asU64(obj.get("cache_read_input_tokens"))) |n| usage.cache_read = n;
-    if (json_value.asU64(obj.get("cache_creation_input_tokens"))) |n| usage.cache_write = n;
+    if (json_value.optionalU64(obj.get("input_tokens"))) |n| usage.input = n;
+    if (json_value.optionalU64(obj.get("output_tokens"))) |n| usage.output = n;
+    if (json_value.optionalU64(obj.get("cache_read_input_tokens"))) |n| usage.cache_read = n;
+    if (json_value.optionalU64(obj.get("cache_creation_input_tokens"))) |n| usage.cache_write = n;
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
@@ -474,7 +474,7 @@ fn buildFinalContent(allocator: std.mem.Allocator, blocks: []const ContentBlockS
             .tool_call => .{ .tool_call = block.tool_call orelse .{
                 .id = "",
                 .name = "",
-                .arguments = .null,
+                .arguments = json_value.OwnedValue.nullValue(),
             } },
         };
     }
@@ -587,9 +587,9 @@ test "SSE parse: braces inside string values survive a real Edit-tool payload" {
 
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), data, .{});
     try testing.expect(parsed == .object);
-    const delta_obj = json_value.asObject(parsed.object.get("delta")).?;
-    try testing.expectEqualStrings("input_json_delta", json_value.asString(delta_obj.get("type")).?);
-    const partial = json_value.asString(delta_obj.get("partial_json")).?;
+    const delta_obj = json_value.optionalObject(parsed.object.get("delta")).?;
+    try testing.expectEqualStrings("input_json_delta", json_value.optionalString(delta_obj.get("type")).?);
+    const partial = json_value.optionalString(delta_obj.get("partial_json")).?;
     try testing.expectEqualStrings("{\"path\":\"/foo/bar.zig\",\"old_str\":\"a {b} c\"}", partial);
 }
 

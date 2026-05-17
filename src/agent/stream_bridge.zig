@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
+const json_value = @import("../json/value.zig");
 
 pub const StreamBridge = struct {
     sink: protocol.AgentEventSink,
@@ -85,7 +86,7 @@ pub const UpdateBridge = struct {
     sink_ctx: ?*anyopaque,
     tool_call_id: []const u8,
     tool_name: []const u8,
-    args: std.json.Value,
+    args: json_value.BorrowedValue,
 
     pub fn callback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaque) void {
         const self: *const UpdateBridge = @ptrCast(@alignCast(ctx));

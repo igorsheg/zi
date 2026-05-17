@@ -6,6 +6,7 @@ const control_mod = @import("control.zig");
 const conversation_state = @import("conversation_state.zig");
 const loop_mod = @import("loop.zig");
 const message_memory = @import("message_memory.zig");
+const json_value = @import("../json/value.zig");
 const shared_committed_mod = @import("shared_committed.zig");
 const SharedCommitted = shared_committed_mod.SharedCommitted;
 const testing = std.testing;
@@ -654,7 +655,8 @@ fn makeAssistantMessage() protocol.AssistantMessage {
             .{ .tool_call = .{
                 .id = "tool-1",
                 .name = "read",
-                .arguments = .null,
+                .arguments = json_value.OwnedValue.nullValue(),
+                .thought_signature = null,
             } },
         },
         .api = .openai_responses,

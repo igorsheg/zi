@@ -16,7 +16,7 @@ pub const ClaimModelRegistration = struct {
     context_window: u64,
     max_tokens: u64,
     headers: []const protocol.Header = &.{},
-    compat: ?std.json.Value = null,
+    compat: ?json_value.OwnedValue = null,
 
     pub fn deinit(self: *ClaimModelRegistration, allocator: std.mem.Allocator) void {
         allocator.free(self.id);

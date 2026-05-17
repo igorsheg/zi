@@ -1,13 +1,48 @@
 const std = @import("std");
 
-/// Ownership helpers for `std.json.Value`.
-///
-/// Contract:
-/// - `cloneJsonValue` returns a value fully owned by `allocator`.
-/// - `freeJsonValue` must only be used for values produced by `cloneJsonValue`
-///   or constructed with the same ownership rules.
-/// - Borrowed values from `std.json.parseFromSliceLeaky` are not accepted by
-///   `freeJsonValue` unless they were first cloned.
+pub const BorrowedValue = std.json.Value;
+
+pub const OwnedValue = union(enum) {
+    null,
+    owned: struct {
+        allocator: std.mem.Allocator,
+        value: std.json.Value,
+    },
+
+    pub fn clone(allocator: std.mem.Allocator, value: std.json.Value) !OwnedValue {
+        return .{ .owned = .{ .allocator = allocator, .value = try cloneJsonValue(allocator, value) } };
+    }
+
+    pub fn adopt(allocator: std.mem.Allocator, value: std.json.Value) OwnedValue {
+        return .{ .owned = .{ .allocator = allocator, .value = value } };
+    }
+
+    pub fn nullValue() OwnedValue {
+        return .null;
+    }
+
+    pub fn borrowed(self: OwnedValue) std.json.Value {
+        return switch (self) {
+            .null => .null,
+            .owned => |owned| owned.value,
+        };
+    }
+
+    pub fn deinit(self: *OwnedValue) void {
+        switch (self.*) {
+            .null => {},
+            .owned => |owned| freeJsonValue(owned.allocator, owned.value),
+        }
+        self.* = undefined;
+    }
+
+    pub fn move(self: *OwnedValue) OwnedValue {
+        const moved = self.*;
+        self.* = undefined;
+        return moved;
+    }
+};
+
 pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     switch (value) {
         .null => return .null,
@@ -78,15 +113,15 @@ pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
-pub fn jsonToFloat(v: std.json.Value) f64 {
+pub fn expectNumber(v: std.json.Value) !f64 {
     return switch (v) {
         .float => |f| f,
         .integer => |i| @floatFromInt(i),
-        else => 0,
+        else => error.ExpectedNumber,
     };
 }
 
-pub fn asString(v: ?std.json.Value) ?[]const u8 {
+pub fn optionalString(v: ?std.json.Value) ?[]const u8 {
     const val = v orelse return null;
     return switch (val) {
         .string => |s| s,
@@ -94,7 +129,7 @@ pub fn asString(v: ?std.json.Value) ?[]const u8 {
     };
 }
 
-pub fn asU64(v: ?std.json.Value) ?u64 {
+pub fn optionalU64(v: ?std.json.Value) ?u64 {
     const val = v orelse return null;
     return switch (val) {
         .integer => |i| if (i >= 0) @intCast(i) else null,
@@ -102,7 +137,7 @@ pub fn asU64(v: ?std.json.Value) ?u64 {
     };
 }
 
-pub fn asBool(v: ?std.json.Value) ?bool {
+pub fn optionalBool(v: ?std.json.Value) ?bool {
     const val = v orelse return null;
     return switch (val) {
         .bool => |b| b,
@@ -110,7 +145,7 @@ pub fn asBool(v: ?std.json.Value) ?bool {
     };
 }
 
-pub fn asObject(v: ?std.json.Value) ?std.json.ObjectMap {
+pub fn optionalObject(v: ?std.json.Value) ?std.json.ObjectMap {
     const val = v orelse return null;
     return switch (val) {
         .object => |o| o,
@@ -118,7 +153,7 @@ pub fn asObject(v: ?std.json.Value) ?std.json.ObjectMap {
     };
 }
 
-pub fn asArray(v: ?std.json.Value) ?std.json.Array {
+pub fn optionalArray(v: ?std.json.Value) ?std.json.Array {
     const val = v orelse return null;
     return switch (val) {
         .array => |a| a,
@@ -144,4 +179,27 @@ test "cloneJsonValue dupes strings and keys" {
     try testing.expect(cloned == .object);
     try testing.expectEqualStrings("v", cloned.object.get("k").?.string);
     try testing.expectEqual(@as(usize, 2), cloned.object.get("n").?.array.items.len);
+}
+
+test "OwnedValue carries allocator and releases cloned tree" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        \\{"k":"v","n":[1,2]}
+    ,
+        .{},
+    );
+
+    var owned = try OwnedValue.clone(testing.allocator, parsed);
+    defer owned.deinit();
+
+    try testing.expect(owned.borrowed() == .object);
+    try testing.expectEqualStrings("v", owned.borrowed().object.get("k").?.string);
+}
+
+test "expectNumber rejects non-numeric values" {
+    try testing.expectEqual(@as(f64, 2), try expectNumber(.{ .integer = 2 }));
+    try testing.expectError(error.ExpectedNumber, expectNumber(.{ .string = "2" }));
 }

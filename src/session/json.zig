@@ -179,7 +179,7 @@ pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: p
             try jw.write(c.tokens_before);
             if (c.details) |d| {
                 try jw.objectField(Field.details);
-                try jw.write(d);
+                try jw.write(d.borrowed());
             }
             if (c.from_hook) |fh| {
                 try jw.objectField(Field.from_hook);
@@ -193,7 +193,7 @@ pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: p
             try jw.write(bs.summary);
             if (bs.details) |d| {
                 try jw.objectField(Field.details);
-                try jw.write(d);
+                try jw.write(d.borrowed());
             }
             if (bs.from_hook) |fh| {
                 try jw.objectField(Field.from_hook);
@@ -205,7 +205,7 @@ pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: p
             try jw.write(c.custom_type);
             if (c.data) |d| {
                 try jw.objectField(Field.data);
-                try jw.write(d);
+                try jw.write(d.borrowed());
             }
         },
         .custom_message => |cm| {
@@ -215,7 +215,7 @@ pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: p
             try writeCustomContent(allocator, &jw, cm.content);
             if (cm.details) |d| {
                 try jw.objectField(Field.details);
-                try jw.write(d);
+                try jw.write(d.borrowed());
             }
             try jw.objectField(Field.display);
             try jw.write(cm.display);
@@ -346,11 +346,11 @@ pub fn writeToolResultMessage(allocator: std.mem.Allocator, jw: *Stringify, msg:
 
     if (msg.details) |d| {
         try jw.objectField(Field.details);
-        try jw.write(d);
+        try jw.write(d.borrowed());
     }
     if (msg.presentation) |p| {
         try jw.objectField(Field.presentation);
-        try jw.write(p);
+        try jw.write(p.borrowed());
     }
     try jw.objectField(Field.is_error);
     try jw.write(msg.is_error);
@@ -395,7 +395,7 @@ pub fn writeCustomMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: age
     try writeCustomContent(allocator, jw, msg.content);
     if (msg.details) |d| {
         try jw.objectField(Field.details);
-        try jw.write(d);
+        try jw.write(d.borrowed());
     }
     try jw.objectField(Field.display);
     try jw.write(msg.display);
@@ -461,7 +461,7 @@ pub fn writeToolCallBlock(jw: *Stringify, tc: ai.protocol.ToolCall) !void {
     try jw.objectField(Field.name);
     try jw.write(tc.name);
     try jw.objectField(Field.arguments);
-    try jw.write(tc.arguments);
+    try jw.write(tc.arguments.borrowed());
     if (tc.thought_signature) |sig| {
         try jw.objectField(Field.thought_signature);
         try jw.write(sig);
@@ -554,26 +554,26 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: [
             .summary = try allocator.dupe(u8, try requiredString(obj, Field.summary)),
             .first_kept_entry_id = try allocator.dupe(u8, try requiredString(obj, Field.first_kept_entry_id)),
             .tokens_before = try requiredU64(obj, Field.tokens_before),
-            .details = if (obj.get(Field.details)) |d| try json_value.cloneJsonValue(allocator, d) else null,
+            .details = if (obj.get(Field.details)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
             .from_hook = try optionalBool(obj, Field.from_hook),
         } }
     else if (std.mem.eql(u8, type_str, Tag.branch_summary_entry))
         .{ .branch_summary = .{
             .from_id = try allocator.dupe(u8, try requiredString(obj, Field.from_id)),
             .summary = try allocator.dupe(u8, try requiredString(obj, Field.summary)),
-            .details = if (obj.get(Field.details)) |d| try json_value.cloneJsonValue(allocator, d) else null,
+            .details = if (obj.get(Field.details)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
             .from_hook = try optionalBool(obj, Field.from_hook),
         } }
     else if (std.mem.eql(u8, type_str, Tag.custom))
         .{ .custom = .{
             .custom_type = try allocator.dupe(u8, try requiredString(obj, Field.custom_type)),
-            .data = if (obj.get(Field.data)) |d| try json_value.cloneJsonValue(allocator, d) else null,
+            .data = if (obj.get(Field.data)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
         } }
     else if (std.mem.eql(u8, type_str, Tag.custom_message))
         .{ .custom_message = .{
             .custom_type = try allocator.dupe(u8, try requiredString(obj, Field.custom_type)),
             .content = try parseCustomContent(allocator, try requiredValue(obj, Field.content)),
-            .details = if (obj.get(Field.details)) |d| try json_value.cloneJsonValue(allocator, d) else null,
+            .details = if (obj.get(Field.details)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
             .display = try requiredBool(obj, Field.display),
             .include_in_context = (try optionalBool(obj, Field.include_in_context)) orelse true,
         } }
@@ -790,11 +790,11 @@ fn parseAssistantMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) 
             .cache_write = try requiredU64(usage_obj, Field.cache_write),
             .total_tokens = try requiredU64(usage_obj, Field.total_tokens),
             .cost = .{
-                .input = json_value.jsonToFloat(try requiredValue(cost_obj, Field.input)),
-                .output = json_value.jsonToFloat(try requiredValue(cost_obj, Field.output)),
-                .cache_read = json_value.jsonToFloat(try requiredValue(cost_obj, Field.cache_read)),
-                .cache_write = json_value.jsonToFloat(try requiredValue(cost_obj, Field.cache_write)),
-                .total = json_value.jsonToFloat(try requiredValue(cost_obj, Field.total)),
+                .input = try json_value.expectNumber(try requiredValue(cost_obj, Field.input)),
+                .output = try json_value.expectNumber(try requiredValue(cost_obj, Field.output)),
+                .cache_read = try json_value.expectNumber(try requiredValue(cost_obj, Field.cache_read)),
+                .cache_write = try json_value.expectNumber(try requiredValue(cost_obj, Field.cache_write)),
+                .total = try json_value.expectNumber(try requiredValue(cost_obj, Field.total)),
             },
         },
         .stop_reason = ai.protocol.parseStopReason(try requiredString(obj, Field.stop_reason)),
@@ -876,7 +876,7 @@ fn parseAssistantContentBlock(allocator: std.mem.Allocator, obj: std.json.Object
         return .{ .tool_call = .{
             .id = try allocator.dupe(u8, try requiredString(obj, Field.id)),
             .name = try allocator.dupe(u8, try requiredString(obj, Field.name)),
-            .arguments = try json_value.cloneJsonValue(allocator, try requiredValue(obj, Field.arguments)),
+            .arguments = try json_value.OwnedValue.clone(allocator, try requiredValue(obj, Field.arguments)),
             .thought_signature = try optionalOwnedString(allocator, obj, Field.thought_signature),
         } };
     }
@@ -1246,7 +1246,7 @@ test "session message entries round-trip through JSON and rebuild context" {
     const tool_call = ai.protocol.ToolCall{
         .id = "toolu_abc123",
         .name = "bash",
-        .arguments = .null,
+        .arguments = json_value.OwnedValue.nullValue(),
     };
     var assistant_blocks = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
         .{ .tool_call = tool_call },

@@ -130,15 +130,15 @@ pub const AgentMessage = union(enum) {
         custom_type: []const u8,
         content: CustomContent,
         display: bool = false,
-        details: ?std.json.Value = null,
+        details: ?json_value.OwnedValue = null,
         timestamp: i64,
     };
 };
 
 pub const AgentToolResult = struct {
     content: []const ContentBlock,
-    details: std.json.Value = .null,
-    presentation: std.json.Value = .null,
+    details: json_value.OwnedValue = json_value.OwnedValue.nullValue(),
+    presentation: json_value.OwnedValue = json_value.OwnedValue.nullValue(),
     is_error: bool = false,
     side_effects: []const ToolSideEffect = &.{},
 
@@ -178,10 +178,10 @@ pub const AgentToolResult = struct {
             initialized += 1;
         }
 
-        const details = try json_value.cloneJsonValue(allocator, self.details);
-        errdefer json_value.freeJsonValue(allocator, details);
-        const presentation = try json_value.cloneJsonValue(allocator, self.presentation);
-        errdefer json_value.freeJsonValue(allocator, presentation);
+        var details = try json_value.OwnedValue.clone(allocator, self.details.borrowed());
+        errdefer details.deinit();
+        var presentation = try json_value.OwnedValue.clone(allocator, self.presentation.borrowed());
+        errdefer presentation.deinit();
         const side_effects = try allocator.alloc(ToolSideEffect, self.side_effects.len);
         errdefer allocator.free(side_effects);
         for (self.side_effects, 0..) |effect, i| {
@@ -209,8 +209,10 @@ pub const AgentToolResult = struct {
             },
         };
         allocator.free(self.content);
-        json_value.freeJsonValue(allocator, self.details);
-        json_value.freeJsonValue(allocator, self.presentation);
+        var details = self.details;
+        details.deinit();
+        var presentation = self.presentation;
+        presentation.deinit();
         for (self.side_effects) |effect| effect.free(allocator);
         allocator.free(self.side_effects);
     }
@@ -281,17 +283,17 @@ pub const AgentTool = struct {
     description: []const u8,
     label: []const u8,
     display_call: ?[]const u8 = null,
-    parameters: std.json.Value,
+    parameters: json_value.BorrowedValue,
 
     ctx: ?*anyopaque = null,
     affinity: ToolExecutionAffinity = .agent_thread,
 
-    prepare_arguments: ?*const fn (allocator: std.mem.Allocator, args: std.json.Value) anyerror!std.json.Value = null,
+    prepare_arguments: ?*const fn (allocator: std.mem.Allocator, args: json_value.BorrowedValue) anyerror!json_value.OwnedValue = null,
     execute: *const fn (
         ctx: ?*anyopaque,
         allocator: std.mem.Allocator,
         tool_call_id: []const u8,
-        args: std.json.Value,
+        args: json_value.BorrowedValue,
         signal: Token,
         on_update: ?AgentToolUpdateCallback,
         update_ctx: ?*anyopaque,
@@ -301,7 +303,7 @@ pub const AgentTool = struct {
         self: AgentTool,
         allocator: std.mem.Allocator,
         tool_call_id: []const u8,
-        args: std.json.Value,
+        args: json_value.BorrowedValue,
         signal: Token,
         on_update: ?AgentToolUpdateCallback,
         update_ctx: ?*anyopaque,
@@ -342,26 +344,26 @@ pub const AgentState = struct {
 pub const BeforeToolCallResult = struct {
     block: bool = false,
     reason: ?[]const u8 = null,
-    args: ?std.json.Value = null,
+    args: ?json_value.OwnedValue = null,
 };
 
 pub const BeforeToolCallContext = struct {
     assistant_message: AssistantMessage,
     tool_call: ToolCall,
-    args: std.json.Value,
+    args: json_value.BorrowedValue,
     context: AgentContext,
 };
 
 pub const AfterToolCallResult = struct {
     content: ?[]const AgentToolResult.ContentBlock = null,
-    details: ?std.json.Value = null,
+    details: ?json_value.OwnedValue = null,
     is_error: ?bool = null,
 };
 
 pub const AfterToolCallContext = struct {
     assistant_message: AssistantMessage,
     tool_call: ToolCall,
-    args: std.json.Value,
+    args: json_value.BorrowedValue,
     result: AgentToolResult,
     is_error: bool,
     context: AgentContext,
@@ -465,8 +467,8 @@ pub const AgentEvent = union(enum) {
     message_update: struct { message: AgentMessage, assistant_message_event: AssistantMessageEvent },
     message_delta: struct { assistant_message_event: AssistantMessageEvent },
     message_end: struct { message: AgentMessage },
-    tool_execution_start: struct { tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value },
-    tool_execution_update: struct { tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value, partial_result: ?AgentToolResult },
+    tool_execution_start: struct { tool_call_id: []const u8, tool_name: []const u8, args: json_value.BorrowedValue },
+    tool_execution_update: struct { tool_call_id: []const u8, tool_name: []const u8, args: json_value.BorrowedValue, partial_result: ?AgentToolResult },
     tool_execution_end: struct { tool_call_id: []const u8, tool_name: []const u8, result: AgentToolResult, is_error: bool },
 };
 
@@ -478,8 +480,8 @@ test "AgentToolResult clone owns content and details" {
     var obj: std.json.ObjectMap = .{};
     try obj.put(allocator, "key", .{ .string = "value" });
     defer {
-        var m = obj;
-        m.deinit(allocator);
+        var mutable = obj;
+        mutable.deinit(allocator);
     }
 
     const original = AgentToolResult{
@@ -487,11 +489,14 @@ test "AgentToolResult clone owns content and details" {
             .{ .text = .{ .text = "hello world", .text_signature = "sig123" } },
             .{ .image = .{ .data = "base64data", .mime_type = "image/png" } },
         },
-        .details = .{ .object = obj },
+        .details = try json_value.OwnedValue.clone(allocator, .{ .object = obj }),
         .is_error = true,
     };
 
-    const cloned = try original.clone(allocator);
+    var owned_original = original;
+    defer owned_original.details.deinit();
+
+    const cloned = try owned_original.clone(allocator);
     defer cloned.free(allocator);
 
     try std.testing.expect(cloned.is_error);
@@ -502,5 +507,5 @@ test "AgentToolResult clone owns content and details" {
     try std.testing.expectEqualStrings("base64data", cloned.content[1].image.data);
     try std.testing.expectEqualStrings("image/png", cloned.content[1].image.mime_type);
     try std.testing.expect(cloned.content[1].image.data.ptr != original.content[1].image.data.ptr);
-    try std.testing.expectEqualStrings("value", cloned.details.object.get("key").?.string);
+    try std.testing.expectEqualStrings("value", cloned.details.borrowed().object.get("key").?.string);
 }
