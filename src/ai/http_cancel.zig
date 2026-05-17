@@ -1,20 +1,23 @@
 const std = @import("std");
-const posix = std.posix;
 const protocol = @import("protocol.zig");
+const runtime_http_cancel = @import("../runtime/http_cancel.zig");
 
-fn requestShutdownFd(req: anytype) ?posix.fd_t {
-    const conn = req.connection orelse return null;
-    return conn.stream_reader.stream.socket.handle;
-}
+pub const requestStream = runtime_http_cancel.requestStream;
 
 pub const ShutdownOnCancel = struct {
-    pub fn start(_: std.Io, token: protocol.CancelToken, req: anytype) !ShutdownOnCancel {
-        _ = token;
-        _ = requestShutdownFd(req);
-        return .{};
+    inner: runtime_http_cancel.ShutdownOnCancel = .inactive,
+
+    pub fn start(io: std.Io, token: protocol.CancelToken, req: anytype) !ShutdownOnCancel {
+        return .{ .inner = try runtime_http_cancel.ShutdownOnCancel.start(
+            std.heap.smp_allocator,
+            io,
+            token,
+            runtime_http_cancel.requestStream(req),
+        ) };
     }
 
     pub fn stop(self: *ShutdownOnCancel) void {
+        self.inner.stop();
         self.* = .{};
     }
 };

@@ -4,6 +4,8 @@ const json_value = @import("../json/value.zig");
 const protocol = @import("protocol.zig");
 
 pub const Decorator = struct {
+    /// Mutates an object payload in place. Return true when the payload changed.
+    /// Use only the provided allocator for inserted JSON values.
     func: *const fn (
         allocator: std.mem.Allocator,
         payload: *std.json.Value,

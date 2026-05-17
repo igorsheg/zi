@@ -128,13 +128,13 @@ pub fn classifyProviderFailure(
     provider_message: ?[]const u8,
 ) protocol.NormalizedFailure.Kind {
     if (provider_type) |provider_type_value| {
-        if (isNonOverflowNeedle(provider_type_value)) return .rate_limited;
+        if (isRateLimitNeedle(provider_type_value)) return .rate_limited;
     }
     if (provider_code) |code| {
-        if (isNonOverflowNeedle(code)) return .rate_limited;
+        if (isRateLimitNeedle(code)) return .rate_limited;
     }
     if (provider_message) |msg| {
-        if (isNonOverflowNeedle(msg)) return .rate_limited;
+        if (isRateLimitNeedle(msg)) return .rate_limited;
     }
     if (provider_code) |code| {
         if (isOverflowNeedle(code)) return .context_overflow;
@@ -206,7 +206,7 @@ fn httpStatusReason(status_code: u16) ?[]const u8 {
     };
 }
 
-fn isNonOverflowNeedle(text: []const u8) bool {
+fn isRateLimitNeedle(text: []const u8) bool {
     return containsAnyCI(text, &.{
         "throttling error",
         "rate limit",

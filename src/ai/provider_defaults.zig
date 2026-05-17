@@ -3,7 +3,7 @@ const provider_mod = @import("provider.zig");
 const provider_registry = @import("provider_registry.zig");
 const protocol = @import("protocol.zig");
 const ai_models = @import("models.zig");
-const anthropic = @import("anthropic.zig");
+const anthropic = @import("anthropic/provider.zig");
 const openai_completions = @import("openai_completions.zig");
 const openai_responses_core = @import("openai_responses_core.zig");
 const openai_codex = @import("openai_codex.zig");
@@ -37,6 +37,8 @@ pub const Bundle = struct {
     }
 
     pub fn deinit(self: *Bundle) void {
+        // Registry owns lookup metadata. Concrete provider storage lives in this
+        // bundle and must remain valid until after registry teardown.
         self.registry.deinit();
         self.allocator.destroy(self);
     }

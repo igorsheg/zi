@@ -170,6 +170,8 @@ pub const Registry = struct {
         }
     };
 
+    /// Current lookup table rebuilt from baseline plus claims. Baseline owns the
+    /// default providers; later claims win for API lookup projection.
     providers: std.StringHashMap(Provider),
     baseline: std.StringHashMap(BaselineRegistration),
     claim_index: std.StringHashMap(std.ArrayListUnmanaged(usize)),
@@ -225,6 +227,8 @@ pub const Registry = struct {
 
         if (self.claim_index.getPtr(registration.name)) |bucket| {
             if (bucket.items.len > 0) {
+                // Same provider name may be refreshed by its owner only. The
+                // first claim remains the provider-name lookup winner.
                 const winner = &self.claims.items[bucket.items[0]];
                 if (!std.mem.eql(u8, winner.registration.owner_id, registration.owner_id)) {
                     return false;
@@ -276,18 +280,7 @@ pub const Registry = struct {
         if (!std.mem.eql(u8, winner.registration.owner_id, owner_id)) return false;
         if (winner.registration.generation != generation) return false;
 
-        const idx = bucket.items[0];
-        _ = bucket.orderedRemove(0);
-        var removed = self.claims.orderedRemove(idx);
-
-        if (bucket.items.len == 0) {
-            const index_entry = self.claim_index.fetchRemove(name) orelse unreachable;
-            var removed_bucket = index_entry.value;
-            removed_bucket.deinit(self.allocator);
-            self.allocator.free(index_entry.key);
-        }
-
-        try self.reindexClaimsFrom(idx);
+        var removed = try self.removeClaimAt(bucket.items[0]);
         try self.rebuildProjection();
         removed.deinit(self.allocator);
         return true;
@@ -302,23 +295,11 @@ pub const Registry = struct {
                 continue;
             }
 
-            const name = self.claims.items[i].registration.name;
-            const bucket = self.claim_index.getPtr(name) orelse unreachable;
-            const bucket_idx = findBucketIndex(bucket.items, i) orelse unreachable;
-            _ = bucket.orderedRemove(bucket_idx);
-
-            var removed = self.claims.orderedRemove(i);
-            if (bucket.items.len == 0) {
-                const index_entry = self.claim_index.fetchRemove(removed.registration.name) orelse unreachable;
-                var removed_bucket = index_entry.value;
-                removed_bucket.deinit(self.allocator);
-                self.allocator.free(index_entry.key);
-            }
+            var removed = try self.removeClaimAt(i);
             removed.deinit(self.allocator);
             removed_any = true;
         }
         if (removed_any) {
-            try self.reindexClaimsFrom(0);
             try self.rebuildProjection();
         }
     }
@@ -375,23 +356,9 @@ pub const Registry = struct {
                 continue;
             }
 
-            const name = self.claims.items[i].registration.name;
-            const bucket = self.claim_index.getPtr(name) orelse unreachable;
-            const bucket_idx = findBucketIndex(bucket.items, i) orelse unreachable;
-            _ = bucket.orderedRemove(bucket_idx);
-
-            var removed = self.claims.orderedRemove(i);
-            if (bucket.items.len == 0) {
-                const index_entry = self.claim_index.fetchRemove(removed.registration.name) orelse unreachable;
-                var removed_bucket = index_entry.value;
-                removed_bucket.deinit(self.allocator);
-                self.allocator.free(index_entry.key);
-            }
+            var removed = try self.removeClaimAt(i);
             removed.deinit(self.allocator);
             removed_any = true;
-        }
-        if (removed_any) {
-            try self.reindexClaimsFrom(0);
         }
         if (removed_any or baseline_removed) {
             try self.rebuildProjection();
@@ -444,9 +411,24 @@ pub const Registry = struct {
         return &self.claims.items[bucket.items[0]];
     }
 
-    fn reindexClaimsFrom(self: *Registry, start: usize) !void {
-        _ = start;
+    fn removeClaimAt(self: *Registry, idx: usize) !Claim {
+        const name = self.claims.items[idx].registration.name;
+        const bucket = self.claim_index.getPtr(name) orelse unreachable;
+        const bucket_idx = findBucketIndex(bucket.items, idx) orelse unreachable;
+        _ = bucket.orderedRemove(bucket_idx);
 
+        const removed = self.claims.orderedRemove(idx);
+        if (bucket.items.len == 0) {
+            const index_entry = self.claim_index.fetchRemove(removed.registration.name) orelse unreachable;
+            var removed_bucket = index_entry.value;
+            removed_bucket.deinit(self.allocator);
+            self.allocator.free(index_entry.key);
+        }
+        try self.reindexClaims();
+        return removed;
+    }
+
+    fn reindexClaims(self: *Registry) !void {
         var bucket_it = self.claim_index.valueIterator();
         while (bucket_it.next()) |bucket| {
             bucket.clearRetainingCapacity();
@@ -474,6 +456,7 @@ pub const Registry = struct {
             try self.providers.put(entry.key_ptr.*, entry.value_ptr.provider);
         }
         for (self.claims.items) |claim| {
+            // Later claims override earlier claims for API lookup.
             try self.providers.put(claim.registration.api, claim.provider);
         }
     }

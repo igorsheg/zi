@@ -1,5 +1,5 @@
 const std = @import("std");
-const protocol = @import("protocol.zig");
+const protocol = @import("../protocol.zig");
 
 fn supportsAdaptiveThinking(model_id: []const u8) bool {
     if (std.mem.indexOf(u8, model_id, "opus-4-6") != null) return true;

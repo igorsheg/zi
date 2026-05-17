@@ -1,15 +1,15 @@
 const Token = protocol.CancelToken;
-const http_cancel = @import("http_cancel.zig");
+const http_cancel = @import("../../runtime/http_cancel.zig");
 const std = @import("std");
-const protocol = @import("protocol.zig");
-const ai_models = @import("models.zig");
-const sse = @import("sse.zig");
-const ai_provider = @import("provider.zig");
-const provider_failure = @import("provider_failure.zig");
-const request_transform = @import("request_transform.zig");
-const anthropic_request = @import("anthropic_request.zig");
-const partial_json = @import("../json/partial.zig");
-const json_value = @import("../json/value.zig");
+const protocol = @import("../protocol.zig");
+const ai_models = @import("../models.zig");
+const sse = @import("../sse.zig");
+const ai_provider = @import("../provider.zig");
+const provider_failure = @import("../provider_failure.zig");
+const request_transform = @import("../request_transform.zig");
+const anthropic_request = @import("request.zig");
+const partial_json = @import("../../json/partial.zig");
+const json_value = @import("../../json/value.zig");
 
 pub const AnthropicProvider = struct {
     allocator: std.mem.Allocator,
@@ -147,7 +147,7 @@ pub const AnthropicProvider = struct {
         };
         defer req.deinit();
 
-        var abort_guard = http_cancel.ShutdownOnCancel.start(options.io, options.signal, &req) catch |err| {
+        var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
             emitError(allocator, sink, model.api, model.provider, model.id, "failed to start interrupt guard: {s}", .{@errorName(err)});
             return;
         };
