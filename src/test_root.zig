@@ -13,6 +13,5 @@ test {
     _ = @import("runtime/log.zig");
     _ = @import("ai/root.zig");
     _ = @import("json/root.zig");
-    _ = @import("lib/command_query.zig");
     _ = @import("agent/root.zig");
 }
