@@ -73,20 +73,20 @@ Each directory directly under `after/` is treated as another runtime root, loade
 
 ## Loading
 
-zi installs a global `zi` table. An extension may register at top level or return a function that receives `zi`.
+zi installs a global `zi` table. An extension file must return a factory function that receives `zi`.
 
 ```lua
 return function(zi)
   zi.define.tool({
     name = "greet",
     description = "Generate a greeting.",
-    parameters = {
+    input = {
       type = "object",
       properties = {
         name = { type = "string", description = "Name to greet" },
       },
     },
-    execute = function(ctx, params)
+    run = function(ctx, params)
       local name = params.name or "world"
       return { content = { { type = "text", text = "hello, " .. name } } }
     end,

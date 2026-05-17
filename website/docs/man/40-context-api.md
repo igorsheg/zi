@@ -24,11 +24,8 @@ Most tools, commands, and events receive `ctx`.
 `ctx.capabilities().ui`
 : Whether UI APIs are available.
 
-`ctx.binding`
-: Session and extension identity, when available.
-
-`ctx.extension`
-: Current extension identity and resource paths. Bundled extensions get their extension directory as `root`; flat extensions get the directory containing the `.lua` file.
+`ctx.env`
+: Runtime environment and extension identity. Includes `cwd`, `workspace_id`, `session_id`, `session_file`, `extension_id`, `extension_root`, `state_owner_id`, `generation_id`, and `namespace_id`.
 
 `ctx.ui`
 : Host-owned UI API, or `nil`.
@@ -44,9 +41,6 @@ Most tools, commands, and events receive `ctx`.
 
 `ctx.models`
 : Visible model catalog helpers.
-
-`ctx.signal`
-: Cancellation signal, or `nil`.
 
 `ctx.control.is_idle()`
 : Return whether the active session is idle.
@@ -69,15 +63,6 @@ Most tools, commands, and events receive `ctx`.
 `ctx.chat.has_pending()`
 : Return whether the session has queued messages.
 
-`ctx.shutdown()`
-: Request shutdown.
-
-`ctx.context_usage()`
-: Return context usage information.
-
-`ctx.system_prompt()`
-: Return the active system prompt.
-
 ## UI
 
 `ctx.ui` publishes host-owned UI intent. Extensions describe views; zi owns placement, focus, and redraw. API v4 exposes three methods:
@@ -88,14 +73,14 @@ Most tools, commands, and events receive `ctx`.
 `ctx.ui.surface.frame(spec)`
 : Publish a frame for a `surface` node in an existing render tree. `spec.view` names the render view id, `spec.node` names the surface node id, and `spec.data` contains frame bytes. Supported formats include `rgba8888` and `halfblock_rgb`. `surface` remains the node type for framebuffer graphs and other pixel/cell-frame visuals.
 
-`ctx.ui.notify.show(message, opts?)`
-: Publish or update a fidget-style notification in the bottom-right notification stack. `opts.id` is the replacement key. `opts.level` is `debug`, `info`, `warn`, `error`, or `success`; `opts.group`, `opts.title`, `opts.annote`, `opts.progress`, and `opts.done` shape the compact row. Repeated identical messages with the same id collapse as `(Nx)`. Done notifications linger briefly by default; set `ttl` seconds or `ttl_ms` to control expiry.
+`ctx.ui.notify.show(spec)`
+: Publish or update a notification. `spec.message` is required. `spec.id` is the replacement key. `spec.level` is `debug`, `info`, `warn`, `error`, or `success`; `spec.group`, `spec.title`, `spec.progress`, and `spec.done` shape the compact row.
 
-`ctx.ui.notify.clear(id_or_opts)`
+`ctx.ui.notify.clear(id)`
 : Remove a retained notification by id.
 
 `ctx.ui.notify.progress(opts)`
-: Start a progress notification (`opts.id`, `opts.message`, `opts.group`, `opts.title`) with an animated spinner. Update the same progress row by calling `ctx.ui.notify.show(next_message, { id = opts.id, progress = true })`; finish with `{ done = true }`.
+: Start a progress notification (`opts.id`, `opts.message`, `opts.group`, `opts.title`) with an animated spinner. Update the same progress row by calling `ctx.ui.notify.show({ id = opts.id, message = next_message, progress = true })`; finish with `{ done = true }`.
 
 ### UI input nodes
 
@@ -201,7 +186,7 @@ ctx.ui.view.set({
 Example:
 
 ```lua
-ctx.ui.notify.show("Hello from zi", { id = "hello", level = "info" })
+ctx.ui.notify.show({ id = "hello", level = "info", message = "Hello from zi" })
 
 ctx.ui.view.set({
   id = "panel",
@@ -236,7 +221,7 @@ There is no synchronous editor text getter.
 
 ## State
 
-Extension-scoped state maps are not part of API v4. Use Lua locals for extension-ephemeral state. Durable extension state should be represented explicitly as session artifacts. Use `ctx.session.append_artifact` for extension-owned JSON state, or notes/labels for human-readable annotations and entry bookmarks.
+Extension-scoped state maps are not part of API v4. Use Lua locals for extension-ephemeral state. Durable extension state should be represented explicitly as session artifacts. Use `ctx.session.artifacts.append` for extension-owned JSON state, or notes/labels for human-readable annotations and entry bookmarks.
 
 ## Session
 
@@ -252,22 +237,22 @@ Extension-scoped state maps are not part of API v4. Use Lua locals for extension
 `ctx.session.messages({ limit?, include_tools? })`
 : Return recent durable transcript messages. Default limit is 50, max is 500. Returned messages include durable `entry_id` values and are shaped for transcript inspection.
 
-`ctx.session.context({ include_tools?, max_messages? })`
+`ctx.session.model_context({ include_tools?, max_messages? })`
 : Return the active assembled model context as semantic data: `{ system_prompt, messages, tools? }`. Messages are normalized from the current branch with compaction/branch summaries converted the same way zi prepares provider context. `max_messages` limits the returned tail after optional tool filtering (default/max 500). `include_tools = false` omits tool schemas, tool calls, and tool results. The result intentionally avoids provider transport payloads and session-manager internals; use `before_provider_request` when you need to observe the exact transport request.
 
 `ctx.session.tool_results(tool_name)`
 : Return recorded tool results.
 
-`ctx.session.append_note({ kind, title?, body, source_entry_id? })`
-: Append a durable note. `sourceEntryId` is accepted as an alias.
+`ctx.session.notes.append(text, opts?)`
+: Append a durable note. `opts.kind`, `opts.title`, and `opts.source_entry_id` are optional.
 
-`ctx.session.notes({ kind?, source_entry_id?, limit? })`
+`ctx.session.notes.list({ kind?, source_entry_id?, limit? })`
 : Return notes. Default limit is 50, max is 500.
 
-`ctx.session.append_artifact({ kind?, key?, title?, data })`
-: Append a durable extension-owned artifact on the current branch. `data` must be JSON-compatible and is bounded by the extension JSON conversion limits. Artifacts are stored as inspectable session entries, are not added to model context, advance the session tree like other durable entries, and are scoped to the calling extension owner. Default `kind` is `"artifact"`.
+`ctx.session.artifacts.append({ kind?, key?, title?, data })`
+: Append a durable extension-owned artifact on the current branch. `data` must be JSON-compatible and is bounded by the extension JSON conversion limits. Artifacts are inspectable session entries, are not model-visible, and are scoped to the calling extension owner. Default `kind` is `"artifact"`.
 
-`ctx.session.artifacts({ kind?, key?, limit? })`
+`ctx.session.artifacts.list({ kind?, key?, limit? })`
 : Return artifacts for the calling extension owner from the current branch, newest limited to the requested tail. Default limit is 50, max is 500. Each item includes `entry_id`, `owner_id`, `kind`, optional `key`/`title`, and `data`.
 
 `ctx.session.label(entry_id, label)`
@@ -289,9 +274,8 @@ zi.define.event("message", function(ctx, event)
   local message = event.message or {}
   if message.role == "user" and message.text and message.text:match("decision") then
     ctx.session.label(message.entry_id, "decision")
-    ctx.session.append_note({
+    ctx.session.notes.append("decision candidate", {
       kind = "observation",
-      body = "decision candidate",
       source_entry_id = message.entry_id,
     })
   end
@@ -302,7 +286,7 @@ Later:
 
 ```lua
 for _, entry in ipairs(ctx.session.entries({ label = "decision", limit = 20 })) do
-  local notes = ctx.session.notes({ source_entry_id = entry.entry_id })
+  local notes = ctx.session.notes.list({ source_entry_id = entry.entry_id })
 end
 ```
 
@@ -360,7 +344,7 @@ local side = ctx.ai.session({
   system_prompt = "You are concise",  -- optional
   reasoning = "low",                  -- optional
   tools = { "read", "edit" },         -- optional allowlist; absent means no tools
-  context = ctx.session.context({ max_messages = 120 }), -- optional string or context object
+  context = ctx.session.model_context({ max_messages = 120 }), -- optional string or context object
   on = {
     message_update = function(event) end,
     tool_execution_start = function(event) end,

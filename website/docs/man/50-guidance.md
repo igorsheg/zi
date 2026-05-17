@@ -68,8 +68,8 @@ return function(zi)
   zi.define.tool({
     name = "project_status",
     description = "Summarize project status.",
-    parameters = { type = "object", properties = {} },
-    execute = function(ctx, params)
+    input = { type = "object", properties = {} },
+    run = function(ctx, input)
       return { content = { { type = "text", text = "No status provider configured." } } }
     end,
   })
@@ -83,9 +83,9 @@ return function(zi)
   zi.define.command({
     name = "note",
     description = "Save a session note.",
-    handler = function(ctx, args)
-      local ok = ctx.session.append_note({ kind = "manual", body = tostring(args or "") })
-      if ctx.ui then ctx.ui.notify.show(ok and "note saved" or "note failed", { id = "note", level = ok and "success" or "error" }) end
+    run = function(ctx, input)
+      local ok = ctx.session.notes.append(tostring(input and input.body or ""), { kind = "manual" })
+      if ctx.ui then ctx.ui.notify.show({ id = "note", message = ok and "note saved" or "note failed", level = ok and "success" or "error" }) end
     end,
   })
 end
@@ -98,9 +98,8 @@ zi.define.event("message", function(ctx, event)
   local message = event.message or {}
   if message.role == "user" and message.text and message.text:match("decision") then
     ctx.session.label(message.entry_id, "decision")
-    ctx.session.append_note({
+    ctx.session.notes.append("possible decision", {
       kind = "observation",
-      body = "possible decision",
       source_entry_id = message.entry_id,
     })
   end
@@ -113,7 +112,7 @@ An event is for policy or reaction. Keep it easy to explain later.
 zi.define.event("message", function(ctx, event)
   local message = event.message or {}
   if message.role == "assistant" and ctx.ui then
-    ctx.ui.notify.show("assistant replied", { id = "assistant-replied", level = "info" })
+    ctx.ui.notify.show({ id = "assistant-replied", level = "info", message = "assistant replied" })
   end
 end)
 ```
