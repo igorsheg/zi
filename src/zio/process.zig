@@ -199,12 +199,14 @@ pub const InheritOptions = struct {
 pub fn runInherit(io: std.Io, options: InheritOptions) RunError!std.process.Child.Term {
     if (options.argv.len == 0) return error.EmptyArgv;
     if (options.stdin == .bytes) return error.InvalidStdio;
-    var env_map_storage = process_env.buildMap(std.heap.smp_allocator, options.env, options.clear_env) catch return error.EnvironmentBuildFailed;
-    defer if (env_map_storage) |*env_map| env_map.deinit();
+    var env_map = process_env.buildMap(std.heap.smp_allocator, options.env, options.clear_env) catch return error.EnvironmentBuildFailed;
+    defer env_map.deinit();
+    const prepared_argv = process_env.spawnArgv(std.heap.smp_allocator, io, options.argv, &env_map) catch return error.SpawnFailed;
+    defer prepared_argv.deinit(std.heap.smp_allocator);
     var child = std.process.spawn(io, .{
-        .argv = options.argv,
+        .argv = prepared_argv.argv,
         .cwd = options.cwd,
-        .environ_map = if (env_map_storage) |*env_map| env_map else null,
+        .environ_map = &env_map,
         .stdin = if (options.stdin == .inherit) .inherit else .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -634,6 +636,65 @@ test "process.run env overlays inherited environment" {
     };
     try std.testing.expect(std.mem.startsWith(u8, completed.stdout.bytes, "/"));
     try std.testing.expect(std.mem.endsWith(u8, completed.stdout.bytes, ":overlay"));
+}
+
+test "process.run inherits runtime environment without overlays" {
+    try skipShellProcessTestsIfUnsupported();
+    var result = try runShell("printf '%s' \"$PATH\"", .{ .argv = &.{} });
+    defer result.deinit(std.testing.allocator);
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
+    try std.testing.expect(std.mem.startsWith(u8, completed.stdout.bytes, "/"));
+}
+
+test "process.run resolves bare argv0 with explicit environment" {
+    try skipShellProcessTestsIfUnsupported();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Options.debug_io;
+    const cmd_name = "zi-process-path-test";
+    try tmp.dir.createDir(io, "bad", .default_dir);
+    try tmp.dir.createDir(io, "good", .default_dir);
+    {
+        const file = try tmp.dir.createFile(io, "bad/zi-process-path-test", .{});
+        defer file.close(io);
+        try file.setPermissions(io, .fromMode(0o600));
+        var write_buf: [128]u8 = undefined;
+        var writer = file.writer(io, &write_buf);
+        try writer.interface.writeAll("#!/bin/sh\nprintf bad");
+        try writer.interface.flush();
+    }
+    {
+        const file = try tmp.dir.createFile(io, "good/zi-process-path-test", .{});
+        defer file.close(io);
+        try file.setPermissions(io, .fromMode(0o700));
+        var write_buf: [128]u8 = undefined;
+        var writer = file.writer(io, &write_buf);
+        try writer.interface.writeAll("#!/bin/sh\nprintf ok");
+        try writer.interface.flush();
+    }
+
+    const bad_dir = try tmp.dir.realPathFileAlloc(io, "bad", std.testing.allocator);
+    defer std.testing.allocator.free(bad_dir);
+    const good_dir = try tmp.dir.realPathFileAlloc(io, "good", std.testing.allocator);
+    defer std.testing.allocator.free(good_dir);
+    const path_value = try std.fmt.allocPrint(std.testing.allocator, "{s}:{s}", .{ bad_dir, good_dir });
+    defer std.testing.allocator.free(path_value);
+
+    var result = try run(std.testing.allocator, std.Options.debug_io, .{
+        .argv = &.{cmd_name},
+        .clear_env = true,
+        .env = &.{.{ .key = "PATH", .value = path_value }},
+    });
+    defer result.deinit(std.testing.allocator);
+    const completed = switch (result) {
+        .completed => |x| x,
+        else => return error.UnexpectedProcessError,
+    };
+    try std.testing.expectEqualSlices(u8, "ok", completed.stdout.bytes);
 }
 
 test "process.run clear_env starts from empty environment" {

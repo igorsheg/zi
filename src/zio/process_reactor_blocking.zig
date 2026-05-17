@@ -255,12 +255,14 @@ const Process = struct {
     fn init(allocator: std.mem.Allocator, io: std.Io, reactor: *Reactor, request: types.SpawnRequest) !Process {
         var owned = try request.clone(allocator);
         errdefer owned.deinit(allocator);
-        var env_map_storage = process_env.buildMap(std.heap.page_allocator, owned.env, owned.clear_env) catch return error.EnvironmentBuildFailed;
-        defer if (env_map_storage) |*env_map| env_map.deinit();
+        var env_map = process_env.buildMap(std.heap.page_allocator, owned.env, owned.clear_env) catch return error.EnvironmentBuildFailed;
+        defer env_map.deinit();
+        const prepared_argv = try process_env.spawnArgv(std.heap.page_allocator, io, owned.argv, &env_map);
+        defer prepared_argv.deinit(std.heap.page_allocator);
         var child = try std.process.spawn(io, .{
-            .argv = owned.argv,
+            .argv = prepared_argv.argv,
             .cwd = if (owned.cwd) |cwd| .{ .path = cwd } else .inherit,
-            .environ_map = if (env_map_storage) |*env_map| env_map else null,
+            .environ_map = &env_map,
             .stdin = if (owned.stdin) .pipe else .ignore,
             .stdout = if (owned.stdout) .pipe else .ignore,
             .stderr = if (owned.stderr) .pipe else .ignore,

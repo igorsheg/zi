@@ -19,7 +19,7 @@ const DESCRIPTION =
     "Executes the given shell command using bash.\n\n" ++
     "- Do NOT use interactive commands (REPLs, editors, password prompts)\n" ++
     "- Output is bounded to 50KB each for stdout and stderr\n" ++
-    "- Environment variables and `cd` do not persist between commands; use the `cwd` parameter instead\n" ++
+    "- Commands run with zi's process environment plus tool-specific overrides; environment changes and `cd` do not persist between commands\n" ++
     "- Commands run in the workspace root by default; only use `cwd` when you need a different directory\n" ++
     "- Use focused commands and prefer dedicated tools for file reads and searches.";
 
