@@ -1095,19 +1095,22 @@ fn pushSessionApi(L: *c.lua_State, runner: *runner_mod.ExtensionRunner, provenan
     pushMethod(L, runner, &ctxSessionMessages);
     c.lua_setfield(L, -2, "messages");
     pushMethod(L, runner, &ctxSessionContext);
-    c.lua_setfield(L, -2, "context");
-    pushMethod(L, runner, &ctxSessionContext);
     c.lua_setfield(L, -2, "model_context");
     pushMethod(L, runner, &ctxAppendEntry);
     c.lua_setfield(L, -2, "append_entry");
-    pushMethod(L, runner, &ctxSessionAppendNote);
-    c.lua_setfield(L, -2, "append_note");
+
+    c.lua_createtable(L, 0, 2);
+    pushMethod(L, runner, &ctxSessionNotesAppend);
+    c.lua_setfield(L, -2, "append");
     pushMethod(L, runner, &ctxSessionNotes);
+    c.lua_setfield(L, -2, "list");
     c.lua_setfield(L, -2, "notes");
     if (provenance) |prov| {
+        c.lua_createtable(L, 0, 2);
         pushUiMethod(L, runner, prov.state_owner_id, &ctxSessionAppendArtifact);
-        c.lua_setfield(L, -2, "append_artifact");
+        c.lua_setfield(L, -2, "append");
         pushUiMethod(L, runner, prov.state_owner_id, &ctxSessionArtifacts);
+        c.lua_setfield(L, -2, "list");
         c.lua_setfield(L, -2, "artifacts");
     }
     pushMethod(L, runner, &ctxSessionLabel);
@@ -1405,6 +1408,25 @@ fn ctxSessionAppendNote(L_opt: ?*c.lua_State) callconv(.c) c_int {
             return 1;
         },
     }
+}
+
+fn ctxSessionNotesAppend(L_opt: ?*c.lua_State) callconv(.c) c_int {
+    const L = L_opt.?;
+    if (c.lua_type(L, 1) != c.LUA_TSTRING) {
+        c.lua_pushboolean(L, 0);
+        return 1;
+    }
+    c.lua_createtable(L, 0, 4);
+    c.lua_pushvalue(L, 1);
+    c.lua_setfield(L, -2, "body");
+    if (c.lua_type(L, 2) == c.LUA_TTABLE) {
+        inline for (.{ "kind", "title", "source_entry_id", "sourceEntryId" }) |field| {
+            _ = c.lua_getfield(L, 2, field);
+            if (c.lua_type(L, -1) != c.LUA_TNIL) c.lua_setfield(L, -2, field) else c.lua_pop(L, 1);
+        }
+    }
+    c.lua_replace(L, 1);
+    return ctxSessionAppendNote(L);
 }
 
 fn ctxSessionNotes(L_opt: ?*c.lua_State) callconv(.c) c_int {

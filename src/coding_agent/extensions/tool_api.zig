@@ -129,10 +129,10 @@ fn buildExtensionTool(
     const display_call = try optionalDisplayCall(L, 1, a, error.InvalidDisplay);
     errdefer if (display_call) |field| a.free(field);
 
-    const prompt_snippet = spec.optionalString("prompt_snippet") catch |err| return mapSchemaError(err, error.InvalidPromptSnippet, error.InvalidPromptSnippet);
+    const prompt_snippet = try optionalPromptSnippet(L, 1, a, error.InvalidPromptSnippet);
     errdefer if (prompt_snippet) |s| a.free(s);
 
-    const prompt_guidelines = spec.optionalStringArray("prompt_guidelines") catch |err| return mapSchemaError(err, error.InvalidPromptGuidelines, error.InvalidPromptGuidelines);
+    const prompt_guidelines = try optionalPromptGuidelines(L, 1, a, error.InvalidPromptGuidelines);
     errdefer freeStringArray(a, prompt_guidelines);
 
     const parameters = spec.requiredJsonTable("input", lua_runtime.default_json_convert_limits) catch |err| switch (err) {
@@ -200,6 +200,71 @@ fn optionalDisplayCall(
     const slice = ptr[0..len];
     if (!std.unicode.utf8ValidateSlice(slice)) return error.InvalidUtf8;
     return try allocator.dupe(u8, slice);
+}
+
+fn optionalPromptSnippet(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+    invalid_err: BuildError,
+) BuildError!?[]const u8 {
+    _ = c.lua_getfield(L, table_idx, "prompt");
+    defer c.lua_pop(L, 1);
+    const prompt_type = c.lua_type(L, -1);
+    if (prompt_type == c.LUA_TNIL) return null;
+    if (prompt_type != c.LUA_TTABLE) return invalid_err;
+
+    _ = c.lua_getfield(L, -1, "snippet");
+    defer c.lua_pop(L, 1);
+    const snippet_type = c.lua_type(L, -1);
+    if (snippet_type == c.LUA_TNIL) return null;
+    if (snippet_type != c.LUA_TSTRING) return invalid_err;
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len) orelse return invalid_err;
+    const slice = ptr[0..len];
+    if (!std.unicode.utf8ValidateSlice(slice)) return error.InvalidUtf8;
+    return try allocator.dupe(u8, slice);
+}
+
+fn optionalPromptGuidelines(
+    L: *c.lua_State,
+    table_idx: c_int,
+    allocator: std.mem.Allocator,
+    invalid_err: BuildError,
+) BuildError![]const []const u8 {
+    _ = c.lua_getfield(L, table_idx, "prompt");
+    defer c.lua_pop(L, 1);
+    const prompt_type = c.lua_type(L, -1);
+    if (prompt_type == c.LUA_TNIL) return &.{};
+    if (prompt_type != c.LUA_TTABLE) return invalid_err;
+
+    _ = c.lua_getfield(L, -1, "guidelines");
+    defer c.lua_pop(L, 1);
+    const guidelines_type = c.lua_type(L, -1);
+    if (guidelines_type == c.LUA_TNIL) return &.{};
+    if (guidelines_type != c.LUA_TTABLE) return invalid_err;
+
+    const len = c.lua_rawlen(L, -1);
+    if (len == 0) return &.{};
+    const out = try allocator.alloc([]const u8, len);
+    errdefer allocator.free(out);
+    var written: usize = 0;
+    errdefer {
+        for (out[0..written]) |s| allocator.free(s);
+    }
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        _ = c.lua_rawgeti(L, -1, @intCast(i + 1));
+        defer c.lua_pop(L, 1);
+        if (c.lua_type(L, -1) != c.LUA_TSTRING) return invalid_err;
+        var item_len: usize = 0;
+        const ptr = c.lua_tolstring(L, -1, &item_len) orelse return invalid_err;
+        const slice = ptr[0..item_len];
+        if (!std.unicode.utf8ValidateSlice(slice)) return error.InvalidUtf8;
+        out[written] = try allocator.dupe(u8, slice);
+        written += 1;
+    }
+    return out;
 }
 
 fn freeBuiltTool(allocator: std.mem.Allocator, tool: *tool_registry.ToolDefinition) void {

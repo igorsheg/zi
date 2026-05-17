@@ -1,225 +1,106 @@
-local function ui_toast(ctx, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.notify) then return end
-  local opts = { id = "notice", level = "info" }
-  if type(tone) == "string" then opts.level = tone end
-  if type(tone) == "table" then
-    opts.level = tone.level or tone.kind or tone.tone or opts.level
-    opts.id = tone.id or opts.id
-    opts.group = tone.group
-    opts.title = tone.title
-    opts.annote = tone.annote
-    opts.progress = tone.progress
-    opts.done = tone.done
-  end
-  if opts.level == "warning" then opts.level = "warn" end
-  if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify.show(tostring(text or ""), opts)
-end
-
-local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
-  ctx.ui.view.set({ id = id, slot = "status", root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } } })
-end
-
-local function ui_status_spec(ctx, spec)
-  if spec == nil then return end
-  ui_status(ctx, spec.id or "status", spec.text or spec.title or "", spec.tone or "info")
-end
-
-local function ui_progress_spec(ctx, spec)
-  if not (ctx and ctx.ui and ctx.ui.view.set and spec) then return end
-  ctx.ui.view.set({ id = spec.id or "progress", slot = "status", root = { type = "progress", value = spec.current and spec.total and (spec.current / spec.total) or nil, label = spec.text or spec.title or spec.status or "working" } })
-end
-
-local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
-  ctx.ui.view.set({ id = id or "report", slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" }, keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } }, root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = { { type = "text", text = tostring(body or "") } } } })
-end
-
-local function ui_report_spec(ctx, spec)
-  ui_report(ctx, spec and spec.id or "report", spec and spec.title or "Report", spec and spec.body or "")
-end
-
-local function ui_toast(ctx, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.notify) then return end
-  local opts = { id = "notice", level = "info" }
-  if type(tone) == "string" then opts.level = tone end
-  if type(tone) == "table" then
-    opts.level = tone.level or tone.kind or tone.tone or opts.level
-    opts.id = tone.id or opts.id
-    opts.group = tone.group
-    opts.title = tone.title
-    opts.annote = tone.annote
-    opts.progress = tone.progress
-    opts.done = tone.done
-  end
-  if opts.level == "warning" then opts.level = "warn" end
-  if opts.level == "danger" then opts.level = "error" end
-  ctx.ui.notify.show(tostring(text or ""), opts)
-end
-
-local function ui_status(ctx, id, text, tone)
-  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
-  ctx.ui.view.set({
-    id = id,
-    slot = "status",
-    root = { type = "text", text = tostring(text or ""), style = { tone = tone or "info" } },
-  })
-end
-
-local function ui_report(ctx, id, title, body)
-  if not (ctx and ctx.ui and ctx.ui.view.set) then return end
-  ctx.ui.view.set({
-    id = id or "report",
-    slot = { kind = "overlay", width = "80%", max_height = "80%", anchor = "center", backdrop = "dim" },
-    keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
-    root = { type = "view", style = { chrome = { kind = "frame", title = title, border = "rounded", tone = "muted" }, padding = 1 }, children = {
-      { type = "text", text = tostring(body or "") },
-    } },
-  })
-end
 return function(zi)
   local todos = {}
   local next_id = 1
 
-  local function clone_todos()
-    local out = {}
-    for i, todo in ipairs(todos) do
-      out[i] = { id = todo.id, text = todo.text, done = todo.done }
-    end
-    return out
+  local function snapshot()
+    local items = {}
+    for i, item in ipairs(todos) do items[i] = { id = item.id, text = item.text, done = item.done } end
+    return { next_id = next_id, items = items }
   end
 
-  local function hydrate(ctx)
-    todos = {}
-    next_id = 1
-    if not ctx or not ctx.session then return end
+  local function restore(ctx)
+    if not (ctx.session and ctx.session.artifacts) then return end
+    local artifacts = nil
+    if ctx.session.artifacts.list then
+      artifacts = ctx.session.artifacts.list({ kind = "todo_state", key = "main", limit = 1 })
+    elseif type(ctx.session.artifacts) == "function" then
+      artifacts = ctx.session.artifacts({ kind = "todo_state", key = "main", limit = 1 })
+    end
+    local latest = artifacts and artifacts[1]
+    if latest and latest.data then
+      todos = latest.data.items or {}
+      next_id = latest.data.next_id or 1
+    end
+  end
 
-    for _, result in ipairs(ctx.session.tool_results("todo")) do
-      local d = result.details
-      if type(d) == "table" then
-        todos = d.todos or {}
-        next_id = d.nextId or 1
-      end
+  local function persist(ctx)
+    if not ctx.session then return end
+    local state = snapshot()
+    if ctx.session.artifacts and ctx.session.artifacts.append then
+      ctx.session.artifacts.append({ kind = "todo_state", key = "main", title = "Todo state", data = state })
+    elseif ctx.session.append_artifact then
+      ctx.session.append_artifact({ kind = "todo_state", key = "main", title = "Todo state", data = state })
     end
   end
 
   local function list_text()
     if #todos == 0 then return "No todos" end
     local lines = {}
-    for i, todo in ipairs(todos) do
-      lines[i] = string.format("[%s] #%d: %s", todo.done and "x" or " ", todo.id, todo.text)
-    end
+    for i, item in ipairs(todos) do lines[i] = string.format("[%s] #%d %s", item.done and "x" or " ", item.id, item.text) end
     return table.concat(lines, "\n")
   end
 
-
-  local function details(action, err)
-    return { action = action, todos = clone_todos(), nextId = next_id, error = err }
-  end
-
-  local function find_todo(id)
-    for _, todo in ipairs(todos) do
-      if todo.id == id then return todo end
-    end
+  local function find(id)
+    for _, item in ipairs(todos) do if item.id == id then return item end end
     return nil
   end
 
   zi.define.tool({
     name = "todo",
     label = "Todo",
-    description = "Manage a todo list. Actions: list, add (text), toggle (id), clear",
+    description = "Manage a session-local todo list. Actions: list, add, toggle, clear.",
     input = {
       type = "object",
       properties = {
         action = { type = "string", enum = { "list", "add", "toggle", "clear" } },
-        text = { type = "string", description = "Todo text for add" },
-        id = { type = "number", description = "Todo id for toggle" },
+        text = { type = "string", description = "Todo text for add." },
+        id = { type = "number", description = "Todo id for toggle." },
       },
       required = { "action" },
     },
-    run = function(ctx, params)
-      hydrate(ctx)
-      local action = params.action
+    display = { call = "action" },
+    run = function(ctx, input)
+      restore(ctx)
+      local action = input.action
       if action == "list" then
-        return { content = { { type = "text", text = list_text() } }, details = details("list") }
-      end
-
-      if action == "add" then
-        if not params.text or params.text == "" then
-          return {
-            content = { { type = "text", text = "Error: text required for add" } },
-            is_error = true,
-            details = details("add", "text required"),
-          }
-        end
-        local todo = { id = next_id, text = params.text, done = false }
+        return { content = { { type = "text", text = list_text() } }, metadata = snapshot() }
+      elseif action == "add" then
+        if not input.text or input.text == "" then return { content = { { type = "text", text = "text is required" } }, is_error = true } end
+        todos[#todos + 1] = { id = next_id, text = input.text, done = false }
         next_id = next_id + 1
-        todos[#todos + 1] = todo
-        return { content = { { type = "text", text = string.format("Added todo #%d: %s", todo.id, todo.text) } }, details = details("add") }
+        persist(ctx)
+        return { content = { { type = "text", text = list_text() } }, metadata = snapshot() }
+      elseif action == "toggle" then
+        local item = find(input.id)
+        if not item then return { content = { { type = "text", text = "todo not found" } }, is_error = true, metadata = snapshot() } end
+        item.done = not item.done
+        persist(ctx)
+        return { content = { { type = "text", text = list_text() } }, metadata = snapshot() }
+      elseif action == "clear" then
+        todos = {}; next_id = 1; persist(ctx)
+        return { content = { { type = "text", text = "Cleared todos" } }, metadata = snapshot() }
       end
-
-      if action == "toggle" then
-        if params.id == nil then
-          return {
-            content = { { type = "text", text = "Error: id required for toggle" } },
-            is_error = true,
-            details = details("toggle", "id required"),
-          }
-        end
-        local todo = find_todo(params.id)
-        if not todo then
-          return {
-            content = { { type = "text", text = string.format("Todo #%d not found", params.id) } },
-            is_error = true,
-            details = details("toggle", string.format("#%d not found", params.id)),
-          }
-        end
-        todo.done = not todo.done
-        return {
-          content = { { type = "text", text = string.format("Todo #%d %s", todo.id, todo.done and "completed" or "uncompleted") } },
-          details = details("toggle"),
-        }
-      end
-
-      if action == "clear" then
-        local count = #todos
-        todos = {}
-        next_id = 1
-        return { content = { { type = "text", text = string.format("Cleared %d todos", count) } }, details = details("clear") }
-      end
-
-      return {
-        content = { { type = "text", text = "Unknown action: " .. tostring(action) } },
-        is_error = true,
-        details = details("list", "unknown action: " .. tostring(action)),
-      }
+      return { content = { { type = "text", text = "unknown action" } }, is_error = true }
     end,
   })
-
-  zi.define.event("session_start", function(ctx, _)
-    hydrate(ctx)
-  end)
-
-  zi.define.event("session_tree", function(ctx, _)
-    hydrate(ctx)
-  end)
 
   zi.define.command({
     name = "todos",
-    description = "Show all todos on the current session branch",
-    run = function(ctx, _)
-      hydrate(ctx)
-      if ctx and ctx.ui and ctx.ui.view.set then
-        ui_report_spec(ctx, {
-          id = "todos",
-          title = "Todos",
-          body = list_text(),
-          transient = true,
+    description = "Show todos in an overlay.",
+    run = function(ctx, _input)
+      restore(ctx)
+      if ctx.ui and ctx.ui.view then
+        ctx.ui.view.set({
+          id = "example-todos",
+          slot = { kind = "overlay", width = "60%", max_height = "70%", anchor = "center", backdrop = "dim" },
+          keys = { { key = "escape", action = "close" }, { key = "q", action = "close" } },
+          root = { type = "view", style = { chrome = { kind = "frame", title = "Todos", border = "rounded" }, padding = 1 }, children = { { type = "text", text = list_text() } } },
         })
-        return
       end
-      return list_text()
     end,
   })
+
+  zi.define.event("ui", function(ctx, event)
+    if event.view == "example-todos" and event.action == "close" and ctx.ui and ctx.ui.view then ctx.ui.view.set({ id = "example-todos", remove = true }) end
+  end)
 end

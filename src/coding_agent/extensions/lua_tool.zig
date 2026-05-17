@@ -659,7 +659,7 @@ fn parseReturn(
         c.lua_pop(L, 1);
 
         var details: std.json.Value = .null;
-        _ = c.lua_getfield(L, idx, "details");
+        _ = c.lua_getfield(L, idx, "metadata");
         if (c.lua_type(L, -1) != c.LUA_TNIL) {
             var budget = lua_runtime.JsonConvertBudget{ .limits = limits.details };
             details = lua_runtime.luaValueToJsonLimited(L, -1, allocator, &budget) catch .null;
@@ -667,12 +667,6 @@ fn parseReturn(
         c.lua_pop(L, 1);
 
         var presentation: std.json.Value = .null;
-        _ = c.lua_getfield(L, idx, "presentation");
-        if (c.lua_type(L, -1) != c.LUA_TNIL) {
-            presentation = lua_runtime.luaValueToPresentationJson(L, -1, allocator, limits.presentation) catch .null;
-        }
-        c.lua_pop(L, 1);
-
         _ = c.lua_getfield(L, idx, "content");
         defer c.lua_pop(L, 1);
 
@@ -681,12 +675,11 @@ fn parseReturn(
         if (content_ty == c.LUA_TSTRING) {
             var result = try boundedTextResult(allocator, lstring(L, -1), is_error, limits);
             result.details = details;
-            result.presentation = presentation;
             return result;
         }
 
         if (content_ty == c.LUA_TTABLE) {
-            const blocks = try parseContentBlocks(allocator, L, -1, limits);
+            const blocks = try parseContentBlocks(allocator, L, -1, limits, &presentation);
             return .{ .content = blocks, .is_error = is_error, .details = details, .presentation = presentation };
         }
 
@@ -701,6 +694,7 @@ fn parseContentBlocks(
     L: *c.lua_State,
     idx: c_int,
     limits: ToolResultLimits,
+    presentation: *std.json.Value,
 ) ![]const AgentToolResult.ContentBlock {
     const len = c.lua_rawlen(L, idx);
     if (len == 0 or limits.max_blocks == 0 or limits.max_text_bytes == 0) return &.{};
@@ -717,8 +711,38 @@ fn parseContentBlocks(
         defer c.lua_pop(L, 1);
 
         if (c.lua_type(L, -1) != c.LUA_TTABLE) continue;
+        const block_idx = c.lua_absindex(L, -1);
 
-        _ = c.lua_getfield(L, -1, "text");
+        _ = c.lua_getfield(L, block_idx, "type");
+        defer c.lua_pop(L, 1);
+        const kind = if (c.lua_type(L, -1) == c.LUA_TSTRING) lstring(L, -1) else "text";
+
+        if (std.mem.eql(u8, kind, "doc")) {
+            if (presentation.* == .null) {
+                _ = c.lua_getfield(L, block_idx, "doc");
+                defer c.lua_pop(L, 1);
+                if (c.lua_type(L, -1) != c.LUA_TNIL) {
+                    presentation.* = lua_runtime.luaValueToPresentationJson(L, -1, allocator, limits.presentation) catch .null;
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, kind, "json")) {
+            _ = c.lua_getfield(L, block_idx, "value");
+            defer c.lua_pop(L, 1);
+            if (c.lua_type(L, -1) == c.LUA_TNIL) continue;
+            var json_budget = lua_runtime.JsonConvertBudget{ .limits = limits.details };
+            const value = lua_runtime.luaValueToJsonLimited(L, -1, allocator, &json_budget) catch continue;
+            defer lua_runtime.freeJsonValue(allocator, value);
+            const rendered = stringifyJson(allocator, value) catch continue;
+            defer allocator.free(rendered);
+            const text = try dupeTextWithBudget(allocator, rendered, &budget);
+            try blocks.append(allocator, .{ .text = .{ .text = text } });
+            continue;
+        }
+
+        _ = c.lua_getfield(L, block_idx, "text");
         defer c.lua_pop(L, 1);
         if (c.lua_type(L, -1) != c.LUA_TSTRING) continue;
 
@@ -756,6 +780,14 @@ fn boundedTextResult(
     const blocks = try allocator.alloc(AgentToolResult.ContentBlock, 1);
     blocks[0] = .{ .text = .{ .text = dup } };
     return .{ .content = blocks, .is_error = is_error };
+}
+
+fn stringifyJson(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
+    try jw.write(value);
+    return try allocator.dupe(u8, out.written());
 }
 
 const TextBudget = struct { remaining: usize };
@@ -871,20 +903,22 @@ test "parseReturn enforces content block count limit" {
     try testing.expectEqual(default_tool_result_limits.max_blocks, result.content.len);
 }
 
-test "parseReturn preserves presentation shape while bounding oversized strings" {
+test "parseReturn accepts v4 metadata and doc content while bounding oversized strings" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
     const result = try parseLuaGlobalResult(arena.allocator(),
         \\result = {
-        \\  content = { { type = 'text', text = 'ok' } },
-        \\  presentation = {
-        \\    kind = 'tree',
-        \\    summary = string.rep('a', 200 * 1024),
+        \\  content = {
+        \\    { type = 'text', text = 'ok' },
+        \\    { type = 'doc', doc = { kind = 'tree', summary = string.rep('a', 200 * 1024) } },
         \\  },
+        \\  metadata = { kind = 'meta' },
         \\}
     , "huge_presentation_result", default_tool_result_limits);
 
+    try testing.expect(result.details == .object);
+    try testing.expectEqualStrings("meta", result.details.object.get("kind").?.string);
     try testing.expect(result.presentation == .object);
     const obj = result.presentation.object;
     try testing.expectEqualStrings("tree", obj.get("kind").?.string);
@@ -1033,7 +1067,7 @@ test "lua tool ctx exposes binding from tool provenance" {
         \\    assert(ctx.context_usage == nil)
         \\    assert(ctx.system_prompt == nil)
         \\    return {
-        \\      details = {
+        \\      metadata = {
         \\        state_owner_id = ctx.env.state_owner_id,
         \\        generation_id = ctx.env.generation_id,
         \\        namespace_id = ctx.env.namespace_id,
@@ -1123,20 +1157,20 @@ fn loadTodoFixture(state: *lua_runtime.LuaState, runner: *runner_mod.ExtensionRu
         \\  run = function(ctx, params)
         \\    local action = params.action
         \\    if action == "list" then
-        \\      return { content = { { type = "text", text = list_text() } }, details = details("list") }
+        \\      return { content = { { type = "text", text = list_text() } }, metadata = details("list") }
         \\    end
         \\    if action == "add" then
         \\      local todo = { id = next_id, text = params.text, done = false }
         \\      next_id = next_id + 1
         \\      todos[#todos + 1] = todo
-        \\      return { content = { { type = "text", text = string.format("Added todo #%d: %s", todo.id, todo.text) } }, details = details("add") }
+        \\      return { content = { { type = "text", text = string.format("Added todo #%d: %s", todo.id, todo.text) } }, metadata = details("add") }
         \\    end
         \\    if action == "toggle" then
         \\      local todo = find_todo(params.id)
         \\      todo.done = not todo.done
-        \\      return { content = { { type = "text", text = string.format("Todo #%d %s", todo.id, todo.done and "completed" or "uncompleted") } }, details = details("toggle") }
+        \\      return { content = { { type = "text", text = string.format("Todo #%d %s", todo.id, todo.done and "completed" or "uncompleted") } }, metadata = details("toggle") }
         \\    end
-        \\    return { content = { { type = "text", text = "Unknown action" } }, is_error = true, details = details("list", "unknown action") }
+        \\    return { content = { { type = "text", text = "Unknown action" } }, is_error = true, metadata = details("list", "unknown action") }
         \\  end,
         \\})
         \\
@@ -1598,15 +1632,15 @@ test "extension command context exposes read-only session ui_publication" {
         \\    assert(#messages == 1)
         \\    assert(messages[1].role == "assistant")
         \\    assert(messages[1].text == "hi")
-        \\    assert(ctx.session.append_note({ kind = "manual", title = "Note", body = "remember", source_entry_id = "entry-2" }) == true)
-        \\    local notes = ctx.session.notes({ kind = "manual", source_entry_id = "entry-2" })
+        \\    assert(ctx.session.notes.append("remember", { kind = "manual", title = "Note", source_entry_id = "entry-2" }) == true)
+        \\    local notes = ctx.session.notes.list({ kind = "manual", source_entry_id = "entry-2" })
         \\    assert(#notes == 1)
         \\    assert(notes[1].title == "Note")
         \\    assert(notes[1].body == "remember")
         \\    assert(notes[1].source_entry_id == "entry-2")
-        \\    assert(#ctx.session.notes({ source_entry_id = "missing" }) == 0)
-        \\    assert(ctx.session.append_artifact({ kind = "todo_state", key = "main", title = "Todo state", data = { next_id = 3, items = { "a", "b" } } }) == true)
-        \\    local artifacts = ctx.session.artifacts({ kind = "todo_state", key = "main" })
+        \\    assert(#ctx.session.notes.list({ source_entry_id = "missing" }) == 0)
+        \\    assert(ctx.session.artifacts.append({ kind = "todo_state", key = "main", title = "Todo state", data = { next_id = 3, items = { "a", "b" } } }) == true)
+        \\    local artifacts = ctx.session.artifacts.list({ kind = "todo_state", key = "main" })
         \\    assert(#artifacts == 1)
         \\    assert(artifacts[1].entry_id == "artifact-1")
         \\    assert(artifacts[1].owner_id == "state-123")
@@ -1615,7 +1649,7 @@ test "extension command context exposes read-only session ui_publication" {
         \\    assert(artifacts[1].title == "Todo state")
         \\    assert(artifacts[1].data.next_id == 3)
         \\    assert(artifacts[1].data.items[2] == "b")
-        \\    assert(#ctx.session.artifacts({ key = "missing" }) == 0)
+        \\    assert(#ctx.session.artifacts.list({ key = "missing" }) == 0)
         \\    assert(ctx.session.label("entry-2", "important") == true)
         \\    local labels = ctx.session.labels({ target_entry_id = "entry-2" })
         \\    assert(#labels == 1)

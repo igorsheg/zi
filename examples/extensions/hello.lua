@@ -2,18 +2,19 @@ return function(zi)
   zi.define.tool({
     name = "greet",
     label = "Greeting",
-    description = "Generate a friendly greeting for a named person.",
+    description = "Generate a greeting for a named person.",
     input = {
       type = "object",
       properties = {
-        name = { type = "string", description = "Name to greet; defaults to world." },
+        name = { type = "string", description = "Name to greet. Defaults to world." },
       },
     },
-    run = function(params)
-      local name = params and params.name or "world"
+    display = { call = "name" },
+    run = function(_ctx, input)
+      local name = input and input.name or "world"
       return {
-        content = { { type = "text", text = "Hello, " .. tostring(name) .. "!" } },
-        details = { name = name },
+        content = { { type = "text", text = "Hello, " .. tostring(name) .. "." } },
+        metadata = { name = name },
       }
     end,
   })

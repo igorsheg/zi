@@ -1,147 +1,39 @@
 return function(zi)
-  local MAX_LINES = 2000
   local MAX_BYTES = 50 * 1024
 
-  local function shell_quote(value)
-    local s = tostring(value or "")
-    return "'" .. string.gsub(s, "'", "'\\''") .. "'"
-  end
-
-  local function format_size(bytes)
-    if bytes >= 1024 * 1024 then return string.format("%.1f MiB", bytes / (1024 * 1024)) end
-    if bytes >= 1024 then return string.format("%.1f KiB", bytes / 1024) end
-    return tostring(bytes) .. " B"
-  end
-
-  local function line_count(text)
-    if text == "" then return 0 end
-    local count = 1
-    for _ in string.gmatch(text, "\n") do count = count + 1 end
-    if string.sub(text, -1) == "\n" then count = count - 1 end
-    return count
-  end
-
-  local function truncate_head(text, max_lines, max_bytes)
-    local total_bytes = #text
-    local total_lines = line_count(text)
-    local out = {}
-    local out_bytes = 0
-    local out_lines = 0
-
-    for line in string.gmatch(text, "([^\n]*)\n?") do
-      if line == "" and out_lines >= total_lines then break end
-      local line_bytes = #line + 1
-      if out_lines >= max_lines or out_bytes + line_bytes > max_bytes then break end
-      out[#out + 1] = line
-      out_lines = out_lines + 1
-      out_bytes = out_bytes + line_bytes
-    end
-
-    local content = table.concat(out, "\n")
-    local truncated = total_lines > out_lines or total_bytes > #content
-    return {
-      content = content,
-      truncated = truncated,
-      totalLines = total_lines,
-      outputLines = out_lines,
-      totalBytes = total_bytes,
-      outputBytes = #content,
-    }
-  end
-
-  local function write_full_output(output)
-    local path = os.tmpname()
-    local file = io.open(path, "w")
-    if not file then return nil end
-    file:write(output)
-    file:close()
-    return path
-  end
-
-  local function run_rg(params, cwd)
-    local cmd = "cd " .. shell_quote(cwd or ".") .. " && rg --line-number --color=never"
-    if params.glob and params.glob ~= "" then
-      cmd = cmd .. " --glob " .. shell_quote(params.glob)
-    end
-    cmd = cmd .. " " .. shell_quote(params.pattern) .. " " .. shell_quote(params.path or ".") .. " 2>&1"
-
-    local pipe = io.popen(cmd)
-    if not pipe then return nil, "failed to start rg" end
-    local output = pipe:read("*a") or ""
-    local ok, reason, code = pipe:close()
-    if ok or code == 1 then return output, nil end
-    return output, "rg failed: " .. tostring(reason or code)
+  local function truncate(text)
+    text = tostring(text or "")
+    if #text <= MAX_BYTES then return text, false end
+    return text:sub(1, MAX_BYTES) .. "\n\n[output truncated]", true
   end
 
   zi.define.tool({
     name = "rg_demo",
     label = "ripgrep demo",
-    description = "Search with ripgrep. Output is bounded to 2000 lines or 50 KiB; truncated full output is saved to a temp file.",
+    description = "Search with ripgrep and bound the returned output.",
     input = {
       type = "object",
       properties = {
-        pattern = { type = "string", description = "Search pattern (regex)" },
-        path = { type = "string", description = "Directory/file to search; defaults to ." },
-        glob = { type = "string", description = "Optional rg glob, e.g. *.zig" },
+        pattern = { type = "string", description = "Search pattern." },
+        path = { type = "string", description = "Path to search. Defaults to current directory." },
+        glob = { type = "string", description = "Optional rg glob." },
       },
       required = { "pattern" },
     },
-    run = function(ctx, params)
-      local output, err = run_rg(params, ctx and ctx.env.cwd or ".")
-      if err then
-        return {
-          content = { { type = "text", text = err .. "\n" .. (output or "") } },
-          is_error = true,
-          details = { pattern = params.pattern, path = params.path, glob = params.glob, error = err },
-        }
+    display = { call = "pattern" },
+    run = function(ctx, input)
+      local argv = { "rg", "--line-number", "--color=never" }
+      if input.glob and input.glob ~= "" then argv[#argv + 1] = "--glob"; argv[#argv + 1] = input.glob end
+      argv[#argv + 1] = input.pattern
+      argv[#argv + 1] = input.path or "."
+      local result = ctx.process.run(argv, { cwd = ctx.env and ctx.env.cwd or ".", max_stdout_bytes = MAX_BYTES + 1024, max_stderr_bytes = 8192 })
+      local output = tostring(result.stdout or "") .. tostring(result.stderr or "")
+      if result.status ~= "completed" or (result.code ~= 0 and result.code ~= 1) then
+        return { content = { { type = "text", text = output ~= "" and output or tostring(result.error or "rg failed") } }, is_error = true, metadata = { code = result.code, status = result.status } }
       end
-
-      if not output or output == "" then
-        return {
-          content = { { type = "text", text = "No matches found" } },
-          details = { pattern = params.pattern, path = params.path, glob = params.glob, matchCount = 0 },
-        }
-      end
-
-      local trunc = truncate_head(output, MAX_LINES, MAX_BYTES)
-      local match_count = line_count(output)
-      local text = trunc.content
-      local full_path = nil
-
-      if trunc.truncated then
-        full_path = write_full_output(output)
-        local omitted_lines = trunc.totalLines - trunc.outputLines
-        local omitted_bytes = trunc.totalBytes - trunc.outputBytes
-        text = text .. string.format(
-          "\n\n[Output truncated: showing %d of %d lines (%s of %s). %d lines (%s) omitted.%s]",
-          trunc.outputLines,
-          trunc.totalLines,
-          format_size(trunc.outputBytes),
-          format_size(trunc.totalBytes),
-          omitted_lines,
-          format_size(omitted_bytes),
-          full_path and (" Full output saved to: " .. full_path) or ""
-        )
-      end
-
-      return {
-        content = { { type = "text", text = text } },
-        details = {
-          pattern = params.pattern,
-          path = params.path,
-          glob = params.glob,
-          matchCount = match_count,
-          truncation = trunc,
-          fullOutputPath = full_path,
-        },
-        presentation = {
-          schema = "zi.doc.v1",
-          blocks = {
-            { type = "line", spans = { { text = tostring(match_count) .. " matches", style = { role = "success", bold = true } }, { text = trunc.truncated and " truncated" or "", style = { role = "warning" } } } },
-            { type = "text", text = text, collapsed_lines = 20 },
-          },
-        },
-      }
+      if output == "" then output = "No matches found" end
+      local text, was_truncated = truncate(output)
+      return { content = { { type = "text", text = text } }, metadata = { pattern = input.pattern, path = input.path, glob = input.glob, truncated = was_truncated } }
     end,
   })
 end
