@@ -1,12 +1,39 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const json_value = @import("../json/value.zig");
-const string_util = @import("../lib/string_util.zig");
 
 pub const cloneJsonValue = json_value.cloneJsonValue;
 pub const freeJsonValue = json_value.freeJsonValue;
 pub const jsonToFloat = json_value.jsonToFloat;
-pub const utf8LossyAlloc = string_util.utf8LossyAlloc;
+
+pub fn utf8LossyAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(bytes)) return allocator.dupe(u8, bytes);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
+            try out.appendSlice(allocator, "\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        };
+        if (i + len > bytes.len) {
+            try out.appendSlice(allocator, "\xEF\xBF\xBD");
+            break;
+        }
+        _ = std.unicode.utf8Decode(bytes[i .. i + len]) catch {
+            try out.appendSlice(allocator, "\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        };
+        try out.appendSlice(allocator, bytes[i .. i + len]);
+        i += len;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
 
 pub fn providerToString(p: protocol.Provider) []const u8 {
     return switch (p) {

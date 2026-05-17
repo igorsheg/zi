@@ -2,7 +2,6 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
-const time_util = @import("../lib/time_util.zig");
 const context_usage = @import("context_usage.zig");
 
 pub const SessionContext = struct {
@@ -99,7 +98,7 @@ pub fn buildSessionContext(
         try messages.append(allocator, .{ .compaction_summary = .{
             .summary = cd.summary,
             .tokens_before = cd.tokens_before,
-            .timestamp = time_util.isoToEpochMs(path[compaction_path_pos.?].timestamp),
+            .timestamp = isoToEpochMs(path[compaction_path_pos.?].timestamp),
         } });
 
         const compaction_pos = compaction_path_pos.?;
@@ -154,7 +153,7 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
                 .content = cm.content,
                 .display = cm.display,
                 .details = cm.details,
-                .timestamp = time_util.isoToEpochMs(entry.timestamp),
+                .timestamp = isoToEpochMs(entry.timestamp),
             } };
         },
         .branch_summary => |bs| {
@@ -162,13 +161,75 @@ fn extractMessage(entry: *const proto.SessionEntry) ?agent.protocol.AgentMessage
                 return .{ .branch_summary = .{
                     .summary = bs.summary,
                     .from_id = bs.from_id,
-                    .timestamp = time_util.isoToEpochMs(entry.timestamp),
+                    .timestamp = isoToEpochMs(entry.timestamp),
                 } };
             }
             return null;
         },
         else => return null,
     }
+}
+
+fn isoToEpochMs(timestamp: []const u8) i64 {
+    const secs = parseIsoToEpochSeconds(timestamp) orelse return 0;
+    return secs * 1000;
+}
+
+const ParsedIsoTimestamp = struct {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+};
+
+fn parseIsoToEpochSeconds(timestamp: []const u8) ?i64 {
+    const parts = parseIsoTimestamp(timestamp) orelse return null;
+    const m_idx: usize = @intCast(parts.month - 1);
+    const max_day = daysInMonth(parts.year, parts.month);
+    if (parts.day < 1 or parts.day > max_day) return null;
+
+    const y = parts.year - 1;
+    const era_days = y * 365 + @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400);
+    const month_days = [_]i64{ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    var days = era_days + month_days[m_idx] + parts.day;
+    if (parts.month > 2 and isLeapYear(parts.year)) days += 1;
+
+    const unix_days = days - 719163;
+    return unix_days * 86400 + parts.hour * 3600 + parts.minute * 60 + parts.second;
+}
+
+fn parseIsoTimestamp(timestamp: []const u8) ?ParsedIsoTimestamp {
+    if (timestamp.len < 19) return null;
+    if (timestamp[4] != '-' or timestamp[7] != '-' or timestamp[10] != 'T' or timestamp[13] != ':' or timestamp[16] != ':') return null;
+
+    const year = std.fmt.parseInt(i64, timestamp[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, timestamp[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, timestamp[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(i64, timestamp[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(i64, timestamp[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(i64, timestamp[17..19], 10) catch return null;
+
+    if (month < 1 or month > 12) return null;
+    if (hour < 0 or hour > 23) return null;
+    if (minute < 0 or minute > 59) return null;
+    if (second < 0 or second > 59) return null;
+
+    return .{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second };
+}
+
+fn isLeapYear(year: i64) bool {
+    return (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
+}
+
+fn daysInMonth(year: i64, month: i64) i64 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => 0,
+    };
 }
 
 fn testMsg(allocator: std.mem.Allocator, id: []const u8, parent_id: ?[]const u8, role: enum { user, assistant }, text: []const u8) proto.SessionEntry {
