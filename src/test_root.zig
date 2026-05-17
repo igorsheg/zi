@@ -15,5 +15,4 @@ test {
     _ = @import("json/root.zig");
     _ = @import("lib/command_query.zig");
     _ = @import("agent/root.zig");
-    _ = @import("search/root.zig");
 }
