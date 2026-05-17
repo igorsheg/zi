@@ -2,7 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
-const json_util = ai.json_util;
+const json_text = @import("../json/text.zig");
 const json_value = @import("../json/value.zig");
 
 const Stringify = std.json.Stringify;
@@ -212,9 +212,9 @@ pub fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: 
     try jw.endArray();
 
     try jw.objectField("api");
-    try jw.write(ai.provider.apiToString(msg.api));
+    try jw.write(ai.protocol.apiToString(msg.api));
     try jw.objectField("provider");
-    try jw.write(json_util.providerToString(msg.provider));
+    try jw.write(ai.protocol.providerToString(msg.provider));
     try jw.objectField("model");
     try jw.write(msg.model);
 
@@ -227,7 +227,7 @@ pub fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: 
     try writeUsage(jw, msg.usage);
 
     try jw.objectField("stopReason");
-    try jw.write(json_util.stopReasonToString(msg.stop_reason));
+    try jw.write(ai.protocol.stopReasonToString(msg.stop_reason));
 
     if (msg.error_message) |em| {
         try jw.objectField("errorMessage");
@@ -343,7 +343,7 @@ pub fn writeTextBlock(allocator: std.mem.Allocator, jw: *Stringify, tc: ai.proto
     try jw.objectField("type");
     try jw.write("text");
     try jw.objectField("text");
-    const sanitized = try json_util.utf8LossyAlloc(allocator, tc.text);
+    const sanitized = try json_text.utf8LossyAlloc(allocator, tc.text);
     defer allocator.free(sanitized);
     try jw.write(sanitized);
     if (tc.text_signature) |sig| {
@@ -652,8 +652,8 @@ fn parseAssistantMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) 
 
     return .{
         .content = blocks,
-        .api = json_util.parseApi(obj.get("api").?.string),
-        .provider = json_util.parseProvider(obj.get("provider").?.string),
+        .api = ai.protocol.parseApi(obj.get("api").?.string),
+        .provider = ai.protocol.parseProvider(obj.get("provider").?.string),
         .model = try allocator.dupe(u8, obj.get("model").?.string),
         .response_id = if (obj.get("responseId")) |v| try allocator.dupe(u8, v.string) else null,
         .usage = .{
@@ -670,7 +670,7 @@ fn parseAssistantMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) 
                 .total = json_value.jsonToFloat(cost_obj.get("total").?),
             },
         },
-        .stop_reason = json_util.parseStopReason(obj.get("stopReason").?.string),
+        .stop_reason = ai.protocol.parseStopReason(obj.get("stopReason").?.string),
         .error_message = if (obj.get("errorMessage")) |v| try allocator.dupe(u8, v.string) else null,
         .failure = if (obj.get("failure")) |v| try parseNormalizedFailure(allocator, v.object) else null,
         .timestamp = @intCast(obj.get("timestamp").?.integer),

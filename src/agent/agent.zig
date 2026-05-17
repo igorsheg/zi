@@ -718,8 +718,7 @@ fn testStream(
     _: protocol.Model,
     _: ai.protocol.Context,
     _: ai.protocol.SimpleStreamOptions,
-    _: ai.provider.EventCallback,
-    _: ?*anyopaque,
+    _: ai.provider.StreamEventSink,
 ) void {}
 
 test "conversation view keeps current turn separate until turn_end" {

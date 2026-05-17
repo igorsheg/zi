@@ -48,7 +48,6 @@ pub const Caps = struct {
     io: std.Io,
     env: runtime_env.Env,
     allocator: std.mem.Allocator,
-    msg_allocator: std.mem.Allocator,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -71,22 +70,6 @@ pub fn main(init: std.process.Init) !void {
         .io = init.io,
         .env = env,
         .allocator = allocator,
-        .msg_allocator = std.heap.smp_allocator,
     };
     _ = caps;
-
-    std.log.info("bootstrap complete", .{});
-
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
-    const writer = &stderr_writer.interface;
-
-    try writer.print(
-        \\zi beta {s}
-        \\core-only rebuild branch
-        \\retained owners: runtime, agent, ai, session, json, lib
-        \\removed owners: coding_agent, tui, zio, spawn, diff, image, search
-        \\
-    , .{build_options.version});
-    try stderr_writer.end();
 }

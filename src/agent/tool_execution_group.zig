@@ -1,6 +1,5 @@
 const std = @import("std");
 const protocol = @import("types.zig");
-const json_util = @import("../ai/json_util.zig");
 const json_value = @import("../json/value.zig");
 
 pub const ToolExecutionEvent = union(enum) {

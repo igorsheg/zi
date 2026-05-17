@@ -98,6 +98,7 @@ pub const Decoder = struct {
 };
 
 const testing = std.testing;
+
 const Collector = struct {
     lines: std.ArrayList([]const u8) = .empty,
     errors: usize = 0,

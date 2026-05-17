@@ -1,6 +1,6 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const json_util = @import("json_util.zig");
+const json_text = @import("../json/text.zig");
 const message_memory = @import("../agent/message_memory.zig");
 const json_value = @import("../json/value.zig");
 
@@ -825,7 +825,7 @@ fn modelSupportsInputType(model: protocol.Model, input_type: protocol.Model.Inpu
 }
 
 fn sanitizeTextAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    return json_util.utf8LossyAlloc(allocator, text);
+    return json_text.utf8LossyAlloc(allocator, text);
 }
 
 fn deinitMessageList(allocator: std.mem.Allocator, messages: []protocol.Message) void {

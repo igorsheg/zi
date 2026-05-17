@@ -43,6 +43,105 @@ pub const Provider = union(enum) {
     custom: []const u8,
 };
 
+pub fn providerToString(p: Provider) []const u8 {
+    return switch (p) {
+        .amazon_bedrock => "amazon-bedrock",
+        .anthropic => "anthropic",
+        .google => "google",
+        .google_gemini_cli => "google-gemini-cli",
+        .google_antigravity => "google-antigravity",
+        .google_vertex => "google-vertex",
+        .openai => "openai",
+        .azure_openai_responses => "azure-openai-responses",
+        .openai_codex => "openai-codex",
+        .github_copilot => "github-copilot",
+        .xai => "xai",
+        .groq => "groq",
+        .cerebras => "cerebras",
+        .openrouter => "openrouter",
+        .vercel_ai_gateway => "vercel-ai-gateway",
+        .zai => "zai",
+        .mistral => "mistral",
+        .minimax => "minimax",
+        .minimax_cn => "minimax-cn",
+        .huggingface => "huggingface",
+        .opencode => "opencode",
+        .opencode_go => "opencode-go",
+        .kimi_coding => "kimi-coding",
+        .custom => |s| s,
+    };
+}
+
+pub fn parseProvider(s: []const u8) Provider {
+    const map = .{
+        .{ "amazon-bedrock", Provider.amazon_bedrock },
+        .{ "anthropic", Provider.anthropic },
+        .{ "google", Provider.google },
+        .{ "google-gemini-cli", Provider.google_gemini_cli },
+        .{ "google-antigravity", Provider.google_antigravity },
+        .{ "google-vertex", Provider.google_vertex },
+        .{ "openai", Provider.openai },
+        .{ "azure-openai-responses", Provider.azure_openai_responses },
+        .{ "openai-codex", Provider.openai_codex },
+        .{ "github-copilot", Provider.github_copilot },
+        .{ "xai", Provider.xai },
+        .{ "groq", Provider.groq },
+        .{ "cerebras", Provider.cerebras },
+        .{ "openrouter", Provider.openrouter },
+        .{ "vercel-ai-gateway", Provider.vercel_ai_gateway },
+        .{ "zai", Provider.zai },
+        .{ "mistral", Provider.mistral },
+        .{ "minimax", Provider.minimax },
+        .{ "minimax-cn", Provider.minimax_cn },
+        .{ "huggingface", Provider.huggingface },
+        .{ "opencode", Provider.opencode },
+        .{ "opencode-go", Provider.opencode_go },
+        .{ "kimi-coding", Provider.kimi_coding },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, s, entry[0])) return entry[1];
+    }
+    return .{ .custom = s };
+}
+
+pub fn parseApi(s: []const u8) Api {
+    const map = .{
+        .{ "openai-completions", Api.openai_completions },
+        .{ "mistral-conversations", Api.mistral_conversations },
+        .{ "openai-responses", Api.openai_responses },
+        .{ "azure-openai-responses", Api.azure_openai_responses },
+        .{ "openai-codex-responses", Api.openai_codex_responses },
+        .{ "anthropic-messages", Api.anthropic_messages },
+        .{ "bedrock-converse-stream", Api.bedrock_converse_stream },
+        .{ "google-generative-ai", Api.google_generative_ai },
+        .{ "google-gemini-cli", Api.google_gemini_cli },
+        .{ "google-vertex", Api.google_vertex },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, s, entry[0])) return entry[1];
+    }
+    return .{ .custom = s };
+}
+
+pub fn stopReasonToString(r: StopReason) []const u8 {
+    return switch (r) {
+        .stop => "stop",
+        .length => "length",
+        .toolUse => "toolUse",
+        .@"error" => "error",
+        .aborted => "aborted",
+    };
+}
+
+pub fn parseStopReason(s: []const u8) StopReason {
+    if (std.mem.eql(u8, s, "stop")) return .stop;
+    if (std.mem.eql(u8, s, "length")) return .length;
+    if (std.mem.eql(u8, s, "toolUse")) return .toolUse;
+    if (std.mem.eql(u8, s, "error")) return .@"error";
+    if (std.mem.eql(u8, s, "aborted")) return .aborted;
+    return .@"error";
+}
+
 pub const ThinkingLevel = enum {
     minimal,
     low,
@@ -102,8 +201,18 @@ pub const StreamOptions = struct {
 
     metadata: ?std.json.Value = null,
 
-    on_payload: ?*const fn (allocator: std.mem.Allocator, payload: std.json.Value, model: *const Model, ctx: ?*anyopaque) ?std.json.Value = null,
-    on_payload_ctx: ?*anyopaque = null,
+    request_transform: ?RequestTransform = null,
+};
+
+pub const RequestTransform = struct {
+    /// Narrow authority to replace a provider request payload during request construction.
+    /// Returned values are borrowed by the provider and cloned before retention.
+    func: *const fn (allocator: std.mem.Allocator, payload: std.json.Value, model: *const Model, ctx: ?*anyopaque) ?std.json.Value,
+    ctx: ?*anyopaque = null,
+
+    pub fn apply(self: RequestTransform, allocator: std.mem.Allocator, payload: std.json.Value, model: *const Model) ?std.json.Value {
+        return self.func(allocator, payload, model, self.ctx);
+    }
 };
 
 pub const Header = struct {
@@ -279,16 +388,16 @@ pub const Context = struct {
 };
 
 pub const AssistantMessageEvent = union(enum) {
-    start: struct { partial: AssistantMessage },
-    text_start: struct { content_index: usize, partial: AssistantMessage },
-    text_delta: struct { content_index: usize, delta: []const u8, partial: AssistantMessage },
-    text_end: struct { content_index: usize, content: []const u8, partial: AssistantMessage },
-    thinking_start: struct { content_index: usize, partial: AssistantMessage },
-    thinking_delta: struct { content_index: usize, delta: []const u8, partial: AssistantMessage },
-    thinking_end: struct { content_index: usize, content: []const u8, partial: AssistantMessage },
-    toolcall_start: struct { content_index: usize, partial: AssistantMessage },
-    toolcall_delta: struct { content_index: usize, delta: []const u8, partial: AssistantMessage },
-    toolcall_end: struct { content_index: usize, tool_call: ToolCall, partial: AssistantMessage },
+    start,
+    text_start: struct { content_index: usize },
+    text_delta: struct { content_index: usize, delta: []const u8 },
+    text_end: struct { content_index: usize, content: []const u8 },
+    thinking_start: struct { content_index: usize },
+    thinking_delta: struct { content_index: usize, delta: []const u8 },
+    thinking_end: struct { content_index: usize, content: []const u8 },
+    toolcall_start: struct { content_index: usize },
+    toolcall_delta: struct { content_index: usize, delta: []const u8 },
+    toolcall_end: struct { content_index: usize, tool_call: ToolCall },
     done: struct { reason: DoneReason, message: AssistantMessage },
     @"error": struct { reason: ErrorReason, @"error": AssistantMessage },
 
@@ -402,11 +511,3 @@ pub const Model = struct {
         cache_write: f64,
     };
 };
-
-pub const StreamFunction = *const fn (
-    model: Model,
-    context: Context,
-    options: StreamOptions,
-    callback: *const fn (event: AssistantMessageEvent, ctx: ?*anyopaque) void,
-    callback_ctx: ?*anyopaque,
-) void;

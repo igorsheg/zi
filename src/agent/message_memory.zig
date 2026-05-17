@@ -1,6 +1,5 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const json_util = @import("../ai/json_util.zig");
 const protocol = @import("types.zig");
 const json_value = @import("../json/value.zig");
 

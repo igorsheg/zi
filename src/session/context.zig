@@ -4,12 +4,6 @@ const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const context_usage = @import("context_usage.zig");
 
-/// Derived agent context for one selected session branch.
-///
-/// Owner: caller owns `messages` and must call `deinit` with the allocator used
-/// by `buildSessionContext`.
-/// Borrowed data: message payloads, model strings, and thinking level point into
-/// the source session entries.
 pub const SessionContext = struct {
     messages: []agent.protocol.AgentMessage,
     thinking_level: []const u8,
@@ -44,10 +38,6 @@ pub fn getLatestCompactionEntry(entries: []const proto.SessionEntry) ?proto.Comp
     return null;
 }
 
-/// Build the ancestry path from the selected leaf back to the root entry.
-///
-/// The returned slice is owned by `allocator`. Entry payloads are borrowed from
-/// `entries`.
 pub fn buildBranchEntries(
     allocator: std.mem.Allocator,
     entries: []const proto.SessionEntry,
@@ -96,7 +86,7 @@ pub fn buildSessionContext(
             .model_change => |m| model = .{ .provider = m.provider, .model_id = m.model_id },
             .message => |msg| {
                 switch (msg.message) {
-                    .assistant => |a| model = .{ .provider = ai.json_util.providerToString(a.provider), .model_id = a.model },
+                    .assistant => |a| model = .{ .provider = ai.protocol.providerToString(a.provider), .model_id = a.model },
                     else => {},
                 }
             },

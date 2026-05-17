@@ -7,42 +7,76 @@ pub const StreamBridge = struct {
     sink: protocol.AgentEventSink,
     sink_ctx: ?*anyopaque,
     owned_allocator: std.mem.Allocator,
+    model: ai.protocol.Model,
+    started: bool = false,
     final_message: ?ai.protocol.AssistantMessage = null,
-    added_partial: bool = false,
 
     pub fn callback(event: ai.protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
         const self: *StreamBridge = @ptrCast(@alignCast(ctx));
 
         switch (event) {
-            .start => |s| {
-                self.added_partial = true;
-                self.sink(.{ .message_start = .{ .message = .{ .assistant = s.partial } } }, self.sink_ctx);
-            },
+            .start => self.emitStart(),
             .done => |d| {
-                const owned = message_memory.cloneAssistantMessage(self.owned_allocator, d.message) catch d.message;
+                if (!self.started) self.emitStart();
+                const owned = message_memory.cloneAssistantMessage(self.owned_allocator, d.message) catch {
+                    self.emitCloneFailure();
+                    return;
+                };
                 self.final_message = owned;
-                if (!self.added_partial) {
-                    self.sink(.{ .message_start = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
-                }
                 self.sink(.{ .message_end = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
             },
             .@"error" => |e| {
-                const owned = message_memory.cloneAssistantMessage(self.owned_allocator, e.@"error") catch e.@"error";
+                if (!self.started) self.emitStart();
+                const owned = message_memory.cloneAssistantMessage(self.owned_allocator, e.@"error") catch {
+                    self.emitCloneFailure();
+                    return;
+                };
                 self.final_message = owned;
-                if (!self.added_partial) {
-                    self.sink(.{ .message_start = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
-                }
                 self.sink(.{ .message_end = .{ .message = .{ .assistant = owned } } }, self.sink_ctx);
             },
-            else => {
-                if (extractPartial(event)) |partial| {
-                    self.sink(.{ .message_update = .{
-                        .message = .{ .assistant = partial },
-                        .assistant_message_event = event,
-                    } }, self.sink_ctx);
-                }
-            },
+            else => self.sink(.{ .message_delta = .{ .assistant_message_event = event } }, self.sink_ctx),
         }
+    }
+
+    fn emitStart(self: *StreamBridge) void {
+        if (self.started) return;
+        self.started = true;
+        self.sink(.{ .message_start = .{ .message = .{ .assistant = .{
+            .content = &.{},
+            .api = self.model.api,
+            .provider = self.model.provider,
+            .model = self.model.id,
+            .usage = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total_tokens = 0,
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+            },
+            .stop_reason = .stop,
+            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        } } } }, self.sink_ctx);
+    }
+    fn emitCloneFailure(self: *StreamBridge) void {
+        self.sink(.{ .message_end = .{ .message = .{ .assistant = .{
+            .content = &.{},
+            .api = self.model.api,
+            .provider = self.model.provider,
+            .model = self.model.id,
+            .usage = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total_tokens = 0,
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+            },
+            .stop_reason = .@"error",
+            .error_message = "failed to copy assistant stream result",
+            .failure = .{ .kind = .fatal },
+            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        } } } }, self.sink_ctx);
     }
 };
 
@@ -63,20 +97,3 @@ pub const UpdateBridge = struct {
         } }, self.sink_ctx);
     }
 };
-
-fn extractPartial(event: ai.protocol.AssistantMessageEvent) ?ai.protocol.AssistantMessage {
-    return switch (event) {
-        .start => |s| s.partial,
-        .text_start => |s| s.partial,
-        .text_delta => |s| s.partial,
-        .text_end => |s| s.partial,
-        .thinking_start => |s| s.partial,
-        .thinking_delta => |s| s.partial,
-        .thinking_end => |s| s.partial,
-        .toolcall_start => |s| s.partial,
-        .toolcall_delta => |s| s.partial,
-        .toolcall_end => |s| s.partial,
-        .done => |d| d.message,
-        .@"error" => |e| e.@"error",
-    };
-}

@@ -1,5 +1,6 @@
 const std = @import("std");
 const provider_mod = @import("provider.zig");
+const provider_registry = @import("provider_registry.zig");
 const protocol = @import("protocol.zig");
 const ai_models = @import("models.zig");
 const anthropic = @import("anthropic.zig");
@@ -9,7 +10,7 @@ const openai_codex = @import("openai_codex.zig");
 
 pub const Bundle = struct {
     allocator: std.mem.Allocator,
-    registry: provider_mod.Registry,
+    registry: provider_registry.Registry,
 
     anthropic_prov: anthropic.AnthropicProvider,
     openai_completions_prov: openai_completions.OpenAICompletionsProvider,
@@ -21,7 +22,7 @@ pub const Bundle = struct {
 
         self.* = .{
             .allocator = allocator,
-            .registry = provider_mod.Registry.init(allocator),
+            .registry = provider_registry.Registry.init(allocator),
             .anthropic_prov = anthropic.AnthropicProvider.init(allocator),
             .openai_completions_prov = openai_completions.OpenAICompletionsProvider.init(allocator),
             .openai_codex_prov = openai_codex.OpenAICodexProvider.init(allocator),
@@ -59,14 +60,13 @@ fn streamOpenAIResponses(
     model: protocol.Model,
     context: protocol.Context,
     options: protocol.StreamOptions,
-    callback: provider_mod.EventCallback,
-    callback_ctx: ?*anyopaque,
+    sink: provider_mod.StreamEventSink,
 ) void {
     openai_responses_core.streamCore(allocator, model, context, options, .{
         .path = "/v1/responses",
         .auth = .{ .build = buildBearerAuth },
         .provider_label = "openai-responses",
-    }, callback, callback_ctx);
+    }, sink);
 }
 
 fn streamOpenAIResponsesSimple(
@@ -75,8 +75,7 @@ fn streamOpenAIResponsesSimple(
     model: protocol.Model,
     context: protocol.Context,
     options: protocol.SimpleStreamOptions,
-    callback: provider_mod.EventCallback,
-    callback_ctx: ?*anyopaque,
+    sink: provider_mod.StreamEventSink,
 ) void {
     const clamped = ai_models.clampReasoning(options.reasoning, model);
     const effort: ?[]const u8 = if (clamped) |level| protocol.thinkingLevelToString(level) else null;
@@ -86,7 +85,7 @@ fn streamOpenAIResponsesSimple(
         .provider_label = "openai-responses",
         .reasoning_effort = effort,
         .reasoning_summary = if (effort != null) "auto" else null,
-    }, callback, callback_ctx);
+    }, sink);
 }
 
 fn getOpenAIResponsesName(_: *anyopaque) []const u8 {

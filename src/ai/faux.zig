@@ -111,12 +111,23 @@ pub const FauxProvider = struct {
         _: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
-        callback: ai_provider.EventCallback,
-        callback_ctx: ?*anyopaque,
+        sink: ai_provider.StreamEventSink,
     ) void {
         const self = getSelf(ptr);
         self.call_count += 1;
-        self.captured_contexts.append(self.allocator, context) catch {};
+        self.captured_contexts.append(self.allocator, context) catch {
+            sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = .{
+                .content = &.{},
+                .api = FAUX_API,
+                .provider = FAUX_PROVIDER,
+                .model = FAUX_MODEL_ID,
+                .usage = DEFAULT_USAGE,
+                .stop_reason = .@"error",
+                .error_message = "failed to capture faux context",
+                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+            } } });
+            return;
+        };
 
         if (self.block_until_cancel) {
             while (!options.signal.isAborted()) {
@@ -132,7 +143,7 @@ pub const FauxProvider = struct {
                 .error_message = "aborted",
                 .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
             };
-            callback(.{ .@"error" = .{ .reason = .aborted, .@"error" = err_msg } }, callback_ctx);
+            sink.emit(.{ .@"error" = .{ .reason = .aborted, .@"error" = err_msg } });
             return;
         }
 
@@ -147,70 +158,38 @@ pub const FauxProvider = struct {
                 .error_message = "No more faux responses queued",
                 .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
             };
-            callback(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } }, callback_ctx);
+            sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } });
             return;
         }
 
         const message = self.responses.orderedRemove(0);
 
-        var partial_content = std.ArrayListUnmanaged(protocol.AssistantMessage.AssistantContentBlock).empty;
-        defer partial_content.deinit(allocator);
-
-        var partial: protocol.AssistantMessage = .{
-            .content = &.{},
-            .api = message.api,
-            .provider = message.provider,
-            .model = message.model,
-            .usage = message.usage,
-            .stop_reason = message.stop_reason,
-            .error_message = message.error_message,
-            .response_id = message.response_id,
-            .timestamp = message.timestamp,
-        };
-
-        callback(.{ .start = .{ .partial = partial } }, callback_ctx);
+        _ = allocator;
+        sink.emit(.start);
 
         for (message.content, 0..) |block, idx| {
             switch (block) {
                 .text => |text_content| {
-                    partial_content.append(allocator, .{ .text = .{ .text = "" } }) catch @panic("alloc failed");
-                    partial.content = partial_content.items;
-                    callback(.{ .text_start = .{ .content_index = idx, .partial = partial } }, callback_ctx);
-
-                    partial_content.items[idx] = .{ .text = .{ .text = text_content.text } };
-                    partial.content = partial_content.items;
-                    callback(.{ .text_delta = .{ .content_index = idx, .delta = text_content.text, .partial = partial } }, callback_ctx);
-
-                    callback(.{ .text_end = .{ .content_index = idx, .content = text_content.text, .partial = partial } }, callback_ctx);
+                    sink.emit(.{ .text_start = .{ .content_index = idx } });
+                    sink.emit(.{ .text_delta = .{ .content_index = idx, .delta = text_content.text } });
+                    sink.emit(.{ .text_end = .{ .content_index = idx, .content = text_content.text } });
                 },
                 .thinking => |thinking_content| {
-                    partial_content.append(allocator, .{ .thinking = .{ .thinking = "" } }) catch @panic("alloc failed");
-                    partial.content = partial_content.items;
-                    callback(.{ .thinking_start = .{ .content_index = idx, .partial = partial } }, callback_ctx);
-
-                    partial_content.items[idx] = .{ .thinking = .{ .thinking = thinking_content.thinking } };
-                    partial.content = partial_content.items;
-                    callback(.{ .thinking_delta = .{ .content_index = idx, .delta = thinking_content.thinking, .partial = partial } }, callback_ctx);
-
-                    callback(.{ .thinking_end = .{ .content_index = idx, .content = thinking_content.thinking, .partial = partial } }, callback_ctx);
+                    sink.emit(.{ .thinking_start = .{ .content_index = idx } });
+                    sink.emit(.{ .thinking_delta = .{ .content_index = idx, .delta = thinking_content.thinking } });
+                    sink.emit(.{ .thinking_end = .{ .content_index = idx, .content = thinking_content.thinking } });
                 },
                 .tool_call => |tc| {
-                    partial_content.append(allocator, .{ .tool_call = .{ .id = tc.id, .name = tc.name, .arguments = .null } }) catch @panic("alloc failed");
-                    partial.content = partial_content.items;
-                    callback(.{ .toolcall_start = .{ .content_index = idx, .partial = partial } }, callback_ctx);
-
-                    callback(.{ .toolcall_delta = .{ .content_index = idx, .delta = "", .partial = partial } }, callback_ctx);
-
-                    partial_content.items[idx] = .{ .tool_call = tc };
-                    partial.content = partial_content.items;
-                    callback(.{ .toolcall_end = .{ .content_index = idx, .tool_call = tc, .partial = partial } }, callback_ctx);
+                    sink.emit(.{ .toolcall_start = .{ .content_index = idx } });
+                    sink.emit(.{ .toolcall_delta = .{ .content_index = idx, .delta = "" } });
+                    sink.emit(.{ .toolcall_end = .{ .content_index = idx, .tool_call = tc } });
                 },
             }
         }
 
         if (message.stop_reason == .@"error" or message.stop_reason == .aborted) {
             const reason: protocol.AssistantMessageEvent.ErrorReason = if (message.stop_reason == .aborted) .aborted else .@"error";
-            callback(.{ .@"error" = .{ .reason = reason, .@"error" = message } }, callback_ctx);
+            sink.emit(.{ .@"error" = .{ .reason = reason, .@"error" = message } });
         } else {
             const reason: protocol.AssistantMessageEvent.DoneReason = switch (message.stop_reason) {
                 .stop => .stop,
@@ -218,7 +197,7 @@ pub const FauxProvider = struct {
                 .toolUse => .toolUse,
                 else => unreachable,
             };
-            callback(.{ .done = .{ .reason = reason, .message = message } }, callback_ctx);
+            sink.emit(.{ .done = .{ .reason = reason, .message = message } });
         }
     }
 
@@ -228,10 +207,9 @@ pub const FauxProvider = struct {
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.SimpleStreamOptions,
-        callback: ai_provider.EventCallback,
-        callback_ctx: ?*anyopaque,
+        sink: ai_provider.StreamEventSink,
     ) void {
-        streamImpl(ptr, allocator, model, context, options.base, callback, callback_ctx);
+        streamImpl(ptr, allocator, model, context, options.base, sink);
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
@@ -270,7 +248,7 @@ test "faux provider streams text response" {
     defer collector.events.deinit(allocator);
 
     const p = faux.provider();
-    p.stream(allocator, fauxModel(), .{ .messages = &.{} }, .{}, Collector.callback, &collector);
+    p.stream(allocator, fauxModel(), .{ .messages = &.{} }, .{}, .{ .func = Collector.callback, .ctx = @ptrCast(&collector) });
 
     try std.testing.expectEqual(@as(usize, 5), collector.events.items.len);
 

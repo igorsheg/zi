@@ -1,6 +1,5 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const json_util = @import("../ai/json_util.zig");
 const json_value = @import("../json/value.zig");
 
 pub const Message = ai.protocol.Message;
@@ -26,8 +25,7 @@ pub const StreamHook = struct {
         model: Model,
         context: ai.protocol.Context,
         options: ai.protocol.SimpleStreamOptions,
-        callback: ai.provider.EventCallback,
-        callback_ctx: ?*anyopaque,
+        sink: ai.provider.StreamEventSink,
     ) void,
     ctx: ?*anyopaque = null,
 
@@ -37,10 +35,9 @@ pub const StreamHook = struct {
         model: Model,
         context: ai.protocol.Context,
         options: ai.protocol.SimpleStreamOptions,
-        callback: ai.provider.EventCallback,
-        callback_ctx: ?*anyopaque,
+        sink: ai.provider.StreamEventSink,
     ) void {
-        self.func(self.ctx, allocator, model, context, options, callback, callback_ctx);
+        self.func(self.ctx, allocator, model, context, options, sink);
     }
 };
 
@@ -466,6 +463,7 @@ pub const AgentEvent = union(enum) {
     turn_end: struct { message: AgentMessage, tool_results: []const ToolResultMessage },
     message_start: struct { message: AgentMessage },
     message_update: struct { message: AgentMessage, assistant_message_event: AssistantMessageEvent },
+    message_delta: struct { assistant_message_event: AssistantMessageEvent },
     message_end: struct { message: AgentMessage },
     tool_execution_start: struct { tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value },
     tool_execution_update: struct { tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value, partial_result: ?AgentToolResult },

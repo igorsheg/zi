@@ -55,6 +55,12 @@ pub fn writeAgentEvent(writer: *std.Io.Writer, event: protocol.AgentEvent) !void
             try jw.objectField("assistantMessageEvent");
             try writeAssistantMessageEvent(&jw, payload.assistant_message_event);
         },
+        .message_delta => |payload| {
+            try jw.objectField("type");
+            try jw.write("message_delta");
+            try jw.objectField("assistantMessageEvent");
+            try writeAssistantMessageEvent(&jw, payload.assistant_message_event);
+        },
         .message_end => |payload| {
             try jw.objectField("type");
             try jw.write("message_end");
@@ -108,16 +114,12 @@ fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessag
         .start => |payload| {
             try jw.objectField("type");
             try jw.write("start");
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .text_start => |payload| {
             try jw.objectField("type");
             try jw.write("text_start");
             try jw.objectField("contentIndex");
             try jw.write(payload.content_index);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .text_delta => |payload| {
             try jw.objectField("type");
@@ -126,8 +128,6 @@ fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessag
             try jw.write(payload.content_index);
             try jw.objectField("delta");
             try jw.write(payload.delta);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .text_end => |payload| {
             try jw.objectField("type");
@@ -136,16 +136,12 @@ fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessag
             try jw.write(payload.content_index);
             try jw.objectField("content");
             try jw.write(payload.content);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .thinking_start => |payload| {
             try jw.objectField("type");
             try jw.write("thinking_start");
             try jw.objectField("contentIndex");
             try jw.write(payload.content_index);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .thinking_delta => |payload| {
             try jw.objectField("type");
@@ -154,8 +150,6 @@ fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessag
             try jw.write(payload.content_index);
             try jw.objectField("delta");
             try jw.write(payload.delta);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .thinking_end => |payload| {
             try jw.objectField("type");
@@ -164,16 +158,12 @@ fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessag
             try jw.write(payload.content_index);
             try jw.objectField("content");
             try jw.write(payload.content);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .toolcall_start => |payload| {
             try jw.objectField("type");
             try jw.write("toolcall_start");
             try jw.objectField("contentIndex");
             try jw.write(payload.content_index);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .toolcall_delta => |payload| {
             try jw.objectField("type");
@@ -182,8 +172,6 @@ fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessag
             try jw.write(payload.content_index);
             try jw.objectField("delta");
             try jw.write(payload.delta);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .toolcall_end => |payload| {
             try jw.objectField("type");
@@ -192,8 +180,6 @@ fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessag
             try jw.write(payload.content_index);
             try jw.objectField("toolCall");
             try session_json.writeToolCallBlock(jw, payload.tool_call);
-            try jw.objectField("partial");
-            try session_json.writeAssistantMessage(jw, payload.partial);
         },
         .done => |payload| {
             try jw.objectField("type");

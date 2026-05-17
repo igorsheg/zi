@@ -3,13 +3,6 @@ const proto = @import("protocol.zig");
 const json = @import("json.zig");
 const reader = @import("reader.zig");
 
-/// Append-only durable session JSONL store.
-///
-/// Owner: `Store` owns the session file path allocation.
-/// Ingress: `create`, `open`, `append`, `readAll`.
-/// Egress: filesystem writes and parsed session logs.
-/// Bounds: reader enforces maximum file size on reads.
-/// Shutdown: `deinit` frees the owned path; open files are scoped per operation.
 pub const Store = struct {
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -67,7 +60,7 @@ pub const Store = struct {
         try writer.end();
     }
 
-    pub fn readAll(self: *const Store, allocator: std.mem.Allocator, io: std.Io) !reader.Log {
+    pub fn readAll(self: *const Store, allocator: std.mem.Allocator, io: std.Io) !reader.SessionLog {
         return reader.readFile(allocator, io, self.path, .strict);
     }
 };

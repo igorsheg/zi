@@ -30,17 +30,16 @@ pub const OpenAICodexProvider = struct {
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
-        callback: ai_provider.EventCallback,
-        callback_ctx: ?*anyopaque,
+        sink: ai_provider.StreamEventSink,
     ) void {
         _ = ptr;
-        if (!acceptCodexTransport(allocator, model, options.transport, callback, callback_ctx)) return;
+        if (!acceptCodexTransport(allocator, model, options.transport, sink)) return;
 
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
 
         var extra_hdrs: [6]protocol.Header = undefined;
-        const account_id = requireAccountId(allocator, model, options.api_key, callback, callback_ctx) orelse return;
+        const account_id = requireAccountId(allocator, model, options.api_key, sink) orelse return;
         const user_agent = buildUserAgent(scratch.allocator()) catch "pi (zig)";
         const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent, options.session_id);
 
@@ -52,7 +51,7 @@ pub const OpenAICodexProvider = struct {
             .provider_label = "openai-codex-responses",
             .event_mapper = .{ .map = core.codexEventMapper },
             .build_request = &buildCodexRequestJson,
-        }, callback, callback_ctx);
+        }, sink);
     }
 
     fn streamSimpleWrap(
@@ -61,17 +60,16 @@ pub const OpenAICodexProvider = struct {
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.SimpleStreamOptions,
-        callback: ai_provider.EventCallback,
-        callback_ctx: ?*anyopaque,
+        sink: ai_provider.StreamEventSink,
     ) void {
         _ = ptr;
-        if (!acceptCodexTransport(allocator, model, options.base.transport, callback, callback_ctx)) return;
+        if (!acceptCodexTransport(allocator, model, options.base.transport, sink)) return;
 
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
 
         var extra_hdrs: [6]protocol.Header = undefined;
-        const account_id = requireAccountId(allocator, model, options.base.api_key, callback, callback_ctx) orelse return;
+        const account_id = requireAccountId(allocator, model, options.base.api_key, sink) orelse return;
         const user_agent = buildUserAgent(scratch.allocator()) catch "pi (zig)";
         const n_hdrs = fillCodexHeaders(&extra_hdrs, account_id, user_agent, options.base.session_id);
 
@@ -91,7 +89,7 @@ pub const OpenAICodexProvider = struct {
             .build_request = &buildCodexRequestJson,
             .reasoning_effort = effort,
             .reasoning_summary = if (effort != null) "auto" else null,
-        }, callback, callback_ctx);
+        }, sink);
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -105,16 +103,14 @@ fn acceptCodexTransport(
     allocator: std.mem.Allocator,
     model: protocol.Model,
     transport: ?protocol.Transport,
-    callback: ai_provider.EventCallback,
-    callback_ctx: ?*anyopaque,
+    sink: ai_provider.StreamEventSink,
 ) bool {
     switch (transport orelse .auto) {
         .auto, .sse => return true,
         .websocket => {
             core.emitFailure(
                 allocator,
-                callback,
-                callback_ctx,
+                sink,
                 model,
                 "openai-codex-responses",
                 .{ .kind = .invalid_request },
@@ -251,11 +247,10 @@ fn requireAccountId(
     allocator: std.mem.Allocator,
     model: protocol.Model,
     api_key: ?[]const u8,
-    callback: ai_provider.EventCallback,
-    callback_ctx: ?*anyopaque,
+    sink: ai_provider.StreamEventSink,
 ) ?[]const u8 {
     const key = api_key orelse {
-        core.emitFailure(allocator, callback, callback_ctx, model, "openai-codex-responses", .{ .kind = .auth }, "no API key provided");
+        core.emitFailure(allocator, sink, model, "openai-codex-responses", .{ .kind = .auth }, "no API key provided");
         return null;
     };
     const account_id = extractAccountId(allocator, key) catch |err| {
@@ -263,7 +258,7 @@ fn requireAccountId(
             error.MissingAccountId => "failed to extract accountId from token: no account ID in token",
             else => "failed to extract accountId from token",
         };
-        core.emitFailure(allocator, callback, callback_ctx, model, "openai-codex-responses", .{ .kind = .auth }, msg);
+        core.emitFailure(allocator, sink, model, "openai-codex-responses", .{ .kind = .auth }, msg);
         return null;
     };
     return account_id;
@@ -417,7 +412,7 @@ test "Codex provider rejects websocket transport before auth" {
         codexTestModel(),
         ctx,
         .{ .transport = .websocket },
-        ErrorCapture.callback,
+        ErrorCapture.sink,
         &captured,
     );
 

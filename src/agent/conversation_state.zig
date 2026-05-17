@@ -1,6 +1,5 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const json_util = @import("../ai/json_util.zig");
 const partial_json = @import("../json/partial.zig");
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
@@ -163,17 +162,19 @@ pub const InFlightState = struct {
                     self.replaceAssistant(assistant);
                     self.assistant_streaming = true;
                     switch (payload.assistant_message_event) {
-                        .toolcall_delta => |tc| {
-                            if (tc.content_index < tc.partial.content.len and tc.partial.content[tc.content_index] == .tool_call) {
-                                self.syncToolCall(tc.partial.content[tc.content_index].tool_call, false, tc.delta);
-                            }
-                        },
                         .toolcall_end => |tc| self.syncToolCall(tc.tool_call, true, null),
                         else => {},
                     }
                     return .{ .did_mutate_conversation = true };
                 },
                 else => return .{},
+            },
+            .message_delta => |payload| {
+                switch (payload.assistant_message_event) {
+                    .toolcall_end => |tc| self.syncToolCall(tc.tool_call, true, null),
+                    else => {},
+                }
+                return .{ .did_mutate_conversation = true };
             },
             .message_end => |payload| switch (payload.message) {
                 .assistant => |assistant| {
@@ -322,6 +323,8 @@ pub const InFlightState = struct {
 
     pub fn freeze(self: *const InFlightState, allocator: std.mem.Allocator) !?InFlightTurn {
         if (!self.isActive()) return null;
+        if (self.assistant_streaming) return null;
+        if (self.assistant == null) return null;
 
         var assistant = if (self.assistant) |assistant|
             try message_memory.cloneAssistantMessage(allocator, assistant)

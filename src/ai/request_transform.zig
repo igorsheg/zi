@@ -1,7 +1,6 @@
 const std = @import("std");
 const json_value = @import("../json/value.zig");
 
-const json_util = @import("json_util.zig");
 const protocol = @import("protocol.zig");
 
 pub const Decorator = struct {
@@ -34,7 +33,7 @@ pub fn transformJsonPayload(
     canonical: []const u8,
     options: TransformOptions,
 ) !?[]u8 {
-    if (options.decorators.len == 0 and options.stream_options.on_payload == null) return null;
+    if (options.decorators.len == 0 and options.stream_options.request_transform == null) return null;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -52,8 +51,8 @@ pub fn transformJsonPayload(
     defer if (replacement) |value| json_value.freeJsonValue(allocator, value);
 
     const final_payload = blk: {
-        if (options.stream_options.on_payload) |hook| {
-            if (hook(temp, payload, options.model, options.stream_options.on_payload_ctx)) |next| {
+        if (options.stream_options.request_transform) |transform| {
+            if (transform.apply(temp, payload, options.model)) |next| {
                 replacement = try json_value.cloneJsonValue(allocator, next);
                 changed = true;
                 break :blk replacement.?;
@@ -67,7 +66,7 @@ pub fn transformJsonPayload(
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try std.json.Stringify.value(final_payload, .{}, &out.writer);
-    return try allocator.dupe(u8, out.written());
+    return try out.toOwnedSlice();
 }
 
 const testing = std.testing;
@@ -116,7 +115,7 @@ test "request transform applies provider decorators to canonical json" {
     try testing.expect(std.mem.indexOf(u8, transformed.?, "\"metadata\":{") != null);
 }
 
-test "request transform clones on_payload replacements before stringifying" {
+test "request transform clones replacements before stringifying" {
     const model = testModel();
     const Replace = struct {
         fn replace(allocator: std.mem.Allocator, payload: std.json.Value, _: *const protocol.Model, _: ?*anyopaque) ?std.json.Value {
@@ -127,7 +126,7 @@ test "request transform clones on_payload replacements before stringifying" {
 
     const transformed = try transformJsonPayload(testing.allocator, "{\"model\":\"a\"}", .{
         .model = &model,
-        .stream_options = .{ .on_payload = Replace.replace },
+        .stream_options = .{ .request_transform = .{ .func = Replace.replace } },
     });
     defer testing.allocator.free(transformed.?);
 

@@ -11,18 +11,18 @@ pub const ReadPolicy = enum {
 
 /// Arena-owned parsed session log.
 ///
-/// Owner: `Log` owns all header and entry memory through `arena`.
+/// Owner: `SessionLog` owns all header and entry memory through `arena`.
 /// Ingress: complete file bytes through `parseContent` or a file path through
 /// `readFile`.
 /// Egress: validated header and append-order entries.
 /// Bounds: `readFile` limits file bytes; validation rejects duplicate IDs,
 /// missing headers, future versions, and unknown parents.
-pub const Log = struct {
+pub const SessionLog = struct {
     arena: std.heap.ArenaAllocator,
     header: proto.SessionHeader,
     entries: []proto.SessionEntry,
 
-    pub fn deinit(self: *Log) void {
+    pub fn deinit(self: *SessionLog) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -33,13 +33,13 @@ pub fn readFile(
     io: std.Io,
     path: []const u8,
     policy: ReadPolicy,
-) !Log {
+) !SessionLog {
     const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_session_file_bytes));
     defer allocator.free(content);
     return parseContent(allocator, content, policy);
 }
 
-pub fn parseContent(allocator: std.mem.Allocator, content: []const u8, policy: ReadPolicy) !Log {
+pub fn parseContent(allocator: std.mem.Allocator, content: []const u8, policy: ReadPolicy) !SessionLog {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const aa = arena.allocator();

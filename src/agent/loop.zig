@@ -4,7 +4,6 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const protocol = @import("types.zig");
 const bridge_mod = @import("stream_bridge.zig");
-const json_util = @import("../ai/json_util.zig");
 const message_memory = @import("message_memory.zig");
 const tool_execution_group = @import("tool_execution_group.zig");
 const json_value = @import("../json/value.zig");
@@ -279,12 +278,11 @@ fn streamAssistantResponse(
     var stream_options = config.buildStreamOptions();
     stream_options.base.signal = signal;
     if (config.on_payload != null) {
-        stream_options.base.on_payload = onPayloadAdapter;
-        stream_options.base.on_payload_ctx = @constCast(&config);
+        stream_options.base.request_transform = .{ .func = onPayloadAdapter, .ctx = @constCast(&config) };
     }
 
     if (config.get_api_key) |hook| {
-        const provider_str = json_util.providerToString(config.model.provider);
+        const provider_str = ai.protocol.providerToString(config.model.provider);
         const resolved_key = hook.call(provider_str);
         if (resolved_key != null and resolved_key.?.len > 0) {
             const owned = turn_allocator.dupe(u8, resolved_key.?) catch resolved_key.?;
@@ -296,8 +294,9 @@ fn streamAssistantResponse(
         .sink = event_sink,
         .sink_ctx = event_ctx,
         .owned_allocator = run_allocator,
+        .model = config.model,
     };
-    config.stream.call(turn_allocator, config.model, llm_context, stream_options, &bridge_mod.StreamBridge.callback, @ptrCast(&bridge));
+    config.stream.call(turn_allocator, config.model, llm_context, stream_options, .{ .func = &bridge_mod.StreamBridge.callback, .ctx = @ptrCast(&bridge) });
 
     const assistant_msg = bridge.final_message orelse return null;
 
