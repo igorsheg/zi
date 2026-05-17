@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
-const env = @import("env");
 const ai_models = @import("models.zig");
 const ai_provider = @import("provider.zig");
 const core = @import("openai_responses_core.zig");
@@ -143,7 +142,7 @@ fn buildCodexRequestJson(
         options,
         reasoning_effort,
         reasoning_summary,
-        codexFastModeEnabledForModel(model.id),
+        codexFastModeEnabledForModel(options.env, model.id),
     );
 }
 
@@ -294,7 +293,7 @@ fn isCodexFastModeSupportedModel(model_id: []const u8) bool {
     return std.mem.eql(u8, id, "gpt-5.4") or std.mem.eql(u8, id, "gpt-5.5");
 }
 
-fn codexFastModeEnabledForModel(model_id: []const u8) bool {
+fn codexFastModeEnabledForModel(env: @import("../runtime/env.zig").Env, model_id: []const u8) bool {
     return isCodexFastModeSupportedModel(model_id) and envFlagEnabled(env.get(CODEX_FAST_MODE_ENV));
 }
 

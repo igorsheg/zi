@@ -1,44 +1,45 @@
 const std = @import("std");
+const runtime_env = @import("../runtime/env.zig");
 
-pub fn getEnvApiKey(provider: []const u8) ?[]const u8 {
+pub fn getEnvApiKey(env: runtime_env.Env, provider: []const u8) ?[]const u8 {
     const eql = std.mem.eql;
 
     if (eql(u8, provider, "github-copilot")) {
-        return @import("env").get("COPILOT_GITHUB_TOKEN") orelse
-            @import("env").get("GH_TOKEN") orelse
-            @import("env").get("GITHUB_TOKEN");
+        return env.get("COPILOT_GITHUB_TOKEN") orelse
+            env.get("GH_TOKEN") orelse
+            env.get("GITHUB_TOKEN");
     }
 
     if (eql(u8, provider, "anthropic")) {
-        return @import("env").get("ANTHROPIC_OAUTH_TOKEN") orelse
-            @import("env").get("ANTHROPIC_API_KEY");
+        return env.get("ANTHROPIC_OAUTH_TOKEN") orelse
+            env.get("ANTHROPIC_API_KEY");
     }
 
     if (eql(u8, provider, "google-vertex")) {
-        if (@import("env").get("GOOGLE_CLOUD_API_KEY")) |key| return key;
+        if (env.get("GOOGLE_CLOUD_API_KEY")) |key| return key;
 
-        const has_project = @import("env").get("GOOGLE_CLOUD_PROJECT") != null or
-            @import("env").get("GCLOUD_PROJECT") != null;
-        const has_location = @import("env").get("GOOGLE_CLOUD_LOCATION") != null;
-        const has_creds = @import("env").get("GOOGLE_APPLICATION_CREDENTIALS") != null;
+        const has_project = env.get("GOOGLE_CLOUD_PROJECT") != null or
+            env.get("GCLOUD_PROJECT") != null;
+        const has_location = env.get("GOOGLE_CLOUD_LOCATION") != null;
+        const has_creds = env.get("GOOGLE_APPLICATION_CREDENTIALS") != null;
 
         if (has_creds and has_project and has_location) return "<authenticated>";
         return null;
     }
 
     if (eql(u8, provider, "amazon-bedrock")) {
-        if (@import("env").get("AWS_PROFILE") != null) return "<authenticated>";
-        if (@import("env").get("AWS_ACCESS_KEY_ID") != null and
-            @import("env").get("AWS_SECRET_ACCESS_KEY") != null) return "<authenticated>";
-        if (@import("env").get("AWS_BEARER_TOKEN_BEDROCK") != null) return "<authenticated>";
-        if (@import("env").get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != null) return "<authenticated>";
-        if (@import("env").get("AWS_CONTAINER_CREDENTIALS_FULL_URI") != null) return "<authenticated>";
-        if (@import("env").get("AWS_WEB_IDENTITY_TOKEN_FILE") != null) return "<authenticated>";
+        if (env.get("AWS_PROFILE") != null) return "<authenticated>";
+        if (env.get("AWS_ACCESS_KEY_ID") != null and
+            env.get("AWS_SECRET_ACCESS_KEY") != null) return "<authenticated>";
+        if (env.get("AWS_BEARER_TOKEN_BEDROCK") != null) return "<authenticated>";
+        if (env.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != null) return "<authenticated>";
+        if (env.get("AWS_CONTAINER_CREDENTIALS_FULL_URI") != null) return "<authenticated>";
+        if (env.get("AWS_WEB_IDENTITY_TOKEN_FILE") != null) return "<authenticated>";
         return null;
     }
 
     const env_var = envVarForProvider(provider) orelse return null;
-    return @import("env").get(env_var);
+    return env.get(env_var);
 }
 
 fn envVarForProvider(provider: []const u8) ?[:0]const u8 {

@@ -100,8 +100,7 @@ fn runLoop(
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
-    const trace = openTraceFile();
-    defer if (trace) |f| f.close(std.Options.debug_io);
+    const trace: ?std.Io.File = null;
 
     var first_turn = true;
 
@@ -1319,15 +1318,6 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
     try std.testing.expectEqual(@as(usize, 2), collector.ends.items.len);
     try std.testing.expectEqualStrings("call-1", collector.ends.items[0]);
     try std.testing.expectEqualStrings("call-2", collector.ends.items[1]);
-}
-
-fn openTraceFile() ?std.Io.File {
-    const path = @import("env").get("ZI_LOOP_TRACE") orelse return null;
-    if (path.len == 0) return null;
-    return std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{
-        .read = false,
-        .truncate = false,
-    }) catch return null;
 }
 
 fn traceWrite(f: ?std.Io.File, comptime fmt: []const u8, args: anytype) void {

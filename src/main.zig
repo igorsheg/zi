@@ -1,7 +1,7 @@
 const std = @import("std");
 const log = @import("runtime/log.zig");
 const runtime_app = @import("runtime/app.zig");
-const env = @import("env");
+const runtime_env = @import("runtime/env.zig");
 const build_options = @import("build_options");
 
 pub const std_options: std.Options = .{
@@ -9,8 +9,8 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main(init: std.process.Init) !void {
-    env.setProcessEnvironment(init.environ_map);
     log.setThreadLabel(.main);
+    const env = runtime_env.Env.from(init.environ_map);
 
     var heap: runtime_app.MainHeap = .{};
     defer heap.deinit();
@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
 
     const caps: runtime_app.Caps = .{
         .io = init.io,
-        .environ = init.environ_map,
+        .env = env,
         .allocator = allocator,
         .msg_allocator = std.heap.smp_allocator,
     };

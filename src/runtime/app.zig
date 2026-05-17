@@ -1,5 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const runtime_env = @import("env.zig");
 
 pub const name = "zi";
 pub const version = build_options.version;
@@ -44,7 +45,7 @@ pub const MainHeap = struct {
 
 pub const Caps = struct {
     io: std.Io,
-    environ: *const std.process.Environ.Map,
+    env: runtime_env.Env,
     allocator: std.mem.Allocator,
     msg_allocator: std.mem.Allocator,
 };

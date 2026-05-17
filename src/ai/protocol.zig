@@ -1,5 +1,6 @@
 const std = @import("std");
 const cancel = @import("../runtime/cancel.zig");
+const runtime_env = @import("../runtime/env.zig");
 
 pub const Api = union(enum) {
     openai_completions,
@@ -86,6 +87,7 @@ pub const StreamOptions = struct {
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
     signal: CancelToken = CancelToken.none,
+    env: runtime_env.Env = .empty,
     api_key: ?[]const u8 = null,
 
     transport: ?Transport = null,

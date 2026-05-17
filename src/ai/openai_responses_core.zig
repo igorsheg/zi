@@ -968,10 +968,10 @@ pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, strict_
     try jw.endArray();
 }
 
-fn resolveCacheRetention(cache_retention: ?protocol.CacheRetention) protocol.CacheRetention {
+fn resolveCacheRetention(env: @import("../runtime/env.zig").Env, cache_retention: ?protocol.CacheRetention) protocol.CacheRetention {
     if (cache_retention) |retention| return retention;
-    const env = @import("env").get("PI_CACHE_RETENTION") orelse return .short;
-    if (std.mem.eql(u8, env, "long")) return .long;
+    const value = env.get("PI_CACHE_RETENTION") orelse return .short;
+    if (std.mem.eql(u8, value, "long")) return .long;
     return .short;
 }
 
@@ -1002,7 +1002,7 @@ pub fn buildRequestJson(
     try writeInput(allocator, &jw, model, context);
     try jw.endArray();
 
-    const cache_retention = resolveCacheRetention(options.cache_retention);
+    const cache_retention = resolveCacheRetention(options.env, options.cache_retention);
     if (cache_retention != .none) {
         if (options.session_id) |sid| {
             try jw.objectField("prompt_cache_key");

@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime_env = @import("runtime/env.zig");
 
 const log = std.log.scoped(.storage);
 
@@ -128,14 +129,14 @@ pub const MemoryFile = struct {
     pub fn releaseLock(_: *const MemoryFile) void {}
 };
 
-pub fn getAgentDir(allocator: std.mem.Allocator, override: ?[]const u8) ![]const u8 {
+pub fn getAgentDir(allocator: std.mem.Allocator, env: runtime_env.Env, override: ?[]const u8) ![]const u8 {
     if (override) |dir| return allocator.dupe(u8, dir);
 
-    if (@import("env").get("ZI_CODING_AGENT_DIR")) |dir| {
-        return expandTilde(allocator, dir);
+    if (env.get("ZI_CODING_AGENT_DIR")) |dir| {
+        return expandTilde(allocator, env, dir);
     }
 
-    const home = @import("env").get("HOME") orelse return error.NoHomeDir;
+    const home = env.get("HOME") orelse return error.NoHomeDir;
     return std.fs.path.join(allocator, &.{ home, ".zi", "agent" });
 }
 
@@ -143,32 +144,32 @@ pub fn getProjectDir(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 
     return std.fs.path.join(allocator, &.{ cwd, ".zi" });
 }
 
-pub fn getSessionsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
-    const agent_dir = try getAgentDir(allocator, agent_dir_override);
+pub fn getSessionsDir(allocator: std.mem.Allocator, env: runtime_env.Env, agent_dir_override: ?[]const u8) ![]const u8 {
+    const agent_dir = try getAgentDir(allocator, env, agent_dir_override);
     defer allocator.free(agent_dir);
     return std.fs.path.join(allocator, &.{ agent_dir, "sessions" });
 }
 
-pub fn getDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
-    const agent_dir = try getAgentDir(allocator, agent_dir_override);
+pub fn getDiagnosticsDir(allocator: std.mem.Allocator, env: runtime_env.Env, agent_dir_override: ?[]const u8) ![]const u8 {
+    const agent_dir = try getAgentDir(allocator, env, agent_dir_override);
     defer allocator.free(agent_dir);
     return std.fs.path.join(allocator, &.{ agent_dir, "diagnostics" });
 }
 
-pub fn getMemoryDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
-    const diagnostics_dir = try getDiagnosticsDir(allocator, agent_dir_override);
+pub fn getMemoryDiagnosticsDir(allocator: std.mem.Allocator, env: runtime_env.Env, agent_dir_override: ?[]const u8) ![]const u8 {
+    const diagnostics_dir = try getDiagnosticsDir(allocator, env, agent_dir_override);
     defer allocator.free(diagnostics_dir);
     return std.fs.path.join(allocator, &.{ diagnostics_dir, "memory" });
 }
 
-pub fn getLogDiagnosticsDir(allocator: std.mem.Allocator, agent_dir_override: ?[]const u8) ![]const u8 {
-    const diagnostics_dir = try getDiagnosticsDir(allocator, agent_dir_override);
+pub fn getLogDiagnosticsDir(allocator: std.mem.Allocator, env: runtime_env.Env, agent_dir_override: ?[]const u8) ![]const u8 {
+    const diagnostics_dir = try getDiagnosticsDir(allocator, env, agent_dir_override);
     defer allocator.free(diagnostics_dir);
     return std.fs.path.join(allocator, &.{ diagnostics_dir, "logs" });
 }
 
-pub fn getSessionDirForCwd(allocator: std.mem.Allocator, cwd: []const u8, agent_dir_override: ?[]const u8) ![]const u8 {
-    const sessions_dir = try getSessionsDir(allocator, agent_dir_override);
+pub fn getSessionDirForCwd(allocator: std.mem.Allocator, env: runtime_env.Env, cwd: []const u8, agent_dir_override: ?[]const u8) ![]const u8 {
+    const sessions_dir = try getSessionsDir(allocator, env, agent_dir_override);
     defer allocator.free(sessions_dir);
     const safe_cwd = try encodeCwd(allocator, cwd);
     defer allocator.free(safe_cwd);
@@ -191,13 +192,13 @@ pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     return result;
 }
 
-fn expandTilde(allocator: std.mem.Allocator, dir: []const u8) ![]const u8 {
+fn expandTilde(allocator: std.mem.Allocator, env: runtime_env.Env, dir: []const u8) ![]const u8 {
     if (std.mem.eql(u8, dir, "~")) {
-        const home = @import("env").get("HOME") orelse return error.NoHomeDir;
+        const home = env.get("HOME") orelse return error.NoHomeDir;
         return allocator.dupe(u8, home);
     }
     if (dir.len > 1 and dir[0] == '~' and dir[1] == '/') {
-        const home = @import("env").get("HOME") orelse return error.NoHomeDir;
+        const home = env.get("HOME") orelse return error.NoHomeDir;
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, dir[1..] });
     }
     return allocator.dupe(u8, dir);
@@ -264,15 +265,15 @@ test "storage path contracts" {
     defer allocator.free(project_dir);
     try std.testing.expectEqualStrings("/home/user/project/.zi", project_dir);
 
-    const session_dir = try getSessionDirForCwd(allocator, "/Users/foo/bar", "/tmp/zi-agent");
+    const session_dir = try getSessionDirForCwd(allocator, .empty, "/Users/foo/bar", "/tmp/zi-agent");
     defer allocator.free(session_dir);
     try std.testing.expectEqualStrings("/tmp/zi-agent/sessions/--Users-foo-bar--", session_dir);
 
-    const memory_diagnostics_dir = try getMemoryDiagnosticsDir(allocator, "/tmp/zi-agent");
+    const memory_diagnostics_dir = try getMemoryDiagnosticsDir(allocator, .empty, "/tmp/zi-agent");
     defer allocator.free(memory_diagnostics_dir);
     try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/memory", memory_diagnostics_dir);
 
-    const log_diagnostics_dir = try getLogDiagnosticsDir(allocator, "/tmp/zi-agent");
+    const log_diagnostics_dir = try getLogDiagnosticsDir(allocator, .empty, "/tmp/zi-agent");
     defer allocator.free(log_diagnostics_dir);
     try std.testing.expectEqualStrings("/tmp/zi-agent/diagnostics/logs", log_diagnostics_dir);
 }

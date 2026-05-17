@@ -72,8 +72,6 @@ pub fn build(b: *std.Build) void {
         .include_extensions = &.{".h"},
     });
 
-    const env_mod = b.createModule(.{ .root_source_file = b.path("src/env.zig") });
-    exe_mod.addImport("env", env_mod);
     exe_mod.addIncludePath(lua_dep.path("src"));
     exe_mod.linkLibrary(lua_lib);
 
@@ -97,7 +95,6 @@ pub fn build(b: *std.Build) void {
     test_mod.addOptions("build_options", build_options);
     test_mod.addImport("self_docs_embedded", b.createModule(.{ .root_source_file = self_docs_generated }));
     test_mod.addImport("mdman_parser", b.createModule(.{ .root_source_file = b.path("website/mdman/parser.zig") }));
-    test_mod.addImport("env", env_mod);
     test_mod.addIncludePath(lua_dep.path("src"));
     test_mod.linkLibrary(lua_lib);
     const tests = b.addTest(.{ .root_module = test_mod });
