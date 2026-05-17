@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const protocol = @import("protocol.zig");
-const ai_models = @import("models.zig");
-const ai_provider = @import("provider.zig");
-const core = @import("openai_responses_core.zig");
+const protocol = @import("../protocol.zig");
+const ai_models = @import("../models.zig");
+const ai_provider = @import("../provider.zig");
+const core = @import("responses/core.zig");
 
 pub const OpenAICodexProvider = struct {
     allocator: std.mem.Allocator,
@@ -288,7 +288,7 @@ fn isCodexFastModeSupportedModel(model_id: []const u8) bool {
     return std.mem.eql(u8, id, "gpt-5.4") or std.mem.eql(u8, id, "gpt-5.5");
 }
 
-fn codexFastModeEnabledForModel(env: @import("../runtime/env.zig").Env, model_id: []const u8) bool {
+fn codexFastModeEnabledForModel(env: @import("../../runtime/env.zig").Env, model_id: []const u8) bool {
     return isCodexFastModeSupportedModel(model_id) and envFlagEnabled(env.get(CODEX_FAST_MODE_ENV));
 }
 

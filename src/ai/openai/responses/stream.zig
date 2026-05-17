@@ -1,9 +1,9 @@
 const std = @import("std");
-const protocol = @import("protocol.zig");
-const sse = @import("sse.zig");
-const ai_provider = @import("provider.zig");
-const provider_failure = @import("provider_failure.zig");
-const partial_json = @import("../json/partial.zig");
+const protocol = @import("../../protocol.zig");
+const sse = @import("../../sse.zig");
+const ai_provider = @import("../../provider.zig");
+const provider_failure = @import("../../provider_failure.zig");
+const partial_json = @import("../../../json/partial.zig");
 const Token = protocol.CancelToken;
 
 pub const EventMapOutcome = union(enum) {

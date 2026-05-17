@@ -1,10 +1,10 @@
 const std = @import("std");
-const protocol = @import("protocol.zig");
-const sse = @import("sse.zig");
-const ai_provider = @import("provider.zig");
-const provider_failure = @import("provider_failure.zig");
-const partial_json = @import("../json/partial.zig");
-const json_value = @import("../json/value.zig");
+const protocol = @import("../../protocol.zig");
+const sse = @import("../../sse.zig");
+const ai_provider = @import("../../provider.zig");
+const provider_failure = @import("../../provider_failure.zig");
+const partial_json = @import("../../../json/partial.zig");
+const json_value = @import("../../../json/value.zig");
 const Token = protocol.CancelToken;
 
 pub fn processStream(

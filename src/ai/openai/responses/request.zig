@@ -1,7 +1,7 @@
 const std = @import("std");
-const protocol = @import("protocol.zig");
-const json_text = @import("../json/text.zig");
-const replay = @import("openai_responses_replay.zig");
+const protocol = @import("../../protocol.zig");
+const json_text = @import("../../../json/text.zig");
+const replay = @import("replay.zig");
 
 pub fn writeBaseFields(jw: *std.json.Stringify, model: protocol.Model) !void {
     try jw.objectField("model");
@@ -49,7 +49,7 @@ pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, strict_
     try jw.endArray();
 }
 
-fn resolveCacheRetention(env: @import("../runtime/env.zig").Env, cache_retention: ?protocol.CacheRetention) protocol.CacheRetention {
+fn resolveCacheRetention(env: @import("../../../runtime/env.zig").Env, cache_retention: ?protocol.CacheRetention) protocol.CacheRetention {
     if (cache_retention) |retention| return retention;
     const value = env.get("PI_CACHE_RETENTION") orelse return .short;
     if (std.mem.eql(u8, value, "long")) return .long;

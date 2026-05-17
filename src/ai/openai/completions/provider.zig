@@ -1,14 +1,14 @@
 const std = @import("std");
-const protocol = @import("protocol.zig");
-const ai_models = @import("models.zig");
-const ai_provider = @import("provider.zig");
-const provider_failure = @import("provider_failure.zig");
-const request_transform = @import("request_transform.zig");
-const completions_request = @import("openai_completions_request.zig");
-const completions_stream = @import("openai_completions_stream.zig");
+const protocol = @import("../../protocol.zig");
+const ai_models = @import("../../models.zig");
+const ai_provider = @import("../../provider.zig");
+const provider_failure = @import("../../provider_failure.zig");
+const request_transform = @import("../../request_transform.zig");
+const completions_request = @import("request.zig");
+const completions_stream = @import("stream.zig");
 const Token = protocol.CancelToken;
-const http_cancel = @import("http_cancel.zig");
-const env_api_keys = @import("env_api_keys.zig");
+const http_cancel = @import("../../../runtime/http_cancel.zig");
+const env_api_keys = @import("../../env_api_keys.zig");
 
 pub const OpenAICompletionsProvider = struct {
     allocator: std.mem.Allocator,
@@ -143,7 +143,7 @@ pub const OpenAICompletionsProvider = struct {
         };
         defer req.deinit();
 
-        var abort_guard = http_cancel.ShutdownOnCancel.start(options.io, options.signal, &req) catch |err| {
+        var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
             completions_stream.emitError(allocator, sink, model, "failed to start interrupt guard: {s}", .{@errorName(err)});
             return;
         };

@@ -472,44 +472,7 @@ pub const AgentEvent = union(enum) {
 
 pub const AgentEventSink = *const fn (event: AgentEvent, ctx: ?*anyopaque) void;
 
-test "AgentToolResult clone+free round-trip with text content" {
-    const allocator = std.testing.allocator;
-
-    const original = AgentToolResult{
-        .content = &.{
-            .{ .text = .{ .text = "hello world", .text_signature = "sig123" } },
-        },
-        .is_error = true,
-    };
-
-    const cloned = try original.clone(allocator);
-    defer cloned.free(allocator);
-
-    try std.testing.expectEqualStrings("hello world", cloned.content[0].text.text);
-    try std.testing.expectEqualStrings("sig123", cloned.content[0].text.text_signature.?);
-    try std.testing.expect(cloned.is_error);
-    try std.testing.expect(cloned.content.ptr != original.content.ptr);
-    try std.testing.expect(cloned.content[0].text.text.ptr != original.content[0].text.text.ptr);
-}
-
-test "AgentToolResult clone+free round-trip with image content" {
-    const allocator = std.testing.allocator;
-
-    const original = AgentToolResult{
-        .content = &.{
-            .{ .image = .{ .data = "base64data", .mime_type = "image/png" } },
-        },
-    };
-
-    const cloned = try original.clone(allocator);
-    defer cloned.free(allocator);
-
-    try std.testing.expectEqualStrings("base64data", cloned.content[0].image.data);
-    try std.testing.expectEqualStrings("image/png", cloned.content[0].image.mime_type);
-    try std.testing.expect(cloned.content[0].image.data.ptr != original.content[0].image.data.ptr);
-}
-
-test "AgentToolResult clone+free with json details" {
+test "AgentToolResult clone owns content and details" {
     const allocator = std.testing.allocator;
 
     var obj: std.json.ObjectMap = .{};
@@ -520,13 +483,24 @@ test "AgentToolResult clone+free with json details" {
     }
 
     const original = AgentToolResult{
-        .content = &.{},
+        .content = &.{
+            .{ .text = .{ .text = "hello world", .text_signature = "sig123" } },
+            .{ .image = .{ .data = "base64data", .mime_type = "image/png" } },
+        },
         .details = .{ .object = obj },
+        .is_error = true,
     };
 
     const cloned = try original.clone(allocator);
     defer cloned.free(allocator);
 
-    const val = cloned.details.object.get("key").?;
-    try std.testing.expectEqualStrings("value", val.string);
+    try std.testing.expect(cloned.is_error);
+    try std.testing.expect(cloned.content.ptr != original.content.ptr);
+    try std.testing.expectEqualStrings("hello world", cloned.content[0].text.text);
+    try std.testing.expectEqualStrings("sig123", cloned.content[0].text.text_signature.?);
+    try std.testing.expect(cloned.content[0].text.text.ptr != original.content[0].text.text.ptr);
+    try std.testing.expectEqualStrings("base64data", cloned.content[1].image.data);
+    try std.testing.expectEqualStrings("image/png", cloned.content[1].image.mime_type);
+    try std.testing.expect(cloned.content[1].image.data.ptr != original.content[1].image.data.ptr);
+    try std.testing.expectEqualStrings("value", cloned.details.object.get("key").?.string);
 }

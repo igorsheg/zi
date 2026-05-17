@@ -1,12 +1,12 @@
 const std = @import("std");
-const protocol = @import("protocol.zig");
-const ai_provider = @import("provider.zig");
-const provider_failure = @import("provider_failure.zig");
-const request_transform = @import("request_transform.zig");
-const responses_request = @import("openai_responses_request.zig");
-const responses_stream = @import("openai_responses_stream.zig");
+const protocol = @import("../../protocol.zig");
+const ai_provider = @import("../../provider.zig");
+const provider_failure = @import("../../provider_failure.zig");
+const request_transform = @import("../../request_transform.zig");
+const responses_request = @import("request.zig");
+const responses_stream = @import("stream.zig");
 const Token = protocol.CancelToken;
-const http_cancel = @import("http_cancel.zig");
+const http_cancel = @import("../../../runtime/http_cancel.zig");
 
 pub const AuthFactory = struct {
     ctx: ?*anyopaque = null,
@@ -125,7 +125,7 @@ pub fn streamCore(
     };
     defer req.deinit();
 
-    var abort_guard = http_cancel.ShutdownOnCancel.start(options.io, options.signal, &req) catch |err| {
+    var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
         responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to start interrupt guard: {s}", .{@errorName(err)});
         return;
     };

@@ -1,5 +1,5 @@
 const std = @import("std");
-const protocol = @import("protocol.zig");
+const protocol = @import("../../protocol.zig");
 
 fn mapReasoningEffort(effort: []const u8, map: ?protocol.OpenAICompletionsCompat.ReasoningEffortMap) []const u8 {
     const m = map orelse return effort;

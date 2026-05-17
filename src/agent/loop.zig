@@ -1113,12 +1113,17 @@ test "parallel worker updates stream live before completion-ordered finalization
     const Collector = struct {
         allocator: std.mem.Allocator,
         events: std.ArrayListUnmanaged(Event) = .empty,
+        alloc_failed: bool = false,
 
         fn emit(event: protocol.AgentEvent, raw_ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
             switch (event) {
-                .tool_execution_update => |payload| self.events.append(self.allocator, .{ .update = payload.tool_call_id }) catch {},
-                .tool_execution_end => |payload| self.events.append(self.allocator, .{ .end = payload.tool_call_id }) catch {},
+                .tool_execution_update => |payload| self.events.append(self.allocator, .{ .update = payload.tool_call_id }) catch {
+                    self.alloc_failed = true;
+                },
+                .tool_execution_end => |payload| self.events.append(self.allocator, .{ .end = payload.tool_call_id }) catch {
+                    self.alloc_failed = true;
+                },
                 else => {},
             }
         }
@@ -1198,6 +1203,7 @@ test "parallel worker updates stream live before completion-ordered finalization
         @ptrCast(&collector),
     ));
 
+    try std.testing.expect(!collector.alloc_failed);
     try std.testing.expectEqual(@as(usize, 3), collector.events.items.len);
     var saw_update = false;
     var saw_call_1_end = false;
@@ -1226,12 +1232,17 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
         allocator: std.mem.Allocator,
         starts: std.ArrayListUnmanaged([]const u8) = .empty,
         ends: std.ArrayListUnmanaged([]const u8) = .empty,
+        alloc_failed: bool = false,
 
         fn emit(event: protocol.AgentEvent, raw_ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
             switch (event) {
-                .tool_execution_start => |payload| self.starts.append(self.allocator, payload.tool_call_id) catch {},
-                .tool_execution_end => |payload| self.ends.append(self.allocator, payload.tool_call_id) catch {},
+                .tool_execution_start => |payload| self.starts.append(self.allocator, payload.tool_call_id) catch {
+                    self.alloc_failed = true;
+                },
+                .tool_execution_end => |payload| self.ends.append(self.allocator, payload.tool_call_id) catch {
+                    self.alloc_failed = true;
+                },
                 else => {},
             }
         }
@@ -1314,6 +1325,7 @@ test "abort during parallel worker updates balances tool execution lifecycle" {
         @ptrCast(&collector),
     ));
 
+    try std.testing.expect(!collector.alloc_failed);
     try std.testing.expectEqual(@as(usize, 2), collector.starts.items.len);
     try std.testing.expectEqual(@as(usize, 2), collector.ends.items.len);
     try std.testing.expectEqualStrings("call-1", collector.ends.items[0]);

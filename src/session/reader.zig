@@ -6,8 +6,6 @@ const max_session_file_bytes: usize = 100 * 1024 * 1024;
 
 pub const ReadPolicy = enum {
     strict,
-    /// Accept a trailing line that was cut off during append. Semantic errors
-    /// on a complete-looking final record are still rejected.
     allow_final_partial_line,
 };
 

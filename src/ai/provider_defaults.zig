@@ -4,9 +4,9 @@ const provider_registry = @import("provider_registry.zig");
 const protocol = @import("protocol.zig");
 const ai_models = @import("models.zig");
 const anthropic = @import("anthropic/provider.zig");
-const openai_completions = @import("openai_completions.zig");
-const openai_responses_core = @import("openai_responses_core.zig");
-const openai_codex = @import("openai_codex.zig");
+const openai_completions = @import("openai/completions/provider.zig");
+const openai_responses_core = @import("openai/responses/core.zig");
+const openai_codex = @import("openai/codex.zig");
 
 pub const Bundle = struct {
     allocator: std.mem.Allocator,
