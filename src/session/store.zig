@@ -3,6 +3,13 @@ const proto = @import("protocol.zig");
 const json = @import("json.zig");
 const reader = @import("reader.zig");
 
+/// Append-only durable session JSONL store.
+///
+/// Owner: `Store` owns the session file path allocation.
+/// Ingress: `create`, `open`, `append`, `readAll`.
+/// Egress: filesystem writes and parsed session logs.
+/// Bounds: reader enforces maximum file size on reads.
+/// Shutdown: `deinit` frees the owned path; open files are scoped per operation.
 pub const Store = struct {
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -47,7 +54,7 @@ pub const Store = struct {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
 
-        try json.writeEntry(&out.writer, entry);
+        try json.writeEntry(self.allocator, &out.writer, entry);
         try out.writer.writeAll("\n");
 
         const file = try std.Io.Dir.cwd().openFile(io, self.path, .{ .mode = .write_only });
@@ -99,4 +106,15 @@ test "store creates appends and reads a session log" {
     try std.testing.expectEqual(@as(usize, 2), log.entries.len);
     try std.testing.expectEqualStrings("1", log.entries[0].id);
     try std.testing.expectEqualStrings("2", log.entries[1].id);
+}
+
+test "store open rejects invalid existing logs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "bad.jsonl", .data = "not json\n" });
+    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "bad.jsonl", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(error.SyntaxError, Store.open(std.testing.allocator, std.Options.debug_io, path));
 }

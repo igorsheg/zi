@@ -2,11 +2,21 @@ const std = @import("std");
 const proto = @import("protocol.zig");
 const json = @import("json.zig");
 
+const max_session_file_bytes: usize = 100 * 1024 * 1024;
+
 pub const ReadPolicy = enum {
     strict,
     allow_final_partial_line,
 };
 
+/// Arena-owned parsed session log.
+///
+/// Owner: `Log` owns all header and entry memory through `arena`.
+/// Ingress: complete file bytes through `parseContent` or a file path through
+/// `readFile`.
+/// Egress: validated header and append-order entries.
+/// Bounds: `readFile` limits file bytes; validation rejects duplicate IDs,
+/// missing headers, future versions, and unknown parents.
 pub const Log = struct {
     arena: std.heap.ArenaAllocator,
     header: proto.SessionHeader,
@@ -24,7 +34,7 @@ pub fn readFile(
     path: []const u8,
     policy: ReadPolicy,
 ) !Log {
-    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(100 * 1024 * 1024));
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_session_file_bytes));
     defer allocator.free(content);
     return parseContent(allocator, content, policy);
 }
@@ -135,4 +145,21 @@ test "reader rejects duplicate IDs and unknown parents" {
         \\
     ;
     try std.testing.expectError(error.UnknownParentEntryId, parseContent(std.testing.allocator, unknown_parent, .strict));
+}
+
+test "reader can ignore only a malformed final partial line" {
+    const content =
+        \\{"type":"session","version":3,"id":"s1","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}
+        \\{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"first","timestamp":1}}
+        \\{"type":"message","id":"2","parentId":"1","timestamp":"2025-01-01T00:00:02Z","message":{"role":"user"
+    ;
+
+    try std.testing.expectError(error.SyntaxError, parseContent(std.testing.allocator, content, .strict));
+
+    var log = try parseContent(std.testing.allocator, content, .allow_final_partial_line);
+    defer log.deinit();
+
+    try std.testing.expectEqualStrings("s1", log.header.id);
+    try std.testing.expectEqual(@as(usize, 1), log.entries.len);
+    try std.testing.expectEqualStrings("1", log.entries[0].id);
 }

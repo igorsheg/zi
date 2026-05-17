@@ -4,6 +4,12 @@ const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const context_usage = @import("context_usage.zig");
 
+/// Derived agent context for one selected session branch.
+///
+/// Owner: caller owns `messages` and must call `deinit` with the allocator used
+/// by `buildSessionContext`.
+/// Borrowed data: message payloads, model strings, and thinking level point into
+/// the source session entries.
 pub const SessionContext = struct {
     messages: []agent.protocol.AgentMessage,
     thinking_level: []const u8,
@@ -13,6 +19,11 @@ pub const SessionContext = struct {
         provider: []const u8,
         model_id: []const u8,
     };
+
+    pub fn deinit(self: *SessionContext, allocator: std.mem.Allocator) void {
+        allocator.free(self.messages);
+        self.* = undefined;
+    }
 };
 
 pub const LeafSelection = union(enum) {
@@ -33,6 +44,10 @@ pub fn getLatestCompactionEntry(entries: []const proto.SessionEntry) ?proto.Comp
     return null;
 }
 
+/// Build the ancestry path from the selected leaf back to the root entry.
+///
+/// The returned slice is owned by `allocator`. Entry payloads are borrowed from
+/// `entries`.
 pub fn buildBranchEntries(
     allocator: std.mem.Allocator,
     entries: []const proto.SessionEntry,
@@ -44,7 +59,7 @@ pub fn buildBranchEntries(
         try by_id.put(entry.id, idx);
     }
 
-    const idx = resolveLeafIndex(entries, &by_id, selection) orelse return &.{};
+    const idx = resolveLeafIndex(entries, &by_id, selection) orelse return allocator.alloc(proto.SessionEntry, 0);
 
     var path: std.ArrayList(proto.SessionEntry) = .empty;
     errdefer path.deinit(allocator);
@@ -64,9 +79,10 @@ pub fn buildSessionContext(
     selection: LeafSelection,
 ) !SessionContext {
     const path = try buildBranchEntries(allocator, entries, selection);
+    defer allocator.free(path);
 
     if (path.len == 0) {
-        return .{ .messages = &.{}, .thinking_level = "off", .model = null };
+        return .{ .messages = try allocator.alloc(agent.protocol.AgentMessage, 0), .thinking_level = "off", .model = null };
     }
 
     var thinking_level: []const u8 = "off";
@@ -93,6 +109,7 @@ pub fn buildSessionContext(
     }
 
     var messages: std.ArrayListUnmanaged(agent.protocol.AgentMessage) = .empty;
+    errdefer messages.deinit(allocator);
 
     if (compaction_data) |cd| {
         try messages.append(allocator, .{ .compaction_summary = .{
@@ -445,7 +462,7 @@ test "compaction emits latest summary, kept messages, and later messages" {
     try expectAssistantTextAt(ctx, 4, "response3");
 }
 
-test "compaction preserves kept pre-compaction assistant usage like pi-mono" {
+test "compaction preserves kept assistant usage for context estimation" {
     var arena = testArena();
     defer arena.deinit();
     var entries = [_]proto.SessionEntry{

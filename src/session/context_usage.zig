@@ -135,12 +135,55 @@ fn getAssistantUsage(message: agent.protocol.AgentMessage) ?ai.protocol.Usage {
 }
 
 fn estimateJsonSize(value: std.json.Value) usize {
-    var out: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-    defer out.deinit();
+    return switch (value) {
+        .null => 4,
+        .bool => |b| if (b) 4 else 5,
+        .integer => |i| countPrint("{d}", .{i}),
+        .float => |f| countPrint("{d}", .{f}),
+        .number_string => |s| s.len,
+        .string => |s| estimateJsonStringSize(s),
+        .array => |arr| estimateJsonArraySize(arr),
+        .object => |obj| estimateJsonObjectSize(obj),
+    };
+}
 
-    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
-    jw.write(value) catch return 0;
-    return out.written().len;
+fn estimateJsonArraySize(arr: std.json.Array) usize {
+    var size: usize = 2;
+    for (arr.items, 0..) |item, i| {
+        if (i > 0) size += 1;
+        size += estimateJsonSize(item);
+    }
+    return size;
+}
+
+fn estimateJsonObjectSize(obj: std.json.ObjectMap) usize {
+    var size: usize = 2;
+    var i: usize = 0;
+    var it = obj.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        if (i > 0) size += 1;
+        size += estimateJsonStringSize(entry.key_ptr.*);
+        size += 1;
+        size += estimateJsonSize(entry.value_ptr.*);
+    }
+    return size;
+}
+
+fn estimateJsonStringSize(s: []const u8) usize {
+    var size: usize = 2;
+    for (s) |c| {
+        size += switch (c) {
+            '"', '\\' => 2,
+            0x00...0x1f => 6,
+            else => 1,
+        };
+    }
+    return size;
+}
+
+fn countPrint(comptime fmt: []const u8, args: anytype) usize {
+    var buf: [128]u8 = undefined;
+    return (std.fmt.bufPrint(&buf, fmt, args) catch return 0).len;
 }
 
 const testing = std.testing;
@@ -188,7 +231,7 @@ test "estimateContextTokensWithInFlight uses assistant message-end usage before 
     try testing.expectEqual(@as(?usize, 1), estimate.last_usage_index);
 }
 
-test "estimateTokens counts tool call arguments using stringified json size" {
+test "estimateTokens counts serialized tool call arguments" {
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         testing.allocator,

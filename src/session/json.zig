@@ -19,7 +19,7 @@ fn entryToOwnedLine(allocator: std.mem.Allocator, entry: proto.SessionEntry) ![]
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
 
-    try writeEntry(&out.writer, entry);
+    try writeEntry(allocator, &out.writer, entry);
     return try out.toOwnedSlice();
 }
 
@@ -44,7 +44,7 @@ pub fn writeHeader(writer: *std.Io.Writer, header: proto.SessionHeader) !void {
     try jw.endObject();
 }
 
-pub fn writeEntry(writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
+pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
     var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();
@@ -76,7 +76,7 @@ pub fn writeEntry(writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
     switch (entry.entry) {
         .message => |m| {
             try jw.objectField("message");
-            try writeAgentMessage(&jw, m.message);
+            try writeAgentMessage(allocator, &jw, m.message);
         },
         .thinking_level_change => |t| {
             try jw.objectField("thinkingLevel");
@@ -130,7 +130,7 @@ pub fn writeEntry(writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
             try jw.objectField("customType");
             try jw.write(cm.custom_type);
             try jw.objectField("content");
-            try writeCustomContent(&jw, cm.content);
+            try writeCustomContent(allocator, &jw, cm.content);
             if (cm.details) |d| {
                 try jw.objectField("details");
                 try jw.write(d);
@@ -159,18 +159,18 @@ pub fn writeEntry(writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
     try jw.endObject();
 }
 
-pub fn writeAgentMessage(jw: *Stringify, msg: agent.protocol.AgentMessage) !void {
+pub fn writeAgentMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: agent.protocol.AgentMessage) !void {
     switch (msg) {
-        .user => |u| try writeUserMessage(jw, u),
-        .assistant => |a| try writeAssistantMessage(jw, a),
-        .tool_result => |tr| try writeToolResultMessage(jw, tr),
+        .user => |u| try writeUserMessage(allocator, jw, u),
+        .assistant => |a| try writeAssistantMessage(allocator, jw, a),
+        .tool_result => |tr| try writeToolResultMessage(allocator, jw, tr),
         .compaction_summary => |cs| try writeCompactionSummaryMessage(jw, cs),
         .branch_summary => |bs| try writeBranchSummaryMessage(jw, bs),
-        .custom => |c| try writeCustomMessage(jw, c),
+        .custom => |c| try writeCustomMessage(allocator, jw, c),
     }
 }
 
-pub fn writeUserMessage(jw: *Stringify, msg: ai.protocol.UserMessage) !void {
+pub fn writeUserMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: ai.protocol.UserMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("user");
@@ -183,7 +183,7 @@ pub fn writeUserMessage(jw: *Stringify, msg: ai.protocol.UserMessage) !void {
             try jw.beginArray();
             for (blocks) |block| {
                 switch (block) {
-                    .text => |tc| try writeTextBlock(jw, tc),
+                    .text => |tc| try writeTextBlock(allocator, jw, tc),
                     .image => |ic| try writeImageBlock(jw, ic),
                 }
             }
@@ -195,7 +195,7 @@ pub fn writeUserMessage(jw: *Stringify, msg: ai.protocol.UserMessage) !void {
     try jw.endObject();
 }
 
-pub fn writeAssistantMessage(jw: *Stringify, msg: ai.protocol.AssistantMessage) !void {
+pub fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: ai.protocol.AssistantMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("assistant");
@@ -204,7 +204,7 @@ pub fn writeAssistantMessage(jw: *Stringify, msg: ai.protocol.AssistantMessage) 
     try jw.beginArray();
     for (msg.content) |block| {
         switch (block) {
-            .text => |tc| try writeTextBlock(jw, tc),
+            .text => |tc| try writeTextBlock(allocator, jw, tc),
             .thinking => |th| try writeThinkingBlock(jw, th),
             .tool_call => |tc| try writeToolCallBlock(jw, tc),
         }
@@ -243,7 +243,7 @@ pub fn writeAssistantMessage(jw: *Stringify, msg: ai.protocol.AssistantMessage) 
     try jw.endObject();
 }
 
-pub fn writeToolResultMessage(jw: *Stringify, msg: ai.protocol.ToolResultMessage) !void {
+pub fn writeToolResultMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: ai.protocol.ToolResultMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("toolResult");
@@ -256,7 +256,7 @@ pub fn writeToolResultMessage(jw: *Stringify, msg: ai.protocol.ToolResultMessage
     try jw.beginArray();
     for (msg.content) |block| {
         switch (block) {
-            .text => |tc| try writeTextBlock(jw, tc),
+            .text => |tc| try writeTextBlock(allocator, jw, tc),
             .image => |ic| try writeImageBlock(jw, ic),
         }
     }
@@ -303,14 +303,14 @@ pub fn writeBranchSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessag
     try jw.endObject();
 }
 
-pub fn writeCustomMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.CustomMessage) !void {
+pub fn writeCustomMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: agent.protocol.AgentMessage.CustomMessage) !void {
     try jw.beginObject();
     try jw.objectField("role");
     try jw.write("custom");
     try jw.objectField("customType");
     try jw.write(msg.custom_type);
     try jw.objectField("content");
-    try writeCustomContent(jw, msg.content);
+    try writeCustomContent(allocator, jw, msg.content);
     if (msg.details) |d| {
         try jw.objectField("details");
         try jw.write(d);
@@ -322,14 +322,14 @@ pub fn writeCustomMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.Custo
     try jw.endObject();
 }
 
-pub fn writeCustomContent(jw: *Stringify, content: agent.protocol.AgentMessage.CustomContent) !void {
+pub fn writeCustomContent(allocator: std.mem.Allocator, jw: *Stringify, content: agent.protocol.AgentMessage.CustomContent) !void {
     switch (content) {
         .text => |t| try jw.write(t),
         .blocks => |blocks| {
             try jw.beginArray();
             for (blocks) |block| {
                 switch (block) {
-                    .text => |tc| try writeTextBlock(jw, tc),
+                    .text => |tc| try writeTextBlock(allocator, jw, tc),
                     .image => |ic| try writeImageBlock(jw, ic),
                 }
             }
@@ -338,13 +338,13 @@ pub fn writeCustomContent(jw: *Stringify, content: agent.protocol.AgentMessage.C
     }
 }
 
-pub fn writeTextBlock(jw: *Stringify, tc: ai.protocol.TextContent) !void {
+pub fn writeTextBlock(allocator: std.mem.Allocator, jw: *Stringify, tc: ai.protocol.TextContent) !void {
     try jw.beginObject();
     try jw.objectField("type");
     try jw.write("text");
     try jw.objectField("text");
-    const sanitized = try json_util.utf8LossyAlloc(std.heap.page_allocator, tc.text);
-    defer std.heap.page_allocator.free(sanitized);
+    const sanitized = try json_util.utf8LossyAlloc(allocator, tc.text);
+    defer allocator.free(sanitized);
     try jw.write(sanitized);
     if (tc.text_signature) |sig| {
         try jw.objectField("textSignature");
@@ -984,7 +984,7 @@ test "assistant message round-trips normalized failure metadata" {
     }
 }
 
-test "entry serialization keeps owned JSON valid with arena allocator" {
+test "tool result entry round-trips long identifiers and multiline text" {
     var arena = testArena();
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1017,8 +1017,12 @@ test "entry serialization keeps owned JSON valid with arena allocator" {
     };
 
     const line = try entryToOwnedLine(allocator, entry);
-    try expectJsonContains(line, long_tool_call_id);
-    try expectJsonContains(line, long_tool_name);
+    const parsed = try parseFileEntry(allocator, line);
+    const tool_result = parsed.entry.entry.message.message.tool_result;
+
+    try std.testing.expectEqualStrings(long_tool_call_id, tool_result.tool_call_id);
+    try std.testing.expectEqualStrings(long_tool_name, tool_result.tool_name);
+    try std.testing.expectEqualStrings(long_text, tool_result.content[0].text.text);
 }
 
 test "tool-result text serializes invalid utf-8 as a json string" {
@@ -1047,7 +1051,7 @@ test "tool-result text serializes invalid utf-8 as a json string" {
     try expectJsonOmits(line, "\"text\":[");
 }
 
-test "compaction fixture preserves persistence fields and context behavior" {
+test "compaction entries preserve metadata and project into context" {
     var arena = testArena();
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1083,7 +1087,8 @@ test "compaction fixture preserves persistence fields and context behavior" {
     try expectJsonContains(serialized, "\"fromHook\":true");
     try expectJsonContains(serialized, "\"provider\":\"custom-compactor\"");
 
-    const ctx = try context.buildSessionContext(allocator, &entries, .current);
+    var ctx = try context.buildSessionContext(allocator, &entries, .current);
+    defer ctx.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 3), ctx.messages.len);
     switch (ctx.messages[0]) {
         .compaction_summary => |summary| {
@@ -1096,7 +1101,7 @@ test "compaction fixture preserves persistence fields and context behavior" {
     try expectUserText(ctx.messages[2], "after compaction");
 }
 
-test "session write-read-buildContext round-trip" {
+test "session message entries round-trip through JSON and rebuild context" {
     const allocator = std.testing.allocator;
     const context = @import("context.zig");
 
@@ -1163,7 +1168,8 @@ test "session write-read-buildContext round-trip" {
         parsed_entries[i] = fe.entry;
     }
 
-    const ctx = try context.buildSessionContext(aa, &parsed_entries, .current);
+    var ctx = try context.buildSessionContext(aa, &parsed_entries, .current);
+    defer ctx.deinit(aa);
 
     try std.testing.expectEqual(@as(usize, 3), ctx.messages.len);
 
