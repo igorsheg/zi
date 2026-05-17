@@ -1,5 +1,13 @@
 const std = @import("std");
 
+/// Bounded JSONL line decoder.
+///
+/// Owner: `Decoder` owns the partial-line buffer and oversize discard state.
+/// Ingress: byte chunks through `feed`.
+/// Egress: complete line slices through `Sink.emit`; diagnostics through
+/// `Sink.err`.
+/// Bound: `Options.max_line_bytes`; oversize lines are discarded until the next
+/// newline so framing can resynchronize.
 pub const ErrorKind = enum { line_too_long };
 
 pub const Options = struct {

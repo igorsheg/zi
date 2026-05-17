@@ -1,5 +1,14 @@
 const std = @import("std");
 
+/// Permissive JSON parser for incomplete streaming fragments.
+///
+/// Contract:
+/// - Complete JSON must match `std.json` semantics at the public boundary.
+/// - Incomplete JSON may return the committed object/array/string prefix when
+///   allowed by `Allow`.
+/// - The returned `std.json.Value` is allocated from the caller allocator.
+/// - Work is bounded by `max_depth`; callers bound input bytes before calling.
+/// - This is not a general-purpose replacement for `std.json`.
 pub const Allow = packed struct(u8) {
     str: bool = false,
     num: bool = false,

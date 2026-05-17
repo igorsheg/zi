@@ -1,10 +1,5 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const json_value = @import("../json/value.zig");
-
-pub const cloneJsonValue = json_value.cloneJsonValue;
-pub const freeJsonValue = json_value.freeJsonValue;
-pub const jsonToFloat = json_value.jsonToFloat;
 
 pub fn utf8LossyAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     if (std.unicode.utf8ValidateSlice(bytes)) return allocator.dupe(u8, bytes);

@@ -7,6 +7,7 @@ const bridge_mod = @import("stream_bridge.zig");
 const json_util = @import("../ai/json_util.zig");
 const message_memory = @import("message_memory.zig");
 const tool_execution_group = @import("tool_execution_group.zig");
+const json_value = @import("../json/value.zig");
 
 pub fn runAgentLoop(
     run_allocator: std.mem.Allocator,
@@ -355,7 +356,7 @@ const WorkerExecution = struct {
     fn deinit(self: *WorkerExecution) void {
         self.group.allocator.free(self.tool_call_id);
         self.group.allocator.free(self.tool_name);
-        json_util.freeJsonValue(self.group.allocator, self.args);
+        json_value.freeJsonValue(self.group.allocator, self.args);
         self.arena.deinit();
         self.owner_allocator.destroy(self);
     }
@@ -413,7 +414,7 @@ fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaq
         allocator.free(tool_call_id);
         return;
     };
-    const args = json_util.cloneJsonValue(allocator, worker.args) catch {
+    const args = json_value.cloneJsonValue(allocator, worker.args) catch {
         allocator.free(tool_call_id);
         allocator.free(tool_name);
         return;
@@ -421,7 +422,7 @@ fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaq
     const owned = partial_result.clone(allocator) catch {
         allocator.free(tool_call_id);
         allocator.free(tool_name);
-        json_util.freeJsonValue(allocator, args);
+        json_value.freeJsonValue(allocator, args);
         return;
     };
 
@@ -542,7 +543,7 @@ fn executeToolCalls(
                     std.heap.page_allocator.destroy(worker);
                     continue;
                 };
-                const args = json_util.cloneJsonValue(group.allocator, prepared.tool_call.arguments) catch {
+                const args = json_value.cloneJsonValue(group.allocator, prepared.tool_call.arguments) catch {
                     group.allocator.free(tool_call_id);
                     group.allocator.free(tool_name);
                     std.heap.page_allocator.destroy(worker);
@@ -734,7 +735,7 @@ fn emitWorkerUpdate(
 
     const tool_call_id = allocator.dupe(u8, update.tool_call_id) catch update.tool_call_id;
     const tool_name = allocator.dupe(u8, update.tool_name) catch update.tool_name;
-    const args = json_util.cloneJsonValue(allocator, update.args) catch update.args;
+    const args = json_value.cloneJsonValue(allocator, update.args) catch update.args;
     const partial_result = update.partial_result.clone(allocator) catch update.partial_result;
 
     event_sink(.{ .tool_execution_update = .{

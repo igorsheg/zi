@@ -5,6 +5,7 @@ const partial_json = @import("../json/partial.zig");
 const protocol = @import("types.zig");
 const message_memory = @import("message_memory.zig");
 const shared_committed_mod = @import("shared_committed.zig");
+const json_value = @import("../json/value.zig");
 
 pub const SharedCommitted = shared_committed_mod.SharedCommitted;
 
@@ -84,8 +85,8 @@ pub const ToolExecution = struct {
         errdefer allocator.free(tool_call_id);
         const tool_name = try allocator.dupe(u8, self.tool_name);
         errdefer allocator.free(tool_name);
-        const args = try json_util.cloneJsonValue(allocator, self.args);
-        errdefer json_util.freeJsonValue(allocator, args);
+        const args = try json_value.cloneJsonValue(allocator, self.args);
+        errdefer json_value.freeJsonValue(allocator, args);
         const args_json_source = if (self.args_json_source) |source|
             try allocator.dupe(u8, source)
         else
@@ -119,7 +120,7 @@ pub const ToolExecution = struct {
     pub fn deinit(self: *ToolExecution, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
-        json_util.freeJsonValue(allocator, self.args);
+        json_value.freeJsonValue(allocator, self.args);
         if (self.args_json_source) |source| allocator.free(source);
         if (self.result) |result| result.free(allocator);
         if (self.result_message) |*result_message| message_memory.freeToolResultMessage(allocator, result_message);
@@ -264,8 +265,8 @@ pub const InFlightState = struct {
 
     pub fn syncToolCall(self: *InFlightState, tool_call: ai.protocol.ToolCall, args_complete: bool, delta: ?[]const u8) void {
         const tool = self.ensureTool(tool_call.id, tool_call.name) orelse return;
-        json_util.freeJsonValue(self.allocator, tool.args);
-        tool.args = json_util.cloneJsonValue(self.allocator, tool_call.arguments) catch .null;
+        json_value.freeJsonValue(self.allocator, tool.args);
+        tool.args = json_value.cloneJsonValue(self.allocator, tool_call.arguments) catch .null;
         if (delta) |bytes| {
             const combined = if (tool.args_json_source) |source|
                 appendBytesOwned(self.allocator, source, bytes) catch return
@@ -274,7 +275,7 @@ pub const InFlightState = struct {
             if (tool.args_json_source) |source| self.allocator.free(source);
             tool.args_json_source = combined;
             if (bytes.len != 0 or combined.len != 0) {
-                json_util.freeJsonValue(self.allocator, tool.args);
+                json_value.freeJsonValue(self.allocator, tool.args);
                 tool.args = partial_json.parseStreaming(self.allocator, combined) catch .null;
             }
         } else if (args_complete) {
@@ -286,8 +287,8 @@ pub const InFlightState = struct {
 
     pub fn markExecutionStarted(self: *InFlightState, tool_call_id: []const u8, tool_name: []const u8, args: std.json.Value) void {
         const tool = self.ensureTool(tool_call_id, tool_name) orelse return;
-        json_util.freeJsonValue(self.allocator, tool.args);
-        tool.args = json_util.cloneJsonValue(self.allocator, args) catch .null;
+        json_value.freeJsonValue(self.allocator, tool.args);
+        tool.args = json_value.cloneJsonValue(self.allocator, args) catch .null;
         if (tool.args_json_source) |source| self.allocator.free(source);
         tool.args_json_source = null;
         tool.execution_started = true;

@@ -40,8 +40,6 @@ pub const Source = struct {
         self.aborted.store(true, .release);
     }
 
-    pub fn notifyWaiters(_: *Source) void {}
-
     pub fn isAborted(self: *const Source) bool {
         return self.aborted.load(.acquire);
     }

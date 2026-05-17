@@ -234,10 +234,6 @@ pub const Agent = struct {
         return self.abort_controller.signal();
     }
 
-    pub fn wakeAbortWaiters(self: *Agent) void {
-        self.abort_controller.notifyWaiters();
-    }
-
     pub fn systemPrompt(self: *const Agent) []const u8 {
         return self.system_prompt;
     }

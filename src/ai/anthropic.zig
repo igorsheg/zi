@@ -835,7 +835,7 @@ fn parseToolArgs(state: *StreamState, json_str: []const u8) std.json.Value {
     const parsed = partial_json.parseStreaming(scratch, json_str) catch {
         return emptyObject(state.allocator);
     };
-    return json_util.cloneJsonValue(state.allocator, parsed) catch emptyObject(state.allocator);
+    return json_value.cloneJsonValue(state.allocator, parsed) catch emptyObject(state.allocator);
 }
 
 fn emptyObject(allocator: std.mem.Allocator) std.json.Value {

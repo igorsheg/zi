@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_value = @import("../json/value.zig");
 
 const json_util = @import("json_util.zig");
 const protocol = @import("protocol.zig");
@@ -48,12 +49,12 @@ pub fn transformJsonPayload(
     }
 
     var replacement: ?std.json.Value = null;
-    defer if (replacement) |value| json_util.freeJsonValue(allocator, value);
+    defer if (replacement) |value| json_value.freeJsonValue(allocator, value);
 
     const final_payload = blk: {
         if (options.stream_options.on_payload) |hook| {
             if (hook(temp, payload, options.model, options.stream_options.on_payload_ctx)) |next| {
-                replacement = try json_util.cloneJsonValue(allocator, next);
+                replacement = try json_value.cloneJsonValue(allocator, next);
                 changed = true;
                 break :blk replacement.?;
             }

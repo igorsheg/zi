@@ -1,5 +1,13 @@
 const std = @import("std");
 
+/// Ownership helpers for `std.json.Value`.
+///
+/// Contract:
+/// - `cloneJsonValue` returns a value fully owned by `allocator`.
+/// - `freeJsonValue` must only be used for values produced by `cloneJsonValue`
+///   or constructed with the same ownership rules.
+/// - Borrowed values from `std.json.parseFromSliceLeaky` are not accepted by
+///   `freeJsonValue` unless they were first cloned.
 pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     switch (value) {
         .null => return .null,
@@ -10,6 +18,10 @@ pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.
         .string => |s| return .{ .string = try allocator.dupe(u8, s) },
         .array => |arr| {
             var new_arr = std.json.Array.initCapacity(allocator, arr.items.len) catch return error.OutOfMemory;
+            errdefer {
+                for (new_arr.items) |item| freeJsonValue(allocator, item);
+                new_arr.deinit();
+            }
             for (arr.items) |item| {
                 try new_arr.append(try cloneJsonValue(allocator, item));
             }
@@ -17,11 +29,27 @@ pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.
         },
         .object => |obj| {
             var new_obj: std.json.ObjectMap = .{};
+            errdefer {
+                var cleanup = new_obj;
+                var cleanup_it = cleanup.iterator();
+                while (cleanup_it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    freeJsonValue(allocator, entry.value_ptr.*);
+                }
+                cleanup.deinit(allocator);
+            }
             var it = obj.iterator();
             while (it.next()) |entry| {
                 const key = try allocator.dupe(u8, entry.key_ptr.*);
-                const val = try cloneJsonValue(allocator, entry.value_ptr.*);
-                try new_obj.put(allocator, key, val);
+                const val = cloneJsonValue(allocator, entry.value_ptr.*) catch |err| {
+                    allocator.free(key);
+                    return err;
+                };
+                new_obj.put(allocator, key, val) catch |err| {
+                    allocator.free(key);
+                    freeJsonValue(allocator, val);
+                    return err;
+                };
             }
             return .{ .object = new_obj };
         },

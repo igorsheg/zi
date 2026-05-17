@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const runtime_env = @import("env.zig");
+const log = @import("log.zig");
 
 pub const name = "zi";
 pub const version = build_options.version;
@@ -49,3 +50,43 @@ pub const Caps = struct {
     allocator: std.mem.Allocator,
     msg_allocator: std.mem.Allocator,
 };
+
+pub fn main(init: std.process.Init) !void {
+    log.setThreadLabel(.main);
+    const env = runtime_env.Env.from(init.environ_map);
+
+    var heap: MainHeap = .{};
+    defer heap.deinit();
+
+    const allocator = heap.allocator();
+
+    var log_session = try log.init(allocator, .{
+        .io = init.io,
+        .sink = .stderr,
+        .min_level = .info,
+    });
+    defer log_session.deinit();
+
+    const caps: Caps = .{
+        .io = init.io,
+        .env = env,
+        .allocator = allocator,
+        .msg_allocator = std.heap.smp_allocator,
+    };
+    _ = caps;
+
+    std.log.info("bootstrap complete", .{});
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    const writer = &stderr_writer.interface;
+
+    try writer.print(
+        \\zi beta {s}
+        \\core-only rebuild branch
+        \\retained owners: runtime, agent, ai, session, json, lib
+        \\removed owners: coding_agent, tui, zio, spawn, diff, image, search
+        \\
+    , .{build_options.version});
+    try stderr_writer.end();
+}

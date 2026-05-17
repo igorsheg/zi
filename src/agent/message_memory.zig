@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
 const protocol = @import("types.zig");
+const json_value = @import("../json/value.zig");
 
 pub fn cloneMessages(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage) ![]protocol.AgentMessage {
     const cloned = try allocator.alloc(protocol.AgentMessage, messages.len);
@@ -152,8 +153,8 @@ pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCa
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, tool_call.name);
     errdefer allocator.free(name);
-    const arguments = try json_util.cloneJsonValue(allocator, tool_call.arguments);
-    errdefer json_util.freeJsonValue(allocator, arguments);
+    const arguments = try json_value.cloneJsonValue(allocator, tool_call.arguments);
+    errdefer json_value.freeJsonValue(allocator, arguments);
     const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
     return .{
         .id = id,
@@ -166,7 +167,7 @@ pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCa
 pub fn freeToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
-    json_util.freeJsonValue(allocator, tool_call.arguments);
+    json_value.freeJsonValue(allocator, tool_call.arguments);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
 }
 
@@ -347,10 +348,10 @@ pub fn cloneToolResultMessage(allocator: std.mem.Allocator, message: ai.protocol
     errdefer allocator.free(tool_call_id);
     const tool_name = try allocator.dupe(u8, message.tool_name);
     errdefer allocator.free(tool_name);
-    const details = if (message.details) |details| try json_util.cloneJsonValue(allocator, details) else null;
-    errdefer if (details) |value| json_util.freeJsonValue(allocator, value);
-    const presentation = if (message.presentation) |presentation| try json_util.cloneJsonValue(allocator, presentation) else null;
-    errdefer if (presentation) |value| json_util.freeJsonValue(allocator, value);
+    const details = if (message.details) |details| try json_value.cloneJsonValue(allocator, details) else null;
+    errdefer if (details) |value| json_value.freeJsonValue(allocator, value);
+    const presentation = if (message.presentation) |presentation| try json_value.cloneJsonValue(allocator, presentation) else null;
+    errdefer if (presentation) |value| json_value.freeJsonValue(allocator, value);
 
     return .{
         .tool_call_id = tool_call_id,
@@ -375,8 +376,8 @@ pub fn freeToolResultMessage(allocator: std.mem.Allocator, message: *ai.protocol
     allocator.free(message.tool_name);
     for (message.content) |block| freeToolResultContentBlock(allocator, block);
     allocator.free(message.content);
-    if (message.details) |details| json_util.freeJsonValue(allocator, details);
-    if (message.presentation) |presentation| json_util.freeJsonValue(allocator, presentation);
+    if (message.details) |details| json_value.freeJsonValue(allocator, details);
+    if (message.presentation) |presentation| json_value.freeJsonValue(allocator, presentation);
 }
 
 fn cloneCustomMessage(allocator: std.mem.Allocator, message: protocol.AgentMessage.CustomMessage) !protocol.AgentMessage.CustomMessage {
@@ -393,7 +394,7 @@ fn cloneCustomMessage(allocator: std.mem.Allocator, message: protocol.AgentMessa
             allocator.free(blocks);
         },
     };
-    const details = if (message.details) |details| try json_util.cloneJsonValue(allocator, details) else null;
+    const details = if (message.details) |details| try json_value.cloneJsonValue(allocator, details) else null;
     return .{
         .custom_type = custom_type,
         .content = content,
@@ -416,5 +417,5 @@ pub fn freeCustomContent(allocator: std.mem.Allocator, content: protocol.AgentMe
 fn freeCustomMessage(allocator: std.mem.Allocator, message: *protocol.AgentMessage.CustomMessage) void {
     allocator.free(message.custom_type);
     freeCustomContent(allocator, message.content);
-    if (message.details) |details| json_util.freeJsonValue(allocator, details);
+    if (message.details) |details| json_value.freeJsonValue(allocator, details);
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const json_util = @import("../ai/json_util.zig");
+const json_value = @import("../json/value.zig");
 
 pub const Message = ai.protocol.Message;
 pub const AssistantMessage = ai.protocol.AssistantMessage;
@@ -180,10 +181,10 @@ pub const AgentToolResult = struct {
             initialized += 1;
         }
 
-        const details = try json_util.cloneJsonValue(allocator, self.details);
-        errdefer json_util.freeJsonValue(allocator, details);
-        const presentation = try json_util.cloneJsonValue(allocator, self.presentation);
-        errdefer json_util.freeJsonValue(allocator, presentation);
+        const details = try json_value.cloneJsonValue(allocator, self.details);
+        errdefer json_value.freeJsonValue(allocator, details);
+        const presentation = try json_value.cloneJsonValue(allocator, self.presentation);
+        errdefer json_value.freeJsonValue(allocator, presentation);
         const side_effects = try allocator.alloc(ToolSideEffect, self.side_effects.len);
         errdefer allocator.free(side_effects);
         for (self.side_effects, 0..) |effect, i| {
@@ -211,8 +212,8 @@ pub const AgentToolResult = struct {
             },
         };
         allocator.free(self.content);
-        json_util.freeJsonValue(allocator, self.details);
-        json_util.freeJsonValue(allocator, self.presentation);
+        json_value.freeJsonValue(allocator, self.details);
+        json_value.freeJsonValue(allocator, self.presentation);
         for (self.side_effects) |effect| effect.free(allocator);
         allocator.free(self.side_effects);
     }

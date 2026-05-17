@@ -1,6 +1,7 @@
 const std = @import("std");
 const protocol = @import("types.zig");
 const json_util = @import("../ai/json_util.zig");
+const json_value = @import("../json/value.zig");
 
 pub const ToolExecutionEvent = union(enum) {
     update: ToolUpdate,
@@ -25,7 +26,7 @@ pub const ToolUpdate = struct {
     pub fn deinit(self: *ToolUpdate, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
-        json_util.freeJsonValue(allocator, self.args);
+        json_value.freeJsonValue(allocator, self.args);
         self.partial_result.free(allocator);
         self.* = undefined;
     }

@@ -3,9 +3,25 @@ const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
 const proto = @import("protocol.zig");
 const json_util = ai.json_util;
-const json_write = @import("../json/write.zig");
+const json_value = @import("../json/value.zig");
 
 const Stringify = std.json.Stringify;
+
+fn headerToOwnedLine(allocator: std.mem.Allocator, header: proto.SessionHeader) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    try writeHeader(&out.writer, header);
+    return try out.toOwnedSlice();
+}
+
+fn entryToOwnedLine(allocator: std.mem.Allocator, entry: proto.SessionEntry) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    try writeEntry(&out.writer, entry);
+    return try out.toOwnedSlice();
+}
 
 pub fn writeHeader(writer: *std.Io.Writer, header: proto.SessionHeader) !void {
     var jw: Stringify = .{ .writer = writer };
@@ -456,26 +472,26 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: [
             .summary = try allocator.dupe(u8, try requiredString(obj, "summary")),
             .first_kept_entry_id = try allocator.dupe(u8, try requiredString(obj, "firstKeptEntryId")),
             .tokens_before = @intCast(try requiredInteger(obj, "tokensBefore")),
-            .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
+            .details = if (obj.get("details")) |d| try json_value.cloneJsonValue(allocator, d) else null,
             .from_hook = try optionalBool(obj, "fromHook"),
         } }
     else if (std.mem.eql(u8, type_str, "branch_summary"))
         .{ .branch_summary = .{
             .from_id = try allocator.dupe(u8, try requiredString(obj, "fromId")),
             .summary = try allocator.dupe(u8, try requiredString(obj, "summary")),
-            .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
+            .details = if (obj.get("details")) |d| try json_value.cloneJsonValue(allocator, d) else null,
             .from_hook = try optionalBool(obj, "fromHook"),
         } }
     else if (std.mem.eql(u8, type_str, "custom"))
         .{ .custom = .{
             .custom_type = try allocator.dupe(u8, try requiredString(obj, "customType")),
-            .data = if (obj.get("data")) |d| try json_util.cloneJsonValue(allocator, d) else null,
+            .data = if (obj.get("data")) |d| try json_value.cloneJsonValue(allocator, d) else null,
         } }
     else if (std.mem.eql(u8, type_str, "custom_message"))
         .{ .custom_message = .{
             .custom_type = try allocator.dupe(u8, try requiredString(obj, "customType")),
             .content = try parseCustomContent(allocator, try requiredValue(obj, "content")),
-            .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
+            .details = if (obj.get("details")) |d| try json_value.cloneJsonValue(allocator, d) else null,
             .display = try requiredBool(obj, "display"),
             .include_in_context = (try optionalBool(obj, "includeInContext")) orelse true,
         } }
@@ -647,11 +663,11 @@ fn parseAssistantMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) 
             .cache_write = @intCast(usage_obj.get("cacheWrite").?.integer),
             .total_tokens = @intCast(usage_obj.get("totalTokens").?.integer),
             .cost = .{
-                .input = json_util.jsonToFloat(cost_obj.get("input").?),
-                .output = json_util.jsonToFloat(cost_obj.get("output").?),
-                .cache_read = json_util.jsonToFloat(cost_obj.get("cacheRead").?),
-                .cache_write = json_util.jsonToFloat(cost_obj.get("cacheWrite").?),
-                .total = json_util.jsonToFloat(cost_obj.get("total").?),
+                .input = json_value.jsonToFloat(cost_obj.get("input").?),
+                .output = json_value.jsonToFloat(cost_obj.get("output").?),
+                .cache_read = json_value.jsonToFloat(cost_obj.get("cacheRead").?),
+                .cache_write = json_value.jsonToFloat(cost_obj.get("cacheWrite").?),
+                .total = json_value.jsonToFloat(cost_obj.get("total").?),
             },
         },
         .stop_reason = json_util.parseStopReason(obj.get("stopReason").?.string),
@@ -727,7 +743,7 @@ fn parseAssistantContentBlock(allocator: std.mem.Allocator, obj: std.json.Object
         return .{ .tool_call = .{
             .id = try allocator.dupe(u8, obj.get("id").?.string),
             .name = try allocator.dupe(u8, obj.get("name").?.string),
-            .arguments = try json_util.cloneJsonValue(allocator, obj.get("arguments").?),
+            .arguments = try json_value.cloneJsonValue(allocator, obj.get("arguments").?),
             .thought_signature = if (obj.get("thoughtSignature")) |v| try allocator.dupe(u8, v.string) else null,
         } };
     }
@@ -758,8 +774,8 @@ fn parseToolResultMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap)
         .tool_call_id = try allocator.dupe(u8, obj.get("toolCallId").?.string),
         .tool_name = try allocator.dupe(u8, obj.get("toolName").?.string),
         .content = blocks,
-        .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
-        .presentation = if (obj.get("presentation")) |p| try json_util.cloneJsonValue(allocator, p) else null,
+        .details = if (obj.get("details")) |d| try json_value.cloneJsonValue(allocator, d) else null,
+        .presentation = if (obj.get("presentation")) |p| try json_value.cloneJsonValue(allocator, p) else null,
         .is_error = obj.get("isError").?.bool,
         .timestamp = @intCast(obj.get("timestamp").?.integer),
     };
@@ -770,7 +786,7 @@ fn parseCustomAgentMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap
         .custom_type = try allocator.dupe(u8, obj.get("customType").?.string),
         .content = try parseCustomContent(allocator, obj.get("content").?),
         .display = if (obj.get("display")) |v| v.bool else false,
-        .details = if (obj.get("details")) |d| try json_util.cloneJsonValue(allocator, d) else null,
+        .details = if (obj.get("details")) |d| try json_value.cloneJsonValue(allocator, d) else null,
         .timestamp = @intCast(obj.get("timestamp").?.integer),
     };
 }
@@ -897,7 +913,7 @@ test "header wire format round-trips parent session and version" {
         .version = 3,
         .parent_session = "parent-uuid",
     };
-    const json_str = try json_write.toOwnedSlice(allocator, header, writeHeader);
+    const json_str = try headerToOwnedLine(allocator, header);
     defer allocator.free(json_str);
 
     try expectJsonContains(json_str, "\"type\":\"session\"");
@@ -953,7 +969,7 @@ test "assistant message round-trips normalized failure metadata" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const json_str = try json_write.toOwnedSlice(allocator, assistantFailureEntry(), writeEntry);
+    const json_str = try entryToOwnedLine(allocator, assistantFailureEntry());
     const parsed = try parseFileEntry(allocator, json_str);
     switch (parsed.entry.entry) {
         .message => |m| switch (m.message) {
@@ -1000,7 +1016,7 @@ test "entry serialization keeps owned JSON valid with arena allocator" {
         } } } },
     };
 
-    const line = try json_write.toOwnedSlice(allocator, entry, writeEntry);
+    const line = try entryToOwnedLine(allocator, entry);
     try expectJsonContains(line, long_tool_call_id);
     try expectJsonContains(line, long_tool_name);
 }
@@ -1023,7 +1039,7 @@ test "tool-result text serializes invalid utf-8 as a json string" {
         } } } },
     };
 
-    const line = try json_write.toOwnedSlice(allocator, entry, writeEntry);
+    const line = try entryToOwnedLine(allocator, entry);
     defer allocator.free(line);
 
     try expectJsonContains(line, "\"text\":\"bad");
@@ -1062,7 +1078,7 @@ test "compaction fixture preserves persistence fields and context behavior" {
     try std.testing.expectEqual(true, compaction.from_hook.?);
     try std.testing.expectEqualStrings("custom-compactor", compaction.details.?.object.get("provider").?.string);
 
-    const serialized = try json_write.toOwnedSlice(std.testing.allocator, entries[3], writeEntry);
+    const serialized = try entryToOwnedLine(std.testing.allocator, entries[3]);
     defer std.testing.allocator.free(serialized);
     try expectJsonContains(serialized, "\"fromHook\":true");
     try expectJsonContains(serialized, "\"provider\":\"custom-compactor\"");
@@ -1133,7 +1149,7 @@ test "session write-read-buildContext round-trip" {
 
     var json_lines: [3][]const u8 = undefined;
     for (entries_data, 0..) |ed, i| {
-        json_lines[i] = try json_write.toOwnedSlice(allocator, messageEntry(ed.id, ed.parent, ed.msg), writeEntry);
+        json_lines[i] = try entryToOwnedLine(allocator, messageEntry(ed.id, ed.parent, ed.msg));
     }
     defer for (&json_lines) |jl| allocator.free(jl);
 
