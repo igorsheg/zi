@@ -118,6 +118,12 @@ pub const AgentSession = struct {
     const ActiveRun = struct {
         command_id: command_mod.CommandId,
         cancel_source: cancel.Source = .{},
+        completion: CompletionAuthority,
+    };
+
+    const CompletionAuthority = enum {
+        external,
+        synchronous,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !AgentSession {
@@ -234,6 +240,16 @@ pub const AgentSession = struct {
     }
 
     pub fn completeRun(self: *AgentSession, terminal: OwnedRunTerminal) void {
+        self.assertCompletionAuthority(.external, "run completion without active run");
+        self.applyRunCompletion(terminal);
+    }
+
+    fn completeSynchronousRun(self: *AgentSession, terminal: OwnedRunTerminal) void {
+        self.assertCompletionAuthority(.synchronous, "synchronous run completion without active run");
+        self.applyRunCompletion(terminal);
+    }
+
+    fn applyRunCompletion(self: *AgentSession, terminal: OwnedRunTerminal) void {
         const finished_command_id = self.activeCommandId();
         const result: event_mod.RunTerminal = switch (terminal.status) {
             .completed => |messages| blk: {
@@ -333,7 +349,11 @@ pub const AgentSession = struct {
                 return;
             },
         }
-        self.active_run = .{ .command_id = id };
+        const completion: CompletionAuthority = switch (self.execution) {
+            .external_terminal => .external,
+            .synchronous => .synchronous,
+        };
+        self.active_run = .{ .command_id = id, .completion = completion };
         self.setActivity(.{ .running = .{
             .command_id = id,
             .pending_follow_ups = self.pending_follow_ups.len,
@@ -366,7 +386,7 @@ pub const AgentSession = struct {
         defer run.deinit();
 
         run.runStream(spec.config);
-        if (capture.terminal) |*terminal| self.completeRun(terminal.*);
+        if (capture.terminal) |*terminal| self.completeSynchronousRun(terminal.*);
     }
 
     fn buildRunSpec(self: *const AgentSession, backend: ExecutionBackend, messages: []const agent_mod.AgentMessage) ?RunSpec {
@@ -483,6 +503,14 @@ pub const AgentSession = struct {
 
     fn clearActiveRun(self: *AgentSession) void {
         self.active_run = null;
+    }
+
+    fn assertCompletionAuthority(self: *const AgentSession, expected: CompletionAuthority, comptime message: []const u8) void {
+        if (self.active_run) |active| {
+            std.debug.assert(active.completion == expected);
+        } else {
+            std.debug.panic(message, .{});
+        }
     }
 
     fn assertRunInvariant(self: *const AgentSession) void {
