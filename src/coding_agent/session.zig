@@ -110,6 +110,11 @@ pub const AgentSession = struct {
         config: agent_mod.config.RunConfig,
     };
 
+    const RunRequest = struct {
+        command_id: command_mod.CommandId,
+        messages: []const agent_mod.AgentMessage,
+    };
+
     const DurableAppend = union(enum) {
         appended,
         skipped,
@@ -250,15 +255,15 @@ pub const AgentSession = struct {
         self.assertCanApplyQueuedCommand(queued.command);
         switch (queued.command) {
             .submit_prompt => |prompt| {
-                self.startRun(queued.id, prompt.messages);
+                self.startRun(.{ .command_id = queued.id, .messages = prompt.messages });
                 return self.drainDecisionAfterTransition();
             },
             .follow_up => |follow_up| {
-                self.startRun(queued.id, follow_up.messages);
+                self.startRun(.{ .command_id = queued.id, .messages = follow_up.messages });
                 return self.drainDecisionAfterTransition();
             },
             .continue_run => {
-                self.startRun(queued.id, &.{});
+                self.startRun(.{ .command_id = queued.id, .messages = &.{} });
                 return self.drainDecisionAfterTransition();
             },
             .set_model => |set| {
@@ -389,8 +394,10 @@ pub const AgentSession = struct {
         return .{ .accepted = id };
     }
 
-    fn startRun(self: *AgentSession, id: command_mod.CommandId, messages: []const agent_mod.AgentMessage) void {
+    fn startRun(self: *AgentSession, request: RunRequest) void {
         std.debug.assert(self.active_run == null);
+        const id = request.command_id;
+        const messages = request.messages;
         const owned_messages = cloneMessages(self.allocator, messages) catch {
             self.clearPendingFollowUps();
             self.setActivity(.{ .failed = .{ .kind = .out_of_memory } });
@@ -519,7 +526,7 @@ pub const AgentSession = struct {
         if (self.pending_follow_ups.pop()) |queued| {
             var owned = queued;
             defer owned.deinit(self.allocator);
-            self.startRun(owned.id, owned.messages);
+            self.startRun(.{ .command_id = owned.id, .messages = owned.messages });
             self.refreshActivityCounts();
             return;
         }
