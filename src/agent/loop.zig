@@ -5,7 +5,7 @@ const ai = @import("../ai/root.zig");
 const protocol = @import("types.zig");
 const bridge_mod = @import("stream_bridge.zig");
 const message_memory = @import("message_memory.zig");
-const tool_execution_group = @import("tool_execution_group.zig");
+const tool_executor = @import("tool_executor.zig");
 const json_value = @import("../json/value.zig");
 
 pub fn runAgentLoop(
@@ -334,57 +334,25 @@ fn emitAbortedToolEnd(
 
 const PreparedToolCall = struct {
     tool_call: ai.protocol.ToolCall,
-    tool: ?protocol.AgentTool,
     effective_args: json_value.OwnedValue,
-    finalized: bool = false,
-    result_message: ?ai.protocol.ToolResultMessage = null,
-    worker_started: bool = false,
-    pending_worker_result: ?protocol.AgentToolResult = null,
-};
+    state: State,
 
-const WorkerExecution = struct {
-    owner_allocator: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
-    group: *tool_execution_group.ToolExecutionGroup,
-    prepared_index: usize,
-    tool_call_id: []const u8,
-    tool_name: []const u8,
-    args: json_value.OwnedValue,
-    signal: Token,
+    const State = union(enum) {
+        ready: protocol.AgentTool,
+        submitted: Submitted,
+        result_ready: ResultReady,
+        finalized: ai.protocol.ToolResultMessage,
+    };
 
-    fn deinit(self: *WorkerExecution) void {
-        self.group.allocator.free(self.tool_call_id);
-        self.group.allocator.free(self.tool_name);
-        self.args.deinit();
-        self.arena.deinit();
-        self.owner_allocator.destroy(self);
-    }
+    const Submitted = struct {
+        op_id: tool_executor.ToolOpId,
+        tool: protocol.AgentTool,
+    };
 
-    fn run(self: *WorkerExecution, prepared: *const PreparedToolCall) void {
-        const tool = prepared.tool orelse {
-            self.group.emit(.{ .completed = .{
-                .prepared_index = self.prepared_index,
-                .result = makeAgentToolTextResult(self.group.allocator, "Tool execution failed", true),
-            } });
-            self.deinit();
-            return;
-        };
-        const execution = tool.start(
-            self.arena.allocator(),
-            prepared.tool_call.id,
-            prepared.effective_args.borrowed(),
-            self.signal,
-            &workerUpdateCallback,
-            @ptrCast(self),
-        );
-        const result = resolveToolExecution(execution, self.arena.allocator(), self.signal, &workerUpdateCallback, @ptrCast(self));
-        const owned = result.clone(self.group.allocator) catch makeAgentToolTextResult(self.group.allocator, "Tool execution failed", true);
-        self.group.emit(.{ .completed = .{
-            .prepared_index = self.prepared_index,
-            .result = owned,
-        } });
-        self.deinit();
-    }
+    const ResultReady = struct {
+        tool: protocol.AgentTool,
+        result: protocol.AgentToolResult,
+    };
 };
 
 fn resolveToolExecution(
@@ -404,36 +372,6 @@ fn resolveToolExecution(
     };
 }
 
-fn workerUpdateCallback(partial_result: protocol.AgentToolResult, ctx: ?*anyopaque) void {
-    const worker: *WorkerExecution = @ptrCast(@alignCast(ctx.?));
-    const allocator = worker.group.allocator;
-
-    const tool_call_id = allocator.dupe(u8, worker.tool_call_id) catch return;
-    const tool_name = allocator.dupe(u8, worker.tool_name) catch {
-        allocator.free(tool_call_id);
-        return;
-    };
-    var args = json_value.OwnedValue.clone(allocator, worker.args.borrowed()) catch {
-        allocator.free(tool_call_id);
-        allocator.free(tool_name);
-        return;
-    };
-    const owned = partial_result.clone(allocator) catch {
-        allocator.free(tool_call_id);
-        allocator.free(tool_name);
-        args.deinit();
-        return;
-    };
-
-    worker.group.emit(.{ .update = .{
-        .prepared_index = worker.prepared_index,
-        .tool_call_id = tool_call_id,
-        .tool_name = tool_name,
-        .args = args,
-        .partial_result = owned,
-    } });
-}
-
 fn executeToolCalls(
     run_allocator: std.mem.Allocator,
     turn_allocator: std.mem.Allocator,
@@ -449,8 +387,8 @@ fn executeToolCalls(
     event_ctx: ?*anyopaque,
 ) bool {
     const tool_phase_messages = message_memory.cloneMessages(turn_allocator, ctx_messages.items) catch ctx_messages.items;
-    var worker_group: ?tool_execution_group.ToolExecutionGroup = tool_execution_group.ToolExecutionGroup.init(std.heap.page_allocator, config.io) catch null;
-    defer if (worker_group) |*group| group.deinit();
+    var executor: ?tool_executor.ToolExecutor = tool_executor.ToolExecutor.init(std.heap.page_allocator, config.io) catch null;
+    defer if (executor) |*exec| exec.deinit();
 
     var prepared_calls: std.ArrayListUnmanaged(PreparedToolCall) = .empty;
     defer prepared_calls.deinit(turn_allocator);
@@ -517,8 +455,8 @@ fn executeToolCalls(
 
             prepared_calls.append(turn_allocator, .{
                 .tool_call = tc,
-                .tool = t,
                 .effective_args = effective_args,
+                .state = .{ .ready = t },
             }) catch |err| {
                 std.log.scoped(.zi_agent_loop).err("append prepared tool call failed: {s}", .{@errorName(err)});
                 return false;
@@ -528,41 +466,38 @@ fn executeToolCalls(
     };
 
     if (config.tool_execution == .parallel) {
-        if (worker_group) |*group| {
+        if (executor) |*exec| {
             for (prepared_calls.items, 0..) |*prepared, prepared_index| {
-                const tool = prepared.tool orelse continue;
+                const tool = switch (prepared.state) {
+                    .ready => |tool| tool,
+                    else => continue,
+                };
                 if (tool.affinity != .worker_thread) continue;
-                const worker = std.heap.page_allocator.create(WorkerExecution) catch continue;
-                const tool_call_id = group.allocator.dupe(u8, prepared.tool_call.id) catch {
-                    std.heap.page_allocator.destroy(worker);
+                const op_id = exec.nextOpId();
+                const tool_call_id = exec.allocator.dupe(u8, prepared.tool_call.id) catch continue;
+                const tool_name = exec.allocator.dupe(u8, prepared.tool_call.name) catch {
+                    exec.allocator.free(tool_call_id);
                     continue;
                 };
-                const tool_name = group.allocator.dupe(u8, prepared.tool_call.name) catch {
-                    group.allocator.free(tool_call_id);
-                    std.heap.page_allocator.destroy(worker);
+                const args = json_value.OwnedValue.clone(exec.allocator, prepared.effective_args.borrowed()) catch {
+                    exec.allocator.free(tool_call_id);
+                    exec.allocator.free(tool_name);
                     continue;
                 };
-                const args = json_value.OwnedValue.clone(group.allocator, prepared.effective_args.borrowed()) catch {
-                    group.allocator.free(tool_call_id);
-                    group.allocator.free(tool_name);
-                    std.heap.page_allocator.destroy(worker);
-                    continue;
-                };
-                worker.* = .{
-                    .owner_allocator = std.heap.page_allocator,
-                    .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-                    .group = group,
-                    .prepared_index = prepared_index,
+                var invocation = tool_executor.ToolInvocation{
+                    .op_id = op_id,
+                    .source_index = prepared_index,
+                    .tool = tool,
                     .tool_call_id = tool_call_id,
                     .tool_name = tool_name,
                     .args = args,
                     .signal = signal,
                 };
-                group.spawnThread(WorkerExecution.run, .{ worker, prepared }) catch {
-                    worker.deinit();
+                exec.submit(invocation) catch {
+                    invocation.deinit(exec.allocator);
                     continue;
                 };
-                prepared.worker_started = true;
+                prepared.state = .{ .submitted = .{ .op_id = op_id, .tool = tool } };
             }
         }
     }
@@ -570,7 +505,10 @@ fn executeToolCalls(
     var finalized_count = countFinalizedPreparedCalls(prepared_calls.items);
     while (finalized_count < prepared_calls.items.len) {
         if (isAborted(signal)) {
-            if (worker_group) |*group| group.cancel();
+            if (executor) |*exec| {
+                exec.closeSubmissions();
+                exec.closeUpdates();
+            }
             emitAbortedPreparedCalls(prepared_calls.items, event_sink, event_ctx, turn_allocator);
             return true;
         }
@@ -584,7 +522,10 @@ fn executeToolCalls(
                 .tool_name = prepared.tool_call.name,
                 .args = prepared.tool_call.arguments.borrowed(),
             };
-            const tool = prepared.tool orelse continue;
+            const tool = switch (prepared.state) {
+                .ready => |tool| tool,
+                else => continue,
+            };
             const execution = tool.start(
                 turn_allocator,
                 prepared.tool_call.id,
@@ -595,28 +536,34 @@ fn executeToolCalls(
             );
             const result = resolveToolExecution(execution, turn_allocator, signal, &bridge_mod.UpdateBridge.callback, @ptrCast(&update_bridge));
             if (isAborted(signal)) {
-                if (worker_group) |*group| group.cancel();
+                if (executor) |*exec| {
+                    exec.closeSubmissions();
+                    exec.closeUpdates();
+                }
                 emitAbortedPreparedCalls(prepared_calls.items, event_sink, event_ctx, turn_allocator);
                 return true;
             }
-            prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
-            prepared.finalized = true;
+            prepared.state = .{ .finalized = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx) };
             finalized_count += 1;
             continue;
         }
 
-        if (worker_group) |*group| {
-            if (group.next() catch null) |event| {
-                var owned_event = event;
-                defer owned_event.deinit(group.allocator);
+        if (executor) |*exec| {
+            if (exec.next()) |completion_event| {
+                var owned_event = completion_event;
+                defer owned_event.deinit(exec.allocator);
                 switch (owned_event) {
                     .update => |update| emitWorkerUpdate(turn_allocator, prepared_calls.items, update, event_sink, event_ctx),
-                    .completed => |completion| {
-                        if (completion.prepared_index >= prepared_calls.items.len) continue;
-                        var prepared = &prepared_calls.items[completion.prepared_index];
-                        if (prepared.finalized) continue;
-                        prepared.pending_worker_result = completion.result.clone(turn_allocator) catch
+                    .terminal => |completion| {
+                        if (completion.source_index >= prepared_calls.items.len) continue;
+                        var prepared = &prepared_calls.items[completion.source_index];
+                        const submitted = switch (prepared.state) {
+                            .submitted => |submitted| submitted,
+                            else => continue,
+                        };
+                        const result = completion.result.clone(turn_allocator) catch
                             makeAgentToolTextResult(turn_allocator, "Tool execution result allocation failed", true);
+                        prepared.state = .{ .result_ready = .{ .tool = submitted.tool, .result = result } };
                         finalized_count += finalizeReadyWorkerCompletions(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared_calls.items, config, system_prompt, signal, event_sink, event_ctx);
                     },
                 }
@@ -643,10 +590,8 @@ fn appendImmediateError(
     emitToolExecutionEnd(event_sink, event_ctx, tc, true, err_tool_result);
     prepared_calls.append(turn_allocator, .{
         .tool_call = tc,
-        .tool = null,
         .effective_args = tc.arguments,
-        .finalized = true,
-        .result_message = err_result,
+        .state = .{ .finalized = err_result },
     }) catch |err| {
         std.log.scoped(.zi_agent_loop).err("append immediate tool error failed: {s}", .{@errorName(err)});
         return false;
@@ -657,7 +602,7 @@ fn appendImmediateError(
 fn countFinalizedPreparedCalls(prepared_calls: []const PreparedToolCall) usize {
     var count: usize = 0;
     for (prepared_calls) |prepared| {
-        if (prepared.finalized) count += 1;
+        if (prepared.state == .finalized) count += 1;
     }
     return count;
 }
@@ -672,7 +617,10 @@ fn emitPreparedToolResultMessagesInSourceOrder(
     event_ctx: ?*anyopaque,
 ) bool {
     for (prepared_calls) |prepared| {
-        const tool_result_msg = prepared.result_message orelse continue;
+        const tool_result_msg = switch (prepared.state) {
+            .finalized => |message| message,
+            else => continue,
+        };
         emitToolResultMessage(event_sink, event_ctx, tool_result_msg);
         ctx_messages.append(allocator, .{ .tool_result = tool_result_msg }) catch |err| {
             std.log.scoped(.zi_agent_loop).err("append tool result to context failed: {s}", .{@errorName(err)});
@@ -705,20 +653,24 @@ fn finalizeReadyWorkerCompletions(
 ) usize {
     var finalized: usize = 0;
     for (prepared_calls) |*prepared| {
-        if (prepared.finalized) continue;
-        if (!prepared.worker_started) break;
-        const result = prepared.pending_worker_result orelse break;
-        prepared.result_message = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, result, config, system_prompt, signal, event_sink, event_ctx);
-        prepared.finalized = true;
-        finalized += 1;
+        switch (prepared.state) {
+            .finalized => continue,
+            .result_ready => |ready| {
+                prepared.state = .{ .finalized = finalizePreparedToolCall(run_allocator, turn_allocator, assistant_msg, tool_phase_messages, tools, prepared, ready.result, config, system_prompt, signal, event_sink, event_ctx) };
+                finalized += 1;
+            },
+            .ready, .submitted => break,
+        }
     }
     return finalized;
 }
 
 fn findNextAgentThreadCall(prepared_calls: []const PreparedToolCall) ?usize {
     for (prepared_calls, 0..) |prepared, index| {
-        if (prepared.finalized) continue;
-        if (!prepared.worker_started) return index;
+        switch (prepared.state) {
+            .finalized, .submitted, .result_ready => continue,
+            .ready => return index,
+        }
     }
     return null;
 }
@@ -726,11 +678,11 @@ fn findNextAgentThreadCall(prepared_calls: []const PreparedToolCall) ?usize {
 fn emitWorkerUpdate(
     allocator: std.mem.Allocator,
     prepared_calls: []const PreparedToolCall,
-    update: tool_execution_group.ToolUpdate,
+    update: tool_executor.ToolUpdate,
     event_sink: protocol.AgentEventSink,
     event_ctx: ?*anyopaque,
 ) void {
-    if (update.prepared_index >= prepared_calls.len) return;
+    if (update.source_index >= prepared_calls.len) return;
 
     const tool_call_id = allocator.dupe(u8, update.tool_call_id) catch update.tool_call_id;
     const tool_name = allocator.dupe(u8, update.tool_name) catch update.tool_name;
@@ -752,8 +704,10 @@ fn emitAbortedPreparedCalls(
     allocator: std.mem.Allocator,
 ) void {
     for (prepared_calls) |prepared| {
-        if (prepared.finalized) continue;
-        emitAbortedToolEnd(event_sink, event_ctx, prepared.tool_call, allocator);
+        switch (prepared.state) {
+            .finalized => {},
+            else => emitAbortedToolEnd(event_sink, event_ctx, prepared.tool_call, allocator),
+        }
     }
 }
 

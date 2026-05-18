@@ -40,8 +40,9 @@ pub fn estimateContextTokensWithInFlight(
         estimator.observe(.{ .assistant = assistant });
     }
     for (in_flight.tool_executions.items) |execution| {
-        if (execution.result_message) |tool_result| {
-            estimator.observe(.{ .tool_result = tool_result });
+        switch (execution.state) {
+            .result_message => |tool_result| estimator.observe(.{ .tool_result = tool_result }),
+            else => {},
         }
     }
     return estimator.finish();

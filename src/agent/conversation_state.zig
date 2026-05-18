@@ -73,11 +73,52 @@ pub const ToolExecution = struct {
     args: json_value.OwnedValue,
     args_json_source: ?[]u8 = null,
     args_complete: bool = false,
-    execution_started: bool = false,
-    result: ?protocol.AgentToolResult = null,
-    result_message: ?protocol.ToolResultMessage = null,
-    is_partial: bool = false,
-    is_error: bool = false,
+    state: State = .discovered,
+
+    pub const State = union(enum) {
+        discovered,
+        started,
+        partial: ResultState,
+        final: ResultState,
+        result_message: protocol.ToolResultMessage,
+
+        pub fn clone(self: State, allocator: std.mem.Allocator) !State {
+            return switch (self) {
+                .discovered => .discovered,
+                .started => .started,
+                .partial => |result| .{ .partial = try result.clone(allocator) },
+                .final => |result| .{ .final = try result.clone(allocator) },
+                .result_message => |result_message| .{ .result_message = try message_memory.cloneToolResultMessage(allocator, result_message) },
+            };
+        }
+
+        pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .discovered, .started => {},
+                .partial => |*result| result.deinit(allocator),
+                .final => |*result| result.deinit(allocator),
+                .result_message => |*result_message| message_memory.freeToolResultMessage(allocator, result_message),
+            }
+            self.* = undefined;
+        }
+    };
+
+    pub const ResultState = struct {
+        result: ?protocol.AgentToolResult,
+        is_error: bool,
+
+        pub fn clone(self: ResultState, allocator: std.mem.Allocator) !ResultState {
+            return .{
+                .result = if (self.result) |result| try result.clone(allocator) else null,
+                .is_error = self.is_error,
+            };
+        }
+
+        pub fn deinit(self: *ResultState, allocator: std.mem.Allocator) void {
+            if (self.result) |result| result.free(allocator);
+            self.* = undefined;
+        }
+    };
 
     pub fn clone(self: ToolExecution, allocator: std.mem.Allocator) !ToolExecution {
         const tool_call_id = try allocator.dupe(u8, self.tool_call_id);
@@ -91,16 +132,8 @@ pub const ToolExecution = struct {
         else
             null;
         errdefer if (args_json_source) |source| allocator.free(source);
-        const result = if (self.result) |result|
-            try result.clone(allocator)
-        else
-            null;
-        errdefer if (result) |owned| owned.free(allocator);
-        const result_message = if (self.result_message) |result_message|
-            try message_memory.cloneToolResultMessage(allocator, result_message)
-        else
-            null;
-        errdefer if (result_message) |*owned| message_memory.freeToolResultMessage(allocator, owned);
+        var state = try self.state.clone(allocator);
+        errdefer state.deinit(allocator);
 
         return .{
             .tool_call_id = tool_call_id,
@@ -108,11 +141,7 @@ pub const ToolExecution = struct {
             .args = args,
             .args_json_source = args_json_source,
             .args_complete = self.args_complete,
-            .execution_started = self.execution_started,
-            .result = result,
-            .result_message = result_message,
-            .is_partial = self.is_partial,
-            .is_error = self.is_error,
+            .state = state,
         };
     }
 
@@ -122,8 +151,7 @@ pub const ToolExecution = struct {
         var args = self.args;
         args.deinit();
         if (self.args_json_source) |source| allocator.free(source);
-        if (self.result) |result| result.free(allocator);
-        if (self.result_message) |*result_message| message_memory.freeToolResultMessage(allocator, result_message);
+        self.state.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -293,33 +321,37 @@ pub const InFlightState = struct {
         tool.args = json_value.OwnedValue.clone(self.allocator, args) catch json_value.OwnedValue.nullValue();
         if (tool.args_json_source) |source| self.allocator.free(source);
         tool.args_json_source = null;
-        tool.execution_started = true;
+        tool.state.deinit(self.allocator);
+        tool.state = .started;
     }
 
     pub fn setPartialResult(self: *InFlightState, tool_call_id: []const u8, result: ?protocol.AgentToolResult, is_error: bool) void {
         const idx = self.findToolIndex(tool_call_id) orelse return;
         const tool = &self.tool_executions.items[idx];
-        if (tool.result) |old| old.free(self.allocator);
-        tool.result = if (result) |owned| (owned.clone(self.allocator) catch null) else null;
-        tool.is_partial = true;
-        tool.is_error = if (result) |owned| owned.is_error else is_error;
+        const owned_result = if (result) |owned| (owned.clone(self.allocator) catch null) else null;
+        tool.state.deinit(self.allocator);
+        tool.state = .{ .partial = .{
+            .result = owned_result,
+            .is_error = if (result) |owned| owned.is_error else is_error,
+        } };
     }
 
     pub fn setFinalResult(self: *InFlightState, tool_call_id: []const u8, result: ?protocol.AgentToolResult, is_error: bool) void {
         const idx = self.findToolIndex(tool_call_id) orelse return;
         const tool = &self.tool_executions.items[idx];
-        if (tool.result) |old| old.free(self.allocator);
-        tool.result = if (result) |owned| (owned.clone(self.allocator) catch null) else null;
-        tool.is_partial = false;
-        tool.is_error = if (result) |owned| owned.is_error else is_error;
+        const owned_result = if (result) |owned| (owned.clone(self.allocator) catch null) else null;
+        tool.state.deinit(self.allocator);
+        tool.state = .{ .final = .{
+            .result = owned_result,
+            .is_error = if (result) |owned| owned.is_error else is_error,
+        } };
     }
 
     pub fn setResultMessage(self: *InFlightState, result_message: protocol.ToolResultMessage) void {
         const tool = self.ensureTool(result_message.tool_call_id, result_message.tool_name) orelse return;
-        if (tool.result_message) |*old| message_memory.freeToolResultMessage(self.allocator, old);
-        tool.result_message = message_memory.cloneToolResultMessage(self.allocator, result_message) catch null;
-        tool.is_error = result_message.is_error;
-        tool.is_partial = false;
+        const owned_result_message = message_memory.cloneToolResultMessage(self.allocator, result_message) catch return;
+        tool.state.deinit(self.allocator);
+        tool.state = .{ .result_message = owned_result_message };
     }
 
     pub fn freeze(self: *const InFlightState, allocator: std.mem.Allocator) !?InFlightTurn {
@@ -382,4 +414,128 @@ fn appendBytesOwned(allocator: std.mem.Allocator, existing: []const u8, extra: [
     @memcpy(out[0..existing.len], existing);
     @memcpy(out[existing.len..], extra);
     return out;
+}
+
+fn testAssistantMessage() protocol.AssistantMessage {
+    return .{
+        .content = &.{},
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "test-model",
+        .usage = .{
+            .input = 0,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 0,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = .toolUse,
+        .timestamp = 1,
+    };
+}
+
+fn testToolResultMessage() protocol.ToolResultMessage {
+    return .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .content = &.{.{ .text = .{ .text = "done" } }},
+        .is_error = false,
+        .timestamp = 2,
+    };
+}
+
+test "in-flight tool execution state follows event lifecycle" {
+    const testing = std.testing;
+    var state = InFlightState.init(testing.allocator);
+    defer state.deinit();
+
+    _ = state.applyEvent(.{ .message_start = .{ .message = .{ .assistant = testAssistantMessage() } } });
+    _ = state.applyEvent(.{ .message_delta = .{ .assistant_message_event = .{ .toolcall_end = .{ .content_index = 0, .tool_call = .{
+        .id = "tool-1",
+        .name = "read",
+        .arguments = json_value.OwnedValue.nullValue(),
+        .thought_signature = null,
+    } } } } });
+
+    try testing.expectEqual(@as(usize, 1), state.tool_executions.items.len);
+    try testing.expect(state.tool_executions.items[0].state == .discovered);
+
+    _ = state.applyEvent(.{ .tool_execution_start = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+    } });
+    try testing.expect(state.tool_executions.items[0].state == .started);
+
+    _ = state.applyEvent(.{ .tool_execution_update = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+        .partial_result = .{ .content = &.{.{ .text = .{ .text = "partial" } }}, .is_error = false },
+    } });
+    switch (state.tool_executions.items[0].state) {
+        .partial => |partial| {
+            try testing.expect(partial.result != null);
+            try testing.expect(!partial.is_error);
+        },
+        else => return error.ExpectedPartialState,
+    }
+
+    _ = state.applyEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .result = .{ .content = &.{.{ .text = .{ .text = "done" } }}, .is_error = false },
+        .is_error = false,
+    } });
+    switch (state.tool_executions.items[0].state) {
+        .final => |final| {
+            try testing.expect(final.result != null);
+            try testing.expect(!final.is_error);
+        },
+        else => return error.ExpectedFinalState,
+    }
+
+    _ = state.applyEvent(.{ .message_end = .{ .message = .{ .tool_result = testToolResultMessage() } } });
+    switch (state.tool_executions.items[0].state) {
+        .result_message => |result_message| {
+            try testing.expectEqualStrings("tool-1", result_message.tool_call_id);
+            try testing.expectEqualStrings("read", result_message.tool_name);
+        },
+        else => return error.ExpectedResultMessageState,
+    }
+}
+
+test "in-flight tool execution clone owns union state payloads" {
+    const testing = std.testing;
+    var state = InFlightState.init(testing.allocator);
+    defer state.deinit();
+
+    _ = state.applyEvent(.{ .message_start = .{ .message = .{ .assistant = testAssistantMessage() } } });
+    _ = state.applyEvent(.{ .tool_execution_start = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+    } });
+    _ = state.applyEvent(.{ .tool_execution_update = .{
+        .tool_call_id = "tool-1",
+        .tool_name = "read",
+        .args = .null,
+        .partial_result = .{ .content = &.{.{ .text = .{ .text = "partial" } }}, .is_error = false },
+    } });
+
+    const cloned = try state.tool_executions.items[0].clone(testing.allocator);
+    defer {
+        var mutable = cloned;
+        mutable.deinit(testing.allocator);
+    }
+
+    switch (cloned.state) {
+        .partial => |partial| {
+            const result = partial.result orelse return error.ExpectedClonedResult;
+            try testing.expectEqualStrings("partial", result.content[0].text.text);
+            try testing.expect(result.content[0].text.text.ptr != state.tool_executions.items[0].state.partial.result.?.content[0].text.text.ptr);
+        },
+        else => return error.ExpectedPartialState,
+    }
 }

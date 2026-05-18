@@ -425,9 +425,10 @@ pub const Agent = struct {
     fn rebuildPendingToolCalls(self: *Agent) []const []const u8 {
         self.state_pending_tool_calls.clearRetainingCapacity();
         for (self.in_flight.tool_executions.items) |*tool| {
-            if (!tool.execution_started) continue;
-            if (tool.result != null and !tool.is_partial) continue;
-            self.state_pending_tool_calls.append(self.allocator, tool.tool_call_id) catch break;
+            switch (tool.state) {
+                .started, .partial => self.state_pending_tool_calls.append(self.allocator, tool.tool_call_id) catch break,
+                .discovered, .final, .result_message => {},
+            }
         }
         return self.state_pending_tool_calls.items;
     }
@@ -757,7 +758,7 @@ test "conversation view keeps current turn separate until turn_end" {
     try testing.expect(view.in_flight.?.assistant != null);
     try testing.expectEqual(@as(usize, 1), view.in_flight.?.tool_executions.len);
     try testing.expectEqualStrings("tool-1", view.in_flight.?.tool_executions[0].tool_call_id);
-    try testing.expect(view.in_flight.?.tool_executions[0].result_message != null);
+    try testing.expect(view.in_flight.?.tool_executions[0].state == .result_message);
 
     agent.processEvent(.{ .turn_end = .{
         .message = .{ .assistant = assistant },
