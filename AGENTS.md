@@ -64,4 +64,9 @@ Rules:
 
 - Code is evidence. Tests are judgment.
 - Add tests for invariants, not just examples.
+- Test behavior, not implementation shape. A good test names a boundary contract, state transition, ownership/lifetime invariant, terminal/cancellation invariant, boundedness/backpressure rule, durable projection rule, external wire contract, or security/capability policy.
+- Do not test private helpers because they exist. Test the observable invariant they enforce. If there is no invariant, delete the test.
+- Avoid snapshotting broad structures when one assertion captures the contract. Prefer narrow assertions that explain the behavior being protected.
+- Test names must describe product/runtime behavior, not function plumbing. Prefer `follow up queues while running and starts after completed terminal` over `startNextFollowUpOrIdle pops queue`.
+- Provider request/response JSON tests are allowed when they pin an external API contract. Internal serialization details are not contracts unless callers rely on them.
 - Run `zig build test` before claiming completion.
