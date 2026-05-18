@@ -281,17 +281,19 @@ pub const AgentSession = struct {
         }
     }
 
-    pub fn completeRun(self: *AgentSession, completion: RunCompletion) void {
+    pub fn completeRun(self: *AgentSession, completion: *RunCompletion) void {
+        defer completion.deinit();
         self.assertActiveExecution(.external_terminal, "run completion without active run");
         self.applyRunCompletion(completion);
     }
 
-    fn completeSynchronousRun(self: *AgentSession, completion: RunCompletion) void {
+    fn completeSynchronousRun(self: *AgentSession, completion: *RunCompletion) void {
+        defer completion.deinit();
         self.assertActiveExecution(.synchronous, "synchronous run completion without active run");
         self.applyRunCompletion(completion);
     }
 
-    fn applyRunCompletion(self: *AgentSession, completion: RunCompletion) void {
+    fn applyRunCompletion(self: *AgentSession, completion: *const RunCompletion) void {
         const finished_command_id = self.activeCommandId();
         const result: event_mod.RunTerminal = switch (completion.terminal.status) {
             .completed => |messages| blk: {
@@ -451,7 +453,10 @@ pub const AgentSession = struct {
         defer run.deinit();
 
         run.runStream(spec.config);
-        if (capture.terminal) |*terminal| self.completeSynchronousRun(.{ .terminal = terminal.* });
+        if (capture.takeTerminal()) |terminal| {
+            var completion = RunCompletion{ .terminal = terminal };
+            self.completeSynchronousRun(&completion);
+        }
     }
 
     fn buildRunSpec(self: *const AgentSession, backend: ExecutionBackend, messages: []const agent_mod.AgentMessage) ?RunSpec {
@@ -738,6 +743,12 @@ const RunCapture = struct {
     fn outputMessages(self: *const RunCapture, messages: []const agent_mod.AgentMessage) []const agent_mod.AgentMessage {
         if (messages.len <= self.input_count) return &.{};
         return messages[self.input_count..];
+    }
+
+    fn takeTerminal(self: *RunCapture) ?OwnedRunTerminal {
+        const terminal = self.terminal orelse return null;
+        self.terminal = null;
+        return terminal;
     }
 
     fn deinit(self: *RunCapture) void {
@@ -1111,9 +1122,9 @@ test "external terminal drain stops after starting one queued run" {
     try std.testing.expectEqual(first, session.state().activity.running.command_id);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started }, events.items[0..events.len]);
 
-    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
-    defer terminal.deinit();
-    session.completeRun(.{ .terminal = terminal });
+    const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
+    var completion = RunCompletion{ .terminal = terminal };
+    session.completeRun(&completion);
     try std.testing.expect(session.state().activity == .idle);
 
     session.drainCommands();
@@ -1176,9 +1187,9 @@ test "abort in external terminal mode keeps original run command id" {
     try std.testing.expectEqual(abort_command_id, collector.abort_command_id);
     try std.testing.expectEqual(started, collector.abort_run_command_id);
 
-    var terminal = try OwnedRunTerminal.aborted(std.testing.allocator, &.{});
-    defer terminal.deinit();
-    session.completeRun(.{ .terminal = terminal });
+    const terminal = try OwnedRunTerminal.aborted(std.testing.allocator, &.{});
+    var completion = RunCompletion{ .terminal = terminal };
+    session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .idle);
     try std.testing.expectEqual(started, collector.finished_command_id);
@@ -1250,9 +1261,9 @@ test "run completion updates product activity before notifying" {
     session.drainCommands();
     try std.testing.expect(session.state().activity == .running);
 
-    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
-    defer terminal.deinit();
-    session.completeRun(.{ .terminal = terminal });
+    const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
+    var completion = RunCompletion{ .terminal = terminal };
+    session.completeRun(&completion);
     try std.testing.expect(collector.saw_idle);
 }
 
@@ -1344,9 +1355,9 @@ test "completed terminal appends messages before run finished" {
     session.drainCommands();
 
     const messages = [_]agent_mod.AgentMessage{testAssistantMessage()};
-    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
-    defer terminal.deinit();
-    session.completeRun(.{ .terminal = terminal });
+    const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
+    var completion = RunCompletion{ .terminal = terminal };
+    session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .idle);
     try std.testing.expectEqual(@as(usize, 1), durable.message_count);
@@ -1367,9 +1378,9 @@ test "completed terminal starts queued follow up only after run finished" {
     _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
 
     const messages = [_]agent_mod.AgentMessage{testAssistantMessage()};
-    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
-    defer terminal.deinit();
-    session.completeRun(.{ .terminal = terminal });
+    const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
+    var completion = RunCompletion{ .terminal = terminal };
+    session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .running);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .session_appended, .run_finished_completed, .run_started }, events.items[0..events.len]);
@@ -1389,9 +1400,9 @@ test "terminal append failure prevents queued follow up" {
     _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
 
     const messages = [_]agent_mod.AgentMessage{testAssistantMessage()};
-    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
-    defer terminal.deinit();
-    session.completeRun(.{ .terminal = terminal });
+    const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
+    var completion = RunCompletion{ .terminal = terminal };
+    session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .failed);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .append_failed, .run_finished_failed }, events.items[0..events.len]);
@@ -1411,9 +1422,9 @@ test "failed and aborted terminals do not append messages" {
     _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
 
     const messages = [_]agent_mod.AgentMessage{testAssistantMessage()};
-    var failed = try OwnedRunTerminal.failed(std.testing.allocator, &messages, .internal);
-    defer failed.deinit();
-    session.completeRun(.{ .terminal = failed });
+    const failed = try OwnedRunTerminal.failed(std.testing.allocator, &messages, .internal);
+    var completion = RunCompletion{ .terminal = failed };
+    session.completeRun(&completion);
 
     try std.testing.expectEqual(@as(usize, 0), durable.message_count);
     try std.testing.expect(session.state().activity == .failed);
@@ -1423,9 +1434,9 @@ test "failed and aborted terminals do not append messages" {
     _ = try session2.submit(.{ .submit_prompt = .{ .messages = &.{} } });
     session2.drainCommands();
     _ = try session2.submit(.{ .follow_up = .{ .messages = &.{} } });
-    var aborted = try OwnedRunTerminal.aborted(std.testing.allocator, &messages);
-    defer aborted.deinit();
-    session2.completeRun(.{ .terminal = aborted });
+    const aborted = try OwnedRunTerminal.aborted(std.testing.allocator, &messages);
+    var aborted_completion = RunCompletion{ .terminal = aborted };
+    session2.completeRun(&aborted_completion);
     try std.testing.expectEqual(@as(usize, 0), durable.message_count);
     try std.testing.expect(session2.state().activity == .idle);
 }
@@ -1464,9 +1475,9 @@ test "follow up queues while running and starts after completed terminal" {
 
     try std.testing.expectEqual(@as(usize, 1), session.state().activity.running.pending_follow_ups);
 
-    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
-    defer terminal.deinit();
-    session.completeRun(.{ .terminal = terminal });
+    const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
+    var completion = RunCompletion{ .terminal = terminal };
+    session.completeRun(&completion);
     try std.testing.expect(session.state().activity == .running);
     try std.testing.expectEqual(@as(usize, 0), session.state().activity.running.pending_follow_ups);
 }
@@ -1491,16 +1502,16 @@ test "aborted and failed terminals clear queued follow ups" {
     _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
     try std.testing.expectEqual(@as(usize, 1), session.state().activity.running.pending_follow_ups);
 
-    var aborted = try OwnedRunTerminal.aborted(std.testing.allocator, &.{});
-    defer aborted.deinit();
-    session.completeRun(.{ .terminal = aborted });
+    const aborted = try OwnedRunTerminal.aborted(std.testing.allocator, &.{});
+    var completion = RunCompletion{ .terminal = aborted };
+    session.completeRun(&completion);
     try std.testing.expect(session.state().activity == .idle);
 
     _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
     session.drainCommands();
     _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
-    var failed = try OwnedRunTerminal.failed(std.testing.allocator, &.{}, .internal);
-    defer failed.deinit();
-    session.completeRun(.{ .terminal = failed });
+    const failed = try OwnedRunTerminal.failed(std.testing.allocator, &.{}, .internal);
+    var failed_completion = RunCompletion{ .terminal = failed };
+    session.completeRun(&failed_completion);
     try std.testing.expect(session.state().activity == .failed);
 }
