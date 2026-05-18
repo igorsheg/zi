@@ -152,7 +152,9 @@ pub fn processStreamMapped(
         .ctx = @ptrCast(&stream_ctx),
     }) catch |err| {
         switch (err) {
-            error.StopStreaming => {},
+            error.StopStreaming => if (abort_flag.isAborted()) {
+                state.message.stop_reason = .aborted;
+            },
             else => if (abort_flag.isAborted()) {
                 state.message.stop_reason = .aborted;
             } else if (err == error.EventDataTooLarge) {
@@ -181,7 +183,7 @@ pub fn processStreamMapped(
     }
 
     if (state.message.stop_reason == .aborted) {
-        sink.emit(.{ .done = .{ .reason = .stop, .message = state.message } });
+        sink.emit(.{ .@"error" = .{ .reason = .aborted, .@"error" = state.message } });
     } else if (state.message.stop_reason == .@"error") {
         sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = state.message } });
     } else {

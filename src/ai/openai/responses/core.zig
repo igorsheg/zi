@@ -1,6 +1,7 @@
 const std = @import("std");
 const protocol = @import("../../protocol.zig");
 const ai_provider = @import("../../provider.zig");
+const ai_stream = @import("../../stream.zig");
 const provider_failure = @import("../../provider_failure.zig");
 const request_transform = @import("../../request_transform.zig");
 const responses_request = @import("request.zig");
@@ -337,8 +338,14 @@ fn runProcessWithMapper(
     collector: *TestCollector,
 ) !void {
     var reader: std.Io.Reader = .fixed(sse_bytes);
-    responses_stream.processStreamMapped(arena, &reader, test_model, Token.none, "openai-responses", event_mapper, .{ .func = TestCollector.cb, .ctx = @ptrCast(collector) });
+    var terminal_tracker: ai_stream.TerminalTracker = .{};
+    var tracking_sink: ai_stream.TrackingSink = .{
+        .tracker = &terminal_tracker,
+        .inner = .{ .func = TestCollector.cb, .ctx = @ptrCast(collector) },
+    };
+    responses_stream.processStreamMapped(arena, &reader, test_model, Token.none, "openai-responses", event_mapper, tracking_sink.sink());
     try testing.expect(!collector.alloc_failed);
+    _ = try terminal_tracker.finish();
 }
 
 fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestCollector) !void {

@@ -2,6 +2,7 @@ const std = @import("std");
 const json_value = @import("../json/value.zig");
 const protocol = @import("protocol.zig");
 const ai_provider = @import("provider.zig");
+const ai_stream = @import("stream.zig");
 
 const FAUX_API: protocol.Api = .{ .custom = "faux" };
 const FAUX_PROVIDER: protocol.Provider = .{ .custom = "faux" };
@@ -247,9 +248,14 @@ test "faux provider streams text response" {
 
     var collector: Collector = .{ .events = .empty, .alloc = allocator };
     defer collector.events.deinit(allocator);
+    var terminal_tracker: ai_stream.TerminalTracker = .{};
+    var tracking_sink: ai_stream.TrackingSink = .{
+        .tracker = &terminal_tracker,
+        .inner = .{ .func = Collector.callback, .ctx = @ptrCast(&collector) },
+    };
 
     const p = faux.provider();
-    p.stream(allocator, fauxModel(), .{ .messages = &.{} }, .{}, .{ .func = Collector.callback, .ctx = @ptrCast(&collector) });
+    p.stream(allocator, fauxModel(), .{ .messages = &.{} }, .{}, tracking_sink.sink());
 
     try std.testing.expectEqual(@as(usize, 5), collector.events.items.len);
 
@@ -261,5 +267,6 @@ test "faux provider streams text response" {
 
     try std.testing.expectEqualStrings("hello world", collector.events.items[2].text_delta.delta);
     try std.testing.expectEqualStrings("hello world", collector.events.items[3].text_end.content);
+    try std.testing.expectEqual(ai_stream.TerminalKind.completed, try terminal_tracker.finish());
     try std.testing.expectEqual(@as(usize, 1), faux.call_count);
 }

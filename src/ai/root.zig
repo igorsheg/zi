@@ -5,3 +5,4 @@ pub const models = @import("models.zig");
 pub const faux = @import("faux.zig");
 pub const provider_defaults = @import("provider_defaults.zig");
 pub const provider_failure = @import("provider_failure.zig");
+pub const stream = @import("stream.zig");

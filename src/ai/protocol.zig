@@ -206,10 +206,10 @@ pub const StreamOptions = struct {
 };
 
 pub const RequestTransform = struct {
-    func: *const fn (allocator: std.mem.Allocator, payload: json_value.BorrowedValue, model: *const Model, ctx: ?*anyopaque) ?json_value.OwnedValue,
+    func: *const fn (allocator: std.mem.Allocator, payload: json_value.BorrowedValue, model: *const Model, ctx: ?*anyopaque) error{OutOfMemory}!?json_value.OwnedValue,
     ctx: ?*anyopaque = null,
 
-    pub fn apply(self: RequestTransform, allocator: std.mem.Allocator, payload: json_value.BorrowedValue, model: *const Model) ?json_value.OwnedValue {
+    pub fn apply(self: RequestTransform, allocator: std.mem.Allocator, payload: json_value.BorrowedValue, model: *const Model) error{OutOfMemory}!?json_value.OwnedValue {
         return self.func(allocator, payload, model, self.ctx);
     }
 };

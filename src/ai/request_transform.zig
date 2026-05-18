@@ -52,7 +52,7 @@ pub fn transformJsonPayload(
 
     const final_payload = blk: {
         if (options.stream_options.request_transform) |transform| {
-            if (transform.apply(temp, payload, options.model)) |next| {
+            if (try transform.apply(temp, payload, options.model)) |next| {
                 replacement = try json_value.cloneJsonValue(allocator, next);
                 changed = true;
                 break :blk replacement.?;
@@ -118,9 +118,9 @@ test "request transform applies provider decorators to canonical json" {
 test "request transform clones replacements before stringifying" {
     const model = testModel();
     const Replace = struct {
-        fn replace(allocator: std.mem.Allocator, payload: json_value.BorrowedValue, _: *const protocol.Model, _: ?*anyopaque) ?json_value.OwnedValue {
+        fn replace(allocator: std.mem.Allocator, payload: json_value.BorrowedValue, _: *const protocol.Model, _: ?*anyopaque) error{OutOfMemory}!?json_value.OwnedValue {
             _ = payload;
-            return .{ .string = allocator.dupe(u8, "replacement") catch return null };
+            return .{ .string = try allocator.dupe(u8, "replacement") };
         }
     };
 
@@ -131,4 +131,18 @@ test "request transform clones replacements before stringifying" {
     defer testing.allocator.free(transformed.?);
 
     try testing.expectEqualStrings("\"replacement\"", transformed.?);
+}
+
+test "request transform reports transform allocation failure" {
+    const model = testModel();
+    const Fails = struct {
+        fn replace(_: std.mem.Allocator, _: json_value.BorrowedValue, _: *const protocol.Model, _: ?*anyopaque) error{OutOfMemory}!?json_value.OwnedValue {
+            return error.OutOfMemory;
+        }
+    };
+
+    try testing.expectError(error.OutOfMemory, transformJsonPayload(testing.allocator, "{\"model\":\"a\"}", .{
+        .model = &model,
+        .stream_options = .{ .request_transform = .{ .func = Fails.replace } },
+    }));
 }

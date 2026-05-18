@@ -263,7 +263,9 @@ pub const AnthropicProvider = struct {
         };
 
         if (state.message.stop_reason == .aborted) {
-            sink.emit(.{ .done = .{ .reason = .stop, .message = state.message } });
+            sink.emit(.{ .@"error" = .{ .reason = .aborted, .@"error" = state.message } });
+        } else if (state.message.stop_reason == .@"error") {
+            sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = state.message } });
         } else if (state.stop_reason) |sr| {
             const done_reason: protocol.AssistantMessageEvent.DoneReason = switch (sr) {
                 .end_turn => .stop,
@@ -449,7 +451,9 @@ fn handleSseEvent(evt: sse.SseEvent, state: *StreamState, sink: ai_provider.Stre
             .kind = failure_kind,
             .provider_type = if (err_type) |t| try state.allocator.dupe(u8, t) else null,
         };
-        emitFailure(state.allocator, sink, state.message.api, state.message.provider, state.message.model, failure, err_msg);
+        state.message.stop_reason = .@"error";
+        state.message.error_message = try state.allocator.dupe(u8, err_msg);
+        state.message.failure = failure;
     }
 }
 
@@ -511,7 +515,6 @@ fn emitError(
 fn emitFailure(
     allocator: std.mem.Allocator,
     sink: ai_provider.StreamEventSink,
-    ctx: ?*anyopaque,
     api: protocol.Api,
     provider: protocol.Provider,
     model_id: []const u8,
@@ -536,7 +539,7 @@ fn emitFailure(
         .error_message = owned_message,
         .failure = failure,
         .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
-    } } }, ctx);
+    } } });
 }
 
 const testing = std.testing;
