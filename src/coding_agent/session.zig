@@ -118,11 +118,11 @@ pub const AgentSession = struct {
     const ActiveRun = struct {
         command_id: command_mod.CommandId,
         cancel_source: cancel.Source = .{},
-        completion: CompletionAuthority,
+        execution: ActiveExecution,
     };
 
-    const CompletionAuthority = enum {
-        external,
+    const ActiveExecution = enum {
+        external_terminal,
         synchronous,
     };
 
@@ -240,12 +240,12 @@ pub const AgentSession = struct {
     }
 
     pub fn completeRun(self: *AgentSession, terminal: OwnedRunTerminal) void {
-        self.assertCompletionAuthority(.external, "run completion without active run");
+        self.assertActiveExecution(.external_terminal, "run completion without active run");
         self.applyRunCompletion(terminal);
     }
 
     fn completeSynchronousRun(self: *AgentSession, terminal: OwnedRunTerminal) void {
-        self.assertCompletionAuthority(.synchronous, "synchronous run completion without active run");
+        self.assertActiveExecution(.synchronous, "synchronous run completion without active run");
         self.applyRunCompletion(terminal);
     }
 
@@ -349,11 +349,11 @@ pub const AgentSession = struct {
                 return;
             },
         }
-        const completion: CompletionAuthority = switch (self.execution) {
-            .external_terminal => .external,
+        const active_execution: ActiveExecution = switch (self.execution) {
+            .external_terminal => .external_terminal,
             .synchronous => .synchronous,
         };
-        self.active_run = .{ .command_id = id, .completion = completion };
+        self.active_run = .{ .command_id = id, .execution = active_execution };
         self.setActivity(.{ .running = .{
             .command_id = id,
             .pending_follow_ups = self.pending_follow_ups.len,
@@ -505,9 +505,9 @@ pub const AgentSession = struct {
         self.active_run = null;
     }
 
-    fn assertCompletionAuthority(self: *const AgentSession, expected: CompletionAuthority, comptime message: []const u8) void {
+    fn assertActiveExecution(self: *const AgentSession, expected: ActiveExecution, comptime message: []const u8) void {
         if (self.active_run) |active| {
-            std.debug.assert(active.completion == expected);
+            std.debug.assert(active.execution == expected);
         } else {
             std.debug.panic(message, .{});
         }
