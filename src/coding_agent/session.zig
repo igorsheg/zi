@@ -247,6 +247,7 @@ pub const AgentSession = struct {
     }
 
     fn applyCommand(self: *AgentSession, queued: QueuedCommand) DrainDecision {
+        self.assertCanApplyQueuedCommand(queued.command);
         switch (queued.command) {
             .submit_prompt => |prompt| {
                 self.startRun(queued.id, prompt.messages);
@@ -547,6 +548,21 @@ pub const AgentSession = struct {
         };
     }
 
+    fn assertCanApplyQueuedCommand(self: *const AgentSession, command: OwnedCommand) void {
+        switch (command) {
+            .submit_prompt, .follow_up, .set_model, .set_reasoning => std.debug.assert(self.isIdleOrFailed()),
+            .continue_run => std.debug.assert(self.state_value.activity == .idle),
+            .abort_run, .steer => unreachable,
+        }
+    }
+
+    fn isIdleOrFailed(self: *const AgentSession) bool {
+        return switch (self.state_value.activity) {
+            .idle, .failed => true,
+            .running, .aborting => false,
+        };
+    }
+
     fn drainAbortControl(self: *AgentSession) DrainDecision {
         const pending = self.pending_abort orelse return .continue_draining;
         self.pending_abort = null;
@@ -607,6 +623,8 @@ pub const AgentSession = struct {
     }
 };
 
+// Command is borrowed ingress. OwnedCommand is the queue-owned backlog copy.
+// Active-run controls that target the current run must not be queued here.
 const QueuedCommand = struct {
     id: command_mod.CommandId,
     command: OwnedCommand,
