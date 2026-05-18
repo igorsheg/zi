@@ -7,12 +7,19 @@ pub const State = struct {
 pub const Activity = union(enum) {
     idle,
     running: Running,
-    aborting: Running,
+    aborting: Aborting,
     failed: Failed,
 };
 
 pub const Running = struct {
     command_id: command.CommandId,
+    pending_follow_ups: usize = 0,
+    pending_steering: usize = 0,
+};
+
+pub const Aborting = struct {
+    command_id: command.CommandId,
+    pending_follow_ups: usize = 0,
 };
 
 pub const Failed = struct {

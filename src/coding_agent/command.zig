@@ -4,12 +4,22 @@ pub const CommandId = enum(u64) { _ };
 
 pub const Command = union(enum) {
     submit_prompt: SubmitPrompt,
+    follow_up: FollowUp,
+    steer: Steer,
     abort_run,
     continue_run,
 };
 
 pub const SubmitPrompt = struct {
     messages: []const agent_message.AgentMessage,
+};
+
+pub const FollowUp = struct {
+    messages: []const agent_message.AgentMessage,
+};
+
+pub const Steer = struct {
+    text: []const u8,
 };
 
 pub const SubmitResult = union(enum) {
@@ -21,4 +31,6 @@ pub const Rejection = union(enum) {
     busy,
     invalid_state,
     queue_full,
+    follow_up_queue_full,
+    unsupported,
 };
