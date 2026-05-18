@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent = @import("../agent/root.zig");
+const agent_message = @import("../agent/message.zig");
 const json_value = @import("../json/value.zig");
 
 pub const CURRENT_SESSION_VERSION: u32 = 3;
@@ -43,7 +43,7 @@ pub const Event = struct {
 };
 
 pub const MessageEntry = struct {
-    message: agent.protocol.AgentMessage,
+    message: agent_message.AgentMessage,
 };
 
 pub const ThinkingLevelChangeEntry = struct {
@@ -77,7 +77,7 @@ pub const CustomEntry = struct {
 
 pub const CustomMessageEntry = struct {
     custom_type: []const u8,
-    content: agent.protocol.AgentMessage.CustomContent,
+    content: agent_message.AgentMessage.CustomContent,
     details: ?json_value.OwnedValue = null,
     display: bool,
     include_in_context: bool = true,

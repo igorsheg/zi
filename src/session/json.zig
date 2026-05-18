@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent = @import("../agent/root.zig");
+const agent_message = @import("../agent/message.zig");
 const event = @import("event.zig");
 const json_text = @import("../json/text.zig");
 const json_value = @import("../json/value.zig");
@@ -231,7 +231,7 @@ pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: e
     try jw.endObject();
 }
 
-pub fn writeAgentMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: agent.protocol.AgentMessage) !void {
+pub fn writeAgentMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: agent_message.AgentMessage) !void {
     switch (msg) {
         .user => |u| try writeUserMessage(allocator, jw, u),
         .assistant => |a| try writeAssistantMessage(allocator, jw, a),
@@ -349,7 +349,7 @@ pub fn writeToolResultMessage(allocator: std.mem.Allocator, jw: *Stringify, msg:
     try jw.endObject();
 }
 
-pub fn writeCompactionSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.CompactionSummaryMessage) !void {
+pub fn writeCompactionSummaryMessage(jw: *Stringify, msg: agent_message.AgentMessage.CompactionSummary) !void {
     try jw.beginObject();
     try jw.objectField(Field.role);
     try jw.write(Tag.compaction_summary);
@@ -362,7 +362,7 @@ pub fn writeCompactionSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMe
     try jw.endObject();
 }
 
-pub fn writeBranchSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessage.BranchSummaryMessage) !void {
+pub fn writeBranchSummaryMessage(jw: *Stringify, msg: agent_message.AgentMessage.BranchSummary) !void {
     try jw.beginObject();
     try jw.objectField(Field.role);
     try jw.write(Tag.branch_summary);
@@ -375,7 +375,7 @@ pub fn writeBranchSummaryMessage(jw: *Stringify, msg: agent.protocol.AgentMessag
     try jw.endObject();
 }
 
-pub fn writeCustomMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: agent.protocol.AgentMessage.CustomMessage) !void {
+pub fn writeCustomMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: agent_message.AgentMessage.Custom) !void {
     try jw.beginObject();
     try jw.objectField(Field.role);
     try jw.write(Tag.custom);
@@ -394,7 +394,7 @@ pub fn writeCustomMessage(allocator: std.mem.Allocator, jw: *Stringify, msg: age
     try jw.endObject();
 }
 
-pub fn writeCustomContent(allocator: std.mem.Allocator, jw: *Stringify, content: agent.protocol.AgentMessage.CustomContent) !void {
+pub fn writeCustomContent(allocator: std.mem.Allocator, jw: *Stringify, content: agent_message.AgentMessage.CustomContent) !void {
     switch (content) {
         .text => |t| try jw.write(t),
         .blocks => |blocks| {
@@ -579,7 +579,7 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: [
     };
 }
 
-fn parseAgentMessage(allocator: std.mem.Allocator, value: std.json.Value) !agent.protocol.AgentMessage {
+fn parseAgentMessage(allocator: std.mem.Allocator, value: std.json.Value) !agent_message.AgentMessage {
     const obj = try expectObject(value);
     const role = try requiredString(obj, Field.role);
 
@@ -896,7 +896,7 @@ fn parseToolResultMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap)
     };
 }
 
-fn parseCustomAgentMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !agent.protocol.AgentMessage.CustomMessage {
+fn parseCustomAgentMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !agent_message.AgentMessage.Custom {
     return .{
         .custom_type = try allocator.dupe(u8, try requiredString(obj, Field.custom_type)),
         .content = try parseCustomContent(allocator, try requiredValue(obj, Field.content)),
@@ -906,7 +906,7 @@ fn parseCustomAgentMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap
     };
 }
 
-fn parseCustomContent(allocator: std.mem.Allocator, val: std.json.Value) !agent.protocol.AgentMessage.CustomContent {
+fn parseCustomContent(allocator: std.mem.Allocator, val: std.json.Value) !agent_message.AgentMessage.CustomContent {
     return switch (val) {
         .string => |s| .{ .text = try allocator.dupe(u8, s) },
         .array => |arr| blk: {
@@ -932,7 +932,7 @@ fn expectJsonOmits(json: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, json, needle) == null);
 }
 
-fn messageEntry(id: []const u8, parent_id: ?[]const u8, message: agent.protocol.AgentMessage) event.Event {
+fn messageEntry(id: []const u8, parent_id: ?[]const u8, message: agent_message.AgentMessage) event.Event {
     return .{
         .id = id,
         .parent_id = parent_id,
@@ -941,7 +941,7 @@ fn messageEntry(id: []const u8, parent_id: ?[]const u8, message: agent.protocol.
     };
 }
 
-fn userTextFromMessage(message: agent.protocol.AgentMessage) ![]const u8 {
+fn userTextFromMessage(message: agent_message.AgentMessage) ![]const u8 {
     return switch (message) {
         .user => |user| switch (user.content) {
             .text => |text| text,
@@ -957,11 +957,11 @@ fn userTextFromMessage(message: agent.protocol.AgentMessage) ![]const u8 {
     };
 }
 
-fn expectUserText(message: agent.protocol.AgentMessage, expected: []const u8) !void {
+fn expectUserText(message: agent_message.AgentMessage, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, try userTextFromMessage(message));
 }
 
-fn expectToolCall(message: agent.protocol.AgentMessage, expected_id: []const u8, expected_name: []const u8) !void {
+fn expectToolCall(message: agent_message.AgentMessage, expected_id: []const u8, expected_name: []const u8) !void {
     switch (message) {
         .assistant => |assistant| {
             try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
@@ -977,7 +977,7 @@ fn expectToolCall(message: agent.protocol.AgentMessage, expected_id: []const u8,
     }
 }
 
-fn expectToolResultText(message: agent.protocol.AgentMessage, expected_call_id: []const u8, expected_tool_name: []const u8, expected_text: []const u8) !void {
+fn expectToolResultText(message: agent_message.AgentMessage, expected_call_id: []const u8, expected_tool_name: []const u8, expected_text: []const u8) !void {
     switch (message) {
         .tool_result => |tool_result| {
             try std.testing.expectEqualStrings(expected_call_id, tool_result.tool_call_id);
@@ -1220,7 +1220,7 @@ test "session message entries round-trip through JSON and rebuild context" {
     const allocator = std.testing.allocator;
     const context = @import("context.zig");
 
-    const user_msg = agent.protocol.AgentMessage{ .user = .{
+    const user_msg = agent_message.AgentMessage{ .user = .{
         .content = .{ .text = "what files are here?" },
         .timestamp = 1700000000000,
     } };
@@ -1233,7 +1233,7 @@ test "session message entries round-trip through JSON and rebuild context" {
     var assistant_blocks = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
         .{ .tool_call = tool_call },
     };
-    const assistant_msg = agent.protocol.AgentMessage{ .assistant = .{
+    const assistant_msg = agent_message.AgentMessage{ .assistant = .{
         .content = &assistant_blocks,
         .api = .anthropic_messages,
         .provider = .anthropic,
@@ -1253,7 +1253,7 @@ test "session message entries round-trip through JSON and rebuild context" {
     var tool_content = [_]ai.protocol.ToolResultMessage.ContentBlock{
         .{ .text = .{ .text = "file1.txt\nfile2.txt" } },
     };
-    const tool_result_msg = agent.protocol.AgentMessage{ .tool_result = .{
+    const tool_result_msg = agent_message.AgentMessage{ .tool_result = .{
         .tool_call_id = "toolu_abc123",
         .tool_name = "bash",
         .content = &tool_content,
@@ -1261,7 +1261,7 @@ test "session message entries round-trip through JSON and rebuild context" {
         .timestamp = 1700000002000,
     } };
 
-    const entries_data = [_]struct { msg: agent.protocol.AgentMessage, id: []const u8, parent: ?[]const u8 }{
+    const entries_data = [_]struct { msg: agent_message.AgentMessage, id: []const u8, parent: ?[]const u8 }{
         .{ .msg = user_msg, .id = "aaaa0001", .parent = null },
         .{ .msg = assistant_msg, .id = "aaaa0002", .parent = "aaaa0001" },
         .{ .msg = tool_result_msg, .id = "aaaa0003", .parent = "aaaa0002" },

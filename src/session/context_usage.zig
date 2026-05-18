@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent = @import("../agent/root.zig");
+const agent_message = @import("../agent/message.zig");
 const faux = ai.faux;
 
 pub const ContextUsage = struct {
@@ -17,6 +17,11 @@ pub const ContextUsageEstimate = struct {
     last_usage_index: ?usize,
 };
 
+pub const InFlightUsageInput = struct {
+    assistant: ?ai.protocol.AssistantMessage = null,
+    tool_results: []const ai.protocol.ToolResultMessage = &.{},
+};
+
 pub fn calculateContextTokens(usage: ai.protocol.Usage) u64 {
     return if (usage.total_tokens != 0)
         usage.total_tokens
@@ -24,26 +29,23 @@ pub fn calculateContextTokens(usage: ai.protocol.Usage) u64 {
         usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
-pub fn estimateContextTokens(messages: []const agent.protocol.AgentMessage) ContextUsageEstimate {
+pub fn estimateContextTokens(messages: []const agent_message.AgentMessage) ContextUsageEstimate {
     var estimator = ContextUsageEstimator{};
     for (messages) |message| estimator.observe(message);
     return estimator.finish();
 }
 
 pub fn estimateContextTokensWithInFlight(
-    committed: []const agent.protocol.AgentMessage,
-    in_flight: *const agent.conversation_state.InFlightState,
+    committed: []const agent_message.AgentMessage,
+    in_flight: InFlightUsageInput,
 ) ContextUsageEstimate {
     var estimator = ContextUsageEstimator{};
     for (committed) |message| estimator.observe(message);
     if (in_flight.assistant) |assistant| {
         estimator.observe(.{ .assistant = assistant });
     }
-    for (in_flight.tool_executions.items) |execution| {
-        switch (execution.state) {
-            .result_message => |tool_result| estimator.observe(.{ .tool_result = tool_result }),
-            else => {},
-        }
+    for (in_flight.tool_results) |tool_result| {
+        estimator.observe(.{ .tool_result = tool_result });
     }
     return estimator.finish();
 }
@@ -55,7 +57,7 @@ const ContextUsageEstimator = struct {
     trailing_tokens: u64 = 0,
     last_usage_index: ?usize = null,
 
-    fn observe(self: *ContextUsageEstimator, message: agent.protocol.AgentMessage) void {
+    fn observe(self: *ContextUsageEstimator, message: agent_message.AgentMessage) void {
         if (getAssistantUsage(message)) |usage| {
             self.usage_tokens = calculateContextTokens(usage);
             self.trailing_tokens = 0;
@@ -86,7 +88,7 @@ const ContextUsageEstimator = struct {
     }
 };
 
-pub fn estimateTokens(message: agent.protocol.AgentMessage) u64 {
+pub fn estimateTokens(message: agent_message.AgentMessage) u64 {
     var chars: usize = 0;
 
     switch (message) {
@@ -128,7 +130,7 @@ fn estimateUserContentBlock(block: ai.protocol.UserMessage.UserMessageContent.Bl
     };
 }
 
-fn getAssistantUsage(message: agent.protocol.AgentMessage) ?ai.protocol.Usage {
+fn getAssistantUsage(message: agent_message.AgentMessage) ?ai.protocol.Usage {
     switch (message) {
         .assistant => |assistant| switch (assistant.stop_reason) {
             .aborted, .@"error" => return null,
@@ -193,10 +195,7 @@ fn countPrint(comptime fmt: []const u8, args: anytype) usize {
 const testing = std.testing;
 
 test "estimateContextTokensWithInFlight uses assistant message-end usage before turn commit" {
-    var in_flight = agent.conversation_state.InFlightState.init(testing.allocator);
-    defer in_flight.deinit();
-
-    const committed = [_]agent.protocol.AgentMessage{.{ .user = .{
+    const committed = [_]agent_message.AgentMessage{.{ .user = .{
         .content = .{ .text = "hello" },
         .timestamp = 1,
     } }};
@@ -216,7 +215,7 @@ test "estimateContextTokensWithInFlight uses assistant message-end usage before 
         .stop_reason = .stop,
         .timestamp = 2,
     };
-    const tool_result = agent.protocol.ToolResultMessage{
+    const tool_result = agent_message.ToolResultMessage{
         .tool_call_id = "tool-1",
         .tool_name = "read",
         .content = &.{.{ .text = .{ .text = "abcdefgh" } }},
@@ -224,10 +223,7 @@ test "estimateContextTokensWithInFlight uses assistant message-end usage before 
         .timestamp = 3,
     };
 
-    _ = in_flight.applyEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
-    _ = in_flight.applyEvent(.{ .message_end = .{ .message = .{ .tool_result = tool_result } } });
-
-    const estimate = estimateContextTokensWithInFlight(&committed, &in_flight);
+    const estimate = estimateContextTokensWithInFlight(&committed, .{ .assistant = assistant, .tool_results = &.{tool_result} });
 
     try testing.expectEqual(@as(u64, 122), estimate.tokens);
     try testing.expectEqual(@as(u64, 120), estimate.usage_tokens);
@@ -247,7 +243,7 @@ test "estimateTokens counts serialized tool call arguments" {
     const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
         faux.fauxToolCall("read", "tc-1", parsed.value),
     };
-    const message = agent.protocol.AgentMessage{
+    const message = agent_message.AgentMessage{
         .assistant = faux.fauxAssistantMessage(testing.allocator, &content, .stop),
     };
     defer testing.allocator.free(message.assistant.content);

@@ -1,11 +1,11 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const agent = @import("../agent/root.zig");
+const agent_message = @import("../agent/message.zig");
 const event = @import("event.zig");
 const context_usage = @import("context_usage.zig");
 
 pub const SessionContext = struct {
-    messages: []agent.protocol.AgentMessage,
+    messages: []agent_message.AgentMessage,
     thinking_level: []const u8,
     model: ?ModelInfo,
 
@@ -72,7 +72,7 @@ pub fn buildSessionContext(
     defer allocator.free(path);
 
     if (path.len == 0) {
-        return .{ .messages = try allocator.alloc(agent.protocol.AgentMessage, 0), .thinking_level = "off", .model = null };
+        return .{ .messages = try allocator.alloc(agent_message.AgentMessage, 0), .thinking_level = "off", .model = null };
     }
 
     var thinking_level: []const u8 = "off";
@@ -98,7 +98,7 @@ pub fn buildSessionContext(
         }
     }
 
-    var messages: std.ArrayListUnmanaged(agent.protocol.AgentMessage) = .empty;
+    var messages: std.ArrayListUnmanaged(agent_message.AgentMessage) = .empty;
     errdefer messages.deinit(allocator);
 
     if (compaction_data) |cd| {
@@ -150,7 +150,7 @@ fn resolveLeafIndex(
     };
 }
 
-fn extractMessage(entry: *const event.Event) !?agent.protocol.AgentMessage {
+fn extractMessage(entry: *const event.Event) !?agent_message.AgentMessage {
     switch (entry.payload) {
         .message => |m| return m.message,
         .custom_message => |cm| {
@@ -312,7 +312,7 @@ fn testCustomMessage(id: []const u8, parent_id: ?[]const u8, text: []const u8, i
     } };
 }
 
-fn getUserText(msg: agent.protocol.AgentMessage) ?[]const u8 {
+fn getUserText(msg: agent_message.AgentMessage) ?[]const u8 {
     switch (msg) {
         .user => |u| return switch (u.content) {
             .text => |t| t,
@@ -322,7 +322,7 @@ fn getUserText(msg: agent.protocol.AgentMessage) ?[]const u8 {
     }
 }
 
-fn getAssistantText(msg: agent.protocol.AgentMessage) ?[]const u8 {
+fn getAssistantText(msg: agent_message.AgentMessage) ?[]const u8 {
     switch (msg) {
         .assistant => |a| {
             if (a.content.len > 0) {

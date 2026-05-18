@@ -1,230 +1,65 @@
 const std = @import("std");
-const protocol = @import("types.zig");
-const session_json = @import("../session/json.zig");
-const ai = @import("../ai/root.zig");
+const event = @import("event.zig");
 
-const Stringify = std.json.Stringify;
-
-pub fn writeAgentEvent(writer: *std.Io.Writer, event: protocol.AgentEvent) !void {
-    var jw: Stringify = .{ .writer = writer };
-
+pub fn writeEvent(jw: *std.json.Stringify, value: event.AgentEvent) !void {
     try jw.beginObject();
-
-    switch (event) {
-        .agent_start => {
-            try jw.objectField("type");
-            try jw.write("agent_start");
+    try jw.objectField("type");
+    switch (value) {
+        .lifecycle => |lifecycle| switch (lifecycle) {
+            .run_started => try jw.write("runStarted"),
+            .turn_started => try jw.write("turnStarted"),
+            .run_finished => |terminal| {
+                try jw.write("runFinished");
+                try jw.objectField("terminal");
+                try writeRunTerminal(jw, terminal);
+            },
+            .turn_finished => |terminal| {
+                try jw.write("turnFinished");
+                try jw.objectField("terminal");
+                try writeTurnTerminal(jw, terminal);
+            },
         },
-        .agent_end => |payload| {
-            try jw.objectField("type");
-            try jw.write("agent_end");
-            try jw.objectField("messages");
-            try jw.beginArray();
-            for (payload.messages) |msg| {
-                try session_json.writeAgentMessage(&jw, msg);
-            }
-            try jw.endArray();
+        .message => |message| switch (message) {
+            .started => try jw.write("messageStarted"),
+            .delta => try jw.write("messageDelta"),
+            .finished => try jw.write("messageFinished"),
         },
-        .turn_start => {
-            try jw.objectField("type");
-            try jw.write("turn_start");
-        },
-        .turn_end => |payload| {
-            try jw.objectField("type");
-            try jw.write("turn_end");
-            try jw.objectField("message");
-            try session_json.writeAgentMessage(&jw, payload.message);
-            try jw.objectField("toolResults");
-            try jw.beginArray();
-            for (payload.tool_results) |tr| {
-                try writeToolResultMessage(&jw, tr);
-            }
-            try jw.endArray();
-        },
-        .message_start => |payload| {
-            try jw.objectField("type");
-            try jw.write("message_start");
-            try jw.objectField("message");
-            try session_json.writeAgentMessage(&jw, payload.message);
-        },
-        .message_update => |payload| {
-            try jw.objectField("type");
-            try jw.write("message_update");
-            try jw.objectField("message");
-            try session_json.writeAgentMessage(&jw, payload.message);
-            try jw.objectField("assistantMessageEvent");
-            try writeAssistantMessageEvent(&jw, payload.assistant_message_event);
-        },
-        .message_delta => |payload| {
-            try jw.objectField("type");
-            try jw.write("message_delta");
-            try jw.objectField("assistantMessageEvent");
-            try writeAssistantMessageEvent(&jw, payload.assistant_message_event);
-        },
-        .message_end => |payload| {
-            try jw.objectField("type");
-            try jw.write("message_end");
-            try jw.objectField("message");
-            try session_json.writeAgentMessage(&jw, payload.message);
-        },
-        .tool_execution_start => |payload| {
-            try jw.objectField("type");
-            try jw.write("tool_execution_start");
-            try jw.objectField("toolCallId");
-            try jw.write(payload.tool_call_id);
-            try jw.objectField("toolName");
-            try jw.write(payload.tool_name);
-            try jw.objectField("args");
-            try jw.write(payload.args);
-        },
-        .tool_execution_update => |payload| {
-            try jw.objectField("type");
-            try jw.write("tool_execution_update");
-            try jw.objectField("toolCallId");
-            try jw.write(payload.tool_call_id);
-            try jw.objectField("toolName");
-            try jw.write(payload.tool_name);
-            try jw.objectField("args");
-            try jw.write(payload.args);
-            if (payload.partial_result) |pr| {
-                try jw.objectField("partialResult");
-                try writeAgentToolResult(&jw, pr);
-            }
-        },
-        .tool_execution_end => |payload| {
-            try jw.objectField("type");
-            try jw.write("tool_execution_end");
-            try jw.objectField("toolCallId");
-            try jw.write(payload.tool_call_id);
-            try jw.objectField("toolName");
-            try jw.write(payload.tool_name);
-            try jw.objectField("result");
-            try writeAgentToolResult(&jw, payload.result);
-            try jw.objectField("isError");
-            try jw.write(payload.is_error);
-        },
-    }
-
-    try jw.endObject();
-}
-
-fn writeAssistantMessageEvent(jw: *Stringify, event: ai.protocol.AssistantMessageEvent) !void {
-    try jw.beginObject();
-    switch (event) {
-        .start => |payload| {
-            try jw.objectField("type");
-            try jw.write("start");
-        },
-        .text_start => |payload| {
-            try jw.objectField("type");
-            try jw.write("text_start");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-        },
-        .text_delta => |payload| {
-            try jw.objectField("type");
-            try jw.write("text_delta");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-            try jw.objectField("delta");
-            try jw.write(payload.delta);
-        },
-        .text_end => |payload| {
-            try jw.objectField("type");
-            try jw.write("text_end");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-            try jw.objectField("content");
-            try jw.write(payload.content);
-        },
-        .thinking_start => |payload| {
-            try jw.objectField("type");
-            try jw.write("thinking_start");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-        },
-        .thinking_delta => |payload| {
-            try jw.objectField("type");
-            try jw.write("thinking_delta");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-            try jw.objectField("delta");
-            try jw.write(payload.delta);
-        },
-        .thinking_end => |payload| {
-            try jw.objectField("type");
-            try jw.write("thinking_end");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-            try jw.objectField("content");
-            try jw.write(payload.content);
-        },
-        .toolcall_start => |payload| {
-            try jw.objectField("type");
-            try jw.write("toolcall_start");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-        },
-        .toolcall_delta => |payload| {
-            try jw.objectField("type");
-            try jw.write("toolcall_delta");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-            try jw.objectField("delta");
-            try jw.write(payload.delta);
-        },
-        .toolcall_end => |payload| {
-            try jw.objectField("type");
-            try jw.write("toolcall_end");
-            try jw.objectField("contentIndex");
-            try jw.write(payload.content_index);
-            try jw.objectField("toolCall");
-            try session_json.writeToolCallBlock(jw, payload.tool_call);
-        },
-        .done => |payload| {
-            try jw.objectField("type");
-            try jw.write("done");
-            try jw.objectField("reason");
-            try jw.write(@tagName(payload.reason));
-            try jw.objectField("message");
-            try session_json.writeAssistantMessage(jw, payload.message);
-        },
-        .@"error" => |payload| {
-            try jw.objectField("type");
-            try jw.write("error");
-            try jw.objectField("reason");
-            try jw.write(@tagName(payload.reason));
-            try jw.objectField("error");
-            try session_json.writeAssistantMessage(jw, payload.@"error");
+        .tool => |tool| switch (tool) {
+            .started => try jw.write("toolStarted"),
+            .update => try jw.write("toolUpdate"),
+            .finished => try jw.write("toolFinished"),
         },
     }
     try jw.endObject();
 }
 
-fn writeAgentToolResult(jw: *Stringify, result: protocol.AgentToolResult) !void {
+fn writeRunTerminal(jw: *std.json.Stringify, terminal: event.RunTerminal) !void {
+    return writeTerminalTag(jw, switch (terminal) {
+        .completed => "completed",
+        .failed => "failed",
+        .aborted => "aborted",
+    });
+}
+
+fn writeTurnTerminal(jw: *std.json.Stringify, terminal: event.TurnTerminal) !void {
+    return writeTerminalTag(jw, switch (terminal) {
+        .completed => "completed",
+        .failed => "failed",
+        .aborted => "aborted",
+    });
+}
+
+fn writeTerminalTag(jw: *std.json.Stringify, tag: []const u8) !void {
     try jw.beginObject();
-    try jw.objectField("content");
-    try jw.beginArray();
-    for (result.content) |block| {
-        switch (block) {
-            .text => |tc| try session_json.writeTextBlock(jw, tc),
-            .image => |ic| try session_json.writeImageBlock(jw, ic),
-        }
-    }
-    try jw.endArray();
-    try jw.objectField("isError");
-    try jw.write(result.is_error);
-    if (result.details != .null) {
-        try jw.objectField("details");
-        try jw.write(result.details);
-    }
-    if (result.presentation != .null) {
-        try jw.objectField("presentation");
-        try jw.write(result.presentation);
-    }
+    try jw.objectField("status");
+    try jw.write(tag);
     try jw.endObject();
 }
 
-fn writeToolResultMessage(jw: *Stringify, msg: ai.protocol.ToolResultMessage) !void {
-    try session_json.writeToolResultMessage(jw, msg);
+test "writes run terminal event status" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    try writeEvent(&jw, .{ .lifecycle = .{ .run_finished = .{ .aborted = .{ .messages = &.{} } } } });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "aborted") != null);
 }

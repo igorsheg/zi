@@ -1,410 +1,165 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const protocol = @import("types.zig");
 const json_value = @import("../json/value.zig");
+const message = @import("message.zig");
 
-pub fn cloneMessages(allocator: std.mem.Allocator, messages: []const protocol.AgentMessage) ![]protocol.AgentMessage {
-    const cloned = try allocator.alloc(protocol.AgentMessage, messages.len);
+pub fn cloneMessage(allocator: std.mem.Allocator, value: message.AgentMessage) !message.AgentMessage {
+    return switch (value) {
+        .user => |user| .{ .user = try cloneUser(allocator, user) },
+        .assistant => |assistant| .{ .assistant = try cloneAssistant(allocator, assistant) },
+        .tool_result => |tool_result| .{ .tool_result = try cloneToolResult(allocator, tool_result) },
+        .compaction_summary => |summary| .{ .compaction_summary = .{ .summary = try allocator.dupe(u8, summary.summary), .tokens_before = summary.tokens_before, .timestamp = summary.timestamp } },
+        .branch_summary => |summary| .{ .branch_summary = .{ .summary = try allocator.dupe(u8, summary.summary), .from_id = try allocator.dupe(u8, summary.from_id), .timestamp = summary.timestamp } },
+        .custom => |custom| .{ .custom = try cloneCustom(allocator, custom) },
+    };
+}
+
+pub fn cloneUser(allocator: std.mem.Allocator, value: ai.protocol.UserMessage) !ai.protocol.UserMessage {
+    return .{ .content = try cloneUserContent(allocator, value.content), .timestamp = value.timestamp };
+}
+
+pub fn cloneAssistant(allocator: std.mem.Allocator, value: message.AssistantMessage) !message.AssistantMessage {
+    const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, value.content.len);
     var initialized: usize = 0;
     errdefer {
-        var i: usize = 0;
-        while (i < initialized) : (i += 1) {
-            freeMessage(allocator, &cloned[i]);
-        }
-        allocator.free(cloned);
+        for (content[0..initialized]) |block| freeAssistantBlock(allocator, block);
+        allocator.free(content);
     }
-
-    for (messages, 0..) |message, i| {
-        cloned[i] = try cloneMessage(allocator, message);
+    for (value.content, 0..) |block, i| {
+        content[i] = try cloneAssistantBlock(allocator, block);
         initialized += 1;
     }
-    return cloned;
-}
-
-pub fn freeMessages(allocator: std.mem.Allocator, messages: []protocol.AgentMessage) void {
-    for (messages) |*message| {
-        freeMessage(allocator, message);
-    }
-    allocator.free(messages);
-}
-
-pub fn cloneMessage(allocator: std.mem.Allocator, message: protocol.AgentMessage) !protocol.AgentMessage {
-    return switch (message) {
-        .user => |user| .{ .user = try cloneUserMessage(allocator, user) },
-        .assistant => |assistant| .{ .assistant = try cloneAssistantMessage(allocator, assistant) },
-        .tool_result => |tool_result| .{ .tool_result = try cloneToolResultMessage(allocator, tool_result) },
-        .compaction_summary => |summary| .{ .compaction_summary = try cloneCompactionSummaryMessage(allocator, summary) },
-        .branch_summary => |summary| .{ .branch_summary = try cloneBranchSummaryMessage(allocator, summary) },
-        .custom => |custom| .{ .custom = try cloneCustomMessage(allocator, custom) },
+    return .{
+        .content = content,
+        .api = value.api,
+        .provider = value.provider,
+        .model = try allocator.dupe(u8, value.model),
+        .response_id = if (value.response_id) |id| try allocator.dupe(u8, id) else null,
+        .usage = value.usage,
+        .stop_reason = value.stop_reason,
+        .error_message = if (value.error_message) |msg| try allocator.dupe(u8, msg) else null,
+        .failure = value.failure,
+        .timestamp = value.timestamp,
     };
 }
 
-pub fn cloneUserContent(
-    allocator: std.mem.Allocator,
-    content: ai.protocol.UserMessage.UserMessageContent,
-) !ai.protocol.UserMessage.UserMessageContent {
-    return switch (content) {
-        .text => |text| .{ .text = try allocator.dupe(u8, text) },
-        .blocks => |blocks| .{ .blocks = try cloneUserBlocks(allocator, blocks) },
-    };
+pub fn freeAssistant(allocator: std.mem.Allocator, value: message.AssistantMessage) void {
+    for (value.content) |block| freeAssistantBlock(allocator, block);
+    allocator.free(value.content);
+    allocator.free(value.model);
+    if (value.response_id) |id| allocator.free(id);
+    if (value.error_message) |msg| allocator.free(msg);
 }
 
-pub fn freeUserContent(
-    allocator: std.mem.Allocator,
-    content: *ai.protocol.UserMessage.UserMessageContent,
-) void {
-    switch (content.*) {
-        .text => |text| allocator.free(text),
-        .blocks => |blocks| {
-            for (blocks) |block| freeUserBlock(allocator, block);
-            allocator.free(blocks);
-        },
-    }
-}
-
-pub fn freeMessage(allocator: std.mem.Allocator, message: *protocol.AgentMessage) void {
-    switch (message.*) {
-        .user => |*user| freeUserMessage(allocator, user),
-        .assistant => |*assistant| freeAssistantMessage(allocator, assistant),
-        .tool_result => |*tool_result| freeToolResultMessage(allocator, tool_result),
-        .compaction_summary => |*summary| allocator.free(summary.summary),
-        .branch_summary => |*summary| {
+pub fn freeMessage(allocator: std.mem.Allocator, value: message.AgentMessage) void {
+    switch (value) {
+        .assistant => |assistant| freeAssistant(allocator, assistant),
+        .tool_result => |tool_result| freeToolResult(allocator, tool_result),
+        .user => |user| freeUser(allocator, user),
+        .compaction_summary => |summary| allocator.free(summary.summary),
+        .branch_summary => |summary| {
             allocator.free(summary.summary);
             allocator.free(summary.from_id);
         },
-        .custom => |*custom| freeCustomMessage(allocator, custom),
+        .custom => |custom| freeCustom(allocator, custom),
     }
 }
 
-fn cloneCompactionSummaryMessage(
-    allocator: std.mem.Allocator,
-    summary: protocol.AgentMessage.CompactionSummaryMessage,
-) !protocol.AgentMessage.CompactionSummaryMessage {
-    return .{
-        .summary = try allocator.dupe(u8, summary.summary),
-        .tokens_before = summary.tokens_before,
-        .timestamp = summary.timestamp,
-    };
+pub fn freeUser(allocator: std.mem.Allocator, value: ai.protocol.UserMessage) void {
+    freeUserContent(allocator, value.content);
 }
 
-fn cloneBranchSummaryMessage(
-    allocator: std.mem.Allocator,
-    summary: protocol.AgentMessage.BranchSummaryMessage,
-) !protocol.AgentMessage.BranchSummaryMessage {
-    const summary_text = try allocator.dupe(u8, summary.summary);
-    errdefer allocator.free(summary_text);
-    const from_id = try allocator.dupe(u8, summary.from_id);
-    return .{
-        .summary = summary_text,
-        .from_id = from_id,
-        .timestamp = summary.timestamp,
-    };
-}
-
-pub fn cloneTextContent(allocator: std.mem.Allocator, text: ai.protocol.TextContent) !ai.protocol.TextContent {
-    const text_copy = try allocator.dupe(u8, text.text);
-    errdefer allocator.free(text_copy);
-    const signature_copy = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null;
-    return .{
-        .text = text_copy,
-        .text_signature = signature_copy,
-    };
-}
-
-pub fn freeTextContent(allocator: std.mem.Allocator, text: ai.protocol.TextContent) void {
-    allocator.free(text.text);
-    if (text.text_signature) |signature| allocator.free(signature);
-}
-
-pub fn cloneThinkingContent(allocator: std.mem.Allocator, thinking: ai.protocol.ThinkingContent) !ai.protocol.ThinkingContent {
-    const thinking_copy = try allocator.dupe(u8, thinking.thinking);
-    errdefer allocator.free(thinking_copy);
-    const signature_copy = if (thinking.thinking_signature) |signature| try allocator.dupe(u8, signature) else null;
-    return .{
-        .thinking = thinking_copy,
-        .thinking_signature = signature_copy,
-        .redacted = thinking.redacted,
-    };
-}
-
-pub fn freeThinkingContent(allocator: std.mem.Allocator, thinking: ai.protocol.ThinkingContent) void {
-    allocator.free(thinking.thinking);
-    if (thinking.thinking_signature) |signature| allocator.free(signature);
-}
-
-pub fn cloneImageContent(allocator: std.mem.Allocator, image: ai.protocol.ImageContent) !ai.protocol.ImageContent {
-    const data = try allocator.dupe(u8, image.data);
-    errdefer allocator.free(data);
-    const mime_type = try allocator.dupe(u8, image.mime_type);
-    return .{
-        .data = data,
-        .mime_type = mime_type,
-    };
-}
-
-pub fn freeImageContent(allocator: std.mem.Allocator, image: ai.protocol.ImageContent) void {
-    allocator.free(image.data);
-    allocator.free(image.mime_type);
-}
-
-pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) !ai.protocol.ToolCall {
-    const id = try allocator.dupe(u8, tool_call.id);
-    errdefer allocator.free(id);
-    const name = try allocator.dupe(u8, tool_call.name);
-    errdefer allocator.free(name);
-    var arguments = try json_value.OwnedValue.clone(allocator, tool_call.arguments.borrowed());
-    errdefer arguments.deinit();
-    const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
-    return .{
-        .id = id,
-        .name = name,
-        .arguments = arguments,
-        .thought_signature = thought_signature,
-    };
-}
-
-pub fn freeToolCall(allocator: std.mem.Allocator, tool_call: ai.protocol.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    var arguments = tool_call.arguments;
-    arguments.deinit();
-    if (tool_call.thought_signature) |signature| allocator.free(signature);
-}
-
-fn cloneUserBlocks(
-    allocator: std.mem.Allocator,
-    blocks: []const ai.protocol.UserMessage.UserMessageContent.Block,
-) ![]ai.protocol.UserMessage.UserMessageContent.Block {
-    const cloned = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, blocks.len);
-    var initialized: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < initialized) : (i += 1) {
-            freeUserBlock(allocator, cloned[i]);
-        }
-        allocator.free(cloned);
-    }
-
-    for (blocks, 0..) |block, i| {
-        cloned[i] = switch (block) {
-            .text => |text| .{ .text = try cloneTextContent(allocator, text) },
-            .image => |image| .{ .image = try cloneImageContent(allocator, image) },
-        };
-        initialized += 1;
-    }
-    return cloned;
-}
-
-pub fn freeUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.UserMessageContent.Block) void {
-    switch (block) {
-        .text => |text| freeTextContent(allocator, text),
-        .image => |image| freeImageContent(allocator, image),
-    }
-}
-
-pub fn cloneUserMessage(allocator: std.mem.Allocator, message: ai.protocol.UserMessage) !ai.protocol.UserMessage {
-    return .{
-        .content = try cloneUserContent(allocator, message.content),
-        .timestamp = message.timestamp,
-    };
-}
-
-pub fn freeUserMessage(allocator: std.mem.Allocator, message: *ai.protocol.UserMessage) void {
-    freeUserContent(allocator, &message.content);
-}
-
-fn cloneFailure(allocator: std.mem.Allocator, failure: ai.protocol.NormalizedFailure) !ai.protocol.NormalizedFailure {
-    const provider_code = if (failure.provider_code) |code| try allocator.dupe(u8, code) else null;
-    errdefer if (provider_code) |code| allocator.free(code);
-    const provider_type = if (failure.provider_type) |value| try allocator.dupe(u8, value) else null;
-    return .{
-        .kind = failure.kind,
-        .http_status = failure.http_status,
-        .provider_code = provider_code,
-        .provider_type = provider_type,
-        .retry_after_ms = failure.retry_after_ms,
-    };
-}
-
-fn freeFailure(allocator: std.mem.Allocator, failure: ai.protocol.NormalizedFailure) void {
-    if (failure.provider_code) |code| allocator.free(code);
-    if (failure.provider_type) |provider_type| allocator.free(provider_type);
-}
-
-fn cloneApi(allocator: std.mem.Allocator, api: ai.protocol.Api) !ai.protocol.Api {
-    return switch (api) {
-        .custom => |value| .{ .custom = try allocator.dupe(u8, value) },
-        else => api,
-    };
-}
-
-fn freeApi(allocator: std.mem.Allocator, api: *ai.protocol.Api) void {
-    switch (api.*) {
-        .custom => |value| allocator.free(value),
-        else => {},
-    }
-}
-
-fn cloneProvider(allocator: std.mem.Allocator, provider: ai.protocol.Provider) !ai.protocol.Provider {
-    return switch (provider) {
-        .custom => |value| .{ .custom = try allocator.dupe(u8, value) },
-        else => provider,
-    };
-}
-
-fn freeProvider(allocator: std.mem.Allocator, provider: *ai.protocol.Provider) void {
-    switch (provider.*) {
-        .custom => |value| allocator.free(value),
-        else => {},
-    }
-}
-
-pub fn cloneAssistantMessage(allocator: std.mem.Allocator, message: ai.protocol.AssistantMessage) !ai.protocol.AssistantMessage {
-    const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, message.content.len);
-    var initialized: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < initialized) : (i += 1) {
-            freeAssistantContentBlock(allocator, content[i]);
-        }
-        allocator.free(content);
-    }
-
-    for (message.content, 0..) |block, i| {
-        content[i] = switch (block) {
-            .text => |text| .{ .text = try cloneTextContent(allocator, text) },
-            .thinking => |thinking| .{ .thinking = try cloneThinkingContent(allocator, thinking) },
-            .tool_call => |tool_call| .{ .tool_call = try cloneToolCall(allocator, tool_call) },
-        };
-        initialized += 1;
-    }
-
-    var api = try cloneApi(allocator, message.api);
-    errdefer freeApi(allocator, &api);
-    var provider = try cloneProvider(allocator, message.provider);
-    errdefer freeProvider(allocator, &provider);
-    const model = try allocator.dupe(u8, message.model);
-    errdefer allocator.free(model);
-    const response_id = if (message.response_id) |response_id| try allocator.dupe(u8, response_id) else null;
-    errdefer if (response_id) |value| allocator.free(value);
-    const error_message = if (message.error_message) |error_message| try allocator.dupe(u8, error_message) else null;
-    errdefer if (error_message) |value| allocator.free(value);
-    const failure = if (message.failure) |value| try cloneFailure(allocator, value) else null;
-    errdefer if (failure) |value| freeFailure(allocator, value);
-
-    return .{
-        .content = content,
-        .api = api,
-        .provider = provider,
-        .model = model,
-        .response_id = response_id,
-        .usage = message.usage,
-        .stop_reason = message.stop_reason,
-        .error_message = error_message,
-        .failure = failure,
-        .timestamp = message.timestamp,
-    };
-}
-
-pub fn freeAssistantContentBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) void {
-    switch (block) {
-        .text => |text| freeTextContent(allocator, text),
-        .thinking => |thinking| freeThinkingContent(allocator, thinking),
-        .tool_call => |tool_call| freeToolCall(allocator, tool_call),
-    }
-}
-
-pub fn freeAssistantMessage(allocator: std.mem.Allocator, message: *ai.protocol.AssistantMessage) void {
-    for (message.content) |block| freeAssistantContentBlock(allocator, block);
-    allocator.free(message.content);
-    freeApi(allocator, &message.api);
-    freeProvider(allocator, &message.provider);
-    allocator.free(message.model);
-    if (message.response_id) |response_id| allocator.free(response_id);
-    if (message.error_message) |error_message| allocator.free(error_message);
-    if (message.failure) |failure| freeFailure(allocator, failure);
-}
-
-pub fn cloneToolResultMessage(allocator: std.mem.Allocator, message: ai.protocol.ToolResultMessage) !ai.protocol.ToolResultMessage {
-    const content = try allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, message.content.len);
-    var initialized: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < initialized) : (i += 1) {
-            freeToolResultContentBlock(allocator, content[i]);
-        }
-        allocator.free(content);
-    }
-
-    for (message.content, 0..) |block, i| {
-        content[i] = switch (block) {
-            .text => |text| .{ .text = try cloneTextContent(allocator, text) },
-            .image => |image| .{ .image = try cloneImageContent(allocator, image) },
-        };
-        initialized += 1;
-    }
-
-    const tool_call_id = try allocator.dupe(u8, message.tool_call_id);
-    errdefer allocator.free(tool_call_id);
-    const tool_name = try allocator.dupe(u8, message.tool_name);
-    errdefer allocator.free(tool_name);
-    var details = if (message.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null;
-    errdefer if (details) |*value| value.deinit();
-    var presentation = if (message.presentation) |presentation| try json_value.OwnedValue.clone(allocator, presentation.borrowed()) else null;
-    errdefer if (presentation) |*value| value.deinit();
-
-    return .{
-        .tool_call_id = tool_call_id,
-        .tool_name = tool_name,
-        .content = content,
-        .details = details,
-        .presentation = presentation,
-        .is_error = message.is_error,
-        .timestamp = message.timestamp,
-    };
-}
-
-pub fn freeToolResultContentBlock(allocator: std.mem.Allocator, block: ai.protocol.ToolResultMessage.ContentBlock) void {
-    switch (block) {
-        .text => |text| freeTextContent(allocator, text),
-        .image => |image| freeImageContent(allocator, image),
-    }
-}
-
-pub fn freeToolResultMessage(allocator: std.mem.Allocator, message: *ai.protocol.ToolResultMessage) void {
-    allocator.free(message.tool_call_id);
-    allocator.free(message.tool_name);
-    for (message.content) |block| freeToolResultContentBlock(allocator, block);
-    allocator.free(message.content);
-    if (message.details) |*details| details.deinit();
-    if (message.presentation) |*presentation| presentation.deinit();
-}
-
-fn cloneCustomMessage(allocator: std.mem.Allocator, message: protocol.AgentMessage.CustomMessage) !protocol.AgentMessage.CustomMessage {
-    const custom_type = try allocator.dupe(u8, message.custom_type);
-    errdefer allocator.free(custom_type);
-    const content: protocol.AgentMessage.CustomContent = switch (message.content) {
-        .text => |text| .{ .text = try allocator.dupe(u8, text) },
-        .blocks => |blocks| .{ .blocks = try cloneUserBlocks(allocator, blocks) },
-    };
-    errdefer switch (content) {
-        .text => |text| allocator.free(text),
-        .blocks => |blocks| {
-            for (blocks) |block| freeUserBlock(allocator, block);
-            allocator.free(blocks);
+pub fn freeToolResult(allocator: std.mem.Allocator, value: message.ToolResultMessage) void {
+    for (value.content) |block| switch (block) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |sig| allocator.free(sig);
+        },
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
         },
     };
-    const details = if (message.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null;
+    allocator.free(value.content);
+    if (value.details) |details| {
+        var d = details;
+        d.deinit();
+    }
+    if (value.presentation) |presentation| {
+        var p = presentation;
+        p.deinit();
+    }
+    allocator.free(value.tool_call_id);
+    allocator.free(value.tool_name);
+}
+
+pub fn cloneToolResult(allocator: std.mem.Allocator, value: message.ToolResultMessage) !message.ToolResultMessage {
+    const content = try allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, value.content.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (content[0..initialized]) |block| switch (block) {
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |sig| allocator.free(sig);
+            },
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+        };
+        allocator.free(content);
+    }
+    for (value.content, 0..) |block, i| {
+        content[i] = switch (block) {
+            .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text), .text_signature = if (text.text_signature) |sig| try allocator.dupe(u8, sig) else null } },
+            .image => |image| .{ .image = .{ .data = try allocator.dupe(u8, image.data), .mime_type = try allocator.dupe(u8, image.mime_type) } },
+        };
+        initialized += 1;
+    }
     return .{
-        .custom_type = custom_type,
+        .tool_call_id = try allocator.dupe(u8, value.tool_call_id),
+        .tool_name = try allocator.dupe(u8, value.tool_name),
         .content = content,
-        .display = message.display,
-        .details = details,
-        .timestamp = message.timestamp,
+        .details = if (value.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null,
+        .presentation = if (value.presentation) |presentation| try json_value.OwnedValue.clone(allocator, presentation.borrowed()) else null,
+        .is_error = value.is_error,
+        .timestamp = value.timestamp,
     };
 }
 
-pub fn freeCustomContent(allocator: std.mem.Allocator, content: protocol.AgentMessage.CustomContent) void {
+fn cloneAssistantBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) !ai.protocol.AssistantMessage.AssistantContentBlock {
+    return switch (block) {
+        .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text), .text_signature = if (text.text_signature) |sig| try allocator.dupe(u8, sig) else null } },
+        .thinking => |thinking| .{ .thinking = .{ .thinking = try allocator.dupe(u8, thinking.thinking), .thinking_signature = if (thinking.thinking_signature) |sig| try allocator.dupe(u8, sig) else null, .redacted = thinking.redacted } },
+        .tool_call => |call| .{ .tool_call = .{
+            .id = try allocator.dupe(u8, call.id),
+            .name = try allocator.dupe(u8, call.name),
+            .thought_signature = if (call.thought_signature) |sig| try allocator.dupe(u8, sig) else null,
+            .arguments = try json_value.OwnedValue.clone(allocator, call.arguments.borrowed()),
+        } },
+    };
+}
+
+fn cloneUserContent(allocator: std.mem.Allocator, content: ai.protocol.UserMessage.UserMessageContent) !ai.protocol.UserMessage.UserMessageContent {
+    return switch (content) {
+        .text => |text| .{ .text = try allocator.dupe(u8, text) },
+        .blocks => |blocks| blk: {
+            const out = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, blocks.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |block| freeUserBlock(allocator, block);
+                allocator.free(out);
+            }
+            for (blocks, 0..) |block, i| {
+                out[i] = try cloneUserBlock(allocator, block);
+                initialized += 1;
+            }
+            break :blk .{ .blocks = out };
+        },
+    };
+}
+
+fn freeUserContent(allocator: std.mem.Allocator, content: ai.protocol.UserMessage.UserMessageContent) void {
     switch (content) {
         .text => |text| allocator.free(text),
         .blocks => |blocks| {
@@ -414,8 +169,74 @@ pub fn freeCustomContent(allocator: std.mem.Allocator, content: protocol.AgentMe
     }
 }
 
-fn freeCustomMessage(allocator: std.mem.Allocator, message: *protocol.AgentMessage.CustomMessage) void {
-    allocator.free(message.custom_type);
-    freeCustomContent(allocator, message.content);
-    if (message.details) |*details| details.deinit();
+fn cloneUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.UserMessageContent.Block) !ai.protocol.UserMessage.UserMessageContent.Block {
+    return switch (block) {
+        .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text), .text_signature = if (text.text_signature) |sig| try allocator.dupe(u8, sig) else null } },
+        .image => |image| .{ .image = .{ .data = try allocator.dupe(u8, image.data), .mime_type = try allocator.dupe(u8, image.mime_type) } },
+    };
+}
+
+fn freeUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.UserMessageContent.Block) void {
+    switch (block) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |sig| allocator.free(sig);
+        },
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+    }
+}
+
+fn cloneCustom(allocator: std.mem.Allocator, value: message.AgentMessage.Custom) !message.AgentMessage.Custom {
+    return .{
+        .custom_type = try allocator.dupe(u8, value.custom_type),
+        .content = switch (value.content) {
+            .text => |text| .{ .text = try allocator.dupe(u8, text) },
+            .blocks => |blocks| blk: {
+                const out = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, blocks.len);
+                for (blocks, 0..) |block, i| out[i] = try cloneUserBlock(allocator, block);
+                break :blk .{ .blocks = out };
+            },
+        },
+        .display = value.display,
+        .details = if (value.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null,
+        .timestamp = value.timestamp,
+    };
+}
+
+fn freeCustom(allocator: std.mem.Allocator, value: message.AgentMessage.Custom) void {
+    allocator.free(value.custom_type);
+    switch (value.content) {
+        .text => |text| allocator.free(text),
+        .blocks => |blocks| {
+            for (blocks) |block| freeUserBlock(allocator, block);
+            allocator.free(blocks);
+        },
+    }
+    if (value.details) |details| {
+        var d = details;
+        d.deinit();
+    }
+}
+
+fn freeAssistantBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) void {
+    switch (block) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |sig| allocator.free(sig);
+        },
+        .thinking => |thinking| {
+            allocator.free(thinking.thinking);
+            if (thinking.thinking_signature) |sig| allocator.free(sig);
+        },
+        .tool_call => |call| {
+            allocator.free(call.id);
+            allocator.free(call.name);
+            if (call.thought_signature) |sig| allocator.free(sig);
+            var args = call.arguments;
+            args.deinit();
+        },
+    }
 }
