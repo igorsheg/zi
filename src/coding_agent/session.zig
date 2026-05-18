@@ -112,7 +112,22 @@ pub const AgentSession = struct {
     const DurableAppend = union(enum) {
         appended,
         skipped,
-        failed,
+        failed: SessionRunFailure,
+    };
+
+    const SessionRunFailure = enum {
+        durable_append_rejected,
+        durable_append_failed,
+        unsupported_batch,
+        missing_model,
+
+        fn failureKind(_: SessionRunFailure) state_mod.FailureKind {
+            return .internal;
+        }
+
+        fn runTerminal(self: SessionRunFailure) event_mod.RunTerminal {
+            return .{ .failed = self.failureKind() };
+        }
     };
 
     const ActiveRun = struct {
@@ -255,7 +270,7 @@ pub const AgentSession = struct {
             .completed => |messages| blk: {
                 switch (self.appendTerminalMessages(messages)) {
                     .appended, .skipped => {},
-                    .failed => break :blk .{ .failed = .internal },
+                    .failed => |failure| break :blk failure.runTerminal(),
                 }
                 self.clearActiveRun();
                 self.setActivity(.idle);
@@ -277,7 +292,7 @@ pub const AgentSession = struct {
         if (result == .failed) {
             self.clearActiveRun();
             self.clearPendingFollowUps();
-            self.setActivity(.{ .failed = .{ .kind = .internal } });
+            self.setActivity(.{ .failed = .{ .kind = result.failed } });
         }
         self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = result } } });
         if (result == .completed) self.startNextFollowUpOrIdle();
@@ -343,9 +358,9 @@ pub const AgentSession = struct {
         std.debug.assert(self.active_run == null);
         switch (self.appendRunInput(messages)) {
             .appended, .skipped => {},
-            .failed => {
+            .failed => |failure| {
                 self.clearPendingFollowUps();
-                self.setActivity(.{ .failed = .{ .kind = .internal } });
+                self.setActivity(.{ .failed = .{ .kind = failure.failureKind() } });
                 return;
             },
         }
@@ -370,11 +385,12 @@ pub const AgentSession = struct {
     fn runSynchronous(self: *AgentSession, backend: ExecutionBackend, messages: []const agent_mod.AgentMessage) void {
         std.debug.assert(self.active_run != null);
         const spec = self.buildRunSpec(backend, messages) orelse {
+            const failure: SessionRunFailure = .missing_model;
             const command_id = self.activeCommandId();
             self.clearActiveRun();
             self.clearPendingFollowUps();
-            self.setActivity(.{ .failed = .{ .kind = .internal } });
-            self.emit(.{ .run = .{ .finished = .{ .command_id = command_id, .terminal = .{ .failed = .internal } } } });
+            self.setActivity(.{ .failed = .{ .kind = failure.failureKind() } });
+            self.emit(.{ .run = .{ .finished = .{ .command_id = command_id, .terminal = failure.runTerminal() } } });
             return;
         };
 
@@ -420,7 +436,7 @@ pub const AgentSession = struct {
         if (messages.len == 0) return .skipped;
         if (messages.len != 1) {
             self.emit(.{ .session = .{ .append_rejected = .unsupported_batch } });
-            return .failed;
+            return .{ .failed = .unsupported_batch };
         }
 
         return self.appendDurableMessage(messages[0]);
@@ -433,7 +449,7 @@ pub const AgentSession = struct {
             switch (self.appendDurableMessage(message)) {
                 .appended => appended_any = true,
                 .skipped => {},
-                .failed => return .failed,
+                .failed => |failure| return .{ .failed = failure },
             }
         }
         return if (appended_any) .appended else .skipped;
@@ -448,11 +464,11 @@ pub const AgentSession = struct {
             },
             .rejected => |reason| {
                 self.emit(.{ .session = .{ .append_rejected = reason } });
-                return .failed;
+                return .{ .failed = .durable_append_rejected };
             },
             .failed => |failure| {
                 self.emit(.{ .session = .{ .append_failed = failure } });
-                return .failed;
+                return .{ .failed = .durable_append_failed };
             },
         }
     }
