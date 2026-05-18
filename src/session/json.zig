@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
-const proto = @import("protocol.zig");
+const event = @import("event.zig");
 const json_text = @import("../json/text.zig");
 const json_value = @import("../json/value.zig");
 
@@ -89,7 +89,7 @@ const Tag = struct {
     const user = "user";
 };
 
-fn headerToOwnedLine(allocator: std.mem.Allocator, header: proto.SessionHeader) ![]u8 {
+fn headerToOwnedLine(allocator: std.mem.Allocator, header: event.Header) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
 
@@ -97,7 +97,7 @@ fn headerToOwnedLine(allocator: std.mem.Allocator, header: proto.SessionHeader) 
     return try out.toOwnedSlice();
 }
 
-fn entryToOwnedLine(allocator: std.mem.Allocator, entry: proto.SessionEntry) ![]u8 {
+fn entryToOwnedLine(allocator: std.mem.Allocator, entry: event.Event) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
 
@@ -105,7 +105,7 @@ fn entryToOwnedLine(allocator: std.mem.Allocator, entry: proto.SessionEntry) ![]
     return try out.toOwnedSlice();
 }
 
-pub fn writeHeader(writer: *std.Io.Writer, header: proto.SessionHeader) !void {
+pub fn writeHeader(writer: *std.Io.Writer, header: event.Header) !void {
     var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();
@@ -126,23 +126,13 @@ pub fn writeHeader(writer: *std.Io.Writer, header: proto.SessionHeader) !void {
     try jw.endObject();
 }
 
-pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: proto.SessionEntry) !void {
+pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: event.Event) !void {
     var jw: Stringify = .{ .writer = writer };
 
     try jw.beginObject();
 
     try jw.objectField(Field.kind_type);
-    try jw.write(switch (entry.entry) {
-        .message => Tag.message,
-        .thinking_level_change => Tag.thinking_level_change,
-        .model_change => Tag.model_change,
-        .compaction => Tag.compaction,
-        .branch_summary => Tag.branch_summary_entry,
-        .custom => Tag.custom,
-        .custom_message => Tag.custom_message,
-        .label => Tag.label,
-        .session_info => Tag.session_info,
-    });
+    try jw.write(event.payloadKindTag(event.payloadKind(entry.payload)));
 
     try jw.objectField(Field.id);
     try jw.write(entry.id);
@@ -155,7 +145,7 @@ pub fn writeEntry(allocator: std.mem.Allocator, writer: *std.Io.Writer, entry: p
     try jw.objectField(Field.timestamp);
     try jw.write(entry.timestamp);
 
-    switch (entry.entry) {
+    switch (entry.payload) {
         .message => |m| {
             try jw.objectField(Field.message);
             try writeAgentMessage(allocator, &jw, m.message);
@@ -508,7 +498,7 @@ pub fn writeUsage(jw: *Stringify, usage: ai.protocol.Usage) !void {
     try jw.endObject();
 }
 
-pub fn parseFileEntry(allocator: std.mem.Allocator, line: []const u8) !proto.FileEntry {
+pub fn parseFileEntry(allocator: std.mem.Allocator, line: []const u8) !event.FileEntry {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     const obj = try expectObject(parsed.value);
@@ -517,10 +507,10 @@ pub fn parseFileEntry(allocator: std.mem.Allocator, line: []const u8) !proto.Fil
     if (std.mem.eql(u8, type_str, Tag.session)) {
         return .{ .header = try parseHeader(allocator, obj) };
     }
-    return .{ .entry = try parseEntry(allocator, obj, type_str) };
+    return .{ .event = try parseEntry(allocator, obj, type_str) };
 }
 
-fn parseHeader(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !proto.SessionHeader {
+fn parseHeader(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !event.Header {
     return .{
         .id = try allocator.dupe(u8, try requiredString(obj, Field.id)),
         .timestamp = try allocator.dupe(u8, try requiredString(obj, Field.timestamp)),
@@ -530,7 +520,7 @@ fn parseHeader(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !proto.Ses
     };
 }
 
-fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: []const u8) !proto.SessionEntry {
+fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: []const u8) !event.Event {
     const id = try allocator.dupe(u8, try requiredString(obj, Field.id));
     errdefer allocator.free(id);
     const parent_id = if (try optionalString(obj, Field.parent_id)) |v| try allocator.dupe(u8, v) else null;
@@ -538,62 +528,54 @@ fn parseEntry(allocator: std.mem.Allocator, obj: std.json.ObjectMap, type_str: [
     const timestamp = try allocator.dupe(u8, try requiredString(obj, Field.timestamp));
     errdefer allocator.free(timestamp);
 
-    const entry: proto.SessionEntry.EntryType = if (std.mem.eql(u8, type_str, Tag.message))
-        .{ .message = .{ .message = try parseAgentMessage(allocator, try requiredValue(obj, Field.message)) } }
-    else if (std.mem.eql(u8, type_str, Tag.thinking_level_change))
-        .{ .thinking_level_change = .{
+    const kind = try event.payloadKindFromTag(type_str);
+    const payload: event.Payload = switch (kind) {
+        .message => .{ .message = .{ .message = try parseAgentMessage(allocator, try requiredValue(obj, Field.message)) } },
+        .thinking_level_change => .{ .thinking_level_change = .{
             .thinking_level = try allocator.dupe(u8, try requiredString(obj, Field.thinking_level)),
-        } }
-    else if (std.mem.eql(u8, type_str, Tag.model_change))
-        .{ .model_change = .{
+        } },
+        .model_change => .{ .model_change = .{
             .provider = try allocator.dupe(u8, try requiredString(obj, Field.provider)),
             .model_id = try allocator.dupe(u8, try requiredString(obj, Field.model_id)),
-        } }
-    else if (std.mem.eql(u8, type_str, Tag.compaction))
-        .{ .compaction = .{
+        } },
+        .compaction => .{ .compaction = .{
             .summary = try allocator.dupe(u8, try requiredString(obj, Field.summary)),
             .first_kept_entry_id = try allocator.dupe(u8, try requiredString(obj, Field.first_kept_entry_id)),
             .tokens_before = try requiredU64(obj, Field.tokens_before),
             .details = if (obj.get(Field.details)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
             .from_hook = try optionalBool(obj, Field.from_hook),
-        } }
-    else if (std.mem.eql(u8, type_str, Tag.branch_summary_entry))
-        .{ .branch_summary = .{
+        } },
+        .branch_summary => .{ .branch_summary = .{
             .from_id = try allocator.dupe(u8, try requiredString(obj, Field.from_id)),
             .summary = try allocator.dupe(u8, try requiredString(obj, Field.summary)),
             .details = if (obj.get(Field.details)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
             .from_hook = try optionalBool(obj, Field.from_hook),
-        } }
-    else if (std.mem.eql(u8, type_str, Tag.custom))
-        .{ .custom = .{
+        } },
+        .custom => .{ .custom = .{
             .custom_type = try allocator.dupe(u8, try requiredString(obj, Field.custom_type)),
             .data = if (obj.get(Field.data)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
-        } }
-    else if (std.mem.eql(u8, type_str, Tag.custom_message))
-        .{ .custom_message = .{
+        } },
+        .custom_message => .{ .custom_message = .{
             .custom_type = try allocator.dupe(u8, try requiredString(obj, Field.custom_type)),
             .content = try parseCustomContent(allocator, try requiredValue(obj, Field.content)),
             .details = if (obj.get(Field.details)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
             .display = try requiredBool(obj, Field.display),
             .include_in_context = (try optionalBool(obj, Field.include_in_context)) orelse true,
-        } }
-    else if (std.mem.eql(u8, type_str, Tag.label))
-        .{ .label = .{
+        } },
+        .label => .{ .label = .{
             .target_id = try allocator.dupe(u8, try requiredString(obj, Field.target_id)),
             .label = if (try optionalString(obj, Field.label)) |v| try allocator.dupe(u8, v) else null,
-        } }
-    else if (std.mem.eql(u8, type_str, Tag.session_info))
-        .{ .session_info = .{
+        } },
+        .session_info => .{ .session_info = .{
             .name = if (try optionalString(obj, Field.name)) |v| try allocator.dupe(u8, v) else null,
-        } }
-    else
-        return error.UnknownEntryType;
+        } },
+    };
 
     return .{
         .id = id,
         .parent_id = parent_id,
         .timestamp = timestamp,
-        .entry = entry,
+        .payload = payload,
     };
 }
 
@@ -950,12 +932,12 @@ fn expectJsonOmits(json: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, json, needle) == null);
 }
 
-fn messageEntry(id: []const u8, parent_id: ?[]const u8, message: agent.protocol.AgentMessage) proto.SessionEntry {
+fn messageEntry(id: []const u8, parent_id: ?[]const u8, message: agent.protocol.AgentMessage) event.Event {
     return .{
         .id = id,
         .parent_id = parent_id,
         .timestamp = "2025-01-01T00:00:00.000Z",
-        .entry = .{ .message = .{ .message = message } },
+        .payload = .{ .message = .{ .message = message } },
     };
 }
 
@@ -1011,7 +993,7 @@ fn expectToolResultText(message: agent.protocol.AgentMessage, expected_call_id: 
     }
 }
 
-fn assistantFailureEntry() proto.SessionEntry {
+fn assistantFailureEntry() event.Event {
     return messageEntry("ad000001", null, .{ .assistant = .{
         .content = &.{},
         .api = .openai_responses,
@@ -1039,7 +1021,7 @@ fn assistantFailureEntry() proto.SessionEntry {
 
 test "header wire format round-trips parent session and version" {
     const allocator = std.testing.allocator;
-    const header = proto.SessionHeader{
+    const header = event.Header{
         .id = "child-uuid",
         .timestamp = "2025-01-01T00:00:00.000Z",
         .cwd = "/tmp",
@@ -1104,7 +1086,7 @@ test "assistant message round-trips normalized failure metadata" {
 
     const json_str = try entryToOwnedLine(allocator, assistantFailureEntry());
     const parsed = try parseFileEntry(allocator, json_str);
-    switch (parsed.entry.entry) {
+    switch (parsed.event.payload) {
         .message => |m| switch (m.message) {
             .assistant => |assistant| {
                 try std.testing.expectEqual(ai.protocol.NormalizedFailure.Kind.rate_limited, assistant.failure.?.kind);
@@ -1136,11 +1118,11 @@ test "tool result entry round-trips long identifiers and multiline text" {
     var tool_content = [_]ai.protocol.ToolResultMessage.ContentBlock{
         .{ .text = .{ .text = long_text } },
     };
-    const entry = proto.SessionEntry{
+    const entry = event.Event{
         .id = "arena000",
         .parent_id = null,
         .timestamp = "2025-01-01T00:00:00.000Z",
-        .entry = .{ .message = .{ .message = .{ .tool_result = .{
+        .payload = .{ .message = .{ .message = .{ .tool_result = .{
             .tool_call_id = long_tool_call_id,
             .tool_name = long_tool_name,
             .content = &tool_content,
@@ -1151,7 +1133,7 @@ test "tool result entry round-trips long identifiers and multiline text" {
 
     const line = try entryToOwnedLine(allocator, entry);
     const parsed = try parseFileEntry(allocator, line);
-    const tool_result = parsed.entry.entry.message.message.tool_result;
+    const tool_result = parsed.event.payload.message.message.tool_result;
 
     try std.testing.expectEqualStrings(long_tool_call_id, tool_result.tool_call_id);
     try std.testing.expectEqualStrings(long_tool_name, tool_result.tool_name);
@@ -1163,11 +1145,11 @@ test "tool-result text serializes invalid utf-8 as a json string" {
     var tool_content = [_]ai.protocol.ToolResultMessage.ContentBlock{
         .{ .text = .{ .text = "bad\xaa\xfftail" } },
     };
-    const entry = proto.SessionEntry{
+    const entry = event.Event{
         .id = "utf80001",
         .parent_id = null,
         .timestamp = "2025-01-01T00:00:00.000Z",
-        .entry = .{ .message = .{ .message = .{ .tool_result = .{
+        .payload = .{ .message = .{ .message = .{ .tool_result = .{
             .tool_call_id = "toolu_bad",
             .tool_name = "bash",
             .content = &tool_content,
@@ -1203,12 +1185,12 @@ test "compaction entries preserve metadata and project into context" {
         ,
     };
 
-    var entries: [lines.len]proto.SessionEntry = undefined;
+    var entries: [lines.len]event.Event = undefined;
     for (lines, 0..) |line, index| {
-        entries[index] = (try parseFileEntry(allocator, line)).entry;
+        entries[index] = (try parseFileEntry(allocator, line)).event;
     }
 
-    const compaction = entries[3].entry.compaction;
+    const compaction = entries[3].payload.compaction;
     try std.testing.expectEqualStrings("extension summary", compaction.summary);
     try std.testing.expectEqualStrings("u2", compaction.first_kept_entry_id);
     try std.testing.expectEqual(@as(u64, 5000), compaction.tokens_before);
@@ -1295,10 +1277,10 @@ test "session message entries round-trip through JSON and rebuild context" {
     defer arena.deinit();
     const aa = arena.allocator();
 
-    var parsed_entries: [3]proto.SessionEntry = undefined;
+    var parsed_entries: [3]event.Event = undefined;
     for (json_lines, 0..) |line, i| {
         const fe = try parseFileEntry(aa, line);
-        parsed_entries[i] = fe.entry;
+        parsed_entries[i] = fe.event;
     }
 
     var ctx = try context.buildSessionContext(aa, &parsed_entries, .current);

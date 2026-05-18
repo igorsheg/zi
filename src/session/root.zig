@@ -1,4 +1,4 @@
-pub const protocol = @import("protocol.zig");
+pub const event = @import("event.zig");
 pub const json = @import("json.zig");
 pub const reader = @import("reader.zig");
 pub const store = @import("store.zig");

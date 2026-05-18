@@ -1,5 +1,5 @@
 const std = @import("std");
-const proto = @import("protocol.zig");
+const event = @import("event.zig");
 const json = @import("json.zig");
 
 const max_session_file_bytes: usize = 100 * 1024 * 1024;
@@ -11,8 +11,8 @@ pub const ReadPolicy = enum {
 
 pub const SessionLog = struct {
     arena: std.heap.ArenaAllocator,
-    header: proto.SessionHeader,
-    entries: []proto.SessionEntry,
+    header: event.Header,
+    entries: []event.Event,
 
     pub fn deinit(self: *SessionLog) void {
         self.arena.deinit();
@@ -36,8 +36,8 @@ pub fn parseContent(allocator: std.mem.Allocator, content: []const u8, policy: R
     errdefer arena.deinit();
     const aa = arena.allocator();
 
-    var header: ?proto.SessionHeader = null;
-    var entries: std.ArrayList(proto.SessionEntry) = .empty;
+    var header: ?event.Header = null;
+    var entries: std.ArrayList(event.Event) = .empty;
 
     var line_start: usize = 0;
     var line_no: usize = 1;
@@ -58,7 +58,7 @@ pub fn parseContent(allocator: std.mem.Allocator, content: []const u8, policy: R
                     if (header != null) return error.DuplicateSessionHeader;
                     header = h;
                 },
-                .entry => |entry| {
+                .event => |entry| {
                     if (header == null) return error.EntryBeforeHeader;
                     try entries.append(aa, entry);
                 },
@@ -81,11 +81,11 @@ pub fn parseContent(allocator: std.mem.Allocator, content: []const u8, policy: R
 }
 
 fn validateVersion(version: u32) !void {
-    if (version > proto.CURRENT_SESSION_VERSION) return error.UnsupportedFutureSessionVersion;
+    if (version > event.CURRENT_SESSION_VERSION) return error.UnsupportedFutureSessionVersion;
     if (version == 0) return error.UnsupportedSessionVersion;
 }
 
-fn validateEntries(allocator: std.mem.Allocator, entries: []const proto.SessionEntry) !void {
+fn validateEntries(allocator: std.mem.Allocator, entries: []const event.Event) !void {
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
 

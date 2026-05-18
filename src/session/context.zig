@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
-const proto = @import("protocol.zig");
+const event = @import("event.zig");
 const context_usage = @import("context_usage.zig");
 
 pub const SessionContext = struct {
@@ -26,11 +26,11 @@ pub const LeafSelection = union(enum) {
     entry_id: []const u8,
 };
 
-pub fn getLatestCompactionEntry(entries: []const proto.SessionEntry) ?proto.CompactionEntry {
+pub fn getLatestCompactionEntry(entries: []const event.Event) ?event.CompactionEntry {
     var i: usize = entries.len;
     while (i > 0) {
         i -= 1;
-        switch (entries[i].entry) {
+        switch (entries[i].payload) {
             .compaction => |c| return c,
             else => {},
         }
@@ -40,18 +40,18 @@ pub fn getLatestCompactionEntry(entries: []const proto.SessionEntry) ?proto.Comp
 
 pub fn buildBranchEntries(
     allocator: std.mem.Allocator,
-    entries: []const proto.SessionEntry,
+    entries: []const event.Event,
     selection: LeafSelection,
-) ![]const proto.SessionEntry {
+) ![]const event.Event {
     var by_id = std.StringHashMap(usize).init(allocator);
     defer by_id.deinit();
     for (entries, 0..) |*entry, idx| {
         try by_id.put(entry.id, idx);
     }
 
-    const idx = (try resolveLeafIndex(entries, &by_id, selection)) orelse return allocator.alloc(proto.SessionEntry, 0);
+    const idx = (try resolveLeafIndex(entries, &by_id, selection)) orelse return allocator.alloc(event.Event, 0);
 
-    var path: std.ArrayList(proto.SessionEntry) = .empty;
+    var path: std.ArrayList(event.Event) = .empty;
     errdefer path.deinit(allocator);
     var current: ?usize = idx;
     while (current) |cur| {
@@ -59,13 +59,13 @@ pub fn buildBranchEntries(
         current = if (entries[cur].parent_id) |pid| by_id.get(pid) else null;
     }
 
-    std.mem.reverse(proto.SessionEntry, path.items);
+    std.mem.reverse(event.Event, path.items);
     return try path.toOwnedSlice(allocator);
 }
 
 pub fn buildSessionContext(
     allocator: std.mem.Allocator,
-    entries: []const proto.SessionEntry,
+    entries: []const event.Event,
     selection: LeafSelection,
 ) !SessionContext {
     const path = try buildBranchEntries(allocator, entries, selection);
@@ -78,10 +78,10 @@ pub fn buildSessionContext(
     var thinking_level: []const u8 = "off";
     var model: ?SessionContext.ModelInfo = null;
     var compaction_path_pos: ?usize = null;
-    var compaction_data: ?proto.CompactionEntry = null;
+    var compaction_data: ?event.CompactionEntry = null;
 
     for (path, 0..) |entry, path_pos| {
-        switch (entry.entry) {
+        switch (entry.payload) {
             .thinking_level_change => |t| thinking_level = t.thinking_level,
             .model_change => |m| model = .{ .provider = m.provider, .model_id = m.model_id },
             .message => |msg| {
@@ -139,7 +139,7 @@ pub fn buildSessionContext(
 }
 
 fn resolveLeafIndex(
-    entries: []const proto.SessionEntry,
+    entries: []const event.Event,
     by_id: *const std.StringHashMap(usize),
     selection: LeafSelection,
 ) !?usize {
@@ -150,8 +150,8 @@ fn resolveLeafIndex(
     };
 }
 
-fn extractMessage(entry: *const proto.SessionEntry) !?agent.protocol.AgentMessage {
-    switch (entry.entry) {
+fn extractMessage(entry: *const event.Event) !?agent.protocol.AgentMessage {
+    switch (entry.payload) {
         .message => |m| return m.message,
         .custom_message => |cm| {
             if (!cm.include_in_context) return null;
@@ -239,12 +239,12 @@ fn daysInMonth(year: i64, month: i64) i64 {
     };
 }
 
-fn testMsg(allocator: std.mem.Allocator, id: []const u8, parent_id: ?[]const u8, role: enum { user, assistant }, text: []const u8) proto.SessionEntry {
+fn testMsg(allocator: std.mem.Allocator, id: []const u8, parent_id: ?[]const u8, role: enum { user, assistant }, text: []const u8) event.Event {
     return .{
         .id = id,
         .parent_id = parent_id,
         .timestamp = "2025-01-01T00:00:00Z",
-        .entry = .{
+        .payload = .{
             .message = .{
                 .message = switch (role) {
                     .user => .{ .user = .{ .content = .{ .text = text }, .timestamp = 1 } },
@@ -274,35 +274,35 @@ fn testMsg(allocator: std.mem.Allocator, id: []const u8, parent_id: ?[]const u8,
     };
 }
 
-fn testCompaction(id: []const u8, parent_id: ?[]const u8, summary: []const u8, first_kept: []const u8) proto.SessionEntry {
-    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{ .compaction = .{
+fn testCompaction(id: []const u8, parent_id: ?[]const u8, summary: []const u8, first_kept: []const u8) event.Event {
+    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .payload = .{ .compaction = .{
         .summary = summary,
         .first_kept_entry_id = first_kept,
         .tokens_before = 1000,
     } } };
 }
 
-fn testBranchSummary(id: []const u8, parent_id: ?[]const u8, summary: []const u8, from_id: []const u8) proto.SessionEntry {
-    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{ .branch_summary = .{
+fn testBranchSummary(id: []const u8, parent_id: ?[]const u8, summary: []const u8, from_id: []const u8) event.Event {
+    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .payload = .{ .branch_summary = .{
         .summary = summary,
         .from_id = from_id,
     } } };
 }
 
-fn testThinkingLevel(id: []const u8, parent_id: ?[]const u8, level: []const u8) proto.SessionEntry {
-    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{
+fn testThinkingLevel(id: []const u8, parent_id: ?[]const u8, level: []const u8) event.Event {
+    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .payload = .{
         .thinking_level_change = .{ .thinking_level = level },
     } };
 }
 
-fn testModelChange(id: []const u8, parent_id: ?[]const u8, provider: []const u8, model_id: []const u8) proto.SessionEntry {
-    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{
+fn testModelChange(id: []const u8, parent_id: ?[]const u8, provider: []const u8, model_id: []const u8) event.Event {
+    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .payload = .{
         .model_change = .{ .provider = provider, .model_id = model_id },
     } };
 }
 
-fn testCustomMessage(id: []const u8, parent_id: ?[]const u8, text: []const u8, include_in_context: bool) proto.SessionEntry {
-    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .entry = .{
+fn testCustomMessage(id: []const u8, parent_id: ?[]const u8, text: []const u8, include_in_context: bool) event.Event {
+    return .{ .id = id, .parent_id = parent_id, .timestamp = "2025-01-01T00:00:00Z", .payload = .{
         .custom_message = .{
             .custom_type = "test.custom",
             .content = .{ .text = text },
@@ -382,11 +382,11 @@ test "empty and before_first selections produce default context" {
     var arena = testArena();
     defer arena.deinit();
 
-    var empty_entries = [_]proto.SessionEntry{};
+    var empty_entries = [_]event.Event{};
     const empty_ctx = try buildSessionContext(arena.allocator(), &empty_entries, .current);
     try expectDefaultContext(empty_ctx);
 
-    var entries = [_]proto.SessionEntry{testMsg(arena.allocator(), "1", null, .user, "hello")};
+    var entries = [_]event.Event{testMsg(arena.allocator(), "1", null, .user, "hello")};
     const before_first_ctx = try buildSessionContext(arena.allocator(), &entries, .before_first);
     try expectDefaultContext(before_first_ctx);
 }
@@ -394,7 +394,7 @@ test "empty and before_first selections produce default context" {
 test "conversation context preserves path order and selected leaf" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
+    var entries = [_]event.Event{
         testMsg(arena.allocator(), "1", null, .user, "hello"),
         testMsg(arena.allocator(), "2", "1", .assistant, "hi there"),
         testMsg(arena.allocator(), "3", "2", .user, "branch A"),
@@ -415,7 +415,7 @@ test "conversation context preserves path order and selected leaf" {
 test "tracks user-visible thinking level and model state" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
+    var entries = [_]event.Event{
         testMsg(arena.allocator(), "1", null, .user, "hello"),
         testThinkingLevel("2", "1", "high"),
         testModelChange("3", "2", "openai", "gpt-4"),
@@ -432,7 +432,7 @@ test "tracks user-visible thinking level and model state" {
 test "compaction emits latest summary, kept messages, and later messages" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
+    var entries = [_]event.Event{
         testMsg(arena.allocator(), "1", null, .user, "first"),
         testMsg(arena.allocator(), "2", "1", .assistant, "response1"),
         testCompaction("3", "2", "First summary", "1"),
@@ -455,7 +455,7 @@ test "compaction emits latest summary, kept messages, and later messages" {
 test "compaction preserves kept assistant usage for context estimation" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
+    var entries = [_]event.Event{
         testMsg(arena.allocator(), "1", null, .user, "first"),
         testMsg(arena.allocator(), "2", "1", .assistant, "response1"),
         testMsg(arena.allocator(), "3", "2", .user, "second"),
@@ -463,7 +463,7 @@ test "compaction preserves kept assistant usage for context estimation" {
         testCompaction("5", "4", "summary", "3"),
         testMsg(arena.allocator(), "6", "5", .user, "third"),
     };
-    entries[3].entry.message.message.assistant.usage.total_tokens = 195_000;
+    entries[3].payload.message.message.assistant.usage.total_tokens = 195_000;
 
     const ctx = try buildSessionContext(arena.allocator(), &entries, .current);
     try std.testing.expectEqual(@as(usize, 4), ctx.messages.len);
@@ -476,7 +476,7 @@ test "compaction preserves kept assistant usage for context estimation" {
 test "branch summary appears only on selected branch" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
+    var entries = [_]event.Event{
         testMsg(arena.allocator(), "1", null, .user, "start"),
         testMsg(arena.allocator(), "2", "1", .assistant, "response"),
         testMsg(arena.allocator(), "3", "2", .user, "abandoned path"),
@@ -498,7 +498,7 @@ test "branch summary appears only on selected branch" {
 test "complex branch selection combines compaction and branch summaries" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
+    var entries = [_]event.Event{
         testMsg(arena.allocator(), "1", null, .user, "start"),
         testMsg(arena.allocator(), "2", "1", .assistant, "r1"),
         testMsg(arena.allocator(), "3", "2", .user, "q2"),
@@ -532,7 +532,7 @@ test "complex branch selection combines compaction and branch summaries" {
 test "unknown leaf is rejected" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
+    var entries = [_]event.Event{
         testMsg(arena.allocator(), "1", null, .user, "hello"),
         testMsg(arena.allocator(), "2", "1", .assistant, "hi"),
     };
@@ -543,7 +543,7 @@ test "unknown leaf is rejected" {
 test "custom messages only enter context when included" {
     var arena = testArena();
     defer arena.deinit();
-    var entries = [_]proto.SessionEntry{
+    var entries = [_]event.Event{
         testMsg(arena.allocator(), "1", null, .user, "hello"),
         testCustomMessage("2", "1", "hidden", false),
         testCustomMessage("3", "2", "visible", true),

@@ -1,7 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
-const proto = @import("protocol.zig");
 const faux = ai.faux;
 
 pub const ContextUsage = struct {
