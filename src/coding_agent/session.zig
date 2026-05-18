@@ -547,12 +547,22 @@ pub const AgentSession = struct {
 
 const QueuedCommand = struct {
     id: command_mod.CommandId,
-    command: command_mod.Command,
+    command: OwnedCommand,
 
     fn deinit(self: *QueuedCommand, allocator: std.mem.Allocator) void {
         freeCommand(allocator, self.command);
         self.* = undefined;
     }
+};
+
+const OwnedCommand = union(enum) {
+    submit_prompt: command_mod.SubmitPrompt,
+    follow_up: command_mod.FollowUp,
+    steer: command_mod.Steer,
+    abort_run,
+    continue_run,
+    set_model: command_mod.SetModel,
+    set_reasoning: command_mod.SetReasoning,
 };
 
 pub const OwnedRunTerminal = struct {
@@ -688,7 +698,7 @@ fn cloneHeaders(allocator: std.mem.Allocator, headers: []const ai.protocol.Heade
     return out;
 }
 
-fn cloneCommand(allocator: std.mem.Allocator, value: command_mod.Command) !command_mod.Command {
+fn cloneCommand(allocator: std.mem.Allocator, value: command_mod.Command) !OwnedCommand {
     return switch (value) {
         .submit_prompt => |prompt| .{ .submit_prompt = .{ .messages = try cloneMessages(allocator, prompt.messages) } },
         .follow_up => |follow_up| .{ .follow_up = .{ .messages = try cloneMessages(allocator, follow_up.messages) } },
@@ -700,7 +710,7 @@ fn cloneCommand(allocator: std.mem.Allocator, value: command_mod.Command) !comma
     };
 }
 
-fn freeCommand(allocator: std.mem.Allocator, value: command_mod.Command) void {
+fn freeCommand(allocator: std.mem.Allocator, value: OwnedCommand) void {
     switch (value) {
         .submit_prompt => |prompt| freeMessages(allocator, prompt.messages),
         .follow_up => |follow_up| freeMessages(allocator, follow_up.messages),
