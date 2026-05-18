@@ -11,6 +11,7 @@ test {
     _ = @import("json/root.zig");
     _ = @import("ai/root.zig");
     _ = @import("agent/root.zig");
+    _ = @import("coding_agent/root.zig");
     _ = @import("session/root.zig");
 }
 
