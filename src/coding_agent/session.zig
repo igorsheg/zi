@@ -134,6 +134,12 @@ pub const AgentSession = struct {
         command_id: command_mod.CommandId,
         cancel_source: cancel.Source = .{},
         execution: ActiveExecution,
+        input_messages: []const agent_mod.AgentMessage,
+
+        fn deinit(self: *ActiveRun, allocator: std.mem.Allocator) void {
+            freeMessages(allocator, self.input_messages);
+            self.* = undefined;
+        }
     };
 
     const ActiveExecution = enum {
@@ -168,6 +174,7 @@ pub const AgentSession = struct {
             var owned = queued;
             owned.deinit(self.allocator);
         }
+        self.clearActiveRun();
         self.clearPendingFollowUps();
         self.pending_follow_ups.deinit();
         self.commands.deinit();
@@ -356,11 +363,17 @@ pub const AgentSession = struct {
 
     fn startRun(self: *AgentSession, id: command_mod.CommandId, messages: []const agent_mod.AgentMessage) void {
         std.debug.assert(self.active_run == null);
-        switch (self.appendRunInput(messages)) {
+        const owned_messages = cloneMessages(self.allocator, messages) catch {
+            self.clearPendingFollowUps();
+            self.setActivity(.{ .failed = .{ .kind = .out_of_memory } });
+            return;
+        };
+        switch (self.appendRunInput(owned_messages)) {
             .appended, .skipped => {},
             .failed => |failure| {
                 self.clearPendingFollowUps();
                 self.setActivity(.{ .failed = .{ .kind = failure.failureKind() } });
+                freeMessages(self.allocator, owned_messages);
                 return;
             },
         }
@@ -368,7 +381,7 @@ pub const AgentSession = struct {
             .external_terminal => .external_terminal,
             .synchronous => .synchronous,
         };
-        self.active_run = .{ .command_id = id, .execution = active_execution };
+        self.active_run = .{ .command_id = id, .execution = active_execution, .input_messages = owned_messages };
         self.setActivity(.{ .running = .{
             .command_id = id,
             .pending_follow_ups = self.pending_follow_ups.len,
@@ -378,12 +391,13 @@ pub const AgentSession = struct {
 
         switch (self.execution) {
             .external_terminal => {},
-            .synchronous => |template| self.runSynchronous(template, messages),
+            .synchronous => |template| self.runSynchronous(template),
         }
     }
 
-    fn runSynchronous(self: *AgentSession, backend: ExecutionBackend, messages: []const agent_mod.AgentMessage) void {
+    fn runSynchronous(self: *AgentSession, backend: ExecutionBackend) void {
         std.debug.assert(self.active_run != null);
+        const messages = self.active_run.?.input_messages;
         const spec = self.buildRunSpec(backend, messages) orelse {
             const failure: SessionRunFailure = .missing_model;
             const command_id = self.activeCommandId();
@@ -518,6 +532,7 @@ pub const AgentSession = struct {
     }
 
     fn clearActiveRun(self: *AgentSession) void {
+        if (self.active_run) |*active| active.deinit(self.allocator);
         self.active_run = null;
     }
 
