@@ -147,6 +147,11 @@ pub const AgentSession = struct {
         synchronous,
     };
 
+    const DrainDecision = enum {
+        continue_draining,
+        stop_draining,
+    };
+
     pub fn init(allocator: std.mem.Allocator, options: Options) !AgentSession {
         var commands = try CommandQueue.init(allocator, options.command_capacity);
         errdefer commands.deinit();
@@ -203,7 +208,10 @@ pub const AgentSession = struct {
         while (self.commands.pop()) |queued| {
             var owned = queued;
             defer owned.deinit(self.allocator);
-            self.applyCommand(owned);
+            switch (self.applyCommand(owned)) {
+                .continue_draining => {},
+                .stop_draining => return,
+            }
         }
     }
 
@@ -233,24 +241,29 @@ pub const AgentSession = struct {
         };
     }
 
-    fn applyCommand(self: *AgentSession, queued: QueuedCommand) void {
+    fn applyCommand(self: *AgentSession, queued: QueuedCommand) DrainDecision {
         switch (queued.command) {
             .submit_prompt => |prompt| {
                 self.startRun(queued.id, prompt.messages);
+                return self.drainDecisionAfterTransition();
             },
             .follow_up => |follow_up| {
                 self.startRun(queued.id, follow_up.messages);
+                return self.drainDecisionAfterTransition();
             },
             .continue_run => {
                 self.startRun(queued.id, &.{});
+                return self.drainDecisionAfterTransition();
             },
             .set_model => |set| {
                 self.policy.replaceModel(self.allocator, set.model) catch {
                     self.setActivity(.{ .failed = .{ .kind = .out_of_memory } });
                 };
+                return .continue_draining;
             },
             .set_reasoning => |set| {
                 self.policy.setReasoning(set.reasoning);
+                return .continue_draining;
             },
             .steer => std.debug.panic("steer command must not enter command queue before agent control support", .{}),
             .abort_run => {
@@ -258,6 +271,7 @@ pub const AgentSession = struct {
                 if (self.active_run) |*active| active.cancel_source.requestAbort();
                 self.setActivity(.{ .aborting = .{ .command_id = run_command_id, .pending_follow_ups = self.pending_follow_ups.len } });
                 self.emit(.{ .run = .{ .abort_requested = .{ .command_id = queued.id, .run_command_id = run_command_id } } });
+                return .stop_draining;
             },
         }
     }
@@ -512,6 +526,13 @@ pub const AgentSession = struct {
             .aborting => |*aborting| aborting.pending_follow_ups = self.pending_follow_ups.len,
             .idle, .failed => {},
         }
+    }
+
+    fn drainDecisionAfterTransition(self: *const AgentSession) DrainDecision {
+        return switch (self.state_value.activity) {
+            .running, .aborting => .stop_draining,
+            .idle, .failed => .continue_draining,
+        };
     }
 
     fn nextCommandId(self: *AgentSession) command_mod.CommandId {
@@ -1009,6 +1030,50 @@ test "external terminal execution keeps active run until terminal" {
     session.drainCommands();
 
     try std.testing.expect(session.state().activity == .running);
+}
+
+test "external terminal drain stops after starting one queued run" {
+    var events = EventCollector{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .execution = .external_terminal,
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    const first = (try session.submit(.{ .submit_prompt = .{ .messages = &.{} } })).accepted;
+    const second = (try session.submit(.{ .follow_up = .{ .messages = &.{} } })).accepted;
+
+    session.drainCommands();
+    try std.testing.expect(session.state().activity == .running);
+    try std.testing.expectEqual(first, session.state().activity.running.command_id);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started }, events.items[0..events.len]);
+
+    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
+    defer terminal.deinit();
+    session.completeRun(terminal);
+    try std.testing.expect(session.state().activity == .idle);
+
+    session.drainCommands();
+    try std.testing.expect(session.state().activity == .running);
+    try std.testing.expectEqual(second, session.state().activity.running.command_id);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started, .run_finished_completed, .run_started }, events.items[0..events.len]);
+}
+
+test "synchronous drain continues after completed queued run" {
+    var events = EventCollector{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .policy = testPolicy(),
+        .execution = .{ .synchronous = testExecutionBackend() },
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
+    session.drainCommands();
+
+    try std.testing.expect(session.state().activity == .idle);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started, .run_finished_completed, .run_started, .run_finished_completed }, events.items[0..events.len]);
 }
 
 test "abort in external terminal mode keeps original run command id" {
