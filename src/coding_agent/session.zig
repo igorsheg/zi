@@ -254,9 +254,10 @@ pub const AgentSession = struct {
             },
             .steer => std.debug.panic("steer command must not enter command queue before agent control support", .{}),
             .abort_run => {
+                const run_command_id = self.activeCommandId();
                 if (self.active_run) |*active| active.cancel_source.requestAbort();
-                const command_id = if (self.active_run) |active| active.command_id else queued.id;
-                self.setActivity(.{ .aborting = .{ .command_id = command_id, .pending_follow_ups = self.pending_follow_ups.len } });
+                self.setActivity(.{ .aborting = .{ .command_id = run_command_id, .pending_follow_ups = self.pending_follow_ups.len } });
+                self.emit(.{ .run = .{ .abort_requested = .{ .command_id = queued.id, .run_command_id = run_command_id } } });
             },
         }
     }
@@ -801,6 +802,7 @@ const ObservedEvent = enum {
     append_rejected,
     append_failed,
     run_started,
+    run_abort_requested,
     run_finished_completed,
     run_finished_failed,
     run_finished_aborted,
@@ -825,6 +827,7 @@ const EventCollector = struct {
             },
             .run => |run| switch (run) {
                 .started => .run_started,
+                .abort_requested => .run_abort_requested,
                 .finished => |finished| switch (finished.terminal) {
                     .completed => .run_finished_completed,
                     .failed => .run_finished_failed,
@@ -1011,12 +1014,20 @@ test "external terminal execution keeps active run until terminal" {
 test "abort in external terminal mode keeps original run command id" {
     const Collector = struct {
         finished_command_id: command_mod.CommandId = @enumFromInt(0),
+        abort_command_id: command_mod.CommandId = @enumFromInt(0),
+        abort_run_command_id: command_mod.CommandId = @enumFromInt(0),
 
         fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             if (value != .run) return;
-            if (value.run != .finished) return;
-            self.finished_command_id = value.run.finished.command_id;
+            switch (value.run) {
+                .abort_requested => |abort| {
+                    self.abort_command_id = abort.command_id;
+                    self.abort_run_command_id = abort.run_command_id;
+                },
+                .finished => |finished| self.finished_command_id = finished.command_id,
+                .started => {},
+            }
         }
     };
 
@@ -1029,11 +1040,13 @@ test "abort in external terminal mode keeps original run command id" {
 
     const started = (try session.submit(.{ .submit_prompt = .{ .messages = &.{} } })).accepted;
     session.drainCommands();
-    _ = try session.submit(.abort_run);
+    const abort_command_id = (try session.submit(.abort_run)).accepted;
     session.drainCommands();
 
     try std.testing.expect(session.state().activity == .aborting);
     try std.testing.expectEqual(started, session.state().activity.aborting.command_id);
+    try std.testing.expectEqual(abort_command_id, collector.abort_command_id);
+    try std.testing.expectEqual(started, collector.abort_run_command_id);
 
     var terminal = try OwnedRunTerminal.aborted(std.testing.allocator, &.{});
     defer terminal.deinit();
