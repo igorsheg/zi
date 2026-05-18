@@ -1,5 +1,6 @@
 const std = @import("std");
 const runtime_queue = @import("../runtime/queue.zig");
+const cancel = @import("../runtime/cancel.zig");
 const agent_mod = @import("../agent/root.zig");
 const message_memory = @import("../agent/message_memory.zig");
 const command_mod = @import("command.zig");
@@ -17,20 +18,38 @@ pub const max_pending_follow_ups: usize = 8;
 
 pub const AgentSession = struct {
     allocator: std.mem.Allocator,
-    agent: agent_mod.Agent,
     commands: CommandQueue,
     pending_follow_ups: FollowUpQueue,
     state_value: state_mod.State = .{},
+    active_run: ?ActiveRun = null,
     next_command_id: u64 = 1,
     event_sink: ?event_mod.Sink = null,
     durable_appender: durable_mod.Appender = .disabled,
     extension_host: extension_mod.Host = .disabled,
+    execution: Execution = .external_terminal,
 
     pub const Options = struct {
         command_capacity: usize = max_commands,
         follow_up_capacity: usize = max_pending_follow_ups,
         event_sink: ?event_mod.Sink = null,
         durable_appender: durable_mod.Appender = .disabled,
+        execution: Execution = .external_terminal,
+    };
+
+    pub const Execution = union(enum) {
+        external_terminal,
+        synchronous: RunTemplate,
+    };
+
+    pub const RunTemplate = struct {
+        system_prompt: []const u8 = "",
+        tools: []const agent_mod.AgentTool = &.{},
+        config: agent_mod.config.RunConfig,
+    };
+
+    const ActiveRun = struct {
+        command_id: command_mod.CommandId,
+        cancel_source: cancel.Source = .{},
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !AgentSession {
@@ -40,16 +59,13 @@ pub const AgentSession = struct {
         var pending_follow_ups = try FollowUpQueue.init(allocator, options.follow_up_capacity);
         errdefer pending_follow_ups.deinit();
 
-        var agent = agent_mod.Agent.init(allocator);
-        errdefer agent.deinit();
-
         const self: AgentSession = .{
             .allocator = allocator,
-            .agent = agent,
             .commands = commands,
             .pending_follow_ups = pending_follow_ups,
             .event_sink = options.event_sink,
             .durable_appender = options.durable_appender,
+            .execution = options.execution,
         };
         return self;
     }
@@ -63,7 +79,6 @@ pub const AgentSession = struct {
         self.pending_follow_ups.deinit();
         self.commands.deinit();
         self.clearActivity();
-        self.agent.deinit();
         self.* = undefined;
     }
 
@@ -126,8 +141,9 @@ pub const AgentSession = struct {
             },
             .steer => std.debug.panic("steer command must not enter command queue before agent control support", .{}),
             .abort_run => {
-                self.agent.abort();
-                self.setActivity(.{ .aborting = .{ .command_id = queued.id, .pending_follow_ups = self.pending_follow_ups.len } });
+                if (self.active_run) |*active| active.cancel_source.requestAbort();
+                const command_id = if (self.active_run) |active| active.command_id else queued.id;
+                self.setActivity(.{ .aborting = .{ .command_id = command_id, .pending_follow_ups = self.pending_follow_ups.len } });
             },
         }
     }
@@ -140,16 +156,19 @@ pub const AgentSession = struct {
                 .run_finished => |terminal| switch (terminal) {
                     .completed => {
                         run_terminal = .completed;
+                        self.clearActiveRun();
                         self.setActivity(.idle);
                     },
                     .aborted => {
                         run_terminal = .aborted;
+                        self.clearActiveRun();
                         self.clearPendingFollowUps();
                         self.setActivity(.idle);
                     },
                     .failed => |failed| {
                         const kind = failureKind(failed.reason);
                         run_terminal = .{ .failed = kind };
+                        self.clearActiveRun();
                         self.clearPendingFollowUps();
                         self.setActivity(.{ .failed = .{ .kind = kind } });
                     },
@@ -169,15 +188,18 @@ pub const AgentSession = struct {
         const result: event_mod.RunTerminal = switch (terminal.status) {
             .completed => |messages| blk: {
                 if (!self.appendTerminalMessages(messages)) break :blk .{ .failed = .internal };
+                self.clearActiveRun();
                 self.setActivity(.idle);
                 break :blk .completed;
             },
             .aborted => {
+                self.clearActiveRun();
                 self.clearPendingFollowUps();
                 self.setActivity(.idle);
                 return self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = .aborted } } });
             },
             .failed => |failed| {
+                self.clearActiveRun();
                 self.clearPendingFollowUps();
                 self.setActivity(.{ .failed = .{ .kind = failed.kind } });
                 return self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = .{ .failed = failed.kind } } } });
@@ -244,17 +266,37 @@ pub const AgentSession = struct {
     }
 
     fn startRun(self: *AgentSession, id: command_mod.CommandId, messages: []const agent_mod.AgentMessage) void {
+        std.debug.assert(self.active_run == null);
         if (!self.appendRunInput(messages)) return;
-        // The current spine records the outer-loop transition only. The
-        // messages were synchronously consumed by the durable append boundary
-        // above; future agent.runStream wiring must clone or consume them
-        // before this function returns.
+        self.active_run = .{ .command_id = id };
         self.setActivity(.{ .running = .{
             .command_id = id,
             .pending_follow_ups = self.pending_follow_ups.len,
             .pending_steering = 0,
         } });
         self.emit(.{ .run = .{ .started = id } });
+
+        switch (self.execution) {
+            .external_terminal => {},
+            .synchronous => |template| self.runSynchronous(template, messages),
+        }
+    }
+
+    fn runSynchronous(self: *AgentSession, template: RunTemplate, messages: []const agent_mod.AgentMessage) void {
+        std.debug.assert(self.active_run != null);
+        var capture = RunCapture{ .allocator = self.allocator, .input_count = messages.len };
+        defer capture.deinit();
+
+        const token = self.active_run.?.cancel_source.beginRun();
+        var run = agent_mod.Run.init(self.allocator, .{
+            .system_prompt = template.system_prompt,
+            .messages = messages,
+            .tools = template.tools,
+        }, .{ .emit_fn = RunCapture.emit, .ctx = &capture }, token);
+        defer run.deinit();
+
+        run.runStream(template.config);
+        if (capture.terminal) |*terminal| self.applyOwnedRunTerminal(terminal.*);
     }
 
     fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) bool {
@@ -294,12 +336,14 @@ pub const AgentSession = struct {
                 .rejected => |reason| {
                     self.emit(.{ .session = .{ .append_rejected = reason } });
                     self.clearPendingFollowUps();
+                    self.clearActiveRun();
                     self.setActivity(.{ .failed = .{ .kind = .internal } });
                     return false;
                 },
                 .failed => |failure| {
                     self.emit(.{ .session = .{ .append_failed = failure } });
                     self.clearPendingFollowUps();
+                    self.clearActiveRun();
                     self.setActivity(.{ .failed = .{ .kind = .internal } });
                     return false;
                 },
@@ -345,10 +389,22 @@ pub const AgentSession = struct {
     fn setActivity(self: *AgentSession, next: state_mod.Activity) void {
         self.clearActivity();
         self.state_value.activity = next;
+        self.assertRunInvariant();
     }
 
     fn clearActivity(self: *AgentSession) void {
         self.state_value.activity = .idle;
+    }
+
+    fn clearActiveRun(self: *AgentSession) void {
+        self.active_run = null;
+    }
+
+    fn assertRunInvariant(self: *const AgentSession) void {
+        switch (self.state_value.activity) {
+            .running, .aborting => std.debug.assert(self.active_run != null),
+            .idle, .failed => std.debug.assert(self.active_run == null),
+        }
     }
 
     fn activeCommandId(self: *const AgentSession) command_mod.CommandId {
@@ -411,6 +467,40 @@ pub const OwnedRunTerminal = struct {
         self.* = undefined;
     }
 };
+
+const RunCapture = struct {
+    allocator: std.mem.Allocator,
+    input_count: usize,
+    terminal: ?OwnedRunTerminal = null,
+
+    fn emit(value: agent_mod.AgentEvent, ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (value != .lifecycle) return;
+        const lifecycle = value.lifecycle;
+        if (lifecycle != .run_finished) return;
+        if (self.terminal != null) return;
+
+        self.terminal = switch (lifecycle.run_finished) {
+            .completed => |completed| OwnedRunTerminal.completed(self.allocator, self.outputMessages(completed.messages)) catch |err| oomTerminal(self.allocator, err),
+            .failed => |failed| OwnedRunTerminal.failed(self.allocator, self.outputMessages(failed.messages), failureKind(failed.reason)) catch |err| oomTerminal(self.allocator, err),
+            .aborted => |aborted| OwnedRunTerminal.aborted(self.allocator, self.outputMessages(aborted.messages)) catch |err| oomTerminal(self.allocator, err),
+        };
+    }
+
+    fn outputMessages(self: *const RunCapture, messages: []const agent_mod.AgentMessage) []const agent_mod.AgentMessage {
+        if (messages.len <= self.input_count) return &.{};
+        return messages[self.input_count..];
+    }
+
+    fn deinit(self: *RunCapture) void {
+        if (self.terminal) |*terminal| terminal.deinit();
+        self.* = undefined;
+    }
+};
+
+fn oomTerminal(allocator: std.mem.Allocator, _: anyerror) OwnedRunTerminal {
+    return OwnedRunTerminal.failed(allocator, &.{}, .out_of_memory) catch @panic("OOM while recording run terminal");
+}
 
 fn cloneCommand(allocator: std.mem.Allocator, value: command_mod.Command) !command_mod.Command {
     return switch (value) {
@@ -525,6 +615,37 @@ fn testAssistantMessage() agent_mod.AgentMessage {
     } };
 }
 
+fn testModel() agent_mod.message.Model {
+    return .{
+        .id = "test",
+        .name = "test",
+        .api = .openai_responses,
+        .provider = .openai,
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 0,
+        .max_tokens = 0,
+    };
+}
+
+fn convertNoop(_: ?*anyopaque, _: std.mem.Allocator, _: []const agent_mod.AgentMessage) error{OutOfMemory}![]const @import("../ai/root.zig").protocol.Message {
+    return &.{};
+}
+
+fn completeWithAssistant(_: ?*anyopaque, _: std.mem.Allocator, _: agent_mod.message.Model, _: @import("../ai/root.zig").protocol.Context, _: @import("../ai/root.zig").protocol.SimpleStreamOptions, sink: @import("../ai/root.zig").provider.StreamEventSink) error{OutOfMemory}!void {
+    sink.emit(.{ .done = .{ .reason = .stop, .message = testAssistantMessage().assistant } });
+}
+
+fn testRunTemplate() AgentSession.RunTemplate {
+    return .{ .config = .{
+        .model = testModel(),
+        .stream = .{ .call_fn = completeWithAssistant },
+        .convert_messages = .{ .call_fn = convertNoop },
+    } };
+}
+
 test "agent session command queue is bounded" {
     var session = try AgentSession.init(std.testing.allocator, .{ .command_capacity = 1 });
     defer session.deinit();
@@ -543,6 +664,68 @@ test "agent session accepts prompt through owner drain" {
 
     session.drainCommands();
     try std.testing.expect(session.state().activity == .running);
+}
+
+test "agent session executes run template to terminal through owner drain" {
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .appended = [_]u8{'e'} ** session_event_mod.event_id_hex_len } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_appender = .{ .scripted = &durable },
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+        .execution = .{ .synchronous = testRunTemplate() },
+    });
+    defer session.deinit();
+
+    const messages = [_]agent_mod.AgentMessage{.{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } }};
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &messages } });
+    session.drainCommands();
+
+    try std.testing.expect(session.state().activity == .idle);
+    try std.testing.expectEqual(@as(usize, 2), durable.message_count);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .session_appended, .run_started, .session_appended, .run_finished_completed }, events.items[0..events.len]);
+}
+
+test "external terminal execution keeps active run until terminal" {
+    var session = try AgentSession.init(std.testing.allocator, .{ .execution = .external_terminal });
+    defer session.deinit();
+
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    session.drainCommands();
+
+    try std.testing.expect(session.state().activity == .running);
+}
+
+test "abort in external terminal mode keeps original run command id" {
+    const Collector = struct {
+        finished_command_id: command_mod.CommandId = @enumFromInt(0),
+
+        fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (value != .run) return;
+            if (value.run != .finished) return;
+            self.finished_command_id = value.run.finished.command_id;
+        }
+    };
+
+    var collector = Collector{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .execution = .external_terminal,
+        .event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector },
+    });
+    defer session.deinit();
+
+    const started = (try session.submit(.{ .submit_prompt = .{ .messages = &.{} } })).accepted;
+    session.drainCommands();
+    _ = try session.submit(.abort_run);
+    session.drainCommands();
+
+    try std.testing.expect(session.state().activity == .aborting);
+    try std.testing.expectEqual(started, session.state().activity.aborting.command_id);
+
+    session.applyAgentEvent(.{ .lifecycle = .{ .run_finished = .{ .aborted = .{ .messages = &.{} } } } });
+
+    try std.testing.expect(session.state().activity == .idle);
+    try std.testing.expectEqual(started, collector.finished_command_id);
 }
 
 test "agent terminal event updates product activity before notifying" {
