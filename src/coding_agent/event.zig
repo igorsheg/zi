@@ -1,6 +1,7 @@
 const command = @import("command.zig");
 const session_event = @import("../session/event.zig");
 const state = @import("state.zig");
+const durable = @import("durable.zig");
 
 pub const Event = union(enum) {
     command: CommandEvent,
@@ -26,6 +27,8 @@ pub const RunTerminal = union(enum) {
 
 pub const SessionEvent = union(enum) {
     appended: session_event.EventId,
+    append_rejected: durable.Rejection,
+    append_failed: durable.Failure,
 };
 
 pub const Sink = struct {

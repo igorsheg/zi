@@ -6,6 +6,8 @@ const command_mod = @import("command.zig");
 const event_mod = @import("event.zig");
 const state_mod = @import("state.zig");
 const extension_mod = @import("extension.zig");
+const durable_mod = @import("durable.zig");
+const session_event_mod = @import("../session/event.zig");
 
 const CommandQueue = runtime_queue.BoundedQueue(QueuedCommand);
 const FollowUpQueue = runtime_queue.BoundedQueue(QueuedFollowUp);
@@ -21,12 +23,14 @@ pub const AgentSession = struct {
     state_value: state_mod.State = .{},
     next_command_id: u64 = 1,
     event_sink: ?event_mod.Sink = null,
+    durable_sink: ?durable_mod.Sink = null,
     extension_host: extension_mod.Host = .disabled,
 
     pub const Options = struct {
         command_capacity: usize = max_commands,
         follow_up_capacity: usize = max_pending_follow_ups,
         event_sink: ?event_mod.Sink = null,
+        durable_sink: ?durable_mod.Sink = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !AgentSession {
@@ -45,6 +49,7 @@ pub const AgentSession = struct {
             .commands = commands,
             .pending_follow_ups = pending_follow_ups,
             .event_sink = options.event_sink,
+            .durable_sink = options.durable_sink,
         };
         return self;
     }
@@ -216,16 +221,45 @@ pub const AgentSession = struct {
     }
 
     fn startRun(self: *AgentSession, id: command_mod.CommandId, messages: []const agent_mod.AgentMessage) void {
-        // The current spine records the outer-loop transition only. Wiring to
-        // agent.runStream must clone or consume these messages before this
-        // function returns.
-        _ = messages;
+        if (!self.appendRunInput(messages)) return;
+        // The current spine records the outer-loop transition only. The
+        // messages were synchronously consumed by the durable append boundary
+        // above; future agent.runStream wiring must clone or consume them
+        // before this function returns.
         self.setActivity(.{ .running = .{
             .command_id = id,
             .pending_follow_ups = self.pending_follow_ups.len,
             .pending_steering = 0,
         } });
         self.emit(.{ .run = .{ .started = id } });
+    }
+
+    fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) bool {
+        const sink = self.durable_sink orelse return true;
+        if (messages.len == 0) return true;
+        if (messages.len != 1) {
+            self.emit(.{ .session = .{ .append_rejected = .unsupported_batch } });
+            self.setActivity(.{ .failed = .{ .kind = .internal } });
+            return false;
+        }
+
+        const result = sink.append(.{ .message = .{ .message = messages[0] } });
+        switch (result) {
+            .appended => |id| {
+                self.emit(.{ .session = .{ .appended = id } });
+                return true;
+            },
+            .rejected => |reason| {
+                self.emit(.{ .session = .{ .append_rejected = reason } });
+                self.setActivity(.{ .failed = .{ .kind = .internal } });
+                return false;
+            },
+            .failed => |failure| {
+                self.emit(.{ .session = .{ .append_failed = failure } });
+                self.setActivity(.{ .failed = .{ .kind = .internal } });
+                return false;
+            },
+        }
     }
 
     fn startNextFollowUpOrIdle(self: *AgentSession) void {
@@ -349,6 +383,56 @@ fn failureKind(value: agent_mod.failure.Failure) state_mod.FailureKind {
     };
 }
 
+const observed_event_count = 16;
+const ObservedEvent = enum {
+    command_accepted,
+    session_appended,
+    append_rejected,
+    append_failed,
+    run_started,
+};
+
+const EventCollector = struct {
+    items: [observed_event_count]ObservedEvent = undefined,
+    len: usize = 0,
+
+    fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        std.debug.assert(self.len < observed_event_count);
+        self.items[self.len] = switch (value) {
+            .command => |command| switch (command) {
+                .accepted => .command_accepted,
+                .rejected => .append_rejected,
+            },
+            .session => |session| switch (session) {
+                .appended => .session_appended,
+                .append_rejected => .append_rejected,
+                .append_failed => .append_failed,
+            },
+            .run => |run| switch (run) {
+                .started => .run_started,
+                .finished => .command_accepted,
+            },
+        };
+        self.len += 1;
+    }
+};
+
+const FakeDurable = struct {
+    result: durable_mod.AppendResult,
+    message_count: usize = 0,
+
+    fn sink(self: *FakeDurable) durable_mod.Sink {
+        return .{ .append_fn = append, .ctx = self };
+    }
+
+    fn append(payload: session_event_mod.Payload, ctx: ?*anyopaque) durable_mod.AppendResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (payload == .message) self.message_count += 1;
+        return self.result;
+    }
+};
+
 test "agent session command queue is bounded" {
     var session = try AgentSession.init(std.testing.allocator, .{ .command_capacity = 1 });
     defer session.deinit();
@@ -391,6 +475,81 @@ test "agent terminal event updates product activity before notifying" {
 
     session.applyAgentEvent(.{ .lifecycle = .{ .run_finished = .{ .completed = .{ .messages = &.{} } } } });
     try std.testing.expect(collector.saw_idle);
+}
+
+test "prompt append happens before run start" {
+    var durable = FakeDurable{ .result = .{ .appended = [_]u8{'a'} ** session_event_mod.event_id_hex_len } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_sink = durable.sink(),
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    const messages = [_]agent_mod.AgentMessage{.{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } }};
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &messages } });
+    session.drainCommands();
+
+    try std.testing.expectEqual(@as(usize, 1), durable.message_count);
+    try std.testing.expect(session.state().activity == .running);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .session_appended, .run_started }, events.items[0..events.len]);
+}
+
+test "append rejection prevents run start" {
+    var durable = FakeDurable{ .result = .{ .rejected = .invalid_state } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_sink = durable.sink(),
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    const messages = [_]agent_mod.AgentMessage{.{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } }};
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &messages } });
+    session.drainCommands();
+
+    try std.testing.expectEqual(@as(usize, 1), durable.message_count);
+    try std.testing.expect(session.state().activity == .failed);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .append_rejected }, events.items[0..events.len]);
+}
+
+test "append failure prevents run start" {
+    var durable = FakeDurable{ .result = .{ .failed = .io } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_sink = durable.sink(),
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    const messages = [_]agent_mod.AgentMessage{.{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } }};
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &messages } });
+    session.drainCommands();
+
+    try std.testing.expectEqual(@as(usize, 1), durable.message_count);
+    try std.testing.expect(session.state().activity == .failed);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .append_failed }, events.items[0..events.len]);
+}
+
+test "multi message prompt is rejected before partial durable append" {
+    var durable = FakeDurable{ .result = .{ .appended = [_]u8{'a'} ** session_event_mod.event_id_hex_len } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_sink = durable.sink(),
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    const messages = [_]agent_mod.AgentMessage{
+        .{ .user = .{ .content = .{ .text = "one" }, .timestamp = 1 } },
+        .{ .user = .{ .content = .{ .text = "two" }, .timestamp = 2 } },
+    };
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &messages } });
+    session.drainCommands();
+
+    try std.testing.expectEqual(@as(usize, 0), durable.message_count);
+    try std.testing.expect(session.state().activity == .failed);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .append_rejected }, events.items[0..events.len]);
 }
 
 test "agent session rejects steering until inner loop supports it" {
