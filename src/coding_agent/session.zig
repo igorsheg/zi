@@ -393,6 +393,11 @@ pub const AgentSession = struct {
         };
         self.refreshActivityCounts();
         self.emit(.{ .command = .{ .accepted = id } });
+        self.emit(.{ .run = .{ .follow_up_queued = .{
+            .command_id = id,
+            .run_command_id = self.activeCommandId(),
+            .pending_follow_ups = self.pending_follow_ups.len,
+        } } });
         return .{ .accepted = id };
     }
 
@@ -897,6 +902,7 @@ const ObservedEvent = enum {
     append_rejected,
     append_failed,
     run_started,
+    run_follow_up_queued,
     run_abort_requested,
     run_finished_completed,
     run_finished_failed,
@@ -922,6 +928,7 @@ const EventCollector = struct {
             },
             .run => |run| switch (run) {
                 .started => .run_started,
+                .follow_up_queued => .run_follow_up_queued,
                 .abort_requested => .run_abort_requested,
                 .finished => |finished| switch (finished.terminal) {
                     .completed => .run_finished_completed,
@@ -1096,6 +1103,41 @@ test "policy commands are rejected while running" {
     try std.testing.expectEqual(command_mod.Rejection.busy, (try session.submit(.{ .set_reasoning = .{ .reasoning = .low } })).rejected);
 }
 
+test "follow up while running emits queued fact with active run id" {
+    const Collector = struct {
+        command_id: command_mod.CommandId = @enumFromInt(0),
+        run_command_id: command_mod.CommandId = @enumFromInt(0),
+        pending_follow_ups: usize = 0,
+        state_pending_follow_ups: usize = 0,
+        session: *AgentSession,
+
+        fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (value != .run) return;
+            if (value.run != .follow_up_queued) return;
+            const queued = value.run.follow_up_queued;
+            self.command_id = queued.command_id;
+            self.run_command_id = queued.run_command_id;
+            self.pending_follow_ups = queued.pending_follow_ups;
+            self.state_pending_follow_ups = self.session.state().activity.running.pending_follow_ups;
+        }
+    };
+
+    var session = try AgentSession.init(std.testing.allocator, .{ .execution = .external_terminal });
+    defer session.deinit();
+    var collector = Collector{ .session = &session };
+    session.event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector };
+
+    const run_id = (try session.submit(.{ .submit_prompt = .{ .messages = &.{} } })).accepted;
+    session.drainCommands();
+    const follow_up_id = (try session.submit(.{ .follow_up = .{ .messages = &.{} } })).accepted;
+
+    try std.testing.expectEqual(follow_up_id, collector.command_id);
+    try std.testing.expectEqual(run_id, collector.run_command_id);
+    try std.testing.expectEqual(@as(usize, 1), collector.pending_follow_ups);
+    try std.testing.expectEqual(@as(usize, 1), collector.state_pending_follow_ups);
+}
+
 test "external terminal execution keeps active run until terminal" {
     var session = try AgentSession.init(std.testing.allocator, .{ .execution = .external_terminal });
     defer session.deinit();
@@ -1165,6 +1207,7 @@ test "abort in external terminal mode keeps original run command id" {
                     self.abort_run_command_id = abort.run_command_id;
                 },
                 .finished => |finished| self.finished_command_id = finished.command_id,
+                .follow_up_queued => {},
                 .started => {},
             }
         }
@@ -1212,6 +1255,7 @@ test "abort control drains before queued future runs" {
                 .started => {
                     if (self.saw_abort) self.started_after_abort = true;
                 },
+                .follow_up_queued => {},
                 .finished => {},
             }
         }
@@ -1383,7 +1427,7 @@ test "completed terminal starts queued follow up only after run finished" {
     session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .running);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .session_appended, .run_finished_completed, .run_started }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .run_follow_up_queued, .session_appended, .run_finished_completed, .run_started }, events.items[0..events.len]);
 }
 
 test "terminal append failure prevents queued follow up" {
@@ -1405,7 +1449,7 @@ test "terminal append failure prevents queued follow up" {
     session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .failed);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .append_failed, .run_finished_failed }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .run_follow_up_queued, .append_failed, .run_finished_failed }, events.items[0..events.len]);
 }
 
 test "failed and aborted terminals do not append messages" {

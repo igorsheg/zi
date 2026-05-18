@@ -16,8 +16,15 @@ pub const CommandEvent = union(enum) {
 
 pub const RunEvent = union(enum) {
     started: command.CommandId,
+    follow_up_queued: FollowUpQueued,
     abort_requested: AbortRequested,
     finished: struct { command_id: command.CommandId, terminal: RunTerminal },
+};
+
+pub const FollowUpQueued = struct {
+    command_id: command.CommandId,
+    run_command_id: command.CommandId,
+    pending_follow_ups: usize,
 };
 
 pub const AbortRequested = struct {
