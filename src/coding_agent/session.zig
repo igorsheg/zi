@@ -21,6 +21,7 @@ pub const AgentSession = struct {
     allocator: std.mem.Allocator,
     commands: CommandQueue,
     pending_follow_ups: FollowUpQueue,
+    pending_abort: ?QueuedAbort = null,
     policy: SessionPolicy,
     state_value: state_mod.State = .{},
     active_run: ?ActiveRun = null,
@@ -181,6 +182,7 @@ pub const AgentSession = struct {
         }
         self.clearActiveRun();
         self.clearPendingFollowUps();
+        self.pending_abort = null;
         self.pending_follow_ups.deinit();
         self.commands.deinit();
         self.policy.deinit();
@@ -192,6 +194,7 @@ pub const AgentSession = struct {
         switch (command) {
             .follow_up => |follow_up| return self.submitFollowUp(follow_up),
             .steer => |steer| return self.submitSteer(steer),
+            .abort_run => return self.submitAbortRun(),
             else => {},
         }
 
@@ -205,6 +208,7 @@ pub const AgentSession = struct {
     }
 
     pub fn drainCommands(self: *AgentSession) void {
+        if (self.drainAbortControl() == .stop_draining) return;
         while (self.commands.pop()) |queued| {
             var owned = queued;
             defer owned.deinit(self.allocator);
@@ -212,6 +216,7 @@ pub const AgentSession = struct {
                 .continue_draining => {},
                 .stop_draining => return,
             }
+            if (self.drainAbortControl() == .stop_draining) return;
         }
     }
 
@@ -234,7 +239,7 @@ pub const AgentSession = struct {
                 .running, .aborting => .busy,
             },
             .abort_run => switch (self.state_value.activity) {
-                .running => null,
+                .running => if (self.pending_abort == null) null else .busy,
                 .idle, .aborting, .failed => .invalid_state,
             },
             .follow_up, .steer => unreachable,
@@ -266,13 +271,7 @@ pub const AgentSession = struct {
                 return .continue_draining;
             },
             .steer => std.debug.panic("steer command must not enter command queue before agent control support", .{}),
-            .abort_run => {
-                const run_command_id = self.activeCommandId();
-                if (self.active_run) |*active| active.cancel_source.requestAbort();
-                self.setActivity(.{ .aborting = .{ .command_id = run_command_id, .pending_follow_ups = self.pending_follow_ups.len } });
-                self.emit(.{ .run = .{ .abort_requested = .{ .command_id = queued.id, .run_command_id = run_command_id } } });
-                return .stop_draining;
-            },
+            .abort_run => unreachable,
         }
     }
 
@@ -349,6 +348,19 @@ pub const AgentSession = struct {
                 break :blk .{ .rejected = .invalid_state };
             },
         };
+    }
+
+    fn submitAbortRun(self: *AgentSession) command_mod.SubmitResult {
+        const rejected = self.rejectCommand(.abort_run);
+        if (rejected) |reason| {
+            self.emit(.{ .command = .{ .rejected = reason } });
+            return .{ .rejected = reason };
+        }
+
+        const id = self.nextCommandId();
+        self.pending_abort = .{ .id = id };
+        self.emit(.{ .command = .{ .accepted = id } });
+        return .{ .accepted = id };
     }
 
     fn submitQueued(self: *AgentSession, command: command_mod.Command) error{OutOfMemory}!command_mod.SubmitResult {
@@ -535,6 +547,19 @@ pub const AgentSession = struct {
         };
     }
 
+    fn drainAbortControl(self: *AgentSession) DrainDecision {
+        const pending = self.pending_abort orelse return .continue_draining;
+        self.pending_abort = null;
+
+        if (self.state_value.activity != .running) return .continue_draining;
+
+        const run_command_id = self.activeCommandId();
+        if (self.active_run) |*active| active.cancel_source.requestAbort();
+        self.setActivity(.{ .aborting = .{ .command_id = run_command_id, .pending_follow_ups = self.pending_follow_ups.len } });
+        self.emit(.{ .run = .{ .abort_requested = .{ .command_id = pending.id, .run_command_id = run_command_id } } });
+        return .stop_draining;
+    }
+
     fn nextCommandId(self: *AgentSession) command_mod.CommandId {
         std.debug.assert(self.next_command_id != 0);
         const id = self.next_command_id;
@@ -590,6 +615,10 @@ const QueuedCommand = struct {
         freeCommand(allocator, self.command);
         self.* = undefined;
     }
+};
+
+const QueuedAbort = struct {
+    id: command_mod.CommandId,
 };
 
 const OwnedCommand = union(enum) {
@@ -1119,6 +1148,52 @@ test "abort in external terminal mode keeps original run command id" {
 
     try std.testing.expect(session.state().activity == .idle);
     try std.testing.expectEqual(started, collector.finished_command_id);
+}
+
+test "abort control drains before queued future runs" {
+    const Collector = struct {
+        abort_run_command_id: command_mod.CommandId = @enumFromInt(0),
+        started_after_abort: bool = false,
+        saw_abort: bool = false,
+
+        fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (value != .run) return;
+            switch (value.run) {
+                .abort_requested => |abort| {
+                    self.saw_abort = true;
+                    self.abort_run_command_id = abort.run_command_id;
+                },
+                .started => {
+                    if (self.saw_abort) self.started_after_abort = true;
+                },
+                .finished => {},
+            }
+        }
+    };
+
+    var collector = Collector{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .execution = .external_terminal,
+        .event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector },
+    });
+    defer session.deinit();
+
+    const first = (try session.submit(.{ .submit_prompt = .{ .messages = &.{} } })).accepted;
+    const second = (try session.submit(.{ .submit_prompt = .{ .messages = &.{} } })).accepted;
+    _ = second;
+
+    session.drainCommands();
+    try std.testing.expect(session.state().activity == .running);
+    try std.testing.expectEqual(first, session.state().activity.running.command_id);
+
+    _ = try session.submit(.abort_run);
+    session.drainCommands();
+
+    try std.testing.expect(session.state().activity == .aborting);
+    try std.testing.expectEqual(first, session.state().activity.aborting.command_id);
+    try std.testing.expectEqual(first, collector.abort_run_command_id);
+    try std.testing.expect(!collector.started_after_abort);
 }
 
 test "run completion updates product activity before notifying" {
