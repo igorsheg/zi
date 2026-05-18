@@ -23,5 +23,14 @@ pub const Aborting = struct {
 };
 
 pub const Failed = struct {
-    reason: []const u8,
+    kind: FailureKind,
+};
+
+pub const FailureKind = enum {
+    out_of_memory,
+    invalid_context,
+    stream_failed,
+    tool_failed,
+    tool_protocol_violation,
+    internal,
 };

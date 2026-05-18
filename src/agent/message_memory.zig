@@ -19,6 +19,15 @@ pub fn cloneUser(allocator: std.mem.Allocator, value: ai.protocol.UserMessage) !
 }
 
 pub fn cloneAssistant(allocator: std.mem.Allocator, value: message.AssistantMessage) !message.AssistantMessage {
+    const model = try allocator.dupe(u8, value.model);
+    errdefer allocator.free(model);
+
+    const response_id = if (value.response_id) |id| try allocator.dupe(u8, id) else null;
+    errdefer if (response_id) |id| allocator.free(id);
+
+    const error_message = if (value.error_message) |msg| try allocator.dupe(u8, msg) else null;
+    errdefer if (error_message) |msg| allocator.free(msg);
+
     const content = try allocator.alloc(ai.protocol.AssistantMessage.AssistantContentBlock, value.content.len);
     var initialized: usize = 0;
     errdefer {
@@ -33,11 +42,11 @@ pub fn cloneAssistant(allocator: std.mem.Allocator, value: message.AssistantMess
         .content = content,
         .api = value.api,
         .provider = value.provider,
-        .model = try allocator.dupe(u8, value.model),
-        .response_id = if (value.response_id) |id| try allocator.dupe(u8, id) else null,
+        .model = model,
+        .response_id = response_id,
         .usage = value.usage,
         .stop_reason = value.stop_reason,
-        .error_message = if (value.error_message) |msg| try allocator.dupe(u8, msg) else null,
+        .error_message = error_message,
         .failure = value.failure,
         .timestamp = value.timestamp,
     };
@@ -94,6 +103,24 @@ pub fn freeToolResult(allocator: std.mem.Allocator, value: message.ToolResultMes
 }
 
 pub fn cloneToolResult(allocator: std.mem.Allocator, value: message.ToolResultMessage) !message.ToolResultMessage {
+    const tool_call_id = try allocator.dupe(u8, value.tool_call_id);
+    errdefer allocator.free(tool_call_id);
+
+    const tool_name = try allocator.dupe(u8, value.tool_name);
+    errdefer allocator.free(tool_name);
+
+    const details = if (value.details) |d| try json_value.OwnedValue.clone(allocator, d.borrowed()) else null;
+    errdefer if (details) |d| {
+        var owned = d;
+        owned.deinit();
+    };
+
+    const presentation = if (value.presentation) |p| try json_value.OwnedValue.clone(allocator, p.borrowed()) else null;
+    errdefer if (presentation) |p| {
+        var owned = p;
+        owned.deinit();
+    };
+
     const content = try allocator.alloc(ai.protocol.ToolResultMessage.ContentBlock, value.content.len);
     var initialized: usize = 0;
     errdefer {
@@ -110,18 +137,15 @@ pub fn cloneToolResult(allocator: std.mem.Allocator, value: message.ToolResultMe
         allocator.free(content);
     }
     for (value.content, 0..) |block, i| {
-        content[i] = switch (block) {
-            .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text), .text_signature = if (text.text_signature) |sig| try allocator.dupe(u8, sig) else null } },
-            .image => |image| .{ .image = .{ .data = try allocator.dupe(u8, image.data), .mime_type = try allocator.dupe(u8, image.mime_type) } },
-        };
+        content[i] = try cloneToolResultBlock(allocator, block);
         initialized += 1;
     }
     return .{
-        .tool_call_id = try allocator.dupe(u8, value.tool_call_id),
-        .tool_name = try allocator.dupe(u8, value.tool_name),
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
         .content = content,
-        .details = if (value.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null,
-        .presentation = if (value.presentation) |presentation| try json_value.OwnedValue.clone(allocator, presentation.borrowed()) else null,
+        .details = details,
+        .presentation = presentation,
         .is_error = value.is_error,
         .timestamp = value.timestamp,
     };
@@ -129,14 +153,28 @@ pub fn cloneToolResult(allocator: std.mem.Allocator, value: message.ToolResultMe
 
 fn cloneAssistantBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) !ai.protocol.AssistantMessage.AssistantContentBlock {
     return switch (block) {
-        .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text), .text_signature = if (text.text_signature) |sig| try allocator.dupe(u8, sig) else null } },
-        .thinking => |thinking| .{ .thinking = .{ .thinking = try allocator.dupe(u8, thinking.thinking), .thinking_signature = if (thinking.thinking_signature) |sig| try allocator.dupe(u8, sig) else null, .redacted = thinking.redacted } },
-        .tool_call => |call| .{ .tool_call = .{
-            .id = try allocator.dupe(u8, call.id),
-            .name = try allocator.dupe(u8, call.name),
-            .thought_signature = if (call.thought_signature) |sig| try allocator.dupe(u8, sig) else null,
-            .arguments = try json_value.OwnedValue.clone(allocator, call.arguments.borrowed()),
-        } },
+        .text => |text| blk: {
+            const owned_text = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(owned_text);
+            const sig = if (text.text_signature) |s| try allocator.dupe(u8, s) else null;
+            break :blk .{ .text = .{ .text = owned_text, .text_signature = sig } };
+        },
+        .thinking => |thinking| blk: {
+            const owned_thinking = try allocator.dupe(u8, thinking.thinking);
+            errdefer allocator.free(owned_thinking);
+            const sig = if (thinking.thinking_signature) |s| try allocator.dupe(u8, s) else null;
+            break :blk .{ .thinking = .{ .thinking = owned_thinking, .thinking_signature = sig, .redacted = thinking.redacted } };
+        },
+        .tool_call => |call| blk: {
+            const id = try allocator.dupe(u8, call.id);
+            errdefer allocator.free(id);
+            const name = try allocator.dupe(u8, call.name);
+            errdefer allocator.free(name);
+            const sig = if (call.thought_signature) |s| try allocator.dupe(u8, s) else null;
+            errdefer if (sig) |owned| allocator.free(owned);
+            const arguments = try json_value.OwnedValue.clone(allocator, call.arguments.borrowed());
+            break :blk .{ .tool_call = .{ .id = id, .name = name, .thought_signature = sig, .arguments = arguments } };
+        },
     };
 }
 
@@ -171,8 +209,35 @@ fn freeUserContent(allocator: std.mem.Allocator, content: ai.protocol.UserMessag
 
 fn cloneUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.UserMessageContent.Block) !ai.protocol.UserMessage.UserMessageContent.Block {
     return switch (block) {
-        .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.text), .text_signature = if (text.text_signature) |sig| try allocator.dupe(u8, sig) else null } },
-        .image => |image| .{ .image = .{ .data = try allocator.dupe(u8, image.data), .mime_type = try allocator.dupe(u8, image.mime_type) } },
+        .text => |text| blk: {
+            const owned_text = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(owned_text);
+            const sig = if (text.text_signature) |s| try allocator.dupe(u8, s) else null;
+            break :blk .{ .text = .{ .text = owned_text, .text_signature = sig } };
+        },
+        .image => |image| blk: {
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
+        },
+    };
+}
+
+fn cloneToolResultBlock(allocator: std.mem.Allocator, block: ai.protocol.ToolResultMessage.ContentBlock) !ai.protocol.ToolResultMessage.ContentBlock {
+    return switch (block) {
+        .text => |text| blk: {
+            const owned_text = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(owned_text);
+            const sig = if (text.text_signature) |s| try allocator.dupe(u8, s) else null;
+            break :blk .{ .text = .{ .text = owned_text, .text_signature = sig } };
+        },
+        .image => |image| blk: {
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
+        },
     };
 }
 
@@ -190,18 +255,44 @@ fn freeUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.Us
 }
 
 fn cloneCustom(allocator: std.mem.Allocator, value: message.AgentMessage.Custom) !message.AgentMessage.Custom {
-    return .{
-        .custom_type = try allocator.dupe(u8, value.custom_type),
-        .content = switch (value.content) {
+    const custom_type = try allocator.dupe(u8, value.custom_type);
+    errdefer allocator.free(custom_type);
+
+    const content: message.AgentMessage.CustomContent = switch (value.content) {
             .text => |text| .{ .text = try allocator.dupe(u8, text) },
             .blocks => |blocks| blk: {
                 const out = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, blocks.len);
-                for (blocks, 0..) |block, i| out[i] = try cloneUserBlock(allocator, block);
+                var initialized: usize = 0;
+                errdefer {
+                    for (out[0..initialized]) |block| freeUserBlock(allocator, block);
+                    allocator.free(out);
+                }
+                for (blocks, 0..) |block, i| {
+                    out[i] = try cloneUserBlock(allocator, block);
+                    initialized += 1;
+                }
                 break :blk .{ .blocks = out };
             },
+    };
+    errdefer switch (content) {
+        .text => |text| allocator.free(text),
+        .blocks => |blocks| {
+            for (blocks) |block| freeUserBlock(allocator, block);
+            allocator.free(blocks);
         },
+    };
+
+    const details = if (value.details) |d| try json_value.OwnedValue.clone(allocator, d.borrowed()) else null;
+    errdefer if (details) |d| {
+        var owned = d;
+        owned.deinit();
+    };
+
+    return .{
+        .custom_type = custom_type,
+        .content = content,
         .display = value.display,
-        .details = if (value.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null,
+        .details = details,
         .timestamp = value.timestamp,
     };
 }

@@ -1,6 +1,6 @@
 const command = @import("command.zig");
-const agent_event = @import("../agent/event.zig");
 const session_event = @import("../session/event.zig");
+const state = @import("state.zig");
 
 pub const Event = union(enum) {
     command: CommandEvent,
@@ -14,7 +14,14 @@ pub const CommandEvent = union(enum) {
 };
 
 pub const RunEvent = union(enum) {
-    agent: agent_event.AgentEvent,
+    started: command.CommandId,
+    finished: struct { command_id: command.CommandId, terminal: RunTerminal },
+};
+
+pub const RunTerminal = union(enum) {
+    completed,
+    failed: state.FailureKind,
+    aborted,
 };
 
 pub const SessionEvent = union(enum) {

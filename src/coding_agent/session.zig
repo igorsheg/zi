@@ -57,6 +57,7 @@ pub const AgentSession = struct {
         self.clearPendingFollowUps();
         self.pending_follow_ups.deinit();
         self.commands.deinit();
+        self.clearActivity();
         self.agent.deinit();
         self.* = undefined;
     }
@@ -121,30 +122,41 @@ pub const AgentSession = struct {
             .steer => std.debug.panic("steer command must not enter command queue before agent control support", .{}),
             .abort_run => {
                 self.agent.abort();
-                self.state_value.activity = .{ .aborting = .{ .command_id = queued.id, .pending_follow_ups = self.pending_follow_ups.len } };
+                self.setActivity(.{ .aborting = .{ .command_id = queued.id, .pending_follow_ups = self.pending_follow_ups.len } });
             },
         }
     }
 
     pub fn applyAgentEvent(self: *AgentSession, value: agent_mod.AgentEvent) void {
+        var run_terminal: ?event_mod.RunTerminal = null;
+        const finished_command_id = self.activeCommandId();
         switch (value) {
             .lifecycle => |lifecycle| switch (lifecycle) {
                 .run_finished => |terminal| switch (terminal) {
-                    .completed => self.startNextFollowUpOrIdle(),
+                    .completed => {
+                        run_terminal = .completed;
+                        self.setActivity(.idle);
+                    },
                     .aborted => {
+                        run_terminal = .aborted;
                         self.clearPendingFollowUps();
-                        self.state_value.activity = .idle;
+                        self.setActivity(.idle);
                     },
                     .failed => |failed| {
+                        const kind = failureKind(failed.reason);
+                        run_terminal = .{ .failed = kind };
                         self.clearPendingFollowUps();
-                        self.state_value.activity = .{ .failed = .{ .reason = failureMessage(failed.reason) } };
+                        self.setActivity(.{ .failed = .{ .kind = kind } });
                     },
                 },
                 else => {},
             },
             else => {},
         }
-        self.emit(.{ .run = .{ .agent = value } });
+        if (run_terminal) |terminal| {
+            self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = terminal } } });
+            if (terminal == .completed) self.startNextFollowUpOrIdle();
+        }
     }
 
     fn emit(self: *AgentSession, value: event_mod.Event) void {
@@ -179,8 +191,7 @@ pub const AgentSession = struct {
     }
 
     fn submitQueued(self: *AgentSession, command: command_mod.Command) error{OutOfMemory}!command_mod.SubmitResult {
-        const id: command_mod.CommandId = @enumFromInt(self.next_command_id);
-        self.next_command_id +%= 1;
+        const id = self.nextCommandId();
         const owned_command = try cloneCommand(self.allocator, command);
         self.commands.push(.{ .id = id, .command = owned_command }) catch {
             freeCommand(self.allocator, owned_command);
@@ -192,8 +203,7 @@ pub const AgentSession = struct {
     }
 
     fn queuePendingFollowUp(self: *AgentSession, follow_up: command_mod.FollowUp) error{OutOfMemory}!command_mod.SubmitResult {
-        const id: command_mod.CommandId = @enumFromInt(self.next_command_id);
-        self.next_command_id +%= 1;
+        const id = self.nextCommandId();
         const owned_messages = try cloneMessages(self.allocator, follow_up.messages);
         self.pending_follow_ups.push(.{ .id = id, .messages = owned_messages }) catch {
             freeMessages(self.allocator, owned_messages);
@@ -210,11 +220,12 @@ pub const AgentSession = struct {
         // agent.runStream must clone or consume these messages before this
         // function returns.
         _ = messages;
-        self.state_value.activity = .{ .running = .{
+        self.setActivity(.{ .running = .{
             .command_id = id,
             .pending_follow_ups = self.pending_follow_ups.len,
             .pending_steering = 0,
-        } };
+        } });
+        self.emit(.{ .run = .{ .started = id } });
     }
 
     fn startNextFollowUpOrIdle(self: *AgentSession) void {
@@ -225,7 +236,7 @@ pub const AgentSession = struct {
             self.refreshActivityCounts();
             return;
         }
-        self.state_value.activity = .idle;
+        self.setActivity(.idle);
     }
 
     fn clearPendingFollowUps(self: *AgentSession) void {
@@ -241,6 +252,31 @@ pub const AgentSession = struct {
             .aborting => |*aborting| aborting.pending_follow_ups = self.pending_follow_ups.len,
             .idle, .failed => {},
         }
+    }
+
+    fn nextCommandId(self: *AgentSession) command_mod.CommandId {
+        std.debug.assert(self.next_command_id != 0);
+        const id = self.next_command_id;
+        self.next_command_id += 1;
+        std.debug.assert(self.next_command_id != 0);
+        return @enumFromInt(id);
+    }
+
+    fn setActivity(self: *AgentSession, next: state_mod.Activity) void {
+        self.clearActivity();
+        self.state_value.activity = next;
+    }
+
+    fn clearActivity(self: *AgentSession) void {
+        self.state_value.activity = .idle;
+    }
+
+    fn activeCommandId(self: *const AgentSession) command_mod.CommandId {
+        return switch (self.state_value.activity) {
+            .running => |running| running.command_id,
+            .aborting => |aborting| aborting.command_id,
+            .idle, .failed => @enumFromInt(0),
+        };
     }
 };
 
@@ -302,9 +338,14 @@ fn freeMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentM
     allocator.free(messages);
 }
 
-fn failureMessage(value: agent_mod.failure.Failure) []const u8 {
+fn failureKind(value: agent_mod.failure.Failure) state_mod.FailureKind {
     return switch (value) {
-        inline else => |message| message,
+        .out_of_memory => .out_of_memory,
+        .invalid_context => .invalid_context,
+        .stream_failed => .stream_failed,
+        .tool_failed => .tool_failed,
+        .tool_protocol_violation => .tool_protocol_violation,
+        .internal => .internal,
     };
 }
 
