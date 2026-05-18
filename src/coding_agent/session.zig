@@ -29,7 +29,7 @@ pub const AgentSession = struct {
     event_sink: ?event_mod.Sink = null,
     durable_appender: durable_mod.Appender = .disabled,
     extension_host: extension_mod.Host = .disabled,
-    execution: Execution = .external_terminal,
+    execution: Execution = .external_completion,
 
     pub const Options = struct {
         command_capacity: usize = max_commands,
@@ -37,11 +37,11 @@ pub const AgentSession = struct {
         event_sink: ?event_mod.Sink = null,
         durable_appender: durable_mod.Appender = .disabled,
         policy: SessionPolicyInit = .{},
-        execution: Execution = .external_terminal,
+        execution: Execution = .external_completion,
     };
 
     pub const Execution = union(enum) {
-        external_terminal,
+        external_completion,
         synchronous: ExecutionBackend,
     };
 
@@ -149,7 +149,7 @@ pub const AgentSession = struct {
     };
 
     const ActiveExecution = enum {
-        external_terminal,
+        external_completion,
         synchronous,
     };
 
@@ -283,7 +283,7 @@ pub const AgentSession = struct {
 
     pub fn completeRun(self: *AgentSession, completion: *RunCompletion) void {
         defer completion.deinit();
-        self.assertActiveExecution(.external_terminal, "run completion without active run");
+        self.assertActiveExecution(.external_completion, "run completion without active run");
         self.applyRunCompletion(completion);
     }
 
@@ -421,7 +421,7 @@ pub const AgentSession = struct {
             },
         }
         const active_execution: ActiveExecution = switch (self.execution) {
-            .external_terminal => .external_terminal,
+            .external_completion => .external_completion,
             .synchronous => .synchronous,
         };
         self.active_run = .{ .command_id = id, .execution = active_execution, .input_messages = owned_messages };
@@ -433,7 +433,7 @@ pub const AgentSession = struct {
         self.emit(.{ .run = .{ .started = id } });
 
         switch (self.execution) {
-            .external_terminal => {},
+            .external_completion => {},
             .synchronous => |template| self.runSynchronous(template),
         }
     }
@@ -1097,7 +1097,7 @@ test "policy commands update owned run spec inputs while idle" {
 test "policy commands are rejected while running" {
     var session = try AgentSession.init(std.testing.allocator, .{
         .policy = testPolicy(),
-        .execution = .external_terminal,
+        .execution = .external_completion,
     });
     defer session.deinit();
 
@@ -1129,7 +1129,7 @@ test "follow up while running emits queued fact with active run id" {
         }
     };
 
-    var session = try AgentSession.init(std.testing.allocator, .{ .execution = .external_terminal });
+    var session = try AgentSession.init(std.testing.allocator, .{ .execution = .external_completion });
     defer session.deinit();
     var collector = Collector{ .session = &session };
     session.event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector };
@@ -1144,8 +1144,8 @@ test "follow up while running emits queued fact with active run id" {
     try std.testing.expectEqual(@as(usize, 1), collector.state_pending_follow_ups);
 }
 
-test "external terminal execution keeps active run until terminal" {
-    var session = try AgentSession.init(std.testing.allocator, .{ .execution = .external_terminal });
+test "external completion execution keeps active run until completion" {
+    var session = try AgentSession.init(std.testing.allocator, .{ .execution = .external_completion });
     defer session.deinit();
 
     _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
@@ -1154,10 +1154,10 @@ test "external terminal execution keeps active run until terminal" {
     try std.testing.expect(session.state().activity == .running);
 }
 
-test "external terminal drain stops after starting one queued run" {
+test "external completion drain stops after starting one queued run" {
     var events = EventCollector{};
     var session = try AgentSession.init(std.testing.allocator, .{
-        .execution = .external_terminal,
+        .execution = .external_completion,
         .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
     });
     defer session.deinit();
@@ -1198,7 +1198,7 @@ test "synchronous drain continues after completed queued run" {
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started, .run_finished_completed, .run_started, .run_finished_completed }, events.items[0..events.len]);
 }
 
-test "abort in external terminal mode keeps original run command id" {
+test "abort in external completion mode keeps original run command id" {
     const Collector = struct {
         finished_command_id: command_mod.CommandId = @enumFromInt(0),
         abort_command_id: command_mod.CommandId = @enumFromInt(0),
@@ -1221,7 +1221,7 @@ test "abort in external terminal mode keeps original run command id" {
 
     var collector = Collector{};
     var session = try AgentSession.init(std.testing.allocator, .{
-        .execution = .external_terminal,
+        .execution = .external_completion,
         .event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector },
     });
     defer session.deinit();
@@ -1269,7 +1269,7 @@ test "abort control drains before queued future runs" {
 
     var collector = Collector{};
     var session = try AgentSession.init(std.testing.allocator, .{
-        .execution = .external_terminal,
+        .execution = .external_completion,
         .event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector },
     });
     defer session.deinit();
