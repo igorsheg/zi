@@ -66,11 +66,8 @@ pub const Store = struct {
         const file = try std.Io.Dir.cwd().openFile(io, self.path, .{ .mode = .write_only });
         defer file.close(io);
 
-        var buf: [256]u8 = undefined;
-        var writer = file.writer(io, &buf);
-        try writer.seekFromEnd(0);
-        try writer.interface.writeAll(out.written());
-        try writer.end();
+        const stat = try file.stat(io);
+        try file.writePositionalAll(io, out.written(), stat.size);
 
         self.index.commitPrepared(indexed_id);
     }
@@ -155,7 +152,9 @@ test "store creates appends and reads a session log" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = dir_buf[0..try tmp.dir.realPath(std.Options.debug_io, &dir_buf)];
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "session.jsonl" });
     defer std.testing.allocator.free(path);
 
     var store = try Store.create(std.testing.allocator, std.Options.debug_io, path, .{
@@ -202,7 +201,9 @@ test "store appendPayload owns event id generation and parent validation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "session.jsonl", std.testing.allocator);
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = dir_buf[0..try tmp.dir.realPath(std.Options.debug_io, &dir_buf)];
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "session.jsonl" });
     defer std.testing.allocator.free(path);
 
     var store = try Store.create(std.testing.allocator, std.Options.debug_io, path, .{

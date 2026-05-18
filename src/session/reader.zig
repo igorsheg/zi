@@ -50,7 +50,7 @@ pub fn parseContent(allocator: std.mem.Allocator, content: []const u8, policy: R
 
         if (line.len > 0) {
             const file_entry = json.parseFileEntry(aa, line) catch |err| switch (policy) {
-                .allow_final_partial_line => if (final_without_newline and err == error.SyntaxError) break else return err,
+                .allow_final_partial_line => if (final_without_newline and (err == error.SyntaxError or err == error.UnexpectedEndOfInput)) break else return err,
                 .strict => return err,
             };
             switch (file_entry) {
@@ -146,7 +146,7 @@ test "reader can ignore only a malformed final partial line" {
         \\{"type":"message","id":"2","parentId":"1","timestamp":"2025-01-01T00:00:02Z","message":{"role":"user"
     ;
 
-    try std.testing.expectError(error.SyntaxError, parseContent(std.testing.allocator, content, .strict));
+    try std.testing.expectError(error.UnexpectedEndOfInput, parseContent(std.testing.allocator, content, .strict));
 
     var log = try parseContent(std.testing.allocator, content, .allow_final_partial_line);
     defer log.deinit();

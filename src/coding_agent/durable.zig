@@ -1,4 +1,6 @@
+const std = @import("std");
 const session_event = @import("../session/event.zig");
+const durable_store = @import("durable_store.zig");
 
 pub const AppendResult = union(enum) {
     appended: session_event.EventId,
@@ -18,11 +20,26 @@ pub const Failure = union(enum) {
     internal,
 };
 
-pub const Sink = struct {
-    ctx: ?*anyopaque = null,
-    append_fn: *const fn (payload: session_event.Payload, ctx: ?*anyopaque) AppendResult,
+pub const Appender = union(enum) {
+    disabled,
+    store: *durable_store.StoreAppender,
+    scripted: *ScriptedAppender,
 
-    pub fn append(self: Sink, payload: session_event.Payload) AppendResult {
-        return self.append_fn(payload, self.ctx);
+    pub fn append(self: *Appender, payload: session_event.Payload) AppendResult {
+        return switch (self.*) {
+            .disabled => .{ .failed = .internal },
+            .store => |store| store.append(payload),
+            .scripted => |scripted| scripted.append(payload),
+        };
+    }
+};
+
+pub const ScriptedAppender = struct {
+    result: AppendResult,
+    message_count: usize = 0,
+
+    pub fn append(self: *ScriptedAppender, payload: session_event.Payload) AppendResult {
+        if (payload == .message) self.message_count += 1;
+        return self.result;
     }
 };

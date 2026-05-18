@@ -23,14 +23,14 @@ pub const AgentSession = struct {
     state_value: state_mod.State = .{},
     next_command_id: u64 = 1,
     event_sink: ?event_mod.Sink = null,
-    durable_sink: ?durable_mod.Sink = null,
+    durable_appender: durable_mod.Appender = .disabled,
     extension_host: extension_mod.Host = .disabled,
 
     pub const Options = struct {
         command_capacity: usize = max_commands,
         follow_up_capacity: usize = max_pending_follow_ups,
         event_sink: ?event_mod.Sink = null,
-        durable_sink: ?durable_mod.Sink = null,
+        durable_appender: durable_mod.Appender = .disabled,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !AgentSession {
@@ -49,7 +49,7 @@ pub const AgentSession = struct {
             .commands = commands,
             .pending_follow_ups = pending_follow_ups,
             .event_sink = options.event_sink,
-            .durable_sink = options.durable_sink,
+            .durable_appender = options.durable_appender,
         };
         return self;
     }
@@ -235,7 +235,7 @@ pub const AgentSession = struct {
     }
 
     fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) bool {
-        const sink = self.durable_sink orelse return true;
+        if (self.durable_appender == .disabled) return true;
         if (messages.len == 0) return true;
         if (messages.len != 1) {
             self.emit(.{ .session = .{ .append_rejected = .unsupported_batch } });
@@ -243,7 +243,7 @@ pub const AgentSession = struct {
             return false;
         }
 
-        const result = sink.append(.{ .message = .{ .message = messages[0] } });
+        const result = self.durable_appender.append(.{ .message = .{ .message = messages[0] } });
         switch (result) {
             .appended => |id| {
                 self.emit(.{ .session = .{ .appended = id } });
@@ -418,21 +418,6 @@ const EventCollector = struct {
     }
 };
 
-const FakeDurable = struct {
-    result: durable_mod.AppendResult,
-    message_count: usize = 0,
-
-    fn sink(self: *FakeDurable) durable_mod.Sink {
-        return .{ .append_fn = append, .ctx = self };
-    }
-
-    fn append(payload: session_event_mod.Payload, ctx: ?*anyopaque) durable_mod.AppendResult {
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
-        if (payload == .message) self.message_count += 1;
-        return self.result;
-    }
-};
-
 test "agent session command queue is bounded" {
     var session = try AgentSession.init(std.testing.allocator, .{ .command_capacity = 1 });
     defer session.deinit();
@@ -478,10 +463,10 @@ test "agent terminal event updates product activity before notifying" {
 }
 
 test "prompt append happens before run start" {
-    var durable = FakeDurable{ .result = .{ .appended = [_]u8{'a'} ** session_event_mod.event_id_hex_len } };
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .appended = [_]u8{'a'} ** session_event_mod.event_id_hex_len } };
     var events: EventCollector = .{};
     var session = try AgentSession.init(std.testing.allocator, .{
-        .durable_sink = durable.sink(),
+        .durable_appender = .{ .scripted = &durable },
         .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
     });
     defer session.deinit();
@@ -496,10 +481,10 @@ test "prompt append happens before run start" {
 }
 
 test "append rejection prevents run start" {
-    var durable = FakeDurable{ .result = .{ .rejected = .invalid_state } };
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .rejected = .invalid_state } };
     var events: EventCollector = .{};
     var session = try AgentSession.init(std.testing.allocator, .{
-        .durable_sink = durable.sink(),
+        .durable_appender = .{ .scripted = &durable },
         .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
     });
     defer session.deinit();
@@ -514,10 +499,10 @@ test "append rejection prevents run start" {
 }
 
 test "append failure prevents run start" {
-    var durable = FakeDurable{ .result = .{ .failed = .io } };
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .failed = .io } };
     var events: EventCollector = .{};
     var session = try AgentSession.init(std.testing.allocator, .{
-        .durable_sink = durable.sink(),
+        .durable_appender = .{ .scripted = &durable },
         .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
     });
     defer session.deinit();
@@ -532,10 +517,10 @@ test "append failure prevents run start" {
 }
 
 test "multi message prompt is rejected before partial durable append" {
-    var durable = FakeDurable{ .result = .{ .appended = [_]u8{'a'} ** session_event_mod.event_id_hex_len } };
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .appended = [_]u8{'a'} ** session_event_mod.event_id_hex_len } };
     var events: EventCollector = .{};
     var session = try AgentSession.init(std.testing.allocator, .{
-        .durable_sink = durable.sink(),
+        .durable_appender = .{ .scripted = &durable },
         .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
     });
     defer session.deinit();

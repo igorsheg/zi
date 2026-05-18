@@ -124,6 +124,22 @@ pub fn parseApi(s: []const u8) Api {
     return .{ .custom = s };
 }
 
+pub fn apiToString(api: Api) []const u8 {
+    return switch (api) {
+        .openai_completions => "openai-completions",
+        .mistral_conversations => "mistral-conversations",
+        .openai_responses => "openai-responses",
+        .azure_openai_responses => "azure-openai-responses",
+        .openai_codex_responses => "openai-codex-responses",
+        .anthropic_messages => "anthropic-messages",
+        .bedrock_converse_stream => "bedrock-converse-stream",
+        .google_generative_ai => "google-generative-ai",
+        .google_gemini_cli => "google-gemini-cli",
+        .google_vertex => "google-vertex",
+        .custom => |s| s,
+    };
+}
+
 pub fn stopReasonToString(r: StopReason) []const u8 {
     return switch (r) {
         .stop => "stop",

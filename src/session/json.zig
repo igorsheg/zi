@@ -889,8 +889,8 @@ fn parseToolResultMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap)
         .tool_call_id = try allocator.dupe(u8, try requiredString(obj, Field.tool_call_id)),
         .tool_name = try allocator.dupe(u8, try requiredString(obj, Field.tool_name)),
         .content = blocks,
-        .details = if (obj.get(Field.details)) |d| try json_value.cloneJsonValue(allocator, d) else null,
-        .presentation = if (obj.get(Field.presentation)) |p| try json_value.cloneJsonValue(allocator, p) else null,
+        .details = if (obj.get(Field.details)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
+        .presentation = if (obj.get(Field.presentation)) |p| try json_value.OwnedValue.clone(allocator, p) else null,
         .is_error = try requiredBool(obj, Field.is_error),
         .timestamp = try requiredI64(obj, Field.timestamp),
     };
@@ -901,7 +901,7 @@ fn parseCustomAgentMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap
         .custom_type = try allocator.dupe(u8, try requiredString(obj, Field.custom_type)),
         .content = try parseCustomContent(allocator, try requiredValue(obj, Field.content)),
         .display = if (obj.get(Field.display)) |v| try expectBool(v) else false,
-        .details = if (obj.get(Field.details)) |d| try json_value.cloneJsonValue(allocator, d) else null,
+        .details = if (obj.get(Field.details)) |d| try json_value.OwnedValue.clone(allocator, d) else null,
         .timestamp = try requiredI64(obj, Field.timestamp),
     };
 }
@@ -1195,7 +1195,7 @@ test "compaction entries preserve metadata and project into context" {
     try std.testing.expectEqualStrings("u2", compaction.first_kept_entry_id);
     try std.testing.expectEqual(@as(u64, 5000), compaction.tokens_before);
     try std.testing.expectEqual(true, compaction.from_hook.?);
-    try std.testing.expectEqualStrings("custom-compactor", compaction.details.?.object.get("provider").?.string);
+    try std.testing.expectEqualStrings("custom-compactor", compaction.details.?.borrowed().object.get("provider").?.string);
 
     const serialized = try entryToOwnedLine(std.testing.allocator, entries[3]);
     defer std.testing.allocator.free(serialized);

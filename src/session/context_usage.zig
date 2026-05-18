@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent_message = @import("../agent/message.zig");
+const json_value = @import("../json/value.zig");
 const faux = ai.faux;
 
 pub const ContextUsage = struct {
@@ -102,7 +103,7 @@ pub fn estimateTokens(message: agent_message.AgentMessage) u64 {
             for (a.content) |block| switch (block) {
                 .text => |t| chars += t.text.len,
                 .thinking => |t| chars += t.thinking.len,
-                .tool_call => |tc| chars += tc.name.len + estimateJsonSize(tc.arguments),
+                .tool_call => |tc| chars += tc.name.len + estimateJsonSize(tc.arguments.borrowed()),
             };
         },
         .custom => |c| switch (c.content) {
@@ -240,13 +241,13 @@ test "estimateTokens counts serialized tool call arguments" {
     );
     defer parsed.deinit();
 
-    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{
-        faux.fauxToolCall("read", "tc-1", parsed.value),
-    };
+    var args = try json_value.OwnedValue.clone(testing.allocator, parsed.value);
+    defer args.deinit();
+    const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxToolCall("read", "tc-1", args)};
     const message = agent_message.AgentMessage{
         .assistant = faux.fauxAssistantMessage(testing.allocator, &content, .stop),
     };
     defer testing.allocator.free(message.assistant.content);
 
-    try testing.expectEqual(@as(u64, 11), estimateTokens(message));
+    try testing.expectEqual(@as(u64, 12), estimateTokens(message));
 }
