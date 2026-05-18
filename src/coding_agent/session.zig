@@ -109,6 +109,12 @@ pub const AgentSession = struct {
         config: agent_mod.config.RunConfig,
     };
 
+    const DurableAppend = union(enum) {
+        appended,
+        skipped,
+        failed,
+    };
+
     const ActiveRun = struct {
         command_id: command_mod.CommandId,
         cancel_source: cancel.Source = .{},
@@ -266,7 +272,10 @@ pub const AgentSession = struct {
         const finished_command_id = self.activeCommandId();
         const result: event_mod.RunTerminal = switch (terminal.status) {
             .completed => |messages| blk: {
-                if (!self.appendTerminalMessages(messages)) break :blk .{ .failed = .internal };
+                switch (self.appendTerminalMessages(messages)) {
+                    .appended, .skipped => {},
+                    .failed => break :blk .{ .failed = .internal },
+                }
                 self.clearActiveRun();
                 self.setActivity(.idle);
                 break :blk .completed;
@@ -284,6 +293,11 @@ pub const AgentSession = struct {
                 return self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = .{ .failed = failed.kind } } } });
             },
         };
+        if (result == .failed) {
+            self.clearActiveRun();
+            self.clearPendingFollowUps();
+            self.setActivity(.{ .failed = .{ .kind = .internal } });
+        }
         self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = result } } });
         if (result == .completed) self.startNextFollowUpOrIdle();
     }
@@ -346,7 +360,14 @@ pub const AgentSession = struct {
 
     fn startRun(self: *AgentSession, id: command_mod.CommandId, messages: []const agent_mod.AgentMessage) void {
         std.debug.assert(self.active_run == null);
-        if (!self.appendRunInput(messages)) return;
+        switch (self.appendRunInput(messages)) {
+            .appended, .skipped => {},
+            .failed => {
+                self.clearPendingFollowUps();
+                self.setActivity(.{ .failed = .{ .kind = .internal } });
+                return;
+            },
+        }
         self.active_run = .{ .command_id = id };
         self.setActivity(.{ .running = .{
             .command_id = id,
@@ -409,57 +430,46 @@ pub const AgentSession = struct {
         };
     }
 
-    fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) bool {
-        if (self.durable_appender == .disabled) return true;
-        if (messages.len == 0) return true;
+    fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) DurableAppend {
+        if (self.durable_appender == .disabled) return .skipped;
+        if (messages.len == 0) return .skipped;
         if (messages.len != 1) {
             self.emit(.{ .session = .{ .append_rejected = .unsupported_batch } });
-            self.setActivity(.{ .failed = .{ .kind = .internal } });
-            return false;
+            return .failed;
         }
 
-        const result = self.durable_appender.append(.{ .message = .{ .message = messages[0] } });
+        return self.appendDurableMessage(messages[0]);
+    }
+
+    fn appendTerminalMessages(self: *AgentSession, messages: []const agent_mod.AgentMessage) DurableAppend {
+        if (self.durable_appender == .disabled) return .skipped;
+        var appended_any = false;
+        for (messages) |message| {
+            switch (self.appendDurableMessage(message)) {
+                .appended => appended_any = true,
+                .skipped => {},
+                .failed => return .failed,
+            }
+        }
+        return if (appended_any) .appended else .skipped;
+    }
+
+    fn appendDurableMessage(self: *AgentSession, message: agent_mod.AgentMessage) DurableAppend {
+        const result = self.durable_appender.append(.{ .message = .{ .message = message } });
         switch (result) {
             .appended => |id| {
                 self.emit(.{ .session = .{ .appended = id } });
-                return true;
+                return .appended;
             },
             .rejected => |reason| {
                 self.emit(.{ .session = .{ .append_rejected = reason } });
-                self.setActivity(.{ .failed = .{ .kind = .internal } });
-                return false;
+                return .failed;
             },
             .failed => |failure| {
                 self.emit(.{ .session = .{ .append_failed = failure } });
-                self.setActivity(.{ .failed = .{ .kind = .internal } });
-                return false;
+                return .failed;
             },
         }
-    }
-
-    fn appendTerminalMessages(self: *AgentSession, messages: []const agent_mod.AgentMessage) bool {
-        if (self.durable_appender == .disabled) return true;
-        for (messages) |message| {
-            const result = self.durable_appender.append(.{ .message = .{ .message = message } });
-            switch (result) {
-                .appended => |id| self.emit(.{ .session = .{ .appended = id } }),
-                .rejected => |reason| {
-                    self.emit(.{ .session = .{ .append_rejected = reason } });
-                    self.clearPendingFollowUps();
-                    self.clearActiveRun();
-                    self.setActivity(.{ .failed = .{ .kind = .internal } });
-                    return false;
-                },
-                .failed => |failure| {
-                    self.emit(.{ .session = .{ .append_failed = failure } });
-                    self.clearPendingFollowUps();
-                    self.clearActiveRun();
-                    self.setActivity(.{ .failed = .{ .kind = .internal } });
-                    return false;
-                },
-            }
-        }
-        return true;
     }
 
     fn startNextFollowUpOrIdle(self: *AgentSession) void {
