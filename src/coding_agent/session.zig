@@ -164,6 +164,29 @@ pub const AgentSession = struct {
         }
     }
 
+    pub fn applyOwnedRunTerminal(self: *AgentSession, terminal: OwnedRunTerminal) void {
+        const finished_command_id = self.activeCommandId();
+        const result: event_mod.RunTerminal = switch (terminal.status) {
+            .completed => |messages| blk: {
+                if (!self.appendTerminalMessages(messages)) break :blk .{ .failed = .internal };
+                self.setActivity(.idle);
+                break :blk .completed;
+            },
+            .aborted => {
+                self.clearPendingFollowUps();
+                self.setActivity(.idle);
+                return self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = .aborted } } });
+            },
+            .failed => |failed| {
+                self.clearPendingFollowUps();
+                self.setActivity(.{ .failed = .{ .kind = failed.kind } });
+                return self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = .{ .failed = failed.kind } } } });
+            },
+        };
+        self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = result } } });
+        if (result == .completed) self.startNextFollowUpOrIdle();
+    }
+
     fn emit(self: *AgentSession, value: event_mod.Event) void {
         if (self.event_sink) |sink| sink.emit(value);
     }
@@ -262,6 +285,29 @@ pub const AgentSession = struct {
         }
     }
 
+    fn appendTerminalMessages(self: *AgentSession, messages: []const agent_mod.AgentMessage) bool {
+        if (self.durable_appender == .disabled) return true;
+        for (messages) |message| {
+            const result = self.durable_appender.append(.{ .message = .{ .message = message } });
+            switch (result) {
+                .appended => |id| self.emit(.{ .session = .{ .appended = id } }),
+                .rejected => |reason| {
+                    self.emit(.{ .session = .{ .append_rejected = reason } });
+                    self.clearPendingFollowUps();
+                    self.setActivity(.{ .failed = .{ .kind = .internal } });
+                    return false;
+                },
+                .failed => |failure| {
+                    self.emit(.{ .session = .{ .append_failed = failure } });
+                    self.clearPendingFollowUps();
+                    self.setActivity(.{ .failed = .{ .kind = .internal } });
+                    return false;
+                },
+            }
+        }
+        return true;
+    }
+
     fn startNextFollowUpOrIdle(self: *AgentSession) void {
         if (self.pending_follow_ups.pop()) |queued| {
             var owned = queued;
@@ -320,6 +366,48 @@ const QueuedCommand = struct {
 
     fn deinit(self: *QueuedCommand, allocator: std.mem.Allocator) void {
         freeCommand(allocator, self.command);
+        self.* = undefined;
+    }
+};
+
+pub const OwnedRunTerminal = struct {
+    arena: std.heap.ArenaAllocator,
+    status: Status,
+
+    pub const Status = union(enum) {
+        completed: []const agent_mod.AgentMessage,
+        failed: Failed,
+        aborted: []const agent_mod.AgentMessage,
+    };
+
+    pub const Failed = struct {
+        messages: []const agent_mod.AgentMessage,
+        kind: state_mod.FailureKind,
+    };
+
+    pub fn completed(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) !OwnedRunTerminal {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const owned_messages = try cloneMessages(arena.allocator(), messages);
+        return .{ .arena = arena, .status = .{ .completed = owned_messages } };
+    }
+
+    pub fn failed(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage, kind: state_mod.FailureKind) !OwnedRunTerminal {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const owned_messages = try cloneMessages(arena.allocator(), messages);
+        return .{ .arena = arena, .status = .{ .failed = .{ .messages = owned_messages, .kind = kind } } };
+    }
+
+    pub fn aborted(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) !OwnedRunTerminal {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const owned_messages = try cloneMessages(arena.allocator(), messages);
+        return .{ .arena = arena, .status = .{ .aborted = owned_messages } };
+    }
+
+    pub fn deinit(self: *OwnedRunTerminal) void {
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -390,6 +478,9 @@ const ObservedEvent = enum {
     append_rejected,
     append_failed,
     run_started,
+    run_finished_completed,
+    run_finished_failed,
+    run_finished_aborted,
 };
 
 const EventCollector = struct {
@@ -411,12 +502,28 @@ const EventCollector = struct {
             },
             .run => |run| switch (run) {
                 .started => .run_started,
-                .finished => .command_accepted,
+                .finished => |finished| switch (finished.terminal) {
+                    .completed => .run_finished_completed,
+                    .failed => .run_finished_failed,
+                    .aborted => .run_finished_aborted,
+                },
             },
         };
         self.len += 1;
     }
 };
+
+fn testAssistantMessage() agent_mod.AgentMessage {
+    return .{ .assistant = .{
+        .content = &.{},
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "test",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .stop,
+        .timestamp = 1,
+    } };
+}
 
 test "agent session command queue is bounded" {
     var session = try AgentSession.init(std.testing.allocator, .{ .command_capacity = 1 });
@@ -535,6 +642,105 @@ test "multi message prompt is rejected before partial durable append" {
     try std.testing.expectEqual(@as(usize, 0), durable.message_count);
     try std.testing.expect(session.state().activity == .failed);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .append_rejected }, events.items[0..events.len]);
+}
+
+test "completed terminal appends messages before run finished" {
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .appended = [_]u8{'b'} ** session_event_mod.event_id_hex_len } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_appender = .{ .scripted = &durable },
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    session.drainCommands();
+
+    const messages = [_]agent_mod.AgentMessage{testAssistantMessage()};
+    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
+    defer terminal.deinit();
+    session.applyOwnedRunTerminal(terminal);
+
+    try std.testing.expect(session.state().activity == .idle);
+    try std.testing.expectEqual(@as(usize, 1), durable.message_count);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .session_appended, .run_finished_completed }, events.items[0..events.len]);
+}
+
+test "completed terminal starts queued follow up only after run finished" {
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .appended = [_]u8{'c'} ** session_event_mod.event_id_hex_len } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_appender = .{ .scripted = &durable },
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    session.drainCommands();
+    _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
+
+    const messages = [_]agent_mod.AgentMessage{testAssistantMessage()};
+    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
+    defer terminal.deinit();
+    session.applyOwnedRunTerminal(terminal);
+
+    try std.testing.expect(session.state().activity == .running);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .session_appended, .run_finished_completed, .run_started }, events.items[0..events.len]);
+}
+
+test "terminal append failure prevents queued follow up" {
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .failed = .io } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_appender = .{ .scripted = &durable },
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    session.drainCommands();
+    _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
+
+    const messages = [_]agent_mod.AgentMessage{testAssistantMessage()};
+    var terminal = try OwnedRunTerminal.completed(std.testing.allocator, &messages);
+    defer terminal.deinit();
+    session.applyOwnedRunTerminal(terminal);
+
+    try std.testing.expect(session.state().activity == .failed);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .append_failed, .run_finished_failed }, events.items[0..events.len]);
+}
+
+test "failed and aborted terminals do not append messages" {
+    var durable = durable_mod.ScriptedAppender{ .result = .{ .appended = [_]u8{'d'} ** session_event_mod.event_id_hex_len } };
+    var events: EventCollector = .{};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .durable_appender = .{ .scripted = &durable },
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+    });
+    defer session.deinit();
+
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    session.drainCommands();
+    _ = try session.submit(.{ .follow_up = .{ .messages = &.{} } });
+
+    const messages = [_]agent_mod.AgentMessage{testAssistantMessage()};
+    var failed = try OwnedRunTerminal.failed(std.testing.allocator, &messages, .internal);
+    defer failed.deinit();
+    session.applyOwnedRunTerminal(failed);
+
+    try std.testing.expectEqual(@as(usize, 0), durable.message_count);
+    try std.testing.expect(session.state().activity == .failed);
+
+    var session2 = try AgentSession.init(std.testing.allocator, .{ .durable_appender = .{ .scripted = &durable } });
+    defer session2.deinit();
+    _ = try session2.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    session2.drainCommands();
+    _ = try session2.submit(.{ .follow_up = .{ .messages = &.{} } });
+    var aborted = try OwnedRunTerminal.aborted(std.testing.allocator, &messages);
+    defer aborted.deinit();
+    session2.applyOwnedRunTerminal(aborted);
+    try std.testing.expectEqual(@as(usize, 0), durable.message_count);
+    try std.testing.expect(session2.state().activity == .idle);
 }
 
 test "agent session rejects steering until inner loop supports it" {
