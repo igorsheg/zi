@@ -5,6 +5,48 @@ const tool = @import("tool.zig");
 pub const max_tool_ops: usize = 32;
 pub const max_tool_updates: usize = 128;
 
+pub const Contract = struct {
+    max_in_flight: usize,
+    max_updates: usize,
+    completion_delivery: CompletionDelivery,
+
+    pub fn init(options: ContractOptions) Contract {
+        if (options.max_in_flight == 0) @panic("tool executor max_in_flight must be greater than zero");
+        if (options.max_updates == 0) @panic("tool executor max_updates must be greater than zero");
+        if (options.completion_delivery == .bounded_queue) {
+            if (options.completion_delivery.bounded_queue.terminals == 0) @panic("tool executor terminal queue capacity must be greater than zero");
+            if (options.completion_delivery.bounded_queue.updates == 0) @panic("tool executor update queue capacity must be greater than zero");
+        }
+        return .{
+            .max_in_flight = options.max_in_flight,
+            .max_updates = options.max_updates,
+            .completion_delivery = options.completion_delivery,
+        };
+    }
+};
+
+pub const ContractOptions = struct {
+    max_in_flight: usize = max_tool_ops,
+    max_updates: usize = max_tool_updates,
+    completion_delivery: CompletionDelivery = .{ .bounded_queue = .{ .terminals = max_tool_ops, .updates = max_tool_updates } },
+};
+
+pub const CompletionDelivery = union(enum) {
+    direct_owner_call,
+    bounded_queue: QueueCapacity,
+};
+
+pub const QueueCapacity = struct {
+    terminals: usize,
+    updates: usize,
+};
+
+pub const InvocationContract = struct {
+    pub const terminal_completion_required = true;
+    pub const updates_are_optional = true;
+    pub const cancellation_completion_is_terminal_aborted = true;
+};
+
 pub const Executor = struct {
     allocator: std.mem.Allocator,
     updates: runtime_queue.BoundedQueue(tool.ToolUpdate),
@@ -31,6 +73,14 @@ pub const Executor = struct {
 
     pub fn sink(self: *Executor) tool.ToolCompletionSink {
         return .{ .emit_fn = emitCompletion, .ctx = self };
+    }
+
+    pub fn contract(self: *const Executor) Contract {
+        return Contract.init(.{
+            .max_in_flight = self.terminals.capacity(),
+            .max_updates = self.updates.capacity(),
+            .completion_delivery = .{ .bounded_queue = .{ .terminals = self.terminals.capacity(), .updates = self.updates.capacity() } },
+        });
     }
 
     pub fn reserveTerminal(self: *Executor) !void {
@@ -92,4 +142,19 @@ test "tool executor reserves terminal capacity for accepted ops" {
         else => return error.TestExpectedEqual,
     }
     try std.testing.expectEqual(@as(usize, max_tool_ops - 1), executor.terminal_slots_reserved);
+}
+
+test "tool executor contract names bounded completions and in flight capacity" {
+    var executor = try Executor.init(std.testing.allocator);
+    defer executor.deinit();
+
+    const c = executor.contract();
+
+    try std.testing.expectEqual(@as(usize, max_tool_ops), c.max_in_flight);
+    try std.testing.expectEqual(@as(usize, max_tool_updates), c.max_updates);
+    try std.testing.expectEqual(@as(usize, max_tool_ops), c.completion_delivery.bounded_queue.terminals);
+    try std.testing.expectEqual(@as(usize, max_tool_updates), c.completion_delivery.bounded_queue.updates);
+    try std.testing.expect(InvocationContract.terminal_completion_required);
+    try std.testing.expect(InvocationContract.updates_are_optional);
+    try std.testing.expect(InvocationContract.cancellation_completion_is_terminal_aborted);
 }
