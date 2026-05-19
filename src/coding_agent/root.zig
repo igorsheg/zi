@@ -5,6 +5,7 @@ pub const extension = @import("extension.zig");
 pub const durable = @import("durable.zig");
 pub const durable_store = @import("durable_store.zig");
 pub const run_completion = @import("run_completion.zig");
+pub const run_executor = @import("run_executor.zig");
 pub const session = @import("session.zig");
 
 pub const AgentSession = session.AgentSession;
@@ -13,6 +14,7 @@ pub const CommandId = command.CommandId;
 pub const Event = event.Event;
 pub const OwnedRunTerminal = run_completion.OwnedRunTerminal;
 pub const RunCompletion = run_completion.RunCompletion;
+pub const RunSpec = run_executor.RunSpec;
 pub const State = state.State;
 
 test {

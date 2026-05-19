@@ -7,6 +7,7 @@ const message_memory = @import("../agent/message_memory.zig");
 const command_mod = @import("command.zig");
 const event_mod = @import("event.zig");
 const run_completion_mod = @import("run_completion.zig");
+const run_executor_mod = @import("run_executor.zig");
 const state_mod = @import("state.zig");
 const extension_mod = @import("extension.zig");
 const durable_mod = @import("durable.zig");
@@ -16,6 +17,7 @@ const CommandQueue = runtime_queue.BoundedQueue(QueuedCommand);
 const FollowUpQueue = runtime_queue.BoundedQueue(QueuedFollowUp);
 pub const OwnedRunTerminal = run_completion_mod.OwnedRunTerminal;
 pub const RunCompletion = run_completion_mod.RunCompletion;
+const RunSpec = run_executor_mod.RunSpec;
 
 pub const max_commands: usize = 64;
 pub const max_pending_follow_ups: usize = 8;
@@ -118,11 +120,6 @@ pub const AgentSession = struct {
         max_retry_delay_ms: ?u64 = null,
         thinking_budgets: ?ai.protocol.ThinkingBudgets = null,
         transport: ?ai.protocol.Transport = null,
-    };
-
-    const RunSpec = struct {
-        input: agent_mod.AgentInput,
-        config: agent_mod.config.RunConfig,
     };
 
     const RunRequest = struct {
