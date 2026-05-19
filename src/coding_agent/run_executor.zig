@@ -154,7 +154,16 @@ const RunCapture = struct {
                 .tool_call_id = started.tool_call_id,
                 .tool_name = started.tool_name,
             } } }),
-            .update => {},
+            .update => |update| sink.emit(.{ .run = .{ .tool_updated = .{
+                .run_command_id = self.run_command_id,
+                .op_id = update.op_id,
+                .tool_call_id = update.tool_call_id,
+                .tool_name = update.tool_name,
+                .content_blocks = update.partial_result.content.len,
+                .is_error = update.partial_result.is_error,
+                .has_details = update.partial_result.details.borrowed() != .null,
+                .has_presentation = update.partial_result.presentation.borrowed() != .null,
+            } } }),
             .finished => |finished| sink.emit(.{ .run = .{ .tool_finished = .{
                 .run_command_id = self.run_command_id,
                 .op_id = finished.op_id,

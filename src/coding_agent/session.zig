@@ -851,7 +851,7 @@ fn freeMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentM
     allocator.free(messages);
 }
 
-const observed_event_count = 18;
+const observed_event_count = 19;
 const ObservedEvent = enum {
     command_accepted,
     command_rejected,
@@ -862,6 +862,7 @@ const ObservedEvent = enum {
     run_follow_up_queued,
     run_abort_requested,
     run_tool_started,
+    run_tool_updated,
     run_tool_finished,
     run_finished_completed,
     run_finished_failed,
@@ -890,6 +891,7 @@ const EventCollector = struct {
                 .follow_up_queued => .run_follow_up_queued,
                 .abort_requested => .run_abort_requested,
                 .tool_started => .run_tool_started,
+                .tool_updated => .run_tool_updated,
                 .tool_finished => .run_tool_finished,
                 .finished => |finished| switch (finished.terminal) {
                     .completed => .run_finished_completed,
@@ -1142,6 +1144,14 @@ test "synchronous tool execution emits coding agent tool events" {
     };
     const Tool = struct {
         fn execute(_: ?*anyopaque, _: std.mem.Allocator, invocation: agent_mod.tool.ToolInvocation, sink: agent_mod.tool.ToolCompletionSink) void {
+            var update = agent_mod.tool.ToolCompletion{ .update = .{
+                .op_id = invocation.op_id,
+                .source_index = invocation.source_index,
+                .tool_call_id = invocation.tool_call_id,
+                .tool_name = invocation.tool_name,
+                .partial_result = .{ .content = &.{}, .is_error = false },
+            } };
+            sink.emit(&update);
             var completion = agent_mod.tool.ToolCompletion{ .terminal = .{
                 .op_id = invocation.op_id,
                 .source_index = invocation.source_index,
@@ -1167,7 +1177,91 @@ test "synchronous tool execution emits coding agent tool events" {
     _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
     session.drainCommands();
 
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .run_tool_started, .run_tool_finished, .run_finished_completed }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .run_tool_started, .run_tool_updated, .run_tool_finished, .run_finished_completed }, events.items[0..events.len]);
+}
+
+test "tool update projection emits summary without payload ownership" {
+    const Collector = struct {
+        saw_update: bool = false,
+        matched_ids: bool = false,
+        content_blocks: usize = 0,
+        is_error: bool = false,
+        has_details: bool = true,
+        has_presentation: bool = true,
+        expected_run_id: command_mod.CommandId,
+
+        fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (value != .run) return;
+            if (value.run != .tool_updated) return;
+            const updated = value.run.tool_updated;
+            self.saw_update = true;
+            self.matched_ids = updated.run_command_id == self.expected_run_id and
+                updated.op_id == 1 and
+                std.mem.eql(u8, updated.tool_call_id, "tool-1") and
+                std.mem.eql(u8, updated.tool_name, "read");
+            self.content_blocks = updated.content_blocks;
+            self.is_error = updated.is_error;
+            self.has_details = updated.has_details;
+            self.has_presentation = updated.has_presentation;
+        }
+    };
+    const Capture = struct {
+        calls: usize = 0,
+
+        fn stream(ctx: ?*anyopaque, _: std.mem.Allocator, _: agent_mod.message.Model, _: ai.protocol.Context, _: ai.protocol.SimpleStreamOptions, sink: ai.provider.StreamEventSink) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            if (self.calls == 1) {
+                sink.emit(.{ .done = .{ .reason = .toolUse, .message = testToolUseAssistantMessage().assistant } });
+            } else {
+                sink.emit(.{ .done = .{ .reason = .stop, .message = testAssistantMessage().assistant } });
+            }
+        }
+    };
+    const Tool = struct {
+        fn execute(_: ?*anyopaque, _: std.mem.Allocator, invocation: agent_mod.tool.ToolInvocation, sink: agent_mod.tool.ToolCompletionSink) void {
+            const content = [_]agent_mod.tool.AgentToolResult.ContentBlock{.{ .text = .{ .text = "partial" } }};
+            var update = agent_mod.tool.ToolCompletion{ .update = .{
+                .op_id = invocation.op_id,
+                .source_index = invocation.source_index,
+                .tool_call_id = invocation.tool_call_id,
+                .tool_name = invocation.tool_name,
+                .partial_result = .{ .content = &content, .details = .null, .presentation = .null, .is_error = true },
+            } };
+            sink.emit(&update);
+            var completion = agent_mod.tool.ToolCompletion{ .terminal = .{
+                .op_id = invocation.op_id,
+                .source_index = invocation.source_index,
+                .tool_call_id = invocation.tool_call_id,
+                .tool_name = invocation.tool_name,
+                .terminal = .{ .completed = .{ .content = &.{}, .is_error = false } },
+            } };
+            sink.emit(&completion);
+        }
+    };
+
+    var capture = Capture{};
+    const source_tools = [_]agent_mod.AgentTool{.{ .name = "read", .description = "read files", .parameters = .null, .execute_fn = Tool.execute }};
+    const run_id: command_mod.CommandId = @enumFromInt(1);
+    var collector = Collector{ .expected_run_id = run_id };
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .policy = testPolicy(),
+        .event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector },
+        .extension_host = try extension_mod.Host.initTools(std.testing.allocator, &source_tools),
+        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop } } },
+    });
+    defer session.deinit();
+
+    try std.testing.expectEqual(run_id, (try session.submit(.{ .submit_prompt = .{ .messages = &.{} } })).accepted);
+    session.drainCommands();
+
+    try std.testing.expect(collector.saw_update);
+    try std.testing.expect(collector.matched_ids);
+    try std.testing.expectEqual(@as(usize, 1), collector.content_blocks);
+    try std.testing.expect(collector.is_error);
+    try std.testing.expect(!collector.has_details);
+    try std.testing.expect(!collector.has_presentation);
 }
 
 test "policy commands are rejected while running" {
@@ -1290,7 +1384,7 @@ test "abort in external completion mode keeps original run command id" {
                 },
                 .finished => |finished| self.finished_command_id = finished.command_id,
                 .follow_up_queued => {},
-                .tool_started, .tool_finished => {},
+                .tool_started, .tool_updated, .tool_finished => {},
                 .started => {},
             }
         }
@@ -1339,7 +1433,7 @@ test "abort control drains before queued future runs" {
                     if (self.saw_abort) self.started_after_abort = true;
                 },
                 .follow_up_queued => {},
-                .tool_started, .tool_finished => {},
+                .tool_started, .tool_updated, .tool_finished => {},
                 .finished => {},
             }
         }

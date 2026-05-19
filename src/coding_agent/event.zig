@@ -19,6 +19,7 @@ pub const RunEvent = union(enum) {
     follow_up_queued: FollowUpQueued,
     abort_requested: AbortRequested,
     tool_started: ToolStarted,
+    tool_updated: ToolUpdated,
     tool_finished: ToolFinished,
     finished: struct { command_id: command.CommandId, terminal: RunTerminal },
 };
@@ -39,6 +40,17 @@ pub const ToolStarted = struct {
     op_id: u64,
     tool_call_id: []const u8,
     tool_name: []const u8,
+};
+
+pub const ToolUpdated = struct {
+    run_command_id: command.CommandId,
+    op_id: u64,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    content_blocks: usize,
+    is_error: bool,
+    has_details: bool,
+    has_presentation: bool,
 };
 
 pub const ToolFinished = struct {
