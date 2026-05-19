@@ -6,6 +6,7 @@ const agent_mod = @import("../agent/root.zig");
 const message_memory = @import("../agent/message_memory.zig");
 const command_mod = @import("command.zig");
 const event_mod = @import("event.zig");
+const run_completion_mod = @import("run_completion.zig");
 const state_mod = @import("state.zig");
 const extension_mod = @import("extension.zig");
 const durable_mod = @import("durable.zig");
@@ -13,6 +14,8 @@ const session_event_mod = @import("../session/event.zig");
 
 const CommandQueue = runtime_queue.BoundedQueue(QueuedCommand);
 const FollowUpQueue = runtime_queue.BoundedQueue(QueuedFollowUp);
+pub const OwnedRunTerminal = run_completion_mod.OwnedRunTerminal;
+pub const RunCompletion = run_completion_mod.RunCompletion;
 
 pub const max_commands: usize = 64;
 pub const max_pending_follow_ups: usize = 8;
@@ -45,6 +48,13 @@ pub const AgentSession = struct {
         execution: Execution = .external_completion,
     };
 
+    // Execution names the run mechanism currently wired into AgentSession.
+    // Future runtime-backed execution must keep this boundary shape:
+    // AgentSession builds RunSpec and owns ActiveRun; the executor owns backend
+    // operation memory and publishes exactly one RunCompletion back to the owner
+    // drain path. Executors must not receive *AgentSession or mutate session
+    // state from callbacks. Abort request is cancellation intent; aborted
+    // RunCompletion is cancellation completion.
     pub const Execution = union(enum) {
         external_completion,
         synchronous: ExecutionBackend,
@@ -143,8 +153,11 @@ pub const AgentSession = struct {
         unsupported_batch,
         missing_model,
 
-        fn failureKind(_: SessionRunFailure) state_mod.FailureKind {
-            return .internal;
+        fn failureKind(self: SessionRunFailure) state_mod.FailureKind {
+            return switch (self) {
+                .unsupported_batch, .missing_model => .invalid_context,
+                .durable_append_rejected, .durable_append_failed => .internal,
+            };
         }
 
         fn runTerminal(self: SessionRunFailure) event_mod.RunTerminal {
@@ -724,67 +737,6 @@ const OwnedCommand = union(enum) {
     set_reasoning: command_mod.SetReasoning,
 };
 
-pub const OwnedRunTerminal = struct {
-    arena: std.heap.ArenaAllocator,
-    status: Status,
-
-    pub const Status = union(enum) {
-        completed: []const agent_mod.AgentMessage,
-        failed: Failed,
-        aborted: []const agent_mod.AgentMessage,
-    };
-
-    pub const Failed = struct {
-        messages: []const agent_mod.AgentMessage,
-        kind: state_mod.FailureKind,
-    };
-
-    pub fn completed(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) !OwnedRunTerminal {
-        var self = OwnedRunTerminal{
-            .arena = std.heap.ArenaAllocator.init(allocator),
-            .status = .{ .completed = &.{} },
-        };
-        errdefer self.deinit();
-        self.status = .{ .completed = try cloneMessages(self.arena.allocator(), messages) };
-        return self;
-    }
-
-    pub fn failed(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage, kind: state_mod.FailureKind) !OwnedRunTerminal {
-        var self = OwnedRunTerminal{
-            .arena = std.heap.ArenaAllocator.init(allocator),
-            .status = .{ .failed = .{ .messages = &.{}, .kind = kind } },
-        };
-        errdefer self.deinit();
-        self.status = .{ .failed = .{ .messages = try cloneMessages(self.arena.allocator(), messages), .kind = kind } };
-        return self;
-    }
-
-    pub fn aborted(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) !OwnedRunTerminal {
-        var self = OwnedRunTerminal{
-            .arena = std.heap.ArenaAllocator.init(allocator),
-            .status = .{ .aborted = &.{} },
-        };
-        errdefer self.deinit();
-        self.status = .{ .aborted = try cloneMessages(self.arena.allocator(), messages) };
-        return self;
-    }
-
-    pub fn deinit(self: *OwnedRunTerminal) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const RunCompletion = struct {
-    command_id: command_mod.CommandId,
-    terminal: OwnedRunTerminal,
-
-    pub fn deinit(self: *RunCompletion) void {
-        self.terminal.deinit();
-        self.* = undefined;
-    }
-};
-
 const RunCapture = struct {
     allocator: std.mem.Allocator,
     input_count: usize,
@@ -925,17 +877,7 @@ const QueuedFollowUp = struct {
 };
 
 fn cloneMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) ![]const agent_mod.AgentMessage {
-    const out = try allocator.alloc(agent_mod.AgentMessage, messages.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |msg| message_memory.freeMessage(allocator, msg);
-        allocator.free(out);
-    }
-    for (messages, 0..) |msg, i| {
-        out[i] = try message_memory.cloneMessage(allocator, msg);
-        initialized += 1;
-    }
-    return out;
+    return message_memory.cloneMessages(allocator, messages);
 }
 
 fn freeMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) void {
@@ -1125,6 +1067,7 @@ test "synchronous execution requires selected model policy" {
     session.drainCommands();
 
     try std.testing.expect(session.state().activity == .failed);
+    try std.testing.expectEqual(state_mod.FailureKind.invalid_context, session.state().activity.failed.kind);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .run_finished_failed }, events.items[0..events.len]);
 }
 
@@ -1430,6 +1373,7 @@ test "append rejection prevents run start" {
 
     try std.testing.expectEqual(@as(usize, 1), durable.message_count);
     try std.testing.expect(session.state().activity == .failed);
+    try std.testing.expectEqual(state_mod.FailureKind.internal, session.state().activity.failed.kind);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .append_rejected }, events.items[0..events.len]);
 }
 
@@ -1448,6 +1392,7 @@ test "append failure prevents run start" {
 
     try std.testing.expectEqual(@as(usize, 1), durable.message_count);
     try std.testing.expect(session.state().activity == .failed);
+    try std.testing.expectEqual(state_mod.FailureKind.internal, session.state().activity.failed.kind);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .append_failed }, events.items[0..events.len]);
 }
 
@@ -1469,6 +1414,7 @@ test "multi message prompt is rejected before partial durable append" {
 
     try std.testing.expectEqual(@as(usize, 0), durable.message_count);
     try std.testing.expect(session.state().activity == .failed);
+    try std.testing.expectEqual(state_mod.FailureKind.invalid_context, session.state().activity.failed.kind);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .append_rejected }, events.items[0..events.len]);
 }
 

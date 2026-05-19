@@ -14,6 +14,20 @@ pub fn cloneMessage(allocator: std.mem.Allocator, value: message.AgentMessage) !
     };
 }
 
+pub fn cloneMessages(allocator: std.mem.Allocator, messages: []const message.AgentMessage) ![]const message.AgentMessage {
+    const out = try allocator.alloc(message.AgentMessage, messages.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |msg| freeMessage(allocator, msg);
+        allocator.free(out);
+    }
+    for (messages, 0..) |msg, i| {
+        out[i] = try cloneMessage(allocator, msg);
+        initialized += 1;
+    }
+    return out;
+}
+
 pub fn cloneUser(allocator: std.mem.Allocator, value: ai.protocol.UserMessage) !ai.protocol.UserMessage {
     return .{ .content = try cloneUserContent(allocator, value.content), .timestamp = value.timestamp };
 }
