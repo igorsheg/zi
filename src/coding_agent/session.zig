@@ -27,6 +27,10 @@ pub const AgentSession = struct {
     active_run: ?ActiveRun = null,
     owner_call_active: bool = false,
     next_command_id: u64 = 1,
+    // Event sinks run synchronously inside the current owner call. They may
+    // observe AgentSession state, but public owner entry points assert against
+    // reentrant mutation. Replace this with an explicit bounded event queue
+    // when a caller needs post-transition delivery/backpressure semantics.
     event_sink: ?event_mod.Sink = null,
     durable_appender: durable_mod.Appender = .disabled,
     extension_host: extension_mod.Host = .disabled,
@@ -353,9 +357,6 @@ pub const AgentSession = struct {
     }
 
     fn emit(self: *AgentSession, value: event_mod.Event) void {
-        // Event sinks run synchronously inside the current owner call. They may
-        // observe AgentSession state, but public owner entry points assert
-        // against reentrant mutation.
         if (self.event_sink) |sink| sink.emit(value);
     }
 
@@ -453,7 +454,7 @@ pub const AgentSession = struct {
         };
         self.active_run = .{ .command_id = id, .execution = active_execution, .input_messages = owned_messages };
         self.setActivity(.{ .running = .{
-            .command_id = id,
+            .run_command_id = id,
             .pending_follow_ups = self.pending_follow_ups.len,
             .pending_steering = 0,
         } });
@@ -627,7 +628,7 @@ pub const AgentSession = struct {
 
         const run_command_id = self.activeCommandId();
         if (self.active_run) |*active| active.cancel_source.requestAbort();
-        self.setActivity(.{ .aborting = .{ .command_id = run_command_id, .pending_follow_ups = self.pending_follow_ups.len } });
+        self.setActivity(.{ .aborting = .{ .run_command_id = run_command_id, .pending_follow_ups = self.pending_follow_ups.len } });
         self.emit(.{ .run = .{ .abort_requested = .{ .command_id = pending.id, .run_command_id = run_command_id } } });
         return .stop_draining;
     }
@@ -686,8 +687,8 @@ pub const AgentSession = struct {
 
     fn activeCommandId(self: *const AgentSession) command_mod.CommandId {
         return switch (self.state_value.activity) {
-            .running => |running| running.command_id,
-            .aborting => |aborting| aborting.command_id,
+            .running => |running| running.run_command_id,
+            .aborting => |aborting| aborting.run_command_id,
             .idle, .failed => @enumFromInt(0),
         };
     }
@@ -1145,7 +1146,7 @@ test "external completion rejects stale run id" {
 
     try std.testing.expectEqual(AgentSession.CompletionRejection.stale_run, session.completeRun(&completion).rejected);
     try std.testing.expect(session.state().activity == .running);
-    try std.testing.expectEqual(run_id, session.state().activity.running.command_id);
+    try std.testing.expectEqual(run_id, session.state().activity.running.run_command_id);
 }
 
 test "policy commands update owned run spec inputs while idle" {
@@ -1241,7 +1242,7 @@ test "external completion drain stops after starting one queued run" {
 
     session.drainCommands();
     try std.testing.expect(session.state().activity == .running);
-    try std.testing.expectEqual(first, session.state().activity.running.command_id);
+    try std.testing.expectEqual(first, session.state().activity.running.run_command_id);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started }, events.items[0..events.len]);
 
     const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
@@ -1251,7 +1252,7 @@ test "external completion drain stops after starting one queued run" {
 
     session.drainCommands();
     try std.testing.expect(session.state().activity == .running);
-    try std.testing.expectEqual(second, session.state().activity.running.command_id);
+    try std.testing.expectEqual(second, session.state().activity.running.run_command_id);
     try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started, .run_finished_completed, .run_started }, events.items[0..events.len]);
 }
 
@@ -1306,7 +1307,7 @@ test "abort in external completion mode keeps original run command id" {
     session.drainCommands();
 
     try std.testing.expect(session.state().activity == .aborting);
-    try std.testing.expectEqual(started, session.state().activity.aborting.command_id);
+    try std.testing.expectEqual(started, session.state().activity.aborting.run_command_id);
     try std.testing.expectEqual(abort_command_id, collector.abort_command_id);
     try std.testing.expectEqual(started, collector.abort_run_command_id);
 
@@ -1354,13 +1355,13 @@ test "abort control drains before queued future runs" {
 
     session.drainCommands();
     try std.testing.expect(session.state().activity == .running);
-    try std.testing.expectEqual(first, session.state().activity.running.command_id);
+    try std.testing.expectEqual(first, session.state().activity.running.run_command_id);
 
     _ = try session.submit(.abort_run);
     session.drainCommands();
 
     try std.testing.expect(session.state().activity == .aborting);
-    try std.testing.expectEqual(first, session.state().activity.aborting.command_id);
+    try std.testing.expectEqual(first, session.state().activity.aborting.run_command_id);
     try std.testing.expectEqual(first, collector.abort_run_command_id);
     try std.testing.expect(!collector.started_after_abort);
 }
