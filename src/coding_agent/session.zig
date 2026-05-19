@@ -46,6 +46,7 @@ pub const AgentSession = struct {
         follow_up_capacity: usize = max_pending_follow_ups,
         event_sink: ?event_mod.Sink = null,
         durable_appender: durable_mod.Appender = .disabled,
+        extension_host: extension_mod.Host = .disabled,
         policy: SessionPolicyInit = .{},
         execution: Execution = .external_completion,
     };
@@ -194,6 +195,9 @@ pub const AgentSession = struct {
         var policy = try SessionPolicy.init(allocator, options.policy);
         errdefer policy.deinit();
 
+        var extension_host = options.extension_host;
+        errdefer extension_host.deinit();
+
         const self: AgentSession = .{
             .allocator = allocator,
             .commands = commands,
@@ -201,6 +205,7 @@ pub const AgentSession = struct {
             .policy = policy,
             .event_sink = options.event_sink,
             .durable_appender = options.durable_appender,
+            .extension_host = extension_host,
             .execution = options.execution,
         };
         return self;
@@ -216,6 +221,7 @@ pub const AgentSession = struct {
         self.clearPendingAbort();
         self.pending_follow_ups.deinit();
         self.commands.deinit();
+        self.extension_host.deinit();
         self.policy.deinit();
         self.clearActivity();
         self.* = undefined;
@@ -505,7 +511,7 @@ pub const AgentSession = struct {
             .input = .{
                 .system_prompt = self.policy.system_prompt,
                 .messages = messages,
-                .tools = &.{},
+                .tools = self.extension_host.tools(),
             },
             .config = .{
                 .model = model,
@@ -1058,6 +1064,40 @@ test "policy commands update owned run spec inputs while idle" {
     try std.testing.expect(session.state().activity == .idle);
     try std.testing.expectEqualStrings("next-model", capture.model_id);
     try std.testing.expectEqual(ai.protocol.ThinkingLevel.high, capture.reasoning.?);
+}
+
+test "extension host tools are exposed through run spec" {
+    const Capture = struct {
+        tool_count: usize = 0,
+        tool_name: []const u8 = "",
+
+        fn stream(ctx: ?*anyopaque, _: std.mem.Allocator, _: agent_mod.message.Model, context: ai.protocol.Context, _: ai.protocol.SimpleStreamOptions, sink: ai.provider.StreamEventSink) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.tool_count = if (context.tools) |tools| tools.len else 0;
+            if (context.tools) |tools| {
+                if (tools.len > 0) self.tool_name = tools[0].name;
+            }
+            sink.emit(.{ .done = .{ .reason = .stop, .message = testAssistantMessage().assistant } });
+        }
+    };
+    const Tool = struct {
+        fn execute(_: ?*anyopaque, _: std.mem.Allocator, _: agent_mod.tool.ToolInvocation, _: agent_mod.tool.ToolCompletionSink) void {}
+    };
+
+    var capture = Capture{};
+    const source_tools = [_]agent_mod.AgentTool{.{ .name = "read", .description = "read files", .parameters = .null, .execute_fn = Tool.execute }};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .policy = testPolicy(),
+        .extension_host = try extension_mod.Host.initTools(std.testing.allocator, &source_tools),
+        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop } } },
+    });
+    defer session.deinit();
+
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    session.drainCommands();
+
+    try std.testing.expectEqual(@as(usize, 1), capture.tool_count);
+    try std.testing.expectEqualStrings("read", capture.tool_name);
 }
 
 test "policy commands are rejected while running" {

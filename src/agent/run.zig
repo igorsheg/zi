@@ -84,10 +84,11 @@ pub const Run = struct {
             self.finishRunFailed(.{ .out_of_memory = @errorName(err) });
             return;
         };
+        const protocol_tools = try protocolTools(turn_allocator, self.input.tools);
         const context = ai.protocol.Context{
             .system_prompt = self.input.system_prompt,
             .messages = llm_messages,
-            .tools = null,
+            .tools = protocol_tools,
         };
 
         var stream_op = stream_op_mod.StreamOp.init(self.allocator) catch |err| {
@@ -218,6 +219,15 @@ pub const Run = struct {
         return true;
     }
 };
+
+fn protocolTools(allocator: std.mem.Allocator, tools: []const @import("tool.zig").AgentTool) !?[]const ai.protocol.Tool {
+    if (tools.len == 0) return null;
+    const out = try allocator.alloc(ai.protocol.Tool, tools.len);
+    for (tools, 0..) |tool, i| {
+        out[i] = .{ .name = tool.name, .description = tool.description, .parameters = tool.parameters };
+    }
+    return out;
+}
 
 fn testModel() message.Model {
     return .{
