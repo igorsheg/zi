@@ -488,22 +488,9 @@ pub const AgentSession = struct {
             return;
         };
 
-        var capture = RunCapture{ .allocator = self.allocator, .input_count = submission.spec.input.messages.len };
-        defer capture.deinit();
-
         const token = self.active_run.?.cancel_source.beginRun();
-        var run = agent_mod.Run.init(self.allocator, submission.spec.input, .{ .emit_fn = RunCapture.emit, .ctx = &capture }, token);
-        defer run.deinit();
-
-        run.runStream(submission.spec.config);
-        if (capture.takeTerminal()) |terminal| {
-            var completion = RunCompletion{ .command_id = submission.run_command_id, .terminal = terminal };
-            self.completeSynchronousRun(&completion);
-        } else {
-            const terminal = OwnedRunTerminal.failed(self.allocator, &.{}, .internal) catch @panic("OOM while recording missing run terminal");
-            var completion = RunCompletion{ .command_id = submission.run_command_id, .terminal = terminal };
-            self.completeSynchronousRun(&completion);
-        }
+        const completion_sink = run_executor_mod.CompletionSink{ .complete_fn = completeSynchronousRunFromExecutor, .ctx = self };
+        run_executor_mod.SynchronousExecutor.run(self.allocator, submission, token, completion_sink);
     }
 
     fn buildRunSubmission(self: *const AgentSession, backend: ExecutionBackend) ?run_executor_mod.Submission {
@@ -536,6 +523,11 @@ pub const AgentSession = struct {
                 .reasoning = self.policy.reasoning,
             },
         };
+    }
+
+    fn completeSynchronousRunFromExecutor(completion: *RunCompletion, ctx: ?*anyopaque) void {
+        const self: *AgentSession = @ptrCast(@alignCast(ctx.?));
+        self.completeSynchronousRun(completion);
     }
 
     fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) DurableAppend {
@@ -739,46 +731,6 @@ const OwnedCommand = union(enum) {
     set_reasoning: command_mod.SetReasoning,
 };
 
-const RunCapture = struct {
-    allocator: std.mem.Allocator,
-    input_count: usize,
-    terminal: ?OwnedRunTerminal = null,
-
-    fn emit(value: agent_mod.AgentEvent, ctx: ?*anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
-        if (value != .lifecycle) return;
-        const lifecycle = value.lifecycle;
-        if (lifecycle != .run_finished) return;
-        if (self.terminal != null) return;
-
-        self.terminal = switch (lifecycle.run_finished) {
-            .completed => |completed| OwnedRunTerminal.completed(self.allocator, self.outputMessages(completed.messages)) catch |err| oomTerminal(self.allocator, err),
-            .failed => |failed| OwnedRunTerminal.failed(self.allocator, self.outputMessages(failed.messages), failureKind(failed.reason)) catch |err| oomTerminal(self.allocator, err),
-            .aborted => |aborted| OwnedRunTerminal.aborted(self.allocator, self.outputMessages(aborted.messages)) catch |err| oomTerminal(self.allocator, err),
-        };
-    }
-
-    fn outputMessages(self: *const RunCapture, messages: []const agent_mod.AgentMessage) []const agent_mod.AgentMessage {
-        if (messages.len <= self.input_count) return &.{};
-        return messages[self.input_count..];
-    }
-
-    fn takeTerminal(self: *RunCapture) ?OwnedRunTerminal {
-        const terminal = self.terminal orelse return null;
-        self.terminal = null;
-        return terminal;
-    }
-
-    fn deinit(self: *RunCapture) void {
-        if (self.terminal) |*terminal| terminal.deinit();
-        self.* = undefined;
-    }
-};
-
-fn oomTerminal(allocator: std.mem.Allocator, _: anyerror) OwnedRunTerminal {
-    return OwnedRunTerminal.failed(allocator, &.{}, .out_of_memory) catch @panic("OOM while recording run terminal");
-}
-
 fn cloneModel(allocator: std.mem.Allocator, model: agent_mod.message.Model) !agent_mod.message.Model {
     const id = try allocator.dupe(u8, model.id);
     errdefer allocator.free(id);
@@ -885,17 +837,6 @@ fn cloneMessages(allocator: std.mem.Allocator, messages: []const agent_mod.Agent
 fn freeMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) void {
     for (messages) |msg| message_memory.freeMessage(allocator, msg);
     allocator.free(messages);
-}
-
-fn failureKind(value: agent_mod.failure.Failure) state_mod.FailureKind {
-    return switch (value) {
-        .out_of_memory => .out_of_memory,
-        .invalid_context => .invalid_context,
-        .stream_failed => .stream_failed,
-        .tool_failed => .tool_failed,
-        .tool_protocol_violation => .tool_protocol_violation,
-        .internal => .internal,
-    };
 }
 
 const observed_event_count = 16;

@@ -1,7 +1,9 @@
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
+const cancel = @import("../runtime/cancel.zig");
 const command_mod = @import("command.zig");
 const run_completion_mod = @import("run_completion.zig");
+const state_mod = @import("state.zig");
 
 // RunSpec is borrowed executor ingress. An executor may inspect it during
 // submission, but async/runtime-backed execution must clone the fields it needs
@@ -78,6 +80,84 @@ pub const CompletionDelivery = union(enum) {
     bounded_queue: usize,
 };
 
+pub const SynchronousExecutor = struct {
+    // Runs the borrowed submission to terminal before returning. The cancel token
+    // is a scoped borrow for this call only; this executor must not retain it.
+    pub fn run(
+        allocator: std.mem.Allocator,
+        submission: Submission,
+        token: cancel.Token,
+        completion_sink: CompletionSink,
+    ) void {
+        var capture = RunCapture{ .allocator = allocator, .input_count = submission.spec.input.messages.len };
+        defer capture.deinit();
+
+        var run_value = agent_mod.Run.init(allocator, submission.spec.input, .{ .emit_fn = RunCapture.emit, .ctx = &capture }, token);
+        defer run_value.deinit();
+
+        run_value.runStream(submission.spec.config);
+        if (capture.takeTerminal()) |terminal| {
+            var completion = Completion{ .command_id = submission.run_command_id, .terminal = terminal };
+            completion_sink.complete(&completion);
+        } else {
+            const terminal = run_completion_mod.OwnedRunTerminal.failed(allocator, &.{}, .internal) catch @panic("OOM while recording missing run terminal");
+            var completion = Completion{ .command_id = submission.run_command_id, .terminal = terminal };
+            completion_sink.complete(&completion);
+        }
+    }
+};
+
+const RunCapture = struct {
+    allocator: std.mem.Allocator,
+    input_count: usize,
+    terminal: ?run_completion_mod.OwnedRunTerminal = null,
+
+    fn emit(value: agent_mod.AgentEvent, ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (value != .lifecycle) return;
+        const lifecycle = value.lifecycle;
+        if (lifecycle != .run_finished) return;
+        if (self.terminal != null) return;
+
+        self.terminal = switch (lifecycle.run_finished) {
+            .completed => |completed| run_completion_mod.OwnedRunTerminal.completed(self.allocator, self.outputMessages(completed.messages)) catch |err| oomTerminal(self.allocator, err),
+            .failed => |failed| run_completion_mod.OwnedRunTerminal.failed(self.allocator, self.outputMessages(failed.messages), failureKind(failed.reason)) catch |err| oomTerminal(self.allocator, err),
+            .aborted => |aborted| run_completion_mod.OwnedRunTerminal.aborted(self.allocator, self.outputMessages(aborted.messages)) catch |err| oomTerminal(self.allocator, err),
+        };
+    }
+
+    fn outputMessages(self: *const RunCapture, messages: []const agent_mod.AgentMessage) []const agent_mod.AgentMessage {
+        if (messages.len <= self.input_count) return &.{};
+        return messages[self.input_count..];
+    }
+
+    fn takeTerminal(self: *RunCapture) ?run_completion_mod.OwnedRunTerminal {
+        const terminal = self.terminal orelse return null;
+        self.terminal = null;
+        return terminal;
+    }
+
+    fn deinit(self: *RunCapture) void {
+        if (self.terminal) |*terminal| terminal.deinit();
+        self.* = undefined;
+    }
+};
+
+fn oomTerminal(allocator: std.mem.Allocator, _: anyerror) run_completion_mod.OwnedRunTerminal {
+    return run_completion_mod.OwnedRunTerminal.failed(allocator, &.{}, .out_of_memory) catch @panic("OOM while recording run terminal");
+}
+
+fn failureKind(value: agent_mod.failure.Failure) state_mod.FailureKind {
+    return switch (value) {
+        .out_of_memory => .out_of_memory,
+        .invalid_context => .invalid_context,
+        .stream_failed => .stream_failed,
+        .tool_failed => .tool_failed,
+        .tool_protocol_violation => .tool_protocol_violation,
+        .internal => .internal,
+    };
+}
+
 test "run executor submission carries run identity and borrowed spec" {
     const submission = Submission{
         .run_command_id = @enumFromInt(7),
@@ -149,4 +229,113 @@ test "run executor contract names bounded delivery and in flight capacity" {
 
     try std.testing.expectEqual(@as(usize, 1), contract.max_in_flight);
     try std.testing.expectEqual(@as(usize, 4), contract.completion_delivery.bounded_queue);
+}
+
+fn testAssistantMessage() agent_mod.AgentMessage {
+    return .{ .assistant = .{
+        .content = &.{},
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "test",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .stop,
+        .timestamp = 1,
+    } };
+}
+
+fn testModel() agent_mod.message.Model {
+    return .{
+        .id = "test",
+        .name = "test",
+        .api = .openai_responses,
+        .provider = .openai,
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 0,
+        .max_tokens = 0,
+    };
+}
+
+fn convertNoop(_: ?*anyopaque, _: std.mem.Allocator, _: []const agent_mod.AgentMessage) error{OutOfMemory}![]const @import("../ai/root.zig").protocol.Message {
+    return &.{};
+}
+
+fn completeWithAssistant(_: ?*anyopaque, _: std.mem.Allocator, _: agent_mod.message.Model, _: @import("../ai/root.zig").protocol.Context, _: @import("../ai/root.zig").protocol.SimpleStreamOptions, sink: @import("../ai/root.zig").provider.StreamEventSink) error{OutOfMemory}!void {
+    sink.emit(.{ .done = .{ .reason = .stop, .message = testAssistantMessage().assistant } });
+}
+
+fn failWithAssistant(_: ?*anyopaque, _: std.mem.Allocator, _: agent_mod.message.Model, _: @import("../ai/root.zig").protocol.Context, _: @import("../ai/root.zig").protocol.SimpleStreamOptions, sink: @import("../ai/root.zig").provider.StreamEventSink) error{OutOfMemory}!void {
+    sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = testAssistantMessage().assistant } });
+}
+
+fn abortWithAssistant(_: ?*anyopaque, _: std.mem.Allocator, _: agent_mod.message.Model, _: @import("../ai/root.zig").protocol.Context, _: @import("../ai/root.zig").protocol.SimpleStreamOptions, sink: @import("../ai/root.zig").provider.StreamEventSink) error{OutOfMemory}!void {
+    sink.emit(.{ .@"error" = .{ .reason = .aborted, .@"error" = testAssistantMessage().assistant } });
+}
+
+const CompletionCapture = struct {
+    command_id: ?command_mod.CommandId = null,
+    terminal: ?run_completion_mod.OwnedRunTerminal = null,
+
+    fn complete(completion: *Completion, ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.command_id = completion.command_id;
+        self.terminal = completion.terminal;
+        completion.* = undefined;
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.terminal) |*terminal| terminal.deinit();
+        self.* = undefined;
+    }
+};
+
+fn testSubmission(run_command_id: command_mod.CommandId, stream: agent_mod.config.StreamHook) Submission {
+    return .{
+        .run_command_id = run_command_id,
+        .spec = .{
+            .input = .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
+            .config = .{
+                .model = testModel(),
+                .stream = stream,
+                .convert_messages = .{ .call_fn = convertNoop },
+            },
+        },
+    };
+}
+
+test "synchronous executor publishes one completed run completion" {
+    var capture = CompletionCapture{};
+    defer capture.deinit();
+    const submission = testSubmission(@enumFromInt(11), .{ .call_fn = completeWithAssistant });
+
+    SynchronousExecutor.run(std.testing.allocator, submission, .none, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture });
+
+    try std.testing.expectEqual(@as(command_mod.CommandId, @enumFromInt(11)), capture.command_id.?);
+    try std.testing.expect(capture.terminal.?.status == .completed);
+}
+
+test "synchronous executor publishes failed run completion" {
+    var capture = CompletionCapture{};
+    defer capture.deinit();
+
+    SynchronousExecutor.run(std.testing.allocator, testSubmission(@enumFromInt(12), .{ .call_fn = failWithAssistant }), .none, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture });
+
+    try std.testing.expectEqual(@as(command_mod.CommandId, @enumFromInt(12)), capture.command_id.?);
+    try std.testing.expect(capture.terminal.?.status == .failed);
+    try std.testing.expectEqual(state_mod.FailureKind.stream_failed, capture.terminal.?.status.failed.kind);
+}
+
+test "synchronous executor publishes aborted run completion" {
+    var capture = CompletionCapture{};
+    defer capture.deinit();
+    var source = cancel.Source{};
+    const token = source.beginRun();
+    source.requestAbort();
+
+    SynchronousExecutor.run(std.testing.allocator, testSubmission(@enumFromInt(13), .{ .call_fn = completeWithAssistant }), token, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture });
+
+    try std.testing.expectEqual(@as(command_mod.CommandId, @enumFromInt(13)), capture.command_id.?);
+    try std.testing.expect(capture.terminal.?.status == .aborted);
 }
