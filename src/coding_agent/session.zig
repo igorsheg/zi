@@ -25,6 +25,7 @@ pub const AgentSession = struct {
     policy: SessionPolicy,
     state_value: state_mod.State = .{},
     active_run: ?ActiveRun = null,
+    owner_call_active: bool = false,
     next_command_id: u64 = 1,
     event_sink: ?event_mod.Sink = null,
     durable_appender: durable_mod.Appender = .disabled,
@@ -207,6 +208,9 @@ pub const AgentSession = struct {
     }
 
     pub fn submit(self: *AgentSession, command: command_mod.Command) error{OutOfMemory}!command_mod.SubmitResult {
+        self.enterOwnerCall();
+        defer self.leaveOwnerCall();
+
         switch (command) {
             .follow_up => |follow_up| return self.submitFollowUp(follow_up),
             .steer => |steer| return self.submitSteer(steer),
@@ -224,6 +228,9 @@ pub const AgentSession = struct {
     }
 
     pub fn drainCommands(self: *AgentSession) void {
+        self.enterOwnerCall();
+        defer self.leaveOwnerCall();
+
         if (self.drainAbortControl() == .stop_draining) return;
         while (self.commands.pop()) |queued| {
             var owned = queued;
@@ -293,6 +300,9 @@ pub const AgentSession = struct {
     }
 
     pub fn completeRun(self: *AgentSession, completion: *RunCompletion) CompleteRunResult {
+        self.enterOwnerCall();
+        defer self.leaveOwnerCall();
+
         defer completion.deinit();
         const active = self.active_run orelse return .{ .rejected = .no_active_run };
         if (active.execution != .external_completion) return .{ .rejected = .wrong_execution };
@@ -343,6 +353,9 @@ pub const AgentSession = struct {
     }
 
     fn emit(self: *AgentSession, value: event_mod.Event) void {
+        // Event sinks run synchronously inside the current owner call. They may
+        // observe AgentSession state, but public owner entry points assert
+        // against reentrant mutation.
         if (self.event_sink) |sink| sink.emit(value);
     }
 
@@ -648,6 +661,16 @@ pub const AgentSession = struct {
             .running, .aborting => std.debug.assert(self.active_run != null),
             .idle, .failed => std.debug.assert(self.active_run == null),
         }
+    }
+
+    fn enterOwnerCall(self: *AgentSession) void {
+        std.debug.assert(!self.owner_call_active);
+        self.owner_call_active = true;
+    }
+
+    fn leaveOwnerCall(self: *AgentSession) void {
+        std.debug.assert(self.owner_call_active);
+        self.owner_call_active = false;
     }
 
     fn activeCommandId(self: *const AgentSession) command_mod.CommandId {
