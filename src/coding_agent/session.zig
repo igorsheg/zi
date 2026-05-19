@@ -192,14 +192,14 @@ pub const AgentSession = struct {
         return self;
     }
 
+    // deinit is destructive cleanup. It does not emit terminal events or
+    // perform graceful cancellation. Runtime-backed execution must be shut down
+    // before deinit so no completion can arrive after this object is destroyed.
     pub fn deinit(self: *AgentSession) void {
-        while (self.commands.pop()) |queued| {
-            var owned = queued;
-            owned.deinit(self.allocator);
-        }
+        self.clearQueuedCommands();
         self.clearActiveRun();
         self.clearPendingFollowUps();
-        self.pending_abort = null;
+        self.clearPendingAbort();
         self.pending_follow_ups.deinit();
         self.commands.deinit();
         self.policy.deinit();
@@ -576,6 +576,17 @@ pub const AgentSession = struct {
             var owned = queued;
             owned.deinit(self.allocator);
         }
+    }
+
+    fn clearQueuedCommands(self: *AgentSession) void {
+        while (self.commands.pop()) |queued| {
+            var owned = queued;
+            owned.deinit(self.allocator);
+        }
+    }
+
+    fn clearPendingAbort(self: *AgentSession) void {
+        self.pending_abort = null;
     }
 
     fn refreshActivityCounts(self: *AgentSession) void {
