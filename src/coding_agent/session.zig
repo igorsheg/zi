@@ -478,8 +478,7 @@ pub const AgentSession = struct {
 
     fn runSynchronous(self: *AgentSession, backend: ExecutionBackend) void {
         std.debug.assert(self.active_run != null);
-        const messages = self.active_run.?.input_messages;
-        const spec = self.buildRunSpec(backend, messages) orelse {
+        const submission = self.buildRunSubmission(backend) orelse {
             const failure: SessionRunFailure = .missing_model;
             const command_id = self.activeRunCommandId();
             self.clearActiveRun();
@@ -489,22 +488,28 @@ pub const AgentSession = struct {
             return;
         };
 
-        var capture = RunCapture{ .allocator = self.allocator, .input_count = messages.len };
+        var capture = RunCapture{ .allocator = self.allocator, .input_count = submission.spec.input.messages.len };
         defer capture.deinit();
 
         const token = self.active_run.?.cancel_source.beginRun();
-        var run = agent_mod.Run.init(self.allocator, spec.input, .{ .emit_fn = RunCapture.emit, .ctx = &capture }, token);
+        var run = agent_mod.Run.init(self.allocator, submission.spec.input, .{ .emit_fn = RunCapture.emit, .ctx = &capture }, token);
         defer run.deinit();
 
-        run.runStream(spec.config);
+        run.runStream(submission.spec.config);
         if (capture.takeTerminal()) |terminal| {
-            var completion = RunCompletion{ .command_id = self.activeRunCommandId(), .terminal = terminal };
+            var completion = RunCompletion{ .command_id = submission.run_command_id, .terminal = terminal };
             self.completeSynchronousRun(&completion);
         } else {
             const terminal = OwnedRunTerminal.failed(self.allocator, &.{}, .internal) catch @panic("OOM while recording missing run terminal");
-            var completion = RunCompletion{ .command_id = self.activeRunCommandId(), .terminal = terminal };
+            var completion = RunCompletion{ .command_id = submission.run_command_id, .terminal = terminal };
             self.completeSynchronousRun(&completion);
         }
+    }
+
+    fn buildRunSubmission(self: *const AgentSession, backend: ExecutionBackend) ?run_executor_mod.Submission {
+        const active = self.active_run orelse std.debug.panic("run submission requires active run", .{});
+        const spec = self.buildRunSpec(backend, active.input_messages) orelse return null;
+        return .{ .run_command_id = active.command_id, .spec = spec };
     }
 
     fn buildRunSpec(self: *const AgentSession, backend: ExecutionBackend, messages: []const agent_mod.AgentMessage) ?RunSpec {
