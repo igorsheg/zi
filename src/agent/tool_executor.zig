@@ -53,9 +53,9 @@ pub const Executor = struct {
         return null;
     }
 
-    fn emitCompletion(completion: tool.ToolCompletion, ctx: ?*anyopaque) void {
+    fn emitCompletion(completion: *tool.ToolCompletion, ctx: ?*anyopaque) void {
         const self: *Executor = @ptrCast(@alignCast(ctx.?));
-        switch (completion) {
+        switch (completion.*) {
             .update => |update| {
                 if (self.updates.push(update)) |_| {} else |_| {
                     update.deinit(self.allocator);
@@ -66,6 +66,7 @@ pub const Executor = struct {
                 self.terminals.push(terminal) catch unreachable;
             },
         }
+        completion.* = undefined;
     }
 };
 
@@ -77,13 +78,14 @@ test "tool executor reserves terminal capacity for accepted ops" {
     try std.testing.expectError(error.TooManyToolOperations, executor.reserveTerminal());
 
     const sink = executor.sink();
-    sink.emit(.{ .terminal = .{
+    var emitted = tool.ToolCompletion{ .terminal = .{
         .op_id = 1,
         .source_index = 0,
         .tool_call_id = "tool-1",
         .tool_name = "read",
         .terminal = .{ .completed = .{ .content = &.{} } },
-    } });
+    } };
+    sink.emit(&emitted);
     const completion = executor.next().?;
     switch (completion) {
         .terminal => {},

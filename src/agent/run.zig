@@ -377,13 +377,14 @@ test "run observes cancellation before stream start" {
 }
 
 fn completeRead(_: ?*anyopaque, _: std.mem.Allocator, invocation: @import("tool.zig").ToolInvocation, sink: @import("tool.zig").ToolCompletionSink) void {
-    sink.emit(.{ .terminal = .{
+    var completion = @import("tool.zig").ToolCompletion{ .terminal = .{
         .op_id = invocation.op_id,
         .source_index = invocation.source_index,
         .tool_call_id = invocation.tool_call_id,
         .tool_name = invocation.tool_name,
         .terminal = .{ .completed = .{ .content = &.{}, .is_error = false } },
-    } });
+    } };
+    sink.emit(&completion);
 }
 
 test "run executes tool turn then continues to final assistant" {

@@ -38,9 +38,14 @@ pub const AgentToolResult = struct {
 pub const ToolInvocation = struct {
     op_id: ToolOpId,
     source_index: usize,
+    // Borrowed invocation ingress. Synchronous tools may inspect these fields
+    // during execute. Async/runtime-backed tools must clone any retained id,
+    // name, or args into operation-owned memory before returning.
     tool_call_id: []const u8,
     tool_name: []const u8,
     args: json_value.BorrowedValue,
+    // Scoped cancellation intent. Tools may observe it, but cancellation
+    // completion is a ToolTerminal.aborted completion emitted through the sink.
     signal: cancel.Token,
 };
 
@@ -97,9 +102,12 @@ pub const AgentTool = struct {
 
 pub const ToolCompletionSink = struct {
     ctx: ?*anyopaque = null,
-    emit_fn: *const fn (completion: ToolCompletion, ctx: ?*anyopaque) void,
+    // Synchronous consumption boundary. ToolCompletion can contain owned heap
+    // payloads and must not be bitwise-copied by value. The callee consumes the
+    // pointed-to completion before returning.
+    emit_fn: *const fn (completion: *ToolCompletion, ctx: ?*anyopaque) void,
 
-    pub fn emit(self: ToolCompletionSink, completion: ToolCompletion) void {
+    pub fn emit(self: ToolCompletionSink, completion: *ToolCompletion) void {
         self.emit_fn(completion, self.ctx);
     }
 };

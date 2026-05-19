@@ -197,13 +197,14 @@ fn jsonCloneOrNull(allocator: std.mem.Allocator, value: json_value.OwnedValue) !
 fn noopEvent(_: event.AgentEvent, _: ?*anyopaque) void {}
 
 fn completeTool(_: ?*anyopaque, _: std.mem.Allocator, invocation: tool.ToolInvocation, sink: tool.ToolCompletionSink) void {
-    sink.emit(.{ .terminal = .{
+    var completion = tool.ToolCompletion{ .terminal = .{
         .op_id = invocation.op_id,
         .source_index = invocation.source_index,
         .tool_call_id = invocation.tool_call_id,
         .tool_name = invocation.tool_name,
         .terminal = .{ .completed = .{ .content = &.{}, .is_error = false } },
-    } });
+    } };
+    sink.emit(&completion);
 }
 
 test "tool turn executes and finalizes tool result" {
