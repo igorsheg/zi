@@ -4,6 +4,7 @@ pub const state = @import("state.zig");
 pub const extension = @import("extension.zig");
 pub const durable = @import("durable.zig");
 pub const durable_store = @import("durable_store.zig");
+pub const builtin_tools = @import("builtin_tools.zig");
 pub const run_completion = @import("run_completion.zig");
 pub const run_executor = @import("run_executor.zig");
 pub const session = @import("session.zig");
