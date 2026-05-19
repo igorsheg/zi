@@ -2,6 +2,19 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const json_value = @import("../json/value.zig");
 
+pub const max_registered_tools: usize = 128;
+pub const max_tool_name_len: usize = 128;
+pub const max_tool_description_len: usize = 4096;
+
+pub const InitError = error{
+    TooManyTools,
+    EmptyToolName,
+    ToolNameTooLong,
+    ToolDescriptionTooLong,
+    DuplicateToolName,
+    OutOfMemory,
+};
+
 pub const Host = union(enum) {
     disabled,
     registry: ToolRegistry,
@@ -10,7 +23,7 @@ pub const Host = union(enum) {
         return .disabled;
     }
 
-    pub fn initTools(allocator: std.mem.Allocator, source: []const agent_mod.AgentTool) !Host {
+    pub fn initTools(allocator: std.mem.Allocator, source: []const agent_mod.AgentTool) InitError!Host {
         return .{ .registry = try ToolRegistry.init(allocator, source) };
     }
 
@@ -35,7 +48,9 @@ pub const ToolRegistry = struct {
     tools: []agent_mod.AgentTool,
     parameters: []json_value.OwnedValue,
 
-    pub fn init(allocator: std.mem.Allocator, source: []const agent_mod.AgentTool) !ToolRegistry {
+    pub fn init(allocator: std.mem.Allocator, source: []const agent_mod.AgentTool) InitError!ToolRegistry {
+        try validateTools(source);
+
         const tools = try allocator.alloc(agent_mod.AgentTool, source.len);
         errdefer allocator.free(tools);
         const parameters = try allocator.alloc(json_value.OwnedValue, source.len);
@@ -78,6 +93,18 @@ pub const ToolRegistry = struct {
     }
 };
 
+fn validateTools(source: []const agent_mod.AgentTool) InitError!void {
+    if (source.len > max_registered_tools) return error.TooManyTools;
+    for (source, 0..) |tool, i| {
+        if (tool.name.len == 0) return error.EmptyToolName;
+        if (tool.name.len > max_tool_name_len) return error.ToolNameTooLong;
+        if (tool.description.len > max_tool_description_len) return error.ToolDescriptionTooLong;
+        for (source[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, tool.name)) return error.DuplicateToolName;
+        }
+    }
+}
+
 const ClonedToolDescriptor = struct {
     name: []const u8,
     description: []const u8,
@@ -109,4 +136,23 @@ test "extension host owns registered tool descriptors" {
     try std.testing.expect(tools[0].description.ptr != source[0].description.ptr);
     try std.testing.expect(tools[0].parameters == .string);
     try std.testing.expectEqualStrings("schema", tools[0].parameters.string);
+}
+
+test "extension host rejects oversized tool registry" {
+    const source = [_]agent_mod.AgentTool{.{ .name = "read", .description = "", .parameters = .null, .execute_fn = noopTool }} ** (max_registered_tools + 1);
+
+    try std.testing.expectError(error.TooManyTools, Host.initTools(std.testing.allocator, &source));
+}
+
+test "extension host rejects invalid tool descriptors" {
+    const too_long_name = "a" ** (max_tool_name_len + 1);
+    const too_long_description = "a" ** (max_tool_description_len + 1);
+
+    try std.testing.expectError(error.EmptyToolName, Host.initTools(std.testing.allocator, &.{.{ .name = "", .description = "", .parameters = .null, .execute_fn = noopTool }}));
+    try std.testing.expectError(error.ToolNameTooLong, Host.initTools(std.testing.allocator, &.{.{ .name = too_long_name, .description = "", .parameters = .null, .execute_fn = noopTool }}));
+    try std.testing.expectError(error.ToolDescriptionTooLong, Host.initTools(std.testing.allocator, &.{.{ .name = "read", .description = too_long_description, .parameters = .null, .execute_fn = noopTool }}));
+    try std.testing.expectError(error.DuplicateToolName, Host.initTools(std.testing.allocator, &.{
+        .{ .name = "read", .description = "", .parameters = .null, .execute_fn = noopTool },
+        .{ .name = "read", .description = "other", .parameters = .null, .execute_fn = noopTool },
+    }));
 }
