@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const cancel = @import("../runtime/cancel.zig");
 const command_mod = @import("command.zig");
+const event_mod = @import("event.zig");
 const run_completion_mod = @import("run_completion.zig");
 const state_mod = @import("state.zig");
 
@@ -54,6 +55,15 @@ pub const CompletionSink = struct {
     }
 };
 
+pub const EventSink = struct {
+    ctx: ?*anyopaque = null,
+    emit_fn: *const fn (event: event_mod.Event, ctx: ?*anyopaque) void,
+
+    pub fn emit(self: EventSink, event: event_mod.Event) void {
+        self.emit_fn(event, self.ctx);
+    }
+};
+
 pub const Contract = struct {
     completion_delivery: CompletionDelivery,
     max_in_flight: usize,
@@ -88,8 +98,9 @@ pub const SynchronousExecutor = struct {
         submission: Submission,
         token: cancel.Token,
         completion_sink: CompletionSink,
+        event_sink: ?EventSink,
     ) void {
-        var capture = RunCapture{ .allocator = allocator, .input_count = submission.spec.input.messages.len };
+        var capture = RunCapture{ .allocator = allocator, .run_command_id = submission.run_command_id, .input_count = submission.spec.input.messages.len, .event_sink = event_sink };
         defer capture.deinit();
 
         var run_value = agent_mod.Run.init(allocator, submission.spec.input, .{ .emit_fn = RunCapture.emit, .ctx = &capture }, token);
@@ -109,13 +120,21 @@ pub const SynchronousExecutor = struct {
 
 const RunCapture = struct {
     allocator: std.mem.Allocator,
+    run_command_id: command_mod.CommandId,
     input_count: usize,
+    event_sink: ?EventSink = null,
     terminal: ?run_completion_mod.OwnedRunTerminal = null,
 
     fn emit(value: agent_mod.AgentEvent, ctx: ?*anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
-        if (value != .lifecycle) return;
-        const lifecycle = value.lifecycle;
+        switch (value) {
+            .lifecycle => |lifecycle| self.captureLifecycle(lifecycle),
+            .tool => |tool| self.emitTool(tool),
+            .message => {},
+        }
+    }
+
+    fn captureLifecycle(self: *RunCapture, lifecycle: agent_mod.event.Lifecycle) void {
         if (lifecycle != .run_finished) return;
         if (self.terminal != null) return;
 
@@ -124,6 +143,26 @@ const RunCapture = struct {
             .failed => |failed| run_completion_mod.OwnedRunTerminal.failed(self.allocator, self.outputMessages(failed.messages), failureKind(failed.reason)) catch |err| oomTerminal(self.allocator, err),
             .aborted => |aborted| run_completion_mod.OwnedRunTerminal.aborted(self.allocator, self.outputMessages(aborted.messages)) catch |err| oomTerminal(self.allocator, err),
         };
+    }
+
+    fn emitTool(self: *RunCapture, tool: agent_mod.event.ToolEvent) void {
+        const sink = self.event_sink orelse return;
+        switch (tool) {
+            .started => |started| sink.emit(.{ .run = .{ .tool_started = .{
+                .run_command_id = self.run_command_id,
+                .op_id = started.op_id,
+                .tool_call_id = started.tool_call_id,
+                .tool_name = started.tool_name,
+            } } }),
+            .update => {},
+            .finished => |finished| sink.emit(.{ .run = .{ .tool_finished = .{
+                .run_command_id = self.run_command_id,
+                .op_id = finished.op_id,
+                .tool_call_id = finished.tool_call_id,
+                .tool_name = finished.tool_name,
+                .terminal = toolTerminal(finished.terminal),
+            } } }),
+        }
     }
 
     fn outputMessages(self: *const RunCapture, messages: []const agent_mod.AgentMessage) []const agent_mod.AgentMessage {
@@ -155,6 +194,14 @@ fn failureKind(value: agent_mod.failure.Failure) state_mod.FailureKind {
         .tool_failed => .tool_failed,
         .tool_protocol_violation => .tool_protocol_violation,
         .internal => .internal,
+    };
+}
+
+fn toolTerminal(value: agent_mod.tool.ToolTerminal) event_mod.ToolTerminal {
+    return switch (value) {
+        .completed => .completed,
+        .failed => .failed,
+        .aborted => .aborted,
     };
 }
 
@@ -310,7 +357,7 @@ test "synchronous executor publishes one completed run completion" {
     defer capture.deinit();
     const submission = testSubmission(@enumFromInt(11), .{ .call_fn = completeWithAssistant });
 
-    SynchronousExecutor.run(std.testing.allocator, submission, .none, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture });
+    SynchronousExecutor.run(std.testing.allocator, submission, .none, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture }, null);
 
     try std.testing.expectEqual(@as(command_mod.CommandId, @enumFromInt(11)), capture.command_id.?);
     try std.testing.expect(capture.terminal.?.status == .completed);
@@ -320,7 +367,7 @@ test "synchronous executor publishes failed run completion" {
     var capture = CompletionCapture{};
     defer capture.deinit();
 
-    SynchronousExecutor.run(std.testing.allocator, testSubmission(@enumFromInt(12), .{ .call_fn = failWithAssistant }), .none, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture });
+    SynchronousExecutor.run(std.testing.allocator, testSubmission(@enumFromInt(12), .{ .call_fn = failWithAssistant }), .none, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture }, null);
 
     try std.testing.expectEqual(@as(command_mod.CommandId, @enumFromInt(12)), capture.command_id.?);
     try std.testing.expect(capture.terminal.?.status == .failed);
@@ -334,7 +381,7 @@ test "synchronous executor publishes aborted run completion" {
     const token = source.beginRun();
     source.requestAbort();
 
-    SynchronousExecutor.run(std.testing.allocator, testSubmission(@enumFromInt(13), .{ .call_fn = completeWithAssistant }), token, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture });
+    SynchronousExecutor.run(std.testing.allocator, testSubmission(@enumFromInt(13), .{ .call_fn = completeWithAssistant }), token, .{ .complete_fn = CompletionCapture.complete, .ctx = &capture }, null);
 
     try std.testing.expectEqual(@as(command_mod.CommandId, @enumFromInt(13)), capture.command_id.?);
     try std.testing.expect(capture.terminal.?.status == .aborted);

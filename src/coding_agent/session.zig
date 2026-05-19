@@ -496,7 +496,8 @@ pub const AgentSession = struct {
 
         const token = self.active_run.?.cancel_source.beginRun();
         const completion_sink = run_executor_mod.CompletionSink{ .complete_fn = completeSynchronousRunFromExecutor, .ctx = self };
-        run_executor_mod.SynchronousExecutor.run(self.allocator, submission, token, completion_sink);
+        const event_sink = run_executor_mod.EventSink{ .emit_fn = emitRunEventFromExecutor, .ctx = self };
+        run_executor_mod.SynchronousExecutor.run(self.allocator, submission, token, completion_sink, event_sink);
     }
 
     fn buildRunSubmission(self: *const AgentSession, backend: ExecutionBackend) ?run_executor_mod.Submission {
@@ -534,6 +535,11 @@ pub const AgentSession = struct {
     fn completeSynchronousRunFromExecutor(completion: *RunCompletion, ctx: ?*anyopaque) void {
         const self: *AgentSession = @ptrCast(@alignCast(ctx.?));
         self.completeSynchronousRun(completion);
+    }
+
+    fn emitRunEventFromExecutor(event: event_mod.Event, ctx: ?*anyopaque) void {
+        const self: *AgentSession = @ptrCast(@alignCast(ctx.?));
+        self.emit(event);
     }
 
     fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) DurableAppend {
@@ -845,7 +851,7 @@ fn freeMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentM
     allocator.free(messages);
 }
 
-const observed_event_count = 16;
+const observed_event_count = 18;
 const ObservedEvent = enum {
     command_accepted,
     command_rejected,
@@ -855,6 +861,8 @@ const ObservedEvent = enum {
     run_started,
     run_follow_up_queued,
     run_abort_requested,
+    run_tool_started,
+    run_tool_finished,
     run_finished_completed,
     run_finished_failed,
     run_finished_aborted,
@@ -881,6 +889,8 @@ const EventCollector = struct {
                 .started => .run_started,
                 .follow_up_queued => .run_follow_up_queued,
                 .abort_requested => .run_abort_requested,
+                .tool_started => .run_tool_started,
+                .tool_finished => .run_tool_finished,
                 .finished => |finished| switch (finished.terminal) {
                     .completed => .run_finished_completed,
                     .failed => .run_finished_failed,
@@ -900,6 +910,22 @@ fn testAssistantMessage() agent_mod.AgentMessage {
         .model = "test",
         .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
         .stop_reason = .stop,
+        .timestamp = 1,
+    } };
+}
+
+fn testToolUseAssistantMessage() agent_mod.AgentMessage {
+    const json_value = @import("../json/value.zig");
+    const content = struct {
+        const blocks = [_]ai.protocol.AssistantMessage.AssistantContentBlock{.{ .tool_call = .{ .id = "tool-1", .name = "read", .arguments = json_value.OwnedValue.nullValue() } }};
+    }.blocks;
+    return .{ .assistant = .{
+        .content = &content,
+        .api = .openai_responses,
+        .provider = .openai,
+        .model = "test",
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .stop_reason = .toolUse,
         .timestamp = 1,
     } };
 }
@@ -1100,6 +1126,50 @@ test "extension host tools are exposed through run spec" {
     try std.testing.expectEqualStrings("read", capture.tool_name);
 }
 
+test "synchronous tool execution emits coding agent tool events" {
+    const Capture = struct {
+        calls: usize = 0,
+
+        fn stream(ctx: ?*anyopaque, _: std.mem.Allocator, _: agent_mod.message.Model, _: ai.protocol.Context, _: ai.protocol.SimpleStreamOptions, sink: ai.provider.StreamEventSink) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            if (self.calls == 1) {
+                sink.emit(.{ .done = .{ .reason = .toolUse, .message = testToolUseAssistantMessage().assistant } });
+            } else {
+                sink.emit(.{ .done = .{ .reason = .stop, .message = testAssistantMessage().assistant } });
+            }
+        }
+    };
+    const Tool = struct {
+        fn execute(_: ?*anyopaque, _: std.mem.Allocator, invocation: agent_mod.tool.ToolInvocation, sink: agent_mod.tool.ToolCompletionSink) void {
+            var completion = agent_mod.tool.ToolCompletion{ .terminal = .{
+                .op_id = invocation.op_id,
+                .source_index = invocation.source_index,
+                .tool_call_id = invocation.tool_call_id,
+                .tool_name = invocation.tool_name,
+                .terminal = .{ .completed = .{ .content = &.{}, .is_error = false } },
+            } };
+            sink.emit(&completion);
+        }
+    };
+
+    var capture = Capture{};
+    var events = EventCollector{};
+    const source_tools = [_]agent_mod.AgentTool{.{ .name = "read", .description = "read files", .parameters = .null, .execute_fn = Tool.execute }};
+    var session = try AgentSession.init(std.testing.allocator, .{
+        .policy = testPolicy(),
+        .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
+        .extension_host = try extension_mod.Host.initTools(std.testing.allocator, &source_tools),
+        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop } } },
+    });
+    defer session.deinit();
+
+    _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
+    session.drainCommands();
+
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .run_tool_started, .run_tool_finished, .run_finished_completed }, events.items[0..events.len]);
+}
+
 test "policy commands are rejected while running" {
     var session = try AgentSession.init(std.testing.allocator, .{
         .policy = testPolicy(),
@@ -1220,6 +1290,7 @@ test "abort in external completion mode keeps original run command id" {
                 },
                 .finished => |finished| self.finished_command_id = finished.command_id,
                 .follow_up_queued => {},
+                .tool_started, .tool_finished => {},
                 .started => {},
             }
         }
@@ -1268,6 +1339,7 @@ test "abort control drains before queued future runs" {
                     if (self.saw_abort) self.started_after_abort = true;
                 },
                 .follow_up_queued => {},
+                .tool_started, .tool_finished => {},
                 .finished => {},
             }
         }
