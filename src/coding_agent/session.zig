@@ -1186,8 +1186,8 @@ test "policy commands are rejected while running" {
 
 test "follow up while running emits queued fact with active run id" {
     const Collector = struct {
-        command_id: command_mod.CommandId = @enumFromInt(0),
-        run_command_id: command_mod.CommandId = @enumFromInt(0),
+        command_id: ?command_mod.CommandId = null,
+        run_command_id: ?command_mod.CommandId = null,
         pending_follow_ups: usize = 0,
         state_pending_follow_ups: usize = 0,
         session: *AgentSession,
@@ -1213,8 +1213,8 @@ test "follow up while running emits queued fact with active run id" {
     session.drainCommands();
     const follow_up_id = (try session.submit(.{ .follow_up = .{ .messages = &.{} } })).accepted;
 
-    try std.testing.expectEqual(follow_up_id, collector.command_id);
-    try std.testing.expectEqual(run_id, collector.run_command_id);
+    try std.testing.expectEqual(follow_up_id, collector.command_id.?);
+    try std.testing.expectEqual(run_id, collector.run_command_id.?);
     try std.testing.expectEqual(@as(usize, 1), collector.pending_follow_ups);
     try std.testing.expectEqual(@as(usize, 1), collector.state_pending_follow_ups);
 }
@@ -1275,9 +1275,9 @@ test "synchronous drain continues after completed queued run" {
 
 test "abort in external completion mode keeps original run command id" {
     const Collector = struct {
-        finished_command_id: command_mod.CommandId = @enumFromInt(0),
-        abort_command_id: command_mod.CommandId = @enumFromInt(0),
-        abort_run_command_id: command_mod.CommandId = @enumFromInt(0),
+        finished_command_id: ?command_mod.CommandId = null,
+        abort_command_id: ?command_mod.CommandId = null,
+        abort_run_command_id: ?command_mod.CommandId = null,
 
         fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
@@ -1308,20 +1308,20 @@ test "abort in external completion mode keeps original run command id" {
 
     try std.testing.expect(session.state().activity == .aborting);
     try std.testing.expectEqual(started, session.state().activity.aborting.run_command_id);
-    try std.testing.expectEqual(abort_command_id, collector.abort_command_id);
-    try std.testing.expectEqual(started, collector.abort_run_command_id);
+    try std.testing.expectEqual(abort_command_id, collector.abort_command_id.?);
+    try std.testing.expectEqual(started, collector.abort_run_command_id.?);
 
     const terminal = try OwnedRunTerminal.aborted(std.testing.allocator, &.{});
     var completion = RunCompletion{ .command_id = session.activeRunCommandId(), .terminal = terminal };
     _ = session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .idle);
-    try std.testing.expectEqual(started, collector.finished_command_id);
+    try std.testing.expectEqual(started, collector.finished_command_id.?);
 }
 
 test "abort control drains before queued future runs" {
     const Collector = struct {
-        abort_run_command_id: command_mod.CommandId = @enumFromInt(0),
+        abort_run_command_id: ?command_mod.CommandId = null,
         started_after_abort: bool = false,
         saw_abort: bool = false,
 
@@ -1362,7 +1362,7 @@ test "abort control drains before queued future runs" {
 
     try std.testing.expect(session.state().activity == .aborting);
     try std.testing.expectEqual(first, session.state().activity.aborting.run_command_id);
-    try std.testing.expectEqual(first, collector.abort_run_command_id);
+    try std.testing.expectEqual(first, collector.abort_run_command_id.?);
     try std.testing.expect(!collector.started_after_abort);
 }
 
