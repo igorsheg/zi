@@ -490,6 +490,10 @@ pub const AgentSession = struct {
         if (capture.takeTerminal()) |terminal| {
             var completion = RunCompletion{ .command_id = self.activeRunCommandId(), .terminal = terminal };
             self.completeSynchronousRun(&completion);
+        } else {
+            const terminal = OwnedRunTerminal.failed(self.allocator, &.{}, .internal) catch @panic("OOM while recording missing run terminal");
+            var completion = RunCompletion{ .command_id = self.activeRunCommandId(), .terminal = terminal };
+            self.completeSynchronousRun(&completion);
         }
     }
 
@@ -953,6 +957,7 @@ fn failureKind(value: agent_mod.failure.Failure) state_mod.FailureKind {
 const observed_event_count = 16;
 const ObservedEvent = enum {
     command_accepted,
+    command_rejected,
     session_appended,
     append_rejected,
     append_failed,
@@ -974,7 +979,7 @@ const EventCollector = struct {
         self.items[self.len] = switch (value) {
             .command => |command| switch (command) {
                 .accepted => .command_accepted,
-                .rejected => .append_rejected,
+                .rejected => .command_rejected,
             },
             .session => |session| switch (session) {
                 .appended => .session_appended,
