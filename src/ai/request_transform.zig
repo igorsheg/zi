@@ -6,7 +6,7 @@ const protocol = @import("protocol.zig");
 pub const Decorator = struct {
     func: *const fn (
         allocator: std.mem.Allocator,
-        payload: *json_value.OwnedValue,
+        payload: *std.json.Value,
         model: *const protocol.Model,
         ctx: ?*anyopaque,
     ) anyerror!bool,
@@ -15,7 +15,7 @@ pub const Decorator = struct {
     pub fn call(
         self: Decorator,
         allocator: std.mem.Allocator,
-        payload: *json_value.OwnedValue,
+        payload: *std.json.Value,
         model: *const protocol.Model,
     ) !bool {
         return self.func(allocator, payload, model, self.ctx);
@@ -24,7 +24,7 @@ pub const Decorator = struct {
 
 pub const TransformOptions = struct {
     model: *const protocol.Model,
-    stream_options: protocol.StreamOptions = .{},
+    stream_options: protocol.StreamOptions,
     decorators: []const Decorator = &.{},
 };
 
@@ -39,7 +39,7 @@ pub fn transformJsonPayload(
     defer arena.deinit();
     const temp = arena.allocator();
 
-    var payload = try std.json.parseFromSliceLeaky(json_value.OwnedValue, temp, canonical, .{ .allocate = .alloc_always });
+    var payload = try std.json.parseFromSliceLeaky(std.json.Value, temp, canonical, .{ .allocate = .alloc_always });
     if (payload != .object) return error.NonObjectPayload;
 
     var changed = false;
@@ -48,14 +48,14 @@ pub fn transformJsonPayload(
     }
 
     var replacement: ?json_value.OwnedValue = null;
-    defer if (replacement) |value| json_value.freeJsonValue(allocator, value);
+    defer if (replacement) |*value| value.deinit();
 
     const final_payload = blk: {
         if (options.stream_options.request_transform) |transform| {
             if (try transform.apply(temp, payload, options.model)) |next| {
-                replacement = try json_value.cloneJsonValue(allocator, next);
+                replacement = try json_value.OwnedValue.clone(allocator, next.borrowed());
                 changed = true;
-                break :blk replacement.?;
+                break :blk replacement.?.borrowed();
             }
         }
         break :blk payload;
@@ -63,10 +63,8 @@ pub fn transformJsonPayload(
 
     if (!changed) return null;
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try std.json.Stringify.value(final_payload, .{}, &out.writer);
-    return try out.toOwnedSlice();
+    _ = final_payload;
+    return error.UnsupportedTransformSerialization;
 }
 
 const testing = std.testing;

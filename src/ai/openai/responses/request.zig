@@ -1,6 +1,7 @@
 const std = @import("std");
 const protocol = @import("../../protocol.zig");
 const json_text = @import("../../../json/text.zig");
+const json_value = @import("../../../json/value.zig");
 const replay = @import("replay.zig");
 
 pub fn writeBaseFields(jw: *std.json.Stringify, model: protocol.Model) !void {
@@ -32,7 +33,7 @@ pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, strict_
         try jw.objectField("description");
         try jw.write(tool.description);
         try jw.objectField("parameters");
-        try jw.write(tool.parameters);
+        try json_value.writeJsonValue(jw.writer, tool.parameters);
         switch (strict_mode) {
             .omit => {},
             .false_value => {
@@ -352,7 +353,7 @@ fn writeAssistantMessage(
             if (th.thinking_signature) |sig| {
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, sig, .{}) catch continue;
                 defer parsed.deinit();
-                try jw.write(parsed.value);
+                try json_value.writeJsonValue(jw.writer, parsed.value);
             }
         },
         .text => |tc| {
@@ -437,8 +438,7 @@ fn writeAssistantMessage(
             try jw.objectField("arguments");
             var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
-            var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
-            try inner.write(tcall.arguments);
+            try json_value.writeJsonValue(&args_buf.writer, tcall.arguments.borrowed());
             try jw.write(args_buf.written());
             try jw.endObject();
         },

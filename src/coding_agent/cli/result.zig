@@ -9,4 +9,5 @@ pub const Diagnostic = union(enum) {
     missing_model,
     unknown_model,
     provider_unavailable,
+    missing_api_key,
 };

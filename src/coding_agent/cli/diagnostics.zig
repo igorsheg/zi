@@ -27,6 +27,7 @@ pub fn writeResult(writer: anytype, diag: result_mod.Diagnostic) !void {
         .missing_model => try writer.writeAll("missing model runtime\n"),
         .unknown_model => try writer.writeAll("unknown model\n"),
         .provider_unavailable => try writer.writeAll("provider runtime unavailable\n"),
+        .missing_api_key => try writer.writeAll("missing OPENAI_API_KEY\n"),
     }
 }
 

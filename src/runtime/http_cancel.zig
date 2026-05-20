@@ -64,7 +64,7 @@ pub const ShutdownOnCancel = union(enum) {
                 interruptRequest(state.io, state.stream);
                 return;
             }
-            std.Thread.sleep(poll_interval_ns);
+            state.io.sleep(.fromNanoseconds(poll_interval_ns), .boot) catch {};
         }
     }
 

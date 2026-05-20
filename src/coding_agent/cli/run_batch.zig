@@ -96,6 +96,7 @@ fn resolveExecution(ctx: Context, run_plan: plan_mod.RunPlan, demo_backend: *Dem
     const model = runtime.resolveModel(model_ref) orelse return .{ .err = .unknown_model };
     const backend = runtime.executionBackend(model) catch |err| switch (err) {
         error.ProviderUnavailable => return .{ .err = .provider_unavailable },
+        error.MissingApiKey => return .{ .err = .missing_api_key },
     };
     return .{ .ok = .{ .model = model, .backend = backend } };
 }

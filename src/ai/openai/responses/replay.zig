@@ -237,8 +237,7 @@ fn appendAssistantItems(
 
             var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
-            var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
-            try inner.write(tool_call.arguments);
+            try json_value.writeJsonValue(&args_buf.writer, tool_call.arguments.borrowed());
 
             try items.append(allocator, .{ .function_call = .{
                 .id = item_id,
@@ -368,7 +367,7 @@ fn writeConvertedResponsesInput(
         .reasoning_item => |raw_json| {
             const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch continue;
             defer parsed.deinit();
-            try jw.write(parsed.value);
+            try json_value.writeJsonValue(jw.writer, parsed.value);
         },
         .assistant_message => |msg| {
             try jw.beginObject();
@@ -844,8 +843,7 @@ fn deinitMessage(allocator: std.mem.Allocator, msg: protocol.Message) void {
 }
 
 fn deinitUserMessage(allocator: std.mem.Allocator, user: protocol.UserMessage) void {
-    var owned = user;
-    message_memory.freeUserMessage(allocator, &owned);
+    message_memory.freeUserMessage(allocator, user);
 }
 
 fn deinitAssistantMessage(allocator: std.mem.Allocator, assistant: protocol.AssistantMessage) void {
@@ -854,8 +852,7 @@ fn deinitAssistantMessage(allocator: std.mem.Allocator, assistant: protocol.Assi
 }
 
 fn deinitToolResultMessage(allocator: std.mem.Allocator, tool_result: protocol.ToolResultMessage) void {
-    var owned = tool_result;
-    message_memory.freeToolResultMessage(allocator, &owned);
+    message_memory.freeToolResultMessage(allocator, tool_result);
 }
 
 fn deinitAssistantContentList(allocator: std.mem.Allocator, content: []const protocol.AssistantMessage.AssistantContentBlock) void {

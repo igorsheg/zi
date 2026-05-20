@@ -4,6 +4,7 @@ const sse = @import("../../sse.zig");
 const ai_provider = @import("../../provider.zig");
 const provider_failure = @import("../../provider_failure.zig");
 const partial_json = @import("../../../json/partial.zig");
+const json_value = @import("../../../json/value.zig");
 const Token = protocol.CancelToken;
 
 pub const EventMapOutcome = union(enum) {
@@ -42,13 +43,15 @@ const ItemState = struct {
     tool_item_id: []const u8 = "",
     tool_name: []const u8 = "",
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
-    tool_args_parsed: std.json.Value = .null,
+    tool_args_parsed: json_value.OwnedValue = .null,
 
     tool_composite_id: []const u8 = "",
 
     fn deinit(self: *ItemState, allocator: std.mem.Allocator) void {
         self.text_buf.deinit(allocator);
         self.tool_args_partial.deinit(allocator);
+        self.tool_args_parsed.deinit();
+        if (self.thinking_signature) |signature| allocator.free(signature);
     }
 };
 
@@ -381,7 +384,7 @@ fn handleEvent(
         if (dv != .string) return;
         try it.tool_args_partial.appendSlice(allocator, dv.string);
         _ = scratch.reset(.retain_capacity);
-        it.tool_args_parsed = partial_json.parseStreaming(scratch.allocator(), it.tool_args_partial.items) catch .null;
+        it.tool_args_parsed = json_value.OwnedValue.adopt(scratch.allocator(), partial_json.parseStreaming(scratch.allocator(), it.tool_args_partial.items) catch .null);
         sink.emit(.{ .toolcall_delta = .{
             .content_index = it.block_idx,
             .delta = dv.string,
@@ -413,7 +416,7 @@ fn handleEvent(
             const final_text = try finalThinkingTextFromItem(allocator, item);
             defer allocator.free(final_text);
             try clearAndSetText(&st.text_buf, allocator, final_text);
-            st.thinking_signature = try stringifyJsonValue(allocator, item);
+            st.thinking_signature = stringifyJsonValue(allocator, item) catch return error.OutOfMemory;
             sink.emit(.{ .thinking_end = .{
                 .content_index = st.block_idx,
                 .content = st.text_buf.items,
@@ -429,7 +432,7 @@ fn handleEvent(
             const final_text = try finalMessageTextFromItem(allocator, item);
             defer allocator.free(final_text);
             try clearAndSetText(&st.text_buf, allocator, final_text);
-            st.text_signature = try encodeTextSignatureV1(allocator, st.msg_id, st.msg_phase);
+            st.text_signature = encodeTextSignatureV1(allocator, st.msg_id, st.msg_phase) catch return error.OutOfMemory;
             sink.emit(.{ .text_end = .{
                 .content_index = st.block_idx,
                 .content = st.text_buf.items,
@@ -450,13 +453,13 @@ fn handleEvent(
                 try st.tool_args_partial.appendSlice(allocator, arguments.string);
             };
             const final_args = partial_json.parseStreaming(allocator, st.tool_args_partial.items) catch .null;
-            st.tool_args_parsed = final_args;
+            st.tool_args_parsed = json_value.OwnedValue.adopt(allocator, final_args);
             st.tool_composite_id = "";
             try ensureToolCompositeId(allocator, st);
             const tc: protocol.ToolCall = .{
                 .id = st.tool_composite_id,
                 .name = st.tool_name,
-                .arguments = final_args,
+                .arguments = st.tool_args_parsed,
             };
             sink.emit(.{ .toolcall_end = .{
                 .content_index = st.block_idx,
@@ -581,9 +584,54 @@ fn buildFinalContent(allocator: std.mem.Allocator, items: []const ItemState) ![]
 
 fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
-    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
-    try jw.write(value);
+    try writeJsonValue(&out.writer, value);
     return out.toOwnedSlice();
+}
+
+fn writeJsonValue(writer: *std.Io.Writer, value: std.json.Value) !void {
+    switch (value) {
+        .null => try writer.writeAll("null"),
+        .bool => |b| try writer.writeAll(if (b) "true" else "false"),
+        .integer => |i| try writer.print("{}", .{i}),
+        .float => |f| try writer.print("{}", .{f}),
+        .number_string => |s| try writer.writeAll(s),
+        .string => |s| try writeJsonString(writer, s),
+        .array => |arr| {
+            try writer.writeByte('[');
+            for (arr.items, 0..) |item, i| {
+                if (i != 0) try writer.writeByte(',');
+                try writeJsonValue(writer, item);
+            }
+            try writer.writeByte(']');
+        },
+        .object => |obj| {
+            try writer.writeByte('{');
+            var it = obj.iterator();
+            var first = true;
+            while (it.next()) |entry| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try writeJsonString(writer, entry.key_ptr.*);
+                try writer.writeByte(':');
+                try writeJsonValue(writer, entry.value_ptr.*);
+            }
+            try writer.writeByte('}');
+        },
+    }
+}
+
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |c| switch (c) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        0...8, 11...12, 14...0x1f => try writer.print("\\u{x:0>4}", .{c}),
+        else => try writer.writeByte(c),
+    };
+    try writer.writeByte('"');
 }
 
 fn encodeTextSignatureV1(
@@ -592,17 +640,13 @@ fn encodeTextSignatureV1(
     phase: ?[]const u8,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
-    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
-    try jw.beginObject();
-    try jw.objectField("v");
-    try jw.write(@as(u8, 1));
-    try jw.objectField("id");
-    try jw.write(id);
+    try out.writer.writeAll("{\"v\":1,\"id\":");
+    try writeJsonString(&out.writer, id);
     if (phase) |p| {
-        try jw.objectField("phase");
-        try jw.write(p);
+        try out.writer.writeAll(",\"phase\":");
+        try writeJsonString(&out.writer, p);
     }
-    try jw.endObject();
+    try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
 
