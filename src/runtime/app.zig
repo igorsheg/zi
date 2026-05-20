@@ -59,11 +59,14 @@ pub fn main(init: std.process.Init) !void {
         .env = env,
         .allocator = allocator,
     };
-    const exit_code = try runCli(caps, init.minimal.args);
+    var cli_runtime = try cli.runtime.Runtime.init(allocator, init.io, env);
+    defer cli_runtime.deinit();
+
+    const exit_code = try runCli(caps, init.minimal.args, &cli_runtime);
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn runCli(caps: Caps, process_args: std.process.Args) !u8 {
+fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *cli.runtime.Runtime) !u8 {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(caps.allocator);
     var it = std.process.Args.Iterator.init(process_args);
@@ -88,10 +91,13 @@ fn runCli(caps: Caps, process_args: std.process.Args) !u8 {
     };
     defer planned.deinit(caps.allocator);
 
-    const result = try cli.dispatch.run(.{ .allocator = caps.allocator, .io = caps.io }, planned.ok);
+    const result = try cli.dispatch.run(.{ .allocator = caps.allocator, .io = caps.io, .runtime = cli_runtime }, planned.ok);
     switch (result) {
         .ok => return 0,
-        .err => return 1,
+        .err => |diag| {
+            try writeResultDiagnostic(caps.io, diag);
+            return 1;
+        },
     }
 }
 
@@ -106,5 +112,12 @@ fn writePlanDiagnostic(io: std.Io, diag: cli.plan.Diagnostic) !void {
     var buf: [1024]u8 = undefined;
     var writer = std.Io.File.stderr().writer(io, &buf);
     try cli.diagnostics.writePlan(&writer.interface, diag);
+    try writer.end();
+}
+
+fn writeResultDiagnostic(io: std.Io, diag: cli.result.Diagnostic) !void {
+    var buf: [1024]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(io, &buf);
+    try cli.diagnostics.writeResult(&writer.interface, diag);
     try writer.end();
 }

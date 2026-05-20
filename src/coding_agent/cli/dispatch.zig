@@ -2,11 +2,13 @@ const std = @import("std");
 const help = @import("help.zig");
 const plan_mod = @import("plan.zig");
 const run_batch = @import("run_batch.zig");
+const cli_runtime = @import("runtime.zig");
 const result_mod = @import("result.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    runtime: ?*cli_runtime.Runtime = null,
 };
 
 pub fn run(ctx: Context, plan: plan_mod.ExecutionPlan) !result_mod.ExecutionResult {
@@ -25,6 +27,6 @@ pub fn run(ctx: Context, plan: plan_mod.ExecutionPlan) !result_mod.ExecutionResu
             try writer.end();
             break :blk .ok;
         },
-        .run => |run_plan| try run_batch.run(.{ .allocator = ctx.allocator, .io = ctx.io }, run_plan),
+        .run => |run_plan| try run_batch.run(.{ .allocator = ctx.allocator, .io = ctx.io, .runtime = ctx.runtime }, run_plan),
     };
 }

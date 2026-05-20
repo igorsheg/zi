@@ -4,11 +4,13 @@ const agent = @import("../../agent/root.zig");
 const coding_agent = @import("../root.zig");
 const plan_mod = @import("plan.zig");
 const result_mod = @import("result.zig");
+const cli_runtime = @import("runtime.zig");
 const message_memory = @import("../../agent/message_memory.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    runtime: ?*cli_runtime.Runtime = null,
 };
 
 const EventCapture = struct {
@@ -39,16 +41,16 @@ pub fn run(ctx: Context, run_plan: plan_mod.RunPlan) !result_mod.ExecutionResult
     } else coding_agent.extension.Host.disabled;
 
     var events = EventCapture{};
-    var backend = DemoBackend{ .prompt = run_plan.prompt };
+    var demo_backend = DemoBackend{ .prompt = run_plan.prompt };
+    const resolved = switch (try resolveExecution(ctx, run_plan, &demo_backend)) {
+        .ok => |ok| ok,
+        .err => |diag| return .{ .err = diag },
+    };
     var session = try coding_agent.AgentSession.init(ctx.allocator, .{
         .event_sink = .{ .emit_fn = EventCapture.emit, .ctx = &events },
         .extension_host = extension_host,
-        .policy = .{ .model = demoModel(run_plan.model orelse "demo") },
-        .execution = .{ .synchronous = .{
-            .stream = .{ .call_fn = DemoBackend.stream, .ctx = &backend },
-            .convert_messages = .{ .call_fn = convertMessages },
-            .io = ctx.io,
-        } },
+        .policy = .{ .model = resolved.model },
+        .execution = .{ .synchronous = resolved.backend },
     });
     defer session.deinit();
 
@@ -66,6 +68,36 @@ pub fn run(ctx: Context, run_plan: plan_mod.RunPlan) !result_mod.ExecutionResult
         .completed => .ok,
         .failed, .aborted => .{ .err = .run_failed },
     };
+}
+
+const ResolvedExecution = struct {
+    model: agent.message.Model,
+    backend: coding_agent.AgentSession.ExecutionBackend,
+};
+
+const ResolveExecutionResult = union(enum) {
+    ok: ResolvedExecution,
+    err: result_mod.Diagnostic,
+};
+
+fn resolveExecution(ctx: Context, run_plan: plan_mod.RunPlan, demo_backend: *DemoBackend) !ResolveExecutionResult {
+    const model_ref = run_plan.model orelse return .{
+        .ok = .{
+            .model = demoModel("demo"),
+            .backend = .{
+            .stream = .{ .call_fn = DemoBackend.stream, .ctx = demo_backend },
+            .convert_messages = .{ .call_fn = convertMessages },
+            .io = ctx.io,
+            },
+        },
+    };
+
+    const runtime = ctx.runtime orelse return .{ .err = .missing_model };
+    const model = runtime.resolveModel(model_ref) orelse return .{ .err = .unknown_model };
+    const backend = runtime.executionBackend(model) catch |err| switch (err) {
+        error.ProviderUnavailable => return .{ .err = .provider_unavailable },
+    };
+    return .{ .ok = .{ .model = model, .backend = backend } };
 }
 
 fn writeText(ctx: Context, terminal: coding_agent.event.RunTerminal, saw_tool: bool) !void {

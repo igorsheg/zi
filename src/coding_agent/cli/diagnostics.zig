@@ -1,6 +1,7 @@
 const std = @import("std");
 const parse_mod = @import("parse.zig");
 const plan_mod = @import("plan.zig");
+const result_mod = @import("result.zig");
 const spec = @import("spec.zig");
 
 pub fn writeParse(writer: anytype, diag: parse_mod.Diagnostic) !void {
@@ -16,6 +17,16 @@ pub fn writePlan(writer: anytype, diag: plan_mod.Diagnostic) !void {
         .missing_prompt => try writer.writeAll("missing prompt\n"),
         .invalid_mode => |mode| try writer.print("invalid mode: {s}\n", .{mode}),
         .conflicting_output_modes => try writer.writeAll("conflicting output modes\n"),
+    }
+}
+
+pub fn writeResult(writer: anytype, diag: result_mod.Diagnostic) !void {
+    switch (diag) {
+        .submit_rejected => try writer.writeAll("run rejected\n"),
+        .run_failed => try writer.writeAll("run failed\n"),
+        .missing_model => try writer.writeAll("missing model runtime\n"),
+        .unknown_model => try writer.writeAll("unknown model\n"),
+        .provider_unavailable => try writer.writeAll("provider runtime unavailable\n"),
     }
 }
 
