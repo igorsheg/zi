@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const runtime_env = @import("env.zig");
 const log = @import("log.zig");
+const cli = @import("../coding_agent/cli/root.zig");
 
 pub const name = "zi";
 pub const version = build_options.version;
@@ -58,5 +59,51 @@ pub fn main(init: std.process.Init) !void {
         .env = env,
         .allocator = allocator,
     };
-    _ = caps;
+    try runCli(caps, init.minimal.args);
+}
+
+fn runCli(caps: Caps, process_args: std.process.Args) !void {
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(caps.allocator);
+    var it = std.process.Args.Iterator.init(process_args);
+    _ = it.next();
+    while (it.next()) |arg| try args.append(caps.allocator, arg);
+
+    var raw = switch (try cli.parse.parse(caps.allocator, args.items)) {
+        .ok => |command| command,
+        .err => |diag| {
+            try writeParseDiagnostic(caps.io, diag);
+            std.process.exit(1);
+        },
+    };
+    defer raw.deinit(caps.allocator);
+
+    var planned = switch (try cli.plan.build(caps.allocator, raw)) {
+        .ok => |plan| cli.plan.Result{ .ok = plan },
+        .err => |diag| {
+            try writePlanDiagnostic(caps.io, diag);
+            std.process.exit(1);
+        },
+    };
+    defer planned.deinit(caps.allocator);
+
+    const result = try cli.dispatch.run(.{ .allocator = caps.allocator, .io = caps.io }, planned.ok);
+    switch (result) {
+        .ok => {},
+        .err => std.process.exit(1),
+    }
+}
+
+fn writeParseDiagnostic(io: std.Io, diag: cli.parse.Diagnostic) !void {
+    var buf: [1024]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(io, &buf);
+    try cli.diagnostics.writeParse(&writer.interface, diag);
+    try writer.end();
+}
+
+fn writePlanDiagnostic(io: std.Io, diag: cli.plan.Diagnostic) !void {
+    var buf: [1024]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(io, &buf);
+    try cli.diagnostics.writePlan(&writer.interface, diag);
+    try writer.end();
 }

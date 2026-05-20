@@ -1,4 +1,5 @@
 pub const command = @import("command.zig");
+pub const cli = @import("cli/root.zig");
 pub const event = @import("event.zig");
 pub const state = @import("state.zig");
 pub const extension = @import("extension.zig");
