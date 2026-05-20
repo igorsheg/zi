@@ -5,6 +5,7 @@ pub const completion = @import("completion.zig");
 pub const env = @import("env.zig");
 pub const loop = @import("loop.zig");
 pub const log = @import("log.zig");
+pub const process_executor = @import("process_executor.zig");
 pub const queue = @import("queue.zig");
 pub const timer = @import("timer.zig");
 pub const wake = @import("wake.zig");
