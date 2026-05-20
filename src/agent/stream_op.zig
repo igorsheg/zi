@@ -52,7 +52,11 @@ pub const StreamOp = struct {
                 };
                 self.pushTerminalIfNeeded(.{ .completed = owned });
             },
-            .@"error" => self.pushTerminalIfNeeded(.{ .failed = .{ .stream_failed = "provider stream error" } }),
+            .@"error" => |err| {
+                const detail = err.@"error".error_message orelse "provider stream error";
+                std.log.warn("provider stream error: {s}", .{detail});
+                self.pushTerminalIfNeeded(.{ .failed = .{ .stream_failed = "provider stream error" } });
+            },
             else => self.queue.pushDelta(value),
         }
     }
