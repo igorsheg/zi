@@ -4,6 +4,7 @@ const ai_provider = @import("../../provider.zig");
 const ai_stream = @import("../../stream.zig");
 const provider_failure = @import("../../provider_failure.zig");
 const request_transform = @import("../../request_transform.zig");
+const json_value = @import("../../../json/value.zig");
 const responses_request = @import("request.zig");
 const responses_stream = @import("stream.zig");
 const Token = protocol.CancelToken;
@@ -508,7 +509,7 @@ test "buildRequestJson emits store:false, input[], and reasoning:none for reason
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
-    try responses_request.buildRequestJson(alloc, &out, test_model, ctx, .{}, null, null);
+    try responses_request.buildRequestJson(alloc, &out, test_model, ctx, .{ .io = testing.io }, null, null);
 
     try testing.expect(std.mem.indexOf(u8, out.items, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"store\":false") != null);
@@ -532,6 +533,7 @@ test "buildRequestJson includes prompt cache, max_output_tokens, and temperature
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
     try responses_request.buildRequestJson(alloc, &out, test_model, ctx, .{
+        .io = testing.io,
         .session_id = "session-123",
         .cache_retention = .long,
         .max_tokens = 321,
@@ -556,7 +558,7 @@ test "writeInputOpts remaps foreign tool result ids to the replayed function cal
         .content = &.{.{ .tool_call = .{
             .id = "call:bad|item bad!!!",
             .name = "bash",
-            .arguments = foreign_args,
+            .arguments = json_value.OwnedValue.adopt(alloc, foreign_args),
         } }},
         .api = .openai_completions,
         .provider = .openrouter,
@@ -593,7 +595,7 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
         .content = &.{.{ .tool_call = .{
             .id = "call_1|fc_1",
             .name = "bash",
-            .arguments = synthetic_args,
+            .arguments = json_value.OwnedValue.adopt(alloc, synthetic_args),
         } }},
         .api = .openai_codex_responses,
         .provider = .openai_codex,
@@ -643,7 +645,7 @@ test "writeInputOpts serializes invalid tool-result utf-8 as output text" {
         .content = &.{.{ .tool_call = .{
             .id = "call:bad|item bad!!!",
             .name = "bash",
-            .arguments = foreign_args,
+            .arguments = json_value.OwnedValue.adopt(alloc, foreign_args),
         } }},
         .api = .openai_completions,
         .provider = .openrouter,

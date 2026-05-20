@@ -952,7 +952,7 @@ test "transformMessages converts cross-model thinking to text and strips tool th
                 .{ .tool_call = .{
                     .id = "call_123",
                     .name = "bash",
-                    .arguments = args,
+                    .arguments = json_value.OwnedValue.adopt(alloc, args),
                     .thought_signature = "opaque-signature",
                 } },
             },
@@ -1004,7 +1004,7 @@ test "convertResponsesMessages hashes foreign responses item ids like pi-mono" {
             .content = &.{.{ .tool_call = .{
                 .id = raw_id,
                 .name = "edit",
-                .arguments = args,
+                .arguments = json_value.OwnedValue.adopt(alloc, args),
             } }},
             .api = .openai_responses,
             .provider = .github_copilot,

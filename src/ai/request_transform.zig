@@ -63,8 +63,10 @@ pub fn transformJsonPayload(
 
     if (!changed) return null;
 
-    _ = final_payload;
-    return error.UnsupportedTransformSerialization;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try json_value.writeJsonValue(&out.writer, final_payload);
+    return try out.toOwnedSlice();
 }
 
 const testing = std.testing;
@@ -86,7 +88,7 @@ fn testModel() protocol.Model {
 
 test "request transform skips parsing when no hooks are registered" {
     const model = testModel();
-    const transformed = try transformJsonPayload(testing.allocator, "not json", .{ .model = &model });
+    const transformed = try transformJsonPayload(testing.allocator, "not json", .{ .model = &model, .stream_options = .{ .io = testing.io } });
     try testing.expect(transformed == null);
 }
 
@@ -95,7 +97,7 @@ test "request transform applies provider decorators to canonical json" {
     const AddMetadata = struct {
         fn decorate(
             allocator: std.mem.Allocator,
-            payload: *json_value.OwnedValue,
+            payload: *std.json.Value,
             _: *const protocol.Model,
             _: ?*anyopaque,
         ) !bool {
@@ -106,6 +108,7 @@ test "request transform applies provider decorators to canonical json" {
 
     const transformed = try transformJsonPayload(testing.allocator, "{\"model\":\"a\"}", .{
         .model = &model,
+        .stream_options = .{ .io = testing.io },
         .decorators = &.{.{ .func = AddMetadata.decorate }},
     });
     defer testing.allocator.free(transformed.?);
@@ -118,13 +121,13 @@ test "request transform clones replacements before stringifying" {
     const Replace = struct {
         fn replace(allocator: std.mem.Allocator, payload: json_value.BorrowedValue, _: *const protocol.Model, _: ?*anyopaque) error{OutOfMemory}!?json_value.OwnedValue {
             _ = payload;
-            return .{ .string = try allocator.dupe(u8, "replacement") };
+            return json_value.OwnedValue.adopt(allocator, .{ .string = try allocator.dupe(u8, "replacement") });
         }
     };
 
     const transformed = try transformJsonPayload(testing.allocator, "{\"model\":\"a\"}", .{
         .model = &model,
-        .stream_options = .{ .request_transform = .{ .func = Replace.replace } },
+        .stream_options = .{ .io = testing.io, .request_transform = .{ .func = Replace.replace } },
     });
     defer testing.allocator.free(transformed.?);
 
@@ -141,6 +144,6 @@ test "request transform reports transform allocation failure" {
 
     try testing.expectError(error.OutOfMemory, transformJsonPayload(testing.allocator, "{\"model\":\"a\"}", .{
         .model = &model,
-        .stream_options = .{ .request_transform = .{ .func = Fails.replace } },
+        .stream_options = .{ .io = testing.io, .request_transform = .{ .func = Fails.replace } },
     }));
 }
