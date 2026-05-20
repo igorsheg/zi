@@ -93,13 +93,15 @@ const ContentBlockState = struct {
     tool_id: []const u8 = "",
     tool_name: []const u8 = "",
     tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
-    tool_args_parsed: std.json.Value = .null,
+    tool_args_parsed: json_value.OwnedValue = .null,
 
     thought_signature: ?[]const u8 = null,
 
     fn deinit(self: *ContentBlockState, allocator: std.mem.Allocator) void {
         self.text_buf.deinit(allocator);
         self.tool_args_partial.deinit(allocator);
+        self.tool_args_parsed.deinit();
+        if (self.thought_signature) |signature| allocator.free(signature);
     }
 };
 
@@ -136,6 +138,7 @@ const StreamState = struct {
     fn deinit(self: *StreamState) void {
         for (self.content_blocks.items) |*b| b.deinit(self.allocator);
         self.content_blocks.deinit(self.allocator);
+        if (self.message.content.len > 0) self.allocator.free(self.message.content);
         if (self.response_id) |rid| self.allocator.free(rid);
     }
 };
@@ -257,7 +260,7 @@ fn handleSseEvent(
                 if (id_v != .string) continue;
                 const data_v = detail.object.get("data") orelse continue;
                 if (data_v != .string) continue;
-                try attachThoughtSignature(allocator, state, id_v.string, detail);
+                attachThoughtSignature(allocator, state, id_v.string, detail) catch return error.OutOfMemory;
             }
         }
     }
@@ -314,10 +317,10 @@ fn handleToolCallDelta(
                     try blk_state.tool_args_partial.appendSlice(allocator, av.string);
                     _ = scratch.reset(.retain_capacity);
                     const sa = scratch.allocator();
-                    blk_state.tool_args_parsed = partial_json.parseStreaming(
+                    blk_state.tool_args_parsed = json_value.OwnedValue.adopt(sa, partial_json.parseStreaming(
                         sa,
                         blk_state.tool_args_partial.items,
-                    ) catch .null;
+                    ) catch .null);
                 }
             }
         }
@@ -377,11 +380,11 @@ fn finishCurrentBlock(
                 allocator,
                 blk_state.tool_args_partial.items,
             ) catch .null;
-            blk_state.tool_args_parsed = final_args;
+            blk_state.tool_args_parsed = json_value.OwnedValue.adopt(allocator, final_args);
             const tc: protocol.ToolCall = .{
                 .id = blk_state.tool_id,
                 .name = blk_state.tool_name,
-                .arguments = final_args,
+                .arguments = blk_state.tool_args_parsed,
                 .thought_signature = blk_state.thought_signature,
             };
             sink.emit(.{ .toolcall_end = .{

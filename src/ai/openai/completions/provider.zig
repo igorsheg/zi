@@ -9,7 +9,6 @@ const completions_request = @import("request.zig");
 const completions_stream = @import("stream.zig");
 const Token = protocol.CancelToken;
 const http_cancel = @import("../../../runtime/http_cancel.zig");
-const env_api_keys = @import("../../env_api_keys.zig");
 
 pub const OpenAICompletionsProvider = struct {
     allocator: std.mem.Allocator,

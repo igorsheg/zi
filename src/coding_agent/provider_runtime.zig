@@ -5,12 +5,14 @@ const agent = @import("../agent/root.zig");
 const runtime_env = @import("../runtime/env.zig");
 const provider_backend = @import("provider_backend.zig");
 const session_mod = @import("session.zig");
+const openai_completions = @import("../ai/openai/completions/provider.zig");
 const openai_responses = @import("../ai/openai/responses/provider.zig");
 
 pub const ProviderRuntime = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     env: runtime_env.Env,
+    openai_completions_provider: openai_completions.OpenAICompletionsProvider,
     openai_responses_provider: openai_responses.OpenAIResponsesProvider,
     static_provider: ?StaticProvider,
     active_provider: ?ai.provider.Provider = null,
@@ -34,6 +36,7 @@ pub const ProviderRuntime = struct {
             .allocator = allocator,
             .io = io,
             .env = env,
+            .openai_completions_provider = openai_completions.OpenAICompletionsProvider.init(allocator),
             .openai_responses_provider = openai_responses.OpenAIResponsesProvider.init(allocator),
             .static_provider = options.static_provider,
         };
@@ -62,10 +65,17 @@ pub const ProviderRuntime = struct {
             }
         }
 
+        if (model.provider == .openrouter and model.api == .openai_completions) {
+            return self.executionBackendForProvider(model, self.openai_completions_provider.provider());
+        }
         if (model.provider != .openai or model.api != .openai_responses) return error.ProviderUnavailable;
+        return self.executionBackendForProvider(model, self.openai_responses_provider.provider());
+    }
+
+    fn executionBackendForProvider(self: *ProviderRuntime, model: agent.message.Model, provider: ai.provider.Provider) !session_mod.AgentSession.ExecutionBackend {
         const provider_name = ai.protocol.providerToString(model.provider);
         const api_key = env_api_keys.getEnvApiKey(self.env, provider_name) orelse return error.MissingApiKey;
-        self.active_provider = self.openai_responses_provider.provider();
+        self.active_provider = provider;
         return provider_backend.synchronous(&self.active_provider.?, .{
             .io = self.io,
             .api_key = api_key,

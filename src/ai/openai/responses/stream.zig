@@ -88,6 +88,7 @@ const StreamState = struct {
     fn deinit(self: *StreamState) void {
         for (self.items.items) |*it| it.deinit(self.allocator);
         self.items.deinit(self.allocator);
+        if (self.message.content.len > 0) self.allocator.free(self.message.content);
     }
 };
 
