@@ -80,7 +80,7 @@ pub fn buildRequestJson(
 
     try jw.objectField("input");
     try jw.beginArray();
-    try writeInput(allocator, &jw, model, context);
+    try writeInput(allocator, options.io, &jw, model, context);
     try jw.endArray();
 
     const cache_retention = resolveCacheRetention(options.env, options.cache_retention);
@@ -137,21 +137,23 @@ pub fn buildRequestJson(
 
 pub fn writeInput(
     allocator: std.mem.Allocator,
+    io: std.Io,
     jw: *std.json.Stringify,
     model: protocol.Model,
     context: protocol.Context,
 ) !void {
-    writeInputOpts(allocator, jw, model, context, true) catch |err| return err;
+    writeInputOpts(allocator, io, jw, model, context, true) catch |err| return err;
 }
 
 pub fn writeInputOpts(
     allocator: std.mem.Allocator,
+    io: std.Io,
     jw: *std.json.Stringify,
     model: protocol.Model,
     context: protocol.Context,
     include_system_prompt: bool,
 ) !void {
-    try replay.writeResponsesInput(allocator, jw, model, context, .{ .include_system_prompt = include_system_prompt });
+    try replay.writeResponsesInput(allocator, io, jw, model, context, .{ .include_system_prompt = include_system_prompt });
 }
 
 const ToolCallIdMapping = struct {
@@ -307,6 +309,7 @@ fn recordToolCallIdMapping(
 
 fn flushPendingSyntheticToolResults(
     allocator: std.mem.Allocator,
+    io: std.Io,
     jw: *std.json.Stringify,
     pending_tool_calls: *std.ArrayListUnmanaged(PendingToolCall),
     existing_tool_result_ids: []const []const u8,
@@ -328,7 +331,7 @@ fn flushPendingSyntheticToolResults(
             .content = &.{.{ .text = .{ .text = "No result provided" } }},
             .details = null,
             .is_error = true,
-            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+            .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
         };
         const mapped_id = try getMappedToolCallId(allocator, tool_id_map.items, pending.id);
         defer allocator.free(mapped_id);

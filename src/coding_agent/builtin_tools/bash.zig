@@ -6,7 +6,7 @@ const process_executor = @import("../../runtime/process_executor.zig");
 pub const Config = struct {
     allocator: std.mem.Allocator,
     parameters: json_value.OwnedValue,
-    io: std.Io = std.Options.debug_io,
+    io: std.Io,
     cwd: ?[]const u8 = null,
     shell: []const u8 = "/bin/bash",
     timeout_ms: u64 = 30_000,
@@ -15,7 +15,7 @@ pub const Config = struct {
     kill_scope: process_executor.KillScope = .process,
 
     pub const Options = struct {
-        io: std.Io = std.Options.debug_io,
+        io: std.Io,
         cwd: ?[]const u8 = null,
         shell: []const u8 = "/bin/bash",
         timeout_ms: u64 = 30_000,
@@ -197,7 +197,6 @@ fn formatStatus(allocator: std.mem.Allocator, status: process_executor.OwnedComp
         .internal => |message| std.fmt.allocPrint(allocator, "internal error: {s}", .{message}),
     };
 }
-
 fn parametersSchema(allocator: std.mem.Allocator) !json_value.OwnedValue {
     var root: std.json.ObjectMap = .{};
     errdefer freeObject(allocator, root);
@@ -281,7 +280,7 @@ fn commandArgs(allocator: std.mem.Allocator, cmd: []const u8) !std.json.Value {
 }
 
 test "bash tool exposes command argument schema" {
-    var config = try Config.init(std.testing.allocator, .{});
+    var config = try Config.init(std.testing.allocator, .{ .io = std.testing.io });
     defer config.deinit();
 
     const params = tool(&config).parameters;
@@ -296,7 +295,7 @@ test "bash tool exposes command argument schema" {
 }
 
 test "bash tool rejects invalid arguments" {
-    var config = try Config.init(std.testing.allocator, .{});
+    var config = try Config.init(std.testing.allocator, .{ .io = std.testing.io });
     defer config.deinit();
     var capture = CompletionCapture{};
     defer capture.deinit();
@@ -307,7 +306,7 @@ test "bash tool rejects invalid arguments" {
 }
 
 test "bash tool captures stdout for successful command" {
-    var config = try Config.init(std.testing.allocator, .{ .timeout_ms = 5_000 });
+    var config = try Config.init(std.testing.allocator, .{ .io = std.testing.io, .timeout_ms = 5_000 });
     defer config.deinit();
     const args = try commandArgs(std.testing.allocator, "printf hello");
     defer {
@@ -325,7 +324,7 @@ test "bash tool captures stdout for successful command" {
 }
 
 test "bash tool marks nonzero exit as error result" {
-    var config = try Config.init(std.testing.allocator, .{ .timeout_ms = 5_000 });
+    var config = try Config.init(std.testing.allocator, .{ .io = std.testing.io, .timeout_ms = 5_000 });
     defer config.deinit();
     const args = try commandArgs(std.testing.allocator, "exit 7");
     defer {
@@ -343,7 +342,7 @@ test "bash tool marks nonzero exit as error result" {
 }
 
 test "bash tool reports pre-cancelled invocation as aborted" {
-    var config = try Config.init(std.testing.allocator, .{});
+    var config = try Config.init(std.testing.allocator, .{ .io = std.testing.io });
     defer config.deinit();
     var source = @import("../../runtime/cancel.zig").Source{};
     const token = source.beginRun();
@@ -365,7 +364,7 @@ test "bash tool reports pre-cancelled invocation as aborted" {
 }
 
 test "bash tool fails unsupported process group kill scope with baseline executor" {
-    var config = try Config.init(std.testing.allocator, .{ .kill_scope = .process_group });
+    var config = try Config.init(std.testing.allocator, .{ .io = std.testing.io, .kill_scope = .process_group });
     defer config.deinit();
     const args = try commandArgs(std.testing.allocator, "printf nope");
     defer {

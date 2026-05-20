@@ -55,14 +55,14 @@ pub fn streamCore(
     defer payload_buf.deinit(allocator);
     const build_fn = core.build_request orelse &responses_request.buildRequestJson;
     build_fn(allocator, &payload_buf, model, context, options, core.reasoning_effort, core.reasoning_summary) catch |err| {
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to build request: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to build request: {s}", .{@errorName(err)});
         return;
     };
     const transformed_payload = request_transform.transformJsonPayload(allocator, payload_buf.items, .{
         .model = &model,
         .stream_options = options,
     }) catch |err| {
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to transform request: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to transform request: {s}", .{@errorName(err)});
         return;
     };
     defer if (transformed_payload) |payload| allocator.free(payload);
@@ -74,19 +74,19 @@ pub fn streamCore(
             error.NoApiKey => "no API key provided",
             error.BufferTooSmall => "API key too long for auth buffer",
         };
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "{s}", .{msg});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "{s}", .{msg});
         return;
     };
 
     const base = core.base_url orelse model.base_url;
     const uri_str = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, core.path }) catch |err| {
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to build URI: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to build URI: {s}", .{@errorName(err)});
         return;
     };
     defer allocator.free(uri_str);
 
     const uri = std.Uri.parse(uri_str) catch |err| {
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to parse URI: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to parse URI: {s}", .{@errorName(err)});
         return;
     };
 
@@ -121,25 +121,25 @@ pub fn streamCore(
             .accept_encoding = .{ .override = "identity" },
         },
     }) catch |err| {
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to open connection: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to open connection: {s}", .{@errorName(err)});
         return;
     };
     defer req.deinit();
 
     var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to start interrupt guard: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to start interrupt guard: {s}", .{@errorName(err)});
         return;
     };
     defer abort_guard.stop();
 
     req.sendBodyComplete(request_payload) catch |err| {
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to send body: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to send body: {s}", .{@errorName(err)});
         return;
     };
 
     var redirect_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch |err| {
-        responses_stream.emitError(allocator, sink, model, core.provider_label, "request failed: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "request failed: {s}", .{@errorName(err)});
         return;
     };
 
@@ -160,15 +160,15 @@ pub fn streamCore(
             n_read += n;
         }
         const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
-            responses_stream.emitError(allocator, sink, model, core.provider_label, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+            responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to normalize HTTP error: {s}", .{@errorName(err)});
             return;
         };
-        responses_stream.emitFailure(allocator, sink, model, core.provider_label, normalized.failure, normalized.display_message);
+        responses_stream.emitFailure(allocator, options.io, sink, model, core.provider_label, normalized.failure, normalized.display_message);
         return;
     }
 
     var reader = response.reader(&transfer_buf);
-    responses_stream.processStreamMapped(allocator, &reader, model, options.signal, core.provider_label, core.event_mapper, sink);
+    responses_stream.processStreamMapped(allocator, options.io, &reader, model, options.signal, core.provider_label, core.event_mapper, sink);
 }
 
 fn formatHttpErrorDetail(allocator: std.mem.Allocator, status: std.http.Status, body: []const u8) ![]const u8 {
@@ -343,7 +343,7 @@ fn runProcessWithMapper(
         .tracker = &terminal_tracker,
         .inner = .{ .func = TestCollector.cb, .ctx = @ptrCast(collector) },
     };
-    responses_stream.processStreamMapped(arena, &reader, test_model, Token.none, "openai-responses", event_mapper, tracking_sink.sink());
+    responses_stream.processStreamMapped(arena, std.testing.io, &reader, test_model, Token.none, "openai-responses", event_mapper, tracking_sink.sink());
     try testing.expect(!collector.alloc_failed);
     _ = try terminal_tracker.finish();
 }
@@ -365,7 +365,7 @@ fn writeInputToJson(allocator: std.mem.Allocator, model: protocol.Model, ctx: pr
     var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
     var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
     try jw.beginArray();
-    try responses_request.writeInputOpts(allocator, &jw, model, ctx, false);
+    try responses_request.writeInputOpts(allocator, std.testing.io, &jw, model, ctx, false);
     try jw.endArray();
     return allocating.toOwnedSlice();
 }

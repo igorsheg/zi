@@ -49,7 +49,7 @@ pub const RunConfig = struct {
     convert_messages: ConvertMessagesHook,
     steering_messages: ?MessageSourceHook = null,
     follow_up_messages: ?MessageSourceHook = null,
-    io: std.Io = std.Options.debug_io,
+    io: std.Io,
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
     api_key: ?[]const u8 = null,

@@ -199,7 +199,7 @@ pub const Transport = enum {
 pub const CancelToken = cancel.Token;
 
 pub const StreamOptions = struct {
-    io: std.Io = std.Options.debug_io,
+    io: std.Io,
     temperature: ?f64 = null,
     max_tokens: ?u64 = null,
     signal: CancelToken = CancelToken.none,
@@ -236,13 +236,13 @@ pub const Header = struct {
 };
 
 pub const ProviderStreamOptions = struct {
-    base: StreamOptions = .{},
+    base: StreamOptions,
 
     provider_data: ?*anyopaque = null,
 };
 
 pub const SimpleStreamOptions = struct {
-    base: StreamOptions = .{},
+    base: StreamOptions,
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,
 };

@@ -74,32 +74,32 @@ pub const OpenAICompletionsProvider = struct {
         var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer payload_buf.deinit(allocator);
         completions_request.buildRequestJson(allocator, &payload_buf, model, context, reasoning) catch |err| {
-            completions_stream.emitError(allocator, sink, model, "failed to build request: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to build request: {s}", .{@errorName(err)});
             return;
         };
         const transformed_payload = request_transform.transformJsonPayload(allocator, payload_buf.items, .{
             .model = &model,
             .stream_options = options,
         }) catch |err| {
-            completions_stream.emitError(allocator, sink, model, "failed to transform request: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to transform request: {s}", .{@errorName(err)});
             return;
         };
         defer if (transformed_payload) |payload| allocator.free(payload);
         const request_payload = transformed_payload orelse payload_buf.items;
 
         const api_key = options.api_key orelse {
-            completions_stream.emitError(allocator, sink, model, "no API key provided", .{});
+            completions_stream.emitError(allocator, options.io, sink, model, "no API key provided", .{});
             return;
         };
 
         const uri_str = std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url}) catch |err| {
-            completions_stream.emitError(allocator, sink, model, "failed to build URI: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to build URI: {s}", .{@errorName(err)});
             return;
         };
         defer allocator.free(uri_str);
 
         const uri = std.Uri.parse(uri_str) catch |err| {
-            completions_stream.emitError(allocator, sink, model, "failed to parse URI: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to parse URI: {s}", .{@errorName(err)});
             return;
         };
 
@@ -108,7 +108,7 @@ pub const OpenAICompletionsProvider = struct {
 
         var auth_buf: [4096]u8 = undefined;
         const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
-            completions_stream.emitError(allocator, sink, model, "API key too long for auth buffer", .{});
+            completions_stream.emitError(allocator, options.io, sink, model, "API key too long for auth buffer", .{});
             return;
         };
 
@@ -139,25 +139,25 @@ pub const OpenAICompletionsProvider = struct {
                 .accept_encoding = .{ .override = "identity" },
             },
         }) catch |err| {
-            completions_stream.emitError(allocator, sink, model, "failed to open connection: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to open connection: {s}", .{@errorName(err)});
             return;
         };
         defer req.deinit();
 
         var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
-            completions_stream.emitError(allocator, sink, model, "failed to start interrupt guard: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to start interrupt guard: {s}", .{@errorName(err)});
             return;
         };
         defer abort_guard.stop();
 
         req.sendBodyComplete(request_payload) catch |err| {
-            completions_stream.emitError(allocator, sink, model, "failed to send body: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to send body: {s}", .{@errorName(err)});
             return;
         };
 
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch |err| {
-            completions_stream.emitError(allocator, sink, model, "request failed: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "request failed: {s}", .{@errorName(err)});
             return;
         };
 
@@ -179,15 +179,15 @@ pub const OpenAICompletionsProvider = struct {
                 n_read += n;
             }
             const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
-                completions_stream.emitError(allocator, sink, model, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+                completions_stream.emitError(allocator, options.io, sink, model, "failed to normalize HTTP error: {s}", .{@errorName(err)});
                 return;
             };
-            completions_stream.emitFailure(sink, model, normalized.failure, normalized.display_message);
+            completions_stream.emitFailure(options.io, sink, model, normalized.failure, normalized.display_message);
             return;
         }
 
         const reader = response.reader(&transfer_buf);
-        completions_stream.processStream(allocator, reader, model, options.signal, sink);
+        completions_stream.processStream(allocator, options.io, reader, model, options.signal, sink);
     }
 };
 
@@ -295,7 +295,7 @@ fn runProcess(arena: std.mem.Allocator, sse_bytes: []const u8, collector: *TestC
         .tracker = &terminal_tracker,
         .inner = .{ .func = TestCollector.callback, .ctx = @ptrCast(collector) },
     };
-    completions_stream.processStream(arena, &reader, test_model, Token.none, tracking_sink.sink());
+    completions_stream.processStream(arena, std.testing.io, &reader, test_model, Token.none, tracking_sink.sink());
     try testing.expect(!collector.alloc_failed);
     _ = try terminal_tracker.finish();
 }

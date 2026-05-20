@@ -59,7 +59,7 @@ const StreamState = struct {
     message: protocol.AssistantMessage,
     response_id: ?[]const u8 = null,
 
-    fn init(allocator: std.mem.Allocator, model: protocol.Model) StreamState {
+    fn init(allocator: std.mem.Allocator, io: std.Io, model: protocol.Model) StreamState {
         return .{
             .allocator = allocator,
             .items = .empty,
@@ -77,7 +77,7 @@ const StreamState = struct {
                     .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
                 },
                 .stop_reason = .stop,
-                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+                .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
             },
         };
     }
@@ -97,17 +97,19 @@ fn assistantHasToolCalls(msg: protocol.AssistantMessage) bool {
 
 pub fn processStream(
     allocator: std.mem.Allocator,
+    io: std.Io,
     reader: anytype,
     model: protocol.Model,
     abort_flag: Token,
     provider_label: []const u8,
     sink: ai_provider.StreamEventSink,
 ) void {
-    processStreamMapped(allocator, reader, model, abort_flag, provider_label, .{ .map = identityEventMapper }, sink);
+    processStreamMapped(allocator, io, reader, model, abort_flag, provider_label, .{ .map = identityEventMapper }, sink);
 }
 
 pub fn processStreamMapped(
     allocator: std.mem.Allocator,
+    io: std.Io,
     reader: anytype,
     model: protocol.Model,
     abort_flag: Token,
@@ -118,7 +120,7 @@ pub fn processStreamMapped(
     var scratch_arena = std.heap.ArenaAllocator.init(allocator);
     defer scratch_arena.deinit();
 
-    var state = StreamState.init(allocator, model);
+    var state = StreamState.init(allocator, io, model);
     defer state.deinit();
 
     sink.emit(.start);
@@ -160,6 +162,7 @@ pub fn processStreamMapped(
             } else if (err == error.EventDataTooLarge) {
                 emitError(
                     allocator,
+                    io,
                     sink,
                     model,
                     provider_label,
@@ -168,14 +171,14 @@ pub fn processStreamMapped(
                 );
                 return;
             } else {
-                emitError(allocator, sink, model, provider_label, "stream read error: {s}", .{@errorName(err)});
+                emitError(allocator, io, sink, model, provider_label, "stream read error: {s}", .{@errorName(err)});
                 return;
             },
         }
     };
 
     state.message.content = buildFinalContent(allocator, state.items.items) catch |err| {
-        emitError(allocator, sink, model, provider_label, "failed to build final content: {s}", .{@errorName(err)});
+        emitError(allocator, io, sink, model, provider_label, "failed to build final content: {s}", .{@errorName(err)});
         return;
     };
     if (state.message.stop_reason == .stop and assistantHasToolCalls(state.message)) {
@@ -695,6 +698,7 @@ fn mapResponseStatus(status: []const u8) protocol.StopReason {
 
 pub fn emitError(
     allocator: std.mem.Allocator,
+    io: std.Io,
     sink: ai_provider.StreamEventSink,
     model: protocol.Model,
     provider_label: []const u8,
@@ -703,11 +707,12 @@ pub fn emitError(
 ) void {
     const inner = std.fmt.allocPrint(allocator, fmt, args) catch "error";
     const normalized = provider_failure.formatTransportFailure(allocator, inner) catch null;
-    emitFailure(allocator, sink, model, provider_label, if (normalized) |n| n.failure else null, inner);
+    emitFailure(allocator, io, sink, model, provider_label, if (normalized) |n| n.failure else null, inner);
 }
 
 pub fn emitFailure(
     allocator: std.mem.Allocator,
+    io: std.Io,
     sink: ai_provider.StreamEventSink,
     model: protocol.Model,
     provider_label: []const u8,
@@ -731,7 +736,7 @@ pub fn emitFailure(
         .stop_reason = .@"error",
         .error_message = msg,
         .failure = failure,
-        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
     };
     sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } });
 }

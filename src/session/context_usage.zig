@@ -245,7 +245,7 @@ test "estimateTokens counts serialized tool call arguments" {
     defer args.deinit();
     const content = [_]ai.protocol.AssistantMessage.AssistantContentBlock{faux.fauxToolCall("read", "tc-1", args)};
     const message = agent_message.AgentMessage{
-        .assistant = faux.fauxAssistantMessage(testing.allocator, &content, .stop),
+        .assistant = faux.fauxAssistantMessage(testing.allocator, std.testing.io, &content, .stop),
     };
     defer testing.allocator.free(message.assistant.content);
 

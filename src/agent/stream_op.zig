@@ -99,7 +99,7 @@ test "stream op converts provider callback to terminal completion" {
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
-    }, .{ .messages = &.{}, .tools = null, .system_prompt = null }, .{ .base = .{} });
+    }, .{ .messages = &.{}, .tools = null, .system_prompt = null }, .{ .base = .{ .io = std.testing.io } });
 
     var saw_terminal = false;
     while (op.next()) |completion| switch (completion) {

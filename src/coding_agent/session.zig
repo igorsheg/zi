@@ -112,7 +112,7 @@ pub const AgentSession = struct {
     pub const ExecutionBackend = struct {
         stream: agent_mod.config.StreamHook,
         convert_messages: agent_mod.config.ConvertMessagesHook,
-        io: std.Io = std.Options.debug_io,
+        io: std.Io,
         temperature: ?f64 = null,
         max_tokens: ?u64 = null,
         api_key: ?[]const u8 = null,
@@ -982,6 +982,7 @@ fn testExecutionBackend() AgentSession.ExecutionBackend {
     return .{
         .stream = .{ .call_fn = completeWithAssistant },
         .convert_messages = .{ .call_fn = convertNoop },
+        .io = std.testing.io,
     };
 }
 
@@ -989,6 +990,7 @@ fn captureExecutionBackend(capture: *SpecCapture) AgentSession.ExecutionBackend 
     return .{
         .stream = .{ .call_fn = SpecCapture.stream, .ctx = capture },
         .convert_messages = .{ .call_fn = convertNoop },
+        .io = std.testing.io,
     };
 }
 
@@ -1117,7 +1119,7 @@ test "extension host tools are exposed through run spec" {
     var session = try AgentSession.init(std.testing.allocator, .{
         .policy = testPolicy(),
         .extension_host = try extension_mod.Host.initTools(std.testing.allocator, &source_tools),
-        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop } } },
+        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop }, .io = std.testing.io } },
     });
     defer session.deinit();
 
@@ -1170,7 +1172,7 @@ test "synchronous tool execution emits coding agent tool events" {
         .policy = testPolicy(),
         .event_sink = .{ .emit_fn = EventCollector.emit, .ctx = &events },
         .extension_host = try extension_mod.Host.initTools(std.testing.allocator, &source_tools),
-        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop } } },
+        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop }, .io = std.testing.io } },
     });
     defer session.deinit();
 
@@ -1249,7 +1251,7 @@ test "tool update projection emits summary without payload ownership" {
         .policy = testPolicy(),
         .event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector },
         .extension_host = try extension_mod.Host.initTools(std.testing.allocator, &source_tools),
-        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop } } },
+        .execution = .{ .synchronous = .{ .stream = .{ .call_fn = Capture.stream, .ctx = &capture }, .convert_messages = .{ .call_fn = convertNoop }, .io = std.testing.io } },
     });
     defer session.deinit();
 

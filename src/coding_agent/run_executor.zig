@@ -234,6 +234,7 @@ test "run executor submission carries run identity and borrowed spec" {
                 },
                 .stream = undefined,
                 .convert_messages = undefined,
+                .io = std.testing.io,
             },
         },
     };
@@ -356,6 +357,7 @@ fn testSubmission(run_command_id: command_mod.CommandId, stream: agent_mod.confi
                 .model = testModel(),
                 .stream = stream,
                 .convert_messages = .{ .call_fn = convertNoop },
+                .io = std.testing.io,
             },
         },
     };

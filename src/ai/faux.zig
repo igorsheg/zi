@@ -42,6 +42,7 @@ pub fn fauxToolCall(name: []const u8, id: []const u8, arguments: json_value.Owne
 
 pub fn fauxAssistantMessage(
     allocator: std.mem.Allocator,
+    io: std.Io,
     content: []const protocol.AssistantMessage.AssistantContentBlock,
     stop_reason: protocol.StopReason,
 ) protocol.AssistantMessage {
@@ -54,7 +55,7 @@ pub fn fauxAssistantMessage(
         .model = FAUX_MODEL_ID,
         .usage = DEFAULT_USAGE,
         .stop_reason = stop_reason,
-        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
     };
 }
 
@@ -126,14 +127,14 @@ pub const FauxProvider = struct {
                 .usage = DEFAULT_USAGE,
                 .stop_reason = .@"error",
                 .error_message = "failed to capture faux context",
-                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+                .timestamp = std.Io.Timestamp.now(options.io, .real).toMilliseconds(),
             } } });
             return;
         };
 
         if (self.block_until_cancel) {
             while (!options.signal.isAborted()) {
-                std.Options.debug_io.sleep(.fromMilliseconds(10), .awake) catch {};
+                options.io.sleep(.fromMilliseconds(10), .awake) catch {};
             }
             const err_msg: protocol.AssistantMessage = .{
                 .content = &.{},
@@ -143,7 +144,7 @@ pub const FauxProvider = struct {
                 .usage = DEFAULT_USAGE,
                 .stop_reason = .aborted,
                 .error_message = "aborted",
-                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+                .timestamp = std.Io.Timestamp.now(options.io, .real).toMilliseconds(),
             };
             sink.emit(.{ .@"error" = .{ .reason = .aborted, .@"error" = err_msg } });
             return;
@@ -158,7 +159,7 @@ pub const FauxProvider = struct {
                 .usage = DEFAULT_USAGE,
                 .stop_reason = .@"error",
                 .error_message = "No more faux responses queued",
-                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+                .timestamp = std.Io.Timestamp.now(options.io, .real).toMilliseconds(),
             };
             sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } });
             return;
@@ -231,7 +232,7 @@ test "faux provider streams text response" {
     defer faux.deinit();
 
     const content = [_]protocol.AssistantMessage.AssistantContentBlock{fauxText("hello world")};
-    const msg = fauxAssistantMessage(allocator, &content, .stop);
+    const msg = fauxAssistantMessage(allocator, std.testing.io, &content, .stop);
     defer allocator.free(msg.content);
 
     faux.setResponses(&.{msg});
@@ -255,7 +256,7 @@ test "faux provider streams text response" {
     };
 
     const p = faux.provider();
-    p.stream(allocator, fauxModel(), .{ .messages = &.{} }, .{}, tracking_sink.sink());
+    p.stream(allocator, fauxModel(), .{ .messages = &.{} }, .{ .io = std.testing.io }, tracking_sink.sink());
 
     try std.testing.expectEqual(@as(usize, 5), collector.events.items.len);
 

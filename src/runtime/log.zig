@@ -94,7 +94,7 @@ var state: State = .{};
 const State = struct {
     mutex: std.Io.Mutex = .init,
     configured: bool = false,
-    io_value: std.Io = std.Options.debug_io,
+    io_value: ?std.Io = null,
     min_level: std.log.Level = .info,
     stderr: bool = false,
     file: ?std.Io.File = null,
@@ -117,35 +117,38 @@ const State = struct {
     }
 
     fn shutdown(self: *State) void {
-        self.mutex.lockUncancelable(self.io_value);
-        defer self.mutex.unlock(self.io_value);
-        if (self.file) |file| file.close(self.io_value);
+        const io_value = self.io_value orelse return;
+        self.mutex.lockUncancelable(io_value);
+        defer self.mutex.unlock(io_value);
+        if (self.file) |file| file.close(io_value);
         self.file = null;
         self.stderr = false;
         self.configured = false;
     }
 
     fn enabled(self: *State, comptime level: std.log.Level) bool {
-        self.mutex.lockUncancelable(self.io_value);
-        defer self.mutex.unlock(self.io_value);
+        const io_value = self.io_value orelse return false;
+        self.mutex.lockUncancelable(io_value);
+        defer self.mutex.unlock(io_value);
         if (!self.configured) return true;
         return rank(level) >= rank(self.min_level);
     }
 
     fn io(self: *State) std.Io {
-        return self.io_value;
+        return self.io_value orelse std.debug.panic("log io requested before runtime log init", .{});
     }
 
     fn write(self: *State, line: []const u8) void {
-        self.mutex.lockUncancelable(self.io_value);
-        defer self.mutex.unlock(self.io_value);
+        const io_value = self.io_value orelse return;
+        self.mutex.lockUncancelable(io_value);
+        defer self.mutex.unlock(io_value);
 
         if (!self.configured) {
-            writeStderr(self.io_value, line);
+            writeStderr(io_value, line);
             return;
         }
-        if (self.stderr) writeStderr(self.io_value, line);
-        if (self.file) |file| file.writeStreamingAll(self.io_value, line) catch {};
+        if (self.stderr) writeStderr(io_value, line);
+        if (self.file) |file| file.writeStreamingAll(io_value, line) catch {};
     }
 };
 

@@ -312,6 +312,7 @@ fn configWithStream(comptime stream_fn: anytype) config_mod.RunConfig {
         .model = testModel(),
         .stream = .{ .call_fn = stream_fn },
         .convert_messages = .{ .call_fn = convertNoop },
+        .io = std.testing.io,
     };
 }
 

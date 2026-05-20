@@ -9,6 +9,7 @@ const Token = protocol.CancelToken;
 
 pub fn processStream(
     allocator: std.mem.Allocator,
+    io: std.Io,
     reader: anytype,
     model: protocol.Model,
     abort_flag: Token,
@@ -17,7 +18,7 @@ pub fn processStream(
     var scratch_arena = std.heap.ArenaAllocator.init(allocator);
     defer scratch_arena.deinit();
 
-    var state = StreamState.init(allocator, model);
+    var state = StreamState.init(allocator, io, model);
     defer state.deinit();
 
     sink.emit(.start);
@@ -51,20 +52,20 @@ pub fn processStream(
         if (abort_flag.isAborted()) {
             state.message.stop_reason = .aborted;
         } else if (err == error.EventDataTooLarge) {
-            emitError(allocator, sink, model, "stream event exceeded {d} bytes", .{sse.max_event_data_bytes});
+            emitError(allocator, io, sink, model, "stream event exceeded {d} bytes", .{sse.max_event_data_bytes});
             return;
         } else {
-            emitError(allocator, sink, model, "stream read error: {s}", .{@errorName(err)});
+            emitError(allocator, io, sink, model, "stream read error: {s}", .{@errorName(err)});
             return;
         }
     };
 
     finishCurrentBlock(allocator, &state, sink) catch |err| {
-        emitError(allocator, sink, model, "failed to finish stream block: {s}", .{@errorName(err)});
+        emitError(allocator, io, sink, model, "failed to finish stream block: {s}", .{@errorName(err)});
         return;
     };
     state.message.content = buildFinalContent(allocator, state.content_blocks.items) catch |err| {
-        emitError(allocator, sink, model, "failed to build final content: {s}", .{@errorName(err)});
+        emitError(allocator, io, sink, model, "failed to build final content: {s}", .{@errorName(err)});
         return;
     };
 
@@ -109,7 +110,7 @@ const StreamState = struct {
     message: protocol.AssistantMessage,
     response_id: ?[]const u8 = null,
 
-    fn init(allocator: std.mem.Allocator, model: protocol.Model) StreamState {
+    fn init(allocator: std.mem.Allocator, io: std.Io, model: protocol.Model) StreamState {
         return .{
             .allocator = allocator,
             .content_blocks = .empty,
@@ -127,7 +128,7 @@ const StreamState = struct {
                     .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
                 },
                 .stop_reason = .stop,
-                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+                .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
             },
         };
     }
@@ -538,6 +539,7 @@ fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: json_value.
 
 pub fn emitError(
     allocator: std.mem.Allocator,
+    io: std.Io,
     sink: ai_provider.StreamEventSink,
     model: protocol.Model,
     comptime fmt: []const u8,
@@ -545,10 +547,11 @@ pub fn emitError(
 ) void {
     const msg = std.fmt.allocPrint(allocator, fmt, args) catch "openai-completions error";
     const normalized = provider_failure.formatTransportFailure(allocator, msg) catch null;
-    emitFailure(sink, model, if (normalized) |n| n.failure else null, msg);
+    emitFailure(io, sink, model, if (normalized) |n| n.failure else null, msg);
 }
 
 pub fn emitFailure(
+    io: std.Io,
     sink: ai_provider.StreamEventSink,
     model: protocol.Model,
     failure: ?protocol.NormalizedFailure,
@@ -570,7 +573,7 @@ pub fn emitFailure(
         .stop_reason = .@"error",
         .error_message = message,
         .failure = failure,
-        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
     };
     sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = err_msg } });
 }

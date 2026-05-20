@@ -54,7 +54,7 @@ pub const AnthropicProvider = struct {
 
         const is_oauth_token = if (options.api_key) |k| std.mem.indexOf(u8, k, "sk-ant-oat") != null else false;
         anthropic_request.buildRequestJson(allocator, &payload_buf, model, context, options, is_oauth_token, reasoning, thinking_budgets) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "failed to build request: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build request: {s}", .{@errorName(err)});
             return;
         };
 
@@ -70,25 +70,25 @@ pub const AnthropicProvider = struct {
             .stream_options = options,
             .decorators = decorators_buf[0..decorator_count],
         }) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "failed to transform request: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to transform request: {s}", .{@errorName(err)});
             return;
         };
         defer if (transformed_payload) |payload| allocator.free(payload);
         const request_payload = transformed_payload orelse payload_buf.items;
 
         const api_key = options.api_key orelse {
-            emitError(allocator, sink, model.api, model.provider, model.id, "no API key provided", .{});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "no API key provided", .{});
             return;
         };
 
         const uri_str = std.fmt.allocPrint(allocator, "{s}/v1/messages", .{model.base_url}) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "failed to build URI: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build URI: {s}", .{@errorName(err)});
             return;
         };
         defer allocator.free(uri_str);
 
         const uri = std.Uri.parse(uri_str) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "failed to parse URI: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to parse URI: {s}", .{@errorName(err)});
             return;
         };
 
@@ -106,7 +106,7 @@ pub const AnthropicProvider = struct {
         var auth_buf: [4096]u8 = undefined;
         if (is_oauth) {
             const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
-                emitError(allocator, sink, model.api, model.provider, model.id, "API key too long for auth buffer", .{});
+                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "API key too long for auth buffer", .{});
                 return;
             };
             extra_headers_buf[n_extra] = .{ .name = "authorization", .value = auth_value };
@@ -142,25 +142,25 @@ pub const AnthropicProvider = struct {
                 .accept_encoding = .{ .override = "identity" },
             },
         }) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "failed to open connection: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to open connection: {s}", .{@errorName(err)});
             return;
         };
         defer req.deinit();
 
         var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "failed to start interrupt guard: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to start interrupt guard: {s}", .{@errorName(err)});
             return;
         };
         defer abort_guard.stop();
 
         req.sendBodyComplete(request_payload) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "failed to send body: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to send body: {s}", .{@errorName(err)});
             return;
         };
 
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "request failed: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "request failed: {s}", .{@errorName(err)});
             return;
         };
 
@@ -182,10 +182,10 @@ pub const AnthropicProvider = struct {
                 n_read += n;
             }
             const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
-                emitError(allocator, sink, model.api, model.provider, model.id, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to normalize HTTP error: {s}", .{@errorName(err)});
                 return;
             };
-            emitFailure(allocator, sink, model.api, model.provider, model.id, normalized.failure, normalized.display_message);
+            emitFailure(allocator, options.io, sink, model.api, model.provider, model.id, normalized.failure, normalized.display_message);
             return;
         }
 
@@ -214,7 +214,7 @@ pub const AnthropicProvider = struct {
                     .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
                 },
                 .stop_reason = .stop,
-                .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+                .timestamp = std.Io.Timestamp.now(options.io, .real).toMilliseconds(),
             },
             .stop_reason = null,
         };
@@ -249,16 +249,16 @@ pub const AnthropicProvider = struct {
             if (options.signal.isAborted()) {
                 state.message.stop_reason = .aborted;
             } else if (err == error.EventDataTooLarge) {
-                emitError(allocator, sink, model.api, model.provider, model.id, "stream event exceeded {d} bytes", .{sse.max_event_data_bytes});
+                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "stream event exceeded {d} bytes", .{sse.max_event_data_bytes});
                 return;
             } else {
-                emitError(allocator, sink, model.api, model.provider, model.id, "stream read error: {s}", .{@errorName(err)});
+                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "stream read error: {s}", .{@errorName(err)});
                 return;
             }
         };
 
         state.message.content = buildFinalContent(allocator, state.content_blocks.items) catch |err| {
-            emitError(allocator, sink, model.api, model.provider, model.id, "failed to build final content: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build final content: {s}", .{@errorName(err)});
             return;
         };
 
@@ -501,6 +501,7 @@ fn emptyObject(allocator: std.mem.Allocator) std.json.Value {
 
 fn emitError(
     allocator: std.mem.Allocator,
+    io: std.Io,
     sink: ai_provider.StreamEventSink,
     api: protocol.Api,
     provider: protocol.Provider,
@@ -509,11 +510,12 @@ fn emitError(
     args: anytype,
 ) void {
     const inner = std.fmt.allocPrint(allocator, fmt, args) catch "anthropic error";
-    emitFailure(allocator, sink, api, provider, model_id, .{ .kind = provider_failure.classifyTransportFailure(inner) }, inner);
+    emitFailure(allocator, io, sink, api, provider, model_id, .{ .kind = provider_failure.classifyTransportFailure(inner) }, inner);
 }
 
 fn emitFailure(
     allocator: std.mem.Allocator,
+    io: std.Io,
     sink: ai_provider.StreamEventSink,
     api: protocol.Api,
     provider: protocol.Provider,
@@ -538,7 +540,7 @@ fn emitFailure(
         .stop_reason = .@"error",
         .error_message = owned_message,
         .failure = failure,
-        .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+        .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
     } } });
 }
 

@@ -12,7 +12,7 @@ pub const Builtins = struct {
     tools_value: [max_builtin_tools]agent_mod.AgentTool,
 
     pub const Options = struct {
-        bash: bash.Config.Options = .{},
+        bash: bash.Config.Options,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !Builtins {
@@ -114,7 +114,7 @@ test "empty builtin tool source feeds empty host" {
 }
 
 test "default builtins feed extension host registry" {
-    var builtins = try Builtins.init(std.testing.allocator, .{});
+    var builtins = try Builtins.init(std.testing.allocator, .{ .bash = .{ .io = std.testing.io } });
     defer builtins.deinit();
     var h = try builtins.host(std.testing.allocator);
     defer h.deinit();
@@ -125,7 +125,7 @@ test "default builtins feed extension host registry" {
 }
 
 test "builtin host bundle owns host and configs in deinit order" {
-    var bundle = try HostBundle.init(std.testing.allocator, .{});
+    var bundle = try HostBundle.init(std.testing.allocator, .{ .bash = .{ .io = std.testing.io } });
     defer bundle.deinit();
 
     const registered = bundle.host().tools();

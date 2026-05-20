@@ -32,7 +32,7 @@ pub fn run(ctx: Context, run_plan: plan_mod.RunPlan) !result_mod.ExecutionResult
     var builtins: ?coding_agent.builtin_tools.Builtins = null;
     defer if (builtins) |*bundle| bundle.deinit();
     const extension_host = if (run_plan.tools == .builtins) blk: {
-        builtins = try coding_agent.builtin_tools.Builtins.init(ctx.allocator, .{});
+        builtins = try coding_agent.builtin_tools.Builtins.init(ctx.allocator, .{ .bash = .{ .io = ctx.io } });
         break :blk try builtins.?.host(ctx.allocator);
     } else coding_agent.extension.Host.disabled;
 

@@ -10,12 +10,13 @@ pub const ConvertOptions = struct {
 
 pub fn writeResponsesInput(
     allocator: std.mem.Allocator,
+    io: std.Io,
     jw: *std.json.Stringify,
     model: protocol.Model,
     context: protocol.Context,
     options: ConvertOptions,
 ) !void {
-    var transformed = try transformMessages(allocator, context.messages, model);
+    var transformed = try transformMessages(allocator, io, context.messages, model);
     defer transformed.deinit();
 
     var input = try convertResponsesMessages(allocator, model, context.system_prompt, transformed.messages, options);
@@ -36,6 +37,7 @@ pub const TransformedMessages = struct {
 
 pub fn transformMessages(
     allocator: std.mem.Allocator,
+    io: std.Io,
     messages: []const protocol.Message,
     model: protocol.Model,
 ) !TransformedMessages {
@@ -58,13 +60,13 @@ pub fn transformMessages(
     for (messages) |msg| {
         switch (msg) {
             .user => |u| {
-                try flushPendingSyntheticToolResults(allocator, &result, pending_tool_calls.items, existing_tool_result_ids.items);
+                try flushPendingSyntheticToolResults(allocator, io, &result, pending_tool_calls.items, existing_tool_result_ids.items);
                 pending_tool_calls.clearRetainingCapacity();
                 existing_tool_result_ids.clearRetainingCapacity();
                 try result.append(allocator, .{ .user = try message_memory.cloneUserMessage(allocator, u) });
             },
             .assistant => |a| {
-                try flushPendingSyntheticToolResults(allocator, &result, pending_tool_calls.items, existing_tool_result_ids.items);
+                try flushPendingSyntheticToolResults(allocator, io, &result, pending_tool_calls.items, existing_tool_result_ids.items);
                 pending_tool_calls.clearRetainingCapacity();
                 existing_tool_result_ids.clearRetainingCapacity();
 
@@ -567,6 +569,7 @@ fn transformToolResultMessage(
 
 fn flushPendingSyntheticToolResults(
     allocator: std.mem.Allocator,
+    io: std.Io,
     result: *std.ArrayListUnmanaged(protocol.Message),
     pending_tool_calls: []const PendingToolCallRef,
     existing_tool_result_ids: []const []const u8,
@@ -597,7 +600,7 @@ fn flushPendingSyntheticToolResults(
             .content = content,
             .details = null,
             .is_error = true,
-            .timestamp = std.Io.Timestamp.now(std.Options.debug_io, .real).toMilliseconds(),
+            .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
         } });
     }
 }
@@ -978,7 +981,7 @@ test "transformMessages converts cross-model thinking to text and strips tool th
         .max_tokens = 16000,
     };
 
-    var transformed = try transformMessages(alloc, messages, target_model);
+    var transformed = try transformMessages(alloc, std.testing.io, messages, target_model);
     defer transformed.deinit();
 
     const assistant = transformed.messages[1].assistant;
@@ -1017,7 +1020,7 @@ test "convertResponsesMessages hashes foreign responses item ids like pi-mono" {
 
     const model = responsesReplayModel(.openai_codex_responses, .openai_codex, "gpt-5.3-codex");
 
-    var transformed = try transformMessages(alloc, transformed_messages, model);
+    var transformed = try transformMessages(alloc, std.testing.io, transformed_messages, model);
     defer transformed.deinit();
     var input = try convertResponsesMessages(alloc, model, null, transformed.messages, .{});
     defer input.deinit();
