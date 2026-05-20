@@ -65,7 +65,7 @@ pub fn transformJsonPayload(
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try json_value.writeJsonValue(&out.writer, final_payload);
+    try std.json.Stringify.value(final_payload, .{}, &out.writer);
     return try out.toOwnedSlice();
 }
 

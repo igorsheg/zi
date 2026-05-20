@@ -584,54 +584,8 @@ fn buildFinalContent(allocator: std.mem.Allocator, items: []const ItemState) ![]
 
 fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
-    try writeJsonValue(&out.writer, value);
+    try std.json.Stringify.value(value, .{}, &out.writer);
     return out.toOwnedSlice();
-}
-
-fn writeJsonValue(writer: *std.Io.Writer, value: std.json.Value) !void {
-    switch (value) {
-        .null => try writer.writeAll("null"),
-        .bool => |b| try writer.writeAll(if (b) "true" else "false"),
-        .integer => |i| try writer.print("{}", .{i}),
-        .float => |f| try writer.print("{}", .{f}),
-        .number_string => |s| try writer.writeAll(s),
-        .string => |s| try writeJsonString(writer, s),
-        .array => |arr| {
-            try writer.writeByte('[');
-            for (arr.items, 0..) |item, i| {
-                if (i != 0) try writer.writeByte(',');
-                try writeJsonValue(writer, item);
-            }
-            try writer.writeByte(']');
-        },
-        .object => |obj| {
-            try writer.writeByte('{');
-            var it = obj.iterator();
-            var first = true;
-            while (it.next()) |entry| {
-                if (!first) try writer.writeByte(',');
-                first = false;
-                try writeJsonString(writer, entry.key_ptr.*);
-                try writer.writeByte(':');
-                try writeJsonValue(writer, entry.value_ptr.*);
-            }
-            try writer.writeByte('}');
-        },
-    }
-}
-
-fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
-    try writer.writeByte('"');
-    for (value) |c| switch (c) {
-        '"' => try writer.writeAll("\\\""),
-        '\\' => try writer.writeAll("\\\\"),
-        '\n' => try writer.writeAll("\\n"),
-        '\r' => try writer.writeAll("\\r"),
-        '\t' => try writer.writeAll("\\t"),
-        0...8, 11...12, 14...0x1f => try writer.print("\\u{x:0>4}", .{c}),
-        else => try writer.writeByte(c),
-    };
-    try writer.writeByte('"');
 }
 
 fn encodeTextSignatureV1(
@@ -640,13 +594,17 @@ fn encodeTextSignatureV1(
     phase: ?[]const u8,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
-    try out.writer.writeAll("{\"v\":1,\"id\":");
-    try writeJsonString(&out.writer, id);
+    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
+    try jw.beginObject();
+    try jw.objectField("v");
+    try jw.write(@as(u8, 1));
+    try jw.objectField("id");
+    try jw.write(id);
     if (phase) |p| {
-        try out.writer.writeAll(",\"phase\":");
-        try writeJsonString(&out.writer, p);
+        try jw.objectField("phase");
+        try jw.write(p);
     }
-    try out.writer.writeByte('}');
+    try jw.endObject();
     return out.toOwnedSlice();
 }
 

@@ -237,7 +237,7 @@ fn appendAssistantItems(
 
             var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
-            try json_value.writeJsonValue(&args_buf.writer, tool_call.arguments.borrowed());
+            try std.json.Stringify.value(tool_call.arguments, .{}, &args_buf.writer);
 
             try items.append(allocator, .{ .function_call = .{
                 .id = item_id,
@@ -367,7 +367,7 @@ fn writeConvertedResponsesInput(
         .reasoning_item => |raw_json| {
             const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch continue;
             defer parsed.deinit();
-            try json_value.writeJsonValue(jw.writer, parsed.value);
+            try jw.write(parsed.value);
         },
         .assistant_message => |msg| {
             try jw.beginObject();
