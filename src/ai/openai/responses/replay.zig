@@ -63,7 +63,7 @@ pub fn transformMessages(
                 try flushPendingSyntheticToolResults(allocator, io, &result, pending_tool_calls.items, existing_tool_result_ids.items);
                 pending_tool_calls.clearRetainingCapacity();
                 existing_tool_result_ids.clearRetainingCapacity();
-                try result.append(allocator, .{ .user = try message_memory.cloneUserMessage(allocator, u) });
+                try result.append(allocator, .{ .user = try message_memory.cloneUser(allocator, u) });
             },
             .assistant => |a| {
                 try flushPendingSyntheticToolResults(allocator, io, &result, pending_tool_calls.items, existing_tool_result_ids.items);
@@ -843,7 +843,7 @@ fn deinitMessage(allocator: std.mem.Allocator, msg: protocol.Message) void {
 }
 
 fn deinitUserMessage(allocator: std.mem.Allocator, user: protocol.UserMessage) void {
-    message_memory.freeUserMessage(allocator, user);
+    message_memory.freeUser(allocator, user);
 }
 
 fn deinitAssistantMessage(allocator: std.mem.Allocator, assistant: protocol.AssistantMessage) void {
@@ -852,11 +852,11 @@ fn deinitAssistantMessage(allocator: std.mem.Allocator, assistant: protocol.Assi
 }
 
 fn deinitToolResultMessage(allocator: std.mem.Allocator, tool_result: protocol.ToolResultMessage) void {
-    message_memory.freeToolResultMessage(allocator, tool_result);
+    message_memory.freeToolResult(allocator, tool_result);
 }
 
 fn deinitAssistantContentList(allocator: std.mem.Allocator, content: []const protocol.AssistantMessage.AssistantContentBlock) void {
-    for (content) |block| message_memory.freeAssistantContentBlock(allocator, block);
+    for (content) |block| message_memory.freeAssistantBlock(allocator, block);
 }
 
 fn deinitToolResultContentList(allocator: std.mem.Allocator, content: []const protocol.ToolResultMessage.ContentBlock) void {

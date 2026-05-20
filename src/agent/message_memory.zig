@@ -32,8 +32,6 @@ pub fn cloneUser(allocator: std.mem.Allocator, value: ai.protocol.UserMessage) !
     return .{ .content = try cloneUserContent(allocator, value.content), .timestamp = value.timestamp };
 }
 
-pub const cloneUserMessage = cloneUser;
-
 pub fn cloneAssistant(allocator: std.mem.Allocator, value: message.AssistantMessage) !message.AssistantMessage {
     const model = try allocator.dupe(u8, value.model);
     errdefer allocator.free(model);
@@ -76,8 +74,8 @@ pub fn freeAssistant(allocator: std.mem.Allocator, value: message.AssistantMessa
     if (value.error_message) |msg| allocator.free(msg);
 }
 
-pub fn freeAssistantContentBlock(allocator: std.mem.Allocator, value: ai.protocol.AssistantMessage.AssistantContentBlock) void {
-    freeAssistantBlock(allocator, value);
+pub fn freeAssistantBlock(allocator: std.mem.Allocator, value: ai.protocol.AssistantMessage.AssistantContentBlock) void {
+    freeAssistantBlockImpl(allocator, value);
 }
 
 pub fn cloneThinkingContent(allocator: std.mem.Allocator, value: ai.protocol.ThinkingContent) !ai.protocol.ThinkingContent {
@@ -119,8 +117,6 @@ pub fn freeUser(allocator: std.mem.Allocator, value: ai.protocol.UserMessage) vo
     freeUserContent(allocator, value.content);
 }
 
-pub const freeUserMessage = freeUser;
-
 pub fn freeToolResult(allocator: std.mem.Allocator, value: message.ToolResultMessage) void {
     for (value.content) |block| switch (block) {
         .text => |text| {
@@ -144,8 +140,6 @@ pub fn freeToolResult(allocator: std.mem.Allocator, value: message.ToolResultMes
     allocator.free(value.tool_call_id);
     allocator.free(value.tool_name);
 }
-
-pub const freeToolResultMessage = freeToolResult;
 
 pub fn freeToolResultContentBlock(allocator: std.mem.Allocator, value: ai.protocol.ToolResultMessage.ContentBlock) void {
     switch (value) {
@@ -370,7 +364,7 @@ fn freeCustom(allocator: std.mem.Allocator, value: message.AgentMessage.Custom) 
     }
 }
 
-fn freeAssistantBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) void {
+fn freeAssistantBlockImpl(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) void {
     switch (block) {
         .text => |text| {
             allocator.free(text.text);
