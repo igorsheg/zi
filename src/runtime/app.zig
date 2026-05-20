@@ -59,10 +59,11 @@ pub fn main(init: std.process.Init) !void {
         .env = env,
         .allocator = allocator,
     };
-    try runCli(caps, init.minimal.args);
+    const exit_code = try runCli(caps, init.minimal.args);
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn runCli(caps: Caps, process_args: std.process.Args) !void {
+fn runCli(caps: Caps, process_args: std.process.Args) !u8 {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(caps.allocator);
     var it = std.process.Args.Iterator.init(process_args);
@@ -73,7 +74,7 @@ fn runCli(caps: Caps, process_args: std.process.Args) !void {
         .ok => |command| command,
         .err => |diag| {
             try writeParseDiagnostic(caps.io, diag);
-            std.process.exit(1);
+            return 1;
         },
     };
     defer raw.deinit(caps.allocator);
@@ -82,15 +83,15 @@ fn runCli(caps: Caps, process_args: std.process.Args) !void {
         .ok => |plan| cli.plan.Result{ .ok = plan },
         .err => |diag| {
             try writePlanDiagnostic(caps.io, diag);
-            std.process.exit(1);
+            return 1;
         },
     };
     defer planned.deinit(caps.allocator);
 
     const result = try cli.dispatch.run(.{ .allocator = caps.allocator, .io = caps.io }, planned.ok);
     switch (result) {
-        .ok => {},
-        .err => std.process.exit(1),
+        .ok => return 0,
+        .err => return 1,
     }
 }
 

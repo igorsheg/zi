@@ -30,6 +30,8 @@ const EventCapture = struct {
 
 pub fn run(ctx: Context, run_plan: plan_mod.RunPlan) !result_mod.ExecutionResult {
     var builtins: ?coding_agent.builtin_tools.Builtins = null;
+    // extension_host contains tool ctx pointers into builtins. AgentSession owns
+    // and deinits the host, so session.deinit must run before builtins.deinit.
     defer if (builtins) |*bundle| bundle.deinit();
     const extension_host = if (run_plan.tools == .builtins) blk: {
         builtins = try coding_agent.builtin_tools.Builtins.init(ctx.allocator, .{ .bash = .{ .io = ctx.io } });
@@ -125,7 +127,7 @@ fn convertMessages(_: ?*anyopaque, allocator: std.mem.Allocator, messages: []con
         .user => |user| .{ .user = user },
         .assistant => |assistant| .{ .assistant = assistant },
         .tool_result => |tool| .{ .tool_result = tool },
-        else => .{ .user = .{ .content = .{ .text = "" }, .timestamp = 0 } },
+        else => std.debug.panic("unsupported message type in CLI demo backend", .{}),
     };
     return out;
 }
