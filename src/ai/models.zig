@@ -33,6 +33,13 @@ pub fn getAllModels() []const protocol.Model {
     return &generated.models;
 }
 
+pub fn defaultBaseUrlForProvider(provider: protocol.Provider) ?[]const u8 {
+    for (generated.models) |model| {
+        if (std.meta.eql(model.provider, provider) and model.base_url.len > 0) return model.base_url;
+    }
+    return null;
+}
+
 pub fn calculateCost(model: protocol.Model, usage: *protocol.Usage) protocol.Usage.Cost {
     usage.cost.input = (model.cost.input / 1_000_000.0) * @as(f64, @floatFromInt(usage.input));
     usage.cost.output = (model.cost.output / 1_000_000.0) * @as(f64, @floatFromInt(usage.output));
@@ -70,4 +77,10 @@ test "find anthropic sonnet by id" {
         getModelById("claude-sonnet-4-5") orelse
         findModel("sonnet");
     try std.testing.expect(m != null);
+}
+
+test "provider base url defaults come from generated model catalog" {
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", defaultBaseUrlForProvider(.openrouter).?);
+    try std.testing.expectEqualStrings("https://api.anthropic.com", defaultBaseUrlForProvider(.anthropic).?);
+    try std.testing.expect(defaultBaseUrlForProvider(.{ .custom = "unknown" }) == null);
 }

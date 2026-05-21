@@ -97,25 +97,19 @@ pub const ProviderRuntime = struct {
 };
 
 fn settingsModelToProtocol(model: settings_mod.Model) ai.protocol.Model {
+    const provider = ai.protocol.parseProvider(model.provider);
     return .{
         .id = model.provider_model orelse model.id,
         .name = model.name orelse model.id,
         .api = ai.protocol.parseApi(model.api),
-        .provider = ai.protocol.parseProvider(model.provider),
-        .base_url = model.base_url orelse defaultBaseUrl(model.provider),
+        .provider = provider,
+        .base_url = model.base_url orelse ai.models.defaultBaseUrlForProvider(provider) orelse "",
         .reasoning = false,
         .input = &.{.text},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = model.context_window orelse 0,
         .max_tokens = model.max_tokens orelse 0,
     };
-}
-
-fn defaultBaseUrl(provider: []const u8) []const u8 {
-    if (std.mem.eql(u8, provider, "openai")) return "https://api.openai.com/v1";
-    if (std.mem.eql(u8, provider, "openrouter")) return "https://openrouter.ai/api/v1";
-    if (std.mem.eql(u8, provider, "anthropic")) return "https://api.anthropic.com";
-    return "";
 }
 
 fn modelsMatch(a: ai.protocol.Model, b: ai.protocol.Model) bool {
