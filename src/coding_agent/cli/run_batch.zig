@@ -103,20 +103,20 @@ fn resolveExecution(ctx: Context, run_plan: plan_mod.RunPlan, demo_backend: *Dem
 
 fn writeText(ctx: Context, terminal: coding_agent.event.RunTerminal, saw_tool: bool) !void {
     var buf: [1024]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(ctx.io, &buf);
+    var writer = std.Io.File.stdout().writerStreaming(ctx.io, &buf);
     switch (terminal) {
         .completed => try writer.interface.print("completed{s}\n", .{if (saw_tool) " with tools" else ""}),
         .aborted => try writer.interface.writeAll("aborted\n"),
         .failed => |kind| try writer.interface.print("failed: {s}\n", .{@tagName(kind)}),
     }
-    try writer.end();
+    try writer.interface.flush();
 }
 
 fn writeJsonLine(ctx: Context, terminal: coding_agent.event.RunTerminal, saw_tool: bool) !void {
     var buf: [1024]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(ctx.io, &buf);
+    var writer = std.Io.File.stdout().writerStreaming(ctx.io, &buf);
     try writer.interface.print("{{\"terminal\":\"{s}\",\"saw_tool\":{s}}}\n", .{ terminalName(terminal), if (saw_tool) "true" else "false" });
-    try writer.end();
+    try writer.interface.flush();
 }
 
 fn terminalName(terminal: coding_agent.event.RunTerminal) []const u8 {

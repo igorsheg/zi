@@ -103,21 +103,21 @@ fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *cli.runtime.
 
 fn writeParseDiagnostic(io: std.Io, diag: cli.parse.Diagnostic) !void {
     var buf: [1024]u8 = undefined;
-    var writer = std.Io.File.stderr().writer(io, &buf);
+    var writer = std.Io.File.stderr().writerStreaming(io, &buf);
     try cli.diagnostics.writeParse(&writer.interface, diag);
-    try writer.end();
+    try writer.interface.flush();
 }
 
 fn writePlanDiagnostic(io: std.Io, diag: cli.plan.Diagnostic) !void {
     var buf: [1024]u8 = undefined;
-    var writer = std.Io.File.stderr().writer(io, &buf);
+    var writer = std.Io.File.stderr().writerStreaming(io, &buf);
     try cli.diagnostics.writePlan(&writer.interface, diag);
-    try writer.end();
+    try writer.interface.flush();
 }
 
 fn writeResultDiagnostic(io: std.Io, diag: cli.result.Diagnostic) !void {
     var buf: [1024]u8 = undefined;
-    var writer = std.Io.File.stderr().writer(io, &buf);
+    var writer = std.Io.File.stderr().writerStreaming(io, &buf);
     try cli.diagnostics.writeResult(&writer.interface, diag);
-    try writer.end();
+    try writer.interface.flush();
 }

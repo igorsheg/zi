@@ -15,16 +15,16 @@ pub fn run(ctx: Context, plan: plan_mod.ExecutionPlan) !result_mod.ExecutionResu
     return switch (plan) {
         .help => blk: {
             var buf: [4096]u8 = undefined;
-            var writer = std.Io.File.stdout().writer(ctx.io, &buf);
+            var writer = std.Io.File.stdout().writerStreaming(ctx.io, &buf);
             try help.writeGeneral(&writer.interface);
-            try writer.end();
+            try writer.interface.flush();
             break :blk .ok;
         },
         .version => blk: {
             var buf: [128]u8 = undefined;
-            var writer = std.Io.File.stdout().writer(ctx.io, &buf);
+            var writer = std.Io.File.stdout().writerStreaming(ctx.io, &buf);
             try help.writeVersion(&writer.interface);
-            try writer.end();
+            try writer.interface.flush();
             break :blk .ok;
         },
         .run => |run_plan| try run_batch.run(.{ .allocator = ctx.allocator, .io = ctx.io, .runtime = ctx.runtime }, run_plan),
