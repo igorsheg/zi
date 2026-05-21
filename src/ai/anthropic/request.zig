@@ -84,7 +84,7 @@ pub fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanag
 
     try jw.beginObject();
     try jw.objectField("model");
-    try jw.write(model.id);
+    try jw.write(model.requestModel());
     const effective_max_tokens = blk: {
         if (model.reasoning) {
             if (reasoning) |level| {

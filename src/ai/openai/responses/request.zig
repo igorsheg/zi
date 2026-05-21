@@ -5,7 +5,7 @@ const replay = @import("replay.zig");
 
 pub fn writeBaseFields(jw: *std.json.Stringify, model: protocol.Model) !void {
     try jw.objectField("model");
-    try jw.write(model.id);
+    try jw.write(model.requestModel());
 
     try jw.objectField("stream");
     try jw.write(true);

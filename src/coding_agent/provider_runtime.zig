@@ -60,7 +60,7 @@ pub const ProviderRuntime = struct {
 
     fn resolveSettingsModel(self: *ProviderRuntime, model_ref: []const u8) ?agent.message.Model {
         for (self.settings_models) |model| {
-            if (std.mem.eql(u8, model.id, model_ref)) return settingsModelToProtocol(model);
+            if (std.mem.eql(u8, model.id, model_ref)) return settings_mod.resolve.modelToProtocol(model);
         }
         return null;
     }
@@ -95,22 +95,6 @@ pub const ProviderRuntime = struct {
         });
     }
 };
-
-fn settingsModelToProtocol(model: settings_mod.Model) ai.protocol.Model {
-    const provider = ai.protocol.parseProvider(model.provider);
-    return .{
-        .id = model.provider_model orelse model.id,
-        .name = model.name orelse model.id,
-        .api = ai.protocol.parseApi(model.api),
-        .provider = provider,
-        .base_url = model.base_url orelse ai.models.defaultBaseUrlForProvider(provider) orelse "",
-        .reasoning = false,
-        .input = &.{.text},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = model.context_window orelse 0,
-        .max_tokens = model.max_tokens orelse 0,
-    };
-}
 
 fn modelsMatch(a: ai.protocol.Model, b: ai.protocol.Model) bool {
     return std.mem.eql(u8, a.id, b.id) and std.meta.eql(a.provider, b.provider) and std.meta.eql(a.api, b.api);
@@ -195,7 +179,8 @@ test "provider runtime resolves settings model before builtins" {
     defer runtime.deinit();
 
     const model = runtime.resolveModel("openrouter/sonnet") orelse return error.MissingSettingsModel;
-    try testing.expectEqualStrings("anthropic/claude-sonnet-4", model.id);
+    try testing.expectEqualStrings("openrouter/sonnet", model.id);
+    try testing.expectEqualStrings("anthropic/claude-sonnet-4", model.requestModel());
     try testing.expectEqualStrings("Sonnet via OpenRouter", model.name);
     try testing.expect(model.api == .openai_completions);
     try testing.expect(model.provider == .openrouter);

@@ -497,6 +497,7 @@ pub const Compat = union(enum) {
 
 pub const Model = struct {
     id: []const u8,
+    provider_model: ?[]const u8 = null,
     name: []const u8,
     api: Api,
     provider: Provider,
@@ -509,6 +510,10 @@ pub const Model = struct {
     headers: ?[]const Header = null,
 
     compat: ?Compat = null,
+
+    pub fn requestModel(self: Model) []const u8 {
+        return self.provider_model orelse self.id;
+    }
 
     pub const InputType = enum {
         text,

@@ -746,6 +746,8 @@ const OwnedCommand = union(enum) {
 fn cloneModel(allocator: std.mem.Allocator, model: agent_mod.message.Model) !agent_mod.message.Model {
     const id = try allocator.dupe(u8, model.id);
     errdefer allocator.free(id);
+    const provider_model = if (model.provider_model) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (provider_model) |value| allocator.free(value);
     const name = try allocator.dupe(u8, model.name);
     errdefer allocator.free(name);
     const base_url = try allocator.dupe(u8, model.base_url);
@@ -757,6 +759,7 @@ fn cloneModel(allocator: std.mem.Allocator, model: agent_mod.message.Model) !age
 
     return .{
         .id = id,
+        .provider_model = provider_model,
         .name = name,
         .api = model.api,
         .provider = model.provider,
@@ -816,6 +819,7 @@ fn freeCommand(allocator: std.mem.Allocator, value: OwnedCommand) void {
 
 fn freeModel(allocator: std.mem.Allocator, model: agent_mod.message.Model) void {
     allocator.free(model.id);
+    if (model.provider_model) |value| allocator.free(value);
     allocator.free(model.name);
     allocator.free(model.base_url);
     allocator.free(model.input);

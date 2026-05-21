@@ -426,3 +426,15 @@ test "buildRequestJson emits stream:true and message round-trip" {
     try testing.expect(std.mem.indexOf(u8, out.items, "be helpful") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"openai/gpt-test\"") != null);
 }
+
+test "buildRequestJson emits provider model when configured" {
+    var model = test_model;
+    model.provider_model = "provider/gpt-test";
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try completions_request.buildRequestJson(testing.allocator, &out, model, .{ .messages = &.{} }, null);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"provider/gpt-test\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"openai/gpt-test\"") == null);
+}

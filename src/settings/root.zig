@@ -1,5 +1,6 @@
 pub const schema = @import("schema.zig");
 pub const loader = @import("load.zig");
+pub const resolve = @import("resolve.zig");
 
 pub const max_settings_file_bytes = schema.max_settings_file_bytes;
 pub const max_models = schema.max_models;
