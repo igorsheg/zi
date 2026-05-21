@@ -2,8 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const runtime_env = @import("env.zig");
+const runtime_storage = @import("storage.zig");
 const log = @import("log.zig");
 const cli = @import("../coding_agent/cli/root.zig");
+const settings_mod = @import("../settings/root.zig");
 
 pub const name = "zi";
 pub const version = build_options.version;
@@ -59,14 +61,22 @@ pub fn main(init: std.process.Init) !void {
         .env = env,
         .allocator = allocator,
     };
+
+    const project_root = env.get("PWD");
+    var storage = try runtime_storage.Storage.init(allocator, env, project_root);
+    defer storage.deinit();
+
+    var settings = try settings_mod.load(allocator, init.io, storage);
+    defer settings.deinit();
+
     var cli_runtime = try cli.runtime.Runtime.init(allocator, init.io, env);
     defer cli_runtime.deinit();
 
-    const exit_code = try runCli(caps, init.minimal.args, &cli_runtime);
+    const exit_code = try runCli(caps, init.minimal.args, &cli_runtime, settings);
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *cli.runtime.Runtime) !u8 {
+fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *cli.runtime.Runtime, settings: settings_mod.Settings) !u8 {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(caps.allocator);
     var it = std.process.Args.Iterator.init(process_args);
@@ -82,7 +92,7 @@ fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *cli.runtime.
     };
     defer raw.deinit(caps.allocator);
 
-    var planned = switch (try cli.plan.build(caps.allocator, raw)) {
+    var planned = switch (try cli.plan.build(caps.allocator, raw, settings)) {
         .ok => |plan| cli.plan.Result{ .ok = plan },
         .err => |diag| {
             try writePlanDiagnostic(caps.io, diag);

@@ -13,6 +13,7 @@ test {
     _ = @import("agent/root.zig");
     _ = @import("coding_agent/root.zig");
     _ = @import("session/root.zig");
+    _ = @import("settings/root.zig");
 }
 
 fn setupTestRuntime() void {
