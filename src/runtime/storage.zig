@@ -5,6 +5,20 @@ pub const Error = error{
     MissingHome,
 } || std.mem.Allocator.Error;
 
+pub const ProjectRootResolution = union(enum) {
+    cwd: []const u8,
+    pwd_fallback: []const u8,
+    none,
+
+    pub fn path(resolution: ProjectRootResolution) ?[]const u8 {
+        return switch (resolution) {
+            .cwd => |value| value,
+            .pwd_fallback => |value| value,
+            .none => null,
+        };
+    }
+};
+
 pub const Storage = struct {
     allocator: std.mem.Allocator,
 
@@ -20,6 +34,12 @@ pub const Storage = struct {
     pub fn init(allocator: std.mem.Allocator, environment: env_mod.Env, project_root: ?[]const u8) Error!Storage {
         const home = environment.get("HOME") orelse return error.MissingHome;
         return initFromHome(allocator, home, project_root);
+    }
+
+    pub fn initForProcess(allocator: std.mem.Allocator, io: std.Io, environment: env_mod.Env) Error!Storage {
+        var project_root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const project_root = resolveProjectRoot(io, environment, &project_root_buffer).path();
+        return init(allocator, environment, project_root);
     }
 
     pub fn initFromHome(allocator: std.mem.Allocator, home: []const u8, project_root: ?[]const u8) Error!Storage {
@@ -64,6 +84,19 @@ pub const Storage = struct {
     }
 };
 
+pub fn resolveProjectRoot(io: std.Io, environment: env_mod.Env, buffer: []u8) ProjectRootResolution {
+    std.debug.assert(buffer.len >= std.Io.Dir.max_path_bytes);
+
+    if (std.Io.Dir.cwd().realPath(io, buffer)) |byte_count| {
+        return .{ .cwd = buffer[0..byte_count] };
+    } else |_| {
+        if (environment.get("PWD")) |pwd| {
+            if (pwd.len > 0) return .{ .pwd_fallback = pwd };
+        }
+        return .none;
+    }
+}
+
 fn join(allocator: std.mem.Allocator, parts: []const []const u8) std.mem.Allocator.Error![]const u8 {
     return std.fs.path.join(allocator, parts);
 }
@@ -92,4 +125,16 @@ test "storage builds project settings path from project root" {
 
 test "storage requires home from environment" {
     try std.testing.expectError(error.MissingHome, Storage.init(std.testing.allocator, .empty, null));
+}
+
+test "project root resolution falls back to PWD when cwd realpath fails" {
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("PWD", "/work/project");
+
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const resolution = resolveProjectRoot(std.Io.failing, env_mod.Env.from(&map), &buffer);
+
+    try std.testing.expect(resolution == .pwd_fallback);
+    try std.testing.expectEqualStrings("/work/project", resolution.path().?);
 }

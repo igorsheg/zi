@@ -62,8 +62,7 @@ pub fn main(init: std.process.Init) !void {
         .allocator = allocator,
     };
 
-    const project_root = env.get("PWD");
-    var storage = try runtime_storage.Storage.init(allocator, env, project_root);
+    var storage = try runtime_storage.Storage.initForProcess(allocator, init.io, env);
     defer storage.deinit();
 
     var settings = try settings_mod.load(allocator, init.io, storage);
