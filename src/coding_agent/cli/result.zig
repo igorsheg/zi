@@ -8,6 +8,7 @@ pub const ExecutionResult = union(enum) {
 pub const Diagnostic = union(enum) {
     submit_rejected,
     run_failed,
+    tui_unavailable,
     missing_model,
     unknown_model,
     invalid_settings_model: settings_resolve.Diagnostic,

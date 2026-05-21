@@ -18,6 +18,7 @@ pub const RawCommand = union(enum) {
 pub const RawRun = struct {
     prompt_parts: []const []const u8,
     print: bool = false,
+    json: bool = false,
     mode: ?[]const u8 = null,
     model: ?[]const u8 = null,
     no_tools: bool = false,
@@ -40,6 +41,7 @@ const Seen = struct {
     help: bool = false,
     version: bool = false,
     print: bool = false,
+    json: bool = false,
     mode: bool = false,
     model: bool = false,
     no_tools: bool = false,
@@ -49,6 +51,7 @@ const Seen = struct {
             .help => &self.help,
             .version => &self.version,
             .print => &self.print,
+            .json => &self.json,
             .mode => &self.mode,
             .model => &self.model,
             .no_tools => &self.no_tools,
@@ -81,6 +84,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) error{OutOf
                     .help => run = run,
                     .version => run = run,
                     .print => run.print = true,
+                    .json => run.json = true,
                     .no_tools => run.no_tools = true,
                     .mode, .model => unreachable,
                 },
@@ -109,6 +113,14 @@ test "parse maps print prompt" {
     defer if (result == .ok) result.ok.deinit(std.testing.allocator);
     try std.testing.expect(result.ok == .run);
     try std.testing.expect(result.ok.run.print);
+    try std.testing.expectEqualStrings("hello", result.ok.run.prompt_parts[0]);
+}
+
+test "parse maps json prompt" {
+    var result = try parse(std.testing.allocator, &.{ "--json", "hello" });
+    defer if (result == .ok) result.ok.deinit(std.testing.allocator);
+    try std.testing.expect(result.ok == .run);
+    try std.testing.expect(result.ok.run.json);
     try std.testing.expectEqualStrings("hello", result.ok.run.prompt_parts[0]);
 }
 

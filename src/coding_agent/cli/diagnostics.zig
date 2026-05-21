@@ -25,6 +25,7 @@ pub fn writeResult(writer: anytype, diag: result_mod.Diagnostic) !void {
     switch (diag) {
         .submit_rejected => try writer.writeAll("run rejected\n"),
         .run_failed => try writer.writeAll("run failed\n"),
+        .tui_unavailable => try writer.writeAll("TUI mode is not implemented yet; use -p or --json\n"),
         .missing_model => try writer.writeAll("missing model runtime\n"),
         .unknown_model => try writer.writeAll("unknown model\n"),
         .invalid_settings_model => |invalid| try writeInvalidSettingsModel(writer, invalid),

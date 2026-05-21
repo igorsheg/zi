@@ -62,7 +62,7 @@ pub fn run(ctx: Context, run_plan: plan_mod.RunPlan) !result_mod.ExecutionResult
     const terminal = events.terminal orelse return .{ .err = .run_failed };
     switch (run_plan.output) {
         .jsonl_events => try writeJsonLine(ctx, terminal, events.saw_tool),
-        .text, .final_text => try writeText(ctx, terminal, events.saw_tool),
+        .final_text => try writeText(ctx, terminal, events.saw_tool),
     }
     return switch (terminal) {
         .completed => .ok,

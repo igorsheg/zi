@@ -27,6 +27,7 @@ pub fn run(ctx: Context, plan: plan_mod.ExecutionPlan) !result_mod.ExecutionResu
             try writer.interface.flush();
             break :blk .ok;
         },
+        .tui => .{ .err = .tui_unavailable },
         .run => |run_plan| try run_batch.run(.{ .allocator = ctx.allocator, .io = ctx.io, .runtime = ctx.runtime }, run_plan),
     };
 }

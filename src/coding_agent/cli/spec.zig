@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const FlagId = enum { help, version, print, mode, model, no_tools };
+pub const FlagId = enum { help, version, print, json, mode, model, no_tools };
 pub const ValueKind = enum { none, required };
 
 pub const FlagSpec = struct {
@@ -22,7 +22,8 @@ pub const all_flags = [_]FlagSpec{
     .{ .id = .help, .long = "help", .short = 'h', .description = "Show help" },
     .{ .id = .version, .long = "version", .description = "Show version" },
     .{ .id = .print, .long = "print", .short = 'p', .description = "Print final assistant text only" },
-    .{ .id = .mode, .long = "mode", .value_kind = .required, .value_name = "<text|json>", .description = "Output mode" },
+    .{ .id = .json, .long = "json", .description = "Emit JSONL events" },
+    .{ .id = .mode, .long = "mode", .value_kind = .required, .value_name = "<json>", .description = "Legacy output mode alias" },
     .{ .id = .model, .long = "model", .value_kind = .required, .value_name = "<id>", .description = "Model id" },
     .{ .id = .no_tools, .long = "no-tools", .description = "Disable builtin tools" },
 };
