@@ -1,3 +1,4 @@
+const std = @import("std");
 const ai = @import("../ai/root.zig");
 const schema = @import("schema.zig");
 
@@ -27,7 +28,7 @@ test "settings model resolves user id separately from provider request model" {
         .provider_model = "anthropic/claude-sonnet-4",
     });
 
-    try @import("std").testing.expectEqualStrings("openrouter/sonnet", model.id);
-    try @import("std").testing.expectEqualStrings("anthropic/claude-sonnet-4", model.requestModel());
-    try @import("std").testing.expectEqualStrings("https://openrouter.ai/api/v1", model.base_url);
+    try std.testing.expectEqualStrings("openrouter/sonnet", model.id);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", model.requestModel());
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", model.base_url);
 }
