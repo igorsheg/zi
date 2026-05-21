@@ -37,7 +37,7 @@ pub const Storage = struct {
     }
 
     pub fn initForProcess(allocator: std.mem.Allocator, io: std.Io, environment: env_mod.Env) Error!Storage {
-        var project_root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var project_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const project_root = resolveProjectRoot(io, environment, &project_root_buffer).path();
         return init(allocator, environment, project_root);
     }
@@ -85,9 +85,9 @@ pub const Storage = struct {
 };
 
 pub fn resolveProjectRoot(io: std.Io, environment: env_mod.Env, buffer: []u8) ProjectRootResolution {
-    std.debug.assert(buffer.len >= std.Io.Dir.max_path_bytes);
+    std.debug.assert(buffer.len >= std.fs.max_path_bytes);
 
-    if (std.Io.Dir.cwd().realPath(io, buffer)) |byte_count| {
+    if (std.process.currentPath(io, buffer)) |byte_count| {
         return .{ .cwd = buffer[0..byte_count] };
     } else |_| {
         if (environment.get("PWD")) |pwd| {
@@ -132,7 +132,7 @@ test "project root resolution falls back to PWD when cwd realpath fails" {
     defer map.deinit();
     try map.put("PWD", "/work/project");
 
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const resolution = resolveProjectRoot(std.Io.failing, env_mod.Env.from(&map), &buffer);
 
     try std.testing.expect(resolution == .pwd_fallback);
