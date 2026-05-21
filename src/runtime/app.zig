@@ -68,7 +68,9 @@ pub fn main(init: std.process.Init) !void {
     var settings = try settings_mod.load(allocator, init.io, storage);
     defer settings.deinit();
 
-    var cli_runtime = try cli.runtime.Runtime.init(allocator, init.io, env);
+    var cli_runtime = try cli.runtime.Runtime.initWithOptions(allocator, init.io, env, .{
+        .settings_models = settings.models,
+    });
     defer cli_runtime.deinit();
 
     const exit_code = try runCli(caps, init.minimal.args, &cli_runtime, settings);
