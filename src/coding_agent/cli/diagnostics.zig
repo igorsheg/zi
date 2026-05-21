@@ -2,6 +2,7 @@ const std = @import("std");
 const parse_mod = @import("parse.zig");
 const plan_mod = @import("plan.zig");
 const result_mod = @import("result.zig");
+const settings_resolve = @import("../../settings/resolve.zig");
 const spec = @import("spec.zig");
 
 pub fn writeParse(writer: anytype, diag: parse_mod.Diagnostic) !void {
@@ -26,8 +27,26 @@ pub fn writeResult(writer: anytype, diag: result_mod.Diagnostic) !void {
         .run_failed => try writer.writeAll("run failed\n"),
         .missing_model => try writer.writeAll("missing model runtime\n"),
         .unknown_model => try writer.writeAll("unknown model\n"),
+        .invalid_settings_model => |invalid| try writeInvalidSettingsModel(writer, invalid),
         .provider_unavailable => try writer.writeAll("provider runtime unavailable\n"),
         .missing_api_key => try writer.writeAll("missing OPENAI_API_KEY\n"),
+    }
+}
+
+fn writeInvalidSettingsModel(writer: anytype, diag: settings_resolve.Diagnostic) !void {
+    switch (diag) {
+        .unknown_api => |field| try writer.print(
+            "settings model {s} has unknown api: {s}\n",
+            .{ field.model_id, field.value },
+        ),
+        .unknown_provider => |field| try writer.print(
+            "settings model {s} has unknown provider: {s}\n",
+            .{ field.model_id, field.value },
+        ),
+        .missing_base_url => |missing| try writer.print(
+            "settings model {s} provider {s} requires baseUrl\n",
+            .{ missing.model_id, missing.provider },
+        ),
     }
 }
 

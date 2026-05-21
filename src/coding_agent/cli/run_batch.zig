@@ -93,7 +93,11 @@ fn resolveExecution(ctx: Context, run_plan: plan_mod.RunPlan, demo_backend: *Dem
     };
 
     const runtime = ctx.runtime orelse return .{ .err = .missing_model };
-    const model = runtime.resolveModel(model_ref) orelse return .{ .err = .unknown_model };
+    const model = switch (runtime.resolveModel(model_ref)) {
+        .ok => |model| model,
+        .unknown_model => return .{ .err = .unknown_model },
+        .invalid_settings_model => |diag| return .{ .err = .{ .invalid_settings_model = diag } },
+    };
     const backend = runtime.executionBackend(model) catch |err| switch (err) {
         error.ProviderUnavailable => return .{ .err = .provider_unavailable },
         error.MissingApiKey => return .{ .err = .missing_api_key },

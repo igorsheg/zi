@@ -30,6 +30,12 @@ pub const ProviderRuntime = struct {
         api_key: ?[]const u8 = "test-key",
     };
 
+    pub const ResolveModelResult = union(enum) {
+        ok: agent.message.Model,
+        unknown_model,
+        invalid_settings_model: settings_mod.resolve.Diagnostic,
+    };
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, env: runtime_env.Env) !ProviderRuntime {
         return initWithOptions(allocator, io, env, .{});
     }
@@ -50,17 +56,21 @@ pub const ProviderRuntime = struct {
         self.* = undefined;
     }
 
-    pub fn resolveModel(self: *ProviderRuntime, model_ref: []const u8) ?agent.message.Model {
+    pub fn resolveModel(self: *ProviderRuntime, model_ref: []const u8) ResolveModelResult {
         if (self.static_provider) |static| {
-            if (std.mem.eql(u8, static.model.id, model_ref)) return static.model;
+            if (std.mem.eql(u8, static.model.id, model_ref)) return .{ .ok = static.model };
         }
-        if (self.resolveSettingsModel(model_ref)) |model| return model;
-        return ai.models.getModelById(model_ref) orelse ai.models.findModel(model_ref);
+        if (self.resolveSettingsModel(model_ref)) |result| return result;
+        if (ai.models.getModelById(model_ref) orelse ai.models.findModel(model_ref)) |model| return .{ .ok = model };
+        return .unknown_model;
     }
 
-    fn resolveSettingsModel(self: *ProviderRuntime, model_ref: []const u8) ?agent.message.Model {
+    fn resolveSettingsModel(self: *ProviderRuntime, model_ref: []const u8) ?ResolveModelResult {
         for (self.settings_models) |model| {
-            if (std.mem.eql(u8, model.id, model_ref)) return settings_mod.resolve.modelToProtocol(model);
+            if (std.mem.eql(u8, model.id, model_ref)) return switch (settings_mod.resolve.modelToProtocol(model)) {
+                .ok => |resolved| .{ .ok = resolved },
+                .err => |diag| .{ .invalid_settings_model = diag },
+            };
         }
         return null;
     }
@@ -122,7 +132,10 @@ test "provider runtime can drive AgentSession through faux provider" {
     });
     defer runtime.deinit();
 
-    const model = runtime.resolveModel("faux-1") orelse return error.MissingFauxModel;
+    const model = switch (runtime.resolveModel("faux-1")) {
+        .ok => |model| model,
+        else => return error.MissingFauxModel,
+    };
     const backend = try runtime.executionBackend(model);
 
     const Capture = struct {
@@ -178,7 +191,10 @@ test "provider runtime resolves settings model before builtins" {
     });
     defer runtime.deinit();
 
-    const model = runtime.resolveModel("openrouter/sonnet") orelse return error.MissingSettingsModel;
+    const model = switch (runtime.resolveModel("openrouter/sonnet")) {
+        .ok => |model| model,
+        else => return error.MissingSettingsModel,
+    };
     try testing.expectEqualStrings("openrouter/sonnet", model.id);
     try testing.expectEqualStrings("anthropic/claude-sonnet-4", model.requestModel());
     try testing.expectEqualStrings("Sonnet via OpenRouter", model.name);
