@@ -25,7 +25,7 @@ pub const SseParser = struct {
     id_len: usize = 0,
     has_id: bool = false,
     needs_reset: bool = false,
-    data_buf: std.ArrayListUnmanaged(u8) = .empty,
+    data_buf: std.ArrayList(u8) = .empty,
 
     last_event_id_buf: [512]u8 = undefined,
     last_event_id_len: usize = 0,
@@ -37,6 +37,7 @@ pub const SseParser = struct {
 
     pub fn deinit(self: *SseParser) void {
         self.data_buf.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn lastEventId(self: *const SseParser) ?[]const u8 {
@@ -58,7 +59,7 @@ pub const SseParser = struct {
                 dlen -= 1;
             }
 
-            const evt = SseEvent{
+            const evt: SseEvent = .{
                 .id = if (self.has_id) self.id_buf[0..self.id_len] else self.lastEventId(),
                 .event = if (self.event_len > 0) self.event_buf[0..self.event_len] else null,
                 .data = self.data_buf.items[0..dlen],
@@ -78,7 +79,7 @@ pub const SseParser = struct {
         var field: []const u8 = "";
         var value: []const u8 = "";
 
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+        if (std.mem.findScalar(u8, line, ':')) |colon| {
             field = line[0..colon];
             var v = line[colon + 1 ..];
             if (v.len > 0 and v[0] == ' ') v = v[1..];
@@ -100,7 +101,7 @@ pub const SseParser = struct {
             @memcpy(self.event_buf[0..len], value[0..len]);
             self.event_len = len;
         } else if (std.mem.eql(u8, field, "id")) {
-            if (std.mem.indexOfScalar(u8, value, 0) == null) {
+            if (std.mem.findScalar(u8, value, 0) == null) {
                 const len = @min(value.len, self.id_buf.len);
                 @memcpy(self.id_buf[0..len], value[0..len]);
                 self.id_len = len;
@@ -131,7 +132,7 @@ pub fn streamEvents(
     chunk_size: usize,
     handler: EventHandler,
 ) !void {
-    var pending: std.ArrayListUnmanaged(u8) = .empty;
+    var pending: std.ArrayList(u8) = .empty;
     defer pending.deinit(allocator);
 
     const effective_chunk_size = if (chunk_size == 0) 4096 else chunk_size;
@@ -176,8 +177,8 @@ fn streamReaderChunk(reader: anytype, w: *std.Io.Writer, limit: std.Io.Limit) !u
 
 fn drainReaderBufferInto(
     reader: anytype,
-    pending: *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(u8),
+    allocator: std.mem.Allocator, // ziglint-ignore: Z023
 ) !bool {
     switch (comptime @typeInfo(@TypeOf(reader))) {
         .pointer => |info| switch (comptime @typeInfo(info.child)) {
@@ -198,12 +199,12 @@ fn drainReaderBufferInto(
 
 fn flushPendingLines(
     parser: *SseParser,
-    pending: *std.ArrayListUnmanaged(u8),
+    pending: *std.ArrayList(u8),
     handler: EventHandler,
     flush_tail: bool,
 ) !void {
     var start: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, pending.items, start, '\n')) |newline_idx| {
+    while (std.mem.findScalarPos(u8, pending.items, start, '\n')) |newline_idx| {
         var line = pending.items[start..newline_idx];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         if (try parser.feedLine(line)) |evt| {
@@ -228,7 +229,7 @@ fn flushPendingLines(
     }
 
     const remaining = pending.items.len - start;
-    std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[start..]);
+    @memmove(pending.items[0..remaining], pending.items[start..]);
     pending.items.len = remaining;
 }
 
@@ -243,7 +244,7 @@ fn expectNextEvent(parser: *SseParser, expected_data: []const u8) !SseEvent {
 }
 
 fn feedDataLine(parser: *SseParser, data: []const u8) !void {
-    var line: std.ArrayListUnmanaged(u8) = .empty;
+    var line: std.ArrayList(u8) = .empty;
     defer line.deinit(std.testing.allocator);
     try line.appendSlice(std.testing.allocator, "data: ");
     try line.appendSlice(std.testing.allocator, data);
@@ -251,27 +252,29 @@ fn feedDataLine(parser: *SseParser, data: []const u8) !void {
 }
 
 const CapturedEvents = struct {
+    const Self = CapturedEvents;
     count: usize = 0,
     last_event: ?[]const u8 = null,
     last_data: ?[]const u8 = null,
 
     fn handler(event: SseEvent, ctx: ?*anyopaque) anyerror!void {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const self: *Self = @ptrCast(@alignCast(ctx));
         self.count += 1;
         self.last_event = event.event;
         self.last_data = event.data;
     }
 
-    fn eventHandler(self: *@This()) EventHandler {
+    fn eventHandler(self: *Self) EventHandler {
         return .{ .func = &handler, .ctx = @ptrCast(self) };
     }
 };
 
 const ChunkedSliceReader = struct {
+    const Self = ChunkedSliceReader;
     input: []const u8,
     pos: usize = 0,
 
-    fn stream(self: *@This(), w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+    fn stream(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) !usize {
         if (self.pos >= self.input.len) return error.EndOfStream;
         const remaining = self.input.len - self.pos;
         const n = @min(limit.minInt(remaining), remaining);
@@ -365,7 +368,7 @@ test "streamEvents feeds reader into parser" {
     var reader: std.Io.Reader = .fixed(input);
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
-    var captured = CapturedEvents{};
+    var captured: CapturedEvents = .{};
 
     try streamEvents(std.testing.allocator, &reader, &parser, 8, captured.eventHandler());
 
@@ -377,10 +380,10 @@ test "streamEvents feeds reader into parser" {
 test "streamEvents emits a data line longer than the read chunk" {
     const long_json = "{\"type\":\"response.output_text.delta\",\"delta\":\"" ++ ("x" ** 20000) ++ "\"}";
     const input = "data: " ++ long_json ++ "\n\n";
-    var reader = ChunkedSliceReader{ .input = input };
+    var reader: ChunkedSliceReader = .{ .input = input };
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
-    var captured = CapturedEvents{};
+    var captured: CapturedEvents = .{};
 
     try streamEvents(std.testing.allocator, &reader, &parser, 64, captured.eventHandler());
 
@@ -390,9 +393,11 @@ test "streamEvents emits a data line longer than the read chunk" {
 
 test "streamEvents retries after zero-byte read instead of treating it as EOF" {
     const ZeroThenMoreReader = struct {
+        const Self = @This();
+
         calls: usize = 0,
 
-        fn stream(self: *@This(), w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+        fn stream(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) !usize {
             const chunk = switch (self.calls) {
                 0 => "data: hel",
                 1 => {
@@ -409,10 +414,10 @@ test "streamEvents retries after zero-byte read instead of treating it as EOF" {
         }
     };
 
-    var reader = ZeroThenMoreReader{};
+    var reader: ZeroThenMoreReader = .{};
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
-    var captured = CapturedEvents{};
+    var captured: CapturedEvents = .{};
 
     try streamEvents(std.testing.allocator, &reader, &parser, 64, captured.eventHandler());
 
@@ -422,11 +427,13 @@ test "streamEvents retries after zero-byte read instead of treating it as EOF" {
 
 test "streamEvents discards unterminated tail at EOF" {
     const ZeroAtEndReader = struct {
+        const Self = @This();
+
         input: []const u8,
         pos: usize = 0,
         returned_zero: bool = false,
 
-        fn stream(self: *@This(), w: *std.Io.Writer, limit: std.Io.Limit) !usize {
+        fn stream(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) !usize {
             if (self.pos < self.input.len) {
                 const remaining = self.input.len - self.pos;
                 const n = @min(limit.minInt(remaining), remaining);
@@ -442,10 +449,10 @@ test "streamEvents discards unterminated tail at EOF" {
         }
     };
 
-    var reader = ZeroAtEndReader{ .input = "data: {\"type\":\"response.completed\"" };
+    var reader: ZeroAtEndReader = .{ .input = "data: {\"type\":\"response.completed\"" };
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
-    var captured = CapturedEvents{};
+    var captured: CapturedEvents = .{};
 
     try streamEvents(std.testing.allocator, &reader, &parser, 64, captured.eventHandler());
 
@@ -461,7 +468,7 @@ test "streamEvents makes forward progress when stream parks bytes in reader buff
 
     var parser = SseParser.init(std.testing.allocator);
     defer parser.deinit();
-    var captured = CapturedEvents{};
+    var captured: CapturedEvents = .{};
 
     try streamEvents(std.testing.allocator, &indirect.interface, &parser, 16, captured.eventHandler());
 
