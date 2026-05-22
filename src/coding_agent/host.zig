@@ -75,8 +75,9 @@ pub const AgentHost = struct {
             error.ProviderUnavailable => return .{ .err = .provider_unavailable },
             error.MissingApiKey => return .{ .err = .missing_api_key },
         };
-        bundle.provider = resolved_provider.provider;
-        const backend = provider_backend.synchronous(&bundle.provider.?, .{
+        bundle.provider = try self.allocator.create(ai.provider.Provider);
+        bundle.provider.?.* = resolved_provider.provider;
+        const backend = provider_backend.synchronous(bundle.provider.?, .{
             .io = self.io,
             .api_key = resolved_provider.api_key,
             .transport = resolved_provider.transport,
@@ -116,12 +117,13 @@ pub const Diagnostic = union(enum) {
 pub const SessionBundle = struct {
     allocator: std.mem.Allocator,
     builtins: ?builtin_tools.Builtins = null,
-    provider: ?ai.provider.Provider = null,
+    provider: ?*ai.provider.Provider = null,
     demo_backend: ?*DemoBackend = null,
     session: ?session_mod.AgentSession = null,
 
     pub fn deinit(self: *SessionBundle) void {
         if (self.session) |*session| session.deinit();
+        if (self.provider) |provider| self.allocator.destroy(provider);
         if (self.demo_backend) |demo_backend| self.allocator.destroy(demo_backend);
         if (self.builtins) |*builtins| builtins.deinit();
         self.* = undefined;
