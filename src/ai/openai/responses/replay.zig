@@ -32,6 +32,7 @@ pub const TransformedMessages = struct {
     pub fn deinit(self: *TransformedMessages) void {
         for (self.messages) |msg| deinitMessage(self.allocator, msg);
         self.allocator.free(self.messages);
+        self.* = undefined;
     }
 };
 
@@ -41,32 +42,32 @@ pub fn transformMessages(
     messages: []const protocol.Message,
     model: protocol.Model,
 ) !TransformedMessages {
-    var result: std.ArrayListUnmanaged(protocol.Message) = .empty;
+    var result: std.ArrayList(protocol.Message) = .empty;
     errdefer deinitMessageList(allocator, result.items);
     errdefer result.deinit(allocator);
 
-    var tool_id_map: std.ArrayListUnmanaged(ToolCallIdMapping) = .empty;
+    var tool_id_map: std.ArrayList(ToolCallIdMapping) = .empty;
     defer {
         for (tool_id_map.items) |mapping| mapping.deinit(allocator);
         tool_id_map.deinit(allocator);
     }
 
-    var pending_tool_calls: std.ArrayListUnmanaged(PendingToolCallRef) = .empty;
+    var pending_tool_calls: std.ArrayList(PendingToolCallRef) = .empty;
     defer pending_tool_calls.deinit(allocator);
 
-    var existing_tool_result_ids: std.ArrayListUnmanaged([]const u8) = .empty;
+    var existing_tool_result_ids: std.ArrayList([]const u8) = .empty;
     defer existing_tool_result_ids.deinit(allocator);
 
     for (messages) |msg| {
         switch (msg) {
             .user => |u| {
-                try flushPendingSyntheticToolResults(allocator, io, &result, pending_tool_calls.items, existing_tool_result_ids.items);
+                try flushPendingSyntheticToolResults(allocator, io, &result, pending_tool_calls.items, existing_tool_result_ids.items); // ziglint-ignore: Z024
                 pending_tool_calls.clearRetainingCapacity();
                 existing_tool_result_ids.clearRetainingCapacity();
                 try result.append(allocator, .{ .user = try message_memory.cloneUser(allocator, u) });
             },
             .assistant => |a| {
-                try flushPendingSyntheticToolResults(allocator, io, &result, pending_tool_calls.items, existing_tool_result_ids.items);
+                try flushPendingSyntheticToolResults(allocator, io, &result, pending_tool_calls.items, existing_tool_result_ids.items); // ziglint-ignore: Z024
                 pending_tool_calls.clearRetainingCapacity();
                 existing_tool_result_ids.clearRetainingCapacity();
 
@@ -87,7 +88,7 @@ pub fn transformMessages(
             .tool_result => |tr| {
                 const transformed = try transformToolResultMessage(allocator, tr, tool_id_map.items);
                 try result.append(allocator, .{ .tool_result = transformed });
-                try existing_tool_result_ids.append(allocator, result.items[result.items.len - 1].tool_result.tool_call_id);
+                try existing_tool_result_ids.append(allocator, result.items[result.items.len - 1].tool_result.tool_call_id); // ziglint-ignore: Z024
             },
         }
     }
@@ -105,6 +106,7 @@ pub const ResponsesInputItems = struct {
     pub fn deinit(self: *ResponsesInputItems) void {
         for (self.items) |item| deinitResponsesInputItem(self.allocator, item);
         self.allocator.free(self.items);
+        self.* = undefined;
     }
 };
 
@@ -115,7 +117,7 @@ pub fn convertResponsesMessages(
     messages: []const protocol.Message,
     options: ConvertOptions,
 ) !ResponsesInputItems {
-    var items: std.ArrayListUnmanaged(ResponsesInputItem) = .empty;
+    var items: std.ArrayList(ResponsesInputItem) = .empty;
     errdefer deinitResponsesInputItemList(allocator, items.items);
     errdefer items.deinit(allocator);
 
@@ -203,7 +205,7 @@ const ResponsesInputItem = union(enum) {
 
 fn appendAssistantItems(
     allocator: std.mem.Allocator,
-    items: *std.ArrayListUnmanaged(ResponsesInputItem),
+    items: *std.ArrayList(ResponsesInputItem),
     model: protocol.Model,
     assistant: protocol.AssistantMessage,
     msg_index: usize,
@@ -230,7 +232,7 @@ fn appendAssistantItems(
         .tool_call => |tool_call| {
             const split = splitToolCallId(tool_call.id);
             const item_id = if (split.item_id) |raw_item_id|
-                if (is_different_model and std.mem.startsWith(u8, raw_item_id, "fc_")) null else try allocator.dupe(u8, raw_item_id)
+                if (is_different_model and std.mem.startsWith(u8, raw_item_id, "fc_")) null else try allocator.dupe(u8, raw_item_id) // ziglint-ignore: Z024
             else
                 null;
             errdefer if (item_id) |id| allocator.free(id);
@@ -254,14 +256,14 @@ fn convertUserMessage(
     model: protocol.Model,
     user: protocol.UserMessage,
 ) !?ResponsesInputItem {
-    var content: std.ArrayListUnmanaged(ResponsesInputContentPart) = .empty;
+    var content: std.ArrayList(ResponsesInputContentPart) = .empty;
     errdefer deinitResponsesInputContentList(allocator, content.items);
     errdefer content.deinit(allocator);
 
     switch (user.content) {
         .text => |text| try content.append(allocator, .{ .input_text = try sanitizeTextAlloc(allocator, text) }),
         .blocks => |blocks| for (blocks) |block| switch (block) {
-            .text => |text| try content.append(allocator, .{ .input_text = try sanitizeTextAlloc(allocator, text.text) }),
+            .text => |text| try content.append(allocator, .{ .input_text = try sanitizeTextAlloc(allocator, text.text) }), // ziglint-ignore: Z024
             .image => |image| {
                 if (!modelSupportsInputType(model, .image)) continue;
                 const url = try std.fmt.allocPrint(
@@ -286,7 +288,7 @@ fn convertToolResultInput(
     model: protocol.Model,
     tool_result: protocol.ToolResultMessage,
 ) !ResponsesInputItem {
-    var joined_text: std.ArrayListUnmanaged(u8) = .empty;
+    var joined_text: std.ArrayList(u8) = .empty;
     defer joined_text.deinit(allocator);
 
     var has_images = false;
@@ -305,7 +307,7 @@ fn convertToolResultInput(
     errdefer allocator.free(call_id);
 
     if (has_images and modelSupportsInputType(model, .image)) {
-        var parts: std.ArrayListUnmanaged(ResponsesInputContentPart) = .empty;
+        var parts: std.ArrayList(ResponsesInputContentPart) = .empty;
         errdefer deinitResponsesInputContentList(allocator, parts.items);
         errdefer parts.deinit(allocator);
 
@@ -468,11 +470,11 @@ fn transformAssistantMessage(
     allocator: std.mem.Allocator,
     assistant: protocol.AssistantMessage,
     model: protocol.Model,
-    tool_id_map: *std.ArrayListUnmanaged(ToolCallIdMapping),
+    tool_id_map: *std.ArrayList(ToolCallIdMapping),
 ) !protocol.AssistantMessage {
     const same_model = assistantMessageIsSameModel(assistant, model);
 
-    var content: std.ArrayListUnmanaged(protocol.AssistantMessage.AssistantContentBlock) = .empty;
+    var content: std.ArrayList(protocol.AssistantMessage.AssistantContentBlock) = .empty;
     errdefer deinitAssistantContentList(allocator, content.items);
     errdefer content.deinit(allocator);
 
@@ -480,16 +482,16 @@ fn transformAssistantMessage(
         .thinking => |thinking| {
             if (thinking.redacted orelse false) {
                 if (!same_model) continue;
-                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) });
+                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) }); // ziglint-ignore: Z024
                 continue;
             }
             if (same_model and thinking.thinking_signature != null) {
-                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) });
+                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) }); // ziglint-ignore: Z024
                 continue;
             }
             if (std.mem.trim(u8, thinking.thinking, &std.ascii.whitespace).len == 0) continue;
             if (same_model) {
-                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) });
+                try content.append(allocator, .{ .thinking = try message_memory.cloneThinkingContent(allocator, thinking) }); // ziglint-ignore: Z024
             } else {
                 try content.append(allocator, .{ .text = .{
                     .text = try allocator.dupe(u8, thinking.thinking),
@@ -522,7 +524,7 @@ fn transformAssistantMessage(
                 .id = id,
                 .name = try allocator.dupe(u8, tool_call.name),
                 .arguments = try json_value.OwnedValue.clone(allocator, tool_call.arguments.borrowed()),
-                .thought_signature = if (!same_model) null else if (tool_call.thought_signature) |sig| try allocator.dupe(u8, sig) else null,
+                .thought_signature = if (!same_model) null else if (tool_call.thought_signature) |sig| try allocator.dupe(u8, sig) else null, // ziglint-ignore: Z024
             } });
         },
     };
@@ -546,21 +548,21 @@ fn transformToolResultMessage(
     tool_result: protocol.ToolResultMessage,
     tool_id_map: []const ToolCallIdMapping,
 ) !protocol.ToolResultMessage {
-    var content: std.ArrayListUnmanaged(protocol.ToolResultMessage.ContentBlock) = .empty;
+    var content: std.ArrayList(protocol.ToolResultMessage.ContentBlock) = .empty;
     errdefer deinitToolResultContentList(allocator, content.items);
     errdefer content.deinit(allocator);
 
     for (tool_result.content) |block| switch (block) {
-        .text => |text| try content.append(allocator, .{ .text = try message_memory.cloneTextContent(allocator, text) }),
-        .image => |image| try content.append(allocator, .{ .image = try message_memory.cloneImageContent(allocator, image) }),
+        .text => |text| try content.append(allocator, .{ .text = try message_memory.cloneTextContent(allocator, text) }), // ziglint-ignore: Z024
+        .image => |image| try content.append(allocator, .{ .image = try message_memory.cloneImageContent(allocator, image) }), // ziglint-ignore: Z024
     };
 
     return .{
         .tool_call_id = try getMappedToolCallId(allocator, tool_id_map, tool_result.tool_call_id),
         .tool_name = try allocator.dupe(u8, tool_result.tool_name),
         .content = try content.toOwnedSlice(allocator),
-        .details = if (tool_result.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null,
-        .presentation = if (tool_result.presentation) |presentation| try json_value.OwnedValue.clone(allocator, presentation.borrowed()) else null,
+        .details = if (tool_result.details) |details| try json_value.OwnedValue.clone(allocator, details.borrowed()) else null, // ziglint-ignore: Z024
+        .presentation = if (tool_result.presentation) |presentation| try json_value.OwnedValue.clone(allocator, presentation.borrowed()) else null, // ziglint-ignore: Z024
         .is_error = tool_result.is_error,
         .timestamp = tool_result.timestamp,
     };
@@ -569,7 +571,7 @@ fn transformToolResultMessage(
 fn flushPendingSyntheticToolResults(
     allocator: std.mem.Allocator,
     io: std.Io,
-    result: *std.ArrayListUnmanaged(protocol.Message),
+    result: *std.ArrayList(protocol.Message),
     pending_tool_calls: []const PendingToolCallRef,
     existing_tool_result_ids: []const []const u8,
 ) !void {
@@ -606,7 +608,7 @@ fn flushPendingSyntheticToolResults(
 
 fn recordToolCallIdMapping(
     allocator: std.mem.Allocator,
-    tool_id_map: *std.ArrayListUnmanaged(ToolCallIdMapping),
+    tool_id_map: *std.ArrayList(ToolCallIdMapping),
     original_id: []const u8,
     mapped_id: []const u8,
 ) !void {
@@ -660,7 +662,7 @@ fn resolveAssistantMessageId(
                                 candidate_id = id.string;
                                 if (parsed.value.object.get("phase")) |phase| {
                                     if (phase == .string) {
-                                        if (std.mem.eql(u8, phase.string, "commentary") or std.mem.eql(u8, phase.string, "final_answer")) {
+                                        if (std.mem.eql(u8, phase.string, "commentary") or std.mem.eql(u8, phase.string, "final_answer")) { // ziglint-ignore: Z024
                                             parsed_phase = try allocator.dupe(u8, phase.string);
                                         }
                                     }
@@ -693,7 +695,7 @@ fn resolveAssistantMessageId(
 }
 
 fn splitToolCallId(id: []const u8) struct { call_id: []const u8, item_id: ?[]const u8 } {
-    if (std.mem.indexOfScalar(u8, id, '|')) |sep| {
+    if (std.mem.findScalar(u8, id, '|')) |sep| {
         return .{ .call_id = id[0..sep], .item_id = id[sep + 1 ..] };
     }
     return .{ .call_id = id, .item_id = null };
@@ -708,12 +710,12 @@ fn normalizeResponsesToolCallId(
     if (!targetUsesResponsesToolCallNormalization(target_model.provider)) {
         return normalizeIdPart(allocator, id);
     }
-    if (std.mem.indexOfScalar(u8, id, '|')) |sep| {
+    if (std.mem.findScalar(u8, id, '|')) |sep| {
         const normalized_call_id = try normalizeIdPart(allocator, id[0..sep]);
         errdefer allocator.free(normalized_call_id);
 
         const item_part = id[sep + 1 ..];
-        const is_foreign_tool_call = !providersEqual(source.provider, target_model.provider) or !apisEqual(source.api, target_model.api);
+        const is_foreign_tool_call = !providersEqual(source.provider, target_model.provider) or !apisEqual(source.api, target_model.api); // ziglint-ignore: Z024
         var normalized_item_id = if (is_foreign_tool_call)
             try buildForeignResponsesItemId(allocator, item_part)
         else
@@ -740,7 +742,7 @@ fn targetUsesResponsesToolCallNormalization(provider: protocol.Provider) bool {
 }
 
 fn normalizeIdPart(allocator: std.mem.Allocator, part: []const u8) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     for (part) |c| {
@@ -780,7 +782,7 @@ fn shortHashAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     h1 = imul32(h1 ^ (h1 >> 16), 2246822507) ^ imul32(h2 ^ (h2 >> 13), 3266489909);
     h2 = imul32(h2 ^ (h2 >> 16), 2246822507) ^ imul32(h1 ^ (h1 >> 13), 3266489909);
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try appendBase36U32(allocator, &out, h2);
     try appendBase36U32(allocator, &out, h1);
@@ -789,7 +791,7 @@ fn shortHashAlloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
 
 fn appendBase36U32(
     allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
+    out: *std.ArrayList(u8),
     value: u32,
 ) !void {
     if (value == 0) {
@@ -803,7 +805,7 @@ fn appendBase36U32(
     while (n != 0) {
         const digit = n % 36;
         idx -= 1;
-        buf[idx] = if (digit < 10) @as(u8, '0') + @as(u8, @intCast(digit)) else @as(u8, 'a') + @as(u8, @intCast(digit - 10));
+        buf[idx] = if (digit < 10) @as(u8, '0') + @as(u8, @intCast(digit)) else @as(u8, 'a') + @as(u8, @intCast(digit - 10)); // ziglint-ignore: Z024
         n /= 36;
     }
     try out.appendSlice(allocator, buf[idx..]);
@@ -855,11 +857,11 @@ fn deinitToolResultMessage(allocator: std.mem.Allocator, tool_result: protocol.T
     message_memory.freeToolResult(allocator, tool_result);
 }
 
-fn deinitAssistantContentList(allocator: std.mem.Allocator, content: []const protocol.AssistantMessage.AssistantContentBlock) void {
+fn deinitAssistantContentList(allocator: std.mem.Allocator, content: []const protocol.AssistantMessage.AssistantContentBlock) void { // ziglint-ignore: Z024
     for (content) |block| message_memory.freeAssistantBlock(allocator, block);
 }
 
-fn deinitToolResultContentList(allocator: std.mem.Allocator, content: []const protocol.ToolResultMessage.ContentBlock) void {
+fn deinitToolResultContentList(allocator: std.mem.Allocator, content: []const protocol.ToolResultMessage.ContentBlock) void { // ziglint-ignore: Z024
     for (content) |block| message_memory.freeToolResultContentBlock(allocator, block);
 }
 
@@ -941,7 +943,7 @@ test "transformMessages converts cross-model thinking to text and strips tool th
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var args = std.json.Value{ .object = .{} };
+    var args: std.json.Value = .{ .object = .{} };
     defer args.object.deinit(alloc);
 
     const messages: []const protocol.Message = &.{
@@ -959,13 +961,13 @@ test "transformMessages converts cross-model thinking to text and strips tool th
             .api = .openai_responses,
             .provider = .github_copilot,
             .model = "gpt-5",
-            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
             .stop_reason = .toolUse,
             .timestamp = 0,
         } },
     };
 
-    const target_model = protocol.Model{
+    const target_model: protocol.Model = .{
         .id = "claude-sonnet-4",
         .name = "Claude Sonnet 4",
         .api = .anthropic_messages,
@@ -994,10 +996,10 @@ test "convertResponsesMessages hashes foreign responses item ids like pi-mono" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var args = std.json.Value{ .object = .{} };
+    var args: std.json.Value = .{ .object = .{} };
     defer args.object.deinit(alloc);
 
-    const raw_id = "call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA==";
+    const raw_id = "call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA=="; // ziglint-ignore: Z024
 
     const transformed_messages: []const protocol.Message = &.{
         .{ .assistant = .{
@@ -1009,7 +1011,7 @@ test "convertResponsesMessages hashes foreign responses item ids like pi-mono" {
             .api = .openai_responses,
             .provider = .github_copilot,
             .model = "gpt-5.3-codex",
-            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
             .stop_reason = .toolUse,
             .timestamp = 0,
         } },
@@ -1039,7 +1041,7 @@ test "convertResponsesMessages preserves legacy plain-string text signatures" {
             .api = .openai_responses,
             .provider = .openai,
             .model = "gpt-5.4",
-            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
             .stop_reason = .stop,
             .timestamp = 0,
         } },
@@ -1060,11 +1062,11 @@ test "convertResponsesMessages preserves text signature phase as string" {
 
     const messages: []const protocol.Message = &.{
         .{ .assistant = .{
-            .content = &.{.{ .text = .{ .text = "hello", .text_signature = "{\"v\":1,\"id\":\"msg_123\",\"phase\":\"final_answer\"}" } }},
+            .content = &.{.{ .text = .{ .text = "hello", .text_signature = "{\"v\":1,\"id\":\"msg_123\",\"phase\":\"final_answer\"}" } }}, // ziglint-ignore: Z024
             .api = .openai_responses,
             .provider = .openai,
             .model = "gpt-5.4",
-            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+            .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
             .stop_reason = .stop,
             .timestamp = 0,
         } },
