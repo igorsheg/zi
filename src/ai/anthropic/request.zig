@@ -78,7 +78,7 @@ pub fn addAnthropicMetadata(
     return true;
 }
 
-pub fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, is_oauth: bool, reasoning: ?protocol.ThinkingLevel, thinking_budgets: ?protocol.ThinkingBudgets) !void {
+pub fn buildRequestJson(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, is_oauth: bool, reasoning: ?protocol.ThinkingLevel, thinking_budgets: ?protocol.ThinkingBudgets) !void { // ziglint-ignore: Z024
     var out = std.Io.Writer.Allocating.fromArrayList(allocator, buf);
     var jw: std.json.Stringify = .{ .writer = &out.writer };
 
