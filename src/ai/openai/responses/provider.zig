@@ -4,14 +4,14 @@ const ai_models = @import("../../models.zig");
 const ai_provider = @import("../../provider.zig");
 const core = @import("core.zig");
 
-pub const OpenAIResponsesProvider = struct {
+pub const OpenAiResponsesProvider = struct {
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) OpenAIResponsesProvider {
+    pub fn init(allocator: std.mem.Allocator) OpenAiResponsesProvider {
         return .{ .allocator = allocator };
     }
 
-    pub fn provider(self: *OpenAIResponsesProvider) ai_provider.Provider {
+    pub fn provider(self: *OpenAiResponsesProvider) ai_provider.Provider {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -25,7 +25,7 @@ pub const OpenAIResponsesProvider = struct {
 
     fn streamImpl(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
@@ -41,7 +41,7 @@ pub const OpenAIResponsesProvider = struct {
 
     fn streamSimpleImpl(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.SimpleStreamOptions,

@@ -9,7 +9,7 @@ pub const Bundle = struct {
     registry: provider_registry.Registry,
 
     openai_completions_prov: openai_completions.OpenAICompletionsProvider,
-    openai_responses_prov: openai_responses.OpenAIResponsesProvider,
+    openai_responses_prov: openai_responses.OpenAiResponsesProvider,
 
     pub fn init(allocator: std.mem.Allocator) !*Bundle {
         const self = try allocator.create(Bundle);
@@ -19,7 +19,7 @@ pub const Bundle = struct {
             .allocator = allocator,
             .registry = provider_registry.Registry.init(allocator),
             .openai_completions_prov = openai_completions.OpenAICompletionsProvider.init(allocator),
-            .openai_responses_prov = openai_responses.OpenAIResponsesProvider.init(allocator),
+            .openai_responses_prov = openai_responses.OpenAiResponsesProvider.init(allocator),
         };
         errdefer self.registry.deinit();
 
