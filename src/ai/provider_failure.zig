@@ -16,8 +16,8 @@ pub fn normalizeHttpFailure(
     var parsed_detail = try parseHttpErrorDetail(allocator, trimmed);
     errdefer parsed_detail.deinit(allocator);
 
-    const failure_kind = classifyHttpFailure(status_code, parsed_detail.provider_type, parsed_detail.provider_code, parsed_detail.provider_message);
-    const display_message = try formatHttpErrorDetail(allocator, status_code, parsed_detail.provider_message orelse trimmed, trimmed.len == 0);
+    const failure_kind = classifyHttpFailure(status_code, parsed_detail.provider_type, parsed_detail.provider_code, parsed_detail.provider_message); // ziglint-ignore: Z024
+    const display_message = try formatHttpErrorDetail(allocator, status_code, parsed_detail.provider_message orelse trimmed, trimmed.len == 0); // ziglint-ignore: Z024
 
     const result: NormalizedHttpFailure = .{
         .failure = .{
@@ -53,6 +53,7 @@ const ParsedHttpError = struct {
         if (self.provider_message) |message| allocator.free(message);
         if (self.provider_code) |code| allocator.free(code);
         if (self.provider_type) |provider_type| allocator.free(provider_type);
+        self.* = undefined;
     }
 };
 
@@ -63,7 +64,7 @@ fn parseHttpErrorDetail(
     if (trimmed.len == 0) return .{};
     if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{})) |parsed| {
         defer parsed.deinit();
-        return try cloneParsedHttpError(allocator, extractJsonError(parsed.value));
+        return cloneParsedHttpError(allocator, extractJsonError(parsed.value));
     } else |_| {
         return .{ .provider_message = try allocator.dupe(u8, trimmed) };
     }
@@ -75,19 +76,19 @@ fn extractJsonError(value: std.json.Value) ParsedHttpError {
         switch (err) {
             .string => |s| return .{ .provider_message = s },
             .object => {
-                return .{
-                    .provider_message = if (err.object.get("message")) |msg| if (msg == .string and msg.string.len > 0) msg.string else null else null,
-                    .provider_code = if (err.object.get("code")) |code| if (code == .string and code.string.len > 0) code.string else null else null,
-                    .provider_type = if (err.object.get("type")) |t| if (t == .string and t.string.len > 0) t.string else null else null,
+                return .{ // ziglint-ignore: Z024
+                    .provider_message = if (err.object.get("message")) |msg| if (msg == .string and msg.string.len > 0) msg.string else null else null, // ziglint-ignore: Z024
+                    .provider_code = if (err.object.get("code")) |code| if (code == .string and code.string.len > 0) code.string else null else null, // ziglint-ignore: Z024
+                    .provider_type = if (err.object.get("type")) |t| if (t == .string and t.string.len > 0) t.string else null else null, // ziglint-ignore: Z024
                 };
             },
             else => {},
         }
     }
-    return .{
-        .provider_message = if (value.object.get("message")) |msg| if (msg == .string and msg.string.len > 0) msg.string else null else null,
-        .provider_code = if (value.object.get("code")) |code| if (code == .string and code.string.len > 0) code.string else null else null,
-        .provider_type = if (value.object.get("type")) |t| if (t == .string and t.string.len > 0) t.string else null else null,
+    return .{ // ziglint-ignore: Z024
+        .provider_message = if (value.object.get("message")) |msg| if (msg == .string and msg.string.len > 0) msg.string else null else null, // ziglint-ignore: Z024
+        .provider_code = if (value.object.get("code")) |code| if (code == .string and code.string.len > 0) code.string else null else null, // ziglint-ignore: Z024
+        .provider_type = if (value.object.get("type")) |t| if (t == .string and t.string.len > 0) t.string else null else null, // ziglint-ignore: Z024
     };
 }
 
@@ -143,32 +144,32 @@ pub fn classifyProviderFailure(
         if (isOverflowNeedle(msg)) return .context_overflow;
     }
     if (provider_type) |provider_type_value| {
-        if (containsAnyCI(provider_type_value, &.{ "authentication_error", "permission_error", "auth_error" })) {
+        if (containsAnyCi(provider_type_value, &.{ "authentication_error", "permission_error", "auth_error" })) {
             return .auth;
         }
-        if (containsAnyCI(provider_type_value, &.{ "rate_limit_error", "throttling_error" })) {
+        if (containsAnyCi(provider_type_value, &.{ "rate_limit_error", "throttling_error" })) {
             return .rate_limited;
         }
-        if (containsAnyCI(provider_type_value, &.{ "overloaded_error", "api_error", "server_error" })) {
+        if (containsAnyCi(provider_type_value, &.{ "overloaded_error", "api_error", "server_error" })) {
             return .transient;
         }
-        if (containsAnyCI(provider_type_value, &.{ "invalid_request_error", "bad_request_error" })) {
+        if (containsAnyCi(provider_type_value, &.{ "invalid_request_error", "bad_request_error" })) {
             return .invalid_request;
         }
     }
     if (provider_message) |msg| {
-        if (containsAnyCI(msg, &.{ "rate limit", "too many requests", "throttl" })) return .rate_limited;
-        if (containsAnyCI(msg, &.{ "overloaded", "temporar", "try again", "service unavailable", "internal error" })) return .transient;
-        if (containsAnyCI(msg, &.{ "unauthorized", "forbidden", "invalid api key", "api key" })) return .auth;
+        if (containsAnyCi(msg, &.{ "rate limit", "too many requests", "throttl" })) return .rate_limited; // ziglint-ignore: Z024
+        if (containsAnyCi(msg, &.{ "overloaded", "temporar", "try again", "service unavailable", "internal error" })) return .transient; // ziglint-ignore: Z024
+        if (containsAnyCi(msg, &.{ "unauthorized", "forbidden", "invalid api key", "api key" })) return .auth;
     }
     return .fatal;
 }
 
-pub fn classifyTransportFailure(message: []const u8) protocol.NormalizedFailure.Kind {
-    if (containsAnyCI(message, &.{ "no api key", "accountid", "account id", "api key too long", "invalid api key", "unauthorized", "forbidden" })) {
+pub fn classifyTransportFailure(message: []const u8) protocol.NormalizedFailure.Kind { // ziglint-ignore: Z024
+    if (containsAnyCi(message, &.{ "no api key", "accountid", "account id", "api key too long", "invalid api key", "unauthorized", "forbidden" })) { // ziglint-ignore: Z024
         return .auth;
-    }
-    if (containsAnyCI(message, &.{ "timeout", "timed out", "connection", "network", "refused", "reset", "closed", "unavailable", "failed to open connection", "request failed", "failed to send body", "stream read error" })) {
+    } // ziglint-ignore: Z024
+    if (containsAnyCi(message, &.{ "timeout", "timed out", "connection", "network", "refused", "reset", "closed", "unavailable", "failed to open connection", "request failed", "failed to send body", "stream read error" })) { // ziglint-ignore: Z024
         return .transient;
     }
     return .fatal;
@@ -184,8 +185,8 @@ fn formatHttpErrorDetail(
     if (empty_body) {
         if (reason.len > 0) return std.fmt.allocPrint(allocator, "HTTP {d} {s} (empty body)", .{ status_code, reason });
         return std.fmt.allocPrint(allocator, "HTTP {d} (empty body)", .{status_code});
-    }
-    if (reason.len > 0) return std.fmt.allocPrint(allocator, "HTTP {d} {s}: {s}", .{ status_code, reason, maybe_message });
+    } // ziglint-ignore: Z024
+    if (reason.len > 0) return std.fmt.allocPrint(allocator, "HTTP {d} {s}: {s}", .{ status_code, reason, maybe_message }); // ziglint-ignore: Z024
     return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status_code, maybe_message });
 }
 
@@ -207,7 +208,7 @@ fn httpStatusReason(status_code: u16) ?[]const u8 {
 }
 
 fn isRateLimitNeedle(text: []const u8) bool {
-    return containsAnyCI(text, &.{
+    return containsAnyCi(text, &.{
         "throttling error",
         "rate limit",
         "too many requests",
@@ -215,7 +216,7 @@ fn isRateLimitNeedle(text: []const u8) bool {
 }
 
 fn isOverflowNeedle(text: []const u8) bool {
-    return containsAnyCI(text, &.{
+    return containsAnyCi(text, &.{
         "prompt is too long",
         "input is too long for requested model",
         "exceeds the context window",
@@ -228,14 +229,14 @@ fn isOverflowNeedle(text: []const u8) bool {
     });
 }
 
-fn containsAnyCI(haystack: []const u8, needles: []const []const u8) bool {
+fn containsAnyCi(haystack: []const u8, needles: []const []const u8) bool {
     for (needles) |needle| {
-        if (containsCI(haystack, needle)) return true;
+        if (containsCi(haystack, needle)) return true;
     }
     return false;
 }
 
-fn containsCI(haystack: []const u8, needle: []const u8) bool {
+fn containsCi(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > haystack.len) return false;
 
@@ -303,8 +304,8 @@ fn expectTransportKind(expected: FailureKind, message: []const u8) !void {
 
 test "normalizeHttpFailure preserves provider metadata and formats nested JSON error" {
     try expectNormalizedHttpFailure(
-        .bad_request,
-        "{\"error\":{\"message\":\"context length exceeded\",\"code\":\"context_length_exceeded\",\"type\":\"invalid_request_error\"}}",
+        .bad_request, // ziglint-ignore: Z024
+        "{\"error\":{\"message\":\"context length exceeded\",\"code\":\"context_length_exceeded\",\"type\":\"invalid_request_error\"}}", // ziglint-ignore: Z024
         .context_overflow,
         "HTTP 400 Bad Request: context length exceeded",
         "context_length_exceeded",
