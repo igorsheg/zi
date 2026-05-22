@@ -86,6 +86,10 @@ pub const ProviderRuntime = struct {
         const api = ai.protocol.apiToString(model.api);
         const provider_name = ai.protocol.providerToString(model.provider);
         const provider = self.provider_bundle.registry.getForModel(api, provider_name) orelse return error.ProviderUnavailable;
+        // TODO(auth): ProviderRuntime currently decides that resolved providers
+        // require environment API keys. When OAuth/custom provider claims mature,
+        // move credential policy behind ai.provider_registry or a dedicated AI
+        // credential resolver so coding_agent only consumes resolved provider auth.
         const api_key = env_api_keys.getEnvApiKey(self.env, provider_name) orelse return error.MissingApiKey;
         return .{ .provider = provider, .api_key = api_key };
     }
