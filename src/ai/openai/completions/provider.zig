@@ -210,6 +210,8 @@ const TestCollector = struct {
         self.events.deinit(self.allocator);
         self.text.deinit(self.allocator);
         self.final_args.deinit(self.allocator);
+        if (self.final_tool_id.len > 0) self.allocator.free(self.final_tool_id);
+        if (self.final_tool_name.len > 0) self.allocator.free(self.final_tool_name);
     }
 
     fn callback(evt: protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
@@ -247,8 +249,14 @@ const TestCollector = struct {
                 self.events.append(self.allocator, .toolcall_end) catch {
                     self.alloc_failed = true;
                 };
-                self.final_tool_id = e.tool_call.id;
-                self.final_tool_name = e.tool_call.name;
+                self.final_tool_id = self.allocator.dupe(u8, e.tool_call.id) catch {
+                    self.alloc_failed = true;
+                    return;
+                };
+                self.final_tool_name = self.allocator.dupe(u8, e.tool_call.name) catch {
+                    self.alloc_failed = true;
+                    return;
+                };
             },
             .thinking_start => self.events.append(self.allocator, .thinking_start) catch {
                 self.alloc_failed = true;

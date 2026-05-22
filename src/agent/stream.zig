@@ -39,8 +39,13 @@ pub const Queue = struct {
     }
 
     pub fn pushDelta(self: *Queue, delta: message.AssistantMessageEvent) void {
-        if (self.terminal_reserved and self.queue.len >= self.queue.capacity() - 1) return;
-        self.queue.push(.{ .delta = delta }) catch {};
+        if (self.terminal_reserved and self.queue.len >= self.queue.capacity() - 1) {
+            message_memory.freeAssistantEvent(self.queue.allocator, delta);
+            return;
+        }
+        self.queue.push(.{ .delta = delta }) catch {
+            message_memory.freeAssistantEvent(self.queue.allocator, delta);
+        };
     }
 
     pub fn pushTerminal(self: *Queue, terminal: Terminal) void {
@@ -57,6 +62,7 @@ pub const Queue = struct {
 
 pub fn deinitCompletion(allocator: std.mem.Allocator, completion: Completion) void {
     switch (completion) {
+        .delta => |delta| message_memory.freeAssistantEvent(allocator, delta),
         .terminal => |terminal| switch (terminal) {
             .completed => |assistant| message_memory.freeAssistant(allocator, assistant),
             .failed, .aborted => {},

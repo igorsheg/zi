@@ -36,8 +36,6 @@ pub const ToolsMode = enum { none, builtins };
 
 pub const Diagnostic = union(enum) {
     missing_prompt,
-    invalid_mode: []const u8,
-    conflicting_output_modes,
 };
 
 pub const Result = union(enum) {
@@ -68,13 +66,11 @@ pub fn build(allocator: std.mem.Allocator, raw: parse_mod.RawCommand, settings: 
 fn buildRun(allocator: std.mem.Allocator, raw: parse_mod.RawRun, settings: settings_mod.Settings) error{OutOfMemory}!Result {
     const model = raw.model orelse settings.default_model;
     const output: ?RunOutput = blk: {
-        if (raw.print and raw.json) return .{ .err = .conflicting_output_modes };
-        if ((raw.print or raw.json) and raw.mode != null) return .{ .err = .conflicting_output_modes };
-        if (raw.print) break :blk .final_text;
-        if (raw.json) break :blk .jsonl_events;
-        if (raw.mode) |mode| {
-            if (std.mem.eql(u8, mode, "json")) break :blk .jsonl_events;
-            return .{ .err = .{ .invalid_mode = mode } };
+        const mode = raw.mode orelse break :blk null;
+        switch (mode) {
+            .interactive => break :blk null,
+            .print => break :blk .final_text,
+            .json => break :blk .jsonl_events,
         }
         break :blk null;
     };
@@ -91,8 +87,8 @@ fn buildRun(allocator: std.mem.Allocator, raw: parse_mod.RawRun, settings: setti
     } } };
 }
 
-test "plan maps json mode" {
-    const raw = parse_mod.RawCommand{ .run = .{ .prompt_parts = &.{"hello"}, .mode = "json" } };
+test "plan maps json output flag" {
+    const raw = parse_mod.RawCommand{ .run = .{ .prompt_parts = &.{"hello"}, .mode = .json } };
     const settings = settings_mod.Settings.empty(std.testing.allocator);
     var result = try build(std.testing.allocator, raw, settings);
     defer result.deinit(std.testing.allocator);
@@ -143,15 +139,17 @@ test "prompt without output flag opens tui with initial prompt" {
 }
 
 test "print mode requires prompt" {
-    const raw = parse_mod.RawCommand{ .run = .{ .prompt_parts = &.{}, .print = true } };
+    const raw = parse_mod.RawCommand{ .run = .{ .prompt_parts = &.{}, .mode = .print } };
     const settings = settings_mod.Settings.empty(std.testing.allocator);
     const result = try build(std.testing.allocator, raw, settings);
     try std.testing.expect(result.err == .missing_prompt);
 }
 
-test "json mode conflicts with print mode" {
-    const raw = parse_mod.RawCommand{ .run = .{ .prompt_parts = &.{"hello"}, .print = true, .json = true } };
+test "interactive mode with prompt opens tui" {
+    const raw = parse_mod.RawCommand{ .run = .{ .prompt_parts = &.{"hello"}, .mode = .interactive } };
     const settings = settings_mod.Settings.empty(std.testing.allocator);
-    const result = try build(std.testing.allocator, raw, settings);
-    try std.testing.expect(result.err == .conflicting_output_modes);
+    var result = try build(std.testing.allocator, raw, settings);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.ok == .tui);
+    try std.testing.expectEqualStrings("hello", result.ok.tui.initial_prompt.?);
 }

@@ -127,9 +127,10 @@ const RunCapture = struct {
 
     fn emit(value: agent_mod.AgentEvent, ctx: ?*anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (self.event_sink) |sink| sink.emit(.{ .agent = value });
         switch (value) {
             .lifecycle => |lifecycle| self.captureLifecycle(lifecycle),
-            .tool => |tool| self.emitTool(tool),
+            .tool => {},
             .message => {},
         }
     }
@@ -143,35 +144,6 @@ const RunCapture = struct {
             .failed => |failed| run_completion_mod.OwnedRunTerminal.failed(self.allocator, self.outputMessages(failed.messages), failureKind(failed.reason)) catch |err| oomTerminal(self.allocator, err),
             .aborted => |aborted| run_completion_mod.OwnedRunTerminal.aborted(self.allocator, self.outputMessages(aborted.messages)) catch |err| oomTerminal(self.allocator, err),
         };
-    }
-
-    fn emitTool(self: *RunCapture, tool: agent_mod.event.ToolEvent) void {
-        const sink = self.event_sink orelse return;
-        switch (tool) {
-            .started => |started| sink.emit(.{ .run = .{ .tool_started = .{
-                .run_command_id = self.run_command_id,
-                .op_id = started.op_id,
-                .tool_call_id = started.tool_call_id,
-                .tool_name = started.tool_name,
-            } } }),
-            .update => |update| sink.emit(.{ .run = .{ .tool_updated = .{
-                .run_command_id = self.run_command_id,
-                .op_id = update.op_id,
-                .tool_call_id = update.tool_call_id,
-                .tool_name = update.tool_name,
-                .content_blocks = update.partial_result.content.len,
-                .is_error = update.partial_result.is_error,
-                .has_details = update.partial_result.details.borrowed() != .null,
-                .has_presentation = update.partial_result.presentation.borrowed() != .null,
-            } } }),
-            .finished => |finished| sink.emit(.{ .run = .{ .tool_finished = .{
-                .run_command_id = self.run_command_id,
-                .op_id = finished.op_id,
-                .tool_call_id = finished.tool_call_id,
-                .tool_name = finished.tool_name,
-                .terminal = toolTerminal(finished.terminal),
-            } } }),
-        }
     }
 
     fn outputMessages(self: *const RunCapture, messages: []const agent_mod.AgentMessage) []const agent_mod.AgentMessage {
@@ -203,14 +175,6 @@ fn failureKind(value: agent_mod.failure.Failure) state_mod.FailureKind {
         .tool_failed => .tool_failed,
         .tool_protocol_violation => .tool_protocol_violation,
         .internal => .internal,
-    };
-}
-
-fn toolTerminal(value: agent_mod.tool.ToolTerminal) event_mod.ToolTerminal {
-    return switch (value) {
-        .completed => .completed,
-        .failed => .failed,
-        .aborted => .aborted,
     };
 }
 

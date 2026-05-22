@@ -14,4 +14,5 @@ pub const Diagnostic = union(enum) {
     invalid_settings_model: settings_resolve.Diagnostic,
     provider_unavailable,
     missing_api_key,
+    final_text_too_large,
 };

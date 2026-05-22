@@ -74,6 +74,37 @@ pub fn freeAssistant(allocator: std.mem.Allocator, value: message.AssistantMessa
     if (value.error_message) |msg| allocator.free(msg);
 }
 
+pub fn cloneAssistantEvent(allocator: std.mem.Allocator, value: message.AssistantMessageEvent) !message.AssistantMessageEvent {
+    return switch (value) {
+        .start => .start,
+        .text_start => |payload| .{ .text_start = payload },
+        .text_delta => |payload| .{ .text_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } },
+        .text_end => |payload| .{ .text_end = .{ .content_index = payload.content_index, .content = try allocator.dupe(u8, payload.content) } },
+        .thinking_start => |payload| .{ .thinking_start = payload },
+        .thinking_delta => |payload| .{ .thinking_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } },
+        .thinking_end => |payload| .{ .thinking_end = .{ .content_index = payload.content_index, .content = try allocator.dupe(u8, payload.content) } },
+        .toolcall_start => |payload| .{ .toolcall_start = payload },
+        .toolcall_delta => |payload| .{ .toolcall_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } },
+        .toolcall_end => |payload| .{ .toolcall_end = .{ .content_index = payload.content_index, .tool_call = try cloneToolCall(allocator, payload.tool_call) } },
+        .done => |payload| .{ .done = .{ .reason = payload.reason, .message = try cloneAssistant(allocator, payload.message) } },
+        .@"error" => |payload| .{ .@"error" = .{ .reason = payload.reason, .@"error" = try cloneAssistant(allocator, payload.@"error") } },
+    };
+}
+
+pub fn freeAssistantEvent(allocator: std.mem.Allocator, value: message.AssistantMessageEvent) void {
+    switch (value) {
+        .text_delta => |payload| allocator.free(payload.delta),
+        .text_end => |payload| allocator.free(payload.content),
+        .thinking_delta => |payload| allocator.free(payload.delta),
+        .thinking_end => |payload| allocator.free(payload.content),
+        .toolcall_delta => |payload| allocator.free(payload.delta),
+        .toolcall_end => |payload| freeToolCall(allocator, payload.tool_call),
+        .done => |payload| freeAssistant(allocator, payload.message),
+        .@"error" => |payload| freeAssistant(allocator, payload.@"error"),
+        .start, .text_start, .thinking_start, .toolcall_start => {},
+    }
+}
+
 pub fn freeAssistantBlock(allocator: std.mem.Allocator, value: ai.protocol.AssistantMessage.AssistantContentBlock) void {
     freeAssistantBlockImpl(allocator, value);
 }
@@ -228,6 +259,25 @@ fn cloneAssistantBlock(allocator: std.mem.Allocator, block: ai.protocol.Assistan
             break :blk .{ .tool_call = .{ .id = id, .name = name, .thought_signature = sig, .arguments = arguments } };
         },
     };
+}
+
+fn cloneToolCall(allocator: std.mem.Allocator, value: ai.protocol.ToolCall) !ai.protocol.ToolCall {
+    const id = try allocator.dupe(u8, value.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, value.name);
+    errdefer allocator.free(name);
+    const sig = if (value.thought_signature) |s| try allocator.dupe(u8, s) else null;
+    errdefer if (sig) |owned| allocator.free(owned);
+    const arguments = try json_value.OwnedValue.clone(allocator, value.arguments.borrowed());
+    return .{ .id = id, .name = name, .thought_signature = sig, .arguments = arguments };
+}
+
+fn freeToolCall(allocator: std.mem.Allocator, value: ai.protocol.ToolCall) void {
+    allocator.free(value.id);
+    allocator.free(value.name);
+    if (value.thought_signature) |sig| allocator.free(sig);
+    var arguments = value.arguments;
+    arguments.deinit();
 }
 
 fn cloneUserContent(allocator: std.mem.Allocator, content: ai.protocol.UserMessage.UserMessageContent) !ai.protocol.UserMessage.UserMessageContent {

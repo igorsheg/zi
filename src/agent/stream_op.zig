@@ -44,7 +44,7 @@ pub const StreamOp = struct {
     fn providerCallback(value: ai.protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
         const self: *StreamOp = @ptrCast(@alignCast(ctx.?));
         switch (value) {
-            .start => self.queue.pushDelta(value),
+            .start => self.pushDelta(value),
             .done => |done| {
                 const owned = message_memory.cloneAssistant(self.allocator, done.message) catch {
                     self.pushTerminalIfNeeded(.{ .failed = .{ .out_of_memory = "clone stream assistant" } });
@@ -57,8 +57,16 @@ pub const StreamOp = struct {
                 std.log.warn("provider stream error: {s}", .{detail});
                 self.pushTerminalIfNeeded(.{ .failed = .{ .stream_failed = "provider stream error" } });
             },
-            else => self.queue.pushDelta(value),
+            else => self.pushDelta(value),
         }
+    }
+
+    fn pushDelta(self: *StreamOp, value: ai.protocol.AssistantMessageEvent) void {
+        const owned = message_memory.cloneAssistantEvent(self.allocator, value) catch {
+            self.pushTerminalIfNeeded(.{ .failed = .{ .out_of_memory = "clone stream delta" } });
+            return;
+        };
+        self.queue.pushDelta(owned);
     }
 
     fn pushTerminalIfNeeded(self: *StreamOp, terminal: stream.Terminal) void {

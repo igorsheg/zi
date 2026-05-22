@@ -5,6 +5,7 @@ const runtime_env = @import("env.zig");
 const runtime_storage = @import("storage.zig");
 const log = @import("log.zig");
 const cli = @import("../coding_agent/cli/root.zig");
+const provider_runtime = @import("../coding_agent/provider_runtime.zig");
 const settings_mod = @import("../settings/root.zig");
 
 pub const name = "zi";
@@ -68,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
     var settings = try settings_mod.load(allocator, init.io, storage);
     defer settings.deinit();
 
-    var cli_runtime = try cli.runtime.Runtime.initWithOptions(allocator, init.io, env, .{
+    var cli_runtime = try provider_runtime.ProviderRuntime.initWithOptions(allocator, init.io, env, .{
         .settings_models = settings.models,
     });
     defer cli_runtime.deinit();
@@ -77,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *cli.runtime.Runtime, settings: settings_mod.Settings) !u8 {
+fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *provider_runtime.ProviderRuntime, settings: settings_mod.Settings) !u8 {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(caps.allocator);
     var it = std.process.Args.Iterator.init(process_args);

@@ -115,7 +115,10 @@ pub const Run = struct {
     fn applyStreamCompletion(self: *Run, completion: stream_mod.Completion) !void {
         switch (completion) {
             .started => self.sink.emit(.{ .message = .started }),
-            .delta => |delta| self.sink.emit(.{ .message = .{ .delta = delta } }),
+            .delta => |delta| {
+                defer message_memory.freeAssistantEvent(self.allocator, delta);
+                self.sink.emit(.{ .message = .{ .delta = delta } });
+            },
             .terminal => |terminal| switch (terminal) {
                 .completed => |assistant| try self.finishAssistantTurn(assistant),
                 .failed => |reason| {

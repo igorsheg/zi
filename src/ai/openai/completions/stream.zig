@@ -99,6 +99,8 @@ const ContentBlockState = struct {
 
     fn deinit(self: *ContentBlockState, allocator: std.mem.Allocator) void {
         self.text_buf.deinit(allocator);
+        if (self.tool_id.len > 0) allocator.free(self.tool_id);
+        if (self.tool_name.len > 0) allocator.free(self.tool_name);
         self.tool_args_partial.deinit(allocator);
         self.tool_args_parsed.deinit();
         if (self.thought_signature) |signature| allocator.free(signature);

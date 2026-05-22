@@ -139,13 +139,16 @@ test "provider runtime can drive AgentSession through faux provider" {
     const backend = try runtime.executionBackend(model);
 
     const Capture = struct {
-        terminal: ?coding_agent.event.RunTerminal = null,
+        terminal: ?agent.event.RunTerminal = null,
 
         fn emit(event: coding_agent.event.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             switch (event) {
-                .run => |run_event| switch (run_event) {
-                    .finished => |finished| self.terminal = finished.terminal,
+                .agent => |agent_event| switch (agent_event) {
+                    .lifecycle => |lifecycle| switch (lifecycle) {
+                        .run_finished => |terminal| self.terminal = terminal,
+                        else => {},
+                    },
                     else => {},
                 },
                 else => {},

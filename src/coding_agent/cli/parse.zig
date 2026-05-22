@@ -17,11 +17,11 @@ pub const RawCommand = union(enum) {
 
 pub const RawRun = struct {
     prompt_parts: []const []const u8,
-    print: bool = false,
-    json: bool = false,
-    mode: ?[]const u8 = null,
+    mode: ?Mode = null,
     model: ?[]const u8 = null,
     no_tools: bool = false,
+
+    pub const Mode = enum { interactive, print, json };
 
     fn deinit(self: *RawRun, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt_parts);
@@ -33,6 +33,7 @@ pub const Diagnostic = union(enum) {
     unknown_flag: []const u8,
     missing_value: spec.FlagId,
     duplicate_flag: spec.FlagId,
+    invalid_mode: []const u8,
 };
 
 pub const Result = union(enum) { ok: RawCommand, err: Diagnostic };
@@ -40,8 +41,6 @@ pub const Result = union(enum) { ok: RawCommand, err: Diagnostic };
 const Seen = struct {
     help: bool = false,
     version: bool = false,
-    print: bool = false,
-    json: bool = false,
     mode: bool = false,
     model: bool = false,
     no_tools: bool = false,
@@ -50,8 +49,6 @@ const Seen = struct {
         const slot = switch (id) {
             .help => &self.help,
             .version => &self.version,
-            .print => &self.print,
-            .json => &self.json,
             .mode => &self.mode,
             .model => &self.model,
             .no_tools => &self.no_tools,
@@ -83,17 +80,18 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) error{OutOf
                 .none => switch (flag.id) {
                     .help => run = run,
                     .version => run = run,
-                    .print => run.print = true,
-                    .json => run.json = true,
                     .no_tools => run.no_tools = true,
-                    .mode, .model => unreachable,
+                    .model, .mode => unreachable,
                 },
                 .required => {
                     i += 1;
                     if (i >= args.len) return .{ .err = .{ .missing_value = flag.id } };
                     switch (flag.id) {
-                        .mode => run.mode = args[i],
                         .model => run.model = args[i],
+                        .mode => {
+                            const mode = parseMode(args[i]) orelse return .{ .err = .{ .invalid_mode = args[i] } };
+                            run.mode = mode;
+                        },
                         else => unreachable,
                     }
                 },
@@ -108,20 +106,24 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) error{OutOf
     return .{ .ok = .{ .run = run } };
 }
 
-test "parse maps print prompt" {
-    var result = try parse(std.testing.allocator, &.{ "-p", "hello" });
+fn parseMode(value: []const u8) ?RawRun.Mode {
+    if (std.mem.eql(u8, value, "interactive")) return .interactive;
+    if (std.mem.eql(u8, value, "print")) return .print;
+    if (std.mem.eql(u8, value, "json")) return .json;
+    return null;
+}
+
+test "parse maps explicit json mode prompt" {
+    var result = try parse(std.testing.allocator, &.{ "--mode", "json", "hello" });
     defer if (result == .ok) result.ok.deinit(std.testing.allocator);
     try std.testing.expect(result.ok == .run);
-    try std.testing.expect(result.ok.run.print);
+    try std.testing.expectEqual(RawRun.Mode.json, result.ok.run.mode.?);
     try std.testing.expectEqualStrings("hello", result.ok.run.prompt_parts[0]);
 }
 
-test "parse maps json prompt" {
-    var result = try parse(std.testing.allocator, &.{ "--json", "hello" });
-    defer if (result == .ok) result.ok.deinit(std.testing.allocator);
-    try std.testing.expect(result.ok == .run);
-    try std.testing.expect(result.ok.run.json);
-    try std.testing.expectEqualStrings("hello", result.ok.run.prompt_parts[0]);
+test "parse rejects invalid mode" {
+    const result = try parse(std.testing.allocator, &.{ "--mode", "wat" });
+    try std.testing.expect(result.err == .invalid_mode);
 }
 
 test "parse rejects unknown flag" {

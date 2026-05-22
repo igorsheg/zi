@@ -10,14 +10,13 @@ pub fn writeParse(writer: anytype, diag: parse_mod.Diagnostic) !void {
         .unknown_flag => |flag| try writer.print("unknown flag: {s}\n", .{flag}),
         .missing_value => |flag| try writer.print("missing value for --{s}\n", .{flagName(flag)}),
         .duplicate_flag => |flag| try writer.print("duplicate flag: --{s}\n", .{flagName(flag)}),
+        .invalid_mode => |mode| try writer.print("invalid mode: {s}\n", .{mode}),
     }
 }
 
 pub fn writePlan(writer: anytype, diag: plan_mod.Diagnostic) !void {
     switch (diag) {
         .missing_prompt => try writer.writeAll("missing prompt\n"),
-        .invalid_mode => |mode| try writer.print("invalid mode: {s}\n", .{mode}),
-        .conflicting_output_modes => try writer.writeAll("conflicting output modes\n"),
     }
 }
 
@@ -25,12 +24,13 @@ pub fn writeResult(writer: anytype, diag: result_mod.Diagnostic) !void {
     switch (diag) {
         .submit_rejected => try writer.writeAll("run rejected\n"),
         .run_failed => try writer.writeAll("run failed\n"),
-        .tui_unavailable => try writer.writeAll("TUI mode is not implemented yet; use -p or --json\n"),
+        .tui_unavailable => try writer.writeAll("TUI mode is not implemented yet; use --mode print or --mode json\n"),
         .missing_model => try writer.writeAll("missing model runtime\n"),
         .unknown_model => try writer.writeAll("unknown model\n"),
         .invalid_settings_model => |invalid| try writeInvalidSettingsModel(writer, invalid),
         .provider_unavailable => try writer.writeAll("provider runtime unavailable\n"),
         .missing_api_key => try writer.writeAll("missing OPENAI_API_KEY\n"),
+        .final_text_too_large => try writer.writeAll("final assistant text exceeded 1048576 bytes\n"),
     }
 }
 

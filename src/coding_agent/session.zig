@@ -145,6 +145,11 @@ pub const AgentSession = struct {
         failed: SessionRunFailure,
     };
 
+    const CompletionApplyResult = union(enum) {
+        completed,
+        failed: state_mod.FailureKind,
+    };
+
     const SessionRunFailure = enum {
         durable_append_rejected,
         durable_append_failed,
@@ -158,9 +163,6 @@ pub const AgentSession = struct {
             };
         }
 
-        fn runTerminal(self: SessionRunFailure) event_mod.RunTerminal {
-            return .{ .failed = self.failureKind() };
-        }
     };
 
     const ActiveRun = struct {
@@ -339,12 +341,11 @@ pub const AgentSession = struct {
 
     fn applyRunCompletion(self: *AgentSession, completion: *const RunCompletion) void {
         self.assertCompletionMatchesActiveRun(completion);
-        const finished_command_id = self.activeRunCommandId();
-        const result: event_mod.RunTerminal = switch (completion.terminal.status) {
+        const result: CompletionApplyResult = switch (completion.terminal.status) {
             .completed => |messages| blk: {
                 switch (self.appendTerminalMessages(messages)) {
                     .appended, .skipped => {},
-                    .failed => |failure| break :blk failure.runTerminal(),
+                    .failed => |failure| break :blk .{ .failed = failure.failureKind() },
                 }
                 self.clearActiveRun();
                 self.setActivity(.idle);
@@ -354,22 +355,23 @@ pub const AgentSession = struct {
                 self.clearActiveRun();
                 self.clearPendingFollowUps();
                 self.setActivity(.idle);
-                return self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = .aborted } } });
+                return;
             },
             .failed => |failed| {
                 self.clearActiveRun();
                 self.clearPendingFollowUps();
                 self.setActivity(.{ .failed = .{ .kind = failed.kind } });
-                return self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = .{ .failed = failed.kind } } } });
+                return;
             },
         };
-        if (result == .failed) {
+        switch (result) {
+            .completed => self.startNextFollowUpOrIdle(),
+            .failed => |failure_kind| {
             self.clearActiveRun();
             self.clearPendingFollowUps();
-            self.setActivity(.{ .failed = .{ .kind = result.failed } });
+            self.setActivity(.{ .failed = .{ .kind = failure_kind } });
+            },
         }
-        self.emit(.{ .run = .{ .finished = .{ .command_id = finished_command_id, .terminal = result } } });
-        if (result == .completed) self.startNextFollowUpOrIdle();
     }
 
     fn emit(self: *AgentSession, value: event_mod.Event) void {
@@ -438,7 +440,7 @@ pub const AgentSession = struct {
         };
         self.refreshActivityCounts();
         self.emit(.{ .command = .{ .accepted = id } });
-        self.emit(.{ .run = .{ .follow_up_queued = .{
+        self.emit(.{ .control = .{ .follow_up_queued = .{
             .command_id = id,
             .run_command_id = self.activeRunCommandId(),
             .pending_follow_ups = self.pending_follow_ups.len,
@@ -474,8 +476,6 @@ pub const AgentSession = struct {
             .pending_follow_ups = self.pending_follow_ups.len,
             .pending_steering = 0,
         } });
-        self.emit(.{ .run = .{ .started = id } });
-
         switch (self.execution) {
             .external_completion => {},
             .synchronous => |template| self.runSynchronous(template),
@@ -486,11 +486,9 @@ pub const AgentSession = struct {
         std.debug.assert(self.active_run != null);
         const submission = self.buildRunSubmission(backend) orelse {
             const failure: SessionRunFailure = .missing_model;
-            const command_id = self.activeRunCommandId();
             self.clearActiveRun();
             self.clearPendingFollowUps();
             self.setActivity(.{ .failed = .{ .kind = failure.failureKind() } });
-            self.emit(.{ .run = .{ .finished = .{ .command_id = command_id, .terminal = failure.runTerminal() } } });
             return;
         };
 
@@ -652,7 +650,7 @@ pub const AgentSession = struct {
         const run_command_id = self.activeRunCommandId();
         if (self.active_run) |*active| active.cancel_source.requestAbort();
         self.setActivity(.{ .aborting = .{ .run_command_id = run_command_id, .pending_follow_ups = self.pending_follow_ups.len } });
-        self.emit(.{ .run = .{ .abort_requested = .{ .command_id = pending.id, .run_command_id = run_command_id } } });
+        self.emit(.{ .control = .{ .abort_requested = .{ .command_id = pending.id, .run_command_id = run_command_id } } });
         return .stop_draining;
     }
 
@@ -863,8 +861,8 @@ const ObservedEvent = enum {
     append_rejected,
     append_failed,
     run_started,
-    run_follow_up_queued,
-    run_abort_requested,
+    control_follow_up_queued,
+    control_abort_requested,
     run_tool_started,
     run_tool_updated,
     run_tool_finished,
@@ -879,8 +877,27 @@ const EventCollector = struct {
 
     fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (value == .agent and value.agent == .message) return;
+        if (value == .agent and value.agent == .lifecycle and value.agent.lifecycle != .run_started and value.agent.lifecycle != .run_finished) return;
         std.debug.assert(self.len < observed_event_count);
         self.items[self.len] = switch (value) {
+            .agent => |agent_event| switch (agent_event) {
+                .lifecycle => |lifecycle| switch (lifecycle) {
+                    .run_started => .run_started,
+                    .run_finished => |terminal| switch (terminal) {
+                        .completed => .run_finished_completed,
+                        .failed => .run_finished_failed,
+                        .aborted => .run_finished_aborted,
+                    },
+                    else => unreachable,
+                },
+                .tool => |tool| switch (tool) {
+                    .started => .run_tool_started,
+                    .update => .run_tool_updated,
+                    .finished => .run_tool_finished,
+                },
+                .message => unreachable,
+            },
             .command => |command| switch (command) {
                 .accepted => .command_accepted,
                 .rejected => .command_rejected,
@@ -890,18 +907,9 @@ const EventCollector = struct {
                 .append_rejected => .append_rejected,
                 .append_failed => .append_failed,
             },
-            .run => |run| switch (run) {
-                .started => .run_started,
-                .follow_up_queued => .run_follow_up_queued,
-                .abort_requested => .run_abort_requested,
-                .tool_started => .run_tool_started,
-                .tool_updated => .run_tool_updated,
-                .tool_finished => .run_tool_finished,
-                .finished => |finished| switch (finished.terminal) {
-                    .completed => .run_finished_completed,
-                    .failed => .run_finished_failed,
-                    .aborted => .run_finished_aborted,
-                },
+            .control => |control| switch (control) {
+                .follow_up_queued => .control_follow_up_queued,
+                .abort_requested => .control_abort_requested,
             },
         };
         self.len += 1;
@@ -1035,7 +1043,7 @@ test "agent session snapshots policy and executes backend to terminal through ow
 
     try std.testing.expect(session.state().activity == .idle);
     try std.testing.expectEqual(@as(usize, 2), durable.message_count);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .session_appended, .run_started, .session_appended, .run_finished_completed }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .session_appended, .run_started, .run_finished_completed, .session_appended }, events.items[0..events.len]);
 }
 
 test "synchronous execution requires selected model policy" {
@@ -1051,7 +1059,7 @@ test "synchronous execution requires selected model policy" {
 
     try std.testing.expect(session.state().activity == .failed);
     try std.testing.expectEqual(state_mod.FailureKind.invalid_context, session.state().activity.failed.kind);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .run_finished_failed }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted }, events.items[0..events.len]);
 }
 
 test "external completion rejects when no run is active" {
@@ -1198,18 +1206,17 @@ test "tool update projection emits summary without payload ownership" {
 
         fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (value != .run) return;
-            if (value.run != .tool_updated) return;
-            const updated = value.run.tool_updated;
+            if (value != .agent or value.agent != .tool or value.agent.tool != .update) return;
+            const updated = value.agent.tool.update;
             self.saw_update = true;
-            self.matched_ids = updated.run_command_id == self.expected_run_id and
-                updated.op_id == 1 and
+            _ = self.expected_run_id;
+            self.matched_ids = updated.op_id == 1 and
                 std.mem.eql(u8, updated.tool_call_id, "tool-1") and
                 std.mem.eql(u8, updated.tool_name, "read");
-            self.content_blocks = updated.content_blocks;
-            self.is_error = updated.is_error;
-            self.has_details = updated.has_details;
-            self.has_presentation = updated.has_presentation;
+            self.content_blocks = updated.partial_result.content.len;
+            self.is_error = updated.partial_result.is_error;
+            self.has_details = updated.partial_result.details != .null;
+            self.has_presentation = updated.partial_result.presentation != .null;
         }
     };
     const Capture = struct {
@@ -1295,9 +1302,9 @@ test "follow up while running emits queued fact with active run id" {
 
         fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (value != .run) return;
-            if (value.run != .follow_up_queued) return;
-            const queued = value.run.follow_up_queued;
+            if (value != .control) return;
+            if (value.control != .follow_up_queued) return;
+            const queued = value.control.follow_up_queued;
             self.command_id = queued.command_id;
             self.run_command_id = queued.run_command_id;
             self.pending_follow_ups = queued.pending_follow_ups;
@@ -1344,7 +1351,7 @@ test "external completion drain stops after starting one queued run" {
     session.drainCommands();
     try std.testing.expect(session.state().activity == .running);
     try std.testing.expectEqual(first, session.state().activity.running.run_command_id);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted }, events.items[0..events.len]);
 
     const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
     var completion = RunCompletion{ .command_id = session.activeRunCommandId(), .terminal = terminal };
@@ -1354,7 +1361,7 @@ test "external completion drain stops after starting one queued run" {
     session.drainCommands();
     try std.testing.expect(session.state().activity == .running);
     try std.testing.expectEqual(second, session.state().activity.running.run_command_id);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .run_started, .run_finished_completed, .run_started }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted }, events.items[0..events.len]);
 }
 
 test "synchronous drain continues after completed queued run" {
@@ -1376,22 +1383,21 @@ test "synchronous drain continues after completed queued run" {
 
 test "abort in external completion mode keeps original run command id" {
     const Collector = struct {
-        finished_command_id: ?command_mod.CommandId = null,
         abort_command_id: ?command_mod.CommandId = null,
         abort_run_command_id: ?command_mod.CommandId = null,
 
         fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (value != .run) return;
-            switch (value.run) {
+            switch (value) {
+                .control => |control| switch (control) {
                 .abort_requested => |abort| {
                     self.abort_command_id = abort.command_id;
                     self.abort_run_command_id = abort.run_command_id;
                 },
-                .finished => |finished| self.finished_command_id = finished.command_id,
-                .follow_up_queued => {},
-                .tool_started, .tool_updated, .tool_finished => {},
-                .started => {},
+                    else => {},
+                },
+                .agent => {},
+                else => {},
             }
         }
     };
@@ -1418,7 +1424,6 @@ test "abort in external completion mode keeps original run command id" {
     _ = session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .idle);
-    try std.testing.expectEqual(started, collector.finished_command_id.?);
 }
 
 test "abort control drains before queued future runs" {
@@ -1429,18 +1434,24 @@ test "abort control drains before queued future runs" {
 
         fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (value != .run) return;
-            switch (value.run) {
+            switch (value) {
+                .control => |control| switch (control) {
                 .abort_requested => |abort| {
                     self.saw_abort = true;
                     self.abort_run_command_id = abort.run_command_id;
                 },
-                .started => {
-                    if (self.saw_abort) self.started_after_abort = true;
+                    else => {},
                 },
-                .follow_up_queued => {},
-                .tool_started, .tool_updated, .tool_finished => {},
-                .finished => {},
+                .agent => |agent_event| switch (agent_event) {
+                    .lifecycle => |lifecycle| switch (lifecycle) {
+                        .run_started => {
+                    if (self.saw_abort) self.started_after_abort = true;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                },
+                else => {},
             }
         }
     };
@@ -1469,30 +1480,25 @@ test "abort control drains before queued future runs" {
     try std.testing.expect(!collector.started_after_abort);
 }
 
-test "run completion updates product activity before notifying" {
+test "agent terminal forwards before session completion state apply" {
     const Collector = struct {
         session: *AgentSession,
         saw_idle: bool = false,
 
         fn emit(value: event_mod.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            if (value == .run) self.saw_idle = self.session.state().activity == .idle;
+            if (value == .agent and value.agent == .lifecycle and value.agent.lifecycle == .run_finished) self.saw_idle = self.session.state().activity == .idle;
         }
     };
 
-    var session = try AgentSession.init(std.testing.allocator, .{});
+    var session = try AgentSession.init(std.testing.allocator, .{ .policy = testPolicy(), .execution = .{ .synchronous = testExecutionBackend() } });
     defer session.deinit();
     var collector = Collector{ .session = &session };
     session.event_sink = .{ .emit_fn = Collector.emit, .ctx = &collector };
 
     _ = try session.submit(.{ .submit_prompt = .{ .messages = &.{} } });
     session.drainCommands();
-    try std.testing.expect(session.state().activity == .running);
-
-    const terminal = try OwnedRunTerminal.completed(std.testing.allocator, &.{});
-    var completion = RunCompletion{ .command_id = session.activeRunCommandId(), .terminal = terminal };
-    _ = session.completeRun(&completion);
-    try std.testing.expect(collector.saw_idle);
+    try std.testing.expect(!collector.saw_idle);
 }
 
 test "prompt append happens before run start" {
@@ -1510,7 +1516,7 @@ test "prompt append happens before run start" {
 
     try std.testing.expectEqual(@as(usize, 1), durable.message_count);
     try std.testing.expect(session.state().activity == .running);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .session_appended, .run_started }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .session_appended }, events.items[0..events.len]);
 }
 
 test "append rejection prevents run start" {
@@ -1592,7 +1598,7 @@ test "completed terminal appends messages before run finished" {
 
     try std.testing.expect(session.state().activity == .idle);
     try std.testing.expectEqual(@as(usize, 1), durable.message_count);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .session_appended, .run_finished_completed }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .session_appended }, events.items[0..events.len]);
 }
 
 test "completed terminal starts queued follow up only after run finished" {
@@ -1614,7 +1620,7 @@ test "completed terminal starts queued follow up only after run finished" {
     _ = session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .running);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .run_follow_up_queued, .session_appended, .run_finished_completed, .run_started }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .control_follow_up_queued, .session_appended }, events.items[0..events.len]);
 }
 
 test "terminal append failure prevents queued follow up" {
@@ -1636,7 +1642,7 @@ test "terminal append failure prevents queued follow up" {
     _ = session.completeRun(&completion);
 
     try std.testing.expect(session.state().activity == .failed);
-    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .run_started, .command_accepted, .run_follow_up_queued, .append_failed, .run_finished_failed }, events.items[0..events.len]);
+    try std.testing.expectEqualSlices(ObservedEvent, &.{ .command_accepted, .command_accepted, .control_follow_up_queued, .append_failed }, events.items[0..events.len]);
 }
 
 test "failed and aborted terminals do not append messages" {
