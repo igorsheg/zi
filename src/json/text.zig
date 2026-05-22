@@ -17,7 +17,13 @@ pub fn utf8LossyAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const 
             try out.appendSlice(allocator, "\xEF\xBF\xBD");
             break;
         }
-        _ = std.unicode.utf8Decode(bytes[i .. i + len]) catch {
+        _ = switch (len) {
+            1 => bytes[i],
+            2 => std.unicode.utf8Decode2(.{ bytes[i], bytes[i + 1] }),
+            3 => std.unicode.utf8Decode3(.{ bytes[i], bytes[i + 1], bytes[i + 2] }),
+            4 => std.unicode.utf8Decode4(.{ bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3] }),
+            else => unreachable,
+        } catch {
             try out.appendSlice(allocator, "\xEF\xBF\xBD");
             i += 1;
             continue;

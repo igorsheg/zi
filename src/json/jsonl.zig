@@ -41,7 +41,7 @@ pub const Decoder = struct {
         var start: usize = 0;
         while (start < chunk.len) {
             if (self.discarding) {
-                if (std.mem.indexOfScalar(u8, chunk[start..], '\n')) |off| {
+                if (std.mem.findScalar(u8, chunk[start..], '\n')) |off| {
                     self.discarding = false;
                     start += off + 1;
                     continue;
@@ -49,7 +49,7 @@ pub const Decoder = struct {
                 return;
             }
 
-            if (std.mem.indexOfScalar(u8, chunk[start..], '\n')) |off| {
+            if (std.mem.findScalar(u8, chunk[start..], '\n')) |off| {
                 const segment = chunk[start .. start + off];
                 try self.acceptSegment(segment, true, sink);
                 start += off + 1;
@@ -100,28 +100,31 @@ pub const Decoder = struct {
 const testing = std.testing;
 
 const Collector = struct {
+    const Self = Collector;
+
     lines: std.ArrayList([]const u8) = .empty,
     errors: usize = 0,
     allocator: std.mem.Allocator,
     fn emit(ptr: *anyopaque, line: []const u8) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const self: *Self = @ptrCast(@alignCast(ptr));
         self.lines.append(self.allocator, self.allocator.dupe(u8, line) catch return) catch return;
     }
     fn err(ptr: *anyopaque, _: ErrorKind, _: []const u8) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const self: *Self = @ptrCast(@alignCast(ptr));
         self.errors += 1;
     }
-    fn sink(self: *@This()) Sink {
+    fn sink(self: *Self) Sink {
         return .{ .ptr = self, .emit = emit, .err = err };
     }
-    fn deinit(self: *@This()) void {
+    fn deinit(self: *Self) void {
         for (self.lines.items) |l| self.allocator.free(l);
         self.lines.deinit(self.allocator);
+        self.* = undefined;
     }
 };
 
 test "jsonl decoder frames split lines crlf tail and oversize resync" {
-    var c = Collector{ .allocator = testing.allocator };
+    var c: Collector = .{ .allocator = testing.allocator };
     defer c.deinit();
     var d = Decoder.init(testing.allocator, .{ .max_line_bytes = 5 });
     defer d.deinit();
