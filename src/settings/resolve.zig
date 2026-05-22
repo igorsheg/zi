@@ -32,10 +32,12 @@ pub fn modelToProtocol(model: schema.Model) ModelResult {
         .model_id = model.id,
         .value = model.provider,
     } } };
-    const base_url = model.base_url orelse ai.models.defaultBaseUrlForProvider(provider) orelse return .{ .err = .{ .missing_base_url = .{
+    const base_url = model.base_url orelse ai.models.defaultBaseUrlForProvider(provider) orelse return .{
+        .err = .{ .missing_base_url = .{
         .model_id = model.id,
         .provider = model.provider,
-    } } };
+    } },
+    };
 
     return .{ .ok = .{
         .id = model.id,

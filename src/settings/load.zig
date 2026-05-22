@@ -2,23 +2,26 @@ const std = @import("std");
 const runtime = @import("../runtime/root.zig");
 const schema = @import("schema.zig");
 
-pub const Error = error{
+const Error = error{
     SettingsFileTooLarge,
     TooManyModels,
     InvalidSettings,
-} || std.mem.Allocator.Error || std.Io.Dir.StatFileError || std.Io.Dir.ReadFileAllocError || std.json.ParseError(std.json.Scanner);
+} || std.mem.Allocator.Error ||
+    std.Io.Dir.StatFileError ||
+    std.Io.Dir.ReadFileAllocError ||
+    std.json.ParseError(std.json.Scanner);
 
-pub fn load(allocator: std.mem.Allocator, io: std.Io, storage: runtime.storage.Storage) Error!schema.Settings {
+pub fn load(allocator: std.mem.Allocator, io: std.Io, storage: runtime.storage.Storage) !schema.Settings {
     var settings = schema.Settings.empty(allocator);
     errdefer settings.deinit();
 
-    try loadFileIfPresent(&settings, io, storage.user_settings);
-    if (storage.project_settings) |path| try loadFileIfPresent(&settings, io, path);
+    try loadFileIfPresent(io, &settings, storage.user_settings);
+    if (storage.project_settings) |path| try loadFileIfPresent(io, &settings, path);
 
     return settings;
 }
 
-fn loadFileIfPresent(settings: *schema.Settings, io: std.Io, path: []const u8) Error!void {
+fn loadFileIfPresent(io: std.Io, settings: *schema.Settings, path: []const u8) Error!void {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => |e| return e,
@@ -26,7 +29,12 @@ fn loadFileIfPresent(settings: *schema.Settings, io: std.Io, path: []const u8) E
     if (stat.size > schema.max_settings_file_bytes) return error.SettingsFileTooLarge;
 
     const allocator = settings.arena.child_allocator;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(schema.max_settings_file_bytes)) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(schema.max_settings_file_bytes),
+    ) catch |err| switch (err) {
         error.FileNotFound => return,
         else => |e| return e,
     };
@@ -57,7 +65,7 @@ fn applyJsonSettings(settings: *schema.Settings, json: schema.JsonSettings) Erro
 
 fn upsertModel(settings: *schema.Settings, json: schema.JsonModel) Error!void {
     const allocator = settings.arena.allocator();
-    const model = schema.Model{
+    const model: schema.Model = .{
         .id = try allocator.dupe(u8, json.id),
         .name = if (json.name) |value| try allocator.dupe(u8, value) else null,
         .api = try allocator.dupe(u8, json.api),
@@ -83,7 +91,11 @@ fn upsertModel(settings: *schema.Settings, json: schema.JsonModel) Error!void {
 }
 
 test "settings load empty when files are missing" {
-    var storage = try runtime.storage.Storage.initFromHome(std.testing.allocator, "/tmp/zi-missing-home", "/tmp/zi-missing-project");
+    var storage = try runtime.storage.Storage.initFromHome(
+        std.testing.allocator,
+        "/tmp/zi-missing-home",
+        "/tmp/zi-missing-project",
+    );
     defer storage.deinit();
 
     var settings = try load(std.testing.allocator, std.testing.io, storage);
@@ -179,7 +191,10 @@ test "settings malformed json is rejected" {
 
     try fixture.writeUserSettings("{");
 
-    try std.testing.expectError(error.UnexpectedEndOfInput, load(std.testing.allocator, std.testing.io, fixture.storage));
+    try std.testing.expectError(
+        error.UnexpectedEndOfInput,
+        load(std.testing.allocator, std.testing.io, fixture.storage),
+    );
 }
 
 test "settings reject too many models" {
@@ -192,7 +207,10 @@ test "settings reject too many models" {
         try upsertModel(&settings, .{ .id = id, .api = "openai", .provider = "openai" });
     }
 
-    try std.testing.expectError(error.TooManyModels, upsertModel(&settings, .{ .id = "overflow", .api = "openai", .provider = "openai" }));
+    try std.testing.expectError(
+        error.TooManyModels,
+        upsertModel(&settings, .{ .id = "overflow", .api = "openai", .provider = "openai" }),
+    );
 }
 
 const Fixture = struct {
@@ -229,11 +247,17 @@ const Fixture = struct {
 
     fn writeUserSettings(fixture: Fixture, bytes: []const u8) !void {
         try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture.storage.agent_home);
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = fixture.storage.user_settings, .data = bytes });
+        try std.Io.Dir.cwd().writeFile(
+            std.testing.io,
+            .{ .sub_path = fixture.storage.user_settings, .data = bytes },
+        );
     }
 
     fn writeProjectSettings(fixture: Fixture, bytes: []const u8) !void {
         try std.Io.Dir.cwd().createDirPath(std.testing.io, fixture.storage.project_zi.?);
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = fixture.storage.project_settings.?, .data = bytes });
+        try std.Io.Dir.cwd().writeFile(
+            std.testing.io,
+            .{ .sub_path = fixture.storage.project_settings.?, .data = bytes },
+        );
     }
 };
