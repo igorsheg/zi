@@ -1,5 +1,4 @@
 const std = @import("std");
-const provider_mod = @import("provider.zig");
 const provider_registry = @import("provider_registry.zig");
 const openai_completions = @import("openai/completions/provider.zig");
 const openai_responses = @import("openai/responses/provider.zig");
@@ -28,11 +27,13 @@ pub const Bundle = struct {
         return self;
     }
 
-    pub fn deinit(self: *Bundle) void {
+    pub fn deinit(self: *Bundle) void { // ziglint-ignore: Z030
         // Registry owns lookup metadata. Concrete provider storage lives in this
         // bundle and must remain valid until after registry teardown.
         self.registry.deinit();
-        self.allocator.destroy(self);
+        const allocator = self.allocator;
+        self.* = undefined;
+        allocator.destroy(self);
     }
 };
 
