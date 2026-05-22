@@ -2,6 +2,7 @@ const std = @import("std");
 const protocol = @import("../../protocol.zig");
 const json_text = @import("../../../json/text.zig");
 const replay = @import("replay.zig");
+const runtime_env = @import("../../../runtime/env.zig");
 
 pub fn writeBaseFields(jw: *std.json.Stringify, model: protocol.Model) !void {
     try jw.objectField("model");
@@ -49,7 +50,10 @@ pub fn writeTools(jw: *std.json.Stringify, tools: []const protocol.Tool, strict_
     try jw.endArray();
 }
 
-fn resolveCacheRetention(env: @import("../../../runtime/env.zig").Env, cache_retention: ?protocol.CacheRetention) protocol.CacheRetention {
+fn resolveCacheRetention(
+    env: runtime_env.Env,
+    cache_retention: ?protocol.CacheRetention,
+) protocol.CacheRetention {
     if (cache_retention) |retention| return retention;
     const value = env.get("PI_CACHE_RETENTION") orelse return .short;
     if (std.mem.eql(u8, value, "long")) return .long;
@@ -64,7 +68,7 @@ fn getPromptCacheRetention(base_url: []const u8, cache_retention: protocol.Cache
 
 pub fn buildRequestJson(
     allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
+    out: *std.ArrayListUnmanaged(u8), // ziglint-ignore: Z011
     model: protocol.Model,
     context: protocol.Context,
     options: protocol.StreamOptions,
@@ -72,7 +76,7 @@ pub fn buildRequestJson(
     reasoning_summary: ?[]const u8,
 ) !void {
     var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    var jw: std.json.Stringify = .{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
 
@@ -142,7 +146,7 @@ pub fn writeInput(
     model: protocol.Model,
     context: protocol.Context,
 ) !void {
-    writeInputOpts(allocator, io, jw, model, context, true) catch |err| return err;
+    try writeInputOpts(allocator, io, jw, model, context, true);
 }
 
 pub fn writeInputOpts(
@@ -153,7 +157,14 @@ pub fn writeInputOpts(
     context: protocol.Context,
     include_system_prompt: bool,
 ) !void {
-    try replay.writeResponsesInput(allocator, io, jw, model, context, .{ .include_system_prompt = include_system_prompt });
+    try replay.writeResponsesInput(
+        allocator,
+        io,
+        jw,
+        model,
+        context,
+        .{ .include_system_prompt = include_system_prompt },
+    );
 }
 
 const ToolCallIdMapping = struct {
@@ -232,7 +243,7 @@ fn writeToolResultMessage(
     tr: protocol.ToolResultMessage,
     mapped_tool_call_id: []const u8,
 ) !void {
-    var concat: std.ArrayListUnmanaged(u8) = .empty;
+    var concat: std.ArrayList(u8) = .empty;
     defer concat.deinit(allocator);
     var saw_text = false;
     for (tr.content) |cb| switch (cb) {
@@ -248,7 +259,7 @@ fn writeToolResultMessage(
     try jw.objectField("type");
     try jw.write("function_call_output");
     try jw.objectField("call_id");
-    const call_id = if (std.mem.indexOfScalar(u8, mapped_tool_call_id, '|')) |i|
+    const call_id = if (std.mem.findScalar(u8, mapped_tool_call_id, '|')) |i|
         mapped_tool_call_id[0..i]
     else
         mapped_tool_call_id;
@@ -279,11 +290,11 @@ fn getMappedToolCallId(
 
 fn recordToolCallIdMapping(
     allocator: std.mem.Allocator,
-    tool_id_map: *std.ArrayListUnmanaged(ToolCallIdMapping),
+    tool_id_map: *std.ArrayList(ToolCallIdMapping),
     original_id: []const u8,
     normalized: NormalizedToolCallId,
 ) !void {
-    var mapped = std.ArrayListUnmanaged(u8).empty;
+    var mapped: std.ArrayList(u8) = .empty;
     defer mapped.deinit(allocator);
     try mapped.appendSlice(allocator, normalized.call_id);
     if (normalized.item_id) |item_id| {
@@ -311,9 +322,9 @@ fn flushPendingSyntheticToolResults(
     allocator: std.mem.Allocator,
     io: std.Io,
     jw: *std.json.Stringify,
-    pending_tool_calls: *std.ArrayListUnmanaged(PendingToolCall),
+    pending_tool_calls: *std.ArrayList(PendingToolCall),
     existing_tool_result_ids: []const []const u8,
-    tool_id_map: *std.ArrayListUnmanaged(ToolCallIdMapping),
+    tool_id_map: *std.ArrayList(ToolCallIdMapping),
 ) !void {
     for (pending_tool_calls.items) |pending| {
         var found = false;
@@ -345,7 +356,7 @@ fn writeAssistantMessage(
     target_model: protocol.Model,
     a: protocol.AssistantMessage,
     msg_index: usize,
-    tool_id_map: *std.ArrayListUnmanaged(ToolCallIdMapping),
+    tool_id_map: *std.ArrayList(ToolCallIdMapping),
 ) !void {
     for (a.content) |b| switch (b) {
         .thinking => |th| {
@@ -451,6 +462,7 @@ const NormalizedToolCallId = struct {
     fn deinit(self: *NormalizedToolCallId, allocator: std.mem.Allocator) void {
         allocator.free(self.call_id);
         if (self.item_id) |item_id| allocator.free(item_id);
+        self.* = undefined;
     }
 };
 
@@ -466,7 +478,7 @@ fn normalizeResponsesToolCallId(
     if (!targetUsesResponsesToolCallNormalization(target_model.provider)) {
         return .{ .call_id = try normalizeIdPart(allocator, id), .item_id = null };
     }
-    if (std.mem.indexOfScalar(u8, id, '|')) |sep| {
+    if (std.mem.findScalar(u8, id, '|')) |sep| {
         if (same_model) {
             return .{
                 .call_id = try allocator.dupe(u8, id[0..sep]),
@@ -475,7 +487,8 @@ fn normalizeResponsesToolCallId(
         }
         const call_id = try normalizeIdPart(allocator, id[0..sep]);
         const item_part = id[sep + 1 ..];
-        var item_id = if (!providersEqual(source.provider, target_model.provider) or !apisEqual(source.api, target_model.api))
+        var item_id = if (!providersEqual(source.provider, target_model.provider) or
+            !apisEqual(source.api, target_model.api))
             try buildForeignResponsesItemId(allocator, item_part)
         else
             try normalizeIdPart(allocator, item_part);
@@ -501,7 +514,7 @@ fn targetUsesResponsesToolCallNormalization(provider: protocol.Provider) bool {
 }
 
 fn normalizeIdPart(allocator: std.mem.Allocator, part: []const u8) ![]const u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     for (part) |c| {
         const normalized = switch (c) {
