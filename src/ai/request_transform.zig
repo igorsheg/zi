@@ -66,7 +66,8 @@ pub fn transformJsonPayload(
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try std.json.Stringify.value(final_payload, .{}, &out.writer);
-    return try out.toOwnedSlice();
+    const owned = try out.toOwnedSlice();
+    return owned;
 }
 
 const testing = std.testing;
@@ -88,7 +89,10 @@ fn testModel() protocol.Model {
 
 test "request transform skips parsing when no hooks are registered" {
     const model = testModel();
-    const transformed = try transformJsonPayload(testing.allocator, "not json", .{ .model = &model, .stream_options = .{ .io = testing.io } });
+    const transformed = try transformJsonPayload(testing.allocator, "not json", .{
+        .model = &model,
+        .stream_options = .{ .io = testing.io },
+    });
     try testing.expect(transformed == null);
 }
 
@@ -119,7 +123,12 @@ test "request transform applies provider decorators to canonical json" {
 test "request transform clones replacements before stringifying" {
     const model = testModel();
     const Replace = struct {
-        fn replace(allocator: std.mem.Allocator, payload: json_value.BorrowedValue, _: *const protocol.Model, _: ?*anyopaque) error{OutOfMemory}!?json_value.OwnedValue {
+        fn replace(
+            allocator: std.mem.Allocator,
+            payload: json_value.BorrowedValue,
+            _: *const protocol.Model,
+            _: ?*anyopaque,
+        ) error{OutOfMemory}!?json_value.OwnedValue {
             _ = payload;
             return json_value.OwnedValue.adopt(allocator, .{ .string = try allocator.dupe(u8, "replacement") });
         }
@@ -137,7 +146,12 @@ test "request transform clones replacements before stringifying" {
 test "request transform reports transform allocation failure" {
     const model = testModel();
     const Fails = struct {
-        fn replace(_: std.mem.Allocator, _: json_value.BorrowedValue, _: *const protocol.Model, _: ?*anyopaque) error{OutOfMemory}!?json_value.OwnedValue {
+        fn replace(
+            _: std.mem.Allocator,
+            _: json_value.BorrowedValue,
+            _: *const protocol.Model,
+            _: ?*anyopaque,
+        ) error{OutOfMemory}!?json_value.OwnedValue {
             return error.OutOfMemory;
         }
     };
