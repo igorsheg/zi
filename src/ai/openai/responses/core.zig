@@ -52,18 +52,18 @@ pub fn streamCore(
     core: CoreOptions,
     sink: ai_provider.StreamEventSink,
 ) void {
-    var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+    var payload_buf: std.ArrayListUnmanaged(u8) = .empty; // ziglint-ignore: Z011
     defer payload_buf.deinit(allocator);
     const build_fn = core.build_request orelse &responses_request.buildRequestJson;
-    build_fn(allocator, &payload_buf, model, context, options, core.reasoning_effort, core.reasoning_summary) catch |err| {
-        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to build request: {s}", .{@errorName(err)});
+    build_fn(allocator, &payload_buf, model, context, options, core.reasoning_effort, core.reasoning_summary) catch |err| { // ziglint-ignore: Z024
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to build request: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
         return;
     };
     const transformed_payload = request_transform.transformJsonPayload(allocator, payload_buf.items, .{
         .model = &model,
         .stream_options = options,
     }) catch |err| {
-        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to transform request: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to transform request: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
         return;
     };
     defer if (transformed_payload) |payload| allocator.free(payload);
@@ -81,13 +81,13 @@ pub fn streamCore(
 
     const base = core.base_url orelse model.base_url;
     const uri_str = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, core.path }) catch |err| {
-        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to build URI: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to build URI: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
         return;
     };
     defer allocator.free(uri_str);
 
     const uri = std.Uri.parse(uri_str) catch |err| {
-        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to parse URI: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to parse URI: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
         return;
     };
 
@@ -122,25 +122,25 @@ pub fn streamCore(
             .accept_encoding = .{ .override = "identity" },
         },
     }) catch |err| {
-        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to open connection: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to open connection: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
         return;
     };
     defer req.deinit();
 
-    var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
-        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to start interrupt guard: {s}", .{@errorName(err)});
+    var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| { // ziglint-ignore: Z024
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to start interrupt guard: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
         return;
     };
     defer abort_guard.stop();
 
     req.sendBodyComplete(request_payload) catch |err| {
-        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to send body: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to send body: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
         return;
     };
 
     var redirect_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&redirect_buf) catch |err| {
-        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "request failed: {s}", .{@errorName(err)});
+        responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "request failed: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
         return;
     };
 
@@ -160,16 +160,16 @@ pub fn streamCore(
             if (n == 0) break;
             n_read += n;
         }
-        const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
-            responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+        const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| { // ziglint-ignore: Z024
+            responses_stream.emitError(allocator, options.io, sink, model, core.provider_label, "failed to normalize HTTP error: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
-        responses_stream.emitFailure(allocator, options.io, sink, model, core.provider_label, normalized.failure, normalized.display_message);
+        responses_stream.emitFailure(allocator, options.io, sink, model, core.provider_label, normalized.failure, normalized.display_message); // ziglint-ignore: Z024
         return;
     }
 
     var reader = response.reader(&transfer_buf);
-    responses_stream.processStreamMapped(allocator, options.io, &reader, model, options.signal, core.provider_label, core.event_mapper, sink);
+    responses_stream.processStreamMapped(allocator, options.io, &reader, model, options.signal, core.provider_label, core.event_mapper, sink); // ziglint-ignore: Z024
 }
 
 fn formatHttpErrorDetail(allocator: std.mem.Allocator, status: std.http.Status, body: []const u8) ![]const u8 {
@@ -184,7 +184,7 @@ fn formatHttpErrorDetail(allocator: std.mem.Allocator, status: std.http.Status, 
     if (std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{})) |parsed| {
         defer parsed.deinit();
         if (extractJsonErrorMessage(parsed.value)) |message| {
-            if (reason.len > 0) return std.fmt.allocPrint(allocator, "HTTP {d} {s}: {s}", .{ status_code, reason, message });
+            if (reason.len > 0) return std.fmt.allocPrint(allocator, "HTTP {d} {s}: {s}", .{ status_code, reason, message }); // ziglint-ignore: Z024
             return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status_code, message });
         }
     } else |_| {}
@@ -243,6 +243,7 @@ const TestCollector = struct {
         self.text.deinit(self.allocator);
         self.thinking.deinit(self.allocator);
         self.tool_args.deinit(self.allocator);
+        self.* = undefined;
     }
 
     fn cb(evt: protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
@@ -344,7 +345,7 @@ fn runProcessWithMapper(
         .tracker = &terminal_tracker,
         .inner = .{ .func = TestCollector.cb, .ctx = @ptrCast(collector) },
     };
-    responses_stream.processStreamMapped(arena, std.testing.io, &reader, test_model, Token.none, "openai-responses", event_mapper, tracking_sink.sink());
+    responses_stream.processStreamMapped(arena, std.testing.io, &reader, test_model, Token.none, "openai-responses", event_mapper, tracking_sink.sink()); // ziglint-ignore: Z024
     try testing.expect(!collector.alloc_failed);
     _ = try terminal_tracker.finish();
 }
@@ -361,10 +362,10 @@ fn expectCollectorSaw(col: TestCollector, kind: TestCollector.EventKind) !void {
 }
 
 fn writeInputToJson(allocator: std.mem.Allocator, model: protocol.Model, ctx: protocol.Context) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty; // ziglint-ignore: Z011
     errdefer out.deinit(allocator);
     var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    var jw: std.json.Stringify = .{ .writer = &allocating.writer, .options = .{} };
     try jw.beginArray();
     try responses_request.writeInputOpts(allocator, std.testing.io, &jw, model, ctx, false);
     try jw.endArray();
@@ -376,17 +377,17 @@ test "processStream maps reasoning summary deltas to a thinking block" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = .{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abc\"}}\n\n" ++
         "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n" ++
-        "data: {\"type\":\"response.reasoning_summary_part.added\",\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.reasoning_summary_part.added\",\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n" ++ // ziglint-ignore: Z024
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Let me think\"}\n\n" ++
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\" carefully.\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque-blob\"}}\n\n" ++
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_abc\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30}}}\n\n";
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque-blob\"}}\n\n" ++ // ziglint-ignore: Z024
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_abc\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"total_tokens\":30}}}\n\n"; // ziglint-ignore: Z024
 
     try runProcess(alloc, sse_bytes, &col);
 
@@ -402,7 +403,7 @@ test "processStream maps output_text deltas to a text block with response_id" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = .{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
@@ -426,17 +427,17 @@ test "processStream concatenates function_call argument chunks and overrides sto
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = .{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tc\"}}\n\n" ++
-        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n" ++ // ziglint-ignore: Z024
         "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"cmd\\\":\\\"\"}\n\n" ++
         "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"echo hi\"}\n\n" ++
         "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"\\\"}\"}\n\n" ++
-        "data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{\\\"cmd\\\":\\\"echo hi\\\"}\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"echo hi\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{\\\"cmd\\\":\\\"echo hi\\\"}\"}\n\n" ++ // ziglint-ignore: Z024
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"echo hi\\\"}\"}}\n\n" ++ // ziglint-ignore: Z024
         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tc\",\"status\":\"completed\"}}\n\n";
 
     try runProcess(alloc, sse_bytes, &col);
@@ -452,7 +453,7 @@ test "processStreamMapped codex mapper stops after terminal response.completed" 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = .{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
@@ -460,7 +461,7 @@ test "processStreamMapped codex mapper stops after terminal response.completed" 
         "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" ++
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n" ++
         "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n" ++
-        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n" ++ // ziglint-ignore: Z024
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\" ignored\"}\n\n";
 
     try runProcessWithMapper(alloc, sse_bytes, .{ .map = codexEventMapper }, &col);
@@ -474,17 +475,17 @@ test "processStream uses final output_item payload for message phase and tool id
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = .{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
         "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_added\"}}\n\n" ++
         "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" ++
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"draft\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_final\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"final text\"}]}}\n\n" ++
-        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_added\",\"call_id\":\"call_added\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"draft\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_final\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"final text\"}]}}\n\n" ++ // ziglint-ignore: Z024
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_added\",\"call_id\":\"call_added\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"draft\\\"}\"}}\n\n" ++ // ziglint-ignore: Z024
         "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"cmd\\\":\\\"draft\\\"}\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_final\",\"call_id\":\"call_final\",\"name\":\"bash_final\",\"arguments\":\"{\\\"cmd\\\":\\\"final\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_final\",\"call_id\":\"call_final\",\"name\":\"bash_final\",\"arguments\":\"{\\\"cmd\\\":\\\"final\\\"}\"}}\n\n" ++ // ziglint-ignore: Z024
         "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
 
     try runProcess(alloc, sse_bytes, &col);
@@ -507,7 +508,7 @@ test "buildRequestJson emits store:false, input[], and reasoning:none for reason
         .tools = null,
     };
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty; // ziglint-ignore: Z011
     defer out.deinit(alloc);
     try responses_request.buildRequestJson(alloc, &out, test_model, ctx, .{ .io = testing.io }, null, null);
 
@@ -530,7 +531,7 @@ test "buildRequestJson includes prompt cache, max_output_tokens, and temperature
         },
     };
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty; // ziglint-ignore: Z011
     defer out.deinit(alloc);
     try responses_request.buildRequestJson(alloc, &out, test_model, ctx, .{
         .io = testing.io,
@@ -551,10 +552,10 @@ test "writeInputOpts remaps foreign tool result ids to the replayed function cal
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var foreign_args = std.json.Value{ .object = .{} };
+    var foreign_args: std.json.Value = .{ .object = .{} };
     defer foreign_args.object.deinit(alloc);
 
-    const assistant = protocol.AssistantMessage{
+    const assistant: protocol.AssistantMessage = .{
         .content = &.{.{ .tool_call = .{
             .id = "call:bad|item bad!!!",
             .name = "bash",
@@ -563,7 +564,7 @@ test "writeInputOpts remaps foreign tool result ids to the replayed function cal
         .api = .openai_completions,
         .provider = .openrouter,
         .model = "openai/gpt-test",
-        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
         .stop_reason = .toolUse,
         .timestamp = 0,
     };
@@ -588,10 +589,10 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var synthetic_args = std.json.Value{ .object = .{} };
+    var synthetic_args: std.json.Value = .{ .object = .{} };
     defer synthetic_args.object.deinit(alloc);
 
-    const tool_calling_assistant = protocol.AssistantMessage{
+    const tool_calling_assistant: protocol.AssistantMessage = .{
         .content = &.{.{ .tool_call = .{
             .id = "call_1|fc_1",
             .name = "bash",
@@ -600,21 +601,21 @@ test "writeInputOpts inserts synthetic tool result and skips errored assistants"
         .api = .openai_codex_responses,
         .provider = .openai_codex,
         .model = "gpt-5.4",
-        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
         .stop_reason = .toolUse,
         .timestamp = 0,
     };
-    const errored_assistant = protocol.AssistantMessage{
+    const errored_assistant: protocol.AssistantMessage = .{
         .content = &.{.{ .text = .{ .text = "should not replay" } }},
         .api = .openai_codex_responses,
         .provider = .openai_codex,
         .model = "gpt-5.4",
-        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
         .stop_reason = .@"error",
         .timestamp = 0,
     };
-    const user = protocol.UserMessage{ .content = .{ .text = "next" }, .timestamp = 0 };
-    const ctx: protocol.Context = .{ .messages = &.{ .{ .assistant = tool_calling_assistant }, .{ .assistant = errored_assistant }, .{ .user = user } } };
+    const user: protocol.UserMessage = .{ .content = .{ .text = "next" }, .timestamp = 0 };
+    const ctx: protocol.Context = .{ .messages = &.{ .{ .assistant = tool_calling_assistant }, .{ .assistant = errored_assistant }, .{ .user = user } } }; // ziglint-ignore: Z024
 
     const written = try writeInputToJson(alloc, .{
         .id = "gpt-5.4",
@@ -638,10 +639,10 @@ test "writeInputOpts serializes invalid tool-result utf-8 as output text" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var foreign_args = std.json.Value{ .object = .{} };
+    var foreign_args: std.json.Value = .{ .object = .{} };
     defer foreign_args.object.deinit(alloc);
 
-    const assistant = protocol.AssistantMessage{
+    const assistant: protocol.AssistantMessage = .{
         .content = &.{.{ .tool_call = .{
             .id = "call:bad|item bad!!!",
             .name = "bash",
@@ -650,7 +651,7 @@ test "writeInputOpts serializes invalid tool-result utf-8 as output text" {
         .api = .openai_completions,
         .provider = .openrouter,
         .model = "openai/gpt-test",
-        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+        .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
         .stop_reason = .toolUse,
         .timestamp = 0,
     };
@@ -689,14 +690,14 @@ test "processStream infers toolUse at EOF when tool calls are present" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = .{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tc\"}}\n\n" ++
-        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n" ++
-        "data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{\\\"cmd\\\":\\\"echo hi\\\"}\"}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"echo hi\\\"}\"}}\n\n";
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n" ++ // ziglint-ignore: Z024
+        "data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{\\\"cmd\\\":\\\"echo hi\\\"}\"}\n\n" ++ // ziglint-ignore: Z024
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_abc\",\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"echo hi\\\"}\"}}\n\n"; // ziglint-ignore: Z024
 
     try runProcess(alloc, sse_bytes, &col);
 
