@@ -30,14 +30,28 @@ pub const AnthropicProvider = struct {
         };
     }
 
-    fn streamImplWrapper(ptr: *anyopaque, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, sink: ai_provider.StreamEventSink) void {
+    fn streamImplWrapper(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
+        model: protocol.Model,
+        context: protocol.Context,
+        options: protocol.StreamOptions,
+        sink: ai_provider.StreamEventSink,
+    ) void {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
         self.streamImpl(allocator, model, context, options, null, null, sink);
     }
 
-    fn streamSimpleImplWrapper(ptr: *anyopaque, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.SimpleStreamOptions, sink: ai_provider.StreamEventSink) void {
+    fn streamSimpleImplWrapper(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
+        model: protocol.Model,
+        context: protocol.Context,
+        options: protocol.SimpleStreamOptions,
+        sink: ai_provider.StreamEventSink,
+    ) void {
         const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
-        self.streamImpl(allocator, model, context, options.base, ai_models.clampReasoning(options.reasoning, model), options.thinking_budgets, sink);
+        self.streamImpl(allocator, model, context, options.base, ai_models.clampReasoning(options.reasoning, model), options.thinking_budgets, sink); // ziglint-ignore: Z024
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
@@ -46,23 +60,32 @@ pub const AnthropicProvider = struct {
 
     fn deinitImpl(_: *anyopaque) void {}
 
-    fn streamImpl(self: *AnthropicProvider, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, reasoning: ?protocol.ThinkingLevel, thinking_budgets: ?protocol.ThinkingBudgets, sink: ai_provider.StreamEventSink) void {
+    fn streamImpl(
+        self: *AnthropicProvider,
+        allocator: std.mem.Allocator,
+        model: protocol.Model,
+        context: protocol.Context,
+        options: protocol.StreamOptions,
+        reasoning: ?protocol.ThinkingLevel,
+        thinking_budgets: ?protocol.ThinkingBudgets,
+        sink: ai_provider.StreamEventSink,
+    ) void {
         _ = self;
 
-        var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+        var payload_buf: std.ArrayList(u8) = .empty;
         defer payload_buf.deinit(allocator);
 
         const is_oauth_token = if (options.api_key) |k| std.mem.indexOf(u8, k, "sk-ant-oat") != null else false;
-        anthropic_request.buildRequestJson(allocator, &payload_buf, model, context, options, is_oauth_token, reasoning, thinking_budgets) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build request: {s}", .{@errorName(err)});
+        anthropic_request.buildRequestJson(allocator, &payload_buf, model, context, options, is_oauth_token, reasoning, thinking_budgets) catch |err| { // ziglint-ignore: Z024
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build request: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
 
         var decorators_buf: [1]request_transform.Decorator = undefined;
         var decorator_count: usize = 0;
-        var metadata_context = anthropic_request.AnthropicMetadataContext{ .metadata = options.metadata };
+        var metadata_context: anthropic_request.AnthropicMetadataContext = .{ .metadata = options.metadata };
         if (anthropic_request.anthropicMetadataUserId(options.metadata) != null) {
-            decorators_buf[decorator_count] = .{ .func = anthropic_request.addAnthropicMetadata, .ctx = @ptrCast(&metadata_context) };
+            decorators_buf[decorator_count] = .{ .func = anthropic_request.addAnthropicMetadata, .ctx = @ptrCast(&metadata_context) }; // ziglint-ignore: Z024
             decorator_count += 1;
         }
         const transformed_payload = request_transform.transformJsonPayload(allocator, payload_buf.items, .{
@@ -70,7 +93,7 @@ pub const AnthropicProvider = struct {
             .stream_options = options,
             .decorators = decorators_buf[0..decorator_count],
         }) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to transform request: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to transform request: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         defer if (transformed_payload) |payload| allocator.free(payload);
@@ -82,13 +105,13 @@ pub const AnthropicProvider = struct {
         };
 
         const uri_str = std.fmt.allocPrint(allocator, "{s}/v1/messages", .{model.base_url}) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build URI: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build URI: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         defer allocator.free(uri_str);
 
         const uri = std.Uri.parse(uri_str) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to parse URI: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to parse URI: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
 
@@ -106,12 +129,12 @@ pub const AnthropicProvider = struct {
         var auth_buf: [4096]u8 = undefined;
         if (is_oauth) {
             const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch {
-                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "API key too long for auth buffer", .{});
+                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "API key too long for auth buffer", .{}); // ziglint-ignore: Z024
                 return;
             };
             extra_headers_buf[n_extra] = .{ .name = "authorization", .value = auth_value };
             n_extra += 1;
-            extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14" };
+            extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14" }; // ziglint-ignore: Z024
             n_extra += 1;
             extra_headers_buf[n_extra] = .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" };
             n_extra += 1;
@@ -122,7 +145,7 @@ pub const AnthropicProvider = struct {
         } else {
             extra_headers_buf[n_extra] = .{ .name = "x-api-key", .value = api_key };
             n_extra += 1;
-            extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14" };
+            extra_headers_buf[n_extra] = .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14" }; // ziglint-ignore: Z024
             n_extra += 1;
         }
 
@@ -142,25 +165,25 @@ pub const AnthropicProvider = struct {
                 .accept_encoding = .{ .override = "identity" },
             },
         }) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to open connection: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to open connection: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         defer req.deinit();
 
-        var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to start interrupt guard: {s}", .{@errorName(err)});
+        var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| { // ziglint-ignore: Z024
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to start interrupt guard: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         defer abort_guard.stop();
 
         req.sendBodyComplete(request_payload) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to send body: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to send body: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
 
         var redirect_buf: [4096]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "request failed: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "request failed: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
 
@@ -181,11 +204,11 @@ pub const AnthropicProvider = struct {
                 if (n == 0) break;
                 n_read += n;
             }
-            const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
-                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+            const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| { // ziglint-ignore: Z024
+                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to normalize HTTP error: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
                 return;
             };
-            emitFailure(allocator, options.io, sink, model.api, model.provider, model.id, normalized.failure, normalized.display_message);
+            emitFailure(allocator, options.io, sink, model.api, model.provider, model.id, normalized.failure, normalized.display_message); // ziglint-ignore: Z024
             return;
         }
 
@@ -196,7 +219,7 @@ pub const AnthropicProvider = struct {
         var scratch_arena = std.heap.ArenaAllocator.init(allocator);
         defer scratch_arena.deinit();
 
-        var state = StreamState{
+        var state: StreamState = .{
             .allocator = allocator,
             .scratch = &scratch_arena,
             .content_blocks = .empty,
@@ -228,16 +251,18 @@ pub const AnthropicProvider = struct {
         sink.emit(.start);
 
         const StreamCtx = struct {
+            const Self = @This();
+
             state: *StreamState,
             sink: ai_provider.StreamEventSink,
 
             fn onEvent(evt: sse.SseEvent, ctx: ?*anyopaque) anyerror!void {
-                const stream_self: *@This() = @ptrCast(@alignCast(ctx));
+                const stream_self: *Self = @ptrCast(@alignCast(ctx));
                 try handleSseEvent(evt, stream_self.state, stream_self.sink);
             }
         };
 
-        var stream_ctx = StreamCtx{
+        var stream_ctx: StreamCtx = .{
             .state = &state,
             .sink = sink,
         };
@@ -249,16 +274,16 @@ pub const AnthropicProvider = struct {
             if (options.signal.isAborted()) {
                 state.message.stop_reason = .aborted;
             } else if (err == error.EventDataTooLarge) {
-                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "stream event exceeded {d} bytes", .{sse.max_event_data_bytes});
+                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "stream event exceeded {d} bytes", .{sse.max_event_data_bytes}); // ziglint-ignore: Z024
                 return;
             } else {
-                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "stream read error: {s}", .{@errorName(err)});
+                emitError(allocator, options.io, sink, model.api, model.provider, model.id, "stream read error: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
                 return;
             }
         };
 
         state.message.content = buildFinalContent(allocator, state.content_blocks.items) catch |err| {
-            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build final content: {s}", .{@errorName(err)});
+            emitError(allocator, options.io, sink, model.api, model.provider, model.id, "failed to build final content: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
 
@@ -289,8 +314,8 @@ pub const AnthropicProvider = struct {
 const ContentBlockState = struct {
     block_type: BlockType,
     index: usize,
-    text: std.ArrayListUnmanaged(u8),
-    thinking: std.ArrayListUnmanaged(u8),
+    text: std.ArrayList(u8),
+    thinking: std.ArrayList(u8),
     tool_call: ?protocol.ToolCall,
 
     const BlockType = enum { text, thinking, tool_call };
@@ -308,13 +333,14 @@ const ContentBlockState = struct {
     fn deinit(self: *ContentBlockState, allocator: std.mem.Allocator) void {
         self.text.deinit(allocator);
         self.thinking.deinit(allocator);
+        self.* = undefined;
     }
 };
 
 const StreamState = struct {
     allocator: std.mem.Allocator,
     scratch: *std.heap.ArenaAllocator,
-    content_blocks: std.ArrayListUnmanaged(ContentBlockState),
+    content_blocks: std.ArrayList(ContentBlockState),
     message: protocol.AssistantMessage,
     stop_reason: ?StopReason,
 };
@@ -465,7 +491,7 @@ fn updateUsageFromObject(usage: *protocol.Usage, obj: std.json.ObjectMap) void {
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
-fn buildFinalContent(allocator: std.mem.Allocator, blocks: []const ContentBlockState) ![]const protocol.AssistantMessage.AssistantContentBlock {
+fn buildFinalContent(allocator: std.mem.Allocator, blocks: []const ContentBlockState) ![]const protocol.AssistantMessage.AssistantContentBlock { // ziglint-ignore: Z024
     const content = try allocator.alloc(protocol.AssistantMessage.AssistantContentBlock, blocks.len);
     for (blocks, 0..) |block, i| {
         content[i] = switch (block.block_type) {
@@ -506,11 +532,11 @@ fn emitError(
     api: protocol.Api,
     provider: protocol.Provider,
     model_id: []const u8,
-    comptime fmt: []const u8,
+    comptime fmt: []const u8, // ziglint-ignore: Z023
     args: anytype,
 ) void {
     const inner = std.fmt.allocPrint(allocator, fmt, args) catch "anthropic error";
-    emitFailure(allocator, io, sink, api, provider, model_id, .{ .kind = provider_failure.classifyTransportFailure(inner) }, inner);
+    emitFailure(allocator, io, sink, api, provider, model_id, .{ .kind = provider_failure.classifyTransportFailure(inner) }, inner); // ziglint-ignore: Z024
 }
 
 fn emitFailure(
@@ -563,7 +589,7 @@ fn testAnthropicModel() protocol.Model {
 
 test "Anthropic request transform maps metadata user_id" {
     const allocator = testing.allocator;
-    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
 
     var metadata: std.json.ObjectMap = .{};
@@ -571,9 +597,9 @@ test "Anthropic request transform maps metadata user_id" {
     try metadata.put(allocator, "user_id", .{ .string = "user-123" });
 
     const model = testAnthropicModel();
-    try anthropic_request.buildRequestJson(allocator, &payload, model, .{ .messages = &.{} }, .{ .metadata = .{ .object = metadata } }, false, null, null);
+    try anthropic_request.buildRequestJson(allocator, &payload, model, .{ .messages = &.{} }, .{ .metadata = .{ .object = metadata } }, false, null, null); // ziglint-ignore: Z024
 
-    var metadata_context = anthropic_request.AnthropicMetadataContext{ .metadata = .{ .object = metadata } };
+    var metadata_context: anthropic_request.AnthropicMetadataContext = .{ .metadata = .{ .object = metadata } };
     const transformed = try request_transform.transformJsonPayload(allocator, payload.items, .{
         .model = &model,
         .decorators = &.{.{ .func = anthropic_request.addAnthropicMetadata, .ctx = @ptrCast(&metadata_context) }},
@@ -585,7 +611,7 @@ test "Anthropic request transform maps metadata user_id" {
 
 test "SSE parse: braces inside string values survive a real Edit-tool payload" {
     const data =
-        \\{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/foo/bar.zig\",\"old_str\":\"a {b} c\"}"}}
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/foo/bar.zig\",\"old_str\":\"a {b} c\"}"}} // ziglint-ignore: Z024
     ;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -604,7 +630,7 @@ test "Anthropic SSE usage keeps cache tokens in total_tokens" {
     var scratch_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer scratch_arena.deinit();
 
-    var state = StreamState{
+    var state: StreamState = .{
         .allocator = turn_arena.allocator(),
         .scratch = &scratch_arena,
         .content_blocks = .empty,
@@ -636,7 +662,7 @@ test "Anthropic SSE usage keeps cache tokens in total_tokens" {
     };
 
     try handleSseEvent(.{ .data =
-        \\{"type":"message_start","message":{"usage":{"input_tokens":1200,"output_tokens":10,"cache_read_input_tokens":800,"cache_creation_input_tokens":400}}}
+        \\{"type":"message_start","message":{"usage":{"input_tokens":1200,"output_tokens":10,"cache_read_input_tokens":800,"cache_creation_input_tokens":400}}} // ziglint-ignore: Z024
     }, &state, &Noop.sink, null);
     try testing.expectEqual(@as(u64, 1200), state.message.usage.input);
     try testing.expectEqual(@as(u64, 10), state.message.usage.output);
@@ -645,7 +671,7 @@ test "Anthropic SSE usage keeps cache tokens in total_tokens" {
     try testing.expectEqual(@as(u64, 2410), state.message.usage.total_tokens);
 
     try handleSseEvent(.{ .data =
-        \\{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":25,"cache_read_input_tokens":900}}
+        \\{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":25,"cache_read_input_tokens":900}} // ziglint-ignore: Z024
     }, &state, &Noop.sink, null);
     try testing.expectEqual(@as(u64, 1200), state.message.usage.input);
     try testing.expectEqual(@as(u64, 25), state.message.usage.output);
