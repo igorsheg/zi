@@ -24,7 +24,10 @@ pub const ClaimModelRegistration = struct {
         if (self.api) |api| allocator.free(api);
         if (self.input.len > 0) allocator.free(self.input);
         freeHeaders(allocator, self.headers);
-        if (self.compat) |compat| json_value.freeJsonValue(allocator, compat);
+        if (self.compat) |compat| {
+            var owned = compat;
+            owned.deinit();
+        }
         self.* = undefined;
     }
 };
@@ -616,7 +619,7 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
         testing.allocator,
         testModel("https://baseline.example"),
         .{ .messages = &.{} },
-        .{},
+        .{ .base = .{ .io = testing.io } },
         .{ .func = &noopEvent },
     );
     try testing.expectEqualStrings("https://proxy-b.example", baseline.last_base_url.?);
@@ -629,7 +632,7 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
         testing.allocator,
         testModel("https://baseline.example"),
         .{ .messages = &.{} },
-        .{},
+        .{ .base = .{ .io = testing.io } },
         .{ .func = &noopEvent },
     );
     try testing.expectEqualStrings("https://proxy-a.example", baseline.last_base_url.?);
@@ -641,7 +644,7 @@ test "Registry reapplies surviving provider claims and restores the baseline" {
         testing.allocator,
         testModel("https://baseline.example"),
         .{ .messages = &.{} },
-        .{},
+        .{ .base = .{ .io = testing.io } },
         .{ .func = &noopEvent },
     );
     try testing.expectEqualStrings("https://baseline.example", baseline.last_base_url.?);
@@ -719,7 +722,7 @@ test "Registry resolves provider claims by provider name before api projection" 
         testing.allocator,
         testModelWithProvider("https://baseline.example", .openai_responses, .openai),
         .{ .messages = &.{} },
-        .{},
+        .{ .base = .{ .io = testing.io } },
         .{ .func = &noopEvent },
     );
     try testing.expectEqualStrings("https://proxy.example", baseline.last_base_url.?);
@@ -728,7 +731,7 @@ test "Registry resolves provider claims by provider name before api projection" 
         testing.allocator,
         testModelWithProvider("https://baseline.example", .openai_responses, .github_copilot),
         .{ .messages = &.{} },
-        .{},
+        .{ .base = .{ .io = testing.io } },
         .{ .func = &noopEvent },
     );
     try testing.expectEqualStrings("https://baseline.example", baseline.last_base_url.?);
@@ -770,7 +773,7 @@ test "Registry teardown drops one generation and restores surviving same-name cl
         testing.allocator,
         testModelWithProvider("https://baseline.example", .anthropic_messages, .anthropic),
         .{ .messages = &.{} },
-        .{},
+        .{ .base = .{ .io = testing.io } },
         .{ .func = &noopEvent },
     );
     try testing.expectEqualStrings("https://gen2.example", baseline.last_base_url.?);

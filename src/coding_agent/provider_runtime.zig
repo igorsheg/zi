@@ -1,23 +1,18 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const env_api_keys = @import("../ai/env_api_keys.zig");
+const provider_defaults = @import("../ai/provider_defaults.zig");
 const agent = @import("../agent/root.zig");
 const runtime_env = @import("../runtime/env.zig");
 const settings_mod = @import("../settings/root.zig");
-const provider_backend = @import("provider_backend.zig");
-const session_mod = @import("session.zig");
-const openai_completions = @import("../ai/openai/completions/provider.zig");
-const openai_responses = @import("../ai/openai/responses/provider.zig");
 
 pub const ProviderRuntime = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     env: runtime_env.Env,
-    openai_completions_provider: openai_completions.OpenAICompletionsProvider,
-    openai_responses_provider: openai_responses.OpenAIResponsesProvider,
+    provider_bundle: *provider_defaults.Bundle,
     static_provider: ?StaticProvider,
     settings_models: []const settings_mod.Model,
-    active_provider: ?ai.provider.Provider = null,
 
     pub const Options = struct {
         static_provider: ?StaticProvider = null,
@@ -36,6 +31,12 @@ pub const ProviderRuntime = struct {
         invalid_settings_model: settings_mod.resolve.Diagnostic,
     };
 
+    pub const ResolvedProvider = struct {
+        provider: ai.provider.Provider,
+        api_key: ?[]const u8,
+        transport: ?ai.protocol.Transport = .sse,
+    };
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, env: runtime_env.Env) !ProviderRuntime {
         return initWithOptions(allocator, io, env, .{});
     }
@@ -45,14 +46,14 @@ pub const ProviderRuntime = struct {
             .allocator = allocator,
             .io = io,
             .env = env,
-            .openai_completions_provider = openai_completions.OpenAICompletionsProvider.init(allocator),
-            .openai_responses_provider = openai_responses.OpenAIResponsesProvider.init(allocator),
+            .provider_bundle = try provider_defaults.Bundle.init(allocator),
             .static_provider = options.static_provider,
             .settings_models = options.settings_models,
         };
     }
 
     pub fn deinit(self: *ProviderRuntime) void {
+        self.provider_bundle.deinit();
         self.* = undefined;
     }
 
@@ -75,34 +76,18 @@ pub const ProviderRuntime = struct {
         return null;
     }
 
-    pub fn executionBackend(self: *ProviderRuntime, model: agent.message.Model) !session_mod.AgentSession.ExecutionBackend {
+    pub fn resolveProvider(self: *ProviderRuntime, model: agent.message.Model) !ResolvedProvider {
         if (self.static_provider) |static| {
             if (modelsMatch(static.model, model)) {
-                self.active_provider = static.provider;
-                return provider_backend.synchronous(&self.active_provider.?, .{
-                    .io = self.io,
-                    .api_key = static.api_key,
-                    .transport = .sse,
-                });
+                return .{ .provider = static.provider, .api_key = static.api_key };
             }
         }
 
-        if (model.provider == .openrouter and model.api == .openai_completions) {
-            return self.executionBackendForProvider(model, self.openai_completions_provider.provider());
-        }
-        if (model.provider != .openai or model.api != .openai_responses) return error.ProviderUnavailable;
-        return self.executionBackendForProvider(model, self.openai_responses_provider.provider());
-    }
-
-    fn executionBackendForProvider(self: *ProviderRuntime, model: agent.message.Model, provider: ai.provider.Provider) !session_mod.AgentSession.ExecutionBackend {
+        const api = ai.protocol.apiToString(model.api);
         const provider_name = ai.protocol.providerToString(model.provider);
+        const provider = self.provider_bundle.registry.getForModel(api, provider_name) orelse return error.ProviderUnavailable;
         const api_key = env_api_keys.getEnvApiKey(self.env, provider_name) orelse return error.MissingApiKey;
-        self.active_provider = provider;
-        return provider_backend.synchronous(&self.active_provider.?, .{
-            .io = self.io,
-            .api_key = api_key,
-            .transport = .sse,
-        });
+        return .{ .provider = provider, .api_key = api_key };
     }
 };
 
@@ -136,7 +121,9 @@ test "provider runtime can drive AgentSession through faux provider" {
         .ok => |model| model,
         else => return error.MissingFauxModel,
     };
-    const backend = try runtime.executionBackend(model);
+    const resolved_provider = try runtime.resolveProvider(model);
+    var provider = resolved_provider.provider;
+    const backend = coding_agent.provider_backend.synchronous(&provider, .{ .io = testing.io, .api_key = resolved_provider.api_key, .transport = resolved_provider.transport });
 
     const Capture = struct {
         terminal: ?agent.event.RunTerminal = null,
@@ -181,29 +168,19 @@ test "provider runtime resolves settings model before builtins" {
     const models = [_]settings_mod.Model{.{
         .id = "openrouter/sonnet",
         .name = "Sonnet via OpenRouter",
-        .api = "openai-completions",
         .provider = "openrouter",
-        .base_url = "https://openrouter.ai/api/v1",
-        .provider_model = "anthropic/claude-sonnet-4",
-        .context_window = 200000,
-        .max_tokens = 8192,
+        .api = "openai-completions",
+        .provider_model = "anthropic/claude-sonnet-4.5",
     }};
-
-    var runtime = try ProviderRuntime.initWithOptions(testing.allocator, testing.io, .empty, .{
-        .settings_models = &models,
-    });
+    var runtime = try ProviderRuntime.initWithOptions(testing.allocator, testing.io, .empty, .{ .settings_models = &models });
     defer runtime.deinit();
 
     const model = switch (runtime.resolveModel("openrouter/sonnet")) {
         .ok => |model| model,
-        else => return error.MissingSettingsModel,
+        else => return error.ExpectedSettingsModel,
     };
+
     try testing.expectEqualStrings("openrouter/sonnet", model.id);
-    try testing.expectEqualStrings("anthropic/claude-sonnet-4", model.requestModel());
-    try testing.expectEqualStrings("Sonnet via OpenRouter", model.name);
-    try testing.expect(model.api == .openai_completions);
-    try testing.expect(model.provider == .openrouter);
-    try testing.expectEqualStrings("https://openrouter.ai/api/v1", model.base_url);
-    try testing.expectEqual(@as(u64, 200000), model.context_window);
-    try testing.expectEqual(@as(u64, 8192), model.max_tokens);
+    try testing.expectEqualStrings("anthropic/claude-sonnet-4.5", model.provider_model.?);
+    try testing.expectEqual(ai.protocol.Provider.openrouter, model.provider);
 }

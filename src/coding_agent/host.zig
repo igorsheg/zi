@@ -7,6 +7,7 @@ const settings_resolve = @import("../settings/resolve.zig");
 const builtin_tools = @import("builtin_tools.zig");
 const event_mod = @import("event.zig");
 const extension = @import("extension.zig");
+const provider_backend = @import("provider_backend.zig");
 const provider_runtime_mod = @import("provider_runtime.zig");
 const session_mod = @import("session.zig");
 
@@ -70,10 +71,16 @@ pub const AgentHost = struct {
             .unknown_model => return .{ .err = .unknown_model },
             .invalid_settings_model => |diag| return .{ .err = .{ .invalid_settings_model = diag } },
         };
-        const backend = runtime.executionBackend(model) catch |err| switch (err) {
+        const resolved_provider = runtime.resolveProvider(model) catch |err| switch (err) {
             error.ProviderUnavailable => return .{ .err = .provider_unavailable },
             error.MissingApiKey => return .{ .err = .missing_api_key },
         };
+        bundle.provider = resolved_provider.provider;
+        const backend = provider_backend.synchronous(&bundle.provider.?, .{
+            .io = self.io,
+            .api_key = resolved_provider.api_key,
+            .transport = resolved_provider.transport,
+        });
         return .{ .ok = .{ .model = model, .backend = backend } };
     }
 };
@@ -109,6 +116,7 @@ pub const Diagnostic = union(enum) {
 pub const SessionBundle = struct {
     allocator: std.mem.Allocator,
     builtins: ?builtin_tools.Builtins = null,
+    provider: ?ai.provider.Provider = null,
     demo_backend: ?*DemoBackend = null,
     session: ?session_mod.AgentSession = null,
 
