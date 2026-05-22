@@ -10,14 +10,14 @@ const completions_stream = @import("stream.zig");
 const Token = protocol.CancelToken;
 const http_cancel = @import("../../../runtime/http_cancel.zig");
 
-pub const OpenAICompletionsProvider = struct {
+pub const OpenAiCompletionsProvider = struct {
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) OpenAICompletionsProvider {
+    pub fn init(allocator: std.mem.Allocator) OpenAiCompletionsProvider {
         return .{ .allocator = allocator };
     }
 
-    pub fn provider(self: *OpenAICompletionsProvider) ai_provider.Provider {
+    pub fn provider(self: *OpenAiCompletionsProvider) ai_provider.Provider {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -31,26 +31,26 @@ pub const OpenAICompletionsProvider = struct {
 
     fn streamImplWrapper(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
         sink: ai_provider.StreamEventSink,
     ) void {
-        const self: *OpenAICompletionsProvider = @ptrCast(@alignCast(ptr));
+        const self: *OpenAiCompletionsProvider = @ptrCast(@alignCast(ptr));
         self.streamImpl(allocator, model, context, options, null, sink);
     }
 
     fn streamSimpleImplWrapper(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.SimpleStreamOptions,
         sink: ai_provider.StreamEventSink,
     ) void {
-        const self: *OpenAICompletionsProvider = @ptrCast(@alignCast(ptr));
-        self.streamImpl(allocator, model, context, options.base, ai_models.clampReasoning(options.reasoning, model), sink);
+        const self: *OpenAiCompletionsProvider = @ptrCast(@alignCast(ptr));
+        self.streamImpl(allocator, model, context, options.base, ai_models.clampReasoning(options.reasoning, model), sink); // ziglint-ignore: Z024
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
@@ -60,8 +60,8 @@ pub const OpenAICompletionsProvider = struct {
     fn deinitImpl(_: *anyopaque) void {}
 
     fn streamImpl(
-        self: *OpenAICompletionsProvider,
-        allocator: std.mem.Allocator,
+        self: *OpenAiCompletionsProvider,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
@@ -70,17 +70,17 @@ pub const OpenAICompletionsProvider = struct {
     ) void {
         _ = self;
 
-        var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+        var payload_buf: std.ArrayList(u8) = .empty;
         defer payload_buf.deinit(allocator);
         completions_request.buildRequestJson(allocator, &payload_buf, model, context, reasoning) catch |err| {
-            completions_stream.emitError(allocator, options.io, sink, model, "failed to build request: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to build request: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         const transformed_payload = request_transform.transformJsonPayload(allocator, payload_buf.items, .{
             .model = &model,
             .stream_options = options,
         }) catch |err| {
-            completions_stream.emitError(allocator, options.io, sink, model, "failed to transform request: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to transform request: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         defer if (transformed_payload) |payload| allocator.free(payload);
@@ -92,13 +92,13 @@ pub const OpenAICompletionsProvider = struct {
         };
 
         const uri_str = std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url}) catch |err| {
-            completions_stream.emitError(allocator, options.io, sink, model, "failed to build URI: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to build URI: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         defer allocator.free(uri_str);
 
         const uri = std.Uri.parse(uri_str) catch |err| {
-            completions_stream.emitError(allocator, options.io, sink, model, "failed to parse URI: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to parse URI: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
 
@@ -138,19 +138,19 @@ pub const OpenAICompletionsProvider = struct {
                 .accept_encoding = .{ .override = "identity" },
             },
         }) catch |err| {
-            completions_stream.emitError(allocator, options.io, sink, model, "failed to open connection: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to open connection: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         defer req.deinit();
 
-        var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| {
-            completions_stream.emitError(allocator, options.io, sink, model, "failed to start interrupt guard: {s}", .{@errorName(err)});
+        var abort_guard = http_cancel.ShutdownOnCancel.start(allocator, options.io, options.signal, http_cancel.requestStream(&req)) catch |err| { // ziglint-ignore: Z024
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to start interrupt guard: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
         defer abort_guard.stop();
 
         req.sendBodyComplete(request_payload) catch |err| {
-            completions_stream.emitError(allocator, options.io, sink, model, "failed to send body: {s}", .{@errorName(err)});
+            completions_stream.emitError(allocator, options.io, sink, model, "failed to send body: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
             return;
         };
 
@@ -177,8 +177,8 @@ pub const OpenAICompletionsProvider = struct {
                 if (n == 0) break;
                 n_read += n;
             }
-            const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| {
-                completions_stream.emitError(allocator, options.io, sink, model, "failed to normalize HTTP error: {s}", .{@errorName(err)});
+            const normalized = provider_failure.normalizeHttpFailure(allocator, status, err_body_buf[0..n_read]) catch |err| { // ziglint-ignore: Z024
+                completions_stream.emitError(allocator, options.io, sink, model, "failed to normalize HTTP error: {s}", .{@errorName(err)}); // ziglint-ignore: Z024
                 return;
             };
             completions_stream.emitFailure(options.io, sink, model, normalized.failure, normalized.display_message);
@@ -193,9 +193,9 @@ pub const OpenAICompletionsProvider = struct {
 const testing = std.testing;
 
 const TestCollector = struct {
-    events: std.ArrayListUnmanaged(EventKind) = .empty,
-    text: std.ArrayListUnmanaged(u8) = .empty,
-    final_args: std.ArrayListUnmanaged(u8) = .empty,
+    events: std.ArrayList(EventKind) = .empty,
+    text: std.ArrayList(u8) = .empty,
+    final_args: std.ArrayList(u8) = .empty,
     final_tool_id: []const u8 = "",
     final_tool_name: []const u8 = "",
     final_error_message: ?[]const u8 = null,
@@ -204,7 +204,7 @@ const TestCollector = struct {
     allocator: std.mem.Allocator,
     alloc_failed: bool = false,
 
-    const EventKind = enum { start, text_start, text_delta, text_end, toolcall_start, toolcall_delta, toolcall_end, done, err, thinking_start, thinking_delta, thinking_end };
+    const EventKind = enum { start, text_start, text_delta, text_end, toolcall_start, toolcall_delta, toolcall_end, done, err, thinking_start, thinking_delta, thinking_end }; // ziglint-ignore: Z024
 
     fn deinit(self: *TestCollector) void {
         self.events.deinit(self.allocator);
@@ -212,6 +212,7 @@ const TestCollector = struct {
         self.final_args.deinit(self.allocator);
         if (self.final_tool_id.len > 0) self.allocator.free(self.final_tool_id);
         if (self.final_tool_name.len > 0) self.allocator.free(self.final_tool_name);
+        self.* = undefined;
     }
 
     fn callback(evt: protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
@@ -329,7 +330,7 @@ test "processStream emits text_delta then done for a simple text response" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = TestCollector{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
@@ -355,13 +356,13 @@ test "processStream concatenates split tool-call argument chunks" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = TestCollector{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
-        "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"t1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"\"}}]}}]}\n\n" ++
-        "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"echo hi\"}}]}}]}\n\n" ++
-        "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"t1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"\"}}]}}]}\n\n" ++ // ziglint-ignore: Z024
+        "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"echo hi\"}}]}}]}\n\n" ++ // ziglint-ignore: Z024
+        "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"}\"}}]}}]}\n\n" ++ // ziglint-ignore: Z024
         "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
         "data: [DONE]\n\n";
 
@@ -378,11 +379,11 @@ test "processStream normalizes openrouter error events carried in a 200 stream" 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = TestCollector{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
-        "data: {\"id\":\"chat-err\",\"error\":{\"code\":429,\"message\":\"Rate limit exceeded\",\"metadata\":{\"raw\":\"provider overload\"}}}\n\n" ++
+        "data: {\"id\":\"chat-err\",\"error\":{\"code\":429,\"message\":\"Rate limit exceeded\",\"metadata\":{\"raw\":\"provider overload\"}}}\n\n" ++ // ziglint-ignore: Z024
         "data: [DONE]\n\n";
 
     try runProcess(alloc, sse_bytes, &col);
@@ -397,7 +398,7 @@ test "processStream maps network_error finish_reason to transient failure" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var col = TestCollector{ .allocator = testing.allocator };
+    var col: TestCollector = TestCollector{ .allocator = testing.allocator };
     defer col.deinit();
 
     const sse_bytes =
@@ -424,7 +425,7 @@ test "buildRequestJson emits stream:true and message round-trip" {
         .tools = null,
     };
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
     try completions_request.buildRequestJson(alloc, &out, test_model, ctx, null);
 
@@ -439,7 +440,7 @@ test "buildRequestJson emits provider model when configured" {
     var model = test_model;
     model.provider_model = "provider/gpt-test";
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     try completions_request.buildRequestJson(testing.allocator, &out, model, .{ .messages = &.{} }, null);
 
