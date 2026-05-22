@@ -13,13 +13,13 @@ fn mapReasoningEffort(effort: []const u8, map: ?protocol.OpenAiCompletionsCompat
 
 pub fn buildRequestJson(
     allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
+    out: *std.ArrayListUnmanaged(u8), // ziglint-ignore: Z011
     model: protocol.Model,
     context: protocol.Context,
     reasoning: ?protocol.ThinkingLevel,
 ) !void {
     var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    var jw: std.json.Stringify = .{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
 
@@ -107,7 +107,12 @@ pub fn buildRequestJson(
     out.* = allocating.toArrayList();
 }
 
-fn writeMessages(allocator: std.mem.Allocator, jw: *std.json.Stringify, model: protocol.Model, context: protocol.Context) !void {
+fn writeMessages(
+    allocator: std.mem.Allocator,
+    jw: *std.json.Stringify,
+    model: protocol.Model,
+    context: protocol.Context,
+) !void {
     if (context.system_prompt) |sys| {
         try jw.beginObject();
         try jw.objectField("role");
@@ -172,7 +177,7 @@ fn writeMessages(allocator: std.mem.Allocator, jw: *std.json.Stringify, model: p
                 try jw.objectField("tool_call_id");
                 try jw.write(tr.tool_call_id);
                 try jw.objectField("content");
-                var concat: std.ArrayListUnmanaged(u8) = .empty;
+                var concat: std.ArrayList(u8) = .empty;
                 defer concat.deinit(allocator);
                 for (tr.content) |cb| {
                     switch (cb) {
@@ -197,7 +202,7 @@ fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *std.json.Stringify, 
     try jw.objectField("role");
     try jw.write("assistant");
 
-    var text_concat: std.ArrayListUnmanaged(u8) = .empty;
+    var text_concat: std.ArrayList(u8) = .empty;
     defer text_concat.deinit(allocator);
     for (a.content) |b| {
         switch (b) {
@@ -235,7 +240,7 @@ fn writeAssistantMessage(allocator: std.mem.Allocator, jw: *std.json.Stringify, 
             try jw.objectField("arguments");
             var args_buf: std.Io.Writer.Allocating = .init(allocator);
             defer args_buf.deinit();
-            var inner = std.json.Stringify{ .writer = &args_buf.writer, .options = .{} };
+            var inner: std.json.Stringify = .{ .writer = &args_buf.writer, .options = .{} };
             try inner.write(tc.arguments);
             try jw.write(args_buf.written());
             try jw.endObject();
