@@ -222,10 +222,20 @@ pub const StreamOptions = struct {
 };
 
 pub const RequestTransform = struct {
-    func: *const fn (allocator: std.mem.Allocator, payload: json_value.BorrowedValue, model: *const Model, ctx: ?*anyopaque) error{OutOfMemory}!?json_value.OwnedValue,
+    func: *const fn (
+        allocator: std.mem.Allocator,
+        payload: json_value.BorrowedValue,
+        model: *const Model,
+        ctx: ?*anyopaque,
+    ) error{OutOfMemory}!?json_value.OwnedValue,
     ctx: ?*anyopaque = null,
 
-    pub fn apply(self: RequestTransform, allocator: std.mem.Allocator, payload: json_value.BorrowedValue, model: *const Model) error{OutOfMemory}!?json_value.OwnedValue {
+    pub fn apply(
+        self: RequestTransform,
+        allocator: std.mem.Allocator,
+        payload: json_value.BorrowedValue,
+        model: *const Model,
+    ) error{OutOfMemory}!?json_value.OwnedValue {
         return self.func(allocator, payload, model, self.ctx);
     }
 };
@@ -427,7 +437,7 @@ pub const AssistantMessageEvent = union(enum) {
     };
 };
 
-pub const OpenAICompletionsCompat = struct {
+pub const OpenAiCompletionsCompat = struct {
     supports_store: ?bool = null,
 
     supports_developer_role: ?bool = null,
@@ -476,7 +486,7 @@ pub const OpenAICompletionsCompat = struct {
     };
 };
 
-pub const OpenAIResponsesCompat = struct {};
+pub const OpenAiResponsesCompat = struct {};
 
 pub const OpenRouterRouting = struct {
     only: ?[][]const u8 = null,
@@ -491,8 +501,8 @@ pub const VercelGatewayRouting = struct {
 };
 
 pub const Compat = union(enum) {
-    openai_completions: OpenAICompletionsCompat,
-    openai_responses: OpenAIResponsesCompat,
+    openai_completions: OpenAiCompletionsCompat,
+    openai_responses: OpenAiResponsesCompat,
 };
 
 pub const Model = struct {

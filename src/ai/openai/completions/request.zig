@@ -1,7 +1,7 @@
 const std = @import("std");
 const protocol = @import("../../protocol.zig");
 
-fn mapReasoningEffort(effort: []const u8, map: ?protocol.OpenAICompletionsCompat.ReasoningEffortMap) []const u8 {
+fn mapReasoningEffort(effort: []const u8, map: ?protocol.OpenAiCompletionsCompat.ReasoningEffortMap) []const u8 {
     const m = map orelse return effort;
     if (std.mem.eql(u8, effort, "minimal")) return m.minimal orelse effort;
     if (std.mem.eql(u8, effort, "low")) return m.low orelse effort;
