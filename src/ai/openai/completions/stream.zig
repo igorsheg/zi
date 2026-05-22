@@ -27,18 +27,19 @@ pub fn processStream(
     defer parser.deinit();
 
     const StreamCtx = struct {
+        const Self = @This();
         allocator: std.mem.Allocator,
         state: *StreamState,
         scratch: *std.heap.ArenaAllocator,
         sink: ai_provider.StreamEventSink,
 
         fn onEvent(evt: sse.SseEvent, ctx: ?*anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const self: *Self = @ptrCast(@alignCast(ctx));
             try handleSseEvent(self.allocator, self.state, self.scratch, evt, self.sink);
         }
     };
 
-    var stream_ctx = StreamCtx{
+    var stream_ctx: StreamCtx = .{
         .allocator = allocator,
         .state = &state,
         .scratch = &scratch_arena,
@@ -88,11 +89,11 @@ const BlockKind = enum { text, thinking, tool_call };
 
 const ContentBlockState = struct {
     kind: BlockKind,
-    text_buf: std.ArrayListUnmanaged(u8) = .empty,
+    text_buf: std.ArrayList(u8) = .empty,
 
     tool_id: []const u8 = "",
     tool_name: []const u8 = "",
-    tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
+    tool_args_partial: std.ArrayList(u8) = .empty,
     tool_args_parsed: json_value.OwnedValue = .null,
 
     thought_signature: ?[]const u8 = null,
@@ -104,12 +105,13 @@ const ContentBlockState = struct {
         self.tool_args_partial.deinit(allocator);
         self.tool_args_parsed.deinit();
         if (self.thought_signature) |signature| allocator.free(signature);
+        self.* = undefined;
     }
 };
 
 const StreamState = struct {
     allocator: std.mem.Allocator,
-    content_blocks: std.ArrayListUnmanaged(ContentBlockState),
+    content_blocks: std.ArrayList(ContentBlockState),
     current_index: ?usize = null,
     message: protocol.AssistantMessage,
     response_id: ?[]const u8 = null,
@@ -142,6 +144,7 @@ const StreamState = struct {
         self.content_blocks.deinit(self.allocator);
         if (self.message.content.len > 0) self.allocator.free(self.message.content);
         if (self.response_id) |rid| self.allocator.free(rid);
+        self.* = undefined;
     }
 };
 
@@ -200,7 +203,7 @@ fn handleSseEvent(
             state.message.stop_reason = mapFinishReason(fr.string);
             state.message.failure = mapFinishReasonFailure(fr.string);
             if (state.message.stop_reason == .@"error") {
-                state.message.error_message = try std.fmt.allocPrint(allocator, "Provider finish_reason: {s}", .{fr.string});
+                state.message.error_message = try std.fmt.allocPrint(allocator, "Provider finish_reason: {s}", .{fr.string}); // ziglint-ignore: Z024
             }
         }
     }
@@ -433,7 +436,7 @@ fn attachThoughtSignature(
         if (!std.mem.eql(u8, b.tool_id, tool_id)) continue;
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
-        var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
+        var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
         try jw.write(detail);
         b.thought_signature = try out.toOwnedSlice();
         return;
@@ -484,7 +487,7 @@ fn mapFinishReason(reason: []const u8) protocol.StopReason {
 fn mapFinishReasonFailure(reason: []const u8) ?protocol.NormalizedFailure {
     if (std.mem.eql(u8, reason, "network_error")) return .{ .kind = .transient };
     if (std.mem.eql(u8, reason, "content_filter")) return .{ .kind = .invalid_request };
-    if (std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "end") or std.mem.eql(u8, reason, "length") or std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function_call")) {
+    if (std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "end") or std.mem.eql(u8, reason, "length") or std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function_call")) { // ziglint-ignore: Z024
         return null;
     }
     return .{ .kind = .fatal };
@@ -495,9 +498,9 @@ fn applyProviderError(
     partial: *protocol.AssistantMessage,
     err_obj: std.json.ObjectMap,
 ) error{OutOfMemory}!void {
-    const provider_type = if (err_obj.get("type")) |v| if (v == .string and v.string.len > 0) try allocator.dupe(u8, v.string) else null else null;
+    const provider_type = if (err_obj.get("type")) |v| if (v == .string and v.string.len > 0) try allocator.dupe(u8, v.string) else null else null; // ziglint-ignore: Z024
     const provider_code = if (err_obj.get("code")) |v| try dupErrorCode(allocator, v) else null;
-    const message = if (err_obj.get("message")) |v| if (v == .string and v.string.len > 0) v.string else "unknown provider error" else "unknown provider error";
+    const message = if (err_obj.get("message")) |v| if (v == .string and v.string.len > 0) v.string else "unknown provider error" else "unknown provider error"; // ziglint-ignore: Z024
     const detail = if (err_obj.get("metadata")) |metadata| try formatProviderMetadataRaw(allocator, metadata) else null;
     const combined_message = if (detail) |detail_text|
         try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ message, detail_text })
@@ -522,7 +525,7 @@ fn dupErrorCode(allocator: std.mem.Allocator, value: std.json.Value) error{OutOf
     };
 }
 
-fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: json_value.BorrowedValue) error{OutOfMemory}!?[]const u8 {
+fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: json_value.BorrowedValue) error{OutOfMemory}!?[]const u8 { // ziglint-ignore: Z024
     if (metadata != .object) return null;
     const raw = metadata.object.get("raw") orelse return null;
     return switch (raw) {
@@ -530,7 +533,7 @@ fn formatProviderMetadataRaw(allocator: std.mem.Allocator, metadata: json_value.
         else => blk: {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
+            var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
             jw.write(raw) catch return error.OutOfMemory;
             const rendered = try out.toOwnedSlice();
             if (rendered.len == 0 or std.mem.eql(u8, rendered, "null")) {
@@ -547,7 +550,7 @@ pub fn emitError(
     io: std.Io,
     sink: ai_provider.StreamEventSink,
     model: protocol.Model,
-    comptime fmt: []const u8,
+    comptime fmt: []const u8, // ziglint-ignore: Z023
     args: anytype,
 ) void {
     const msg = std.fmt.allocPrint(allocator, fmt, args) catch "openai-completions error";
