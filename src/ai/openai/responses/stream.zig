@@ -19,7 +19,12 @@ pub const EventMapOutcome = union(enum) {
 
 pub const EventMapper = struct {
     ctx: ?*anyopaque = null,
-    map: *const fn (allocator: std.mem.Allocator, root: std.json.Value, event_type: []const u8, ctx: ?*anyopaque) anyerror!EventMapOutcome,
+    map: *const fn (
+        allocator: std.mem.Allocator,
+        root: std.json.Value,
+        event_type: []const u8,
+        ctx: ?*anyopaque,
+    ) anyerror!EventMapOutcome,
 };
 
 const ItemKind = enum { reasoning, message, function_call };
@@ -28,7 +33,7 @@ const MessagePartKind = enum { output_text, refusal };
 const ItemState = struct {
     kind: ItemKind,
     block_idx: usize,
-    text_buf: std.ArrayListUnmanaged(u8) = .empty,
+    text_buf: std.ArrayList(u8) = .empty,
 
     summary_started: bool = false,
     thinking_signature: ?[]const u8 = null,
@@ -42,7 +47,7 @@ const ItemState = struct {
     tool_call_id: []const u8 = "",
     tool_item_id: []const u8 = "",
     tool_name: []const u8 = "",
-    tool_args_partial: std.ArrayListUnmanaged(u8) = .empty,
+    tool_args_partial: std.ArrayList(u8) = .empty,
     tool_args_parsed: json_value.OwnedValue = .null,
 
     tool_composite_id: []const u8 = "",
@@ -52,12 +57,13 @@ const ItemState = struct {
         self.tool_args_partial.deinit(allocator);
         self.tool_args_parsed.deinit();
         if (self.thinking_signature) |signature| allocator.free(signature);
+        self.* = undefined;
     }
 };
 
 const StreamState = struct {
     allocator: std.mem.Allocator,
-    items: std.ArrayListUnmanaged(ItemState),
+    items: std.ArrayList(ItemState),
     current: ?usize = null,
     message: protocol.AssistantMessage,
     response_id: ?[]const u8 = null,
@@ -89,6 +95,7 @@ const StreamState = struct {
         for (self.items.items) |*it| it.deinit(self.allocator);
         self.items.deinit(self.allocator);
         if (self.message.content.len > 0) self.allocator.free(self.message.content);
+        self.* = undefined;
     }
 };
 
@@ -108,7 +115,16 @@ pub fn processStream(
     provider_label: []const u8,
     sink: ai_provider.StreamEventSink,
 ) void {
-    processStreamMapped(allocator, io, reader, model, abort_flag, provider_label, .{ .map = identityEventMapper }, sink);
+    processStreamMapped(
+        allocator,
+        io,
+        reader,
+        model,
+        abort_flag,
+        provider_label,
+        .{ .map = identityEventMapper },
+        sink,
+    );
 }
 
 pub fn processStreamMapped(
@@ -139,13 +155,15 @@ pub fn processStreamMapped(
         mapper: EventMapper,
         sink: ai_provider.StreamEventSink,
 
+        const Self = @This();
+
         fn onEvent(evt: sse.SseEvent, ctx: ?*anyopaque) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const self: *Self = @ptrCast(@alignCast(ctx));
             try handleEvent(self.allocator, self.state, self.scratch, evt, self.mapper, self.sink);
         }
     };
 
-    var stream_ctx = StreamCtx{
+    var stream_ctx: StreamCtx = .{
         .allocator = allocator,
         .state = &state,
         .scratch = &scratch_arena,
@@ -175,14 +193,30 @@ pub fn processStreamMapped(
                 );
                 return;
             } else {
-                emitError(allocator, io, sink, model, provider_label, "stream read error: {s}", .{@errorName(err)});
+                emitError(
+                    allocator,
+                    io,
+                    sink,
+                    model,
+                    provider_label,
+                    "stream read error: {s}",
+                    .{@errorName(err)},
+                );
                 return;
             },
         }
     };
 
     state.message.content = buildFinalContent(allocator, state.items.items) catch |err| {
-        emitError(allocator, io, sink, model, provider_label, "failed to build final content: {s}", .{@errorName(err)});
+        emitError(
+            allocator,
+            io,
+            sink,
+            model,
+            provider_label,
+            "failed to build final content: {s}",
+            .{@errorName(err)},
+        );
         return;
     };
     if (state.message.stop_reason == .stop and assistantHasToolCalls(state.message)) {
@@ -385,7 +419,11 @@ fn handleEvent(
         if (dv != .string) return;
         try it.tool_args_partial.appendSlice(allocator, dv.string);
         _ = scratch.reset(.retain_capacity);
-        it.tool_args_parsed = json_value.OwnedValue.adopt(scratch.allocator(), partial_json.parseStreaming(scratch.allocator(), it.tool_args_partial.items) catch .null);
+        const partial_args = partial_json.parseStreaming(
+            scratch.allocator(),
+            it.tool_args_partial.items,
+        ) catch .null;
+        it.tool_args_parsed = json_value.OwnedValue.adopt(scratch.allocator(), partial_args);
         sink.emit(.{ .toolcall_delta = .{
             .content_index = it.block_idx,
             .delta = dv.string,
@@ -416,7 +454,7 @@ fn handleEvent(
         if (std.mem.eql(u8, it_type, "reasoning") and st.kind == .reasoning) {
             const final_text = try finalThinkingTextFromItem(allocator, item);
             defer allocator.free(final_text);
-            try clearAndSetText(&st.text_buf, allocator, final_text);
+            try clearAndSetText(allocator, &st.text_buf, final_text);
             st.thinking_signature = stringifyJsonValue(allocator, item) catch return error.OutOfMemory;
             sink.emit(.{ .thinking_end = .{
                 .content_index = st.block_idx,
@@ -432,8 +470,12 @@ fn handleEvent(
             };
             const final_text = try finalMessageTextFromItem(allocator, item);
             defer allocator.free(final_text);
-            try clearAndSetText(&st.text_buf, allocator, final_text);
-            st.text_signature = encodeTextSignatureV1(allocator, st.msg_id, st.msg_phase) catch return error.OutOfMemory;
+            try clearAndSetText(allocator, &st.text_buf, final_text);
+            st.text_signature = encodeTextSignatureV1(
+                allocator,
+                st.msg_id,
+                st.msg_phase,
+            ) catch return error.OutOfMemory;
             sink.emit(.{ .text_end = .{
                 .content_index = st.block_idx,
                 .content = st.text_buf.items,
@@ -485,7 +527,8 @@ fn handleEvent(
         };
         if (resp.object.get("usage")) |u| if (u == .object) parseUsage(u, &state.message);
         if (resp.object.get("status")) |s| if (s == .string) {
-            state.message.stop_reason = mapResponseStatus(if (normalize_terminal_status) normalizeCodexStatus(s.string) else s.string);
+            const status = if (normalize_terminal_status) normalizeCodexStatus(s.string) else s.string;
+            state.message.stop_reason = mapResponseStatus(status);
         };
         if (state.message.stop_reason == .stop) {
             for (state.items.items) |it| if (it.kind == .function_call) {
@@ -506,7 +549,7 @@ fn handleEvent(
     }
 }
 
-fn clearAndSetText(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+fn clearAndSetText(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
     buf.clearRetainingCapacity();
     try buf.appendSlice(allocator, text);
 }
@@ -516,7 +559,7 @@ fn finalThinkingTextFromItem(allocator: std.mem.Allocator, item: std.json.Value)
     const summary = item.object.get("summary") orelse return allocator.dupe(u8, "");
     if (summary != .array) return allocator.dupe(u8, "");
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (summary.array.items, 0..) |part, idx| {
         if (part != .object) continue;
@@ -533,7 +576,7 @@ fn finalMessageTextFromItem(allocator: std.mem.Allocator, item: std.json.Value) 
     const content = item.object.get("content") orelse return allocator.dupe(u8, "");
     if (content != .array) return allocator.dupe(u8, "");
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (content.array.items) |part| {
         if (part != .object) continue;
@@ -556,7 +599,11 @@ fn ensureToolCompositeId(allocator: std.mem.Allocator, it: *ItemState) !void {
     if (it.kind != .function_call) return;
     if (it.tool_composite_id.len > 0) return;
     if (it.tool_call_id.len == 0 or it.tool_item_id.len == 0) return;
-    it.tool_composite_id = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ it.tool_call_id, it.tool_item_id });
+    it.tool_composite_id = try std.fmt.allocPrint(
+        allocator,
+        "{s}|{s}",
+        .{ it.tool_call_id, it.tool_item_id },
+    );
 }
 
 fn renderItem(it: *const ItemState) protocol.AssistantMessage.AssistantContentBlock {
@@ -577,7 +624,10 @@ fn renderItem(it: *const ItemState) protocol.AssistantMessage.AssistantContentBl
     };
 }
 
-fn buildFinalContent(allocator: std.mem.Allocator, items: []const ItemState) ![]protocol.AssistantMessage.AssistantContentBlock {
+fn buildFinalContent(
+    allocator: std.mem.Allocator,
+    items: []const ItemState,
+) ![]protocol.AssistantMessage.AssistantContentBlock {
     const out = try allocator.alloc(protocol.AssistantMessage.AssistantContentBlock, items.len);
     for (items, 0..) |*it, i| out[i] = renderItem(it);
     return out;
@@ -595,7 +645,7 @@ fn encodeTextSignatureV1(
     phase: ?[]const u8,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
-    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{} };
+    var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
     try jw.beginObject();
     try jw.objectField("v");
     try jw.write(@as(u8, 1));
@@ -629,7 +679,8 @@ pub fn codexEventMapper(
         const message = if (root.object.get("message")) |m| if (m == .string) m.string else "" else "";
         if (message.len > 0) return .{ .fail = try std.fmt.allocPrint(allocator, "Codex error: {s}", .{message}) };
         if (code.len > 0) return .{ .fail = try std.fmt.allocPrint(allocator, "Codex error: {s}", .{code}) };
-        return .{ .fail = try std.fmt.allocPrint(allocator, "Codex error: {s}", .{try stringifyJsonValue(allocator, root)}) };
+        const json = try stringifyJsonValue(allocator, root);
+        return .{ .fail = try std.fmt.allocPrint(allocator, "Codex error: {s}", .{json}) };
     }
 
     if (std.mem.eql(u8, event_type, "response.failed")) {
@@ -681,7 +732,10 @@ fn parseUsage(usage: std.json.Value, partial: *protocol.AssistantMessage) void {
     partial.usage.output = output;
     partial.usage.cache_read = cache_read;
     partial.usage.cache_write = 0;
-    partial.usage.total_tokens = if (usage.object.get("total_tokens")) |t| jsonU64(t) else (non_cached_input + output + cache_read);
+    partial.usage.total_tokens = if (usage.object.get("total_tokens")) |t|
+        jsonU64(t)
+    else
+        non_cached_input + output + cache_read;
 }
 
 fn jsonU64(v: std.json.Value) u64 {
@@ -705,7 +759,7 @@ pub fn emitError(
     sink: ai_provider.StreamEventSink,
     model: protocol.Model,
     provider_label: []const u8,
-    comptime fmt: []const u8,
+    comptime fmt: []const u8, // ziglint-ignore: Z023
     args: anytype,
 ) void {
     const inner = std.fmt.allocPrint(allocator, fmt, args) catch "error";
