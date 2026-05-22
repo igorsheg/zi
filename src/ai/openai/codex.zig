@@ -4,15 +4,16 @@ const protocol = @import("../protocol.zig");
 const ai_models = @import("../models.zig");
 const ai_provider = @import("../provider.zig");
 const core = @import("responses/core.zig");
+const runtime_env = @import("../../runtime/env.zig");
 
-pub const OpenAICodexProvider = struct {
+pub const OpenAiCodexProvider = struct {
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) OpenAICodexProvider {
+    pub fn init(allocator: std.mem.Allocator) OpenAiCodexProvider {
         return .{ .allocator = allocator };
     }
 
-    pub fn provider(self: *OpenAICodexProvider) ai_provider.Provider {
+    pub fn provider(self: *OpenAiCodexProvider) ai_provider.Provider {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -26,7 +27,7 @@ pub const OpenAICodexProvider = struct {
 
     fn streamWrap(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
@@ -56,7 +57,7 @@ pub const OpenAICodexProvider = struct {
 
     fn streamSimpleWrap(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.SimpleStreamOptions,
@@ -123,7 +124,7 @@ fn acceptCodexTransport(
 
 fn buildCodexRequestJson(
     allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
+    out: *std.ArrayListUnmanaged(u8), // ziglint-ignore: Z011
     model: protocol.Model,
     context: protocol.Context,
     options: protocol.StreamOptions,
@@ -144,7 +145,7 @@ fn buildCodexRequestJson(
 
 fn buildCodexRequestJsonWithFastMode(
     allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
+    out: *std.ArrayListUnmanaged(u8), // ziglint-ignore: Z011
     model: protocol.Model,
     context: protocol.Context,
     options: protocol.StreamOptions,
@@ -153,7 +154,7 @@ fn buildCodexRequestJsonWithFastMode(
     use_codex_fast_mode: bool,
 ) anyerror!void {
     var allocating = std.Io.Writer.Allocating.fromArrayList(allocator, out);
-    var jw = std.json.Stringify{ .writer = &allocating.writer, .options = .{} };
+    var jw: std.json.Stringify = .{ .writer = &allocating.writer, .options = .{} };
 
     try jw.beginObject();
 
@@ -240,7 +241,7 @@ fn extractAccountId(allocator: std.mem.Allocator, token: []const u8) ![]const u8
     const id_val = auth_claim.object.get("chatgpt_account_id") orelse return error.MissingAccountId;
     if (id_val != .string or id_val.string.len == 0) return error.MissingAccountId;
 
-    return try allocator.dupe(u8, id_val.string);
+    return allocator.dupe(u8, id_val.string);
 }
 
 fn requireAccountId(
@@ -250,7 +251,14 @@ fn requireAccountId(
     sink: ai_provider.StreamEventSink,
 ) ?[]const u8 {
     const key = api_key orelse {
-        core.emitFailure(allocator, sink, model, "openai-codex-responses", .{ .kind = .auth }, "no API key provided");
+        core.emitFailure(
+            allocator,
+            sink,
+            model,
+            "openai-codex-responses",
+            .{ .kind = .auth },
+            "no API key provided",
+        );
         return null;
     };
     const account_id = extractAccountId(allocator, key) catch |err| {
@@ -264,7 +272,12 @@ fn requireAccountId(
     return account_id;
 }
 
-fn fillCodexHeaders(buf: *[6]protocol.Header, account_id: []const u8, user_agent: []const u8, session_id: ?[]const u8) usize {
+fn fillCodexHeaders(
+    buf: *[6]protocol.Header,
+    account_id: []const u8,
+    user_agent: []const u8,
+    session_id: ?[]const u8,
+) usize {
     buf[0] = .{ .key = "chatgpt-account-id", .value = account_id };
     buf[1] = .{ .key = "originator", .value = "pi" };
     buf[2] = .{ .key = "user-agent", .value = user_agent };
@@ -277,7 +290,7 @@ fn fillCodexHeaders(buf: *[6]protocol.Header, account_id: []const u8, user_agent
     return 5;
 }
 
-const CODEX_FAST_MODE_ENV = "ZI_CODEX_FAST_MODE";
+const codex_fast_mode_env = "ZI_CODEX_FAST_MODE";
 
 fn codexModelLeaf(model_id: []const u8) []const u8 {
     return if (std.mem.lastIndexOfScalar(u8, model_id, '/')) |idx| model_id[idx + 1 ..] else model_id;
@@ -288,8 +301,8 @@ fn isCodexFastModeSupportedModel(model_id: []const u8) bool {
     return std.mem.eql(u8, id, "gpt-5.4") or std.mem.eql(u8, id, "gpt-5.5");
 }
 
-fn codexFastModeEnabledForModel(env: @import("../../runtime/env.zig").Env, model_id: []const u8) bool {
-    return isCodexFastModeSupportedModel(model_id) and envFlagEnabled(env.get(CODEX_FAST_MODE_ENV));
+fn codexFastModeEnabledForModel(env: runtime_env.Env, model_id: []const u8) bool {
+    return isCodexFastModeSupportedModel(model_id) and envFlagEnabled(env.get(codex_fast_mode_env));
 }
 
 fn envFlagEnabled(value: ?[]const u8) bool {
@@ -342,7 +355,8 @@ fn osRelease() []const u8 {
 
 const testing = std.testing;
 
-const codex_account_token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";
+const codex_account_token =
+    "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xMjMifX0.";
 
 fn expectHeader(header: protocol.Header, key: []const u8, value: []const u8) !void {
     try testing.expectEqualStrings(key, header.key);
@@ -402,10 +416,10 @@ test "Codex provider rejects websocket transport before auth" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
-    const ctx = protocol.Context{ .messages = &.{msg} };
-    var provider = OpenAICodexProvider.init(alloc);
-    var captured = ErrorCapture{};
+    const msg: protocol.Message = .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
+    const ctx: protocol.Context = .{ .messages = &.{msg} };
+    var provider = OpenAiCodexProvider.init(alloc);
+    var captured: ErrorCapture = .{};
 
     provider.provider().stream(
         alloc,
@@ -441,20 +455,20 @@ const ErrorCapture = struct {
 
 test "buildCodexRequestJson preserves Codex request contract" {
     const alloc = testing.allocator;
-    var params = std.json.Value{ .object = .{} };
+    var params: std.json.Value = .{ .object = .{} };
     defer params.object.deinit(alloc);
-    const tool = protocol.Tool{
+    const tool: protocol.Tool = .{
         .name = "bash",
         .description = "run shell",
         .parameters = params,
     };
-    const msg = protocol.Message{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
-    const ctx = protocol.Context{
+    const msg: protocol.Message = .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 1 } };
+    const ctx: protocol.Context = .{
         .system_prompt = "be precise",
         .messages = &.{msg},
         .tools = &.{tool},
     };
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty; // ziglint-ignore: Z011
     defer out.deinit(alloc);
 
     try buildCodexRequestJsonWithFastMode(alloc, &out, codexTestModel(), ctx, .{
