@@ -1,6 +1,5 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const json_value = @import("../json/value.zig");
 
 pub const StreamEventSink = struct {
     /// Synchronous borrowed-event sink. Providers may call this only during stream execution.
@@ -41,11 +40,25 @@ pub const Provider = struct {
         deinit: *const fn (ptr: *anyopaque) void,
     };
 
-    pub fn stream(self: Provider, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.StreamOptions, sink: StreamEventSink) void {
+    pub fn stream(
+        self: Provider,
+        allocator: std.mem.Allocator,
+        model: protocol.Model,
+        context: protocol.Context,
+        options: protocol.StreamOptions,
+        sink: StreamEventSink,
+    ) void {
         self.vtable.stream(self.ptr, allocator, model, context, options, sink);
     }
 
-    pub fn streamSimple(self: Provider, allocator: std.mem.Allocator, model: protocol.Model, context: protocol.Context, options: protocol.SimpleStreamOptions, sink: StreamEventSink) void {
+    pub fn streamSimple(
+        self: Provider,
+        allocator: std.mem.Allocator,
+        model: protocol.Model,
+        context: protocol.Context,
+        options: protocol.SimpleStreamOptions,
+        sink: StreamEventSink,
+    ) void {
         self.vtable.stream_simple(self.ptr, allocator, model, context, options, sink);
     }
 
