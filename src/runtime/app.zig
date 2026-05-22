@@ -74,11 +74,17 @@ pub fn main(init: std.process.Init) !void {
     });
     defer cli_runtime.deinit();
 
-    const exit_code = try runCli(caps, init.minimal.args, &cli_runtime, settings);
+    var agent_host = cli.host.AgentHost.init(.{
+        .allocator = allocator,
+        .io = init.io,
+        .provider_runtime = &cli_runtime,
+    });
+
+    const exit_code = try runCli(caps, init.minimal.args, &agent_host, settings);
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *provider_runtime.ProviderRuntime, settings: settings_mod.Settings) !u8 {
+fn runCli(caps: Caps, process_args: std.process.Args, agent_host: *cli.host.AgentHost, settings: settings_mod.Settings) !u8 {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(caps.allocator);
     var it = std.process.Args.Iterator.init(process_args);
@@ -103,7 +109,7 @@ fn runCli(caps: Caps, process_args: std.process.Args, cli_runtime: *provider_run
     };
     defer planned.deinit(caps.allocator);
 
-    const result = try cli.dispatch.run(.{ .allocator = caps.allocator, .io = caps.io, .runtime = cli_runtime }, planned.ok);
+    const result = try cli.dispatch.run(.{ .allocator = caps.allocator, .io = caps.io, .host = agent_host }, planned.ok);
     switch (result) {
         .ok => return 0,
         .err => |diag| {

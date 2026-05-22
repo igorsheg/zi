@@ -10,6 +10,7 @@ pub const run_completion = @import("run_completion.zig");
 pub const run_executor = @import("run_executor.zig");
 pub const provider_backend = @import("provider_backend.zig");
 pub const provider_runtime = @import("provider_runtime.zig");
+pub const host = @import("host.zig");
 pub const session = @import("session.zig");
 
 pub const AgentSession = session.AgentSession;
@@ -20,6 +21,7 @@ pub const OwnedRunTerminal = run_completion.OwnedRunTerminal;
 pub const RunCompletion = run_completion.RunCompletion;
 pub const RunSpec = run_executor.RunSpec;
 pub const ProviderRuntime = provider_runtime.ProviderRuntime;
+pub const AgentHost = host.AgentHost;
 pub const State = state.State;
 
 test {

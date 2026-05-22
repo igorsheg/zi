@@ -6,5 +6,6 @@ pub const dispatch = @import("dispatch.zig");
 pub const help = @import("help.zig");
 pub const result = @import("result.zig");
 pub const run_batch = @import("run_batch.zig");
+pub const host = @import("../host.zig");
 
 pub const ExecutionPlan = plan.ExecutionPlan;
