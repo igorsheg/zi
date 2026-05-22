@@ -4,11 +4,11 @@ const protocol = @import("protocol.zig");
 const ai_provider = @import("provider.zig");
 const ai_stream = @import("stream.zig");
 
-const FAUX_API: protocol.Api = .{ .custom = "faux" };
-const FAUX_PROVIDER: protocol.Provider = .{ .custom = "faux" };
-const FAUX_MODEL_ID = "faux-1";
+const faux_api: protocol.Api = .{ .custom = "faux" };
+const faux_provider: protocol.Provider = .{ .custom = "faux" };
+const faux_model_id = "faux-1";
 
-const DEFAULT_USAGE: protocol.Usage = .{
+const default_usage: protocol.Usage = .{
     .input = 0,
     .output = 0,
     .cache_read = 0,
@@ -19,10 +19,10 @@ const DEFAULT_USAGE: protocol.Usage = .{
 
 pub fn fauxModel() protocol.Model {
     return .{
-        .id = FAUX_MODEL_ID,
+        .id = faux_model_id,
         .name = "Faux Model",
-        .api = FAUX_API,
-        .provider = FAUX_PROVIDER,
+        .api = faux_api,
+        .provider = faux_provider,
         .base_url = "http://localhost:0",
         .reasoning = false,
         .input = &.{.text},
@@ -36,7 +36,11 @@ pub fn fauxText(text: []const u8) protocol.AssistantMessage.AssistantContentBloc
     return .{ .text = .{ .text = text } };
 }
 
-pub fn fauxToolCall(name: []const u8, id: []const u8, arguments: json_value.OwnedValue) protocol.AssistantMessage.AssistantContentBlock {
+pub fn fauxToolCall(
+    name: []const u8,
+    id: []const u8,
+    arguments: json_value.OwnedValue,
+) protocol.AssistantMessage.AssistantContentBlock {
     return .{ .tool_call = .{ .id = id, .name = name, .arguments = arguments } };
 }
 
@@ -50,10 +54,10 @@ pub fn fauxAssistantMessage(
         @panic("fauxAssistantMessage: allocation failed");
     return .{
         .content = owned,
-        .api = FAUX_API,
-        .provider = FAUX_PROVIDER,
-        .model = FAUX_MODEL_ID,
-        .usage = DEFAULT_USAGE,
+        .api = faux_api,
+        .provider = faux_provider,
+        .model = faux_model_id,
+        .usage = default_usage,
         .stop_reason = stop_reason,
         .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
     };
@@ -85,6 +89,7 @@ pub const FauxProvider = struct {
     pub fn deinit(self: *FauxProvider) void {
         self.responses.deinit(self.allocator);
         self.captured_contexts.deinit(self.allocator);
+        self.* = undefined;
     }
 
     pub fn setResponses(self: *FauxProvider, msgs: []const protocol.AssistantMessage) void {
@@ -110,7 +115,7 @@ pub const FauxProvider = struct {
 
     fn streamImpl(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         _: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
@@ -121,10 +126,10 @@ pub const FauxProvider = struct {
         self.captured_contexts.append(self.allocator, context) catch {
             sink.emit(.{ .@"error" = .{ .reason = .@"error", .@"error" = .{
                 .content = &.{},
-                .api = FAUX_API,
-                .provider = FAUX_PROVIDER,
-                .model = FAUX_MODEL_ID,
-                .usage = DEFAULT_USAGE,
+                .api = faux_api,
+                .provider = faux_provider,
+                .model = faux_model_id,
+                .usage = default_usage,
                 .stop_reason = .@"error",
                 .error_message = "failed to capture faux context",
                 .timestamp = std.Io.Timestamp.now(options.io, .real).toMilliseconds(),
@@ -134,14 +139,16 @@ pub const FauxProvider = struct {
 
         if (self.block_until_cancel) {
             while (!options.signal.isAborted()) {
-                options.io.sleep(.fromMilliseconds(10), .awake) catch {};
+                options.io.sleep(.fromMilliseconds(10), .awake) catch |err| switch (err) {
+                    else => {},
+                };
             }
             const err_msg: protocol.AssistantMessage = .{
                 .content = &.{},
-                .api = FAUX_API,
-                .provider = FAUX_PROVIDER,
-                .model = FAUX_MODEL_ID,
-                .usage = DEFAULT_USAGE,
+                .api = faux_api,
+                .provider = faux_provider,
+                .model = faux_model_id,
+                .usage = default_usage,
                 .stop_reason = .aborted,
                 .error_message = "aborted",
                 .timestamp = std.Io.Timestamp.now(options.io, .real).toMilliseconds(),
@@ -153,10 +160,10 @@ pub const FauxProvider = struct {
         if (self.responses.items.len == 0) {
             const err_msg: protocol.AssistantMessage = .{
                 .content = &.{},
-                .api = FAUX_API,
-                .provider = FAUX_PROVIDER,
-                .model = FAUX_MODEL_ID,
-                .usage = DEFAULT_USAGE,
+                .api = faux_api,
+                .provider = faux_provider,
+                .model = faux_model_id,
+                .usage = default_usage,
                 .stop_reason = .@"error",
                 .error_message = "No more faux responses queued",
                 .timestamp = std.Io.Timestamp.now(options.io, .real).toMilliseconds(),
@@ -191,7 +198,10 @@ pub const FauxProvider = struct {
         }
 
         if (message.stop_reason == .@"error" or message.stop_reason == .aborted) {
-            const reason: protocol.AssistantMessageEvent.ErrorReason = if (message.stop_reason == .aborted) .aborted else .@"error";
+            const reason: protocol.AssistantMessageEvent.ErrorReason = if (message.stop_reason == .aborted)
+                .aborted
+            else
+                .@"error";
             sink.emit(.{ .@"error" = .{ .reason = reason, .@"error" = message } });
         } else {
             const reason: protocol.AssistantMessageEvent.DoneReason = switch (message.stop_reason) {
@@ -206,7 +216,7 @@ pub const FauxProvider = struct {
 
     fn streamSimpleImpl(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.SimpleStreamOptions,
@@ -238,11 +248,12 @@ test "faux provider streams text response" {
     faux.setResponses(&.{msg});
 
     const Collector = struct {
+        const Self = @This();
         events: std.ArrayListUnmanaged(protocol.AssistantMessageEvent),
         alloc: std.mem.Allocator,
 
         fn callback(event: protocol.AssistantMessageEvent, ctx: ?*anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.events.append(self.alloc, event) catch @panic("alloc failed");
         }
     };
