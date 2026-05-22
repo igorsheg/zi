@@ -3,7 +3,6 @@ const ai = @import("../ai/root.zig");
 const runtime_queue = @import("../runtime/queue.zig");
 const cancel = @import("../runtime/cancel.zig");
 const agent_mod = @import("../agent/root.zig");
-const message_memory = @import("../agent/message_memory.zig");
 const command_mod = @import("command.zig");
 const event_mod = @import("event.zig");
 const run_completion_mod = @import("run_completion.zig");
@@ -11,13 +10,26 @@ const run_executor_mod = @import("run_executor.zig");
 const state_mod = @import("state.zig");
 const extension_mod = @import("extension.zig");
 const durable_mod = @import("durable.zig");
+const session_policy_mod = @import("session_policy.zig");
+const session_queue = @import("session_queue.zig");
+const durable_projection_mod = @import("session_durable_projection.zig");
 const session_event_mod = @import("../session/event.zig");
 
 const CommandQueue = runtime_queue.BoundedQueue(QueuedCommand);
 const FollowUpQueue = runtime_queue.BoundedQueue(QueuedFollowUp);
 pub const OwnedRunTerminal = run_completion_mod.OwnedRunTerminal;
 pub const RunCompletion = run_completion_mod.RunCompletion;
-const RunSpec = run_executor_mod.RunSpec;
+const BorrowedRunSpec = run_executor_mod.BorrowedRunSpec;
+const PolicyInit = session_policy_mod.Init;
+const Policy = session_policy_mod.SessionPolicy;
+const QueuedCommand = session_queue.QueuedCommand;
+const QueuedAbort = session_queue.QueuedAbort;
+const QueuedFollowUp = session_queue.QueuedFollowUp;
+const OwnedCommand = session_queue.OwnedCommand;
+const cloneCommand = session_queue.cloneCommand;
+const cloneMessages = session_queue.cloneMessages;
+const freeCommand = session_queue.freeCommand;
+const freeMessages = session_queue.freeMessages;
 
 pub const max_commands: usize = 64;
 pub const max_pending_follow_ups: usize = 8;
@@ -27,7 +39,7 @@ pub const AgentSession = struct {
     commands: CommandQueue,
     pending_follow_ups: FollowUpQueue,
     pending_abort: ?QueuedAbort = null,
-    policy: SessionPolicy,
+    policy: Policy,
     state_value: state_mod.State = .{},
     active_run: ?ActiveRun = null,
     owner_call_active: bool = false,
@@ -47,13 +59,13 @@ pub const AgentSession = struct {
         event_sink: ?event_mod.Sink = null,
         durable_appender: durable_mod.Appender = .disabled,
         extension_host: extension_mod.Host = .disabled,
-        policy: SessionPolicyInit = .{},
+        policy: PolicyInit = .{},
         execution: Execution = .external_completion,
     };
 
     // Execution names the run mechanism currently wired into AgentSession.
     // Future runtime-backed execution must keep this boundary shape:
-    // AgentSession builds RunSpec and owns ActiveRun; the executor owns backend
+    // AgentSession builds BorrowedRunSpec and owns ActiveRun; the executor owns backend
     // operation memory and publishes exactly one RunCompletion back to the owner
     // drain path. Executors must not receive *AgentSession or mutate session
     // state from callbacks. Abort request is cancellation intent; aborted
@@ -61,52 +73,6 @@ pub const AgentSession = struct {
     pub const Execution = union(enum) {
         external_completion,
         synchronous: ExecutionBackend,
-    };
-
-    pub const SessionPolicyInit = struct {
-        system_prompt: []const u8 = "",
-        model: ?agent_mod.message.Model = null,
-        reasoning: ?ai.protocol.ThinkingLevel = null,
-    };
-
-    pub const SessionPolicy = struct {
-        arena: std.heap.ArenaAllocator,
-        system_prompt: []const u8,
-        model: ?agent_mod.message.Model,
-        reasoning: ?ai.protocol.ThinkingLevel,
-
-        pub fn init(allocator: std.mem.Allocator, policy: SessionPolicyInit) !SessionPolicy {
-            var self = SessionPolicy{
-                .arena = std.heap.ArenaAllocator.init(allocator),
-                .system_prompt = &.{},
-                .model = null,
-                .reasoning = policy.reasoning,
-            };
-            errdefer self.deinit();
-            const a = self.arena.allocator();
-            self.system_prompt = try a.dupe(u8, policy.system_prompt);
-            self.model = if (policy.model) |model| try cloneModel(a, model) else null;
-            return self;
-        }
-
-        pub fn deinit(self: *SessionPolicy) void {
-            self.arena.deinit();
-            self.* = undefined;
-        }
-
-        pub fn replaceModel(self: *SessionPolicy, allocator: std.mem.Allocator, model: agent_mod.message.Model) !void {
-            const next = try SessionPolicy.init(allocator, .{
-                .system_prompt = self.system_prompt,
-                .model = model,
-                .reasoning = self.reasoning,
-            });
-            self.deinit();
-            self.* = next;
-        }
-
-        pub fn setReasoning(self: *SessionPolicy, reasoning: ?ai.protocol.ThinkingLevel) void {
-            self.reasoning = reasoning;
-        }
     };
 
     pub const ExecutionBackend = struct {
@@ -139,27 +105,17 @@ pub const AgentSession = struct {
         stale_run,
     };
 
-    const DurableAppend = union(enum) {
-        appended,
-        skipped,
-        failed: SessionRunFailure,
-    };
-
     const CompletionApplyResult = union(enum) {
         completed,
         failed: state_mod.FailureKind,
     };
 
     const SessionRunFailure = enum {
-        durable_append_rejected,
-        durable_append_failed,
-        unsupported_batch,
         missing_model,
 
         fn failureKind(self: SessionRunFailure) state_mod.FailureKind {
             return switch (self) {
-                .unsupported_batch, .missing_model => .invalid_context,
-                .durable_append_rejected, .durable_append_failed => .internal,
+                .missing_model => .invalid_context,
             };
         }
 
@@ -194,7 +150,7 @@ pub const AgentSession = struct {
         var pending_follow_ups = try FollowUpQueue.init(allocator, options.follow_up_capacity);
         errdefer pending_follow_ups.deinit();
 
-        var policy = try SessionPolicy.init(allocator, options.policy);
+        var policy = try Policy.init(allocator, options.policy);
         errdefer policy.deinit();
 
         var extension_host = options.extension_host;
@@ -345,7 +301,7 @@ pub const AgentSession = struct {
             .completed => |messages| blk: {
                 switch (self.appendTerminalMessages(messages)) {
                     .appended, .skipped => {},
-                    .failed => |failure| break :blk .{ .failed = failure.failureKind() },
+                    .failed => |failure| break :blk .{ .failed = durableFailureKind(failure) },
                 }
                 self.clearActiveRun();
                 self.setActivity(.idle);
@@ -449,7 +405,7 @@ pub const AgentSession = struct {
     }
 
     fn startRun(self: *AgentSession, request: RunRequest) void {
-        std.debug.assert(self.active_run == null);
+        if (self.active_run != null) @panic("startRun requires no active run");
         const id = request.command_id;
         const messages = request.messages;
         const owned_messages = cloneMessages(self.allocator, messages) catch {
@@ -461,7 +417,7 @@ pub const AgentSession = struct {
             .appended, .skipped => {},
             .failed => |failure| {
                 self.clearPendingFollowUps();
-                self.setActivity(.{ .failed = .{ .kind = failure.failureKind() } });
+                self.setActivity(.{ .failed = .{ .kind = durableFailureKind(failure) } });
                 freeMessages(self.allocator, owned_messages);
                 return;
             },
@@ -483,7 +439,7 @@ pub const AgentSession = struct {
     }
 
     fn runSynchronous(self: *AgentSession, backend: ExecutionBackend) void {
-        std.debug.assert(self.active_run != null);
+        if (self.active_run == null) @panic("synchronous run requires active run");
         const submission = self.buildRunSubmission(backend) orelse {
             const failure: SessionRunFailure = .missing_model;
             self.clearActiveRun();
@@ -500,11 +456,11 @@ pub const AgentSession = struct {
 
     fn buildRunSubmission(self: *const AgentSession, backend: ExecutionBackend) ?run_executor_mod.Submission {
         const active = self.active_run orelse std.debug.panic("run submission requires active run", .{});
-        const spec = self.buildRunSpec(backend, active.input_messages) orelse return null;
+        const spec = self.buildBorrowedRunSpec(backend, active.input_messages) orelse return null;
         return .{ .run_command_id = active.command_id, .spec = spec };
     }
 
-    fn buildRunSpec(self: *const AgentSession, backend: ExecutionBackend, messages: []const agent_mod.AgentMessage) ?RunSpec {
+    fn buildBorrowedRunSpec(self: *const AgentSession, backend: ExecutionBackend, messages: []const agent_mod.AgentMessage) ?BorrowedRunSpec {
         const model = self.policy.model orelse return null;
         return .{
             .input = .{
@@ -540,46 +496,16 @@ pub const AgentSession = struct {
         self.emit(event);
     }
 
-    fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) DurableAppend {
-        if (self.durable_appender == .disabled) return .skipped;
-        if (messages.len == 0) return .skipped;
-        if (messages.len != 1) {
-            self.emit(.{ .session = .{ .append_rejected = .unsupported_batch } });
-            return .{ .failed = .unsupported_batch };
-        }
-
-        return self.appendDurableMessage(messages[0]);
+    fn appendRunInput(self: *AgentSession, messages: []const agent_mod.AgentMessage) durable_projection_mod.Append {
+        return self.durableProjection().appendRunInput(messages);
     }
 
-    fn appendTerminalMessages(self: *AgentSession, messages: []const agent_mod.AgentMessage) DurableAppend {
-        if (self.durable_appender == .disabled) return .skipped;
-        var appended_any = false;
-        for (messages) |message| {
-            switch (self.appendDurableMessage(message)) {
-                .appended => appended_any = true,
-                .skipped => {},
-                .failed => |failure| return .{ .failed = failure },
-            }
-        }
-        return if (appended_any) .appended else .skipped;
+    fn appendTerminalMessages(self: *AgentSession, messages: []const agent_mod.AgentMessage) durable_projection_mod.Append {
+        return self.durableProjection().appendCompletedTerminal(messages);
     }
 
-    fn appendDurableMessage(self: *AgentSession, message: agent_mod.AgentMessage) DurableAppend {
-        const result = self.durable_appender.append(.{ .message = .{ .message = message } });
-        switch (result) {
-            .appended => |id| {
-                self.emit(.{ .session = .{ .appended = id } });
-                return .appended;
-            },
-            .rejected => |reason| {
-                self.emit(.{ .session = .{ .append_rejected = reason } });
-                return .{ .failed = .durable_append_rejected };
-            },
-            .failed => |failure| {
-                self.emit(.{ .session = .{ .append_failed = failure } });
-                return .{ .failed = .durable_append_failed };
-            },
-        }
+    fn durableProjection(self: *AgentSession) durable_projection_mod.Projection {
+        return .{ .appender = &self.durable_appender, .event_sink = self.event_sink };
     }
 
     fn startNextFollowUpOrIdle(self: *AgentSession) void {
@@ -628,8 +554,12 @@ pub const AgentSession = struct {
 
     fn assertCanApplyQueuedCommand(self: *const AgentSession, command: OwnedCommand) void {
         switch (command) {
-            .submit_prompt, .follow_up, .set_model, .set_reasoning => std.debug.assert(self.isIdleOrFailed()),
-            .continue_run => std.debug.assert(self.state_value.activity == .idle),
+            .submit_prompt, .follow_up, .set_model, .set_reasoning => {
+                if (!self.isIdleOrFailed()) @panic("queued command requires idle or failed session");
+            },
+            .continue_run => {
+                if (self.state_value.activity != .idle) @panic("continue_run requires idle session");
+            },
             .abort_run, .steer => unreachable,
         }
     }
@@ -679,30 +609,30 @@ pub const AgentSession = struct {
 
     fn assertActiveExecution(self: *const AgentSession, expected: ActiveExecution, comptime message: []const u8) void {
         if (self.active_run) |active| {
-            std.debug.assert(active.execution == expected);
+            if (active.execution != expected) @panic(message);
         } else {
             std.debug.panic(message, .{});
         }
     }
 
     fn assertCompletionMatchesActiveRun(self: *const AgentSession, completion: *const RunCompletion) void {
-        std.debug.assert(completion.command_id == self.activeRunCommandId());
+        if (completion.command_id != self.activeRunCommandId()) @panic("completion command id does not match active run");
     }
 
     fn assertRunInvariant(self: *const AgentSession) void {
         switch (self.state_value.activity) {
-            .running, .aborting => std.debug.assert(self.active_run != null),
-            .idle, .failed => std.debug.assert(self.active_run == null),
+            .running, .aborting => if (self.active_run == null) @panic("active activity requires active run"),
+            .idle, .failed => if (self.active_run != null) @panic("inactive activity forbids active run"),
         }
     }
 
     fn enterOwnerCall(self: *AgentSession) void {
-        std.debug.assert(!self.owner_call_active);
+        if (self.owner_call_active) @panic("reentrant AgentSession owner call");
         self.owner_call_active = true;
     }
 
     fn leaveOwnerCall(self: *AgentSession) void {
-        std.debug.assert(self.owner_call_active);
+        if (!self.owner_call_active) @panic("AgentSession owner call underflow");
         self.owner_call_active = false;
     }
 
@@ -715,142 +645,11 @@ pub const AgentSession = struct {
     }
 };
 
-// Command is borrowed ingress. OwnedCommand is the queue-owned backlog copy.
-// Active-run controls that target the current run must not be queued here.
-const QueuedCommand = struct {
-    id: command_mod.CommandId,
-    command: OwnedCommand,
-
-    fn deinit(self: *QueuedCommand, allocator: std.mem.Allocator) void {
-        freeCommand(allocator, self.command);
-        self.* = undefined;
-    }
-};
-
-const QueuedAbort = struct {
-    id: command_mod.CommandId,
-};
-
-const OwnedCommand = union(enum) {
-    submit_prompt: command_mod.SubmitPrompt,
-    follow_up: command_mod.FollowUp,
-    steer: command_mod.Steer,
-    abort_run,
-    continue_run,
-    set_model: command_mod.SetModel,
-    set_reasoning: command_mod.SetReasoning,
-};
-
-fn cloneModel(allocator: std.mem.Allocator, model: agent_mod.message.Model) !agent_mod.message.Model {
-    const id = try allocator.dupe(u8, model.id);
-    errdefer allocator.free(id);
-    const provider_model = if (model.provider_model) |value| try allocator.dupe(u8, value) else null;
-    errdefer if (provider_model) |value| allocator.free(value);
-    const name = try allocator.dupe(u8, model.name);
-    errdefer allocator.free(name);
-    const base_url = try allocator.dupe(u8, model.base_url);
-    errdefer allocator.free(base_url);
-    const input = try allocator.dupe(ai.protocol.Model.InputType, model.input);
-    errdefer allocator.free(input);
-    const headers = if (model.headers) |source| try cloneHeaders(allocator, source) else null;
-    errdefer if (headers) |owned| freeHeaders(allocator, owned);
-
-    return .{
-        .id = id,
-        .provider_model = provider_model,
-        .name = name,
-        .api = model.api,
-        .provider = model.provider,
-        .base_url = base_url,
-        .reasoning = model.reasoning,
-        .input = input,
-        .cost = model.cost,
-        .context_window = model.context_window,
-        .max_tokens = model.max_tokens,
-        .headers = headers,
-        .compat = model.compat,
+fn durableFailureKind(failure: durable_projection_mod.Failure) state_mod.FailureKind {
+    return switch (failure) {
+        .unsupported_batch => .invalid_context,
+        .durable_append_rejected, .durable_append_failed => .internal,
     };
-}
-
-fn cloneHeaders(allocator: std.mem.Allocator, headers: []const ai.protocol.Header) ![]const ai.protocol.Header {
-    const out = try allocator.alloc(ai.protocol.Header, headers.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |header| {
-            allocator.free(header.key);
-            allocator.free(header.value);
-        }
-        allocator.free(out);
-    }
-    for (headers, 0..) |header, i| {
-        out[i] = .{
-            .key = try allocator.dupe(u8, header.key),
-            .value = try allocator.dupe(u8, header.value),
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneCommand(allocator: std.mem.Allocator, value: command_mod.Command) !OwnedCommand {
-    return switch (value) {
-        .submit_prompt => |prompt| .{ .submit_prompt = .{ .messages = try cloneMessages(allocator, prompt.messages) } },
-        .follow_up => |follow_up| .{ .follow_up = .{ .messages = try cloneMessages(allocator, follow_up.messages) } },
-        .steer => |steer| .{ .steer = .{ .text = try allocator.dupe(u8, steer.text) } },
-        .set_model => |set| .{ .set_model = .{ .model = try cloneModel(allocator, set.model) } },
-        .set_reasoning => |set| .{ .set_reasoning = set },
-        .abort_run => .abort_run,
-        .continue_run => .continue_run,
-    };
-}
-
-fn freeCommand(allocator: std.mem.Allocator, value: OwnedCommand) void {
-    switch (value) {
-        .submit_prompt => |prompt| freeMessages(allocator, prompt.messages),
-        .follow_up => |follow_up| freeMessages(allocator, follow_up.messages),
-        .steer => |steer| allocator.free(steer.text),
-        .set_model => |set| freeModel(allocator, set.model),
-        .set_reasoning => {},
-        .abort_run, .continue_run => {},
-    }
-}
-
-fn freeModel(allocator: std.mem.Allocator, model: agent_mod.message.Model) void {
-    allocator.free(model.id);
-    if (model.provider_model) |value| allocator.free(value);
-    allocator.free(model.name);
-    allocator.free(model.base_url);
-    allocator.free(model.input);
-    if (model.headers) |headers| {
-        freeHeaders(allocator, headers);
-    }
-}
-
-fn freeHeaders(allocator: std.mem.Allocator, headers: []const ai.protocol.Header) void {
-    for (headers) |header| {
-        allocator.free(header.key);
-        allocator.free(header.value);
-    }
-    allocator.free(headers);
-}
-
-const QueuedFollowUp = struct {
-    id: command_mod.CommandId,
-    messages: []const agent_mod.AgentMessage,
-
-    fn deinit(self: *QueuedFollowUp, allocator: std.mem.Allocator) void {
-        freeMessages(allocator, self.messages);
-        self.* = undefined;
-    }
-};
-
-fn cloneMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) ![]const agent_mod.AgentMessage {
-    return message_memory.cloneMessages(allocator, messages);
-}
-
-fn freeMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) void {
-    for (messages) |msg| message_memory.freeMessage(allocator, msg);
-    allocator.free(messages);
 }
 
 const observed_event_count = 19;
@@ -986,7 +785,7 @@ const SpecCapture = struct {
     }
 };
 
-fn testPolicy() AgentSession.SessionPolicyInit {
+fn testPolicy() PolicyInit {
     return .{ .model = testModel() };
 }
 

@@ -6,13 +6,13 @@ const event_mod = @import("event.zig");
 const run_completion_mod = @import("run_completion.zig");
 const state_mod = @import("state.zig");
 
-// RunSpec is borrowed executor ingress. An executor may inspect it during
+// BorrowedRunSpec is synchronous executor ingress. An executor may inspect it during
 // submission, but async/runtime-backed execution must clone the fields it needs
 // into operation-owned memory before returning .submitted. AgentSession remains
 // the owner of policy memory and active input messages. Hook contexts inside
 // RunConfig are borrowed pointers; the executor must ensure they remain valid
 // for the operation lifetime or clone them into operation-owned memory.
-pub const RunSpec = struct {
+pub const BorrowedRunSpec = struct {
     input: agent_mod.AgentInput,
     config: agent_mod.config.RunConfig,
 };
@@ -22,7 +22,7 @@ pub const RunSpec = struct {
 // CancelRequest; cancellation completion still returns as RunCompletion.
 pub const Submission = struct {
     run_command_id: command_mod.CommandId,
-    spec: RunSpec,
+    spec: BorrowedRunSpec,
 };
 
 pub const CancelRequest = struct {
