@@ -85,9 +85,10 @@ const Claim = struct {
         };
     }
 
-    fn deinit(self: *Claim, allocator: std.mem.Allocator) void {
+    fn deinit(self: *Claim, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
         self.provider.deinit();
         self.registration.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -126,7 +127,7 @@ const BaseUrlClaimProvider = struct {
 
     fn streamImpl(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.StreamOptions,
@@ -140,7 +141,7 @@ const BaseUrlClaimProvider = struct {
 
     fn streamSimpleImpl(
         ptr: *anyopaque,
-        allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         context: protocol.Context,
         options: protocol.SimpleStreamOptions,
@@ -167,7 +168,7 @@ pub const Registry = struct {
         provider: Provider,
         source_id: ?[]const u8,
 
-        fn deinit(self: *BaselineRegistration, allocator: std.mem.Allocator) void {
+        fn deinit(self: *BaselineRegistration, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
             if (self.source_id) |source_id| allocator.free(source_id);
             self.* = undefined;
         }
@@ -177,15 +178,15 @@ pub const Registry = struct {
     /// default providers; later claims win for API lookup projection.
     providers: std.StringHashMap(Provider),
     baseline: std.StringHashMap(BaselineRegistration),
-    claim_index: std.StringHashMap(std.ArrayListUnmanaged(usize)),
-    claims: std.ArrayListUnmanaged(Claim) = .empty,
+    claim_index: std.StringHashMap(std.ArrayList(usize)),
+    claims: std.ArrayList(Claim) = .empty,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{
             .providers = std.StringHashMap(Provider).init(allocator),
             .baseline = std.StringHashMap(BaselineRegistration).init(allocator),
-            .claim_index = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(allocator),
+            .claim_index = std.StringHashMap(std.ArrayList(usize)).init(allocator),
             .allocator = allocator,
         };
     }
@@ -202,6 +203,7 @@ pub const Registry = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.claim_index.deinit();
+        self.* = undefined;
     }
 
     pub fn register(self: *Registry, api: []const u8, prov: Provider, source_id: ?[]const u8) !void {
@@ -260,7 +262,7 @@ pub const Registry = struct {
         const key_dup = try self.allocator.dupe(u8, claim.registration.name);
         errdefer self.allocator.free(key_dup);
 
-        var bucket: std.ArrayListUnmanaged(usize) = .empty;
+        var bucket: std.ArrayList(usize) = .empty;
         errdefer bucket.deinit(self.allocator);
         try bucket.append(self.allocator, idx);
 
@@ -495,7 +497,7 @@ const RecordingProvider = struct {
 
     fn streamImpl(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
+        _: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         _: protocol.Context,
         _: protocol.StreamOptions,
@@ -506,7 +508,7 @@ const RecordingProvider = struct {
 
     fn streamSimpleImpl(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
+        _: std.mem.Allocator, // ziglint-ignore: Z023
         model: protocol.Model,
         _: protocol.Context,
         _: protocol.SimpleStreamOptions,
