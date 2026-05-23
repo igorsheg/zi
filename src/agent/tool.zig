@@ -5,19 +5,18 @@ const cancel = @import("../runtime/cancel.zig");
 
 pub const ToolOpId = u64;
 
-pub const AgentToolResult = struct {
-    content: []const ContentBlock,
-    details: json_value.OwnedValue = json_value.OwnedValue.nullValue(),
-    presentation: json_value.OwnedValue = json_value.OwnedValue.nullValue(),
-    is_error: bool = false,
+pub const ExecutionMode = enum {
+    sequential,
+    parallel,
+};
 
-    pub const ContentBlock = union(enum) {
-        text: ai.protocol.TextContent,
-        image: ai.protocol.ImageContent,
-    };
+pub const AgentToolResult = ai.protocol.AgentToolResult;
 
-    pub fn deinit(self: AgentToolResult, allocator: std.mem.Allocator) void {
-        for (self.content) |block| switch (block) {
+pub const AgentToolResultOwned = struct {
+    result: AgentToolResult,
+
+    pub fn deinit(self: AgentToolResultOwned, allocator: std.mem.Allocator) void {
+        for (self.result.content) |block| switch (block) {
             .text => |text| {
                 allocator.free(text.text);
                 if (text.text_signature) |sig| allocator.free(sig);
@@ -27,11 +26,15 @@ pub const AgentToolResult = struct {
                 allocator.free(image.mime_type);
             },
         };
-        allocator.free(self.content);
-        var details = self.details;
-        details.deinit();
-        var presentation = self.presentation;
-        presentation.deinit();
+        allocator.free(self.result.content);
+        if (self.result.details) |details| {
+            var owned = details;
+            owned.deinit();
+        }
+        if (self.result.presentation) |presentation| {
+            var owned = presentation;
+            owned.deinit();
+        }
     }
 };
 
@@ -68,7 +71,7 @@ pub const ToolUpdate = struct {
     partial_result: AgentToolResult,
 
     pub fn deinit(self: ToolUpdate, allocator: std.mem.Allocator) void {
-        self.partial_result.deinit(allocator);
+        (AgentToolResultOwned{ .result = self.partial_result }).deinit(allocator);
     }
 };
 
@@ -81,9 +84,9 @@ pub const ToolTerminalCompletion = struct {
 
     pub fn deinit(self: ToolTerminalCompletion, allocator: std.mem.Allocator) void {
         switch (self.terminal) {
-            .completed => |result| result.deinit(allocator),
-            .failed => |result| result.deinit(allocator),
-            .aborted => |result| result.deinit(allocator),
+            .completed => |result| (AgentToolResultOwned{ .result = result }).deinit(allocator),
+            .failed => |result| (AgentToolResultOwned{ .result = result }).deinit(allocator),
+            .aborted => |result| (AgentToolResultOwned{ .result = result }).deinit(allocator),
         }
     }
 };
@@ -93,9 +96,10 @@ pub const AgentTool = struct {
     description: []const u8,
     parameters: json_value.BorrowedValue,
     ctx: ?*anyopaque = null,
-    execute_fn: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, invocation: ToolInvocation, sink: ToolCompletionSink) void,
+    execution_mode: ?ExecutionMode = null,
+    execute_fn: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, invocation: ToolInvocation, sink: ToolCompletionSink) void, // ziglint-ignore: Z024
 
-    pub fn execute(self: AgentTool, allocator: std.mem.Allocator, invocation: ToolInvocation, sink: ToolCompletionSink) void {
+    pub fn execute(self: AgentTool, allocator: std.mem.Allocator, invocation: ToolInvocation, sink: ToolCompletionSink) void { // ziglint-ignore: Z024
         self.execute_fn(self.ctx, allocator, invocation, sink);
     }
 };

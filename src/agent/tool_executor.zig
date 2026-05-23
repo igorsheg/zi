@@ -14,8 +14,8 @@ pub const Contract = struct {
         if (options.max_in_flight == 0) @panic("tool executor max_in_flight must be greater than zero");
         if (options.max_updates == 0) @panic("tool executor max_updates must be greater than zero");
         if (options.completion_delivery == .bounded_queue) {
-            if (options.completion_delivery.bounded_queue.terminals == 0) @panic("tool executor terminal queue capacity must be greater than zero");
-            if (options.completion_delivery.bounded_queue.updates == 0) @panic("tool executor update queue capacity must be greater than zero");
+            if (options.completion_delivery.bounded_queue.terminals == 0) @panic("tool executor terminal queue capacity must be greater than zero"); // ziglint-ignore: Z024
+            if (options.completion_delivery.bounded_queue.updates == 0) @panic("tool executor update queue capacity must be greater than zero"); // ziglint-ignore: Z024
         }
         return .{
             .max_in_flight = options.max_in_flight,
@@ -28,7 +28,7 @@ pub const Contract = struct {
 pub const ContractOptions = struct {
     max_in_flight: usize = max_tool_ops,
     max_updates: usize = max_tool_updates,
-    completion_delivery: CompletionDelivery = .{ .bounded_queue = .{ .terminals = max_tool_ops, .updates = max_tool_updates } },
+    completion_delivery: CompletionDelivery = .{ .bounded_queue = .{ .terminals = max_tool_ops, .updates = max_tool_updates } }, // ziglint-ignore: Z024
 };
 
 pub const CompletionDelivery = union(enum) {
@@ -79,7 +79,7 @@ pub const Executor = struct {
         return Contract.init(.{
             .max_in_flight = self.terminals.capacity(),
             .max_updates = self.updates.capacity(),
-            .completion_delivery = .{ .bounded_queue = .{ .terminals = self.terminals.capacity(), .updates = self.updates.capacity() } },
+            .completion_delivery = .{ .bounded_queue = .{ .terminals = self.terminals.capacity(), .updates = self.updates.capacity() } }, // ziglint-ignore: Z024
         });
     }
 
@@ -113,7 +113,10 @@ pub const Executor = struct {
                 }
             },
             .terminal => |terminal| {
-                self.terminals.push(terminal) catch unreachable;
+                self.terminals.push(terminal) catch |err| {
+                    terminal.deinit(self.allocator);
+                    std.log.scoped(.agent).warn("dropped excess tool terminal: {s}", .{@errorName(err)});
+                };
             },
         }
         completion.* = undefined;
@@ -128,7 +131,7 @@ test "tool executor reserves terminal capacity for accepted ops" {
     try std.testing.expectError(error.TooManyToolOperations, executor.reserveTerminal());
 
     const sink = executor.sink();
-    var emitted = tool.ToolCompletion{ .terminal = .{
+    var emitted = tool.ToolCompletion{ .terminal = .{ // ziglint-ignore: Z004
         .op_id = 1,
         .source_index = 0,
         .tool_call_id = "tool-1",

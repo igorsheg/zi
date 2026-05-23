@@ -2,7 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const config = @import("config.zig");
 const stream = @import("stream.zig");
-const failure = @import("failure.zig");
+const failure = @import("failure.zig"); // ziglint-ignore: Z013
 const message_memory = @import("message_memory.zig");
 
 pub const StreamOp = struct {
@@ -30,7 +30,7 @@ pub const StreamOp = struct {
             self.queue.pushTerminal(.{ .failed = .{ .internal = "stream terminal reservation failed" } });
             return;
         };
-        const sink = ai.provider.StreamEventSink{ .func = providerCallback, .ctx = self };
+        const sink = ai.provider.StreamEventSink{ .func = providerCallback, .ctx = self }; // ziglint-ignore: Z004
         hook.call(self.allocator, model, context, options, sink) catch |err| {
             self.pushTerminalIfNeeded(.{ .failed = .{ .out_of_memory = @errorName(err) } });
         };
@@ -80,7 +80,7 @@ test "stream op converts provider callback to terminal completion" {
     const Hook = struct {
         fn call(
             _: ?*anyopaque,
-            _: std.mem.Allocator,
+            _: std.mem.Allocator, // ziglint-ignore: Z023
             _: ai.protocol.Model,
             _: ai.protocol.Context,
             _: ai.protocol.SimpleStreamOptions,
@@ -91,7 +91,7 @@ test "stream op converts provider callback to terminal completion" {
                 .api = .openai_responses,
                 .provider = .openai,
                 .model = "test",
-                .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } },
+                .usage = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total_tokens = 0, .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 } }, // ziglint-ignore: Z024
                 .stop_reason = .stop,
                 .timestamp = 0,
             } } });

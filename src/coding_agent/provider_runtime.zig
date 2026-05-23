@@ -130,16 +130,13 @@ test "provider runtime can drive AgentSession through faux provider" {
     const backend = coding_agent.provider_backend.synchronous(&provider, .{ .io = testing.io, .api_key = resolved_provider.api_key, .transport = resolved_provider.transport });
 
     const Capture = struct {
-        terminal: ?agent.event.RunTerminal = null,
+        completed: bool = false,
 
         fn emit(event: coding_agent.event.Event, ctx: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             switch (event) {
                 .agent => |agent_event| switch (agent_event) {
-                    .lifecycle => |lifecycle| switch (lifecycle) {
-                        .run_finished => |terminal| self.terminal = terminal,
-                        else => {},
-                    },
+                    .agent_end => self.completed = true,
                     else => {},
                 },
                 else => {},
@@ -152,19 +149,15 @@ test "provider runtime can drive AgentSession through faux provider" {
         .event_sink = .{ .emit_fn = Capture.emit, .ctx = &capture },
         .extension_host = coding_agent.extension.Host.disabled,
         .policy = .{ .model = model },
-        .execution = .{ .synchronous = backend },
+        .backend = backend,
     });
     defer session.deinit();
 
     const user = agent.AgentMessage{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } };
     const submit = try session.submit(.{ .submit_prompt = .{ .messages = &.{user} } });
     try testing.expect(submit == .accepted);
-    session.drainCommands();
 
-    switch (capture.terminal orelse return error.NoTerminal) {
-        .completed => {},
-        else => return error.NotCompleted,
-    }
+    try testing.expect(capture.completed);
     try testing.expectEqual(@as(usize, 1), faux.call_count);
 }
 

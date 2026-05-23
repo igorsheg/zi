@@ -392,10 +392,88 @@ pub const ToolResultMessage = struct {
     };
 };
 
+pub const AgentEvent = union(enum) {
+    agent_start,
+    agent_end: AgentEnd,
+    turn_start,
+    turn_end: TurnEnd,
+    message_start: struct { message: AgentMessage },
+    message_update: struct { message: ?AgentMessage = null, assistant_message_event: AssistantMessageEvent },
+    message_end: struct { message: AgentMessage },
+    tool_execution_start: struct { op_id: u64, tool_call_id: []const u8, tool_name: []const u8, args: json_value.BorrowedValue },
+    tool_execution_update: struct { op_id: u64, tool_call_id: []const u8, tool_name: []const u8, args: json_value.BorrowedValue, partial_result: AgentToolResult },
+    tool_execution_end: struct { op_id: u64, tool_call_id: []const u8, tool_name: []const u8, result: AgentToolResult, is_error: bool },
+};
+
+pub const AgentEnd = union(enum) {
+    completed: struct { messages: []const AgentMessage },
+    failed: struct { messages: []const AgentMessage, reason: []const u8 },
+    aborted: struct { messages: []const AgentMessage },
+};
+
+pub const TurnEnd = union(enum) {
+    completed: struct { message: AgentMessage, tool_results: []const ToolResultMessage },
+    failed: struct { message: ?AgentMessage = null, tool_results: []const ToolResultMessage = &.{}, reason: []const u8 },
+    aborted: struct { message: ?AgentMessage = null, tool_results: []const ToolResultMessage = &.{} },
+};
+
+pub const AgentToolResult = struct {
+    content: []const ToolResultMessage.ContentBlock,
+    details: ?json_value.OwnedValue = null,
+    presentation: ?json_value.OwnedValue = null,
+    terminate: bool = false,
+    is_error: bool = false,
+
+    pub const ContentBlock = ToolResultMessage.ContentBlock;
+};
+
 pub const Message = union(enum) {
     user: UserMessage,
     assistant: AssistantMessage,
     tool_result: ToolResultMessage,
+};
+
+pub const AgentMessage = union(enum) {
+    user: UserMessage,
+    assistant: AssistantMessage,
+    tool_result: ToolResultMessage,
+    compaction_summary: CompactionSummary,
+    branch_summary: BranchSummary,
+    custom: Custom,
+
+    pub const CompactionSummary = struct {
+        summary: []const u8,
+        tokens_before: u64,
+        timestamp: i64,
+    };
+
+    pub const BranchSummary = struct {
+        summary: []const u8,
+        from_id: []const u8,
+        timestamp: i64,
+    };
+
+    pub const CustomContent = union(enum) {
+        text: []const u8,
+        blocks: []const UserMessage.UserMessageContent.Block,
+    };
+
+    pub const Custom = struct {
+        custom_type: []const u8,
+        content: CustomContent,
+        display: bool = false,
+        details: ?json_value.OwnedValue = null,
+        timestamp: i64,
+    };
+};
+
+pub const AgentEventSink = struct {
+    ctx: ?*anyopaque = null,
+    emit_fn: *const fn (event: AgentEvent, ctx: ?*anyopaque) void,
+
+    pub fn emit(self: AgentEventSink, event: AgentEvent) void {
+        self.emit_fn(event, self.ctx);
+    }
 };
 
 pub const Tool = struct {

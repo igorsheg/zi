@@ -1,14 +1,14 @@
 const std = @import("std");
 const help = @import("help.zig");
 const plan_mod = @import("plan.zig");
-const host_mod = @import("../host.zig");
+const provider_runtime_mod = @import("../provider_runtime.zig");
 const run_batch = @import("run_batch.zig");
 const result_mod = @import("result.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    host: *host_mod.AgentHost,
+    provider_runtime: ?*provider_runtime_mod.ProviderRuntime = null,
 };
 
 pub fn run(ctx: Context, plan: plan_mod.ExecutionPlan) !result_mod.ExecutionResult {
@@ -28,6 +28,6 @@ pub fn run(ctx: Context, plan: plan_mod.ExecutionPlan) !result_mod.ExecutionResu
             break :blk .ok;
         },
         .tui => .{ .err = .tui_unavailable },
-        .run => |run_plan| try run_batch.run(.{ .allocator = ctx.allocator, .io = ctx.io, .host = ctx.host }, run_plan),
+        .run => |run_plan| try run_batch.run(.{ .allocator = ctx.allocator, .io = ctx.io, .provider_runtime = ctx.provider_runtime }, run_plan),
     };
 }

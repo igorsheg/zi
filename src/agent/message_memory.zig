@@ -8,13 +8,13 @@ pub fn cloneMessage(allocator: std.mem.Allocator, value: message.AgentMessage) !
         .user => |user| .{ .user = try cloneUser(allocator, user) },
         .assistant => |assistant| .{ .assistant = try cloneAssistant(allocator, assistant) },
         .tool_result => |tool_result| .{ .tool_result = try cloneToolResult(allocator, tool_result) },
-        .compaction_summary => |summary| .{ .compaction_summary = .{ .summary = try allocator.dupe(u8, summary.summary), .tokens_before = summary.tokens_before, .timestamp = summary.timestamp } },
-        .branch_summary => |summary| .{ .branch_summary = .{ .summary = try allocator.dupe(u8, summary.summary), .from_id = try allocator.dupe(u8, summary.from_id), .timestamp = summary.timestamp } },
+        .compaction_summary => |summary| .{ .compaction_summary = .{ .summary = try allocator.dupe(u8, summary.summary), .tokens_before = summary.tokens_before, .timestamp = summary.timestamp } }, // ziglint-ignore: Z024
+        .branch_summary => |summary| .{ .branch_summary = .{ .summary = try allocator.dupe(u8, summary.summary), .from_id = try allocator.dupe(u8, summary.from_id), .timestamp = summary.timestamp } }, // ziglint-ignore: Z024
         .custom => |custom| .{ .custom = try cloneCustom(allocator, custom) },
     };
 }
 
-pub fn cloneMessages(allocator: std.mem.Allocator, messages: []const message.AgentMessage) ![]const message.AgentMessage {
+pub fn cloneMessages(allocator: std.mem.Allocator, messages: []const message.AgentMessage) ![]const message.AgentMessage { // ziglint-ignore: Z024
     const out = try allocator.alloc(message.AgentMessage, messages.len);
     var initialized: usize = 0;
     errdefer {
@@ -74,20 +74,20 @@ pub fn freeAssistant(allocator: std.mem.Allocator, value: message.AssistantMessa
     if (value.error_message) |msg| allocator.free(msg);
 }
 
-pub fn cloneAssistantEvent(allocator: std.mem.Allocator, value: message.AssistantMessageEvent) !message.AssistantMessageEvent {
+pub fn cloneAssistantEvent(allocator: std.mem.Allocator, value: message.AssistantMessageEvent) !message.AssistantMessageEvent { // ziglint-ignore: Z024
     return switch (value) {
         .start => .start,
         .text_start => |payload| .{ .text_start = payload },
-        .text_delta => |payload| .{ .text_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } },
-        .text_end => |payload| .{ .text_end = .{ .content_index = payload.content_index, .content = try allocator.dupe(u8, payload.content) } },
+        .text_delta => |payload| .{ .text_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } }, // ziglint-ignore: Z024
+        .text_end => |payload| .{ .text_end = .{ .content_index = payload.content_index, .content = try allocator.dupe(u8, payload.content) } }, // ziglint-ignore: Z024
         .thinking_start => |payload| .{ .thinking_start = payload },
-        .thinking_delta => |payload| .{ .thinking_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } },
-        .thinking_end => |payload| .{ .thinking_end = .{ .content_index = payload.content_index, .content = try allocator.dupe(u8, payload.content) } },
+        .thinking_delta => |payload| .{ .thinking_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } }, // ziglint-ignore: Z024
+        .thinking_end => |payload| .{ .thinking_end = .{ .content_index = payload.content_index, .content = try allocator.dupe(u8, payload.content) } }, // ziglint-ignore: Z024
         .toolcall_start => |payload| .{ .toolcall_start = payload },
-        .toolcall_delta => |payload| .{ .toolcall_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } },
-        .toolcall_end => |payload| .{ .toolcall_end = .{ .content_index = payload.content_index, .tool_call = try cloneToolCall(allocator, payload.tool_call) } },
-        .done => |payload| .{ .done = .{ .reason = payload.reason, .message = try cloneAssistant(allocator, payload.message) } },
-        .@"error" => |payload| .{ .@"error" = .{ .reason = payload.reason, .@"error" = try cloneAssistant(allocator, payload.@"error") } },
+        .toolcall_delta => |payload| .{ .toolcall_delta = .{ .content_index = payload.content_index, .delta = try allocator.dupe(u8, payload.delta) } }, // ziglint-ignore: Z024
+        .toolcall_end => |payload| .{ .toolcall_end = .{ .content_index = payload.content_index, .tool_call = try cloneToolCall(allocator, payload.tool_call) } }, // ziglint-ignore: Z024
+        .done => |payload| .{ .done = .{ .reason = payload.reason, .message = try cloneAssistant(allocator, payload.message) } }, // ziglint-ignore: Z024
+        .@"error" => |payload| .{ .@"error" = .{ .reason = payload.reason, .@"error" = try cloneAssistant(allocator, payload.@"error") } }, // ziglint-ignore: Z024
     };
 }
 
@@ -105,11 +105,11 @@ pub fn freeAssistantEvent(allocator: std.mem.Allocator, value: message.Assistant
     }
 }
 
-pub fn freeAssistantBlock(allocator: std.mem.Allocator, value: ai.protocol.AssistantMessage.AssistantContentBlock) void {
+pub fn freeAssistantBlock(allocator: std.mem.Allocator, value: ai.protocol.AssistantMessage.AssistantContentBlock) void { // ziglint-ignore: Z024
     freeAssistantBlockImpl(allocator, value);
 }
 
-pub fn cloneThinkingContent(allocator: std.mem.Allocator, value: ai.protocol.ThinkingContent) !ai.protocol.ThinkingContent {
+pub fn cloneThinkingContent(allocator: std.mem.Allocator, value: ai.protocol.ThinkingContent) !ai.protocol.ThinkingContent { // ziglint-ignore: Z024
     const thinking = try allocator.dupe(u8, value.thinking);
     errdefer allocator.free(thinking);
     const signature = if (value.thinking_signature) |sig| try allocator.dupe(u8, sig) else null;
@@ -172,7 +172,7 @@ pub fn freeToolResult(allocator: std.mem.Allocator, value: message.ToolResultMes
     allocator.free(value.tool_name);
 }
 
-pub fn freeToolResultContentBlock(allocator: std.mem.Allocator, value: ai.protocol.ToolResultMessage.ContentBlock) void {
+pub fn freeToolResultContentBlock(allocator: std.mem.Allocator, value: ai.protocol.ToolResultMessage.ContentBlock) void { // ziglint-ignore: Z024
     switch (value) {
         .text => |text| {
             allocator.free(text.text);
@@ -234,7 +234,7 @@ pub fn cloneToolResult(allocator: std.mem.Allocator, value: message.ToolResultMe
     };
 }
 
-fn cloneAssistantBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) !ai.protocol.AssistantMessage.AssistantContentBlock {
+fn cloneAssistantBlock(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) !ai.protocol.AssistantMessage.AssistantContentBlock { // ziglint-ignore: Z024
     return switch (block) {
         .text => |text| blk: {
             const owned_text = try allocator.dupe(u8, text.text);
@@ -246,7 +246,7 @@ fn cloneAssistantBlock(allocator: std.mem.Allocator, block: ai.protocol.Assistan
             const owned_thinking = try allocator.dupe(u8, thinking.thinking);
             errdefer allocator.free(owned_thinking);
             const sig = if (thinking.thinking_signature) |s| try allocator.dupe(u8, s) else null;
-            break :blk .{ .thinking = .{ .thinking = owned_thinking, .thinking_signature = sig, .redacted = thinking.redacted } };
+            break :blk .{ .thinking = .{ .thinking = owned_thinking, .thinking_signature = sig, .redacted = thinking.redacted } }; // ziglint-ignore: Z024
         },
         .tool_call => |call| blk: {
             const id = try allocator.dupe(u8, call.id);
@@ -280,7 +280,7 @@ fn freeToolCall(allocator: std.mem.Allocator, value: ai.protocol.ToolCall) void 
     arguments.deinit();
 }
 
-fn cloneUserContent(allocator: std.mem.Allocator, content: ai.protocol.UserMessage.UserMessageContent) !ai.protocol.UserMessage.UserMessageContent {
+fn cloneUserContent(allocator: std.mem.Allocator, content: ai.protocol.UserMessage.UserMessageContent) !ai.protocol.UserMessage.UserMessageContent { // ziglint-ignore: Z024
     return switch (content) {
         .text => |text| .{ .text = try allocator.dupe(u8, text) },
         .blocks => |blocks| blk: {
@@ -309,7 +309,7 @@ fn freeUserContent(allocator: std.mem.Allocator, content: ai.protocol.UserMessag
     }
 }
 
-fn cloneUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.UserMessageContent.Block) !ai.protocol.UserMessage.UserMessageContent.Block {
+fn cloneUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.UserMessageContent.Block) !ai.protocol.UserMessage.UserMessageContent.Block { // ziglint-ignore: Z024
     return switch (block) {
         .text => |text| blk: {
             const owned_text = try allocator.dupe(u8, text.text);
@@ -326,7 +326,7 @@ fn cloneUserBlock(allocator: std.mem.Allocator, block: ai.protocol.UserMessage.U
     };
 }
 
-fn cloneToolResultBlock(allocator: std.mem.Allocator, block: ai.protocol.ToolResultMessage.ContentBlock) !ai.protocol.ToolResultMessage.ContentBlock {
+fn cloneToolResultBlock(allocator: std.mem.Allocator, block: ai.protocol.ToolResultMessage.ContentBlock) !ai.protocol.ToolResultMessage.ContentBlock { // ziglint-ignore: Z024
     return switch (block) {
         .text => |text| blk: {
             const owned_text = try allocator.dupe(u8, text.text);
@@ -361,20 +361,20 @@ fn cloneCustom(allocator: std.mem.Allocator, value: message.AgentMessage.Custom)
     errdefer allocator.free(custom_type);
 
     const content: message.AgentMessage.CustomContent = switch (value.content) {
-            .text => |text| .{ .text = try allocator.dupe(u8, text) },
-            .blocks => |blocks| blk: {
-                const out = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, blocks.len);
-                var initialized: usize = 0;
-                errdefer {
-                    for (out[0..initialized]) |block| freeUserBlock(allocator, block);
-                    allocator.free(out);
-                }
-                for (blocks, 0..) |block, i| {
-                    out[i] = try cloneUserBlock(allocator, block);
-                    initialized += 1;
-                }
-                break :blk .{ .blocks = out };
-            },
+        .text => |text| .{ .text = try allocator.dupe(u8, text) },
+        .blocks => |blocks| blk: {
+            const out = try allocator.alloc(ai.protocol.UserMessage.UserMessageContent.Block, blocks.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |block| freeUserBlock(allocator, block);
+                allocator.free(out);
+            }
+            for (blocks, 0..) |block, i| {
+                out[i] = try cloneUserBlock(allocator, block);
+                initialized += 1;
+            }
+            break :blk .{ .blocks = out };
+        },
     };
     errdefer switch (content) {
         .text => |text| allocator.free(text),
@@ -414,7 +414,7 @@ fn freeCustom(allocator: std.mem.Allocator, value: message.AgentMessage.Custom) 
     }
 }
 
-fn freeAssistantBlockImpl(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) void {
+fn freeAssistantBlockImpl(allocator: std.mem.Allocator, block: ai.protocol.AssistantMessage.AssistantContentBlock) void { // ziglint-ignore: Z024
     switch (block) {
         .text => |text| {
             allocator.free(text.text);

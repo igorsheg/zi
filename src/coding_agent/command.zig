@@ -22,7 +22,7 @@ pub const FollowUp = struct {
 };
 
 pub const Steer = struct {
-    text: []const u8,
+    messages: []const agent_message.AgentMessage,
 };
 
 pub const SetModel = struct {

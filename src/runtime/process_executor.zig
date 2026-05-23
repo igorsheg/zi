@@ -406,7 +406,7 @@ test "synchronous process executor captures stderr" {
 }
 
 test "synchronous process executor reports missing executable" {
-    var capture = runTestProcess(.{ .argv = &.{ "/definitely/missing/zi-process-test" }, .stdout_limit = 1024, .stderr_limit = 1024, .timeout_ms = 5_000 }, .none);
+    var capture = runTestProcess(.{ .argv = &.{"/definitely/missing/zi-process-test"}, .stdout_limit = 1024, .stderr_limit = 1024, .timeout_ms = 5_000 }, .none);
     defer capture.deinit();
 
     try std.testing.expect(capture.completion.?.status == .spawn_failed);

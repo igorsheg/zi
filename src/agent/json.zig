@@ -1,76 +1,62 @@
 const std = @import("std");
-const event = @import("event.zig");
+const event = @import("../ai/root.zig").protocol;
 const message = @import("message.zig");
-const ai = @import("../ai/root.zig");
+const ai = @import("../ai/root.zig"); // ziglint-ignore: Z013
 
 pub fn writeEvent(jw: *std.json.Stringify, value: event.AgentEvent) !void {
     try jw.beginObject();
     try jw.objectField("type");
     switch (value) {
-        .lifecycle => |lifecycle| switch (lifecycle) {
-            .run_started => try jw.write("runStarted"),
-            .turn_started => try jw.write("turnStarted"),
-            .run_finished => |terminal| {
-                try jw.write("runFinished");
-                try jw.objectField("terminal");
-                try writeRunTerminal(jw, terminal);
-            },
-            .turn_finished => |terminal| {
-                try jw.write("turnFinished");
-                try jw.objectField("terminal");
-                try writeTurnTerminal(jw, terminal);
-            },
+        .agent_start => try jw.write("agent_start"),
+        .agent_end => |terminal| {
+            try jw.write("agent_end");
+            try jw.objectField("status");
+            try jw.write(@tagName(terminal));
         },
-        .message => |message_event| switch (message_event) {
-            .started => try jw.write("messageStarted"),
-            .delta => |delta| {
-                try jw.write("messageDelta");
-                try jw.objectField("delta");
-                try writeAssistantMessageEvent(jw, delta);
-            },
-            .finished => |assistant| {
-                try jw.write("messageFinished");
-                try jw.objectField("message");
-                try writeAssistantMessageSummary(jw, assistant);
-            },
+        .turn_start => try jw.write("turn_start"),
+        .turn_end => |terminal| {
+            try jw.write("turn_end");
+            try jw.objectField("status");
+            try jw.write(@tagName(terminal));
         },
-        .tool => |tool| switch (tool) {
-            .started => |started| {
-                try jw.write("toolStarted");
-                try jw.objectField("opId");
-                try jw.write(started.op_id);
-                try jw.objectField("toolCallId");
-                try jw.write(started.tool_call_id);
-                try jw.objectField("toolName");
-                try jw.write(started.tool_name);
-            },
-            .update => |update| {
-                try jw.write("toolUpdate");
-                try jw.objectField("opId");
-                try jw.write(update.op_id);
-                try jw.objectField("toolCallId");
-                try jw.write(update.tool_call_id);
-                try jw.objectField("toolName");
-                try jw.write(update.tool_name);
-                try jw.objectField("isError");
-                try jw.write(update.partial_result.is_error);
-                try jw.objectField("contentBlocks");
-                try jw.write(update.partial_result.content.len);
-            },
-            .finished => |finished| {
-                try jw.write("toolFinished");
-                try jw.objectField("opId");
-                try jw.write(finished.op_id);
-                try jw.objectField("toolCallId");
-                try jw.write(finished.tool_call_id);
-                try jw.objectField("toolName");
-                try jw.write(finished.tool_name);
-                try jw.objectField("terminal");
-                try jw.write(@tagName(finished.terminal));
-            },
+        .message_start => try jw.write("message_start"),
+        .message_update => |update| {
+            try jw.write("message_update");
+            try jw.objectField("delta");
+            try writeAssistantMessageEvent(jw, update.assistant_message_event);
+        },
+        .message_end => |end| {
+            try jw.write("message_end");
+            try jw.objectField("messageRole");
+            try jw.write(@tagName(end.message));
+        },
+        .tool_execution_start => |started| {
+            try jw.write("tool_execution_start");
+            try writeToolIds(jw, started.op_id, started.tool_call_id, started.tool_name);
+        },
+        .tool_execution_update => |update| {
+            try jw.write("tool_execution_update");
+            try writeToolIds(jw, update.op_id, update.tool_call_id, update.tool_name);
+            try jw.objectField("isError");
+            try jw.write(update.partial_result.is_error);
+        },
+        .tool_execution_end => |end| {
+            try jw.write("tool_execution_end");
+            try writeToolIds(jw, end.op_id, end.tool_call_id, end.tool_name);
+            try jw.objectField("isError");
+            try jw.write(end.is_error);
         },
     }
     try jw.endObject();
+}
+
+fn writeToolIds(jw: *std.json.Stringify, op_id: u64, tool_call_id: []const u8, tool_name: []const u8) !void {
+    try jw.objectField("opId");
+    try jw.write(op_id);
+    try jw.objectField("toolCallId");
+    try jw.write(tool_call_id);
+    try jw.objectField("toolName");
+    try jw.write(tool_name);
 }
 
 fn writeAssistantMessageEvent(jw: *std.json.Stringify, value: message.AssistantMessageEvent) !void {
@@ -139,60 +125,20 @@ fn writeIndexedEvent(jw: *std.json.Stringify, event_type: []const u8, content_in
     try jw.write(content_index);
 }
 
-fn writeAssistantMessageSummary(jw: *std.json.Stringify, assistant: message.AssistantMessage) !void {
-    try jw.beginObject();
-    try jw.objectField("api");
-    try jw.write(ai.protocol.apiToString(assistant.api));
-    try jw.objectField("provider");
-    try jw.write(ai.protocol.providerToString(assistant.provider));
-    try jw.objectField("model");
-    try jw.write(assistant.model);
-    try jw.objectField("stopReason");
-    try jw.write(ai.protocol.stopReasonToString(assistant.stop_reason));
-    try jw.objectField("contentBlocks");
-    try jw.write(assistant.content.len);
-    try jw.endObject();
-}
-
-fn writeRunTerminal(jw: *std.json.Stringify, terminal: event.RunTerminal) !void {
-    return writeTerminalTag(jw, switch (terminal) {
-        .completed => "completed",
-        .failed => "failed",
-        .aborted => "aborted",
-    });
-}
-
-fn writeTurnTerminal(jw: *std.json.Stringify, terminal: event.TurnTerminal) !void {
-    return writeTerminalTag(jw, switch (terminal) {
-        .completed => "completed",
-        .failed => "failed",
-        .aborted => "aborted",
-    });
-}
-
-fn writeTerminalTag(jw: *std.json.Stringify, tag: []const u8) !void {
-    try jw.beginObject();
-    try jw.objectField("status");
-    try jw.write(tag);
-    try jw.endObject();
-}
-
-test "writes run terminal event status" {
+test "writes agent end event" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var jw: std.json.Stringify = .{ .writer = &out.writer };
-    try writeEvent(&jw, .{ .lifecycle = .{ .run_finished = .{ .aborted = .{ .messages = &.{} } } } });
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "aborted") != null);
+    try writeEvent(&jw, .{ .agent_end = .{ .completed = .{ .messages = &.{} } } });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "agent_end") != null);
 }
 
 test "writes assistant text delta payload" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var jw: std.json.Stringify = .{ .writer = &out.writer };
-
-    try writeEvent(&jw, .{ .message = .{ .delta = .{ .text_delta = .{ .content_index = 0, .delta = "hello" } } } });
-
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "messageDelta") != null);
+    try writeEvent(&jw, .{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{ .content_index = 0, .delta = "hello" } } } }); // ziglint-ignore: Z024
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "message_update") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "textDelta") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "hello") != null);
 }

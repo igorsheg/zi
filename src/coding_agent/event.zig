@@ -22,13 +22,11 @@ pub const ControlEvent = union(enum) {
 
 pub const FollowUpQueued = struct {
     command_id: command.CommandId,
-    run_command_id: command.CommandId,
-    pending_follow_ups: usize,
+    queued_followups: usize,
 };
 
 pub const AbortRequested = struct {
     command_id: command.CommandId,
-    run_command_id: command.CommandId,
 };
 
 pub const SessionEvent = union(enum) {

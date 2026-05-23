@@ -1,7 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const agent = @import("../agent/root.zig");
-const session_mod = @import("session.zig");
 
 pub const Options = struct {
     io: std.Io,
@@ -9,10 +8,10 @@ pub const Options = struct {
     transport: ?ai.protocol.Transport = null,
 };
 
-pub fn synchronous(provider: *ai.provider.Provider, options: Options) session_mod.AgentSession.ExecutionBackend {
+pub fn synchronous(provider: *ai.provider.Provider, options: Options) agent.config.RunBackend {
     return .{
         .stream = .{ .call_fn = streamProvider, .ctx = provider },
-        .convert_messages = .{ .call_fn = convertMessages },
+        .convert_messages = agent.llm_messages.default_hook,
         .io = options.io,
         .api_key = options.api_key,
         .transport = options.transport,
@@ -29,15 +28,4 @@ fn streamProvider(
 ) error{OutOfMemory}!void {
     const provider: *const ai.provider.Provider = @ptrCast(@alignCast(ctx.?));
     provider.streamSimple(allocator, model, context, options, sink);
-}
-
-fn convertMessages(_: ?*anyopaque, allocator: std.mem.Allocator, messages: []const agent.AgentMessage) error{OutOfMemory}![]const ai.protocol.Message {
-    const out = try allocator.alloc(ai.protocol.Message, messages.len);
-    for (messages, 0..) |message, i| out[i] = switch (message) {
-        .user => |user| .{ .user = user },
-        .assistant => |assistant| .{ .assistant = assistant },
-        .tool_result => |tool| .{ .tool_result = tool },
-        else => std.debug.panic("unsupported message type in provider backend", .{}),
-    };
-    return out;
 }

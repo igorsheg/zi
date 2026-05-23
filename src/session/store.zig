@@ -93,7 +93,6 @@ pub const Store = struct {
     pub fn readAll(self: *const Store, allocator: std.mem.Allocator, io: std.Io) !reader.SessionLog {
         return reader.readFile(allocator, io, self.path, .strict);
     }
-
 };
 
 const AppendIndex = struct {

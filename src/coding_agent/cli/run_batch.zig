@@ -2,7 +2,8 @@ const std = @import("std");
 const agent_json = @import("../../agent/json.zig");
 const agent = @import("../../agent/root.zig");
 const coding_agent = @import("../root.zig");
-const host_mod = @import("../host.zig");
+const session_mod = @import("../session.zig");
+const provider_runtime_mod = @import("../provider_runtime.zig");
 const plan_mod = @import("plan.zig");
 const result_mod = @import("result.zig");
 
@@ -11,7 +12,7 @@ const final_text_size_max: usize = 1024 * 1024;
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    host: *host_mod.AgentHost,
+    provider_runtime: ?*provider_runtime_mod.ProviderRuntime = null,
 };
 
 const EventCapture = struct {
@@ -160,22 +161,23 @@ pub fn run(ctx: Context, run_plan: plan_mod.RunPlan) !result_mod.ExecutionResult
         },
     };
     defer events.deinit();
-    var session_bundle = switch (try ctx.host.createSession(.{
+    var session = switch (try session_mod.AgentSession.initManaged(.{
+        .allocator = ctx.allocator,
+        .io = ctx.io,
+        .provider_runtime = ctx.provider_runtime,
         .model = run_plan.model,
         .tools = toolsMode(run_plan.tools),
         .event_sink = .{ .emit_fn = EventCapture.emit, .ctx = &events },
         .demo_prompt = run_plan.prompt,
     })) {
-        .ok => |bundle| bundle,
-        .err => |diag| return .{ .err = hostDiagnostic(diag) },
+        .ok => |created| created,
+        .err => |diag| return .{ .err = sessionDiagnostic(diag) },
     };
-    defer session_bundle.deinit();
-    const session = &session_bundle.session.?;
+    defer session.deinit();
 
     const user = agent.AgentMessage{ .user = .{ .content = .{ .text = run_plan.prompt }, .timestamp = 0 } };
     const submit = try session.submit(.{ .submit_prompt = .{ .messages = &.{user} } });
     if (submit != .accepted) return .{ .err = .submit_rejected };
-    session.drainCommands();
     switch (events.output) {
         .jsonl_events => |jsonl| if (jsonl.write_failed) return .{ .err = .run_failed },
         .final_text => |final_text| {
@@ -206,7 +208,11 @@ fn writeFinalTextToWriter(writer: *std.Io.Writer, text: []const u8) !void {
 }
 
 fn terminalName(terminal: EventCapture.TerminalStatus) []const u8 {
-    return switch (terminal) { .completed => "completed", .aborted => "aborted", .failed => "failed" };
+    return switch (terminal) {
+        .completed => "completed",
+        .aborted => "aborted",
+        .failed => "failed",
+    };
 }
 
 fn terminalStatus(terminal: agent.event.RunTerminal) EventCapture.TerminalStatus {
@@ -217,14 +223,14 @@ fn terminalStatus(terminal: agent.event.RunTerminal) EventCapture.TerminalStatus
     };
 }
 
-fn toolsMode(value: plan_mod.ToolsMode) host_mod.ToolsMode {
+fn toolsMode(value: plan_mod.ToolsMode) session_mod.ToolsMode {
     return switch (value) {
         .none => .none,
         .builtins => .builtins,
     };
 }
 
-fn hostDiagnostic(value: host_mod.Diagnostic) result_mod.Diagnostic {
+fn sessionDiagnostic(value: session_mod.Diagnostic) result_mod.Diagnostic {
     return switch (value) {
         .missing_model => .missing_model,
         .unknown_model => .unknown_model,

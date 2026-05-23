@@ -34,9 +34,9 @@ pub fn modelToProtocol(model: schema.Model) ModelResult {
     } } };
     const base_url = model.base_url orelse ai.models.defaultBaseUrlForProvider(provider) orelse return .{
         .err = .{ .missing_base_url = .{
-        .model_id = model.id,
-        .provider = model.provider,
-    } },
+            .model_id = model.id,
+            .provider = model.provider,
+        } },
     };
 
     return .{ .ok = .{
