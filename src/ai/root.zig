@@ -1,4 +1,5 @@
 pub const protocol = @import("protocol.zig");
+pub const provider_registry = @import("provider_registry.zig");
 
 pub const Api = protocol.Api;
 pub const Provider = protocol.Provider;
@@ -36,7 +37,10 @@ pub const DoneReason = protocol.DoneReason;
 pub const ErrorReason = protocol.ErrorReason;
 pub const AssistantMessageEventStream = protocol.AssistantMessageEventStream;
 pub const AssistantMessageEventSink = protocol.AssistantMessageEventSink;
+pub const ApiProvider = provider_registry.ApiProvider;
+pub const ProviderRegistry = provider_registry.ProviderRegistry;
 
 test {
     _ = protocol;
+    _ = provider_registry;
 }
