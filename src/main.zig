@@ -2,8 +2,10 @@ const std = @import("std");
 const zi = @import("zi");
 
 pub fn main(init: std.process.Init) !void {
+    const process = zi.runtime.Process.init(init);
+
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), process.io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
 
     try stdout.print("zi {d}\n", .{zi.add(1, 1)});

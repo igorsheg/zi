@@ -35,6 +35,7 @@ Operation -> Backend -> Completion -> bounded queue -> owner drain
 Rules:
 
 - control flow is simple and explicit
+- use platform/runtime interfaces as mechanisms; wrap them with zi policy instead of bypassing them
 - runtime is mechanism, not app policy
 - completions are data, not authority
 - owners mutate only at drain/apply sites
