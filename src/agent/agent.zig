@@ -5,10 +5,10 @@ const ai = @import("../ai/root.zig");
 const config_mod = @import("config.zig");
 const failure_mod = @import("failure.zig");
 const message_mod = @import("message.zig");
-const message_memory = @import("message_memory.zig");
+const message_memory = @import("../ai/root.zig").message_memory;
 const run_mod = @import("run.zig");
 const run_terminal = @import("run_terminal.zig");
-const tool_mod = @import("tool.zig");
+const tool_mod = @import("../ai/root.zig").tool;
 
 pub const max_pending_follow_ups: usize = 8;
 pub const max_listeners: usize = 16;

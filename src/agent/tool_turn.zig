@@ -1,11 +1,11 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const message = @import("message.zig");
-const tool = @import("tool.zig");
+const tool = @import("../ai/root.zig").tool;
 const event = @import("../ai/root.zig").protocol;
 const failure = @import("failure.zig"); // ziglint-ignore: Z013
 const tool_executor = @import("tool_executor.zig");
-const message_memory = @import("message_memory.zig");
+const message_memory = @import("../ai/root.zig").message_memory;
 const json_value = @import("../json/value.zig");
 const config_mod = @import("config.zig");
 

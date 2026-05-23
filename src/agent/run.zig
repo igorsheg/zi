@@ -8,7 +8,7 @@ const config_mod = @import("config.zig");
 const stream_mod = @import("stream.zig");
 const stream_op_mod = @import("stream_op.zig");
 const tool_turn_mod = @import("tool_turn.zig");
-const message_memory = @import("message_memory.zig");
+const message_memory = @import("../ai/root.zig").message_memory;
 
 pub const max_turns: usize = 32;
 
@@ -287,7 +287,7 @@ pub const Run = struct {
     }
 };
 
-fn protocolTools(allocator: std.mem.Allocator, tools: []const @import("tool.zig").AgentTool) !?[]const ai.protocol.Tool { // ziglint-ignore: Z024, Z028
+fn protocolTools(allocator: std.mem.Allocator, tools: []const @import("../ai/root.zig").tool.AgentTool) !?[]const ai.protocol.Tool { // ziglint-ignore: Z024, Z028
     if (tools.len == 0) return null;
     const out = try allocator.alloc(ai.protocol.Tool, tools.len);
     for (tools, 0..) |tool, i| {
@@ -470,8 +470,8 @@ test "run observes cancellation before stream start" {
     try std.testing.expect(run.state == .aborted);
 }
 
-fn completeRead(_: ?*anyopaque, _: std.mem.Allocator, invocation: @import("tool.zig").ToolInvocation, sink: @import("tool.zig").ToolCompletionSink) void { // ziglint-ignore: Z024, Z023, Z028
-    var completion = @import("tool.zig").ToolCompletion{ .terminal = .{ // ziglint-ignore: Z004, Z028
+fn completeRead(_: ?*anyopaque, _: std.mem.Allocator, invocation: @import("../ai/root.zig").tool.ToolInvocation, sink: @import("../ai/root.zig").tool.ToolCompletionSink) void { // ziglint-ignore: Z024, Z023, Z028
+    var completion = @import("../ai/root.zig").tool.ToolCompletion{ .terminal = .{ // ziglint-ignore: Z004, Z028
         .op_id = invocation.op_id,
         .source_index = invocation.source_index,
         .tool_call_id = invocation.tool_call_id,
@@ -497,7 +497,7 @@ test "run executes tool turn then continues to final assistant" {
 
     var hook = Hook{}; // ziglint-ignore: Z004
     var collector = Collector{}; // ziglint-ignore: Z004
-    const tools = [_]@import("tool.zig").AgentTool{.{ .name = "read", .description = "", .parameters = .null, .execute_fn = completeRead }}; // ziglint-ignore: Z024, Z028
+    const tools = [_]@import("../ai/root.zig").tool.AgentTool{.{ .name = "read", .description = "", .parameters = .null, .execute_fn = completeRead }}; // ziglint-ignore: Z024, Z028
     var run = Run.init(std.testing.allocator, .{
         .system_prompt = "",
         .messages = &.{},

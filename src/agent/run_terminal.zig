@@ -1,6 +1,6 @@
 const std = @import("std");
 const message = @import("message.zig");
-const message_memory = @import("message_memory.zig");
+const message_memory = @import("../ai/root.zig").message_memory;
 const failure = @import("failure.zig");
 
 pub const OwnedRunTerminal = struct {

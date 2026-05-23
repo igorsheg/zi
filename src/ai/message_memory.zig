@@ -1,7 +1,7 @@
 const std = @import("std");
-const ai = @import("../ai/root.zig");
+const ai = @import("root.zig");
 const json_value = @import("../json/value.zig");
-const message = @import("message.zig");
+const message = ai.protocol;
 
 pub fn cloneMessage(allocator: std.mem.Allocator, value: message.AgentMessage) !message.AgentMessage {
     return switch (value) {

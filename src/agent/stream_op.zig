@@ -3,7 +3,7 @@ const ai = @import("../ai/root.zig");
 const config = @import("config.zig");
 const stream = @import("stream.zig");
 const failure = @import("failure.zig"); // ziglint-ignore: Z013
-const message_memory = @import("message_memory.zig");
+const message_memory = @import("../ai/root.zig").message_memory;
 
 pub const StreamOp = struct {
     allocator: std.mem.Allocator,

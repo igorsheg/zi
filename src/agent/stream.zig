@@ -2,7 +2,7 @@ const std = @import("std");
 const runtime_queue = @import("../runtime/queue.zig");
 const message = @import("message.zig");
 const failure = @import("failure.zig");
-const message_memory = @import("message_memory.zig");
+const message_memory = @import("../ai/root.zig").message_memory;
 
 pub const max_stream_completions: usize = 256;
 

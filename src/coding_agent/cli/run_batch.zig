@@ -1,5 +1,6 @@
 const std = @import("std");
-const agent_json = @import("../../agent/json.zig");
+const ai = @import("../../ai/root.zig");
+const agent_json = ai.event_json;
 const agent = @import("../../agent/root.zig");
 const coding_agent = @import("../root.zig");
 const session_mod = @import("../session.zig");
@@ -65,15 +66,13 @@ const EventCapture = struct {
         self.writeJsonLine(event);
         switch (event) {
             .agent => |agent_event| switch (agent_event) {
-                .message => |message_event| switch (message_event) {
-                    .finished => |assistant| self.captureAssistantText(assistant),
+                .message_end => |message_end| switch (message_end.message) {
+                    .assistant => |assistant| self.captureAssistantText(assistant),
                     else => {},
                 },
-                .tool => self.saw_tool = true,
-                .lifecycle => |lifecycle| switch (lifecycle) {
-                    .run_finished => |terminal| self.terminal = terminalStatus(terminal),
-                    else => {},
-                },
+                .tool_execution_start, .tool_execution_update, .tool_execution_end => self.saw_tool = true,
+                .agent_end => |terminal| self.terminal = terminalStatus(terminal),
+                else => {},
             },
             else => {},
         }
@@ -215,7 +214,7 @@ fn terminalName(terminal: EventCapture.TerminalStatus) []const u8 {
     };
 }
 
-fn terminalStatus(terminal: agent.event.RunTerminal) EventCapture.TerminalStatus {
+fn terminalStatus(terminal: ai.protocol.AgentEnd) EventCapture.TerminalStatus {
     return switch (terminal) {
         .completed => .completed,
         .failed => .failed,

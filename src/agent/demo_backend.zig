@@ -2,7 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const json_value = @import("../json/value.zig");
 const message = @import("message.zig");
-const message_memory = @import("message_memory.zig");
+const message_memory = @import("../ai/root.zig").message_memory;
 const llm_messages = @import("llm_messages.zig");
 const config = @import("config.zig");
 

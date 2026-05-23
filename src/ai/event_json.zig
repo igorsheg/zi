@@ -1,7 +1,6 @@
 const std = @import("std");
-const event = @import("../ai/root.zig").protocol;
-const message = @import("message.zig");
-const ai = @import("../ai/root.zig"); // ziglint-ignore: Z013
+const event = @import("root.zig").protocol;
+const message = event;
 
 pub fn writeEvent(jw: *std.json.Stringify, value: event.AgentEvent) !void {
     try jw.beginObject();

@@ -10,5 +10,5 @@ pub const AgentMessage = ai.protocol.AgentMessage;
 pub const AgentInput = struct {
     system_prompt: []const u8,
     messages: []const AgentMessage,
-    tools: []const @import("tool.zig").AgentTool = &.{}, // ziglint-ignore: Z028
+    tools: []const @import("../ai/root.zig").tool.AgentTool = &.{}, // ziglint-ignore: Z028
 };

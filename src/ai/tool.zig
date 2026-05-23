@@ -1,5 +1,5 @@
 const std = @import("std");
-const ai = @import("../ai/root.zig");
+const ai = @import("root.zig");
 const json_value = @import("../json/value.zig");
 const cancel = @import("../runtime/cancel.zig");
 

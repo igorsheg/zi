@@ -1,6 +1,6 @@
 const std = @import("std");
 const runtime_queue = @import("../runtime/queue.zig");
-const tool = @import("tool.zig");
+const tool = @import("../ai/root.zig").tool;
 
 pub const max_tool_ops: usize = 32;
 pub const max_tool_updates: usize = 128;

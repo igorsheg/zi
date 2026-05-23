@@ -1,7 +1,7 @@
 const std = @import("std");
 const protocol = @import("../../protocol.zig");
 const json_text = @import("../../../json/text.zig");
-const message_memory = @import("../../../agent/message_memory.zig");
+const message_memory = @import("../../message_memory.zig");
 const json_value = @import("../../../json/value.zig");
 
 pub const ConvertOptions = struct {
