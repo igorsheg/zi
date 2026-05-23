@@ -3,6 +3,21 @@ const runtime = @import("../runtime/root.zig");
 
 pub const Api = []const u8;
 pub const Provider = []const u8;
+
+pub const KnownApi = struct {
+    pub const openai_completions = "openai-completions";
+    pub const openai_responses = "openai-responses";
+    pub const openai_codex_responses = "openai-codex-responses";
+    pub const anthropic_messages = "anthropic-messages";
+};
+
+pub const KnownProvider = struct {
+    pub const anthropic = "anthropic";
+    pub const openai = "openai";
+    pub const openai_codex = "openai-codex";
+    pub const openrouter = "openrouter";
+    pub const fireworks = "fireworks";
+};
 pub const Timestamp = i64;
 
 pub const ThinkingLevel = enum {
@@ -55,6 +70,51 @@ pub const SimpleStreamOptions = struct {
     stream: StreamOptions = .{},
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,
+};
+
+pub const Model = struct {
+    id: []const u8,
+    name: []const u8,
+    api: Api,
+    provider: Provider,
+    base_url: []const u8,
+    reasoning: bool,
+    input: []const Input,
+    cost: Cost,
+    context_window: u64,
+    max_tokens: u64,
+    headers: ?std.json.Value = null,
+    compat: ?std.json.Value = null,
+
+    pub const Input = enum {
+        text,
+        image,
+    };
+
+    pub const Cost = struct {
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_write: f64,
+    };
+};
+
+pub const StreamRequest = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: Model,
+    context: Context,
+    options: StreamOptions = .{},
+    event_buffer: []AssistantMessageEvent,
+};
+
+pub const StreamFunction = struct {
+    context: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, StreamRequest) AssistantMessageEventStream,
+
+    pub fn call(self: StreamFunction, request: StreamRequest) AssistantMessageEventStream {
+        return self.call_fn(self.context, request);
+    }
 };
 
 pub const TextSignatureV1 = struct {
@@ -244,20 +304,20 @@ pub const ErrorReason = enum {
     error_,
 };
 
-pub const AssistantMessageEventStream = struct {
-    pipe: Pipe,
+const AssistantEventPipe = runtime.EventPipe(AssistantMessageEvent, AssistantMessage);
 
-    const Pipe = runtime.EventPipe(AssistantMessageEvent, AssistantMessage);
+pub const AssistantMessageEventStream = struct {
+    pipe: AssistantEventPipe,
 
     pub fn init(buffer: []AssistantMessageEvent) AssistantMessageEventStream {
-        return .{ .pipe = Pipe.init(buffer) };
+        return .{ .pipe = AssistantEventPipe.init(buffer) };
     }
 
     pub fn sink(self: *AssistantMessageEventStream) AssistantMessageEventSink {
         return .{ .pipe = self.pipe.sink() };
     }
 
-    pub fn next(self: *AssistantMessageEventStream, io: std.Io) Pipe.NextError!?AssistantMessageEvent {
+    pub fn next(self: *AssistantMessageEventStream, io: std.Io) AssistantEventPipe.NextError!?AssistantMessageEvent {
         return self.pipe.stream().next(io);
     }
 
@@ -279,13 +339,13 @@ pub const AssistantMessageEventStream = struct {
 };
 
 pub const AssistantMessageEventSink = struct {
-    pipe: AssistantMessageEventStream.Pipe.Sink,
+    pipe: AssistantEventPipe.Sink,
 
     pub fn emit(
         self: AssistantMessageEventSink,
         io: std.Io,
         event: AssistantMessageEvent,
-    ) AssistantMessageEventStream.Pipe.EmitError!void {
+    ) AssistantEventPipe.EmitError!void {
         switch (event) {
             .done => |done| try self.pipe.emitTerminal(io, event, done.message),
             .@"error" => |err| try self.pipe.emitTerminal(io, event, err.@"error"),
@@ -293,6 +353,32 @@ pub const AssistantMessageEventSink = struct {
         }
     }
 };
+
+test "stream function calls provider implementation with request" {
+    var event_buffer: [1]AssistantMessageEvent = undefined;
+    var calls: usize = 0;
+    const request: StreamRequest = .{
+        .allocator = std.testing.allocator,
+        .io = std.Io.failing,
+        .model = emptyModel(),
+        .context = .{ .messages = &.{} },
+        .event_buffer = &event_buffer,
+    };
+    const stream_function: StreamFunction = .{
+        .context = &calls,
+        .call_fn = testStreamFunction,
+    };
+
+    var stream = stream_function.call(request);
+
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(?AssistantMessage, null), stream.result());
+}
+
+test "known api and provider names stay wire strings" {
+    try std.testing.expectEqualStrings("openai-responses", KnownApi.openai_responses);
+    try std.testing.expectEqualStrings("anthropic", KnownProvider.anthropic);
+}
 
 test "assistant stream derives terminal message from done event" {
     const message = emptyAssistantMessage(.stop);
@@ -346,6 +432,32 @@ const CountingHandler = struct {
         self.event_count += 1;
     }
 };
+
+fn testStreamFunction(context: ?*anyopaque, request: StreamRequest) AssistantMessageEventStream {
+    const calls: *usize = @ptrCast(@alignCast(context.?));
+    calls.* += 1;
+    return AssistantMessageEventStream.init(request.event_buffer);
+}
+
+fn emptyModel() Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = KnownApi.openai_responses,
+        .provider = KnownProvider.openai,
+        .base_url = "https://example.test",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{
+            .input = 1,
+            .output = 2,
+            .cache_read = 0.5,
+            .cache_write = 1.5,
+        },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+}
 
 fn emptyAssistantMessage(stop_reason: StopReason) AssistantMessage {
     return .{
