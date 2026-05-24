@@ -20,6 +20,7 @@ pub const AgentEventStream = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     pipe: AgentEventPipe,
+    future: ?std.Io.Future(anyerror!void) = null,
     terminal_messages: ?[]const agent.AgentMessage = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, buffer: []agent.AgentEvent) AgentEventStream {
@@ -27,6 +28,7 @@ pub const AgentEventStream = struct {
     }
 
     pub fn deinit(self: *AgentEventStream) void {
+        std.debug.assert(self.future == null);
         if (self.terminal_messages) |messages| self.allocator.free(messages);
         self.* = undefined;
     }
@@ -38,16 +40,24 @@ pub const AgentEventStream = struct {
     pub fn result(self: *AgentEventStream) ?[]const agent.AgentMessage {
         return self.pipe.stream().result();
     }
+
+    pub fn awaitProducer(self: *AgentEventStream) anyerror!void {
+        if (self.future) |*future| {
+            defer self.future = null;
+            try future.await(self.io);
+        }
+    }
+
+    pub fn cancelProducer(self: *AgentEventStream) anyerror!void {
+        if (self.future) |*future| {
+            defer self.future = null;
+            try future.cancel(self.io);
+        }
+    }
 };
 
-pub const Error = error{
-    NoMessages,
-    CannotContinueFromAssistant,
-    TooManyTools,
-    MissingAssistantResult,
-};
-
-pub fn promptStream(
+pub fn startPromptStream(
+    stream: *AgentEventStream,
     allocator: std.mem.Allocator,
     io: std.Io,
     prompts: []const agent.AgentMessage,
@@ -55,26 +65,53 @@ pub fn promptStream(
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
     buffer: []agent.AgentEvent,
-) !AgentEventStream {
-    var stream = AgentEventStream.init(allocator, io, buffer);
-    errdefer stream.deinit();
-    try runPrompt(allocator, io, prompts, context, config, token, streamSink(&stream));
-    return stream;
+) void {
+    stream.* = AgentEventStream.init(allocator, io, buffer);
+    stream.future = io.async(runPromptStreamProducer, .{ allocator, io, prompts, context, config, token, stream });
 }
 
-pub fn continueStream(
+pub fn startContinueStream(
+    stream: *AgentEventStream,
     allocator: std.mem.Allocator,
     io: std.Io,
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
     buffer: []agent.AgentEvent,
-) !AgentEventStream {
-    var stream = AgentEventStream.init(allocator, io, buffer);
-    errdefer stream.deinit();
-    try runContinue(allocator, io, context, config, token, streamSink(&stream));
-    return stream;
+) void {
+    stream.* = AgentEventStream.init(allocator, io, buffer);
+    stream.future = io.async(runContinueStreamProducer, .{ allocator, io, context, config, token, stream });
 }
+
+fn runPromptStreamProducer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prompts: []const agent.AgentMessage,
+    context: agent.AgentContext,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    stream: *AgentEventStream,
+) anyerror!void {
+    try runPrompt(allocator, io, prompts, context, config, token, streamSink(stream));
+}
+
+fn runContinueStreamProducer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: agent.AgentContext,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    stream: *AgentEventStream,
+) anyerror!void {
+    try runContinue(allocator, io, context, config, token, streamSink(stream));
+}
+
+pub const Error = error{
+    NoMessages,
+    CannotContinueFromAssistant,
+    TooManyTools,
+    MissingAssistantResult,
+};
 
 fn streamSink(stream: *AgentEventStream) EventSink {
     return .{ .context = stream, .call_fn = streamSinkEmit };
@@ -179,7 +216,10 @@ fn runLoop(
                 return;
             }
 
-            const tool_results = try executeToolCallsSequential(allocator, io, current, assistant, config, token, emit);
+            const tool_results = if (shouldExecuteToolsSequential(current.tools, assistant, config.tool_execution))
+                try executeToolCallsSequential(allocator, io, current, assistant, config, token, emit)
+            else
+                try executeToolCallsParallel(allocator, io, current, assistant, config, token, emit);
             defer allocator.free(tool_results.messages);
             for (tool_results.messages) |message| {
                 try current.messages.append(allocator, .{ .tool_result = message });
@@ -313,6 +353,23 @@ const ToolBatch = struct {
     terminate: bool,
 };
 
+fn shouldExecuteToolsSequential(
+    tools: []const agent.AgentTool,
+    assistant: ai.AssistantMessage,
+    mode: agent.ToolExecutionMode,
+) bool {
+    if (mode == .sequential) return true;
+    for (assistant.content) |content| {
+        const tool_call = switch (content) {
+            .tool_call => |value| value,
+            else => continue,
+        };
+        const tool = findTool(tools, tool_call.name) orelse continue;
+        if (tool.execution_mode == .sequential) return true;
+    }
+    return false;
+}
+
 fn executeToolCallsSequential(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -360,10 +417,344 @@ fn executeToolCallsSequential(
     };
 }
 
+const ExecutablePreparedToolCall = struct {
+    index: usize,
+    tool: agent.AgentTool,
+    tool_call: ai.ToolCall,
+    args: std.json.Value,
+};
+
+const FailedPreparedToolCall = struct {
+    index: usize,
+    tool_call: ai.ToolCall,
+    reason: []const u8,
+};
+
+const PreparedToolCall = union(enum) {
+    executable: ExecutablePreparedToolCall,
+    missing: FailedPreparedToolCall,
+    prepare_error: FailedPreparedToolCall,
+    blocked: FailedPreparedToolCall,
+
+    fn index(self: PreparedToolCall) usize {
+        return switch (self) {
+            .executable => |item| item.index,
+            .missing, .prepare_error, .blocked => |item| item.index,
+        };
+    }
+
+    fn toolCall(self: PreparedToolCall) ai.ToolCall {
+        return switch (self) {
+            .executable => |item| item.tool_call,
+            .missing, .prepare_error, .blocked => |item| item.tool_call,
+        };
+    }
+
+    fn args(self: PreparedToolCall) std.json.Value {
+        return switch (self) {
+            .executable => |item| item.args,
+            .missing => |item| item.tool_call.arguments,
+            .prepare_error, .blocked => |item| .{ .string = item.reason },
+        };
+    }
+};
+
+const ExecutedToolCall = struct {
+    prepared: PreparedToolCall,
+    result: agent.AgentToolResult,
+    is_error: bool,
+};
+
 const FinalizedToolCall = struct {
     result: agent.AgentToolResult,
     is_error: bool,
 };
+
+const ToolWorkerEvent = union(enum) {
+    update: ToolUpdate,
+    complete: ExecutedToolCall,
+
+    const ToolUpdate = struct {
+        tool_call_id: []const u8,
+        tool_name: []const u8,
+        args: std.json.Value,
+        partial_result: agent.AgentToolResult,
+    };
+};
+
+const ToolWorkerQueue = std.Io.Queue(ToolWorkerEvent);
+
+const ParallelToolUpdateContext = struct {
+    io: std.Io,
+    queue: *ToolWorkerQueue,
+    tool_call: ai.ToolCall,
+    args: std.json.Value,
+    update_count: *std.atomic.Value(usize),
+};
+
+fn executeToolCallsParallel(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    current: *Context,
+    assistant: ai.AssistantMessage,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    emit: EventSink,
+) !ToolBatch {
+    var prepared: [agent.max_tool_calls_per_turn]PreparedToolCall = undefined;
+    const prepared_count = try prepareParallelToolCalls(allocator, current, assistant, config, token, emit, &prepared);
+
+    var queue_buffer: [agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch]ToolWorkerEvent = undefined;
+    var queue = ToolWorkerQueue.init(&queue_buffer);
+    var update_count: std.atomic.Value(usize) = .init(0);
+    var futures: [agent.max_tool_calls_per_turn]std.Io.Future(anyerror!void) = undefined;
+
+    for (prepared[0..prepared_count], 0..) |item, index| {
+        futures[index] = io.async(
+            executePreparedToolCallWorker,
+            .{ allocator, io, item, token, &queue, &update_count },
+        );
+    }
+
+    var executed: [agent.max_tool_calls_per_turn]ExecutedToolCall = undefined;
+    var completed_count: usize = 0;
+    while (completed_count < prepared_count) {
+        const event = try queue.getOne(io);
+        switch (event) {
+            .update => |update| try emit.emit(.{ .tool_execution_update = .{
+                .tool_call_id = update.tool_call_id,
+                .tool_name = update.tool_name,
+                .args = update.args,
+                .partial_result = update.partial_result,
+            } }),
+            .complete => |complete| {
+                executed[complete.prepared.index()] = complete;
+                completed_count += 1;
+            },
+        }
+    }
+
+    for (futures[0..prepared_count]) |*future| try future.await(io);
+
+    var messages = std.ArrayList(ai.ToolResultMessage).empty;
+    errdefer messages.deinit(allocator);
+    var terminate_count: usize = 0;
+
+    for (executed[0..prepared_count]) |item| {
+        const finalized = try finalizeExecutedToolCall(allocator, current, assistant, config, token, item);
+        if (finalized.result.terminate) terminate_count += 1;
+        try emitFinalizedToolCall(allocator, emit, item.prepared.toolCall(), finalized, &messages);
+    }
+
+    return .{
+        .messages = try messages.toOwnedSlice(allocator),
+        .terminate = prepared_count > 0 and terminate_count == prepared_count,
+    };
+}
+
+fn prepareParallelToolCalls(
+    allocator: std.mem.Allocator,
+    current: *Context,
+    assistant: ai.AssistantMessage,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    emit: EventSink,
+    out: *[agent.max_tool_calls_per_turn]PreparedToolCall,
+) !usize {
+    var prepared_count: usize = 0;
+    for (assistant.content) |content| {
+        const tool_call = switch (content) {
+            .tool_call => |value| value,
+            else => continue,
+        };
+        if (token.isRequested()) break;
+        if (prepared_count == out.len) return error.TooManyTools;
+
+        out[prepared_count] = prepareToolCall(allocator, current, assistant, tool_call, config, token, prepared_count);
+        const item = out[prepared_count];
+        const started_tool_call = item.toolCall();
+        try emit.emit(.{ .tool_execution_start = .{
+            .tool_call_id = started_tool_call.id,
+            .tool_name = started_tool_call.name,
+            .args = item.args(),
+        } });
+        prepared_count += 1;
+    }
+    return prepared_count;
+}
+
+fn executePreparedToolCallWorker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prepared: PreparedToolCall,
+    token: runtime.CancelToken,
+    queue: *ToolWorkerQueue,
+    update_count: *std.atomic.Value(usize),
+) anyerror!void {
+    const executed = try executePreparedToolCall(allocator, io, prepared, token, queue, update_count);
+    try queue.putOne(io, .{ .complete = executed });
+}
+
+fn prepareToolCall(
+    allocator: std.mem.Allocator,
+    current: *Context,
+    assistant: ai.AssistantMessage,
+    tool_call: ai.ToolCall,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    index: usize,
+) PreparedToolCall {
+    const tool = findTool(current.tools, tool_call.name) orelse return .{ .missing = .{
+        .index = index,
+        .tool_call = tool_call,
+        .reason = tool_call.name,
+    } };
+
+    const args = if (tool.prepare_arguments) |prepare|
+        agent.PrepareArgumentsHook.call(allocator, prepare, tool_call.arguments) catch |err| return .{
+            .prepare_error = .{
+                .index = index,
+                .tool_call = tool_call,
+                .reason = @errorName(err),
+            },
+        }
+    else
+        tool_call.arguments;
+
+    // TODO: Validate args against tool.parameters before tool execution.
+    if (config.before_tool_call) |before| {
+        const before_result = before.call(token, .{
+            .assistant_message = assistant,
+            .tool_call = tool_call,
+            .args = args,
+            .agent = .{
+                .system_prompt = current.system_prompt,
+                .messages = current.messages.items,
+                .tools = current.tools,
+            },
+        });
+        if (before_result == .block) return .{ .blocked = .{
+            .index = index,
+            .tool_call = tool_call,
+            .reason = before_result.block,
+        } };
+    }
+
+    return .{ .executable = .{ .index = index, .tool = tool, .tool_call = tool_call, .args = args } };
+}
+
+fn executePreparedToolCall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prepared: PreparedToolCall,
+    token: runtime.CancelToken,
+    queue: *ToolWorkerQueue,
+    update_count: *std.atomic.Value(usize),
+) anyerror!ExecutedToolCall {
+    switch (prepared) {
+        .missing => |item| return .{
+            .prepared = prepared,
+            .result = try createErrorToolResultFmt(allocator, "Tool {s} not found", .{item.reason}),
+            .is_error = true,
+        },
+        .prepare_error => |item| return .{
+            .prepared = prepared,
+            .result = try createErrorToolResultFmt(allocator, "prepare arguments failed: {s}", .{item.reason}),
+            .is_error = true,
+        },
+        .blocked => |item| return .{
+            .prepared = prepared,
+            .result = try createErrorToolResult(allocator, item.reason),
+            .is_error = true,
+        },
+        .executable => |item| {
+            var update_context: ParallelToolUpdateContext = .{
+                .io = io,
+                .queue = queue,
+                .tool_call = item.tool_call,
+                .args = item.args,
+                .update_count = update_count,
+            };
+            const update_callback: agent.AgentToolUpdateCallback = .{
+                .context = &update_context,
+                .call_fn = enqueueToolUpdate,
+            };
+            const result = agent.ExecuteToolHook.call(
+                allocator,
+                io,
+                item.tool.execute,
+                token,
+                item.tool_call.id,
+                item.args,
+                update_callback,
+            ) catch |err| return .{
+                .prepared = prepared,
+                .result = try createErrorToolResultFmt(allocator, "tool execution failed: {s}", .{@errorName(err)}),
+                .is_error = true,
+            };
+            return .{ .prepared = prepared, .result = result, .is_error = false };
+        },
+    }
+}
+
+fn finalizeExecutedToolCall(
+    allocator: std.mem.Allocator,
+    current: *Context,
+    assistant: ai.AssistantMessage,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    executed: ExecutedToolCall,
+) !FinalizedToolCall {
+    var result = executed.result;
+    var is_error = executed.is_error;
+    if (executed.prepared == .executable) {
+        if (config.after_tool_call) |after| {
+            const prepared = executed.prepared.executable;
+            const override = after.call(token, .{
+                .assistant_message = assistant,
+                .tool_call = prepared.tool_call,
+                .args = prepared.args,
+                .result = result,
+                .is_error = is_error,
+                .agent = .{
+                    .system_prompt = current.system_prompt,
+                    .messages = current.messages.items,
+                    .tools = current.tools,
+                },
+            }) catch |err| return .{
+                .result = try createErrorToolResultFmt(allocator, "after tool call failed: {s}", .{@errorName(err)}),
+                .is_error = true,
+            };
+            if (override) |value| {
+                if (value.content) |content| result.content = content;
+                if (value.details) |details| result.details = details;
+                if (value.terminate) |terminate| result.terminate = terminate;
+                if (value.is_error) |override_is_error| is_error = override_is_error;
+            }
+        }
+    }
+    return .{ .result = result, .is_error = is_error };
+}
+
+fn emitFinalizedToolCall(
+    allocator: std.mem.Allocator,
+    emit: EventSink,
+    tool_call: ai.ToolCall,
+    finalized: FinalizedToolCall,
+    messages: *std.ArrayList(ai.ToolResultMessage),
+) !void {
+    try emit.emit(.{ .tool_execution_end = .{
+        .tool_call_id = tool_call.id,
+        .tool_name = tool_call.name,
+        .result = finalized.result,
+        .is_error = finalized.is_error,
+    } });
+
+    const message = createToolResultMessage(tool_call, finalized.result, finalized.is_error);
+    try emit.emit(.{ .message_start = .{ .message = .{ .tool_result = message } } });
+    try emit.emit(.{ .message_end = .{ .message = .{ .tool_result = message } } });
+    try messages.append(allocator, message);
+}
 
 fn executeOneToolCall(
     allocator: std.mem.Allocator,
@@ -432,7 +823,7 @@ fn executeOneToolCall(
     var is_error = false;
 
     if (config.after_tool_call) |after| {
-        if (after.call(token, .{
+        const override = after.call(token, .{
             .assistant_message = assistant,
             .tool_call = tool_call,
             .args = args,
@@ -443,11 +834,15 @@ fn executeOneToolCall(
                 .messages = current.messages.items,
                 .tools = current.tools,
             },
-        })) |override| {
-            if (override.content) |content| result.content = content;
-            if (override.details) |details| result.details = details;
-            if (override.terminate) |terminate| result.terminate = terminate;
-            if (override.is_error) |value| is_error = value;
+        }) catch |err| return .{
+            .result = try createErrorToolResultFmt(allocator, "after tool call failed: {s}", .{@errorName(err)}),
+            .is_error = true,
+        };
+        if (override) |value| {
+            if (value.content) |content| result.content = content;
+            if (value.details) |details| result.details = details;
+            if (value.terminate) |terminate| result.terminate = terminate;
+            if (value.is_error) |override_is_error| is_error = override_is_error;
         }
     }
 
@@ -460,14 +855,26 @@ const ToolUpdateContext = struct {
     args: std.json.Value,
 };
 
-fn emitToolUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult) void {
-    const update: *ToolUpdateContext = @ptrCast(@alignCast(context.?));
-    update.emit.emit(.{ .tool_execution_update = .{
+fn enqueueToolUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult) anyerror!void {
+    const update: *ParallelToolUpdateContext = @ptrCast(@alignCast(context.?));
+    const previous_count = update.update_count.fetchAdd(1, .monotonic);
+    if (previous_count >= agent.max_tool_updates_per_batch) return error.TooManyTools;
+    try update.queue.putOne(update.io, .{ .update = .{
         .tool_call_id = update.tool_call.id,
         .tool_name = update.tool_call.name,
         .args = update.args,
         .partial_result = partial_result,
-    } }) catch unreachable;
+    } });
+}
+
+fn emitToolUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult) anyerror!void {
+    const update: *ToolUpdateContext = @ptrCast(@alignCast(context.?));
+    try update.emit.emit(.{ .tool_execution_update = .{
+        .tool_call_id = update.tool_call.id,
+        .tool_name = update.tool_call.name,
+        .args = update.args,
+        .partial_result = partial_result,
+    } });
 }
 
 fn findTool(tools: []const agent.AgentTool, name: []const u8) ?agent.AgentTool {
@@ -603,9 +1010,22 @@ fn testToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantM
     return stream;
 }
 
-fn assistantMessage(text: []const u8) ai.AssistantMessage {
+fn testTwoToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
+    const calls: *usize = @ptrCast(@alignCast(context.?));
+    var stream = ai.AssistantMessageEventStream.init(request.event_buffer);
+    const sink = stream.sink();
+    if (calls.* == 0) {
+        sink.endDone(request.io, .tool_use, assistantTwoToolCallMessage()) catch unreachable;
+    } else {
+        sink.endDone(request.io, .stop, assistantMessage("done")) catch unreachable;
+    }
+    calls.* += 1;
+    return stream;
+}
+
+fn assistantMessage(_: []const u8) ai.AssistantMessage {
     return .{
-        .content = &.{.{ .text = .{ .text = text } }},
+        .content = &.{},
         .api = ai.KnownApi.openai_responses,
         .provider = ai.KnownProvider.openai,
         .model = "test-model",
@@ -631,6 +1051,29 @@ fn assistantToolCallMessage() ai.AssistantMessage {
     };
 }
 
+fn assistantTwoToolCallMessage() ai.AssistantMessage {
+    return .{
+        .content = &.{
+            .{ .tool_call = .{
+                .id = "tool-1",
+                .name = "echo",
+                .arguments = .{ .object = .empty },
+            } },
+            .{ .tool_call = .{
+                .id = "tool-2",
+                .name = "echo",
+                .arguments = .{ .object = .empty },
+            } },
+        },
+        .api = ai.KnownApi.openai_responses,
+        .provider = ai.KnownProvider.openai,
+        .model = "test-model",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+}
+
 fn userMessage(text: []const u8) agent.AgentMessage {
     return .{ .user = .{ .content = .{ .string = text }, .timestamp = 0 } };
 }
@@ -647,6 +1090,23 @@ fn echoTool(
     const calls: *usize = @ptrCast(@alignCast(context.?));
     calls.* += 1;
     return .{ .content = &.{.{ .text = .{ .text = "echoed" } }} };
+}
+
+fn updatingTool(
+    _: std.mem.Allocator,
+    _: std.Io,
+    context: ?*anyopaque,
+    _: runtime.CancelToken,
+    _: []const u8,
+    _: std.json.Value,
+    on_update: ?agent.AgentToolUpdateCallback,
+) anyerror!agent.AgentToolResult {
+    const calls: *usize = @ptrCast(@alignCast(context.?));
+    calls.* += 1;
+    if (on_update) |callback| {
+        try callback.call(.{ .content = &.{.{ .text = .{ .text = "partial" } }} });
+    }
+    return .{ .content = &.{.{ .text = .{ .text = "done" } }} };
 }
 
 test "run prompt emits prompt assistant and agent end events" {
@@ -677,8 +1137,10 @@ test "prompt stream exposes events and terminal messages through event pipe" {
     var cancel: runtime.CancelSource = .{};
     const prompt = userMessage("hello");
     var buffer: [8]agent.AgentEvent = undefined;
+    var stream: AgentEventStream = undefined;
 
-    var stream = try promptStream(
+    startPromptStream(
+        &stream,
         std.testing.allocator,
         std.Io.failing,
         &.{prompt},
@@ -695,6 +1157,7 @@ test "prompt stream exposes events and terminal messages through event pipe" {
 
     try std.testing.expectEqual(agent.AgentEvent.agent_start, (try stream.next(std.Io.failing)).?);
     while (try stream.next(std.Io.failing)) |_| {}
+    try stream.awaitProducer();
     try std.testing.expectEqual(@as(usize, 2), stream.result().?.len);
 }
 
@@ -730,6 +1193,89 @@ test "run prompt executes tool result then continues assistant turn" {
     try std.testing.expectEqual(@as(usize, 2), stream_calls);
     try std.testing.expectEqual(@as(usize, 1), tool_calls);
     try std.testing.expect(events.items[events.items.len - 1] == .agent_end);
+}
+
+test "parallel tool calls emit bounded live updates through owner" {
+    var events = std.ArrayList(agent.AgentEvent).empty;
+    defer events.deinit(std.testing.allocator);
+    var cancel: runtime.CancelSource = .{};
+    var stream_calls: usize = 0;
+    var tool_calls: usize = 0;
+    const prompt = userMessage("hello");
+    const tool: agent.AgentTool = .{
+        .name = "echo",
+        .description = "Echo",
+        .parameters = .{ .object = .empty },
+        .label = "Echo",
+        .execute = .{ .context = &tool_calls, .call_fn = updatingTool },
+    };
+
+    try runPrompt(
+        std.testing.allocator,
+        std.Io.failing,
+        &.{prompt},
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
+        .{
+            .model = testModel(),
+            .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
+            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .tool_execution = .parallel,
+        },
+        cancel.token(),
+        .{ .context = &events, .call_fn = testSink },
+    );
+
+    var update_count: usize = 0;
+    for (events.items) |event| {
+        if (event == .tool_execution_update) update_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), tool_calls);
+    try std.testing.expectEqual(@as(usize, 1), update_count);
+}
+
+test "parallel tool calls finalize results in assistant source order" {
+    var events = std.ArrayList(agent.AgentEvent).empty;
+    defer events.deinit(std.testing.allocator);
+    var cancel: runtime.CancelSource = .{};
+    var stream_calls: usize = 0;
+    var tool_calls: usize = 0;
+    const prompt = userMessage("hello");
+    const tool: agent.AgentTool = .{
+        .name = "echo",
+        .description = "Echo",
+        .parameters = .{ .object = .empty },
+        .label = "Echo",
+        .execute = .{ .context = &tool_calls, .call_fn = echoTool },
+    };
+
+    try runPrompt(
+        std.testing.allocator,
+        std.Io.failing,
+        &.{prompt},
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
+        .{
+            .model = testModel(),
+            .stream = .{ .context = &stream_calls, .call_fn = testTwoToolStream },
+            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .tool_execution = .parallel,
+        },
+        cancel.token(),
+        .{ .context = &events, .call_fn = testSink },
+    );
+
+    var tool_result_count: usize = 0;
+    for (events.items) |event| {
+        if (event == .message_end and event.message_end.message == .tool_result) {
+            const message = event.message_end.message.tool_result;
+            if (tool_result_count == 0) try std.testing.expectEqualStrings("tool-1", message.tool_call_id);
+            if (tool_result_count == 1) try std.testing.expectEqualStrings("tool-2", message.tool_call_id);
+            tool_result_count += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), tool_calls);
+    try std.testing.expectEqual(@as(usize, 2), tool_result_count);
 }
 
 test "run continue rejects assistant tail" {

@@ -240,15 +240,28 @@ pub fn promptMessage(self: *Agent, message: agent.AgentMessage) !void {
 }
 
 pub fn promptMessages(self: *Agent, messages: []const agent.AgentMessage) !void {
+    try self.runPromptMessages(messages, false);
+}
+
+fn promptMessagesSkipInitialSteering(self: *Agent, messages: []const agent.AgentMessage) !void {
+    try self.runPromptMessages(messages, true);
+}
+
+fn runPromptMessages(self: *Agent, messages: []const agent.AgentMessage, skip_initial_steering: bool) !void {
     const token = try self.beginRun();
     errdefer self.finishRun();
+    var config = self.loop_config;
+    var steering_once: SkipInitialSteeringHook = .{ .agent = self, .skip = skip_initial_steering };
+    if (skip_initial_steering) {
+        config.get_steering_messages = .{ .context = &steering_once, .call_fn = skipInitialSteeringMessages };
+    }
 
     agent.loop.runPrompt(
         self.allocator,
         self.io,
         messages,
         self.contextSnapshot(),
-        self.loop_config,
+        config,
         token,
         .{ .context = self, .call_fn = emitFromLoop },
     ) catch |err| {
@@ -268,11 +281,9 @@ pub fn continueRun(self: *Agent) !void {
 
     if (last == .assistant) {
         if (self.steering_queue.hasItems()) {
-            while (self.steering_queue.hasItems()) {
-                const drained = try self.steering_queue.drain(self.allocator);
-                defer self.allocator.free(drained);
-                try self.promptMessages(drained);
-            }
+            const drained = try self.steering_queue.drain(self.allocator);
+            defer self.allocator.free(drained);
+            try self.promptMessagesSkipInitialSteering(drained);
             return;
         }
         if (self.follow_up_queue.hasItems()) {
@@ -338,12 +349,10 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
 
 fn recordRunFailure(self: *Agent, token: runtime.CancelToken, message: []const u8) !void {
     const stop_reason: ai.StopReason = if (token.isRequested()) .aborted else .error_;
-    var assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
-    try self.emitEvent(.{ .message_start = .{ .message = .{ .assistant = assistant } } });
-    try self.emitEvent(.{ .message_end = .{ .message = .{ .assistant = assistant } } });
-    assistant.error_message = message;
+    const assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
+    try self.appendMessage(.{ .assistant = assistant });
     self.state.status = .{ .failed = message };
-    try self.emitEvent(.{ .agent_end = .{ .messages = self.state.messages } });
+    try self.emitEvent(.{ .agent_end = .{ .messages = &.{.{ .assistant = assistant }} } });
 }
 
 fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_message: ?[]const u8) ai.AssistantMessage {
@@ -357,6 +366,23 @@ fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_messag
         .error_message = error_message,
         .timestamp = 0,
     };
+}
+
+const SkipInitialSteeringHook = struct {
+    agent: *Agent,
+    skip: bool,
+};
+
+fn skipInitialSteeringMessages(
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+) std.mem.Allocator.Error![]const agent.AgentMessage {
+    const hook: *SkipInitialSteeringHook = @ptrCast(@alignCast(context.?));
+    if (hook.skip) {
+        hook.skip = false;
+        return allocator.alloc(agent.AgentMessage, 0);
+    }
+    return hook.agent.steering_queue.drain(allocator);
 }
 
 fn contextSnapshot(self: *const Agent) agent.AgentContext {
@@ -886,7 +912,7 @@ test "continue rejects empty transcript" {
     try std.testing.expectError(error.NoMessages, self.continueRun());
 }
 
-test "continue from assistant drains steering one at a time" {
+test "continue from assistant drains one steering batch" {
     var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
     defer self.deinit();
     try self.appendMessage(assistantMessage("done"));

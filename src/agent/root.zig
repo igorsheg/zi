@@ -6,6 +6,7 @@ pub const Agent = @import("Agent.zig");
 pub const loop = @import("loop.zig");
 
 pub const max_tool_calls_per_turn = 32;
+pub const max_tool_updates_per_batch = 256;
 
 pub const ToolExecutionMode = enum {
     sequential,
@@ -139,10 +140,10 @@ pub const AgentState = struct {
 
 pub const AgentToolUpdateCallback = struct {
     context: ?*anyopaque = null,
-    call_fn: *const fn (?*anyopaque, AgentToolResult) void,
+    call_fn: *const fn (?*anyopaque, AgentToolResult) anyerror!void,
 
-    pub fn call(self: AgentToolUpdateCallback, partial_result: AgentToolResult) void {
-        self.call_fn(self.context, partial_result);
+    pub fn call(self: AgentToolUpdateCallback, partial_result: AgentToolResult) anyerror!void {
+        try self.call_fn(self.context, partial_result);
     }
 };
 
@@ -300,13 +301,13 @@ pub const BeforeToolCallHook = struct {
 
 pub const AfterToolCallHook = struct {
     context: ?*anyopaque = null,
-    call_fn: *const fn (?*anyopaque, runtime.CancelToken, AfterToolCallContext) ?AfterToolCallResult,
+    call_fn: *const fn (?*anyopaque, runtime.CancelToken, AfterToolCallContext) anyerror!?AfterToolCallResult,
 
     pub fn call(
         self: AfterToolCallHook,
         token: runtime.CancelToken,
         context: AfterToolCallContext,
-    ) ?AfterToolCallResult {
+    ) anyerror!?AfterToolCallResult {
         return self.call_fn(self.context, token, context);
     }
 };
