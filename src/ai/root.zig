@@ -6,6 +6,7 @@ pub const sanitize_unicode = @import("sanitize_unicode.zig");
 pub const headers_api = @import("headers.zig");
 pub const hash_api = @import("hash.zig");
 pub const json_parse = @import("json_parse.zig");
+pub const faux = @import("providers/faux.zig");
 pub const provider_registry = @import("provider_registry.zig");
 pub const stream_api = @import("stream.zig");
 
@@ -47,6 +48,7 @@ pub const StreamingJson = json_parse.StreamingJson;
 pub const repairJson = json_parse.repairJson;
 pub const parseJsonWithRepair = json_parse.parseJsonWithRepair;
 pub const parseStreamingJson = json_parse.parseStreamingJson;
+pub const FauxProvider = faux.Provider;
 pub const TextSignatureV1 = protocol.TextSignatureV1;
 pub const TextContent = protocol.TextContent;
 pub const ThinkingContent = protocol.ThinkingContent;
@@ -86,6 +88,7 @@ test {
     _ = headers_api;
     _ = hash_api;
     _ = json_parse;
+    _ = faux;
     _ = protocol;
     _ = provider_registry;
     _ = stream_api;
