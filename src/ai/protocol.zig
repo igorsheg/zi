@@ -105,6 +105,7 @@ pub const StreamRequest = struct {
     model: Model,
     context: Context,
     options: StreamOptions = .{},
+    cancel_token: ?runtime.CancelToken = null,
     event_buffer: []AssistantMessageEvent,
 };
 
