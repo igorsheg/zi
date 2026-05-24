@@ -42,8 +42,8 @@ pub fn EventPipe(comptime Event: type, comptime Result: type) type {
                 try self.pipe.emit(io, event);
             }
 
-            pub fn emitTerminal(self: Sink, io: std.Io, event: Event, terminal_result: Result) EmitError!void {
-                try self.pipe.emitTerminal(io, event, terminal_result);
+            pub fn end(self: Sink, io: std.Io, event: Event, terminal_result: Result) EmitError!void {
+                try self.pipe.end(io, event, terminal_result);
             }
         };
 
@@ -64,7 +64,7 @@ pub fn EventPipe(comptime Event: type, comptime Result: type) type {
             try self.queue.putOne(io, event);
         }
 
-        fn emitTerminal(self: *Self, io: std.Io, event: Event, terminal_result: Result) EmitError!void {
+        fn end(self: *Self, io: std.Io, event: Event, terminal_result: Result) EmitError!void {
             if (self.terminal_result != null) return error.Terminal;
             try self.queue.putOne(io, event);
             self.terminal_result = terminal_result;
@@ -100,7 +100,7 @@ test "event pipe drains events in order before terminal" {
     const stream = pipe.stream();
 
     try sink.emit(std.Io.failing, 1);
-    try sink.emitTerminal(std.Io.failing, 2, 9);
+    try sink.end(std.Io.failing, 2, 9);
 
     try std.testing.expectEqual(@as(?u8, 1), try stream.next(std.Io.failing));
     try std.testing.expectEqual(@as(?u8, 2), try stream.next(std.Io.failing));
@@ -114,7 +114,7 @@ test "event pipe rejects events after terminal" {
     var pipe = Pipe.init(&buffer);
     const sink = pipe.sink();
 
-    try sink.emitTerminal(std.Io.failing, 1, 9);
+    try sink.end(std.Io.failing, 1, 9);
     try std.testing.expectError(error.Terminal, sink.emit(std.Io.failing, 2));
 }
 

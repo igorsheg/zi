@@ -1,5 +1,8 @@
 pub const protocol = @import("protocol.zig");
+pub const owned = @import("owned.zig");
+pub const models_api = @import("models.zig");
 pub const provider_registry = @import("provider_registry.zig");
+pub const stream_api = @import("stream.zig");
 
 pub const Api = protocol.Api;
 pub const Provider = protocol.Provider;
@@ -16,6 +19,15 @@ pub const SimpleStreamOptions = protocol.SimpleStreamOptions;
 pub const Model = protocol.Model;
 pub const StreamRequest = protocol.StreamRequest;
 pub const StreamFunction = protocol.StreamFunction;
+pub const OwnedAssistantMessage = owned.OwnedAssistantMessage;
+pub const models = models_api.models;
+pub const modelProviders = models_api.providers;
+pub const getModel = models_api.getModel;
+pub const getProviders = models_api.getProviders;
+pub const getModels = models_api.getModels;
+pub const calculateCost = models_api.calculateCost;
+pub const supportsXhigh = models_api.supportsXhigh;
+pub const modelsAreEqual = models_api.modelsAreEqual;
 pub const TextSignatureV1 = protocol.TextSignatureV1;
 pub const TextContent = protocol.TextContent;
 pub const ThinkingContent = protocol.ThinkingContent;
@@ -36,11 +48,21 @@ pub const AssistantMessageEvent = protocol.AssistantMessageEvent;
 pub const DoneReason = protocol.DoneReason;
 pub const ErrorReason = protocol.ErrorReason;
 pub const AssistantMessageEventStream = protocol.AssistantMessageEventStream;
+pub const AssistantMessageEventStreamNextError = protocol.AssistantMessageEventStreamNextError;
 pub const AssistantMessageEventSink = protocol.AssistantMessageEventSink;
+pub const AssistantMessageEventSinkEmitError = protocol.AssistantMessageEventSinkEmitError;
 pub const ApiProvider = provider_registry.ApiProvider;
 pub const ProviderRegistry = provider_registry.ProviderRegistry;
+pub const StreamError = stream_api.StreamError;
+pub const stream = stream_api.stream;
+pub const streamSimple = stream_api.streamSimple;
+pub const complete = stream_api.complete;
+pub const completeSimple = stream_api.completeSimple;
 
 test {
+    _ = owned;
+    _ = models_api;
     _ = protocol;
     _ = provider_registry;
+    _ = stream_api;
 }

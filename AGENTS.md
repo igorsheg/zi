@@ -49,6 +49,7 @@ Rules:
 ## zig craft
 
 - Read before writing. Trace before fixing.
+- Protocol types describe shape, not ownership; owned wrappers describe lifetime.
 - Small structs, explicit lifetimes, owned wrappers.
 - State machines over callback control flow.
 - Zi-shaped code over dependency-shaped ports.

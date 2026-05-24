@@ -306,6 +306,9 @@ pub const ErrorReason = enum {
 
 const AssistantEventPipe = runtime.EventPipe(AssistantMessageEvent, AssistantMessage);
 
+pub const AssistantMessageEventStreamNextError = AssistantEventPipe.NextError;
+pub const AssistantMessageEventSinkEmitError = AssistantEventPipe.EmitError;
+
 pub const AssistantMessageEventStream = struct {
     pipe: AssistantEventPipe,
 
@@ -347,12 +350,73 @@ pub const AssistantMessageEventSink = struct {
         event: AssistantMessageEvent,
     ) AssistantEventPipe.EmitError!void {
         switch (event) {
-            .done => |done| try self.pipe.emitTerminal(io, event, done.message),
-            .@"error" => |err| try self.pipe.emitTerminal(io, event, err.@"error"),
+            .done => |done| try self.pipe.end(io, event, done.message),
+            .@"error" => |err| try self.pipe.end(io, event, err.@"error"),
             else => try self.pipe.emit(io, event),
         }
     }
+
+    pub fn endDone(
+        self: AssistantMessageEventSink,
+        io: std.Io,
+        reason: DoneReason,
+        message: AssistantMessage,
+    ) AssistantEventPipe.EmitError!void {
+        try self.pipe.end(io, .{ .done = .{ .reason = reason, .message = message } }, message);
+    }
+
+    pub fn endError(
+        self: AssistantMessageEventSink,
+        io: std.Io,
+        reason: ErrorReason,
+        message: AssistantMessage,
+    ) AssistantEventPipe.EmitError!void {
+        try self.pipe.end(io, .{ .@"error" = .{ .reason = reason, .@"error" = message } }, message);
+    }
+
+    pub fn endAborted(
+        self: AssistantMessageEventSink,
+        io: std.Io,
+        message: AssistantMessage,
+    ) AssistantEventPipe.EmitError!void {
+        std.debug.assert(message.stop_reason == .aborted);
+        try self.endError(io, .aborted, message);
+    }
 };
+
+pub fn emptyAssistantMessageFromRequest(
+    request: StreamRequest,
+    stop_reason: StopReason,
+    error_message: ?[]const u8,
+) AssistantMessage {
+    return .{
+        .content = &.{},
+        .api = request.model.api,
+        .provider = request.model.provider,
+        .model = request.model.id,
+        .usage = emptyUsage(),
+        .stop_reason = stop_reason,
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+}
+
+pub fn emptyUsage() Usage {
+    return .{
+        .input = 0,
+        .output = 0,
+        .cache_read = 0,
+        .cache_write = 0,
+        .total_tokens = 0,
+        .cost = .{
+            .input = 0,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total = 0,
+        },
+    };
+}
 
 test "stream function calls provider implementation with request" {
     var event_buffer: [1]AssistantMessageEvent = undefined;
@@ -382,12 +446,11 @@ test "known api and provider names stay wire strings" {
 
 test "assistant stream derives terminal message from done event" {
     const message = emptyAssistantMessage(.stop);
-    const event: AssistantMessageEvent = .{ .done = .{ .reason = .stop, .message = message } };
     var buffer: [1]AssistantMessageEvent = undefined;
     var stream = AssistantMessageEventStream.init(&buffer);
     const sink = stream.sink();
 
-    try sink.emit(std.Io.failing, event);
+    try sink.endDone(std.Io.failing, .stop, message);
 
     const received = try stream.next(std.Io.failing);
     try std.testing.expect(received.? == .done);
@@ -397,13 +460,12 @@ test "assistant stream derives terminal message from done event" {
 
 test "assistant stream drains events and returns result" {
     const message = emptyAssistantMessage(.stop);
-    const event: AssistantMessageEvent = .{ .done = .{ .reason = .stop, .message = message } };
     var buffer: [1]AssistantMessageEvent = undefined;
     var stream = AssistantMessageEventStream.init(&buffer);
     const sink = stream.sink();
     var handler: CountingHandler = .{};
 
-    try sink.emit(std.Io.failing, event);
+    try sink.endDone(std.Io.failing, .stop, message);
 
     const result_message = try AssistantMessageEventStream.drain(CountingHandler, std.Io.failing, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), handler.event_count);
@@ -413,16 +475,34 @@ test "assistant stream drains events and returns result" {
 test "assistant stream derives terminal message from error event" {
     var message = emptyAssistantMessage(.aborted);
     message.error_message = "aborted";
-    const event: AssistantMessageEvent = .{ .@"error" = .{ .reason = .aborted, .@"error" = message } };
     var buffer: [1]AssistantMessageEvent = undefined;
     var stream = AssistantMessageEventStream.init(&buffer);
     const sink = stream.sink();
 
-    try sink.emit(std.Io.failing, event);
+    try sink.endAborted(std.Io.failing, message);
 
     const received = try stream.next(std.Io.failing);
     try std.testing.expect(received.? == .@"error");
     try std.testing.expectEqual(@as(?AssistantMessage, message), stream.result());
+}
+
+test "empty assistant message from request preserves provider identity" {
+    var event_buffer: [1]AssistantMessageEvent = undefined;
+    const request: StreamRequest = .{
+        .allocator = std.testing.allocator,
+        .io = std.Io.failing,
+        .model = emptyModel(),
+        .context = .{ .messages = &.{} },
+        .event_buffer = &event_buffer,
+    };
+
+    const message = emptyAssistantMessageFromRequest(request, .aborted, "aborted");
+
+    try std.testing.expectEqualStrings(KnownApi.openai_responses, message.api);
+    try std.testing.expectEqualStrings(KnownProvider.openai, message.provider);
+    try std.testing.expectEqualStrings("test-model", message.model);
+    try std.testing.expectEqual(StopReason.aborted, message.stop_reason);
+    try std.testing.expectEqualStrings("aborted", message.error_message.?);
 }
 
 const CountingHandler = struct {
