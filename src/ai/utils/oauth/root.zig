@@ -60,17 +60,27 @@ pub const OAuthProviderInterface = struct {
     name: []const u8,
     uses_callback_server: bool = false,
     context: ?*anyopaque = null,
-    login_fn: *const fn (?*anyopaque, OAuthLoginCallbacks) anyerror!OAuthCredentials,
-    refresh_token_fn: *const fn (?*anyopaque, OAuthCredentials) anyerror!OAuthCredentials,
+    login_fn: *const fn (std.mem.Allocator, std.Io, ?*anyopaque, OAuthLoginCallbacks) anyerror!OAuthCredentials,
+    refresh_token_fn: *const fn (std.mem.Allocator, std.Io, ?*anyopaque, OAuthCredentials) anyerror!OAuthCredentials,
     get_api_key_fn: *const fn (?*anyopaque, OAuthCredentials) anyerror![]const u8,
     modify_models_fn: ?*const fn (?*anyopaque, []protocol.Model, OAuthCredentials) anyerror![]protocol.Model = null,
 
-    pub fn login(self: OAuthProviderInterface, callbacks: OAuthLoginCallbacks) !OAuthCredentials {
-        return self.login_fn(self.context, callbacks);
+    pub fn login(
+        self: OAuthProviderInterface,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        callbacks: OAuthLoginCallbacks,
+    ) !OAuthCredentials {
+        return self.login_fn(allocator, io, self.context, callbacks);
     }
 
-    pub fn refreshToken(self: OAuthProviderInterface, credentials: OAuthCredentials) !OAuthCredentials {
-        return self.refresh_token_fn(self.context, credentials);
+    pub fn refreshToken(
+        self: OAuthProviderInterface,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        credentials: OAuthCredentials,
+    ) !OAuthCredentials {
+        return self.refresh_token_fn(allocator, io, self.context, credentials);
     }
 
     pub fn getApiKey(self: OAuthProviderInterface, credentials: OAuthCredentials) ![]const u8 {
@@ -147,8 +157,8 @@ test "oauth provider interface delegates to callbacks" {
         .modify_models_fn = testModifyModels,
     };
     const callbacks: OAuthLoginCallbacks = .{ .on_auth_fn = noopOnAuth, .on_prompt_fn = noopOnPrompt };
-    const credentials = try provider.login(callbacks);
-    const refreshed = try provider.refreshToken(credentials);
+    const credentials = try provider.login(std.testing.allocator, std.Io.failing, callbacks);
+    const refreshed = try provider.refreshToken(std.testing.allocator, std.Io.failing, credentials);
     const api_key = try provider.getApiKey(refreshed);
     var models = [_]protocol.Model{testModel()};
     const modified_models = try provider.modifyModels(&models, refreshed);
@@ -203,14 +213,24 @@ const ProviderCalls = struct {
     modify_models_count: usize = 0,
 };
 
-fn testLogin(context: ?*anyopaque, callbacks: OAuthLoginCallbacks) !OAuthCredentials {
+fn testLogin(
+    _: std.mem.Allocator,
+    _: std.Io,
+    context: ?*anyopaque,
+    callbacks: OAuthLoginCallbacks,
+) !OAuthCredentials {
     const calls: *ProviderCalls = @ptrCast(@alignCast(context.?));
     calls.login_count += 1;
     try callbacks.onAuth(.{ .url = "https://example.test" });
     return .{ .refresh = "refresh", .access = "access", .expires = 1 };
 }
 
-fn testRefreshToken(context: ?*anyopaque, credentials: OAuthCredentials) !OAuthCredentials {
+fn testRefreshToken(
+    _: std.mem.Allocator,
+    _: std.Io,
+    context: ?*anyopaque,
+    credentials: OAuthCredentials,
+) !OAuthCredentials {
     const calls: *ProviderCalls = @ptrCast(@alignCast(context.?));
     calls.refresh_count += 1;
     return .{ .refresh = credentials.refresh, .access = "refreshed", .expires = 2 };

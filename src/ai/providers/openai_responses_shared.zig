@@ -113,7 +113,10 @@ pub const ResponseStreamReducer = struct {
             if (jsonString(object.get("arguments"))) |arguments| try self.finishToolArguments(io, sink, arguments);
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
             if (object.get("item")) |item| if (item == .object) try self.finishItem(io, sink, item.object);
-        } else if (std.mem.eql(u8, event_type, "response.completed")) {
+        } else if (std.mem.eql(u8, event_type, "response.completed") or
+            std.mem.eql(u8, event_type, "response.done") or
+            std.mem.eql(u8, event_type, "response.incomplete"))
+        {
             if (object.get("response")) |response| if (response == .object) try self.applyCompleted(response.object);
         } else if (std.mem.eql(u8, event_type, "error")) {
             self.output.stop_reason = .error_;

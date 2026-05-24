@@ -10,6 +10,12 @@ pub const redirect_uri = "http://localhost:1455/auth/callback";
 pub const scope = "openid profile email offline_access";
 pub const jwt_claim_path = "https://api.openai.com/auth";
 
+const read_buffer_len = 8192;
+const redirect_buffer_len = 0;
+const max_error_body_bytes = 16 * 1024;
+const callback_read_buffer_len = 4096;
+const callback_write_buffer_len = 4096;
+
 pub const AuthorizationFlow = struct {
     verifier: []u8,
     state: []u8,
@@ -162,12 +168,214 @@ fn decodeBase64Url(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     return output;
 }
 
-fn login(_: ?*anyopaque, _: oauth.OAuthLoginCallbacks) !oauth.OAuthCredentials {
-    return error.NotImplemented;
+fn login(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    _: ?*anyopaque,
+    callbacks: oauth.OAuthLoginCallbacks,
+) !oauth.OAuthCredentials {
+    var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Clock.awake.now(io).nanoseconds));
+    var flow = try createAuthorizationFlow(allocator, prng.random(), "zi");
+    defer flow.deinit(allocator);
+
+    var callback_server = CallbackServer.start(io) catch null;
+    defer if (callback_server) |*server| server.deinit(io);
+
+    try callbacks.onAuth(.{
+        .url = flow.url,
+        .instructions = "Complete login in the browser. If callback capture fails, paste the redirect URL or code.",
+    });
+
+    const code = if (try callbacks.onManualCodeInput()) |manual|
+        try codeFromInput(allocator, manual, flow.state)
+    else if (callback_server) |*server|
+        server.waitForCode(allocator, io, flow.state) catch try promptForCode(allocator, callbacks, flow.state)
+    else
+        try promptForCode(allocator, callbacks, flow.state);
+    defer allocator.free(code);
+    return exchangeAuthorizationCode(allocator, io, code, flow.verifier);
 }
 
-fn refreshToken(_: ?*anyopaque, _: oauth.OAuthCredentials) !oauth.OAuthCredentials {
-    return error.NotImplemented;
+const CallbackServer = struct {
+    server: std.Io.net.Server,
+
+    fn start(io: std.Io) !CallbackServer {
+        const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(callback_port) };
+        return .{ .server = try address.listen(io, .{ .reuse_address = true }) };
+    }
+
+    fn deinit(self: *CallbackServer, io: std.Io) void {
+        self.server.deinit(io);
+        self.* = undefined;
+    }
+
+    fn waitForCode(
+        self: *CallbackServer,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        expected_state: []const u8,
+    ) ![]const u8 {
+        var stream = try self.server.accept(io);
+        defer stream.close(io);
+        var read_buffer: [callback_read_buffer_len]u8 = undefined;
+        var write_buffer: [callback_write_buffer_len]u8 = undefined;
+        var reader = stream.reader(io, &read_buffer);
+        var writer = stream.writer(io, &write_buffer);
+        var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+        var request = try http_server.receiveHead();
+        if (!std.mem.startsWith(u8, request.head.target, "/auth/callback")) {
+            try request.respond(oauth.oauthErrorHtml("Callback route not found."), .{ .status = .not_found });
+            return error.CallbackRouteNotFound;
+        }
+        const input = parseAuthorizationInput(request.head.target);
+        if (input.state == null or !std.mem.eql(u8, input.state.?, expected_state)) {
+            try request.respond(oauth.oauthErrorHtml("State mismatch."), .{ .status = .bad_request });
+            return error.StateMismatch;
+        }
+        const code = input.code orelse {
+            try request.respond(oauth.oauthErrorHtml("Missing authorization code."), .{ .status = .bad_request });
+            return error.MissingAuthorizationCode;
+        };
+        const owned_code = try allocator.dupe(u8, code);
+        errdefer allocator.free(owned_code);
+        try request.respond(oauth.oauthSuccessHtml("OpenAI authentication completed. You can close this window."), .{});
+        return owned_code;
+    }
+};
+
+fn promptForCode(
+    allocator: std.mem.Allocator,
+    callbacks: oauth.OAuthLoginCallbacks,
+    expected_state: []const u8,
+) ![]const u8 {
+    const input = try callbacks.onPrompt(.{ .message = "Paste the OpenAI Codex authorization code or redirect URL:" });
+    return codeFromInput(allocator, input, expected_state);
+}
+
+fn codeFromInput(allocator: std.mem.Allocator, input: []const u8, expected_state: []const u8) ![]const u8 {
+    const parsed = parseAuthorizationInput(input);
+    if (parsed.state) |state| if (!std.mem.eql(u8, state, expected_state)) return error.StateMismatch;
+    const code = parsed.code orelse return error.MissingAuthorizationCode;
+    return allocator.dupe(u8, code);
+}
+
+fn refreshToken(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    _: ?*anyopaque,
+    credentials: oauth.OAuthCredentials,
+) !oauth.OAuthCredentials {
+    return refreshAccessToken(allocator, io, credentials.refresh);
+}
+
+fn exchangeAuthorizationCode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    code: []const u8,
+    verifier: []const u8,
+) !oauth.OAuthCredentials {
+    var body = std.Io.Writer.Allocating.init(allocator);
+    defer body.deinit();
+    try appendParam(&body.writer, "grant_type", "authorization_code", false);
+    try appendParam(&body.writer, "client_id", client_id, true);
+    try appendParam(&body.writer, "code", code, true);
+    try appendParam(&body.writer, "code_verifier", verifier, true);
+    try appendParam(&body.writer, "redirect_uri", redirect_uri, true);
+    return requestToken(allocator, io, body.written());
+}
+
+fn refreshAccessToken(allocator: std.mem.Allocator, io: std.Io, refresh_token: []const u8) !oauth.OAuthCredentials {
+    var body = std.Io.Writer.Allocating.init(allocator);
+    defer body.deinit();
+    try appendParam(&body.writer, "grant_type", "refresh_token", false);
+    try appendParam(&body.writer, "refresh_token", refresh_token, true);
+    try appendParam(&body.writer, "client_id", client_id, true);
+    return requestToken(allocator, io, body.written());
+}
+
+fn requestToken(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oauth.OAuthCredentials {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+    const uri = try std.Uri.parse(token_url);
+    var req = try client.request(.POST, uri, .{
+        .headers = .{
+            .content_type = .{ .override = "application/x-www-form-urlencoded" },
+            .accept_encoding = .omit,
+        },
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+    });
+    defer req.deinit();
+
+    req.transfer_encoding = .{ .content_length = body.len };
+    var body_writer = try req.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(body);
+    try body_writer.end();
+    try req.connection.?.flush();
+
+    var redirects: [redirect_buffer_len]u8 = .{};
+    var response = try req.receiveHead(&redirects);
+    var transfer_buffer: [read_buffer_len]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    const response_body = try readResponseBody(allocator, reader);
+    defer allocator.free(response_body);
+    if (response.head.status != .ok) return error.TokenRequestFailed;
+    return parseTokenResponse(allocator, io, response_body);
+}
+
+fn readResponseBody(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
+    var body = std.Io.Writer.Allocating.init(allocator);
+    errdefer body.deinit();
+    while (body.written().len < max_error_body_bytes) {
+        var chunk: [1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&chunk);
+        const remaining = @min(chunk.len, max_error_body_bytes - body.written().len);
+        const n = reader.stream(&writer, .limited(remaining)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) continue;
+        try body.writer.writeAll(chunk[0..n]);
+    }
+    return body.toOwnedSlice();
+}
+
+fn parseTokenResponse(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oauth.OAuthCredentials {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidTokenResponse;
+    const object = parsed.value.object;
+    const access = jsonString(object.get("access_token")) orelse return error.InvalidTokenResponse;
+    const refresh = jsonString(object.get("refresh_token")) orelse return error.InvalidTokenResponse;
+    const expires_in = jsonI64(object.get("expires_in")) orelse return error.InvalidTokenResponse;
+    const account_id = try getAccountId(allocator, access) orelse return error.MissingAccountId;
+    allocator.free(account_id);
+    const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000));
+    return .{
+        .access = try allocator.dupe(u8, access),
+        .refresh = try allocator.dupe(u8, refresh),
+        .expires = now_ms + expires_in * 1000,
+    };
+}
+
+fn jsonString(value: ?std.json.Value) ?[]const u8 {
+    const resolved = value orelse return null;
+    return switch (resolved) {
+        .string => |string| string,
+        else => null,
+    };
+}
+
+fn jsonI64(value: ?std.json.Value) ?i64 {
+    const resolved = value orelse return null;
+    return switch (resolved) {
+        .integer => |integer| if (integer >= 0 and integer <= std.math.maxInt(i64)) @intCast(integer) else null,
+        .float => |float| if (float >= 0 and float <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+            @intFromFloat(float)
+        else
+            null,
+        else => null,
+    };
 }
 
 fn getApiKey(_: ?*anyopaque, credentials: oauth.OAuthCredentials) ![]const u8 {
@@ -212,6 +420,30 @@ test "get account id extracts openai auth claim from jwt payload" {
     const account_id = (try getAccountId(std.testing.allocator, token)).?;
     defer std.testing.allocator.free(account_id);
     try std.testing.expectEqualStrings("acct_123", account_id);
+}
+
+test "token response validates account id and owns credentials" {
+    const payload =
+        \\{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}
+    ;
+    const encoded_payload = try oauth.pkce.base64UrlEncode(std.testing.allocator, payload);
+    defer std.testing.allocator.free(encoded_payload);
+    const access = try std.fmt.allocPrint(std.testing.allocator, "header.{s}.signature", .{encoded_payload});
+    defer std.testing.allocator.free(access);
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"refresh\",\"expires_in\":60}}",
+        .{access},
+    );
+    defer std.testing.allocator.free(body);
+
+    const credentials = try parseTokenResponse(std.testing.allocator, std.testing.io, body);
+    defer std.testing.allocator.free(credentials.access);
+    defer std.testing.allocator.free(credentials.refresh);
+
+    try std.testing.expectEqualStrings(access, credentials.access);
+    try std.testing.expectEqualStrings("refresh", credentials.refresh);
+    try std.testing.expect(credentials.expires > 0);
 }
 
 test "openai codex provider exposes access token as api key" {
