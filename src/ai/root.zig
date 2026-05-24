@@ -1,13 +1,14 @@
 pub const protocol = @import("protocol.zig");
 pub const owned = @import("owned.zig");
 pub const models_api = @import("models.zig");
-pub const env_api_keys = @import("env_api_keys.zig");
-pub const sanitize_unicode = @import("sanitize_unicode.zig");
-pub const headers_api = @import("headers.zig");
-pub const hash_api = @import("hash.zig");
-pub const json_parse = @import("json_parse.zig");
+pub const env_api_keys = @import("utils/env_api_keys.zig");
+pub const sanitize_unicode = @import("utils/sanitize_unicode.zig");
+pub const headers_api = @import("utils/headers.zig");
+pub const hash_api = @import("utils/hash.zig");
+pub const json_parse = @import("utils/json_parse.zig");
 pub const faux = @import("providers/faux.zig");
 pub const provider_registry = @import("provider_registry.zig");
+pub const runtime_stream = @import("runtime_stream.zig");
 pub const stream_api = @import("stream.zig");
 
 pub const Api = protocol.Api;
@@ -74,6 +75,9 @@ pub const AssistantMessageEventSink = protocol.AssistantMessageEventSink;
 pub const AssistantMessageEventSinkEmitError = protocol.AssistantMessageEventSinkEmitError;
 pub const ApiProvider = provider_registry.ApiProvider;
 pub const ProviderRegistry = provider_registry.ProviderRegistry;
+pub const RuntimeStreamOperation = runtime_stream.Operation;
+pub const RuntimeStreamCompletion = runtime_stream.Completion;
+pub const RuntimeStreamCompletionQueue = runtime_stream.CompletionQueue;
 pub const StreamError = stream_api.StreamError;
 pub const stream = stream_api.stream;
 pub const streamSimple = stream_api.streamSimple;
@@ -89,6 +93,7 @@ test {
     _ = hash_api;
     _ = json_parse;
     _ = faux;
+    _ = runtime_stream;
     _ = protocol;
     _ = provider_registry;
     _ = stream_api;

@@ -1,5 +1,15 @@
 const std = @import("std");
 
+pub const cancel = @import("cancel.zig");
+pub const completion_queue = @import("completion_queue.zig");
+pub const operation = @import("operation.zig");
+
+pub const CancelSource = cancel.CancelSource;
+pub const CancelToken = cancel.CancelToken;
+pub const CompletionQueue = completion_queue.CompletionQueue;
+pub const OperationId = operation.OperationId;
+pub const OperationState = operation.OperationState;
+pub const OperationTable = operation.OperationTable;
 pub const EventPipe = @import("event_pipe.zig").EventPipe;
 
 pub const Process = struct {
@@ -17,6 +27,9 @@ pub const Process = struct {
 };
 
 test {
+    _ = cancel;
+    _ = completion_queue;
+    _ = operation;
     _ = @import("event_pipe.zig");
 }
 
