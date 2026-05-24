@@ -1,6 +1,8 @@
 pub const protocol = @import("protocol.zig");
 pub const owned = @import("owned.zig");
 pub const models_api = @import("models.zig");
+pub const env_api_keys = @import("env_api_keys.zig");
+pub const sanitize_unicode = @import("sanitize_unicode.zig");
 pub const provider_registry = @import("provider_registry.zig");
 pub const stream_api = @import("stream.zig");
 
@@ -28,6 +30,11 @@ pub const getModels = models_api.getModels;
 pub const calculateCost = models_api.calculateCost;
 pub const supportsXhigh = models_api.supportsXhigh;
 pub const modelsAreEqual = models_api.modelsAreEqual;
+pub const EnvApiKey = env_api_keys.EnvApiKey;
+pub const getApiKeyEnvVars = env_api_keys.getApiKeyEnvVars;
+pub const findEnvKey = env_api_keys.findEnvKey;
+pub const getEnvApiKey = env_api_keys.getEnvApiKey;
+pub const sanitizeSurrogates = sanitize_unicode.sanitizeSurrogates;
 pub const TextSignatureV1 = protocol.TextSignatureV1;
 pub const TextContent = protocol.TextContent;
 pub const ThinkingContent = protocol.ThinkingContent;
@@ -62,6 +69,8 @@ pub const completeSimple = stream_api.completeSimple;
 test {
     _ = owned;
     _ = models_api;
+    _ = env_api_keys;
+    _ = sanitize_unicode;
     _ = protocol;
     _ = provider_registry;
     _ = stream_api;
