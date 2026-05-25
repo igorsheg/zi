@@ -2,6 +2,7 @@ const std = @import("std");
 const oauth_openai_codex = @import("../utils/oauth/openai_codex.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
+const runtime = @import("../../runtime/root.zig");
 const sse = @import("../sse.zig");
 const shared = @import("openai_responses_shared.zig");
 const simple_options = @import("simple_options.zig");
@@ -62,6 +63,11 @@ fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protoco
 
     run(self, request, sink) catch |err| {
         if (err == error.ErrorEmitted) return stream;
+        if (err == error.OperationCancelled or err == error.Canceled) {
+            const message = protocol.emptyAssistantMessageFromRequest(request, .aborted, "Request was aborted");
+            sink.endAborted(request.io, message) catch return stream;
+            return stream;
+        }
         const message = protocol.emptyAssistantMessageFromRequest(request, .error_, @errorName(err));
         sink.endError(request.io, .error_, message) catch return stream;
     };
@@ -99,13 +105,21 @@ fn requestWithRetries(
             error.RetryableRequestFailed => {
                 last_error = err;
                 if (attempt == retry_count_max) return err;
-                request.io.sleep(retryDelay(attempt, request.options.max_retry_delay_ms), .awake);
+                try runtime.sleep(
+                    request.io,
+                    retryDelay(attempt, request.options.max_retry_delay_ms),
+                    request.cancel_token,
+                );
                 continue;
             },
             else => |other| {
                 last_error = other;
                 if (attempt == retry_count_max or !isRetryableTransportError(other)) return other;
-                request.io.sleep(retryDelay(attempt, request.options.max_retry_delay_ms), .awake);
+                try runtime.sleep(
+                    request.io,
+                    retryDelay(attempt, request.options.max_retry_delay_ms),
+                    request.cancel_token,
+                );
                 continue;
             },
         };

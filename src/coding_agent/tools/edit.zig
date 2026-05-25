@@ -111,7 +111,7 @@ fn execute(
     params: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
 ) anyerror!agent.OwnedAgentToolResult {
-    if (token.isRequested()) return error.OperationCancelled;
+    try token.throwIfRequested();
     const self: *EditTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(allocator, params);
     defer allocator.free(args.edits);
@@ -121,7 +121,7 @@ fn execute(
     var guard = self.queue().lock();
     defer guard.unlock();
 
-    if (token.isRequested()) return error.OperationCancelled;
+    try token.throwIfRequested();
     const original = try std.Io.Dir.readFileAlloc(
         .cwd(),
         io,
@@ -132,7 +132,7 @@ fn execute(
     defer allocator.free(original);
     const edited = try applyEdits(allocator, original, args.edits, self.config.max_output_bytes);
     defer allocator.free(edited);
-    if (token.isRequested()) return error.OperationCancelled;
+    try token.throwIfRequested();
     try atomicWriteFile(allocator, io, resolved_path, edited);
 
     return textResult(allocator, "Successfully replaced {d} block(s) in {s}.", .{ args.edits.len, args.path });

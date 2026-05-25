@@ -59,6 +59,11 @@ fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protoco
 
     run(self, request, sink) catch |err| {
         if (err == error.ErrorEmitted) return stream;
+        if (err == error.OperationCancelled or err == error.Canceled) {
+            const message = protocol.emptyAssistantMessageFromRequest(request, .aborted, "Request was aborted");
+            sink.endAborted(request.io, message) catch return stream;
+            return stream;
+        }
         const message = protocol.emptyAssistantMessageFromRequest(request, .error_, @errorName(err));
         sink.endError(request.io, .error_, message) catch return stream;
     };

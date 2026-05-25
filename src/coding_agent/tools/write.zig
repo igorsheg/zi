@@ -84,7 +84,7 @@ fn execute(
     params: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
 ) anyerror!agent.OwnedAgentToolResult {
-    if (token.isRequested()) return error.OperationCancelled;
+    try token.throwIfRequested();
     const self: *WriteTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(params);
     if (args.content.len > self.config.max_write_bytes) return error.WriteTooLarge;
@@ -94,10 +94,10 @@ fn execute(
     var guard = self.queue().lock();
     defer guard.unlock();
 
-    if (token.isRequested()) return error.OperationCancelled;
+    try token.throwIfRequested();
     if (std.fs.path.dirname(resolved_path)) |dir| try std.Io.Dir.createDirPath(.cwd(), io, dir);
     try atomicWriteFile(allocator, io, resolved_path, args.content);
-    if (token.isRequested()) return error.OperationCancelled;
+    try token.throwIfRequested();
 
     return textResult(allocator, "Successfully wrote {d} bytes to {s}", .{ args.content.len, args.path });
 }

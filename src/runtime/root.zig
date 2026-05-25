@@ -6,6 +6,7 @@ pub const operation = @import("operation.zig");
 
 pub const CancelSource = cancel.CancelSource;
 pub const CancelToken = cancel.CancelToken;
+pub const sleep = cancel.sleep;
 pub const CompletionQueue = completion_queue.CompletionQueue;
 pub const OperationId = operation.OperationId;
 pub const OperationState = operation.OperationState;

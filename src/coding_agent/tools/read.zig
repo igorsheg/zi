@@ -75,7 +75,7 @@ fn execute(
     params: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
 ) anyerror!agent.OwnedAgentToolResult {
-    if (token.isRequested()) return error.OperationCancelled;
+    try token.throwIfRequested();
     const self: *ReadTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(params);
     const resolved_path = try resolvePath(allocator, io, self.config, args.path);
@@ -89,7 +89,7 @@ fn execute(
         .limited(self.config.max_read_bytes),
     );
     defer allocator.free(content);
-    if (token.isRequested()) return error.OperationCancelled;
+    try token.throwIfRequested();
 
     const formatted = try formatReadOutput(allocator, self.config, args, content);
     errdefer formatted.deinit(allocator);
