@@ -1,4 +1,5 @@
 const std = @import("std");
+const skills_mod = @import("skills.zig");
 
 pub const max_context_files = 64;
 pub const max_context_file_bytes = 256 * 1024;
@@ -58,6 +59,7 @@ pub const PromptResources = struct {
     context_files: OwnedContextFiles,
     system_prompt: OwnedPromptFile,
     append_system_prompt: OwnedPromptFile,
+    skills: skills_mod.OwnedSkills,
 
     pub const LoadOptions = struct {
         dir: std.Io.Dir = .cwd(),
@@ -87,10 +89,18 @@ pub const PromptResources = struct {
         });
         errdefer append_system_prompt.deinit();
 
+        var loaded_skills = try skills_mod.loadSkills(allocator, io, .{
+            .dir = options.dir,
+            .agent_dir = options.agent_dir,
+            .cwd = options.cwd,
+        });
+        errdefer loaded_skills.deinit();
+
         return .{
             .context_files = context_files,
             .system_prompt = system_prompt,
             .append_system_prompt = append_system_prompt,
+            .skills = loaded_skills,
         };
     }
 
@@ -98,6 +108,7 @@ pub const PromptResources = struct {
         self.context_files.deinit();
         self.system_prompt.deinit();
         self.append_system_prompt.deinit();
+        self.skills.deinit();
         self.* = undefined;
     }
 
@@ -149,16 +160,16 @@ pub fn loadProjectContextFiles(
     options: LoadProjectContextOptions,
 ) !OwnedContextFiles {
     var files = std.ArrayList(ContextFile).empty;
-    errdefer freeContextFileItems(allocator, files.items);
     errdefer files.deinit(allocator);
+    errdefer freeContextFileItems(allocator, files.items);
 
     if (try loadContextFileFromDir(allocator, io, options.dir, options.agent_dir)) |global| {
         try appendContextFile(allocator, &files, global);
     }
 
     var ancestor_files = std.ArrayList(ContextFile).empty;
-    errdefer freeContextFileItems(allocator, ancestor_files.items);
     errdefer ancestor_files.deinit(allocator);
+    errdefer freeContextFileItems(allocator, ancestor_files.items);
 
     var current_dir = options.cwd;
     var depth: usize = 0;
@@ -286,6 +297,7 @@ test "prompt resources load context and prompt overrides" {
     defer prompt_resources.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), prompt_resources.context_files.files.len);
+    try std.testing.expectEqual(@as(usize, 0), prompt_resources.skills.skills.len);
     try std.testing.expectEqualStrings("system", prompt_resources.customPrompt().?);
     try std.testing.expectEqualStrings("append", prompt_resources.appendSystemPrompt().?);
 }

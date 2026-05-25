@@ -1,5 +1,6 @@
 const std = @import("std");
 const resources = @import("resources.zig");
+const skills_mod = @import("skills.zig");
 
 pub const max_prompt_bytes = 512 * 1024;
 pub const max_tool_snippets = 128;
@@ -17,6 +18,7 @@ pub const BuildOptions = struct {
     tool_snippets: []const ToolSnippet = &.{},
     prompt_guidelines: []const []const u8 = &.{},
     context_files: []const resources.ContextFile = &.{},
+    skills: []const skills_mod.Skill = &.{},
     custom_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
     readme_path: []const u8 = "README.md",
@@ -36,6 +38,7 @@ pub fn build(allocator: std.mem.Allocator, options: BuildOptions) ![]u8 {
         try appendBounded(&writer, custom_prompt);
         try appendAppendSystemPrompt(&writer, options.append_system_prompt);
         try appendProjectContext(&writer, options.context_files);
+        if (containsString(options.selected_tools, "read")) try appendSkills(&writer, options.skills);
         try appendDateAndCwd(&writer, options.current_date, options.cwd);
         return writer.toOwnedSlice();
     };
@@ -56,6 +59,7 @@ pub fn build(allocator: std.mem.Allocator, options: BuildOptions) ![]u8 {
     try appendPiDocumentation(&writer, options);
     try appendAppendSystemPrompt(&writer, options.append_system_prompt);
     try appendProjectContext(&writer, options.context_files);
+    if (containsString(options.selected_tools, "read")) try appendSkills(&writer, options.skills);
     try appendDateAndCwd(&writer, options.current_date, options.cwd);
     return writer.toOwnedSlice();
 }
@@ -179,6 +183,44 @@ fn appendProjectContext(writer: *std.Io.Writer.Allocating, context_files: []cons
     }
 }
 
+fn appendSkills(writer: *std.Io.Writer.Allocating, loaded_skills: []const skills_mod.Skill) !void {
+    if (loaded_skills.len == 0) return;
+    try appendBounded(writer, "\n\nThe following skills provide specialized instructions for specific tasks.\n");
+    try appendBounded(writer, "Use the read tool to load a skill's file when the task matches its description.\n");
+    try appendBounded(
+        writer,
+        "When a skill file references a relative path, resolve it against the skill directory " ++
+            "(parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n",
+    );
+    try appendBounded(writer, "<available_skills>\n");
+    for (loaded_skills) |skill| {
+        try appendBounded(writer, "  <skill>\n    <name>");
+        try appendXmlEscaped(writer, skill.name);
+        try appendBounded(writer, "</name>\n    <description>");
+        try appendXmlEscaped(writer, skill.description);
+        try appendBounded(writer, "</description>\n    <location>");
+        try appendXmlEscaped(writer, skill.path);
+        try appendBounded(writer, "</location>\n  </skill>\n");
+    }
+    try appendBounded(writer, "</available_skills>");
+}
+
+fn appendXmlEscaped(writer: *std.Io.Writer.Allocating, text: []const u8) !void {
+    for (text) |char| {
+        switch (char) {
+            '&' => try appendBounded(writer, "&amp;"),
+            '<' => try appendBounded(writer, "&lt;"),
+            '>' => try appendBounded(writer, "&gt;"),
+            '"' => try appendBounded(writer, "&quot;"),
+            '\'' => try appendBounded(writer, "&apos;"),
+            else => {
+                if (writer.writer.end + 1 > max_prompt_bytes) return error.PromptTooLarge;
+                try writer.writer.writeByte(char);
+            },
+        }
+    }
+}
+
 fn appendDateAndCwd(writer: *std.Io.Writer.Allocating, current_date: []const u8, cwd: []const u8) !void {
     try appendBounded(writer, "\nCurrent date: ");
     try appendBounded(writer, current_date);
@@ -274,6 +316,35 @@ test "empty custom and append prompts are ignored" {
 
     try std.testing.expect(std.mem.startsWith(u8, prompt, "You are an expert coding assistant"));
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\n\n\nCurrent date") == null);
+}
+
+test "skills are included only when read tool is selected" {
+    const loaded_skills = [_]skills_mod.Skill{.{
+        .path = "/repo/.zi/skills/zig/SKILL.md",
+        .name = "zig<&",
+        .description = "use > zig",
+    }};
+    const prompt = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{"read"},
+        .skills = &loaded_skills,
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "zig&lt;&amp;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "use &gt; zig") != null);
+
+    const no_read_prompt = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{"bash"},
+        .skills = &loaded_skills,
+    });
+    defer std.testing.allocator.free(no_read_prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, no_read_prompt, "<available_skills>") == null);
 }
 
 test "custom prompt appends context date and cwd" {
