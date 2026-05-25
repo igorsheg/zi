@@ -19,7 +19,10 @@ pub const SessionContext = session_manager.SessionContext;
 pub const SessionStore = session_store.SessionStore;
 pub const Skill = skills.Skill;
 pub const OwnedSkills = skills.OwnedSkills;
+pub const EditTool = tools.EditTool;
+pub const FileMutationQueue = tools.FileMutationQueue;
 pub const ReadTool = tools.ReadTool;
+pub const WriteTool = tools.WriteTool;
 pub const ToolSnippet = system_prompt.ToolSnippet;
 
 pub const current_session_version = session_manager.current_session_version;
