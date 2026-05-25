@@ -132,7 +132,7 @@ fn discoverPromptFile(
     options: DiscoverPromptFileOptions,
     file_name: []const u8,
 ) !OwnedPromptFile {
-    const project_dir = try std.fs.path.join(allocator, &.{ options.cwd, ".pi" });
+    const project_dir = try std.fs.path.join(allocator, &.{ options.cwd, ".zi" });
     defer allocator.free(project_dir);
     if (try loadPromptFileFromDir(allocator, io, options.dir, project_dir, file_name)) |file| {
         return .{ .allocator = allocator, .file = file };
@@ -272,11 +272,11 @@ test "prompt resources load context and prompt overrides" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo/.pi");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/AGENTS.md", .data = "global" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/AGENTS.md", .data = "repo" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.pi/SYSTEM.md", .data = "system" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.pi/APPEND_SYSTEM.md", .data = "append" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.zi/SYSTEM.md", .data = "system" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.zi/APPEND_SYSTEM.md", .data = "append" });
 
     var prompt_resources = try PromptResources.load(std.testing.allocator, std.testing.io, .{
         .dir = tmp.dir,
@@ -310,7 +310,7 @@ test "system prompt discovery rejects directory at prompt path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io, "repo/.pi/SYSTEM.md");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi/SYSTEM.md");
 
     try std.testing.expectError(error.IsDir, discoverSystemPromptFile(std.testing.allocator, std.testing.io, .{
         .dir = tmp.dir,
@@ -324,9 +324,9 @@ test "discovers project system prompt before global" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo/.pi");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/SYSTEM.md", .data = "global" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.pi/SYSTEM.md", .data = "project" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.zi/SYSTEM.md", .data = "project" });
 
     var file = try discoverSystemPromptFile(std.testing.allocator, std.testing.io, .{
         .dir = tmp.dir,
@@ -336,7 +336,7 @@ test "discovers project system prompt before global" {
     defer file.deinit();
 
     try std.testing.expect(file.file != null);
-    try std.testing.expectEqualStrings("repo/.pi/SYSTEM.md", file.file.?.path);
+    try std.testing.expectEqualStrings("repo/.zi/SYSTEM.md", file.file.?.path);
     try std.testing.expectEqualStrings("project", file.file.?.content);
 }
 
@@ -345,7 +345,7 @@ test "discovers global append system prompt when project prompt is missing" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo/.pi");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/APPEND_SYSTEM.md", .data = "append" });
 
     var file = try discoverAppendSystemPromptFile(std.testing.allocator, std.testing.io, .{

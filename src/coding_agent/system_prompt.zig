@@ -42,7 +42,7 @@ pub fn build(allocator: std.mem.Allocator, options: BuildOptions) ![]u8 {
 
     try appendBounded(
         &writer,
-        "You are an expert coding assistant operating inside pi, a coding agent harness. " ++
+        "You are an expert coding assistant operating inside zi, a coding agent harness. " ++
             "You help users by reading files, executing commands, editing code, and writing new files.\n\n",
     );
     try appendBounded(&writer, "Available tools:\n");
@@ -128,7 +128,7 @@ fn appendGuideline(guidelines: *[max_guidelines][]const u8, len: *usize, guideli
 fn appendPiDocumentation(writer: *std.Io.Writer.Allocating, options: BuildOptions) !void {
     try appendBounded(
         writer,
-        "\nPi documentation (read only when the user asks about pi itself, " ++
+        "\nZi documentation (read only when the user asks about zi itself, " ++
             "its SDK, extensions, themes, skills, or TUI):\n",
     );
     try appendBounded(writer, "- Main documentation: ");
@@ -144,16 +144,16 @@ fn appendPiDocumentation(writer: *std.Io.Writer.Allocating, options: BuildOption
             "themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), " ++
             "TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), " ++
             "custom providers (docs/custom-provider.md), adding models (docs/models.md), " ++
-            "pi packages (docs/packages.md)\n",
+            "zi packages (docs/packages.md)\n",
     );
     try appendBounded(
         writer,
-        "- When working on pi topics, read the docs and examples, " ++
+        "- When working on zi topics, read the docs and examples, " ++
             "and follow .md cross-references before implementing\n",
     );
     try appendBounded(
         writer,
-        "- Always read pi .md files completely and follow links to related docs " ++
+        "- Always read zi .md files completely and follow links to related docs " ++
             "(e.g., tui.md for TUI API details)\n",
     );
 }
@@ -251,15 +251,15 @@ test "default prompt includes pi documentation paths" {
         .cwd = "/repo",
         .current_date = "2026-05-25",
         .selected_tools = &.{},
-        .readme_path = "/pi/README.md",
-        .docs_path = "/pi/docs",
-        .examples_path = "/pi/examples",
+        .readme_path = "/zi/README.md",
+        .docs_path = "/zi/docs",
+        .examples_path = "/zi/examples",
     });
     defer std.testing.allocator.free(prompt);
 
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Main documentation: /pi/README.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Additional docs: /pi/docs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Examples: /pi/examples") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Main documentation: /zi/README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Additional docs: /zi/docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Examples: /zi/examples") != null);
 }
 
 test "empty custom and append prompts are ignored" {
