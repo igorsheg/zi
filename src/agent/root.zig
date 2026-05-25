@@ -50,6 +50,8 @@ pub const AgentMessage = union(enum) {
 };
 
 pub const AgentToolResult = struct {
+    /// Tool results allocate inner content on the provided allocator and transfer
+    /// ownership to the caller according to the agent loop storage contract.
     content: []const ai.ToolResultContent,
     details: ?std.json.Value = null,
     terminate: bool = false,

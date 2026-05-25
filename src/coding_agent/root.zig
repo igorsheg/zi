@@ -4,6 +4,7 @@ pub const session_manager = @import("session_manager.zig");
 pub const session_store = @import("session_store.zig");
 pub const skills = @import("skills.zig");
 pub const system_prompt = @import("system_prompt.zig");
+pub const tools = @import("tools/root.zig");
 
 pub const PersistencePaths = paths.PersistencePaths;
 pub const ContextFile = resources.ContextFile;
@@ -18,6 +19,7 @@ pub const SessionContext = session_manager.SessionContext;
 pub const SessionStore = session_store.SessionStore;
 pub const Skill = skills.Skill;
 pub const OwnedSkills = skills.OwnedSkills;
+pub const ReadTool = tools.ReadTool;
 pub const ToolSnippet = system_prompt.ToolSnippet;
 
 pub const current_session_version = session_manager.current_session_version;
@@ -34,6 +36,7 @@ pub fn testsReachable() void {
     _ = session_store;
     _ = skills;
     _ = system_prompt;
+    _ = tools;
 }
 
 test {
@@ -43,4 +46,5 @@ test {
     _ = session_store;
     _ = skills;
     _ = system_prompt;
+    _ = tools;
 }
