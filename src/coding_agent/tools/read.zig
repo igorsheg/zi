@@ -74,7 +74,7 @@ fn execute(
     _: []const u8,
     params: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
-) anyerror!agent.AgentToolResult {
+) anyerror!agent.OwnedAgentToolResult {
     if (token.isRequested()) return error.OperationCancelled;
     const self: *ReadTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(params);
@@ -97,7 +97,10 @@ fn execute(
     const result_content = try allocator.alloc(ai.ToolResultContent, 1);
     errdefer allocator.free(result_content);
     result_content[0] = .{ .text = .{ .text = text } };
-    return .{ .content = result_content, .details = try formatted.details(allocator) };
+    return .{
+        .allocator = allocator,
+        .result = .{ .content = result_content, .details = try formatted.details(allocator) },
+    };
 }
 
 const ReadArgs = struct {
@@ -269,7 +272,7 @@ test "read tool reads bounded text with offset and limit" {
     try object.put(std.testing.allocator, "limit", .{ .integer = 2 });
 
     var cancel_source: runtime.CancelSource = .{};
-    const result = try execute(
+    var result = try execute(
         std.testing.allocator,
         std.testing.io,
         &read_tool,
@@ -278,38 +281,12 @@ test "read tool reads bounded text with offset and limit" {
         .{ .object = object },
         null,
     );
-    defer freeToolResult(std.testing.allocator, result);
+    defer result.deinit();
 
     try std.testing.expectEqualStrings(
         "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
-        result.content[0].text.text,
+        result.result.content[0].text.text,
     );
-}
-
-fn freeToolResult(allocator: std.mem.Allocator, result: agent.AgentToolResult) void {
-    allocator.free(result.content[0].text.text);
-    allocator.free(result.content);
-    if (result.details) |details| freeJsonValue(allocator, details);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .null, .bool, .integer, .float => {},
-        .number_string, .string => |text| allocator.free(text),
-        .array => |array| {
-            for (array.items) |item| freeJsonValue(allocator, item);
-            array.deinit();
-        },
-        .object => |object| {
-            var owned = object;
-            var iterator = owned.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            owned.deinit(allocator);
-        },
-    }
 }
 
 test "read tool can reject paths outside cwd by config" {

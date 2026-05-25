@@ -50,12 +50,59 @@ pub const AgentMessage = union(enum) {
 };
 
 pub const AgentToolResult = struct {
-    /// Tool results allocate inner content on the provided allocator and transfer
-    /// ownership to the caller according to the agent loop storage contract.
     content: []const ai.ToolResultContent,
     details: ?std.json.Value = null,
     terminate: bool = false,
 };
+
+pub const OwnedAgentToolResult = struct {
+    allocator: std.mem.Allocator,
+    result: AgentToolResult,
+
+    pub fn deinit(self: *OwnedAgentToolResult) void {
+        for (self.result.content) |content| freeToolResultContent(self.allocator, content);
+        self.allocator.free(self.result.content);
+        if (self.result.details) |details| freeJsonValue(self.allocator, details);
+        self.* = undefined;
+    }
+
+    pub fn view(self: *const OwnedAgentToolResult) AgentToolResult {
+        return self.result;
+    }
+};
+
+pub fn freeToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResultContent) void {
+    switch (content) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |signature| allocator.free(signature);
+        },
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+    }
+}
+
+pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .null, .bool, .integer, .float => {},
+        .number_string, .string => |text| allocator.free(text),
+        .array => |array| {
+            for (array.items) |item| freeJsonValue(allocator, item);
+            array.deinit();
+        },
+        .object => |object| {
+            var owned = object;
+            var iterator = owned.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeJsonValue(allocator, entry.value_ptr.*);
+            }
+            owned.deinit(allocator);
+        },
+    }
+}
 
 pub const PendingToolCalls = struct {
     ids: [max_tool_calls_per_turn][]const u8 = undefined,
@@ -172,7 +219,7 @@ pub const ExecuteToolHook = struct {
         []const u8,
         std.json.Value,
         ?AgentToolUpdateCallback,
-    ) anyerror!AgentToolResult,
+    ) anyerror!OwnedAgentToolResult,
 
     pub fn call(
         allocator: std.mem.Allocator,
@@ -182,7 +229,7 @@ pub const ExecuteToolHook = struct {
         tool_call_id: []const u8,
         params: std.json.Value,
         on_update: ?AgentToolUpdateCallback,
-    ) anyerror!AgentToolResult {
+    ) anyerror!OwnedAgentToolResult {
         return self.call_fn(allocator, io, self.context, token, tool_call_id, params, on_update);
     }
 };
@@ -442,15 +489,15 @@ test "agent tool exposes llm tool shape" {
 }
 
 fn testExecuteTool(
-    _: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     _: std.Io,
     _: ?*anyopaque,
     _: runtime.CancelToken,
     _: []const u8,
     _: std.json.Value,
     _: ?AgentToolUpdateCallback,
-) anyerror!AgentToolResult {
-    return .{ .content = &.{} };
+) anyerror!OwnedAgentToolResult {
+    return .{ .allocator = allocator, .result = .{ .content = try allocator.alloc(ai.ToolResultContent, 0) } };
 }
 
 fn emptyModel() ai.Model {

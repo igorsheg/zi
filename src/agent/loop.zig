@@ -20,16 +20,22 @@ pub const AgentEventStream = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     pipe: AgentEventPipe,
+    event_arena: std.heap.ArenaAllocator,
     future: ?std.Io.Future(anyerror!void) = null,
     terminal_messages: ?[]const agent.AgentMessage = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, buffer: []agent.AgentEvent) AgentEventStream {
-        return .{ .allocator = allocator, .io = io, .pipe = AgentEventPipe.init(buffer) };
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .pipe = AgentEventPipe.init(buffer),
+            .event_arena = std.heap.ArenaAllocator.init(allocator),
+        };
     }
 
     pub fn deinit(self: *AgentEventStream) void {
         std.debug.assert(self.future == null);
-        if (self.terminal_messages) |messages| self.allocator.free(messages);
+        self.event_arena.deinit();
         self.* = undefined;
     }
 
@@ -113,6 +119,89 @@ pub const Error = error{
     MissingAssistantResult,
 };
 
+fn cloneTerminalMessages(
+    allocator: std.mem.Allocator,
+    messages: []const agent.AgentMessage,
+) ![]const agent.AgentMessage {
+    const cloned = try allocator.alloc(agent.AgentMessage, messages.len);
+    for (messages, cloned) |message, *out| {
+        out.* = switch (message) {
+            .tool_result => |tool_result| .{ .tool_result = try createToolResultMessage(
+                allocator,
+                .{ .id = tool_result.tool_call_id, .name = tool_result.tool_name, .arguments = .null },
+                .{ .content = tool_result.content, .details = tool_result.details },
+                tool_result.is_error,
+            ) },
+            else => message,
+        };
+    }
+    return cloned;
+}
+
+fn cloneStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
+    return switch (event) {
+        .tool_execution_update => |payload| .{ .tool_execution_update = .{
+            .tool_call_id = payload.tool_call_id,
+            .tool_name = payload.tool_name,
+            .args = payload.args,
+            .partial_result = try cloneAgentToolResult(allocator, payload.partial_result),
+        } },
+        .tool_execution_end => |payload| .{ .tool_execution_end = .{
+            .tool_call_id = payload.tool_call_id,
+            .tool_name = payload.tool_name,
+            .result = try cloneAgentToolResult(allocator, payload.result),
+            .is_error = payload.is_error,
+        } },
+        .message_start => |payload| .{ .message_start = .{
+            .message = try cloneStreamMessage(allocator, payload.message),
+        } },
+        .message_end => |payload| .{ .message_end = .{
+            .message = try cloneStreamMessage(allocator, payload.message),
+        } },
+        .turn_end => |payload| .{ .turn_end = .{
+            .message = try cloneStreamMessage(allocator, payload.message),
+            .tool_results = try cloneStreamToolResultMessages(allocator, payload.tool_results),
+        } },
+        else => event,
+    };
+}
+
+fn cloneStreamMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) !agent.AgentMessage {
+    return switch (message) {
+        .tool_result => |tool_result| .{ .tool_result = try createToolResultMessage(
+            allocator,
+            .{ .id = tool_result.tool_call_id, .name = tool_result.tool_name, .arguments = .null },
+            .{ .content = tool_result.content, .details = tool_result.details },
+            tool_result.is_error,
+        ) },
+        else => message,
+    };
+}
+
+fn cloneStreamToolResultMessages(
+    allocator: std.mem.Allocator,
+    source: []const ai.ToolResultMessage,
+) ![]const ai.ToolResultMessage {
+    const cloned = try allocator.alloc(ai.ToolResultMessage, source.len);
+    for (source, cloned) |message, *out| {
+        out.* = try createToolResultMessage(
+            allocator,
+            .{ .id = message.tool_call_id, .name = message.tool_name, .arguments = .null },
+            .{ .content = message.content, .details = message.details },
+            message.is_error,
+        );
+    }
+    return cloned;
+}
+
+fn cloneAgentToolResult(allocator: std.mem.Allocator, result: agent.AgentToolResult) !agent.AgentToolResult {
+    return .{
+        .content = try cloneToolResultContentSlice(allocator, result.content),
+        .details = if (result.details) |details| try cloneJsonValue(allocator, details) else null,
+        .terminate = result.terminate,
+    };
+}
+
 fn streamSink(stream: *AgentEventStream) EventSink {
     return .{ .context = stream, .call_fn = streamSinkEmit };
 }
@@ -121,11 +210,11 @@ fn streamSinkEmit(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const stream: *AgentEventStream = @ptrCast(@alignCast(context.?));
     switch (event) {
         .agent_end => |end| {
-            const messages = try stream.allocator.dupe(agent.AgentMessage, end.messages);
+            const messages = try cloneTerminalMessages(stream.event_arena.allocator(), end.messages);
             stream.terminal_messages = messages;
             try stream.pipe.sink().end(stream.io, .{ .agent_end = .{ .messages = messages } }, messages);
         },
-        else => try stream.pipe.sink().emit(stream.io, event),
+        else => try stream.pipe.sink().emit(stream.io, try cloneStreamEvent(stream.event_arena.allocator(), event)),
     }
 }
 
@@ -149,6 +238,7 @@ pub fn runPrompt(
         try current.messages.append(allocator, prompt);
     }
 
+    current.owned_tool_results_start = current.messages.items.len;
     try runLoop(allocator, io, &current, config, token, emit);
 }
 
@@ -221,8 +311,13 @@ fn runLoop(
             else
                 try executeToolCallsParallel(allocator, io, current, assistant, config, token, emit);
             defer allocator.free(tool_results.messages);
+            var moved_tool_results: usize = 0;
+            errdefer {
+                for (tool_results.messages[moved_tool_results..]) |message| freeToolResultMessage(allocator, message);
+            }
             for (tool_results.messages) |message| {
                 try current.messages.append(allocator, .{ .tool_result = message });
+                moved_tool_results += 1;
             }
 
             try emit.emit(.{ .turn_end = .{
@@ -380,7 +475,7 @@ fn executeToolCallsSequential(
     emit: EventSink,
 ) !ToolBatch {
     var messages = std.ArrayList(ai.ToolResultMessage).empty;
-    errdefer messages.deinit(allocator);
+    errdefer freeToolResultMessages(allocator, messages.items, &messages);
     var finalized_count: usize = 0;
     var terminate_count: usize = 0;
 
@@ -394,21 +489,15 @@ fn executeToolCallsSequential(
             .args = tool_call.arguments,
         } });
 
-        const finalized = try executeOneToolCall(allocator, io, current, assistant, tool_call, config, token, emit);
+        var finalized = try executeOneToolCall(allocator, io, current, assistant, tool_call, config, token, emit);
         finalized_count += 1;
-        if (finalized.result.terminate) terminate_count += 1;
+        if (finalized.result.result.terminate) terminate_count += 1;
 
-        try emit.emit(.{ .tool_execution_end = .{
-            .tool_call_id = tool_call.id,
-            .tool_name = tool_call.name,
-            .result = finalized.result,
-            .is_error = finalized.is_error,
-        } });
-
-        const message = createToolResultMessage(tool_call, finalized.result, finalized.is_error);
-        try emit.emit(.{ .message_start = .{ .message = .{ .tool_result = message } } });
-        try emit.emit(.{ .message_end = .{ .message = .{ .tool_result = message } } });
-        try messages.append(allocator, message);
+        emitFinalizedToolCall(allocator, emit, tool_call, finalized, &messages) catch |err| {
+            finalized.result.deinit();
+            return err;
+        };
+        finalized.result.deinit();
     }
 
     return .{
@@ -461,12 +550,12 @@ const PreparedToolCall = union(enum) {
 
 const ExecutedToolCall = struct {
     prepared: PreparedToolCall,
-    result: agent.AgentToolResult,
+    result: agent.OwnedAgentToolResult,
     is_error: bool,
 };
 
 const FinalizedToolCall = struct {
-    result: agent.AgentToolResult,
+    result: agent.OwnedAgentToolResult,
     is_error: bool,
 };
 
@@ -537,13 +626,17 @@ fn executeToolCallsParallel(
     for (futures[0..prepared_count]) |*future| try future.await(io);
 
     var messages = std.ArrayList(ai.ToolResultMessage).empty;
-    errdefer messages.deinit(allocator);
+    errdefer freeToolResultMessages(allocator, messages.items, &messages);
     var terminate_count: usize = 0;
 
     for (executed[0..prepared_count]) |item| {
-        const finalized = try finalizeExecutedToolCall(allocator, current, assistant, config, token, item);
-        if (finalized.result.terminate) terminate_count += 1;
-        try emitFinalizedToolCall(allocator, emit, item.prepared.toolCall(), finalized, &messages);
+        var finalized = try finalizeExecutedToolCall(allocator, current, assistant, config, token, item);
+        if (finalized.result.result.terminate) terminate_count += 1;
+        emitFinalizedToolCall(allocator, emit, item.prepared.toolCall(), finalized, &messages) catch |err| {
+            finalized.result.deinit();
+            return err;
+        };
+        finalized.result.deinit();
     }
 
     return .{
@@ -706,6 +799,8 @@ fn finalizeExecutedToolCall(
     executed: ExecutedToolCall,
 ) !FinalizedToolCall {
     var result = executed.result;
+    var result_owned = true;
+    errdefer if (result_owned) result.deinit();
     var is_error = executed.is_error;
     if (executed.prepared == .executable) {
         if (config.after_tool_call) |after| {
@@ -714,25 +809,34 @@ fn finalizeExecutedToolCall(
                 .assistant_message = assistant,
                 .tool_call = prepared.tool_call,
                 .args = prepared.args,
-                .result = result,
+                .result = result.view(),
                 .is_error = is_error,
                 .agent = .{
                     .system_prompt = current.system_prompt,
                     .messages = current.messages.items,
                     .tools = current.tools,
                 },
-            }) catch |err| return .{
-                .result = try createErrorToolResultFmt(allocator, "after tool call failed: {s}", .{@errorName(err)}),
-                .is_error = true,
+            }) catch |err| {
+                result.deinit();
+                result_owned = false;
+                return .{
+                    .result = try createErrorToolResultFmt(
+                        allocator,
+                        "after tool call failed: {s}",
+                        .{@errorName(err)},
+                    ),
+                    .is_error = true,
+                };
             };
             if (override) |value| {
-                if (value.content) |content| result.content = content;
-                if (value.details) |details| result.details = details;
-                if (value.terminate) |terminate| result.terminate = terminate;
+                if (value.content) |content| try replaceToolResultContent(&result, content);
+                if (value.details) |details| try replaceToolResultDetails(&result, details);
+                if (value.terminate) |terminate| result.result.terminate = terminate;
                 if (value.is_error) |override_is_error| is_error = override_is_error;
             }
         }
     }
+    result_owned = false;
     return .{ .result = result, .is_error = is_error };
 }
 
@@ -746,11 +850,12 @@ fn emitFinalizedToolCall(
     try emit.emit(.{ .tool_execution_end = .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
-        .result = finalized.result,
+        .result = finalized.result.view(),
         .is_error = finalized.is_error,
     } });
 
-    const message = createToolResultMessage(tool_call, finalized.result, finalized.is_error);
+    const message = try createToolResultMessage(allocator, tool_call, finalized.result.view(), finalized.is_error);
+    errdefer freeToolResultMessage(allocator, message);
     try emit.emit(.{ .message_start = .{ .message = .{ .tool_result = message } } });
     try emit.emit(.{ .message_end = .{ .message = .{ .tool_result = message } } });
     try messages.append(allocator, message);
@@ -827,21 +932,24 @@ fn executeOneToolCall(
             .assistant_message = assistant,
             .tool_call = tool_call,
             .args = args,
-            .result = result,
+            .result = result.view(),
             .is_error = is_error,
             .agent = .{
                 .system_prompt = current.system_prompt,
                 .messages = current.messages.items,
                 .tools = current.tools,
             },
-        }) catch |err| return .{
-            .result = try createErrorToolResultFmt(allocator, "after tool call failed: {s}", .{@errorName(err)}),
-            .is_error = true,
+        }) catch |err| {
+            result.deinit();
+            return .{
+                .result = try createErrorToolResultFmt(allocator, "after tool call failed: {s}", .{@errorName(err)}),
+                .is_error = true,
+            };
         };
         if (override) |value| {
-            if (value.content) |content| result.content = content;
-            if (value.details) |details| result.details = details;
-            if (value.terminate) |terminate| result.terminate = terminate;
+            if (value.content) |content| try replaceToolResultContent(&result, content);
+            if (value.details) |details| try replaceToolResultDetails(&result, details);
+            if (value.terminate) |terminate| result.result.terminate = terminate;
             if (value.is_error) |override_is_error| is_error = override_is_error;
         }
     }
@@ -884,34 +992,148 @@ fn findTool(tools: []const agent.AgentTool, name: []const u8) ?agent.AgentTool {
     return null;
 }
 
+fn replaceToolResultContent(result: *agent.OwnedAgentToolResult, content: []const ai.ToolResultContent) !void {
+    const previous = result.result.content;
+    result.result.content = try cloneToolResultContentSlice(result.allocator, content);
+    for (previous) |item| agent.freeToolResultContent(result.allocator, item);
+    result.allocator.free(previous);
+}
+
+fn replaceToolResultDetails(result: *agent.OwnedAgentToolResult, details: std.json.Value) !void {
+    const cloned = try cloneJsonValue(result.allocator, details);
+    const previous = result.result.details;
+    result.result.details = cloned;
+    if (previous) |value| agent.freeJsonValue(result.allocator, value);
+}
+
 fn createToolResultMessage(
+    allocator: std.mem.Allocator,
     tool_call: ai.ToolCall,
     result: agent.AgentToolResult,
     is_error: bool,
-) ai.ToolResultMessage {
+) !ai.ToolResultMessage {
+    const tool_call_id = try allocator.dupe(u8, tool_call.id);
+    errdefer allocator.free(tool_call_id);
+    const tool_name = try allocator.dupe(u8, tool_call.name);
+    errdefer allocator.free(tool_name);
+    const content = try cloneToolResultContentSlice(allocator, result.content);
+    errdefer {
+        for (content) |item| agent.freeToolResultContent(allocator, item);
+        allocator.free(content);
+    }
+    const details = if (result.details) |value| try cloneJsonValue(allocator, value) else null;
+    errdefer if (details) |value| agent.freeJsonValue(allocator, value);
     return .{
-        .tool_call_id = tool_call.id,
-        .tool_name = tool_call.name,
-        .content = result.content,
-        .details = result.details,
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .content = content,
+        .details = details,
         .is_error = is_error,
         .timestamp = 0,
     };
 }
 
-fn createErrorToolResult(allocator: std.mem.Allocator, message: []const u8) !agent.AgentToolResult {
+fn createErrorToolResult(allocator: std.mem.Allocator, message: []const u8) !agent.OwnedAgentToolResult {
     const content = try allocator.alloc(ai.ToolResultContent, 1);
+    errdefer allocator.free(content);
     content[0] = .{ .text = .{ .text = try allocator.dupe(u8, message) } };
-    return .{ .content = content, .details = .{ .object = .empty } };
+    return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = .empty } } };
 }
 
 fn createErrorToolResultFmt(
     allocator: std.mem.Allocator,
     comptime fmt: []const u8,
     args: anytype,
-) !agent.AgentToolResult {
+) !agent.OwnedAgentToolResult {
     const message = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(message);
     return createErrorToolResult(allocator, message);
+}
+
+fn cloneToolResultContentSlice(
+    allocator: std.mem.Allocator,
+    source: []const ai.ToolResultContent,
+) ![]const ai.ToolResultContent {
+    const cloned = try allocator.alloc(ai.ToolResultContent, source.len);
+    var cloned_count: usize = 0;
+    errdefer {
+        for (cloned[0..cloned_count]) |item| agent.freeToolResultContent(allocator, item);
+        allocator.free(cloned);
+    }
+    for (source, cloned) |content, *out| {
+        out.* = switch (content) {
+            .text => |text| blk: {
+                const text_value = try allocator.dupe(u8, text.text);
+                errdefer allocator.free(text_value);
+                const text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null;
+                errdefer if (text_signature) |signature| allocator.free(signature);
+                break :blk .{ .text = .{ .text = text_value, .text_signature = text_signature } };
+            },
+            .image => |image| blk: {
+                const data = try allocator.dupe(u8, image.data);
+                errdefer allocator.free(data);
+                const mime_type = try allocator.dupe(u8, image.mime_type);
+                errdefer allocator.free(mime_type);
+                break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
+            },
+        };
+        cloned_count += 1;
+    }
+    return cloned;
+}
+
+fn cloneJsonValue(allocator: std.mem.Allocator, source: std.json.Value) !std.json.Value {
+    return switch (source) {
+        .null => .null,
+        .bool => |value| .{ .bool = value },
+        .integer => |value| .{ .integer = value },
+        .float => |value| .{ .float = value },
+        .number_string => |value| .{ .number_string = try allocator.dupe(u8, value) },
+        .string => |value| .{ .string = try allocator.dupe(u8, value) },
+        .array => |array| blk: {
+            var cloned: std.json.Array = .init(allocator);
+            errdefer {
+                for (cloned.items) |item| agent.freeJsonValue(allocator, item);
+                cloned.deinit();
+            }
+            for (array.items) |item| try cloned.append(try cloneJsonValue(allocator, item));
+            break :blk .{ .array = cloned };
+        },
+        .object => |object| blk: {
+            var cloned: std.json.ObjectMap = .empty;
+            errdefer agent.freeJsonValue(allocator, .{ .object = cloned });
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                var key: ?[]const u8 = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer if (key) |value| allocator.free(value);
+                var value: ?std.json.Value = try cloneJsonValue(allocator, entry.value_ptr.*);
+                errdefer if (value) |item| agent.freeJsonValue(allocator, item);
+                try cloned.put(allocator, key.?, value.?);
+                key = null;
+                value = null;
+            }
+            break :blk .{ .object = cloned };
+        },
+    };
+}
+
+fn freeToolResultMessages(
+    allocator: std.mem.Allocator,
+    messages: []const ai.ToolResultMessage,
+    list: *std.ArrayList(ai.ToolResultMessage),
+) void {
+    for (messages) |message| freeToolResultMessage(allocator, message);
+    list.deinit(allocator);
+}
+
+fn freeToolResultMessage(allocator: std.mem.Allocator, message: ai.ToolResultMessage) void {
+    allocator.free(message.tool_call_id);
+    allocator.free(message.tool_name);
+    var result: agent.OwnedAgentToolResult = .{
+        .allocator = allocator,
+        .result = .{ .content = message.content, .details = message.details },
+    };
+    result.deinit();
 }
 
 fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_message: ?[]const u8) ai.AssistantMessage {
@@ -949,6 +1171,7 @@ const Context = struct {
     system_prompt: []const u8,
     messages: std.ArrayList(agent.AgentMessage),
     tools: []const agent.AgentTool,
+    owned_tool_results_start: usize,
 
     fn init(allocator: std.mem.Allocator, source: agent.AgentContext) !Context {
         var messages = std.ArrayList(agent.AgentMessage).empty;
@@ -959,10 +1182,14 @@ const Context = struct {
             .system_prompt = source.system_prompt,
             .messages = messages,
             .tools = source.tools,
+            .owned_tool_results_start = source.messages.len,
         };
     }
 
     fn deinit(self: *Context) void {
+        for (self.messages.items[self.owned_tool_results_start..]) |message| {
+            if (message == .tool_result) freeToolResultMessage(self.allocator, message.tool_result);
+        }
         self.messages.deinit(self.allocator);
         self.* = undefined;
     }
@@ -987,7 +1214,62 @@ fn defaultConvertToLlm(
 
 fn testSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const events: *std.ArrayList(agent.AgentEvent) = @ptrCast(@alignCast(context.?));
-    try events.append(std.testing.allocator, event);
+    try events.append(std.testing.allocator, try cloneEventForTest(event));
+}
+
+fn cloneEventForTest(event: agent.AgentEvent) !agent.AgentEvent {
+    return switch (event) {
+        .message_start => |payload| .{ .message_start = .{ .message = try cloneMessageForTest(payload.message) } },
+        .message_update => event,
+        .message_end => |payload| .{ .message_end = .{ .message = try cloneMessageForTest(payload.message) } },
+        .turn_end => |payload| .{ .turn_end = .{
+            .message = try cloneMessageForTest(payload.message),
+            .tool_results = try cloneToolResultMessagesForTest(payload.tool_results),
+        } },
+        .agent_end => |payload| .{ .agent_end = .{ .messages = payload.messages } },
+        else => event,
+    };
+}
+
+fn cloneMessageForTest(message: agent.AgentMessage) !agent.AgentMessage {
+    return switch (message) {
+        .tool_result => |tool_result| .{ .tool_result = try cloneToolResultMessageForTest(tool_result) },
+        else => message,
+    };
+}
+
+fn cloneToolResultMessagesForTest(source: []const ai.ToolResultMessage) ![]const ai.ToolResultMessage {
+    const cloned = try std.testing.allocator.alloc(ai.ToolResultMessage, source.len);
+    for (source, cloned) |message, *out| out.* = try cloneToolResultMessageForTest(message);
+    return cloned;
+}
+
+fn cloneToolResultMessageForTest(message: ai.ToolResultMessage) !ai.ToolResultMessage {
+    return .{
+        .tool_call_id = try std.testing.allocator.dupe(u8, message.tool_call_id),
+        .tool_name = try std.testing.allocator.dupe(u8, message.tool_name),
+        .content = try cloneToolResultContentSlice(std.testing.allocator, message.content),
+        .details = if (message.details) |details| try cloneJsonValue(std.testing.allocator, details) else null,
+        .is_error = message.is_error,
+        .timestamp = message.timestamp,
+    };
+}
+
+fn freeTestEvents(events: []const agent.AgentEvent) void {
+    for (events) |event| switch (event) {
+        .message_start => |payload| freeTestMessage(payload.message),
+        .message_end => |payload| freeTestMessage(payload.message),
+        .turn_end => |payload| {
+            freeTestMessage(payload.message);
+            for (payload.tool_results) |message| freeToolResultMessage(std.testing.allocator, message);
+            std.testing.allocator.free(payload.tool_results);
+        },
+        else => {},
+    };
+}
+
+fn freeTestMessage(message: agent.AgentMessage) void {
+    if (message == .tool_result) freeToolResultMessage(std.testing.allocator, message.tool_result);
 }
 
 fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
@@ -1079,39 +1361,46 @@ fn userMessage(text: []const u8) agent.AgentMessage {
 }
 
 fn echoTool(
-    _: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     _: std.Io,
     context: ?*anyopaque,
     _: runtime.CancelToken,
     _: []const u8,
     _: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
-) anyerror!agent.AgentToolResult {
+) anyerror!agent.OwnedAgentToolResult {
     const calls: *usize = @ptrCast(@alignCast(context.?));
     calls.* += 1;
-    return .{ .content = &.{.{ .text = .{ .text = "echoed" } }} };
+    return ownedTextResult(allocator, "echoed");
 }
 
 fn updatingTool(
-    _: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     _: std.Io,
     context: ?*anyopaque,
     _: runtime.CancelToken,
     _: []const u8,
     _: std.json.Value,
     on_update: ?agent.AgentToolUpdateCallback,
-) anyerror!agent.AgentToolResult {
+) anyerror!agent.OwnedAgentToolResult {
     const calls: *usize = @ptrCast(@alignCast(context.?));
     calls.* += 1;
     if (on_update) |callback| {
         try callback.call(.{ .content = &.{.{ .text = .{ .text = "partial" } }} });
     }
-    return .{ .content = &.{.{ .text = .{ .text = "done" } }} };
+    return ownedTextResult(allocator, "done");
+}
+
+fn ownedTextResult(allocator: std.mem.Allocator, text: []const u8) !agent.OwnedAgentToolResult {
+    const content = try allocator.alloc(ai.ToolResultContent, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    return .{ .allocator = allocator, .result = .{ .content = content } };
 }
 
 test "run prompt emits prompt assistant and agent end events" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
+    defer freeTestEvents(events.items);
     var cancel: runtime.CancelSource = .{};
     const prompt = userMessage("hello");
 
@@ -1164,6 +1453,7 @@ test "prompt stream exposes events and terminal messages through event pipe" {
 test "run prompt executes tool result then continues assistant turn" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
+    defer freeTestEvents(events.items);
     var cancel: runtime.CancelSource = .{};
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
@@ -1198,6 +1488,7 @@ test "run prompt executes tool result then continues assistant turn" {
 test "parallel tool calls emit bounded live updates through owner" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
+    defer freeTestEvents(events.items);
     var cancel: runtime.CancelSource = .{};
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
@@ -1237,6 +1528,7 @@ test "parallel tool calls emit bounded live updates through owner" {
 test "parallel tool calls finalize results in assistant source order" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
+    defer freeTestEvents(events.items);
     var cancel: runtime.CancelSource = .{};
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
@@ -1281,6 +1573,7 @@ test "parallel tool calls finalize results in assistant source order" {
 test "run continue rejects assistant tail" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
+    defer freeTestEvents(events.items);
     var cancel: runtime.CancelSource = .{};
     const assistant: agent.AgentMessage = .{ .assistant = assistantMessage("done") };
 
