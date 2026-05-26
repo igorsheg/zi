@@ -26,6 +26,7 @@ public_event_buffer: []PublicEvent,
 public_events: *PublicEventQueue,
 queue_mirror: *QueueMirror,
 event_drain: *EventDrain,
+lifecycle: Lifecycle = .accepting,
 
 pub const Options = struct {
     cwd: []const u8,
@@ -48,6 +49,27 @@ pub const StreamingBehavior = enum {
 
 pub const PromptOptions = struct {
     streaming_behavior: ?StreamingBehavior = null,
+};
+
+pub const AgentSessionStatus = enum {
+    idle,
+    running,
+    cancel_requested,
+    shutdown_requested,
+    stopped,
+};
+
+pub const Error = error{
+    SessionBusy,
+    SessionCancelling,
+    SessionShuttingDown,
+};
+
+const Lifecycle = enum {
+    accepting,
+    cancel_requested,
+    shutdown_requested,
+    stopped,
 };
 
 pub const PublicEvent = union(enum) {
@@ -339,10 +361,15 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .public_events = public_events,
         .queue_mirror = queue_mirror,
         .event_drain = event_drain,
+        .lifecycle = .accepting,
     };
 }
 
+/// Caller must request shutdown, observe stopped status, and drain public events before deinit.
 pub fn deinit(self: *AgentSession) void {
+    self.reconcileLifecycle();
+    std.debug.assert(self.agent.waitForIdle());
+    std.debug.assert(self.lifecycle == .stopped);
     std.debug.assert(self.public_events.empty());
     self.agent.deinit();
     self.allocator.destroy(self.agent);
@@ -373,6 +400,7 @@ pub fn promptWithOptions(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !void {
+    try self.ensureAcceptsPrompt();
     var preflight = try self.preparePromptInput(text, images, options);
     defer preflight.deinit(self.allocator);
     if (try self.tryHandlePromptCommand(&preflight)) return;
@@ -388,7 +416,46 @@ pub fn promptWithOptions(
 }
 
 pub fn continueRun(self: *AgentSession) !void {
+    try self.ensureAcceptsContinue();
     try self.agent.continueRun();
+}
+
+pub fn cancel(self: *AgentSession) void {
+    self.reconcileLifecycle();
+    if (self.agent.state.status == .settling) return;
+    if (!self.agent.state.isStreaming()) return;
+    if (self.lifecycle == .shutdown_requested or self.lifecycle == .stopped) return;
+    if (self.lifecycle == .cancel_requested) return;
+    self.lifecycle = .cancel_requested;
+    self.agent.abort();
+}
+
+pub fn requestShutdown(self: *AgentSession) void {
+    self.reconcileLifecycle();
+    switch (self.lifecycle) {
+        .stopped, .shutdown_requested => return,
+        .accepting, .cancel_requested => {},
+    }
+    if (self.agent.state.status == .settling) {
+        self.lifecycle = .shutdown_requested;
+        return;
+    }
+    if (self.agent.state.isStreaming()) {
+        self.lifecycle = .shutdown_requested;
+        self.agent.abort();
+    } else {
+        self.lifecycle = .stopped;
+    }
+}
+
+pub fn status(self: *AgentSession) AgentSessionStatus {
+    self.reconcileLifecycle();
+    return switch (self.lifecycle) {
+        .stopped => .stopped,
+        .shutdown_requested => .shutdown_requested,
+        .cancel_requested => .cancel_requested,
+        .accepting => if (self.agent.state.isStreaming()) .running else .idle,
+    };
 }
 
 pub fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !void {
@@ -419,6 +486,34 @@ pub fn drainPublicEvent(self: *AgentSession) ?PublicEvent {
 
 pub fn activeToolNames(self: *const AgentSession) []const []const u8 {
     return self.tools.activeToolNames();
+}
+
+fn ensureAcceptsPrompt(self: *AgentSession) Error!void {
+    self.reconcileLifecycle();
+    switch (self.lifecycle) {
+        .accepting => {},
+        .cancel_requested => return error.SessionCancelling,
+        .shutdown_requested, .stopped => return error.SessionShuttingDown,
+    }
+}
+
+fn ensureAcceptsContinue(self: *AgentSession) Error!void {
+    self.reconcileLifecycle();
+    switch (self.lifecycle) {
+        .accepting => {},
+        .cancel_requested => return error.SessionCancelling,
+        .shutdown_requested, .stopped => return error.SessionShuttingDown,
+    }
+    if (self.agent.state.isStreaming()) return error.SessionBusy;
+}
+
+fn reconcileLifecycle(self: *AgentSession) void {
+    if (!self.agent.waitForIdle()) return;
+    switch (self.lifecycle) {
+        .cancel_requested => self.lifecycle = .accepting,
+        .shutdown_requested => self.lifecycle = .stopped,
+        .accepting, .stopped => {},
+    }
 }
 
 fn buildPromptForActiveNames(self: *AgentSession, active_names: []const []const u8) ![]const u8 {
@@ -566,7 +661,7 @@ test "agent session initializes policy spine with definition-first builtin tools
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.tools.definitions.items.len);
     try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.agent.state.tools.len);
@@ -589,7 +684,7 @@ test "agent session persists message_end through session event drain" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
     try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
@@ -599,6 +694,116 @@ test "agent session persists message_end through session event drain" {
     session.agent.finishRun();
 
     try std.testing.expectEqual(@as(usize, 1), session.manager.entries.items.len);
+    drainAllPublicEvents(&session);
+}
+
+test "agent session cancel while running is observable until terminal event" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    try std.testing.expectEqual(AgentSessionStatus.running, session.status());
+
+    session.cancel();
+
+    try std.testing.expectEqual(AgentSessionStatus.cancel_requested, session.status());
+    try std.testing.expect(session.agent.signal().?.isRequested());
+
+    try session.agent.emitEvent(.{ .agent_end = .{ .messages = session.agent.state.messages } });
+    session.agent.finishRun();
+
+    try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
+    drainAllPublicEvents(&session);
+}
+
+test "agent session shutdown rejects new prompts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer shutdownAndDeinit(&session);
+
+    session.requestShutdown();
+
+    try std.testing.expectEqual(AgentSessionStatus.stopped, session.status());
+    try std.testing.expectError(error.SessionShuttingDown, session.prompt("blocked", &.{}));
+    try std.testing.expectError(error.SessionShuttingDown, session.continueRun());
+}
+
+test "agent session continue while running returns session busy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+
+    try std.testing.expectError(error.SessionBusy, session.continueRun());
+}
+
+test "agent session shutdown while running stops after terminal event" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    session.requestShutdown();
+
+    try std.testing.expectEqual(AgentSessionStatus.shutdown_requested, session.status());
+    try std.testing.expect(session.agent.signal().?.isRequested());
+    try std.testing.expectError(error.SessionShuttingDown, session.prompt("blocked", &.{}));
+
+    try session.agent.emitEvent(.{ .agent_end = .{ .messages = session.agent.state.messages } });
+    session.agent.finishRun();
+
+    try std.testing.expectEqual(AgentSessionStatus.stopped, session.status());
     drainAllPublicEvents(&session);
 }
 
@@ -617,7 +822,7 @@ test "agent session active tool changes rebuild prompt and agent tools" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     try session.setActiveToolsByName(&.{"read"});
 
@@ -642,7 +847,7 @@ test "agent session active tool change validates before mutation" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     try session.setActiveToolsByName(&.{"read"});
     try std.testing.expectError(error.UnknownToolName, session.setActiveToolsByName(&.{ "edit", "missing" }));
@@ -668,7 +873,7 @@ test "agent session rejects active tool changes while running" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
@@ -691,7 +896,7 @@ test "agent session prompt uses preflight spine before agent submission" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     try session.prompt("hello", &.{});
 
@@ -715,7 +920,7 @@ test "agent session prompt requires streaming behavior while running" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
@@ -739,7 +944,7 @@ test "agent session prompt queues follow up while running" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
@@ -768,7 +973,7 @@ test "agent session prompt queues steering while running" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
@@ -797,7 +1002,7 @@ test "agent session public events are caller drained after message persistence" 
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     const message: agent_mod.AgentMessage = .{ .user = .{
         .content = .{ .string = "hello" },
@@ -831,7 +1036,7 @@ test "agent session queue update consumes block user message text" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     const image: ai.ImageContent = .{ .data = "abc", .mime_type = "image/png" };
 
@@ -867,7 +1072,7 @@ test "agent session queue update is emitted before queued user message start" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
@@ -902,7 +1107,7 @@ test "agent session public event queue overflow is explicit" {
         .dir = tmp.dir,
         .public_event_capacity = 1,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     const message: agent_mod.AgentMessage = .{ .user = .{
         .content = .{ .string = "overflow" },
@@ -934,7 +1139,7 @@ test "agent session public event drain is caller driven" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
@@ -960,7 +1165,7 @@ test "agent session terminal policy runs after persistence" {
         .timestamp = "2026-05-25T00:00:00Z",
         .dir = tmp.dir,
     });
-    defer session.deinit();
+    defer shutdownAndDeinit(&session);
 
     const message: agent_mod.AgentMessage = .{ .user = .{
         .content = .{ .string = "hello" },
@@ -974,6 +1179,13 @@ test "agent session terminal policy runs after persistence" {
 
     try std.testing.expectEqual(@as(usize, 1), session.event_drain.terminal_snapshot_entry_count);
     drainAllPublicEvents(&session);
+}
+
+fn shutdownAndDeinit(session: *AgentSession) void {
+    if (!session.agent.waitForIdle()) session.agent.finishRun();
+    session.requestShutdown();
+    drainAllPublicEvents(session);
+    session.deinit();
 }
 
 fn drainAllPublicEvents(session: *AgentSession) void {
