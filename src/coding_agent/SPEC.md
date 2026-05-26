@@ -88,6 +88,41 @@ coding-agent has two “hearts”:
 
 the TUI/CLI/RPC modes are consumers. tools/resources/auth are dependencies. so i would not start with TUI or tools first.
 
+## AgentSession semantic contract
+
+Preserve these pi-mono behaviors even when Zi uses different implementation mechanics:
+
+```text
+1. AgentSession is the app-policy owner above Agent.
+
+2. Agent emits conversation events; AgentSession decides what they mean
+   for queues, persistence, retry, compaction, extensions, and UI.
+
+3. Event processing order matters:
+   queue mirror
+   -> extension/session hooks
+   -> public event
+   -> persistence
+   -> terminal policy
+
+4. prompt() is not a raw Agent call.
+   it owns command handling, input hooks, skill/template expansion,
+   streaming queue choice, auth/model preflight, compaction preflight,
+   pending message flush, and before-agent-start hooks.
+
+5. streaming user input does not mutate agent state directly.
+   it becomes steer/follow-up queued intent.
+
+6. session history is durable truth.
+   agent transcript is runtime context.
+
+7. retry and compaction are terminal policies, not provider policies.
+
+8. TUI observes session state; it does not own agent/provider/tool execution.
+```
+
+Zi translates those semantics through Tiger Style: one owner per mutation path, bounded queues, explicit terminal states, observable cancellation, and no hidden callback ownership.
+
 recommended zi build order
 
 ### phase 1: session persistence spine

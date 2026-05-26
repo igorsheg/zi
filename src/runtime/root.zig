@@ -1,9 +1,11 @@
 const std = @import("std");
 
+pub const bounded_queue = @import("bounded_queue.zig");
 pub const cancel = @import("cancel.zig");
 pub const completion_queue = @import("completion_queue.zig");
 pub const operation = @import("operation.zig");
 
+pub const BoundedQueue = bounded_queue.BoundedQueue;
 pub const CancelSource = cancel.CancelSource;
 pub const CancelToken = cancel.CancelToken;
 pub const sleep = cancel.sleep;
@@ -28,6 +30,7 @@ pub const Process = struct {
 };
 
 test {
+    _ = bounded_queue;
     _ = cancel;
     _ = completion_queue;
     _ = operation;

@@ -9,6 +9,8 @@ const tool_registry = @import("tool_registry.zig");
 
 const AgentSession = @This();
 
+pub const public_event_capacity_default = 256;
+
 allocator: std.mem.Allocator,
 io: std.Io,
 cwd: []const u8,
@@ -20,6 +22,8 @@ builtin_tools: tool_registry.OwnedBuiltinTools,
 tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 agent: *agent_mod.Agent,
+public_event_buffer: []PublicEvent,
+public_events: *PublicEventQueue,
 event_drain: *EventDrain,
 
 pub const Options = struct {
@@ -33,7 +37,20 @@ pub const Options = struct {
     stream: ?ai.StreamFunction = null,
     dir: std.Io.Dir = .cwd(),
     allow_paths_outside_cwd: bool = false,
+    public_event_capacity: usize = public_event_capacity_default,
 };
+
+pub const PublicEvent = union(enum) {
+    agent_event: agent_mod.AgentEvent,
+    queue_update: QueueUpdate,
+
+    pub const QueueUpdate = struct {
+        steering_count: usize,
+        follow_up_count: usize,
+    };
+};
+
+const PublicEventQueue = runtime.BoundedQueue(PublicEvent);
 
 const SystemPromptState = struct {
     text: []const u8,
@@ -96,28 +113,51 @@ const SystemPromptState = struct {
 
 const EventDrain = struct {
     manager: *session_manager.SessionManager,
+    agent: *agent_mod.Agent,
+    public_events: *PublicEventQueue,
     timestamp: []const u8,
+    dropped_public_event_count: usize = 0,
+    terminal_snapshot_entry_count: usize = 0,
 
     pub fn handle(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         try self.updateQueueMirror(event);
         try self.runSessionHooks(event);
         try self.emitPublicEvent(event);
+        // TODO(owner: coding_agent): When terminal policy can run for the same event as fallible persistence, preserve the persistence error but still apply terminal policy before returning.
         try self.persistEvent(event);
         try self.handleTerminalPolicy(event);
     }
 
-    fn updateQueueMirror(_: *EventDrain, _: agent_mod.AgentEvent) !void {}
+    fn updateQueueMirror(self: *EventDrain, event: agent_mod.AgentEvent) !void {
+        if (event != .message_start) return;
+        if (event.message_start.message != .user) return;
+        if (!self.agent.hasQueuedMessages()) return;
+        self.enqueuePublicEvent(.{ .queue_update = .{
+            .steering_count = self.agent.steering_queue.count(),
+            .follow_up_count = self.agent.follow_up_queue.count(),
+        } });
+    }
 
     fn runSessionHooks(_: *EventDrain, _: agent_mod.AgentEvent) !void {}
 
-    fn emitPublicEvent(_: *EventDrain, _: agent_mod.AgentEvent) !void {}
+    fn emitPublicEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
+        self.enqueuePublicEvent(.{ .agent_event = event });
+    }
 
     fn persistEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         if (event != .message_end) return;
         _ = try self.manager.appendMessage(event.message_end.message, self.timestamp);
     }
 
-    fn handleTerminalPolicy(_: *EventDrain, _: agent_mod.AgentEvent) !void {}
+    fn handleTerminalPolicy(self: *EventDrain, event: agent_mod.AgentEvent) !void {
+        if (event != .agent_end) return;
+        self.terminal_snapshot_entry_count = self.manager.entries.items.len;
+    }
+
+    fn enqueuePublicEvent(self: *EventDrain, event: PublicEvent) void {
+        _ = self.public_events.pushOrDrop(event);
+        self.dropped_public_event_count = self.public_events.dropped();
+    }
 };
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSession {
@@ -178,9 +218,21 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     core_agent.* = try agent_mod.Agent.init(allocator, io, agent_options);
     errdefer core_agent.deinit();
 
+    if (options.public_event_capacity == 0) return error.PublicEventCapacityZero;
+    const public_event_buffer = try allocator.alloc(PublicEvent, options.public_event_capacity);
+    errdefer allocator.free(public_event_buffer);
+    const public_events = try allocator.create(PublicEventQueue);
+    errdefer allocator.destroy(public_events);
+    public_events.* = PublicEventQueue.init(public_event_buffer);
+
     const event_drain = try allocator.create(EventDrain);
     errdefer allocator.destroy(event_drain);
-    event_drain.* = .{ .manager = manager, .timestamp = timestamp };
+    event_drain.* = .{
+        .manager = manager,
+        .agent = core_agent,
+        .public_events = public_events,
+        .timestamp = timestamp,
+    };
 
     _ = try core_agent.subscribe(.{ .context = event_drain, .call_fn = drainAgentEvent });
 
@@ -196,14 +248,19 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .tools = tools,
         .manager = manager,
         .agent = core_agent,
+        .public_event_buffer = public_event_buffer,
+        .public_events = public_events,
         .event_drain = event_drain,
     };
 }
 
 pub fn deinit(self: *AgentSession) void {
+    std.debug.assert(self.public_events.empty());
     self.agent.deinit();
     self.allocator.destroy(self.agent);
     self.allocator.destroy(self.event_drain);
+    self.allocator.destroy(self.public_events);
+    self.allocator.free(self.public_event_buffer);
     self.manager.deinit();
     self.allocator.destroy(self.manager);
     self.tools.deinit(self.allocator);
@@ -242,6 +299,14 @@ pub fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !voi
 
 pub fn state(self: *const AgentSession) agent_mod.AgentState {
     return self.agent.state;
+}
+
+pub fn publicEventCount(self: *const AgentSession) usize {
+    return self.public_events.count();
+}
+
+pub fn drainPublicEvent(self: *AgentSession) ?PublicEvent {
+    return self.public_events.pop();
 }
 
 pub fn activeToolNames(self: *const AgentSession) []const []const u8 {
@@ -344,6 +409,7 @@ test "agent session persists message_end through session event drain" {
     session.agent.finishRun();
 
     try std.testing.expectEqual(@as(usize, 1), session.manager.entries.items.len);
+    drainAllPublicEvents(&session);
 }
 
 test "agent session active tool changes rebuild prompt and agent tools" {
@@ -418,4 +484,178 @@ test "agent session rejects active tool changes while running" {
     defer session.agent.finishRun();
 
     try std.testing.expectError(error.SessionBusy, session.setActiveToolsByName(&.{"read"}));
+}
+
+test "agent session public events are caller drained after message persistence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    const message: agent_mod.AgentMessage = .{ .user = .{
+        .content = .{ .string = "hello" },
+        .timestamp = 0,
+    } };
+
+    _ = try session.agent.beginRun();
+    try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = message } });
+    session.agent.finishRun();
+
+    try std.testing.expectEqual(@as(usize, 1), session.manager.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), session.publicEventCount());
+    try expectUserMessageEvent(session.drainPublicEvent().?.agent_event, .message_start, "hello");
+    try expectUserMessageEvent(session.drainPublicEvent().?.agent_event, .message_end, "hello");
+    try std.testing.expect(session.drainPublicEvent() == null);
+}
+
+test "agent session queue update is emitted before queued user message start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    const message: agent_mod.AgentMessage = .{ .user = .{
+        .content = .{ .string = "queued" },
+        .timestamp = 0,
+    } };
+    try session.agent.steer(message);
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+    try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
+
+    const queue_update = session.drainPublicEvent().?.queue_update;
+    try std.testing.expectEqual(@as(usize, 1), queue_update.steering_count);
+    try std.testing.expectEqual(@as(usize, 0), queue_update.follow_up_count);
+    try expectUserMessageEvent(session.drainPublicEvent().?.agent_event, .message_start, "queued");
+}
+
+test "agent session public event queue overflow is explicit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .public_event_capacity = 1,
+    });
+    defer session.deinit();
+
+    const message: agent_mod.AgentMessage = .{ .user = .{
+        .content = .{ .string = "overflow" },
+        .timestamp = 0,
+    } };
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+    try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
+    try session.agent.emitEvent(.agent_start);
+
+    try std.testing.expectEqual(@as(usize, 1), session.publicEventCount());
+    try std.testing.expectEqual(@as(usize, 1), session.event_drain.dropped_public_event_count);
+    drainAllPublicEvents(&session);
+}
+
+test "agent session public event drain is caller driven" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+    try session.agent.emitEvent(.agent_start);
+
+    try std.testing.expectEqual(@as(usize, 1), session.publicEventCount());
+    _ = session.drainPublicEvent().?;
+    try std.testing.expectEqual(@as(usize, 0), session.publicEventCount());
+}
+
+test "agent session terminal policy runs after persistence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    const message: agent_mod.AgentMessage = .{ .user = .{
+        .content = .{ .string = "hello" },
+        .timestamp = 0,
+    } };
+
+    _ = try session.agent.beginRun();
+    try session.agent.emitEvent(.{ .message_end = .{ .message = message } });
+    try session.agent.emitEvent(.{ .agent_end = .{ .messages = session.agent.state.messages } });
+    session.agent.finishRun();
+
+    try std.testing.expectEqual(@as(usize, 1), session.event_drain.terminal_snapshot_entry_count);
+    drainAllPublicEvents(&session);
+}
+
+fn drainAllPublicEvents(session: *AgentSession) void {
+    while (session.drainPublicEvent() != null) {}
+}
+
+fn expectUserMessageEvent(event: agent_mod.AgentEvent, comptime tag: std.meta.Tag(agent_mod.AgentEvent), text: []const u8) !void {
+    try std.testing.expectEqual(tag, std.meta.activeTag(event));
+    const message = switch (event) {
+        .message_start => |payload| payload.message,
+        .message_end => |payload| payload.message,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(.user, std.meta.activeTag(message));
+    const user = message.user;
+    try std.testing.expectEqual(.string, std.meta.activeTag(user.content));
+    try std.testing.expectEqualStrings(text, user.content.string);
 }

@@ -481,6 +481,10 @@ pub const PendingMessageQueue = struct {
         return self.messages.items.len > 0;
     }
 
+    pub fn count(self: *const PendingMessageQueue) usize {
+        return self.messages.items.len;
+    }
+
     pub fn clear(self: *PendingMessageQueue) void {
         self.messages.clearRetainingCapacity();
     }
@@ -491,14 +495,14 @@ pub const PendingMessageQueue = struct {
     ) std.mem.Allocator.Error![]const agent.AgentMessage {
         if (self.messages.items.len == 0) return &.{};
 
-        const count: usize = switch (self.mode) {
+        const drain_count: usize = switch (self.mode) {
             .all => self.messages.items.len,
             .one_at_a_time => 1,
         };
-        const drained = try allocator.dupe(agent.AgentMessage, self.messages.items[0..count]);
-        const remaining = self.messages.items.len - count;
-        @memmove(self.messages.items[0..remaining], self.messages.items[count..]);
-        self.messages.shrinkRetainingCapacity(self.messages.items.len - count);
+        const drained = try allocator.dupe(agent.AgentMessage, self.messages.items[0..drain_count]);
+        const remaining = self.messages.items.len - drain_count;
+        @memmove(self.messages.items[0..remaining], self.messages.items[drain_count..]);
+        self.messages.shrinkRetainingCapacity(self.messages.items.len - drain_count);
         return drained;
     }
 };
