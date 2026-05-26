@@ -24,6 +24,7 @@ manager: *session_manager.SessionManager,
 agent: *agent_mod.Agent,
 public_event_buffer: []PublicEvent,
 public_events: *PublicEventQueue,
+queue_mirror: *QueueMirror,
 event_drain: *EventDrain,
 
 pub const Options = struct {
@@ -57,6 +58,70 @@ pub const PublicEvent = union(enum) {
         steering_count: usize,
         follow_up_count: usize,
     };
+};
+
+const QueueMirror = struct {
+    steering: std.ArrayList([]const u8) = .empty,
+    follow_up: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *QueueMirror, allocator: std.mem.Allocator) void {
+        self.clearList(allocator, &self.steering);
+        self.clearList(allocator, &self.follow_up);
+        self.steering.deinit(allocator);
+        self.follow_up.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn appendSteering(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) !void {
+        try self.append(allocator, &self.steering, text);
+    }
+
+    fn appendFollowUp(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) !void {
+        try self.append(allocator, &self.follow_up, text);
+    }
+
+    fn removeUserText(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) bool {
+        return self.remove(allocator, &self.steering, text) or self.remove(allocator, &self.follow_up, text);
+    }
+
+    fn removeSteeringText(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) bool {
+        return self.remove(allocator, &self.steering, text);
+    }
+
+    fn removeFollowUpText(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) bool {
+        return self.remove(allocator, &self.follow_up, text);
+    }
+
+    fn steeringCount(self: *const QueueMirror) usize {
+        return self.steering.items.len;
+    }
+
+    fn followUpCount(self: *const QueueMirror) usize {
+        return self.follow_up.items.len;
+    }
+
+    fn append(_: *QueueMirror, allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), text: []const u8) !void {
+        const owned = try allocator.dupe(u8, text);
+        errdefer allocator.free(owned);
+        try list.append(allocator, owned);
+    }
+
+    fn remove(_: *QueueMirror, allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), text: []const u8) bool {
+        for (list.items, 0..) |queued, index| {
+            if (!std.mem.eql(u8, queued, text)) continue;
+            allocator.free(queued);
+            const remaining = list.items.len - index - 1;
+            if (remaining > 0) @memmove(list.items[index .. index + remaining], list.items[index + 1 ..]);
+            list.shrinkRetainingCapacity(list.items.len - 1);
+            return true;
+        }
+        return false;
+    }
+
+    fn clearList(_: *QueueMirror, allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+        for (list.items) |text| allocator.free(text);
+        list.clearRetainingCapacity();
+    }
 };
 
 const PublicEventQueue = runtime.BoundedQueue(PublicEvent);
@@ -121,8 +186,9 @@ const SystemPromptState = struct {
 };
 
 const EventDrain = struct {
+    allocator: std.mem.Allocator,
     manager: *session_manager.SessionManager,
-    agent: *agent_mod.Agent,
+    queue_mirror: *QueueMirror,
     public_events: *PublicEventQueue,
     timestamp: []const u8,
     dropped_public_event_count: usize = 0,
@@ -132,7 +198,8 @@ const EventDrain = struct {
         try self.updateQueueMirror(event);
         try self.runSessionHooks(event);
         try self.emitPublicEvent(event);
-        // TODO(owner: coding_agent): When terminal policy can run for the same event as fallible persistence, preserve the persistence error but still apply terminal policy before returning.
+        // TODO(owner: coding_agent): When terminal policy can run for the same event as fallible persistence,
+        // preserve the persistence error but still apply terminal policy before returning.
         try self.persistEvent(event);
         try self.handleTerminalPolicy(event);
     }
@@ -140,11 +207,9 @@ const EventDrain = struct {
     fn updateQueueMirror(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         if (event != .message_start) return;
         if (event.message_start.message != .user) return;
-        if (!self.agent.hasQueuedMessages()) return;
-        self.enqueuePublicEvent(.{ .queue_update = .{
-            .steering_count = self.agent.steering_queue.count(),
-            .follow_up_count = self.agent.follow_up_queue.count(),
-        } });
+        const text = userMessageText(event.message_start.message.user) orelse return;
+        if (!self.queue_mirror.removeUserText(self.allocator, text)) return;
+        self.emitQueueUpdate();
     }
 
     fn runSessionHooks(_: *EventDrain, _: agent_mod.AgentEvent) !void {}
@@ -161,6 +226,13 @@ const EventDrain = struct {
     fn handleTerminalPolicy(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         if (event != .agent_end) return;
         self.terminal_snapshot_entry_count = self.manager.entries.items.len;
+    }
+
+    fn emitQueueUpdate(self: *EventDrain) void {
+        self.enqueuePublicEvent(.{ .queue_update = .{
+            .steering_count = self.queue_mirror.steeringCount(),
+            .follow_up_count = self.queue_mirror.followUpCount(),
+        } });
     }
 
     fn enqueuePublicEvent(self: *EventDrain, event: PublicEvent) void {
@@ -234,11 +306,17 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     errdefer allocator.destroy(public_events);
     public_events.* = PublicEventQueue.init(public_event_buffer);
 
+    const queue_mirror = try allocator.create(QueueMirror);
+    errdefer allocator.destroy(queue_mirror);
+    queue_mirror.* = .{};
+    errdefer queue_mirror.deinit(allocator);
+
     const event_drain = try allocator.create(EventDrain);
     errdefer allocator.destroy(event_drain);
     event_drain.* = .{
+        .allocator = allocator,
         .manager = manager,
-        .agent = core_agent,
+        .queue_mirror = queue_mirror,
         .public_events = public_events,
         .timestamp = timestamp,
     };
@@ -259,6 +337,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .agent = core_agent,
         .public_event_buffer = public_event_buffer,
         .public_events = public_events,
+        .queue_mirror = queue_mirror,
         .event_drain = event_drain,
     };
 }
@@ -268,6 +347,8 @@ pub fn deinit(self: *AgentSession) void {
     self.agent.deinit();
     self.allocator.destroy(self.agent);
     self.allocator.destroy(self.event_drain);
+    self.queue_mirror.deinit(self.allocator);
+    self.allocator.destroy(self.queue_mirror);
     self.allocator.destroy(self.public_events);
     self.allocator.free(self.public_event_buffer);
     self.manager.deinit();
@@ -286,7 +367,12 @@ pub fn prompt(self: *AgentSession, text: []const u8, images: []const ai.ImageCon
     try self.promptWithOptions(text, images, .{});
 }
 
-pub fn promptWithOptions(self: *AgentSession, text: []const u8, images: []const ai.ImageContent, options: PromptOptions) !void {
+pub fn promptWithOptions(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    options: PromptOptions,
+) !void {
     var preflight = try self.preparePromptInput(text, images, options);
     defer preflight.deinit(self.allocator);
     if (try self.tryHandlePromptCommand(&preflight)) return;
@@ -403,15 +489,17 @@ fn queuePromptIfStreaming(self: *AgentSession, preflight: *const PromptPreflight
         .steer => if (!self.agent.steering_queue.hasCapacity()) return error.QueueFull,
         .follow_up => if (!self.agent.follow_up_queue.hasCapacity()) return error.QueueFull,
     }
+    switch (behavior) {
+        .steer => try self.queue_mirror.appendSteering(self.allocator, preflight.text),
+        .follow_up => try self.queue_mirror.appendFollowUp(self.allocator, preflight.text),
+    }
+    errdefer self.rollbackQueuedPrompt(behavior, preflight.text);
+    self.event_drain.emitQueueUpdate();
     const message = try self.constructUserMessage(preflight.text, preflight.images);
     switch (behavior) {
         .steer => try self.agent.steer(message),
         .follow_up => try self.agent.followUp(message),
     }
-    self.event_drain.enqueuePublicEvent(.{ .queue_update = .{
-        .steering_count = self.agent.steering_queue.count(),
-        .follow_up_count = self.agent.follow_up_queue.count(),
-    } });
     return true;
 }
 
@@ -421,8 +509,29 @@ fn checkModelPreconditions(_: *AgentSession) !void {}
 
 fn checkPrePromptCompaction(_: *AgentSession) !void {}
 
-fn constructUserMessage(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !agent_mod.AgentMessage {
+fn constructUserMessage(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+) !agent_mod.AgentMessage {
     return self.agent.userMessageFromText(text, images);
+}
+
+fn rollbackQueuedPrompt(self: *AgentSession, behavior: StreamingBehavior, text: []const u8) void {
+    switch (behavior) {
+        .steer => _ = self.queue_mirror.removeSteeringText(self.allocator, text),
+        .follow_up => _ = self.queue_mirror.removeFollowUpText(self.allocator, text),
+    }
+    self.event_drain.emitQueueUpdate();
+}
+
+fn userMessageText(message: ai.UserMessage) ?[]const u8 {
+    return switch (message.content) {
+        .string => |text| text,
+        .blocks => |blocks| for (blocks) |block| {
+            if (block == .text) break block.text.text;
+        } else null,
+    };
 }
 
 fn runBeforeAgentStartHooks(_: *AgentSession, _: *const PromptPreflight) !void {}
@@ -587,7 +696,7 @@ test "agent session prompt uses preflight spine before agent submission" {
     try session.prompt("hello", &.{});
 
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
-    try expectNextUserMessageEvent(&session, .message_start, "hello");
+    try expectNextUserMessageEvent(.message_start, &session, "hello");
     drainAllPublicEvents(&session);
 }
 
@@ -702,9 +811,45 @@ test "agent session public events are caller drained after message persistence" 
 
     try std.testing.expectEqual(@as(usize, 1), session.manager.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), session.publicEventCount());
-    try expectUserMessageEvent(session.drainPublicEvent().?.agent_event, .message_start, "hello");
-    try expectUserMessageEvent(session.drainPublicEvent().?.agent_event, .message_end, "hello");
+    try expectUserMessageEvent(.message_start, session.drainPublicEvent().?.agent_event, "hello");
+    try expectUserMessageEvent(.message_end, session.drainPublicEvent().?.agent_event, "hello");
     try std.testing.expect(session.drainPublicEvent() == null);
+}
+
+test "agent session queue update consumes block user message text" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    const image: ai.ImageContent = .{ .data = "abc", .mime_type = "image/png" };
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+    try session.promptWithOptions("queued image", &.{image}, .{ .streaming_behavior = .follow_up });
+
+    const queued_update = session.drainPublicEvent().?.queue_update;
+    try std.testing.expectEqual(@as(usize, 0), queued_update.steering_count);
+    try std.testing.expectEqual(@as(usize, 1), queued_update.follow_up_count);
+
+    const message = try session.agent.userMessageFromText("queued image", &.{image});
+    try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
+
+    const consumed_update = session.drainPublicEvent().?.queue_update;
+    try std.testing.expectEqual(@as(usize, 0), consumed_update.steering_count);
+    try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up_count);
+    try expectUserMessageEvent(.message_start, session.drainPublicEvent().?.agent_event, "queued image");
 }
 
 test "agent session queue update is emitted before queued user message start" {
@@ -724,20 +869,21 @@ test "agent session queue update is emitted before queued user message start" {
     });
     defer session.deinit();
 
-    const message: agent_mod.AgentMessage = .{ .user = .{
-        .content = .{ .string = "queued" },
-        .timestamp = 0,
-    } };
-    try session.agent.steer(message);
-
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
+    try session.promptWithOptions("queued", &.{}, .{ .streaming_behavior = .steer });
+
+    const queued_update = session.drainPublicEvent().?.queue_update;
+    try std.testing.expectEqual(@as(usize, 1), queued_update.steering_count);
+    try std.testing.expectEqual(@as(usize, 0), queued_update.follow_up_count);
+
+    const message = try session.agent.userMessageFromText("queued", &.{});
     try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
 
-    const queue_update = session.drainPublicEvent().?.queue_update;
-    try std.testing.expectEqual(@as(usize, 1), queue_update.steering_count);
-    try std.testing.expectEqual(@as(usize, 0), queue_update.follow_up_count);
-    try expectUserMessageEvent(session.drainPublicEvent().?.agent_event, .message_start, "queued");
+    const consumed_update = session.drainPublicEvent().?.queue_update;
+    try std.testing.expectEqual(@as(usize, 0), consumed_update.steering_count);
+    try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up_count);
+    try expectUserMessageEvent(.message_start, session.drainPublicEvent().?.agent_event, "queued");
 }
 
 test "agent session public event queue overflow is explicit" {
@@ -834,17 +980,25 @@ fn drainAllPublicEvents(session: *AgentSession) void {
     while (session.drainPublicEvent() != null) {}
 }
 
-fn expectNextUserMessageEvent(session: *AgentSession, comptime tag: std.meta.Tag(agent_mod.AgentEvent), text: []const u8) !void {
+fn expectNextUserMessageEvent(
+    comptime tag: std.meta.Tag(agent_mod.AgentEvent),
+    session: *AgentSession,
+    text: []const u8,
+) !void {
     while (session.drainPublicEvent()) |event| {
         if (event != .agent_event) continue;
         if (std.meta.activeTag(event.agent_event) != tag) continue;
-        try expectUserMessageEvent(event.agent_event, tag, text);
+        try expectUserMessageEvent(tag, event.agent_event, text);
         return;
     }
     return error.ExpectedUserMessageEvent;
 }
 
-fn expectUserMessageEvent(event: agent_mod.AgentEvent, comptime tag: std.meta.Tag(agent_mod.AgentEvent), text: []const u8) !void {
+fn expectUserMessageEvent(
+    comptime tag: std.meta.Tag(agent_mod.AgentEvent),
+    event: agent_mod.AgentEvent,
+    text: []const u8,
+) !void {
     try std.testing.expectEqual(tag, std.meta.activeTag(event));
     const message = switch (event) {
         .message_start => |payload| payload.message,
@@ -853,6 +1007,5 @@ fn expectUserMessageEvent(event: agent_mod.AgentEvent, comptime tag: std.meta.Ta
     };
     try std.testing.expectEqual(.user, std.meta.activeTag(message));
     const user = message.user;
-    try std.testing.expectEqual(.string, std.meta.activeTag(user.content));
-    try std.testing.expectEqualStrings(text, user.content.string);
+    try std.testing.expectEqualStrings(text, userMessageText(user).?);
 }
