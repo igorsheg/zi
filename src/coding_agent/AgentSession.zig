@@ -40,6 +40,15 @@ pub const Options = struct {
     public_event_capacity: usize = public_event_capacity_default,
 };
 
+pub const StreamingBehavior = enum {
+    steer,
+    follow_up,
+};
+
+pub const PromptOptions = struct {
+    streaming_behavior: ?StreamingBehavior = null,
+};
+
 pub const PublicEvent = union(enum) {
     agent_event: agent_mod.AgentEvent,
     queue_update: QueueUpdate,
@@ -274,9 +283,22 @@ pub fn deinit(self: *AgentSession) void {
 }
 
 pub fn prompt(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
-    const expanded = try self.expandPromptText(text);
-    defer self.allocator.free(expanded);
-    try self.sendPrompt(expanded, images);
+    try self.promptWithOptions(text, images, .{});
+}
+
+pub fn promptWithOptions(self: *AgentSession, text: []const u8, images: []const ai.ImageContent, options: PromptOptions) !void {
+    var preflight = try self.preparePromptInput(text, images, options);
+    defer preflight.deinit(self.allocator);
+    if (try self.tryHandlePromptCommand(&preflight)) return;
+    try self.runInputHooks(&preflight);
+    try self.expandPromptResources(&preflight);
+    if (try self.queuePromptIfStreaming(&preflight)) return;
+    try self.flushPendingSessionMessages();
+    try self.checkModelPreconditions();
+    try self.checkPrePromptCompaction();
+    try self.runBeforeAgentStartHooks(&preflight);
+    const message = try self.constructUserMessage(preflight.text, preflight.images);
+    try self.sendPreparedPrompt(&.{message});
 }
 
 pub fn continueRun(self: *AgentSession) !void {
@@ -342,12 +364,71 @@ fn buildPromptForActiveNames(self: *AgentSession, active_names: []const []const 
     });
 }
 
-fn expandPromptText(self: *AgentSession, text: []const u8) ![]const u8 {
-    return self.allocator.dupe(u8, text);
+const PromptPreflight = struct {
+    text: []const u8,
+    images: []const ai.ImageContent,
+    streaming_behavior: ?StreamingBehavior,
+
+    fn deinit(self: *PromptPreflight, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+};
+
+fn preparePromptInput(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    options: PromptOptions,
+) !PromptPreflight {
+    return .{
+        .text = try self.allocator.dupe(u8, text),
+        .images = images,
+        .streaming_behavior = options.streaming_behavior,
+    };
 }
 
-fn sendPrompt(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
-    try self.agent.promptText(text, images);
+fn tryHandlePromptCommand(_: *AgentSession, _: *const PromptPreflight) !bool {
+    return false;
+}
+
+fn runInputHooks(_: *AgentSession, _: *const PromptPreflight) !void {}
+
+fn expandPromptResources(_: *AgentSession, _: *PromptPreflight) !void {}
+
+fn queuePromptIfStreaming(self: *AgentSession, preflight: *const PromptPreflight) !bool {
+    if (!self.agent.state.isStreaming()) return false;
+    const behavior = preflight.streaming_behavior orelse return error.StreamingBehaviorRequired;
+    switch (behavior) {
+        .steer => if (!self.agent.steering_queue.hasCapacity()) return error.QueueFull,
+        .follow_up => if (!self.agent.follow_up_queue.hasCapacity()) return error.QueueFull,
+    }
+    const message = try self.constructUserMessage(preflight.text, preflight.images);
+    switch (behavior) {
+        .steer => try self.agent.steer(message),
+        .follow_up => try self.agent.followUp(message),
+    }
+    self.event_drain.enqueuePublicEvent(.{ .queue_update = .{
+        .steering_count = self.agent.steering_queue.count(),
+        .follow_up_count = self.agent.follow_up_queue.count(),
+    } });
+    return true;
+}
+
+fn flushPendingSessionMessages(_: *AgentSession) !void {}
+
+fn checkModelPreconditions(_: *AgentSession) !void {}
+
+fn checkPrePromptCompaction(_: *AgentSession) !void {}
+
+fn constructUserMessage(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !agent_mod.AgentMessage {
+    return self.agent.userMessageFromText(text, images);
+}
+
+fn runBeforeAgentStartHooks(_: *AgentSession, _: *const PromptPreflight) !void {}
+
+fn sendPreparedPrompt(self: *AgentSession, messages: []const agent_mod.AgentMessage) !void {
+    try self.agent.promptMessages(messages);
 }
 
 fn drainAgentEvent(
@@ -484,6 +565,112 @@ test "agent session rejects active tool changes while running" {
     defer session.agent.finishRun();
 
     try std.testing.expectError(error.SessionBusy, session.setActiveToolsByName(&.{"read"}));
+}
+
+test "agent session prompt uses preflight spine before agent submission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    try session.prompt("hello", &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
+    try expectNextUserMessageEvent(&session, .message_start, "hello");
+    drainAllPublicEvents(&session);
+}
+
+test "agent session prompt requires streaming behavior while running" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+
+    try std.testing.expectError(error.StreamingBehaviorRequired, session.prompt("queued", &.{}));
+    try std.testing.expect(!session.agent.hasQueuedMessages());
+}
+
+test "agent session prompt queues follow up while running" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+
+    try session.promptWithOptions("queued", &.{}, .{ .streaming_behavior = .follow_up });
+
+    try std.testing.expectEqual(@as(usize, 0), session.agent.steering_queue.count());
+    try std.testing.expectEqual(@as(usize, 1), session.agent.follow_up_queue.count());
+    const queue_update = session.drainPublicEvent().?.queue_update;
+    try std.testing.expectEqual(@as(usize, 0), queue_update.steering_count);
+    try std.testing.expectEqual(@as(usize, 1), queue_update.follow_up_count);
+}
+
+test "agent session prompt queues steering while running" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer session.deinit();
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+
+    try session.promptWithOptions("steer", &.{}, .{ .streaming_behavior = .steer });
+
+    try std.testing.expectEqual(@as(usize, 1), session.agent.steering_queue.count());
+    try std.testing.expectEqual(@as(usize, 0), session.agent.follow_up_queue.count());
+    const queue_update = session.drainPublicEvent().?.queue_update;
+    try std.testing.expectEqual(@as(usize, 1), queue_update.steering_count);
+    try std.testing.expectEqual(@as(usize, 0), queue_update.follow_up_count);
 }
 
 test "agent session public events are caller drained after message persistence" {
@@ -645,6 +832,16 @@ test "agent session terminal policy runs after persistence" {
 
 fn drainAllPublicEvents(session: *AgentSession) void {
     while (session.drainPublicEvent() != null) {}
+}
+
+fn expectNextUserMessageEvent(session: *AgentSession, comptime tag: std.meta.Tag(agent_mod.AgentEvent), text: []const u8) !void {
+    while (session.drainPublicEvent()) |event| {
+        if (event != .agent_event) continue;
+        if (std.meta.activeTag(event.agent_event) != tag) continue;
+        try expectUserMessageEvent(event.agent_event, tag, text);
+        return;
+    }
+    return error.ExpectedUserMessageEvent;
 }
 
 fn expectUserMessageEvent(event: agent_mod.AgentEvent, comptime tag: std.meta.Tag(agent_mod.AgentEvent), text: []const u8) !void {

@@ -402,7 +402,7 @@ fn emitFromLoop(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     try self.emitEvent(event);
 }
 
-fn userMessageFromText(self: *Agent, text: []const u8, images: []const ai.ImageContent) !agent.AgentMessage {
+pub fn userMessageFromText(self: *Agent, text: []const u8, images: []const ai.ImageContent) !agent.AgentMessage {
     if (images.len == 0) {
         return .{ .user = .{
             .content = .{ .string = try self.message_arena.allocator().dupe(u8, text) },
@@ -483,6 +483,10 @@ pub const PendingMessageQueue = struct {
 
     pub fn count(self: *const PendingMessageQueue) usize {
         return self.messages.items.len;
+    }
+
+    pub fn hasCapacity(self: *const PendingMessageQueue) bool {
+        return self.messages.items.len < max_queued_messages;
     }
 
     pub fn clear(self: *PendingMessageQueue) void {
