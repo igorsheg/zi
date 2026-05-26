@@ -1,4 +1,5 @@
 const std = @import("std");
+const mem = @import("../mem/root.zig");
 
 pub const PersistencePaths = struct {
     global_dir: []const u8,
@@ -12,18 +13,18 @@ pub const PersistencePaths = struct {
 };
 
 pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "--");
+    var out = mem.ByteBuilder.init(allocator);
+    errdefer out.deinit();
+    try out.append("--");
     const start: usize = if (cwd.len > 0 and (cwd[0] == '/' or cwd[0] == '\\')) 1 else 0;
     for (cwd[start..]) |char| {
         switch (char) {
-            '/', '\\', ':' => try out.append(allocator, '-'),
-            else => try out.append(allocator, char),
+            '/', '\\', ':' => try out.appendByte('-'),
+            else => try out.appendByte(char),
         }
     }
-    try out.appendSlice(allocator, "--");
-    return out.toOwnedSlice(allocator);
+    try out.append("--");
+    return out.toOwnedSlice();
 }
 
 test "cwd encoding matches pi session directory shape" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const http_utils = @import("../utils/http.zig");
 const oauth_openai_codex = @import("../utils/oauth/openai_codex.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
@@ -144,7 +145,7 @@ fn requestOnce(
     defer request.allocator.free(url);
     const uri = try std.Uri.parse(url);
     const headers = [_]std.http.Header{
-        .{ .name = "Authorization", .value = try authorizationHeader(request.allocator, api_key) },
+        .{ .name = "Authorization", .value = try http_utils.bearerHeader(request.allocator, api_key) },
         .{ .name = "chatgpt-account-id", .value = account_id },
         .{ .name = "originator", .value = "zi" },
         .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
@@ -256,30 +257,15 @@ const ReducerSseSink = struct {
 };
 
 fn readErrorBody(allocator: std.mem.Allocator, reader: anytype) ![]const u8 {
-    var body = std.Io.Writer.Allocating.init(allocator);
-    errdefer body.deinit();
-    while (body.written().len < max_error_body_bytes) {
-        var chunk: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&chunk);
-        const remaining = @min(chunk.len, max_error_body_bytes - body.written().len);
-        const n = reader.stream(&writer, .limited(remaining)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) continue;
-        try body.writer.writeAll(chunk[0..n]);
-    }
-    if (body.written().len == 0) return allocator.dupe(u8, "HTTP request failed");
-    return body.toOwnedSlice();
+    const body = try http_utils.readBoundedBody(allocator, reader, max_error_body_bytes);
+    if (body.len > 0) return body;
+    allocator.free(body);
+    return allocator.dupe(u8, "HTTP request failed");
 }
 
 fn resolveApiKey(request: protocol.StreamRequest) ?[]const u8 {
     if (request.options.api_key) |api_key| if (api_key.len > 0) return api_key;
     return null;
-}
-
-fn authorizationHeader(allocator: std.mem.Allocator, api_key: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
 }
 
 fn endpointUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {

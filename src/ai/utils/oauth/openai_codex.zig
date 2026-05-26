@@ -1,4 +1,6 @@
 const std = @import("std");
+const http_utils = @import("../http.zig");
+const mem = @import("../../../mem/root.zig");
 const oauth = @import("root.zig");
 
 pub const callback_host = "127.0.0.1";
@@ -74,7 +76,7 @@ pub fn getAccountId(allocator: std.mem.Allocator, access_token: []const u8) !?[]
     const decoded = try decodeBase64Url(allocator, payload_segment);
     defer allocator.free(decoded);
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return null;
+    var parsed = mem.Owned(std.json.Value).parseJson(allocator, decoded, .{}) catch return null;
     defer parsed.deinit();
     const auth = parsed.value.object.get(jwt_claim_path) orelse return null;
     if (auth != .object) return null;
@@ -317,31 +319,14 @@ fn requestToken(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oau
     var response = try req.receiveHead(&redirects);
     var transfer_buffer: [read_buffer_len]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    const response_body = try readResponseBody(allocator, reader);
+    const response_body = try http_utils.readBoundedBody(allocator, reader, max_error_body_bytes);
     defer allocator.free(response_body);
     if (response.head.status != .ok) return error.TokenRequestFailed;
     return parseTokenResponse(allocator, io, response_body);
 }
 
-fn readResponseBody(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
-    var body = std.Io.Writer.Allocating.init(allocator);
-    errdefer body.deinit();
-    while (body.written().len < max_error_body_bytes) {
-        var chunk: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&chunk);
-        const remaining = @min(chunk.len, max_error_body_bytes - body.written().len);
-        const n = reader.stream(&writer, .limited(remaining)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) continue;
-        try body.writer.writeAll(chunk[0..n]);
-    }
-    return body.toOwnedSlice();
-}
-
 fn parseTokenResponse(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oauth.OAuthCredentials {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    var parsed = try mem.Owned(std.json.Value).parseJson(allocator, body, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidTokenResponse;
     const object = parsed.value.object;

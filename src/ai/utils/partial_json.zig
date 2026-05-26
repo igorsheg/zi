@@ -1,4 +1,5 @@
 const std = @import("std");
+const mem = @import("../../mem/root.zig");
 
 const max_depth: u16 = 128;
 
@@ -183,14 +184,14 @@ const Parser = struct {
     fn parseString(self: *Parser) InternalError![]const u8 {
         std.debug.assert(self.input[self.index] == '"');
         self.index += 1;
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(self.allocator);
+        var out = mem.ByteBuilder.init(self.allocator);
+        errdefer out.deinit();
 
         while (self.index < self.input.len) {
             const byte = self.input[self.index];
             if (byte == '"') {
                 self.index += 1;
-                return out.toOwnedSlice(self.allocator);
+                return out.toOwnedSlice();
             }
             if (byte == '\\') {
                 try self.parseEscape(&out);
@@ -198,35 +199,35 @@ const Parser = struct {
             }
             const len = std.unicode.utf8ByteSequenceLength(byte) catch return self.finishString(&out);
             if (self.index + len > self.input.len) return self.finishString(&out);
-            try out.appendSlice(self.allocator, self.input[self.index .. self.index + len]);
+            try out.append(self.input[self.index .. self.index + len]);
             self.index += len;
         }
 
         return self.finishString(&out);
     }
 
-    fn finishString(self: *Parser, out: *std.ArrayList(u8)) InternalError![]const u8 {
+    fn finishString(self: *Parser, out: *mem.ByteBuilder) InternalError![]const u8 {
         self.incomplete = true;
-        return out.toOwnedSlice(self.allocator);
+        return out.toOwnedSlice();
     }
 
-    fn parseEscape(self: *Parser, out: *std.ArrayList(u8)) InternalError!void {
+    fn parseEscape(self: *Parser, out: *mem.ByteBuilder) InternalError!void {
         if (self.index + 1 >= self.input.len) return self.finishEscape();
         const escaped = self.input[self.index + 1];
         switch (escaped) {
-            '"', '\\', '/' => try out.append(self.allocator, escaped),
-            'b' => try out.append(self.allocator, 0x08),
-            'f' => try out.append(self.allocator, 0x0c),
-            'n' => try out.append(self.allocator, '\n'),
-            'r' => try out.append(self.allocator, '\r'),
-            't' => try out.append(self.allocator, '\t'),
+            '"', '\\', '/' => try out.appendByte(escaped),
+            'b' => try out.appendByte(0x08),
+            'f' => try out.appendByte(0x0c),
+            'n' => try out.appendByte('\n'),
+            'r' => try out.appendByte('\r'),
+            't' => try out.appendByte('\t'),
             'u' => {
                 if (self.index + 6 > self.input.len) return self.finishEscape();
                 const hex = self.input[self.index + 2 .. self.index + 6];
                 const codepoint = std.fmt.parseInt(u21, hex, 16) catch return self.finishEscape();
                 var buffer: [4]u8 = undefined;
                 const len = std.unicode.utf8Encode(codepoint, &buffer) catch return self.finishEscape();
-                try out.appendSlice(self.allocator, buffer[0..len]);
+                try out.append(buffer[0..len]);
                 self.index += 6;
                 return;
             },

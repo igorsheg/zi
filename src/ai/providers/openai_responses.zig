@@ -1,5 +1,6 @@
 const std = @import("std");
 const env_api_keys = @import("../utils/env_api_keys.zig");
+const http_utils = @import("../utils/http.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
 const sse = @import("../sse.zig");
@@ -86,7 +87,7 @@ fn run(self: *Provider, request: protocol.StreamRequest, sink: protocol.Assistan
     defer request.allocator.free(url);
     const uri = try std.Uri.parse(url);
     const headers = [_]std.http.Header{
-        .{ .name = "Authorization", .value = try authorizationHeader(request.allocator, api_key) },
+        .{ .name = "Authorization", .value = try http_utils.bearerHeader(request.allocator, api_key) },
         .{ .name = "Accept", .value = "text/event-stream" },
     };
     defer request.allocator.free(headers[0].value);
@@ -155,21 +156,10 @@ const ReducerSseSink = struct {
 };
 
 fn readErrorBody(allocator: std.mem.Allocator, reader: anytype) ![]const u8 {
-    var body = std.Io.Writer.Allocating.init(allocator);
-    errdefer body.deinit();
-    while (body.written().len < max_error_body_bytes) {
-        var chunk: [1024]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&chunk);
-        const remaining = @min(chunk.len, max_error_body_bytes - body.written().len);
-        const n = reader.stream(&writer, .limited(remaining)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) continue;
-        try body.writer.writeAll(chunk[0..n]);
-    }
-    if (body.written().len == 0) return allocator.dupe(u8, "HTTP request failed");
-    return body.toOwnedSlice();
+    const body = try http_utils.readBoundedBody(allocator, reader, max_error_body_bytes);
+    if (body.len > 0) return body;
+    allocator.free(body);
+    return allocator.dupe(u8, "HTTP request failed");
 }
 
 fn resolveApiKey(self: *Provider, request: protocol.StreamRequest) ?[]const u8 {
@@ -178,16 +168,8 @@ fn resolveApiKey(self: *Provider, request: protocol.StreamRequest) ?[]const u8 {
     return if (env_api_keys.getEnvApiKey(environ, request.model.provider)) |key| key.value else null;
 }
 
-fn authorizationHeader(allocator: std.mem.Allocator, api_key: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-}
-
 fn endpointUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
-    if (std.mem.endsWith(u8, base_url, "/responses")) return allocator.dupe(u8, base_url);
-    if (std.mem.endsWith(u8, base_url, "/")) {
-        return std.fmt.allocPrint(allocator, "{s}responses", .{base_url});
-    }
-    return std.fmt.allocPrint(allocator, "{s}/responses", .{base_url});
+    return http_utils.appendPath(allocator, base_url, "responses");
 }
 
 fn buildRequestBody(allocator: std.mem.Allocator, request: protocol.StreamRequest) ![]const u8 {

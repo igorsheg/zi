@@ -1,4 +1,5 @@
 const std = @import("std");
+const mem = @import("../../mem/root.zig");
 const owned = @import("../owned.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
@@ -318,6 +319,11 @@ const PartialBuilder = struct {
     final_message: protocol.AssistantMessage,
     content: std.ArrayList(protocol.AssistantContent),
     partial: protocol.AssistantMessage,
+    text_bytes: mem.ByteBuilder,
+    thinking_bytes: mem.ByteBuilder,
+    active: ActiveBlock = .none,
+
+    const ActiveBlock = enum { none, text, thinking };
 
     fn init(response: *owned.OwnedAssistantMessage) PartialBuilder {
         const allocator = response.arena.allocator();
@@ -325,6 +331,8 @@ const PartialBuilder = struct {
             .allocator = allocator,
             .final_message = response.value,
             .content = .empty,
+            .text_bytes = mem.ByteBuilder.init(allocator),
+            .thinking_bytes = mem.ByteBuilder.init(allocator),
             .partial = .{
                 .content = &.{},
                 .api = response.value.api,
@@ -347,24 +355,33 @@ const PartialBuilder = struct {
     }
 
     fn startText(self: *PartialBuilder) !void {
+        try self.freezeActive();
+        self.text_bytes.clearRetainingCapacity();
         try self.content.append(self.allocator, .{ .text = .{ .text = "" } });
+        self.active = .text;
     }
 
     fn appendText(self: *PartialBuilder, delta: []const u8) !void {
+        try self.text_bytes.append(delta);
         const text_block = &self.content.items[self.content.items.len - 1].text;
-        text_block.text = try concat(self.allocator, text_block.text, delta);
+        text_block.text = self.text_bytes.items();
     }
 
     fn startThinking(self: *PartialBuilder) !void {
+        try self.freezeActive();
+        self.thinking_bytes.clearRetainingCapacity();
         try self.content.append(self.allocator, .{ .thinking = .{ .thinking = "" } });
+        self.active = .thinking;
     }
 
     fn appendThinking(self: *PartialBuilder, delta: []const u8) !void {
+        try self.thinking_bytes.append(delta);
         const thinking_block = &self.content.items[self.content.items.len - 1].thinking;
-        thinking_block.thinking = try concat(self.allocator, thinking_block.thinking, delta);
+        thinking_block.thinking = self.thinking_bytes.items();
     }
 
     fn startToolCall(self: *PartialBuilder, call: protocol.ToolCall) !void {
+        try self.freezeActive();
         const empty_object: std.json.ObjectMap = .empty;
         const empty_args: std.json.Value = .{ .object = empty_object };
         try self.content.append(self.allocator, .{ .tool_call = .{
@@ -377,6 +394,21 @@ const PartialBuilder = struct {
 
     fn endToolCall(self: *PartialBuilder, call: protocol.ToolCall) void {
         self.content.items[self.content.items.len - 1] = .{ .tool_call = call };
+    }
+
+    fn freezeActive(self: *PartialBuilder) !void {
+        switch (self.active) {
+            .none => {},
+            .text => {
+                const block = &self.content.items[self.content.items.len - 1].text;
+                block.text = try self.allocator.dupe(u8, self.text_bytes.items());
+            },
+            .thinking => {
+                const block = &self.content.items[self.content.items.len - 1].thinking;
+                block.thinking = try self.allocator.dupe(u8, self.thinking_bytes.items());
+            },
+        }
+        self.active = .none;
     }
 };
 

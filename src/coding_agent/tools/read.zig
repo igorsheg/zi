@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
+const mem = @import("../../mem/root.zig");
 const runtime = @import("../../runtime/root.zig");
 
 pub const max_read_bytes = 1024 * 1024;
@@ -22,7 +23,7 @@ const parameters_schema =
 pub const ReadTool = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    parsed_parameters: std.json.Parsed(std.json.Value),
+    parsed_parameters: mem.Owned(std.json.Value),
 
     pub const Config = struct {
         cwd: []const u8,
@@ -35,7 +36,7 @@ pub const ReadTool = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !ReadTool {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
-        const parsed_parameters = try std.json.parseFromSlice(std.json.Value, allocator, parameters_schema, .{});
+        const parsed_parameters = try mem.Owned(std.json.Value).parseJson(allocator, parameters_schema, .{});
         return .{
             .allocator = allocator,
             .config = .{

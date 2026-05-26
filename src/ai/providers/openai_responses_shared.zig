@@ -1,5 +1,6 @@
 const std = @import("std");
 const models_api = @import("../models.zig");
+const mem = @import("../../mem/root.zig");
 const protocol = @import("../protocol.zig");
 const json_parse = @import("../utils/json_parse.zig");
 
@@ -10,6 +11,7 @@ pub const ProcessError = error{
 } || protocol.AssistantMessageEventSinkEmitError;
 
 pub const ResponseStreamReducer = struct {
+    backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     model: protocol.Model,
     output: protocol.AssistantMessage,
@@ -18,14 +20,19 @@ pub const ResponseStreamReducer = struct {
 
     const CurrentBlock = union(enum) {
         none,
-        thinking: usize,
-        text: usize,
+        thinking: TextState,
+        text: TextState,
         tool_call: ToolCallState,
+    };
+
+    const TextState = struct {
+        content_index: usize,
+        bytes: mem.ByteBuilder,
     };
 
     const ToolCallState = struct {
         content_index: usize,
-        partial_json: std.ArrayList(u8),
+        partial_json: mem.ByteBuilder,
     };
 
     pub fn init(
@@ -34,6 +41,7 @@ pub const ResponseStreamReducer = struct {
         timestamp: protocol.Timestamp,
     ) ResponseStreamReducer {
         return .{
+            .backing_allocator = backing_allocator,
             .arena = std.heap.ArenaAllocator.init(backing_allocator),
             .model = model,
             .output = .{
@@ -49,6 +57,7 @@ pub const ResponseStreamReducer = struct {
     }
 
     pub fn deinit(self: *ResponseStreamReducer) void {
+        self.discardCurrentBlock();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -142,12 +151,12 @@ pub const ResponseStreamReducer = struct {
         if (std.mem.eql(u8, item_type, "reasoning")) {
             try self.content.append(self.arena.allocator(), .{ .thinking = .{ .thinking = "" } });
             const index = self.content.items.len - 1;
-            self.current = .{ .thinking = index };
+            self.current = .{ .thinking = .{ .content_index = index, .bytes = mem.ByteBuilder.init(self.arena.allocator()) } };
             try sink.emit(io, .{ .thinking_start = .{ .content_index = index, .partial = try self.partial() } });
         } else if (std.mem.eql(u8, item_type, "message")) {
             try self.content.append(self.arena.allocator(), .{ .text = .{ .text = "" } });
             const index = self.content.items.len - 1;
-            self.current = .{ .text = index };
+            self.current = .{ .text = .{ .content_index = index, .bytes = mem.ByteBuilder.init(self.arena.allocator()) } };
             try sink.emit(io, .{ .text_start = .{ .content_index = index, .partial = try self.partial() } });
         } else if (std.mem.eql(u8, item_type, "function_call")) {
             const call_id = jsonString(item.get("call_id")) orelse "";
@@ -160,9 +169,9 @@ pub const ResponseStreamReducer = struct {
                 .arguments = emptyObject(),
             } });
             const index = self.content.items.len - 1;
-            self.current = .{ .tool_call = .{ .content_index = index, .partial_json = .empty } };
+            self.current = .{ .tool_call = .{ .content_index = index, .partial_json = mem.ByteBuilder.init(self.backing_allocator) } };
             if (jsonString(item.get("arguments"))) |arguments| {
-                try self.current.tool_call.partial_json.appendSlice(self.arena.allocator(), arguments);
+                try self.current.tool_call.partial_json.append(arguments);
             }
             try sink.emit(io, .{ .toolcall_start = .{ .content_index = index, .partial = try self.partial() } });
         }
@@ -175,24 +184,43 @@ pub const ResponseStreamReducer = struct {
     ) anyerror!void {
         switch (self.current) {
             .none => {},
-            .thinking => |index| try sink.emit(io, .{ .thinking_end = .{
-                .content_index = index,
-                .content = self.content.items[index].thinking.thinking,
-                .partial = try self.partial(),
-            } }),
-            .text => |index| try sink.emit(io, .{ .text_end = .{
-                .content_index = index,
-                .content = self.content.items[index].text.text,
-                .partial = try self.partial(),
-            } }),
+            .thinking => |*state| {
+                const frozen = try state.bytes.copyTo(self.arena.allocator());
+                self.content.items[state.content_index].thinking.thinking = frozen;
+                try sink.emit(io, .{ .thinking_end = .{
+                    .content_index = state.content_index,
+                    .content = frozen,
+                    .partial = try self.partial(),
+                } });
+            },
+            .text => |*state| {
+                const frozen = try state.bytes.copyTo(self.arena.allocator());
+                self.content.items[state.content_index].text.text = frozen;
+                try sink.emit(io, .{ .text_end = .{
+                    .content_index = state.content_index,
+                    .content = frozen,
+                    .partial = try self.partial(),
+                } });
+            },
             .tool_call => |*state| {
+                errdefer state.partial_json.deinit();
                 try self.parseToolArguments(state);
                 try sink.emit(io, .{ .toolcall_end = .{
                     .content_index = state.content_index,
                     .tool_call = self.content.items[state.content_index].tool_call,
                     .partial = try self.partial(),
                 } });
+                state.partial_json.deinit();
             },
+        }
+        self.current = .none;
+    }
+
+    fn discardCurrentBlock(self: *ResponseStreamReducer) void {
+        switch (self.current) {
+            .thinking, .text => {},
+            .tool_call => |*state| state.partial_json.deinit(),
+            .none => {},
         }
         self.current = .none;
     }
@@ -204,9 +232,10 @@ pub const ResponseStreamReducer = struct {
         delta: []const u8,
     ) anyerror!void {
         if (self.current != .thinking) return;
-        const index = self.current.thinking;
-        const thinking = &self.content.items[index].thinking;
-        thinking.thinking = try concat(self.arena.allocator(), thinking.thinking, delta);
+        const state = &self.current.thinking;
+        try state.bytes.append(delta);
+        const index = state.content_index;
+        self.content.items[index].thinking.thinking = state.bytes.items();
         try sink.emit(io, .{ .thinking_delta = .{
             .content_index = index,
             .delta = try dupe(self, delta),
@@ -221,9 +250,10 @@ pub const ResponseStreamReducer = struct {
         delta: []const u8,
     ) anyerror!void {
         if (self.current != .text) return;
-        const index = self.current.text;
-        const text = &self.content.items[index].text;
-        text.text = try concat(self.arena.allocator(), text.text, delta);
+        const state = &self.current.text;
+        try state.bytes.append(delta);
+        const index = state.content_index;
+        self.content.items[index].text.text = state.bytes.items();
         try sink.emit(io, .{ .text_delta = .{
             .content_index = index,
             .delta = try dupe(self, delta),
@@ -239,7 +269,7 @@ pub const ResponseStreamReducer = struct {
     ) anyerror!void {
         if (self.current != .tool_call) return;
         const state = &self.current.tool_call;
-        try state.partial_json.appendSlice(self.arena.allocator(), delta);
+        try state.partial_json.append(delta);
         try sink.emit(io, .{ .toolcall_delta = .{
             .content_index = state.content_index,
             .delta = try dupe(self, delta),
@@ -255,9 +285,9 @@ pub const ResponseStreamReducer = struct {
     ) anyerror!void {
         if (self.current != .tool_call) return;
         const state = &self.current.tool_call;
-        const previous_len = state.partial_json.items.len;
+        const previous_len = state.partial_json.items().len;
         state.partial_json.clearRetainingCapacity();
-        try state.partial_json.appendSlice(self.arena.allocator(), arguments);
+        try state.partial_json.append(arguments);
         try self.parseToolArguments(state);
         if (arguments.len > previous_len) {
             const delta = arguments[previous_len..];
@@ -277,7 +307,7 @@ pub const ResponseStreamReducer = struct {
     ) anyerror!void {
         const item_type = jsonString(item.get("type")) orelse return;
         if (std.mem.eql(u8, item_type, "message") and self.current == .text) {
-            const index = self.current.text;
+            const index = self.current.text.content_index;
             if (jsonString(item.get("id"))) |id| {
                 self.content.items[index].text.text_signature = encodeTextSignature(
                     self.arena.allocator(),
@@ -288,14 +318,14 @@ pub const ResponseStreamReducer = struct {
             const state = &self.current.tool_call;
             if (jsonString(item.get("arguments"))) |arguments| {
                 state.partial_json.clearRetainingCapacity();
-                try state.partial_json.appendSlice(self.arena.allocator(), arguments);
+                try state.partial_json.append(arguments);
             }
         }
         try self.finishCurrentBlock(io, sink);
     }
 
     fn parseToolArguments(self: *ResponseStreamReducer, state: *ToolCallState) !void {
-        const parsed = try parseJsonValueLeaky(self.arena.allocator(), state.partial_json.items);
+        const parsed = try parseJsonValueLeaky(self.arena.allocator(), state.partial_json.items());
         self.content.items[state.content_index].tool_call.arguments = parsed;
     }
 

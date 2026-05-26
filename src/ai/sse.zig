@@ -1,4 +1,5 @@
 const std = @import("std");
+const mem = @import("../mem/root.zig");
 
 pub const default_max_line_bytes: usize = 64 * 1024;
 pub const default_max_event_name_bytes: usize = 128;
@@ -30,22 +31,29 @@ pub const Error = error{
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
-    pending_line: std.ArrayList(u8) = .empty,
-    event_name: std.ArrayList(u8) = .empty,
-    data: std.ArrayList(u8) = .empty,
-    id: std.ArrayList(u8) = .empty,
+    pending_line: mem.ByteBuilder,
+    event_name: mem.ByteBuilder,
+    data: mem.ByteBuilder,
+    id: mem.ByteBuilder,
     retry_ms: ?u64 = null,
     data_line_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) Parser {
-        return .{ .allocator = allocator, .limits = limits };
+        return .{
+            .allocator = allocator,
+            .limits = limits,
+            .pending_line = mem.ByteBuilder.init(allocator),
+            .event_name = mem.ByteBuilder.init(allocator),
+            .data = mem.ByteBuilder.init(allocator),
+            .id = mem.ByteBuilder.init(allocator),
+        };
     }
 
     pub fn deinit(self: *Parser) void {
-        self.pending_line.deinit(self.allocator);
-        self.event_name.deinit(self.allocator);
-        self.data.deinit(self.allocator);
-        self.id.deinit(self.allocator);
+        self.pending_line.deinit();
+        self.event_name.deinit();
+        self.data.deinit();
+        self.id.deinit();
         self.* = undefined;
     }
 
@@ -61,19 +69,19 @@ pub const Parser = struct {
     ) Error!void {
         for (bytes) |byte| {
             if (byte == '\n') {
-                try self.processLine(stripTrailingCarriageReturn(self.pending_line.items), sink);
+                try self.processLine(stripTrailingCarriageReturn(self.pending_line.items()), sink);
                 self.pending_line.clearRetainingCapacity();
                 continue;
             }
 
-            if (self.pending_line.items.len + 1 > self.limits.max_line_bytes) return error.LineTooLong;
-            try self.pending_line.append(self.allocator, byte);
+            if (self.pending_line.items().len + 1 > self.limits.max_line_bytes) return error.LineTooLong;
+            try self.pending_line.appendByte(byte);
         }
     }
 
     pub fn finish(self: *Parser, sink: anytype) Error!void {
-        if (self.pending_line.items.len > 0) {
-            try self.processLine(stripTrailingCarriageReturn(self.pending_line.items), sink);
+        if (self.pending_line.items().len > 0) {
+            try self.processLine(stripTrailingCarriageReturn(self.pending_line.items()), sink);
             self.pending_line.clearRetainingCapacity();
         }
         try self.dispatchIfNotEmpty(sink);
@@ -96,31 +104,31 @@ pub const Parser = struct {
         if (std.mem.eql(u8, field, "event")) {
             if (value.len > self.limits.max_event_name_bytes) return error.EventNameTooLong;
             self.event_name.clearRetainingCapacity();
-            try self.event_name.appendSlice(self.allocator, value);
+            try self.event_name.append(value);
         } else if (std.mem.eql(u8, field, "data")) {
             const separator_len: usize = if (self.data_line_count > 0) 1 else 0;
-            if (self.data.items.len + separator_len + value.len > self.limits.max_data_bytes) {
+            if (self.data.items().len + separator_len + value.len > self.limits.max_data_bytes) {
                 return error.DataTooLarge;
             }
-            if (separator_len == 1) try self.data.append(self.allocator, '\n');
-            try self.data.appendSlice(self.allocator, value);
+            if (separator_len == 1) try self.data.appendByte('\n');
+            try self.data.append(value);
             self.data_line_count += 1;
         } else if (std.mem.eql(u8, field, "id")) {
             if (std.mem.findScalar(u8, value, 0) != null) return;
             if (value.len > self.limits.max_id_bytes) return error.IdTooLong;
             self.id.clearRetainingCapacity();
-            try self.id.appendSlice(self.allocator, value);
+            try self.id.append(value);
         } else if (std.mem.eql(u8, field, "retry")) {
             self.retry_ms = std.fmt.parseUnsigned(u64, value, 10) catch self.retry_ms;
         }
     }
 
     fn dispatchIfNotEmpty(self: *Parser, sink: anytype) Error!void {
-        if (self.data_line_count == 0 and self.event_name.items.len == 0 and self.id.items.len == 0) return;
+        if (self.data_line_count == 0 and self.event_name.items().len == 0 and self.id.items().len == 0) return;
         try sink.emit(.{
-            .event = if (self.event_name.items.len > 0) self.event_name.items else null,
-            .data = self.data.items,
-            .id = if (self.id.items.len > 0) self.id.items else null,
+            .event = if (self.event_name.items().len > 0) self.event_name.items() else null,
+            .data = self.data.items(),
+            .id = if (self.id.items().len > 0) self.id.items() else null,
             .retry_ms = self.retry_ms,
         });
     }

@@ -6,6 +6,7 @@ pub const sanitize_unicode = @import("utils/sanitize_unicode.zig");
 pub const headers_api = @import("utils/headers.zig");
 pub const hash_api = @import("utils/hash.zig");
 pub const json_parse = @import("utils/json_parse.zig");
+pub const http_utils = @import("utils/http.zig");
 pub const oauth = @import("utils/oauth/root.zig");
 pub const faux = @import("providers/faux.zig");
 pub const simple_options = @import("providers/simple_options.zig");
@@ -124,6 +125,7 @@ test {
     _ = headers_api;
     _ = hash_api;
     _ = json_parse;
+    _ = http_utils;
     _ = oauth;
     _ = faux;
     _ = simple_options;

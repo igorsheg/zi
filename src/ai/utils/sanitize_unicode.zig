@@ -1,8 +1,9 @@
 const std = @import("std");
+const mem = @import("../../mem/root.zig");
 
 pub fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var sanitized = std.ArrayList(u8).empty;
-    errdefer sanitized.deinit(allocator);
+    var sanitized = mem.ByteBuilder.init(allocator);
+    errdefer sanitized.deinit();
 
     var index: usize = 0;
     while (index < text.len) {
@@ -11,11 +12,11 @@ pub fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]u8 
             continue;
         }
 
-        try sanitized.append(allocator, text[index]);
+        try sanitized.appendByte(text[index]);
         index += 1;
     }
 
-    return sanitized.toOwnedSlice(allocator);
+    return sanitized.toOwnedSlice();
 }
 
 fn isUtf8SurrogateAt(text: []const u8, index: usize) bool {
