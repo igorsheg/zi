@@ -1,9 +1,11 @@
+pub const AgentSession = @import("AgentSession.zig");
 pub const paths = @import("paths.zig");
 pub const resources = @import("resources.zig");
 pub const session_manager = @import("session_manager.zig");
 pub const session_store = @import("session_store.zig");
 pub const skills = @import("skills.zig");
 pub const system_prompt = @import("system_prompt.zig");
+pub const tool_registry = @import("tool_registry.zig");
 pub const tools = @import("tools/root.zig");
 
 pub const PersistencePaths = paths.PersistencePaths;
@@ -19,6 +21,8 @@ pub const SessionContext = session_manager.SessionContext;
 pub const SessionStore = session_store.SessionStore;
 pub const Skill = skills.Skill;
 pub const OwnedSkills = skills.OwnedSkills;
+pub const ToolDefinition = tool_registry.ToolDefinition;
+pub const ToolRegistry = tool_registry.ToolRegistry;
 pub const EditTool = tools.EditTool;
 pub const FileMutationQueue = tools.FileMutationQueue;
 pub const ReadTool = tools.ReadTool;
@@ -33,21 +37,25 @@ pub const loadSkills = skills.loadSkills;
 pub const buildSystemPrompt = system_prompt.build;
 
 pub fn testsReachable() void {
+    _ = AgentSession;
     _ = paths;
     _ = resources;
     _ = session_manager;
     _ = session_store;
     _ = skills;
     _ = system_prompt;
+    _ = tool_registry;
     _ = tools;
 }
 
 test {
+    _ = AgentSession;
     _ = paths;
     _ = resources;
     _ = session_manager;
     _ = session_store;
     _ = skills;
     _ = system_prompt;
+    _ = tool_registry;
     _ = tools;
 }

@@ -104,6 +104,7 @@ pub fn initRuntime(process: runtime.Process, options: Options) !Agent {
 }
 
 pub fn deinit(self: *Agent) void {
+    std.debug.assert(self.active_run == null);
     self.messages.deinit(self.allocator);
     self.tools.deinit(self.allocator);
     self.steering_queue.deinit(self.allocator);
@@ -128,8 +129,11 @@ pub fn setThinkingLevel(self: *Agent, thinking_level: agent.ThinkingLevel) void 
 }
 
 pub fn setTools(self: *Agent, tools: []const agent.AgentTool) !void {
-    self.tools.clearRetainingCapacity();
-    try self.tools.appendSlice(self.allocator, tools);
+    var next_tools = try std.ArrayList(agent.AgentTool).initCapacity(self.allocator, tools.len);
+    errdefer next_tools.deinit(self.allocator);
+    next_tools.appendSliceAssumeCapacity(tools);
+    self.tools.deinit(self.allocator);
+    self.tools = next_tools;
     self.state.tools = self.tools.items;
 }
 
@@ -314,13 +318,13 @@ pub fn continueRun(self: *Agent) !void {
 
 pub fn emitEvent(self: *Agent, event: agent.AgentEvent) !void {
     const token = self.signal() orelse return error.NoActiveRun;
-    try self.applyEvent(event);
-    if (event == .agent_end and self.state.status != .failed) {
-        self.state.status = .{ .settling = .{ .messages = self.state.messages } };
-    }
     for (self.listeners.items) |maybe_listener| {
         const listener = maybe_listener orelse continue;
         try Listener.call(self.io, listener, event, token);
+    }
+    try self.applyEvent(event);
+    if (event == .agent_end and self.state.status != .failed) {
+        self.state.status = .{ .settling = .{ .messages = self.state.messages } };
     }
 }
 
@@ -823,6 +827,7 @@ test "emit event reduces state before notifying listeners" {
     var probe: ListenerProbe = .{};
     _ = try self.subscribe(.{ .context = &probe, .call_fn = countListener });
     _ = try self.beginRun();
+    defer self.finishRun();
 
     const message = userMessage("hello");
     try self.emitEvent(.{ .message_start = .{ .message = message } });
@@ -852,6 +857,7 @@ test "tool execution events track pending tool calls" {
     var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
     defer self.deinit();
     _ = try self.beginRun();
+    defer self.finishRun();
 
     try self.emitEvent(.{ .tool_execution_start = .{
         .tool_call_id = "tool-1",
@@ -873,6 +879,7 @@ test "turn end records assistant error message" {
     var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
     defer self.deinit();
     _ = try self.beginRun();
+    defer self.finishRun();
     var message = assistantMessage("");
     message.assistant.error_message = "failed";
     message.assistant.stop_reason = .error_;
@@ -901,6 +908,7 @@ test "prompt rejects while active run exists" {
     var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
     defer self.deinit();
     _ = try self.beginRun();
+    defer self.finishRun();
 
     try std.testing.expectError(error.AlreadyRunning, self.promptText("blocked", &.{}));
 }

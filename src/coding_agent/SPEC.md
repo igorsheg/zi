@@ -238,6 +238,19 @@ zi shape:
   src/coding/sdk.zig
 ```
 
+current implemented spine:
+- `ToolRegistry` is definition-first and exposes borrowed `agent.AgentTool` views.
+- `ToolDefinition.init(&tool, metadata)` uses a small comptime-generated adapter at the heterogeneous boundary.
+- `AgentSession` owns prompt resources, builtin tool definitions, active tool names, `SystemPromptState`, `SessionManager`, and core `agent.Agent`.
+- `SystemPromptState` rebuilds prompt text from active tools and resources.
+- `EventDrain` centralizes agent event policy order: queue mirror placeholder -> session hooks placeholder -> public event placeholder -> persistence -> terminal policy placeholder.
+- `AgentSession.setActiveToolsByName()` is the single active-tool mutation path: registry -> prompt rebuild -> `agent.setTools()` -> `agent.setSystemPrompt()`.
+
+next tightening work:
+- make prompt preflight phases explicit beyond the current skill/template no-op seam.
+- add public session listeners after event drain ordering is stable.
+- add queue mirror state for steering/follow-up before TUI/RPC.
+
 this is where the previous agent package becomes useful.
 
 ### phase 5: model/auth/settings
