@@ -365,12 +365,10 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     };
 }
 
-/// Caller must request shutdown, observe stopped status, and drain public events before deinit.
+/// Asserts shutdownComplete(); call requestShutdown() and keep draining before deinit.
 pub fn deinit(self: *AgentSession) void {
     self.reconcileLifecycle();
-    std.debug.assert(self.agent.waitForIdle());
-    std.debug.assert(self.lifecycle == .stopped);
-    std.debug.assert(self.public_events.empty());
+    std.debug.assert(self.shutdownComplete());
     self.agent.deinit();
     self.allocator.destroy(self.agent);
     self.allocator.destroy(self.event_drain);
@@ -456,6 +454,13 @@ pub fn status(self: *AgentSession) AgentSessionStatus {
         .cancel_requested => .cancel_requested,
         .accepting => if (self.agent.state.isStreaming()) .running else .idle,
     };
+}
+
+pub fn shutdownComplete(self: *AgentSession) bool {
+    self.reconcileLifecycle();
+    return self.lifecycle == .stopped and
+        self.agent.waitForIdle() and
+        self.public_events.empty();
 }
 
 pub fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !void {
@@ -727,6 +732,28 @@ test "agent session cancel while running is observable until terminal event" {
 
     try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
     drainAllPublicEvents(&session);
+}
+
+test "agent session shutdown complete requires stopped idle and drained events" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer shutdownAndDeinit(&session);
+
+    try std.testing.expect(!session.shutdownComplete());
+    session.requestShutdown();
+    try std.testing.expect(session.shutdownComplete());
 }
 
 test "agent session shutdown rejects new prompts" {
