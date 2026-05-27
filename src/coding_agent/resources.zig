@@ -1,4 +1,5 @@
 const std = @import("std");
+const paths_mod = @import("paths.zig");
 const skills_mod = @import("skills.zig");
 
 pub const max_context_files = 64;
@@ -126,7 +127,7 @@ pub fn discoverSystemPromptFile(
     io: std.Io,
     options: DiscoverPromptFileOptions,
 ) !OwnedPromptFile {
-    return discoverPromptFile(allocator, io, options, "SYSTEM.md");
+    return discoverPromptFile(allocator, io, options, paths_mod.system_prompt_file_name);
 }
 
 pub fn discoverAppendSystemPromptFile(
@@ -134,7 +135,7 @@ pub fn discoverAppendSystemPromptFile(
     io: std.Io,
     options: DiscoverPromptFileOptions,
 ) !OwnedPromptFile {
-    return discoverPromptFile(allocator, io, options, "APPEND_SYSTEM.md");
+    return discoverPromptFile(allocator, io, options, paths_mod.append_system_prompt_file_name);
 }
 
 fn discoverPromptFile(
@@ -143,7 +144,8 @@ fn discoverPromptFile(
     options: DiscoverPromptFileOptions,
     file_name: []const u8,
 ) !OwnedPromptFile {
-    const project_dir = try std.fs.path.join(allocator, &.{ options.cwd, ".zi" });
+    const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = options.agent_dir, .cwd = options.cwd };
+    const project_dir = try resource_paths.projectConfigDir(allocator);
     defer allocator.free(project_dir);
     if (try loadPromptFileFromDir(allocator, io, options.dir, project_dir, file_name)) |file| {
         return .{ .allocator = allocator, .file = file };

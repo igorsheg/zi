@@ -30,62 +30,22 @@ pub fn main(init: std.process.Init) !void {
     const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
     defer process.gpa.free(session_id);
 
-    var host = try zi.coding_agent.RuntimeHost.init(process.gpa, process.io, .{
+    var runtime = try zi.coding_agent.sdk.createRuntimeHost(process.gpa, process.io, .{
         .cwd = ".",
-        .agent_dir = ".zi",
+        .agent_dir = zi.coding_agent.paths.global_config_dir_name,
         .current_date = timestamp_text,
-    }, .{
         .session_id = session_id,
         .timestamp = timestamp_text,
     });
-    defer {
-        drainPrintEvents(&host, stdout, stderr) catch {};
-        host.requestShutdown();
-        while (host.drainPublicEvent() != null) {}
-        host.deinit();
-    }
+    defer runtime.deinit();
 
-    try host.prompt(prompt, &.{});
-    try drainPrintEvents(&host, stdout, stderr);
+    try zi.coding_agent.print_mode.run(&runtime.host, stdout, stderr, .{ .prompt = prompt });
 }
 
 fn printUsageAndExit(stderr: *std.Io.Writer) !noreturn {
     try stderr.writeAll("usage: zi <prompt>\n");
     try stderr.flush();
     std.process.exit(2);
-}
-
-fn drainPrintEvents(
-    host: *zi.coding_agent.RuntimeHost,
-    stdout: *std.Io.Writer,
-    stderr: *std.Io.Writer,
-) !void {
-    var wrote_text = false;
-    while (host.drainPublicEvent()) |event| {
-        switch (event) {
-            .agent_event => |agent_event| switch (agent_event) {
-                .message_end => |payload| switch (payload.message) {
-                    .assistant => |assistant| {
-                        if (assistant.error_message) |message| return printAssistantError(stderr, message);
-                        for (assistant.content) |content| {
-                            if (content != .text) continue;
-                            try stdout.writeAll(content.text.text);
-                            wrote_text = true;
-                        }
-                    },
-                    else => {},
-                },
-                else => {},
-            },
-            else => {},
-        }
-    }
-    if (wrote_text) try stdout.writeByte('\n');
-}
-
-fn printAssistantError(stdout: *std.Io.Writer, message: []const u8) !void {
-    try stdout.writeAll(message);
-    try stdout.writeByte('\n');
 }
 
 test "main module links zi" {

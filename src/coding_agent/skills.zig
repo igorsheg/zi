@@ -1,4 +1,5 @@
 const std = @import("std");
+const paths_mod = @import("paths.zig");
 
 pub const max_skills = 128;
 pub const max_skill_bytes = 256 * 1024;
@@ -34,11 +35,12 @@ pub fn loadSkills(allocator: std.mem.Allocator, io: std.Io, options: LoadSkillsO
     errdefer skills.deinit(allocator);
     errdefer freeSkillItems(allocator, skills.items);
 
-    const global_dir = try std.fs.path.join(allocator, &.{ options.agent_dir, "skills" });
+    const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = options.agent_dir, .cwd = options.cwd };
+    const global_dir = try resource_paths.globalSkillsDir(allocator);
     defer allocator.free(global_dir);
     try loadSkillsFromDir(allocator, io, options.dir, global_dir, 0, &skills);
 
-    const project_dir = try std.fs.path.join(allocator, &.{ options.cwd, ".zi", "skills" });
+    const project_dir = try resource_paths.projectSkillsDir(allocator);
     defer allocator.free(project_dir);
     try loadSkillsFromDir(allocator, io, options.dir, project_dir, 0, &skills);
 
