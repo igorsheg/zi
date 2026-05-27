@@ -379,8 +379,11 @@ fn streamAssistantResponse(
     for (current.tools) |tool| try tools.append(allocator, tool.asTool());
 
     var stream_options = config.options.stream;
+    var owned_api_key: ?[]const u8 = null;
+    defer if (owned_api_key) |api_key| allocator.free(api_key);
     if (config.get_api_key) |get_api_key| {
         if (try agent.GetApiKeyHook.call(allocator, get_api_key, config.model.provider)) |api_key| {
+            owned_api_key = api_key;
             stream_options.api_key = api_key;
         }
     }

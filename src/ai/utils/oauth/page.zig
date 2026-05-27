@@ -78,10 +78,10 @@ fn renderPage(allocator: std.mem.Allocator, options: PageOptions) ![]u8 {
         \\    <div class="logo">{s}</div>
         \\    <h1>{s}</h1>
         \\    <p>{s}</p>
-        , .{ title.written(), logo_svg, heading.written(), message.written() });
-    if (details) |value| try writer.writer.print(
+    , .{ title.written(), logo_svg, heading.written(), message.written() });
+    if (details) |*value| try writer.writer.print(
         \\    <div class="details">{s}</div>
-        , .{value.written()});
+    , .{value.written()});
     try writer.writer.writeAll(
         \\  </main>
         \\</body>

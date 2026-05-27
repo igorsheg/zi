@@ -55,6 +55,7 @@ pub fn createAuthorizationFlow(
     const state = try createState(allocator, random);
     errdefer allocator.free(state);
     const url = try authorizationUrl(allocator, pkce.challenge, state, originator);
+    allocator.free(pkce.challenge);
     return .{ .verifier = pkce.verifier, .state = state, .url = url };
 }
 
@@ -226,21 +227,29 @@ const CallbackServer = struct {
         var http_server = std.http.Server.init(&reader.interface, &writer.interface);
         var request = try http_server.receiveHead();
         if (!std.mem.startsWith(u8, request.head.target, "/auth/callback")) {
-            try request.respond(oauth.oauthErrorHtml("Callback route not found."), .{ .status = .not_found });
+            const html = try oauth.oauthErrorHtml(allocator, "Callback route not found.", null);
+            defer allocator.free(html);
+            try request.respond(html, .{ .status = .not_found });
             return error.CallbackRouteNotFound;
         }
         const input = parseAuthorizationInput(request.head.target);
         if (input.state == null or !std.mem.eql(u8, input.state.?, expected_state)) {
-            try request.respond(oauth.oauthErrorHtml("State mismatch."), .{ .status = .bad_request });
+            const html = try oauth.oauthErrorHtml(allocator, "State mismatch.", null);
+            defer allocator.free(html);
+            try request.respond(html, .{ .status = .bad_request });
             return error.StateMismatch;
         }
         const code = input.code orelse {
-            try request.respond(oauth.oauthErrorHtml("Missing authorization code."), .{ .status = .bad_request });
+            const html = try oauth.oauthErrorHtml(allocator, "Missing authorization code.", null);
+            defer allocator.free(html);
+            try request.respond(html, .{ .status = .bad_request });
             return error.MissingAuthorizationCode;
         };
         const owned_code = try allocator.dupe(u8, code);
         errdefer allocator.free(owned_code);
-        try request.respond(oauth.oauthSuccessHtml("OpenAI authentication completed. You can close this window."), .{});
+        const html = try oauth.oauthSuccessHtml(allocator, "OpenAI authentication completed. You can close this window.");
+        defer allocator.free(html);
+        try request.respond(html, .{});
         return owned_code;
     }
 };
@@ -258,7 +267,7 @@ fn codeFromInput(allocator: std.mem.Allocator, input: []const u8, expected_state
     const parsed = parseAuthorizationInput(input);
     if (parsed.state) |state| if (!std.mem.eql(u8, state, expected_state)) return error.StateMismatch;
     const code = parsed.code orelse return error.MissingAuthorizationCode;
-    return allocator.dupe(u8, code);
+    return try allocator.dupe(u8, code);
 }
 
 fn refreshToken(

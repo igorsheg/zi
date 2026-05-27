@@ -1,10 +1,12 @@
 pub const AgentSession = @import("AgentSession.zig");
 pub const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
+pub const auth = @import("auth.zig");
 pub const paths = @import("paths.zig");
 pub const print_mode = @import("print_mode.zig");
 pub const runtime_services = @import("runtime_services.zig");
 pub const sdk = @import("sdk.zig");
 pub const settings = @import("settings.zig");
+pub const model_registry = @import("model_registry.zig");
 pub const resources = @import("resources.zig");
 pub const session_config = @import("session_config.zig");
 pub const session_manager = @import("session_manager.zig");
@@ -46,12 +48,14 @@ pub const buildSystemPrompt = system_prompt.build;
 pub fn testsReachable() void {
     _ = AgentSession;
     _ = AgentSessionRuntimeHost;
+    _ = auth;
     _ = paths;
     _ = print_mode;
     _ = resources;
     _ = runtime_services;
     _ = sdk;
     _ = settings;
+    _ = model_registry;
     _ = session_config;
     _ = session_manager;
     _ = session_store;
@@ -64,12 +68,14 @@ pub fn testsReachable() void {
 test {
     _ = AgentSession;
     _ = AgentSessionRuntimeHost;
+    _ = auth;
     _ = paths;
     _ = print_mode;
     _ = resources;
     _ = runtime_services;
     _ = sdk;
     _ = settings;
+    _ = model_registry;
     _ = session_config;
     _ = session_manager;
     _ = session_store;

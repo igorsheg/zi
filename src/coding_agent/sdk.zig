@@ -17,6 +17,7 @@ pub const CreateRuntimeHostOptions = struct {
     thinking_level: ?agent_mod.ThinkingLevel = null,
     stream: ?ai.StreamFunction = null,
     dir: std.Io.Dir = .cwd(),
+    environ: ?*const std.process.Environ.Map = null,
     allow_paths_outside_cwd: bool = false,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
@@ -43,6 +44,7 @@ pub fn createRuntimeHost(
         .cwd = options.cwd,
         .agent_dir = options.agent_dir,
         .dir = options.dir,
+        .environ = options.environ,
     });
     errdefer services.deinit();
 

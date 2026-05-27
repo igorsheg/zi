@@ -37,6 +37,7 @@ pub const Options = struct {
     model: ai.Model = agent_mod.Agent.defaultModel(),
     thinking_level: agent_mod.ThinkingLevel = .off,
     stream: ?ai.StreamFunction = null,
+    get_api_key: ?agent_mod.GetApiKeyHook = null,
     dir: std.Io.Dir = .cwd(),
     allow_paths_outside_cwd: bool = false,
     public_event_capacity: usize = public_event_capacity_default,
@@ -443,6 +444,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .tools = tools.activeAgentTools(),
     };
     if (options.stream) |stream| agent_options.stream = stream;
+    if (options.get_api_key) |get_api_key| agent_options.get_api_key = get_api_key;
 
     const core_agent = try allocator.create(agent_mod.Agent);
     errdefer allocator.destroy(core_agent);

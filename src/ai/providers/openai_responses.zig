@@ -355,6 +355,26 @@ fn writeToolResult(
     try writer.writeByte('}');
 }
 
+test "provider registers openai responses api" {
+    var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var provider = Provider.init(.{});
+
+    try provider.register(&registry);
+
+    try std.testing.expect(registry.get(protocol.KnownApi.openai_responses) != null);
+}
+
+test "provider stream without auth emits missing api key error" {
+    var provider = Provider.init(.{});
+    var event_buffer: [4]protocol.AssistantMessageEvent = undefined;
+    var stream = provider.apiProvider().stream.call(testRequestWithBuffer(&event_buffer));
+
+    const err = (try stream.next(std.Io.failing)).?.@"error";
+    try std.testing.expectEqual(protocol.ErrorReason.error_, err.reason);
+    try std.testing.expectEqualStrings("MissingApiKey", err.@"error".error_message.?);
+}
+
 test "endpoint url appends responses path" {
     const url = try endpointUrl(std.testing.allocator, "https://api.openai.com/v1");
     defer std.testing.allocator.free(url);
@@ -376,6 +396,10 @@ test "request body includes model stream input and tools" {
 fn testRequest() protocol.StreamRequest {
     var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
     _ = &event_buffer;
+    return testRequestWithBuffer(&event_buffer);
+}
+
+fn testRequestWithBuffer(event_buffer: []protocol.AssistantMessageEvent) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
@@ -396,6 +420,6 @@ fn testRequest() protocol.StreamRequest {
             .messages = &.{.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }},
             .tools = &.{.{ .name = "echo", .description = "Echo", .parameters = .{ .object = .empty } }},
         },
-        .event_buffer = &event_buffer,
+        .event_buffer = event_buffer,
     };
 }

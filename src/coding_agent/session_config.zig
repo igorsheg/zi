@@ -16,8 +16,9 @@ pub const Options = struct {
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
-pub fn resolve(services: *const RuntimeServices, options: Options) AgentSessionRuntimeHost.BaseOptions {
-    const model = resolveModel(services.settings_manager.current(), options.model);
+pub fn resolve(services: *RuntimeServices, options: Options) AgentSessionRuntimeHost.BaseOptions {
+    services.clearDiagnostics();
+    const model = resolveModel(services, options.model);
     return .{
         .cwd = services.cwd,
         .agent_dir = services.agent_dir,
@@ -25,28 +26,38 @@ pub fn resolve(services: *const RuntimeServices, options: Options) AgentSessionR
         .model = model,
         .thinking_level = resolveThinkingLevel(services.settings_manager.current(), options.thinking_level),
         .stream = resolveStream(services, options.stream, model),
+        .get_api_key = services.getApiKeyHook(),
         .dir = options.dir,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
     };
 }
 
-fn resolveStream(services: *const RuntimeServices, explicit: ?ai.StreamFunction, model: ai.Model) ?ai.StreamFunction {
+fn resolveStream(services: *RuntimeServices, explicit: ?ai.StreamFunction, model: ai.Model) ?ai.StreamFunction {
     if (explicit) |stream| return stream;
-    const provider = services.provider_registry.get(model.api) orelse return null;
+    const provider = services.provider_registry.get(model.api) orelse {
+        if (!std.mem.eql(u8, model.api, "unknown")) {
+            services.appendDiagnostic(.{ .unresolved_stream = .{ .api = model.api } });
+        }
+        return null;
+    };
     return provider.stream_simple;
 }
 
-fn resolveModel(snapshot: *const settings_mod.SettingsSnapshot, explicit: ?ai.Model) ai.Model {
+fn resolveModel(services: *RuntimeServices, explicit: ?ai.Model) ai.Model {
     if (explicit) |model| return model;
-    if (effectiveModelSettings(snapshot)) |settings| {
+    if (effectiveModelSettings(services.settings_manager.current())) |settings| {
         if (settings.provider) |provider| {
             if (settings.model) |model_id| {
-                if (ai.getModel(provider, model_id)) |model| return model;
+                if (services.model_registry.findAvailable(provider, model_id)) |model| return model;
             }
         }
+        services.appendDiagnostic(.{ .unresolved_model_setting = .{
+            .provider = settings.provider,
+            .model = settings.model,
+        } });
     }
-    return agent_mod.Agent.defaultModel();
+    return services.model_registry.firstAvailable() orelse agent_mod.Agent.defaultModel();
 }
 
 fn resolveThinkingLevel(
@@ -134,6 +145,9 @@ test "session config uses explicit model thinking and stream before settings" {
 test "session config uses project settings before global settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("OPENAI_API_KEY", "secret");
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
@@ -151,6 +165,7 @@ test "session config uses project settings before global settings" {
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
+        .environ = &environ,
     });
     defer services.deinit();
 
@@ -159,11 +174,15 @@ test "session config uses project settings before global settings" {
     try std.testing.expectEqualStrings("gpt-5.1", base.model.id);
     try std.testing.expectEqual(agent_mod.ThinkingLevel.xhigh, base.thinking_level);
     try std.testing.expect(base.stream != null);
+    try std.testing.expectEqual(@as(usize, 0), services.diagnosticSlice().len);
 }
 
 test "session config keeps provider and model settings scope atomic" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("OPENAI_API_KEY", "secret");
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
@@ -180,13 +199,15 @@ test "session config keeps provider and model settings scope atomic" {
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
+        .environ = &environ,
     });
     defer services.deinit();
 
     const base = resolve(&services, .{ .current_date = "2026-05-27", .dir = tmp.dir });
-    const default_model = agent_mod.Agent.defaultModel();
 
-    try std.testing.expectEqualStrings(default_model.id, base.model.id);
+    try std.testing.expectEqualStrings(ai.KnownProvider.openai, base.model.provider);
+    try std.testing.expectEqual(@as(usize, 1), services.diagnosticSlice().len);
+    try std.testing.expect(services.diagnosticSlice()[0] == .unresolved_model_setting);
 }
 
 test "session config falls back when settings are absent or unresolved" {
@@ -213,6 +234,59 @@ test "session config falls back when settings are absent or unresolved" {
     try std.testing.expectEqualStrings(default_model.id, base.model.id);
     try std.testing.expectEqual(agent_mod.ThinkingLevel.off, base.thinking_level);
     try std.testing.expect(base.stream == null);
+    try std.testing.expectEqual(@as(usize, 1), services.diagnosticSlice().len);
+    try std.testing.expect(services.diagnosticSlice()[0] == .unresolved_model_setting);
+}
+
+test "session config exposes auth hook from runtime services" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("OPENAI_API_KEY", "secret");
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+
+    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .environ = &environ,
+    });
+    defer services.deinit();
+
+    const base = resolve(&services, .{ .current_date = "2026-05-27", .dir = tmp.dir });
+    const key = try agent_mod.GetApiKeyHook.call(std.testing.allocator, base.get_api_key.?, ai.KnownProvider.openai);
+    defer std.testing.allocator.free(key.?);
+
+    try std.testing.expectEqualStrings("secret", key.?);
+}
+
+test "session config skips unauthed codex settings and falls back to available model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.zi/settings.json",
+        .data = "{\"defaultProvider\":\"openai-codex\",\"defaultModel\":\"gpt-5.1-codex-max\"}",
+    });
+
+    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+    });
+    defer services.deinit();
+
+    const base = resolve(&services, .{ .current_date = "2026-05-27", .dir = tmp.dir });
+
+    try std.testing.expectEqualStrings("unknown", base.model.id);
+    try std.testing.expect(base.stream == null);
+    try std.testing.expectEqual(@as(usize, 1), services.diagnosticSlice().len);
+    try std.testing.expect(services.diagnosticSlice()[0] == .unresolved_model_setting);
 }
 
 fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {

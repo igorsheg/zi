@@ -139,7 +139,7 @@ fn requestOnce(
     var reducer = shared.ResponseStreamReducer.init(request.allocator, request.model, 0);
     defer reducer.deinit();
 
-    var client: std.http.Client = .{ .allocator = request.allocator };
+    var client: std.http.Client = .{ .allocator = request.allocator, .io = request.io };
     defer client.deinit();
     const url = try endpointUrl(request.allocator, request.model.base_url);
     defer request.allocator.free(url);
@@ -251,7 +251,7 @@ const ReducerSseSink = struct {
     assistant_sink: protocol.AssistantMessageEventSink,
     reducer: *shared.ResponseStreamReducer,
 
-    fn emit(self: *ReducerSseSink, event: sse.Event) !void {
+    pub fn emit(self: *ReducerSseSink, event: sse.Event) !void {
         try self.reducer.applySseData(self.io, self.assistant_sink, event.data);
     }
 };
@@ -462,6 +462,26 @@ fn writeToolResult(
     try writer.writeByte('}');
 }
 
+test "provider registers openai codex responses api" {
+    var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var provider = Provider.init(.{});
+
+    try provider.register(&registry);
+
+    try std.testing.expect(registry.get(protocol.KnownApi.openai_codex_responses) != null);
+}
+
+test "provider stream without auth emits missing api key error" {
+    var provider = Provider.init(.{});
+    var event_buffer: [4]protocol.AssistantMessageEvent = undefined;
+    var stream = provider.apiProvider().stream.call(testRequestWithBuffer(&event_buffer));
+
+    const err = (try stream.next(std.Io.failing)).?.@"error";
+    try std.testing.expectEqual(protocol.ErrorReason.error_, err.reason);
+    try std.testing.expectEqualStrings("MissingApiKey", err.@"error".error_message.?);
+}
+
 test "endpoint url appends codex responses path" {
     const url = try endpointUrl(std.testing.allocator, "https://chatgpt.com/backend-api");
     defer std.testing.allocator.free(url);
@@ -486,6 +506,10 @@ test "request body includes model stream input and tools" {
 fn testRequest() protocol.StreamRequest {
     var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
     _ = &event_buffer;
+    return testRequestWithBuffer(&event_buffer);
+}
+
+fn testRequestWithBuffer(event_buffer: []protocol.AssistantMessageEvent) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
@@ -506,6 +530,6 @@ fn testRequest() protocol.StreamRequest {
             .messages = &.{.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }},
             .tools = &.{.{ .name = "echo", .description = "Echo", .parameters = .{ .object = .empty } }},
         },
-        .event_buffer = &event_buffer,
+        .event_buffer = event_buffer,
     };
 }
