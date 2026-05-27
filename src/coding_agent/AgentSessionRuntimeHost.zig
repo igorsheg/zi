@@ -30,6 +30,11 @@ pub const ReplaceResult = struct {
     old_event_count: usize,
 };
 
+pub const NewSessionResult = struct {
+    cancelled: bool = false,
+    old_event_count: usize,
+};
+
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: AgentSession.Options) !AgentSessionRuntimeHost {
     return .{ .session = try AgentSession.init(allocator, io, options) };
 }
@@ -52,6 +57,16 @@ pub fn setBeforeSessionInvalidate(
     before_session_invalidate: ?BeforeSessionInvalidate,
 ) void {
     self.before_session_invalidate = before_session_invalidate;
+}
+
+pub fn newSession(
+    self: *AgentSessionRuntimeHost,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: AgentSession.Options,
+) !NewSessionResult {
+    const result = try self.replaceSession(allocator, io, options);
+    return .{ .old_event_count = result.old_event_count };
 }
 
 pub fn replaceSession(
@@ -204,6 +219,41 @@ test "runtime host replacement invalidates old session before rebinding new sess
     try std.testing.expectEqualStrings("second", state.rebound_session_id);
     try std.testing.expectEqualStrings("second", host.currentSession().manager.header.id);
     try std.testing.expectEqual(@as(usize, 0), host.publicEventCount());
+}
+
+test "runtime host new session replaces current session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .session_id = "first",
+        .timestamp = "2026-05-26T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer {
+        host.requestShutdown();
+        while (host.drainPublicEvent() != null) {}
+        host.deinit();
+    }
+
+    const result = try host.newSession(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .session_id = "second",
+        .timestamp = "2026-05-26T00:00:01Z",
+        .dir = tmp.dir,
+    });
+
+    try std.testing.expect(!result.cancelled);
+    try std.testing.expectEqual(@as(usize, 0), result.old_event_count);
+    try std.testing.expectEqualStrings("second", host.currentSession().manager.header.id);
 }
 
 test "runtime host replacement rejects active old session" {
