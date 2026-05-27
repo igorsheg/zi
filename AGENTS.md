@@ -1,120 +1,171 @@
-# zi
+# zi agent rules
+
+build the smallest correct system. do not add machinery because another project has it. pi-mono is a behavioral reference, not a port target.
 
 ## contract
 
-- Simple first. Complexity must earn its keep.
-- One owner. One mutation path. One obvious failure mode.
-- Encode states directly; no dummy fields, boolean modes, or ambient discipline.
-- Compile errors beat runtime crashes. Crashes beat hidden corruption.
-- Allocation may fail. Deallocation must succeed.
-- Comments explain why. Types, assertions, comptime checks, and tests enforce what.
+- simple first. complexity must pay rent.
+- one owner. one mutation path. one obvious failure mode.
+- encode state directly. no dummy fields, boolean protocols, or ambient discipline.
+- compile errors beat crashes. crashes beat silent corruption.
+- allocation may fail. deallocation must succeed.
+- comments explain why. types, bounds, assertions, and tests enforce what.
 
-## tiger style systems
+## runtime discipline
 
-Use the Tiger Style discipline for runtime, async, lifecycle, queues, ownership, cancellation, workers, UI, process, and shutdown.
-
-Before designing a boundary, answer in code:
+before adding a boundary, answer in code:
 
 ```text
-What can go wrong?
-What is the maximum bound?
-Who owns each resource?
-Where is mutation allowed?
-Which errors are handled?
-Which invariants must always hold?
-What is the slowest resource involved?
-What must future maintainers not have to remember?
+what can go wrong?
+what is the maximum bound?
+who owns each resource?
+where is mutation allowed?
+which errors are handled?
+which invariants must always hold?
+what is the slowest resource involved?
+what must future maintainers not remember?
 ```
 
-Runtime spine:
+runtime shape:
 
 ```text
-Operation -> Backend -> Completion -> bounded queue -> owner drain
+operation -> backend -> completion -> bounded queue -> owner drain
 ```
 
-Rules:
+rules:
 
-- control flow is simple and explicit
-- use platform/runtime interfaces as mechanisms; wrap them with zi policy instead of bypassing them
-- runtime is mechanism, not app policy
-- completions are data, not authority
-- owners mutate only at drain/apply sites
-- loops, queues, buffers, retries, batches, and concurrency are bounded
-- wakeups coalesce; inspect state after wake
-- cancellation intent != cancellation completion
-- every submitted operation completes, fails, or cancels observably
-- programmer errors fail fast; operational errors are returned or reported
-- no hidden async mutation, implicit defaults, or dependency-shaped control flow
+- `std.Io` enters at the process/runtime boundary and is passed down explicitly.
+- runtime is mechanism, not app policy.
+- completions are data, not authority.
+- owners mutate only at drain/apply sites.
+- queues, buffers, loops, retries, batches, and concurrency are bounded.
+- wakeups coalesce; inspect state after wake.
+- cancellation intent is not cancellation completion.
+- shutdown is request -> drain -> stopped -> deinit.
+- no global runtime, hidden task spawning, callback reentrancy, or unbounded event queues.
+
+## ownership boundaries
+
+```text
+main.zig
+  parse args, create process/runtime, call sdk/mode. no core policy.
+
+coding_agent
+  owns product/session policy: resources, settings, model/session config, tools,
+  prompt preflight, session persistence, public events, runtime host replacement.
+
+agent
+  owns generic agent runtime: transcript, active run, cancel source, tool loop,
+  steering/follow-up queues, agent events. must not import coding_agent.
+
+ai
+  owns provider protocol, model catalog, provider registry, wire adapters, streams.
+  no session persistence, UI, retry/compaction policy, or tool execution policy.
+
+runtime
+  owns operation ids, cancel tokens, bounded completion/event queues, wake/shutdown
+  mechanisms. no app policy.
+```
+
+## coding-agent spine
+
+```text
+frontend / cli / rpc / tests
+      |
+      v
+coding_agent.sdk
+  create runtime/services/session host
+      |
+      v
+RuntimeServices
+  cwd-bound services: zi paths, settings, provider registry, auth/model owners later
+      |
+      v
+session_config.resolve
+  explicit options + services -> AgentSessionRuntimeHost.BaseOptions
+      |
+      v
+AgentSessionRuntimeHost
+  owns current AgentSession and replacement; frontends do not
+      |
+      v
+AgentSession
+  owns one session's app policy, preflight, events, persistence, resources/tools
+      |
+      v
+agent.Agent
+  owns transcript loop, provider stream, tool execution, steering/follow-up queues
+```
+
+invariants:
+
+- `AgentSession` contains one long-lived `agent.Agent`.
+- `AgentSessionRuntimeHost` is the only owner of session replacement.
+- session replacement is commit-atomic from the host perspective.
+- public clients communicate through commands, bounded events, and owned snapshots.
+- no callback subscription path may mutate session state directly.
+- session history is durable truth; agent transcript is runtime context.
+
+## event policy
+
+agent events are processed in this order:
+
+```text
+agent event
+  -> queue/status mirror
+  -> session hooks/extensions        future
+  -> public AgentSessionEvent queue
+  -> persistence
+  -> terminal policy                 retry/compaction/follow-up later
+```
+
+only this owner drain may mutate queue mirrors, session history, retry/compaction state, or public event queues.
+
+## tools
+
+- product tools are definition-first: metadata + schema + prompt text + implementation.
+- core `agent.Agent` receives borrowed `agent.AgentTool` views only.
+- heterogeneous runtime adapters belong at the registry boundary.
+- file mutation has one path; tool output is bounded; process tools need timeout/cancel before shipping.
+
+## paths and resources
+
+- all zi path policy lives in `src/coding_agent/paths.zig`.
+- use `.zi`, never `.pi`, in Zi-owned behavior.
+- global/user and project paths are separate concepts even if both currently use `.zi`.
+- do not hardcode `.zi`, `settings.json`, `skills`, `SYSTEM.md`, or `APPEND_SYSTEM.md` outside the path owner.
 
 ## zig craft
 
-- Read before writing. Trace before fixing.
-- Protocol types describe shape, not ownership; owned wrappers describe lifetime.
-- Small structs, explicit lifetimes, owned wrappers.
-- State machines over callback control flow.
-- Zi-shaped code over dependency-shaped ports.
-- TigerBeetle-grade suspicion: bounds, ownership, shutdown.
+- read before writing. trace before fixing.
+- protocol types describe shape, not ownership; owned wrappers describe lifetime.
+- small structs, explicit lifetimes, owned wrappers.
+- state machines over callback control flow.
+- pass allocator and `std.Io`; no ambient resource access.
+- use `std.json.encodeJsonString` for JSON strings. do not hand-roll escaping.
+- do not use removed pre-0.16 APIs. check local Zig 0.16 APIs when unsure.
 
-## tests
+## tests and gates
 
-- Run `zig build test` before claiming completion.
-- Test invariants, not helper existence.
-- Prefer narrow assertions over broad snapshots.
-- Test names describe behavior: `follow up queues while running and starts after terminal`.
-- Provider JSON tests may pin external contracts; internal serialization is not a contract unless callers rely on it.
+run before claiming done:
 
-## project structure
-
-Zi starts minimal, but its architecture follows `.references/pi-mono/` contracts, rewritten with Tiger Style bounds, ownership, and explicit control flow.
-
-```text
-src/
-  ai/        provider-agnostic LLM protocol and provider registry
-  agent/     stateful agent loop, tool execution, event stream
-  runtime/   operations, backend mechanisms, completions, queues, cancellation
-  main.zig   CLI shell only; no core policy
-  root.zig   public package surface
+```sh
+zig build test
+ziglint src/coding_agent
+zig build
 ```
 
-### `src/ai/`
+also run focused behavior commands when relevant, e.g.:
 
-Inspired by `.references/pi-mono/packages/ai/`.
+```sh
+zig build run -- "hello"
+```
 
-Owns:
+test invariants, not helper existence. use narrow assertions. test names describe behavior.
 
-- message protocol: user, assistant, tool-result
-- content blocks: text, thinking, image, tool-call
-- assistant event protocol: start, deltas, tool-call events, done/error
-- model metadata and cost/accounting data
-- provider registry keyed by API
-- stream/complete entry points
-- provider adapters for OpenAI, Anthropic, etc.
+## git hygiene
 
-Rules:
-
-- provider request failures terminate through stream events, not side channels
-- provider-specific wire formats stay behind provider adapters
-- tools are schema/protocol data here; execution belongs to `agent/`
-- context transformation for model calls is a boundary, not ambient mutation
-
-### `src/agent/`
-
-Inspired by `.references/pi-mono/packages/agent/`.
-
-Owns:
-
-- `Agent` state: system prompt, model, tools, transcript, active run
-- agent loop: prompt/continue -> turns -> tool calls -> follow-up/steering
-- event stream for UI/runtime consumers
-- tool lifecycle: prepare arguments -> before hook -> execute -> after hook -> tool-result message
-- steering and follow-up queues
-
-Rules:
-
-- `AgentMessage` may include app messages; only `ai.Message` crosses the LLM boundary
-- `convertToLlm` filters/transforms at that boundary
-- assistant `message_end` is a barrier before tool preflight
-- parallel tools preflight sequentially, execute concurrently, persist results in assistant source order
-- sequential tools execute, finalize, and emit result one at a time
-- tool `terminate` stops the follow-up LLM call only when every tool in the batch asks for it
-- `agent_end` means no more loop events; idle means subscribers/listeners have settled
+- do not commit or push unless asked.
+- stage files explicitly. never `git add -A` or `git add .`.
+- keep user/unrelated changes untouched.
+- commit messages: `type(scope): imperative summary`.
