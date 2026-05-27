@@ -1,4 +1,5 @@
 pub const AgentSession = @import("AgentSession.zig");
+pub const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 pub const paths = @import("paths.zig");
 pub const resources = @import("resources.zig");
 pub const session_manager = @import("session_manager.zig");
@@ -14,6 +15,7 @@ pub const OwnedContextFiles = resources.OwnedContextFiles;
 pub const OwnedPromptFile = resources.OwnedPromptFile;
 pub const PromptFile = resources.PromptFile;
 pub const PromptResources = resources.PromptResources;
+pub const RuntimeHost = AgentSessionRuntimeHost;
 pub const SessionManager = session_manager.SessionManager;
 pub const SessionHeader = session_manager.SessionHeader;
 pub const SessionEntry = session_manager.SessionEntry;
@@ -38,6 +40,7 @@ pub const buildSystemPrompt = system_prompt.build;
 
 pub fn testsReachable() void {
     _ = AgentSession;
+    _ = AgentSessionRuntimeHost;
     _ = paths;
     _ = resources;
     _ = session_manager;
@@ -50,6 +53,7 @@ pub fn testsReachable() void {
 
 test {
     _ = AgentSession;
+    _ = AgentSessionRuntimeHost;
     _ = paths;
     _ = resources;
     _ = session_manager;
