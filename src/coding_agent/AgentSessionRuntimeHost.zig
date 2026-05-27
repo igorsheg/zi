@@ -10,10 +10,10 @@ before_session_invalidate: ?BeforeSessionInvalidate = null,
 
 pub const RebindSession = struct {
     context: ?*anyopaque = null,
-    call_fn: *const fn (context: ?*anyopaque, session: *AgentSession) anyerror!void,
+    call_fn: *const fn (context: ?*anyopaque, session: *AgentSession) void,
 
-    fn call(self: RebindSession, session: *AgentSession) !void {
-        try self.call_fn(self.context, session);
+    fn call(self: RebindSession, session: *AgentSession) void {
+        self.call_fn(self.context, session);
     }
 };
 
@@ -60,8 +60,11 @@ pub fn replaceSession(
     io: std.Io,
     options: AgentSession.Options,
 ) !ReplaceResult {
+    if (self.session.statusSnapshot().status != .idle) return error.SessionReplacementRequiresIdle;
+
     var next_session = try AgentSession.init(allocator, io, options);
-    errdefer shutdownAndDeinitSession(&next_session);
+    var next_session_needs_deinit = true;
+    errdefer if (next_session_needs_deinit) shutdownAndDeinitSession(&next_session);
 
     self.session.requestShutdown();
     const old_event_count = drainSessionEvents(&self.session);
@@ -69,9 +72,10 @@ pub fn replaceSession(
 
     if (self.before_session_invalidate) |callback| callback.call();
     self.session.deinit();
+    next_session_needs_deinit = false;
     self.session = next_session;
 
-    if (self.rebind_session) |callback| try callback.call(&self.session);
+    if (self.rebind_session) |callback| callback.call(&self.session);
     return .{ .old_event_count = old_event_count };
 }
 
@@ -173,7 +177,7 @@ test "runtime host replacement invalidates old session before rebinding new sess
             state.before_count += 1;
         }
 
-        fn rebind(context: ?*anyopaque, session: *AgentSession) !void {
+        fn rebind(context: ?*anyopaque, session: *AgentSession) void {
             const state: *Self = @ptrCast(@alignCast(context.?));
             state.rebind_count += 1;
             state.rebound_session_id = session.manager.header.id;
@@ -226,7 +230,7 @@ test "runtime host replacement rejects active old session" {
 
     _ = try host.currentSession().agent.beginRun();
 
-    try std.testing.expectError(error.SessionReplacementRequiresShutdownComplete, host.replaceSession(
+    try std.testing.expectError(error.SessionReplacementRequiresIdle, host.replaceSession(
         std.testing.allocator,
         std.testing.io,
         .{
