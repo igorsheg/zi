@@ -5,6 +5,30 @@ const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntimeHost = @This();
 
 session: AgentSession,
+rebind_session: ?RebindSession = null,
+before_session_invalidate: ?BeforeSessionInvalidate = null,
+
+pub const RebindSession = struct {
+    context: ?*anyopaque = null,
+    call_fn: *const fn (context: ?*anyopaque, session: *AgentSession) anyerror!void,
+
+    fn call(self: RebindSession, session: *AgentSession) !void {
+        try self.call_fn(self.context, session);
+    }
+};
+
+pub const BeforeSessionInvalidate = struct {
+    context: ?*anyopaque = null,
+    call_fn: *const fn (context: ?*anyopaque) void,
+
+    fn call(self: BeforeSessionInvalidate) void {
+        self.call_fn(self.context);
+    }
+};
+
+pub const ReplaceResult = struct {
+    old_event_count: usize,
+};
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: AgentSession.Options) !AgentSessionRuntimeHost {
     return .{ .session = try AgentSession.init(allocator, io, options) };
@@ -17,6 +41,38 @@ pub fn deinit(self: *AgentSessionRuntimeHost) void {
 
 pub fn currentSession(self: *AgentSessionRuntimeHost) *AgentSession {
     return &self.session;
+}
+
+pub fn setRebindSession(self: *AgentSessionRuntimeHost, rebind_session: ?RebindSession) void {
+    self.rebind_session = rebind_session;
+}
+
+pub fn setBeforeSessionInvalidate(
+    self: *AgentSessionRuntimeHost,
+    before_session_invalidate: ?BeforeSessionInvalidate,
+) void {
+    self.before_session_invalidate = before_session_invalidate;
+}
+
+pub fn replaceSession(
+    self: *AgentSessionRuntimeHost,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: AgentSession.Options,
+) !ReplaceResult {
+    var next_session = try AgentSession.init(allocator, io, options);
+    errdefer shutdownAndDeinitSession(&next_session);
+
+    self.session.requestShutdown();
+    const old_event_count = drainSessionEvents(&self.session);
+    if (!self.session.shutdownComplete()) return error.SessionReplacementRequiresShutdownComplete;
+
+    if (self.before_session_invalidate) |callback| callback.call();
+    self.session.deinit();
+    self.session = next_session;
+
+    if (self.rebind_session) |callback| try callback.call(&self.session);
+    return .{ .old_event_count = old_event_count };
 }
 
 pub fn prompt(
@@ -70,6 +126,119 @@ pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?AgentSession.AgentSessi
 
 pub fn shutdownComplete(self: *AgentSessionRuntimeHost) bool {
     return self.session.shutdownComplete();
+}
+
+fn shutdownAndDeinitSession(session: *AgentSession) void {
+    session.requestShutdown();
+    _ = drainSessionEvents(session);
+    session.deinit();
+}
+
+fn drainSessionEvents(session: *AgentSession) usize {
+    var count: usize = 0;
+    while (session.drainPublicEvent() != null) count += 1;
+    return count;
+}
+
+test "runtime host replacement invalidates old session before rebinding new session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .session_id = "first",
+        .timestamp = "2026-05-26T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer {
+        host.requestShutdown();
+        while (host.drainPublicEvent() != null) {}
+        host.deinit();
+    }
+
+    const State = struct {
+        before_count: usize = 0,
+        rebind_count: usize = 0,
+        rebound_session_id: []const u8 = "",
+
+        const Self = @This();
+
+        fn before(context: ?*anyopaque) void {
+            const state: *Self = @ptrCast(@alignCast(context.?));
+            state.before_count += 1;
+        }
+
+        fn rebind(context: ?*anyopaque, session: *AgentSession) !void {
+            const state: *Self = @ptrCast(@alignCast(context.?));
+            state.rebind_count += 1;
+            state.rebound_session_id = session.manager.header.id;
+        }
+    };
+
+    var state: State = .{};
+    host.setBeforeSessionInvalidate(.{ .context = &state, .call_fn = State.before });
+    host.setRebindSession(.{ .context = &state, .call_fn = State.rebind });
+
+    try host.prompt("old event", &.{});
+    const result = try host.replaceSession(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .session_id = "second",
+        .timestamp = "2026-05-26T00:00:01Z",
+        .dir = tmp.dir,
+    });
+
+    try std.testing.expect(result.old_event_count > 0);
+    try std.testing.expectEqual(@as(usize, 1), state.before_count);
+    try std.testing.expectEqual(@as(usize, 1), state.rebind_count);
+    try std.testing.expectEqualStrings("second", state.rebound_session_id);
+    try std.testing.expectEqualStrings("second", host.currentSession().manager.header.id);
+    try std.testing.expectEqual(@as(usize, 0), host.publicEventCount());
+}
+
+test "runtime host replacement rejects active old session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .session_id = "first",
+        .timestamp = "2026-05-26T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer {
+        if (!host.currentSession().agent.waitForIdle()) host.currentSession().agent.finishRun();
+        host.requestShutdown();
+        while (host.drainPublicEvent() != null) {}
+        host.deinit();
+    }
+
+    _ = try host.currentSession().agent.beginRun();
+
+    try std.testing.expectError(error.SessionReplacementRequiresShutdownComplete, host.replaceSession(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .cwd = "repo",
+            .agent_dir = "agent",
+            .current_date = "2026-05-26",
+            .session_id = "second",
+            .timestamp = "2026-05-26T00:00:01Z",
+            .dir = tmp.dir,
+        },
+    ));
+    try std.testing.expectEqualStrings("first", host.currentSession().manager.header.id);
 }
 
 test "runtime host owns current agent session public boundary" {
