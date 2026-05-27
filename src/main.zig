@@ -18,40 +18,55 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next();
     const prompt = args.next() orelse {
-        try stderr.writeAll("usage: zi <prompt>\n");
-        std.process.exit(2);
+        try printUsageAndExit(stderr);
     };
     if (args.next() != null) {
-        try stderr.writeAll("usage: zi <prompt>\n");
-        std.process.exit(2);
+        try printUsageAndExit(stderr);
     }
+
+    const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
+    const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
+    defer process.gpa.free(timestamp_text);
+    const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
+    defer process.gpa.free(session_id);
 
     var host = try zi.coding_agent.RuntimeHost.init(process.gpa, process.io, .{
         .cwd = ".",
         .agent_dir = ".zi",
-        .current_date = "1970-01-01",
+        .current_date = timestamp_text,
     }, .{
-        .session_id = "cli",
-        .timestamp = "1970-01-01T00:00:00Z",
+        .session_id = session_id,
+        .timestamp = timestamp_text,
     });
     defer {
+        drainPrintEvents(&host, stdout, stderr) catch {};
         host.requestShutdown();
         while (host.drainPublicEvent() != null) {}
         host.deinit();
     }
 
     try host.prompt(prompt, &.{});
-    try drainPrintEvents(&host, stdout);
+    try drainPrintEvents(&host, stdout, stderr);
 }
 
-fn drainPrintEvents(host: *zi.coding_agent.RuntimeHost, stdout: *std.Io.Writer) !void {
+fn printUsageAndExit(stderr: *std.Io.Writer) !noreturn {
+    try stderr.writeAll("usage: zi <prompt>\n");
+    try stderr.flush();
+    std.process.exit(2);
+}
+
+fn drainPrintEvents(
+    host: *zi.coding_agent.RuntimeHost,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
     var wrote_text = false;
     while (host.drainPublicEvent()) |event| {
         switch (event) {
             .agent_event => |agent_event| switch (agent_event) {
                 .message_end => |payload| switch (payload.message) {
                     .assistant => |assistant| {
-                        if (assistant.error_message) |message| return printAssistantError(stdout, message);
+                        if (assistant.error_message) |message| return printAssistantError(stderr, message);
                         for (assistant.content) |content| {
                             if (content != .text) continue;
                             try stdout.writeAll(content.text.text);
