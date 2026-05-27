@@ -66,7 +66,7 @@ pub const Parser = struct {
         self: *Parser,
         bytes: []const u8,
         sink: anytype,
-    ) Error!void {
+    ) anyerror!void {
         for (bytes) |byte| {
             if (byte == '\n') {
                 try self.processLine(stripTrailingCarriageReturn(self.pending_line.items()), sink);
@@ -79,7 +79,7 @@ pub const Parser = struct {
         }
     }
 
-    pub fn finish(self: *Parser, sink: anytype) Error!void {
+    pub fn finish(self: *Parser, sink: anytype) anyerror!void {
         if (self.pending_line.items().len > 0) {
             try self.processLine(stripTrailingCarriageReturn(self.pending_line.items()), sink);
             self.pending_line.clearRetainingCapacity();
@@ -87,7 +87,7 @@ pub const Parser = struct {
         try self.dispatchIfNotEmpty(sink);
     }
 
-    fn processLine(self: *Parser, line: []const u8, sink: anytype) Error!void {
+    fn processLine(self: *Parser, line: []const u8, sink: anytype) anyerror!void {
         if (line.len == 0) {
             try self.dispatchIfNotEmpty(sink);
             self.resetEvent();
@@ -123,7 +123,7 @@ pub const Parser = struct {
         }
     }
 
-    fn dispatchIfNotEmpty(self: *Parser, sink: anytype) Error!void {
+    fn dispatchIfNotEmpty(self: *Parser, sink: anytype) anyerror!void {
         if (self.data_line_count == 0 and self.event_name.items().len == 0 and self.id.items().len == 0) return;
         try sink.emit(.{
             .event = if (self.event_name.items().len > 0) self.event_name.items() else null,

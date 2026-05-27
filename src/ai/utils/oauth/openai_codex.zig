@@ -82,7 +82,7 @@ pub fn getAccountId(allocator: std.mem.Allocator, access_token: []const u8) !?[]
     if (auth != .object) return null;
     const account_id = auth.object.get("chatgpt_account_id") orelse return null;
     if (account_id != .string or account_id.string.len == 0) return null;
-    return allocator.dupe(u8, account_id.string);
+    return try allocator.dupe(u8, account_id.string);
 }
 
 fn createState(allocator: std.mem.Allocator, random: std.Random) ![]u8 {
@@ -296,7 +296,7 @@ fn refreshAccessToken(allocator: std.mem.Allocator, io: std.Io, refresh_token: [
 }
 
 fn requestToken(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oauth.OAuthCredentials {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
     const uri = try std.Uri.parse(token_url);
     var req = try client.request(.POST, uri, .{

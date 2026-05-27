@@ -17,17 +17,24 @@ pub const Options = struct {
 };
 
 pub fn resolve(services: *const RuntimeServices, options: Options) AgentSessionRuntimeHost.BaseOptions {
+    const model = resolveModel(services.settings_manager.current(), options.model);
     return .{
         .cwd = services.cwd,
         .agent_dir = services.agent_dir,
         .current_date = options.current_date,
-        .model = resolveModel(services.settings_manager.current(), options.model),
+        .model = model,
         .thinking_level = resolveThinkingLevel(services.settings_manager.current(), options.thinking_level),
-        .stream = options.stream,
+        .stream = resolveStream(services, options.stream, model),
         .dir = options.dir,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
     };
+}
+
+fn resolveStream(services: *const RuntimeServices, explicit: ?ai.StreamFunction, model: ai.Model) ?ai.StreamFunction {
+    if (explicit) |stream| return stream;
+    const provider = services.provider_registry.get(model.api) orelse return null;
+    return provider.stream_simple;
 }
 
 fn resolveModel(snapshot: *const settings_mod.SettingsSnapshot, explicit: ?ai.Model) ai.Model {
@@ -136,7 +143,7 @@ test "session config uses project settings before global settings" {
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.zi/settings.json",
-        .data = "{\"defaultProvider\":\"openai-codex\",\"defaultModel\":\"gpt-5.1-codex-max\"," ++
+        .data = "{\"defaultProvider\":\"openai\",\"defaultModel\":\"gpt-5.1\"," ++
             "\"defaultThinkingLevel\":\"xhigh\"}",
     });
 
@@ -149,8 +156,9 @@ test "session config uses project settings before global settings" {
 
     const base = resolve(&services, .{ .current_date = "2026-05-27", .dir = tmp.dir });
 
-    try std.testing.expectEqualStrings("gpt-5.1-codex-max", base.model.id);
+    try std.testing.expectEqualStrings("gpt-5.1", base.model.id);
     try std.testing.expectEqual(agent_mod.ThinkingLevel.xhigh, base.thinking_level);
+    try std.testing.expect(base.stream != null);
 }
 
 test "session config keeps provider and model settings scope atomic" {
@@ -204,6 +212,7 @@ test "session config falls back when settings are absent or unresolved" {
 
     try std.testing.expectEqualStrings(default_model.id, base.model.id);
     try std.testing.expectEqual(agent_mod.ThinkingLevel.off, base.thinking_level);
+    try std.testing.expect(base.stream == null);
 }
 
 fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {

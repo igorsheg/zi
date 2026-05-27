@@ -28,7 +28,8 @@ pub fn base64UrlEncode(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const encoder = std.base64.url_safe_no_pad.Encoder;
     const output = try allocator.alloc(u8, encoder.calcSize(bytes.len));
     errdefer allocator.free(output);
-    return encoder.encode(output, bytes);
+    _ = encoder.encode(output, bytes);
+    return output;
 }
 
 test "base64 url encode omits padding and uses url alphabet" {

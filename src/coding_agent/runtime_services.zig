@@ -10,6 +10,7 @@ pub const RuntimeServices = struct {
     agent_dir: []const u8,
     settings_manager: settings_mod.SettingsManager,
     provider_registry: ai.ProviderRegistry,
+    openai_provider: *ai.OpenAiResponsesProvider,
 
     pub const Options = struct {
         cwd: []const u8,
@@ -24,11 +25,19 @@ pub const RuntimeServices = struct {
         errdefer allocator.free(agent_dir);
 
         const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = agent_dir, .cwd = cwd };
-        const settings_manager = try settings_mod.SettingsManager.init(allocator, io, .{
+        var settings_manager = try settings_mod.SettingsManager.init(allocator, io, .{
             .paths = resource_paths,
             .dir = options.dir,
         });
         errdefer settings_manager.deinit();
+
+        const openai_provider = try allocator.create(ai.OpenAiResponsesProvider);
+        errdefer allocator.destroy(openai_provider);
+        openai_provider.* = ai.OpenAiResponsesProvider.init(.{});
+
+        var provider_registry = ai.ProviderRegistry.init(allocator);
+        errdefer provider_registry.deinit();
+        try openai_provider.register(&provider_registry);
 
         return .{
             .allocator = allocator,
@@ -36,7 +45,8 @@ pub const RuntimeServices = struct {
             .cwd = cwd,
             .agent_dir = agent_dir,
             .settings_manager = settings_manager,
-            .provider_registry = ai.ProviderRegistry.init(allocator),
+            .provider_registry = provider_registry,
+            .openai_provider = openai_provider,
         };
     }
 
@@ -46,6 +56,7 @@ pub const RuntimeServices = struct {
 
     pub fn deinit(self: *RuntimeServices) void {
         self.provider_registry.deinit();
+        self.allocator.destroy(self.openai_provider);
         self.settings_manager.deinit();
         self.allocator.free(self.agent_dir);
         self.allocator.free(self.cwd);
@@ -72,5 +83,5 @@ test "runtime services owns stable cwd, agent dir, settings manager" {
     const service_paths = services.paths();
     try std.testing.expectEqualStrings(services.cwd, service_paths.cwd);
     try std.testing.expectEqualStrings(services.agent_dir, service_paths.global_dir);
-    try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_responses) == null);
+    try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_responses) != null);
 }

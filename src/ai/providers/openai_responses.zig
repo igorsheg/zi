@@ -81,7 +81,7 @@ fn run(self: *Provider, request: protocol.StreamRequest, sink: protocol.Assistan
     defer reducer.deinit();
     try sink.emit(request.io, .{ .start = .{ .partial = try reducer.partial() } });
 
-    var client: std.http.Client = .{ .allocator = request.allocator };
+    var client: std.http.Client = .{ .allocator = request.allocator, .io = request.io };
     defer client.deinit();
     const url = try endpointUrl(request.allocator, request.model.base_url);
     defer request.allocator.free(url);
@@ -150,7 +150,7 @@ const ReducerSseSink = struct {
     assistant_sink: protocol.AssistantMessageEventSink,
     reducer: *shared.ResponseStreamReducer,
 
-    fn emit(self: *ReducerSseSink, event: sse.Event) !void {
+    pub fn emit(self: *ReducerSseSink, event: sse.Event) !void {
         try self.reducer.applySseData(self.io, self.assistant_sink, event.data);
     }
 };
