@@ -42,7 +42,12 @@ pub const RuntimeServices = struct {
 
         const auth_manager = try allocator.create(auth_mod.AuthManager);
         errdefer allocator.destroy(auth_manager);
-        auth_manager.* = auth_mod.AuthManager.init(.{ .environ = options.environ });
+        auth_manager.* = try auth_mod.AuthManager.init(allocator, io, .{
+            .environ = options.environ,
+            .paths = resource_paths,
+            .dir = options.dir,
+        });
+        errdefer auth_manager.deinit();
 
         const model_registry = model_registry_mod.ModelRegistry.init(auth_manager);
 
@@ -115,6 +120,7 @@ pub const RuntimeServices = struct {
         self.provider_registry.deinit();
         self.allocator.destroy(self.openai_codex_provider);
         self.allocator.destroy(self.openai_provider);
+        self.auth_manager.deinit();
         self.allocator.destroy(self.auth_manager);
         self.settings_manager.deinit();
         self.allocator.free(self.agent_dir);

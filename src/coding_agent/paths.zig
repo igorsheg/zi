@@ -4,6 +4,7 @@ const mem = @import("../mem/root.zig");
 pub const global_config_dir_name = ".zi";
 pub const project_config_dir_name = ".zi";
 pub const settings_file_name = "settings.json";
+pub const auth_file_name = "auth.json";
 pub const skills_dir_name = "skills";
 pub const system_prompt_file_name = "SYSTEM.md";
 pub const append_system_prompt_file_name = "APPEND_SYSTEM.md";
@@ -20,6 +21,10 @@ pub const PersistencePaths = struct {
 
     pub fn globalSettingsPath(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
         return std.fs.path.join(allocator, &.{ self.global_dir, settings_file_name });
+    }
+
+    pub fn authPath(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.global_dir, auth_file_name });
     }
 
     pub fn projectConfigDir(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
@@ -74,6 +79,8 @@ test "persistence paths owns user and project zi resource paths" {
 
     const global_settings = try paths.globalSettingsPath(std.testing.allocator);
     defer std.testing.allocator.free(global_settings);
+    const auth_path = try paths.authPath(std.testing.allocator);
+    defer std.testing.allocator.free(auth_path);
     const project_config = try paths.projectConfigDir(std.testing.allocator);
     defer std.testing.allocator.free(project_config);
     const project_settings = try paths.projectSettingsPath(std.testing.allocator);
@@ -85,6 +92,7 @@ test "persistence paths owns user and project zi resource paths" {
 
     try std.testing.expectEqualStrings(".zi", global_config_dir_name);
     try std.testing.expectEqualStrings("agent/settings.json", global_settings);
+    try std.testing.expectEqualStrings("agent/auth.json", auth_path);
     try std.testing.expectEqualStrings("repo/.zi", project_config);
     try std.testing.expectEqualStrings("repo/.zi/settings.json", project_settings);
     try std.testing.expectEqualStrings("agent/skills", global_skills);

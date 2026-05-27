@@ -37,7 +37,15 @@ test "model registry finds model only when auth is configured" {
     defer environ.deinit();
     try environ.put("OPENAI_API_KEY", "secret");
 
-    const auth = auth_mod.AuthManager.init(.{ .environ = &environ });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    var auth = try auth_mod.AuthManager.init(std.testing.allocator, std.testing.io, .{
+        .environ = &environ,
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer auth.deinit();
     const registry = ModelRegistry.init(&auth);
 
     try std.testing.expect(registry.findAvailable(ai.KnownProvider.openai, "gpt-5.1") != null);
@@ -49,7 +57,15 @@ test "model registry exposes first available authed model" {
     defer environ.deinit();
     try environ.put("OPENAI_API_KEY", "secret");
 
-    const auth = auth_mod.AuthManager.init(.{ .environ = &environ });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    var auth = try auth_mod.AuthManager.init(std.testing.allocator, std.testing.io, .{
+        .environ = &environ,
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer auth.deinit();
     const registry = ModelRegistry.init(&auth);
 
     try std.testing.expect(registry.firstAvailable() != null);
@@ -60,7 +76,15 @@ test "model registry considers every known provider for first available model" {
     defer environ.deinit();
     try environ.put("ANTHROPIC_API_KEY", "secret");
 
-    const auth = auth_mod.AuthManager.init(.{ .environ = &environ });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    var auth = try auth_mod.AuthManager.init(std.testing.allocator, std.testing.io, .{
+        .environ = &environ,
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer auth.deinit();
     const registry = ModelRegistry.init(&auth);
     const model = registry.firstAvailable().?;
 

@@ -289,6 +289,37 @@ test "session config skips unauthed codex settings and falls back to available m
     try std.testing.expect(services.diagnosticSlice()[0] == .unresolved_model_setting);
 }
 
+test "session config resolves codex settings when oauth credentials are stored" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/auth.json",
+        .data =
+        \\{"openai-codex":{"type":"oauth","refresh":"refresh-token","access":"access-token","expires":123}}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.zi/settings.json",
+        .data = "{\"defaultProvider\":\"openai-codex\",\"defaultModel\":\"gpt-5.1-codex-max\"}",
+    });
+
+    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+    });
+    defer services.deinit();
+
+    const base = resolve(&services, .{ .current_date = "2026-05-27", .dir = tmp.dir });
+
+    try std.testing.expectEqualStrings("gpt-5.1-codex-max", base.model.id);
+    try std.testing.expect(base.stream != null);
+    try std.testing.expectEqual(@as(usize, 0), services.diagnosticSlice().len);
+}
+
 fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
     return ai.AssistantMessageEventStream.init(request.event_buffer);
 }
