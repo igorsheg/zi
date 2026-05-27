@@ -140,14 +140,43 @@ The ordering invariant is:
 agent event
   -> queue mirror update
   -> extension/session hooks          (future)
-  -> public session listeners
+  -> public `AgentSessionEvent` queue
   -> persistence
   -> terminal policy: retry/compaction/queued continue
 ```
 
 Only the drain/apply site may mutate `SessionManager`, session queue mirrors, retry state, compaction state, or prompt state.
 
-### 5. Prompting goes through session preflight
+Pi-mono exposes this stream as `session.subscribe(listener)`. Zi exposes the same behavioral boundary as a bounded event queue drained explicitly by clients. This preserves event ordering without callback reentrancy or hidden listener mutation.
+
+### 5. Public clients communicate through events, commands, snapshots, and a runtime host
+
+`AgentSession` owns one current session's app policy. It should not own mode-specific frontend behavior or session replacement.
+
+The public boundary is:
+
+```text
+TUI / CLI / print / RPC adapter
+  -> AgentSessionRuntimeHost
+     owns current session replacement: new / switch / fork / import / teardown / rebind
+  -> AgentSession
+     owns one session's prompt, queue mirror, persistence, tool/resource policy, events
+  -> agent.Agent
+     owns the transcript loop, tool execution, steering/follow-up queues
+```
+
+Zi's client-facing read side is:
+
+```text
+AgentSessionEvent stream
+  -> bounded public event queue
+  -> explicit drain by frontend/host
+  -> owned snapshots for status, queue contents, tools, and session metadata
+```
+
+Zi's write side starts as direct session/host methods while the method set stabilizes. A serialized RPC protocol should be an adapter over the same command/event/snapshot semantics, not a separate app-policy path.
+
+### 6. Prompting goes through session preflight
 
 The public prompt API should become session-level, not `agent.promptText` pass-through.
 
@@ -170,13 +199,13 @@ prompt input
 
 A skeleton may implement no-op phases, but the function names and control flow should preserve this seam.
 
-### 6. Session history is source of durable truth
+### 7. Session history is source of durable truth
 
 `SessionManager` owns append-only history and branch structure. `AgentSession` may replace `agent.state.messages` from `SessionManager.buildSessionContext()` after compaction, tree navigation, resume, or fork.
 
 Core `Agent` state is runtime context, not the only durable source of truth.
 
-### 7. Encode deferred subsystems explicitly
+### 8. Encode deferred subsystems explicitly
 
 Do not smuggle future behavior into loose booleans or nullable callbacks.
 

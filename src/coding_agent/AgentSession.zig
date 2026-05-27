@@ -22,7 +22,7 @@ builtin_tools: tool_registry.OwnedBuiltinTools,
 tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 agent: *agent_mod.Agent,
-public_event_buffer: []PublicEvent,
+public_event_buffer: []AgentSessionEvent,
 public_events: *PublicEventQueue,
 queue_mirror: *QueueMirror,
 event_drain: *EventDrain,
@@ -59,10 +59,34 @@ pub const AgentSessionStatus = enum {
     stopped,
 };
 
+pub const RuntimeStatusSnapshot = struct {
+    status: AgentSessionStatus,
+    public_event_count: usize,
+    dropped_public_event_count: usize,
+};
+
+pub const ToolSnapshot = struct {
+    active_count: usize,
+};
+
 pub const Error = error{
     SessionBusy,
     SessionCancelling,
     SessionShuttingDown,
+};
+
+pub const OwnedEventText = struct {
+    allocator: std.mem.Allocator,
+    text: []const u8,
+
+    pub fn init(allocator: std.mem.Allocator, text: []const u8) !OwnedEventText {
+        return .{ .allocator = allocator, .text = try allocator.dupe(u8, text) };
+    }
+
+    pub fn deinit(self: *OwnedEventText) void {
+        self.allocator.free(self.text);
+        self.* = undefined;
+    }
 };
 
 const Lifecycle = enum {
@@ -72,19 +96,80 @@ const Lifecycle = enum {
     stopped,
 };
 
-pub const PublicEvent = union(enum) {
+pub const AgentSessionEvent = union(enum) {
     agent_event: agent_mod.AgentEvent,
     queue_update: QueueUpdate,
+    compaction_start: CompactionStart,
+    session_info_changed: SessionInfoChanged,
+    compaction_end: CompactionEnd,
+    auto_retry_start: AutoRetryStart,
+    auto_retry_end: AutoRetryEnd,
 
     pub const QueueUpdate = struct {
         steering_count: usize,
         follow_up_count: usize,
+        revision: u64,
     };
+
+    pub const CompactionReason = enum {
+        manual,
+        threshold,
+        overflow,
+    };
+
+    pub const CompactionResult = struct {
+        placeholder: void = {},
+    };
+
+    pub const CompactionStart = struct {
+        reason: CompactionReason,
+    };
+
+    pub const SessionInfoChanged = struct {
+        name: ?OwnedEventText,
+    };
+
+    pub const CompactionEnd = struct {
+        reason: CompactionReason,
+        result: ?CompactionResult,
+        aborted: bool,
+        will_retry: bool,
+        error_message: ?OwnedEventText = null,
+    };
+
+    pub const AutoRetryStart = struct {
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+        error_message: OwnedEventText,
+    };
+
+    pub const AutoRetryEnd = struct {
+        success: bool,
+        attempt: usize,
+        final_error: ?OwnedEventText = null,
+    };
+};
+
+pub const QueueSnapshot = struct {
+    allocator: std.mem.Allocator,
+    revision: u64,
+    steering: []const []const u8,
+    follow_up: []const []const u8,
+
+    pub fn deinit(self: *QueueSnapshot) void {
+        for (self.steering) |text| self.allocator.free(text);
+        for (self.follow_up) |text| self.allocator.free(text);
+        self.allocator.free(self.steering);
+        self.allocator.free(self.follow_up);
+        self.* = undefined;
+    }
 };
 
 const QueueMirror = struct {
     steering: std.ArrayList([]const u8) = .empty,
     follow_up: std.ArrayList([]const u8) = .empty,
+    revision: u64 = 0,
 
     fn deinit(self: *QueueMirror, allocator: std.mem.Allocator) void {
         self.clearList(allocator, &self.steering);
@@ -122,19 +207,44 @@ const QueueMirror = struct {
         return self.follow_up.items.len;
     }
 
-    fn append(_: *QueueMirror, allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), text: []const u8) !void {
+    fn snapshot(self: *const QueueMirror, allocator: std.mem.Allocator) !QueueSnapshot {
+        const steering = try cloneTextList(allocator, self.steering.items);
+        errdefer freeTextList(allocator, steering);
+        const follow_up = try cloneTextList(allocator, self.follow_up.items);
+        errdefer freeTextList(allocator, follow_up);
+        return .{
+            .allocator = allocator,
+            .revision = self.revision,
+            .steering = steering,
+            .follow_up = follow_up,
+        };
+    }
+
+    fn append(
+        self: *QueueMirror,
+        allocator: std.mem.Allocator,
+        list: *std.ArrayList([]const u8),
+        text: []const u8,
+    ) !void {
         const owned = try allocator.dupe(u8, text);
         errdefer allocator.free(owned);
         try list.append(allocator, owned);
+        self.revision += 1;
     }
 
-    fn remove(_: *QueueMirror, allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), text: []const u8) bool {
+    fn remove(
+        self: *QueueMirror,
+        allocator: std.mem.Allocator,
+        list: *std.ArrayList([]const u8),
+        text: []const u8,
+    ) bool {
         for (list.items, 0..) |queued, index| {
             if (!std.mem.eql(u8, queued, text)) continue;
             allocator.free(queued);
             const remaining = list.items.len - index - 1;
             if (remaining > 0) @memmove(list.items[index .. index + remaining], list.items[index + 1 ..]);
             list.shrinkRetainingCapacity(list.items.len - 1);
+            self.revision += 1;
             return true;
         }
         return false;
@@ -144,9 +254,26 @@ const QueueMirror = struct {
         for (list.items) |text| allocator.free(text);
         list.clearRetainingCapacity();
     }
+
+    fn cloneTextList(allocator: std.mem.Allocator, source: []const []const u8) ![]const []const u8 {
+        const result = try allocator.alloc([]const u8, source.len);
+        errdefer allocator.free(result);
+        var initialized: usize = 0;
+        errdefer for (result[0..initialized]) |owned| allocator.free(owned);
+        for (source, 0..) |text, index| {
+            result[index] = try allocator.dupe(u8, text);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    fn freeTextList(allocator: std.mem.Allocator, list: []const []const u8) void {
+        for (list) |text| allocator.free(text);
+        allocator.free(list);
+    }
 };
 
-const PublicEventQueue = runtime.BoundedQueue(PublicEvent);
+const PublicEventQueue = runtime.BoundedQueue(AgentSessionEvent);
 
 const SystemPromptState = struct {
     text: []const u8,
@@ -254,10 +381,11 @@ const EventDrain = struct {
         self.enqueuePublicEvent(.{ .queue_update = .{
             .steering_count = self.queue_mirror.steeringCount(),
             .follow_up_count = self.queue_mirror.followUpCount(),
+            .revision = self.queue_mirror.revision,
         } });
     }
 
-    fn enqueuePublicEvent(self: *EventDrain, event: PublicEvent) void {
+    fn enqueuePublicEvent(self: *EventDrain, event: AgentSessionEvent) void {
         _ = self.public_events.pushOrDrop(event);
         self.dropped_public_event_count = self.public_events.dropped();
     }
@@ -322,7 +450,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     errdefer core_agent.deinit();
 
     if (options.public_event_capacity == 0) return error.PublicEventCapacityZero;
-    const public_event_buffer = try allocator.alloc(PublicEvent, options.public_event_capacity);
+    const public_event_buffer = try allocator.alloc(AgentSessionEvent, options.public_event_capacity);
     errdefer allocator.free(public_event_buffer);
     const public_events = try allocator.create(PublicEventQueue);
     errdefer allocator.destroy(public_events);
@@ -456,6 +584,18 @@ pub fn status(self: *AgentSession) AgentSessionStatus {
     };
 }
 
+pub fn statusSnapshot(self: *AgentSession) RuntimeStatusSnapshot {
+    return .{
+        .status = self.status(),
+        .public_event_count = self.public_events.count(),
+        .dropped_public_event_count = self.public_events.dropped(),
+    };
+}
+
+pub fn toolSnapshot(self: *const AgentSession) ToolSnapshot {
+    return .{ .active_count = self.tools.activeToolNames().len };
+}
+
 pub fn shutdownComplete(self: *AgentSession) bool {
     self.reconcileLifecycle();
     return self.lifecycle == .stopped and
@@ -485,7 +625,11 @@ pub fn publicEventCount(self: *const AgentSession) usize {
     return self.public_events.count();
 }
 
-pub fn drainPublicEvent(self: *AgentSession) ?PublicEvent {
+pub fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !QueueSnapshot {
+    return self.queue_mirror.snapshot(allocator);
+}
+
+pub fn drainPublicEvent(self: *AgentSession) ?AgentSessionEvent {
     return self.public_events.pop();
 }
 
@@ -1048,6 +1192,38 @@ test "agent session public events are caller drained after message persistence" 
     try std.testing.expect(session.drainPublicEvent() == null);
 }
 
+test "agent session queue update carries revision and snapshot exposes queued text" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+    try session.promptWithOptions("queued", &.{}, .{ .streaming_behavior = .follow_up });
+
+    const queue_update = session.drainPublicEvent().?.queue_update;
+    try std.testing.expectEqual(@as(u64, 1), queue_update.revision);
+
+    var snapshot = try session.queueSnapshot(std.testing.allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.revision);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.follow_up.len);
+    try std.testing.expectEqualStrings("queued", snapshot.follow_up[0]);
+}
+
 test "agent session queue update consumes block user message text" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1116,6 +1292,38 @@ test "agent session queue update is emitted before queued user message start" {
     try std.testing.expectEqual(@as(usize, 0), consumed_update.steering_count);
     try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up_count);
     try expectUserMessageEvent(.message_start, session.drainPublicEvent().?.agent_event, "queued");
+}
+
+test "agent session snapshots expose status and active tool read models" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .public_event_capacity = 1,
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+    try session.agent.emitEvent(.agent_start);
+    try session.agent.emitEvent(.agent_start);
+
+    const status_snapshot = session.statusSnapshot();
+    try std.testing.expectEqual(AgentSessionStatus.running, status_snapshot.status);
+    try std.testing.expectEqual(@as(usize, 1), status_snapshot.public_event_count);
+    try std.testing.expectEqual(@as(usize, 1), status_snapshot.dropped_public_event_count);
+
+    const tool_snapshot = session.toolSnapshot();
+    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), tool_snapshot.active_count);
 }
 
 test "agent session public event queue overflow is explicit" {

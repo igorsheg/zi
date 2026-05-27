@@ -283,8 +283,29 @@ current implemented spine:
 
 next tightening work:
 - make prompt preflight phases explicit beyond the current skill/template no-op seam.
-- add public session listeners after event drain ordering is stable.
-- add queue mirror state for steering/follow-up before TUI/RPC.
+- finish the public `AgentSessionEvent` stream as a bounded drain, not callback subscription.
+- expose narrow owned snapshots for status, queue contents, tools, and session metadata instead of raw internals.
+- introduce `AgentSessionRuntimeHost` before TUI/RPC so session replacement policy is not owned by frontends.
+
+public boundary shape:
+
+```text
+frontend mode / adapter
+  -> AgentSessionRuntimeHost
+     owns current session replacement: new / switch / fork / import / teardown / rebind
+  -> AgentSession
+     owns one session's app policy: prompt preflight, queue mirror, persistence, events
+  -> agent.Agent
+     owns transcript loop, tool execution, steering/follow-up queues
+```
+
+Zi translates pi-mono `session.subscribe(listener)` into explicit event draining:
+
+```text
+AgentSessionEvent union
+  -> bounded public queue
+  -> frontend drains events and requests snapshots when it needs read models
+```
 
 this is where the previous agent package becomes useful.
 
