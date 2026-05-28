@@ -11,9 +11,7 @@ pub const OAuthCredential = struct {
 
     pub fn deinit(self: *OAuthCredential, allocator: std.mem.Allocator) void {
         allocator.free(self.provider);
-        allocator.free(self.credentials.refresh);
-        allocator.free(self.credentials.access);
-        if (self.credentials.extra) |extra| agent_mod.freeJsonValue(allocator, extra);
+        freeOAuthCredentials(allocator, &self.credentials);
         self.* = undefined;
     }
 };
@@ -208,6 +206,17 @@ pub const AuthManager = struct {
         try self.store.remove(io, provider);
     }
 
+    pub fn loginOAuth(
+        self: *AuthManager,
+        io: std.Io,
+        provider: ai.OAuthProviderInterface,
+        callbacks: ai.OAuthLoginCallbacks,
+    ) !void {
+        var credentials = try provider.login(self.store.allocator, io, callbacks);
+        defer freeOAuthCredentials(self.store.allocator, &credentials);
+        try self.setOAuthCredentials(io, provider.id, credentials);
+    }
+
     pub fn hasAuth(self: *const AuthManager, provider: ai.Provider) bool {
         return self.findEnvApiKey(provider) != null or self.findOAuthCredentials(provider) != null;
     }
@@ -232,6 +241,13 @@ pub const AuthManager = struct {
         return null;
     }
 };
+
+fn freeOAuthCredentials(allocator: std.mem.Allocator, credentials: *ai.OAuthCredentials) void {
+    allocator.free(credentials.refresh);
+    allocator.free(credentials.access);
+    if (credentials.extra) |extra| agent_mod.freeJsonValue(allocator, extra);
+    credentials.* = undefined;
+}
 
 fn formatCredentials(allocator: std.mem.Allocator, credentials: []const OAuthCredential) ![]const u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -500,4 +516,80 @@ test "auth manager removes stored credentials" {
     defer std.testing.allocator.free(bytes);
     try std.testing.expectEqualStrings("{}\n", bytes);
     try std.testing.expect(!auth.hasAuth(ai.KnownProvider.openai_codex));
+}
+
+test "auth manager logs in through oauth provider and persists credentials" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var calls: OAuthLoginCalls = .{};
+    const provider: ai.OAuthProviderInterface = .{
+        .id = "openai-codex",
+        .name = "Test Codex",
+        .login_fn = testOAuthLogin,
+        .refresh_token_fn = testOAuthRefresh,
+        .get_api_key_fn = testOAuthApiKey,
+    };
+
+    var auth = try AuthManager.init(std.testing.allocator, std.testing.io, .{
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer auth.deinit();
+
+    try auth.loginOAuth(std.testing.io, provider, .{
+        .context = &calls,
+        .on_auth_fn = testOnOAuthAuth,
+        .on_prompt_fn = testOnOAuthPrompt,
+    });
+
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "agent/auth.json", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), calls.auth_count);
+    try std.testing.expectEqualStrings(
+        "{\"openai-codex\":{\"type\":\"oauth\",\"refresh\":\"refresh-token\"," ++
+            "\"access\":\"access-token\",\"expires\":123}}\n",
+        bytes,
+    );
+    try std.testing.expect(auth.hasAuth(ai.KnownProvider.openai_codex));
+}
+
+const OAuthLoginCalls = struct {
+    auth_count: usize = 0,
+};
+
+fn testOAuthLogin(
+    allocator: std.mem.Allocator,
+    _: std.Io,
+    _: ?*anyopaque,
+    callbacks: ai.OAuthLoginCallbacks,
+) !ai.OAuthCredentials {
+    try callbacks.onAuth(.{ .url = "https://example.test" });
+    return .{
+        .refresh = try allocator.dupe(u8, "refresh-token"),
+        .access = try allocator.dupe(u8, "access-token"),
+        .expires = 123,
+    };
+}
+
+fn testOAuthRefresh(
+    _: std.mem.Allocator,
+    _: std.Io,
+    _: ?*anyopaque,
+    credentials: ai.OAuthCredentials,
+) !ai.OAuthCredentials {
+    return credentials;
+}
+
+fn testOAuthApiKey(_: ?*anyopaque, credentials: ai.OAuthCredentials) ![]const u8 {
+    return credentials.access;
+}
+
+fn testOnOAuthAuth(context: ?*anyopaque, info: ai.OAuthAuthInfo) !void {
+    const calls: *OAuthLoginCalls = @ptrCast(@alignCast(context.?));
+    calls.auth_count += 1;
+    try std.testing.expectEqualStrings("https://example.test", info.url);
+}
+
+fn testOnOAuthPrompt(_: ?*anyopaque, _: ai.OAuthPrompt) ![]const u8 {
+    return "";
 }
