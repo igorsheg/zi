@@ -249,20 +249,20 @@ fn raceLoginCode(
     server: *CallbackServer,
     expected_state: []const u8,
 ) ![]const u8 {
+    var threaded = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(2) });
+    defer threaded.deinit();
+    const race_io = threaded.io();
+
     var completions_buffer: [2]LoginCodeCompletion = undefined;
-    var race = zistd.Race(LoginCodeCompletion).init(
-        allocator,
-        &completions_buffer,
-        .{ .concurrent_limit = .limited(2) },
-    );
+    var race = zistd.Race(LoginCodeCompletion).init(race_io, &completions_buffer);
     defer race.deinit();
     errdefer race.cancelAndDrain(allocator, drainLoginCodeLoser);
 
-    try race.concurrent(.callback, waitForCallbackCode, .{ allocator, race.io(), server, expected_state });
+    try race.concurrent(.callback, waitForCallbackCode, .{ allocator, race_io, server, expected_state });
     try race.concurrent(.manual, waitForManualCode, .{ allocator, callbacks, expected_state });
 
     const winner = try race.await();
-    if (winner == .manual) server.shutdown(race.io());
+    if (winner == .manual) server.shutdown(race_io);
     defer race.cancelAndDrain(allocator, drainLoginCodeLoser);
     return switch (winner) {
         .callback => |result| result,
