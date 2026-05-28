@@ -1,7 +1,7 @@
 const std = @import("std");
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
-const mem = @import("../mem/root.zig");
+const mem = @import("../zistd/root.zig");
 const session_manager = @import("session_manager.zig");
 
 pub const max_session_file_bytes = 64 * 1024 * 1024;

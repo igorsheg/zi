@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const runtime = @import("../runtime/root.zig");
+const runtime = @import("../zistd/root.zig");
 
 pub const Agent = @import("Agent.zig");
 pub const loop = @import("loop.zig");

@@ -1,5 +1,5 @@
 const std = @import("std");
-const mem = @import("../../mem/root.zig");
+const mem = @import("../../zistd/root.zig");
 const partial_json = @import("partial_json.zig");
 
 pub const OwnedJsonValue = mem.Owned(std.json.Value);

@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime = @import("../runtime/root.zig");
+const runtime = @import("../zistd/root.zig");
 const protocol = @import("protocol.zig");
 const provider_registry = @import("provider_registry.zig");
 const stream_api = @import("stream.zig");

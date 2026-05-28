@@ -1,6 +1,6 @@
 const std = @import("std");
 const http_utils = @import("../http.zig");
-const mem = @import("../../../mem/root.zig");
+const zistd = @import("../../../zistd/root.zig");
 const oauth = @import("root.zig");
 
 pub const callback_host = "127.0.0.1";
@@ -77,7 +77,7 @@ pub fn getAccountId(allocator: std.mem.Allocator, access_token: []const u8) !?[]
     const decoded = try decodeBase64Url(allocator, payload_segment);
     defer allocator.free(decoded);
 
-    var parsed = mem.Owned(std.json.Value).parseJson(allocator, decoded, .{}) catch return null;
+    var parsed = zistd.Owned(std.json.Value).parseJson(allocator, decoded, .{}) catch return null;
     defer parsed.deinit();
     const auth = parsed.value.object.get(jwt_claim_path) orelse return null;
     if (auth != .object) return null;
@@ -249,18 +249,21 @@ fn raceLoginCode(
     server: *CallbackServer,
     expected_state: []const u8,
 ) ![]const u8 {
-    var threaded = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(2) });
-    defer threaded.deinit();
-    const race_io = threaded.io();
-
     var completions_buffer: [2]LoginCodeCompletion = undefined;
-    var select = std.Io.Select(LoginCodeCompletion).init(race_io, &completions_buffer);
-    try select.concurrent(.callback, waitForCallbackCode, .{ allocator, race_io, server, expected_state });
-    try select.concurrent(.manual, waitForManualCode, .{ allocator, callbacks, expected_state });
+    var race = zistd.Race(LoginCodeCompletion).init(
+        allocator,
+        &completions_buffer,
+        .{ .concurrent_limit = .limited(2) },
+    );
+    defer race.deinit();
+    errdefer race.cancelAndDrain(allocator, drainLoginCodeLoser);
 
-    const winner = try select.await();
-    if (winner == .manual) server.shutdown(race_io);
-    defer drainLoginCodeLosers(allocator, &select);
+    try race.concurrent(.callback, waitForCallbackCode, .{ allocator, race.io(), server, expected_state });
+    try race.concurrent(.manual, waitForManualCode, .{ allocator, callbacks, expected_state });
+
+    const winner = try race.await();
+    if (winner == .manual) server.shutdown(race.io());
+    defer race.cancelAndDrain(allocator, drainLoginCodeLoser);
     return switch (winner) {
         .callback => |result| result,
         .manual => |result| result,
@@ -285,12 +288,10 @@ fn waitForManualCode(
     return codeFromInput(allocator, manual, expected_state);
 }
 
-fn drainLoginCodeLosers(allocator: std.mem.Allocator, select: *std.Io.Select(LoginCodeCompletion)) void {
-    while (select.cancel()) |completion| {
-        switch (completion) {
-            .callback => |result| if (result) |code| allocator.free(code) else |_| {},
-            .manual => |result| if (result) |code| allocator.free(code) else |_| {},
-        }
+fn drainLoginCodeLoser(allocator: std.mem.Allocator, completion: LoginCodeCompletion) void {
+    switch (completion) {
+        .callback => |result| if (result) |code| allocator.free(code) else |_| {},
+        .manual => |result| if (result) |code| allocator.free(code) else |_| {},
     }
 }
 
@@ -449,7 +450,7 @@ fn requestToken(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oau
 }
 
 fn parseTokenResponse(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oauth.OAuthCredentials {
-    var parsed = try mem.Owned(std.json.Value).parseJson(allocator, body, .{});
+    var parsed = try zistd.Owned(std.json.Value).parseJson(allocator, body, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidTokenResponse;
     const object = parsed.value.object;

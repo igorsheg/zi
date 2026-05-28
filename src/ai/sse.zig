@@ -1,5 +1,5 @@
 const std = @import("std");
-const mem = @import("../mem/root.zig");
+const mem = @import("../zistd/root.zig");
 
 pub const default_max_line_bytes: usize = 64 * 1024;
 pub const default_max_event_name_bytes: usize = 128;

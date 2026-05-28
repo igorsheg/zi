@@ -2,7 +2,7 @@ const std = @import("std");
 const zi = @import("zi");
 
 pub fn main(init: std.process.Init) !void {
-    const process = zi.runtime.Process.init(init);
+    const process = zi.zistd.Process.init(init);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), process.io, &stdout_buffer);

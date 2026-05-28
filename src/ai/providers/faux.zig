@@ -1,5 +1,5 @@
 const std = @import("std");
-const mem = @import("../../mem/root.zig");
+const mem = @import("../../zistd/root.zig");
 const owned = @import("../owned.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");

@@ -1,5 +1,5 @@
 const std = @import("std");
-const mem = @import("../mem/root.zig");
+const mem = @import("../zistd/root.zig");
 
 pub const global_config_dir_name = ".zi";
 pub const project_config_dir_name = ".zi";

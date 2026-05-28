@@ -1,19 +1,24 @@
 const std = @import("std");
 
-pub const bounded_queue = @import("bounded_queue.zig");
-pub const cancel = @import("cancel.zig");
-pub const completion_queue = @import("completion_queue.zig");
-pub const operation = @import("operation.zig");
+pub const bounded_queue = @import("BoundedQueue.zig");
+pub const cancel = @import("Cancel.zig");
+pub const completion_queue = @import("CompletionQueue.zig");
+pub const event_pipe = @import("EventPipe.zig");
+pub const operation = @import("Operation.zig");
+pub const race = @import("Race.zig");
 
+pub const ByteBuilder = @import("ByteBuilder.zig").ByteBuilder;
 pub const BoundedQueue = bounded_queue.BoundedQueue;
 pub const CancelSource = cancel.CancelSource;
 pub const CancelToken = cancel.CancelToken;
-pub const sleep = cancel.sleep;
 pub const CompletionQueue = completion_queue.CompletionQueue;
+pub const EventPipe = event_pipe.EventPipe;
 pub const OperationId = operation.OperationId;
 pub const OperationState = operation.OperationState;
 pub const OperationTable = operation.OperationTable;
-pub const EventPipe = @import("event_pipe.zig").EventPipe;
+pub const Owned = @import("Owned.zig").Owned;
+pub const Race = race.Race;
+pub const sleep = cancel.sleep;
 
 pub const Process = struct {
     arena: std.mem.Allocator,
@@ -32,11 +37,14 @@ pub const Process = struct {
 };
 
 test {
-    _ = bounded_queue;
-    _ = cancel;
-    _ = completion_queue;
-    _ = operation;
-    _ = @import("event_pipe.zig");
+    _ = @import("BoundedQueue.zig");
+    _ = @import("ByteBuilder.zig");
+    _ = @import("Cancel.zig");
+    _ = @import("CompletionQueue.zig");
+    _ = @import("EventPipe.zig");
+    _ = @import("Operation.zig");
+    _ = @import("Owned.zig");
+    _ = @import("Race.zig");
 }
 
 test "process runtime stores explicit resources" {

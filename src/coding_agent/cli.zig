@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime = @import("../runtime/root.zig");
+const runtime = @import("../zistd/root.zig");
 const auth_mode = @import("auth_mode.zig");
 const paths_mod = @import("paths.zig");
 const print_mode = @import("print_mode.zig");

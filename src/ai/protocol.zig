@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime = @import("../runtime/root.zig");
+const runtime = @import("../zistd/root.zig");
 
 pub const Api = []const u8;
 pub const Provider = []const u8;

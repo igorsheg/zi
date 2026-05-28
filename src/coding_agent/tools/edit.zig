@@ -1,8 +1,7 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
-const mem = @import("../../mem/root.zig");
-const runtime = @import("../../runtime/root.zig");
+const zistd = @import("../../zistd/root.zig");
 const mutation = @import("file_mutation_queue.zig");
 
 pub const max_edit_read_bytes = 4 * 1024 * 1024;
@@ -37,7 +36,7 @@ const parameters_schema =
 pub const EditTool = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    parsed_parameters: mem.Owned(std.json.Value),
+    parsed_parameters: zistd.Owned(std.json.Value),
     owned_queue: mutation.FileMutationQueue = .{},
 
     pub const Config = struct {
@@ -51,7 +50,7 @@ pub const EditTool = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !EditTool {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
-        const parsed_parameters = try mem.Owned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        const parsed_parameters = try zistd.Owned(std.json.Value).parseJson(allocator, parameters_schema, .{});
         return .{
             .allocator = allocator,
             .config = .{
@@ -107,7 +106,7 @@ fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: ?*anyopaque,
-    token: runtime.CancelToken,
+    token: zistd.CancelToken,
     _: []const u8,
     params: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
@@ -299,7 +298,7 @@ test "edit tool applies multiple exact replacements against original content" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "edits", .{ .array = edits });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source: zistd.CancelSource = .{};
     var result = try execute(
         std.testing.allocator,
         std.testing.io,
