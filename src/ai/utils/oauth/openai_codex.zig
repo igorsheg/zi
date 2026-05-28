@@ -223,14 +223,74 @@ fn waitForLoginCode(
     callbacks: oauth.OAuthLoginCallbacks,
     attempt: *LoginAttempt,
 ) ![]const u8 {
-    if (try callbacks.onManualCodeInput()) |manual| {
-        return codeFromInput(allocator, manual, attempt.flow.state);
-    }
     if (attempt.callback_server) |*server| {
+        if (callbacks.on_manual_code_input_fn != null) {
+            return raceLoginCode(allocator, callbacks, server, attempt.flow.state);
+        }
         return server.waitForCode(allocator, io, attempt.flow.state) catch
             promptForCode(allocator, callbacks, attempt.flow.state);
     }
+    if (try callbacks.onManualCodeInput()) |manual| {
+        return codeFromInput(allocator, manual, attempt.flow.state);
+    }
     return promptForCode(allocator, callbacks, attempt.flow.state);
+}
+
+const LoginCodeResult = anyerror![]const u8;
+
+const LoginCodeCompletion = union(enum) {
+    callback: LoginCodeResult,
+    manual: LoginCodeResult,
+};
+
+fn raceLoginCode(
+    allocator: std.mem.Allocator,
+    callbacks: oauth.OAuthLoginCallbacks,
+    server: *CallbackServer,
+    expected_state: []const u8,
+) ![]const u8 {
+    var threaded = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(2) });
+    defer threaded.deinit();
+    const race_io = threaded.io();
+
+    var completions_buffer: [2]LoginCodeCompletion = undefined;
+    var select = std.Io.Select(LoginCodeCompletion).init(race_io, &completions_buffer);
+    try select.concurrent(.callback, waitForCallbackCode, .{ allocator, race_io, server, expected_state });
+    try select.concurrent(.manual, waitForManualCode, .{ allocator, callbacks, expected_state });
+
+    const winner = try select.await();
+    defer drainLoginCodeLosers(allocator, &select);
+    return switch (winner) {
+        .callback => |result| result,
+        .manual => |result| result,
+    };
+}
+
+fn waitForCallbackCode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    server: *CallbackServer,
+    expected_state: []const u8,
+) LoginCodeResult {
+    return server.waitForCode(allocator, io, expected_state);
+}
+
+fn waitForManualCode(
+    allocator: std.mem.Allocator,
+    callbacks: oauth.OAuthLoginCallbacks,
+    expected_state: []const u8,
+) LoginCodeResult {
+    const manual = (try callbacks.onManualCodeInput()) orelse return error.ManualOAuthInputUnavailable;
+    return codeFromInput(allocator, manual, expected_state);
+}
+
+fn drainLoginCodeLosers(allocator: std.mem.Allocator, select: *std.Io.Select(LoginCodeCompletion)) void {
+    while (select.cancel()) |completion| {
+        switch (completion) {
+            .callback => |result| if (result) |code| allocator.free(code) else |_| {},
+            .manual => |result| if (result) |code| allocator.free(code) else |_| {},
+        }
+    }
 }
 
 fn completeLogin(
