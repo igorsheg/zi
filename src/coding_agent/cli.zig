@@ -51,6 +51,9 @@ fn runAuth(
     if (std.mem.eql(u8, action, "logout")) {
         return auth_mode.logout(process.gpa, process.io, stdout, provider, options);
     }
+    if (std.mem.eql(u8, action, "status")) {
+        return auth_mode.status(process.gpa, process.io, stdout, provider, options);
+    }
     return usage(stderr);
 }
 
@@ -84,6 +87,7 @@ fn usage(stderr: *std.Io.Writer) noreturn {
         \\usage: zi <prompt>
         \\       zi auth login openai-codex
         \\       zi auth logout openai-codex
+        \\       zi auth status openai-codex
         \\
     ) catch std.process.exit(2);
     stderr.flush() catch std.process.exit(2);
@@ -103,12 +107,7 @@ test "cli auth logout dispatches to auth mode" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    const process: runtime.Process = .{
-        .arena = std.testing.allocator,
-        .gpa = std.testing.allocator,
-        .io = std.testing.io,
-        .environ = &environ,
-    };
+    const process = testProcess(&environ);
     var output_buffer: [128]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [128]u8 = undefined;
@@ -126,4 +125,46 @@ test "cli auth logout dispatches to auth mode" {
 
     try std.testing.expectEqualStrings("logged out openai-codex\n", output.buffered());
     try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "cli auth status dispatches to auth mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/auth.json",
+        .data =
+        \\{"openai-codex":{"type":"oauth","refresh":"refresh-token","access":"access-token","expires":123}}
+        ,
+    });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const process = testProcess(&environ);
+    var output_buffer: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var argv = [_:null]?[*:0]const u8{ "zi", "auth", "status", "openai-codex" };
+    var args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&argv) }, std.testing.allocator);
+    defer args.deinit();
+
+    try runWithOptions(process, &args, &output, &stderr, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    });
+
+    try std.testing.expectEqualStrings("openai-codex: authenticated\n", output.buffered());
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+fn testProcess(environ: *std.process.Environ.Map) runtime.Process {
+    return .{
+        .arena = std.testing.allocator,
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = environ,
+    };
 }

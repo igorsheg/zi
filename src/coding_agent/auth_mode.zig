@@ -56,15 +56,37 @@ pub fn logout(
     provider: ai.Provider,
     options: Options,
 ) !void {
-    var auth = try auth_mod.AuthManager.init(allocator, io, .{
-        .environ = options.environ,
-        .paths = .{ .global_dir = options.agent_dir, .cwd = options.cwd },
-        .dir = options.dir,
-    });
+    var auth = try initAuth(allocator, io, options);
     defer auth.deinit();
 
     try auth.removeCredentials(io, provider);
     try stdout.print("logged out {s}\n", .{provider});
+}
+
+pub fn status(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    provider: ai.Provider,
+    options: Options,
+) !void {
+    var auth = try initAuth(allocator, io, options);
+    defer auth.deinit();
+
+    const state: []const u8 = if (auth.hasAuth(provider)) "authenticated" else "missing";
+    try stdout.print("{s}: {s}\n", .{ provider, state });
+}
+
+fn initAuth(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+) !auth_mod.AuthManager {
+    return auth_mod.AuthManager.init(allocator, io, .{
+        .environ = options.environ,
+        .paths = .{ .global_dir = options.agent_dir, .cwd = options.cwd },
+        .dir = options.dir,
+    });
 }
 
 fn oauthProvider(provider: ai.Provider) ?ai.OAuthProviderInterface {
@@ -81,17 +103,20 @@ const LoginCallbacks = struct {
         const self: *LoginCallbacks = @ptrCast(@alignCast(context.?));
         try self.stdout.print("open {s}\n", .{info.url});
         if (info.instructions) |instructions| try self.stdout.print("{s}\n", .{instructions});
+        try self.stdout.flush();
     }
 
     fn onPrompt(context: ?*anyopaque, prompt: ai.OAuthPrompt) ![]const u8 {
         const self: *LoginCallbacks = @ptrCast(@alignCast(context.?));
         try self.stderr.print("{s}\n", .{prompt.message});
+        try self.stderr.flush();
         return self.readLine();
     }
 
     fn onManualCodeInput(context: ?*anyopaque) ![]const u8 {
         const self: *LoginCallbacks = @ptrCast(@alignCast(context.?));
         try self.stderr.writeAll("paste redirect url or code, then press enter:\n");
+        try self.stderr.flush();
         return self.readLine();
     }
 
@@ -160,6 +185,64 @@ test "auth mode prompt reads bounded oauth input" {
 
     try std.testing.expectEqualStrings("prompt-code", value);
     try std.testing.expectEqualStrings("enter code:\n", stderr.buffered());
+}
+
+test "auth mode status reports stored oauth auth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/auth.json",
+        .data =
+        \\{"openai-codex":{"type":"oauth","refresh":"refresh-token","access":"access-token","expires":123}}
+        ,
+    });
+
+    var output_buffer: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    try status(std.testing.allocator, std.testing.io, &output, ai.KnownProvider.openai_codex, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+    });
+
+    try std.testing.expectEqualStrings("openai-codex: authenticated\n", output.buffered());
+}
+
+test "auth mode status reports env auth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("OPENAI_API_KEY", "secret");
+
+    var output_buffer: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    try status(std.testing.allocator, std.testing.io, &output, ai.KnownProvider.openai, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .environ = &environ,
+    });
+
+    try std.testing.expectEqualStrings("openai: authenticated\n", output.buffered());
+}
+
+test "auth mode status reports missing auth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+
+    var output_buffer: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    try status(std.testing.allocator, std.testing.io, &output, ai.KnownProvider.openai, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+    });
+
+    try std.testing.expectEqualStrings("openai: missing\n", output.buffered());
 }
 
 test "auth mode logout removes stored provider auth" {
