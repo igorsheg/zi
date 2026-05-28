@@ -83,7 +83,8 @@ pub fn getAccountId(allocator: std.mem.Allocator, access_token: []const u8) !?[]
     if (auth != .object) return null;
     const account_id = auth.object.get("chatgpt_account_id") orelse return null;
     if (account_id != .string or account_id.string.len == 0) return null;
-    return try allocator.dupe(u8, account_id.string);
+    const owned_account_id = try allocator.dupe(u8, account_id.string);
+    return owned_account_id;
 }
 
 fn createState(allocator: std.mem.Allocator, random: std.Random) ![]u8 {
@@ -177,26 +178,68 @@ fn login(
     _: ?*anyopaque,
     callbacks: oauth.OAuthLoginCallbacks,
 ) !oauth.OAuthCredentials {
+    var attempt = try beginLogin(allocator, io, callbacks);
+    defer attempt.deinit(allocator, io);
+
+    const code = try waitForLoginCode(allocator, io, callbacks, &attempt);
+    defer allocator.free(code);
+    return completeLogin(allocator, io, &attempt, code);
+}
+
+const LoginAttempt = struct {
+    flow: AuthorizationFlow,
+    callback_server: ?CallbackServer,
+
+    fn deinit(self: *LoginAttempt, allocator: std.mem.Allocator, io: std.Io) void {
+        if (self.callback_server) |*server| server.deinit(io);
+        self.flow.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn beginLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    callbacks: oauth.OAuthLoginCallbacks,
+) !LoginAttempt {
     var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Clock.awake.now(io).nanoseconds));
     var flow = try createAuthorizationFlow(allocator, prng.random(), "zi");
-    defer flow.deinit(allocator);
+    errdefer flow.deinit(allocator);
 
     var callback_server = CallbackServer.start(io) catch null;
-    defer if (callback_server) |*server| server.deinit(io);
+    errdefer if (callback_server) |*server| server.deinit(io);
 
     try callbacks.onAuth(.{
         .url = flow.url,
         .instructions = "Complete login in the browser. If callback capture fails, paste the redirect URL or code.",
     });
 
-    const code = if (try callbacks.onManualCodeInput()) |manual|
-        try codeFromInput(allocator, manual, flow.state)
-    else if (callback_server) |*server|
-        server.waitForCode(allocator, io, flow.state) catch try promptForCode(allocator, callbacks, flow.state)
-    else
-        try promptForCode(allocator, callbacks, flow.state);
-    defer allocator.free(code);
-    return exchangeAuthorizationCode(allocator, io, code, flow.verifier);
+    return .{ .flow = flow, .callback_server = callback_server };
+}
+
+fn waitForLoginCode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    callbacks: oauth.OAuthLoginCallbacks,
+    attempt: *LoginAttempt,
+) ![]const u8 {
+    if (try callbacks.onManualCodeInput()) |manual| {
+        return codeFromInput(allocator, manual, attempt.flow.state);
+    }
+    if (attempt.callback_server) |*server| {
+        return server.waitForCode(allocator, io, attempt.flow.state) catch
+            promptForCode(allocator, callbacks, attempt.flow.state);
+    }
+    return promptForCode(allocator, callbacks, attempt.flow.state);
+}
+
+fn completeLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    attempt: *LoginAttempt,
+    code: []const u8,
+) !oauth.OAuthCredentials {
+    return exchangeAuthorizationCode(allocator, io, code, attempt.flow.verifier);
 }
 
 const CallbackServer = struct {
@@ -247,7 +290,10 @@ const CallbackServer = struct {
         };
         const owned_code = try allocator.dupe(u8, code);
         errdefer allocator.free(owned_code);
-        const html = try oauth.oauthSuccessHtml(allocator, "OpenAI authentication completed. You can close this window.");
+        const html = try oauth.oauthSuccessHtml(
+            allocator,
+            "OpenAI authentication completed. You can close this window.",
+        );
         defer allocator.free(html);
         try request.respond(html, .{});
         return owned_code;
@@ -267,7 +313,7 @@ fn codeFromInput(allocator: std.mem.Allocator, input: []const u8, expected_state
     const parsed = parseAuthorizationInput(input);
     if (parsed.state) |state| if (!std.mem.eql(u8, state, expected_state)) return error.StateMismatch;
     const code = parsed.code orelse return error.MissingAuthorizationCode;
-    return try allocator.dupe(u8, code);
+    return allocator.dupe(u8, code);
 }
 
 fn refreshToken(
