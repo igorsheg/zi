@@ -7,7 +7,7 @@ pub const max_manual_input_bytes = 16 * 1024;
 
 pub const Options = struct {
     cwd: []const u8 = ".",
-    agent_dir: []const u8 = paths_mod.global_config_dir_name,
+    agent_dir_override: ?[]const u8 = null,
     dir: std.Io.Dir = .cwd(),
     environ: ?*const std.process.Environ.Map = null,
     stdin: ?*std.Io.Reader = null,
@@ -25,11 +25,7 @@ pub fn login(
         try stderr.print("unknown oauth provider: {s}\n", .{provider});
         return error.UnsupportedOAuthProvider;
     };
-    var auth = try auth_mod.AuthManager.init(allocator, io, .{
-        .environ = options.environ,
-        .paths = .{ .global_dir = options.agent_dir, .cwd = options.cwd },
-        .dir = options.dir,
-    });
+    var auth = try initAuth(allocator, io, options);
     defer auth.deinit();
 
     var stdin_buffer: [max_manual_input_bytes]u8 = undefined;
@@ -82,9 +78,15 @@ fn initAuth(
     io: std.Io,
     options: Options,
 ) !auth_mod.AuthManager {
+    const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
+        agent_dir_override
+    else
+        try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
+    defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
+
     return auth_mod.AuthManager.init(allocator, io, .{
         .environ = options.environ,
-        .paths = .{ .global_dir = options.agent_dir, .cwd = options.cwd },
+        .paths = .{ .global_dir = resolved_agent_dir, .cwd = options.cwd },
         .dir = options.dir,
     });
 }
@@ -145,7 +147,7 @@ test "auth mode login rejects unsupported oauth provider" {
         error.UnsupportedOAuthProvider,
         login(std.testing.allocator, std.testing.io, &stdout, &stderr, "missing", .{
             .cwd = "repo",
-            .agent_dir = "agent",
+            .agent_dir_override = "agent",
             .dir = tmp.dir,
         }),
     );
@@ -202,7 +204,7 @@ test "auth mode status reports stored oauth auth" {
     var output = std.Io.Writer.fixed(&output_buffer);
     try status(std.testing.allocator, std.testing.io, &output, ai.KnownProvider.openai_codex, .{
         .cwd = "repo",
-        .agent_dir = "agent",
+        .agent_dir_override = "agent",
         .dir = tmp.dir,
     });
 
@@ -221,7 +223,7 @@ test "auth mode status reports env auth" {
     var output = std.Io.Writer.fixed(&output_buffer);
     try status(std.testing.allocator, std.testing.io, &output, ai.KnownProvider.openai, .{
         .cwd = "repo",
-        .agent_dir = "agent",
+        .agent_dir_override = "agent",
         .dir = tmp.dir,
         .environ = &environ,
     });
@@ -238,7 +240,7 @@ test "auth mode status reports missing auth" {
     var output = std.Io.Writer.fixed(&output_buffer);
     try status(std.testing.allocator, std.testing.io, &output, ai.KnownProvider.openai, .{
         .cwd = "repo",
-        .agent_dir = "agent",
+        .agent_dir_override = "agent",
         .dir = tmp.dir,
     });
 
@@ -260,7 +262,7 @@ test "auth mode logout removes stored provider auth" {
     var output = std.Io.Writer.fixed(&output_buffer);
     try logout(std.testing.allocator, std.testing.io, &output, ai.KnownProvider.openai_codex, .{
         .cwd = "repo",
-        .agent_dir = "agent",
+        .agent_dir_override = "agent",
         .dir = tmp.dir,
     });
 

@@ -1,9 +1,14 @@
 const std = @import("std");
-const runtime = @import("../runtime/root.zig");
-const auth_mode = @import("auth_mode.zig");
-const paths_mod = @import("paths.zig");
-const print_mode = @import("print_mode.zig");
-const sdk = @import("sdk.zig");
+const runtime = @import("../../runtime/root.zig");
+const auth_mode = @import("../auth_mode.zig");
+const args_mod = @import("args.zig");
+const print_mode = @import("../print_mode.zig");
+const sdk = @import("../sdk.zig");
+
+pub const parser = args_mod;
+pub const Command = args_mod.Command;
+pub const AppArgs = args_mod.AppArgs;
+pub const AuthCommand = args_mod.AuthCommand;
 
 pub fn run(
     process: runtime.Process,
@@ -13,7 +18,7 @@ pub fn run(
 ) !void {
     return runWithOptions(process, args, stdout, stderr, .{
         .cwd = ".",
-        .agent_dir = paths_mod.global_config_dir_name,
+        .agent_dir_override = null,
         .environ = process.environ,
     });
 }
@@ -25,36 +30,42 @@ fn runWithOptions(
     stderr: *std.Io.Writer,
     auth_options: auth_mode.Options,
 ) !void {
-    _ = args.next();
-    const first = args.next() orelse return usage(stderr);
-    if (std.mem.eql(u8, first, "auth")) {
-        return runAuth(process, args, stdout, stderr, auth_options);
+    const command = args_mod.parseIterator(args) catch return usage(stderr);
+    switch (command) {
+        .auth => |auth| return runAuth(process, stdout, stderr, auth, auth_options),
+        .app => |app| return runApp(process, stdout, stderr, app, auth_options),
     }
-    if (args.next() != null) return usage(stderr);
-    return runPrompt(process, stdout, stderr, first);
 }
 
 fn runAuth(
     process: runtime.Process,
-    args: *std.process.Args.Iterator,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
+    command: args_mod.AuthCommand,
     options: auth_mode.Options,
 ) !void {
-    const action = args.next() orelse return usage(stderr);
-    const provider = args.next() orelse return usage(stderr);
-    if (args.next() != null) return usage(stderr);
+    return switch (command.action) {
+        .login => auth_mode.login(process.gpa, process.io, stdout, stderr, command.provider, options),
+        .logout => auth_mode.logout(process.gpa, process.io, stdout, command.provider, options),
+        .status => auth_mode.status(process.gpa, process.io, stdout, command.provider, options),
+    };
+}
 
-    if (std.mem.eql(u8, action, "login")) {
-        return auth_mode.login(process.gpa, process.io, stdout, stderr, provider, options);
-    }
-    if (std.mem.eql(u8, action, "logout")) {
-        return auth_mode.logout(process.gpa, process.io, stdout, provider, options);
-    }
-    if (std.mem.eql(u8, action, "status")) {
-        return auth_mode.status(process.gpa, process.io, stdout, provider, options);
-    }
-    return usage(stderr);
+fn runApp(
+    process: runtime.Process,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    app: args_mod.AppArgs,
+    options: auth_mode.Options,
+) !void {
+    if (app.help) return help(stdout);
+    if (app.messages.count != 1) return usage(stderr);
+
+    const stdin_is_tty = try std.Io.File.stdin().isTty(process.io);
+    return switch (args_mod.resolveAppMode(app, stdin_is_tty)) {
+        .print => runPrompt(process, stdout, stderr, app.messages.slice()[0], options),
+        .interactive => unsupported(stderr, "interactive mode is not implemented yet; use -p/--print"),
+    };
 }
 
 fn runPrompt(
@@ -62,6 +73,7 @@ fn runPrompt(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     prompt: []const u8,
+    options: auth_mode.Options,
 ) !void {
     const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
     const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
@@ -70,8 +82,8 @@ fn runPrompt(
     defer process.gpa.free(session_id);
 
     var app = try sdk.createRuntimeHost(process.gpa, process.io, .{
-        .cwd = ".",
-        .agent_dir = paths_mod.global_config_dir_name,
+        .cwd = options.cwd,
+        .agent_dir_override = options.agent_dir_override,
         .current_date = timestamp_text,
         .session_id = session_id,
         .timestamp = timestamp_text,
@@ -82,9 +94,33 @@ fn runPrompt(
     try print_mode.run(&app.host, stdout, stderr, .{ .prompt = prompt });
 }
 
+fn help(stdout: *std.Io.Writer) !void {
+    try stdout.writeAll(
+        \\zi - AI coding assistant with read, bash, edit, write tools
+        \\
+        \\Usage:
+        \\  zi -p <prompt>
+        \\  zi auth login openai-codex
+        \\  zi auth logout openai-codex
+        \\  zi auth status openai-codex
+        \\
+        \\Options:
+        \\  --print, -p                    Non-interactive mode: process prompt and exit
+        \\  --help, -h                     Show this help
+        \\
+    );
+    try stdout.flush();
+}
+
+fn unsupported(stderr: *std.Io.Writer, message: []const u8) !void {
+    try stderr.print("unsupported: {s}\n", .{message});
+    try stderr.flush();
+    return error.UnsupportedCliFeature;
+}
+
 fn usage(stderr: *std.Io.Writer) noreturn {
     stderr.writeAll(
-        \\usage: zi <prompt>
+        \\usage: zi -p <prompt>
         \\       zi auth login openai-codex
         \\       zi auth logout openai-codex
         \\       zi auth status openai-codex
@@ -118,7 +154,7 @@ test "cli auth logout dispatches to auth mode" {
 
     try runWithOptions(process, &args, &output, &stderr, .{
         .cwd = "repo",
-        .agent_dir = "agent",
+        .agent_dir_override = "agent",
         .dir = tmp.dir,
         .environ = process.environ,
     });
@@ -151,7 +187,7 @@ test "cli auth status dispatches to auth mode" {
 
     try runWithOptions(process, &args, &output, &stderr, .{
         .cwd = "repo",
-        .agent_dir = "agent",
+        .agent_dir_override = "agent",
         .dir = tmp.dir,
         .environ = process.environ,
     });

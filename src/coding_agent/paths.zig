@@ -2,12 +2,46 @@ const std = @import("std");
 const mem = @import("../zistd/root.zig");
 
 pub const global_config_dir_name = ".zi";
+pub const agent_dir_name = "agent";
+pub const env_agent_dir_name = "ZI_CODING_AGENT_DIR";
 pub const project_config_dir_name = ".zi";
 pub const settings_file_name = "settings.json";
 pub const auth_file_name = "auth.json";
 pub const skills_dir_name = "skills";
 pub const system_prompt_file_name = "SYSTEM.md";
 pub const append_system_prompt_file_name = "APPEND_SYSTEM.md";
+
+pub const GlobalAgentDirOptions = struct {
+    home_dir: []const u8,
+    override: ?[]const u8 = null,
+};
+
+pub fn resolveGlobalAgentDirFromEnv(
+    allocator: std.mem.Allocator,
+    environ: ?*const std.process.Environ.Map,
+) ![]u8 {
+    const env = environ orelse return error.HomeNotSet;
+    const home_dir = env.get("HOME") orelse return error.HomeNotSet;
+    return resolveGlobalAgentDir(allocator, .{
+        .home_dir = home_dir,
+        .override = env.get(env_agent_dir_name),
+    });
+}
+
+pub fn resolveGlobalAgentDir(
+    allocator: std.mem.Allocator,
+    options: GlobalAgentDirOptions,
+) ![]u8 {
+    if (options.override) |value| {
+        if (std.mem.eql(u8, value, "~")) return allocator.dupe(u8, options.home_dir);
+        if (std.mem.startsWith(u8, value, "~/")) {
+            return std.fs.path.join(allocator, &.{ options.home_dir, value[2..] });
+        }
+        return allocator.dupe(u8, value);
+    }
+
+    return std.fs.path.join(allocator, &.{ options.home_dir, global_config_dir_name, agent_dir_name });
+}
 
 pub const PersistencePaths = struct {
     global_dir: []const u8,
@@ -57,6 +91,33 @@ pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     }
     try out.append("--");
     return out.toOwnedSlice();
+}
+
+test "global agent dir defaults under home zi agent" {
+    const dir = try resolveGlobalAgentDir(std.testing.allocator, .{ .home_dir = "/home/me" });
+    defer std.testing.allocator.free(dir);
+
+    try std.testing.expectEqualStrings("/home/me/.zi/agent", dir);
+}
+
+test "global agent dir expands tilde override" {
+    const dir = try resolveGlobalAgentDir(std.testing.allocator, .{
+        .home_dir = "/home/me",
+        .override = "~/custom-agent",
+    });
+    defer std.testing.allocator.free(dir);
+
+    try std.testing.expectEqualStrings("/home/me/custom-agent", dir);
+}
+
+test "global agent dir accepts absolute override" {
+    const dir = try resolveGlobalAgentDir(std.testing.allocator, .{
+        .home_dir = "/home/me",
+        .override = "/tmp/zi-agent",
+    });
+    defer std.testing.allocator.free(dir);
+
+    try std.testing.expectEqualStrings("/tmp/zi-agent", dir);
 }
 
 test "cwd encoding matches pi session directory shape" {

@@ -9,7 +9,7 @@ const session_config = @import("session_config.zig");
 
 pub const CreateRuntimeHostOptions = struct {
     cwd: []const u8 = ".",
-    agent_dir: []const u8 = paths_mod.global_config_dir_name,
+    agent_dir_override: ?[]const u8 = null,
     current_date: []const u8,
     session_id: []const u8,
     timestamp: []const u8,
@@ -40,9 +40,15 @@ pub fn createRuntimeHost(
     io: std.Io,
     options: CreateRuntimeHostOptions,
 ) !Runtime {
+    const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
+        agent_dir_override
+    else
+        try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
+    defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
+
     var services = try RuntimeServices.init(allocator, io, .{
         .cwd = options.cwd,
-        .agent_dir = options.agent_dir,
+        .agent_dir = resolved_agent_dir,
         .dir = options.dir,
         .environ = options.environ,
     });
@@ -81,7 +87,7 @@ test "sdk runtime owns services before host and deinitializes in order" {
 
     var runtime = try createRuntimeHost(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
-        .agent_dir = "agent",
+        .agent_dir_override = "agent",
         .current_date = "2026-05-27",
         .session_id = "session",
         .timestamp = "2026-05-27T00:00:00Z",
