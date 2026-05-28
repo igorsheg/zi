@@ -259,6 +259,7 @@ fn raceLoginCode(
     try select.concurrent(.manual, waitForManualCode, .{ allocator, callbacks, expected_state });
 
     const winner = try select.await();
+    if (winner == .manual) server.shutdown(race_io);
     defer drainLoginCodeLosers(allocator, &select);
     return switch (winner) {
         .callback => |result| result,
@@ -304,14 +305,21 @@ fn completeLogin(
 
 const CallbackServer = struct {
     server: std.Io.net.Server,
+    closed: bool = false,
 
     fn start(io: std.Io) !CallbackServer {
         const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(callback_port) };
         return .{ .server = try address.listen(io, .{ .reuse_address = true }) };
     }
 
+    fn shutdown(self: *CallbackServer, io: std.Io) void {
+        if (self.closed) return;
+        self.server.socket.close(io);
+        self.closed = true;
+    }
+
     fn deinit(self: *CallbackServer, io: std.Io) void {
-        self.server.deinit(io);
+        self.shutdown(io);
         self.* = undefined;
     }
 
