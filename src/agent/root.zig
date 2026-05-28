@@ -312,13 +312,13 @@ pub const TransformContextHook = struct {
 
 pub const GetApiKeyHook = struct {
     context: ?*anyopaque = null,
-    call_fn: *const fn (std.mem.Allocator, ?*anyopaque, ai.Provider) std.mem.Allocator.Error!?[]const u8,
+    call_fn: *const fn (std.mem.Allocator, ?*anyopaque, ai.Provider) anyerror!?[]const u8,
 
     pub fn call(
         allocator: std.mem.Allocator,
         self: GetApiKeyHook,
         provider: ai.Provider,
-    ) std.mem.Allocator.Error!?[]const u8 {
+    ) anyerror!?[]const u8 {
         return self.call_fn(allocator, self.context, provider);
     }
 };

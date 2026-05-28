@@ -216,7 +216,7 @@ pub const AuthManager = struct {
         allocator: std.mem.Allocator,
         context: ?*anyopaque,
         provider: ai.Provider,
-    ) std.mem.Allocator.Error!?[]const u8 {
+    ) anyerror!?[]const u8 {
         const self: *const AuthManager = @ptrCast(@alignCast(context.?));
         if (self.findEnvApiKey(provider)) |key| {
             const owned = try allocator.dupe(u8, key.value);
@@ -224,7 +224,7 @@ pub const AuthManager = struct {
         }
         if (self.findOAuthCredentials(provider)) |credentials| {
             if (std.mem.eql(u8, provider, ai.openai_codex_oauth_provider.id)) {
-                const api_key = ai.openai_codex_oauth_provider.getApiKey(credentials) catch unreachable;
+                const api_key = try ai.openai_codex_oauth_provider.getApiKey(credentials);
                 const owned = try allocator.dupe(u8, api_key);
                 return owned;
             }
