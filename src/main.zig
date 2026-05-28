@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
         .current_date = timestamp_text,
         .session_id = session_id,
         .timestamp = timestamp_text,
+        .environ = process.environ,
     });
     defer runtime.deinit();
 
