@@ -1,7 +1,8 @@
 const std = @import("std");
 const agent = @import("root.zig");
 const ai = @import("../ai/root.zig");
-const runtime = @import("../zistd/root.zig");
+const runtime = @import("../runtime/root.zig");
+const zistd = @import("../zistd/root.zig");
 
 const Agent = @This();
 
@@ -18,9 +19,9 @@ steering_queue: PendingMessageQueue = .{},
 follow_up_queue: PendingMessageQueue = .{},
 loop_config: agent.AgentLoopConfig,
 listeners: std.ArrayList(?Listener) = .empty,
-operations: runtime.OperationTable = .{},
-cancel_source: runtime.CancelSource = .{},
-active_run: ?runtime.OperationId = null,
+operations: zistd.OperationTable = .{},
+cancel_source: zistd.CancelSource = .{},
+active_run: ?zistd.OperationId = null,
 
 pub const QueueMode = enum {
     all,
@@ -55,13 +56,13 @@ pub const Error = error{
 
 pub const Listener = struct {
     context: ?*anyopaque = null,
-    call_fn: *const fn (std.Io, ?*anyopaque, agent.AgentEvent, runtime.CancelToken) anyerror!void,
+    call_fn: *const fn (std.Io, ?*anyopaque, agent.AgentEvent, zistd.CancelToken) anyerror!void,
 
     fn call(
         io: std.Io,
         self: Listener,
         event: agent.AgentEvent,
-        token: runtime.CancelToken,
+        token: zistd.CancelToken,
     ) anyerror!void {
         return self.call_fn(io, self.context, event, token);
     }
@@ -184,7 +185,7 @@ pub fn abort(self: *Agent) void {
     if (self.active_run != null) self.cancel_source.request();
 }
 
-pub fn signal(self: *Agent) ?runtime.CancelToken {
+pub fn signal(self: *Agent) ?zistd.CancelToken {
     if (self.active_run == null) return null;
     return self.cancel_source.token();
 }
@@ -216,7 +217,7 @@ pub fn unsubscribe(self: *Agent, handle: usize) void {
     self.listeners.items[handle] = null;
 }
 
-pub fn beginRun(self: *Agent) Error!runtime.CancelToken {
+pub fn beginRun(self: *Agent) Error!zistd.CancelToken {
     if (self.active_run != null) return error.AlreadyRunning;
     self.cancel_source.reset();
     self.active_run = self.operations.reserve();
@@ -351,7 +352,7 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
     }
 }
 
-fn recordRunFailure(self: *Agent, token: runtime.CancelToken, message: []const u8) !void {
+fn recordRunFailure(self: *Agent, token: zistd.CancelToken, message: []const u8) !void {
     const stop_reason: ai.StopReason = if (token.isRequested()) .aborted else .error_;
     const assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
     try self.appendMessage(.{ .assistant = assistant });
@@ -708,7 +709,7 @@ const ListenerProbe = struct {
     saw_cancel_requested: bool = false,
 };
 
-fn countListener(_: std.Io, context: ?*anyopaque, _: agent.AgentEvent, token: runtime.CancelToken) anyerror!void {
+fn countListener(_: std.Io, context: ?*anyopaque, _: agent.AgentEvent, token: zistd.CancelToken) anyerror!void {
     const probe: *ListenerProbe = @ptrCast(@alignCast(context.?));
     probe.calls += 1;
     probe.saw_cancel_requested = token.isRequested();
