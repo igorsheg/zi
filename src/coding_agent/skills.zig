@@ -176,21 +176,50 @@ fn parseFrontmatter(content: []const u8) !ParsedFrontmatter {
     const frontmatter = content[start..end];
     var name: ?[]const u8 = null;
     var description: ?[]const u8 = null;
+    var description_start: ?usize = null;
+    var description_end: ?usize = null;
 
-    var lines = std.mem.splitScalar(u8, frontmatter, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse return error.InvalidSkillFrontmatter;
-        const key = std.mem.trim(u8, trimmed[0..colon], " \t\r");
-        const value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t\r");
-        if (std.mem.eql(u8, key, "name")) {
-            if (name != null) return error.InvalidSkillFrontmatter;
-            name = value;
-        } else if (std.mem.eql(u8, key, "description")) {
-            if (description != null) return error.InvalidSkillFrontmatter;
-            description = value;
+    var line_start: usize = 0;
+    while (line_start <= frontmatter.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, frontmatter, line_start, '\n') orelse frontmatter.len;
+        const raw_line = frontmatter[line_start..line_end];
+        const trimmed = std.mem.trim(u8, raw_line, " \t\r");
+        if (trimmed.len != 0) {
+            if (description_start) |start_index| {
+                if (raw_line.len != trimmed.len) {
+                    description_end = line_end;
+                    if (line_end == frontmatter.len) break;
+                    line_start = line_end + 1;
+                    continue;
+                }
+                const end_index = description_end orelse line_start;
+                description = std.mem.trim(u8, frontmatter[start_index..end_index], " \t\r\n");
+                description_start = null;
+            }
+
+            const colon = std.mem.findScalar(u8, trimmed, ':') orelse return error.InvalidSkillFrontmatter;
+            const key = std.mem.trim(u8, trimmed[0..colon], " \t\r");
+            const value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t\r");
+            if (std.mem.eql(u8, key, "name")) {
+                if (name != null) return error.InvalidSkillFrontmatter;
+                name = value;
+            } else if (std.mem.eql(u8, key, "description")) {
+                if (description != null or description_start != null) return error.InvalidSkillFrontmatter;
+                if (value.len == 0 or std.mem.eql(u8, value, ">")) {
+                    description_start = line_end + 1;
+                    description_end = null;
+                } else {
+                    description = value;
+                }
+            }
         }
+        if (line_end == frontmatter.len) break;
+        line_start = line_end + 1;
+    }
+
+    if (description_start) |start_index| {
+        const end_index = description_end orelse frontmatter.len;
+        description = std.mem.trim(u8, frontmatter[start_index..end_index], " \t\r\n");
     }
 
     return .{
@@ -357,6 +386,36 @@ test "falls back to parent directory name for SKILL files" {
     try std.testing.expectEqual(@as(usize, 1), skills.skills.len);
     try std.testing.expectEqualStrings("parent-name", skills.skills[0].name);
     try std.testing.expectEqualStrings("directory skill", skills.skills[0].description);
+}
+
+test "accepts folded description frontmatter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent/skills/folded");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/skills/folded/SKILL.md",
+        .data =
+        \\---
+        \\name: folded
+        \\description: >
+        \\  first line
+        \\  second line
+        \\---
+        \\body
+        ,
+    });
+
+    var skills = try loadSkills(std.testing.allocator, std.testing.io, .{
+        .dir = tmp.dir,
+        .agent_dir = "agent",
+        .cwd = "repo",
+    });
+    defer skills.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), skills.skills.len);
+    try std.testing.expectEqualStrings("folded", skills.skills[0].name);
+    try std.testing.expectEqualStrings("first line\n  second line", skills.skills[0].description);
 }
 
 test "accepts crlf frontmatter delimiters" {
