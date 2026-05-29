@@ -119,7 +119,6 @@ fn run(self: *Provider, request: protocol.StreamRequest, sink: protocol.Assistan
             "HTTP {s}",
             .{@tagName(response.head.status)},
         );
-        defer request.allocator.free(detail);
         var message = protocol.emptyAssistantMessageFromRequest(request, .error_, detail);
         message.stop_reason = .error_;
         try sink.endError(request.io, .error_, message);

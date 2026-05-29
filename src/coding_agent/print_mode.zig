@@ -39,6 +39,9 @@ fn drainTextEvent(
             .message_end => |payload| switch (payload.message) {
                 .assistant => |assistant| {
                     if (assistant.error_message) |message| return printAssistantError(stderr, message);
+                    if (assistant.stop_reason == .error_) {
+                        return printAssistantError(stderr, "assistant request failed");
+                    }
                     for (assistant.content) |content| {
                         if (content != .text) continue;
                         try stdout.writeAll(content.text.text);

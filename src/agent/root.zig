@@ -85,23 +85,7 @@ pub fn freeToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResul
 }
 
 pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .null, .bool, .integer, .float => {},
-        .number_string, .string => |text| allocator.free(text),
-        .array => |array| {
-            for (array.items) |item| freeJsonValue(allocator, item);
-            array.deinit();
-        },
-        .object => |object| {
-            var owned = object;
-            var iterator = owned.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            owned.deinit(allocator);
-        },
-    }
+    runtime.freeJsonValue(allocator, value);
 }
 
 pub const PendingToolCalls = struct {

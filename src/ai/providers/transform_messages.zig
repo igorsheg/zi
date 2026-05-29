@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol = @import("../protocol.zig");
+const zistd = @import("../../zistd/root.zig");
 
 const non_vision_user_image_placeholder = "(image omitted: model does not support images)";
 const non_vision_tool_image_placeholder = "(tool image omitted: model does not support images)";
@@ -132,7 +133,7 @@ fn cloneToolResultMessageDowngradingImages(
         .tool_call_id = try allocator.dupe(u8, normalized_tool_call_id orelse source.tool_call_id),
         .tool_name = try allocator.dupe(u8, source.tool_name),
         .content = try cloneToolResultContentSlice(allocator, source.content, supportsImages(model)),
-        .details = if (source.details) |details| try cloneJsonValue(allocator, details) else null,
+        .details = if (source.details) |details| try zistd.cloneJsonValue(allocator, details) else null,
         .is_error = source.is_error,
         .timestamp = source.timestamp,
     };
@@ -297,7 +298,7 @@ fn cloneToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !proto
     return .{
         .id = try allocator.dupe(u8, source.id),
         .name = try allocator.dupe(u8, source.name),
-        .arguments = try cloneJsonValue(allocator, source.arguments),
+        .arguments = try zistd.cloneJsonValue(allocator, source.arguments),
         .thought_signature = try cloneOptionalString(allocator, source.thought_signature),
     };
 }
@@ -306,33 +307,6 @@ fn cloneOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]co
     return if (source) |value| try allocator.dupe(u8, value) else null;
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, source: std.json.Value) !std.json.Value {
-    return switch (source) {
-        .null => .null,
-        .bool => |value| .{ .bool = value },
-        .integer => |value| .{ .integer = value },
-        .float => |value| .{ .float = value },
-        .number_string => |value| .{ .number_string = try allocator.dupe(u8, value) },
-        .string => |value| .{ .string = try allocator.dupe(u8, value) },
-        .array => |array| blk: {
-            var cloned: std.json.Array = .init(allocator);
-            for (array.items) |item| try cloned.append(try cloneJsonValue(allocator, item));
-            break :blk .{ .array = cloned };
-        },
-        .object => |object| blk: {
-            var cloned: std.json.ObjectMap = .empty;
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try cloned.put(
-                    allocator,
-                    try allocator.dupe(u8, entry.key_ptr.*),
-                    try cloneJsonValue(allocator, entry.value_ptr.*),
-                );
-            }
-            break :blk .{ .object = cloned };
-        },
-    };
-}
 
 test "non vision model replaces adjacent user images with one placeholder" {
     const source = [_]protocol.Message{.{ .user = .{

@@ -15,6 +15,8 @@ pub const OperationId = operation.OperationId;
 pub const OperationState = operation.OperationState;
 pub const OperationTable = operation.OperationTable;
 pub const Owned = @import("Owned.zig").Owned;
+pub const cloneJsonValue = @import("Owned.zig").cloneJsonValue;
+pub const freeJsonValue = @import("Owned.zig").freeJsonValue;
 pub const Race = race.Race;
 pub const sleep = cancel.sleep;
 

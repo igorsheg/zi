@@ -144,17 +144,29 @@ fn requestOnce(
     const url = try endpointUrl(request.allocator, request.model.base_url);
     defer request.allocator.free(url);
     const uri = try std.Uri.parse(url);
-    const headers = [_]std.http.Header{
-        .{ .name = "Authorization", .value = try http_utils.bearerHeader(request.allocator, api_key) },
-        .{ .name = "chatgpt-account-id", .value = account_id },
-        .{ .name = "originator", .value = "zi" },
-        .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
-        .{ .name = "Accept", .value = "text/event-stream" },
-    };
+    var headers: [7]std.http.Header = undefined;
+    var header_count: usize = 0;
+    headers[header_count] = .{ .name = "Authorization", .value = try http_utils.bearerHeader(request.allocator, api_key) };
+    header_count += 1;
+    headers[header_count] = .{ .name = "chatgpt-account-id", .value = account_id };
+    header_count += 1;
+    headers[header_count] = .{ .name = "originator", .value = "zi" };
+    header_count += 1;
+    headers[header_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
+    header_count += 1;
+    headers[header_count] = .{ .name = "Accept", .value = "text/event-stream" };
+    header_count += 1;
+    if (request.options.session_id) |session_id| {
+        headers[header_count] = .{ .name = "session_id", .value = session_id };
+        header_count += 1;
+        headers[header_count] = .{ .name = "x-client-request-id", .value = session_id };
+        header_count += 1;
+    }
     defer request.allocator.free(headers[0].value);
 
+    const extra_headers = headers[0..header_count];
     var req = try client.request(.POST, uri, .{
-        .extra_headers = &headers,
+        .extra_headers = extra_headers,
         .headers = .{ .content_type = .{ .override = "application/json" }, .accept_encoding = .omit },
         .redirect_behavior = .unhandled,
         .keep_alive = false,
@@ -177,8 +189,8 @@ fn requestOnce(
             "HTTP {s}",
             .{@tagName(response.head.status)},
         );
-        defer request.allocator.free(detail);
         if (isRetryableStatus(response.head.status) or isRetryableErrorText(detail)) {
+            request.allocator.free(detail);
             return error.RetryableRequestFailed;
         }
         var message = protocol.emptyAssistantMessageFromRequest(request, .error_, detail);
@@ -306,7 +318,6 @@ fn buildRequestBody(allocator: std.mem.Allocator, request: protocol.StreamReques
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"}");
     try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
     try writer.writeAll(",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
-    if (request.options.max_tokens) |max_tokens| try writer.print(",\"max_output_tokens\":{}", .{max_tokens});
     if (request.options.temperature) |temperature| try writer.print(",\"temperature\":{d}", .{temperature});
     if (request.options.session_id) |session_id| {
         if (request.options.cache_retention != .none) {
@@ -501,6 +512,18 @@ test "request body includes model stream input and tools" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning.encrypted_content\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"parallel_tool_calls\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
+}
+
+test "request body follows codex contract and omits max output tokens" {
+    var request = testRequest();
+    request.options.max_tokens = 32_000;
+    request.options.session_id = "session-123";
+
+    const body = try buildRequestBody(std.testing.allocator, request);
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_output_tokens\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-123\"") != null);
 }
 
 fn testRequest() protocol.StreamRequest {

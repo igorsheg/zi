@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const paths_mod = @import("paths.zig");
+const zistd = @import("../zistd/root.zig");
 
 pub const max_auth_file_bytes = 64 * 1024;
 
@@ -245,7 +246,7 @@ pub const AuthManager = struct {
 fn freeOAuthCredentials(allocator: std.mem.Allocator, credentials: *ai.OAuthCredentials) void {
     allocator.free(credentials.refresh);
     allocator.free(credentials.access);
-    if (credentials.extra) |extra| agent_mod.freeJsonValue(allocator, extra);
+    if (credentials.extra) |extra| zistd.freeJsonValue(allocator, extra);
     credentials.* = undefined;
 }
 
@@ -304,8 +305,8 @@ fn cloneOAuthCredential(
     errdefer allocator.free(owned_refresh);
     const owned_access = try allocator.dupe(u8, credentials.access);
     errdefer allocator.free(owned_access);
-    const owned_extra = if (credentials.extra) |extra| try cloneJsonValue(allocator, extra) else null;
-    errdefer if (owned_extra) |extra| agent_mod.freeJsonValue(allocator, extra);
+    const owned_extra = if (credentials.extra) |extra| try zistd.cloneJsonValue(allocator, extra) else null;
+    errdefer if (owned_extra) |extra| zistd.freeJsonValue(allocator, extra);
 
     return .{
         .provider = owned_provider,
@@ -329,8 +330,11 @@ fn parseOAuthCredential(
     const refresh = requiredString(value.object.get("refresh")) orelse return null;
     const access = requiredString(value.object.get("access")) orelse return null;
     const expires = requiredInteger(value.object.get("expires")) orelse return null;
-    const extra = if (value.object.get("extra")) |extra_value| try cloneJsonValue(allocator, extra_value) else null;
-    errdefer if (extra) |item| agent_mod.freeJsonValue(allocator, item);
+    const extra = if (value.object.get("extra")) |extra_value|
+        try zistd.cloneJsonValue(allocator, extra_value)
+    else
+        null;
+    errdefer if (extra) |item| zistd.freeJsonValue(allocator, item);
 
     const owned_provider = try allocator.dupe(u8, provider);
     errdefer allocator.free(owned_provider);
@@ -346,41 +350,6 @@ fn parseOAuthCredential(
             .access = owned_access,
             .expires = expires,
             .extra = extra,
-        },
-    };
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, source: std.json.Value) !std.json.Value {
-    return switch (source) {
-        .null => .null,
-        .bool => |value| .{ .bool = value },
-        .integer => |value| .{ .integer = value },
-        .float => |value| .{ .float = value },
-        .number_string => |value| .{ .number_string = try allocator.dupe(u8, value) },
-        .string => |value| .{ .string = try allocator.dupe(u8, value) },
-        .array => |array| blk: {
-            var cloned: std.json.Array = .init(allocator);
-            errdefer agent_mod.freeJsonValue(allocator, .{ .array = cloned });
-            for (array.items) |item| try cloned.append(try cloneJsonValue(allocator, item));
-            break :blk .{ .array = cloned };
-        },
-        .object => |object| blk: {
-            var cloned: std.json.ObjectMap = .empty;
-            errdefer agent_mod.freeJsonValue(allocator, .{ .object = cloned });
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                const key = try allocator.dupe(u8, entry.key_ptr.*);
-                const value = cloneJsonValue(allocator, entry.value_ptr.*) catch |err| {
-                    allocator.free(key);
-                    return err;
-                };
-                cloned.put(allocator, key, value) catch |err| {
-                    allocator.free(key);
-                    agent_mod.freeJsonValue(allocator, value);
-                    return err;
-                };
-            }
-            break :blk .{ .object = cloned };
         },
     };
 }

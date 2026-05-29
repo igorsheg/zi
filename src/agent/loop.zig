@@ -132,6 +132,9 @@ fn cloneTerminalMessages(
                 .{ .content = tool_result.content, .details = tool_result.details },
                 tool_result.is_error,
             ) },
+            .assistant => |assistant| blk: {
+                break :blk .{ .assistant = try ai.owned.cloneAssistantMessage(allocator, assistant) };
+            },
             else => message,
         };
     }
@@ -140,20 +143,29 @@ fn cloneTerminalMessages(
 
 fn cloneStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
     return switch (event) {
+        .tool_execution_start => |payload| .{ .tool_execution_start = .{
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
+            .args = try runtime.cloneJsonValue(allocator, payload.args),
+        } },
         .tool_execution_update => |payload| .{ .tool_execution_update = .{
-            .tool_call_id = payload.tool_call_id,
-            .tool_name = payload.tool_name,
-            .args = payload.args,
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
+            .args = try runtime.cloneJsonValue(allocator, payload.args),
             .partial_result = try cloneAgentToolResult(allocator, payload.partial_result),
         } },
         .tool_execution_end => |payload| .{ .tool_execution_end = .{
-            .tool_call_id = payload.tool_call_id,
-            .tool_name = payload.tool_name,
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
             .result = try cloneAgentToolResult(allocator, payload.result),
             .is_error = payload.is_error,
         } },
         .message_start => |payload| .{ .message_start = .{
             .message = try cloneStreamMessage(allocator, payload.message),
+        } },
+        .message_update => |payload| .{ .message_update = .{
+            .message = try cloneStreamMessage(allocator, payload.message),
+            .assistant_message_event = try ai.owned.cloneAssistantMessageEvent(allocator, payload.assistant_message_event),
         } },
         .message_end => |payload| .{ .message_end = .{
             .message = try cloneStreamMessage(allocator, payload.message),
@@ -174,6 +186,9 @@ fn cloneStreamMessage(allocator: std.mem.Allocator, message: agent.AgentMessage)
             .{ .content = tool_result.content, .details = tool_result.details },
             tool_result.is_error,
         ) },
+        .assistant => |assistant| blk: {
+            break :blk .{ .assistant = try ai.owned.cloneAssistantMessage(allocator, assistant) };
+        },
         else => message,
     };
 }
@@ -197,7 +212,7 @@ fn cloneStreamToolResultMessages(
 fn cloneAgentToolResult(allocator: std.mem.Allocator, result: agent.AgentToolResult) !agent.AgentToolResult {
     return .{
         .content = try cloneToolResultContentSlice(allocator, result.content),
-        .details = if (result.details) |details| try cloneJsonValue(allocator, details) else null,
+        .details = if (result.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
         .terminate = result.terminate,
     };
 }
@@ -277,10 +292,13 @@ fn runLoop(
         var has_more_tool_calls = true;
         while (has_more_tool_calls or pending_messages.len > 0) {
             if (token.isRequested()) {
-                const aborted = terminalAssistantMessage(config.model, .aborted, "aborted");
+                const aborted = try ai.owned.cloneAssistantMessage(
+                    allocator,
+                    terminalAssistantMessage(config.model, .aborted, "aborted"),
+                );
+                try current.messages.append(allocator, .{ .assistant = aborted });
                 try emit.emit(.{ .message_start = .{ .message = .{ .assistant = aborted } } });
                 try emit.emit(.{ .message_end = .{ .message = .{ .assistant = aborted } } });
-                try current.messages.append(allocator, .{ .assistant = aborted });
                 try emit.emit(.{ .turn_end = .{ .message = .{ .assistant = aborted }, .tool_results = &.{} } });
                 try emit.emit(.{ .agent_end = .{ .messages = current.messages.items } });
                 return;
@@ -297,8 +315,11 @@ fn runLoop(
                 pending_messages = &.{};
             }
 
-            const assistant = try streamAssistantResponse(allocator, io, current, config, token, emit);
+            var owned_assistant: ?ai.AssistantMessage = try streamAssistantResponse(allocator, io, current, config, token, emit);
+            errdefer if (owned_assistant) |assistant| ai.owned.freeAssistantMessage(allocator, assistant);
+            const assistant = owned_assistant.?;
             try current.messages.append(allocator, .{ .assistant = assistant });
+            owned_assistant = null;
 
             if (assistant.stop_reason == .error_ or assistant.stop_reason == .aborted) {
                 try emit.emit(.{ .turn_end = .{ .message = .{ .assistant = assistant }, .tool_results = &.{} } });
@@ -388,9 +409,12 @@ fn streamAssistantResponse(
         }
     }
 
+    var response_arena = std.heap.ArenaAllocator.init(allocator);
+    defer response_arena.deinit();
+
     var event_buffer: [64]ai.AssistantMessageEvent = undefined;
     var stream = config.stream.call(.{
-        .allocator = allocator,
+        .allocator = response_arena.allocator(),
         .io = io,
         .model = config.model,
         .context = .{
@@ -428,14 +452,14 @@ fn streamAssistantResponse(
                     try emit.emit(.{ .message_start = .{ .message = .{ .assistant = done.message } } });
                 }
                 try emit.emit(.{ .message_end = .{ .message = .{ .assistant = done.message } } });
-                return done.message;
+                return ai.owned.cloneAssistantMessage(allocator, done.message);
             },
             .@"error" => |err| {
                 if (!added_partial) {
                     try emit.emit(.{ .message_start = .{ .message = .{ .assistant = err.@"error" } } });
                 }
                 try emit.emit(.{ .message_end = .{ .message = .{ .assistant = err.@"error" } } });
-                return err.@"error";
+                return ai.owned.cloneAssistantMessage(allocator, err.@"error");
             },
         }
     }
@@ -443,7 +467,7 @@ fn streamAssistantResponse(
     const result = stream.result() orelse return error.MissingAssistantResult;
     if (!added_partial) try emit.emit(.{ .message_start = .{ .message = .{ .assistant = result } } });
     try emit.emit(.{ .message_end = .{ .message = .{ .assistant = result } } });
-    return result;
+    return ai.owned.cloneAssistantMessage(allocator, result);
 }
 
 const ToolBatch = struct {
@@ -1003,7 +1027,7 @@ fn replaceToolResultContent(result: *agent.OwnedAgentToolResult, content: []cons
 }
 
 fn replaceToolResultDetails(result: *agent.OwnedAgentToolResult, details: std.json.Value) !void {
-    const cloned = try cloneJsonValue(result.allocator, details);
+    const cloned = try runtime.cloneJsonValue(result.allocator, details);
     const previous = result.result.details;
     result.result.details = cloned;
     if (previous) |value| agent.freeJsonValue(result.allocator, value);
@@ -1024,7 +1048,7 @@ fn createToolResultMessage(
         for (content) |item| agent.freeToolResultContent(allocator, item);
         allocator.free(content);
     }
-    const details = if (result.details) |value| try cloneJsonValue(allocator, value) else null;
+    const details = if (result.details) |value| try runtime.cloneJsonValue(allocator, value) else null;
     errdefer if (details) |value| agent.freeJsonValue(allocator, value);
     return .{
         .tool_call_id = tool_call_id,
@@ -1083,41 +1107,6 @@ fn cloneToolResultContentSlice(
         cloned_count += 1;
     }
     return cloned;
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, source: std.json.Value) !std.json.Value {
-    return switch (source) {
-        .null => .null,
-        .bool => |value| .{ .bool = value },
-        .integer => |value| .{ .integer = value },
-        .float => |value| .{ .float = value },
-        .number_string => |value| .{ .number_string = try allocator.dupe(u8, value) },
-        .string => |value| .{ .string = try allocator.dupe(u8, value) },
-        .array => |array| blk: {
-            var cloned: std.json.Array = .init(allocator);
-            errdefer {
-                for (cloned.items) |item| agent.freeJsonValue(allocator, item);
-                cloned.deinit();
-            }
-            for (array.items) |item| try cloned.append(try cloneJsonValue(allocator, item));
-            break :blk .{ .array = cloned };
-        },
-        .object => |object| blk: {
-            var cloned: std.json.ObjectMap = .empty;
-            errdefer agent.freeJsonValue(allocator, .{ .object = cloned });
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                var key: ?[]const u8 = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer if (key) |value| allocator.free(value);
-                var value: ?std.json.Value = try cloneJsonValue(allocator, entry.value_ptr.*);
-                errdefer if (value) |item| agent.freeJsonValue(allocator, item);
-                try cloned.put(allocator, key.?, value.?);
-                key = null;
-                value = null;
-            }
-            break :blk .{ .object = cloned };
-        },
-    };
 }
 
 fn freeToolResultMessages(
@@ -1191,7 +1180,11 @@ const Context = struct {
 
     fn deinit(self: *Context) void {
         for (self.messages.items[self.owned_tool_results_start..]) |message| {
-            if (message == .tool_result) freeToolResultMessage(self.allocator, message.tool_result);
+            switch (message) {
+                .assistant => |assistant| ai.owned.freeAssistantMessage(self.allocator, assistant),
+                .tool_result => |tool_result| freeToolResultMessage(self.allocator, tool_result),
+                else => {},
+            }
         }
         self.messages.deinit(self.allocator);
         self.* = undefined;
@@ -1252,7 +1245,7 @@ fn cloneToolResultMessageForTest(message: ai.ToolResultMessage) !ai.ToolResultMe
         .tool_call_id = try std.testing.allocator.dupe(u8, message.tool_call_id),
         .tool_name = try std.testing.allocator.dupe(u8, message.tool_name),
         .content = try cloneToolResultContentSlice(std.testing.allocator, message.content),
-        .details = if (message.details) |details| try cloneJsonValue(std.testing.allocator, details) else null,
+        .details = if (message.details) |details| try runtime.cloneJsonValue(std.testing.allocator, details) else null,
         .is_error = message.is_error,
         .timestamp = message.timestamp,
     };

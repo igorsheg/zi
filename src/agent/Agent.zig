@@ -357,7 +357,7 @@ fn recordRunFailure(self: *Agent, token: zistd.CancelToken, message: []const u8)
     const assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
     try self.appendMessage(.{ .assistant = assistant });
     self.state.status = .{ .failed = message };
-    try self.emitEvent(.{ .agent_end = .{ .messages = &.{.{ .assistant = assistant }} } });
+    try self.emitEvent(try cloneAgentEvent(self.message_arena.allocator(), .{ .agent_end = .{ .messages = self.state.messages } }));
 }
 
 fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_message: ?[]const u8) ai.AssistantMessage {
@@ -400,7 +400,7 @@ fn contextSnapshot(self: *const Agent) agent.AgentContext {
 
 fn emitFromLoop(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const self: *Agent = @ptrCast(@alignCast(context.?));
-    try self.emitEvent(event);
+    try self.emitEvent(try cloneAgentEvent(self.message_arena.allocator(), event));
 }
 
 pub fn userMessageFromText(self: *Agent, text: []const u8, images: []const ai.ImageContent) !agent.AgentMessage {
@@ -512,6 +512,75 @@ pub const PendingMessageQueue = struct {
     }
 };
 
+fn cloneAgentEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
+    return switch (event) {
+        .message_start => |payload| .{ .message_start = .{
+            .message = try cloneAgentMessage(allocator, payload.message),
+        } },
+        .message_update => |payload| .{ .message_update = .{
+            .message = try cloneAgentMessage(allocator, payload.message),
+            .assistant_message_event = try ai.owned.cloneAssistantMessageEvent(allocator, payload.assistant_message_event),
+        } },
+        .message_end => |payload| .{ .message_end = .{
+            .message = try cloneAgentMessage(allocator, payload.message),
+        } },
+        .turn_end => |payload| .{ .turn_end = .{
+            .message = try cloneAgentMessage(allocator, payload.message),
+            .tool_results = try cloneToolResultMessages(allocator, payload.tool_results),
+        } },
+        .agent_end => |payload| .{ .agent_end = .{
+            .messages = try cloneAgentMessages(allocator, payload.messages),
+        } },
+        .tool_execution_start => |payload| .{ .tool_execution_start = .{
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
+            .args = try zistd.cloneJsonValue(allocator, payload.args),
+        } },
+        .tool_execution_update => |payload| .{ .tool_execution_update = .{
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
+            .args = try zistd.cloneJsonValue(allocator, payload.args),
+            .partial_result = try cloneAgentToolResult(allocator, payload.partial_result),
+        } },
+        .tool_execution_end => |payload| .{ .tool_execution_end = .{
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
+            .result = try cloneAgentToolResult(allocator, payload.result),
+            .is_error = payload.is_error,
+        } },
+        else => event,
+    };
+}
+
+fn cloneAgentMessages(allocator: std.mem.Allocator, source: []const agent.AgentMessage) ![]const agent.AgentMessage {
+    const cloned = try allocator.alloc(agent.AgentMessage, source.len);
+    for (source, cloned) |message, *out| out.* = try cloneAgentMessage(allocator, message);
+    return cloned;
+}
+
+fn cloneToolResultMessages(allocator: std.mem.Allocator, source: []const ai.ToolResultMessage) ![]const ai.ToolResultMessage {
+    const cloned = try allocator.alloc(ai.ToolResultMessage, source.len);
+    for (source, cloned) |message, *out| {
+        out.* = .{
+            .tool_call_id = try allocator.dupe(u8, message.tool_call_id),
+            .tool_name = try allocator.dupe(u8, message.tool_name),
+            .content = try cloneToolResultContentSlice(allocator, message.content),
+            .details = if (message.details) |details| try zistd.cloneJsonValue(allocator, details) else null,
+            .is_error = message.is_error,
+            .timestamp = message.timestamp,
+        };
+    }
+    return cloned;
+}
+
+fn cloneAgentToolResult(allocator: std.mem.Allocator, source: agent.AgentToolResult) !agent.AgentToolResult {
+    return .{
+        .content = try cloneToolResultContentSlice(allocator, source.content),
+        .details = if (source.details) |details| try zistd.cloneJsonValue(allocator, details) else null,
+        .terminate = source.terminate,
+    };
+}
+
 fn cloneAgentMessage(allocator: std.mem.Allocator, source: agent.AgentMessage) !agent.AgentMessage {
     return switch (source) {
         .user => |message| .{ .user = .{
@@ -521,28 +590,18 @@ fn cloneAgentMessage(allocator: std.mem.Allocator, source: agent.AgentMessage) !
             },
             .timestamp = message.timestamp,
         } },
-        .assistant => |message| .{ .assistant = .{
-            .content = try cloneAssistantContentSlice(allocator, message.content),
-            .api = try allocator.dupe(u8, message.api),
-            .provider = try allocator.dupe(u8, message.provider),
-            .model = try allocator.dupe(u8, message.model),
-            .response_id = try cloneOptionalString(allocator, message.response_id),
-            .usage = message.usage,
-            .stop_reason = message.stop_reason,
-            .error_message = try cloneOptionalString(allocator, message.error_message),
-            .timestamp = message.timestamp,
-        } },
+        .assistant => |message| .{ .assistant = try ai.owned.cloneAssistantMessage(allocator, message) },
         .tool_result => |message| .{ .tool_result = .{
             .tool_call_id = try allocator.dupe(u8, message.tool_call_id),
             .tool_name = try allocator.dupe(u8, message.tool_name),
             .content = try cloneToolResultContentSlice(allocator, message.content),
-            .details = if (message.details) |details| try cloneJsonValue(allocator, details) else null,
+            .details = if (message.details) |details| try zistd.cloneJsonValue(allocator, details) else null,
             .is_error = message.is_error,
             .timestamp = message.timestamp,
         } },
         .custom => |message| .{ .custom = .{
             .kind = try allocator.dupe(u8, message.kind),
-            .payload = try cloneJsonValue(allocator, message.payload),
+            .payload = try zistd.cloneJsonValue(allocator, message.payload),
             .timestamp = message.timestamp,
         } },
     };
@@ -550,46 +609,46 @@ fn cloneAgentMessage(allocator: std.mem.Allocator, source: agent.AgentMessage) !
 
 fn cloneUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserContent) ![]const ai.UserContent {
     const cloned = try allocator.alloc(ai.UserContent, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeUserContentItems(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
     for (source, cloned) |content, *out| {
-        out.* = switch (content) {
-            .text => |text| .{ .text = .{
-                .text = try allocator.dupe(u8, text.text),
-                .text_signature = try cloneOptionalString(allocator, text.text_signature),
-            } },
-            .image => |image| .{ .image = .{
-                .data = try allocator.dupe(u8, image.data),
-                .mime_type = try allocator.dupe(u8, image.mime_type),
-            } },
-        };
+        out.* = try cloneUserContent(allocator, content);
+        initialized += 1;
     }
     return cloned;
 }
 
-fn cloneAssistantContentSlice(
-    allocator: std.mem.Allocator,
-    source: []const ai.AssistantContent,
-) ![]const ai.AssistantContent {
-    const cloned = try allocator.alloc(ai.AssistantContent, source.len);
-    for (source, cloned) |content, *out| {
-        out.* = switch (content) {
-            .text => |text| .{ .text = .{
-                .text = try allocator.dupe(u8, text.text),
-                .text_signature = try cloneOptionalString(allocator, text.text_signature),
-            } },
-            .thinking => |thinking| .{ .thinking = .{
-                .thinking = try allocator.dupe(u8, thinking.thinking),
-                .thinking_signature = try cloneOptionalString(allocator, thinking.thinking_signature),
-                .redacted = thinking.redacted,
-            } },
-            .tool_call => |tool_call| .{ .tool_call = .{
-                .id = try allocator.dupe(u8, tool_call.id),
-                .name = try allocator.dupe(u8, tool_call.name),
-                .arguments = try cloneJsonValue(allocator, tool_call.arguments),
-                .thought_signature = try cloneOptionalString(allocator, tool_call.thought_signature),
-            } },
-        };
-    }
-    return cloned;
+fn cloneUserContent(allocator: std.mem.Allocator, content: ai.UserContent) !ai.UserContent {
+    return switch (content) {
+        .text => |text| blk: {
+            const text_copy = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(text_copy);
+            const signature = try cloneOptionalString(allocator, text.text_signature);
+            break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
+        },
+        .image => |image| blk: {
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
+        },
+    };
+}
+
+fn freeUserContentItems(allocator: std.mem.Allocator, source: []const ai.UserContent) void {
+    for (source) |content| switch (content) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |value| allocator.free(value);
+        },
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+    };
 }
 
 fn cloneToolResultContentSlice(
@@ -597,48 +656,50 @@ fn cloneToolResultContentSlice(
     source: []const ai.ToolResultContent,
 ) ![]const ai.ToolResultContent {
     const cloned = try allocator.alloc(ai.ToolResultContent, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeToolResultContentItems(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
     for (source, cloned) |content, *out| {
-        out.* = switch (content) {
-            .text => |text| .{ .text = .{
-                .text = try allocator.dupe(u8, text.text),
-                .text_signature = try cloneOptionalString(allocator, text.text_signature),
-            } },
-            .image => |image| .{ .image = .{
-                .data = try allocator.dupe(u8, image.data),
-                .mime_type = try allocator.dupe(u8, image.mime_type),
-            } },
-        };
+        out.* = try cloneToolResultContent(allocator, content);
+        initialized += 1;
     }
     return cloned;
 }
 
-fn cloneOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
-    return if (source) |value| try allocator.dupe(u8, value) else null;
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, source: std.json.Value) !std.json.Value {
-    return switch (source) {
-        .null => .null,
-        .bool => |value| .{ .bool = value },
-        .integer => |value| .{ .integer = value },
-        .float => |value| .{ .float = value },
-        .number_string => |value| .{ .number_string = try allocator.dupe(u8, value) },
-        .string => |value| .{ .string = try allocator.dupe(u8, value) },
-        .array => |array| blk: {
-            var cloned: std.json.Array = .init(allocator);
-            for (array.items) |item| try cloned.append(try cloneJsonValue(allocator, item));
-            break :blk .{ .array = cloned };
+fn cloneToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResultContent) !ai.ToolResultContent {
+    return switch (content) {
+        .text => |text| blk: {
+            const text_copy = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(text_copy);
+            const signature = try cloneOptionalString(allocator, text.text_signature);
+            break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
         },
-        .object => |object| blk: {
-            var cloned: std.json.ObjectMap = .empty;
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                const key = try allocator.dupe(u8, entry.key_ptr.*);
-                try cloned.put(allocator, key, try cloneJsonValue(allocator, entry.value_ptr.*));
-            }
-            break :blk .{ .object = cloned };
+        .image => |image| blk: {
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
         },
     };
+}
+
+fn freeToolResultContentItems(allocator: std.mem.Allocator, source: []const ai.ToolResultContent) void {
+    for (source) |content| switch (content) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |value| allocator.free(value);
+        },
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+    };
+}
+
+fn cloneOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
+    return if (source) |value| try allocator.dupe(u8, value) else null;
 }
 
 fn defaultConvertToLlm(
