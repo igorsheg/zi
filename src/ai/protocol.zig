@@ -131,17 +131,42 @@ pub const TextSignatureV1 = struct {
 pub const TextContent = struct {
     text: []const u8,
     text_signature: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: TextContent, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "text");
+        try writeJsonField("text", stringify, self.text);
+        if (self.text_signature) |signature| try writeJsonField("textSignature", stringify, signature);
+        try stringify.endObject();
+    }
 };
 
 pub const ThinkingContent = struct {
     thinking: []const u8,
     thinking_signature: ?[]const u8 = null,
     redacted: bool = false,
+
+    pub fn jsonStringify(self: ThinkingContent, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "thinking");
+        try writeJsonField("thinking", stringify, self.thinking);
+        if (self.thinking_signature) |signature| try writeJsonField("thinkingSignature", stringify, signature);
+        if (self.redacted) try writeJsonField("redacted", stringify, true);
+        try stringify.endObject();
+    }
 };
 
 pub const ImageContent = struct {
     data: []const u8,
     mime_type: []const u8,
+
+    pub fn jsonStringify(self: ImageContent, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "image");
+        try writeJsonField("data", stringify, self.data);
+        try writeJsonField("mimeType", stringify, self.mime_type);
+        try stringify.endObject();
+    }
 };
 
 pub const ToolCall = struct {
@@ -149,6 +174,16 @@ pub const ToolCall = struct {
     name: []const u8,
     arguments: std.json.Value,
     thought_signature: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: ToolCall, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "toolCall");
+        try writeJsonField("id", stringify, self.id);
+        try writeJsonField("name", stringify, self.name);
+        try writeJsonField("arguments", stringify, self.arguments);
+        if (self.thought_signature) |signature| try writeJsonField("thoughtSignature", stringify, signature);
+        try stringify.endObject();
+    }
 };
 
 pub const Usage = struct {
@@ -165,7 +200,28 @@ pub const Usage = struct {
         cache_read: f64,
         cache_write: f64,
         total: f64,
+
+        pub fn jsonStringify(self: Cost, stringify: *std.json.Stringify) !void {
+            try stringify.beginObject();
+            try writeJsonField("input", stringify, self.input);
+            try writeJsonField("output", stringify, self.output);
+            try writeJsonField("cacheRead", stringify, self.cache_read);
+            try writeJsonField("cacheWrite", stringify, self.cache_write);
+            try writeJsonField("total", stringify, self.total);
+            try stringify.endObject();
+        }
     };
+
+    pub fn jsonStringify(self: Usage, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("input", stringify, self.input);
+        try writeJsonField("output", stringify, self.output);
+        try writeJsonField("cacheRead", stringify, self.cache_read);
+        try writeJsonField("cacheWrite", stringify, self.cache_write);
+        try writeJsonField("totalTokens", stringify, self.total_tokens);
+        try writeJsonField("cost", stringify, self.cost);
+        try stringify.endObject();
+    }
 };
 
 pub const StopReason = enum {
@@ -179,17 +235,39 @@ pub const StopReason = enum {
 pub const UserContent = union(enum) {
     text: TextContent,
     image: ImageContent,
+
+    pub fn jsonStringify(self: UserContent, stringify: *std.json.Stringify) !void {
+        switch (self) {
+            .text => |text| try stringify.write(text),
+            .image => |image| try stringify.write(image),
+        }
+    }
 };
 
 pub const AssistantContent = union(enum) {
     text: TextContent,
     thinking: ThinkingContent,
     tool_call: ToolCall,
+
+    pub fn jsonStringify(self: AssistantContent, stringify: *std.json.Stringify) !void {
+        switch (self) {
+            .text => |text| try stringify.write(text),
+            .thinking => |thinking| try stringify.write(thinking),
+            .tool_call => |tool_call| try stringify.write(tool_call),
+        }
+    }
 };
 
 pub const ToolResultContent = union(enum) {
     text: TextContent,
     image: ImageContent,
+
+    pub fn jsonStringify(self: ToolResultContent, stringify: *std.json.Stringify) !void {
+        switch (self) {
+            .text => |text| try stringify.write(text),
+            .image => |image| try stringify.write(image),
+        }
+    }
 };
 
 pub const UserMessage = struct {
@@ -199,7 +277,22 @@ pub const UserMessage = struct {
     pub const Content = union(enum) {
         string: []const u8,
         blocks: []const UserContent,
+
+        pub fn jsonStringify(self: Content, stringify: *std.json.Stringify) !void {
+            switch (self) {
+                .string => |text| try stringify.write(text),
+                .blocks => |blocks| try stringify.write(blocks),
+            }
+        }
     };
+
+    pub fn jsonStringify(self: UserMessage, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("role", stringify, "user");
+        try writeJsonField("content", stringify, self.content);
+        try writeJsonField("timestamp", stringify, self.timestamp);
+        try stringify.endObject();
+    }
 };
 
 pub const AssistantMessage = struct {
@@ -212,6 +305,21 @@ pub const AssistantMessage = struct {
     stop_reason: StopReason,
     error_message: ?[]const u8 = null,
     timestamp: Timestamp,
+
+    pub fn jsonStringify(self: AssistantMessage, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("role", stringify, "assistant");
+        try writeJsonField("content", stringify, self.content);
+        try writeJsonField("api", stringify, self.api);
+        try writeJsonField("provider", stringify, self.provider);
+        try writeJsonField("model", stringify, self.model);
+        if (self.response_id) |id| try writeJsonField("responseId", stringify, id);
+        try writeJsonField("usage", stringify, self.usage);
+        try writeJsonField("stopReason", stringify, jsonStopReason(self.stop_reason));
+        if (self.error_message) |message| try writeJsonField("errorMessage", stringify, message);
+        try writeJsonField("timestamp", stringify, self.timestamp);
+        try stringify.endObject();
+    }
 };
 
 pub const ToolResultMessage = struct {
@@ -221,12 +329,32 @@ pub const ToolResultMessage = struct {
     details: ?std.json.Value = null,
     is_error: bool,
     timestamp: Timestamp,
+
+    pub fn jsonStringify(self: ToolResultMessage, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("role", stringify, "toolResult");
+        try writeJsonField("toolCallId", stringify, self.tool_call_id);
+        try writeJsonField("toolName", stringify, self.tool_name);
+        try writeJsonField("content", stringify, self.content);
+        if (self.details) |details| try writeJsonField("details", stringify, details);
+        try writeJsonField("isError", stringify, self.is_error);
+        try writeJsonField("timestamp", stringify, self.timestamp);
+        try stringify.endObject();
+    }
 };
 
 pub const Message = union(enum) {
     user: UserMessage,
     assistant: AssistantMessage,
     tool_result: ToolResultMessage,
+
+    pub fn jsonStringify(self: Message, stringify: *std.json.Stringify) !void {
+        switch (self) {
+            .user => |message| try stringify.write(message),
+            .assistant => |message| try stringify.write(message),
+            .tool_result => |message| try stringify.write(message),
+        }
+    }
 };
 
 pub const Tool = struct {
@@ -291,6 +419,41 @@ pub const AssistantMessageEvent = union(enum) {
         reason: ErrorReason,
         @"error": AssistantMessage,
     };
+
+    pub fn jsonStringify(self: AssistantMessageEvent, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        switch (self) {
+            .start => |payload| {
+                try writeJsonField("type", stringify, "start");
+                try writeJsonField("partial", stringify, payload.partial);
+            },
+            .text_start => |payload| try writeIndexedPartial("text_start", stringify, payload),
+            .text_delta => |payload| try writeTextDelta("text_delta", stringify, payload),
+            .text_end => |payload| try writeTextEnd("text_end", stringify, payload),
+            .thinking_start => |payload| try writeIndexedPartial("thinking_start", stringify, payload),
+            .thinking_delta => |payload| try writeTextDelta("thinking_delta", stringify, payload),
+            .thinking_end => |payload| try writeTextEnd("thinking_end", stringify, payload),
+            .toolcall_start => |payload| try writeIndexedPartial("toolcall_start", stringify, payload),
+            .toolcall_delta => |payload| try writeTextDelta("toolcall_delta", stringify, payload),
+            .toolcall_end => |payload| {
+                try writeJsonField("type", stringify, "toolcall_end");
+                try writeJsonField("contentIndex", stringify, payload.content_index);
+                try writeJsonField("toolCall", stringify, payload.tool_call);
+                try writeJsonField("partial", stringify, payload.partial);
+            },
+            .done => |payload| {
+                try writeJsonField("type", stringify, "done");
+                try writeJsonField("reason", stringify, jsonDoneReason(payload.reason));
+                try writeJsonField("message", stringify, payload.message);
+            },
+            .@"error" => |payload| {
+                try writeJsonField("type", stringify, "error");
+                try writeJsonField("reason", stringify, jsonErrorReason(payload.reason));
+                try writeJsonField("error", stringify, payload.@"error");
+            },
+        }
+        try stringify.endObject();
+    }
 };
 
 pub const DoneReason = enum {
@@ -303,6 +466,68 @@ pub const ErrorReason = enum {
     aborted,
     error_,
 };
+
+fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, value: anytype) !void {
+    try stringify.objectField(name);
+    try stringify.write(value);
+}
+
+fn writeIndexedPartial(
+    comptime event_type: []const u8,
+    stringify: *std.json.Stringify,
+    payload: AssistantMessageEvent.IndexedPartial,
+) !void {
+    try writeJsonField("type", stringify, event_type);
+    try writeJsonField("contentIndex", stringify, payload.content_index);
+    try writeJsonField("partial", stringify, payload.partial);
+}
+
+fn writeTextDelta(
+    comptime event_type: []const u8,
+    stringify: *std.json.Stringify,
+    payload: AssistantMessageEvent.TextDelta,
+) !void {
+    try writeJsonField("type", stringify, event_type);
+    try writeJsonField("contentIndex", stringify, payload.content_index);
+    try writeJsonField("delta", stringify, payload.delta);
+    try writeJsonField("partial", stringify, payload.partial);
+}
+
+fn writeTextEnd(
+    comptime event_type: []const u8,
+    stringify: *std.json.Stringify,
+    payload: AssistantMessageEvent.TextEnd,
+) !void {
+    try writeJsonField("type", stringify, event_type);
+    try writeJsonField("contentIndex", stringify, payload.content_index);
+    try writeJsonField("content", stringify, payload.content);
+    try writeJsonField("partial", stringify, payload.partial);
+}
+
+fn jsonStopReason(reason: StopReason) []const u8 {
+    return switch (reason) {
+        .stop => "stop",
+        .length => "length",
+        .tool_use => "toolUse",
+        .error_ => "error",
+        .aborted => "aborted",
+    };
+}
+
+fn jsonDoneReason(reason: DoneReason) []const u8 {
+    return switch (reason) {
+        .stop => "stop",
+        .length => "length",
+        .tool_use => "toolUse",
+    };
+}
+
+fn jsonErrorReason(reason: ErrorReason) []const u8 {
+    return switch (reason) {
+        .aborted => "aborted",
+        .error_ => "error",
+    };
+}
 
 pub const AssistantMessageEventStreamNextError = anyerror;
 pub const AssistantMessageEventSinkEmitError = error{StreamEventBufferFull};

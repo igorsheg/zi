@@ -9,12 +9,28 @@ pub const OutputMode = enum {
     json,
 };
 
+pub const Error = error{
+    OutputClosed,
+};
+
 pub const Options = struct {
     prompt: []const u8,
     output: OutputMode = .text,
 };
 
 pub fn run(
+    host: *AgentSessionRuntimeHost,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    options: Options,
+) !void {
+    return runInner(host, stdout, stderr, options) catch |err| switch (err) {
+        error.WriteFailed => error.OutputClosed,
+        else => |unexpected| return unexpected,
+    };
+}
+
+fn runInner(
     host: *AgentSessionRuntimeHost,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
@@ -36,43 +52,55 @@ fn drainEvents(
     stderr: *std.Io.Writer,
     output: OutputMode,
 ) !void {
-    var wrote_text = false;
-    while (host.drainPublicEvent()) |event| {
-        switch (output) {
-            .text => try drainTextEvent(event, stdout, stderr, &wrote_text),
-            .json => try drainJsonEvent(event, stdout),
-        }
-    }
-    if (output == .text and wrote_text) try stdout.writeByte('\n');
+    var drain: PrintDrain = .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .output = output,
+    };
+    _ = try host.drainPublicEvents(.{ .context = &drain, .call_fn = PrintDrain.onEvent });
+    if (output == .text and drain.wrote_text) try stdout.writeByte('\n');
 }
 
-fn drainTextEvent(
-    event: AgentSession.AgentSessionEvent,
+const PrintDrain = struct {
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    wrote_text: *bool,
-) !void {
-    switch (event) {
-        .agent_event => |agent_event| switch (agent_event) {
-            .message_end => |payload| switch (payload.message) {
-                .assistant => |assistant| {
-                    if (assistant.error_message) |message| return printAssistantError(stderr, message);
-                    if (assistant.stop_reason == .error_) {
-                        return printAssistantError(stderr, "assistant request failed");
-                    }
-                    for (assistant.content) |content| {
-                        if (content != .text) continue;
-                        try stdout.writeAll(content.text.text);
-                        wrote_text.* = true;
-                    }
+    output: OutputMode,
+    wrote_text: bool = false,
+
+    fn onEvent(context: ?*anyopaque, event: AgentSession.AgentSessionEvent) !void {
+        const self: *PrintDrain = @ptrCast(@alignCast(context.?));
+        switch (self.output) {
+            .text => try self.onTextEvent(event),
+            .json => try drainJsonEvent(event, self.stdout),
+        }
+    }
+
+    fn onTextEvent(
+        self: *PrintDrain,
+        event: AgentSession.AgentSessionEvent,
+    ) !void {
+        switch (event) {
+            .agent_event => |agent_event| switch (agent_event) {
+                .message_end => |payload| switch (payload.message) {
+                    .assistant => |assistant| {
+                        if (assistant.error_message) |message| return printAssistantError(self.stderr, message);
+                        if (assistant.stop_reason == .error_) {
+                            return printAssistantError(self.stderr, "assistant request failed");
+                        }
+                        for (assistant.content) |content| {
+                            if (content != .text) continue;
+                            try self.stdout.writeAll(content.text.text);
+                            self.wrote_text = true;
+                        }
+                    },
+                    else => {},
                 },
                 else => {},
             },
             else => {},
-        },
-        else => {},
+        }
     }
-}
+};
 
 fn printAssistantError(stderr: *std.Io.Writer, message: []const u8) !void {
     try stderr.writeAll(message);
@@ -92,7 +120,7 @@ fn writeSessionHeader(
     host: *AgentSessionRuntimeHost,
     stdout: *std.Io.Writer,
 ) !void {
-    try writeJsonSessionHeader(host.currentSession().manager.header, stdout);
+    try writeJsonSessionHeader(host.sessionHeader(), stdout);
 }
 
 fn writeJsonSessionHeader(
@@ -108,7 +136,7 @@ fn writeJsonSessionHeader(
     try stdout.writeAll(",\"cwd\":");
     try std.json.Stringify.value(header.cwd, .{}, stdout);
     if (header.parent_session) |parent_session| {
-        try stdout.writeAll(",\"parent_session\":");
+        try stdout.writeAll(",\"parentSession\":");
         try std.json.Stringify.value(parent_session, .{}, stdout);
     }
     try stdout.writeAll("}\n");
@@ -140,7 +168,7 @@ test "print mode emits assistant text from injected stream" {
     });
     defer {
         host.requestShutdown();
-        while (host.drainPublicEvent() != null) {}
+        drainAllPublicEvents(&host);
         host.deinit();
     }
 
@@ -179,7 +207,7 @@ test "json print mode streams session header and public events" {
     });
     defer {
         host.requestShutdown();
-        while (host.drainPublicEvent() != null) {}
+        drainAllPublicEvents(&host);
         host.deinit();
     }
 
@@ -191,10 +219,20 @@ test "json print mode streams session header and public events" {
     try run(&host, &stdout, &stderr, .{ .prompt = "hello", .output = .json });
     const output = stdout.buffered();
     try std.testing.expect(std.mem.startsWith(u8, output, "{\"type\":\"session\",\"version\":3"));
-    try std.testing.expect(std.mem.indexOf(u8, output, "{\"agent_event\":{\"message_start\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "{\"agent_event\":{\"message_update\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"assistant_message_event\":{\"text_delta\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "{\"agent_event\":{\"message_end\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "{\"agent_event\":{\"agent_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"message_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"message_update\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"assistantMessageEvent\":{\"type\":\"text_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"stopReason\":\"stop\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"totalTokens\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"message_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"agent_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"agent_event\"") == null);
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
+
+fn drainAllPublicEvents(host: *AgentSessionRuntimeHost) void {
+    _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
+}
+
+fn ignorePublicEvent(_: ?*anyopaque, _: AgentSession.AgentSessionEvent) !void {}

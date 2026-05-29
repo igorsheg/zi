@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const AgentSession = @import("AgentSession.zig");
+const session_manager = @import("session_manager.zig");
 
 const AgentSessionRuntimeHost = @This();
 
@@ -57,6 +58,15 @@ pub const NewSessionResult = struct {
     old_event_count: usize,
 };
 
+pub const PublicEventHandler = struct {
+    context: ?*anyopaque = null,
+    call_fn: *const fn (context: ?*anyopaque, event: AgentSession.AgentSessionEvent) anyerror!void,
+
+    fn call(self: PublicEventHandler, event: AgentSession.AgentSessionEvent) anyerror!void {
+        try self.call_fn(self.context, event);
+    }
+};
+
 pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -77,8 +87,12 @@ pub fn deinit(self: *AgentSessionRuntimeHost) void {
     self.* = undefined;
 }
 
-pub fn currentSession(self: *AgentSessionRuntimeHost) *AgentSession {
-    return &self.session;
+pub fn sessionHeader(self: *const AgentSessionRuntimeHost) session_manager.SessionHeader {
+    return self.session.manager.header;
+}
+
+pub fn sessionId(self: *const AgentSessionRuntimeHost) []const u8 {
+    return self.session.manager.header.id;
 }
 
 pub fn setRebindSession(self: *AgentSessionRuntimeHost, rebind_session: ?RebindSession) void {
@@ -115,23 +129,6 @@ pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !Repl
 
     if (self.rebind_session) |callback| callback.call(&self.session);
     return .{ .old_event_count = old_event_count };
-}
-
-pub fn prompt(
-    self: *AgentSessionRuntimeHost,
-    text: []const u8,
-    images: []const ai.ImageContent,
-) !void {
-    try self.session.prompt(text, images);
-}
-
-pub fn promptWithOptions(
-    self: *AgentSessionRuntimeHost,
-    text: []const u8,
-    images: []const ai.ImageContent,
-    options: AgentSession.PromptOptions,
-) !void {
-    try self.session.promptWithOptions(text, images, options);
 }
 
 pub fn startPromptRun(
@@ -183,6 +180,17 @@ pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?AgentSession.AgentSessi
     return self.session.drainPublicEvent();
 }
 
+pub fn drainPublicEvents(self: *AgentSessionRuntimeHost, handler: PublicEventHandler) !usize {
+    var count: usize = 0;
+    while (self.drainPublicEvent()) |event| {
+        var owned_event = event;
+        defer owned_event.deinit();
+        try handler.call(owned_event);
+        count += 1;
+    }
+    return count;
+}
+
 pub fn shutdownComplete(self: *AgentSessionRuntimeHost) bool {
     return self.session.shutdownComplete();
 }
@@ -212,8 +220,24 @@ fn shutdownAndDeinitSession(session: *AgentSession) void {
 
 fn drainSessionEvents(session: *AgentSession) usize {
     var count: usize = 0;
-    while (session.drainPublicEvent() != null) count += 1;
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        defer owned_event.deinit();
+        count += 1;
+    }
     return count;
+}
+
+fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
+    _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
+}
+
+fn ignorePublicEvent(_: ?*anyopaque, _: AgentSession.AgentSessionEvent) !void {}
+
+fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
+    const run = try host.startPromptRun(text, &.{}, .{});
+    defer host.destroyPromptRun(run);
+    while (try host.stepPromptRun(run)) {}
 }
 
 test "runtime host replacement invalidates old session before rebinding new session" {
@@ -234,7 +258,7 @@ test "runtime host replacement invalidates old session before rebinding new sess
     });
     defer {
         host.requestShutdown();
-        while (host.drainPublicEvent() != null) {}
+        drainHostEvents(&host);
         host.deinit();
     }
 
@@ -261,7 +285,7 @@ test "runtime host replacement invalidates old session before rebinding new sess
     host.setBeforeSessionInvalidate(.{ .context = &state, .call_fn = State.before });
     host.setRebindSession(.{ .context = &state, .call_fn = State.rebind });
 
-    try host.prompt("old event", &.{});
+    try runPromptForTest(&host, "old event");
     const result = try host.replaceSession(.{
         .session_id = "second",
         .timestamp = "2026-05-26T00:00:01Z",
@@ -271,7 +295,7 @@ test "runtime host replacement invalidates old session before rebinding new sess
     try std.testing.expectEqual(@as(usize, 1), state.before_count);
     try std.testing.expectEqual(@as(usize, 1), state.rebind_count);
     try std.testing.expectEqualStrings("second", state.rebound_session_id);
-    try std.testing.expectEqualStrings("second", host.currentSession().manager.header.id);
+    try std.testing.expectEqualStrings("second", host.sessionId());
     try std.testing.expectEqual(@as(usize, 0), host.publicEventCount());
 }
 
@@ -293,7 +317,7 @@ test "runtime host new session replaces current session" {
     });
     defer {
         host.requestShutdown();
-        while (host.drainPublicEvent() != null) {}
+        drainHostEvents(&host);
         host.deinit();
     }
 
@@ -304,7 +328,7 @@ test "runtime host new session replaces current session" {
 
     try std.testing.expect(!result.cancelled);
     try std.testing.expectEqual(@as(usize, 0), result.old_event_count);
-    try std.testing.expectEqualStrings("second", host.currentSession().manager.header.id);
+    try std.testing.expectEqualStrings("second", host.sessionId());
 }
 
 test "runtime host replacement rejects active old session" {
@@ -324,19 +348,19 @@ test "runtime host replacement rejects active old session" {
         .timestamp = "2026-05-26T00:00:00Z",
     });
     defer {
-        if (!host.currentSession().agent.waitForIdle()) host.currentSession().agent.finishRun();
+        if (!host.session.agent.waitForIdle()) host.session.agent.finishRun();
         host.requestShutdown();
-        while (host.drainPublicEvent() != null) {}
+        drainHostEvents(&host);
         host.deinit();
     }
 
-    _ = try host.currentSession().agent.beginRun();
+    _ = try host.session.agent.beginRun();
 
     try std.testing.expectError(error.SessionReplacementRequiresIdle, host.replaceSession(.{
         .session_id = "second",
         .timestamp = "2026-05-26T00:00:01Z",
     }));
-    try std.testing.expectEqualStrings("first", host.currentSession().manager.header.id);
+    try std.testing.expectEqualStrings("first", host.sessionId());
 }
 
 test "runtime host owns current agent session public boundary" {
@@ -357,11 +381,11 @@ test "runtime host owns current agent session public boundary" {
     });
     defer {
         host.requestShutdown();
-        while (host.drainPublicEvent() != null) {}
+        drainHostEvents(&host);
         host.deinit();
     }
 
-    try host.prompt("hello", &.{});
+    try runPromptForTest(&host, "hello");
 
     try std.testing.expect(host.publicEventCount() > 0);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);

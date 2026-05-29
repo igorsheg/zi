@@ -102,6 +102,37 @@ pub const OwnedEventText = struct {
     }
 };
 
+pub const OwnedEventTextList = struct {
+    allocator: std.mem.Allocator,
+    items: []OwnedEventText,
+
+    pub fn init(allocator: std.mem.Allocator, source: []const []const u8) !OwnedEventTextList {
+        const items = try allocator.alloc(OwnedEventText, source.len);
+        errdefer allocator.free(items);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| item.deinit();
+        }
+        for (source) |text| {
+            items[initialized] = try OwnedEventText.init(allocator, text);
+            initialized += 1;
+        }
+        return .{ .allocator = allocator, .items = items };
+    }
+
+    pub fn deinit(self: *OwnedEventTextList) void {
+        for (self.items) |*item| item.deinit();
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: OwnedEventTextList, stringify: *std.json.Stringify) !void {
+        try stringify.beginArray();
+        for (self.items) |item| try stringify.write(item);
+        try stringify.endArray();
+    }
+};
+
 const Lifecycle = enum {
     accepting,
     cancel_requested,
@@ -119,9 +150,15 @@ pub const AgentSessionEvent = union(enum) {
     auto_retry_end: AutoRetryEnd,
 
     pub const QueueUpdate = struct {
-        steering_count: usize,
-        follow_up_count: usize,
+        steering: OwnedEventTextList,
+        follow_up: OwnedEventTextList,
         revision: u64,
+
+        pub fn deinit(self: *QueueUpdate) void {
+            self.steering.deinit();
+            self.follow_up.deinit();
+            self.* = undefined;
+        }
     };
 
     pub const CompactionReason = enum {
@@ -162,7 +199,84 @@ pub const AgentSessionEvent = union(enum) {
         attempt: usize,
         final_error: ?OwnedEventText = null,
     };
+
+    pub fn deinit(self: *AgentSessionEvent) void {
+        switch (self.*) {
+            .agent_event => {},
+            .queue_update => |*payload| payload.deinit(),
+            .compaction_start => {},
+            .session_info_changed => |*payload| {
+                if (payload.name) |*name| name.deinit();
+            },
+            .compaction_end => |*payload| {
+                if (payload.error_message) |*message| message.deinit();
+            },
+            .auto_retry_start => |*payload| payload.error_message.deinit(),
+            .auto_retry_end => |*payload| {
+                if (payload.final_error) |*err| err.deinit();
+            },
+        }
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: AgentSessionEvent, stringify: *std.json.Stringify) !void {
+        switch (self) {
+            .agent_event => |event| try stringify.write(event),
+            .queue_update => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "queue_update");
+                try writeJsonField("steering", stringify, payload.steering);
+                try writeJsonField("followUp", stringify, payload.follow_up);
+                try writeJsonField("revision", stringify, payload.revision);
+                try stringify.endObject();
+            },
+            .compaction_start => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "compaction_start");
+                try writeJsonField("reason", stringify, payload.reason);
+                try stringify.endObject();
+            },
+            .session_info_changed => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "session_info_changed");
+                if (payload.name) |name| try writeJsonField("name", stringify, name);
+                try stringify.endObject();
+            },
+            .compaction_end => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "compaction_end");
+                try writeJsonField("reason", stringify, payload.reason);
+                try writeJsonField("result", stringify, payload.result);
+                try writeJsonField("aborted", stringify, payload.aborted);
+                try writeJsonField("willRetry", stringify, payload.will_retry);
+                if (payload.error_message) |message| try writeJsonField("errorMessage", stringify, message);
+                try stringify.endObject();
+            },
+            .auto_retry_start => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "auto_retry_start");
+                try writeJsonField("attempt", stringify, payload.attempt);
+                try writeJsonField("maxAttempts", stringify, payload.max_attempts);
+                try writeJsonField("delayMs", stringify, payload.delay_ms);
+                try writeJsonField("errorMessage", stringify, payload.error_message);
+                try stringify.endObject();
+            },
+            .auto_retry_end => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "auto_retry_end");
+                try writeJsonField("success", stringify, payload.success);
+                try writeJsonField("attempt", stringify, payload.attempt);
+                if (payload.final_error) |err| try writeJsonField("finalError", stringify, err);
+                try stringify.endObject();
+            },
+        }
+    }
 };
+
+fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, value: anytype) !void {
+    try stringify.objectField(name);
+    try stringify.write(value);
+}
 
 pub const QueueSnapshot = struct {
     allocator: std.mem.Allocator,
@@ -371,7 +485,7 @@ const EventDrain = struct {
         if (event.message_start.message != .user) return;
         const text = userMessageText(event.message_start.message.user) orelse return;
         if (!self.queue_mirror.removeUserText(self.allocator, text)) return;
-        self.emitQueueUpdate();
+        try self.emitQueueUpdate();
     }
 
     fn runSessionHooks(_: *EventDrain, _: agent_mod.AgentEvent) !void {}
@@ -390,16 +504,21 @@ const EventDrain = struct {
         self.terminal_snapshot_entry_count = self.manager.entries.items.len;
     }
 
-    fn emitQueueUpdate(self: *EventDrain) void {
+    fn emitQueueUpdate(self: *EventDrain) !void {
+        var steering = try OwnedEventTextList.init(self.allocator, self.queue_mirror.steering.items);
+        errdefer steering.deinit();
+        var follow_up = try OwnedEventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
+        errdefer follow_up.deinit();
         self.enqueuePublicEvent(.{ .queue_update = .{
-            .steering_count = self.queue_mirror.steeringCount(),
-            .follow_up_count = self.queue_mirror.followUpCount(),
+            .steering = steering,
+            .follow_up = follow_up,
             .revision = self.queue_mirror.revision,
         } });
     }
 
     fn enqueuePublicEvent(self: *EventDrain, event: AgentSessionEvent) void {
-        _ = self.public_events.pushOrDrop(event);
+        var owned_event = event;
+        if (!self.public_events.pushOrDrop(owned_event)) owned_event.deinit();
         self.dropped_public_event_count = self.public_events.dropped();
     }
 };
@@ -621,8 +740,11 @@ pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
 
 pub fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
     if (run.active) {
+        // Cancellation is cleanup. The producer may finish with its own error
+        // while being drained; the invariant here is that ownership is settled.
         run.stream.cancelProducer() catch |err| {
-            std.debug.panic("prompt run cancellation failed: {s}", .{@errorName(err)});
+            const ignored_cleanup_error = @errorName(err);
+            _ = ignored_cleanup_error;
         };
         self.agent.finishRun();
         run.active = false;
@@ -828,11 +950,19 @@ fn queuePromptIfStreaming(self: *AgentSession, preflight: *const PromptPreflight
         .follow_up => try self.queue_mirror.appendFollowUp(self.allocator, preflight.text),
     }
     errdefer self.rollbackQueuedPrompt(behavior, preflight.text);
-    self.event_drain.emitQueueUpdate();
     const message = try self.constructUserMessage(preflight.text, preflight.images);
+    try self.event_drain.emitQueueUpdate();
     switch (behavior) {
-        .steer => try self.agent.steer(message),
-        .follow_up => try self.agent.followUp(message),
+        .steer => self.agent.steer(message) catch |err| {
+            self.rollbackQueuedPrompt(behavior, preflight.text);
+            try self.event_drain.emitQueueUpdate();
+            return err;
+        },
+        .follow_up => self.agent.followUp(message) catch |err| {
+            self.rollbackQueuedPrompt(behavior, preflight.text);
+            try self.event_drain.emitQueueUpdate();
+            return err;
+        },
     }
     return true;
 }
@@ -856,7 +986,6 @@ fn rollbackQueuedPrompt(self: *AgentSession, behavior: StreamingBehavior, text: 
         .steer => _ = self.queue_mirror.removeSteeringText(self.allocator, text),
         .follow_up => _ = self.queue_mirror.removeFollowUpText(self.allocator, text),
     }
-    self.event_drain.emitQueueUpdate();
 }
 
 fn userMessageText(message: ai.UserMessage) ?[]const u8 {
@@ -1210,9 +1339,12 @@ test "agent session prompt queues follow up while running" {
 
     try std.testing.expectEqual(@as(usize, 0), session.agent.steering_queue.count());
     try std.testing.expectEqual(@as(usize, 1), session.agent.follow_up_queue.count());
-    const queue_update = session.drainPublicEvent().?.queue_update;
-    try std.testing.expectEqual(@as(usize, 0), queue_update.steering_count);
-    try std.testing.expectEqual(@as(usize, 1), queue_update.follow_up_count);
+    var event = session.drainPublicEvent().?;
+    defer event.deinit();
+    const queue_update = event.queue_update;
+    try std.testing.expectEqual(@as(usize, 0), queue_update.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 1), queue_update.follow_up.items.len);
+    try std.testing.expectEqualStrings("queued", queue_update.follow_up.items[0].text);
 }
 
 test "agent session prompt queues steering while running" {
@@ -1239,9 +1371,12 @@ test "agent session prompt queues steering while running" {
 
     try std.testing.expectEqual(@as(usize, 1), session.agent.steering_queue.count());
     try std.testing.expectEqual(@as(usize, 0), session.agent.follow_up_queue.count());
-    const queue_update = session.drainPublicEvent().?.queue_update;
-    try std.testing.expectEqual(@as(usize, 1), queue_update.steering_count);
-    try std.testing.expectEqual(@as(usize, 0), queue_update.follow_up_count);
+    var event = session.drainPublicEvent().?;
+    defer event.deinit();
+    const queue_update = event.queue_update;
+    try std.testing.expectEqual(@as(usize, 1), queue_update.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), queue_update.follow_up.items.len);
+    try std.testing.expectEqualStrings("steer", queue_update.steering.items[0].text);
 }
 
 test "agent session public events are caller drained after message persistence" {
@@ -1273,8 +1408,12 @@ test "agent session public events are caller drained after message persistence" 
 
     try std.testing.expectEqual(@as(usize, 1), session.manager.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), session.publicEventCount());
-    try expectUserMessageEvent(.message_start, session.drainPublicEvent().?.agent_event, "hello");
-    try expectUserMessageEvent(.message_end, session.drainPublicEvent().?.agent_event, "hello");
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try expectUserMessageEvent(.message_start, start_event.agent_event, "hello");
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try expectUserMessageEvent(.message_end, end_event.agent_event, "hello");
     try std.testing.expect(session.drainPublicEvent() == null);
 }
 
@@ -1299,8 +1438,20 @@ test "agent session queue update carries revision and snapshot exposes queued te
     defer session.agent.finishRun();
     try session.promptWithOptions("queued", &.{}, .{ .streaming_behavior = .follow_up });
 
-    const queue_update = session.drainPublicEvent().?.queue_update;
+    var event = session.drainPublicEvent().?;
+    defer event.deinit();
+    const queue_update = event.queue_update;
     try std.testing.expectEqual(@as(u64, 1), queue_update.revision);
+    try std.testing.expectEqual(@as(usize, 0), queue_update.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 1), queue_update.follow_up.items.len);
+    try std.testing.expectEqualStrings("queued", queue_update.follow_up.items[0].text);
+    var json_buffer: [128]u8 = undefined;
+    var json_writer = std.Io.Writer.fixed(&json_buffer);
+    try std.json.Stringify.value(event, .{}, &json_writer);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"queue_update\",\"steering\":[],\"followUp\":[\"queued\"],\"revision\":1}",
+        json_writer.buffered(),
+    );
 
     var snapshot = try session.queueSnapshot(std.testing.allocator);
     defer snapshot.deinit();
@@ -1333,17 +1484,24 @@ test "agent session queue update consumes block user message text" {
     defer session.agent.finishRun();
     try session.promptWithOptions("queued image", &.{image}, .{ .streaming_behavior = .follow_up });
 
-    const queued_update = session.drainPublicEvent().?.queue_update;
-    try std.testing.expectEqual(@as(usize, 0), queued_update.steering_count);
-    try std.testing.expectEqual(@as(usize, 1), queued_update.follow_up_count);
+    var queued_event = session.drainPublicEvent().?;
+    defer queued_event.deinit();
+    const queued_update = queued_event.queue_update;
+    try std.testing.expectEqual(@as(usize, 0), queued_update.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 1), queued_update.follow_up.items.len);
+    try std.testing.expectEqualStrings("queued image", queued_update.follow_up.items[0].text);
 
     const message = try session.agent.userMessageFromText("queued image", &.{image});
     try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
 
-    const consumed_update = session.drainPublicEvent().?.queue_update;
-    try std.testing.expectEqual(@as(usize, 0), consumed_update.steering_count);
-    try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up_count);
-    try expectUserMessageEvent(.message_start, session.drainPublicEvent().?.agent_event, "queued image");
+    var consumed_event = session.drainPublicEvent().?;
+    defer consumed_event.deinit();
+    const consumed_update = consumed_event.queue_update;
+    try std.testing.expectEqual(@as(usize, 0), consumed_update.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up.items.len);
+    var message_event = session.drainPublicEvent().?;
+    defer message_event.deinit();
+    try expectUserMessageEvent(.message_start, message_event.agent_event, "queued image");
 }
 
 test "agent session queue update is emitted before queued user message start" {
@@ -1367,17 +1525,24 @@ test "agent session queue update is emitted before queued user message start" {
     defer session.agent.finishRun();
     try session.promptWithOptions("queued", &.{}, .{ .streaming_behavior = .steer });
 
-    const queued_update = session.drainPublicEvent().?.queue_update;
-    try std.testing.expectEqual(@as(usize, 1), queued_update.steering_count);
-    try std.testing.expectEqual(@as(usize, 0), queued_update.follow_up_count);
+    var queued_event = session.drainPublicEvent().?;
+    defer queued_event.deinit();
+    const queued_update = queued_event.queue_update;
+    try std.testing.expectEqual(@as(usize, 1), queued_update.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), queued_update.follow_up.items.len);
+    try std.testing.expectEqualStrings("queued", queued_update.steering.items[0].text);
 
     const message = try session.agent.userMessageFromText("queued", &.{});
     try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
 
-    const consumed_update = session.drainPublicEvent().?.queue_update;
-    try std.testing.expectEqual(@as(usize, 0), consumed_update.steering_count);
-    try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up_count);
-    try expectUserMessageEvent(.message_start, session.drainPublicEvent().?.agent_event, "queued");
+    var consumed_event = session.drainPublicEvent().?;
+    defer consumed_event.deinit();
+    const consumed_update = consumed_event.queue_update;
+    try std.testing.expectEqual(@as(usize, 0), consumed_update.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up.items.len);
+    var message_event = session.drainPublicEvent().?;
+    defer message_event.deinit();
+    try expectUserMessageEvent(.message_start, message_event.agent_event, "queued");
 }
 
 test "agent session snapshots expose status and active tool read models" {
@@ -1467,7 +1632,8 @@ test "agent session public event drain is caller driven" {
     try session.agent.emitEvent(.agent_start);
 
     try std.testing.expectEqual(@as(usize, 1), session.publicEventCount());
-    _ = session.drainPublicEvent().?;
+    var event = session.drainPublicEvent().?;
+    event.deinit();
     try std.testing.expectEqual(@as(usize, 0), session.publicEventCount());
 }
 
@@ -1510,7 +1676,10 @@ fn shutdownAndDeinit(session: *AgentSession) void {
 }
 
 fn drainAllPublicEvents(session: *AgentSession) void {
-    while (session.drainPublicEvent() != null) {}
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        owned_event.deinit();
+    }
 }
 
 fn expectNextUserMessageEvent(
@@ -1519,9 +1688,11 @@ fn expectNextUserMessageEvent(
     text: []const u8,
 ) !void {
     while (session.drainPublicEvent()) |event| {
-        if (event != .agent_event) continue;
-        if (std.meta.activeTag(event.agent_event) != tag) continue;
-        try expectUserMessageEvent(tag, event.agent_event, text);
+        var owned_event = event;
+        defer owned_event.deinit();
+        if (owned_event != .agent_event) continue;
+        if (std.meta.activeTag(owned_event.agent_event) != tag) continue;
+        try expectUserMessageEvent(tag, owned_event.agent_event, text);
         return;
     }
     return error.ExpectedUserMessageEvent;

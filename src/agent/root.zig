@@ -47,12 +47,35 @@ pub const AgentMessage = union(enum) {
     assistant: ai.AssistantMessage,
     tool_result: ai.ToolResultMessage,
     custom: CustomAgentMessage,
+
+    pub fn jsonStringify(self: AgentMessage, stringify: *std.json.Stringify) !void {
+        switch (self) {
+            .user => |message| try stringify.write(message),
+            .assistant => |message| try stringify.write(message),
+            .tool_result => |message| try stringify.write(message),
+            .custom => |message| {
+                try stringify.beginObject();
+                try writeJsonField("role", stringify, message.kind);
+                try writeJsonField("payload", stringify, message.payload);
+                try writeJsonField("timestamp", stringify, message.timestamp);
+                try stringify.endObject();
+            },
+        }
+    }
 };
 
 pub const AgentToolResult = struct {
     content: []const ai.ToolResultContent,
     details: ?std.json.Value = null,
     terminate: bool = false,
+
+    pub fn jsonStringify(self: AgentToolResult, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("content", stringify, self.content);
+        if (self.details) |details| try writeJsonField("details", stringify, details);
+        if (self.terminate) try writeJsonField("terminate", stringify, true);
+        try stringify.endObject();
+    }
 };
 
 pub const OwnedAgentToolResult = struct {
@@ -408,7 +431,63 @@ pub const AgentEvent = union(enum) {
         result: AgentToolResult,
         is_error: bool,
     };
+
+    pub fn jsonStringify(self: AgentEvent, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        switch (self) {
+            .agent_start => try writeJsonField("type", stringify, "agent_start"),
+            .agent_end => |payload| {
+                try writeJsonField("type", stringify, "agent_end");
+                try writeJsonField("messages", stringify, payload.messages);
+            },
+            .turn_start => try writeJsonField("type", stringify, "turn_start"),
+            .turn_end => |payload| {
+                try writeJsonField("type", stringify, "turn_end");
+                try writeJsonField("message", stringify, payload.message);
+                try writeJsonField("toolResults", stringify, payload.tool_results);
+            },
+            .message_start => |payload| {
+                try writeJsonField("type", stringify, "message_start");
+                try writeJsonField("message", stringify, payload.message);
+            },
+            .message_update => |payload| {
+                try writeJsonField("type", stringify, "message_update");
+                try writeJsonField("message", stringify, payload.message);
+                try writeJsonField("assistantMessageEvent", stringify, payload.assistant_message_event);
+            },
+            .message_end => |payload| {
+                try writeJsonField("type", stringify, "message_end");
+                try writeJsonField("message", stringify, payload.message);
+            },
+            .tool_execution_start => |payload| {
+                try writeJsonField("type", stringify, "tool_execution_start");
+                try writeJsonField("toolCallId", stringify, payload.tool_call_id);
+                try writeJsonField("toolName", stringify, payload.tool_name);
+                try writeJsonField("args", stringify, payload.args);
+            },
+            .tool_execution_update => |payload| {
+                try writeJsonField("type", stringify, "tool_execution_update");
+                try writeJsonField("toolCallId", stringify, payload.tool_call_id);
+                try writeJsonField("toolName", stringify, payload.tool_name);
+                try writeJsonField("args", stringify, payload.args);
+                try writeJsonField("partialResult", stringify, payload.partial_result);
+            },
+            .tool_execution_end => |payload| {
+                try writeJsonField("type", stringify, "tool_execution_end");
+                try writeJsonField("toolCallId", stringify, payload.tool_call_id);
+                try writeJsonField("toolName", stringify, payload.tool_name);
+                try writeJsonField("result", stringify, payload.result);
+                try writeJsonField("isError", stringify, payload.is_error);
+            },
+        }
+        try stringify.endObject();
+    }
 };
+
+fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, value: anytype) !void {
+    try stringify.objectField(name);
+    try stringify.write(value);
+}
 
 pub fn toAiThinkingLevel(level: ThinkingLevel) ?ai.ThinkingLevel {
     return switch (level) {

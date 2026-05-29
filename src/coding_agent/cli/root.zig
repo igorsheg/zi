@@ -12,6 +12,7 @@ pub const AuthCommand = args_mod.AuthCommand;
 
 pub const CliError = error{
     InvalidCliUsage,
+    OutputClosed,
     UnsupportedCliFeature,
 };
 
@@ -28,6 +29,7 @@ pub fn main(process: runtime.Process, args_source: std.process.Args) !void {
     defer args.deinit();
 
     run(process, &args, stdout, stderr) catch |err| switch (err) {
+        error.OutputClosed => return,
         error.InvalidCliUsage, error.UnsupportedCliFeature => {
             try flushOutputs(stdout, stderr);
             std.process.exit(2);

@@ -28,7 +28,7 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         self.host.requestShutdown();
-        while (self.host.drainPublicEvent() != null) {}
+        drainHostEvents(&self.host);
         self.host.deinit();
         self.services.deinit();
         self.* = undefined;
@@ -71,12 +71,18 @@ pub fn createRuntimeHost(
     errdefer {
         var host_copy = host;
         host_copy.requestShutdown();
-        while (host_copy.drainPublicEvent() != null) {}
+        drainHostEvents(&host_copy);
         host_copy.deinit();
     }
 
     return .{ .services = services, .host = host };
 }
+
+fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
+    _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
+}
+
+fn ignorePublicEvent(_: ?*anyopaque, _: AgentSession.AgentSessionEvent) !void {}
 
 test "sdk runtime owns services before host and deinitializes in order" {
     var tmp = std.testing.tmpDir(.{});
@@ -97,5 +103,5 @@ test "sdk runtime owns services before host and deinitializes in order" {
 
     try std.testing.expectEqualStrings("repo", runtime.services.cwd);
     try std.testing.expectEqualStrings(runtime.services.cwd, runtime.host.base.cwd);
-    try std.testing.expectEqualStrings("session", runtime.host.currentSession().manager.header.id);
+    try std.testing.expectEqualStrings("session", runtime.host.sessionId());
 }
