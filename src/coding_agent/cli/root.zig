@@ -58,7 +58,8 @@ fn runApp(
     app: args_mod.AppArgs,
     options: auth_mode.Options,
 ) !void {
-    if (app.help) return help(stdout);
+    if (app.help) return args_mod.writeHelp(stdout);
+    if (app.unknown_flags.count > 0) return unknownFlag(stderr, app.unknown_flags.slice()[0].name);
     if (app.messages.count != 1) return usage(stderr);
 
     const stdin_is_tty = try std.Io.File.stdin().isTty(process.io);
@@ -94,40 +95,20 @@ fn runPrompt(
     try print_mode.run(&app.host, stdout, stderr, .{ .prompt = prompt });
 }
 
-fn help(stdout: *std.Io.Writer) !void {
-    try stdout.writeAll(
-        \\zi - AI coding assistant with read, bash, edit, write tools
-        \\
-        \\Usage:
-        \\  zi -p <prompt>
-        \\  zi auth login openai-codex
-        \\  zi auth logout openai-codex
-        \\  zi auth status openai-codex
-        \\
-        \\Options:
-        \\  --print, -p                    Non-interactive mode: process prompt and exit
-        \\  --help, -h                     Show this help
-        \\
-    );
-    try stdout.flush();
-}
-
 fn unsupported(stderr: *std.Io.Writer, message: []const u8) !void {
     try stderr.print("unsupported: {s}\n", .{message});
     try stderr.flush();
     return error.UnsupportedCliFeature;
 }
 
+fn unknownFlag(stderr: *std.Io.Writer, name: []const u8) !void {
+    try stderr.print("unsupported: unknown extension flag --{s}\n", .{name});
+    try stderr.flush();
+    return error.UnsupportedCliFeature;
+}
+
 fn usage(stderr: *std.Io.Writer) noreturn {
-    stderr.writeAll(
-        \\usage: zi -p <prompt>
-        \\       zi auth login openai-codex
-        \\       zi auth logout openai-codex
-        \\       zi auth status openai-codex
-        \\
-    ) catch std.process.exit(2);
-    stderr.flush() catch std.process.exit(2);
-    std.process.exit(2);
+    args_mod.writeUsage(stderr);
 }
 
 test "cli auth logout dispatches to auth mode" {
