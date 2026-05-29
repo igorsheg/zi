@@ -129,3 +129,40 @@ test "event pipe leaves terminal empty when nonterminal event is queued" {
     try std.testing.expectEqual(@as(?u8, null), stream.result());
     try std.testing.expectEqual(@as(?u8, 1), try stream.next(std.Io.failing));
 }
+
+const ConcurrentProducerState = struct {
+    pipe: *EventPipe(u8, u8),
+    entered: std.atomic.Value(bool) = .init(false),
+};
+
+fn produceMoreThanCapacity(io: std.Io, state: *ConcurrentProducerState) !void {
+    state.entered.store(true, .release);
+    const sink = state.pipe.sink();
+    try sink.emit(io, 1);
+    try sink.emit(io, 2);
+    try sink.emit(io, 3);
+    try sink.end(io, 4, 9);
+}
+
+test "event pipe supports bounded concurrent producer and owner drain" {
+    const Pipe = EventPipe(u8, u8);
+    var buffer: [1]u8 = undefined;
+    var pipe = Pipe.init(&buffer);
+    var state: ConcurrentProducerState = .{ .pipe = &pipe };
+    var future = std.testing.io.async(produceMoreThanCapacity, .{ std.testing.io, &state });
+
+    while (!state.entered.load(.acquire)) {
+        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch |err| switch (err) {
+            error.Canceled => return err,
+        };
+    }
+
+    const stream = pipe.stream();
+    try std.testing.expectEqual(@as(?u8, 1), try stream.next(std.testing.io));
+    try std.testing.expectEqual(@as(?u8, 2), try stream.next(std.testing.io));
+    try std.testing.expectEqual(@as(?u8, 3), try stream.next(std.testing.io));
+    try std.testing.expectEqual(@as(?u8, 4), try stream.next(std.testing.io));
+    try std.testing.expectEqual(@as(?u8, null), try stream.next(std.testing.io));
+    try std.testing.expectEqual(@as(?u8, 9), stream.result());
+    try future.await(std.testing.io);
+}

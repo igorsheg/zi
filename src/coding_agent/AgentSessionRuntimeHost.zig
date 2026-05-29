@@ -134,6 +134,23 @@ pub fn promptWithOptions(
     try self.session.promptWithOptions(text, images, options);
 }
 
+pub fn startPromptRun(
+    self: *AgentSessionRuntimeHost,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    options: AgentSession.PromptOptions,
+) !*AgentSession.LivePromptRun {
+    return self.session.startLivePromptRun(text, images, options);
+}
+
+pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !bool {
+    return self.session.stepPromptRun(run);
+}
+
+pub fn destroyPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) void {
+    self.session.destroyPromptRun(run);
+}
+
 pub fn continueRun(self: *AgentSessionRuntimeHost) !void {
     try self.session.continueRun();
 }

@@ -106,7 +106,6 @@ pub const StreamRequest = struct {
     context: Context,
     options: StreamOptions = .{},
     cancel_token: ?runtime.CancelToken = null,
-    event_buffer: []AssistantMessageEvent,
 };
 
 pub const StreamFunction = struct {
@@ -305,28 +304,66 @@ pub const ErrorReason = enum {
     error_,
 };
 
-const AssistantEventPipe = runtime.EventPipe(AssistantMessageEvent, AssistantMessage);
-
-pub const AssistantMessageEventStreamNextError = AssistantEventPipe.NextError;
-pub const AssistantMessageEventSinkEmitError = AssistantEventPipe.EmitError;
+pub const AssistantMessageEventStreamNextError = anyerror;
+pub const AssistantMessageEventSinkEmitError = error{StreamEventBufferFull};
 
 pub const AssistantMessageEventStream = struct {
-    pipe: AssistantEventPipe,
+    kind: Kind,
 
-    pub fn init(buffer: []AssistantMessageEvent) AssistantMessageEventStream {
-        return .{ .pipe = AssistantEventPipe.init(buffer) };
+    pub const buffered_event_capacity = 256;
+
+    const Kind = union(enum) {
+        buffered: Buffered,
+        custom: Custom,
+    };
+
+    const Buffered = struct {
+        events: [buffered_event_capacity]AssistantMessageEvent = undefined,
+        len: usize = 0,
+        index: usize = 0,
+        terminal_message: ?AssistantMessage = null,
+    };
+
+    pub const Custom = struct {
+        context: ?*anyopaque,
+        next_fn: *const fn (?*anyopaque, std.Io) anyerror!?AssistantMessageEvent,
+        result_fn: *const fn (?*anyopaque) ?AssistantMessage,
+        deinit_fn: ?*const fn (?*anyopaque) void = null,
+    };
+
+    pub fn initBuffered() AssistantMessageEventStream {
+        return .{ .kind = .{ .buffered = .{} } };
+    }
+
+    pub fn initCustom(custom: Custom) AssistantMessageEventStream {
+        return .{ .kind = .{ .custom = custom } };
     }
 
     pub fn sink(self: *AssistantMessageEventStream) AssistantMessageEventSink {
-        return .{ .pipe = self.pipe.sink() };
+        std.debug.assert(self.kind == .buffered);
+        return .{ .context = self, .emit_fn = emitBufferedFn };
     }
 
-    pub fn next(self: *AssistantMessageEventStream, io: std.Io) AssistantEventPipe.NextError!?AssistantMessageEvent {
-        return self.pipe.stream().next(io);
+    pub fn next(self: *AssistantMessageEventStream, io: std.Io) anyerror!?AssistantMessageEvent {
+        return switch (self.kind) {
+            .buffered => |*buffered| nextBuffered(buffered),
+            .custom => |custom| custom.next_fn(custom.context, io),
+        };
     }
 
     pub fn result(self: *AssistantMessageEventStream) ?AssistantMessage {
-        return self.pipe.stream().result();
+        return switch (self.kind) {
+            .buffered => |buffered| buffered.terminal_message,
+            .custom => |custom| custom.result_fn(custom.context),
+        };
+    }
+
+    pub fn deinit(self: *AssistantMessageEventStream) void {
+        switch (self.kind) {
+            .buffered => {},
+            .custom => |custom| if (custom.deinit_fn) |deinit_fn| deinit_fn(custom.context),
+        }
+        self.* = undefined;
     }
 
     pub fn drain(
@@ -335,26 +372,47 @@ pub const AssistantMessageEventStream = struct {
         self: *AssistantMessageEventStream,
         handler: *Handler,
     ) !AssistantMessage {
+        defer self.deinit();
         while (try self.next(io)) |event| {
             try handler.onAssistantMessageEvent(event);
         }
         return self.result() orelse error.MissingResult;
     }
+
+    fn emitBuffered(self: *AssistantMessageEventStream, event: AssistantMessageEvent) AssistantMessageEventSinkEmitError!void {
+        const buffered = &self.kind.buffered;
+        switch (event) {
+            .done => |done| buffered.terminal_message = done.message,
+            .@"error" => |err| buffered.terminal_message = err.@"error",
+            else => {},
+        }
+        if (buffered.len >= buffered.events.len) return error.StreamEventBufferFull;
+        buffered.events[buffered.len] = event;
+        buffered.len += 1;
+    }
+
+    fn nextBuffered(buffered: *Buffered) ?AssistantMessageEvent {
+        if (buffered.index >= buffered.len) return null;
+        defer buffered.index += 1;
+        return buffered.events[buffered.index];
+    }
+
+    fn emitBufferedFn(context: ?*anyopaque, _: std.Io, event: AssistantMessageEvent) AssistantMessageEventSinkEmitError!void {
+        const self: *AssistantMessageEventStream = @ptrCast(@alignCast(context.?));
+        try self.emitBuffered(event);
+    }
 };
 
 pub const AssistantMessageEventSink = struct {
-    pipe: AssistantEventPipe.Sink,
+    context: ?*anyopaque,
+    emit_fn: *const fn (?*anyopaque, std.Io, AssistantMessageEvent) AssistantMessageEventSinkEmitError!void,
 
     pub fn emit(
         self: AssistantMessageEventSink,
         io: std.Io,
         event: AssistantMessageEvent,
-    ) AssistantEventPipe.EmitError!void {
-        switch (event) {
-            .done => |done| try self.pipe.end(io, event, done.message),
-            .@"error" => |err| try self.pipe.end(io, event, err.@"error"),
-            else => try self.pipe.emit(io, event),
-        }
+    ) AssistantMessageEventSinkEmitError!void {
+        try self.emit_fn(self.context, io, event);
     }
 
     pub fn endDone(
@@ -362,8 +420,8 @@ pub const AssistantMessageEventSink = struct {
         io: std.Io,
         reason: DoneReason,
         message: AssistantMessage,
-    ) AssistantEventPipe.EmitError!void {
-        try self.pipe.end(io, .{ .done = .{ .reason = reason, .message = message } }, message);
+    ) AssistantMessageEventSinkEmitError!void {
+        try self.emit(io, .{ .done = .{ .reason = reason, .message = message } });
     }
 
     pub fn endError(
@@ -371,19 +429,20 @@ pub const AssistantMessageEventSink = struct {
         io: std.Io,
         reason: ErrorReason,
         message: AssistantMessage,
-    ) AssistantEventPipe.EmitError!void {
-        try self.pipe.end(io, .{ .@"error" = .{ .reason = reason, .@"error" = message } }, message);
+    ) AssistantMessageEventSinkEmitError!void {
+        try self.emit(io, .{ .@"error" = .{ .reason = reason, .@"error" = message } });
     }
 
     pub fn endAborted(
         self: AssistantMessageEventSink,
         io: std.Io,
         message: AssistantMessage,
-    ) AssistantEventPipe.EmitError!void {
+    ) AssistantMessageEventSinkEmitError!void {
         std.debug.assert(message.stop_reason == .aborted);
         try self.endError(io, .aborted, message);
     }
 };
+
 
 pub fn emptyAssistantMessageFromRequest(
     request: StreamRequest,
@@ -420,14 +479,12 @@ pub fn emptyUsage() Usage {
 }
 
 test "stream function calls provider implementation with request" {
-    var event_buffer: [1]AssistantMessageEvent = undefined;
     var calls: usize = 0;
     const request: StreamRequest = .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
         .model = emptyModel(),
         .context = .{ .messages = &.{} },
-        .event_buffer = &event_buffer,
     };
     const stream_function: StreamFunction = .{
         .context = &calls,
@@ -447,8 +504,7 @@ test "known api and provider names stay wire strings" {
 
 test "assistant stream derives terminal message from done event" {
     const message = emptyAssistantMessage(.stop);
-    var buffer: [1]AssistantMessageEvent = undefined;
-    var stream = AssistantMessageEventStream.init(&buffer);
+    var stream = AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
 
     try sink.endDone(std.Io.failing, .stop, message);
@@ -461,8 +517,7 @@ test "assistant stream derives terminal message from done event" {
 
 test "assistant stream drains events and returns result" {
     const message = emptyAssistantMessage(.stop);
-    var buffer: [1]AssistantMessageEvent = undefined;
-    var stream = AssistantMessageEventStream.init(&buffer);
+    var stream = AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     var handler: CountingHandler = .{};
 
@@ -476,8 +531,7 @@ test "assistant stream drains events and returns result" {
 test "assistant stream derives terminal message from error event" {
     var message = emptyAssistantMessage(.aborted);
     message.error_message = "aborted";
-    var buffer: [1]AssistantMessageEvent = undefined;
-    var stream = AssistantMessageEventStream.init(&buffer);
+    var stream = AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
 
     try sink.endAborted(std.Io.failing, message);
@@ -488,13 +542,11 @@ test "assistant stream derives terminal message from error event" {
 }
 
 test "empty assistant message from request preserves provider identity" {
-    var event_buffer: [1]AssistantMessageEvent = undefined;
     const request: StreamRequest = .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
         .model = emptyModel(),
         .context = .{ .messages = &.{} },
-        .event_buffer = &event_buffer,
     };
 
     const message = emptyAssistantMessageFromRequest(request, .aborted, "aborted");
@@ -517,7 +569,8 @@ const CountingHandler = struct {
 fn testStreamFunction(context: ?*anyopaque, request: StreamRequest) AssistantMessageEventStream {
     const calls: *usize = @ptrCast(@alignCast(context.?));
     calls.* += 1;
-    return AssistantMessageEventStream.init(request.event_buffer);
+    _ = request;
+    return AssistantMessageEventStream.initBuffered();
 }
 
 fn emptyModel() Model {

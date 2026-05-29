@@ -15,12 +15,21 @@ pub const ParseError = error{
 
 pub const AppMode = enum {
     interactive,
-    print,
+    text,
+    json,
+    rpc,
+};
+
+pub const OutputMode = enum {
+    text,
+    json,
+    rpc,
 };
 
 pub const AppArgs = struct {
     help: bool = false,
     print: bool = false,
+    mode: ?OutputMode = null,
     messages: MessageList = .{},
     unknown_flags: UnknownFlagList = .{},
 };
@@ -81,6 +90,7 @@ const FlagValueMode = enum {
 const AppFlagTarget = enum {
     help,
     print,
+    mode,
 };
 
 const AppFlagSpec = struct {
@@ -98,6 +108,13 @@ const app_flags = [_]AppFlagSpec{
         .short = "p",
         .target = .print,
         .help = "Non-interactive mode: process prompt and exit",
+    },
+    .{
+        .long = "mode",
+        .value = .required,
+        .target = .mode,
+        .value_name = "mode",
+        .help = "Output mode: text, json, or rpc",
     },
     .{
         .long = "help",
@@ -149,7 +166,14 @@ pub fn parse(args: []const []const u8) ParseError!Command {
 }
 
 pub fn resolveAppMode(args: AppArgs, stdin_is_tty: bool) AppMode {
-    if (args.print or !stdin_is_tty) return .print;
+    if (args.mode) |mode| {
+        return switch (mode) {
+            .text => .text,
+            .json => .json,
+            .rpc => .rpc,
+        };
+    }
+    if (args.print or !stdin_is_tty) return .text;
     return .interactive;
 }
 
@@ -229,10 +253,11 @@ fn readFlagValue(
 }
 
 fn applyAppFlag(result: *AppArgs, spec: AppFlagSpec, value: ?[]const u8) ParseError!void {
-    _ = value;
     switch (spec.target) {
         .help => result.help = true,
         .print => result.print = true,
+        .mode => result.mode = std.meta.stringToEnum(OutputMode, value orelse return error.MissingOptionValue) orelse
+            return error.InvalidOptionValue,
     }
 }
 
@@ -285,16 +310,15 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.flush();
 }
 
-pub fn writeUsage(writer: *std.Io.Writer) noreturn {
-    writer.writeAll(
+pub fn writeUsage(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
         \\usage: zi [options] <prompt>
         \\       zi auth login openai-codex
         \\       zi auth logout openai-codex
         \\       zi auth status openai-codex
         \\
-    ) catch std.process.exit(2);
-    writer.flush() catch std.process.exit(2);
-    std.process.exit(2);
+    );
+    try writer.flush();
 }
 
 fn writeFlagHelp(writer: *std.Io.Writer, flag: AppFlagSpec) !void {
@@ -334,6 +358,13 @@ test "unknown option fails" {
     try std.testing.expectError(error.UnknownOption, parse(&.{"-x"}));
 }
 
+test "parses output mode from spec" {
+    const app = (try parse(&.{ "--mode", "json", "hello" })).app;
+    try std.testing.expectEqual(.json, app.mode.?);
+    try std.testing.expectEqual(.json, resolveAppMode(app, true));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--mode", "yaml" }));
+}
+
 test "captures unknown long flags for future extension ownership" {
     const app = (try parse(&.{ "--plan", "--shape=fast", "--owner", "cli", "hello" })).app;
     try std.testing.expectEqual(@as(usize, 3), app.unknown_flags.count);
@@ -346,8 +377,8 @@ test "captures unknown long flags for future extension ownership" {
 }
 
 test "resolves app mode from flags and stdin" {
-    try std.testing.expectEqual(.print, resolveAppMode((try parse(&.{"-p"})).app, true));
-    try std.testing.expectEqual(.print, resolveAppMode((try parse(&.{})).app, false));
+    try std.testing.expectEqual(.text, resolveAppMode((try parse(&.{"-p"})).app, true));
+    try std.testing.expectEqual(.text, resolveAppMode((try parse(&.{})).app, false));
     try std.testing.expectEqual(.interactive, resolveAppMode((try parse(&.{})).app, true));
 }
 
@@ -366,4 +397,13 @@ test "writes generated help from specs" {
     try std.testing.expect(std.mem.indexOf(u8, output, "zi [options] <prompt>") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--print") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "zi auth status openai-codex") != null);
+}
+
+test "writes usage without exiting" {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    try writeUsage(&writer);
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, output, "usage: zi [options] <prompt>"));
 }

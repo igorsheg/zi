@@ -412,7 +412,6 @@ fn streamAssistantResponse(
     var response_arena = std.heap.ArenaAllocator.init(allocator);
     defer response_arena.deinit();
 
-    var event_buffer: [64]ai.AssistantMessageEvent = undefined;
     var stream = config.stream.call(.{
         .allocator = response_arena.allocator(),
         .io = io,
@@ -424,8 +423,8 @@ fn streamAssistantResponse(
         },
         .options = stream_options,
         .cancel_token = token,
-        .event_buffer = &event_buffer,
     });
+    defer stream.deinit();
 
     var added_partial = false;
     while (try stream.next(io)) |event| {
@@ -1269,7 +1268,7 @@ fn freeTestMessage(message: agent.AgentMessage) void {
 }
 
 fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
-    var stream = ai.AssistantMessageEventStream.init(request.event_buffer);
+    var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     sink.endDone(request.io, .stop, assistantMessage("ok")) catch unreachable;
     return stream;
@@ -1277,7 +1276,7 @@ fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEven
 
 fn testToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
     const calls: *usize = @ptrCast(@alignCast(context.?));
-    var stream = ai.AssistantMessageEventStream.init(request.event_buffer);
+    var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     if (calls.* == 0) {
         sink.endDone(request.io, .tool_use, assistantToolCallMessage()) catch unreachable;
@@ -1290,7 +1289,7 @@ fn testToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantM
 
 fn testTwoToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
     const calls: *usize = @ptrCast(@alignCast(context.?));
-    var stream = ai.AssistantMessageEventStream.init(request.event_buffer);
+    var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     if (calls.* == 0) {
         sink.endDone(request.io, .tool_use, assistantTwoToolCallMessage()) catch unreachable;

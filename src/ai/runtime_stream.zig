@@ -126,11 +126,10 @@ test "runtime stream forwards provider events as operation completions" {
     defer provider.deinit();
     try provider.register(&registry);
     try provider.setResponses(&.{faux.assistantMessage(&.{faux.text("ok")}, .{})});
-    var event_buffer: [8]protocol.AssistantMessageEvent = undefined;
     var completion_buffer: [8]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
     var table: runtime.OperationTable = .{};
-    var op = try Operation.start(table.reserve(), &registry, testRequest(provider.getModel(), &event_buffer), null);
+    var op = try Operation.start(table.reserve(), &registry, testRequest(provider.getModel()), null);
 
     while (try op.step(&queue)) {}
 
@@ -155,7 +154,6 @@ test "runtime stream cancellation before first event emits only aborted terminal
     defer provider.deinit();
     try provider.register(&registry);
     try provider.setResponses(&.{faux.assistantMessage(&.{faux.text("abcdefghijklmnopqrstuvwxyz")}, .{})});
-    var event_buffer: [16]protocol.AssistantMessageEvent = undefined;
     var completion_buffer: [4]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
     var source: runtime.CancelSource = .{};
@@ -163,7 +161,7 @@ test "runtime stream cancellation before first event emits only aborted terminal
     var op = try Operation.start(
         table.reserve(),
         &registry,
-        testRequest(provider.getModel(), &event_buffer),
+        testRequest(provider.getModel()),
         source.token(),
     );
 
@@ -213,7 +211,6 @@ fn expectCancelAfterDelta(
     defer provider.deinit();
     try provider.register(&registry);
     try provider.setResponses(&.{faux.assistantMessage(content, .{ .stop_reason = .tool_use })});
-    var event_buffer: [32]protocol.AssistantMessageEvent = undefined;
     var completion_buffer: [32]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
     var source: runtime.CancelSource = .{};
@@ -221,7 +218,7 @@ fn expectCancelAfterDelta(
     var op = try Operation.start(
         table.reserve(),
         &registry,
-        testRequest(provider.getModel(), &event_buffer),
+        testRequest(provider.getModel()),
         source.token(),
     );
     var target_delta_count: usize = 0;
@@ -268,12 +265,11 @@ fn jsonObjectWithString(
     return object;
 }
 
-fn testRequest(model: protocol.Model, event_buffer: []protocol.AssistantMessageEvent) protocol.StreamRequest {
+fn testRequest(model: protocol.Model) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
         .model = model,
         .context = .{ .messages = &.{.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }} },
-        .event_buffer = event_buffer,
     };
 }

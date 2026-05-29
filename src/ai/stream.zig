@@ -28,7 +28,7 @@ pub fn streamSimple(
 pub fn complete(
     registry: *const provider_registry.ProviderRegistry,
     request: protocol.StreamRequest,
-) (StreamError || error{MissingResult} || protocol.AssistantMessageEventStreamNextError)!protocol.AssistantMessage {
+) anyerror!protocol.AssistantMessage {
     var assistant_stream = try stream(registry, request);
     var handler: IgnoreEvents = .{};
     return protocol.AssistantMessageEventStream.drain(IgnoreEvents, request.io, &assistant_stream, &handler);
@@ -37,7 +37,7 @@ pub fn complete(
 pub fn completeSimple(
     registry: *const provider_registry.ProviderRegistry,
     request: protocol.StreamRequest,
-) (StreamError || error{MissingResult} || protocol.AssistantMessageEventStreamNextError)!protocol.AssistantMessage {
+) anyerror!protocol.AssistantMessage {
     var assistant_stream = try streamSimple(registry, request);
     var handler: IgnoreEvents = .{};
     return protocol.AssistantMessageEventStream.drain(IgnoreEvents, request.io, &assistant_stream, &handler);
@@ -52,9 +52,8 @@ test "stream dispatches request to provider registered for model api" {
     defer registry.deinit();
     var calls: usize = 0;
     try registry.register(testProvider(protocol.KnownApi.openai_responses, &calls), null);
-    var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
 
-    var assistant_stream = try stream(&registry, testRequest(protocol.KnownApi.openai_responses, &event_buffer));
+    var assistant_stream = try stream(&registry, testRequest(protocol.KnownApi.openai_responses));
 
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expect(assistant_stream.result() != null);
@@ -63,11 +62,10 @@ test "stream dispatches request to provider registered for model api" {
 test "stream reports missing api provider" {
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
-    var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
 
     try std.testing.expectError(
         error.NoApiProvider,
-        stream(&registry, testRequest(protocol.KnownApi.openai_responses, &event_buffer)),
+        stream(&registry, testRequest(protocol.KnownApi.openai_responses)),
     );
 }
 
@@ -76,9 +74,8 @@ test "complete drains stream and returns assistant result" {
     defer registry.deinit();
     var calls: usize = 0;
     try registry.register(testProvider(protocol.KnownApi.openai_responses, &calls), null);
-    var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
 
-    const message = try complete(&registry, testRequest(protocol.KnownApi.openai_responses, &event_buffer));
+    const message = try complete(&registry, testRequest(protocol.KnownApi.openai_responses));
 
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(protocol.StopReason.stop, message.stop_reason);
@@ -89,9 +86,8 @@ test "stream simple dispatches request to provider simple function" {
     defer registry.deinit();
     var calls: usize = 0;
     try registry.register(testProvider(protocol.KnownApi.openai_responses, &calls), null);
-    var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
 
-    var assistant_stream = try streamSimple(&registry, testRequest(protocol.KnownApi.openai_responses, &event_buffer));
+    var assistant_stream = try streamSimple(&registry, testRequest(protocol.KnownApi.openai_responses));
 
     try std.testing.expectEqual(@as(usize, 10), calls);
     try std.testing.expect(assistant_stream.result() != null);
@@ -121,13 +117,13 @@ fn testStreamSimpleFunction(
 }
 
 fn streamWithResult(request: protocol.StreamRequest) protocol.AssistantMessageEventStream {
-    var assistant_stream = protocol.AssistantMessageEventStream.init(request.event_buffer);
+    var assistant_stream = protocol.AssistantMessageEventStream.initBuffered();
     const sink = assistant_stream.sink();
     sink.emit(request.io, .{ .done = .{ .reason = .stop, .message = emptyAssistantMessage() } }) catch unreachable;
     return assistant_stream;
 }
 
-fn testRequest(api: protocol.Api, event_buffer: []protocol.AssistantMessageEvent) protocol.StreamRequest {
+fn testRequest(api: protocol.Api) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
@@ -144,7 +140,6 @@ fn testRequest(api: protocol.Api, event_buffer: []protocol.AssistantMessageEvent
             .max_tokens = 1,
         },
         .context = .{ .messages = &.{} },
-        .event_buffer = event_buffer,
     };
 }
 

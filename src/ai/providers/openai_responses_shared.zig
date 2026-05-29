@@ -2,13 +2,236 @@ const std = @import("std");
 const models_api = @import("../models.zig");
 const mem = @import("../../zistd/root.zig");
 const protocol = @import("../protocol.zig");
+const sse = @import("../sse.zig");
 const json_parse = @import("../utils/json_parse.zig");
 
 pub const ProcessError = error{
     InvalidJson,
     ProviderError,
     OutOfMemory,
-} || protocol.AssistantMessageEventSinkEmitError;
+};
+
+pub fn errorStream(request: protocol.StreamRequest, err: anyerror) protocol.AssistantMessageEventStream {
+    var stream = protocol.AssistantMessageEventStream.initBuffered();
+    const sink = stream.sink();
+    if (err == error.OperationCancelled or err == error.Canceled) {
+        const message = protocol.emptyAssistantMessageFromRequest(request, .aborted, "Request was aborted");
+        sink.endAborted(request.io, message) catch unreachable;
+    } else {
+        const message = protocol.emptyAssistantMessageFromRequest(request, .error_, @errorName(err));
+        sink.endError(request.io, .error_, message) catch unreachable;
+    }
+    return stream;
+}
+
+pub const PullStreamOptions = struct {
+    read_buffer_len: usize,
+    redirect_buffer_len: usize,
+};
+
+pub fn SsePullStream(comptime Owner: type, comptime options: PullStreamOptions) type {
+    return struct {
+        const Self = @This();
+
+        owner: Owner,
+        allocator: std.mem.Allocator,
+        request: protocol.StreamRequest,
+        client: std.http.Client,
+        req: std.http.Client.Request = undefined,
+        response: std.http.Client.Response = undefined,
+        redirects: [options.redirect_buffer_len]u8 = .{},
+        transfer_buffer: [options.read_buffer_len]u8 = undefined,
+        chunk: [options.read_buffer_len]u8 = undefined,
+        reader: ?*std.Io.Reader = null,
+        parser: sse.Parser,
+        reducer: ResponseStreamReducer,
+        pending: std.ArrayList(protocol.AssistantMessageEvent) = .empty,
+        pending_index: usize = 0,
+        result: ?protocol.AssistantMessage = null,
+        started: bool = false,
+        done: bool = false,
+        has_request: bool = false,
+
+        pub fn init(allocator: std.mem.Allocator, request: protocol.StreamRequest, owner: Owner) Self {
+            return .{
+                .owner = owner,
+                .allocator = allocator,
+                .request = request,
+                .client = .{ .allocator = allocator, .io = request.io },
+                .parser = sse.Parser.init(allocator, .{}),
+                .reducer = ResponseStreamReducer.init(allocator, request.model, 0),
+            };
+        }
+
+        pub fn stream(self: *Self) protocol.AssistantMessageEventStream {
+            return protocol.AssistantMessageEventStream.initCustom(.{
+                .context = self,
+                .next_fn = nextFn,
+                .result_fn = resultFn,
+                .deinit_fn = deinitFn,
+            });
+        }
+
+        pub fn openRequest(
+            self: *Self,
+            uri: std.Uri,
+            headers: []const std.http.Header,
+            body: []const u8,
+        ) !void {
+            if (self.has_request) {
+                self.req.deinit();
+                self.has_request = false;
+                self.reader = null;
+            }
+
+            self.req = try self.client.request(.POST, uri, .{
+                .extra_headers = headers,
+                .headers = .{ .content_type = .{ .override = "application/json" }, .accept_encoding = .omit },
+                .redirect_behavior = .unhandled,
+                .keep_alive = false,
+            });
+            self.has_request = true;
+            self.req.transfer_encoding = .{ .content_length = body.len };
+            var body_writer = try self.req.sendBodyUnflushed(&.{});
+            try body_writer.writer.writeAll(body);
+            try body_writer.end();
+            try self.req.connection.?.flush();
+
+            self.response = try self.req.receiveHead(&self.redirects);
+            self.reader = self.response.reader(&self.transfer_buffer);
+        }
+
+        pub fn emitError(self: *Self, detail: []const u8) !void {
+            var message = protocol.emptyAssistantMessageFromRequest(self.request, .error_, detail);
+            message.stop_reason = .error_;
+            try self.pending.append(self.allocator, .{ .@"error" = .{ .reason = .error_, .@"error" = message } });
+            self.result = message;
+            self.done = true;
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.has_request) self.req.deinit();
+            self.pending.deinit(self.allocator);
+            self.reducer.deinit();
+            self.parser.deinit();
+            self.client.deinit();
+            self.owner.deinit(self.allocator);
+            const allocator = self.allocator;
+            self.* = undefined;
+            allocator.destroy(self);
+        }
+
+        fn nextFn(context: ?*anyopaque, io: std.Io) anyerror!?protocol.AssistantMessageEvent {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            return self.next(io);
+        }
+
+        fn resultFn(context: ?*anyopaque) ?protocol.AssistantMessage {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            return self.result;
+        }
+
+        fn deinitFn(context: ?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            self.deinit();
+        }
+
+        fn next(self: *Self, io: std.Io) !?protocol.AssistantMessageEvent {
+            _ = io;
+            if (self.popPending()) |event| return event;
+            if (!self.started and !self.done) {
+                self.started = true;
+                try self.pending.append(self.allocator, .{ .start = .{ .partial = try self.reducer.partial() } });
+                return self.popPending();
+            }
+            while (!self.done) {
+                var writer: std.Io.Writer = .fixed(&self.chunk);
+                const n = self.reader.?.stream(&writer, .limited(self.chunk.len)) catch |err| switch (err) {
+                    error.EndOfStream => {
+                        try self.finish();
+                        return self.popPending();
+                    },
+                    else => return err,
+                };
+                if (n == 0) continue;
+                var sink = self.reducerSink();
+                try self.parser.feed(self.chunk[0..n], &sink);
+                if (self.popPending()) |event| return event;
+            }
+            return self.popPending();
+        }
+
+        fn finish(self: *Self) !void {
+            self.done = true;
+            var sink = self.reducerSink();
+            try self.parser.finish(&sink);
+            try self.reducer.finish(self.request.io, sink.assistant_sink);
+        }
+
+        fn reducerSink(self: *Self) ReducerSseSink {
+            return .{
+                .io = self.request.io,
+                .assistant_sink = .{ .allocator = self.allocator, .events = &self.pending, .result = &self.result },
+                .reducer = &self.reducer,
+            };
+        }
+
+        fn popPending(self: *Self) ?protocol.AssistantMessageEvent {
+            if (self.pending_index >= self.pending.items.len) {
+                self.pending.clearRetainingCapacity();
+                self.pending_index = 0;
+                return null;
+            }
+            const event = self.pending.items[self.pending_index];
+            self.pending_index += 1;
+            return event;
+        }
+    };
+}
+
+const ReducerSseSink = struct {
+    io: std.Io,
+    assistant_sink: PendingEventSink,
+    reducer: *ResponseStreamReducer,
+
+    pub fn emit(self: *ReducerSseSink, event: sse.Event) !void {
+        try self.reducer.applySseData(self.io, self.assistant_sink, event.data);
+    }
+};
+
+const PendingEventSink = struct {
+    allocator: std.mem.Allocator,
+    events: *std.ArrayList(protocol.AssistantMessageEvent),
+    result: *?protocol.AssistantMessage,
+
+    pub fn emit(self: PendingEventSink, _: std.Io, event: protocol.AssistantMessageEvent) !void {
+        try self.events.append(self.allocator, event);
+    }
+
+    pub fn endDone(
+        self: PendingEventSink,
+        io: std.Io,
+        reason: protocol.DoneReason,
+        message: protocol.AssistantMessage,
+    ) !void {
+        try self.emit(io, .{ .done = .{ .reason = reason, .message = message } });
+        self.result.* = message;
+    }
+
+    pub fn endError(
+        self: PendingEventSink,
+        io: std.Io,
+        reason: protocol.ErrorReason,
+        message: protocol.AssistantMessage,
+    ) !void {
+        try self.emit(io, .{ .@"error" = .{ .reason = reason, .@"error" = message } });
+        self.result.* = message;
+    }
+
+    pub fn endAborted(self: PendingEventSink, io: std.Io, message: protocol.AssistantMessage) !void {
+        try self.endError(io, .aborted, message);
+    }
+};
 
 pub const ResponseStreamReducer = struct {
     backing_allocator: std.mem.Allocator,
@@ -71,7 +294,7 @@ pub const ResponseStreamReducer = struct {
     pub fn applySseData(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
         data: []const u8,
     ) anyerror!void {
         if (std.mem.eql(u8, std.mem.trim(u8, data, " \t\r\n"), "[DONE]")) return;
@@ -81,7 +304,7 @@ pub const ResponseStreamReducer = struct {
         try self.applyEvent(io, sink, parsed.value.object);
     }
 
-    pub fn finish(self: *ResponseStreamReducer, io: std.Io, sink: protocol.AssistantMessageEventSink) anyerror!void {
+    pub fn finish(self: *ResponseStreamReducer, io: std.Io, sink: anytype) anyerror!void {
         try self.finishCurrentBlock(io, sink);
         self.output.content = try self.content.toOwnedSlice(self.arena.allocator());
         if (hasToolCall(self.output.content) and self.output.stop_reason == .stop) self.output.stop_reason = .tool_use;
@@ -97,7 +320,7 @@ pub const ResponseStreamReducer = struct {
     fn applyEvent(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
         object: std.json.ObjectMap,
     ) anyerror!void {
         const event_type = jsonString(object.get("type")) orelse return;
@@ -143,7 +366,7 @@ pub const ResponseStreamReducer = struct {
     fn startItem(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
         item: std.json.ObjectMap,
     ) anyerror!void {
         try self.finishCurrentBlock(io, sink);
@@ -180,7 +403,7 @@ pub const ResponseStreamReducer = struct {
     fn finishCurrentBlock(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
     ) anyerror!void {
         switch (self.current) {
             .none => {},
@@ -228,7 +451,7 @@ pub const ResponseStreamReducer = struct {
     fn appendThinking(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
         delta: []const u8,
     ) anyerror!void {
         if (self.current != .thinking) return;
@@ -246,7 +469,7 @@ pub const ResponseStreamReducer = struct {
     fn appendText(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
         delta: []const u8,
     ) anyerror!void {
         if (self.current != .text) return;
@@ -264,7 +487,7 @@ pub const ResponseStreamReducer = struct {
     fn appendToolArguments(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
         delta: []const u8,
     ) anyerror!void {
         if (self.current != .tool_call) return;
@@ -280,7 +503,7 @@ pub const ResponseStreamReducer = struct {
     fn finishToolArguments(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
         arguments: []const u8,
     ) anyerror!void {
         if (self.current != .tool_call) return;
@@ -302,7 +525,7 @@ pub const ResponseStreamReducer = struct {
     fn finishItem(
         self: *ResponseStreamReducer,
         io: std.Io,
-        sink: protocol.AssistantMessageEventSink,
+        sink: anytype,
         item: std.json.ObjectMap,
     ) anyerror!void {
         const item_type = jsonString(item.get("type")) orelse return;
@@ -441,8 +664,7 @@ test "responses reducer emits text deltas and done" {
     const model = testModel();
     var reducer = ResponseStreamReducer.init(std.testing.allocator, model, 123);
     defer reducer.deinit();
-    var buffer: [16]protocol.AssistantMessageEvent = undefined;
-    var stream = protocol.AssistantMessageEventStream.init(&buffer);
+    var stream = protocol.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
 
     try sink.emit(std.Io.failing, .{ .start = .{ .partial = try reducer.partial() } });
@@ -476,8 +698,7 @@ test "responses reducer parses tool call arguments and maps stop to tool use" {
     const model = testModel();
     var reducer = ResponseStreamReducer.init(std.testing.allocator, model, 123);
     defer reducer.deinit();
-    var buffer: [16]protocol.AssistantMessageEvent = undefined;
-    var stream = protocol.AssistantMessageEventStream.init(&buffer);
+    var stream = protocol.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
 
     try sink.emit(std.Io.failing, .{ .start = .{ .partial = try reducer.partial() } });

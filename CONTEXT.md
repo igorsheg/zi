@@ -98,7 +98,30 @@ Zi should grow toward a single owner/drain runtime model:
 operation -> backend -> completion -> bounded queue -> owner drain
 ```
 
-near term, `std.Io.Future` and `runtime.EventPipe` are acceptable mechanisms. the invariant matters more than the mechanism: producers emit events/completions; owners drain and mutate.
+near term, `std.Io.Future`, `std.Io.Select`, and `runtime.EventPipe` are acceptable mechanisms. the invariant matters more than the mechanism: producers emit events/completions; owners drain and mutate.
+
+`--mode json` exposed the provider-streaming pressure point:
+
+```text
+agent asks provider for stream
+provider performs HTTP/SSE synchronously
+provider fills bounded EventPipe before returning
+agent cannot drain until provider returns
+long output fills the pipe and stalls
+```
+
+the fix is not a larger buffer. provider streaming must become operation-backed or pull-based so backend production and owner drain run concurrently with bounded memory and explicit cancellation.
+
+`lalinsky/zio` is a credible runtime candidate because it implements Zig 0.16 `std.Io`, task spawning, cancellation, structured concurrency, and channels. do not import it merely for buffering or queue shape. assess it only against the concrete stream-operation requirement:
+
+```text
+start provider operation
+backend runs concurrently under explicit owner
+events/completions enter bounded queue
+owner drains and mutates session state
+cancel request wakes/interrupts backend
+shutdown drains, joins, then deinits
+```
 
 future runtime vocabulary:
 

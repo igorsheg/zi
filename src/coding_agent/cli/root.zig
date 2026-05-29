@@ -10,6 +10,36 @@ pub const Command = args_mod.Command;
 pub const AppArgs = args_mod.AppArgs;
 pub const AuthCommand = args_mod.AuthCommand;
 
+pub const CliError = error{
+    InvalidCliUsage,
+    UnsupportedCliFeature,
+};
+
+pub fn main(process: runtime.Process, args_source: std.process.Args) !void {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), process.io, &stdout_buffer);
+    const stdout = &stdout_file_writer.interface;
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), process.io, &stderr_buffer);
+    const stderr = &stderr_file_writer.interface;
+
+    var args = try std.process.Args.Iterator.initAllocator(args_source, process.gpa);
+    defer args.deinit();
+
+    run(process, &args, stdout, stderr) catch |err| switch (err) {
+        error.InvalidCliUsage, error.UnsupportedCliFeature => {
+            try flushOutputs(stdout, stderr);
+            std.process.exit(2);
+        },
+        else => |unexpected| {
+            flushOutputs(stdout, stderr) catch return unexpected;
+            return unexpected;
+        },
+    };
+    try flushOutputs(stdout, stderr);
+}
+
 pub fn run(
     process: runtime.Process,
     args: *std.process.Args.Iterator,
@@ -64,7 +94,9 @@ fn runApp(
 
     const stdin_is_tty = try std.Io.File.stdin().isTty(process.io);
     return switch (args_mod.resolveAppMode(app, stdin_is_tty)) {
-        .print => runPrompt(process, stdout, stderr, app.messages.slice()[0], options),
+        .text => runPrompt(process, stdout, stderr, app.messages.slice()[0], .text, options),
+        .json => runPrompt(process, stdout, stderr, app.messages.slice()[0], .json, options),
+        .rpc => unsupported(stderr, "rpc mode is not implemented yet"),
         .interactive => unsupported(stderr, "interactive mode is not implemented yet; use -p/--print"),
     };
 }
@@ -74,6 +106,7 @@ fn runPrompt(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     prompt: []const u8,
+    output: print_mode.OutputMode,
     options: auth_mode.Options,
 ) !void {
     const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
@@ -92,7 +125,7 @@ fn runPrompt(
     });
     defer app.deinit();
 
-    try print_mode.run(&app.host, stdout, stderr, .{ .prompt = prompt });
+    try print_mode.run(&app.host, stdout, stderr, .{ .prompt = prompt, .output = output });
 }
 
 fn unsupported(stderr: *std.Io.Writer, message: []const u8) !void {
@@ -107,8 +140,14 @@ fn unknownFlag(stderr: *std.Io.Writer, name: []const u8) !void {
     return error.UnsupportedCliFeature;
 }
 
-fn usage(stderr: *std.Io.Writer) noreturn {
-    args_mod.writeUsage(stderr);
+fn usage(stderr: *std.Io.Writer) !void {
+    try args_mod.writeUsage(stderr);
+    return error.InvalidCliUsage;
+}
+
+fn flushOutputs(stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
+    try stdout.flush();
+    try stderr.flush();
 }
 
 test "cli auth logout dispatches to auth mode" {
@@ -175,6 +214,23 @@ test "cli auth status dispatches to auth mode" {
 
     try std.testing.expectEqualStrings("openai-codex: authenticated\n", output.buffered());
     try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "cli usage returns an error instead of exiting" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const process = testProcess(&environ);
+    var output_buffer: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var argv = [_:null]?[*:0]const u8{"zi"};
+    var args = try std.process.Args.Iterator.initAllocator(.{ .vector = @ptrCast(&argv) }, std.testing.allocator);
+    defer args.deinit();
+
+    try std.testing.expectError(error.InvalidCliUsage, run(process, &args, &output, &stderr));
+    try std.testing.expectEqualStrings("", output.buffered());
+    try std.testing.expect(std.mem.startsWith(u8, stderr.buffered(), "usage: zi [options] <prompt>"));
 }
 
 fn testProcess(environ: *std.process.Environ.Map) runtime.Process {

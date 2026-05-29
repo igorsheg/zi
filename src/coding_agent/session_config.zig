@@ -321,5 +321,6 @@ test "session config resolves codex settings when oauth credentials are stored" 
 }
 
 fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
-    return ai.AssistantMessageEventStream.init(request.event_buffer);
+    _ = request;
+    return ai.AssistantMessageEventStream.initBuffered();
 }

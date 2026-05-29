@@ -61,8 +61,7 @@ test "provider registry returns registered provider by api" {
     try registry.register(provider, null);
 
     const registered = registry.get(protocol.KnownApi.openai_responses).?;
-    var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
-    _ = registered.stream.call(testRequest(protocol.KnownApi.openai_responses, &event_buffer));
+    _ = registered.stream.call(testRequest(protocol.KnownApi.openai_responses));
     try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
@@ -76,8 +75,7 @@ test "registering same api routes future calls to replacement provider" {
     try registry.register(testProvider(protocol.KnownApi.openai_responses, &second_calls), "second");
 
     const registered = registry.get(protocol.KnownApi.openai_responses).?;
-    var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
-    _ = registered.stream.call(testRequest(protocol.KnownApi.openai_responses, &event_buffer));
+    _ = registered.stream.call(testRequest(protocol.KnownApi.openai_responses));
     try std.testing.expectEqual(@as(usize, 0), first_calls);
     try std.testing.expectEqual(@as(usize, 1), second_calls);
 }
@@ -130,10 +128,11 @@ fn testProvider(api: protocol.Api, calls: *usize) ApiProvider {
 fn testStreamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protocol.AssistantMessageEventStream {
     const calls: *usize = @ptrCast(@alignCast(context.?));
     calls.* += 1;
-    return protocol.AssistantMessageEventStream.init(request.event_buffer);
+    _ = request;
+    return protocol.AssistantMessageEventStream.initBuffered();
 }
 
-fn testRequest(api: protocol.Api, event_buffer: []protocol.AssistantMessageEvent) protocol.StreamRequest {
+fn testRequest(api: protocol.Api) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
@@ -150,6 +149,5 @@ fn testRequest(api: protocol.Api, event_buffer: []protocol.AssistantMessageEvent
             .max_tokens = 1,
         },
         .context = .{ .messages = &.{} },
-        .event_buffer = event_buffer,
     };
 }

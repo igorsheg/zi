@@ -269,7 +269,7 @@ fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protoco
     const self: *Provider = @ptrCast(@alignCast(context.?));
     self.call_count += 1;
 
-    var stream = protocol.AssistantMessageEventStream.init(request.event_buffer);
+    var stream = protocol.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
 
     const step = self.nextResponse() orelse {
@@ -778,9 +778,7 @@ test "faux provider streams queued text response" {
     try provider.register(&registry);
     const message = assistantMessage(&.{text("hello world")}, .{});
     try provider.setResponses(&.{message});
-    var event_buffer: [16]protocol.AssistantMessageEvent = undefined;
-
-    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel()));
 
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
     try std.testing.expectEqual(@as(usize, 0), provider.pendingResponseCount());
@@ -803,9 +801,7 @@ test "faux provider streams tool call argument deltas" {
     try provider.register(&registry);
     const message = assistantMessage(&.{toolCall("tool-1", "echo", .{ .object = .empty })}, .{});
     try provider.setResponses(&.{message});
-    var event_buffer: [16]protocol.AssistantMessageEvent = undefined;
-
-    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel()));
 
     _ = try stream.next(std.Io.failing);
     const start = (try stream.next(std.Io.failing)).?.toolcall_start;
@@ -823,9 +819,7 @@ test "faux provider returns terminal error when queue is empty" {
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.register(&registry);
-    var event_buffer: [2]protocol.AssistantMessageEvent = undefined;
-
-    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel()));
 
     const event = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, event.reason);
@@ -847,9 +841,7 @@ test "faux provider response factory receives call state" {
     defer provider.deinit();
     try provider.register(&registry);
     try provider.appendFactory(.{ .call_fn = testFactory });
-    var event_buffer: [8]protocol.AssistantMessageEvent = undefined;
-
-    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel()));
 
     _ = try stream.next(std.Io.failing);
     _ = try stream.next(std.Io.failing);
@@ -865,13 +857,10 @@ test "faux provider prompt cache accounts common prefix" {
     try provider.register(&registry);
     const message = assistantMessage(&.{text("ok")}, .{});
     try provider.setResponses(&.{ message, message });
-    var first_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var second_buffer: [8]protocol.AssistantMessageEvent = undefined;
-
-    const first_request = testRequestWithSession(provider.getModel(), &first_buffer, "s1");
+    const first_request = testRequestWithSession(provider.getModel(), "s1");
     var first = registry.get(provider.api).?.stream.call(first_request);
     while (try first.next(std.Io.failing)) |_| {}
-    const second_request = testRequestWithSession(provider.getModel(), &second_buffer, "s1");
+    const second_request = testRequestWithSession(provider.getModel(), "s1");
     var second = registry.get(provider.api).?.stream.call(second_request);
     while (try second.next(std.Io.failing)) |_| {}
 
@@ -891,9 +880,7 @@ test "faux provider supports helper blocks for text thinking and tool calls" {
     };
     const message = assistantMessage(&content, .{ .stop_reason = .tool_use });
     try provider.setResponses(&.{message});
-    var event_buffer: [16]protocol.AssistantMessageEvent = undefined;
-
-    const response = try completeProvider(&provider, &event_buffer, provider.getModel());
+    const response = try completeProvider(&provider, provider.getModel());
 
     try std.testing.expectEqual(protocol.StopReason.tool_use, response.stop_reason);
     try std.testing.expectEqualStrings("think", response.content[0].thinking.thinking);
@@ -910,11 +897,8 @@ test "faux provider supports multiple models and model-aware factories" {
     defer provider.deinit();
     try provider.appendFactory(.{ .call_fn = modelAwareFactory });
     try provider.appendFactory(.{ .call_fn = modelAwareFactory });
-    var first_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var second_buffer: [8]protocol.AssistantMessageEvent = undefined;
-
-    const fast = try completeProvider(&provider, &first_buffer, provider.findModel("faux-fast").?);
-    const thinker = try completeProvider(&provider, &second_buffer, provider.findModel("faux-thinker").?);
+    const fast = try completeProvider(&provider, provider.findModel("faux-fast").?);
+    const thinker = try completeProvider(&provider, provider.findModel("faux-thinker").?);
 
     try std.testing.expectEqualStrings("faux-fast:false", fast.content[0].text.text);
     try std.testing.expectEqualStrings("faux-thinker:true", thinker.content[0].text.text);
@@ -928,9 +912,7 @@ test "faux provider rewrites api provider and model on returned messages" {
     });
     defer provider.deinit();
     try provider.setResponses(&.{assistantMessage(&.{text("hello")}, .{})});
-    var event_buffer: [8]protocol.AssistantMessageEvent = undefined;
-
-    const response = try completeProvider(&provider, &event_buffer, provider.getModel());
+    const response = try completeProvider(&provider, provider.getModel());
 
     try std.testing.expectEqualStrings("faux:test", response.api);
     try std.testing.expectEqualStrings("faux-provider", response.provider);
@@ -944,13 +926,9 @@ test "faux provider consumes queued responses in order and errors when exhausted
         assistantMessage(&.{text("first")}, .{}),
         assistantMessage(&.{text("second")}, .{}),
     });
-    var first_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var second_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var third_buffer: [2]protocol.AssistantMessageEvent = undefined;
-
-    const first = try completeProvider(&provider, &first_buffer, provider.getModel());
-    const second = try completeProvider(&provider, &second_buffer, provider.getModel());
-    const exhausted = try completeProvider(&provider, &third_buffer, provider.getModel());
+    const first = try completeProvider(&provider, provider.getModel());
+    const second = try completeProvider(&provider, provider.getModel());
+    const exhausted = try completeProvider(&provider, provider.getModel());
 
     try std.testing.expectEqualStrings("first", first.content[0].text.text);
     try std.testing.expectEqualStrings("second", second.content[0].text.text);
@@ -963,15 +941,14 @@ test "faux provider consumes queued responses in order and errors when exhausted
 test "faux provider can replace and append queued responses" {
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
-    var event_buffer: [8]protocol.AssistantMessageEvent = undefined;
     try provider.setResponses(&.{assistantMessage(&.{text("first")}, .{})});
-    const first = try completeProvider(&provider, &event_buffer, provider.getModel());
+    const first = try completeProvider(&provider, provider.getModel());
     try std.testing.expectEqualStrings("first", first.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 0), provider.pendingResponseCount());
 
     try provider.setResponses(&.{assistantMessage(&.{text("second")}, .{})});
     try std.testing.expectEqual(@as(usize, 1), provider.pendingResponseCount());
-    const second = try completeProvider(&provider, &event_buffer, provider.getModel());
+    const second = try completeProvider(&provider, provider.getModel());
     try std.testing.expectEqualStrings("second", second.content[0].text.text);
 
     try provider.appendResponses(&.{
@@ -979,8 +956,8 @@ test "faux provider can replace and append queued responses" {
         assistantMessage(&.{text("fourth")}, .{}),
     });
     try std.testing.expectEqual(@as(usize, 2), provider.pendingResponseCount());
-    const third = try completeProvider(&provider, &event_buffer, provider.getModel());
-    const fourth = try completeProvider(&provider, &event_buffer, provider.getModel());
+    const third = try completeProvider(&provider, provider.getModel());
+    const fourth = try completeProvider(&provider, provider.getModel());
     try std.testing.expectEqualStrings("third", third.content[0].text.text);
     try std.testing.expectEqualStrings("fourth", fourth.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 0), provider.pendingResponseCount());
@@ -990,9 +967,7 @@ test "faux provider emits an error when a response factory fails" {
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.appendFactory(.{ .call_fn = failingFactory });
-    var event_buffer: [2]protocol.AssistantMessageEvent = undefined;
-
-    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
 
     const event = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, event.reason);
@@ -1017,8 +992,7 @@ test "faux provider estimates prompt and output tokens from serialized context" 
             .timestamp = 2,
         } },
     };
-    var event_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var request = testRequest(provider.getModel(), &event_buffer);
+    var request = testRequest(provider.getModel());
     request.context = .{ .system_prompt = "sys", .messages = &messages };
 
     var stream = provider.apiProvider().stream.call(request);
@@ -1041,13 +1015,9 @@ test "faux provider does not share cache across sessions or requests without ses
         assistantMessage(&.{text("second")}, .{}),
         assistantMessage(&.{text("third")}, .{}),
     });
-    var first_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var second_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var third_buffer: [8]protocol.AssistantMessageEvent = undefined;
-
-    const first = try completeWithSession(&provider, &first_buffer, "session-1", .short);
-    const second = try completeWithSession(&provider, &second_buffer, "session-2", .short);
-    const third = try completeProvider(&provider, &third_buffer, provider.getModel());
+    const first = try completeWithSession(&provider, "session-1", .short);
+    const second = try completeWithSession(&provider, "session-2", .short);
+    const third = try completeProvider(&provider, provider.getModel());
 
     try std.testing.expect(first.usage.cache_write > 0);
     try std.testing.expectEqual(@as(u64, 0), second.usage.cache_read);
@@ -1063,11 +1033,8 @@ test "faux provider does not simulate caching when cache retention is none" {
         assistantMessage(&.{text("first")}, .{}),
         assistantMessage(&.{text("second")}, .{}),
     });
-    var first_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var second_buffer: [8]protocol.AssistantMessageEvent = undefined;
-
-    _ = try completeWithSession(&provider, &first_buffer, "session-1", .none);
-    const second = try completeWithSession(&provider, &second_buffer, "session-1", .none);
+    _ = try completeWithSession(&provider, "session-1", .none);
+    const second = try completeWithSession(&provider, "session-1", .none);
 
     try std.testing.expectEqual(@as(u64, 0), second.usage.cache_read);
     try std.testing.expectEqual(@as(u64, 0), second.usage.cache_write);
@@ -1081,8 +1048,7 @@ test "faux provider streams exact event order for fixed-size chunks" {
         text("ok"),
         toolCall("tool-1", "echo", .{ .object = .empty }),
     }, .{ .stop_reason = .tool_use })});
-    var event_buffer: [16]protocol.AssistantMessageEvent = undefined;
-    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
 
     const expected = [_]std.meta.Tag(protocol.AssistantMessageEvent){
         .start,
@@ -1108,8 +1074,7 @@ test "faux provider streams multiple tool calls in one message" {
         toolCall("tool-1", "echo", .{ .object = .empty }),
         toolCall("tool-2", "echo", .{ .object = .empty }),
     }, .{ .stop_reason = .tool_use })});
-    var event_buffer: [16]protocol.AssistantMessageEvent = undefined;
-    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
     var start_count: usize = 0;
     var end_count: usize = 0;
 
@@ -1130,8 +1095,7 @@ test "faux provider streams explicit assistant error as terminal error" {
         .stop_reason = .error_,
         .error_message = "upstream failed",
     })});
-    var event_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
 
     while (try stream.next(std.Io.failing)) |event| {
         if (event == .@"error") {
@@ -1151,8 +1115,7 @@ test "faux provider streams explicit assistant aborted as terminal error" {
         .stop_reason = .aborted,
         .error_message = "Request was aborted",
     })});
-    var event_buffer: [8]protocol.AssistantMessageEvent = undefined;
-    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel(), &event_buffer));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
 
     while (try stream.next(std.Io.failing)) |event| {
         if (event == .@"error") {
@@ -1207,21 +1170,19 @@ const model_thinker_content = [_]protocol.AssistantContent{text("faux-thinker:tr
 
 fn completeProvider(
     provider: *Provider,
-    event_buffer: []protocol.AssistantMessageEvent,
     model: protocol.Model,
 ) !protocol.AssistantMessage {
-    var stream = provider.apiProvider().stream.call(testRequest(model, event_buffer));
+    var stream = provider.apiProvider().stream.call(testRequest(model));
     while (try stream.next(std.Io.failing)) |_| {}
     return stream.result() orelse error.MissingResult;
 }
 
 fn completeWithSession(
     provider: *Provider,
-    event_buffer: []protocol.AssistantMessageEvent,
     session_id: []const u8,
     cache_retention: protocol.CacheRetention,
 ) !protocol.AssistantMessage {
-    var request = testRequestWithSession(provider.getModel(), event_buffer, session_id);
+    var request = testRequestWithSession(provider.getModel(), session_id);
     request.options.cache_retention = cache_retention;
     var stream = provider.apiProvider().stream.call(request);
     while (try stream.next(std.Io.failing)) |_| {}
@@ -1239,22 +1200,20 @@ fn jsonObjectWithString(
     return object;
 }
 
-fn testRequest(model: protocol.Model, event_buffer: []protocol.AssistantMessageEvent) protocol.StreamRequest {
+fn testRequest(model: protocol.Model) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
         .model = model,
         .context = .{ .messages = &.{.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }} },
-        .event_buffer = event_buffer,
     };
 }
 
 fn testRequestWithSession(
     model: protocol.Model,
-    event_buffer: []protocol.AssistantMessageEvent,
     session_id: []const u8,
 ) protocol.StreamRequest {
-    var request = testRequest(model, event_buffer);
+    var request = testRequest(model);
     request.options.session_id = session_id;
     return request;
 }

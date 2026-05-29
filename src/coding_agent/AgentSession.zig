@@ -52,6 +52,14 @@ pub const PromptOptions = struct {
     streaming_behavior: ?StreamingBehavior = null,
 };
 
+pub const LivePromptRun = struct {
+    token: runtime.CancelToken,
+    stream: agent_mod.loop.AgentEventStream = undefined,
+    buffer: [64]agent_mod.AgentEvent = undefined,
+    prompts: [1]agent_mod.AgentMessage = undefined,
+    active: bool = false,
+};
+
 pub const AgentSessionStatus = enum {
     idle,
     running,
@@ -87,6 +95,10 @@ pub const OwnedEventText = struct {
     pub fn deinit(self: *OwnedEventText) void {
         self.allocator.free(self.text);
         self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: OwnedEventText, stringify: *std.json.Stringify) !void {
+        try stringify.write(self.text);
     }
 };
 
@@ -347,7 +359,7 @@ const EventDrain = struct {
     pub fn handle(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         try self.updateQueueMirror(event);
         try self.runSessionHooks(event);
-        try self.emitPublicEvent(event);
+        self.emitPublicEvent(event);
         // TODO(owner: coding_agent): When terminal policy can run for the same event as fallible persistence,
         // preserve the persistence error but still apply terminal policy before returning.
         try self.persistEvent(event);
@@ -364,7 +376,7 @@ const EventDrain = struct {
 
     fn runSessionHooks(_: *EventDrain, _: agent_mod.AgentEvent) !void {}
 
-    fn emitPublicEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
+    fn emitPublicEvent(self: *EventDrain, event: agent_mod.AgentEvent) void {
         self.enqueuePublicEvent(.{ .agent_event = event });
     }
 
@@ -528,19 +540,95 @@ pub fn promptWithOptions(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !void {
+    const run = self.startPromptRun(text, images, options) catch |err| switch (err) {
+        error.PromptCommandCannotStartLiveRun, error.PromptQueuedCannotStartLiveRun => return,
+        else => |unexpected| return unexpected,
+    };
+    defer self.destroyPromptRun(run);
+    while (try self.stepPromptRun(run)) {}
+}
+
+fn startPromptRun(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    options: PromptOptions,
+) !*LivePromptRun {
     try self.ensureAcceptsPrompt();
     var preflight = try self.preparePromptInput(text, images, options);
     defer preflight.deinit(self.allocator);
-    if (try self.tryHandlePromptCommand(&preflight)) return;
+    if (try self.tryHandlePromptCommand(&preflight)) return error.PromptCommandCannotStartLiveRun;
     try self.runInputHooks(&preflight);
     try self.expandPromptResources(&preflight);
-    if (try self.queuePromptIfStreaming(&preflight)) return;
+    if (try self.queuePromptIfStreaming(&preflight)) return error.PromptQueuedCannotStartLiveRun;
     try self.flushPendingSessionMessages();
     try self.checkModelPreconditions();
     try self.checkPrePromptCompaction();
     try self.runBeforeAgentStartHooks(&preflight);
-    const message = try self.constructUserMessage(preflight.text, preflight.images);
-    try self.sendPreparedPrompt(&.{message});
+    return self.startPreparedPromptRun(&preflight);
+}
+
+pub fn startLivePromptRun(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    options: PromptOptions,
+) !*LivePromptRun {
+    return self.startPromptRun(text, images, options);
+}
+
+fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight) !*LivePromptRun {
+    const run = try self.allocator.create(LivePromptRun);
+    errdefer self.allocator.destroy(run);
+    run.* = .{ .token = undefined };
+    run.prompts[0] = try self.constructUserMessage(preflight.text, preflight.images);
+    run.token = try self.agent.beginRun();
+    errdefer self.agent.finishRun();
+    agent_mod.loop.startPromptStream(
+        &run.stream,
+        self.allocator,
+        self.io,
+        &run.prompts,
+        .{
+            .system_prompt = self.agent.state.system_prompt,
+            .messages = self.agent.state.messages,
+            .tools = self.agent.state.tools,
+        },
+        self.agent.loop_config,
+        run.token,
+        &run.buffer,
+    );
+    run.active = true;
+    return run;
+}
+
+pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
+    if (!run.active) return false;
+    if (try run.stream.next(self.io)) |event| {
+        try self.agent.emitEvent(event);
+        return true;
+    }
+    run.stream.awaitProducer() catch |err| {
+        try self.agent.failRun(run.token, @errorName(err));
+        self.agent.finishRun();
+        run.active = false;
+        return err;
+    };
+    self.agent.finishRun();
+    run.active = false;
+    return false;
+}
+
+pub fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
+    if (run.active) {
+        run.stream.cancelProducer() catch |err| {
+            std.debug.panic("prompt run cancellation failed: {s}", .{@errorName(err)});
+        };
+        self.agent.finishRun();
+        run.active = false;
+    }
+    run.stream.deinit();
+    self.allocator.destroy(run);
 }
 
 pub fn continueRun(self: *AgentSession) !void {
@@ -781,10 +869,6 @@ fn userMessageText(message: ai.UserMessage) ?[]const u8 {
 }
 
 fn runBeforeAgentStartHooks(_: *AgentSession, _: *const PromptPreflight) !void {}
-
-fn sendPreparedPrompt(self: *AgentSession, messages: []const agent_mod.AgentMessage) !void {
-    try self.agent.promptMessages(messages);
-}
 
 fn drainAgentEvent(
     _: std.Io,

@@ -352,6 +352,10 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
     }
 }
 
+pub fn failRun(self: *Agent, token: zistd.CancelToken, message: []const u8) !void {
+    try self.recordRunFailure(token, message);
+}
+
 fn recordRunFailure(self: *Agent, token: zistd.CancelToken, message: []const u8) !void {
     const stop_reason: ai.StopReason = if (token.isRequested()) .aborted else .error_;
     const assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
@@ -720,7 +724,7 @@ fn defaultConvertToLlm(
 }
 
 fn defaultStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
-    var stream = ai.AssistantMessageEventStream.init(request.event_buffer);
+    var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     sink.endDone(request.io, .stop, .{
         .content = &.{},

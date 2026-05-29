@@ -55,104 +55,48 @@ fn streamSimpleFunction(context: ?*anyopaque, request: protocol.StreamRequest) p
 
 fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protocol.AssistantMessageEventStream {
     const self: *Provider = @ptrCast(@alignCast(context.?));
-    var stream = protocol.AssistantMessageEventStream.init(request.event_buffer);
-    const sink = stream.sink();
-
-    run(self, request, sink) catch |err| {
-        if (err == error.ErrorEmitted) return stream;
-        if (err == error.OperationCancelled or err == error.Canceled) {
-            const message = protocol.emptyAssistantMessageFromRequest(request, .aborted, "Request was aborted");
-            sink.endAborted(request.io, message) catch return stream;
-            return stream;
-        }
-        const message = protocol.emptyAssistantMessageFromRequest(request, .error_, @errorName(err));
-        sink.endError(request.io, .error_, message) catch return stream;
-    };
-
-    return stream;
+    const state = createResponseStream(self, request) catch |err| return shared.errorStream(request, err);
+    return state.stream();
 }
 
-fn run(self: *Provider, request: protocol.StreamRequest, sink: protocol.AssistantMessageEventSink) !void {
-    const api_key = request.options.api_key orelse resolveApiKey(self, request) orelse return error.MissingApiKey;
+const OpenAiResponseOwner = struct {
+    pub fn deinit(_: *OpenAiResponseOwner, _: std.mem.Allocator) void {}
+};
+
+const OpenAiResponseStream = shared.SsePullStream(OpenAiResponseOwner, .{
+    .read_buffer_len = read_buffer_len,
+    .redirect_buffer_len = redirect_buffer_len,
+});
+
+fn createResponseStream(provider: *Provider, request: protocol.StreamRequest) !*OpenAiResponseStream {
+    const state = try request.allocator.create(OpenAiResponseStream);
+    state.* = OpenAiResponseStream.init(request.allocator, request, .{});
+    errdefer state.deinit();
+
+    const api_key = request.options.api_key orelse resolveApiKey(provider, request) orelse return error.MissingApiKey;
     const body = try buildRequestBody(request.allocator, request);
     defer request.allocator.free(body);
-
-    var reducer = shared.ResponseStreamReducer.init(request.allocator, request.model, 0);
-    defer reducer.deinit();
-    try sink.emit(request.io, .{ .start = .{ .partial = try reducer.partial() } });
-
-    var client: std.http.Client = .{ .allocator = request.allocator, .io = request.io };
-    defer client.deinit();
     const url = try endpointUrl(request.allocator, request.model.base_url);
     defer request.allocator.free(url);
     const uri = try std.Uri.parse(url);
+    const authorization = try http_utils.bearerHeader(request.allocator, api_key);
+    defer request.allocator.free(authorization);
     const headers = [_]std.http.Header{
-        .{ .name = "Authorization", .value = try http_utils.bearerHeader(request.allocator, api_key) },
+        .{ .name = "Authorization", .value = authorization },
         .{ .name = "Accept", .value = "text/event-stream" },
     };
-    defer request.allocator.free(headers[0].value);
 
-    var req = try client.request(.POST, uri, .{
-        .extra_headers = &headers,
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-            .accept_encoding = .omit,
-        },
-        .redirect_behavior = .unhandled,
-        .keep_alive = false,
-    });
-    defer req.deinit();
-
-    req.transfer_encoding = .{ .content_length = body.len };
-    var body_writer = try req.sendBodyUnflushed(&.{});
-    try body_writer.writer.writeAll(body);
-    try body_writer.end();
-    try req.connection.?.flush();
-
-    var redirects: [redirect_buffer_len]u8 = .{};
-    var response = try req.receiveHead(&redirects);
-    var transfer_buffer: [read_buffer_len]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    if (response.head.status != .ok) {
-        const detail = readErrorBody(request.allocator, reader) catch try std.fmt.allocPrint(
+    try state.openRequest(uri, &headers, body);
+    if (state.response.head.status != .ok) {
+        const detail = readErrorBody(request.allocator, state.reader.?) catch try std.fmt.allocPrint(
             request.allocator,
             "HTTP {s}",
-            .{@tagName(response.head.status)},
+            .{@tagName(state.response.head.status)},
         );
-        var message = protocol.emptyAssistantMessageFromRequest(request, .error_, detail);
-        message.stop_reason = .error_;
-        try sink.endError(request.io, .error_, message);
-        return error.ErrorEmitted;
+        try state.emitError(detail);
     }
-
-    var parser = sse.Parser.init(request.allocator, .{});
-    defer parser.deinit();
-    var parser_sink: ReducerSseSink = .{ .io = request.io, .assistant_sink = sink, .reducer = &reducer };
-
-    while (true) {
-        var chunk: [read_buffer_len]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&chunk);
-        const n = reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) continue;
-        try parser.feed(chunk[0..n], &parser_sink);
-    }
-
-    try parser.finish(&parser_sink);
-    try reducer.finish(request.io, sink);
+    return state;
 }
-
-const ReducerSseSink = struct {
-    io: std.Io,
-    assistant_sink: protocol.AssistantMessageEventSink,
-    reducer: *shared.ResponseStreamReducer,
-
-    pub fn emit(self: *ReducerSseSink, event: sse.Event) !void {
-        try self.reducer.applySseData(self.io, self.assistant_sink, event.data);
-    }
-};
 
 fn readErrorBody(allocator: std.mem.Allocator, reader: anytype) ![]const u8 {
     const body = try http_utils.readBoundedBody(allocator, reader, max_error_body_bytes);
@@ -366,8 +310,7 @@ test "provider registers openai responses api" {
 
 test "provider stream without auth emits missing api key error" {
     var provider = Provider.init(.{});
-    var event_buffer: [4]protocol.AssistantMessageEvent = undefined;
-    var stream = provider.apiProvider().stream.call(testRequestWithBuffer(&event_buffer));
+    var stream = provider.apiProvider().stream.call(testRequest());
 
     const err = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, err.reason);
@@ -393,12 +336,6 @@ test "request body includes model stream input and tools" {
 }
 
 fn testRequest() protocol.StreamRequest {
-    var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
-    _ = &event_buffer;
-    return testRequestWithBuffer(&event_buffer);
-}
-
-fn testRequestWithBuffer(event_buffer: []protocol.AssistantMessageEvent) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
@@ -419,6 +356,5 @@ fn testRequestWithBuffer(event_buffer: []protocol.AssistantMessageEvent) protoco
             .messages = &.{.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }},
             .tools = &.{.{ .name = "echo", .description = "Echo", .parameters = .{ .object = .empty } }},
         },
-        .event_buffer = event_buffer,
     };
 }

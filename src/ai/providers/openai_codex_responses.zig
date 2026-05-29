@@ -59,164 +59,9 @@ fn streamSimpleFunction(context: ?*anyopaque, request: protocol.StreamRequest) p
 
 fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protocol.AssistantMessageEventStream {
     const self: *Provider = @ptrCast(@alignCast(context.?));
-    var stream = protocol.AssistantMessageEventStream.init(request.event_buffer);
-    const sink = stream.sink();
-
-    run(self, request, sink) catch |err| {
-        if (err == error.ErrorEmitted) return stream;
-        if (err == error.OperationCancelled or err == error.Canceled) {
-            const message = protocol.emptyAssistantMessageFromRequest(request, .aborted, "Request was aborted");
-            sink.endAborted(request.io, message) catch return stream;
-            return stream;
-        }
-        const message = protocol.emptyAssistantMessageFromRequest(request, .error_, @errorName(err));
-        sink.endError(request.io, .error_, message) catch return stream;
-    };
-
-    return stream;
-}
-
-fn run(self: *Provider, request: protocol.StreamRequest, sink: protocol.AssistantMessageEventSink) !void {
     _ = self;
-    const api_key = request.options.api_key orelse resolveApiKey(request) orelse return error.MissingApiKey;
-    const account_id = try oauth_openai_codex.getAccountId(
-        request.allocator,
-        api_key,
-    ) orelse return error.MissingAccountId;
-    defer request.allocator.free(account_id);
-    const body = try buildRequestBody(request.allocator, request);
-    defer request.allocator.free(body);
-
-    try requestWithRetries(request, sink, api_key, account_id, body);
-}
-
-fn requestWithRetries(
-    request: protocol.StreamRequest,
-    sink: protocol.AssistantMessageEventSink,
-    api_key: []const u8,
-    account_id: []const u8,
-    body: []const u8,
-) !void {
-    const retry_count_max = boundedRetryCount(request.options.max_retries);
-    var attempt: u32 = 0;
-    var last_error: ?anyerror = null;
-    while (attempt <= retry_count_max) : (attempt += 1) {
-        requestOnce(request, sink, api_key, account_id, body) catch |err| switch (err) {
-            error.ErrorEmitted => return error.ErrorEmitted,
-            error.RetryableRequestFailed => {
-                last_error = err;
-                if (attempt == retry_count_max) return err;
-                try runtime.sleep(
-                    request.io,
-                    retryDelay(attempt, request.options.max_retry_delay_ms),
-                    request.cancel_token,
-                );
-                continue;
-            },
-            else => |other| {
-                last_error = other;
-                if (attempt == retry_count_max or !isRetryableTransportError(other)) return other;
-                try runtime.sleep(
-                    request.io,
-                    retryDelay(attempt, request.options.max_retry_delay_ms),
-                    request.cancel_token,
-                );
-                continue;
-            },
-        };
-        return;
-    }
-    return last_error orelse error.RetryableRequestFailed;
-}
-
-fn requestOnce(
-    request: protocol.StreamRequest,
-    sink: protocol.AssistantMessageEventSink,
-    api_key: []const u8,
-    account_id: []const u8,
-    body: []const u8,
-) !void {
-    var reducer = shared.ResponseStreamReducer.init(request.allocator, request.model, 0);
-    defer reducer.deinit();
-
-    var client: std.http.Client = .{ .allocator = request.allocator, .io = request.io };
-    defer client.deinit();
-    const url = try endpointUrl(request.allocator, request.model.base_url);
-    defer request.allocator.free(url);
-    const uri = try std.Uri.parse(url);
-    var headers: [7]std.http.Header = undefined;
-    var header_count: usize = 0;
-    headers[header_count] = .{ .name = "Authorization", .value = try http_utils.bearerHeader(request.allocator, api_key) };
-    header_count += 1;
-    headers[header_count] = .{ .name = "chatgpt-account-id", .value = account_id };
-    header_count += 1;
-    headers[header_count] = .{ .name = "originator", .value = "zi" };
-    header_count += 1;
-    headers[header_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
-    header_count += 1;
-    headers[header_count] = .{ .name = "Accept", .value = "text/event-stream" };
-    header_count += 1;
-    if (request.options.session_id) |session_id| {
-        headers[header_count] = .{ .name = "session_id", .value = session_id };
-        header_count += 1;
-        headers[header_count] = .{ .name = "x-client-request-id", .value = session_id };
-        header_count += 1;
-    }
-    defer request.allocator.free(headers[0].value);
-
-    const extra_headers = headers[0..header_count];
-    var req = try client.request(.POST, uri, .{
-        .extra_headers = extra_headers,
-        .headers = .{ .content_type = .{ .override = "application/json" }, .accept_encoding = .omit },
-        .redirect_behavior = .unhandled,
-        .keep_alive = false,
-    });
-    defer req.deinit();
-
-    req.transfer_encoding = .{ .content_length = body.len };
-    var body_writer = try req.sendBodyUnflushed(&.{});
-    try body_writer.writer.writeAll(body);
-    try body_writer.end();
-    try req.connection.?.flush();
-
-    var redirects: [redirect_buffer_len]u8 = .{};
-    var response = try req.receiveHead(&redirects);
-    var transfer_buffer: [read_buffer_len]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    if (response.head.status != .ok) {
-        const detail = readErrorBody(request.allocator, reader) catch try std.fmt.allocPrint(
-            request.allocator,
-            "HTTP {s}",
-            .{@tagName(response.head.status)},
-        );
-        if (isRetryableStatus(response.head.status) or isRetryableErrorText(detail)) {
-            request.allocator.free(detail);
-            return error.RetryableRequestFailed;
-        }
-        var message = protocol.emptyAssistantMessageFromRequest(request, .error_, detail);
-        message.stop_reason = .error_;
-        try sink.endError(request.io, .error_, message);
-        return error.ErrorEmitted;
-    }
-
-    try sink.emit(request.io, .{ .start = .{ .partial = try reducer.partial() } });
-    var parser = sse.Parser.init(request.allocator, .{});
-    defer parser.deinit();
-    var parser_sink: ReducerSseSink = .{ .io = request.io, .assistant_sink = sink, .reducer = &reducer };
-
-    while (true) {
-        var chunk: [read_buffer_len]u8 = undefined;
-        var writer: std.Io.Writer = .fixed(&chunk);
-        const n = reader.stream(&writer, .limited(chunk.len)) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) continue;
-        try parser.feed(chunk[0..n], &parser_sink);
-    }
-
-    try parser.finish(&parser_sink);
-    try reducer.finish(request.io, sink);
+    const state = createCodexResponseStream(request) catch |err| return shared.errorStream(request, err);
+    return state.stream();
 }
 
 fn boundedRetryCount(value: ?u32) u32 {
@@ -258,15 +103,110 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
 }
 
-const ReducerSseSink = struct {
-    io: std.Io,
-    assistant_sink: protocol.AssistantMessageEventSink,
-    reducer: *shared.ResponseStreamReducer,
+const CodexResponseOwner = struct {
+    account_id: []const u8,
+    authorization: []const u8,
+    body: []const u8,
+    url: []const u8,
 
-    pub fn emit(self: *ReducerSseSink, event: sse.Event) !void {
-        try self.reducer.applySseData(self.io, self.assistant_sink, event.data);
+    pub fn deinit(self: *CodexResponseOwner, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        allocator.free(self.body);
+        allocator.free(self.authorization);
+        allocator.free(self.account_id);
+        self.* = undefined;
     }
 };
+
+const CodexResponseStream = shared.SsePullStream(CodexResponseOwner, .{
+    .read_buffer_len = read_buffer_len,
+    .redirect_buffer_len = redirect_buffer_len,
+});
+
+fn createCodexResponseStream(request: protocol.StreamRequest) !*CodexResponseStream {
+    const allocator = request.allocator;
+    const api_key = request.options.api_key orelse resolveApiKey(request) orelse return error.MissingApiKey;
+    const account_id = try oauth_openai_codex.getAccountId(allocator, api_key) orelse return error.MissingAccountId;
+    errdefer allocator.free(account_id);
+    const authorization = try http_utils.bearerHeader(allocator, api_key);
+    errdefer allocator.free(authorization);
+    const body = try buildRequestBody(allocator, request);
+    errdefer allocator.free(body);
+    const url = try endpointUrl(allocator, request.model.base_url);
+    errdefer allocator.free(url);
+
+    const state = try allocator.create(CodexResponseStream);
+    state.* = CodexResponseStream.init(allocator, request, .{
+        .account_id = account_id,
+        .authorization = authorization,
+        .body = body,
+        .url = url,
+    });
+    errdefer state.deinit();
+
+    try openWithRetries(state);
+    return state;
+}
+
+fn openWithRetries(state: *CodexResponseStream) !void {
+    const retry_count_max = boundedRetryCount(state.request.options.max_retries);
+    var attempt: u32 = 0;
+    var last_error: ?anyerror = null;
+    while (attempt <= retry_count_max) : (attempt += 1) {
+        openOnce(state) catch |err| switch (err) {
+            error.RetryableRequestFailed => {
+                last_error = err;
+                if (attempt == retry_count_max) return err;
+                try runtime.sleep(state.request.io, retryDelay(attempt, state.request.options.max_retry_delay_ms), state.request.cancel_token);
+                continue;
+            },
+            else => |other| {
+                last_error = other;
+                if (attempt == retry_count_max or !isRetryableTransportError(other)) return other;
+                try runtime.sleep(state.request.io, retryDelay(attempt, state.request.options.max_retry_delay_ms), state.request.cancel_token);
+                continue;
+            },
+        };
+        return;
+    }
+    return last_error orelse error.RetryableRequestFailed;
+}
+
+fn openOnce(state: *CodexResponseStream) !void {
+    const uri = try std.Uri.parse(state.owner.url);
+    var headers: [7]std.http.Header = undefined;
+    var header_count: usize = 0;
+    headers[header_count] = .{ .name = "Authorization", .value = state.owner.authorization };
+    header_count += 1;
+    headers[header_count] = .{ .name = "chatgpt-account-id", .value = state.owner.account_id };
+    header_count += 1;
+    headers[header_count] = .{ .name = "originator", .value = "zi" };
+    header_count += 1;
+    headers[header_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
+    header_count += 1;
+    headers[header_count] = .{ .name = "Accept", .value = "text/event-stream" };
+    header_count += 1;
+    if (state.request.options.session_id) |session_id| {
+        headers[header_count] = .{ .name = "session_id", .value = session_id };
+        header_count += 1;
+        headers[header_count] = .{ .name = "x-client-request-id", .value = session_id };
+        header_count += 1;
+    }
+
+    try state.openRequest(uri, headers[0..header_count], state.owner.body);
+    if (state.response.head.status != .ok) {
+        const detail = readErrorBody(state.allocator, state.reader.?) catch try std.fmt.allocPrint(
+            state.allocator,
+            "HTTP {s}",
+            .{@tagName(state.response.head.status)},
+        );
+        if (isRetryableStatus(state.response.head.status) or isRetryableErrorText(detail)) {
+            state.allocator.free(detail);
+            return error.RetryableRequestFailed;
+        }
+        try state.emitError(detail);
+    }
+}
 
 fn readErrorBody(allocator: std.mem.Allocator, reader: anytype) ![]const u8 {
     const body = try http_utils.readBoundedBody(allocator, reader, max_error_body_bytes);
@@ -485,8 +425,7 @@ test "provider registers openai codex responses api" {
 
 test "provider stream without auth emits missing api key error" {
     var provider = Provider.init(.{});
-    var event_buffer: [4]protocol.AssistantMessageEvent = undefined;
-    var stream = provider.apiProvider().stream.call(testRequestWithBuffer(&event_buffer));
+    var stream = provider.apiProvider().stream.call(testRequest());
 
     const err = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, err.reason);
@@ -527,12 +466,6 @@ test "request body follows codex contract and omits max output tokens" {
 }
 
 fn testRequest() protocol.StreamRequest {
-    var event_buffer: [1]protocol.AssistantMessageEvent = undefined;
-    _ = &event_buffer;
-    return testRequestWithBuffer(&event_buffer);
-}
-
-fn testRequestWithBuffer(event_buffer: []protocol.AssistantMessageEvent) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
@@ -553,6 +486,5 @@ fn testRequestWithBuffer(event_buffer: []protocol.AssistantMessageEvent) protoco
             .messages = &.{.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }},
             .tools = &.{.{ .name = "echo", .description = "Echo", .parameters = .{ .object = .empty } }},
         },
-        .event_buffer = event_buffer,
     };
 }
