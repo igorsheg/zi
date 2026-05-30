@@ -18,6 +18,7 @@ pub const skills = @import("skills.zig");
 pub const system_prompt = @import("system_prompt.zig");
 pub const tool_registry = @import("tool_registry.zig");
 pub const tools = @import("tools/root.zig");
+pub const tui_mode = @import("tui_mode.zig");
 
 pub const PersistencePaths = paths.PersistencePaths;
 pub const ContextFile = resources.ContextFile;
@@ -69,6 +70,7 @@ pub fn testsReachable() void {
     _ = system_prompt;
     _ = tool_registry;
     _ = tools;
+    _ = tui_mode;
 }
 
 test {
@@ -92,4 +94,5 @@ test {
     _ = system_prompt;
     _ = tool_registry;
     _ = tools;
+    _ = tui_mode;
 }

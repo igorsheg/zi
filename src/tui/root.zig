@@ -9,6 +9,7 @@ pub const surface = @import("surface.zig");
 pub const testing = @import("testing.zig");
 pub const terminal = @import("terminal.zig");
 pub const transcript = @import("transcript.zig");
+pub const transcript_renderer = @import("transcript_renderer.zig");
 pub const view = @import("view.zig");
 
 test {
@@ -23,5 +24,6 @@ test {
     _ = testing;
     _ = terminal;
     _ = transcript;
+    _ = transcript_renderer;
     _ = view;
 }

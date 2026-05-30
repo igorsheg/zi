@@ -12,6 +12,7 @@ const event_mod = @import("event.zig");
 const slot_mod = @import("slot.zig");
 const surface_mod = @import("surface.zig");
 const transcript_mod = @import("transcript.zig");
+const transcript_renderer_mod = @import("transcript_renderer.zig");
 const view_mod = @import("view.zig");
 
 pub const App = struct {
@@ -101,6 +102,33 @@ pub const App = struct {
         }
     }
 
+    /// True when any surface has pending paint. The frame loop uses this to
+    /// skip rendering when nothing changed, so repaint cost is paid only on
+    /// real mutation rather than once per input event.
+    pub fn isDirty(self: *const App) bool {
+        var index: usize = 0;
+        while (index < self.surface_count) : (index += 1) {
+            if (self.surfaces[index].dirty) return true;
+        }
+        return false;
+    }
+
+    /// Stretch base-layer surfaces (and their views) to the full terminal
+    /// bounds on a resize. Overlay layers keep their explicit rects.
+    pub fn resize(self: *App, width: u16, height: u16) void {
+        std.debug.assert(width > 0);
+        std.debug.assert(height > 0);
+        const full = view_mod.Rect.init(0, 0, width, height);
+        var index: usize = 0;
+        while (index < self.surface_count) : (index += 1) {
+            var surf = &self.surfaces[index];
+            if (surf.layer != .base) continue;
+            surf.rect = full;
+            surf.markDirty();
+            if (self.getView(surf.view_id)) |view| view.rect = full;
+        }
+    }
+
     fn surfaceLessThan(self: *App, lhs_index: usize, rhs_index: usize) bool {
         const lhs = self.surfaces[lhs_index];
         const rhs = self.surfaces[rhs_index];
@@ -144,21 +172,13 @@ pub const App = struct {
     fn dispatchAppendTranscriptText(self: *App, payload: command_mod.TuiCommand.AppendTranscriptText) !void {
         const item_id = try self.transcript.appendText(payload.kind, payload.durability, payload.text, 0);
         try self.emitTranscriptAppended(item_id, payload.durability);
-
-        switch (payload.kind) {
-            .user_message => {
-                try self.appendChatText("\n> ");
-                try self.appendChatText(payload.text);
-                try self.appendChatText("\n");
-            },
-            .assistant_message, .system => try self.appendChatText(payload.text),
-            .tool_call, .custom => {},
-        }
+        try self.appendTranscriptItemProjection(item_id);
     }
 
     fn dispatchAppendCustomTranscriptItem(self: *App, payload: command_mod.TuiCommand.AppendCustomTranscriptItem) !void {
         const item_id = try self.transcript.appendCustom(payload.durability, payload.custom_type, payload.data_json, 0);
         try self.emitTranscriptAppended(item_id, payload.durability);
+        try self.appendTranscriptItemProjection(item_id);
     }
 
     fn dispatchSlotSetText(self: *App, payload: command_mod.TuiCommand.SlotSetText) !void {
@@ -210,9 +230,6 @@ pub const App = struct {
                     .durability = .ephemeral,
                     .text = payload.tool_name,
                 } });
-                try self.appendChatText("\n[tool] ");
-                try self.appendChatText(payload.tool_name);
-                try self.appendChatText("\n");
             },
             else => {},
         }
@@ -240,7 +257,6 @@ pub const App = struct {
                 try self.appendAssistantDelta(payload.delta);
             },
             .text_end => {
-                try self.appendChatText("\n");
                 self.active_assistant_item_id = null;
             },
             else => {},
@@ -255,11 +271,22 @@ pub const App = struct {
             self.active_assistant_item_id = id;
             try self.emitTranscriptAppended(id, .ephemeral);
         }
-        try self.appendChatText(delta);
+        try self.appendAssistantDeltaProjection(delta);
     }
 
-    fn appendChatText(self: *App, bytes: []const u8) !void {
-        try self.appendBuffer(.chat, bytes);
+    fn appendTranscriptItemProjection(self: *App, item_id: transcript_mod.TranscriptItemId) !void {
+        const chat = self.getBuffer(.chat).?;
+        const item = self.transcript.get(item_id).?;
+        try transcript_renderer_mod.Renderer.appendItemToChatBuffer(self.allocator, item, chat);
+        self.markBufferSurfacesDirty(.chat);
+        try self.emit(.{ .buffer_changed = .{ .id = .chat, .revision = chat.revision } });
+    }
+
+    fn appendAssistantDeltaProjection(self: *App, delta: []const u8) !void {
+        const chat = self.getBuffer(.chat).?;
+        try transcript_renderer_mod.Renderer.appendAssistantDeltaToChatBuffer(self.allocator, delta, chat);
+        self.markBufferSurfacesDirty(.chat);
+        try self.emit(.{ .buffer_changed = .{ .id = .chat, .revision = chat.revision } });
     }
 
     fn appendBuffer(self: *App, id: buffer_mod.BufferId, bytes: []const u8) !void {
@@ -497,6 +524,50 @@ test "surfaces render in deterministic layer and insertion order" {
     });
 
     try @import("testing.zig").expectScreenAscii("modal   ", &screen, 8, 1);
+}
+
+test "resize stretches base surfaces and views to full bounds and marks dirty" {
+    var app = try App.init(std.testing.allocator, 10, 4);
+    defer app.deinit();
+
+    app.resize(20, 8);
+
+    const surf = app.getSurface(.chat).?;
+    try std.testing.expectEqual(@as(u16, 20), surf.rect.width);
+    try std.testing.expectEqual(@as(u16, 8), surf.rect.height);
+    const v = app.getView(.chat).?;
+    try std.testing.expectEqual(@as(u16, 20), v.rect.width);
+    try std.testing.expectEqual(@as(u16, 8), v.rect.height);
+    try std.testing.expect(app.isDirty());
+}
+
+test "render clears dirty until the next mutation" {
+    var app = try App.init(std.testing.allocator, 12, 3);
+    defer app.deinit();
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 3,
+        .cols = 12,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const root: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+
+    try std.testing.expect(app.isDirty());
+    app.render(root);
+    try std.testing.expect(!app.isDirty());
+
+    try app.appendBuffer(.chat, "x");
+    try std.testing.expect(app.isDirty());
 }
 
 fn emptyAssistantMessage() ai.AssistantMessage {

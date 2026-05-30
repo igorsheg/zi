@@ -4,6 +4,7 @@ const auth_mode = @import("../auth_mode.zig");
 const args_mod = @import("args.zig");
 const print_mode = @import("../print_mode.zig");
 const sdk = @import("../sdk.zig");
+const tui_mode = @import("../tui_mode.zig");
 
 pub const parser = args_mod;
 pub const Command = args_mod.Command;
@@ -92,14 +93,23 @@ fn runApp(
 ) !void {
     if (app.help) return args_mod.writeHelp(stdout);
     if (app.unknown_flags.count > 0) return unknownFlag(stderr, app.unknown_flags.slice()[0].name);
-    if (app.messages.count != 1) return usage(stderr);
 
     const stdin_is_tty = try std.Io.File.stdin().isTty(process.io);
     return switch (args_mod.resolveAppMode(app, stdin_is_tty)) {
-        .text => runPrompt(process, stdout, stderr, app.messages.slice()[0], .text, options),
-        .json => runPrompt(process, stdout, stderr, app.messages.slice()[0], .json, options),
+        .text => {
+            if (app.messages.count != 1) return usage(stderr);
+            return runPrompt(process, stdout, stderr, app.messages.slice()[0], .text, options);
+        },
+        .json => {
+            if (app.messages.count != 1) return usage(stderr);
+            return runPrompt(process, stdout, stderr, app.messages.slice()[0], .json, options);
+        },
         .rpc => unsupported(stderr, "rpc mode is not implemented yet"),
-        .interactive => unsupported(stderr, "interactive mode is not implemented yet; use -p/--print"),
+        .interactive => {
+            if (app.messages.count > 1) return usage(stderr);
+            const initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null;
+            return tui_mode.run(process, options, .{ .initial_prompt = initial_prompt });
+        },
     };
 }
 
@@ -232,7 +242,7 @@ test "cli usage returns an error instead of exiting" {
 
     try std.testing.expectError(error.InvalidCliUsage, run(process, &args, &output, &stderr));
     try std.testing.expectEqualStrings("", output.buffered());
-    try std.testing.expect(std.mem.startsWith(u8, stderr.buffered(), "usage: zi [options] <prompt>"));
+    try std.testing.expect(std.mem.startsWith(u8, stderr.buffered(), "usage: zi [options] [prompt]"));
 }
 
 fn testProcess(environ: *std.process.Environ.Map) runtime.Process {

@@ -282,7 +282,7 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
         \\zi - AI coding assistant with read, bash, edit, write tools
         \\
         \\Usage:
-        \\  zi [options] <prompt>
+        \\  zi [options] [prompt]
         \\
         \\Commands:
         \\
@@ -303,6 +303,8 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\
         \\Examples:
+        \\  zi
+        \\  zi "explain this repo"
         \\  zi -p "hello"
         \\  zi auth status openai-codex
         \\
@@ -312,7 +314,7 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
 
 pub fn writeUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\usage: zi [options] <prompt>
+        \\usage: zi [options] [prompt]
         \\       zi auth login openai-codex
         \\       zi auth logout openai-codex
         \\       zi auth status openai-codex
@@ -394,7 +396,7 @@ test "writes generated help from specs" {
 
     try writeHelp(&writer);
     const output = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "zi [options] <prompt>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zi [options] [prompt]") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--print") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "zi auth status openai-codex") != null);
 }
@@ -405,5 +407,5 @@ test "writes usage without exiting" {
 
     try writeUsage(&writer);
     const output = writer.buffered();
-    try std.testing.expect(std.mem.startsWith(u8, output, "usage: zi [options] <prompt>"));
+    try std.testing.expect(std.mem.startsWith(u8, output, "usage: zi [options] [prompt]"));
 }
