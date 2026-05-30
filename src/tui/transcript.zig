@@ -71,7 +71,13 @@ pub const Store = struct {
         self.* = undefined;
     }
 
-    pub fn appendText(self: *Store, kind: Kind, durability: Durability, text: []const u8, created_ns: i128) !TranscriptItemId {
+    pub fn appendText(
+        self: *Store,
+        kind: Kind,
+        durability: Durability,
+        text: []const u8,
+        created_ns: i128,
+    ) !TranscriptItemId {
         std.debug.assert(kind != .custom);
         if (self.item_count == self.items.len) return error.TranscriptStoreFull;
         if (text.len > text_bytes_max) return error.TranscriptTextTooLarge;

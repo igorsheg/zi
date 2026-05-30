@@ -2,6 +2,7 @@ const buffer = @import("buffer.zig");
 const slot = @import("slot.zig");
 const surface = @import("surface.zig");
 const transcript = @import("transcript.zig");
+const view = @import("view.zig");
 
 pub const TuiCommand = union(enum) {
     append_transcript_text: AppendTranscriptText,
@@ -47,8 +48,8 @@ pub const TuiCommand = union(enum) {
 
     pub const OpenSurface = struct {
         id: surface.SurfaceId,
-        view_id: @import("view.zig").ViewId,
-        rect: @import("view.zig").Rect,
+        view_id: view.ViewId,
+        rect: view.Rect,
         layer: surface.Layer,
         modality: surface.Modality = .modeless,
         dismiss_policy: surface.DismissPolicy = .none,

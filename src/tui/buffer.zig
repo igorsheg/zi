@@ -57,8 +57,11 @@ pub const Buffer = struct {
 
         const overflow_byte_count = self.bytes.items.len + append_byte_count - self.max_bytes;
         const trim_byte_count = @min(self.bytes.items.len, overflow_byte_count);
-        std.mem.copyForwards(u8, self.bytes.items[0 .. self.bytes.items.len - trim_byte_count], self.bytes.items[trim_byte_count..]);
-        self.bytes.shrinkRetainingCapacity(self.bytes.items.len - trim_byte_count);
+        const kept_byte_count = self.bytes.items.len - trim_byte_count;
+        // Left-shift the surviving suffix over the dropped prefix; the ranges
+        // overlap, so @memmove (not @memcpy) is required.
+        @memmove(self.bytes.items[0..kept_byte_count], self.bytes.items[trim_byte_count..]);
+        self.bytes.shrinkRetainingCapacity(kept_byte_count);
         self.dropped_prefix_byte_count += trim_byte_count;
     }
 

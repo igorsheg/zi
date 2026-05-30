@@ -13,6 +13,7 @@ const slot_mod = @import("slot.zig");
 const surface_mod = @import("surface.zig");
 const transcript_mod = @import("transcript.zig");
 const transcript_renderer_mod = @import("transcript_renderer.zig");
+const tui_testing = @import("testing.zig");
 const view_mod = @import("view.zig");
 
 pub const App = struct {
@@ -175,7 +176,10 @@ pub const App = struct {
         try self.appendTranscriptItemProjection(item_id);
     }
 
-    fn dispatchAppendCustomTranscriptItem(self: *App, payload: command_mod.TuiCommand.AppendCustomTranscriptItem) !void {
+    fn dispatchAppendCustomTranscriptItem(
+        self: *App,
+        payload: command_mod.TuiCommand.AppendCustomTranscriptItem,
+    ) !void {
         const item_id = try self.transcript.appendCustom(payload.durability, payload.custom_type, payload.data_json, 0);
         try self.emitTranscriptAppended(item_id, payload.durability);
         try self.appendTranscriptItemProjection(item_id);
@@ -183,7 +187,14 @@ pub const App = struct {
 
     fn dispatchSlotSetText(self: *App, payload: command_mod.TuiCommand.SlotSetText) !void {
         const s = self.slots.get(payload.slot_id);
-        try s.setText(self.allocator, payload.contribution_id, payload.owner, payload.priority, payload.lifetime, payload.text);
+        try s.setText(
+            self.allocator,
+            payload.contribution_id,
+            payload.owner,
+            payload.priority,
+            payload.lifetime,
+            payload.text,
+        );
         try self.emit(.{ .slot_changed = .{ .id = payload.slot_id, .revision = s.revision } });
     }
 
@@ -341,7 +352,11 @@ pub const App = struct {
         return false;
     }
 
-    fn emitTranscriptAppended(self: *App, id: transcript_mod.TranscriptItemId, durability: transcript_mod.Durability) !void {
+    fn emitTranscriptAppended(
+        self: *App,
+        id: transcript_mod.TranscriptItemId,
+        durability: transcript_mod.Durability,
+    ) !void {
         try self.emit(.{ .transcript_item_appended = .{
             .id = id,
             .durability = durability,
@@ -402,7 +417,7 @@ test "agent events append to chat buffer and render through the tui world" {
     };
     app.render(root);
 
-    try @import("testing.zig").expectScreenAscii(
+    try tui_testing.expectScreenAscii(
         \\                                
         \\> hello                         
         \\hi                              
@@ -523,7 +538,7 @@ test "surfaces render in deterministic layer and insertion order" {
         .screen = &screen,
     });
 
-    try @import("testing.zig").expectScreenAscii("modal   ", &screen, 8, 1);
+    try tui_testing.expectScreenAscii("modal   ", &screen, 8, 1);
 }
 
 test "resize stretches base surfaces and views to full bounds and marks dirty" {

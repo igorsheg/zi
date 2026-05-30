@@ -42,7 +42,9 @@ pub const Terminal = struct {
 
     pub fn deinit(self: *Terminal) void {
         if (self.alt_screen_entered) {
-            self.exitAltScreen() catch {};
+            // Teardown is best-effort: if restoring the screen fails there is
+            // no recovery path left, but the failure must not be silent.
+            self.exitAltScreen() catch |err| std.log.warn("tui: exit alt screen failed: {t}", .{err});
         }
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
