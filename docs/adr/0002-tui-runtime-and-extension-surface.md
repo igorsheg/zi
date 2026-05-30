@@ -127,6 +127,59 @@ render hot paths avoid steady-state allocation
 
 zi should not copy pz's bespoke tui stack or security/audit policy into this ADR. those are separate product choices. the immediate lesson for the tui substrate is testability, explicit bounds, and cleanup discipline.
 
+## lessons from prise
+
+prise is a useful vaxis-native reference for building an application world above the terminal substrate. it is closer to zi's intended substrate direction than pz, and closer to zi's extension goals than a plain vaxis example, but it is still a product reference rather than a port target.
+
+useful patterns:
+
+- `src/Surface.zig` owns a double-buffered terminal surface with explicit dimensions, resize, dirty state, cursor state, colors, and selection state.
+- `src/widget.zig` separates layout constraints, measured size, hit regions, split handles, surface resize collection, and rendering into vaxis windows.
+- `src/action.zig` uses a typed action union with canonical string names and display names, giving keybinds and command palettes a stable protocol without stringly internal dispatch.
+- `src/lua_event.zig` translates vaxis and product events into typed lua payloads rather than exposing raw parser details directly.
+- `src/tui_test.zig` converts a vaxis screen to an ascii snapshot and builds test windows from virtual screens, making layout/render behavior cheap to assert.
+- `src/redraw.zig` models renderer-facing updates as structured events instead of ad hoc terminal writes.
+
+zi should steal these shapes:
+
+```text
+Surface = owned render target with dimensions, dirty bit, cursor/selection state
+Widget/Layout = constraints -> size/position -> render into a provided window
+Action = typed union + canonical name + display label
+LuaEvent = typed product event payloads, not raw terminal internals
+TuiTest = virtual screen -> ascii/structured assertions
+RedrawEvent = data model for render changes when crossing a boundary
+```
+
+zi should not inherit prise's product assumptions such as terminal multiplexer policy, PTY/session lifecycle, or Lua owning the full layout tree by default. zi's agent session, buffers, views, and extension permissions must remain zi-owned.
+
+## lessons from opentui
+
+opentui is not zi's terminal substrate choice, but its zig core is a strong reference for text-buffer and editing discipline. the relevant files include `text-buffer.zig`, `edit-buffer.zig`, `text-buffer-segment.zig`, `text-buffer-iterators.zig`, `utf8.zig`, `grapheme.zig`, `link.zig`, `syntax-style.zig`, and the Unicode-heavy tests under `tests/`.
+
+useful patterns:
+
+- `TextBuffer` has a monotonic content epoch and per-view dirty flags. views can detect stale render caches even if a dirty flag was already cleared.
+- text storage is not a plain string forever. opentui uses rope/segments, line iterators, wrap offsets, highlights, style spans, links, and grapheme-aware width calculations.
+- editing behavior is separated from storage. `EditBuffer` owns cursor movement, insertion, deletion, undo/redo, word boundaries, and editable cursor metadata over a text buffer.
+- text chunks can reference registered backing memory. this avoids copying large text through every layer and keeps render/edit structures compact.
+- style spans and highlights are buffer/view data, not terminal-cell ownership.
+- the UTF-8 and grapheme tests cover emoji, wide characters, combining marks, zero-width joiners, script transitions, wrapping, selection boundaries, and width-map validation.
+
+zi should steal these shapes:
+
+```text
+Buffer.revision = monotonic content epoch
+View.revision_seen = stale-cache detection, independent of dirty flags
+TextBuffer = future segmented/rope-backed content engine behind the Buffer API
+InputBuffer = editable prompt state over a text buffer, not the same type as chat history
+TextMetrics = grapheme width, wrap, cursor movement, and selection boundary rules
+StyleSpans = structured buffer annotations for markdown, diffs, search, diagnostics
+BorrowedText = possible future memory registry for large tool output and diff hunks
+```
+
+zi should not copy opentui's renderer, FFI-shaped API surface, event bus, or full rope implementation now. those are too much machinery for the current slice. the immediate commitment is to keep zi's public `Buffer` / `View` / `Surface` API stable enough that the internal buffer storage can later become segmented without changing lua or TUI callers.
+
 ## core invariants
 
 ```text
@@ -249,6 +302,8 @@ accepted:
 - pi-mono extension behavior is a parity target, not an api or architecture copy target.
 - zag's buffer/window/lua boundaries are the closest architecture reference.
 - pz's terminal test harness and bounded renderer discipline are required quality references.
+- prise's surface/action/widget/test vocabulary is a strong reference for zi-owned tui semantics over vaxis.
+- opentui's text-buffer, edit-buffer, grapheme, dirty epoch, and style-span disciplines should inform zi's buffer internals.
 
 rejected:
 
@@ -257,6 +312,8 @@ rejected:
 - letting the terminal substrate decide zi's layout, focus, surface, or extension model.
 - encoding extension contribution structs before the retained tui runtime exists.
 - copying zag's product stack or pz's bespoke tui stack wholesale.
+- copying prise's terminal multiplexer or lua-owned product policy wholesale.
+- copying opentui's renderer, FFI API, event bus, or rope implementation before zi needs them.
 - accepting a terminal substrate spike without PTY or virtual-screen test hooks.
 
 ## open questions

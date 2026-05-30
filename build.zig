@@ -9,6 +9,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const vaxis_dep = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    zi.addImport("vaxis", vaxis_dep.module("vaxis"));
 
     const exe = b.addExecutable(.{
         .name = "zi",

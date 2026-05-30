@@ -54,6 +54,11 @@ coding_agent
   owns product/session policy: resources, settings, model/session config, tools,
   prompt preflight, session persistence, public events, runtime host replacement.
 
+tui
+  owns terminal UI product semantics: transcript items, buffers, views, surfaces,
+  slots, composer, actions/keymaps, and the command/event boundary. observes
+  coding_agent through public commands/events/snapshots only.
+
 agent
   owns generic agent runtime: transcript, active run, cancel source, tool loop,
   steering/follow-up queues, agent events. must not import coding_agent.
@@ -105,6 +110,61 @@ invariants:
 - public clients communicate through commands, bounded events, and owned snapshots.
 - no callback subscription path may mutate session state directly.
 - session history is durable truth; agent transcript is runtime context.
+
+## tui spine
+
+```text
+terminal substrate
+  libvaxis: raw terminal, input, resize, cells, styles, window clipping, render.
+      |
+      v
+src/tui/terminal.zig
+  owns substrate lifecycle and hides vaxis sharp edges from app policy.
+      |
+      v
+TuiRuntime / App
+  owns TranscriptStore, BufferStore, ViewStore, SurfaceTree, SlotRegistry,
+  InputComposer, ActionRegistry, KeymapRegistry, TuiCommand, TuiEvent.
+      |
+      v
+coding_agent frontend boundary
+  AgentSessionRuntimeHost commands, AgentSessionEvent drain, owned snapshots.
+```
+
+tui invariants:
+
+- `Buffer != View != Surface`.
+- transcript is domain data first; rendering is a projection.
+- built-in shell is a composition, not the architecture.
+- public TUI mutation goes through `TuiCommand` / owner apply sites.
+- TUI events are bounded and drained; do not add write-only event queues.
+- surfaces render in deterministic `(layer, insertion_index)` order.
+- popovers, modals, autocomplete, command palette, and toasts are surface policy,
+  not special buffer kinds.
+- slots are named, bounded contribution points; extensions do not own layout.
+- future Lua extensions use the same commands/events/actions/slots/renderers as
+  built-in code.
+- extensions request; owners mutate.
+- TUI must not touch `host.currentSession().agent`, provider internals, session
+  manager internals, or tool internals.
+- TUI should use `startPromptRun`, `stepPromptRun`, `cancel`, `continueRun`,
+  `drainPublicEvent`, and owned snapshots.
+
+tui source boundaries:
+
+- `src/tui/terminal.zig`: vaxis lifecycle and raw terminal adapter.
+- `src/tui/transcript.zig`: transcript item facts and durability.
+- `src/tui/buffer.zig`: bounded content storage and revision.
+- `src/tui/view.zig`: presentation state over buffers.
+- `src/tui/surface.zig`: placement, layer, modality, focus, dismiss policy.
+- `src/tui/slot.zig`: bounded named contributions.
+- `src/tui/composer.zig`: editable prompt/completion state.
+- `src/tui/command.zig`: mutation protocol.
+- `src/tui/event.zig`: observable typed facts.
+- `src/tui/app.zig`: owner of stores and dispatch/render coordination.
+
+do not put session, provider, tool, persistence, auth, or model-selection policy
+inside `src/tui`; those belong to `src/coding_agent`.
 
 ## event policy
 
