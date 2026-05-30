@@ -361,7 +361,10 @@ fn recordRunFailure(self: *Agent, token: zistd.CancelToken, message: []const u8)
     const assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
     try self.appendMessage(.{ .assistant = assistant });
     self.state.status = .{ .failed = message };
-    try self.emitEvent(try cloneAgentEvent(self.message_arena.allocator(), .{ .agent_end = .{ .messages = self.state.messages } }));
+    try self.emitEvent(try cloneAgentEvent(
+        self.message_arena.allocator(),
+        .{ .agent_end = .{ .messages = self.state.messages } },
+    ));
 }
 
 fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_message: ?[]const u8) ai.AssistantMessage {
@@ -523,7 +526,10 @@ fn cloneAgentEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
         } },
         .message_update => |payload| .{ .message_update = .{
             .message = try cloneAgentMessage(allocator, payload.message),
-            .assistant_message_event = try ai.owned.cloneAssistantMessageEvent(allocator, payload.assistant_message_event),
+            .assistant_message_event = try ai.owned.cloneAssistantMessageEvent(
+                allocator,
+                payload.assistant_message_event,
+            ),
         } },
         .message_end => |payload| .{ .message_end = .{
             .message = try cloneAgentMessage(allocator, payload.message),
@@ -562,7 +568,10 @@ fn cloneAgentMessages(allocator: std.mem.Allocator, source: []const agent.AgentM
     return cloned;
 }
 
-fn cloneToolResultMessages(allocator: std.mem.Allocator, source: []const ai.ToolResultMessage) ![]const ai.ToolResultMessage {
+fn cloneToolResultMessages(
+    allocator: std.mem.Allocator,
+    source: []const ai.ToolResultMessage,
+) ![]const ai.ToolResultMessage {
     const cloned = try allocator.alloc(ai.ToolResultMessage, source.len);
     for (source, cloned) |message, *out| {
         out.* = .{

@@ -201,7 +201,7 @@ pub const Usage = struct {
         cache_write: f64,
         total: f64,
 
-        pub fn jsonStringify(self: Cost, stringify: *std.json.Stringify) !void {
+        pub fn jsonStringify(self: Usage.Cost, stringify: *std.json.Stringify) !void {
             try stringify.beginObject();
             try writeJsonField("input", stringify, self.input);
             try writeJsonField("output", stringify, self.output);
@@ -604,7 +604,10 @@ pub const AssistantMessageEventStream = struct {
         return self.result() orelse error.MissingResult;
     }
 
-    fn emitBuffered(self: *AssistantMessageEventStream, event: AssistantMessageEvent) AssistantMessageEventSinkEmitError!void {
+    fn emitBuffered(
+        self: *AssistantMessageEventStream,
+        event: AssistantMessageEvent,
+    ) AssistantMessageEventSinkEmitError!void {
         const buffered = &self.kind.buffered;
         switch (event) {
             .done => |done| buffered.terminal_message = done.message,
@@ -622,7 +625,11 @@ pub const AssistantMessageEventStream = struct {
         return buffered.events[buffered.index];
     }
 
-    fn emitBufferedFn(context: ?*anyopaque, _: std.Io, event: AssistantMessageEvent) AssistantMessageEventSinkEmitError!void {
+    fn emitBufferedFn(
+        _: std.Io,
+        context: ?*anyopaque,
+        event: AssistantMessageEvent,
+    ) AssistantMessageEventSinkEmitError!void {
         const self: *AssistantMessageEventStream = @ptrCast(@alignCast(context.?));
         try self.emitBuffered(event);
     }
@@ -630,14 +637,14 @@ pub const AssistantMessageEventStream = struct {
 
 pub const AssistantMessageEventSink = struct {
     context: ?*anyopaque,
-    emit_fn: *const fn (?*anyopaque, std.Io, AssistantMessageEvent) AssistantMessageEventSinkEmitError!void,
+    emit_fn: *const fn (std.Io, ?*anyopaque, AssistantMessageEvent) AssistantMessageEventSinkEmitError!void,
 
     pub fn emit(
         self: AssistantMessageEventSink,
         io: std.Io,
         event: AssistantMessageEvent,
     ) AssistantMessageEventSinkEmitError!void {
-        try self.emit_fn(self.context, io, event);
+        try self.emit_fn(io, self.context, event);
     }
 
     pub fn endDone(
@@ -667,7 +674,6 @@ pub const AssistantMessageEventSink = struct {
         try self.endError(io, .aborted, message);
     }
 };
-
 
 pub fn emptyAssistantMessageFromRequest(
     request: StreamRequest,

@@ -10,7 +10,11 @@ pub fn bearerHeader(allocator: std.mem.Allocator, token: []const u8) std.mem.All
     return std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
 }
 
-pub fn appendPath(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) std.mem.Allocator.Error![]const u8 {
+pub fn appendPath(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    suffix: []const u8,
+) std.mem.Allocator.Error![]const u8 {
     std.debug.assert(suffix.len > 0);
     std.debug.assert(suffix[0] != '/');
     if (std.mem.endsWith(u8, base_url, suffix)) return allocator.dupe(u8, base_url);

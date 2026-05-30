@@ -29,7 +29,11 @@ pub fn Owned(comptime T: type) type {
             return .{ .value = parsed.value, .arena = parsed.arena };
         }
 
-        pub fn parseJson(backing_allocator: std.mem.Allocator, source: []const u8, options: std.json.ParseOptions) !Self {
+        pub fn parseJson(
+            backing_allocator: std.mem.Allocator,
+            source: []const u8,
+            options: std.json.ParseOptions,
+        ) !Self {
             return fromJson(try std.json.parseFromSlice(T, backing_allocator, source, options));
         }
 

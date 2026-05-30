@@ -165,7 +165,10 @@ fn cloneStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agen
         } },
         .message_update => |payload| .{ .message_update = .{
             .message = try cloneStreamMessage(allocator, payload.message),
-            .assistant_message_event = try ai.owned.cloneAssistantMessageEvent(allocator, payload.assistant_message_event),
+            .assistant_message_event = try ai.owned.cloneAssistantMessageEvent(
+                allocator,
+                payload.assistant_message_event,
+            ),
         } },
         .message_end => |payload| .{ .message_end = .{
             .message = try cloneStreamMessage(allocator, payload.message),
@@ -315,7 +318,14 @@ fn runLoop(
                 pending_messages = &.{};
             }
 
-            var owned_assistant: ?ai.AssistantMessage = try streamAssistantResponse(allocator, io, current, config, token, emit);
+            var owned_assistant: ?ai.AssistantMessage = try streamAssistantResponse(
+                allocator,
+                io,
+                current,
+                config,
+                token,
+                emit,
+            );
             errdefer if (owned_assistant) |assistant| ai.owned.freeAssistantMessage(allocator, assistant);
             const assistant = owned_assistant.?;
             try current.messages.append(allocator, .{ .assistant = assistant });

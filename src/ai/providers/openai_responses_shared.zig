@@ -199,7 +199,7 @@ const ReducerSseSink = struct {
     }
 };
 
-const PendingEventSink = struct {
+pub const PendingEventSink = struct {
     allocator: std.mem.Allocator,
     events: *std.ArrayList(protocol.AssistantMessageEvent),
     result: *?protocol.AssistantMessage,
@@ -374,12 +374,18 @@ pub const ResponseStreamReducer = struct {
         if (std.mem.eql(u8, item_type, "reasoning")) {
             try self.content.append(self.arena.allocator(), .{ .thinking = .{ .thinking = "" } });
             const index = self.content.items.len - 1;
-            self.current = .{ .thinking = .{ .content_index = index, .bytes = mem.ByteBuilder.init(self.arena.allocator()) } };
+            self.current = .{ .thinking = .{
+                .content_index = index,
+                .bytes = mem.ByteBuilder.init(self.arena.allocator()),
+            } };
             try sink.emit(io, .{ .thinking_start = .{ .content_index = index, .partial = try self.partial() } });
         } else if (std.mem.eql(u8, item_type, "message")) {
             try self.content.append(self.arena.allocator(), .{ .text = .{ .text = "" } });
             const index = self.content.items.len - 1;
-            self.current = .{ .text = .{ .content_index = index, .bytes = mem.ByteBuilder.init(self.arena.allocator()) } };
+            self.current = .{ .text = .{
+                .content_index = index,
+                .bytes = mem.ByteBuilder.init(self.arena.allocator()),
+            } };
             try sink.emit(io, .{ .text_start = .{ .content_index = index, .partial = try self.partial() } });
         } else if (std.mem.eql(u8, item_type, "function_call")) {
             const call_id = jsonString(item.get("call_id")) orelse "";
@@ -392,7 +398,10 @@ pub const ResponseStreamReducer = struct {
                 .arguments = emptyObject(),
             } });
             const index = self.content.items.len - 1;
-            self.current = .{ .tool_call = .{ .content_index = index, .partial_json = mem.ByteBuilder.init(self.backing_allocator) } };
+            self.current = .{ .tool_call = .{
+                .content_index = index,
+                .partial_json = mem.ByteBuilder.init(self.backing_allocator),
+            } };
             if (jsonString(item.get("arguments"))) |arguments| {
                 try self.current.tool_call.partial_json.append(arguments);
             }

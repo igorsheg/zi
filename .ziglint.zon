@@ -1,15 +1,6 @@
 .{
-    // Paths linted by `ziglint` with no arguments. Scoped to the modules that
-    // are currently clean so the default command is green on arrival.
-    //
-    // `src/agent`, `src/ai`, and `src/zistd` carry pre-existing findings; add
-    // them here as that debt is burned down, rather than encoding a red default.
     .paths = .{
-        "src/coding_agent",
-        "src/runtime",
-        "src/tui",
-        "src/main.zig",
-        "src/root.zig",
+        "src",
         "build.zig",
     },
 }

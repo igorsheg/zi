@@ -4,7 +4,6 @@ const oauth_openai_codex = @import("../utils/oauth/openai_codex.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
 const runtime = @import("../../zistd/root.zig");
-const sse = @import("../sse.zig");
 const shared = @import("openai_responses_shared.zig");
 const simple_options = @import("simple_options.zig");
 const transform_messages = @import("transform_messages.zig");
@@ -157,13 +156,21 @@ fn openWithRetries(state: *CodexResponseStream) !void {
             error.RetryableRequestFailed => {
                 last_error = err;
                 if (attempt == retry_count_max) return err;
-                try runtime.sleep(state.request.io, retryDelay(attempt, state.request.options.max_retry_delay_ms), state.request.cancel_token);
+                try runtime.sleep(
+                    state.request.io,
+                    retryDelay(attempt, state.request.options.max_retry_delay_ms),
+                    state.request.cancel_token,
+                );
                 continue;
             },
             else => |other| {
                 last_error = other;
                 if (attempt == retry_count_max or !isRetryableTransportError(other)) return other;
-                try runtime.sleep(state.request.io, retryDelay(attempt, state.request.options.max_retry_delay_ms), state.request.cancel_token);
+                try runtime.sleep(
+                    state.request.io,
+                    retryDelay(attempt, state.request.options.max_retry_delay_ms),
+                    state.request.cancel_token,
+                );
                 continue;
             },
         };
