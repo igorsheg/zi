@@ -55,12 +55,17 @@ pub fn build(b: *std.Build) void {
     // PTY harness drives the real binary under a pseudo-terminal and needs
     // libc (openpty). Kept on its own step so the unit suite stays libc-free
     // and hermetic.
-    const pty_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/tui/pty.zig"),
+    const pty_options = b.addOptions();
+    pty_options.addOptionPath("zi_bin_path", exe.getEmittedBin());
+
+    const pty_test_module = b.createModule(.{
+        .root_source_file = b.path("src/tui/substrate/pty.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-    }) });
+    });
+    pty_test_module.addOptions("pty_options", pty_options);
+    const pty_tests = b.addTest(.{ .root_module = pty_test_module });
     const pty_test_step = b.step("pty-test", "Run PTY harness tests (links libc)");
     pty_test_step.dependOn(&b.addRunArtifact(pty_tests).step);
 }

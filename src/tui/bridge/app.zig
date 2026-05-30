@@ -1,20 +1,21 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
-const agent_mod = @import("../agent/root.zig");
-const ai = @import("../ai/root.zig");
-const AgentSession = @import("../coding_agent/AgentSession.zig");
+const agent_mod = @import("../../agent/root.zig");
+const ai = @import("../../ai/root.zig");
+const AgentSession = @import("../../coding_agent/AgentSession.zig");
 
-const buffer_mod = @import("buffer.zig");
-const command_mod = @import("command.zig");
-const composer_mod = @import("composer.zig");
-const event_mod = @import("event.zig");
-const slot_mod = @import("slot.zig");
-const surface_mod = @import("surface.zig");
-const transcript_mod = @import("transcript.zig");
-const transcript_renderer_mod = @import("transcript_renderer.zig");
-const tui_testing = @import("testing.zig");
-const view_mod = @import("view.zig");
+const buffer_mod = @import("../primitive/buffer.zig");
+const command_mod = @import("../primitive/command.zig");
+const composer_mod = @import("../component/composer.zig");
+const event_mod = @import("../primitive/event.zig");
+const shell_mod = @import("../composition/shell.zig");
+const slot_mod = @import("../primitive/slot.zig");
+const surface_mod = @import("../primitive/surface.zig");
+const transcript_mod = @import("../primitive/transcript.zig");
+const transcript_renderer_mod = @import("../component/transcript_renderer.zig");
+const tui_testing = @import("../substrate/testing.zig");
+const view_mod = @import("../primitive/view.zig");
 
 pub const App = struct {
     pub const buffer_count_max = 64;
@@ -39,13 +40,12 @@ pub const App = struct {
     event_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, width: u16, height: u16) !App {
+        std.debug.assert(height >= shell_mod.height_min);
         var app: App = .{
             .allocator = allocator,
             .transcript = .init(allocator),
         };
-        try app.createBuffer(.chat, .chat, "chat");
-        try app.createView(.chat, .chat, .init(0, 0, width, height));
-        try app.createSurface(.chat, .chat, .init(0, 0, width, height), .base);
+        try app.createShell(width, height);
         app.active_view_id = .chat;
         return app;
     }
@@ -99,7 +99,11 @@ pub const App = struct {
             var surf = &self.surfaces[ordered[order_index]];
             const view = self.getView(surf.view_id).?;
             const buf = self.getBuffer(view.buffer_id).?;
-            surf.renderText(win, buf.text());
+            if (buf.kind == .chat) {
+                surf.renderTextTail(win, buf.text());
+            } else {
+                surf.renderText(win, buf.text());
+            }
         }
     }
 
@@ -118,15 +122,15 @@ pub const App = struct {
     /// bounds on a resize. Overlay layers keep their explicit rects.
     pub fn resize(self: *App, width: u16, height: u16) void {
         std.debug.assert(width > 0);
-        std.debug.assert(height > 0);
-        const full = view_mod.Rect.init(0, 0, width, height);
+        std.debug.assert(height >= shell_mod.height_min);
+        const layout = shell_mod.layout(width, height);
         var index: usize = 0;
         while (index < self.surface_count) : (index += 1) {
             var surf = &self.surfaces[index];
             if (surf.layer != .base) continue;
-            surf.rect = full;
+            surf.rect = shellPlacement(layout, surf.id).rect;
             surf.markDirty();
-            if (self.getView(surf.view_id)) |view| view.rect = full;
+            if (self.getView(surf.view_id)) |view| view.rect = surf.rect;
         }
     }
 
@@ -137,6 +141,38 @@ pub const App = struct {
         const rhs_layer: u8 = @intFromEnum(rhs.layer);
         if (lhs_layer != rhs_layer) return lhs_layer < rhs_layer;
         return lhs.insertion_index < rhs.insertion_index;
+    }
+
+    fn createShell(self: *App, width: u16, height: u16) !void {
+        try self.createBuffer(.header, .status, "header");
+        try self.createBuffer(.chat, .chat, "chat");
+        try self.createBuffer(.status, .status, "status");
+        try self.createBuffer(.input, .input, "input");
+
+        try self.appendBufferNoEvent(.header, "zi");
+        try self.appendBufferNoEvent(.status, "idle");
+        try self.appendBufferNoEvent(.input, "> ");
+
+        const layout = shell_mod.layout(width, height);
+        try self.createShellViewAndSurface(layout.header);
+        try self.createShellViewAndSurface(layout.transcript);
+        try self.createShellViewAndSurface(layout.status);
+        try self.createShellViewAndSurface(layout.composer);
+    }
+
+    fn createShellViewAndSurface(self: *App, placement: shell_mod.Placement) !void {
+        try self.createView(placement.view_id, placement.buffer_id, placement.rect);
+        try self.createSurface(placement.surface_id, placement.view_id, placement.rect, .base);
+    }
+
+    fn shellPlacement(layout: shell_mod.Layout, id: surface_mod.SurfaceId) shell_mod.Placement {
+        return switch (id) {
+            .header => layout.header,
+            .chat => layout.transcript,
+            .status => layout.status,
+            .input => layout.composer,
+            else => unreachable,
+        };
     }
 
     fn createBuffer(self: *App, id: buffer_mod.BufferId, kind: buffer_mod.Kind, name: []const u8) !void {
@@ -258,6 +294,7 @@ pub const App = struct {
                 },
                 .blocks => {},
             },
+            .assistant => |assistant| try self.appendAssistantMessageEnd(assistant),
             else => {},
         }
     }
@@ -268,10 +305,37 @@ pub const App = struct {
                 try self.appendAssistantDelta(payload.delta);
             },
             .text_end => {
-                self.active_assistant_item_id = null;
+                // Keep the active item until message_end. Some providers emit
+                // only final text at message_end, and streamed providers may
+                // need a final suffix reconciliation.
             },
             else => {},
         }
+    }
+
+    fn appendAssistantMessageEnd(self: *App, assistant: ai.AssistantMessage) !void {
+        for (assistant.content) |content| {
+            if (content != .text) continue;
+            try self.appendAssistantFinalText(content.text.text);
+        }
+        self.active_assistant_item_id = null;
+    }
+
+    fn appendAssistantFinalText(self: *App, text: []const u8) !void {
+        if (text.len == 0) return;
+        if (self.active_assistant_item_id) |id| {
+            const item = self.transcript.get(id).?;
+            const current = item.payload.text;
+            if (std.mem.eql(u8, current, text)) return;
+            if (std.mem.startsWith(u8, text, current)) {
+                try self.appendAssistantDelta(text[current.len..]);
+                return;
+            }
+        }
+
+        const id = try self.transcript.appendText(.assistant_message, .ephemeral, text, 0);
+        try self.emitTranscriptAppended(id, .ephemeral);
+        try self.appendTranscriptItemProjection(id);
     }
 
     fn appendAssistantDelta(self: *App, delta: []const u8) !void {
@@ -305,6 +369,11 @@ pub const App = struct {
         try buf.append(self.allocator, bytes);
         self.markBufferSurfacesDirty(id);
         try self.emit(.{ .buffer_changed = .{ .id = id, .revision = buf.revision } });
+    }
+
+    fn appendBufferNoEvent(self: *App, id: buffer_mod.BufferId, bytes: []const u8) !void {
+        var buf = self.getBuffer(id).?;
+        try buf.append(self.allocator, bytes);
     }
 
     fn markBufferSurfacesDirty(self: *App, buffer_id: buffer_mod.BufferId) void {
@@ -377,7 +446,7 @@ pub const App = struct {
 };
 
 test "agent events append to chat buffer and render through the tui world" {
-    var app = try App.init(std.testing.allocator, 32, 4);
+    var app = try App.init(std.testing.allocator, 32, 6);
     defer app.deinit();
 
     try app.applyAgentSessionEvent(.{ .agent_event = .{ .message_end = .{
@@ -400,7 +469,7 @@ test "agent events append to chat buffer and render through the tui world" {
     try std.testing.expectEqual(@as(usize, 2), app.transcript.item_count);
 
     var screen = try vaxis.Screen.init(std.testing.allocator, .{
-        .rows = 4,
+        .rows = 6,
         .cols = 32,
         .x_pixel = 0,
         .y_pixel = 0,
@@ -417,12 +486,104 @@ test "agent events append to chat buffer and render through the tui world" {
     };
     app.render(root);
 
-    try tui_testing.expectScreenAscii(
-        \\                                
-        \\> hello                         
-        \\hi                              
-        \\                                
-    , &screen, 32, 4);
+    const rendered = try tui_testing.screenToAscii(std.testing.allocator, &screen, 32, 6);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "zi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "> hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "idle") != null);
+}
+
+test "chat rendering follows the live transcript tail" {
+    var app = try App.init(std.testing.allocator, 40, 6);
+    defer app.deinit();
+
+    try app.applyAgentSessionEvent(.{ .agent_event = .{ .message_end = .{
+        .message = .{ .user = .{
+            .content = .{ .string = "Read the ai subsystem" },
+            .timestamp = 0,
+        } },
+    } } });
+    inline for (0..3) |_| {
+        try app.applyAgentSessionEvent(.{ .agent_event = .{ .tool_execution_start = .{
+            .tool_call_id = "tool",
+            .tool_name = "read",
+            .args = .null,
+        } } });
+    }
+    try app.applyAgentSessionEvent(.{ .agent_event = .{ .message_update = .{
+        .message = .{ .assistant = emptyAssistantMessage() },
+        .assistant_message_event = .{ .text_delta = .{
+            .content_index = 0,
+            .delta = "final answer",
+            .partial = emptyAssistantMessage(),
+        } },
+    } } });
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 6,
+        .cols = 40,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const root: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    app.render(root);
+
+    const rendered = try tui_testing.screenToAscii(std.testing.allocator, &screen, 40, 6);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[tool] read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "final answer") != null);
+}
+
+test "assistant final message renders when no deltas were streamed" {
+    var app = try App.init(std.testing.allocator, 40, 6);
+    defer app.deinit();
+
+    try app.applyAgentSessionEvent(.{ .agent_event = .{ .message_end = .{
+        .message = .{ .assistant = assistantTextMessage("final only answer") },
+    } } });
+
+    const chat = app.getBuffer(.chat).?;
+    try std.testing.expectEqualStrings("final only answer", chat.text());
+    try std.testing.expectEqual(@as(usize, 1), app.transcript.item_count);
+}
+
+test "assistant final message does not duplicate streamed deltas" {
+    var app = try App.init(std.testing.allocator, 40, 6);
+    defer app.deinit();
+
+    try app.applyAgentSessionEvent(.{ .agent_event = .{ .message_update = .{
+        .message = .{ .assistant = emptyAssistantMessage() },
+        .assistant_message_event = .{ .text_delta = .{
+            .content_index = 0,
+            .delta = "final",
+            .partial = emptyAssistantMessage(),
+        } },
+    } } });
+    try app.applyAgentSessionEvent(.{ .agent_event = .{ .message_update = .{
+        .message = .{ .assistant = emptyAssistantMessage() },
+        .assistant_message_event = .{ .text_end = .{
+            .content_index = 0,
+            .content = "final answer",
+            .partial = assistantTextMessage("final answer"),
+        } },
+    } } });
+    try app.applyAgentSessionEvent(.{ .agent_event = .{ .message_end = .{
+        .message = .{ .assistant = assistantTextMessage("final answer") },
+    } } });
+
+    const chat = app.getBuffer(.chat).?;
+    try std.testing.expectEqualStrings("final answer", chat.text());
+    try std.testing.expectEqual(@as(usize, 1), app.transcript.item_count);
 }
 
 test "tui commands own custom transcript slots and composer mutation" {
@@ -511,7 +672,7 @@ test "assistant stream deltas accumulate into one transcript item" {
 }
 
 test "surfaces render in deterministic layer and insertion order" {
-    var app = try App.init(std.testing.allocator, 8, 1);
+    var app = try App.init(std.testing.allocator, 8, 4);
     defer app.deinit();
 
     try app.createBuffer(.diagnostics, .diagnostics, "diagnostics");
@@ -541,7 +702,7 @@ test "surfaces render in deterministic layer and insertion order" {
     try tui_testing.expectScreenAscii("modal   ", &screen, 8, 1);
 }
 
-test "resize stretches base surfaces and views to full bounds and marks dirty" {
+test "resize lays out shell surfaces and views and marks dirty" {
     var app = try App.init(std.testing.allocator, 10, 4);
     defer app.deinit();
 
@@ -549,19 +710,21 @@ test "resize stretches base surfaces and views to full bounds and marks dirty" {
 
     const surf = app.getSurface(.chat).?;
     try std.testing.expectEqual(@as(u16, 20), surf.rect.width);
-    try std.testing.expectEqual(@as(u16, 8), surf.rect.height);
+    try std.testing.expectEqual(@as(u16, 5), surf.rect.height);
+    try std.testing.expectEqual(@as(u16, 1), surf.rect.y);
     const v = app.getView(.chat).?;
     try std.testing.expectEqual(@as(u16, 20), v.rect.width);
-    try std.testing.expectEqual(@as(u16, 8), v.rect.height);
+    try std.testing.expectEqual(@as(u16, 5), v.rect.height);
+    try std.testing.expectEqual(@as(u16, 1), v.rect.y);
     try std.testing.expect(app.isDirty());
 }
 
 test "render clears dirty until the next mutation" {
-    var app = try App.init(std.testing.allocator, 12, 3);
+    var app = try App.init(std.testing.allocator, 12, 4);
     defer app.deinit();
 
     var screen = try vaxis.Screen.init(std.testing.allocator, .{
-        .rows = 3,
+        .rows = 4,
         .cols = 12,
         .x_pixel = 0,
         .y_pixel = 0,
@@ -588,6 +751,31 @@ test "render clears dirty until the next mutation" {
 fn emptyAssistantMessage() ai.AssistantMessage {
     return .{
         .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{
+            .input = 0,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 0,
+            .cost = .{
+                .input = 0,
+                .output = 0,
+                .cache_read = 0,
+                .cache_write = 0,
+                .total = 0,
+            },
+        },
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+}
+
+fn assistantTextMessage(comptime text: []const u8) ai.AssistantMessage {
+    return .{
+        .content = &.{.{ .text = .{ .text = text } }},
         .api = "test-api",
         .provider = "test-provider",
         .model = "test-model",

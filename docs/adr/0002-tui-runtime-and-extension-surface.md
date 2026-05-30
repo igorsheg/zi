@@ -279,7 +279,7 @@ exit and deinit cleanly
 the spike must expose the substrate through a zi-owned adapter, not directly to app code or future lua code:
 
 ```text
-src/tui/terminal.zig
+src/tui/substrate/terminal.zig
 ```
 
 the spike must include a test adapter from the beginning:

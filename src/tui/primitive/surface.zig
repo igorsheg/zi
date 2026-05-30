@@ -1,7 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const action = @import("action.zig");
-const tui_testing = @import("testing.zig");
+const tui_testing = @import("../substrate/testing.zig");
 const view = @import("view.zig");
 
 pub const SurfaceId = enum(u32) {
@@ -9,6 +9,8 @@ pub const SurfaceId = enum(u32) {
     chat = 2,
     input = 3,
     diagnostics = 4,
+    header = 5,
+    status = 6,
     _,
 };
 
@@ -75,7 +77,26 @@ pub const Surface = struct {
         _ = child.print(&.{.{ .text = text }}, .{ .wrap = .word });
         self.markClean();
     }
+
+    pub fn renderTextTail(self: *Surface, win: vaxis.Window, text: []const u8) void {
+        const tail = text[tailStartForLineCount(text, self.rect.height)..];
+        self.renderText(win, tail);
+    }
 };
+
+fn tailStartForLineCount(text: []const u8, line_count: u16) usize {
+    if (line_count == 0 or text.len == 0) return text.len;
+
+    var lines_seen: u16 = 1;
+    var index = text.len;
+    while (index > 0) {
+        index -= 1;
+        if (text[index] != '\n') continue;
+        if (lines_seen == line_count) return index + 1;
+        lines_seen += 1;
+    }
+    return 0;
+}
 
 test "surface renders buffer text into a bounded rect" {
     var screen = try vaxis.Screen.init(std.testing.allocator, .{
@@ -104,4 +125,35 @@ test "surface renders buffer text into a bounded rect" {
         \\            
         \\            
     , &screen, 12, 3);
+}
+
+test "surface can render the tail of a multi-line buffer" {
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 3,
+        .cols = 12,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+
+    var surf = Surface.init(.chat, .chat, .init(0, 0, 12, 3), .base);
+    const root: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = screen.width,
+        .height = screen.height,
+        .screen = &screen,
+    };
+    surf.renderTextTail(root, "one\ntwo\nthree\nfour");
+
+    try tui_testing.expectScreenAscii(
+        "two         \n" ++
+            "three       \n" ++
+            "four        ",
+        &screen,
+        12,
+        3,
+    );
 }

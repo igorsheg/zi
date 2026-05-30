@@ -274,7 +274,7 @@ fn writeToolResult(
         .image => has_image = true,
     };
     try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-    try std.json.Stringify.value(result.tool_call_id, .{}, writer);
+    try std.json.Stringify.value(openaiCallId(result.tool_call_id), .{}, writer);
     try writer.writeAll(",\"output\":");
     if (!has_image) {
         try std.json.Stringify.value(text.written(), .{}, writer);
@@ -297,6 +297,11 @@ fn writeToolResult(
         try writer.writeByte(']');
     }
     try writer.writeByte('}');
+}
+
+fn openaiCallId(id: []const u8) []const u8 {
+    const separator = std.mem.findScalar(u8, id, '|');
+    return if (separator) |index| id[0..index] else id;
 }
 
 test "provider registers openai responses api" {
@@ -334,6 +339,38 @@ test "request body includes model stream input and tools" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"input_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") != null);
+}
+
+test "request body writes OpenAI call id for tool results" {
+    var request = testRequest();
+    request.context.messages = &.{
+        .{ .assistant = .{
+            .content = &.{.{ .tool_call = .{
+                .id = "call_123456789|fc_123456789",
+                .name = "echo",
+                .arguments = .{ .object = .empty },
+            } }},
+            .api = protocol.KnownApi.openai_responses,
+            .provider = protocol.KnownProvider.openai,
+            .model = "gpt-test",
+            .usage = protocol.emptyUsage(),
+            .stop_reason = .tool_use,
+            .timestamp = 0,
+        } },
+        .{ .tool_result = .{
+            .tool_call_id = "call_123456789|fc_123456789",
+            .tool_name = "echo",
+            .content = &.{.{ .text = .{ .text = "ok" } }},
+            .is_error = false,
+            .timestamp = 0,
+        } },
+    };
+
+    const body = try buildRequestBody(std.testing.allocator, request);
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":\"call_123456789\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":\"call_123456789|fc_123456789\"") == null);
 }
 
 fn testRequest() protocol.StreamRequest {

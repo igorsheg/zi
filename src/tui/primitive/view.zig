@@ -5,6 +5,8 @@ pub const ViewId = enum(u32) {
     chat = 1,
     input = 2,
     diagnostics = 3,
+    header = 4,
+    status = 5,
     _,
 };
 

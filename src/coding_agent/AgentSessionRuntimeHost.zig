@@ -1,8 +1,10 @@
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
+const zistd = @import("../zistd/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_manager = @import("session_manager.zig");
+const tool_registry = @import("tool_registry.zig");
 
 const AgentSessionRuntimeHost = @This();
 
@@ -240,6 +242,90 @@ fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
     while (try host.stepPromptRun(run)) {}
 }
 
+const EchoTool = struct {
+    call_count: usize = 0,
+
+    pub fn tool(self: *EchoTool) agent_mod.AgentTool {
+        return .{
+            .name = "echo",
+            .description = "Echo test tool",
+            .parameters = .{ .object = .empty },
+            .label = "echo",
+            .execute = .{ .context = self, .call_fn = execute },
+        };
+    }
+
+    fn execute(
+        allocator: std.mem.Allocator,
+        _: std.Io,
+        context: ?*anyopaque,
+        _: zistd.CancelToken,
+        _: []const u8,
+        _: std.json.Value,
+        _: ?agent_mod.AgentToolUpdateCallback,
+    ) anyerror!agent_mod.OwnedAgentToolResult {
+        const self: *EchoTool = @ptrCast(@alignCast(context.?));
+        self.call_count += 1;
+        const content = try allocator.alloc(ai.ToolResultContent, 1);
+        content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "echoed") } };
+        return .{ .allocator = allocator, .result = .{ .content = content } };
+    }
+};
+
+const ToolLoopObservation = struct {
+    user_message_end: bool = false,
+    tool_execution_start: bool = false,
+    tool_execution_end: bool = false,
+    final_text_delta: bool = false,
+    agent_end_with_tool_result: bool = false,
+    agent_end: bool = false,
+
+    fn onEvent(context: ?*anyopaque, event: AgentSession.AgentSessionEvent) !void {
+        const self: *ToolLoopObservation = @ptrCast(@alignCast(context.?));
+        if (event != .agent_event) return;
+
+        switch (event.agent_event) {
+            .message_end => |payload| switch (payload.message) {
+                .user => self.user_message_end = true,
+                else => {},
+            },
+            .message_update => |payload| {
+                switch (payload.assistant_message_event) {
+                    .text_delta => |delta| {
+                        if (std.mem.indexOf(u8, delta.delta, "done after tool") != null) {
+                            self.final_text_delta = true;
+                        }
+                    },
+                    else => {},
+                }
+            },
+            .tool_execution_start => |payload| {
+                if (std.mem.eql(u8, payload.tool_call_id, "tool-1") and
+                    std.mem.eql(u8, payload.tool_name, "echo"))
+                {
+                    self.tool_execution_start = true;
+                }
+            },
+            .tool_execution_end => |payload| {
+                if (std.mem.eql(u8, payload.tool_call_id, "tool-1") and
+                    std.mem.eql(u8, payload.tool_name, "echo"))
+                {
+                    self.tool_execution_end = true;
+                }
+            },
+            .agent_end => |payload| {
+                self.agent_end = true;
+                for (payload.messages) |message| {
+                    if (message == .tool_result and std.mem.eql(u8, message.tool_result.tool_call_id, "tool-1")) {
+                        self.agent_end_with_tool_result = true;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+};
+
 test "runtime host replacement invalidates old session before rebinding new session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -390,4 +476,77 @@ test "runtime host owns current agent session public boundary" {
     try std.testing.expect(host.publicEventCount() > 0);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
     try std.testing.expectEqual(@as(usize, 3), host.toolSnapshot().active_count);
+}
+
+test "runtime host live run executes a tool and continues the assistant turn" {
+    const faux = @import("../ai/providers/faux.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try faux.Provider.init(std.testing.allocator, .{
+        .min_token_size = 128,
+        .max_token_size = 128,
+    });
+    defer provider.deinit();
+
+    const tool_call_content = [_]ai.AssistantContent{
+        faux.toolCall("tool-1", "echo", .{ .object = .empty }),
+    };
+    const final_content = [_]ai.AssistantContent{
+        faux.text("done after tool"),
+    };
+    const responses = [_]ai.AssistantMessage{
+        faux.assistantMessage(&tool_call_content, .{ .stop_reason = .tool_use }),
+        faux.assistantMessage(&final_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&responses);
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    var echo: EchoTool = .{};
+    try host.session.tools.append(
+        std.testing.allocator,
+        tool_registry.ToolDefinition.init(&echo, .{
+            .name = "echo",
+            .label = "echo",
+            .description = "Echo test tool",
+        }),
+    );
+    try host.session.setActiveToolsByName(&.{"echo"});
+
+    const run = try host.startPromptRun("use the tool", &.{}, .{});
+    defer host.destroyPromptRun(run);
+    while (try host.stepPromptRun(run)) {}
+
+    var observed: ToolLoopObservation = .{};
+    _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = ToolLoopObservation.onEvent });
+
+    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
+    try std.testing.expectEqual(@as(usize, 1), echo.call_count);
+    try std.testing.expect(observed.user_message_end);
+    try std.testing.expect(observed.tool_execution_start);
+    try std.testing.expect(observed.tool_execution_end);
+    try std.testing.expect(observed.final_text_delta);
+    try std.testing.expect(observed.agent_end_with_tool_result);
+    try std.testing.expect(observed.agent_end);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
 }

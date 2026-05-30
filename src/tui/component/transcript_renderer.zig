@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const buffer_mod = @import("buffer.zig");
-const transcript_mod = @import("transcript.zig");
+const buffer_mod = @import("../primitive/buffer.zig");
+const transcript_mod = @import("../primitive/transcript.zig");
 
 pub const Renderer = struct {
     pub fn appendItemToChatBuffer(

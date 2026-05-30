@@ -118,7 +118,7 @@ terminal substrate
   libvaxis: raw terminal, input, resize, cells, styles, window clipping, render.
       |
       v
-src/tui/terminal.zig
+src/tui/substrate/terminal.zig
   owns substrate lifecycle and hides vaxis sharp edges from app policy.
       |
       v
@@ -152,16 +152,15 @@ tui invariants:
 
 tui source boundaries:
 
-- `src/tui/terminal.zig`: vaxis lifecycle and raw terminal adapter.
-- `src/tui/transcript.zig`: transcript item facts and durability.
-- `src/tui/buffer.zig`: bounded content storage and revision.
-- `src/tui/view.zig`: presentation state over buffers.
-- `src/tui/surface.zig`: placement, layer, modality, focus, dismiss policy.
-- `src/tui/slot.zig`: bounded named contributions.
-- `src/tui/composer.zig`: editable prompt/completion state.
-- `src/tui/command.zig`: mutation protocol.
-- `src/tui/event.zig`: observable typed facts.
-- `src/tui/app.zig`: owner of stores and dispatch/render coordination.
+- `src/tui/substrate/`: libvaxis lifecycle, terminal adapter, PTY/vscreen tests.
+- `src/tui/primitive/`: bounded retained facts such as buffers, views, surfaces,
+  slots, commands, events, actions, and transcript items.
+- `src/tui/component/`: reusable domain components and renderers built on
+  primitives.
+- `src/tui/composition/`: deterministic arrangements of primitives/components.
+- `src/tui/bridge/`: owner of stores, dispatch, event application, and render
+  coordination.
+- `src/tui/root.zig`: public re-export surface for callers outside `src/tui`.
 
 do not put session, provider, tool, persistence, auth, or model-selection policy
 inside `src/tui`; those belong to `src/coding_agent`.

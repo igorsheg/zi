@@ -4,6 +4,8 @@ pub const BufferId = enum(u32) {
     chat = 1,
     input = 2,
     diagnostics = 3,
+    header = 4,
+    status = 5,
     _,
 };
 
@@ -12,6 +14,7 @@ pub const Kind = enum {
     input,
     tool_output,
     diagnostics,
+    status,
     scratch,
 };
 
