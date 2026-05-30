@@ -320,7 +320,7 @@ rejected:
 
 - exact buffer content representation: lines, spans, rope, structured blocks, or mixed.
 - whether views own scroll state or scroll state belongs to surfaces.
-- how to bound buffer history and rendered viewport caches.
+- how to bound buffer history and rendered viewport caches. answered by ADR 0004.
 - whether custom extension surfaces are data-only or allow bounded callbacks.
 - final substrate selection after the libvaxis spike.
 - hook event taxonomy for zi's lua api.

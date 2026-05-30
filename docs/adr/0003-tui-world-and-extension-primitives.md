@@ -145,12 +145,14 @@ the owner path decides whether an item is live-only or also written to session j
 transcript rendering is a registry boundary:
 
 ```text
-TranscriptItem -> TranscriptRenderer -> Buffer/View/Surface output
+TranscriptItem -> TranscriptRenderer -> virtualized TranscriptView output
 ```
 
 built-ins provide renderers for user, assistant, tool call, system, and known internal items. extensions may register renderers for custom item kinds later.
 
-renderers produce structured buffer/view content, not raw terminal mutation. terminal-cell ownership remains in the renderer/substrate layer.
+renderers produce structured view content, not raw terminal mutation. terminal-cell ownership remains in the compositor/substrate layer.
+
+adr 0004 tightens this boundary: transcript render work must be `O(viewport)`, while durable history lives in session jsonl and the in-memory transcript window stays bounded. `Buffer.chat` is a projection/cache, not durable transcript truth.
 
 ## composer
 
