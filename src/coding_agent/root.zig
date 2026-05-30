@@ -3,6 +3,7 @@ pub const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 pub const auth = @import("auth.zig");
 pub const auth_mode = @import("auth_mode.zig");
 pub const cli = @import("cli/root.zig");
+pub const frontend = @import("frontend.zig");
 pub const paths = @import("paths.zig");
 pub const print_mode = @import("print_mode.zig");
 pub const runtime_services = @import("runtime_services.zig");
@@ -53,6 +54,7 @@ pub fn testsReachable() void {
     _ = auth;
     _ = auth_mode;
     _ = cli;
+    _ = frontend;
     _ = paths;
     _ = print_mode;
     _ = resources;
@@ -75,6 +77,7 @@ test {
     _ = auth;
     _ = auth_mode;
     _ = cli;
+    _ = frontend;
     _ = paths;
     _ = print_mode;
     _ = resources;
