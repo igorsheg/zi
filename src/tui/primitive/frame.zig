@@ -4,11 +4,13 @@ pub const Policy = struct {
     interval_ns: i128 = std.time.ns_per_s / 30,
     terminal_events_per_tick_max: usize = 64,
     host_events_per_tick_max: usize = 128,
+    app_events_per_tick_max: usize = 256,
 
     pub fn validate(self: Policy) void {
         std.debug.assert(self.interval_ns > 0);
         std.debug.assert(self.terminal_events_per_tick_max > 0);
         std.debug.assert(self.host_events_per_tick_max > 0);
+        std.debug.assert(self.app_events_per_tick_max > 0);
     }
 };
 
@@ -50,9 +52,11 @@ test "frame policy exposes nonzero bounded drains" {
     const policy: Policy = .{
         .terminal_events_per_tick_max = 8,
         .host_events_per_tick_max = 16,
+        .app_events_per_tick_max = 32,
     };
     policy.validate();
 
     try std.testing.expectEqual(@as(usize, 8), policy.terminal_events_per_tick_max);
     try std.testing.expectEqual(@as(usize, 16), policy.host_events_per_tick_max);
+    try std.testing.expectEqual(@as(usize, 32), policy.app_events_per_tick_max);
 }

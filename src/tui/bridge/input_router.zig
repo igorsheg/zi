@@ -27,6 +27,8 @@ pub const Key = struct {
     enter: bool = false,
     backspace: bool = false,
     escape: bool = false,
+    left: bool = false,
+    right: bool = false,
     modifiers: Modifiers = .{},
 };
 
@@ -37,6 +39,8 @@ pub const Intent = union(enum) {
     dismiss_focused_surface,
     submit_composer,
     composer_backspace,
+    composer_move_left,
+    composer_move_right,
     composer_insert: []const u8,
 };
 
@@ -61,6 +65,8 @@ fn routeComposer(key: Key, run_state: RunState) Intent {
         return .submit_composer;
     }
     if (key.backspace) return .composer_backspace;
+    if (key.left) return .composer_move_left;
+    if (key.right) return .composer_move_right;
     if (key.modifiers.hasNonTextModifier()) return .none;
     if (key.text) |text| return .{ .composer_insert = text };
     return .none;
@@ -95,6 +101,8 @@ test "input router maps composer editing without mutating app state" {
     try std.testing.expectEqual(Intent.submit_composer, router.route(.{ .enter = true }, .idle));
     try std.testing.expectEqual(Intent.none, router.route(.{ .enter = true }, .active));
     try std.testing.expectEqual(Intent.composer_backspace, router.route(.{ .backspace = true }, .idle));
+    try std.testing.expectEqual(Intent.composer_move_left, router.route(.{ .left = true }, .idle));
+    try std.testing.expectEqual(Intent.composer_move_right, router.route(.{ .right = true }, .idle));
 
     const intent = router.route(.{ .text = "hello" }, .idle);
     try std.testing.expect(intent == .composer_insert);

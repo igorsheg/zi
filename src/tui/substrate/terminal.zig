@@ -99,16 +99,19 @@ test "terminal substrate draws text through owned lifecycle" {
         .y_pixel = 8 * 16,
     });
     try terminal.enterAltScreen();
-    try terminal.drawText("zi tui");
+    try terminal.drawText("terminal");
     try tui_testing.expectScreenAscii(
-        \\zi tui                          
-        \\                                
-        \\                                
-        \\                                
-        \\                                
-        \\                                
-        \\                                
-        \\                                
-    , &terminal.vx.screen, 32, 8);
+        "terminal                        \n" ++
+            "                                \n" ++
+            "                                \n" ++
+            "                                \n" ++
+            "                                \n" ++
+            "                                \n" ++
+            "                                \n" ++
+            "                                ",
+        &terminal.vx.screen,
+        32,
+        8,
+    );
     try terminal.exitAltScreen();
 }

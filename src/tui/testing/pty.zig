@@ -11,7 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const pty_options = @import("pty_options");
-const vscreen = @import("vscreen.zig");
+const vscreen = @import("tui_vscreen");
 
 const c = @cImport({
     if (builtin.os.tag == .macos) {
@@ -319,6 +319,62 @@ test "real zi binary submits composer prompt and renders response" {
     try waitForCleanExit(child, &child_exited, test_timeout_ns);
 }
 
+test "real zi binary keeps running transcript stable across resize" {
+    const zi_path = try std.testing.allocator.dupeZ(u8, pty_options.zi_bin_path);
+    defer std.testing.allocator.free(zi_path);
+    var test_env = try TestEnv.init(std.testing.allocator, "running-resize");
+    defer test_env.deinit();
+
+    const argv = [_:null]?[*:0]const u8{zi_path.ptr};
+    const envp = [_:null]?[*:0]const u8{
+        "TERM=xterm-256color",
+        test_env.home_env.ptr,
+        test_env.agent_dir_env.ptr,
+        "ZI_PTY_FAUX_RESPONSE=resize final answer",
+        "ZI_PTY_FAUX_DELAY_MS=25",
+    };
+    const child = try spawn(zi_path.ptr, &argv, &envp, test_cols, test_rows);
+    var child_exited = false;
+    defer cleanupChild(child, &child_exited);
+
+    var received: [8192]u8 = undefined;
+    var received_len: usize = 0;
+    try readChildOutputUntilContains(child, &child_exited, &received, &received_len, smcup, test_timeout_ns);
+    var screen = vscreen.Screen.init(test_cols, test_rows);
+    screen.feed(received[0..received_len]);
+
+    try readScreenUntilRowEquals(child, &child_exited, &screen, composerRow(), ">", test_timeout_ns);
+    try writeAll(child.master, "resize while running\r");
+    try readScreenUntilRowEquals(child, &child_exited, &screen, statusRow(), "running", test_timeout_ns);
+
+    const resized_cols: u16 = 64;
+    const resized_rows: u16 = 16;
+    try child.resize(resized_cols, resized_rows);
+    screen.resize(resized_cols, resized_rows);
+    try readScreenUntilRowEquals(child, &child_exited, &screen, statusRowFor(resized_rows), "running", test_timeout_ns);
+    try readScreenUntilRowEquals(child, &child_exited, &screen, composerRowFor(resized_rows), ">", test_timeout_ns);
+
+    try readTranscriptUntilContainsForRows(
+        child,
+        &child_exited,
+        &screen,
+        transcriptRowCountFor(resized_rows),
+        "resize final answer",
+        test_timeout_ns,
+    );
+    try readScreenUntilRowEquals(child, &child_exited, &screen, statusRowFor(resized_rows), "idle", test_timeout_ns);
+    try expectTranscriptContainsOrderedForRows(
+        &screen,
+        transcriptRowCountFor(resized_rows),
+        &.{ "> resize while running", "resize final answer" },
+    );
+    try expectScreenCursor(&screen, 2, composerRowFor(resized_rows));
+
+    try writeUntilContains(child, &child_exited, &received, &received_len, "\x03", rmcup, test_timeout_ns);
+    screen.feed(received[0..received_len]);
+    try waitForCleanExit(child, &child_exited, test_timeout_ns);
+}
+
 test "real zi binary composer backspace removes one utf8 codepoint" {
     const zi_path = try std.testing.allocator.dupeZ(u8, pty_options.zi_bin_path);
     defer std.testing.allocator.free(zi_path);
@@ -417,6 +473,12 @@ test "real zi binary composer cursor follows wide character display width" {
     try writeAll(child.master, "中");
     try readScreenUntilRowEquals(child, &child_exited, &screen, composerRow(), "> 中", test_timeout_ns);
     try expectScreenCursor(&screen, 4, composerRow());
+    try writeAll(child.master, "\x1b[D");
+    try readScreenUntilCursor(child, &child_exited, &screen, 2, composerRow(), test_timeout_ns);
+    try expectScreenRowEquals(&screen, composerRow(), "> 中");
+    try writeAll(child.master, "\x1b[C");
+    try readScreenUntilCursor(child, &child_exited, &screen, 4, composerRow(), test_timeout_ns);
+    try expectScreenRowEquals(&screen, composerRow(), "> 中");
 
     try writeUntilContains(child, &child_exited, &received, &received_len, "\x03", rmcup, test_timeout_ns);
     screen.feed(received[0..received_len]);
@@ -651,7 +713,12 @@ fn transcriptRowStart() u16 {
 }
 
 fn transcriptRowCount() u16 {
-    return test_rows - 3;
+    return transcriptRowCountFor(test_rows);
+}
+
+fn transcriptRowCountFor(rows: u16) u16 {
+    std.debug.assert(rows >= 4);
+    return rows - 3;
 }
 
 fn statusRow() u16 {
@@ -744,11 +811,22 @@ fn readTranscriptUntilContains(
     needle: []const u8,
     timeout_ns: i128,
 ) !void {
+    return readTranscriptUntilContainsForRows(child, child_exited, screen, transcriptRowCount(), needle, timeout_ns);
+}
+
+fn readTranscriptUntilContainsForRows(
+    child: Child,
+    child_exited: *bool,
+    screen: *vscreen.Screen,
+    row_count: u16,
+    needle: []const u8,
+    timeout_ns: i128,
+) !void {
     const io = std.testing.io;
     const start_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
     var buf: [256]u8 = undefined;
     while (@as(i128, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) - start_ns < timeout_ns) {
-        if (screen.rowRangeContains(transcriptRowStart(), transcriptRowCount(), needle)) return;
+        if (screen.rowRangeContains(transcriptRowStart(), row_count, needle)) return;
         try failIfChildExited(child, child_exited, screen);
         var fds = [_]posix.pollfd{.{ .fd = child.master, .events = posix.POLL.IN, .revents = 0 }};
         _ = try posix.poll(&fds, 100);
@@ -786,6 +864,31 @@ fn readScreenUntilRowEquals(
     return error.TimeoutWaitingForScreenRowMatch;
 }
 
+fn readScreenUntilCursor(
+    child: Child,
+    child_exited: *bool,
+    screen: *vscreen.Screen,
+    col: u16,
+    row_index: u16,
+    timeout_ns: i128,
+) !void {
+    const io = std.testing.io;
+    const start_ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    var buf: [256]u8 = undefined;
+    while (@as(i128, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) - start_ns < timeout_ns) {
+        if (screen.cursorEquals(col, row_index)) return;
+        try failIfChildExited(child, child_exited, screen);
+        var fds = [_]posix.pollfd{.{ .fd = child.master, .events = posix.POLL.IN, .revents = 0 }};
+        _ = try posix.poll(&fds, 100);
+        if ((fds[0].revents & posix.POLL.IN) == 0) continue;
+        const n = try posix.read(child.master, &buf);
+        if (n == 0) break;
+        screen.feed(buf[0..n]);
+    }
+    try printCursorExpectation(screen, col, row_index);
+    return error.TimeoutWaitingForScreenCursor;
+}
+
 fn expectTranscriptContains(screen: *const vscreen.Screen, needle: []const u8) !void {
     if (screen.rowRangeContains(transcriptRowStart(), transcriptRowCount(), needle)) return;
     try printTranscriptExpectation(screen, "expected transcript to contain", needle);
@@ -793,7 +896,15 @@ fn expectTranscriptContains(screen: *const vscreen.Screen, needle: []const u8) !
 }
 
 fn expectTranscriptContainsOrdered(screen: *const vscreen.Screen, needles: []const []const u8) !void {
-    if (screen.rowRangeContainsOrdered(transcriptRowStart(), transcriptRowCount(), needles)) return;
+    return expectTranscriptContainsOrderedForRows(screen, transcriptRowCount(), needles);
+}
+
+fn expectTranscriptContainsOrderedForRows(
+    screen: *const vscreen.Screen,
+    row_count: u16,
+    needles: []const []const u8,
+) !void {
+    if (screen.rowRangeContainsOrdered(transcriptRowStart(), row_count, needles)) return;
     try printTranscriptOrderedExpectation(screen, "expected transcript to contain ordered rows", needles);
     return error.ExpectedTranscriptTextOrderMissing;
 }

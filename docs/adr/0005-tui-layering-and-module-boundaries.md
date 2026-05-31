@@ -33,7 +33,7 @@ text/rendering core
   utf-8/grapheme/display-width helpers, wrapping, truncation, styled text, cell writers.
 
 retained primitives
-  Buffer, View, Surface, Slot, Action, Keymap, TuiCommand, TuiEvent, Frame policy.
+  Buffer, View, Surface, Slot, Focus, Frame policy, grapheme helpers.
 
 product surfaces
   Zi-specific surfaces such as Composer, Transcript, Status, Header, and
@@ -45,7 +45,8 @@ compositions
   Built-in shell layouts and larger arrangements of product surfaces/primitives.
 
 app bridge
-  Owns mutation, dispatch, event application, frontend/agent bridging, and frame ownership.
+  Owns mutation, `TuiCommand`, `TuiEvent`, dispatch, event application,
+  frontend/agent bridging, and frame ownership.
 ```
 
 `App` is the owner and dispatcher, not the place where every layout decision lives. composition modules may calculate ids and geometry, but `App` performs mutation.
@@ -59,6 +60,8 @@ app bridge
 - composition modules calculate layout; they do not mutate stores directly.
 - app owns mutation and may import all inner rings.
 - libvaxis windows are frame-local and must not be stored in retained state.
+- primitives may use libvaxis unicode/width helpers, but not windows, terminal
+  lifecycle, event loops, or raw cell mutation.
 - test harness modules stay test infrastructure and must not become production terminal emulators.
 
 ## current mapping
@@ -68,38 +71,42 @@ current files map as:
 ```text
 terminal/test substrate
   src/tui/substrate/terminal.zig
-  src/tui/substrate/pty.zig
   src/tui/substrate/vscreen.zig
   src/tui/substrate/testing.zig
+  src/tui/testing/pty.zig
 
 retained primitives
-  src/tui/primitive/action.zig
   src/tui/primitive/buffer.zig
-  src/tui/primitive/command.zig
-  src/tui/primitive/event.zig
   src/tui/primitive/focus.zig
   src/tui/primitive/frame.zig
-  src/tui/primitive/input_router.zig
+  src/tui/primitive/grapheme.zig
   src/tui/primitive/slot.zig
   src/tui/primitive/surface.zig
-  src/tui/primitive/transcript.zig
   src/tui/primitive/view.zig
 
 product surfaces
   src/tui/product/composer.zig
+  src/tui/product/transcript.zig
   src/tui/product/transcript_renderer.zig
 
 compositions
+  src/tui/composition/builtin.zig
   src/tui/composition/shell.zig
 
 app bridge
+  src/tui/bridge/agent_adapter.zig
   src/tui/bridge/app.zig
+  src/tui/bridge/command.zig
+  src/tui/bridge/event.zig
+  src/tui/bridge/input_router.zig
+  src/tui/bridge/read_model.zig
 ```
 
-`src/tui/root.zig` re-exports only stable frontend-facing modules. callers
-outside `src/tui` should import through that root unless a test intentionally
-targets a specific layer. lower-level modules remain importable inside `src/tui`
-without becoming part of the public surface.
+`src/tui/root.zig` re-exports only the intentionally small frontend-facing
+surface: built-in composition ids, frame policy, and terminal setup. bridge
+owners such as `App`, `input_router`, and `agent_adapter` are imported directly
+by `coding_agent/tui_mode.zig` because they are integration points, not general
+TUI API.
 
 ## non-goals
 

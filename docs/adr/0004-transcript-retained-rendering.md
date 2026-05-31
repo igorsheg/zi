@@ -6,7 +6,7 @@ date: 2026-05-30
 
 ## context
 
-zi's tui must support long coding sessions and a responsive retained interface. those constraints are incompatible with treating the chat buffer as the durable transcript or with rebuilding all history on every frame.
+zi's tui must support long coding sessions and a responsive retained interface. those constraints are incompatible with treating the transcript projection buffer as the durable transcript or with rebuilding all history on every frame.
 
 the frame budget is fixed by the human interface. at 30fps, a frame has about 33ms. therefore transcript rendering must be proportional to the viewport and the active tail item, not to total session history.
 
@@ -41,7 +41,7 @@ AgentSessionEvent / TuiCommand
   -> libvaxis cells
 ```
 
-the current in-tree implementation may keep a small resident `TranscriptStore` while the durable session integration is being connected, but it must not encode `Buffer.chat` as the source of truth for transcript history. `Buffer.chat` is a projection/cache and may be rebuilt or discarded.
+the current in-tree implementation may keep a small resident `TranscriptStore` while the durable session integration is being connected, but it must not encode the transcript projection buffer as the source of truth for transcript history. the projection buffer is a cache and may be rebuilt or discarded.
 
 ## invariants
 
@@ -86,13 +86,11 @@ the first renderer slice must remove transcript/chat dual-write:
 
 ```text
 commands and agent events mutate transcript items
-transcript renderer updates the chat projection
+transcript renderer updates the transcript projection
 surface compositor paints buffers
 ```
 
-there must be one transcript mutation path and one projection path. no caller may append formatted transcript text directly into `Buffer.chat`.
-
-the current code may append the active assistant delta to `Buffer.chat` as an interim projection cache update. it must not rebuild the full transcript projection on every delta.
+there must be one transcript mutation path and one projection path. no caller may append formatted transcript text directly into the transcript projection buffer.
 
 ## future work
 
@@ -109,4 +107,4 @@ the current code may append the active assistant delta to `Buffer.chat` as an in
 - keep every rendered chat line in memory forever. this violates bounded resource use.
 - render `TranscriptItem` as `[]const []const u8` per frame. this hides allocation and makes frame cost scale with history.
 - allow extensions to draw terminal cells directly. this bypasses ownership, clipping, z-order, and testability.
-- make the chat buffer the durable transcript. this fuses storage, working set, and projection into one failure-prone knob.
+- make the projection buffer the durable transcript. this fuses storage, working set, and projection into one failure-prone knob.

@@ -59,13 +59,20 @@ pub fn build(b: *std.Build) void {
     pty_options.addOptionPath("zi_bin_path", exe.getEmittedBin());
 
     const pty_test_module = b.createModule(.{
-        .root_source_file = b.path("src/tui/substrate/pty.zig"),
+        .root_source_file = b.path("src/tui/testing/pty.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    const tui_vscreen = b.createModule(.{
+        .root_source_file = b.path("src/tui/substrate/vscreen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tui_vscreen.addImport("vaxis", vaxis_dep.module("vaxis"));
     pty_test_module.addOptions("pty_options", pty_options);
     pty_test_module.addImport("vaxis", vaxis_dep.module("vaxis"));
+    pty_test_module.addImport("tui_vscreen", tui_vscreen);
     const pty_tests = b.addTest(.{ .root_module = pty_test_module });
     pty_tests.step.dependOn(&exe.step);
     const pty_test_step = b.step("pty-test", "Run PTY harness tests (links libc)");

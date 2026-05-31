@@ -1,13 +1,8 @@
-const action = @import("action.zig");
+const std = @import("std");
+
 const view = @import("view.zig");
 
 pub const SurfaceId = enum(u32) {
-    root = 1,
-    chat = 2,
-    input = 3,
-    diagnostics = 4,
-    header = 5,
-    status = 6,
     _,
 };
 
@@ -31,8 +26,14 @@ pub const DismissPolicy = union(enum) {
     escape,
     outside_click,
     escape_or_outside_click,
-    action: action.ActionId,
 };
+
+pub fn dismissesOnEscape(policy: DismissPolicy) bool {
+    return switch (policy) {
+        .escape, .escape_or_outside_click => true,
+        .none, .outside_click => false,
+    };
+}
 
 pub const Surface = struct {
     id: SurfaceId,
@@ -63,3 +64,10 @@ pub const Surface = struct {
         self.dirty = false;
     }
 };
+
+test "dismiss policy records escape behavior explicitly" {
+    try std.testing.expect(dismissesOnEscape(.escape));
+    try std.testing.expect(dismissesOnEscape(.escape_or_outside_click));
+    try std.testing.expect(!dismissesOnEscape(.none));
+    try std.testing.expect(!dismissesOnEscape(.outside_click));
+}

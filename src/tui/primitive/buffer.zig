@@ -1,20 +1,13 @@
 const std = @import("std");
 
 pub const BufferId = enum(u32) {
-    chat = 1,
-    input = 2,
-    diagnostics = 3,
-    header = 4,
-    status = 5,
     _,
 };
 
 pub const Kind = enum {
-    chat,
-    input,
-    tool_output,
-    diagnostics,
-    status,
+    text,
+    scrollback,
+    editable,
     scratch,
 };
 
@@ -111,7 +104,7 @@ fn isUtf8ContinuationByte(byte: u8) bool {
 }
 
 test "buffer revisions advance only on mutation" {
-    var buf = Buffer.init(.chat, .chat, "chat");
+    var buf = Buffer.init(@enumFromInt(1), .text, "text");
     defer buf.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u64, 0), buf.revision);
@@ -121,7 +114,7 @@ test "buffer revisions advance only on mutation" {
 }
 
 test "buffer trims old content instead of failing when full" {
-    var buf = Buffer.init(.chat, .chat, "chat");
+    var buf = Buffer.init(@enumFromInt(1), .text, "text");
     defer buf.deinit(std.testing.allocator);
     buf.max_bytes = 5;
 
@@ -132,7 +125,7 @@ test "buffer trims old content instead of failing when full" {
 }
 
 test "buffer trims on utf8 codepoint boundaries" {
-    var buf = Buffer.init(.chat, .chat, "chat");
+    var buf = Buffer.init(@enumFromInt(1), .text, "text");
     defer buf.deinit(std.testing.allocator);
     buf.max_bytes = 4;
 
@@ -145,7 +138,7 @@ test "buffer trims on utf8 codepoint boundaries" {
 }
 
 test "buffer rejects invalid utf8 text" {
-    var buf = Buffer.init(.chat, .chat, "chat");
+    var buf = Buffer.init(@enumFromInt(1), .text, "text");
     defer buf.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.InvalidUtf8, buf.append(std.testing.allocator, "\x80"));
@@ -153,7 +146,7 @@ test "buffer rejects invalid utf8 text" {
 }
 
 test "buffer replace validates before mutating existing text" {
-    var buf = Buffer.init(.chat, .chat, "chat");
+    var buf = Buffer.init(@enumFromInt(1), .text, "text");
     defer buf.deinit(std.testing.allocator);
 
     try buf.append(std.testing.allocator, "old");

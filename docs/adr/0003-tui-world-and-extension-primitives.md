@@ -25,17 +25,24 @@ the design must avoid encoding the built-in shell as the architecture. the built
 zi will model the tui world with these domain concepts:
 
 ```text
-TuiRuntime
+bridge App
   TranscriptStore
   BufferStore
   ViewStore
-  SurfaceTree
+  SurfaceStack
   SlotRegistry
+  CommandDispatcher
+  EventQueue
+  ReadModel
+
+product systems
+  Composer
+  Transcript
+  TranscriptRenderer
+
+future extension systems
   ActionRegistry
   KeymapRegistry
-  CommandDispatcher
-  EventBus
-  InputComposer
 ```
 
 the built-in shell is a default composition:
@@ -152,7 +159,7 @@ built-ins provide renderers for user, assistant, tool call, system, and known in
 
 renderers produce structured view content, not raw terminal mutation. terminal-cell ownership remains in the compositor/substrate layer.
 
-adr 0004 tightens this boundary: transcript render work must be `O(viewport)`, while durable history lives in session jsonl and the in-memory transcript window stays bounded. `Buffer.chat` is a projection/cache, not durable transcript truth.
+adr 0004 tightens this boundary: transcript render work must be `O(viewport)`, while durable history lives in session jsonl and the in-memory transcript window stays bounded. the transcript projection buffer is a cache, not durable transcript truth.
 
 ## composer
 
@@ -203,16 +210,14 @@ the future `InputBuffer` should be an editable layer over text storage, separate
 
 slots are named composition points. they allow built-ins and future extensions to contribute ui without owning layout or terminal cells.
 
-initial slot ids:
+primitive slot ids are opaque handles:
 
 ```zig
-pub const SlotId = enum {
-    shell_header,
-    transcript_status,
-    composer_header,
-    composer_footer,
-};
+pub const SlotId = enum(u16) { _ };
 ```
+
+the built-in composition owns product slot names such as `shell_header`,
+`transcript_status`, `composer_header`, and `composer_footer`.
 
 slot contributions are bounded and owned:
 
@@ -307,7 +312,6 @@ pub const DismissPolicy = union(enum) {
     escape,
     outside_click,
     escape_or_outside_click,
-    action: ActionId,
 };
 ```
 
@@ -344,9 +348,7 @@ extension-facing operations lower to:
 
 ```text
 TuiCommand
-TuiEvent subscription
-Action registration
-Keymap registration
+TuiEvent drain
 Renderer registration
 Slot contribution
 Transcript item append
@@ -361,13 +363,11 @@ allowed examples:
 create/write/open buffer
 append custom transcript item
 register transcript renderer
-register command/action
-register keymap
 contribute to a named slot
 register completion source
 open view as popover/modal
 show picker/confirm/input/toast
-subscribe to typed tui events
+drain typed tui events
 ```
 
 rejected examples:
@@ -394,7 +394,8 @@ future lua extensions
 
 become bounded commands and owner-applied mutations.
 
-`TuiEvent` carries observable typed facts:
+`TuiEvent` carries observable typed facts. events are drained through bounded
+owner-controlled queues; they are not callback subscriptions into mutation.
 
 ```text
 buffer_changed
@@ -405,7 +406,6 @@ transcript_item_appended
 composer_changed
 completion_opened
 completion_closed
-action_invoked
 slot_changed
 ```
 
@@ -435,11 +435,14 @@ rejected:
 ## next implementation slices
 
 ```text
-src/tui/primitive/transcript.zig
 src/tui/primitive/slot.zig
-src/tui/primitive/command.zig
-src/tui/primitive/event.zig
+src/tui/product/transcript.zig
 src/tui/product/composer.zig
+src/tui/product/transcript_renderer.zig
+src/tui/bridge/command.zig
+src/tui/bridge/event.zig
 ```
 
-after those exist, update `App` so agent events become transcript items, transcript renderers write buffers, and buffers/views/surfaces render through the bridge-owned vaxis frame renderer.
+future slices should preserve the same ownership rule: agent events become
+transcript items, transcript renderers write projection buffers, and
+buffers/views/surfaces render through the bridge-owned vaxis frame renderer.

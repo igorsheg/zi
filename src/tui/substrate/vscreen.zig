@@ -363,11 +363,11 @@ const Parser = struct {
 test "virtual screen applies cursor movement clear and printable text" {
     var screen = Screen.init(10, 3);
 
-    screen.feed("hello\x1b[2;3Hzi\x1b[1;1H!\x1b[2K");
+    screen.feed("hello\x1b[2;3Hab\x1b[1;1H!\x1b[2K");
 
     try std.testing.expectEqual(@as(u21, '!'), screen.textAt(0, 0));
-    try std.testing.expect(screen.rowContains(1, "zi"));
-    try std.testing.expect(screen.contains("zi"));
+    try std.testing.expect(screen.rowContains(1, "ab"));
+    try std.testing.expect(screen.contains("ab"));
     try std.testing.expect(!screen.contains("hello"));
     try std.testing.expect(screen.cursorEquals(1, 0));
 }
@@ -423,7 +423,7 @@ test "virtual screen clears trailing zero width cells when base cell is overwrit
     try std.testing.expect(!screen.rowContains(0, "\u{0301}"));
 }
 
-test "virtual screen keeps bounded raw byte tail for diagnostics" {
+test "virtual screen keeps bounded raw byte tail for debugging" {
     var screen = Screen.init(5, 2);
 
     screen.feed("abc");

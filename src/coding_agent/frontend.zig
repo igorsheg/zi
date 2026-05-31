@@ -31,6 +31,7 @@ pub const ReadModel = struct {
         idle,
         running,
         cancel_requested,
+        failed,
         shutdown_requested,
         stopped,
     };
@@ -65,6 +66,10 @@ pub const ReadModel = struct {
 
     pub fn markRunning(self: *ReadModel) void {
         self.status = .running;
+    }
+
+    pub fn markFailed(self: *ReadModel) void {
+        self.status = .failed;
     }
 
     pub fn markShutdownRequested(self: *ReadModel) void {
@@ -132,6 +137,8 @@ test "frontend read model applies public event stream without touching session i
 
     model.apply(.{ .agent_event = .{ .agent_end = .{ .messages = &.{} } } });
     try std.testing.expectEqual(ReadModel.Status.idle, model.status);
+    model.markFailed();
+    try std.testing.expectEqual(ReadModel.Status.failed, model.status);
 }
 
 fn emptyAssistantMessage() ai.AssistantMessage {

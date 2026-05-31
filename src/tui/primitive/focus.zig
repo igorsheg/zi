@@ -49,27 +49,33 @@ pub const Stack = struct {
 };
 
 test "focus stack has one active owner and removes closed surfaces" {
-    var stack = Stack.init(.input);
+    const base: surface.SurfaceId = @enumFromInt(1);
+    const panel: surface.SurfaceId = @enumFromInt(2);
+    const modal: surface.SurfaceId = @enumFromInt(3);
+    var stack = Stack.init(base);
 
-    try std.testing.expectEqual(surface.SurfaceId.input, stack.active());
-    try stack.push(.diagnostics);
-    try std.testing.expectEqual(surface.SurfaceId.diagnostics, stack.active());
-    try stack.push(.chat);
-    try std.testing.expectEqual(surface.SurfaceId.chat, stack.active());
+    try std.testing.expectEqual(base, stack.active());
+    try stack.push(panel);
+    try std.testing.expectEqual(panel, stack.active());
+    try stack.push(modal);
+    try std.testing.expectEqual(modal, stack.active());
 
-    stack.remove(.chat);
-    try std.testing.expectEqual(surface.SurfaceId.diagnostics, stack.active());
-    stack.remove(.diagnostics);
-    try std.testing.expectEqual(surface.SurfaceId.input, stack.active());
+    stack.remove(modal);
+    try std.testing.expectEqual(panel, stack.active());
+    stack.remove(panel);
+    try std.testing.expectEqual(base, stack.active());
 }
 
 test "focus stack moves duplicate focus to the top" {
-    var stack = Stack.init(.input);
+    const base: surface.SurfaceId = @enumFromInt(1);
+    const panel: surface.SurfaceId = @enumFromInt(2);
+    const modal: surface.SurfaceId = @enumFromInt(3);
+    var stack = Stack.init(base);
 
-    try stack.push(.diagnostics);
-    try stack.push(.chat);
-    try stack.push(.diagnostics);
+    try stack.push(panel);
+    try stack.push(modal);
+    try stack.push(panel);
 
     try std.testing.expectEqual(@as(usize, 3), stack.entry_count);
-    try std.testing.expectEqual(surface.SurfaceId.diagnostics, stack.active());
+    try std.testing.expectEqual(panel, stack.active());
 }

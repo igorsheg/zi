@@ -209,8 +209,8 @@ extensions may observe events and request actions, but owners apply mutation at 
 
 coding-agent tui state naturally consists of inspectable content streams and artifacts:
 
-- chat buffers for conversation and agent events.
-- input buffers for prompt editing.
+- transcript buffers for conversation and agent events.
+- editable buffers for prompt composition.
 - tool buffers for command/tool output.
 - diff buffers for proposed or applied file edits.
 - log buffers for diagnostics and runtime events.

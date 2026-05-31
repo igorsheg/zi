@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const buffer = @import("../primitive/buffer.zig");
+const builtin = @import("builtin.zig");
 const surface = @import("../primitive/surface.zig");
 const view = @import("../primitive/view.zig");
 
@@ -42,27 +43,27 @@ pub fn layout(width: u16, height: u16) Layout {
 
     return .{
         .header = .{
-            .surface_id = .header,
-            .view_id = .header,
-            .buffer_id = .header,
+            .surface_id = builtin.surfaces.header,
+            .view_id = builtin.views.header,
+            .buffer_id = builtin.buffers.header,
             .rect = .init(0, 0, width, 1),
         },
         .transcript = .{
-            .surface_id = .chat,
-            .view_id = .chat,
-            .buffer_id = .chat,
+            .surface_id = builtin.surfaces.transcript,
+            .view_id = builtin.views.transcript,
+            .buffer_id = builtin.buffers.transcript,
             .rect = .init(0, 1, width, height - 3),
         },
         .status = .{
-            .surface_id = .status,
-            .view_id = .status,
-            .buffer_id = .status,
+            .surface_id = builtin.surfaces.status,
+            .view_id = builtin.views.status,
+            .buffer_id = builtin.buffers.status,
             .rect = .init(0, height - 2, width, 1),
         },
         .composer = .{
-            .surface_id = .input,
-            .view_id = .input,
-            .buffer_id = .input,
+            .surface_id = builtin.surfaces.composer,
+            .view_id = builtin.views.composer,
+            .buffer_id = builtin.buffers.composer,
             .rect = .init(0, height - 1, width, 1),
         },
     };

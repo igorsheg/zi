@@ -1,29 +1,20 @@
 const std = @import("std");
 
 pub const SlotId = enum(u16) {
-    shell_header,
-    transcript_status,
-    composer_header,
-    composer_footer,
+    _,
 };
 
 pub const ContributionId = enum(u32) {
     _,
 };
 
-pub const Owner = enum {
-    builtin,
-    extension,
-};
-
 pub const Lifetime = enum {
     frame,
-    session,
+    retained,
 };
 
 pub const Contribution = struct {
     id: ContributionId,
-    owner: Owner,
     priority: i16,
     lifetime: Lifetime,
     text: []u8,
@@ -59,7 +50,6 @@ pub const Slot = struct {
         self: *Slot,
         allocator: std.mem.Allocator,
         id: ContributionId,
-        owner: Owner,
         priority: i16,
         lifetime: Lifetime,
         text: []const u8,
@@ -72,7 +62,6 @@ pub const Slot = struct {
             self.contributions[index].deinit(allocator);
             self.contributions[index] = .{
                 .id = id,
-                .owner = owner,
                 .priority = priority,
                 .lifetime = lifetime,
                 .text = owned,
@@ -85,7 +74,6 @@ pub const Slot = struct {
         if (self.contribution_count == self.contributions.len) return error.SlotFull;
         self.contributions[self.contribution_count] = .{
             .id = id,
-            .owner = owner,
             .priority = priority,
             .lifetime = lifetime,
             .text = owned,
@@ -124,53 +112,60 @@ pub const Slot = struct {
     }
 };
 
-pub const Registry = struct {
-    slots: [4]Slot = .{
-        .init(.shell_header),
-        .init(.transcript_status),
-        .init(.composer_header),
-        .init(.composer_footer),
-    },
+pub fn Registry(comptime slot_ids: []const SlotId) type {
+    return struct {
+        const Self = @This();
 
-    pub fn deinit(self: *Registry, allocator: std.mem.Allocator) void {
-        for (&self.slots) |*s| s.deinit(allocator);
-        self.* = undefined;
-    }
+        slots: [slot_ids.len]Slot = initSlots(),
 
-    pub fn get(self: *Registry, id: SlotId) *Slot {
-        return switch (id) {
-            .shell_header => &self.slots[0],
-            .transcript_status => &self.slots[1],
-            .composer_header => &self.slots[2],
-            .composer_footer => &self.slots[3],
-        };
-    }
-};
+        fn initSlots() [slot_ids.len]Slot {
+            var out: [slot_ids.len]Slot = undefined;
+            for (slot_ids, 0..) |id, index| out[index] = .init(id);
+            return out;
+        }
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            for (&self.slots) |*s| s.deinit(allocator);
+            self.* = undefined;
+        }
+
+        pub fn get(self: *Self, id: SlotId) *Slot {
+            for (&self.slots) |*s| {
+                if (s.id == id) return s;
+            }
+            unreachable;
+        }
+    };
+}
 
 test "slot contribution replace is single-owner mutation" {
-    var registry: Registry = .{};
+    const footer: SlotId = @enumFromInt(1);
+    const TestRegistry = Registry(&.{footer});
+    var registry: TestRegistry = .{};
     defer registry.deinit(std.testing.allocator);
 
     const id: ContributionId = @enumFromInt(1);
-    const s = registry.get(.composer_footer);
-    try s.setText(std.testing.allocator, id, .builtin, 0, .session, "model");
-    try s.setText(std.testing.allocator, id, .builtin, 1, .session, "model gpt");
+    const s = registry.get(footer);
+    try s.setText(std.testing.allocator, id, 0, .retained, "old");
+    try s.setText(std.testing.allocator, id, 1, .retained, "new");
     try std.testing.expectEqual(@as(usize, 1), s.contribution_count);
-    try std.testing.expectEqualStrings("model gpt", s.contributions[0].text);
+    try std.testing.expectEqualStrings("new", s.contributions[0].text);
 }
 
 test "slot contributions are priority ordered and clear preserves order" {
-    var registry: Registry = .{};
+    const footer: SlotId = @enumFromInt(1);
+    const TestRegistry = Registry(&.{footer});
+    var registry: TestRegistry = .{};
     defer registry.deinit(std.testing.allocator);
 
     const low: ContributionId = @enumFromInt(1);
     const high: ContributionId = @enumFromInt(2);
     const middle: ContributionId = @enumFromInt(3);
-    const s = registry.get(.composer_footer);
+    const s = registry.get(footer);
 
-    try s.setText(std.testing.allocator, low, .builtin, 0, .session, "low");
-    try s.setText(std.testing.allocator, high, .extension, 10, .session, "high");
-    try s.setText(std.testing.allocator, middle, .extension, 5, .session, "middle");
+    try s.setText(std.testing.allocator, low, 0, .retained, "low");
+    try s.setText(std.testing.allocator, high, 10, .retained, "high");
+    try s.setText(std.testing.allocator, middle, 5, .retained, "middle");
 
     try std.testing.expectEqual(high, s.contributions[0].id);
     try std.testing.expectEqual(middle, s.contributions[1].id);

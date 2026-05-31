@@ -59,6 +59,12 @@ pub const Store = struct {
     next_id: u64 = 1,
     revision: u64 = 0,
 
+    pub const TextUpdate = union(enum) {
+        unchanged,
+        changed_existing,
+        appended_new: TranscriptItemId,
+    };
+
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
     }
@@ -108,6 +114,47 @@ pub const Store = struct {
         self.revision += 1;
         item.revision = self.revision;
         item.payload = .{ .text = combined };
+    }
+
+    pub fn appendAssistantDelta(
+        self: *Store,
+        active_item_id: *?TranscriptItemId,
+        delta: []const u8,
+        durability: Durability,
+        created_ns: i128,
+    ) !TextUpdate {
+        if (delta.len == 0) return .unchanged;
+        if (active_item_id.*) |id| {
+            try self.appendTextToItem(id, delta);
+            return .changed_existing;
+        }
+
+        const id = try self.appendText(.assistant_message, durability, delta, created_ns);
+        active_item_id.* = id;
+        return .{ .appended_new = id };
+    }
+
+    pub fn appendAssistantFinalText(
+        self: *Store,
+        active_item_id: ?TranscriptItemId,
+        text: []const u8,
+        durability: Durability,
+        created_ns: i128,
+    ) !TextUpdate {
+        if (text.len == 0) return .unchanged;
+        if (active_item_id) |id| {
+            const item = self.get(id) orelse return error.TranscriptItemNotFound;
+            std.debug.assert(item.kind == .assistant_message);
+            const current = item.payload.text;
+            if (std.mem.eql(u8, current, text)) return .unchanged;
+            if (std.mem.startsWith(u8, text, current)) {
+                try self.appendTextToItem(id, text[current.len..]);
+                return .changed_existing;
+            }
+        }
+
+        const id = try self.appendText(.assistant_message, durability, text, created_ns);
+        return .{ .appended_new = id };
     }
 
     pub fn appendCustom(
@@ -186,6 +233,47 @@ test "transcript item accumulates text without adding items" {
 
     const id = try store.appendText(.assistant_message, .ephemeral, "hel", 0);
     try store.appendTextToItem(id, "lo");
+    try std.testing.expectEqual(@as(usize, 1), store.item_count);
+    try std.testing.expectEqualStrings("hello", store.get(id).?.payload.text);
+}
+
+test "assistant delta helper owns active item accumulation" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    var active_item_id: ?TranscriptItemId = null;
+    const first = try store.appendAssistantDelta(&active_item_id, "hel", .ephemeral, 0);
+    const id = switch (first) {
+        .appended_new => |id| id,
+        else => return error.ExpectedNewAssistantItem,
+    };
+    try std.testing.expectEqual(id, active_item_id.?);
+
+    const second = try store.appendAssistantDelta(&active_item_id, "lo", .ephemeral, 0);
+    try std.testing.expectEqual(Store.TextUpdate.changed_existing, second);
+    try std.testing.expectEqual(@as(usize, 1), store.item_count);
+    try std.testing.expectEqualStrings("hello", store.get(id).?.payload.text);
+}
+
+test "assistant final helper avoids duplicate final text" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    var active_item_id: ?TranscriptItemId = null;
+    const first = try store.appendAssistantDelta(&active_item_id, "hel", .ephemeral, 0);
+    const id = switch (first) {
+        .appended_new => |new_id| new_id,
+        else => return error.ExpectedNewAssistantItem,
+    };
+
+    try std.testing.expectEqual(
+        Store.TextUpdate.changed_existing,
+        try store.appendAssistantFinalText(active_item_id, "hello", .ephemeral, 0),
+    );
+    try std.testing.expectEqual(
+        Store.TextUpdate.unchanged,
+        try store.appendAssistantFinalText(active_item_id, "hello", .ephemeral, 0),
+    );
     try std.testing.expectEqual(@as(usize, 1), store.item_count);
     try std.testing.expectEqualStrings("hello", store.get(id).?.payload.text);
 }

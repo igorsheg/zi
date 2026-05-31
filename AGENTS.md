@@ -56,8 +56,9 @@ coding_agent
 
 tui
   owns terminal UI product semantics: transcript items, buffers, views, surfaces,
-  slots, composer, actions/keymaps, and the command/event boundary. observes
-  coding_agent through public commands/events/snapshots only.
+  slots, composer, and the command/event boundary. future actions/keymaps need
+  explicit owners before becoming API. observes coding_agent through public
+  commands/events/snapshots only.
 
 agent
   owns generic agent runtime: transcript, active run, cancel source, tool loop,
@@ -123,9 +124,13 @@ src/tui/substrate/terminal.zig
   owns substrate lifecycle and hides vaxis sharp edges from app policy.
       |
       v
-TuiRuntime / App
-  owns TranscriptStore, BufferStore, ViewStore, SurfaceStack, SlotRegistry,
-  InputComposer, ActionRegistry, KeymapRegistry, TuiCommand, TuiEvent.
+src/tui/primitive + product + composition
+  owns opaque ids, buffers, views, surfaces, slots, focus, frames,
+  composer, transcript, renderers, and built-in shell composition.
+      |
+      v
+src/tui/bridge/App
+  owns stores, dispatch, TuiCommand, TuiEvent, read models, and agent adapters.
       |
       v
 coding_agent frontend boundary
@@ -143,8 +148,9 @@ tui invariants:
 - popovers, modals, autocomplete, command palette, and toasts are surface policy,
   not special buffer kinds.
 - slots are named, bounded contribution points; extensions do not own layout.
-- future Lua extensions use the same commands/events/actions/slots/renderers as
-  built-in code.
+- future Lua extensions use the same commands/events/slots/renderers as
+  built-in code. actions/keymaps are future systems and must have explicit
+  owners before they enter the current API.
 - extensions request; owners mutate.
 - TUI must not touch `host.currentSession().agent`, provider internals, session
   manager internals, or tool internals.
@@ -153,17 +159,19 @@ tui invariants:
 
 tui source boundaries:
 
-- `src/tui/substrate/`: libvaxis lifecycle, terminal adapter, PTY/vscreen tests.
-- `src/tui/primitive/`: bounded retained facts such as buffers, views, surfaces,
-  slots, commands, events, actions, and transcript items.
-- `src/tui/product/`: zi-specific surfaces and renderers built on primitives.
-  reusable mechanics belong in a future widget layer only after reuse is real.
-- `src/tui/composition/`: deterministic arrangements of primitives and product
-  surfaces.
-- `src/tui/bridge/`: owner of stores, dispatch, event application, and render
-  coordination.
-- `src/tui/root.zig`: narrow public re-export surface for callers outside
-  `src/tui`; lower layers do not become API just because they exist.
+- `src/tui/substrate/`: libvaxis lifecycle, terminal adapter, renderer,
+  PTY/vscreen tests.
+- `src/tui/primitive/`: bounded retained mechanics such as buffers, views,
+  surfaces, slots, focus, frames, and grapheme helpers. ids are opaque;
+  product names do not live here.
+- `src/tui/product/`: zi-specific domain state/renderers such as composer and
+  transcript. reusable mechanics belong in a future widget layer only after
+  reuse is real.
+- `src/tui/composition/`: deterministic arrangements and built-in product ids.
+- `src/tui/bridge/`: owner of stores, dispatch, commands, events, read models,
+  agent adaptation, and render coordination.
+- `src/tui/root.zig`: intentionally narrow public re-export surface. today it
+  exports only built-in composition ids, frame policy, and terminal setup.
 
 do not put session, provider, tool, persistence, auth, or model-selection policy
 inside `src/tui`; those belong to `src/coding_agent`.

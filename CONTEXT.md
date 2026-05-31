@@ -52,8 +52,8 @@ AgentSession
   owns bounded public AgentSessionEvent queue
   owns queue mirror and lifecycle state
 
-tui.App
-  owns TUI transcript, buffers, views, surfaces, slots, composer, and TUI events
+src/tui/bridge/App
+  owns TUI stores, dispatch, commands, events, read models, and render cadence
   consumes coding_agent public events/snapshots through a frontend boundary
   does not own AgentSession, tools, providers, settings, or session persistence
 
@@ -96,19 +96,13 @@ window clipping
 terminal rendering
 ```
 
-`src/tui` owns Zi UI semantics:
+`src/tui` owns Zi UI state and composition:
 
 ```text
-TranscriptStore
-BufferStore
-ViewStore
-SurfaceStack
-SlotRegistry
-InputComposer
-ActionRegistry
-KeymapRegistry
-TuiCommand
-TuiEvent
+primitive: opaque ids, buffers, views, surfaces, slots, focus, frames
+product: composer, transcript, transcript renderers
+composition: built-in ids and shell layout
+bridge: App, TuiCommand, TuiEvent, input routing, read models, agent adapters
 ```
 
 the built-in shell is a composition:
@@ -138,10 +132,13 @@ tui contracts:
 - surface render order is deterministic by `(layer, insertion_index)`.
 - TUI events are bounded and drained.
 - extensions request changes through commands; owners mutate.
-- future Lua extensions use the same commands/events/actions/slots/renderers as
-  built-in code.
-- `src/tui/root.zig` exports only stable frontend-facing modules; lower layers
-  stay internal unless tests intentionally target them.
+- future Lua extensions use the same commands/events/slots/renderers as
+  built-in code. actions/keymaps are future systems and must have explicit
+  owners before they enter the current API.
+- `src/tui/root.zig` exports only the deliberately small frontend-facing
+  modules: built-in composition ids, frame policy, and terminal setup. lower
+  layers stay internal unless tests or bridge integration intentionally target
+  them.
 
 relationship to `coding_agent`:
 
@@ -260,10 +257,14 @@ request shutdown
 
 highest value next slices:
 
-1. keep TUI mutation behind `TuiCommand` and observable facts behind bounded `TuiEvent`.
-2. add transcript renderers so transcript is the source of truth and buffers are projections.
-3. add shell composition: header slot, transcript view, status slot, composer surface.
-4. add composer actions for prompt editing, `@file` completion, and slash/command dispatch.
+1. keep shrinking `src/tui/bridge/App` to one mutation owner plus store/apply
+   helpers; product semantics belong in `src/tui/product`.
+2. keep TUI observable facts behind bounded `TuiEvent` drains; no callback
+   reentrancy into mutation.
+3. deepen composer editing with the same boundary: product state first,
+   bridge-owned commands second, projection/rendering last.
+4. add `@file` completion and slash/command dispatch only after their owners,
+   bounds, and extension-facing read model are explicit.
 5. connect TUI to `AgentSessionRuntimeHost` only through live-run commands, public events,
    and owned snapshots.
 6. finish provider/auth/model composition without moving policy into `main.zig`.

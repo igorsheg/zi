@@ -57,12 +57,9 @@ test "screen ascii captures cells and empty space" {
     });
     defer screen.deinit(std.testing.allocator);
 
-    screen.writeCell(0, 0, .{ .char = .{ .grapheme = "z", .width = 1 } });
-    screen.writeCell(1, 0, .{ .char = .{ .grapheme = "i", .width = 1 } });
+    screen.writeCell(0, 0, .{ .char = .{ .grapheme = "a", .width = 1 } });
+    screen.writeCell(1, 0, .{ .char = .{ .grapheme = "b", .width = 1 } });
     screen.writeCell(0, 1, .{ .char = .{ .grapheme = ">", .width = 1 } });
 
-    try expectScreenAscii(
-        \\zi   
-        \\>    
-    , &screen, 5, 2);
+    try expectScreenAscii("ab   \n>    ", &screen, 5, 2);
 }

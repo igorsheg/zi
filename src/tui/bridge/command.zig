@@ -1,8 +1,8 @@
-const buffer = @import("buffer.zig");
-const slot = @import("slot.zig");
-const surface = @import("surface.zig");
-const transcript = @import("transcript.zig");
-const view = @import("view.zig");
+const buffer = @import("../primitive/buffer.zig");
+const slot = @import("../primitive/slot.zig");
+const surface = @import("../primitive/surface.zig");
+const transcript = @import("../product/transcript.zig");
+const view = @import("../primitive/view.zig");
 
 pub const TuiCommand = union(enum) {
     append_transcript_text: AppendTranscriptText,
@@ -11,8 +11,13 @@ pub const TuiCommand = union(enum) {
     buffer_replace: BufferReplace,
     slot_set_text: SlotSetText,
     slot_clear: SlotClear,
+    assistant_delta: []const u8,
+    assistant_final_text: []const u8,
+    assistant_end,
     composer_insert: []const u8,
     composer_backspace,
+    composer_move_left,
+    composer_move_right,
     composer_clear,
     open_text_surface: OpenTextSurface,
     open_surface: OpenSurface,
@@ -43,9 +48,8 @@ pub const TuiCommand = union(enum) {
     pub const SlotSetText = struct {
         slot_id: slot.SlotId,
         contribution_id: slot.ContributionId,
-        owner: slot.Owner,
         priority: i16 = 0,
-        lifetime: slot.Lifetime = .session,
+        lifetime: slot.Lifetime = .retained,
         text: []const u8,
     };
 

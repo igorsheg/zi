@@ -2,11 +2,6 @@ const std = @import("std");
 const buffer = @import("buffer.zig");
 
 pub const ViewId = enum(u32) {
-    chat = 1,
-    input = 2,
-    diagnostics = 3,
-    header = 4,
-    status = 5,
     _,
 };
 
@@ -47,10 +42,12 @@ pub const View = struct {
 };
 
 test "view owns presentation state over a buffer" {
-    var v = View.init(.chat, .chat, .init(0, 0, 80, 24));
+    const id: ViewId = @enumFromInt(1);
+    const buffer_id: buffer.BufferId = @enumFromInt(2);
+    var v = View.init(id, buffer_id, .init(0, 0, 80, 24));
     v.scroll_row = 3;
     v.markSeen(9);
-    try std.testing.expectEqual(buffer.BufferId.chat, v.buffer_id);
+    try std.testing.expectEqual(buffer_id, v.buffer_id);
     try std.testing.expectEqual(@as(u32, 3), v.scroll_row);
     try std.testing.expectEqual(@as(u64, 9), v.revision_seen);
 }

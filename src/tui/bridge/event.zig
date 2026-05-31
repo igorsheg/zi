@@ -1,9 +1,8 @@
-const action = @import("action.zig");
-const buffer = @import("buffer.zig");
-const slot = @import("slot.zig");
-const surface = @import("surface.zig");
-const transcript = @import("transcript.zig");
-const view = @import("view.zig");
+const buffer = @import("../primitive/buffer.zig");
+const slot = @import("../primitive/slot.zig");
+const surface = @import("../primitive/surface.zig");
+const transcript = @import("../product/transcript.zig");
+const view = @import("../primitive/view.zig");
 
 /// TUI events are bounded, non-owning observation facts.
 ///
@@ -20,7 +19,6 @@ pub const TuiEvent = union(enum) {
     composer_changed,
     completion_opened,
     completion_closed,
-    action_invoked: action.ActionId,
     slot_changed: SlotChanged,
 
     pub const BufferChanged = struct {
