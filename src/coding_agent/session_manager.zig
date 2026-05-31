@@ -51,6 +51,22 @@ pub const CompactionPreparation = struct {
     }
 };
 
+pub const CompactionSummaryInput = struct {
+    allocator: std.mem.Allocator,
+    messages: []const agent.AgentMessage,
+    previous_summary: ?[]const u8 = null,
+    first_kept_entry_id: []const u8,
+    tokens_before: u64,
+
+    pub fn deinit(self: *CompactionSummaryInput) void {
+        for (self.messages) |message| agent.deinitAgentMessage(self.allocator, message);
+        self.allocator.free(self.messages);
+        if (self.previous_summary) |summary| self.allocator.free(summary);
+        self.allocator.free(self.first_kept_entry_id);
+        self.* = undefined;
+    }
+};
+
 pub const SessionEntry = union(enum) {
     message: Message,
     thinking_level_change: ThinkingLevelChange,
@@ -546,6 +562,49 @@ pub const SessionManager = struct {
         };
     }
 
+    pub fn buildCompactionSummaryInput(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        settings: CompactionSettings,
+    ) Error!CompactionSummaryInput {
+        var preparation = try self.prepareCompaction(allocator, settings);
+        defer preparation.deinit();
+
+        const branch_entries = try self.getBranch(allocator);
+        defer allocator.free(branch_entries);
+
+        var messages = std.ArrayList(agent.AgentMessage).empty;
+        errdefer {
+            for (messages.items) |message| agent.deinitAgentMessage(allocator, message);
+            messages.deinit(allocator);
+        }
+
+        for (branch_entries[preparation.summarize_start_index..preparation.summarize_end_index]) |entry| {
+            switch (entry) {
+                .message => |message_entry| try appendContextMessageCopy(
+                    allocator,
+                    &messages,
+                    message_entry.message,
+                ),
+                else => {},
+            }
+        }
+        if (messages.items.len == 0) return error.NothingToCompact;
+
+        const first_kept_entry_id = try allocator.dupe(u8, preparation.first_kept_entry_id);
+        errdefer allocator.free(first_kept_entry_id);
+        const previous_summary = if (preparation.previous_summary) |summary| try allocator.dupe(u8, summary) else null;
+        errdefer if (previous_summary) |summary| allocator.free(summary);
+
+        return .{
+            .allocator = allocator,
+            .messages = try messages.toOwnedSlice(allocator),
+            .previous_summary = previous_summary,
+            .first_kept_entry_id = first_kept_entry_id,
+            .tokens_before = preparation.tokens_before,
+        };
+    }
+
     fn validateCompactionInput(summary: []const u8, first_kept_entry_id: []const u8) Error!void {
         if (summary.len > max_compaction_summary_bytes) return error.CompactionSummaryTooLarge;
         if (first_kept_entry_id.len > max_compaction_first_kept_entry_id_bytes) {
@@ -990,6 +1049,25 @@ test "prepare compaction keeps bounded recent suffix" {
     try std.testing.expect(preparation.previous_summary == null);
 }
 
+test "build compaction summary input owns messages to summarize" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendMessage(userMessage("aaaaaaaa"), "t1");
+    _ = try manager.appendMessage(userMessage("bbbbbbbb"), "t2");
+    const kept = try manager.appendMessage(userMessage("cccccccc"), "t3");
+
+    var input = try manager.buildCompactionSummaryInput(std.testing.allocator, .{ .keep_recent_tokens = 2 });
+    defer input.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), input.messages.len);
+    try std.testing.expectEqualStrings("aaaaaaaa", input.messages[0].user.content.string);
+    try std.testing.expectEqualStrings("bbbbbbbb", input.messages[1].user.content.string);
+    try std.testing.expectEqualStrings(kept, input.first_kept_entry_id);
+    try std.testing.expectEqual(@as(u64, 6), input.tokens_before);
+    try std.testing.expect(input.previous_summary == null);
+}
+
 test "prepare compaction reuses previous first kept boundary" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
@@ -1006,6 +1084,25 @@ test "prepare compaction reuses previous first kept boundary" {
     try std.testing.expectEqual(@as(usize, 0), preparation.summarize_start_index);
     try std.testing.expectEqual(@as(usize, 3), preparation.summarize_end_index);
     try std.testing.expectEqualStrings("prior", preparation.previous_summary.?);
+}
+
+test "build compaction summary input carries previous summary" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const root = try manager.appendMessage(userMessage("aaaaaaaa"), "t1");
+    _ = try manager.appendCompaction("prior", root, 2, "t2");
+    _ = try manager.appendMessage(userMessage("bbbbbbbb"), "t3");
+    const kept = try manager.appendMessage(userMessage("cccccccc"), "t4");
+
+    var input = try manager.buildCompactionSummaryInput(std.testing.allocator, .{ .keep_recent_tokens = 2 });
+    defer input.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), input.messages.len);
+    try std.testing.expectEqualStrings("aaaaaaaa", input.messages[0].user.content.string);
+    try std.testing.expectEqualStrings("bbbbbbbb", input.messages[1].user.content.string);
+    try std.testing.expectEqualStrings(kept, input.first_kept_entry_id);
+    try std.testing.expectEqualStrings("prior", input.previous_summary.?);
 }
 
 test "tree navigation returns entries leaf and children" {
