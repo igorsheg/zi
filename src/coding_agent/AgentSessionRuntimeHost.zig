@@ -334,6 +334,7 @@ const ToolLoopObservation = struct {
 
 const BashLimitObservation = struct {
     tool_execution_end: bool = false,
+    tool_error: bool = false,
     output_limit_exceeded: bool = false,
     tool_result_message: bool = false,
 
@@ -345,6 +346,7 @@ const BashLimitObservation = struct {
             .tool_execution_end => |payload| {
                 if (!std.mem.eql(u8, payload.tool_name, "bash")) return;
                 self.tool_execution_end = true;
+                self.tool_error = payload.is_error;
                 if (payload.result.details) |details| {
                     if (details == .object) {
                         const exceeded = details.object.get("outputLimitExceeded") orelse return;
@@ -867,5 +869,63 @@ test "runtime host preserves bash output limit details through public events" {
     try std.testing.expect(observed.tool_execution_end);
     try std.testing.expect(observed.output_limit_exceeded);
     try std.testing.expect(observed.tool_result_message);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+}
+
+test "runtime host cancellation reaches running bash tool through agent loop" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
+
+    var provider = try faux.Provider.init(std.testing.allocator, .{
+        .min_token_size = 128,
+        .max_token_size = 128,
+    });
+    defer provider.deinit();
+
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(std.testing.allocator);
+    try args.put(std.testing.allocator, "command", .{ .string = "sleep 60" });
+
+    const tool_call_content = [_]ai.AssistantContent{
+        faux.toolCall("tool-1", "bash", .{ .object = args }),
+    };
+    const responses = [_]ai.AssistantMessage{
+        faux.assistantMessage(&tool_call_content, .{ .stop_reason = .tool_use }),
+    };
+    try provider.setResponses(&responses);
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = cwd_buffer[0..cwd_len],
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    var future = std.testing.io.async(runPromptForTest, .{ &host, "use bash" });
+    try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.running, host.statusSnapshot().status);
+    host.cancel();
+
+    try future.await(std.testing.io);
+    var observed: BashLimitObservation = .{};
+    _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });
+
+    try std.testing.expect(observed.tool_execution_end);
+    try std.testing.expect(observed.tool_error);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
 }

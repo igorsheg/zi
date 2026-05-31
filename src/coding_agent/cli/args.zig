@@ -30,6 +30,8 @@ pub const AppArgs = struct {
     help: bool = false,
     print: bool = false,
     mode: ?OutputMode = null,
+    resume_session_file: ?[]const u8 = null,
+    resume_latest: bool = false,
     messages: MessageList = .{},
     unknown_flags: UnknownFlagList = .{},
 };
@@ -91,6 +93,8 @@ const AppFlagTarget = enum {
     help,
     print,
     mode,
+    resume_session,
+    resume_latest,
 };
 
 const AppFlagSpec = struct {
@@ -115,6 +119,18 @@ const app_flags = [_]AppFlagSpec{
         .target = .mode,
         .value_name = "mode",
         .help = "Output mode: text, json, or rpc",
+    },
+    .{
+        .long = "resume",
+        .value = .required,
+        .target = .resume_session,
+        .value_name = "session",
+        .help = "Resume the named session file",
+    },
+    .{
+        .long = "resume-latest",
+        .target = .resume_latest,
+        .help = "Resume the newest session for this cwd",
     },
     .{
         .long = "help",
@@ -258,6 +274,14 @@ fn applyAppFlag(result: *AppArgs, spec: AppFlagSpec, value: ?[]const u8) ParseEr
         .print => result.print = true,
         .mode => result.mode = std.meta.stringToEnum(OutputMode, value orelse return error.MissingOptionValue) orelse
             return error.InvalidOptionValue,
+        .resume_session => {
+            if (result.resume_session_file != null or result.resume_latest) return error.InvalidOptionValue;
+            result.resume_session_file = value orelse return error.MissingOptionValue;
+        },
+        .resume_latest => {
+            if (result.resume_session_file != null or result.resume_latest) return error.InvalidOptionValue;
+            result.resume_latest = true;
+        },
     }
 }
 
@@ -306,6 +330,7 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
         \\  zi
         \\  zi "explain this repo"
         \\  zi -p "hello"
+        \\  zi --resume-latest
         \\  zi auth status openai-codex
         \\
     );
@@ -315,6 +340,8 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
 pub fn writeUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\usage: zi [options] [prompt]
+        \\       zi --resume <session> [prompt]
+        \\       zi --resume-latest [prompt]
         \\       zi auth login openai-codex
         \\       zi auth logout openai-codex
         \\       zi auth status openai-codex
@@ -349,6 +376,35 @@ test "parses print prompt" {
     const app = command.app;
     try std.testing.expect(app.print);
     try std.testing.expectEqualStrings("hello", app.messages.slice()[0]);
+}
+
+test "parses resume session file" {
+    const app = (try parse(&.{ "--resume", "t_session.jsonl" })).app;
+    try std.testing.expectEqualStrings("t_session.jsonl", app.resume_session_file.?);
+    try std.testing.expect(!app.resume_latest);
+}
+
+test "parses resume latest" {
+    const app = (try parse(&.{"--resume-latest"})).app;
+    try std.testing.expect(app.resume_latest);
+    try std.testing.expect(app.resume_session_file == null);
+}
+
+test "rejects duplicate resume policy" {
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "a.jsonl", "--resume-latest" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume-latest", "--resume", "a.jsonl" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "a.jsonl", "--resume", "b.jsonl" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume-latest", "--resume-latest" }));
+}
+
+test "usage includes resume forms" {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+
+    try writeUsage(&writer);
+
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --resume <session> [prompt]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --resume-latest [prompt]") != null);
 }
 
 test "parses help" {

@@ -12,14 +12,13 @@ const sdk = @import("sdk.zig");
 
 pub const Options = struct {
     initial_prompt: ?[]const u8 = null,
+    resume_session_file: ?[]const u8 = null,
 };
 
 pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Options) !void {
     const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
     const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
     defer process.gpa.free(timestamp_text);
-    const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
-    defer process.gpa.free(session_id);
 
     var faux_provider: ?ai.FauxProvider = null;
     defer if (faux_provider) |*provider| provider.deinit();
@@ -39,16 +38,32 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
     else
         null;
 
-    var runtime_host = try sdk.createRuntimeHost(process.gpa, process.io, .{
-        .cwd = options.cwd,
-        .agent_dir_override = options.agent_dir_override,
-        .current_date = timestamp_text,
-        .session_id = session_id,
-        .timestamp = timestamp_text,
-        .model = explicit_model,
-        .stream = explicit_stream,
-        .environ = process.environ,
-    });
+    var runtime_host = if (tui_options.resume_session_file) |session_file|
+        try sdk.resumeRuntimeHost(process.gpa, process.io, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = timestamp_text,
+            .session_file_name = session_file,
+            .model = explicit_model,
+            .stream = explicit_stream,
+            .dir = options.dir,
+            .environ = options.environ,
+        })
+    else blk: {
+        const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
+        defer process.gpa.free(session_id);
+        break :blk try sdk.createRuntimeHost(process.gpa, process.io, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = timestamp_text,
+            .session_id = session_id,
+            .timestamp = timestamp_text,
+            .model = explicit_model,
+            .stream = explicit_stream,
+            .dir = options.dir,
+            .environ = options.environ,
+        });
+    };
     defer runtime_host.deinit();
 
     var terminal: tui.terminal.Terminal = undefined;

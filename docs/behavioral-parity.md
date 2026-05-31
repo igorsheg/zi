@@ -57,7 +57,7 @@ ai
 | Queue snapshots expose text without copying full text into every event | `queue_update` plus queue arrays | `AgentSession` | implemented | `agent session queue update carries revision and snapshot exposes queued text` |
 | Public event drain is caller-driven | `subscribe()` over session events | `AgentSession` | implemented | `agent session public event drain is caller driven` |
 | Event order is session policy before frontend policy | `AgentSession` event subscription/persistence path | `AgentSession` | implemented | `agent session terminal policy runs after persistence` |
-| Session history is durable truth | `core/session-manager.ts` | `SessionManager` / `session_store` | implemented for new SDK sessions and explicit resume; fork/import/export missing | `session store appends entries and round trips context`; `runtime host preserves session header active leaf and context after public drain`; `runtime host persists session store that loads after host deinit`; `runtime host resumes session store into agent context and appends new history`; `sdk runtime creates session store under service session path`; `sdk runtime resumes existing session store from service session path` |
+| Session history is durable truth | `core/session-manager.ts` | `SessionManager` / `session_store` | implemented for new SDK sessions, bounded listing/selection, CLI selection, and explicit resume; fork/import/export missing | `session store appends entries and round trips context`; `runtime host preserves session header active leaf and context after public drain`; `runtime host persists session store that loads after host deinit`; `runtime host resumes session store into agent context and appends new history`; `sdk runtime creates session store under service session path`; `sdk runtime lists resumable session leaf names newest first`; `sdk runtime session listing is bounded and ignores non session files`; `sdk runtime session listing returns empty when session directory is absent`; `sdk runtime selects explicit resumable session leaf name`; `sdk runtime selects newest resumable session only from complete listing`; `sdk runtime selection rejects traversal and reports absent sessions`; `sdk runtime newest selection fails when listing is truncated`; `cli selects newest resumable session through sdk policy`; `cli selects explicit resumable session through sdk policy`; `cli reports absent resumable session`; `sdk runtime resumes existing session store from service session path` |
 | Persistent message events are written before public drain | `AgentSession` subscription persistence | `AgentSession` | implemented | `agent session persists message_end through session event drain` |
 | Public event queue overflow is explicit | `AgentSessionEvent` listeners | `AgentSession` | implemented | `agent session public event queue overflow is explicit` |
 | Cancellation intent remains observable until terminal event | abort/cancel flow | `AgentSession` | implemented | `agent session cancel while running is observable until terminal event` |
@@ -75,7 +75,7 @@ ai
 | Auto compaction events and policy | `core/compaction/*` | `AgentSession` future terminal policy | protocol only | missing |
 | Manual compaction | `AgentSession.compact()` | `AgentSession` future terminal policy | missing | missing |
 | Auto retry events and policy | `auto_retry_start/end` in `AgentSession` | `AgentSession` future terminal policy | protocol only | missing |
-| Bash/process tool with timeout/cancel | `core/bash-executor.ts`, `tools/bash.ts` | `tools/BashTool` / `AgentSession` | minimal implemented: cwd-bound, sequential, no stdin/env/PTY/background/streaming | `bash tool runs one cwd-bound command`; `bash tool treats nonzero exit as result data`; `bash tool cancels running process through owner race`; `runtime host preserves bash output limit details through public events` |
+| Bash/process tool with timeout/cancel | `core/bash-executor.ts`, `tools/bash.ts` | `tools/BashTool` / `AgentSession` | minimal implemented: cwd-bound, sequential, no stdin/env/PTY/background/streaming | `bash tool runs one cwd-bound command`; `bash tool treats nonzero exit as result data`; `bash tool cancels running process through owner race`; `runtime host preserves bash output limit details through public events`; `runtime host cancellation reaches running bash tool through agent loop` |
 | Find/grep/ls tools | `core/tools/find.ts`, `grep.ts`, `ls.ts` | `tools/*` | implemented | `find tool recursively filters paths`; `grep tool searches directory files with literal pattern`; `ls tool lists one directory with bounds` |
 | Slash commands and prompt templates | `slash-commands.ts`, `prompt-templates.ts` | future frontend/session command owner | missing | missing |
 | Session fork/resume/import/export HTML | `agent-session-runtime.ts`, `export-html/*` | future host/session manager | missing | missing |
@@ -86,13 +86,12 @@ ai
 Work down this list. Do not add a framework to satisfy a row.
 
 1. Harden durable session truth.
-   - Add listing/selection policy for resumable session files.
+   - Add behavior coverage for TUI resume after TUI test substrate settles.
    - Keep fork/import/export separate from resume.
    - Keep frontend event drains observational; they must not alter persisted
      history, active leaf, or session header.
 
 2. Harden the bounded process tool.
-   - Add session/agent-loop behavior coverage for cancellation.
    - Keep stdin, env overrides, PTY, background jobs, and streaming out until
      each has an owner, bound, and drain site.
 
