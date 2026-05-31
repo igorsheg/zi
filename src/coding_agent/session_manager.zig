@@ -222,9 +222,22 @@ pub const SessionManager = struct {
         tokens_before: u64,
         timestamp: []const u8,
     ) Error![]const u8 {
+        try self.ensureAppendCapacity(1);
+        const entry = try self.prepareCompactionEntry(summary, first_kept_entry_id, tokens_before, timestamp);
+        errdefer self.deinitEntry(entry);
+        return self.commitPreparedEntry(entry);
+    }
+
+    pub fn prepareCompactionEntry(
+        self: *SessionManager,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+        timestamp: []const u8,
+    ) Error!SessionEntry {
         const base = try self.nextBase(timestamp);
-        const entry: SessionEntry = blk: {
-            errdefer self.deinitBase(base);
+        errdefer self.deinitBase(base);
+        return blk: {
             const summary_copy = try self.allocator.dupe(u8, summary);
             errdefer self.allocator.free(summary_copy);
             const first_kept_entry_id_copy = try self.allocator.dupe(u8, first_kept_entry_id);
@@ -235,8 +248,6 @@ pub const SessionManager = struct {
                 .tokens_before = tokens_before,
             } };
         };
-        errdefer self.deinitEntry(entry);
-        return self.appendEntry(entry);
     }
 
     pub fn appendLoadedEntry(self: *SessionManager, loaded: LoadedEntry) Error![]const u8 {

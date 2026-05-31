@@ -93,6 +93,7 @@ pub const Error = error{
     SessionBusy,
     SessionCancelling,
     SessionShuttingDown,
+    CompactionEntryNotInBranch,
 };
 
 pub const EventText = struct {
@@ -843,6 +844,26 @@ pub fn continueRun(self: *AgentSession) !void {
     try self.agent.continueRun();
 }
 
+pub fn compactWithSummary(
+    self: *AgentSession,
+    summary: []const u8,
+    first_kept_entry_id: []const u8,
+    tokens_before: u64,
+) !CompactionResult {
+    try self.ensureAcceptsContinue();
+    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
+    return self.applyManualCompaction(summary, first_kept_entry_id, tokens_before) catch |err| {
+        const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
+        self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
+            .reason = .manual,
+            .aborted = false,
+            .will_retry = false,
+            .error_message = error_message,
+        } });
+        return err;
+    };
+}
+
 pub fn cancel(self: *AgentSession) void {
     self.reconcileLifecycle();
     if (self.agent.state.status == .settling) return;
@@ -951,6 +972,57 @@ fn ensureAcceptsContinue(self: *AgentSession) Error!void {
         .shutdown_requested, .stopped => return error.SessionShuttingDown,
     }
     if (self.agent.state.isStreaming()) return error.SessionBusy;
+}
+
+fn applyManualCompaction(
+    self: *AgentSession,
+    summary: []const u8,
+    first_kept_entry_id: []const u8,
+    tokens_before: u64,
+) !CompactionResult {
+    try self.ensureEntryInActiveBranch(first_kept_entry_id);
+    try self.manager.ensureAppendCapacity(1);
+    const entry = try self.manager.prepareCompactionEntry(
+        summary,
+        first_kept_entry_id,
+        tokens_before,
+        self.timestamp,
+    );
+    errdefer self.manager.deinitPreparedEntry(entry);
+
+    if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
+
+    var event_result = try CompactionResult.init(self.allocator, entry.compaction);
+    errdefer event_result.deinit();
+    var return_result = try CompactionResult.init(self.allocator, entry.compaction);
+    errdefer return_result.deinit();
+
+    _ = self.manager.commitPreparedEntry(entry);
+
+    const context = try self.manager.buildSessionContext(self.allocator);
+    defer self.manager.deinitSessionContext(self.allocator, context);
+    try self.agent.replaceMessages(context.messages);
+
+    self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
+        .reason = .manual,
+        .result = event_result,
+        .aborted = false,
+        .will_retry = false,
+    } });
+    event_result = undefined;
+
+    const result = return_result;
+    return_result = undefined;
+    return result;
+}
+
+fn ensureEntryInActiveBranch(self: *AgentSession, entry_id: []const u8) !void {
+    const branch = try self.manager.getBranch(self.allocator);
+    defer self.allocator.free(branch);
+    for (branch) |entry| {
+        if (std.mem.eql(u8, entry.id(), entry_id)) return;
+    }
+    return error.CompactionEntryNotInBranch;
 }
 
 fn reconcileLifecycle(self: *AgentSession) void {
@@ -1986,6 +2058,76 @@ test "agent session compaction end event serializes owned result" {
             "\"firstKeptEntryId\":\"00000001\",\"tokensBefore\":42},\"aborted\":false,\"willRetry\":false}",
         writer.written(),
     );
+}
+
+test "agent session manual compaction persists and replaces agent context" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    const store = try session_store.SessionStore.create(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "repo",
+        "session",
+        "2026-05-25T00:00:00Z",
+    );
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .session_store = store,
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "dropped" },
+        .timestamp = 0,
+    } } } });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "kept" },
+        .timestamp = 0,
+    } } } });
+    session.agent.finishRun();
+    drainAllPublicEvents(&session);
+
+    const kept = session.manager.entries.items[1].id();
+    var result = try session.compactWithSummary("summary", kept, 2048);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("summary", result.summary.text);
+    try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(u64, 2048), result.tokens_before);
+    try std.testing.expectEqual(@as(usize, 3), session.manager.entries.items.len);
+    try std.testing.expect(session.manager.entries.items[2] == .compaction);
+    try std.testing.expectEqual(@as(usize, 2), session.agent.state.messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, session.agent.state.messages[0].user.content.string, "summary") != null);
+    try std.testing.expectEqualStrings("kept", session.agent.state.messages[1].user.content.string);
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    try std.testing.expectEqual(AgentSessionEvent.CompactionReason.manual, start_event.compaction_start.reason);
+
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expect(end_event.compaction_end.result != null);
+    try std.testing.expectEqualStrings("summary", end_event.compaction_end.result.?.summary.text);
+    try std.testing.expect(session.drainPublicEvent() == null);
+
+    var loaded = try session.store.?.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 3), loaded.entries.items.len);
+    try std.testing.expect(loaded.entries.items[2] == .compaction);
+    try std.testing.expectEqualStrings("summary", loaded.entries.items[2].compaction.summary);
 }
 
 test "agent session terminal policy runs after persistence" {
