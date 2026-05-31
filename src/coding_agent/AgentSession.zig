@@ -63,6 +63,22 @@ const PromptCommandName = enum {
 
 const prompt_commands: []const PromptCommandName = &.{ .help, .session };
 
+const ManualCompactionRequest = union(enum) {
+    explicit: Explicit,
+    prepared: Prepared,
+
+    const Explicit = struct {
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+    };
+
+    const Prepared = struct {
+        summary: []const u8,
+        settings: session_manager.CompactionSettings,
+    };
+};
+
 pub const LivePromptRun = struct {
     token: runtime.CancelToken,
     stream: agent_mod.loop.AgentEventStream = undefined,
@@ -850,18 +866,11 @@ pub fn compactWithSummary(
     first_kept_entry_id: []const u8,
     tokens_before: u64,
 ) !CompactionResult {
-    try self.ensureAcceptsContinue();
-    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
-    return self.applyManualCompaction(summary, first_kept_entry_id, tokens_before) catch |err| {
-        const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
-        self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
-            .reason = .manual,
-            .aborted = false,
-            .will_retry = false,
-            .error_message = error_message,
-        } });
-        return err;
-    };
+    return self.runManualCompaction(.{ .explicit = .{
+        .summary = summary,
+        .first_kept_entry_id = first_kept_entry_id,
+        .tokens_before = tokens_before,
+    } });
 }
 
 pub fn compactPreparedWithSummary(
@@ -869,9 +878,19 @@ pub fn compactPreparedWithSummary(
     summary: []const u8,
     settings: session_manager.CompactionSettings,
 ) !CompactionResult {
+    return self.runManualCompaction(.{ .prepared = .{
+        .summary = summary,
+        .settings = settings,
+    } });
+}
+
+fn runManualCompaction(
+    self: *AgentSession,
+    request: ManualCompactionRequest,
+) !CompactionResult {
     try self.ensureAcceptsContinue();
     self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
-    return self.prepareAndApplyManualCompaction(summary, settings) catch |err| {
+    return self.applyManualCompactionRequest(request) catch |err| {
         const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
             .reason = .manual,
@@ -1033,6 +1052,23 @@ fn applyManualCompaction(
     const result = return_result;
     return_result = undefined;
     return result;
+}
+
+fn applyManualCompactionRequest(
+    self: *AgentSession,
+    request: ManualCompactionRequest,
+) !CompactionResult {
+    return switch (request) {
+        .explicit => |explicit| self.applyManualCompaction(
+            explicit.summary,
+            explicit.first_kept_entry_id,
+            explicit.tokens_before,
+        ),
+        .prepared => |prepared| self.prepareAndApplyManualCompaction(
+            prepared.summary,
+            prepared.settings,
+        ),
+    };
 }
 
 fn prepareAndApplyManualCompaction(
