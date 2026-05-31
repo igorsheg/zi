@@ -197,6 +197,28 @@ pub const CompactionResult = struct {
     }
 };
 
+pub const CompactionPreparationSnapshot = struct {
+    first_kept_entry_id: EventText,
+    tokens_before: u64,
+    has_previous_summary: bool,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        preparation: session_manager.CompactionPreparation,
+    ) !CompactionPreparationSnapshot {
+        return .{
+            .first_kept_entry_id = try EventText.init(allocator, preparation.first_kept_entry_id),
+            .tokens_before = preparation.tokens_before,
+            .has_previous_summary = preparation.previous_summary != null,
+        };
+    }
+
+    pub fn deinit(self: *CompactionPreparationSnapshot) void {
+        self.first_kept_entry_id.deinit();
+        self.* = undefined;
+    }
+};
+
 const Lifecycle = enum {
     accepting,
     cancel_requested,
@@ -891,6 +913,13 @@ pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !Com
         .summary = summary,
         .settings = self.compaction_settings,
     } });
+}
+
+pub fn prepareCompactionSnapshot(self: *AgentSession) !CompactionPreparationSnapshot {
+    try self.ensureAcceptsContinue();
+    var preparation = try self.manager.prepareCompaction(self.allocator, self.compaction_settings);
+    defer preparation.deinit();
+    return CompactionPreparationSnapshot.init(self.allocator, preparation);
 }
 
 fn runManualCompaction(
@@ -2275,6 +2304,31 @@ test "agent session prepared manual compaction uses session settings" {
 
     try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
     try std.testing.expectEqual(@as(u64, 4), result.tokens_before);
+}
+
+test "agent session prepares owned compaction snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+    session.compaction_settings = .{ .keep_recent_tokens = 2 };
+
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    const kept = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    var snapshot = try session.prepareCompactionSnapshot();
+    defer snapshot.deinit();
+
+    try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(u64, 4), snapshot.tokens_before);
+    try std.testing.expect(!snapshot.has_previous_summary);
 }
 
 test "agent session prepared manual compaction emits failure event" {

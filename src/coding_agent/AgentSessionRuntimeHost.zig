@@ -166,6 +166,12 @@ pub fn compactWithPreparedSummary(
     return self.session.compactWithPreparedSummary(summary);
 }
 
+pub fn prepareCompactionSnapshot(
+    self: *AgentSessionRuntimeHost,
+) !AgentSession.CompactionPreparationSnapshot {
+    return self.session.prepareCompactionSnapshot();
+}
+
 pub fn cancel(self: *AgentSessionRuntimeHost) void {
     self.session.cancel();
 }
@@ -870,6 +876,45 @@ test "runtime host compacts through public command boundary" {
     defer end_event.deinit();
     try std.testing.expect(end_event == .compaction_end);
     try std.testing.expectEqualStrings(kept, end_event.compaction_end.result.?.first_kept_entry_id.text);
+}
+
+test "runtime host exposes compaction preparation snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    _ = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    const kept = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    var snapshot = try host.prepareCompactionSnapshot();
+    defer snapshot.deinit();
+
+    try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(u64, 4), snapshot.tokens_before);
 }
 
 test "runtime host preserves bash output limit details through public events" {
