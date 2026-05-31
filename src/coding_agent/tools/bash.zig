@@ -275,19 +275,10 @@ test "bash tool runs one cwd-bound command" {
     try tmp.dir.createDirPath(std.testing.io, "repo");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "ok" });
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
+    var tool = try initTestTool(tmp.dir, "repo", .{});
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "command", .{ .string = "pwd; cat file.txt" });
-
-    var cancel_source: runtime.CancelSource = .{};
-    var result = try execute(std.testing.allocator, std.testing.io, &tool, cancel_source.token(), "call", .{
-        .object = object,
-    }, null);
+    var result = try executeTestCommand(&tool, "pwd; cat file.txt");
     defer result.deinit();
 
     try std.testing.expect(std.mem.endsWith(u8, result.result.content[0].text.text, "repo\nok"));
@@ -298,37 +289,56 @@ test "bash tool treats nonzero exit as result data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
-    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
+    var tool = try initTestTool(tmp.dir, ".", .{});
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "command", .{ .string = "printf nope; exit 7" });
-
-    var cancel_source: runtime.CancelSource = .{};
-    var result = try execute(std.testing.allocator, std.testing.io, &tool, cancel_source.token(), "call", .{
-        .object = object,
-    }, null);
+    var result = try executeTestCommand(&tool, "printf nope; exit 7");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("nope", result.result.content[0].text.text);
     try std.testing.expectEqual(@as(i64, 7), result.result.details.?.object.get("exitCode").?.integer);
 }
 
+test "bash tool treats timeout as bounded result data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var tool = try initTestTool(tmp.dir, ".", .{ .timeout_ms = 1 });
+    defer tool.deinit();
+
+    var result = try executeTestCommand(&tool, "sleep 60");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("bash timed out", result.result.content[0].text.text);
+    try std.testing.expect(result.result.details.?.object.get("timedOut").?.bool);
+    try std.testing.expect(!result.result.details.?.object.get("outputLimitExceeded").?.bool);
+}
+
+test "bash tool treats output limit as bounded result data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var tool = try initTestTool(tmp.dir, ".", .{ .max_stdout_bytes = 4 });
+    defer tool.deinit();
+
+    var result = try executeTestCommand(&tool, "printf abcdef");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("bash output limit exceeded", result.result.content[0].text.text);
+    try std.testing.expect(!result.result.details.?.object.get("timedOut").?.bool);
+    try std.testing.expect(result.result.details.?.object.get("outputLimitExceeded").?.bool);
+}
+
 test "bash tool cancels running process through owner race" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
-    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
+    var tool = try initTestTool(tmp.dir, ".", .{});
     defer tool.deinit();
 
     var object: std.json.ObjectMap = .empty;
     defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "command", .{ .string = "sleep 60" });
+    try putCommand(&object, "sleep 60");
 
     var cancel_source: runtime.CancelSource = .{};
     var future = std.testing.io.async(execute, .{
@@ -344,4 +354,32 @@ test "bash tool cancels running process through owner race" {
     cancel_source.request();
 
     try std.testing.expectError(error.OperationCancelled, future.await(std.testing.io));
+}
+
+fn initTestTool(dir: std.Io.Dir, sub_path: []const u8, config: struct {
+    timeout_ms: ?u64 = null,
+    max_stdout_bytes: ?usize = null,
+}) !BashTool {
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try dir.realPathFile(std.testing.io, sub_path, &cwd_buffer);
+    return BashTool.init(std.testing.allocator, .{
+        .cwd = cwd_buffer[0..cwd_len],
+        .timeout_ms = config.timeout_ms orelse default_timeout_ms,
+        .max_stdout_bytes = config.max_stdout_bytes orelse max_stdout_bytes,
+    });
+}
+
+fn putCommand(object: *std.json.ObjectMap, command: []const u8) !void {
+    try object.put(std.testing.allocator, "command", .{ .string = command });
+}
+
+fn executeTestCommand(tool: *BashTool, command: []const u8) !agent.ToolExecutionResult {
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try putCommand(&object, command);
+
+    var cancel_source: runtime.CancelSource = .{};
+    return execute(std.testing.allocator, std.testing.io, tool, cancel_source.token(), "call", .{
+        .object = object,
+    }, null);
 }
