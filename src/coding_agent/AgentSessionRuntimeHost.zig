@@ -172,6 +172,12 @@ pub fn prepareCompactionSnapshot(
     return self.session.prepareCompactionSnapshot();
 }
 
+pub fn prepareCompactionSummaryInputSnapshot(
+    self: *AgentSessionRuntimeHost,
+) !AgentSession.CompactionSummaryInputSnapshot {
+    return self.session.prepareCompactionSummaryInputSnapshot();
+}
+
 pub fn cancel(self: *AgentSessionRuntimeHost) void {
     self.session.cancel();
 }
@@ -915,6 +921,46 @@ test "runtime host exposes compaction preparation snapshot" {
 
     try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
     try std.testing.expectEqual(@as(u64, 4), snapshot.tokens_before);
+}
+
+test "runtime host exposes compaction summary input snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    _ = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    const kept = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    var snapshot = try host.prepareCompactionSummaryInputSnapshot();
+    defer snapshot.deinit();
+
+    try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.message_count);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.serialized_input.text, "[User]: aaaaaaaa") != null);
 }
 
 test "runtime host preserves bash output limit details through public events" {

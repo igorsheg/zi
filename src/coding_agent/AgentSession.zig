@@ -219,6 +219,36 @@ pub const CompactionPreparationSnapshot = struct {
     }
 };
 
+pub const CompactionSummaryInputSnapshot = struct {
+    serialized_input: EventText,
+    first_kept_entry_id: EventText,
+    tokens_before: u64,
+    message_count: usize,
+    has_previous_summary: bool,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        input: session_manager.CompactionSummaryInput,
+        serialized_input: []const u8,
+    ) !CompactionSummaryInputSnapshot {
+        var serialized = try EventText.init(allocator, serialized_input);
+        errdefer serialized.deinit();
+        return .{
+            .serialized_input = serialized,
+            .first_kept_entry_id = try EventText.init(allocator, input.first_kept_entry_id),
+            .tokens_before = input.tokens_before,
+            .message_count = input.messages.len,
+            .has_previous_summary = input.previous_summary != null,
+        };
+    }
+
+    pub fn deinit(self: *CompactionSummaryInputSnapshot) void {
+        self.serialized_input.deinit();
+        self.first_kept_entry_id.deinit();
+        self.* = undefined;
+    }
+};
+
 const Lifecycle = enum {
     accepting,
     cancel_requested,
@@ -920,6 +950,15 @@ pub fn prepareCompactionSnapshot(self: *AgentSession) !CompactionPreparationSnap
     var preparation = try self.manager.prepareCompaction(self.allocator, self.compaction_settings);
     defer preparation.deinit();
     return CompactionPreparationSnapshot.init(self.allocator, preparation);
+}
+
+pub fn prepareCompactionSummaryInputSnapshot(self: *AgentSession) !CompactionSummaryInputSnapshot {
+    try self.ensureAcceptsContinue();
+    var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
+    defer input.deinit();
+    const serialized_input = try input.serialize(self.allocator);
+    defer self.allocator.free(serialized_input);
+    return CompactionSummaryInputSnapshot.init(self.allocator, input, serialized_input);
 }
 
 fn runManualCompaction(
@@ -2329,6 +2368,34 @@ test "agent session prepares owned compaction snapshot" {
     try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
     try std.testing.expectEqual(@as(u64, 4), snapshot.tokens_before);
     try std.testing.expect(!snapshot.has_previous_summary);
+}
+
+test "agent session prepares owned compaction summary input snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+    session.compaction_settings = .{ .keep_recent_tokens = 2 };
+
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    const kept = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    var snapshot = try session.prepareCompactionSummaryInputSnapshot();
+    defer snapshot.deinit();
+
+    try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(u64, 4), snapshot.tokens_before);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.message_count);
+    try std.testing.expect(!snapshot.has_previous_summary);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.serialized_input.text, "<conversation>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.serialized_input.text, "[User]: aaaaaaaa") != null);
 }
 
 test "agent session prepared manual compaction emits failure event" {
