@@ -350,7 +350,7 @@ fn parseEntryLine(allocator: std.mem.Allocator, manager: *session_manager.Sessio
     };
     if (std.mem.eql(u8, entry_type, "message")) {
         const message = try parseMessage(allocator, object.get("message") orelse return error.InvalidEntry);
-        defer freeParsedMessage(allocator, message);
+        defer deinitParsedMessageContainers(allocator, message);
         var loaded = loaded_base;
         loaded.value = .{ .message = message };
         _ = try manager.appendLoadedEntry(loaded);
@@ -542,7 +542,7 @@ fn parseStopReason(value: []const u8) !ai.StopReason {
     return error.InvalidEntry;
 }
 
-fn freeParsedMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) void {
+fn deinitParsedMessageContainers(allocator: std.mem.Allocator, message: agent.AgentMessage) void {
     switch (message) {
         .user => |user| switch (user.content) {
             .string => {},
@@ -681,7 +681,7 @@ test "session store appends entries and round trips context" {
     var loaded = try store.load(std.testing.allocator, std.testing.io);
     defer loaded.deinit();
     const context = try loaded.buildSessionContext(std.testing.allocator);
-    defer loaded.freeSessionContext(std.testing.allocator, context);
+    defer loaded.deinitSessionContext(std.testing.allocator, context);
 
     try std.testing.expectEqual(@as(usize, 1), context.messages.len);
     try std.testing.expectEqualStrings("hello", context.messages[0].user.content.string);
@@ -735,7 +735,7 @@ test "session store round trips agent message variants" {
     var loaded = try store.load(std.testing.allocator, std.testing.io);
     defer loaded.deinit();
     const context = try loaded.buildSessionContext(std.testing.allocator);
-    defer loaded.freeSessionContext(std.testing.allocator, context);
+    defer loaded.deinitSessionContext(std.testing.allocator, context);
 
     try std.testing.expectEqual(@as(usize, 4), context.messages.len);
     try std.testing.expectEqualStrings("hello", context.messages[0].user.content.blocks[0].text.text);

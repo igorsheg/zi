@@ -163,7 +163,7 @@ pub const ToolRegistry = struct {
     }
 };
 
-pub const OwnedBuiltinTools = struct {
+pub const BuiltinTools = struct {
     allocator: std.mem.Allocator,
     mutation_queue: *tools.FileMutationQueue,
     read: *tools.ReadTool,
@@ -175,7 +175,7 @@ pub const OwnedBuiltinTools = struct {
         allow_paths_outside_cwd: bool = false,
     };
 
-    pub fn init(allocator: std.mem.Allocator, options: Options) !OwnedBuiltinTools {
+    pub fn init(allocator: std.mem.Allocator, options: Options) !BuiltinTools {
         const mutation_queue = try allocator.create(tools.FileMutationQueue);
         errdefer allocator.destroy(mutation_queue);
         mutation_queue.* = .{};
@@ -214,7 +214,7 @@ pub const OwnedBuiltinTools = struct {
         };
     }
 
-    pub fn deinit(self: *OwnedBuiltinTools) void {
+    pub fn deinit(self: *BuiltinTools) void {
         self.write.deinit();
         self.allocator.destroy(self.write);
         self.edit.deinit();
@@ -225,7 +225,7 @@ pub const OwnedBuiltinTools = struct {
         self.* = undefined;
     }
 
-    pub fn appendDefinitions(self: *OwnedBuiltinTools, registry: *ToolRegistry) !void {
+    pub fn appendDefinitions(self: *BuiltinTools, registry: *ToolRegistry) !void {
         try registry.append(self.allocator, ToolDefinition.init(self.read, .{
             .name = "read",
             .label = "read",
@@ -263,7 +263,7 @@ test "tool registry stores definitions first and exposes active agent tools" {
     var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
 
-    var builtins = try OwnedBuiltinTools.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
+    var builtins = try BuiltinTools.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
     defer builtins.deinit();
     var registry: ToolRegistry = .{};
     defer registry.deinit(std.testing.allocator);
@@ -285,7 +285,7 @@ test "tool registry rejects duplicate and unknown tool names without changing ac
     var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
 
-    var builtins = try OwnedBuiltinTools.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
+    var builtins = try BuiltinTools.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
     defer builtins.deinit();
     var registry: ToolRegistry = .{};
     defer registry.deinit(std.testing.allocator);

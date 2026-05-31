@@ -10,11 +10,11 @@ pub const Settings = struct {
     default_thinking_level: ?[]const u8 = null,
 };
 
-pub const OwnedSettings = struct {
+pub const LoadedSettings = struct {
     allocator: std.mem.Allocator,
     value: Settings,
 
-    pub fn deinit(self: *OwnedSettings) void {
+    pub fn deinit(self: *LoadedSettings) void {
         if (self.value.default_provider) |text| self.allocator.free(text);
         if (self.value.default_model) |text| self.allocator.free(text);
         if (self.value.default_thinking_level) |text| self.allocator.free(text);
@@ -24,7 +24,7 @@ pub const OwnedSettings = struct {
 
 pub const SettingsFile = union(enum) {
     missing,
-    loaded: OwnedSettings,
+    loaded: LoadedSettings,
 
     pub fn deinit(self: *SettingsFile) void {
         switch (self.*) {
@@ -110,7 +110,7 @@ fn loadFile(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []c
     return .{ .loaded = try parseSettings(allocator, bytes) };
 }
 
-fn parseSettings(allocator: std.mem.Allocator, bytes: []const u8) !OwnedSettings {
+fn parseSettings(allocator: std.mem.Allocator, bytes: []const u8) !LoadedSettings {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSettings;

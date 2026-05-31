@@ -149,7 +149,7 @@ fn stripTrailingCarriageReturn(line: []const u8) []const u8 {
 
 const CollectingSink = struct {
     allocator: std.mem.Allocator,
-    events: std.ArrayList(OwnedEvent) = .empty,
+    events: std.ArrayList(RetainedEvent) = .empty,
 
     fn deinit(self: *CollectingSink) void {
         for (self.events.items) |*event| event.deinit(self.allocator);
@@ -158,17 +158,17 @@ const CollectingSink = struct {
     }
 
     fn emit(self: *CollectingSink, event: Event) !void {
-        try self.events.append(self.allocator, try OwnedEvent.clone(self.allocator, event));
+        try self.events.append(self.allocator, try RetainedEvent.copy(self.allocator, event));
     }
 };
 
-const OwnedEvent = struct {
+const RetainedEvent = struct {
     event: ?[]const u8 = null,
     data: []const u8,
     id: ?[]const u8 = null,
     retry_ms: ?u64 = null,
 
-    fn clone(allocator: std.mem.Allocator, source: Event) !OwnedEvent {
+    fn copy(allocator: std.mem.Allocator, source: Event) !RetainedEvent {
         return .{
             .event = if (source.event) |value| try allocator.dupe(u8, value) else null,
             .data = try allocator.dupe(u8, source.data),
@@ -177,7 +177,7 @@ const OwnedEvent = struct {
         };
     }
 
-    fn deinit(self: *OwnedEvent, allocator: std.mem.Allocator) void {
+    fn deinit(self: *RetainedEvent, allocator: std.mem.Allocator) void {
         if (self.event) |value| allocator.free(value);
         allocator.free(self.data);
         if (self.id) |value| allocator.free(value);

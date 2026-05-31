@@ -110,7 +110,7 @@ fn execute(
     _: []const u8,
     params: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
-) anyerror!agent.OwnedAgentToolResult {
+) anyerror!agent.ToolExecutionResult {
     try token.throwIfRequested();
     const self: *EditTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(allocator, params);
@@ -261,7 +261,7 @@ fn isPathInside(raw_cwd: []const u8, path: []const u8) bool {
     return std.fs.path.isSep(path[cwd.len]);
 }
 
-fn textResult(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !agent.OwnedAgentToolResult {
+fn textResult(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !agent.ToolExecutionResult {
     const message = try std.fmt.allocPrint(allocator, fmt, args);
     errdefer allocator.free(message);
     const content = try allocator.alloc(ai.ToolResultContent, 1);

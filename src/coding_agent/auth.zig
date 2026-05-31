@@ -12,7 +12,7 @@ pub const OAuthCredential = struct {
 
     pub fn deinit(self: *OAuthCredential, allocator: std.mem.Allocator) void {
         allocator.free(self.provider);
-        freeOAuthCredentials(allocator, &self.credentials);
+        deinitOAuthCredentials(allocator, &self.credentials);
         self.* = undefined;
     }
 };
@@ -85,7 +85,7 @@ pub const AuthStore = struct {
     }
 
     pub fn setOAuth(self: *AuthStore, io: std.Io, provider: ai.Provider, credentials: ai.OAuthCredentials) !void {
-        var owned = try cloneOAuthCredential(self.allocator, provider, credentials);
+        var owned = try copyOAuthCredential(self.allocator, provider, credentials);
         errdefer owned.deinit(self.allocator);
 
         for (self.credentials, 0..) |credential, index| {
@@ -214,7 +214,7 @@ pub const AuthManager = struct {
         callbacks: ai.OAuthLoginCallbacks,
     ) !void {
         var credentials = try provider.login(self.store.allocator, io, callbacks);
-        defer freeOAuthCredentials(self.store.allocator, &credentials);
+        defer deinitOAuthCredentials(self.store.allocator, &credentials);
         try self.setOAuthCredentials(io, provider.id, credentials);
     }
 
@@ -243,7 +243,7 @@ pub const AuthManager = struct {
     }
 };
 
-fn freeOAuthCredentials(allocator: std.mem.Allocator, credentials: *ai.OAuthCredentials) void {
+fn deinitOAuthCredentials(allocator: std.mem.Allocator, credentials: *ai.OAuthCredentials) void {
     allocator.free(credentials.refresh);
     allocator.free(credentials.access);
     if (credentials.extra) |extra| runtime.freeJsonValue(allocator, extra);
@@ -294,7 +294,7 @@ fn writeFileAtomic(
     try std.Io.Dir.rename(dir, tmp_path, dir, path, io);
 }
 
-fn cloneOAuthCredential(
+fn copyOAuthCredential(
     allocator: std.mem.Allocator,
     provider: ai.Provider,
     credentials: ai.OAuthCredentials,

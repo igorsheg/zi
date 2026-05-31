@@ -54,7 +54,7 @@ pub const ResponseFactory = struct {
 };
 
 const ResponseStep = union(enum) {
-    message: owned.OwnedAssistantMessage,
+    message: owned.RetainedAssistantMessage,
     factory: ResponseFactory,
 
     fn deinit(self: *ResponseStep) void {
@@ -92,8 +92,8 @@ pub const Provider = struct {
         errdefer allocator.free(provider);
         const source_id = try std.fmt.allocPrint(allocator, "faux-provider:{s}:{s}", .{ provider, api });
         errdefer allocator.free(source_id);
-        const models = try cloneModels(allocator, api, provider, options.models);
-        errdefer freeModels(allocator, models);
+        const models = try copyModels(allocator, api, provider, options.models);
+        errdefer deinitModels(allocator, models);
 
         return .{
             .allocator = allocator,
@@ -112,7 +112,7 @@ pub const Provider = struct {
         self.responses.deinit(self.allocator);
         self.clearPromptCache();
         self.prompt_cache.deinit(self.allocator);
-        freeModels(self.allocator, self.models);
+        deinitModels(self.allocator, self.models);
         self.allocator.free(self.source_id);
         self.allocator.free(self.provider);
         self.allocator.free(self.api);
@@ -157,7 +157,7 @@ pub const Provider = struct {
             normalized.api = self.api;
             normalized.provider = self.provider;
             normalized.model = self.getModel().id;
-            var cloned = try owned.OwnedAssistantMessage.clone(self.allocator, normalized);
+            var cloned = try owned.RetainedAssistantMessage.copy(self.allocator, normalized);
             errdefer cloned.deinit();
             try self.responses.append(self.allocator, .{ .message = cloned });
         }
@@ -194,7 +194,7 @@ pub const Provider = struct {
     }
 };
 
-fn cloneModels(
+fn copyModels(
     allocator: std.mem.Allocator,
     api: []const u8,
     provider: []const u8,
@@ -224,7 +224,7 @@ fn cloneModels(
     return models;
 }
 
-fn freeModels(allocator: std.mem.Allocator, models: []protocol.Model) void {
+fn deinitModels(allocator: std.mem.Allocator, models: []protocol.Model) void {
     for (models) |model| {
         allocator.free(model.id);
         allocator.free(model.name);
@@ -326,7 +326,7 @@ fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protoco
             message.provider = self.provider;
             message.model = request.model.id;
             message.usage = estimateUsage(self, request.context, message, request.options) catch unreachable;
-            const owned_message = owned.OwnedAssistantMessage.clone(self.allocator, message) catch unreachable;
+            const owned_message = owned.RetainedAssistantMessage.copy(self.allocator, message) catch unreachable;
             step.deinit();
             step.* = .{ .message = owned_message };
             emitDeltas(
@@ -364,7 +364,7 @@ const PartialBuilder = struct {
 
     const ActiveBlock = enum { none, text, thinking };
 
-    fn init(response: *owned.OwnedAssistantMessage) PartialBuilder {
+    fn init(response: *owned.RetainedAssistantMessage) PartialBuilder {
         const allocator = response.arena.allocator();
         return .{
             .allocator = allocator,
@@ -454,7 +454,7 @@ const PartialBuilder = struct {
 fn emitDeltas(
     request: protocol.StreamRequest,
     sink: protocol.AssistantMessageEventSink,
-    response: *owned.OwnedAssistantMessage,
+    response: *owned.RetainedAssistantMessage,
     min_token_size: usize,
     max_token_size: usize,
     delay_per_delta_ms: u32,

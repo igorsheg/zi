@@ -92,14 +92,14 @@ fn transformMessage(
     tool_call_id_map: *std.StringHashMap([]const u8),
 ) !protocol.Message {
     return switch (message) {
-        .user => |user| .{ .user = try cloneUserMessageDowngradingImages(allocator, user, model) },
-        .tool_result => |tool_result| .{ .tool_result = try cloneToolResultMessageDowngradingImages(
+        .user => |user| .{ .user = try transformUserMessageForModel(allocator, user, model) },
+        .tool_result => |tool_result| .{ .tool_result = try transformToolResultMessageForModel(
             allocator,
             tool_result,
             model,
             tool_call_id_map.get(tool_result.tool_call_id),
         ) },
-        .assistant => |assistant| .{ .assistant = try cloneAssistantMessageTransformingContent(
+        .assistant => |assistant| .{ .assistant = try transformAssistantMessageForModel(
             allocator,
             assistant,
             model,
@@ -109,7 +109,7 @@ fn transformMessage(
     };
 }
 
-fn cloneUserMessageDowngradingImages(
+fn transformUserMessageForModel(
     allocator: std.mem.Allocator,
     source: protocol.UserMessage,
     model: protocol.Model,
@@ -117,13 +117,13 @@ fn cloneUserMessageDowngradingImages(
     return .{
         .content = switch (source.content) {
             .string => |text| .{ .string = try allocator.dupe(u8, text) },
-            .blocks => |blocks| .{ .blocks = try cloneUserContentSlice(allocator, blocks, supportsImages(model)) },
+            .blocks => |blocks| .{ .blocks = try transformUserContentSlice(allocator, blocks, supportsImages(model)) },
         },
         .timestamp = source.timestamp,
     };
 }
 
-fn cloneToolResultMessageDowngradingImages(
+fn transformToolResultMessageForModel(
     allocator: std.mem.Allocator,
     source: protocol.ToolResultMessage,
     model: protocol.Model,
@@ -132,14 +132,14 @@ fn cloneToolResultMessageDowngradingImages(
     return .{
         .tool_call_id = try allocator.dupe(u8, normalized_tool_call_id orelse source.tool_call_id),
         .tool_name = try allocator.dupe(u8, source.tool_name),
-        .content = try cloneToolResultContentSlice(allocator, source.content, supportsImages(model)),
+        .content = try transformToolResultContentSlice(allocator, source.content, supportsImages(model)),
         .details = if (source.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
         .is_error = source.is_error,
         .timestamp = source.timestamp,
     };
 }
 
-fn cloneAssistantMessageTransformingContent(
+fn transformAssistantMessageForModel(
     allocator: std.mem.Allocator,
     source: protocol.AssistantMessage,
     model: protocol.Model,
@@ -156,31 +156,31 @@ fn cloneAssistantMessageTransformingContent(
             .thinking => |thinking| {
                 if (thinking.redacted and !same_model) continue;
                 if (same_model and thinking.thinking_signature != null) {
-                    try content.append(allocator, .{ .thinking = try cloneThinkingContent(allocator, thinking) });
+                    try content.append(allocator, .{ .thinking = try copyThinkingContent(allocator, thinking) });
                 } else if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) {
                     continue;
                 } else if (same_model) {
-                    try content.append(allocator, .{ .thinking = try cloneThinkingContent(allocator, thinking) });
+                    try content.append(allocator, .{ .thinking = try copyThinkingContent(allocator, thinking) });
                 } else {
                     try content.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, thinking.thinking) } });
                 }
             },
             .text => |text| try content.append(allocator, .{ .text = .{
                 .text = try allocator.dupe(u8, text.text),
-                .text_signature = if (same_model) try cloneOptionalString(allocator, text.text_signature) else null,
+                .text_signature = if (same_model) try copyOptionalString(allocator, text.text_signature) else null,
             } }),
             .tool_call => |tool_call| {
-                var cloned = try cloneToolCall(allocator, tool_call);
-                if (!same_model) cloned.thought_signature = null;
+                var transformed_tool_call = try copyToolCall(allocator, tool_call);
+                if (!same_model) transformed_tool_call.thought_signature = null;
                 if (!same_model) if (normalize_tool_call_id) |normalizer| {
                     const normalized = try normalizer.call(tool_call.id, model, source);
                     if (!std.mem.eql(u8, normalized, tool_call.id)) {
                         const owned_normalized = try allocator.dupe(u8, normalized);
-                        try tool_call_id_map.put(cloned.id, owned_normalized);
-                        cloned.id = owned_normalized;
+                        try tool_call_id_map.put(transformed_tool_call.id, owned_normalized);
+                        transformed_tool_call.id = owned_normalized;
                     }
                 };
-                try content.append(allocator, .{ .tool_call = cloned });
+                try content.append(allocator, .{ .tool_call = transformed_tool_call });
             },
         }
     }
@@ -190,10 +190,10 @@ fn cloneAssistantMessageTransformingContent(
         .api = try allocator.dupe(u8, source.api),
         .provider = try allocator.dupe(u8, source.provider),
         .model = try allocator.dupe(u8, source.model),
-        .response_id = try cloneOptionalString(allocator, source.response_id),
+        .response_id = try copyOptionalString(allocator, source.response_id),
         .usage = source.usage,
         .stop_reason = source.stop_reason,
-        .error_message = try cloneOptionalString(allocator, source.error_message),
+        .error_message = try copyOptionalString(allocator, source.error_message),
         .timestamp = source.timestamp,
     };
 }
@@ -218,7 +218,7 @@ fn insertSyntheticToolResults(
     }
 }
 
-fn cloneUserContentSlice(
+fn transformUserContentSlice(
     allocator: std.mem.Allocator,
     source: []const protocol.UserContent,
     keep_images: bool,
@@ -228,7 +228,7 @@ fn cloneUserContentSlice(
     for (source) |block| switch (block) {
         .image => |image| {
             if (keep_images) {
-                try result.append(allocator, .{ .image = try cloneImageContent(allocator, image) });
+                try result.append(allocator, .{ .image = try copyImageContent(allocator, image) });
                 previous_was_placeholder = false;
             } else if (!previous_was_placeholder) {
                 try result.append(allocator, .{ .text = .{ .text = non_vision_user_image_placeholder } });
@@ -238,7 +238,7 @@ fn cloneUserContentSlice(
         .text => |text| {
             try result.append(allocator, .{ .text = .{
                 .text = try allocator.dupe(u8, text.text),
-                .text_signature = try cloneOptionalString(allocator, text.text_signature),
+                .text_signature = try copyOptionalString(allocator, text.text_signature),
             } });
             previous_was_placeholder = std.mem.eql(u8, text.text, non_vision_user_image_placeholder);
         },
@@ -246,7 +246,7 @@ fn cloneUserContentSlice(
     return result.toOwnedSlice(allocator);
 }
 
-fn cloneToolResultContentSlice(
+fn transformToolResultContentSlice(
     allocator: std.mem.Allocator,
     source: []const protocol.ToolResultContent,
     keep_images: bool,
@@ -256,7 +256,7 @@ fn cloneToolResultContentSlice(
     for (source) |block| switch (block) {
         .image => |image| {
             if (keep_images) {
-                try result.append(allocator, .{ .image = try cloneImageContent(allocator, image) });
+                try result.append(allocator, .{ .image = try copyImageContent(allocator, image) });
                 previous_was_placeholder = false;
             } else if (!previous_was_placeholder) {
                 try result.append(allocator, .{ .text = .{ .text = non_vision_tool_image_placeholder } });
@@ -266,7 +266,7 @@ fn cloneToolResultContentSlice(
         .text => |text| {
             try result.append(allocator, .{ .text = .{
                 .text = try allocator.dupe(u8, text.text),
-                .text_signature = try cloneOptionalString(allocator, text.text_signature),
+                .text_signature = try copyOptionalString(allocator, text.text_signature),
             } });
             previous_was_placeholder = std.mem.eql(u8, text.text, non_vision_tool_image_placeholder);
         },
@@ -279,31 +279,31 @@ fn supportsImages(model: protocol.Model) bool {
     return false;
 }
 
-fn cloneThinkingContent(allocator: std.mem.Allocator, source: protocol.ThinkingContent) !protocol.ThinkingContent {
+fn copyThinkingContent(allocator: std.mem.Allocator, source: protocol.ThinkingContent) !protocol.ThinkingContent {
     return .{
         .thinking = try allocator.dupe(u8, source.thinking),
-        .thinking_signature = try cloneOptionalString(allocator, source.thinking_signature),
+        .thinking_signature = try copyOptionalString(allocator, source.thinking_signature),
         .redacted = source.redacted,
     };
 }
 
-fn cloneImageContent(allocator: std.mem.Allocator, source: protocol.ImageContent) !protocol.ImageContent {
+fn copyImageContent(allocator: std.mem.Allocator, source: protocol.ImageContent) !protocol.ImageContent {
     return .{
         .data = try allocator.dupe(u8, source.data),
         .mime_type = try allocator.dupe(u8, source.mime_type),
     };
 }
 
-fn cloneToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !protocol.ToolCall {
+fn copyToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !protocol.ToolCall {
     return .{
         .id = try allocator.dupe(u8, source.id),
         .name = try allocator.dupe(u8, source.name),
         .arguments = try runtime.cloneJsonValue(allocator, source.arguments),
-        .thought_signature = try cloneOptionalString(allocator, source.thought_signature),
+        .thought_signature = try copyOptionalString(allocator, source.thought_signature),
     };
 }
 
-fn cloneOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
+fn copyOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
     return if (source) |value| try allocator.dupe(u8, value) else null;
 }
 

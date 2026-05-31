@@ -2,10 +2,10 @@ const std = @import("std");
 const mem = @import("../../runtime/root.zig");
 const partial_json = @import("partial_json.zig");
 
-pub const OwnedJsonValue = mem.JsonOwned(std.json.Value);
+pub const JsonDocument = mem.JsonOwned(std.json.Value);
 
 pub const StreamingJson = struct {
-    owned: OwnedJsonValue,
+    owned: JsonDocument,
     complete: bool,
     consumed: usize,
 
@@ -54,14 +54,14 @@ pub fn repairJson(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     return repaired.toOwnedSlice();
 }
 
-pub fn parseJsonWithRepair(backing_allocator: std.mem.Allocator, json: []const u8) !OwnedJsonValue {
-    if (parseOwnedJson(backing_allocator, json)) |owned| return owned else |_| {}
+pub fn parseJsonWithRepair(backing_allocator: std.mem.Allocator, json: []const u8) !JsonDocument {
+    if (parseJsonDocument(backing_allocator, json)) |owned| return owned else |_| {}
 
     const repaired = try repairJson(backing_allocator, json);
     defer backing_allocator.free(repaired);
 
-    if (std.mem.eql(u8, repaired, json)) return parseOwnedJson(backing_allocator, json);
-    return parseOwnedJson(backing_allocator, repaired);
+    if (std.mem.eql(u8, repaired, json)) return parseJsonDocument(backing_allocator, json);
+    return parseJsonDocument(backing_allocator, repaired);
 }
 
 pub fn parseStreamingJson(backing_allocator: std.mem.Allocator, maybe_json: ?[]const u8) !StreamingJson {
@@ -81,7 +81,7 @@ pub fn parseStreamingJson(backing_allocator: std.mem.Allocator, maybe_json: ?[]c
     return emptyStreamingObject(backing_allocator);
 }
 
-fn parseOwnedJson(backing_allocator: std.mem.Allocator, json: []const u8) !OwnedJsonValue {
+fn parseJsonDocument(backing_allocator: std.mem.Allocator, json: []const u8) !JsonDocument {
     const arena = try backing_allocator.create(std.heap.ArenaAllocator);
     errdefer backing_allocator.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(backing_allocator);

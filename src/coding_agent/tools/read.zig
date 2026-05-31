@@ -74,7 +74,7 @@ fn execute(
     _: []const u8,
     params: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
-) anyerror!agent.OwnedAgentToolResult {
+) anyerror!agent.ToolExecutionResult {
     try token.throwIfRequested();
     const self: *ReadTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(params);

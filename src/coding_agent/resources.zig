@@ -17,11 +17,11 @@ pub const PromptFile = struct {
     content: []const u8,
 };
 
-pub const OwnedPromptFile = struct {
+pub const LoadedPromptFile = struct {
     allocator: std.mem.Allocator,
     file: ?PromptFile,
 
-    pub fn deinit(self: *OwnedPromptFile) void {
+    pub fn deinit(self: *LoadedPromptFile) void {
         if (self.file) |file| {
             self.allocator.free(file.path);
             self.allocator.free(file.content);
@@ -30,11 +30,11 @@ pub const OwnedPromptFile = struct {
     }
 };
 
-pub const OwnedContextFiles = struct {
+pub const LoadedContextFiles = struct {
     allocator: std.mem.Allocator,
     files: []const ContextFile,
 
-    pub fn deinit(self: *OwnedContextFiles) void {
+    pub fn deinit(self: *LoadedContextFiles) void {
         for (self.files) |file| {
             self.allocator.free(file.path);
             self.allocator.free(file.content);
@@ -57,10 +57,10 @@ pub const DiscoverPromptFileOptions = struct {
 };
 
 pub const PromptResources = struct {
-    context_files: OwnedContextFiles,
-    system_prompt: OwnedPromptFile,
-    append_system_prompt: OwnedPromptFile,
-    skills: skills_mod.OwnedSkills,
+    context_files: LoadedContextFiles,
+    system_prompt: LoadedPromptFile,
+    append_system_prompt: LoadedPromptFile,
+    skills: skills_mod.SkillSet,
 
     pub const LoadOptions = struct {
         dir: std.Io.Dir = .cwd(),
@@ -126,7 +126,7 @@ pub fn discoverSystemPromptFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: DiscoverPromptFileOptions,
-) !OwnedPromptFile {
+) !LoadedPromptFile {
     return discoverPromptFile(allocator, io, options, paths_mod.system_prompt_file_name);
 }
 
@@ -134,7 +134,7 @@ pub fn discoverAppendSystemPromptFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: DiscoverPromptFileOptions,
-) !OwnedPromptFile {
+) !LoadedPromptFile {
     return discoverPromptFile(allocator, io, options, paths_mod.append_system_prompt_file_name);
 }
 
@@ -143,7 +143,7 @@ fn discoverPromptFile(
     io: std.Io,
     options: DiscoverPromptFileOptions,
     file_name: []const u8,
-) !OwnedPromptFile {
+) !LoadedPromptFile {
     const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = options.agent_dir, .cwd = options.cwd };
     const project_dir = try resource_paths.projectConfigDir(allocator);
     defer allocator.free(project_dir);
@@ -160,10 +160,10 @@ pub fn loadProjectContextFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: LoadProjectContextOptions,
-) !OwnedContextFiles {
+) !LoadedContextFiles {
     var files = std.ArrayList(ContextFile).empty;
     errdefer files.deinit(allocator);
-    errdefer freeContextFileItems(allocator, files.items);
+    errdefer deinitContextFileItems(allocator, files.items);
 
     if (try loadContextFileFromDir(allocator, io, options.dir, options.agent_dir)) |global| {
         try appendContextFile(allocator, &files, global);
@@ -171,7 +171,7 @@ pub fn loadProjectContextFiles(
 
     var ancestor_files = std.ArrayList(ContextFile).empty;
     errdefer ancestor_files.deinit(allocator);
-    errdefer freeContextFileItems(allocator, ancestor_files.items);
+    errdefer deinitContextFileItems(allocator, ancestor_files.items);
 
     var current_dir = options.cwd;
     var depth: usize = 0;
@@ -183,7 +183,7 @@ pub fn loadProjectContextFiles(
             if (!already_loaded) {
                 try appendContextFile(allocator, &ancestor_files, context_file);
             } else {
-                freeContextFile(allocator, context_file);
+                deinitContextFile(allocator, context_file);
             }
         }
         const parent = std.fs.path.dirname(current_dir) orelse break;
@@ -271,11 +271,11 @@ fn containsPath(files: []const ContextFile, path: []const u8) bool {
     return false;
 }
 
-fn freeContextFileItems(allocator: std.mem.Allocator, files: []const ContextFile) void {
-    for (files) |file| freeContextFile(allocator, file);
+fn deinitContextFileItems(allocator: std.mem.Allocator, files: []const ContextFile) void {
+    for (files) |file| deinitContextFile(allocator, file);
 }
 
-fn freeContextFile(allocator: std.mem.Allocator, file: ContextFile) void {
+fn deinitContextFile(allocator: std.mem.Allocator, file: ContextFile) void {
     allocator.free(file.path);
     allocator.free(file.content);
 }

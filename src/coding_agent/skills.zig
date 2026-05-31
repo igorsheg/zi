@@ -13,12 +13,12 @@ pub const Skill = struct {
     description: []const u8,
 };
 
-pub const OwnedSkills = struct {
+pub const SkillSet = struct {
     allocator: std.mem.Allocator,
     skills: []Skill,
 
-    pub fn deinit(self: *OwnedSkills) void {
-        for (self.skills) |skill| freeSkill(self.allocator, skill);
+    pub fn deinit(self: *SkillSet) void {
+        for (self.skills) |skill| deinitSkill(self.allocator, skill);
         self.allocator.free(self.skills);
         self.* = undefined;
     }
@@ -30,10 +30,10 @@ pub const LoadSkillsOptions = struct {
     cwd: []const u8,
 };
 
-pub fn loadSkills(allocator: std.mem.Allocator, io: std.Io, options: LoadSkillsOptions) !OwnedSkills {
+pub fn loadSkills(allocator: std.mem.Allocator, io: std.Io, options: LoadSkillsOptions) !SkillSet {
     var skills = std.ArrayList(Skill).empty;
     errdefer skills.deinit(allocator);
-    errdefer freeSkillItems(allocator, skills.items);
+    errdefer deinitSkillItems(allocator, skills.items);
 
     const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = options.agent_dir, .cwd = options.cwd };
     const global_dir = try resource_paths.globalSkillsDir(allocator);
@@ -261,17 +261,17 @@ fn fallbackNameFromMarkdownFile(file_name: []const u8) []const u8 {
 fn insertSkill(allocator: std.mem.Allocator, skills: *std.ArrayList(Skill), skill: Skill) !void {
     for (skills.items, 0..) |existing, index| {
         if (std.mem.eql(u8, existing.name, skill.name)) {
-            freeSkill(allocator, existing);
+            deinitSkill(allocator, existing);
             skills.items[index] = skill;
             return;
         }
     }
     if (skills.items.len == max_skills) {
-        freeSkill(allocator, skill);
+        deinitSkill(allocator, skill);
         return error.SkillLimitExceeded;
     }
     skills.append(allocator, skill) catch |err| {
-        freeSkill(allocator, skill);
+        deinitSkill(allocator, skill);
         return err;
     };
 }
@@ -280,12 +280,12 @@ fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
 }
 
-fn freeSkillItems(allocator: std.mem.Allocator, skills: []const Skill) void {
+fn deinitSkillItems(allocator: std.mem.Allocator, skills: []const Skill) void {
     if (skills.len == 0) return;
-    for (skills) |skill| freeSkill(allocator, skill);
+    for (skills) |skill| deinitSkill(allocator, skill);
 }
 
-fn freeSkill(allocator: std.mem.Allocator, skill: Skill) void {
+fn deinitSkill(allocator: std.mem.Allocator, skill: Skill) void {
     allocator.free(skill.path);
     allocator.free(skill.name);
     allocator.free(skill.description);

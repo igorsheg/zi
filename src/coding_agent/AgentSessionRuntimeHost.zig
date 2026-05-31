@@ -263,7 +263,7 @@ const EchoTool = struct {
         _: []const u8,
         _: std.json.Value,
         _: ?agent_mod.AgentToolUpdateCallback,
-    ) anyerror!agent_mod.OwnedAgentToolResult {
+    ) anyerror!agent_mod.ToolExecutionResult {
         const self: *EchoTool = @ptrCast(@alignCast(context.?));
         self.call_count += 1;
         const content = try allocator.alloc(ai.ToolResultContent, 1);

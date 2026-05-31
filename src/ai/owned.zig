@@ -2,42 +2,42 @@ const std = @import("std");
 const runtime = @import("../runtime/root.zig");
 const protocol = @import("protocol.zig");
 
-pub const OwnedAssistantMessage = struct {
+pub const RetainedAssistantMessage = struct {
     arena: std.heap.ArenaAllocator,
     value: protocol.AssistantMessage,
 
-    pub fn clone(backing_allocator: std.mem.Allocator, source: protocol.AssistantMessage) !OwnedAssistantMessage {
+    pub fn copy(backing_allocator: std.mem.Allocator, source: protocol.AssistantMessage) !RetainedAssistantMessage {
         var owned = try runtime.JsonOwned(protocol.AssistantMessage).initClone(
             backing_allocator,
             source,
-            cloneAssistantMessage,
+            copyAssistantMessage,
         );
         const value = owned.value;
         const arena = owned.takeArena();
         return .{ .arena = arena, .value = value };
     }
 
-    pub fn deinit(self: *OwnedAssistantMessage) void {
+    pub fn deinit(self: *RetainedAssistantMessage) void {
         self.arena.deinit();
         self.* = undefined;
     }
 };
 
-pub fn cloneAssistantMessage(
+pub fn copyAssistantMessage(
     allocator: std.mem.Allocator,
     source: protocol.AssistantMessage,
 ) !protocol.AssistantMessage {
-    const content = try cloneAssistantContentSlice(allocator, source.content);
-    errdefer freeAssistantContentSlice(allocator, content);
+    const content = try copyAssistantContentSlice(allocator, source.content);
+    errdefer deinitAssistantContentSlice(allocator, content);
     const api = try allocator.dupe(u8, source.api);
     errdefer allocator.free(api);
     const provider = try allocator.dupe(u8, source.provider);
     errdefer allocator.free(provider);
     const model = try allocator.dupe(u8, source.model);
     errdefer allocator.free(model);
-    const response_id = try cloneOptionalString(allocator, source.response_id);
+    const response_id = try copyOptionalString(allocator, source.response_id);
     errdefer if (response_id) |value| allocator.free(value);
-    const error_message = try cloneOptionalString(allocator, source.error_message);
+    const error_message = try copyOptionalString(allocator, source.error_message);
 
     return .{
         .content = content,
@@ -52,8 +52,8 @@ pub fn cloneAssistantMessage(
     };
 }
 
-pub fn freeAssistantMessage(allocator: std.mem.Allocator, message: protocol.AssistantMessage) void {
-    freeAssistantContentSlice(allocator, message.content);
+pub fn deinitAssistantMessage(allocator: std.mem.Allocator, message: protocol.AssistantMessage) void {
+    deinitAssistantContentSlice(allocator, message.content);
     allocator.free(message.api);
     allocator.free(message.provider);
     allocator.free(message.model);
@@ -61,83 +61,83 @@ pub fn freeAssistantMessage(allocator: std.mem.Allocator, message: protocol.Assi
     if (message.error_message) |value| allocator.free(value);
 }
 
-pub fn cloneAssistantMessageEvent(
+pub fn copyAssistantMessageEvent(
     allocator: std.mem.Allocator,
     source: protocol.AssistantMessageEvent,
 ) !protocol.AssistantMessageEvent {
     return switch (source) {
-        .start => |start| .{ .start = .{ .partial = try cloneAssistantMessage(allocator, start.partial) } },
+        .start => |start| .{ .start = .{ .partial = try copyAssistantMessage(allocator, start.partial) } },
         .text_start => |event| .{ .text_start = .{
             .content_index = event.content_index,
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .text_delta => |event| .{ .text_delta = .{
             .content_index = event.content_index,
             .delta = try allocator.dupe(u8, event.delta),
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .text_end => |event| .{ .text_end = .{
             .content_index = event.content_index,
             .content = try allocator.dupe(u8, event.content),
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .thinking_start => |event| .{ .thinking_start = .{
             .content_index = event.content_index,
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .thinking_delta => |event| .{ .thinking_delta = .{
             .content_index = event.content_index,
             .delta = try allocator.dupe(u8, event.delta),
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .thinking_end => |event| .{ .thinking_end = .{
             .content_index = event.content_index,
             .content = try allocator.dupe(u8, event.content),
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .toolcall_start => |event| .{ .toolcall_start = .{
             .content_index = event.content_index,
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .toolcall_delta => |event| .{ .toolcall_delta = .{
             .content_index = event.content_index,
             .delta = try allocator.dupe(u8, event.delta),
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .toolcall_end => |event| .{ .toolcall_end = .{
             .content_index = event.content_index,
-            .tool_call = try cloneToolCall(allocator, event.tool_call),
-            .partial = try cloneAssistantMessage(allocator, event.partial),
+            .tool_call = try copyToolCall(allocator, event.tool_call),
+            .partial = try copyAssistantMessage(allocator, event.partial),
         } },
         .done => |done| .{ .done = .{
             .reason = done.reason,
-            .message = try cloneAssistantMessage(allocator, done.message),
+            .message = try copyAssistantMessage(allocator, done.message),
         } },
         .@"error" => |err| .{ .@"error" = .{
             .reason = err.reason,
-            .@"error" = try cloneAssistantMessage(allocator, err.@"error"),
+            .@"error" = try copyAssistantMessage(allocator, err.@"error"),
         } },
     };
 }
 
-fn cloneAssistantContentSlice(
+fn copyAssistantContentSlice(
     allocator: std.mem.Allocator,
     source: []const protocol.AssistantContent,
 ) ![]const protocol.AssistantContent {
     const cloned = try allocator.alloc(protocol.AssistantContent, source.len);
     var initialized: usize = 0;
     errdefer {
-        freeAssistantContentItems(allocator, cloned[0..initialized]);
+        deinitAssistantContentItems(allocator, cloned[0..initialized]);
         allocator.free(cloned);
     }
     for (source, cloned) |content, *out| {
-        out.* = try cloneAssistantContent(allocator, content);
+        out.* = try copyAssistantContent(allocator, content);
         initialized += 1;
     }
     return cloned;
 }
 
-fn cloneAssistantContent(
+fn copyAssistantContent(
     allocator: std.mem.Allocator,
     source: protocol.AssistantContent,
 ) !protocol.AssistantContent {
@@ -145,13 +145,13 @@ fn cloneAssistantContent(
         .text => |text| blk: {
             const text_copy = try allocator.dupe(u8, text.text);
             errdefer allocator.free(text_copy);
-            const signature = try cloneOptionalString(allocator, text.text_signature);
+            const signature = try copyOptionalString(allocator, text.text_signature);
             break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
         },
         .thinking => |thinking| blk: {
             const thinking_copy = try allocator.dupe(u8, thinking.thinking);
             errdefer allocator.free(thinking_copy);
-            const signature = try cloneOptionalString(allocator, thinking.thinking_signature);
+            const signature = try copyOptionalString(allocator, thinking.thinking_signature);
             break :blk .{ .thinking = .{
                 .thinking = thinking_copy,
                 .thinking_signature = signature,
@@ -165,7 +165,7 @@ fn cloneAssistantContent(
             errdefer allocator.free(name);
             const arguments = try runtime.cloneJsonValue(allocator, tool_call.arguments);
             errdefer runtime.freeJsonValue(allocator, arguments);
-            const signature = try cloneOptionalString(allocator, tool_call.thought_signature);
+            const signature = try copyOptionalString(allocator, tool_call.thought_signature);
             break :blk .{ .tool_call = .{
                 .id = id,
                 .name = name,
@@ -176,7 +176,7 @@ fn cloneAssistantContent(
     };
 }
 
-fn freeAssistantContentItems(allocator: std.mem.Allocator, source: []const protocol.AssistantContent) void {
+fn deinitAssistantContentItems(allocator: std.mem.Allocator, source: []const protocol.AssistantContent) void {
     for (source) |content| switch (content) {
         .text => |text| {
             allocator.free(text.text);
@@ -195,21 +195,21 @@ fn freeAssistantContentItems(allocator: std.mem.Allocator, source: []const proto
     };
 }
 
-fn freeAssistantContentSlice(allocator: std.mem.Allocator, source: []const protocol.AssistantContent) void {
-    freeAssistantContentItems(allocator, source);
+fn deinitAssistantContentSlice(allocator: std.mem.Allocator, source: []const protocol.AssistantContent) void {
+    deinitAssistantContentItems(allocator, source);
     allocator.free(source);
 }
 
-fn cloneOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
+fn copyOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
     return if (source) |value| try allocator.dupe(u8, value) else null;
 }
 
-fn cloneToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !protocol.ToolCall {
+fn copyToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !protocol.ToolCall {
     return .{
         .id = try allocator.dupe(u8, source.id),
         .name = try allocator.dupe(u8, source.name),
         .arguments = try runtime.cloneJsonValue(allocator, source.arguments),
-        .thought_signature = try cloneOptionalString(allocator, source.thought_signature),
+        .thought_signature = try copyOptionalString(allocator, source.thought_signature),
     };
 }
 
@@ -217,7 +217,7 @@ test "owned assistant message survives source text mutation" {
     var text_buffer = [_]u8{ 'h', 'e', 'y' };
     const source = assistantMessage(&.{.{ .text = .{ .text = &text_buffer } }});
 
-    var owned = try OwnedAssistantMessage.clone(std.testing.allocator, source);
+    var owned = try RetainedAssistantMessage.copy(std.testing.allocator, source);
     defer owned.deinit();
     text_buffer[0] = 'b';
 
@@ -234,7 +234,7 @@ test "owned assistant message clones nested tool call json strings" {
         .arguments = .{ .object = arguments },
     } }});
 
-    var owned = try OwnedAssistantMessage.clone(std.testing.allocator, source);
+    var owned = try RetainedAssistantMessage.copy(std.testing.allocator, source);
     defer owned.deinit();
     argument_buffer[0] = 'd';
 
@@ -249,7 +249,7 @@ test "owned assistant message clones optional metadata strings" {
     source.response_id = &response_id;
     source.error_message = &error_message;
 
-    var owned = try OwnedAssistantMessage.clone(std.testing.allocator, source);
+    var owned = try RetainedAssistantMessage.copy(std.testing.allocator, source);
     defer owned.deinit();
     response_id[0] = 'x';
     error_message[0] = 'z';

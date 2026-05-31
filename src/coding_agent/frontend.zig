@@ -122,9 +122,9 @@ test "frontend read model applies public event stream without touching session i
     } } });
     try std.testing.expectEqual(@as(usize, 1), model.assistant_updates_seen);
 
-    var steering = try AgentSession.OwnedEventTextList.init(std.testing.allocator, &.{"steer"});
+    var steering = try AgentSession.EventTextList.init(std.testing.allocator, &.{"steer"});
     defer steering.deinit();
-    var follow_up = try AgentSession.OwnedEventTextList.init(std.testing.allocator, &.{ "one", "two" });
+    var follow_up = try AgentSession.EventTextList.init(std.testing.allocator, &.{ "one", "two" });
     defer follow_up.deinit();
     model.apply(.{ .queue_update = .{
         .steering = steering,

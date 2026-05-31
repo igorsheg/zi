@@ -18,7 +18,7 @@ current_date: []const u8,
 timestamp: []const u8,
 prompt_resources: resources.PromptResources,
 system_prompt_state: SystemPromptState,
-builtin_tools: tool_registry.OwnedBuiltinTools,
+builtin_tools: tool_registry.BuiltinTools,
 tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 agent: *agent_mod.Agent,
@@ -84,49 +84,49 @@ pub const Error = error{
     SessionShuttingDown,
 };
 
-pub const OwnedEventText = struct {
+pub const EventText = struct {
     allocator: std.mem.Allocator,
     text: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, text: []const u8) !OwnedEventText {
+    pub fn init(allocator: std.mem.Allocator, text: []const u8) !EventText {
         return .{ .allocator = allocator, .text = try allocator.dupe(u8, text) };
     }
 
-    pub fn deinit(self: *OwnedEventText) void {
+    pub fn deinit(self: *EventText) void {
         self.allocator.free(self.text);
         self.* = undefined;
     }
 
-    pub fn jsonStringify(self: OwnedEventText, stringify: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: EventText, stringify: *std.json.Stringify) !void {
         try stringify.write(self.text);
     }
 };
 
-pub const OwnedEventTextList = struct {
+pub const EventTextList = struct {
     allocator: std.mem.Allocator,
-    items: []OwnedEventText,
+    items: []const []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, source: []const []const u8) !OwnedEventTextList {
-        const items = try allocator.alloc(OwnedEventText, source.len);
+    pub fn init(allocator: std.mem.Allocator, source: []const []const u8) !EventTextList {
+        const items = try allocator.alloc([]const u8, source.len);
         errdefer allocator.free(items);
         var initialized: usize = 0;
         errdefer {
-            for (items[0..initialized]) |*item| item.deinit();
+            for (items[0..initialized]) |item| allocator.free(item);
         }
         for (source) |text| {
-            items[initialized] = try OwnedEventText.init(allocator, text);
+            items[initialized] = try allocator.dupe(u8, text);
             initialized += 1;
         }
         return .{ .allocator = allocator, .items = items };
     }
 
-    pub fn deinit(self: *OwnedEventTextList) void {
-        for (self.items) |*item| item.deinit();
+    pub fn deinit(self: *EventTextList) void {
+        for (self.items) |item| self.allocator.free(item);
         self.allocator.free(self.items);
         self.* = undefined;
     }
 
-    pub fn jsonStringify(self: OwnedEventTextList, stringify: *std.json.Stringify) !void {
+    pub fn jsonStringify(self: EventTextList, stringify: *std.json.Stringify) !void {
         try stringify.beginArray();
         for (self.items) |item| try stringify.write(item);
         try stringify.endArray();
@@ -150,8 +150,8 @@ pub const AgentSessionEvent = union(enum) {
     auto_retry_end: AutoRetryEnd,
 
     pub const QueueUpdate = struct {
-        steering: OwnedEventTextList,
-        follow_up: OwnedEventTextList,
+        steering: EventTextList,
+        follow_up: EventTextList,
         revision: u64,
 
         pub fn deinit(self: *QueueUpdate) void {
@@ -176,7 +176,7 @@ pub const AgentSessionEvent = union(enum) {
     };
 
     pub const SessionInfoChanged = struct {
-        name: ?OwnedEventText,
+        name: ?EventText,
     };
 
     pub const CompactionEnd = struct {
@@ -184,20 +184,20 @@ pub const AgentSessionEvent = union(enum) {
         result: ?CompactionResult,
         aborted: bool,
         will_retry: bool,
-        error_message: ?OwnedEventText = null,
+        error_message: ?EventText = null,
     };
 
     pub const AutoRetryStart = struct {
         attempt: usize,
         max_attempts: usize,
         delay_ms: u64,
-        error_message: OwnedEventText,
+        error_message: EventText,
     };
 
     pub const AutoRetryEnd = struct {
         success: bool,
         attempt: usize,
-        final_error: ?OwnedEventText = null,
+        final_error: ?EventText = null,
     };
 
     pub fn deinit(self: *AgentSessionEvent) void {
@@ -279,16 +279,13 @@ fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, val
 }
 
 pub const QueueSnapshot = struct {
-    allocator: std.mem.Allocator,
     revision: u64,
-    steering: []const []const u8,
-    follow_up: []const []const u8,
+    steering: EventTextList,
+    follow_up: EventTextList,
 
     pub fn deinit(self: *QueueSnapshot) void {
-        for (self.steering) |text| self.allocator.free(text);
-        for (self.follow_up) |text| self.allocator.free(text);
-        self.allocator.free(self.steering);
-        self.allocator.free(self.follow_up);
+        self.steering.deinit();
+        self.follow_up.deinit();
         self.* = undefined;
     }
 };
@@ -335,12 +332,11 @@ const QueueMirror = struct {
     }
 
     fn snapshot(self: *const QueueMirror, allocator: std.mem.Allocator) !QueueSnapshot {
-        const steering = try cloneTextList(allocator, self.steering.items);
-        errdefer freeTextList(allocator, steering);
-        const follow_up = try cloneTextList(allocator, self.follow_up.items);
-        errdefer freeTextList(allocator, follow_up);
+        var steering = try EventTextList.init(allocator, self.steering.items);
+        errdefer steering.deinit();
+        var follow_up = try EventTextList.init(allocator, self.follow_up.items);
+        errdefer follow_up.deinit();
         return .{
-            .allocator = allocator,
             .revision = self.revision,
             .steering = steering,
             .follow_up = follow_up,
@@ -380,23 +376,6 @@ const QueueMirror = struct {
     fn clearList(_: *QueueMirror, allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
         for (list.items) |text| allocator.free(text);
         list.clearRetainingCapacity();
-    }
-
-    fn cloneTextList(allocator: std.mem.Allocator, source: []const []const u8) ![]const []const u8 {
-        const result = try allocator.alloc([]const u8, source.len);
-        errdefer allocator.free(result);
-        var initialized: usize = 0;
-        errdefer for (result[0..initialized]) |owned| allocator.free(owned);
-        for (source, 0..) |text, index| {
-            result[index] = try allocator.dupe(u8, text);
-            initialized += 1;
-        }
-        return result;
-    }
-
-    fn freeTextList(allocator: std.mem.Allocator, list: []const []const u8) void {
-        for (list) |text| allocator.free(text);
-        allocator.free(list);
     }
 };
 
@@ -505,9 +484,9 @@ const EventDrain = struct {
     }
 
     fn emitQueueUpdate(self: *EventDrain) !void {
-        var steering = try OwnedEventTextList.init(self.allocator, self.queue_mirror.steering.items);
+        var steering = try EventTextList.init(self.allocator, self.queue_mirror.steering.items);
         errdefer steering.deinit();
-        var follow_up = try OwnedEventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
+        var follow_up = try EventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
         errdefer follow_up.deinit();
         self.enqueuePublicEvent(.{ .queue_update = .{
             .steering = steering,
@@ -538,7 +517,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     });
     errdefer prompt_resources.deinit();
 
-    var builtin_tools = try tool_registry.OwnedBuiltinTools.init(allocator, .{
+    var builtin_tools = try tool_registry.BuiltinTools.init(allocator, .{
         .cwd = options.cwd,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
     });
@@ -1344,7 +1323,7 @@ test "agent session prompt queues follow up while running" {
     const queue_update = event.queue_update;
     try std.testing.expectEqual(@as(usize, 0), queue_update.steering.items.len);
     try std.testing.expectEqual(@as(usize, 1), queue_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued", queue_update.follow_up.items[0].text);
+    try std.testing.expectEqualStrings("queued", queue_update.follow_up.items[0]);
 }
 
 test "agent session prompt queues steering while running" {
@@ -1376,7 +1355,7 @@ test "agent session prompt queues steering while running" {
     const queue_update = event.queue_update;
     try std.testing.expectEqual(@as(usize, 1), queue_update.steering.items.len);
     try std.testing.expectEqual(@as(usize, 0), queue_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("steer", queue_update.steering.items[0].text);
+    try std.testing.expectEqualStrings("steer", queue_update.steering.items[0]);
 }
 
 test "agent session public events are caller drained after message persistence" {
@@ -1444,7 +1423,7 @@ test "agent session queue update carries revision and snapshot exposes queued te
     try std.testing.expectEqual(@as(u64, 1), queue_update.revision);
     try std.testing.expectEqual(@as(usize, 0), queue_update.steering.items.len);
     try std.testing.expectEqual(@as(usize, 1), queue_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued", queue_update.follow_up.items[0].text);
+    try std.testing.expectEqualStrings("queued", queue_update.follow_up.items[0]);
     var json_buffer: [128]u8 = undefined;
     var json_writer = std.Io.Writer.fixed(&json_buffer);
     try std.json.Stringify.value(event, .{}, &json_writer);
@@ -1456,9 +1435,9 @@ test "agent session queue update carries revision and snapshot exposes queued te
     var snapshot = try session.queueSnapshot(std.testing.allocator);
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(u64, 1), snapshot.revision);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.steering.len);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.follow_up.len);
-    try std.testing.expectEqualStrings("queued", snapshot.follow_up[0]);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.follow_up.items.len);
+    try std.testing.expectEqualStrings("queued", snapshot.follow_up.items[0]);
 }
 
 test "agent session queue update consumes block user message text" {
@@ -1489,7 +1468,7 @@ test "agent session queue update consumes block user message text" {
     const queued_update = queued_event.queue_update;
     try std.testing.expectEqual(@as(usize, 0), queued_update.steering.items.len);
     try std.testing.expectEqual(@as(usize, 1), queued_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued image", queued_update.follow_up.items[0].text);
+    try std.testing.expectEqualStrings("queued image", queued_update.follow_up.items[0]);
 
     const message = try session.agent.userMessageFromText("queued image", &.{image});
     try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
@@ -1530,7 +1509,7 @@ test "agent session queue update is emitted before queued user message start" {
     const queued_update = queued_event.queue_update;
     try std.testing.expectEqual(@as(usize, 1), queued_update.steering.items.len);
     try std.testing.expectEqual(@as(usize, 0), queued_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued", queued_update.steering.items[0].text);
+    try std.testing.expectEqualStrings("queued", queued_update.steering.items[0]);
 
     const message = try session.agent.userMessageFromText("queued", &.{});
     try session.agent.emitEvent(.{ .message_start = .{ .message = message } });

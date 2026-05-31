@@ -64,6 +64,84 @@ pub const AgentMessage = union(enum) {
     }
 };
 
+pub fn copyAgentMessage(allocator: std.mem.Allocator, source: AgentMessage) !AgentMessage {
+    return switch (source) {
+        .user => |message| .{ .user = .{
+            .content = switch (message.content) {
+                .string => |text| .{ .string = try allocator.dupe(u8, text) },
+                .blocks => |blocks| .{ .blocks = try copyUserContentSlice(allocator, blocks) },
+            },
+            .timestamp = message.timestamp,
+        } },
+        .assistant => |message| .{ .assistant = try ai.owned.copyAssistantMessage(allocator, message) },
+        .tool_result => |message| blk: {
+            const tool_call_id = try allocator.dupe(u8, message.tool_call_id);
+            errdefer allocator.free(tool_call_id);
+            const tool_name = try allocator.dupe(u8, message.tool_name);
+            errdefer allocator.free(tool_name);
+            const content = try copyToolResultContentSlice(allocator, message.content);
+            errdefer deinitToolResultContentSlice(allocator, content);
+            const details = if (message.details) |details| try runtime.cloneJsonValue(allocator, details) else null;
+            break :blk .{ .tool_result = .{
+                .tool_call_id = tool_call_id,
+                .tool_name = tool_name,
+                .content = content,
+                .details = details,
+                .is_error = message.is_error,
+                .timestamp = message.timestamp,
+            } };
+        },
+        .custom => |message| blk: {
+            const kind = try allocator.dupe(u8, message.kind);
+            errdefer allocator.free(kind);
+            const payload = try runtime.cloneJsonValue(allocator, message.payload);
+            break :blk .{ .custom = .{
+                .kind = kind,
+                .payload = payload,
+                .timestamp = message.timestamp,
+            } };
+        },
+    };
+}
+
+pub fn copyAgentMessages(allocator: std.mem.Allocator, source: []const AgentMessage) ![]const AgentMessage {
+    const cloned = try allocator.alloc(AgentMessage, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitAgentMessageItems(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
+    for (source, cloned) |message, *out| {
+        out.* = try copyAgentMessage(allocator, message);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn deinitAgentMessage(allocator: std.mem.Allocator, message: AgentMessage) void {
+    switch (message) {
+        .user => |user| switch (user.content) {
+            .string => |text| allocator.free(text),
+            .blocks => |blocks| deinitUserContentSlice(allocator, blocks),
+        },
+        .assistant => |assistant| ai.owned.deinitAssistantMessage(allocator, assistant),
+        .tool_result => |tool_result| {
+            allocator.free(tool_result.tool_call_id);
+            allocator.free(tool_result.tool_name);
+            deinitToolResultContentSlice(allocator, tool_result.content);
+            if (tool_result.details) |details| runtime.freeJsonValue(allocator, details);
+        },
+        .custom => |custom| {
+            allocator.free(custom.kind);
+            runtime.freeJsonValue(allocator, custom.payload);
+        },
+    }
+}
+
+fn deinitAgentMessageItems(allocator: std.mem.Allocator, messages: []const AgentMessage) void {
+    for (messages) |message| deinitAgentMessage(allocator, message);
+}
+
 pub const AgentToolResult = struct {
     content: []const ai.ToolResultContent,
     details: ?std.json.Value = null,
@@ -78,23 +156,103 @@ pub const AgentToolResult = struct {
     }
 };
 
-pub const OwnedAgentToolResult = struct {
+pub fn copyToolResultContentSlice(
+    allocator: std.mem.Allocator,
+    source: []const ai.ToolResultContent,
+) ![]const ai.ToolResultContent {
+    const cloned = try allocator.alloc(ai.ToolResultContent, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitToolResultContentItems(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
+    for (source, cloned) |content, *out| {
+        out.* = try copyToolResultContent(allocator, content);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn copyToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResultContent) !ai.ToolResultContent {
+    return switch (content) {
+        .text => |text| blk: {
+            const text_copy = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(text_copy);
+            const signature = try copyOptionalString(allocator, text.text_signature);
+            break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
+        },
+        .image => |image| blk: {
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
+        },
+    };
+}
+
+pub fn copyToolResultMessage(allocator: std.mem.Allocator, source: ai.ToolResultMessage) !ai.ToolResultMessage {
+    const tool_call_id = try allocator.dupe(u8, source.tool_call_id);
+    errdefer allocator.free(tool_call_id);
+    const tool_name = try allocator.dupe(u8, source.tool_name);
+    errdefer allocator.free(tool_name);
+    const content = try copyToolResultContentSlice(allocator, source.content);
+    errdefer deinitToolResultContentSlice(allocator, content);
+    const details = if (source.details) |details| try runtime.cloneJsonValue(allocator, details) else null;
+    return .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .content = content,
+        .details = details,
+        .is_error = source.is_error,
+        .timestamp = source.timestamp,
+    };
+}
+
+pub fn copyToolResultMessages(
+    allocator: std.mem.Allocator,
+    source: []const ai.ToolResultMessage,
+) ![]const ai.ToolResultMessage {
+    const cloned = try allocator.alloc(ai.ToolResultMessage, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitToolResultMessageItems(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
+    for (source, cloned) |message, *out| {
+        out.* = try copyToolResultMessage(allocator, message);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn deinitToolResultMessage(allocator: std.mem.Allocator, message: ai.ToolResultMessage) void {
+    allocator.free(message.tool_call_id);
+    allocator.free(message.tool_name);
+    deinitToolResultContentSlice(allocator, message.content);
+    if (message.details) |details| runtime.freeJsonValue(allocator, details);
+}
+
+fn deinitToolResultMessageItems(allocator: std.mem.Allocator, messages: []const ai.ToolResultMessage) void {
+    for (messages) |message| deinitToolResultMessage(allocator, message);
+}
+
+pub const ToolExecutionResult = struct {
     allocator: std.mem.Allocator,
     result: AgentToolResult,
 
-    pub fn deinit(self: *OwnedAgentToolResult) void {
-        for (self.result.content) |content| freeToolResultContent(self.allocator, content);
+    pub fn deinit(self: *ToolExecutionResult) void {
+        for (self.result.content) |content| deinitToolResultContent(self.allocator, content);
         self.allocator.free(self.result.content);
-        if (self.result.details) |details| freeJsonValue(self.allocator, details);
+        if (self.result.details) |details| deinitJsonValue(self.allocator, details);
         self.* = undefined;
     }
 
-    pub fn view(self: *const OwnedAgentToolResult) AgentToolResult {
+    pub fn view(self: *const ToolExecutionResult) AgentToolResult {
         return self.result;
     }
 };
 
-pub fn freeToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResultContent) void {
+pub fn deinitToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResultContent) void {
     switch (content) {
         .text => |text| {
             allocator.free(text.text);
@@ -107,8 +265,70 @@ pub fn freeToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResul
     }
 }
 
-pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+pub fn deinitToolResultContentSlice(allocator: std.mem.Allocator, source: []const ai.ToolResultContent) void {
+    deinitToolResultContentItems(allocator, source);
+    allocator.free(source);
+}
+
+fn deinitToolResultContentItems(allocator: std.mem.Allocator, source: []const ai.ToolResultContent) void {
+    for (source) |content| deinitToolResultContent(allocator, content);
+}
+
+pub fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     runtime.freeJsonValue(allocator, value);
+}
+
+fn copyUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserContent) ![]const ai.UserContent {
+    const cloned = try allocator.alloc(ai.UserContent, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitUserContentItems(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
+    for (source, cloned) |content, *out| {
+        out.* = try copyUserContent(allocator, content);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn copyUserContent(allocator: std.mem.Allocator, content: ai.UserContent) !ai.UserContent {
+    return switch (content) {
+        .text => |text| blk: {
+            const text_copy = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(text_copy);
+            const signature = try copyOptionalString(allocator, text.text_signature);
+            break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
+        },
+        .image => |image| blk: {
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
+        },
+    };
+}
+
+fn deinitUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserContent) void {
+    deinitUserContentItems(allocator, source);
+    allocator.free(source);
+}
+
+fn deinitUserContentItems(allocator: std.mem.Allocator, source: []const ai.UserContent) void {
+    for (source) |content| switch (content) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |value| allocator.free(value);
+        },
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+    };
+}
+
+fn copyOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
+    return if (source) |value| try allocator.dupe(u8, value) else null;
 }
 
 pub const PendingToolCalls = struct {
@@ -226,7 +446,7 @@ pub const ExecuteToolHook = struct {
         []const u8,
         std.json.Value,
         ?AgentToolUpdateCallback,
-    ) anyerror!OwnedAgentToolResult,
+    ) anyerror!ToolExecutionResult,
 
     pub fn call(
         allocator: std.mem.Allocator,
@@ -236,7 +456,7 @@ pub const ExecuteToolHook = struct {
         tool_call_id: []const u8,
         params: std.json.Value,
         on_update: ?AgentToolUpdateCallback,
-    ) anyerror!OwnedAgentToolResult {
+    ) anyerror!ToolExecutionResult {
         return self.call_fn(allocator, io, self.context, token, tool_call_id, params, on_update);
     }
 };
@@ -559,7 +779,7 @@ fn testExecuteTool(
     _: []const u8,
     _: std.json.Value,
     _: ?AgentToolUpdateCallback,
-) anyerror!OwnedAgentToolResult {
+) anyerror!ToolExecutionResult {
     return .{ .allocator = allocator, .result = .{ .content = try allocator.alloc(ai.ToolResultContent, 0) } };
 }
 

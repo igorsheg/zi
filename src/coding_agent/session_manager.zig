@@ -1,7 +1,6 @@
 const std = @import("std");
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
-const runtime = @import("../runtime/root.zig");
 
 pub const current_session_version = 3;
 pub const max_session_entries = 16_384;
@@ -119,7 +118,7 @@ pub const SessionManager = struct {
         self.allocator.free(self.header.timestamp);
         self.allocator.free(self.header.cwd);
         if (self.header.parent_session) |parent_session| self.allocator.free(parent_session);
-        for (self.entries.items) |entry| self.freeEntry(entry);
+        for (self.entries.items) |entry| self.deinitEntry(entry);
         self.entries.deinit(self.allocator);
         self.* = undefined;
     }
@@ -127,13 +126,13 @@ pub const SessionManager = struct {
     pub fn appendMessage(self: *SessionManager, message: agent.AgentMessage, timestamp: []const u8) Error![]const u8 {
         const base = try self.nextBase(timestamp);
         const entry: SessionEntry = blk: {
-            errdefer self.freeBase(base);
+            errdefer self.deinitBase(base);
             break :blk .{ .message = .{
                 .base = base,
-                .message = try cloneAgentMessage(self.allocator, message),
+                .message = try agent.copyAgentMessage(self.allocator, message),
             } };
         };
-        errdefer self.freeEntry(entry);
+        errdefer self.deinitEntry(entry);
         return self.appendEntry(entry);
     }
 
@@ -144,13 +143,13 @@ pub const SessionManager = struct {
     ) Error![]const u8 {
         const base = try self.nextBase(timestamp);
         const entry: SessionEntry = blk: {
-            errdefer self.freeBase(base);
+            errdefer self.deinitBase(base);
             break :blk .{ .thinking_level_change = .{
                 .base = base,
                 .thinking_level = try self.allocator.dupe(u8, thinking_level),
             } };
         };
-        errdefer self.freeEntry(entry);
+        errdefer self.deinitEntry(entry);
         return self.appendEntry(entry);
     }
 
@@ -162,7 +161,7 @@ pub const SessionManager = struct {
     ) Error![]const u8 {
         const base = try self.nextBase(timestamp);
         const entry: SessionEntry = blk: {
-            errdefer self.freeBase(base);
+            errdefer self.deinitBase(base);
             const provider_copy = try self.allocator.dupe(u8, provider);
             errdefer self.allocator.free(provider_copy);
             const model_id_copy = try self.allocator.dupe(u8, model_id);
@@ -172,7 +171,7 @@ pub const SessionManager = struct {
                 .model_id = model_id_copy,
             } };
         };
-        errdefer self.freeEntry(entry);
+        errdefer self.deinitEntry(entry);
         return self.appendEntry(entry);
     }
 
@@ -192,11 +191,11 @@ pub const SessionManager = struct {
             const timestamp = try self.allocator.dupe(u8, loaded.timestamp);
             break :blk .{ .id = id, .parent_id = parent_id, .timestamp = timestamp };
         };
-        errdefer self.freeBase(base);
+        errdefer self.deinitBase(base);
         const entry: SessionEntry = switch (loaded.value) {
             .message => |message| .{ .message = .{
                 .base = base,
-                .message = try cloneAgentMessage(self.allocator, message),
+                .message = try agent.copyAgentMessage(self.allocator, message),
             } },
             .thinking_level_change => |thinking_level| .{ .thinking_level_change = .{
                 .base = base,
@@ -213,7 +212,7 @@ pub const SessionManager = struct {
                 } };
             },
         };
-        errdefer self.freeEntry(entry);
+        errdefer self.deinitEntry(entry);
         var next_id = self.next_id;
         if (std.fmt.parseInt(u64, loaded.id, 16)) |numeric_id| {
             const after_loaded_id = if (numeric_id == std.math.maxInt(u64)) numeric_id else numeric_id + 1;
@@ -321,7 +320,7 @@ pub const SessionManager = struct {
         };
     }
 
-    pub fn freeSessionContext(_: *const SessionManager, allocator: std.mem.Allocator, context: SessionContext) void {
+    pub fn deinitSessionContext(_: *const SessionManager, allocator: std.mem.Allocator, context: SessionContext) void {
         allocator.free(context.messages);
     }
 
@@ -355,195 +354,30 @@ pub const SessionManager = struct {
         return null;
     }
 
-    fn freeEntry(self: *SessionManager, entry: SessionEntry) void {
+    fn deinitEntry(self: *SessionManager, entry: SessionEntry) void {
         switch (entry) {
             .message => |message| {
-                self.freeBase(message.base);
-                freeAgentMessage(self.allocator, message.message);
+                self.deinitBase(message.base);
+                agent.deinitAgentMessage(self.allocator, message.message);
             },
             .thinking_level_change => |thinking| {
-                self.freeBase(thinking.base);
+                self.deinitBase(thinking.base);
                 self.allocator.free(thinking.thinking_level);
             },
             .model_change => |model| {
-                self.freeBase(model.base);
+                self.deinitBase(model.base);
                 self.allocator.free(model.provider);
                 self.allocator.free(model.model_id);
             },
         }
     }
 
-    fn freeBase(self: *SessionManager, base: SessionEntry.Base) void {
+    fn deinitBase(self: *SessionManager, base: SessionEntry.Base) void {
         self.allocator.free(base.id);
         if (base.parent_id) |parent_id| self.allocator.free(parent_id);
         self.allocator.free(base.timestamp);
     }
 };
-
-fn cloneAgentMessage(allocator: std.mem.Allocator, source: agent.AgentMessage) !agent.AgentMessage {
-    return switch (source) {
-        .user => |message| .{ .user = .{
-            .content = switch (message.content) {
-                .string => |text| .{ .string = try allocator.dupe(u8, text) },
-                .blocks => |blocks| .{ .blocks = try cloneUserContentSlice(allocator, blocks) },
-            },
-            .timestamp = message.timestamp,
-        } },
-        .assistant => |message| .{ .assistant = try ai.owned.cloneAssistantMessage(allocator, message) },
-        .tool_result => |message| blk: {
-            const tool_call_id = try allocator.dupe(u8, message.tool_call_id);
-            errdefer allocator.free(tool_call_id);
-            const tool_name = try allocator.dupe(u8, message.tool_name);
-            errdefer allocator.free(tool_name);
-            const content = try cloneToolResultContentSlice(allocator, message.content);
-            errdefer freeToolResultContentSlice(allocator, content);
-            const details = if (message.details) |details| try runtime.cloneJsonValue(allocator, details) else null;
-            break :blk .{ .tool_result = .{
-                .tool_call_id = tool_call_id,
-                .tool_name = tool_name,
-                .content = content,
-                .details = details,
-                .is_error = message.is_error,
-                .timestamp = message.timestamp,
-            } };
-        },
-        .custom => |message| blk: {
-            const kind = try allocator.dupe(u8, message.kind);
-            errdefer allocator.free(kind);
-            const payload = try runtime.cloneJsonValue(allocator, message.payload);
-            break :blk .{ .custom = .{
-                .kind = kind,
-                .payload = payload,
-                .timestamp = message.timestamp,
-            } };
-        },
-    };
-}
-
-fn freeAgentMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) void {
-    switch (message) {
-        .user => |user| switch (user.content) {
-            .string => |text| allocator.free(text),
-            .blocks => |blocks| freeUserContentSlice(allocator, blocks),
-        },
-        .assistant => |assistant| ai.owned.freeAssistantMessage(allocator, assistant),
-        .tool_result => |tool_result| {
-            allocator.free(tool_result.tool_call_id);
-            allocator.free(tool_result.tool_name);
-            freeToolResultContentSlice(allocator, tool_result.content);
-            if (tool_result.details) |details| runtime.freeJsonValue(allocator, details);
-        },
-        .custom => |custom| {
-            allocator.free(custom.kind);
-            runtime.freeJsonValue(allocator, custom.payload);
-        },
-    }
-}
-
-fn cloneUserContent(allocator: std.mem.Allocator, content: ai.UserContent) !ai.UserContent {
-    return switch (content) {
-        .text => |text| blk: {
-            const text_copy = try allocator.dupe(u8, text.text);
-            errdefer allocator.free(text_copy);
-            const signature = try cloneOptionalString(allocator, text.text_signature);
-            break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
-        },
-        .image => |image| blk: {
-            const data = try allocator.dupe(u8, image.data);
-            errdefer allocator.free(data);
-            const mime_type = try allocator.dupe(u8, image.mime_type);
-            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
-        },
-    };
-}
-
-fn cloneToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResultContent) !ai.ToolResultContent {
-    return switch (content) {
-        .text => |text| blk: {
-            const text_copy = try allocator.dupe(u8, text.text);
-            errdefer allocator.free(text_copy);
-            const signature = try cloneOptionalString(allocator, text.text_signature);
-            break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
-        },
-        .image => |image| blk: {
-            const data = try allocator.dupe(u8, image.data);
-            errdefer allocator.free(data);
-            const mime_type = try allocator.dupe(u8, image.mime_type);
-            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
-        },
-    };
-}
-
-fn cloneUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserContent) ![]const ai.UserContent {
-    const cloned = try allocator.alloc(ai.UserContent, source.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeUserContentItems(allocator, cloned[0..initialized]);
-        allocator.free(cloned);
-    }
-    for (source, cloned) |content, *out| {
-        out.* = try cloneUserContent(allocator, content);
-        initialized += 1;
-    }
-    return cloned;
-}
-
-fn cloneToolResultContentSlice(
-    allocator: std.mem.Allocator,
-    source: []const ai.ToolResultContent,
-) ![]const ai.ToolResultContent {
-    const cloned = try allocator.alloc(ai.ToolResultContent, source.len);
-    var initialized: usize = 0;
-    errdefer {
-        freeToolResultContentItems(allocator, cloned[0..initialized]);
-        allocator.free(cloned);
-    }
-    for (source, cloned) |content, *out| {
-        out.* = try cloneToolResultContent(allocator, content);
-        initialized += 1;
-    }
-    return cloned;
-}
-
-fn freeUserContentItems(allocator: std.mem.Allocator, source: []const ai.UserContent) void {
-    for (source) |content| switch (content) {
-        .text => |text| {
-            allocator.free(text.text);
-            if (text.text_signature) |value| allocator.free(value);
-        },
-        .image => |image| {
-            allocator.free(image.data);
-            allocator.free(image.mime_type);
-        },
-    };
-}
-
-fn freeUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserContent) void {
-    freeUserContentItems(allocator, source);
-    allocator.free(source);
-}
-
-fn freeToolResultContentItems(allocator: std.mem.Allocator, source: []const ai.ToolResultContent) void {
-    for (source) |content| switch (content) {
-        .text => |text| {
-            allocator.free(text.text);
-            if (text.text_signature) |value| allocator.free(value);
-        },
-        .image => |image| {
-            allocator.free(image.data);
-            allocator.free(image.mime_type);
-        },
-    };
-}
-
-fn freeToolResultContentSlice(allocator: std.mem.Allocator, source: []const ai.ToolResultContent) void {
-    freeToolResultContentItems(allocator, source);
-    allocator.free(source);
-}
-
-fn cloneOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
-    return if (source) |value| try allocator.dupe(u8, value) else null;
-}
 
 fn userMessage(text: []const u8) agent.AgentMessage {
     return .{ .user = .{ .content = .{ .string = text }, .timestamp = 0 } };
@@ -592,7 +426,7 @@ test "build context follows active leaf" {
     _ = try manager.appendMessage(assistantMessage("anthropic", "claude"), "t4");
 
     const context = try manager.buildSessionContext(std.testing.allocator);
-    defer manager.freeSessionContext(std.testing.allocator, context);
+    defer manager.deinitSessionContext(std.testing.allocator, context);
 
     try std.testing.expectEqual(@as(usize, 2), context.messages.len);
     try std.testing.expectEqualStrings("medium", context.thinking_level);
@@ -610,7 +444,7 @@ test "branching preserves old entries and appends from selected leaf" {
     _ = try manager.appendMessage(userMessage("branch"), "t3");
 
     const context = try manager.buildSessionContext(std.testing.allocator);
-    defer manager.freeSessionContext(std.testing.allocator, context);
+    defer manager.deinitSessionContext(std.testing.allocator, context);
 
     try std.testing.expectEqual(@as(usize, 2), context.messages.len);
     try std.testing.expectEqualStrings("root", context.messages[0].user.content.string);
