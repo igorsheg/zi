@@ -7,6 +7,7 @@ const path_utils = @import("path_utils.zig");
 
 pub const default_timeout_ms = 30_000;
 pub const max_timeout_ms = 120_000;
+pub const max_command_bytes = 16 * 1024;
 pub const max_stdout_bytes = 64 * 1024;
 pub const max_stderr_bytes = 64 * 1024;
 
@@ -14,7 +15,11 @@ const parameters_schema =
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "command": { "type": "string", "description": "Shell command to run in the session cwd" },
+    \\    "command": {
+    \\      "type": "string",
+    \\      "description": "Shell command to run in the session cwd",
+    \\      "maxLength": 16384
+    \\    },
     \\    "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds, max 120000" }
     \\  },
     \\  "required": ["command"]
@@ -35,6 +40,7 @@ pub const BashTool = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !BashTool {
+        try validateConfig(config);
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
@@ -68,6 +74,15 @@ pub const BashTool = struct {
         };
     }
 };
+
+fn validateConfig(config: BashTool.Config) !void {
+    if (config.cwd.len == 0) return error.InvalidToolConfig;
+    if (config.timeout_ms < 1) return error.InvalidToolConfig;
+    if (config.max_timeout_ms < 1) return error.InvalidToolConfig;
+    if (config.timeout_ms > config.max_timeout_ms) return error.InvalidToolConfig;
+    if (config.max_stdout_bytes == 0) return error.InvalidToolConfig;
+    if (config.max_stderr_bytes == 0) return error.InvalidToolConfig;
+}
 
 const Args = struct {
     command: []const u8,
@@ -175,6 +190,7 @@ fn parseArgs(config: BashTool.Config, params: std.json.Value) !Args {
     if (params != .object) return error.InvalidToolArguments;
     const command_value = params.object.get("command") orelse return error.InvalidToolArguments;
     if (command_value != .string or command_value.string.len == 0) return error.InvalidToolArguments;
+    if (command_value.string.len > max_command_bytes) return error.InvalidToolArguments;
 
     const timeout_ms = if (params.object.get("timeout_ms")) |value| blk: {
         if (value != .integer or value.integer < 1) return error.InvalidToolArguments;
@@ -327,6 +343,38 @@ test "bash tool treats output limit as bounded result data" {
     try std.testing.expectEqualStrings("bash output limit exceeded", result.result.content[0].text.text);
     try std.testing.expect(!result.result.details.?.object.get("timedOut").?.bool);
     try std.testing.expect(result.result.details.?.object.get("outputLimitExceeded").?.bool);
+}
+
+test "bash tool rejects oversized commands before process start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var tool = try initTestTool(tmp.dir, ".", .{});
+    defer tool.deinit();
+
+    const oversized = try std.testing.allocator.alloc(u8, max_command_bytes + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+
+    try std.testing.expectError(error.InvalidToolArguments, executeTestCommand(&tool, oversized));
+}
+
+test "bash tool rejects invalid config bounds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
+
+    try std.testing.expectError(error.InvalidToolConfig, BashTool.init(std.testing.allocator, .{
+        .cwd = cwd_buffer[0..cwd_len],
+        .timeout_ms = max_timeout_ms + 1,
+        .max_timeout_ms = max_timeout_ms,
+    }));
+    try std.testing.expectError(error.InvalidToolConfig, BashTool.init(std.testing.allocator, .{
+        .cwd = cwd_buffer[0..cwd_len],
+        .max_stdout_bytes = 0,
+    }));
 }
 
 test "bash tool cancels running process through owner race" {
