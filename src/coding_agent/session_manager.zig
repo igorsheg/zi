@@ -365,14 +365,17 @@ pub const SessionManager = struct {
         defer allocator.free(branch_entries);
 
         var messages = std.ArrayList(agent.AgentMessage).empty;
-        errdefer messages.deinit(allocator);
+        errdefer {
+            for (messages.items) |message| agent.deinitAgentMessage(allocator, message);
+            messages.deinit(allocator);
+        }
         var thinking_level: []const u8 = "off";
         var model: ?ModelRef = null;
+        var latest_compaction_index: ?usize = null;
 
-        for (branch_entries) |entry| {
+        for (branch_entries, 0..) |entry, index| {
             switch (entry) {
                 .message => |message_entry| {
-                    try messages.append(allocator, message_entry.message);
                     if (message_entry.message == .assistant) {
                         model = .{
                             .provider = message_entry.message.assistant.provider,
@@ -385,7 +388,51 @@ pub const SessionManager = struct {
                     .provider = model_change.provider,
                     .model_id = model_change.model_id,
                 },
-                .compaction => {},
+                .compaction => latest_compaction_index = index,
+            }
+        }
+
+        if (latest_compaction_index) |compaction_index| {
+            const compaction = branch_entries[compaction_index].compaction;
+            try appendContextMessage(
+                allocator,
+                &messages,
+                try compactionSummaryMessage(allocator, compaction),
+            );
+
+            var found_first_kept = false;
+            for (branch_entries[0..compaction_index]) |entry| {
+                if (std.mem.eql(u8, entry.id(), compaction.first_kept_entry_id)) found_first_kept = true;
+                if (found_first_kept) switch (entry) {
+                    .message => |message_entry| try appendContextMessageCopy(
+                        allocator,
+                        &messages,
+                        message_entry.message,
+                    ),
+                    else => {},
+                };
+            }
+
+            for (branch_entries[compaction_index + 1 ..]) |entry| {
+                switch (entry) {
+                    .message => |message_entry| try appendContextMessageCopy(
+                        allocator,
+                        &messages,
+                        message_entry.message,
+                    ),
+                    else => {},
+                }
+            }
+        } else {
+            for (branch_entries) |entry| {
+                switch (entry) {
+                    .message => |message_entry| try appendContextMessageCopy(
+                        allocator,
+                        &messages,
+                        message_entry.message,
+                    ),
+                    else => {},
+                }
             }
         }
 
@@ -397,7 +444,42 @@ pub const SessionManager = struct {
     }
 
     pub fn deinitSessionContext(_: *const SessionManager, allocator: std.mem.Allocator, context: SessionContext) void {
+        for (context.messages) |message| agent.deinitAgentMessage(allocator, message);
         allocator.free(context.messages);
+    }
+
+    fn compactionSummaryMessage(
+        allocator: std.mem.Allocator,
+        compaction: SessionEntry.Compaction,
+    ) std.mem.Allocator.Error!agent.AgentMessage {
+        const text = try std.fmt.allocPrint(
+            allocator,
+            "The conversation history before this point was compacted into the following summary:\n\n" ++
+                "<summary>\n{s}\n</summary>",
+            .{compaction.summary},
+        );
+        errdefer allocator.free(text);
+        return .{ .user = .{
+            .content = .{ .string = text },
+            .timestamp = 0,
+        } };
+    }
+
+    fn appendContextMessage(
+        allocator: std.mem.Allocator,
+        messages: *std.ArrayList(agent.AgentMessage),
+        message: agent.AgentMessage,
+    ) std.mem.Allocator.Error!void {
+        errdefer agent.deinitAgentMessage(allocator, message);
+        try messages.append(allocator, message);
+    }
+
+    fn appendContextMessageCopy(
+        allocator: std.mem.Allocator,
+        messages: *std.ArrayList(agent.AgentMessage),
+        message: agent.AgentMessage,
+    ) std.mem.Allocator.Error!void {
+        try appendContextMessage(allocator, messages, try agent.copyAgentMessage(allocator, message));
     }
 
     fn nextBase(self: *SessionManager, timestamp: []const u8) Error!SessionEntry.Base {
@@ -563,6 +645,24 @@ test "branching preserves old entries and appends from selected leaf" {
     try std.testing.expectEqualStrings("root", context.messages[0].user.content.string);
     try std.testing.expectEqualStrings("branch", context.messages[1].user.content.string);
     try std.testing.expectEqual(@as(usize, 3), manager.entries.items.len);
+}
+
+test "build context projects latest compaction summary then kept messages" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendMessage(userMessage("dropped"), "t1");
+    const kept = try manager.appendMessage(userMessage("kept"), "t2");
+    _ = try manager.appendCompaction("older summary", kept, 3000, "t3");
+    _ = try manager.appendMessage(userMessage("after"), "t4");
+
+    const context = try manager.buildSessionContext(std.testing.allocator);
+    defer manager.deinitSessionContext(std.testing.allocator, context);
+
+    try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].user.content.string, "older summary") != null);
+    try std.testing.expectEqualStrings("kept", context.messages[1].user.content.string);
+    try std.testing.expectEqualStrings("after", context.messages[2].user.content.string);
 }
 
 test "tree navigation returns entries leaf and children" {
