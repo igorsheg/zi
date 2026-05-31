@@ -200,10 +200,6 @@ pub const AgentSessionEvent = union(enum) {
         overflow,
     };
 
-    pub const CompactionResult = struct {
-        placeholder: void = {},
-    };
-
     pub const CompactionStart = struct {
         reason: CompactionReason,
     };
@@ -214,7 +210,6 @@ pub const AgentSessionEvent = union(enum) {
 
     pub const CompactionEnd = struct {
         reason: CompactionReason,
-        result: ?CompactionResult,
         aborted: bool,
         will_retry: bool,
         error_message: ?EventText = null,
@@ -288,7 +283,6 @@ pub const AgentSessionEvent = union(enum) {
                 try stringify.beginObject();
                 try writeJsonField("type", stringify, "compaction_end");
                 try writeJsonField("reason", stringify, payload.reason);
-                try writeJsonField("result", stringify, payload.result);
                 try writeJsonField("aborted", stringify, payload.aborted);
                 try writeJsonField("willRetry", stringify, payload.will_retry);
                 if (payload.error_message) |message| try writeJsonField("errorMessage", stringify, message);
@@ -1900,6 +1894,27 @@ test "agent session slash command event serializes public shape" {
         "{\"type\":\"prompt_command\",\"command\":\"help\",\"result\":\"handled\"," ++
             "\"message\":\"available commands: /help, /session\"}",
         handled_writer.written(),
+    );
+}
+
+test "agent session compaction end event serializes owned state only" {
+    var event: AgentSessionEvent = .{ .compaction_end = .{
+        .reason = .manual,
+        .aborted = true,
+        .will_retry = false,
+        .error_message = try EventText.init(std.testing.allocator, "not implemented"),
+    } };
+    defer event.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try std.json.Stringify.value(event, .{}, &writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"compaction_end\",\"reason\":\"manual\",\"aborted\":true," ++
+            "\"willRetry\":false,\"errorMessage\":\"not implemented\"}",
+        writer.written(),
     );
 }
 
