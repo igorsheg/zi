@@ -826,6 +826,16 @@ pub fn promptWithOptions(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !void {
+    try self.promptWithOptionsInternal(text, images, options, true);
+}
+
+fn promptWithOptionsInternal(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    options: PromptOptions,
+    allow_overflow_retry: bool,
+) anyerror!void {
     const context_overflow_count_before = self.event_drain.context_overflow_count;
     const run = self.startPromptRun(text, images, options) catch |err| switch (err) {
         error.PromptCommandCannotStartLiveRun, error.PromptQueuedCannotStartLiveRun => return,
@@ -833,7 +843,13 @@ pub fn promptWithOptions(
     };
     defer self.destroyPromptRun(run);
     while (try self.stepPromptRun(run)) {}
-    try self.checkPostPromptOverflowCompaction(context_overflow_count_before);
+    const compacted = if (allow_overflow_retry)
+        try self.checkPostPromptOverflowCompaction(context_overflow_count_before, true)
+    else
+        false;
+    if (compacted and allow_overflow_retry) {
+        try self.retryPromptAfterOverflowCompaction(text, images, options);
+    }
 }
 
 fn startPromptRun(
@@ -960,12 +976,16 @@ pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !Com
 
 pub fn compactWithGeneratedSummary(self: *AgentSession) !CompactionResult {
     try self.ensureAcceptsContinue();
-    return self.runGeneratedCompaction(.manual);
+    return self.runGeneratedCompaction(.manual, false);
 }
 
-fn runGeneratedCompaction(self: *AgentSession, reason: AgentSessionEvent.CompactionReason) !CompactionResult {
+fn runGeneratedCompaction(
+    self: *AgentSession,
+    reason: AgentSessionEvent.CompactionReason,
+    will_retry: bool,
+) !CompactionResult {
     self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = reason } });
-    return self.generateAndApplyCompaction(reason) catch |err| {
+    return self.generateAndApplyCompaction(reason, will_retry) catch |err| {
         const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
             .reason = reason,
@@ -1141,6 +1161,7 @@ fn ensureAcceptsContinue(self: *AgentSession) Error!void {
 fn applyManualCompaction(
     self: *AgentSession,
     reason: AgentSessionEvent.CompactionReason,
+    will_retry: bool,
     summary: []const u8,
     first_kept_entry_id: []const u8,
     tokens_before: u64,
@@ -1171,7 +1192,7 @@ fn applyManualCompaction(
         .reason = reason,
         .result = event_result,
         .aborted = false,
-        .will_retry = false,
+        .will_retry = will_retry,
     } });
     event_result = undefined;
 
@@ -1187,6 +1208,7 @@ fn applyManualCompactionRequest(
     return switch (request) {
         .explicit => |explicit| self.applyManualCompaction(
             .manual,
+            false,
             explicit.summary,
             explicit.first_kept_entry_id,
             explicit.tokens_before,
@@ -1207,6 +1229,7 @@ fn prepareAndApplyManualCompaction(
     defer preparation.deinit();
     return self.applyManualCompaction(
         .manual,
+        false,
         summary,
         preparation.first_kept_entry_id,
         preparation.tokens_before,
@@ -1216,6 +1239,7 @@ fn prepareAndApplyManualCompaction(
 fn generateAndApplyCompaction(
     self: *AgentSession,
     reason: AgentSessionEvent.CompactionReason,
+    will_retry: bool,
 ) !CompactionResult {
     var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
     defer input.deinit();
@@ -1225,6 +1249,7 @@ fn generateAndApplyCompaction(
     defer self.allocator.free(summary);
     return self.applyManualCompaction(
         reason,
+        will_retry,
         summary,
         input.first_kept_entry_id,
         input.tokens_before,
@@ -1499,29 +1524,67 @@ fn checkPrePromptCompaction(self: *AgentSession) !void {
         else => return err,
     };
     preparation.deinit();
-    var result = self.runGeneratedCompaction(.threshold) catch |err| switch (err) {
+    var result = self.runGeneratedCompaction(.threshold, false) catch |err| switch (err) {
         error.NothingToCompact, error.AlreadyCompacted => return,
         else => return err,
     };
     result.deinit();
 }
 
-fn checkPostPromptOverflowCompaction(self: *AgentSession, previous_overflow_count: usize) !void {
-    if (!self.compaction_settings.auto_enabled) return;
-    if (self.event_drain.context_overflow_count <= previous_overflow_count) return;
+fn checkPostPromptOverflowCompaction(
+    self: *AgentSession,
+    previous_overflow_count: usize,
+    will_retry: bool,
+) !bool {
+    if (!self.compaction_settings.auto_enabled) return false;
+    if (self.event_drain.context_overflow_count <= previous_overflow_count) return false;
     var preparation = self.manager.prepareCompaction(
         self.allocator,
         self.compaction_settings,
     ) catch |err| switch (err) {
-        error.NothingToCompact, error.AlreadyCompacted => return,
+        error.NothingToCompact, error.AlreadyCompacted => return false,
         else => return err,
     };
     preparation.deinit();
-    var result = self.runGeneratedCompaction(.overflow) catch |err| switch (err) {
-        error.NothingToCompact, error.AlreadyCompacted => return,
+    var result = self.runGeneratedCompaction(.overflow, will_retry) catch |err| switch (err) {
+        error.NothingToCompact, error.AlreadyCompacted => return false,
         else => return err,
     };
     result.deinit();
+    return true;
+}
+
+fn retryPromptAfterOverflowCompaction(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    options: PromptOptions,
+) anyerror!void {
+    var error_message = try EventText.init(self.allocator, "context overflow");
+    var retry_start_owns_error_message = true;
+    errdefer if (retry_start_owns_error_message) error_message.deinit();
+    self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
+        .attempt = 1,
+        .max_attempts = 1,
+        .delay_ms = 0,
+        .error_message = error_message,
+    } });
+    retry_start_owns_error_message = false;
+
+    self.promptWithOptionsInternal(text, images, options, false) catch |err| {
+        const final_error = EventText.init(self.allocator, @errorName(err)) catch return err;
+        self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
+            .success = false,
+            .attempt = 1,
+            .final_error = final_error,
+        } });
+        return err;
+    };
+
+    self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
+        .success = true,
+        .attempt = 1,
+    } });
 }
 
 fn constructUserMessage(
@@ -2889,7 +2952,7 @@ test "agent session auto compaction skips already compacted branch before prompt
     try std.testing.expect(saw_agent_start);
 }
 
-test "agent session auto compacts after context overflow without retrying" {
+test "agent session auto compacts after context overflow and retries once" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2905,6 +2968,7 @@ test "agent session auto compacts after context overflow without retrying" {
             .error_message = "maximum context length exceeded",
         }),
         ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+        ai.faux.assistantMessage(&.{ .{ .text = .{ .text = "retried response" } } }, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&responses);
 
@@ -2923,14 +2987,16 @@ test "agent session auto compacts after context overflow without retrying" {
 
     try session.prompt("overflow request", &.{});
 
-    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
+    try std.testing.expectEqual(@as(usize, 3), provider.call_count);
     try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().context_overflow_count);
-    try std.testing.expectEqual(@as(usize, 3), session.manager.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 5), session.manager.entries.items.len);
     try std.testing.expect(session.manager.entries.items[2] == .compaction);
     try std.testing.expectEqualStrings("overflow summary", session.manager.entries.items[2].compaction.summary);
 
     var saw_overflow_start = false;
     var saw_overflow_end = false;
+    var saw_retry_start = false;
+    var saw_retry_end = false;
     while (session.drainPublicEvent()) |event| {
         var owned_event = event;
         defer owned_event.deinit();
@@ -2946,12 +3012,80 @@ test "agent session auto compacts after context overflow without retrying" {
                 AgentSessionEvent.CompactionReason.overflow,
                 owned_event.compaction_end.reason,
             );
-            try std.testing.expect(!owned_event.compaction_end.will_retry);
+            try std.testing.expect(owned_event.compaction_end.will_retry);
             saw_overflow_end = true;
+        }
+        if (owned_event == .auto_retry_start) {
+            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_start.attempt);
+            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_start.max_attempts);
+            saw_retry_start = true;
+        }
+        if (owned_event == .auto_retry_end) {
+            try std.testing.expect(owned_event.auto_retry_end.success);
+            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_end.attempt);
+            saw_retry_end = true;
         }
     }
     try std.testing.expect(saw_overflow_start);
     try std.testing.expect(saw_overflow_end);
+    try std.testing.expect(saw_retry_start);
+    try std.testing.expect(saw_retry_end);
+}
+
+test "agent session overflow retry does not recurse on second overflow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const summary_content = [_]ai.AssistantContent{ai.faux.text("overflow summary")};
+    const responses = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&.{}, .{
+            .stop_reason = .error_,
+            .error_message = "maximum context length exceeded",
+        }),
+        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+        ai.faux.assistantMessage(&.{}, .{
+            .stop_reason = .error_,
+            .error_message = "maximum context length exceeded",
+        }),
+    };
+    try provider.setResponses(&responses);
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 0, .auto_enabled = true },
+    });
+    defer shutdownAndDeinit(&session);
+
+    try session.prompt("overflow request", &.{});
+
+    try std.testing.expectEqual(@as(usize, 3), provider.call_count);
+    try std.testing.expectEqual(@as(usize, 2), session.statusSnapshot().context_overflow_count);
+    try std.testing.expectEqual(@as(usize, 5), session.manager.entries.items.len);
+
+    var retry_start_count: usize = 0;
+    var overflow_compaction_count: usize = 0;
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        defer owned_event.deinit();
+        if (owned_event == .auto_retry_start) retry_start_count += 1;
+        if (owned_event == .compaction_end and owned_event.compaction_end.reason == .overflow) {
+            overflow_compaction_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), retry_start_count);
+    try std.testing.expectEqual(@as(usize, 1), overflow_compaction_count);
 }
 
 test "agent session prepares owned compaction snapshot" {
