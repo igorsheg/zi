@@ -1,6 +1,6 @@
 # adr 0005: keep tui modules layered by dependency direction
 
-status: accepted
+status: superseded by adr 0006
 
 date: 2026-05-31
 

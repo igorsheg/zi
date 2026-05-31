@@ -3,11 +3,6 @@ const vaxis = @import("vaxis");
 
 const runtime = @import("../runtime/root.zig");
 const tui = @import("../tui/root.zig");
-const tui_agent_adapter = @import("../tui/bridge/agent_adapter.zig");
-const tui_app = @import("../tui/bridge/app.zig");
-const tui_event = @import("../tui/bridge/event.zig");
-const tui_input_router = @import("../tui/bridge/input_router.zig");
-const tui_read_model = @import("../tui/bridge/read_model.zig");
 const ai = @import("../ai/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
@@ -66,7 +61,7 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
 
     try terminal.enterAltScreen();
 
-    var app = try tui_app.App.init(
+    var app = tui.App.init(
         process.gpa,
         nonzero(terminal.vx.screen.width, 80),
         nonzero(terminal.vx.screen.height, 24),
@@ -98,8 +93,6 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
         nonzero(terminal.vx.screen.width, 80),
         nonzero(terminal.vx.screen.height, 24),
     );
-    if (process.env("ZI_PTY_TEST_MODAL") != null) try session.openPtyTestModal();
-
     if (tui_options.initial_prompt) |prompt| try session.beginPrompt(prompt);
     try session.renderIfDirty();
 
@@ -111,27 +104,23 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
 /// one place that steps the host, drains events, and paints.
 const Session = struct {
     host: *AgentSessionRuntimeHost,
-    app: *tui_app.App,
+    app: *tui.App,
     read_model: *frontend.ReadModel,
     allocator: std.mem.Allocator,
     terminal: *tui.terminal.Terminal,
     loop: *tui.terminal.EventLoop,
     io: std.Io,
     active_run: ?*AgentSession.LivePromptRun = null,
-    frame_gate: tui.frame.Gate = .init(frame_policy),
-    input_router: tui_input_router.Router = .{},
     rendered_status: frontend.ReadModel.Status = .idle,
     last_winsize: vaxis.Winsize,
+    last_render_ns: i128 = 0,
     running: bool = true,
 
     /// 30fps with bounded drains. Streaming bursts coalesce into at most one
     /// paint per frame, and each tick has a visible upper bound on work.
-    const frame_policy: tui.frame.Policy = .{
-        .interval_ns = std.time.ns_per_s / 30,
-        .terminal_events_per_tick_max = 64,
-        .host_events_per_tick_max = 128,
-        .app_events_per_tick_max = tui_app.App.event_count_max,
-    };
+    const frame_interval_ns = std.time.ns_per_s / 30;
+    const terminal_events_per_tick_max = 64;
+    const host_events_per_tick_max = 128;
 
     fn shutdown(self: *Session) void {
         if (self.active_run) |prompt_run| {
@@ -164,7 +153,6 @@ const Session = struct {
                 return;
             };
             _ = try self.drainHost();
-            self.drainAppEvents();
             if (more) {
                 try self.maybeRender();
             } else {
@@ -175,7 +163,6 @@ const Session = struct {
             try self.renderIfDirty();
             const event_count = try self.pollEvents();
             const host_event_count = try self.drainHost();
-            self.drainAppEvents();
             try self.maybeRender();
             if (event_count == 0 and host_event_count == 0 and !self.app.isDirty()) {
                 try self.io.sleep(.fromMilliseconds(16), .awake);
@@ -198,11 +185,7 @@ const Session = struct {
     fn appendRunFailureStatus(self: *Session, err: anyerror) !void {
         var buf: [128]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "run failed: {s}", .{@errorName(err)});
-        try self.app.dispatch(.{ .append_transcript_text = .{
-            .kind = .system,
-            .durability = .ephemeral,
-            .text = text,
-        } });
+        try self.app.appendSystem(text);
     }
 
     fn finishRun(self: *Session) void {
@@ -214,7 +197,7 @@ const Session = struct {
 
     fn pollEvents(self: *Session) !usize {
         var count: usize = 0;
-        while (count < frame_policy.terminal_events_per_tick_max) : (count += 1) {
+        while (count < terminal_events_per_tick_max) : (count += 1) {
             const event = try self.loop.tryEvent() orelse return count;
             try self.handleEvent(event);
             if (!self.running) return count;
@@ -225,12 +208,7 @@ const Session = struct {
     fn handleEvent(self: *Session, event: tui.terminal.Event) !void {
         switch (event) {
             .key_press => |key| {
-                var router = self.input_router;
-                router.focus = inputFocusTargetFromReadModel(self.app.readModel().focus.input_target);
-                try self.handleKeyIntent(router.route(
-                    keyToRouterKey(key),
-                    if (self.active_run == null) .idle else .active,
-                ));
+                if (tui.input.commandFromKey(key)) |command| try self.handleCommand(command);
             },
             .winsize => |winsize| {
                 try self.applyResize(winsize);
@@ -249,58 +227,42 @@ const Session = struct {
         self.last_winsize = winsize;
         try self.terminal.resize(winsize);
         self.app.resize(nonzero(winsize.cols, 80), nonzero(winsize.rows, 24));
-        try self.renderFullFrame();
+        try self.renderIfDirty();
     }
 
-    fn handleKeyIntent(self: *Session, intent: tui_input_router.Intent) !void {
-        switch (intent) {
+    fn handleCommand(self: *Session, command: tui.App.Command) !void {
+        var effect = try self.app.apply(command);
+        defer effect.deinit(self.allocator);
+        switch (effect) {
             .none => {},
             .quit => self.running = false,
-            .cancel_run => {
+            .cancel => {
                 self.host.cancel();
                 self.read_model.markCancelled();
                 try self.syncStatus();
                 try self.renderIfDirty();
             },
-            .dismiss_focused_surface => {
-                if (try self.app.dismissFocusedSurfaceByEscape()) try self.renderIfDirty();
-            },
-            .submit_composer => {
-                try self.submitComposer();
-            },
-            .composer_backspace => try self.app.dispatch(.composer_backspace),
-            .composer_move_left => try self.app.dispatch(.composer_move_left),
-            .composer_move_right => try self.app.dispatch(.composer_move_right),
-            .composer_insert => |text| try self.app.dispatch(.{ .composer_insert = text }),
+            .submit_prompt => |text| try self.submitPrompt(text),
         }
     }
 
-    fn submitComposer(self: *Session) !void {
-        const text = try self.app.prepareComposerSubmission(self.allocator) orelse return;
-        defer self.allocator.free(text);
-
+    fn submitPrompt(self: *Session, text: []const u8) !void {
         try self.beginPrompt(text);
         self.read_model.markRunning();
         try self.syncStatus();
-        try self.app.dispatch(.composer_clear);
         try self.renderIfDirty();
     }
 
     fn drainHost(self: *Session) !usize {
         var count: usize = 0;
-        while (count < frame_policy.host_events_per_tick_max) : (count += 1) {
+        while (count < host_events_per_tick_max) : (count += 1) {
             var event = self.host.drainPublicEvent() orelse break;
             defer event.deinit();
             self.read_model.apply(event);
             try self.syncStatus();
-            try tui_agent_adapter.applyAgentSessionEvent(self.allocator, self.app, event);
+            try self.app.applyAgentSessionEvent(event);
         }
         return count;
-    }
-
-    fn drainAppEvents(self: *Session) void {
-        var drained_events: [frame_policy.app_events_per_tick_max]tui_event.TuiEvent = undefined;
-        _ = self.app.drainEvents(&drained_events);
     }
 
     /// Frame-gated paint: skip when nothing changed, and coalesce mutations that
@@ -308,7 +270,7 @@ const Session = struct {
     fn maybeRender(self: *Session) !void {
         if (!self.app.isDirty()) return;
         const now = self.nowNs();
-        if (!self.frame_gate.shouldRender(now)) return;
+        if (self.last_render_ns != 0 and now - self.last_render_ns < frame_interval_ns) return;
         try self.renderNow(now);
     }
 
@@ -320,21 +282,15 @@ const Session = struct {
         try self.renderNow(self.nowNs());
     }
 
-    fn renderFullFrame(self: *Session) !void {
-        self.app.forceFullRepaint();
-        self.terminal.vx.window().clear();
-        try self.renderNow(self.nowNs());
-    }
-
     fn renderNow(self: *Session, now_ns: i128) !void {
         const window = self.terminal.vx.window();
-        self.app.render(window);
+        tui.render.render(self.app, window);
         // Zi does not render scaled text. Keep this optional terminal feature
         // outside our supported surface until we own a tested primitive for it.
         self.terminal.vx.caps.scaled_text = false;
         try self.terminal.vx.render(self.terminal.tty.writer());
         try self.terminal.tty.writer().flush();
-        self.frame_gate.recordRender(now_ns);
+        self.last_render_ns = now_ns;
     }
 
     fn nowNs(self: *Session) i128 {
@@ -344,31 +300,7 @@ const Session = struct {
     fn syncStatus(self: *Session) !void {
         if (self.rendered_status == self.read_model.status) return;
         self.rendered_status = self.read_model.status;
-        try self.app.dispatch(.{ .buffer_replace = .{
-            .id = tui.builtin.buffers.status,
-            .bytes = statusText(self.rendered_status),
-        } });
-    }
-
-    fn openPtyTestModal(self: *Session) !void {
-        const screen_width = nonzero(self.terminal.vx.screen.width, 80);
-        const screen_height = nonzero(self.terminal.vx.screen.height, 24);
-        const width: u16 = @min(screen_width, 28);
-        const height: u16 = 3;
-        const x: u16 = (screen_width - width) / 2;
-        const y: u16 = if (screen_height > height) (screen_height - height) / 2 else 0;
-        try self.app.dispatch(.{ .open_text_surface = .{
-            .surface_id = tui.builtin.surfaces.diagnostics,
-            .view_id = tui.builtin.views.diagnostics,
-            .buffer_id = tui.builtin.buffers.diagnostics,
-            .buffer_kind = .text,
-            .buffer_name = "diagnostics",
-            .rect = .init(x, y, width, height),
-            .layer = .modal,
-            .modality = .focus_trap,
-            .dismiss_policy = .escape,
-            .text = "PTY MODAL",
-        } });
+        self.app.setStatus(appStatus(self.rendered_status));
     }
 };
 
@@ -387,28 +319,12 @@ fn statusText(status: frontend.ReadModel.Status) []const u8 {
     };
 }
 
-fn keyToRouterKey(key: vaxis.Key) tui_input_router.Key {
-    return .{
-        .codepoint = if (key.codepoint == 0) null else key.codepoint,
-        .text = key.text,
-        .enter = key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.kp_enter, .{}),
-        .backspace = key.matches(vaxis.Key.backspace, .{}),
-        .escape = key.matches(0x1b, .{}),
-        .left = key.matches(vaxis.Key.left, .{}),
-        .right = key.matches(vaxis.Key.right, .{}),
-        .modifiers = .{
-            .ctrl = key.mods.ctrl,
-            .alt = key.mods.alt,
-            .super = key.mods.super,
-            .meta = key.mods.meta,
-        },
-    };
-}
-
-fn inputFocusTargetFromReadModel(target: tui_read_model.ReadModel.InputTarget) tui_input_router.FocusTarget {
-    return switch (target) {
-        .composer => .composer,
-        .surface => .surface,
+fn appStatus(status: frontend.ReadModel.Status) tui.App.Status {
+    return switch (status) {
+        .idle, .stopped, .shutdown_requested => .idle,
+        .running => .running,
+        .cancel_requested => .cancel_requested,
+        .failed => .failed,
     };
 }
 

@@ -1,6 +1,6 @@
 # adr 0002: own the tui runtime and expose buffer-oriented extension surfaces
 
-status: accepted
+status: superseded by adr 0006 for the next implementation slice
 
 date: 2026-05-30
 

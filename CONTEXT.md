@@ -52,9 +52,9 @@ AgentSession
   owns bounded public AgentSessionEvent queue
   owns queue mirror and lifecycle state
 
-src/tui/bridge/App
-  owns TUI stores, dispatch, commands, events, read models, and render cadence
-  consumes coding_agent public events/snapshots through a frontend boundary
+src/tui/App
+  owns TUI product state, commands, agent-event application, and dirty state
+  consumes coding_agent public events/snapshots through the frontend boundary
   does not own AgentSession, tools, providers, settings, or session persistence
 
 agent.Agent
@@ -76,12 +76,16 @@ preserve these behaviors, not the TypeScript shape:
 
 ## tui direction
 
-Zi's TUI is an agent workspace over libvaxis, not a port of pi-mono's TUI. See:
+Zi's TUI is a small coding-agent terminal frontend over libvaxis. The accepted
+implementation direction is:
 
 ```text
-docs/adr/0002-tui-runtime-and-extension-surface.md
-docs/adr/0003-tui-world-and-extension-primitives.md
+docs/adr/0006-brutally-small-tui-architecture.md
 ```
+
+ADR 0002, 0003, and 0005 are superseded for the next implementation slice.
+They remain useful reference material for future extension pressure, but they
+are not the current architecture.
 
 libvaxis owns terminal mechanics:
 
@@ -93,52 +97,38 @@ resize
 screen/cell model
 styles/colors
 window clipping
-terminal rendering
+screen diff/flush
 ```
 
-`src/tui` owns Zi UI state and composition:
+`src/tui` should shrink toward:
 
 ```text
-primitive: opaque ids, buffers, views, surfaces, slots, focus, frames
-product: composer, transcript, transcript renderers
-composition: built-in ids and shell layout
-bridge: App, TuiCommand, TuiEvent, input routing, read models, agent adapters
+App.zig          app state, commands, agent-event application, dirty flag
+composer.zig     bounded single-line prompt editor
+transcript.zig   bounded resident transcript and active assistant item
+input.zig        vaxis key events -> App.Command
+render.zig       App snapshot -> libvaxis cells, full-frame repaint
+terminal.zig     libvaxis lifecycle wrapper
+root.zig         tiny public imports
 ```
-
-the built-in shell is a composition:
-
-```text
-Shell composition
-  Header surface
-  Transcript view
-  Status surface
-  Composer surface
-```
-
-it is not the architecture itself.
 
 tui contracts:
 
-- `Buffer != View != Surface`.
-- transcript items are domain facts with durability: `ephemeral` or `persistent`.
-- custom persistent transcript items are session facts and must go through the
-  session-owner persistence path when persistence exists.
-- composer is its own subsystem for prompt editing, `@file` completion, command
-  dispatch, and future attachments.
-- slots are named, bounded contribution points for built-ins and future Lua
-  extensions.
-- popovers, modals, autocomplete menus, command palettes, confirmations, and
-  toasts are z-indexed surface policy, not special buffer kinds.
-- surface render order is deterministic by `(layer, insertion_index)`.
-- TUI events are bounded and drained.
-- extensions request changes through commands; owners mutate.
-- future Lua extensions use the same commands/events/slots/renderers as
-  built-in code. actions/keymaps are future systems and must have explicit
-  owners before they enter the current API.
-- `src/tui/root.zig` exports only the deliberately small frontend-facing
-  modules: built-in composition ids, frame policy, and terminal setup. lower
-  layers stay internal unless tests or bridge integration intentionally target
-  them.
+- `App` is the only owner of TUI product state.
+- public mutation goes through `App.apply`, `App.applyAgentEvent`, or
+  `App.resize`.
+- commands fail before mutation or commit completely.
+- there is no public TUI event queue until another owner proves it must drain
+  one.
+- transcript is domain state, not a generic projection buffer.
+- streaming assistant deltas mutate one active assistant item.
+- composer is single-line until multi-line editing is implemented as a real
+  owner.
+- render is full-frame first; libvaxis handles terminal screen diffing.
+- rendering stores no `vaxis.Window` across frames.
+- wrapping and tailing use display rows, not newline counts.
+- future buffers, views, surfaces, slots, read models, actions, and keymaps must
+  be justified by concrete second-use pressure before entering the current API.
 
 relationship to `coding_agent`:
 
@@ -257,21 +247,20 @@ request shutdown
 
 highest value next slices:
 
-1. keep shrinking `src/tui/bridge/App` to one mutation owner plus store/apply
-   helpers; product semantics belong in `src/tui/product`.
-2. keep TUI observable facts behind bounded `TuiEvent` drains; no callback
-   reentrancy into mutation.
-3. deepen composer editing with the same boundary: product state first,
-   bridge-owned commands second, projection/rendering last.
-4. add `@file` completion and slash/command dispatch only after their owners,
-   bounds, and extension-facing read model are explicit.
-5. connect TUI to `AgentSessionRuntimeHost` only through live-run commands, public events,
+1. replace the current `src/tui` primitive stack with the ADR 0006 shape:
+   `App`, `composer`, `transcript`, `input`, `render`, `terminal`, and `root`.
+2. remove the public TUI event queue until a real second owner needs to drain it.
+3. make `App` commands atomic: fail before mutation or commit completely.
+4. implement full-frame libvaxis rendering before dirty rectangles or surfaces.
+5. add `@file` completion and slash/command dispatch only after their owners and
+   bounds are explicit.
+6. connect TUI to `AgentSessionRuntimeHost` only through live-run commands, public events,
    and owned snapshots.
-6. finish provider/auth/model composition without moving policy into `main.zig`.
-7. add an owned auth storage seam; env lookup is a fallback adapter, not the whole policy.
-8. deepen `session_config` diagnostics for unresolved provider/model/settings.
-9. add runtime limits and a real operation table before TUI concurrency.
-10. add bounded tool runner before process/bash tools.
+7. finish provider/auth/model composition without moving policy into `main.zig`.
+8. add an owned auth storage seam; env lookup is a fallback adapter, not the whole policy.
+9. deepen `session_config` diagnostics for unresolved provider/model/settings.
+10. add runtime limits and a real operation table before TUI concurrency.
+11. add bounded tool runner before process/bash tools.
 
 ## rejected shortcuts
 

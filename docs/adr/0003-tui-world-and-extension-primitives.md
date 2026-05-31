@@ -1,6 +1,6 @@
 # adr 0003: define the tui world as transcript, composer, slots, and surfaces
 
-status: accepted
+status: superseded by adr 0006
 
 date: 2026-05-30
 

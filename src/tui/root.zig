@@ -1,49 +1,16 @@
-const app_mod = @import("bridge/app.zig");
-const builtin_mod = @import("composition/builtin.zig");
-const buffer_mod = @import("primitive/buffer.zig");
-const command_mod = @import("bridge/command.zig");
-const composer_mod = @import("product/composer.zig");
-const event_mod = @import("bridge/event.zig");
-const focus_mod = @import("primitive/focus.zig");
-const frame_mod = @import("primitive/frame.zig");
-const grapheme_mod = @import("primitive/grapheme.zig");
-const input_router_mod = @import("bridge/input_router.zig");
-const read_model_mod = @import("bridge/read_model.zig");
-const renderer_mod = @import("substrate/renderer.zig");
-const shell_mod = @import("composition/shell.zig");
-const slot_mod = @import("primitive/slot.zig");
-const surface_mod = @import("primitive/surface.zig");
-const terminal_mod = @import("substrate/terminal.zig");
-const testing_mod = @import("substrate/testing.zig");
-const transcript_mod = @import("product/transcript.zig");
-const transcript_renderer_mod = @import("product/transcript_renderer.zig");
-const view_mod = @import("primitive/view.zig");
-const vscreen_mod = @import("substrate/vscreen.zig");
-
-pub const builtin = builtin_mod;
-pub const frame = frame_mod;
-pub const terminal = terminal_mod;
+pub const App = @import("App.zig");
+pub const composer = @import("composer.zig");
+pub const input = @import("input.zig");
+pub const render = @import("render.zig");
+pub const terminal = @import("terminal.zig");
+pub const transcript = @import("transcript.zig");
 
 test {
-    _ = app_mod;
-    _ = builtin;
-    _ = buffer_mod;
-    _ = command_mod;
-    _ = composer_mod;
-    _ = event_mod;
-    _ = focus_mod;
-    _ = frame;
-    _ = grapheme_mod;
-    _ = input_router_mod;
-    _ = read_model_mod;
-    _ = renderer_mod;
-    _ = shell_mod;
-    _ = slot_mod;
-    _ = surface_mod;
-    _ = testing_mod;
+    _ = App;
+    _ = composer;
+    _ = input;
+    _ = render;
     _ = terminal;
-    _ = transcript_mod;
-    _ = transcript_renderer_mod;
-    _ = view_mod;
-    _ = vscreen_mod;
+    _ = transcript;
 }
+
