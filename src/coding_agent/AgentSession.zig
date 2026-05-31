@@ -31,6 +31,7 @@ queue_mirror: *QueueMirror,
 event_drain: *EventDrain,
 lifecycle: Lifecycle = .accepting,
 compaction_settings: session_manager.CompactionSettings = .{},
+active_compaction_cancel_source: ?*runtime.CancelSource = null,
 
 pub const Options = struct {
     cwd: []const u8,
@@ -997,6 +998,13 @@ fn runManualCompaction(
 
 pub fn cancel(self: *AgentSession) void {
     self.reconcileLifecycle();
+    if (self.active_compaction_cancel_source) |source| {
+        if (self.lifecycle == .shutdown_requested or self.lifecycle == .stopped) return;
+        if (self.lifecycle == .cancel_requested) return;
+        self.lifecycle = .cancel_requested;
+        source.request();
+        return;
+    }
     if (self.agent.state.status == .settling) return;
     if (!self.agent.state.isStreaming()) return;
     if (self.lifecycle == .shutdown_requested or self.lifecycle == .stopped) return;
@@ -1010,6 +1018,11 @@ pub fn requestShutdown(self: *AgentSession) void {
     switch (self.lifecycle) {
         .stopped, .shutdown_requested => return,
         .accepting, .cancel_requested => {},
+    }
+    if (self.active_compaction_cancel_source) |source| {
+        self.lifecycle = .shutdown_requested;
+        source.request();
+        return;
     }
     if (self.agent.state.status == .settling) {
         self.lifecycle = .shutdown_requested;
@@ -1029,7 +1042,8 @@ pub fn status(self: *AgentSession) AgentSessionStatus {
         .stopped => .stopped,
         .shutdown_requested => .shutdown_requested,
         .cancel_requested => .cancel_requested,
-        .accepting => if (self.agent.state.isStreaming()) .running else .idle,
+        .accepting => if (self.agent.state.isStreaming() or
+            self.active_compaction_cancel_source != null) .running else .idle,
     };
 }
 
@@ -1054,6 +1068,7 @@ pub fn shutdownComplete(self: *AgentSession) bool {
 
 pub fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !void {
     if (!self.agent.waitForIdle()) return error.SessionBusy;
+    if (self.active_compaction_cancel_source != null) return error.SessionBusy;
     var active_set = try self.tools.buildActiveToolSet(self.allocator, names);
     defer active_set.deinit(self.allocator);
     const next_prompt = try self.buildPromptForActiveNames(active_set.names);
@@ -1093,6 +1108,7 @@ fn ensureAcceptsPrompt(self: *AgentSession) Error!void {
         .cancel_requested => return error.SessionCancelling,
         .shutdown_requested, .stopped => return error.SessionShuttingDown,
     }
+    if (self.active_compaction_cancel_source != null) return error.SessionBusy;
 }
 
 fn ensureAcceptsContinue(self: *AgentSession) Error!void {
@@ -1103,6 +1119,7 @@ fn ensureAcceptsContinue(self: *AgentSession) Error!void {
         .shutdown_requested, .stopped => return error.SessionShuttingDown,
     }
     if (self.agent.state.isStreaming()) return error.SessionBusy;
+    if (self.active_compaction_cancel_source != null) return error.SessionBusy;
 }
 
 fn applyManualCompaction(
@@ -1210,6 +1227,9 @@ fn generateCompactionSummary(self: *AgentSession, serialized_input: []const u8) 
     }
 
     var cancel_source: runtime.CancelSource = .{};
+    std.debug.assert(self.active_compaction_cancel_source == null);
+    self.active_compaction_cancel_source = &cancel_source;
+    defer self.active_compaction_cancel_source = null;
     var response_arena = std.heap.ArenaAllocator.init(self.allocator);
     defer response_arena.deinit();
     var stream = self.agent.loop_config.stream.call(.{
@@ -2622,6 +2642,58 @@ test "agent session generated manual compaction oversized summary does not mutat
     try std.testing.expectEqualStrings("CompactionSummaryTooLarge", end_event.compaction_end.error_message.?.text);
 }
 
+test "agent session generated manual compaction cancellation is observable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    var factory_state: CancelGeneratedCompactionFactory = .{};
+    try provider.appendFactory(.{ .context = &factory_state, .call_fn = CancelGeneratedCompactionFactory.call });
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    });
+    defer shutdownAndDeinit(&session);
+    factory_state.session = &session;
+
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    try std.testing.expectError(error.OperationCancelled, session.compactWithGeneratedSummary());
+    try std.testing.expectEqual(@as(usize, 1), factory_state.call_count);
+    try std.testing.expect(factory_state.observed_cancel_request);
+    try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
+    try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expect(end_event.compaction_end.aborted);
+    try std.testing.expect(end_event.compaction_end.result == null);
+    try std.testing.expectEqualStrings("OperationCancelled", end_event.compaction_end.error_message.?.text);
+}
+
 test "agent session prepares owned compaction snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2738,6 +2810,24 @@ test "agent session terminal policy runs after persistence" {
 fn initTestSession(dir: std.Io.Dir) !AgentSession {
     return initTestSessionWithCapacity(dir, public_event_capacity_default);
 }
+
+const CancelGeneratedCompactionFactory = struct {
+    session: ?*AgentSession = null,
+    call_count: usize = 0,
+    observed_cancel_request: bool = false,
+
+    fn call(
+        context: ?*anyopaque,
+        request: ai.StreamRequest,
+        _: *const ai.faux.State,
+    ) ai.faux.FactoryError!ai.AssistantMessage {
+        const self: *CancelGeneratedCompactionFactory = @ptrCast(@alignCast(context.?));
+        self.call_count += 1;
+        self.session.?.cancel();
+        self.observed_cancel_request = request.cancel_token.?.isRequested();
+        return ai.protocol.emptyAssistantMessageFromRequest(request, .aborted, "aborted");
+    }
+};
 
 fn initTestSessionWithCapacity(dir: std.Io.Dir, public_event_capacity: usize) !AgentSession {
     try dir.createDirPath(std.testing.io, "agent");
