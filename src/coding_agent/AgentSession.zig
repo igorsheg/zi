@@ -2517,6 +2517,111 @@ test "agent session generated manual compaction summarizes and persists" {
     try std.testing.expectEqualStrings("generated summary", end_event.compaction_end.result.?.summary.text);
 }
 
+test "agent session generated manual compaction failure does not mutate history" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    try std.testing.expectError(error.CompactionSummaryGenerationFailed, session.compactWithGeneratedSummary());
+    try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expect(end_event.compaction_end.result == null);
+    try std.testing.expectEqualStrings(
+        "CompactionSummaryGenerationFailed",
+        end_event.compaction_end.error_message.?.text,
+    );
+}
+
+test "agent session generated manual compaction oversized summary does not mutate history" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{
+        .min_token_size = session_manager.max_compaction_summary_bytes + 1,
+        .max_token_size = session_manager.max_compaction_summary_bytes + 1,
+    });
+    defer provider.deinit();
+    const oversized_summary = try std.testing.allocator.alloc(u8, session_manager.max_compaction_summary_bytes + 1);
+    defer std.testing.allocator.free(oversized_summary);
+    @memset(oversized_summary, 's');
+    const summary_content = [_]ai.AssistantContent{.{ .text = .{ .text = oversized_summary } }};
+    const summaries = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&summaries);
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    try std.testing.expectError(error.CompactionSummaryTooLarge, session.compactWithGeneratedSummary());
+    try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expect(end_event.compaction_end.result == null);
+    try std.testing.expectEqualStrings("CompactionSummaryTooLarge", end_event.compaction_end.error_message.?.text);
+}
+
 test "agent session prepares owned compaction snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
