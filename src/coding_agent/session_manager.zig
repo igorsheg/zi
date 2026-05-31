@@ -115,6 +115,7 @@ pub const SessionManager = struct {
         NothingToCompact,
         CompactionSummaryTooLarge,
         CompactionFirstKeptEntryIdTooLarge,
+        CompactionFirstKeptEntryNotInBranch,
         CompactionSettingsOutOfBounds,
     } || std.mem.Allocator.Error;
 
@@ -267,6 +268,9 @@ pub const SessionManager = struct {
         timestamp: []const u8,
     ) Error!SessionEntry {
         try validateCompactionInput(summary, first_kept_entry_id);
+        if (!(try self.entryIdInBranchFrom(self.leaf_id, first_kept_entry_id))) {
+            return error.CompactionFirstKeptEntryNotInBranch;
+        }
         const base = try self.nextBase(timestamp);
         errdefer self.deinitBase(base);
         return blk: {
@@ -320,6 +324,9 @@ pub const SessionManager = struct {
             },
             .compaction => |compaction| blk: {
                 try validateCompactionInput(compaction.summary, compaction.first_kept_entry_id);
+                if (!(try self.entryIdInBranchFrom(loaded.parent_id, compaction.first_kept_entry_id))) {
+                    return error.CompactionFirstKeptEntryNotInBranch;
+                }
                 const summary = try self.allocator.dupe(u8, compaction.summary);
                 errdefer self.allocator.free(summary);
                 const first_kept_entry_id = try self.allocator.dupe(u8, compaction.first_kept_entry_id);
@@ -544,6 +551,23 @@ pub const SessionManager = struct {
         if (first_kept_entry_id.len > max_compaction_first_kept_entry_id_bytes) {
             return error.CompactionFirstKeptEntryIdTooLarge;
         }
+    }
+
+    fn entryIdInBranchFrom(
+        self: *const SessionManager,
+        leaf_id: ?[]const u8,
+        target_id: []const u8,
+    ) Error!bool {
+        var current_id = leaf_id;
+        var depth: usize = 0;
+        while (current_id) |id| {
+            if (depth == max_branch_depth) return error.BranchDepthExceeded;
+            const entry = self.findEntry(id) orelse return error.EntryNotFound;
+            if (std.mem.eql(u8, entry.id(), target_id)) return true;
+            current_id = entry.parentId();
+            depth += 1;
+        }
+        return false;
     }
 
     pub fn deinitSessionContext(_: *const SessionManager, allocator: std.mem.Allocator, context: SessionContext) void {
@@ -823,6 +847,22 @@ test "append compaction enforces bounded owned fields before mutation" {
     try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
 }
 
+test "append compaction rejects first kept entry outside active branch" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const root = try manager.appendMessage(userMessage("root"), "t1");
+    const left = try manager.appendMessage(userMessage("left"), "t2");
+    try manager.branch(root);
+    _ = try manager.appendMessage(userMessage("right"), "t3");
+
+    try std.testing.expectError(
+        error.CompactionFirstKeptEntryNotInBranch,
+        manager.appendCompaction("summary", left, 1, "t4"),
+    );
+    try std.testing.expectEqual(@as(usize, 3), manager.entries.items.len);
+}
+
 test "prepared message entry does not mutate active leaf before commit" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
@@ -1039,6 +1079,43 @@ test "loaded compaction entries enforce durable bounds" {
         } },
     }));
     try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
+}
+
+test "loaded compaction entries reject first kept entry outside parent branch" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendLoadedEntry(.{
+        .id = "00000001",
+        .parent_id = null,
+        .timestamp = "t1",
+        .value = .{ .message = userMessage("root") },
+    });
+    _ = try manager.appendLoadedEntry(.{
+        .id = "00000002",
+        .parent_id = "00000001",
+        .timestamp = "t2",
+        .value = .{ .message = userMessage("left") },
+    });
+    try manager.branch("00000001");
+    _ = try manager.appendLoadedEntry(.{
+        .id = "00000003",
+        .parent_id = "00000001",
+        .timestamp = "t3",
+        .value = .{ .message = userMessage("right") },
+    });
+
+    try std.testing.expectError(error.CompactionFirstKeptEntryNotInBranch, manager.appendLoadedEntry(.{
+        .id = "00000004",
+        .parent_id = "00000003",
+        .timestamp = "t4",
+        .value = .{ .compaction = .{
+            .summary = "summary",
+            .first_kept_entry_id = "00000002",
+            .tokens_before = 1,
+        } },
+    }));
+    try std.testing.expectEqual(@as(usize, 3), manager.entries.items.len);
 }
 
 test "loaded entries reject duplicate ids and missing parents" {

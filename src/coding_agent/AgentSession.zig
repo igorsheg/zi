@@ -111,7 +111,6 @@ pub const Error = error{
     SessionBusy,
     SessionCancelling,
     SessionShuttingDown,
-    CompactionEntryNotInBranch,
 };
 
 pub const EventText = struct {
@@ -1028,7 +1027,6 @@ fn applyManualCompaction(
     first_kept_entry_id: []const u8,
     tokens_before: u64,
 ) !CompactionResult {
-    try self.ensureEntryInActiveBranch(first_kept_entry_id);
     try self.manager.ensureAppendCapacity(1);
     const entry = try self.manager.prepareCompactionEntry(
         summary,
@@ -1093,15 +1091,6 @@ fn prepareAndApplyManualCompaction(
         preparation.first_kept_entry_id,
         preparation.tokens_before,
     );
-}
-
-fn ensureEntryInActiveBranch(self: *AgentSession, entry_id: []const u8) !void {
-    const branch = try self.manager.getBranch(self.allocator);
-    defer self.allocator.free(branch);
-    for (branch) |entry| {
-        if (std.mem.eql(u8, entry.id(), entry_id)) return;
-    }
-    return error.CompactionEntryNotInBranch;
 }
 
 fn reconcileLifecycle(self: *AgentSession) void {
