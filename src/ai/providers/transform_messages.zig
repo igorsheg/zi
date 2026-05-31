@@ -1,6 +1,6 @@
 const std = @import("std");
 const protocol = @import("../protocol.zig");
-const zistd = @import("../../zistd/root.zig");
+const runtime = @import("../../runtime/root.zig");
 
 const non_vision_user_image_placeholder = "(image omitted: model does not support images)";
 const non_vision_tool_image_placeholder = "(tool image omitted: model does not support images)";
@@ -133,7 +133,7 @@ fn cloneToolResultMessageDowngradingImages(
         .tool_call_id = try allocator.dupe(u8, normalized_tool_call_id orelse source.tool_call_id),
         .tool_name = try allocator.dupe(u8, source.tool_name),
         .content = try cloneToolResultContentSlice(allocator, source.content, supportsImages(model)),
-        .details = if (source.details) |details| try zistd.cloneJsonValue(allocator, details) else null,
+        .details = if (source.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
         .is_error = source.is_error,
         .timestamp = source.timestamp,
     };
@@ -298,7 +298,7 @@ fn cloneToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !proto
     return .{
         .id = try allocator.dupe(u8, source.id),
         .name = try allocator.dupe(u8, source.name),
-        .arguments = try zistd.cloneJsonValue(allocator, source.arguments),
+        .arguments = try runtime.cloneJsonValue(allocator, source.arguments),
         .thought_signature = try cloneOptionalString(allocator, source.thought_signature),
     };
 }
@@ -306,7 +306,6 @@ fn cloneToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !proto
 fn cloneOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
     return if (source) |value| try allocator.dupe(u8, value) else null;
 }
-
 
 test "non vision model replaces adjacent user images with one placeholder" {
     const source = [_]protocol.Message{.{ .user = .{

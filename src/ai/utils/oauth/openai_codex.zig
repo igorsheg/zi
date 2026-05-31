@@ -1,6 +1,6 @@
 const std = @import("std");
 const http_utils = @import("../http.zig");
-const zistd = @import("../../../zistd/root.zig");
+const runtime = @import("../../../runtime/root.zig");
 const oauth = @import("root.zig");
 
 pub const callback_host = "127.0.0.1";
@@ -77,7 +77,7 @@ pub fn getAccountId(allocator: std.mem.Allocator, access_token: []const u8) !?[]
     const decoded = try decodeBase64Url(allocator, payload_segment);
     defer allocator.free(decoded);
 
-    var parsed = zistd.Owned(std.json.Value).parseJson(allocator, decoded, .{}) catch return null;
+    var parsed = runtime.JsonOwned(std.json.Value).parseJson(allocator, decoded, .{}) catch return null;
     defer parsed.deinit();
     const auth = parsed.value.object.get(jwt_claim_path) orelse return null;
     if (auth != .object) return null;
@@ -254,7 +254,7 @@ fn raceLoginCode(
     const race_io = threaded.io();
 
     var completions_buffer: [2]LoginCodeCompletion = undefined;
-    var race = zistd.Race(LoginCodeCompletion).init(race_io, &completions_buffer);
+    var race = runtime.Race(LoginCodeCompletion).init(race_io, &completions_buffer);
     defer race.deinit();
     errdefer race.cancelAndDrain(allocator, drainLoginCodeLoser);
 
@@ -450,7 +450,7 @@ fn requestToken(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oau
 }
 
 fn parseTokenResponse(allocator: std.mem.Allocator, io: std.Io, body: []const u8) !oauth.OAuthCredentials {
-    var parsed = try zistd.Owned(std.json.Value).parseJson(allocator, body, .{});
+    var parsed = try runtime.JsonOwned(std.json.Value).parseJson(allocator, body, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidTokenResponse;
     const object = parsed.value.object;

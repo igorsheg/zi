@@ -35,7 +35,7 @@ pub fn Race(comptime Completion: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.started > 0 and !self.drained) @panic("zistd.Race deinit before cancelAndDrain");
+            if (self.started > 0 and !self.drained) @panic("runtime.Race deinit before cancelAndDrain");
             self.* = undefined;
         }
 

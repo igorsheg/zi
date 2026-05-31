@@ -1,5 +1,5 @@
 const std = @import("std");
-const operation = @import("Operation.zig");
+const operation = @import("operation.zig");
 
 pub fn CompletionQueue(comptime Completion: type) type {
     return struct {

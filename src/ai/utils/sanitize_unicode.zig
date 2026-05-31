@@ -1,5 +1,5 @@
 const std = @import("std");
-const mem = @import("../../zistd/root.zig");
+const mem = @import("../../runtime/root.zig");
 
 pub fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var sanitized = mem.ByteBuilder.init(allocator);

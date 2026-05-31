@@ -439,7 +439,7 @@ src/tui/primitive/transcript.zig
 src/tui/primitive/slot.zig
 src/tui/primitive/command.zig
 src/tui/primitive/event.zig
-src/tui/component/composer.zig
+src/tui/product/composer.zig
 ```
 
-after those exist, update `App` so agent events become transcript items, transcript renderers write buffers, and buffers/views/surfaces render through the existing vaxis adapter.
+after those exist, update `App` so agent events become transcript items, transcript renderers write buffers, and buffers/views/surfaces render through the bridge-owned vaxis frame renderer.

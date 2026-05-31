@@ -1,8 +1,8 @@
 const std = @import("std");
-const mem = @import("../../zistd/root.zig");
+const mem = @import("../../runtime/root.zig");
 const partial_json = @import("partial_json.zig");
 
-pub const OwnedJsonValue = mem.Owned(std.json.Value);
+pub const OwnedJsonValue = mem.JsonOwned(std.json.Value);
 
 pub const StreamingJson = struct {
     owned: OwnedJsonValue,

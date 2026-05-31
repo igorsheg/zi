@@ -67,8 +67,12 @@ pub const Terminal = struct {
         self.alt_screen_entered = false;
     }
 
-    pub fn resize(self: *Terminal, winsize: vaxis.Winsize) !void {
-        try self.vx.resize(self.allocator, self.tty.writer(), winsize);
+    pub fn resize(self: *Terminal, size: vaxis.Winsize) !void {
+        try self.vx.resize(self.allocator, self.tty.writer(), size);
+    }
+
+    pub fn currentWinsize(self: *Terminal) !vaxis.Winsize {
+        return self.tty.getWinsize();
     }
 
     pub fn drawText(self: *Terminal, text: []const u8) !void {

@@ -65,7 +65,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     pty_test_module.addOptions("pty_options", pty_options);
+    pty_test_module.addImport("vaxis", vaxis_dep.module("vaxis"));
     const pty_tests = b.addTest(.{ .root_module = pty_test_module });
+    pty_tests.step.dependOn(&exe.step);
     const pty_test_step = b.step("pty-test", "Run PTY harness tests (links libc)");
     pty_test_step.dependOn(&b.addRunArtifact(pty_tests).step);
 }

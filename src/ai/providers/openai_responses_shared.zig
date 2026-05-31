@@ -1,6 +1,6 @@
 const std = @import("std");
 const models_api = @import("../models.zig");
-const mem = @import("../../zistd/root.zig");
+const mem = @import("../../runtime/root.zig");
 const protocol = @import("../protocol.zig");
 const sse = @import("../sse.zig");
 const json_parse = @import("../utils/json_parse.zig");

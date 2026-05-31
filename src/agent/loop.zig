@@ -1,7 +1,7 @@
 const std = @import("std");
 const agent = @import("root.zig");
 const ai = @import("../ai/root.zig");
-const runtime = @import("../zistd/root.zig");
+const runtime = @import("../runtime/root.zig");
 
 pub const EventSink = struct {
     context: ?*anyopaque = null,

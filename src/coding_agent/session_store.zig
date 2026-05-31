@@ -1,7 +1,7 @@
 const std = @import("std");
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
-const mem = @import("../zistd/root.zig");
+const mem = @import("../runtime/root.zig");
 const session_manager = @import("session_manager.zig");
 
 pub const max_session_file_bytes = 64 * 1024 * 1024;
@@ -310,7 +310,7 @@ fn stopReasonString(reason: ai.StopReason) []const u8 {
 fn parseSession(allocator: std.mem.Allocator, data: []const u8) !session_manager.SessionManager {
     var lines = std.mem.splitScalar(u8, data, '\n');
     const header_line = lines.next() orelse return error.MissingHeader;
-    var parsed_header = try mem.Owned(std.json.Value).parseJson(allocator, header_line, .{});
+    var parsed_header = try mem.JsonOwned(std.json.Value).parseJson(allocator, header_line, .{});
     defer parsed_header.deinit();
     const header = try jsonObject(parsed_header.value, error.InvalidHeader);
     if (!std.mem.eql(u8, try jsonString(header.get("type") orelse return error.InvalidHeader), "session")) {
@@ -338,7 +338,7 @@ fn parseSession(allocator: std.mem.Allocator, data: []const u8) !session_manager
 }
 
 fn parseEntryLine(allocator: std.mem.Allocator, manager: *session_manager.SessionManager, line: []const u8) !void {
-    var parsed = try mem.Owned(std.json.Value).parseJson(allocator, line, .{});
+    var parsed = try mem.JsonOwned(std.json.Value).parseJson(allocator, line, .{});
     defer parsed.deinit();
     const object = try jsonObject(parsed.value, error.InvalidEntry);
     const entry_type = try jsonString(object.get("type") orelse return error.InvalidEntry);

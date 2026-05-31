@@ -18,7 +18,7 @@ zi's tui uses rings. dependencies point inward only:
 terminal substrate
   -> text/rendering core
   -> retained primitives
-  -> components
+  -> product surfaces
   -> compositions
   -> app bridge
 ```
@@ -33,13 +33,16 @@ text/rendering core
   utf-8/grapheme/display-width helpers, wrapping, truncation, styled text, cell writers.
 
 retained primitives
-  Buffer, View, Surface, Slot, Action, Keymap, TuiCommand, TuiEvent.
+  Buffer, View, Surface, Slot, Action, Keymap, TuiCommand, TuiEvent, Frame policy.
 
-components
-  Composer, Transcript, Status, Header, CompletionMenu, Modal behavior.
+product surfaces
+  Zi-specific surfaces such as Composer, Transcript, Status, Header, and
+  transcript renderers. Reusable mechanics such as Frame, TextInput, Menu, or
+  List should move to a future widget layer only after they exist as reused
+  mechanics.
 
 compositions
-  Built-in shell layouts and larger arrangements of components/primitives.
+  Built-in shell layouts and larger arrangements of product surfaces/primitives.
 
 app bridge
   Owns mutation, dispatch, event application, frontend/agent bridging, and frame ownership.
@@ -51,7 +54,7 @@ app bridge
 
 - put a module in the lowest ring that can explain it.
 - lower rings must not import higher rings.
-- terminal substrate must not import product components or app state.
+- terminal substrate must not import product surfaces or app state.
 - retained primitives must not import app, coding_agent, agent, or ai.
 - composition modules calculate layout; they do not mutate stores directly.
 - app owns mutation and may import all inner rings.
@@ -74,14 +77,17 @@ retained primitives
   src/tui/primitive/buffer.zig
   src/tui/primitive/command.zig
   src/tui/primitive/event.zig
+  src/tui/primitive/focus.zig
+  src/tui/primitive/frame.zig
+  src/tui/primitive/input_router.zig
   src/tui/primitive/slot.zig
   src/tui/primitive/surface.zig
   src/tui/primitive/transcript.zig
   src/tui/primitive/view.zig
 
-components
-  src/tui/component/composer.zig
-  src/tui/component/transcript_renderer.zig
+product surfaces
+  src/tui/product/composer.zig
+  src/tui/product/transcript_renderer.zig
 
 compositions
   src/tui/composition/shell.zig
@@ -90,9 +96,10 @@ app bridge
   src/tui/bridge/app.zig
 ```
 
-`src/tui/root.zig` re-exports the stable public module names. callers outside
-`src/tui` should import through that root unless a test intentionally targets a
-specific layer.
+`src/tui/root.zig` re-exports only stable frontend-facing modules. callers
+outside `src/tui` should import through that root unless a test intentionally
+targets a specific layer. lower-level modules remain importable inside `src/tui`
+without becoming part of the public surface.
 
 ## non-goals
 

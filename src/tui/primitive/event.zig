@@ -5,6 +5,12 @@ const surface = @import("surface.zig");
 const transcript = @import("transcript.zig");
 const view = @import("view.zig");
 
+/// TUI events are bounded, non-owning observation facts.
+///
+/// They may be drained by tests, future extension hooks, or cleared by a
+/// frontend that only needs retained rendering. Variants must not own memory or
+/// borrow caller-owned slices. Add typed ids/revisions here, and keep owned
+/// payloads in the stores they reference.
 pub const TuiEvent = union(enum) {
     buffer_changed: BufferChanged,
     view_focused: ViewFocused,

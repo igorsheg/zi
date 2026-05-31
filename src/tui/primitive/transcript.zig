@@ -81,6 +81,7 @@ pub const Store = struct {
         std.debug.assert(kind != .custom);
         if (self.item_count == self.items.len) return error.TranscriptStoreFull;
         if (text.len > text_bytes_max) return error.TranscriptTextTooLarge;
+        if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
 
         const owned = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned);
@@ -95,6 +96,7 @@ pub const Store = struct {
     pub fn appendTextToItem(self: *Store, id: TranscriptItemId, text: []const u8) !void {
         if (text.len == 0) return;
         if (text.len > text_bytes_max) return error.TranscriptTextTooLarge;
+        if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
 
         const item = self.get(id) orelse return error.TranscriptItemNotFound;
         std.debug.assert(item.kind != .custom);
@@ -118,6 +120,8 @@ pub const Store = struct {
         if (self.item_count == self.items.len) return error.TranscriptStoreFull;
         if (custom_type.len == 0 or custom_type.len > custom_type_bytes_max) return error.InvalidCustomTranscriptType;
         if (data_json.len > custom_payload_bytes_max) return error.CustomTranscriptPayloadTooLarge;
+        if (!std.unicode.utf8ValidateSlice(custom_type)) return error.InvalidUtf8;
+        if (!std.unicode.utf8ValidateSlice(data_json)) return error.InvalidUtf8;
 
         const owned_type = try self.allocator.dupe(u8, custom_type);
         errdefer self.allocator.free(owned_type);
@@ -184,4 +188,22 @@ test "transcript item accumulates text without adding items" {
     try store.appendTextToItem(id, "lo");
     try std.testing.expectEqual(@as(usize, 1), store.item_count);
     try std.testing.expectEqualStrings("hello", store.get(id).?.payload.text);
+}
+
+test "transcript store rejects invalid utf8 before mutation" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+
+    try std.testing.expectError(error.InvalidUtf8, store.appendText(.user_message, .persistent, "\x80", 0));
+    try std.testing.expectEqual(@as(usize, 0), store.item_count);
+    try std.testing.expectEqual(@as(u64, 0), store.revision);
+
+    const id = try store.appendText(.assistant_message, .ephemeral, "ok", 0);
+    try std.testing.expectError(error.InvalidUtf8, store.appendTextToItem(id, "\x80"));
+    try std.testing.expectEqualStrings("ok", store.get(id).?.payload.text);
+    try std.testing.expectEqual(@as(u64, 1), store.revision);
+
+    try std.testing.expectError(error.InvalidUtf8, store.appendCustom(.persistent, "\x80", "{}", 0));
+    try std.testing.expectError(error.InvalidUtf8, store.appendCustom(.persistent, "bad", "\x80", 0));
+    try std.testing.expectEqual(@as(usize, 1), store.item_count);
 }

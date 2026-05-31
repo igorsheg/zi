@@ -77,6 +77,7 @@ pub const Slot = struct {
                 .lifetime = lifetime,
                 .text = owned,
             };
+            self.sortContributions();
             self.revision += 1;
             return;
         }
@@ -90,14 +91,17 @@ pub const Slot = struct {
             .text = owned,
         };
         self.contribution_count += 1;
+        self.sortContributions();
         self.revision += 1;
     }
 
     pub fn clear(self: *Slot, allocator: std.mem.Allocator, id: ContributionId) void {
         const index = self.findIndex(id) orelse return;
         self.contributions[index].deinit(allocator);
-        const last_index = self.contribution_count - 1;
-        if (index != last_index) self.contributions[index] = self.contributions[last_index];
+        var move_index = index;
+        while (move_index + 1 < self.contribution_count) : (move_index += 1) {
+            self.contributions[move_index] = self.contributions[move_index + 1];
+        }
         self.contribution_count -= 1;
         self.revision += 1;
     }
@@ -108,6 +112,15 @@ pub const Slot = struct {
             if (self.contributions[index].id == id) return index;
         }
         return null;
+    }
+
+    fn sortContributions(self: *Slot) void {
+        std.sort.insertion(Contribution, self.contributions[0..self.contribution_count], {}, contributionLessThan);
+    }
+
+    fn contributionLessThan(_: void, lhs: Contribution, rhs: Contribution) bool {
+        if (lhs.priority != rhs.priority) return lhs.priority > rhs.priority;
+        return @intFromEnum(lhs.id) < @intFromEnum(rhs.id);
     }
 };
 
@@ -144,4 +157,27 @@ test "slot contribution replace is single-owner mutation" {
     try s.setText(std.testing.allocator, id, .builtin, 1, .session, "model gpt");
     try std.testing.expectEqual(@as(usize, 1), s.contribution_count);
     try std.testing.expectEqualStrings("model gpt", s.contributions[0].text);
+}
+
+test "slot contributions are priority ordered and clear preserves order" {
+    var registry: Registry = .{};
+    defer registry.deinit(std.testing.allocator);
+
+    const low: ContributionId = @enumFromInt(1);
+    const high: ContributionId = @enumFromInt(2);
+    const middle: ContributionId = @enumFromInt(3);
+    const s = registry.get(.composer_footer);
+
+    try s.setText(std.testing.allocator, low, .builtin, 0, .session, "low");
+    try s.setText(std.testing.allocator, high, .extension, 10, .session, "high");
+    try s.setText(std.testing.allocator, middle, .extension, 5, .session, "middle");
+
+    try std.testing.expectEqual(high, s.contributions[0].id);
+    try std.testing.expectEqual(middle, s.contributions[1].id);
+    try std.testing.expectEqual(low, s.contributions[2].id);
+
+    s.clear(std.testing.allocator, middle);
+    try std.testing.expectEqual(@as(usize, 2), s.contribution_count);
+    try std.testing.expectEqual(high, s.contributions[0].id);
+    try std.testing.expectEqual(low, s.contributions[1].id);
 }

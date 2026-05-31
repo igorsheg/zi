@@ -8,10 +8,13 @@ pub const TuiCommand = union(enum) {
     append_transcript_text: AppendTranscriptText,
     append_custom_transcript_item: AppendCustomTranscriptItem,
     buffer_append: BufferAppend,
+    buffer_replace: BufferReplace,
     slot_set_text: SlotSetText,
     slot_clear: SlotClear,
     composer_insert: []const u8,
+    composer_backspace,
     composer_clear,
+    open_text_surface: OpenTextSurface,
     open_surface: OpenSurface,
     close_surface: surface.SurfaceId,
 
@@ -28,6 +31,11 @@ pub const TuiCommand = union(enum) {
     };
 
     pub const BufferAppend = struct {
+        id: buffer.BufferId,
+        bytes: []const u8,
+    };
+
+    pub const BufferReplace = struct {
         id: buffer.BufferId,
         bytes: []const u8,
     };
@@ -53,5 +61,18 @@ pub const TuiCommand = union(enum) {
         layer: surface.Layer,
         modality: surface.Modality = .modeless,
         dismiss_policy: surface.DismissPolicy = .none,
+    };
+
+    pub const OpenTextSurface = struct {
+        surface_id: surface.SurfaceId,
+        view_id: view.ViewId,
+        buffer_id: buffer.BufferId,
+        buffer_kind: buffer.Kind,
+        buffer_name: []const u8,
+        rect: view.Rect,
+        layer: surface.Layer,
+        modality: surface.Modality = .modeless,
+        dismiss_policy: surface.DismissPolicy = .none,
+        text: []const u8,
     };
 };

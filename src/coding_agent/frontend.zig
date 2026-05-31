@@ -63,6 +63,10 @@ pub const ReadModel = struct {
         self.status = .cancel_requested;
     }
 
+    pub fn markRunning(self: *ReadModel) void {
+        self.status = .running;
+    }
+
     pub fn markShutdownRequested(self: *ReadModel) void {
         self.status = .shutdown_requested;
     }

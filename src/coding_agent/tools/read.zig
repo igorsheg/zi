@@ -1,7 +1,7 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
-const zistd = @import("../../zistd/root.zig");
+const runtime = @import("../../runtime/root.zig");
 
 pub const max_read_bytes = 1024 * 1024;
 pub const max_output_bytes = 50 * 1024;
@@ -22,7 +22,7 @@ const parameters_schema =
 pub const ReadTool = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    parsed_parameters: zistd.Owned(std.json.Value),
+    parsed_parameters: runtime.JsonOwned(std.json.Value),
 
     pub const Config = struct {
         cwd: []const u8,
@@ -35,7 +35,7 @@ pub const ReadTool = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !ReadTool {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
-        const parsed_parameters = try zistd.Owned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
         return .{
             .allocator = allocator,
             .config = .{
@@ -70,7 +70,7 @@ fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
     context: ?*anyopaque,
-    token: zistd.CancelToken,
+    token: runtime.CancelToken,
     _: []const u8,
     params: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
@@ -271,7 +271,7 @@ test "read tool reads bounded text with offset and limit" {
     try object.put(std.testing.allocator, "offset", .{ .integer = 2 });
     try object.put(std.testing.allocator, "limit", .{ .integer = 2 });
 
-    var cancel_source: zistd.CancelSource = .{};
+    var cancel_source: runtime.CancelSource = .{};
     var result = try execute(
         std.testing.allocator,
         std.testing.io,
@@ -342,7 +342,7 @@ test "read tool rejects offset beyond end" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "offset", .{ .integer = 3 });
 
-    var cancel_source: zistd.CancelSource = .{};
+    var cancel_source: runtime.CancelSource = .{};
     try std.testing.expectError(error.OffsetBeyondEndOfFile, execute(
         std.testing.allocator,
         std.testing.io,

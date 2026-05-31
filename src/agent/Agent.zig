@@ -2,7 +2,6 @@ const std = @import("std");
 const agent = @import("root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
-const zistd = @import("../zistd/root.zig");
 
 const Agent = @This();
 
@@ -19,9 +18,9 @@ steering_queue: PendingMessageQueue = .{},
 follow_up_queue: PendingMessageQueue = .{},
 loop_config: agent.AgentLoopConfig,
 listeners: std.ArrayList(?Listener) = .empty,
-operations: zistd.OperationTable = .{},
-cancel_source: zistd.CancelSource = .{},
-active_run: ?zistd.OperationId = null,
+operations: runtime.OperationTable = .{},
+cancel_source: runtime.CancelSource = .{},
+active_run: ?runtime.OperationId = null,
 
 pub const QueueMode = enum {
     all,
@@ -56,13 +55,13 @@ pub const Error = error{
 
 pub const Listener = struct {
     context: ?*anyopaque = null,
-    call_fn: *const fn (std.Io, ?*anyopaque, agent.AgentEvent, zistd.CancelToken) anyerror!void,
+    call_fn: *const fn (std.Io, ?*anyopaque, agent.AgentEvent, runtime.CancelToken) anyerror!void,
 
     fn call(
         io: std.Io,
         self: Listener,
         event: agent.AgentEvent,
-        token: zistd.CancelToken,
+        token: runtime.CancelToken,
     ) anyerror!void {
         return self.call_fn(io, self.context, event, token);
     }
@@ -185,7 +184,7 @@ pub fn abort(self: *Agent) void {
     if (self.active_run != null) self.cancel_source.request();
 }
 
-pub fn signal(self: *Agent) ?zistd.CancelToken {
+pub fn signal(self: *Agent) ?runtime.CancelToken {
     if (self.active_run == null) return null;
     return self.cancel_source.token();
 }
@@ -217,7 +216,7 @@ pub fn unsubscribe(self: *Agent, handle: usize) void {
     self.listeners.items[handle] = null;
 }
 
-pub fn beginRun(self: *Agent) Error!zistd.CancelToken {
+pub fn beginRun(self: *Agent) Error!runtime.CancelToken {
     if (self.active_run != null) return error.AlreadyRunning;
     self.cancel_source.reset();
     self.active_run = self.operations.reserve();
@@ -352,11 +351,11 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
     }
 }
 
-pub fn failRun(self: *Agent, token: zistd.CancelToken, message: []const u8) !void {
+pub fn failRun(self: *Agent, token: runtime.CancelToken, message: []const u8) !void {
     try self.recordRunFailure(token, message);
 }
 
-fn recordRunFailure(self: *Agent, token: zistd.CancelToken, message: []const u8) !void {
+fn recordRunFailure(self: *Agent, token: runtime.CancelToken, message: []const u8) !void {
     const stop_reason: ai.StopReason = if (token.isRequested()) .aborted else .error_;
     const assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
     try self.appendMessage(.{ .assistant = assistant });
@@ -544,12 +543,12 @@ fn cloneAgentEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
         .tool_execution_start => |payload| .{ .tool_execution_start = .{
             .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
             .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .args = try zistd.cloneJsonValue(allocator, payload.args),
+            .args = try runtime.cloneJsonValue(allocator, payload.args),
         } },
         .tool_execution_update => |payload| .{ .tool_execution_update = .{
             .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
             .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .args = try zistd.cloneJsonValue(allocator, payload.args),
+            .args = try runtime.cloneJsonValue(allocator, payload.args),
             .partial_result = try cloneAgentToolResult(allocator, payload.partial_result),
         } },
         .tool_execution_end => |payload| .{ .tool_execution_end = .{
@@ -578,7 +577,7 @@ fn cloneToolResultMessages(
             .tool_call_id = try allocator.dupe(u8, message.tool_call_id),
             .tool_name = try allocator.dupe(u8, message.tool_name),
             .content = try cloneToolResultContentSlice(allocator, message.content),
-            .details = if (message.details) |details| try zistd.cloneJsonValue(allocator, details) else null,
+            .details = if (message.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
             .is_error = message.is_error,
             .timestamp = message.timestamp,
         };
@@ -589,7 +588,7 @@ fn cloneToolResultMessages(
 fn cloneAgentToolResult(allocator: std.mem.Allocator, source: agent.AgentToolResult) !agent.AgentToolResult {
     return .{
         .content = try cloneToolResultContentSlice(allocator, source.content),
-        .details = if (source.details) |details| try zistd.cloneJsonValue(allocator, details) else null,
+        .details = if (source.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
         .terminate = source.terminate,
     };
 }
@@ -608,13 +607,13 @@ fn cloneAgentMessage(allocator: std.mem.Allocator, source: agent.AgentMessage) !
             .tool_call_id = try allocator.dupe(u8, message.tool_call_id),
             .tool_name = try allocator.dupe(u8, message.tool_name),
             .content = try cloneToolResultContentSlice(allocator, message.content),
-            .details = if (message.details) |details| try zistd.cloneJsonValue(allocator, details) else null,
+            .details = if (message.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
             .is_error = message.is_error,
             .timestamp = message.timestamp,
         } },
         .custom => |message| .{ .custom = .{
             .kind = try allocator.dupe(u8, message.kind),
-            .payload = try zistd.cloneJsonValue(allocator, message.payload),
+            .payload = try runtime.cloneJsonValue(allocator, message.payload),
             .timestamp = message.timestamp,
         } },
     };
@@ -783,7 +782,7 @@ const ListenerProbe = struct {
     saw_cancel_requested: bool = false,
 };
 
-fn countListener(_: std.Io, context: ?*anyopaque, _: agent.AgentEvent, token: zistd.CancelToken) anyerror!void {
+fn countListener(_: std.Io, context: ?*anyopaque, _: agent.AgentEvent, token: runtime.CancelToken) anyerror!void {
     const probe: *ListenerProbe = @ptrCast(@alignCast(context.?));
     probe.calls += 1;
     probe.saw_cancel_requested = token.isRequested();

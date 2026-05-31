@@ -1,7 +1,7 @@
 const std = @import("std");
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
-const zistd = @import("../zistd/root.zig");
+const runtime = @import("../runtime/root.zig");
 
 pub const current_session_version = 3;
 pub const max_session_entries = 16_384;
@@ -397,7 +397,7 @@ fn cloneAgentMessage(allocator: std.mem.Allocator, source: agent.AgentMessage) !
             errdefer allocator.free(tool_name);
             const content = try cloneToolResultContentSlice(allocator, message.content);
             errdefer freeToolResultContentSlice(allocator, content);
-            const details = if (message.details) |details| try zistd.cloneJsonValue(allocator, details) else null;
+            const details = if (message.details) |details| try runtime.cloneJsonValue(allocator, details) else null;
             break :blk .{ .tool_result = .{
                 .tool_call_id = tool_call_id,
                 .tool_name = tool_name,
@@ -410,7 +410,7 @@ fn cloneAgentMessage(allocator: std.mem.Allocator, source: agent.AgentMessage) !
         .custom => |message| blk: {
             const kind = try allocator.dupe(u8, message.kind);
             errdefer allocator.free(kind);
-            const payload = try zistd.cloneJsonValue(allocator, message.payload);
+            const payload = try runtime.cloneJsonValue(allocator, message.payload);
             break :blk .{ .custom = .{
                 .kind = kind,
                 .payload = payload,
@@ -431,11 +431,11 @@ fn freeAgentMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) v
             allocator.free(tool_result.tool_call_id);
             allocator.free(tool_result.tool_name);
             freeToolResultContentSlice(allocator, tool_result.content);
-            if (tool_result.details) |details| zistd.freeJsonValue(allocator, details);
+            if (tool_result.details) |details| runtime.freeJsonValue(allocator, details);
         },
         .custom => |custom| {
             allocator.free(custom.kind);
-            zistd.freeJsonValue(allocator, custom.payload);
+            runtime.freeJsonValue(allocator, custom.payload);
         },
     }
 }

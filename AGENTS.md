@@ -68,8 +68,9 @@ ai
   no session persistence, UI, retry/compaction policy, or tool execution policy.
 
 runtime
-  owns operation ids, cancel tokens, bounded completion/event queues, wake/shutdown
-  mechanisms. no app policy.
+  owns operation ids, cancel tokens, bounded completion/event queues, event pipes,
+  races, byte builders, json ownership helpers, and wake/shutdown mechanisms. no
+  app policy.
 ```
 
 ## coding-agent spine
@@ -123,7 +124,7 @@ src/tui/substrate/terminal.zig
       |
       v
 TuiRuntime / App
-  owns TranscriptStore, BufferStore, ViewStore, SurfaceTree, SlotRegistry,
+  owns TranscriptStore, BufferStore, ViewStore, SurfaceStack, SlotRegistry,
   InputComposer, ActionRegistry, KeymapRegistry, TuiCommand, TuiEvent.
       |
       v
@@ -155,12 +156,14 @@ tui source boundaries:
 - `src/tui/substrate/`: libvaxis lifecycle, terminal adapter, PTY/vscreen tests.
 - `src/tui/primitive/`: bounded retained facts such as buffers, views, surfaces,
   slots, commands, events, actions, and transcript items.
-- `src/tui/component/`: reusable domain components and renderers built on
-  primitives.
-- `src/tui/composition/`: deterministic arrangements of primitives/components.
+- `src/tui/product/`: zi-specific surfaces and renderers built on primitives.
+  reusable mechanics belong in a future widget layer only after reuse is real.
+- `src/tui/composition/`: deterministic arrangements of primitives and product
+  surfaces.
 - `src/tui/bridge/`: owner of stores, dispatch, event application, and render
   coordination.
-- `src/tui/root.zig`: public re-export surface for callers outside `src/tui`.
+- `src/tui/root.zig`: narrow public re-export surface for callers outside
+  `src/tui`; lower layers do not become API just because they exist.
 
 do not put session, provider, tool, persistence, auth, or model-selection policy
 inside `src/tui`; those belong to `src/coding_agent`.

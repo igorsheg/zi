@@ -1,7 +1,7 @@
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
-const zistd = @import("../zistd/root.zig");
+const runtime = @import("../runtime/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_manager = @import("session_manager.zig");
 const tool_registry = @import("tool_registry.zig");
@@ -259,7 +259,7 @@ const EchoTool = struct {
         allocator: std.mem.Allocator,
         _: std.Io,
         context: ?*anyopaque,
-        _: zistd.CancelToken,
+        _: runtime.CancelToken,
         _: []const u8,
         _: std.json.Value,
         _: ?agent_mod.AgentToolUpdateCallback,

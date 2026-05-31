@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn Owned(comptime T: type) type {
+pub fn JsonOwned(comptime T: type) type {
     return struct {
         value: T,
         arena: *std.heap.ArenaAllocator,
@@ -115,15 +115,19 @@ pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     }
 }
 
-test "Owned fromJson owns parsed arena" {
+test "JsonOwned fromJson owns parsed arena" {
     const Value = struct { name: []const u8 };
-    var owned = try Owned(Value).parseJson(std.testing.allocator, "{\"name\":\"zi\"}", .{ .allocate = .alloc_always });
+    var owned = try JsonOwned(Value).parseJson(
+        std.testing.allocator,
+        "{\"name\":\"zi\"}",
+        .{ .allocate = .alloc_always },
+    );
     defer owned.deinit();
 
     try std.testing.expectEqualStrings("zi", owned.value.name);
 }
 
-test "Owned initClone stores cloned value in owned arena" {
+test "JsonOwned initClone stores cloned value in owned arena" {
     const Value = struct { name: []const u8 };
     const clone = struct {
         fn call(allocator: std.mem.Allocator, source: Value) !Value {
@@ -132,7 +136,7 @@ test "Owned initClone stores cloned value in owned arena" {
     }.call;
 
     var source = [_]u8{ 'z', 'i' };
-    var owned = try Owned(Value).initClone(std.testing.allocator, .{ .name = &source }, clone);
+    var owned = try JsonOwned(Value).initClone(std.testing.allocator, .{ .name = &source }, clone);
     defer owned.deinit();
     source[0] = 'p';
 

@@ -102,7 +102,7 @@ terminal rendering
 TranscriptStore
 BufferStore
 ViewStore
-SurfaceTree
+SurfaceStack
 SlotRegistry
 InputComposer
 ActionRegistry
@@ -114,14 +114,11 @@ TuiEvent
 the built-in shell is a composition:
 
 ```text
-RootSurface
-  HeaderSlot
-  TranscriptView
-  StatusSlot
-  ComposerSurface
-    ComposerHeaderSlot
-    EditorView
-    ComposerFooterSlot
+Shell composition
+  Header surface
+  Transcript view
+  Status surface
+  Composer surface
 ```
 
 it is not the architecture itself.
@@ -143,6 +140,8 @@ tui contracts:
 - extensions request changes through commands; owners mutate.
 - future Lua extensions use the same commands/events/actions/slots/renderers as
   built-in code.
+- `src/tui/root.zig` exports only stable frontend-facing modules; lower layers
+  stay internal unless tests intentionally target them.
 
 relationship to `coding_agent`:
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const zistd = @import("../zistd/root.zig");
+const runtime = @import("../runtime/root.zig");
 const protocol = @import("protocol.zig");
 
 pub const OwnedAssistantMessage = struct {
@@ -7,7 +7,7 @@ pub const OwnedAssistantMessage = struct {
     value: protocol.AssistantMessage,
 
     pub fn clone(backing_allocator: std.mem.Allocator, source: protocol.AssistantMessage) !OwnedAssistantMessage {
-        var owned = try zistd.Owned(protocol.AssistantMessage).initClone(
+        var owned = try runtime.JsonOwned(protocol.AssistantMessage).initClone(
             backing_allocator,
             source,
             cloneAssistantMessage,
@@ -163,8 +163,8 @@ fn cloneAssistantContent(
             errdefer allocator.free(id);
             const name = try allocator.dupe(u8, tool_call.name);
             errdefer allocator.free(name);
-            const arguments = try zistd.cloneJsonValue(allocator, tool_call.arguments);
-            errdefer zistd.freeJsonValue(allocator, arguments);
+            const arguments = try runtime.cloneJsonValue(allocator, tool_call.arguments);
+            errdefer runtime.freeJsonValue(allocator, arguments);
             const signature = try cloneOptionalString(allocator, tool_call.thought_signature);
             break :blk .{ .tool_call = .{
                 .id = id,
@@ -189,7 +189,7 @@ fn freeAssistantContentItems(allocator: std.mem.Allocator, source: []const proto
         .tool_call => |tool_call| {
             allocator.free(tool_call.id);
             allocator.free(tool_call.name);
-            zistd.freeJsonValue(allocator, tool_call.arguments);
+            runtime.freeJsonValue(allocator, tool_call.arguments);
             if (tool_call.thought_signature) |value| allocator.free(value);
         },
     };
@@ -208,7 +208,7 @@ fn cloneToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !proto
     return .{
         .id = try allocator.dupe(u8, source.id),
         .name = try allocator.dupe(u8, source.name),
-        .arguments = try zistd.cloneJsonValue(allocator, source.arguments),
+        .arguments = try runtime.cloneJsonValue(allocator, source.arguments),
         .thought_signature = try cloneOptionalString(allocator, source.thought_signature),
     };
 }

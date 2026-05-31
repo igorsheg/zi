@@ -1,5 +1,5 @@
 const std = @import("std");
-const mem = @import("../../zistd/root.zig");
+const mem = @import("../../runtime/root.zig");
 const owned = @import("../owned.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
@@ -31,6 +31,7 @@ pub const Options = struct {
     models: []const ModelDefinition = &default_model_definitions,
     min_token_size: usize = default_min_token_size,
     max_token_size: usize = default_max_token_size,
+    delay_per_delta_ms: u32 = 0,
 };
 
 pub const State = struct {
@@ -78,6 +79,7 @@ pub const Provider = struct {
     models: []protocol.Model,
     min_token_size: usize,
     max_token_size: usize,
+    delay_per_delta_ms: u32,
     responses: std.ArrayList(ResponseStep) = .empty,
     next_response: usize = 0,
     call_count: usize = 0,
@@ -101,6 +103,7 @@ pub const Provider = struct {
             .models = models,
             .min_token_size = @max(1, @min(options.min_token_size, options.max_token_size)),
             .max_token_size = @max(options.min_token_size, options.max_token_size),
+            .delay_per_delta_ms = options.delay_per_delta_ms,
         };
     }
 
@@ -287,7 +290,25 @@ fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protoco
                 response.value,
                 request.options,
             ) catch unreachable;
-            emitDeltas(request.io, sink, response, self.min_token_size, self.max_token_size) catch unreachable;
+            emitDeltas(
+                request,
+                sink,
+                response,
+                self.min_token_size,
+                self.max_token_size,
+                self.delay_per_delta_ms,
+            ) catch |err| {
+                if (err == error.OperationCancelled or err == error.Canceled) {
+                    const message = protocol.emptyAssistantMessageFromRequest(
+                        request,
+                        .aborted,
+                        "Request was aborted",
+                    );
+                    sink.endAborted(request.io, message) catch unreachable;
+                    return stream;
+                }
+                unreachable;
+            };
         },
         .factory => |factory| {
             var message = factory.call(request, &.{ .call_count = self.call_count }) catch |err| {
@@ -308,7 +329,25 @@ fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protoco
             const owned_message = owned.OwnedAssistantMessage.clone(self.allocator, message) catch unreachable;
             step.deinit();
             step.* = .{ .message = owned_message };
-            emitDeltas(request.io, sink, &step.message, self.min_token_size, self.max_token_size) catch unreachable;
+            emitDeltas(
+                request,
+                sink,
+                &step.message,
+                self.min_token_size,
+                self.max_token_size,
+                self.delay_per_delta_ms,
+            ) catch |err| {
+                if (err == error.OperationCancelled or err == error.Canceled) {
+                    const aborted_message = protocol.emptyAssistantMessageFromRequest(
+                        request,
+                        .aborted,
+                        "Request was aborted",
+                    );
+                    sink.endAborted(request.io, aborted_message) catch unreachable;
+                    return stream;
+                }
+                unreachable;
+            };
         },
     }
     return stream;
@@ -413,12 +452,17 @@ const PartialBuilder = struct {
 };
 
 fn emitDeltas(
-    io: std.Io,
+    request: protocol.StreamRequest,
     sink: protocol.AssistantMessageEventSink,
     response: *owned.OwnedAssistantMessage,
     min_token_size: usize,
     max_token_size: usize,
-) (protocol.AssistantMessageEventSinkEmitError || std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+    delay_per_delta_ms: u32,
+) (protocol.AssistantMessageEventSinkEmitError || std.mem.Allocator.Error || std.Io.Writer.Error || error{
+    OperationCancelled,
+    Canceled,
+})!void {
+    const io = request.io;
     const message = response.value;
     var partial = PartialBuilder.init(response);
     try sink.emit(io, .{ .start = .{ .partial = try partial.message() } });
@@ -428,7 +472,17 @@ fn emitDeltas(
             .text => |content| {
                 try partial.startText();
                 try sink.emit(io, .{ .text_start = .{ .content_index = index, .partial = try partial.message() } });
-                try emitTextDeltas(io, sink, index, content.text, &partial, min_token_size, max_token_size, .text);
+                try emitTextDeltas(
+                    request,
+                    sink,
+                    index,
+                    content.text,
+                    &partial,
+                    min_token_size,
+                    max_token_size,
+                    delay_per_delta_ms,
+                    .text,
+                );
                 try sink.emit(io, .{ .text_end = .{
                     .content_index = index,
                     .content = content.text,
@@ -439,13 +493,14 @@ fn emitDeltas(
                 try partial.startThinking();
                 try sink.emit(io, .{ .thinking_start = .{ .content_index = index, .partial = try partial.message() } });
                 try emitTextDeltas(
-                    io,
+                    request,
                     sink,
                     index,
                     content.thinking,
                     &partial,
                     min_token_size,
                     max_token_size,
+                    delay_per_delta_ms,
                     .thinking,
                 );
                 try sink.emit(io, .{ .thinking_end = .{
@@ -459,13 +514,14 @@ fn emitDeltas(
                 try sink.emit(io, .{ .toolcall_start = .{ .content_index = index, .partial = try partial.message() } });
                 const arguments_json = try stringifyJsonValue(partial.allocator, call.arguments);
                 try emitToolCallDeltas(
-                    io,
+                    request,
                     sink,
                     index,
                     arguments_json,
                     try partial.message(),
                     min_token_size,
                     max_token_size,
+                    delay_per_delta_ms,
                 );
                 partial.endToolCall(call);
                 try sink.emit(io, .{ .toolcall_end = .{
@@ -489,17 +545,23 @@ fn emitDeltas(
 const DeltaKind = enum { text, thinking };
 
 fn emitTextDeltas(
-    io: std.Io,
+    request: protocol.StreamRequest,
     sink: protocol.AssistantMessageEventSink,
     content_index: usize,
     value: []const u8,
     partial: *PartialBuilder,
     min_token_size: usize,
     max_token_size: usize,
+    delay_per_delta_ms: u32,
     kind: DeltaKind,
-) (protocol.AssistantMessageEventSinkEmitError || std.mem.Allocator.Error)!void {
+) (protocol.AssistantMessageEventSinkEmitError || std.mem.Allocator.Error || error{
+    OperationCancelled,
+    Canceled,
+})!void {
+    const io = request.io;
     var index: usize = 0;
     while (index < value.len) {
+        try waitBeforeDelta(request, delay_per_delta_ms);
         const char_size = @max(@as(usize, 1), nextTokenSize(min_token_size, max_token_size) * 4);
         const end = @min(value.len, index + char_size);
         const delta = value[index..end];
@@ -538,16 +600,19 @@ fn emitTextDeltas(
 }
 
 fn emitToolCallDeltas(
-    io: std.Io,
+    request: protocol.StreamRequest,
     sink: protocol.AssistantMessageEventSink,
     content_index: usize,
     value: []const u8,
     partial: protocol.AssistantMessage,
     min_token_size: usize,
     max_token_size: usize,
-) protocol.AssistantMessageEventSinkEmitError!void {
+    delay_per_delta_ms: u32,
+) (protocol.AssistantMessageEventSinkEmitError || error{ OperationCancelled, Canceled })!void {
+    const io = request.io;
     var index: usize = 0;
     while (index < value.len) {
+        try waitBeforeDelta(request, delay_per_delta_ms);
         const char_size = @max(@as(usize, 1), nextTokenSize(min_token_size, max_token_size) * 4);
         const end = @min(value.len, index + char_size);
         try sink.emit(io, .{ .toolcall_delta = .{
@@ -557,6 +622,19 @@ fn emitToolCallDeltas(
         } });
         index = end;
     }
+}
+
+fn waitBeforeDelta(
+    request: protocol.StreamRequest,
+    delay_per_delta_ms: u32,
+) error{ OperationCancelled, Canceled }!void {
+    if (request.cancel_token) |token| try token.throwIfRequested();
+    if (delay_per_delta_ms == 0) return;
+    try mem.sleep(
+        request.io,
+        .fromMilliseconds(delay_per_delta_ms),
+        request.cancel_token,
+    );
 }
 
 fn concat(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]const u8 {
