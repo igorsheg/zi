@@ -8,6 +8,8 @@ pub const max_branch_depth = 16_384;
 pub const max_compaction_summary_bytes = 256 * 1024;
 pub const max_compaction_first_kept_entry_id_bytes = 128;
 pub const max_compaction_keep_recent_tokens = 1_000_000;
+pub const max_compaction_serialized_input_bytes = 512 * 1024;
+pub const max_compaction_tool_result_chars = 16 * 1024;
 
 pub const SessionHeader = struct {
     version: u32 = current_session_version,
@@ -64,6 +66,112 @@ pub const CompactionSummaryInput = struct {
         if (self.previous_summary) |summary| self.allocator.free(summary);
         self.allocator.free(self.first_kept_entry_id);
         self.* = undefined;
+    }
+
+    pub const SerializeError = error{
+        CompactionSerializedInputTooLarge,
+        WriteFailed,
+    } || std.mem.Allocator.Error;
+
+    pub fn serialize(self: CompactionSummaryInput, allocator: std.mem.Allocator) SerializeError![]const u8 {
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        if (self.previous_summary) |summary| {
+            try appendBounded(&writer, "<previous-summary>\n");
+            try appendBounded(&writer, summary);
+            try appendBounded(&writer, "\n</previous-summary>\n\n");
+        }
+        try appendBounded(&writer, "<conversation>\n");
+        for (self.messages, 0..) |message, index| {
+            if (index > 0) try appendBounded(&writer, "\n\n");
+            try serializeMessage(&writer, message);
+        }
+        try appendBounded(&writer, "\n</conversation>\n");
+        return writer.toOwnedSlice();
+    }
+
+    fn serializeMessage(writer: *std.Io.Writer.Allocating, message: agent.AgentMessage) SerializeError!void {
+        switch (message) {
+            .user => |user| {
+                try appendBounded(writer, "[User]: ");
+                try serializeUserContent(writer, user.content);
+            },
+            .assistant => |assistant| try serializeAssistantContent(writer, assistant.content),
+            .tool_result => |tool_result| try serializeToolResultContent(writer, tool_result.content),
+            .custom => |custom| {
+                try appendBounded(writer, "[Custom ");
+                try appendBounded(writer, custom.kind);
+                try appendBounded(writer, "]");
+            },
+        }
+    }
+
+    fn serializeUserContent(writer: *std.Io.Writer.Allocating, content: ai.UserMessage.Content) SerializeError!void {
+        switch (content) {
+            .string => |text| try appendBounded(writer, text),
+            .blocks => |blocks| {
+                for (blocks) |block| switch (block) {
+                    .text => |text| try appendBounded(writer, text.text),
+                    .image => try appendBounded(writer, "[image]"),
+                };
+            },
+        }
+    }
+
+    fn serializeAssistantContent(
+        writer: *std.Io.Writer.Allocating,
+        content: []const ai.AssistantContent,
+    ) SerializeError!void {
+        var wrote_any = false;
+        for (content) |block| switch (block) {
+            .thinking => |thinking| {
+                if (wrote_any) try appendBounded(writer, "\n");
+                try appendBounded(writer, "[Assistant thinking]: ");
+                try appendBounded(writer, thinking.thinking);
+                wrote_any = true;
+            },
+            .text => |text| {
+                if (wrote_any) try appendBounded(writer, "\n");
+                try appendBounded(writer, "[Assistant]: ");
+                try appendBounded(writer, text.text);
+                wrote_any = true;
+            },
+            .tool_call => |tool_call| {
+                if (wrote_any) try appendBounded(writer, "\n");
+                try appendBounded(writer, "[Assistant tool call]: ");
+                try appendBounded(writer, tool_call.name);
+                wrote_any = true;
+            },
+        };
+    }
+
+    fn serializeToolResultContent(
+        writer: *std.Io.Writer.Allocating,
+        content: []const ai.ToolResultContent,
+    ) SerializeError!void {
+        try appendBounded(writer, "[Tool result]: ");
+        var remaining: usize = max_compaction_tool_result_chars;
+        for (content) |block| switch (block) {
+            .text => |text| {
+                const len = @min(remaining, text.text.len);
+                try appendBounded(writer, text.text[0..len]);
+                remaining -= len;
+                if (remaining == 0) {
+                    try appendBounded(writer, "\n[truncated]");
+                    return;
+                }
+            },
+            .image => try appendBounded(writer, "[image]"),
+        };
+    }
+
+    fn appendBounded(writer: *std.Io.Writer.Allocating, text: []const u8) SerializeError!void {
+        if (text.len > max_compaction_serialized_input_bytes or
+            writer.written().len > max_compaction_serialized_input_bytes - text.len)
+        {
+            return error.CompactionSerializedInputTooLarge;
+        }
+        try writer.writer.writeAll(text);
     }
 };
 
@@ -1103,6 +1211,138 @@ test "build compaction summary input carries previous summary" {
     try std.testing.expectEqualStrings("bbbbbbbb", input.messages[1].user.content.string);
     try std.testing.expectEqualStrings(kept, input.first_kept_entry_id);
     try std.testing.expectEqualStrings("prior", input.previous_summary.?);
+}
+
+test "serialize compaction summary input writes deterministic bounded text" {
+    const assistant_blocks = [_]ai.AssistantContent{
+        .{ .thinking = .{ .thinking = "thought" } },
+        .{ .text = .{ .text = "answer" } },
+        .{ .tool_call = .{ .id = "call-1", .name = "read", .arguments = .null } },
+    };
+    const tool_blocks = [_]ai.ToolResultContent{.{ .text = .{ .text = "tool output" } }};
+    const source_messages = [_]agent.AgentMessage{
+        userMessage("question"),
+        .{ .assistant = .{
+            .content = &assistant_blocks,
+            .api = ai.KnownApi.openai_responses,
+            .provider = "openai",
+            .model = "gpt",
+            .usage = ai.protocol.emptyUsage(),
+            .stop_reason = .tool_use,
+            .timestamp = 0,
+        } },
+        .{ .tool_result = .{
+            .tool_call_id = "call-1",
+            .tool_name = "read",
+            .content = &tool_blocks,
+            .is_error = false,
+            .timestamp = 0,
+        } },
+    };
+
+    const messages = try std.testing.allocator.alloc(agent.AgentMessage, source_messages.len);
+    var initialized: usize = 0;
+    var input_owns_messages = false;
+    errdefer if (!input_owns_messages) {
+        for (messages[0..initialized]) |message| agent.deinitAgentMessage(std.testing.allocator, message);
+        std.testing.allocator.free(messages);
+    };
+    for (source_messages, 0..) |message, index| {
+        messages[index] = try agent.copyAgentMessage(std.testing.allocator, message);
+        initialized += 1;
+    }
+    const previous_summary = try std.testing.allocator.dupe(u8, "prior summary");
+    var input_owns_previous_summary = false;
+    errdefer if (!input_owns_previous_summary) std.testing.allocator.free(previous_summary);
+    const first_kept_entry_id = try std.testing.allocator.dupe(u8, "00000004");
+    var input_owns_first_kept_entry_id = false;
+    errdefer if (!input_owns_first_kept_entry_id) std.testing.allocator.free(first_kept_entry_id);
+    var input: CompactionSummaryInput = .{
+        .allocator = std.testing.allocator,
+        .messages = messages,
+        .previous_summary = previous_summary,
+        .first_kept_entry_id = first_kept_entry_id,
+        .tokens_before = 42,
+    };
+    input_owns_messages = true;
+    input_owns_previous_summary = true;
+    input_owns_first_kept_entry_id = true;
+    defer input.deinit();
+
+    const serialized = try input.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(serialized);
+
+    try std.testing.expectEqualStrings(
+        "<previous-summary>\n" ++
+            "prior summary\n" ++
+            "</previous-summary>\n\n" ++
+            "<conversation>\n" ++
+            "[User]: question\n\n" ++
+            "[Assistant thinking]: thought\n" ++
+            "[Assistant]: answer\n" ++
+            "[Assistant tool call]: read\n\n" ++
+            "[Tool result]: tool output\n" ++
+            "</conversation>\n",
+        serialized,
+    );
+}
+
+test "serialize compaction summary input truncates tool results and bounds output" {
+    const tool_text = try std.testing.allocator.alloc(u8, max_compaction_tool_result_chars + 1);
+    defer std.testing.allocator.free(tool_text);
+    @memset(tool_text, 't');
+
+    const tool_blocks = [_]ai.ToolResultContent{.{ .text = .{ .text = tool_text } }};
+    const source_messages = [_]agent.AgentMessage{.{ .tool_result = .{
+        .tool_call_id = "call-1",
+        .tool_name = "bash",
+        .content = &tool_blocks,
+        .is_error = false,
+        .timestamp = 0,
+    } }};
+
+    const messages = try std.testing.allocator.alloc(agent.AgentMessage, source_messages.len);
+    var input_owns_messages = false;
+    errdefer if (!input_owns_messages) std.testing.allocator.free(messages);
+    messages[0] = try agent.copyAgentMessage(std.testing.allocator, source_messages[0]);
+    const initialized: usize = 1;
+    errdefer if (!input_owns_messages) {
+        for (messages[0..initialized]) |message| agent.deinitAgentMessage(std.testing.allocator, message);
+    };
+
+    const first_kept_entry_id = try std.testing.allocator.dupe(u8, "00000002");
+    var input_owns_first_kept_entry_id = false;
+    errdefer if (!input_owns_first_kept_entry_id) std.testing.allocator.free(first_kept_entry_id);
+    var input: CompactionSummaryInput = .{
+        .allocator = std.testing.allocator,
+        .messages = messages,
+        .first_kept_entry_id = first_kept_entry_id,
+        .tokens_before = 42,
+    };
+    input_owns_messages = true;
+    input_owns_first_kept_entry_id = true;
+    defer input.deinit();
+
+    const serialized = try input.serialize(std.testing.allocator);
+    defer std.testing.allocator.free(serialized);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "\n[truncated]") != null);
+
+    const oversized = try std.testing.allocator.alloc(u8, max_compaction_serialized_input_bytes + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+
+    var oversized_input: CompactionSummaryInput = .{
+        .allocator = std.testing.allocator,
+        .messages = &.{},
+        .previous_summary = oversized,
+        .first_kept_entry_id = &.{},
+        .tokens_before = 0,
+    };
+    try std.testing.expectError(
+        error.CompactionSerializedInputTooLarge,
+        oversized_input.serialize(std.testing.allocator),
+    );
+    oversized_input.previous_summary = null;
 }
 
 test "tree navigation returns entries leaf and children" {
