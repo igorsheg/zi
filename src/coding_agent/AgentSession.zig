@@ -826,12 +826,14 @@ pub fn promptWithOptions(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !void {
+    const context_overflow_count_before = self.event_drain.context_overflow_count;
     const run = self.startPromptRun(text, images, options) catch |err| switch (err) {
         error.PromptCommandCannotStartLiveRun, error.PromptQueuedCannotStartLiveRun => return,
         else => |unexpected| return unexpected,
     };
     defer self.destroyPromptRun(run);
     while (try self.stepPromptRun(run)) {}
+    try self.checkPostPromptOverflowCompaction(context_overflow_count_before);
 }
 
 fn startPromptRun(
@@ -1498,6 +1500,24 @@ fn checkPrePromptCompaction(self: *AgentSession) !void {
     };
     preparation.deinit();
     var result = self.runGeneratedCompaction(.threshold) catch |err| switch (err) {
+        error.NothingToCompact, error.AlreadyCompacted => return,
+        else => return err,
+    };
+    result.deinit();
+}
+
+fn checkPostPromptOverflowCompaction(self: *AgentSession, previous_overflow_count: usize) !void {
+    if (!self.compaction_settings.auto_enabled) return;
+    if (self.event_drain.context_overflow_count <= previous_overflow_count) return;
+    var preparation = self.manager.prepareCompaction(
+        self.allocator,
+        self.compaction_settings,
+    ) catch |err| switch (err) {
+        error.NothingToCompact, error.AlreadyCompacted => return,
+        else => return err,
+    };
+    preparation.deinit();
+    var result = self.runGeneratedCompaction(.overflow) catch |err| switch (err) {
         error.NothingToCompact, error.AlreadyCompacted => return,
         else => return err,
     };
@@ -2867,6 +2887,71 @@ test "agent session auto compaction skips already compacted branch before prompt
         if (owned_event == .agent_event and owned_event.agent_event == .agent_start) saw_agent_start = true;
     }
     try std.testing.expect(saw_agent_start);
+}
+
+test "agent session auto compacts after context overflow without retrying" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const summary_content = [_]ai.AssistantContent{ai.faux.text("overflow summary")};
+    const responses = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&.{}, .{
+            .stop_reason = .error_,
+            .error_message = "maximum context length exceeded",
+        }),
+        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&responses);
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 0, .auto_enabled = true },
+    });
+    defer shutdownAndDeinit(&session);
+
+    try session.prompt("overflow request", &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
+    try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().context_overflow_count);
+    try std.testing.expectEqual(@as(usize, 3), session.manager.entries.items.len);
+    try std.testing.expect(session.manager.entries.items[2] == .compaction);
+    try std.testing.expectEqualStrings("overflow summary", session.manager.entries.items[2].compaction.summary);
+
+    var saw_overflow_start = false;
+    var saw_overflow_end = false;
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        defer owned_event.deinit();
+        if (owned_event == .compaction_start) {
+            try std.testing.expectEqual(
+                AgentSessionEvent.CompactionReason.overflow,
+                owned_event.compaction_start.reason,
+            );
+            saw_overflow_start = true;
+        }
+        if (owned_event == .compaction_end) {
+            try std.testing.expectEqual(
+                AgentSessionEvent.CompactionReason.overflow,
+                owned_event.compaction_end.reason,
+            );
+            try std.testing.expect(!owned_event.compaction_end.will_retry);
+            saw_overflow_end = true;
+        }
+    }
+    try std.testing.expect(saw_overflow_start);
+    try std.testing.expect(saw_overflow_end);
 }
 
 test "agent session prepares owned compaction snapshot" {
