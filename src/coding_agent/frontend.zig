@@ -50,6 +50,7 @@ pub const ReadModel = struct {
                 self.steering_count = payload.steering.items.len;
                 self.follow_up_count = payload.follow_up.items.len;
             },
+            .prompt_command => {},
             .session_info_changed => |payload| {
                 self.session_name_set = payload.name != null;
             },

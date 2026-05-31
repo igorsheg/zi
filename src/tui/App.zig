@@ -102,6 +102,7 @@ pub fn appendSystem(self: *App, text: []const u8) !void {
 pub fn applyAgentSessionEvent(self: *App, event: AgentSession.AgentSessionEvent) !void {
     switch (event) {
         .agent_event => |agent_event| try self.applyAgentEvent(agent_event),
+        .prompt_command => |payload| try self.appendSystem(payload.message.text),
         else => {},
     }
 }
@@ -179,3 +180,20 @@ test "submit returns owned prompt and clears composer" {
     try std.testing.expectEqual(@as(usize, 0), app.composer.bytes.items.len);
 }
 
+test "prompt command event appends system transcript item" {
+    var app = App.init(std.testing.allocator, 80, 24);
+    defer app.deinit();
+
+    var event: AgentSession.AgentSessionEvent = .{ .prompt_command = .{
+        .command = try AgentSession.EventText.init(std.testing.allocator, "missing"),
+        .result = .unknown,
+        .message = try AgentSession.EventText.init(std.testing.allocator, "unknown command: /missing"),
+    } };
+    defer event.deinit();
+
+    try app.applyAgentSessionEvent(event);
+
+    try std.testing.expectEqual(@as(usize, 1), app.transcript.count);
+    try std.testing.expectEqual(transcript_mod.Transcript.Kind.system, app.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("unknown command: /missing", app.transcript.items[0].text);
+}

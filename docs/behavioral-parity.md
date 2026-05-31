@@ -77,7 +77,7 @@ ai
 | Auto retry events and policy | `auto_retry_start/end` in `AgentSession` | `AgentSession` future terminal policy | protocol only | missing |
 | Bash/process tool with timeout/cancel | `core/bash-executor.ts`, `tools/bash.ts` | `tools/BashTool` / `AgentSession` | minimal implemented: cwd-bound, sequential, no stdin/env/PTY/background/streaming | `bash tool runs one cwd-bound command`; `bash tool treats nonzero exit as result data`; `bash tool cancels running process through owner race`; `runtime host preserves bash output limit details through public events`; `runtime host cancellation reaches running bash tool through agent loop` |
 | Find/grep/ls tools | `core/tools/find.ts`, `grep.ts`, `ls.ts` | `tools/*` | implemented | `find tool recursively filters paths`; `grep tool searches directory files with literal pattern`; `ls tool lists one directory with bounds` |
-| Slash commands and prompt templates | `slash-commands.ts`, `prompt-templates.ts` | future frontend/session command owner | missing | missing |
+| Slash commands and prompt templates | `slash-commands.ts`, `prompt-templates.ts` | `AgentSession` command owner; templates future | first slice: unknown slash commands emit public command events and do not reach model | `agent session slash command emits public command event without model run`; `agent session slash command event serializes public shape` |
 | Session fork/resume/import/export HTML | `agent-session-runtime.ts`, `export-html/*` | future host/session manager | missing | missing |
 | Extension hooks | `core/extensions/*` | future explicit extension owner | deferred | missing |
 
@@ -100,7 +100,8 @@ Work down this list. Do not add a framework to satisfy a row.
    - Keep provider protocol free of retry/compaction policy.
 
 4. Reintroduce frontend affordances only after session behavior exists.
-   - Slash commands and prompt templates are command/session behavior first.
+   - Add one real slash command after public command events settle.
+   - Keep prompt templates separate from slash command dispatch.
    - TUI display follows public events after the behavior is stable.
 
 ## non-goals

@@ -147,6 +147,7 @@ const Lifecycle = enum {
 pub const AgentSessionEvent = union(enum) {
     agent_event: agent_mod.AgentEvent,
     queue_update: QueueUpdate,
+    prompt_command: PromptCommand,
     compaction_start: CompactionStart,
     session_info_changed: SessionInfoChanged,
     compaction_end: CompactionEnd,
@@ -161,6 +162,22 @@ pub const AgentSessionEvent = union(enum) {
         pub fn deinit(self: *QueueUpdate) void {
             self.steering.deinit();
             self.follow_up.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub const PromptCommandResult = enum {
+        unknown,
+    };
+
+    pub const PromptCommand = struct {
+        command: EventText,
+        result: PromptCommandResult,
+        message: EventText,
+
+        pub fn deinit(self: *PromptCommand) void {
+            self.command.deinit();
+            self.message.deinit();
             self.* = undefined;
         }
     };
@@ -208,6 +225,7 @@ pub const AgentSessionEvent = union(enum) {
         switch (self.*) {
             .agent_event => {},
             .queue_update => |*payload| payload.deinit(),
+            .prompt_command => |*payload| payload.deinit(),
             .compaction_start => {},
             .session_info_changed => |*payload| {
                 if (payload.name) |*name| name.deinit();
@@ -232,6 +250,14 @@ pub const AgentSessionEvent = union(enum) {
                 try writeJsonField("steering", stringify, payload.steering);
                 try writeJsonField("followUp", stringify, payload.follow_up);
                 try writeJsonField("revision", stringify, payload.revision);
+                try stringify.endObject();
+            },
+            .prompt_command => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "prompt_command");
+                try writeJsonField("command", stringify, payload.command);
+                try writeJsonField("result", stringify, payload.result);
+                try writeJsonField("message", stringify, payload.message);
                 try stringify.endObject();
             },
             .compaction_start => |payload| {
@@ -946,8 +972,28 @@ fn preparePromptInput(
     };
 }
 
-fn tryHandlePromptCommand(_: *AgentSession, _: *const PromptPreflight) !bool {
-    return false;
+fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
+    const command = parsePromptCommand(preflight.text) orelse return false;
+    var owned_command = try EventText.init(self.allocator, command);
+    errdefer owned_command.deinit();
+    const message_text = try std.fmt.allocPrint(self.allocator, "unknown command: /{s}", .{command});
+    defer self.allocator.free(message_text);
+    var message = try EventText.init(self.allocator, message_text);
+    errdefer message.deinit();
+    self.event_drain.enqueuePublicEvent(.{ .prompt_command = .{
+        .command = owned_command,
+        .result = .unknown,
+        .message = message,
+    } });
+    return true;
+}
+
+fn parsePromptCommand(text: []const u8) ?[]const u8 {
+    if (text.len < 2 or text[0] != '/') return null;
+    var end: usize = 1;
+    while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
+    if (end == 1) return null;
+    return text[1..end];
 }
 
 fn runInputHooks(_: *AgentSession, _: *const PromptPreflight) !void {}
@@ -1654,6 +1700,64 @@ test "agent session public event drain is caller driven" {
     var event = session.drainPublicEvent().?;
     event.deinit();
     try std.testing.expectEqual(@as(usize, 0), session.publicEventCount());
+}
+
+test "agent session slash command emits public command event without model run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+    });
+    defer shutdownAndDeinit(&session);
+
+    try session.promptWithOptions("/missing arg", &.{}, .{});
+
+    try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
+    try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
+    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
+    var event = session.drainPublicEvent().?;
+    defer event.deinit();
+    try std.testing.expect(event == .prompt_command);
+    try std.testing.expectEqual(AgentSessionEvent.PromptCommandResult.unknown, event.prompt_command.result);
+    try std.testing.expectEqualStrings("missing", event.prompt_command.command.text);
+    try std.testing.expectEqualStrings("unknown command: /missing", event.prompt_command.message.text);
+    try std.testing.expectEqual(@as(usize, 0), session.publicEventCount());
+}
+
+test "agent session slash command parser requires command name" {
+    try std.testing.expect(parsePromptCommand("hello") == null);
+    try std.testing.expect(parsePromptCommand("/") == null);
+    try std.testing.expect(parsePromptCommand("/ missing") == null);
+    try std.testing.expectEqualStrings("missing", parsePromptCommand("/missing arg").?);
+}
+
+test "agent session slash command event serializes public shape" {
+    var event: AgentSessionEvent = .{ .prompt_command = .{
+        .command = try EventText.init(std.testing.allocator, "missing"),
+        .result = .unknown,
+        .message = try EventText.init(std.testing.allocator, "unknown command: /missing"),
+    } };
+    defer event.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try std.json.Stringify.value(event, .{}, &writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"prompt_command\",\"command\":\"missing\",\"result\":\"unknown\"," ++
+            "\"message\":\"unknown command: /missing\"}",
+        writer.written(),
+    );
 }
 
 test "agent session terminal policy runs after persistence" {
