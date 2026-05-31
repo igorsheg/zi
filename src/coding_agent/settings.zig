@@ -8,6 +8,11 @@ pub const Settings = struct {
     default_provider: ?[]const u8 = null,
     default_model: ?[]const u8 = null,
     default_thinking_level: ?[]const u8 = null,
+    compaction: ?Compaction = null,
+
+    pub const Compaction = struct {
+        keep_recent_tokens: ?u64 = null,
+    };
 };
 
 pub const LoadedSettings = struct {
@@ -121,7 +126,17 @@ fn parseSettings(allocator: std.mem.Allocator, bytes: []const u8) !LoadedSetting
             .default_provider = try optionalString(allocator, parsed.value.object.get("defaultProvider")),
             .default_model = try optionalString(allocator, parsed.value.object.get("defaultModel")),
             .default_thinking_level = try optionalString(allocator, parsed.value.object.get("defaultThinkingLevel")),
+            .compaction = try optionalCompaction(parsed.value.object.get("compaction")),
         },
+    };
+}
+
+fn optionalCompaction(value: ?std.json.Value) !?Settings.Compaction {
+    const resolved = value orelse return null;
+    if (resolved == .null) return null;
+    if (resolved != .object) return error.InvalidSettings;
+    return .{
+        .keep_recent_tokens = try optionalNonNegativeInteger(resolved.object.get("keepRecentTokens")),
     };
 }
 
@@ -135,6 +150,13 @@ fn optionalString(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]cons
         },
         else => error.InvalidSettings,
     };
+}
+
+fn optionalNonNegativeInteger(value: ?std.json.Value) !?u64 {
+    const resolved = value orelse return null;
+    if (resolved == .null) return null;
+    if (resolved != .integer or resolved.integer < 0) return error.InvalidSettings;
+    return @intCast(resolved.integer);
 }
 
 test "settings manager treats missing global and project settings as defaults" {
@@ -180,4 +202,27 @@ test "settings manager loads global and project default model settings" {
     try std.testing.expectEqualStrings("openai", manager.current().global.loaded.value.default_provider.?);
     try std.testing.expectEqualStrings("gpt", manager.current().global.loaded.value.default_model.?);
     try std.testing.expectEqualStrings("high", manager.current().project.loaded.value.default_thinking_level.?);
+}
+
+test "settings manager loads compaction settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.zi/settings.json",
+        .data = "{\"compaction\":{\"keepRecentTokens\":1234}}",
+    });
+
+    var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer manager.deinit();
+
+    try std.testing.expectEqual(
+        @as(u64, 1234),
+        manager.current().project.loaded.value.compaction.?.keep_recent_tokens.?,
+    );
 }

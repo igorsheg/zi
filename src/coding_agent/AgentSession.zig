@@ -29,6 +29,7 @@ public_events: *PublicEventQueue,
 queue_mirror: *QueueMirror,
 event_drain: *EventDrain,
 lifecycle: Lifecycle = .accepting,
+compaction_settings: session_manager.CompactionSettings = .{},
 
 pub const Options = struct {
     cwd: []const u8,
@@ -38,6 +39,7 @@ pub const Options = struct {
     timestamp: []const u8,
     model: ai.Model = agent_mod.Agent.defaultModel(),
     thinking_level: agent_mod.ThinkingLevel = .off,
+    compaction_settings: session_manager.CompactionSettings = .{},
     stream: ?ai.StreamFunction = null,
     get_api_key: ?agent_mod.GetApiKeyHook = null,
     dir: std.Io.Dir = .cwd(),
@@ -721,6 +723,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .queue_mirror = queue_mirror,
         .event_drain = event_drain,
         .lifecycle = .accepting,
+        .compaction_settings = options.compaction_settings,
     };
 }
 
@@ -881,6 +884,13 @@ pub fn compactPreparedWithSummary(
     return self.runManualCompaction(.{ .prepared = .{
         .summary = summary,
         .settings = settings,
+    } });
+}
+
+pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !CompactionResult {
+    return self.runManualCompaction(.{ .prepared = .{
+        .summary = summary,
+        .settings = self.compaction_settings,
     } });
 }
 
@@ -2238,6 +2248,44 @@ test "agent session prepared manual compaction owns cutpoint selection" {
     defer end_event.deinit();
     try std.testing.expect(end_event == .compaction_end);
     try std.testing.expectEqualStrings(kept, end_event.compaction_end.result.?.first_kept_entry_id.text);
+}
+
+test "agent session prepared manual compaction uses session settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } } } });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } } } });
+    session.agent.finishRun();
+    drainAllPublicEvents(&session);
+
+    const kept = session.manager.entries.items[1].id();
+    var result = try session.compactWithPreparedSummary("summary");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(u64, 4), result.tokens_before);
 }
 
 test "agent session prepared manual compaction emits failure event" {

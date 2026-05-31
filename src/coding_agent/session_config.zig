@@ -4,6 +4,7 @@ const ai = @import("../ai/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
+const session_manager = @import("session_manager.zig");
 const settings_mod = @import("settings.zig");
 
 pub const Options = struct {
@@ -25,6 +26,7 @@ pub fn resolve(services: *RuntimeServices, options: Options) AgentSessionRuntime
         .current_date = options.current_date,
         .model = model,
         .thinking_level = resolveThinkingLevel(services.settings_manager.current(), options.thinking_level),
+        .compaction_settings = resolveCompactionSettings(services.settings_manager.current()),
         .stream = resolveStream(services, options.stream, model),
         .get_api_key = services.getApiKeyHook(),
         .dir = options.dir,
@@ -93,6 +95,19 @@ fn effectiveThinkingSettings(snapshot: *const settings_mod.SettingsSnapshot) set
     const global = fileSettings(snapshot.global);
     const project = fileSettings(snapshot.project);
     return .{ .default_thinking_level = project.default_thinking_level orelse global.default_thinking_level };
+}
+
+fn resolveCompactionSettings(snapshot: *const settings_mod.SettingsSnapshot) session_manager.CompactionSettings {
+    const global = fileSettings(snapshot.global);
+    const project = fileSettings(snapshot.project);
+    var settings: session_manager.CompactionSettings = .{};
+    if (global.compaction) |compaction| {
+        if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
+    }
+    if (project.compaction) |compaction| {
+        if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
+    }
+    return settings;
 }
 
 fn fileSettings(file: settings_mod.SettingsFile) settings_mod.Settings {
@@ -175,6 +190,33 @@ test "session config uses project settings before global settings" {
     try std.testing.expectEqual(agent_mod.ThinkingLevel.xhigh, base.thinking_level);
     try std.testing.expect(base.stream != null);
     try std.testing.expectEqual(@as(usize, 0), services.diagnosticSlice().len);
+}
+
+test "session config uses project compaction settings before global settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/settings.json",
+        .data = "{\"compaction\":{\"keepRecentTokens\":111}}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.zi/settings.json",
+        .data = "{\"compaction\":{\"keepRecentTokens\":222}}",
+    });
+
+    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+    });
+    defer services.deinit();
+
+    const base = resolve(&services, .{ .current_date = "2026-05-27", .dir = tmp.dir });
+
+    try std.testing.expectEqual(@as(u64, 222), base.compaction_settings.keep_recent_tokens);
 }
 
 test "session config keeps provider and model settings scope atomic" {
