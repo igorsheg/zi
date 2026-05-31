@@ -475,7 +475,45 @@ test "runtime host owns current agent session public boundary" {
 
     try std.testing.expect(host.publicEventCount() > 0);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
-    try std.testing.expectEqual(@as(usize, 3), host.toolSnapshot().active_count);
+    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), host.toolSnapshot().active_count);
+}
+
+test "runtime host persists run messages before frontend drains public events" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    try runPromptForTest(&host, "durable");
+    try std.testing.expect(host.publicEventCount() > 0);
+
+    const context = try host.session.manager.buildSessionContext(std.testing.allocator);
+    defer host.session.manager.deinitSessionContext(std.testing.allocator, context);
+
+    try std.testing.expect(context.messages.len >= 1);
+    try std.testing.expectEqualStrings("durable", context.messages[0].user.content.string);
+
+    drainHostEvents(&host);
+    try std.testing.expectEqual(@as(usize, 0), host.publicEventCount());
+    const drained_context = try host.session.manager.buildSessionContext(std.testing.allocator);
+    defer host.session.manager.deinitSessionContext(std.testing.allocator, drained_context);
+    try std.testing.expectEqual(context.messages.len, drained_context.messages.len);
 }
 
 test "runtime host live run executes a tool and continues the assistant turn" {

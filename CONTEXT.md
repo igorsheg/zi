@@ -74,6 +74,15 @@ preserve these behaviors, not the TypeScript shape:
 - retry and compaction are terminal session policies, not provider policies.
 - TUI observes session state; it does not own agent/provider/tool execution.
 
+The live parity ledger is:
+
+```text
+docs/behavioral-parity.md
+```
+
+Use that ledger to choose coding-agent work. A behavior is done only when it has
+a Zi owner, a pi-mono reference, and a public-boundary test.
+
 ## tui direction
 
 Zi's TUI is a small coding-agent terminal frontend over libvaxis. The accepted
@@ -247,20 +256,16 @@ request shutdown
 
 highest value next slices:
 
-1. replace the current `src/tui` primitive stack with the ADR 0006 shape:
-   `App`, `composer`, `transcript`, `input`, `render`, `terminal`, and `root`.
-2. remove the public TUI event queue until a real second owner needs to drain it.
-3. make `App` commands atomic: fail before mutation or commit completely.
-4. implement full-frame libvaxis rendering before dirty rectangles or surfaces.
-5. add `@file` completion and slash/command dispatch only after their owners and
-   bounds are explicit.
-6. connect TUI to `AgentSessionRuntimeHost` only through live-run commands, public events,
-   and owned snapshots.
-7. finish provider/auth/model composition without moving policy into `main.zig`.
-8. add an owned auth storage seam; env lookup is a fallback adapter, not the whole policy.
-9. deepen `session_config` diagnostics for unresolved provider/model/settings.
-10. add runtime limits and a real operation table before TUI concurrency.
-11. add bounded tool runner before process/bash tools.
+1. use `docs/behavioral-parity.md` to drive coding-agent behavior slices.
+2. harden durable session truth through `AgentSessionRuntimeHost` tests.
+3. finish provider/auth/model composition without moving policy into `main.zig`.
+4. add an owned auth storage seam; env lookup is a fallback adapter, not the whole policy.
+5. deepen `session_config` diagnostics for unresolved provider/model/settings.
+6. add runtime limits and a real operation table before process/bash tools.
+7. add bounded tool runner before process/bash tools.
+8. add retry and compaction as terminal `AgentSession` policies, not provider policy.
+9. add `@file`, slash commands, and prompt templates only after their session owners
+    and bounds are explicit.
 
 ## rejected shortcuts
 

@@ -526,7 +526,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     var tools: tool_registry.ToolRegistry = .{};
     errdefer tools.deinit(allocator);
     try builtin_tools.appendDefinitions(&tools);
-    try tools.setActiveToolsByName(allocator, &.{ "read", "edit", "write" });
+    try tools.setActiveToolsByName(allocator, &.{ "read", "ls", "grep", "find", "edit", "write" });
 
     var system_prompt_state = try SystemPromptState.init(
         allocator,

@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
+const path_utils = @import("path_utils.zig");
 
 pub const max_read_bytes = 1024 * 1024;
 pub const max_output_bytes = 50 * 1024;
@@ -78,7 +79,10 @@ fn execute(
     try token.throwIfRequested();
     const self: *ReadTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(params);
-    const resolved_path = try resolvePath(allocator, io, self.config, args.path);
+    const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
+        .cwd = self.config.cwd,
+        .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
+    }, args.path);
     defer allocator.free(resolved_path);
 
     const content = try std.Io.Dir.readFileAlloc(
@@ -126,31 +130,6 @@ fn optionalPositiveInteger(value: ?std.json.Value) !?usize {
     return std.math.cast(usize, raw.integer) orelse error.InvalidToolArguments;
 }
 
-fn resolvePath(allocator: std.mem.Allocator, io: std.Io, config: ReadTool.Config, path: []const u8) ![]const u8 {
-    const resolved = if (std.fs.path.isAbsolute(path))
-        try std.fs.path.resolve(allocator, &.{path})
-    else
-        try std.fs.path.resolve(allocator, &.{ config.cwd, path });
-    errdefer allocator.free(resolved);
-
-    if (!config.allow_paths_outside_cwd) {
-        const canonical_cwd = try std.Io.Dir.realPathFileAlloc(.cwd(), io, config.cwd, allocator);
-        defer allocator.free(canonical_cwd);
-        const canonical_path = try std.Io.Dir.realPathFileAlloc(.cwd(), io, resolved, allocator);
-        defer allocator.free(canonical_path);
-        if (!isPathInside(canonical_cwd, canonical_path)) return error.PathOutsideCwd;
-    }
-    return resolved;
-}
-
-fn isPathInside(raw_cwd: []const u8, path: []const u8) bool {
-    var cwd = raw_cwd;
-    while (cwd.len > 1 and std.fs.path.isSep(cwd[cwd.len - 1])) cwd = cwd[0 .. cwd.len - 1];
-    if (!std.mem.startsWith(u8, path, cwd)) return false;
-    if (path.len == cwd.len) return true;
-    return std.fs.path.isSep(path[cwd.len]);
-}
-
 const FormattedReadOutput = struct {
     text: []const u8,
     truncated: bool,
@@ -166,27 +145,31 @@ const FormattedReadOutput = struct {
     fn details(self: FormattedReadOutput, allocator: std.mem.Allocator) !std.json.Value {
         var object: std.json.ObjectMap = .empty;
         errdefer object.deinit(allocator);
-        try putJsonField(allocator, &object, "truncated", .{ .bool = self.truncated });
-        try putJsonField(allocator, &object, "firstLineExceedsLimit", .{ .bool = self.first_line_exceeds_limit });
-        try putJsonField(allocator, &object, "outputLines", .{ .integer = @intCast(self.output_lines) });
-        try putJsonField(allocator, &object, "remainingLines", .{ .integer = @intCast(self.remaining_lines) });
+        try path_utils.putJsonField(allocator, &object, "truncated", .{ .bool = self.truncated });
+        try path_utils.putJsonField(
+            allocator,
+            &object,
+            "firstLineExceedsLimit",
+            .{ .bool = self.first_line_exceeds_limit },
+        );
+        try path_utils.putJsonField(
+            allocator,
+            &object,
+            "outputLines",
+            .{ .integer = @intCast(self.output_lines) },
+        );
+        try path_utils.putJsonField(
+            allocator,
+            &object,
+            "remainingLines",
+            .{ .integer = @intCast(self.remaining_lines) },
+        );
         if (self.next_offset) |next_offset| {
-            try putJsonField(allocator, &object, "nextOffset", .{ .integer = @intCast(next_offset) });
+            try path_utils.putJsonField(allocator, &object, "nextOffset", .{ .integer = @intCast(next_offset) });
         }
         return .{ .object = object };
     }
 };
-
-fn putJsonField(
-    allocator: std.mem.Allocator,
-    object: *std.json.ObjectMap,
-    key: []const u8,
-    value: std.json.Value,
-) !void {
-    const owned_key = try allocator.dupe(u8, key);
-    errdefer allocator.free(owned_key);
-    try object.put(allocator, owned_key, value);
-}
 
 fn formatReadOutput(
     allocator: std.mem.Allocator,
@@ -290,7 +273,7 @@ test "read tool reads bounded text with offset and limit" {
 }
 
 test "read tool can reject paths outside cwd by config" {
-    try std.testing.expect(isPathInside("/repo/", "/repo/file.txt"));
+    try std.testing.expect(path_utils.isPathInside("/repo/", "/repo/file.txt"));
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -300,10 +283,10 @@ test "read tool can reject paths outside cwd by config" {
 
     var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cwd = try tmp.dir.realPathFile(std.testing.io, "repo/app", &cwd_buffer);
-    try std.testing.expectError(error.PathOutsideCwd, resolvePath(
+    try std.testing.expectError(error.PathOutsideCwd, path_utils.resolveExistingPath(
         std.testing.allocator,
         std.testing.io,
-        .{ .cwd = cwd_buffer[0..cwd] },
+        .{ .cwd = cwd_buffer[0..cwd], .allow_paths_outside_cwd = false },
         "../other/file.txt",
     ));
 }
