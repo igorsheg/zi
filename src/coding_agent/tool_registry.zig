@@ -4,7 +4,7 @@ const tools = @import("tools/root.zig");
 
 pub const max_tool_definitions = 64;
 pub const max_active_tools = 64;
-pub const builtin_tool_count = 6;
+pub const builtin_tool_count = 7;
 
 pub const ToolSource = union(enum) {
     builtin,
@@ -170,6 +170,7 @@ pub const BuiltinTools = struct {
     ls: *tools.LsTool,
     grep: *tools.GrepTool,
     find: *tools.FindTool,
+    bash: *tools.BashTool,
     edit: *tools.EditTool,
     write: *tools.WriteTool,
 
@@ -215,6 +216,13 @@ pub const BuiltinTools = struct {
         });
         errdefer find.deinit();
 
+        const bash = try allocator.create(tools.BashTool);
+        errdefer allocator.destroy(bash);
+        bash.* = try tools.BashTool.init(allocator, .{
+            .cwd = options.cwd,
+        });
+        errdefer bash.deinit();
+
         const edit = try allocator.create(tools.EditTool);
         errdefer allocator.destroy(edit);
         edit.* = try tools.EditTool.init(allocator, .{
@@ -239,6 +247,7 @@ pub const BuiltinTools = struct {
             .ls = ls,
             .grep = grep,
             .find = find,
+            .bash = bash,
             .edit = edit,
             .write = write,
         };
@@ -249,6 +258,8 @@ pub const BuiltinTools = struct {
         self.allocator.destroy(self.write);
         self.edit.deinit();
         self.allocator.destroy(self.edit);
+        self.bash.deinit();
+        self.allocator.destroy(self.bash);
         self.find.deinit();
         self.allocator.destroy(self.find);
         self.grep.deinit();
@@ -285,6 +296,13 @@ pub const BuiltinTools = struct {
             .label = "find",
             .description = "Recursively find paths under a directory with bounded output.",
             .prompt_snippet = "Find paths under a directory with bounded output.",
+        }));
+        try registry.append(self.allocator, ToolDefinition.init(self.bash, .{
+            .name = "bash",
+            .label = "bash",
+            .description = "Run one shell command in the session cwd with timeout and bounded output.",
+            .prompt_snippet = "Run one shell command in the session cwd. Prefer file tools for simple file work.",
+            .execution_mode = .sequential,
         }));
         try registry.append(self.allocator, ToolDefinition.init(self.edit, .{
             .name = "edit",
@@ -323,7 +341,10 @@ test "tool registry stores definitions first and exposes active agent tools" {
     defer registry.deinit(std.testing.allocator);
 
     try builtins.appendDefinitions(&registry);
-    try registry.setActiveToolsByName(std.testing.allocator, &.{ "read", "ls", "grep", "find", "edit", "write" });
+    try registry.setActiveToolsByName(
+        std.testing.allocator,
+        &.{ "read", "ls", "grep", "find", "bash", "edit", "write" },
+    );
 
     try std.testing.expectEqual(@as(usize, builtin_tool_count), registry.definitions.items.len);
     try std.testing.expectEqual(@as(usize, builtin_tool_count), registry.activeAgentTools().len);
@@ -331,8 +352,10 @@ test "tool registry stores definitions first and exposes active agent tools" {
     try std.testing.expectEqualStrings("ls", registry.activeAgentTools()[1].name);
     try std.testing.expectEqualStrings("grep", registry.activeAgentTools()[2].name);
     try std.testing.expectEqualStrings("find", registry.activeAgentTools()[3].name);
-    try std.testing.expectEqualStrings("edit", registry.activeAgentTools()[4].name);
+    try std.testing.expectEqualStrings("bash", registry.activeAgentTools()[4].name);
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[4].execution_mode.?);
+    try std.testing.expectEqualStrings("edit", registry.activeAgentTools()[5].name);
+    try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[5].execution_mode.?);
 }
 
 test "tool registry rejects duplicate and unknown tool names without changing active set" {

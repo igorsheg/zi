@@ -75,7 +75,7 @@ ai
 | Auto compaction events and policy | `core/compaction/*` | `AgentSession` future terminal policy | protocol only | missing |
 | Manual compaction | `AgentSession.compact()` | `AgentSession` future terminal policy | missing | missing |
 | Auto retry events and policy | `auto_retry_start/end` in `AgentSession` | `AgentSession` future terminal policy | protocol only | missing |
-| Bash/process tool with timeout/cancel | `core/bash-executor.ts`, `tools/bash.ts` | future bounded tool runner | missing | missing |
+| Bash/process tool with timeout/cancel | `core/bash-executor.ts`, `tools/bash.ts` | `tools/BashTool` / `AgentSession` | minimal implemented: cwd-bound, sequential, no stdin/env/PTY/background/streaming | `bash tool runs one cwd-bound command`; `bash tool treats nonzero exit as result data`; `agent session initializes policy spine with definition-first builtin tools` |
 | Find/grep/ls tools | `core/tools/find.ts`, `grep.ts`, `ls.ts` | `tools/*` | implemented | `find tool recursively filters paths`; `grep tool searches directory files with literal pattern`; `ls tool lists one directory with bounds` |
 | Slash commands and prompt templates | `slash-commands.ts`, `prompt-templates.ts` | future frontend/session command owner | missing | missing |
 | Session fork/resume/import/export HTML | `agent-session-runtime.ts`, `export-html/*` | future host/session manager | missing | missing |
@@ -90,10 +90,10 @@ Work down this list. Do not add a framework to satisfy a row.
    - Add tests around session header, active leaf, and message persistence through
      `AgentSessionRuntimeHost`.
 
-2. Add the bounded process tool.
-   - Define timeout, cancellation, output cap, cwd policy, and shutdown behavior
-     first.
-   - Use the runtime operation shape, not ad hoc child process ownership.
+2. Harden the bounded process tool.
+   - Add session/agent-loop behavior coverage for cancellation and output caps.
+   - Keep stdin, env overrides, PTY, background jobs, and streaming out until
+     each has an owner, bound, and drain site.
 
 3. Add retry and compaction as terminal session policies.
    - Events already exist; behavior does not.

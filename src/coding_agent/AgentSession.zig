@@ -526,7 +526,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     var tools: tool_registry.ToolRegistry = .{};
     errdefer tools.deinit(allocator);
     try builtin_tools.appendDefinitions(&tools);
-    try tools.setActiveToolsByName(allocator, &.{ "read", "ls", "grep", "find", "edit", "write" });
+    try tools.setActiveToolsByName(allocator, &.{ "read", "ls", "grep", "find", "bash", "edit", "write" });
 
     var system_prompt_state = try SystemPromptState.init(
         allocator,
@@ -1009,6 +1009,9 @@ test "agent session initializes policy spine with definition-first builtin tools
     try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.tools.definitions.items.len);
     try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.agent.state.tools.len);
     try std.testing.expectEqualStrings("read", session.activeToolNames()[0]);
+    try std.testing.expectEqualStrings("bash", session.activeToolNames()[4]);
+    try std.testing.expectEqualStrings("bash", session.agent.state.tools[4].name);
+    try std.testing.expectEqual(agent_mod.ToolExecutionMode.sequential, session.agent.state.tools[4].execution_mode.?);
     try std.testing.expect(std.mem.indexOf(u8, session.system_prompt_state.text, "global") != null);
 }
 

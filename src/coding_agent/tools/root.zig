@@ -1,3 +1,4 @@
+pub const bash = @import("bash.zig");
 pub const edit = @import("edit.zig");
 pub const file_mutation_queue = @import("file_mutation_queue.zig");
 pub const find = @import("find.zig");
@@ -7,6 +8,7 @@ pub const path_utils = @import("path_utils.zig");
 pub const read = @import("read.zig");
 pub const write = @import("write.zig");
 
+pub const BashTool = bash.BashTool;
 pub const EditTool = edit.EditTool;
 pub const FileMutationQueue = file_mutation_queue.FileMutationQueue;
 pub const FindTool = find.FindTool;
@@ -16,6 +18,7 @@ pub const ReadTool = read.ReadTool;
 pub const WriteTool = write.WriteTool;
 
 pub fn testsReachable() void {
+    _ = bash;
     _ = edit;
     _ = file_mutation_queue;
     _ = find;
@@ -27,6 +30,7 @@ pub fn testsReachable() void {
 }
 
 test {
+    _ = bash;
     _ = edit;
     _ = file_mutation_queue;
     _ = find;
