@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
-const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
+const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
 
 pub const OutputMode = enum {
@@ -67,7 +67,7 @@ const PrintDrain = struct {
     output: OutputMode,
     wrote_text: bool = false,
 
-    fn onEvent(context: ?*anyopaque, event: AgentSession.AgentSessionEvent) !void {
+    fn onEvent(context: ?*anyopaque, event: session_events.AgentSessionEvent) !void {
         const self: *PrintDrain = @ptrCast(@alignCast(context.?));
         switch (self.output) {
             .text => try self.onTextEvent(event),
@@ -77,7 +77,7 @@ const PrintDrain = struct {
 
     fn onTextEvent(
         self: *PrintDrain,
-        event: AgentSession.AgentSessionEvent,
+        event: session_events.AgentSessionEvent,
     ) !void {
         switch (event) {
             .agent_event => |agent_event| switch (agent_event) {
@@ -108,7 +108,7 @@ fn printAssistantError(stderr: *std.Io.Writer, message: []const u8) !void {
 }
 
 fn drainJsonEvent(
-    event: AgentSession.AgentSessionEvent,
+    event: session_events.AgentSessionEvent,
     stdout: *std.Io.Writer,
 ) !void {
     try std.json.Stringify.value(event, .{}, stdout);
@@ -235,4 +235,4 @@ fn drainAllPublicEvents(host: *AgentSessionRuntimeHost) void {
     _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
 }
 
-fn ignorePublicEvent(_: ?*anyopaque, _: AgentSession.AgentSessionEvent) !void {}
+fn ignorePublicEvent(_: ?*anyopaque, _: session_events.AgentSessionEvent) !void {}

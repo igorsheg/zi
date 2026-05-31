@@ -1,0 +1,316 @@
+const std = @import("std");
+const agent_mod = @import("../agent/root.zig");
+const session_manager = @import("session_manager.zig");
+
+pub const EventText = struct {
+    allocator: std.mem.Allocator,
+    text: []const u8,
+
+    pub fn init(allocator: std.mem.Allocator, text: []const u8) !EventText {
+        return .{ .allocator = allocator, .text = try allocator.dupe(u8, text) };
+    }
+
+    pub fn initOwned(allocator: std.mem.Allocator, text: []const u8) EventText {
+        return .{ .allocator = allocator, .text = text };
+    }
+
+    pub fn deinit(self: *EventText) void {
+        self.allocator.free(self.text);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: EventText, stringify: *std.json.Stringify) !void {
+        try stringify.write(self.text);
+    }
+};
+
+pub const EventTextList = struct {
+    allocator: std.mem.Allocator,
+    items: []const []const u8,
+
+    pub fn init(allocator: std.mem.Allocator, source: []const []const u8) !EventTextList {
+        const items = try allocator.alloc([]const u8, source.len);
+        errdefer allocator.free(items);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |item| allocator.free(item);
+        }
+        for (source) |text| {
+            items[initialized] = try allocator.dupe(u8, text);
+            initialized += 1;
+        }
+        return .{ .allocator = allocator, .items = items };
+    }
+
+    pub fn deinit(self: *EventTextList) void {
+        for (self.items) |item| self.allocator.free(item);
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: EventTextList, stringify: *std.json.Stringify) !void {
+        try stringify.beginArray();
+        for (self.items) |item| try stringify.write(item);
+        try stringify.endArray();
+    }
+};
+
+pub const CompactionResult = struct {
+    summary: EventText,
+    first_kept_entry_id: EventText,
+    tokens_before: u64,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        entry: session_manager.SessionEntry.Compaction,
+    ) !CompactionResult {
+        return .{
+            .summary = try EventText.init(allocator, entry.summary),
+            .first_kept_entry_id = try EventText.init(allocator, entry.first_kept_entry_id),
+            .tokens_before = entry.tokens_before,
+        };
+    }
+
+    pub fn deinit(self: *CompactionResult) void {
+        self.summary.deinit();
+        self.first_kept_entry_id.deinit();
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: CompactionResult, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("summary", stringify, self.summary);
+        try writeJsonField("firstKeptEntryId", stringify, self.first_kept_entry_id);
+        try writeJsonField("tokensBefore", stringify, self.tokens_before);
+        try stringify.endObject();
+    }
+};
+
+pub const CompactionPreparationSnapshot = struct {
+    first_kept_entry_id: EventText,
+    tokens_before: u64,
+    has_previous_summary: bool,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        preparation: session_manager.CompactionPreparation,
+    ) !CompactionPreparationSnapshot {
+        return .{
+            .first_kept_entry_id = try EventText.init(allocator, preparation.first_kept_entry_id),
+            .tokens_before = preparation.tokens_before,
+            .has_previous_summary = preparation.previous_summary != null,
+        };
+    }
+
+    pub fn deinit(self: *CompactionPreparationSnapshot) void {
+        self.first_kept_entry_id.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const CompactionSummaryInputSnapshot = struct {
+    serialized_input: EventText,
+    first_kept_entry_id: EventText,
+    tokens_before: u64,
+    message_count: usize,
+    has_previous_summary: bool,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        input: session_manager.CompactionSummaryInput,
+        serialized_input: []const u8,
+    ) !CompactionSummaryInputSnapshot {
+        var serialized = try EventText.init(allocator, serialized_input);
+        errdefer serialized.deinit();
+        return .{
+            .serialized_input = serialized,
+            .first_kept_entry_id = try EventText.init(allocator, input.first_kept_entry_id),
+            .tokens_before = input.tokens_before,
+            .message_count = input.messages.len,
+            .has_previous_summary = input.previous_summary != null,
+        };
+    }
+
+    pub fn deinit(self: *CompactionSummaryInputSnapshot) void {
+        self.serialized_input.deinit();
+        self.first_kept_entry_id.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const AgentSessionEvent = union(enum) {
+    agent_event: agent_mod.AgentEvent,
+    queue_update: QueueUpdate,
+    prompt_command: PromptCommand,
+    compaction_start: CompactionStart,
+    session_info_changed: SessionInfoChanged,
+    compaction_end: CompactionEnd,
+    auto_retry_start: AutoRetryStart,
+    auto_retry_end: AutoRetryEnd,
+
+    pub const QueueUpdate = struct {
+        steering: EventTextList,
+        follow_up: EventTextList,
+        revision: u64,
+
+        pub fn deinit(self: *QueueUpdate) void {
+            self.steering.deinit();
+            self.follow_up.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub const PromptCommandResult = enum {
+        handled,
+        unknown,
+    };
+
+    pub const PromptCommand = struct {
+        command: EventText,
+        result: PromptCommandResult,
+        message: EventText,
+
+        pub fn deinit(self: *PromptCommand) void {
+            self.command.deinit();
+            self.message.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub const CompactionReason = enum {
+        manual,
+        threshold,
+        overflow,
+    };
+
+    pub const CompactionStart = struct {
+        reason: CompactionReason,
+    };
+
+    pub const SessionInfoChanged = struct {
+        name: ?EventText,
+    };
+
+    pub const CompactionEnd = struct {
+        reason: CompactionReason,
+        result: ?CompactionResult = null,
+        aborted: bool,
+        will_retry: bool,
+        error_message: ?EventText = null,
+
+        pub fn deinit(self: *CompactionEnd) void {
+            if (self.result) |*result| result.deinit();
+            if (self.error_message) |*message| message.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub const AutoRetryStart = struct {
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+        error_message: EventText,
+    };
+
+    pub const AutoRetryEnd = struct {
+        success: bool,
+        attempt: usize,
+        final_error: ?EventText = null,
+    };
+
+    pub fn deinit(self: *AgentSessionEvent) void {
+        switch (self.*) {
+            .agent_event => {},
+            .queue_update => |*payload| payload.deinit(),
+            .prompt_command => |*payload| payload.deinit(),
+            .compaction_start => {},
+            .session_info_changed => |*payload| {
+                if (payload.name) |*name| name.deinit();
+            },
+            .compaction_end => |*payload| payload.deinit(),
+            .auto_retry_start => |*payload| payload.error_message.deinit(),
+            .auto_retry_end => |*payload| {
+                if (payload.final_error) |*err| err.deinit();
+            },
+        }
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: AgentSessionEvent, stringify: *std.json.Stringify) !void {
+        switch (self) {
+            .agent_event => |event| try stringify.write(event),
+            .queue_update => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "queue_update");
+                try writeJsonField("steering", stringify, payload.steering);
+                try writeJsonField("followUp", stringify, payload.follow_up);
+                try writeJsonField("revision", stringify, payload.revision);
+                try stringify.endObject();
+            },
+            .prompt_command => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "prompt_command");
+                try writeJsonField("command", stringify, payload.command);
+                try writeJsonField("result", stringify, payload.result);
+                try writeJsonField("message", stringify, payload.message);
+                try stringify.endObject();
+            },
+            .compaction_start => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "compaction_start");
+                try writeJsonField("reason", stringify, payload.reason);
+                try stringify.endObject();
+            },
+            .session_info_changed => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "session_info_changed");
+                if (payload.name) |name| try writeJsonField("name", stringify, name);
+                try stringify.endObject();
+            },
+            .compaction_end => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "compaction_end");
+                try writeJsonField("reason", stringify, payload.reason);
+                if (payload.result) |result| try writeJsonField("result", stringify, result);
+                try writeJsonField("aborted", stringify, payload.aborted);
+                try writeJsonField("willRetry", stringify, payload.will_retry);
+                if (payload.error_message) |message| try writeJsonField("errorMessage", stringify, message);
+                try stringify.endObject();
+            },
+            .auto_retry_start => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "auto_retry_start");
+                try writeJsonField("attempt", stringify, payload.attempt);
+                try writeJsonField("maxAttempts", stringify, payload.max_attempts);
+                try writeJsonField("delayMs", stringify, payload.delay_ms);
+                try writeJsonField("errorMessage", stringify, payload.error_message);
+                try stringify.endObject();
+            },
+            .auto_retry_end => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "auto_retry_end");
+                try writeJsonField("success", stringify, payload.success);
+                try writeJsonField("attempt", stringify, payload.attempt);
+                if (payload.final_error) |err| try writeJsonField("finalError", stringify, err);
+                try stringify.endObject();
+            },
+        }
+    }
+};
+
+pub const QueueSnapshot = struct {
+    revision: u64,
+    steering: EventTextList,
+    follow_up: EventTextList,
+
+    pub fn deinit(self: *QueueSnapshot) void {
+        self.steering.deinit();
+        self.follow_up.deinit();
+        self.* = undefined;
+    }
+};
+
+fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, value: anytype) !void {
+    try stringify.objectField(name);
+    try stringify.write(value);
+}

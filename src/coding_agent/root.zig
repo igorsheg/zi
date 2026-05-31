@@ -12,6 +12,7 @@ pub const settings = @import("settings.zig");
 pub const model_registry = @import("model_registry.zig");
 pub const resources = @import("resources.zig");
 pub const session_config = @import("session_config.zig");
+pub const session_events = @import("session_events.zig");
 pub const session_manager = @import("session_manager.zig");
 pub const session_store = @import("session_store.zig");
 pub const skills = @import("skills.zig");
@@ -64,6 +65,7 @@ pub fn testsReachable() void {
     _ = settings;
     _ = model_registry;
     _ = session_config;
+    _ = session_events;
     _ = session_manager;
     _ = session_store;
     _ = skills;
@@ -88,6 +90,7 @@ test {
     _ = settings;
     _ = model_registry;
     _ = session_config;
+    _ = session_events;
     _ = session_manager;
     _ = session_store;
     _ = skills;

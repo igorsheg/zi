@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const AgentSession = @import("AgentSession.zig");
+const session_events = @import("session_events.zig");
 
 pub const FrontendAction = union(enum) {
     submit_prompt: SubmitPrompt,
@@ -42,7 +43,7 @@ pub const ReadModel = struct {
         };
     }
 
-    pub fn apply(self: *ReadModel, event: AgentSession.AgentSessionEvent) void {
+    pub fn apply(self: *ReadModel, event: session_events.AgentSessionEvent) void {
         switch (event) {
             .agent_event => |agent_event| self.applyAgentEvent(agent_event),
             .queue_update => |payload| {
@@ -124,9 +125,9 @@ test "frontend read model applies public event stream without touching session i
     } } });
     try std.testing.expectEqual(@as(usize, 1), model.assistant_updates_seen);
 
-    var steering = try AgentSession.EventTextList.init(std.testing.allocator, &.{"steer"});
+    var steering = try session_events.EventTextList.init(std.testing.allocator, &.{"steer"});
     defer steering.deinit();
-    var follow_up = try AgentSession.EventTextList.init(std.testing.allocator, &.{ "one", "two" });
+    var follow_up = try session_events.EventTextList.init(std.testing.allocator, &.{ "one", "two" });
     defer follow_up.deinit();
     model.apply(.{ .queue_update = .{
         .steering = steering,

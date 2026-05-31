@@ -3,6 +3,7 @@ const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const resources = @import("resources.zig");
+const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
 const system_prompt = @import("system_prompt.zig");
@@ -26,7 +27,7 @@ tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 store: ?*session_store.SessionStore = null,
 agent: *agent_mod.Agent,
-public_event_buffer: []AgentSessionEvent,
+public_event_buffer: []session_events.AgentSessionEvent,
 public_events: *PublicEventQueue,
 queue_mirror: *QueueMirror,
 event_drain: *EventDrain,
@@ -133,324 +134,11 @@ pub const Error = error{
     SessionShuttingDown,
 };
 
-pub const EventText = struct {
-    allocator: std.mem.Allocator,
-    text: []const u8,
-
-    pub fn init(allocator: std.mem.Allocator, text: []const u8) !EventText {
-        return .{ .allocator = allocator, .text = try allocator.dupe(u8, text) };
-    }
-
-    fn initOwned(allocator: std.mem.Allocator, text: []const u8) EventText {
-        return .{ .allocator = allocator, .text = text };
-    }
-
-    pub fn deinit(self: *EventText) void {
-        self.allocator.free(self.text);
-        self.* = undefined;
-    }
-
-    pub fn jsonStringify(self: EventText, stringify: *std.json.Stringify) !void {
-        try stringify.write(self.text);
-    }
-};
-
-pub const EventTextList = struct {
-    allocator: std.mem.Allocator,
-    items: []const []const u8,
-
-    pub fn init(allocator: std.mem.Allocator, source: []const []const u8) !EventTextList {
-        const items = try allocator.alloc([]const u8, source.len);
-        errdefer allocator.free(items);
-        var initialized: usize = 0;
-        errdefer {
-            for (items[0..initialized]) |item| allocator.free(item);
-        }
-        for (source) |text| {
-            items[initialized] = try allocator.dupe(u8, text);
-            initialized += 1;
-        }
-        return .{ .allocator = allocator, .items = items };
-    }
-
-    pub fn deinit(self: *EventTextList) void {
-        for (self.items) |item| self.allocator.free(item);
-        self.allocator.free(self.items);
-        self.* = undefined;
-    }
-
-    pub fn jsonStringify(self: EventTextList, stringify: *std.json.Stringify) !void {
-        try stringify.beginArray();
-        for (self.items) |item| try stringify.write(item);
-        try stringify.endArray();
-    }
-};
-
-pub const CompactionResult = struct {
-    summary: EventText,
-    first_kept_entry_id: EventText,
-    tokens_before: u64,
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        entry: session_manager.SessionEntry.Compaction,
-    ) !CompactionResult {
-        return .{
-            .summary = try EventText.init(allocator, entry.summary),
-            .first_kept_entry_id = try EventText.init(allocator, entry.first_kept_entry_id),
-            .tokens_before = entry.tokens_before,
-        };
-    }
-
-    pub fn deinit(self: *CompactionResult) void {
-        self.summary.deinit();
-        self.first_kept_entry_id.deinit();
-        self.* = undefined;
-    }
-
-    pub fn jsonStringify(self: CompactionResult, stringify: *std.json.Stringify) !void {
-        try stringify.beginObject();
-        try writeJsonField("summary", stringify, self.summary);
-        try writeJsonField("firstKeptEntryId", stringify, self.first_kept_entry_id);
-        try writeJsonField("tokensBefore", stringify, self.tokens_before);
-        try stringify.endObject();
-    }
-};
-
-pub const CompactionPreparationSnapshot = struct {
-    first_kept_entry_id: EventText,
-    tokens_before: u64,
-    has_previous_summary: bool,
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        preparation: session_manager.CompactionPreparation,
-    ) !CompactionPreparationSnapshot {
-        return .{
-            .first_kept_entry_id = try EventText.init(allocator, preparation.first_kept_entry_id),
-            .tokens_before = preparation.tokens_before,
-            .has_previous_summary = preparation.previous_summary != null,
-        };
-    }
-
-    pub fn deinit(self: *CompactionPreparationSnapshot) void {
-        self.first_kept_entry_id.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const CompactionSummaryInputSnapshot = struct {
-    serialized_input: EventText,
-    first_kept_entry_id: EventText,
-    tokens_before: u64,
-    message_count: usize,
-    has_previous_summary: bool,
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        input: session_manager.CompactionSummaryInput,
-        serialized_input: []const u8,
-    ) !CompactionSummaryInputSnapshot {
-        var serialized = try EventText.init(allocator, serialized_input);
-        errdefer serialized.deinit();
-        return .{
-            .serialized_input = serialized,
-            .first_kept_entry_id = try EventText.init(allocator, input.first_kept_entry_id),
-            .tokens_before = input.tokens_before,
-            .message_count = input.messages.len,
-            .has_previous_summary = input.previous_summary != null,
-        };
-    }
-
-    pub fn deinit(self: *CompactionSummaryInputSnapshot) void {
-        self.serialized_input.deinit();
-        self.first_kept_entry_id.deinit();
-        self.* = undefined;
-    }
-};
-
 const Lifecycle = enum {
     accepting,
     cancel_requested,
     shutdown_requested,
     stopped,
-};
-
-pub const AgentSessionEvent = union(enum) {
-    agent_event: agent_mod.AgentEvent,
-    queue_update: QueueUpdate,
-    prompt_command: PromptCommand,
-    compaction_start: CompactionStart,
-    session_info_changed: SessionInfoChanged,
-    compaction_end: CompactionEnd,
-    auto_retry_start: AutoRetryStart,
-    auto_retry_end: AutoRetryEnd,
-
-    pub const QueueUpdate = struct {
-        steering: EventTextList,
-        follow_up: EventTextList,
-        revision: u64,
-
-        pub fn deinit(self: *QueueUpdate) void {
-            self.steering.deinit();
-            self.follow_up.deinit();
-            self.* = undefined;
-        }
-    };
-
-    pub const PromptCommandResult = enum {
-        handled,
-        unknown,
-    };
-
-    pub const PromptCommand = struct {
-        command: EventText,
-        result: PromptCommandResult,
-        message: EventText,
-
-        pub fn deinit(self: *PromptCommand) void {
-            self.command.deinit();
-            self.message.deinit();
-            self.* = undefined;
-        }
-    };
-
-    pub const CompactionReason = enum {
-        manual,
-        threshold,
-        overflow,
-    };
-
-    pub const CompactionStart = struct {
-        reason: CompactionReason,
-    };
-
-    pub const SessionInfoChanged = struct {
-        name: ?EventText,
-    };
-
-    pub const CompactionEnd = struct {
-        reason: CompactionReason,
-        result: ?CompactionResult = null,
-        aborted: bool,
-        will_retry: bool,
-        error_message: ?EventText = null,
-
-        pub fn deinit(self: *CompactionEnd) void {
-            if (self.result) |*result| result.deinit();
-            if (self.error_message) |*message| message.deinit();
-            self.* = undefined;
-        }
-    };
-
-    pub const AutoRetryStart = struct {
-        attempt: usize,
-        max_attempts: usize,
-        delay_ms: u64,
-        error_message: EventText,
-    };
-
-    pub const AutoRetryEnd = struct {
-        success: bool,
-        attempt: usize,
-        final_error: ?EventText = null,
-    };
-
-    pub fn deinit(self: *AgentSessionEvent) void {
-        switch (self.*) {
-            .agent_event => {},
-            .queue_update => |*payload| payload.deinit(),
-            .prompt_command => |*payload| payload.deinit(),
-            .compaction_start => {},
-            .session_info_changed => |*payload| {
-                if (payload.name) |*name| name.deinit();
-            },
-            .compaction_end => |*payload| payload.deinit(),
-            .auto_retry_start => |*payload| payload.error_message.deinit(),
-            .auto_retry_end => |*payload| {
-                if (payload.final_error) |*err| err.deinit();
-            },
-        }
-        self.* = undefined;
-    }
-
-    pub fn jsonStringify(self: AgentSessionEvent, stringify: *std.json.Stringify) !void {
-        switch (self) {
-            .agent_event => |event| try stringify.write(event),
-            .queue_update => |payload| {
-                try stringify.beginObject();
-                try writeJsonField("type", stringify, "queue_update");
-                try writeJsonField("steering", stringify, payload.steering);
-                try writeJsonField("followUp", stringify, payload.follow_up);
-                try writeJsonField("revision", stringify, payload.revision);
-                try stringify.endObject();
-            },
-            .prompt_command => |payload| {
-                try stringify.beginObject();
-                try writeJsonField("type", stringify, "prompt_command");
-                try writeJsonField("command", stringify, payload.command);
-                try writeJsonField("result", stringify, payload.result);
-                try writeJsonField("message", stringify, payload.message);
-                try stringify.endObject();
-            },
-            .compaction_start => |payload| {
-                try stringify.beginObject();
-                try writeJsonField("type", stringify, "compaction_start");
-                try writeJsonField("reason", stringify, payload.reason);
-                try stringify.endObject();
-            },
-            .session_info_changed => |payload| {
-                try stringify.beginObject();
-                try writeJsonField("type", stringify, "session_info_changed");
-                if (payload.name) |name| try writeJsonField("name", stringify, name);
-                try stringify.endObject();
-            },
-            .compaction_end => |payload| {
-                try stringify.beginObject();
-                try writeJsonField("type", stringify, "compaction_end");
-                try writeJsonField("reason", stringify, payload.reason);
-                if (payload.result) |result| try writeJsonField("result", stringify, result);
-                try writeJsonField("aborted", stringify, payload.aborted);
-                try writeJsonField("willRetry", stringify, payload.will_retry);
-                if (payload.error_message) |message| try writeJsonField("errorMessage", stringify, message);
-                try stringify.endObject();
-            },
-            .auto_retry_start => |payload| {
-                try stringify.beginObject();
-                try writeJsonField("type", stringify, "auto_retry_start");
-                try writeJsonField("attempt", stringify, payload.attempt);
-                try writeJsonField("maxAttempts", stringify, payload.max_attempts);
-                try writeJsonField("delayMs", stringify, payload.delay_ms);
-                try writeJsonField("errorMessage", stringify, payload.error_message);
-                try stringify.endObject();
-            },
-            .auto_retry_end => |payload| {
-                try stringify.beginObject();
-                try writeJsonField("type", stringify, "auto_retry_end");
-                try writeJsonField("success", stringify, payload.success);
-                try writeJsonField("attempt", stringify, payload.attempt);
-                if (payload.final_error) |err| try writeJsonField("finalError", stringify, err);
-                try stringify.endObject();
-            },
-        }
-    }
-};
-
-fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, value: anytype) !void {
-    try stringify.objectField(name);
-    try stringify.write(value);
-}
-
-pub const QueueSnapshot = struct {
-    revision: u64,
-    steering: EventTextList,
-    follow_up: EventTextList,
-
-    pub fn deinit(self: *QueueSnapshot) void {
-        self.steering.deinit();
-        self.follow_up.deinit();
-        self.* = undefined;
-    }
 };
 
 const QueueMirror = struct {
@@ -494,10 +182,10 @@ const QueueMirror = struct {
         return self.follow_up.items.len;
     }
 
-    fn snapshot(self: *const QueueMirror, allocator: std.mem.Allocator) !QueueSnapshot {
-        var steering = try EventTextList.init(allocator, self.steering.items);
+    fn snapshot(self: *const QueueMirror, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
+        var steering = try session_events.EventTextList.init(allocator, self.steering.items);
         errdefer steering.deinit();
-        var follow_up = try EventTextList.init(allocator, self.follow_up.items);
+        var follow_up = try session_events.EventTextList.init(allocator, self.follow_up.items);
         errdefer follow_up.deinit();
         return .{
             .revision = self.revision,
@@ -542,7 +230,7 @@ const QueueMirror = struct {
     }
 };
 
-const PublicEventQueue = runtime.BoundedQueue(AgentSessionEvent);
+const PublicEventQueue = runtime.BoundedQueue(session_events.AgentSessionEvent);
 
 const SystemPromptState = struct {
     text: []const u8,
@@ -661,9 +349,9 @@ const EventDrain = struct {
     }
 
     fn emitQueueUpdate(self: *EventDrain) !void {
-        var steering = try EventTextList.init(self.allocator, self.queue_mirror.steering.items);
+        var steering = try session_events.EventTextList.init(self.allocator, self.queue_mirror.steering.items);
         errdefer steering.deinit();
-        var follow_up = try EventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
+        var follow_up = try session_events.EventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
         errdefer follow_up.deinit();
         self.enqueuePublicEvent(.{ .queue_update = .{
             .steering = steering,
@@ -672,7 +360,7 @@ const EventDrain = struct {
         } });
     }
 
-    fn enqueuePublicEvent(self: *EventDrain, event: AgentSessionEvent) void {
+    fn enqueuePublicEvent(self: *EventDrain, event: session_events.AgentSessionEvent) void {
         var owned_event = event;
         if (!self.public_events.pushOrDrop(owned_event)) owned_event.deinit();
         self.dropped_public_event_count = self.public_events.dropped();
@@ -759,7 +447,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     errdefer core_agent.deinit();
 
     if (options.public_event_capacity == 0) return error.PublicEventCapacityZero;
-    const public_event_buffer = try allocator.alloc(AgentSessionEvent, options.public_event_capacity);
+    const public_event_buffer = try allocator.alloc(session_events.AgentSessionEvent, options.public_event_capacity);
     errdefer allocator.free(public_event_buffer);
     const public_events = try allocator.create(PublicEventQueue);
     errdefer allocator.destroy(public_events);
@@ -971,7 +659,7 @@ pub fn compactWithSummary(
     summary: []const u8,
     first_kept_entry_id: []const u8,
     tokens_before: u64,
-) !CompactionResult {
+) !session_events.CompactionResult {
     return self.runManualCompaction(.{ .explicit = .{
         .summary = summary,
         .first_kept_entry_id = first_kept_entry_id,
@@ -983,33 +671,33 @@ pub fn compactPreparedWithSummary(
     self: *AgentSession,
     summary: []const u8,
     settings: session_manager.CompactionSettings,
-) !CompactionResult {
+) !session_events.CompactionResult {
     return self.runManualCompaction(.{ .prepared = .{
         .summary = summary,
         .settings = settings,
     } });
 }
 
-pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !CompactionResult {
+pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !session_events.CompactionResult {
     return self.runManualCompaction(.{ .prepared = .{
         .summary = summary,
         .settings = self.compaction_settings,
     } });
 }
 
-pub fn compactWithGeneratedSummary(self: *AgentSession) !CompactionResult {
+pub fn compactWithGeneratedSummary(self: *AgentSession) !session_events.CompactionResult {
     try self.ensureAcceptsContinue();
     return self.runGeneratedCompaction(.manual, false);
 }
 
 fn runGeneratedCompaction(
     self: *AgentSession,
-    reason: AgentSessionEvent.CompactionReason,
+    reason: session_events.AgentSessionEvent.CompactionReason,
     will_retry: bool,
-) !CompactionResult {
+) !session_events.CompactionResult {
     self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = reason } });
     return self.generateAndApplyCompaction(reason, will_retry) catch |err| {
-        const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
+        const error_message = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
             .reason = reason,
             .aborted = err == error.OperationCancelled,
@@ -1020,30 +708,30 @@ fn runGeneratedCompaction(
     };
 }
 
-pub fn prepareCompactionSnapshot(self: *AgentSession) !CompactionPreparationSnapshot {
+pub fn prepareCompactionSnapshot(self: *AgentSession) !session_events.CompactionPreparationSnapshot {
     try self.ensureAcceptsContinue();
     var preparation = try self.manager.prepareCompaction(self.allocator, self.compaction_settings);
     defer preparation.deinit();
-    return CompactionPreparationSnapshot.init(self.allocator, preparation);
+    return session_events.CompactionPreparationSnapshot.init(self.allocator, preparation);
 }
 
-pub fn prepareCompactionSummaryInputSnapshot(self: *AgentSession) !CompactionSummaryInputSnapshot {
+pub fn prepareCompactionSummaryInputSnapshot(self: *AgentSession) !session_events.CompactionSummaryInputSnapshot {
     try self.ensureAcceptsContinue();
     var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
     defer input.deinit();
     const serialized_input = try input.serialize(self.allocator);
     defer self.allocator.free(serialized_input);
-    return CompactionSummaryInputSnapshot.init(self.allocator, input, serialized_input);
+    return session_events.CompactionSummaryInputSnapshot.init(self.allocator, input, serialized_input);
 }
 
 fn runManualCompaction(
     self: *AgentSession,
     request: ManualCompactionRequest,
-) !CompactionResult {
+) !session_events.CompactionResult {
     try self.ensureAcceptsContinue();
     self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
     return self.applyManualCompactionRequest(request) catch |err| {
-        const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
+        const error_message = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
             .reason = .manual,
             .aborted = false,
@@ -1148,11 +836,11 @@ pub fn publicEventCount(self: *const AgentSession) usize {
     return self.public_events.count();
 }
 
-pub fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !QueueSnapshot {
+pub fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
     return self.queue_mirror.snapshot(allocator);
 }
 
-pub fn drainPublicEvent(self: *AgentSession) ?AgentSessionEvent {
+pub fn drainPublicEvent(self: *AgentSession) ?session_events.AgentSessionEvent {
     return self.public_events.pop();
 }
 
@@ -1183,12 +871,12 @@ fn ensureAcceptsContinue(self: *AgentSession) Error!void {
 
 fn applyManualCompaction(
     self: *AgentSession,
-    reason: AgentSessionEvent.CompactionReason,
+    reason: session_events.AgentSessionEvent.CompactionReason,
     will_retry: bool,
     summary: []const u8,
     first_kept_entry_id: []const u8,
     tokens_before: u64,
-) !CompactionResult {
+) !session_events.CompactionResult {
     try self.manager.ensureAppendCapacity(1);
     const entry = try self.manager.prepareCompactionEntry(
         summary,
@@ -1200,9 +888,9 @@ fn applyManualCompaction(
 
     if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
 
-    var event_result = try CompactionResult.init(self.allocator, entry.compaction);
+    var event_result = try session_events.CompactionResult.init(self.allocator, entry.compaction);
     errdefer event_result.deinit();
-    var return_result = try CompactionResult.init(self.allocator, entry.compaction);
+    var return_result = try session_events.CompactionResult.init(self.allocator, entry.compaction);
     errdefer return_result.deinit();
 
     _ = self.manager.commitPreparedEntry(entry);
@@ -1227,7 +915,7 @@ fn applyManualCompaction(
 fn applyManualCompactionRequest(
     self: *AgentSession,
     request: ManualCompactionRequest,
-) !CompactionResult {
+) !session_events.CompactionResult {
     return switch (request) {
         .explicit => |explicit| self.applyManualCompaction(
             .manual,
@@ -1247,7 +935,7 @@ fn prepareAndApplyManualCompaction(
     self: *AgentSession,
     summary: []const u8,
     settings: session_manager.CompactionSettings,
-) !CompactionResult {
+) !session_events.CompactionResult {
     var preparation = try self.manager.prepareCompaction(self.allocator, settings);
     defer preparation.deinit();
     return self.applyManualCompaction(
@@ -1261,9 +949,9 @@ fn prepareAndApplyManualCompaction(
 
 fn generateAndApplyCompaction(
     self: *AgentSession,
-    reason: AgentSessionEvent.CompactionReason,
+    reason: session_events.AgentSessionEvent.CompactionReason,
     will_retry: bool,
-) !CompactionResult {
+) !session_events.CompactionResult {
     var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
     defer input.deinit();
     const serialized_input = try input.serialize(self.allocator);
@@ -1433,7 +1121,11 @@ fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight
     const command_name = parsePromptCommandName(command) orelse {
         const unknown_message = try std.fmt.allocPrint(self.allocator, "unknown command: /{s}", .{command});
         errdefer self.allocator.free(unknown_message);
-        try self.emitPromptCommandOwned(command, .unknown, EventText.initOwned(self.allocator, unknown_message));
+        try self.emitPromptCommandOwned(
+            command,
+            .unknown,
+            session_events.EventText.initOwned(self.allocator, unknown_message),
+        );
         return true;
     };
 
@@ -1453,7 +1145,11 @@ fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight
                 },
             );
             errdefer self.allocator.free(message);
-            try self.emitPromptCommandOwned(command, .handled, EventText.initOwned(self.allocator, message));
+            try self.emitPromptCommandOwned(
+                command,
+                .handled,
+                session_events.EventText.initOwned(self.allocator, message),
+            );
         },
     }
     return true;
@@ -1469,10 +1165,10 @@ fn parsePromptCommandName(command: []const u8) ?PromptCommandName {
 fn emitPromptCommand(
     self: *AgentSession,
     command: []const u8,
-    result: AgentSessionEvent.PromptCommandResult,
+    result: session_events.AgentSessionEvent.PromptCommandResult,
     message_text: []const u8,
 ) !void {
-    var message = try EventText.init(self.allocator, message_text);
+    var message = try session_events.EventText.init(self.allocator, message_text);
     errdefer message.deinit();
     try self.emitPromptCommandOwned(command, result, message);
 }
@@ -1480,13 +1176,13 @@ fn emitPromptCommand(
 fn emitPromptCommandOwned(
     self: *AgentSession,
     command: []const u8,
-    result: AgentSessionEvent.PromptCommandResult,
-    message: EventText,
+    result: session_events.AgentSessionEvent.PromptCommandResult,
+    message: session_events.EventText,
 ) !void {
     var owned_message = message;
     errdefer owned_message.deinit();
     self.event_drain.enqueuePublicEvent(.{ .prompt_command = .{
-        .command = try EventText.init(self.allocator, command),
+        .command = try session_events.EventText.init(self.allocator, command),
         .result = result,
         .message = owned_message,
     } });
@@ -1583,7 +1279,7 @@ fn retryPromptAfterOverflowCompaction(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) anyerror!void {
-    var error_message = try EventText.init(self.allocator, "context overflow");
+    var error_message = try session_events.EventText.init(self.allocator, "context overflow");
     var retry_start_owns_error_message = true;
     errdefer if (retry_start_owns_error_message) error_message.deinit();
     self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
@@ -1595,7 +1291,7 @@ fn retryPromptAfterOverflowCompaction(
     retry_start_owns_error_message = false;
 
     self.promptWithOptionsInternal(text, images, options, .{ .overflow = false, .transient = false }) catch |err| {
-        const final_error = EventText.init(self.allocator, @errorName(err)) catch return err;
+        const final_error = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
             .success = false,
             .attempt = 1,
@@ -1622,7 +1318,7 @@ fn retryPromptAfterRetryableError(
     const max_attempts: usize = self.retry_settings.max_attempts;
     var attempt: usize = 1;
     while (attempt <= max_attempts) : (attempt += 1) {
-        var error_message = try EventText.init(self.allocator, current_error_message);
+        var error_message = try session_events.EventText.init(self.allocator, current_error_message);
         var retry_start_owns_error_message = true;
         errdefer if (retry_start_owns_error_message) error_message.deinit();
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
@@ -1678,7 +1374,7 @@ fn latestAssistantError(self: *const AgentSession) ?[]const u8 {
 }
 
 fn emitAutoRetryFailure(self: *AgentSession, attempt: usize, message: []const u8) !void {
-    const final_error = try EventText.init(self.allocator, message);
+    const final_error = try session_events.EventText.init(self.allocator, message);
     self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
         .success = false,
         .attempt = attempt,
@@ -2499,7 +2195,10 @@ test "agent session session command emits snapshot without model run" {
     var event = session.drainPublicEvent().?;
     defer event.deinit();
     try std.testing.expect(event == .prompt_command);
-    try std.testing.expectEqual(AgentSessionEvent.PromptCommandResult.handled, event.prompt_command.result);
+    try std.testing.expectEqual(
+        session_events.AgentSessionEvent.PromptCommandResult.handled,
+        event.prompt_command.result,
+    );
     try std.testing.expectEqualStrings("session", event.prompt_command.command.text);
     const expected_message = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -2519,10 +2218,10 @@ test "agent session slash command parser requires command name" {
 }
 
 test "agent session slash command event serializes public shape" {
-    var unknown_event: AgentSessionEvent = .{ .prompt_command = .{
-        .command = try EventText.init(std.testing.allocator, "missing"),
+    var unknown_event: session_events.AgentSessionEvent = .{ .prompt_command = .{
+        .command = try session_events.EventText.init(std.testing.allocator, "missing"),
         .result = .unknown,
-        .message = try EventText.init(std.testing.allocator, "unknown command: /missing"),
+        .message = try session_events.EventText.init(std.testing.allocator, "unknown command: /missing"),
     } };
     defer unknown_event.deinit();
 
@@ -2537,10 +2236,10 @@ test "agent session slash command event serializes public shape" {
         unknown_writer.written(),
     );
 
-    var handled_event: AgentSessionEvent = .{ .prompt_command = .{
-        .command = try EventText.init(std.testing.allocator, "help"),
+    var handled_event: session_events.AgentSessionEvent = .{ .prompt_command = .{
+        .command = try session_events.EventText.init(std.testing.allocator, "help"),
         .result = .handled,
-        .message = try EventText.init(std.testing.allocator, "available commands: /help, /session"),
+        .message = try session_events.EventText.init(std.testing.allocator, "available commands: /help, /session"),
     } };
     defer handled_event.deinit();
 
@@ -2557,11 +2256,11 @@ test "agent session slash command event serializes public shape" {
 }
 
 test "agent session failed compaction end event omits result" {
-    var event: AgentSessionEvent = .{ .compaction_end = .{
+    var event: session_events.AgentSessionEvent = .{ .compaction_end = .{
         .reason = .manual,
         .aborted = true,
         .will_retry = false,
-        .error_message = try EventText.init(std.testing.allocator, "not implemented"),
+        .error_message = try session_events.EventText.init(std.testing.allocator, "not implemented"),
     } };
     defer event.deinit();
 
@@ -2587,9 +2286,9 @@ test "agent session compaction end event serializes owned result" {
     } }, "t1");
     _ = try manager.appendCompaction("summary", first_kept, 42, "t2");
 
-    var event: AgentSessionEvent = .{ .compaction_end = .{
+    var event: session_events.AgentSessionEvent = .{ .compaction_end = .{
         .reason = .manual,
-        .result = try CompactionResult.init(
+        .result = try session_events.CompactionResult.init(
             std.testing.allocator,
             manager.entries.items[1].compaction,
         ),
@@ -2664,7 +2363,10 @@ test "agent session manual compaction persists and replaces agent context" {
     var start_event = session.drainPublicEvent().?;
     defer start_event.deinit();
     try std.testing.expect(start_event == .compaction_start);
-    try std.testing.expectEqual(AgentSessionEvent.CompactionReason.manual, start_event.compaction_start.reason);
+    try std.testing.expectEqual(
+        session_events.AgentSessionEvent.CompactionReason.manual,
+        start_event.compaction_start.reason,
+    );
 
     var end_event = session.drainPublicEvent().?;
     defer end_event.deinit();
@@ -3027,11 +2729,17 @@ test "agent session auto compacts before prompt when enabled" {
     var start_event = session.drainPublicEvent().?;
     defer start_event.deinit();
     try std.testing.expect(start_event == .compaction_start);
-    try std.testing.expectEqual(AgentSessionEvent.CompactionReason.threshold, start_event.compaction_start.reason);
+    try std.testing.expectEqual(
+        session_events.AgentSessionEvent.CompactionReason.threshold,
+        start_event.compaction_start.reason,
+    );
     var end_event = session.drainPublicEvent().?;
     defer end_event.deinit();
     try std.testing.expect(end_event == .compaction_end);
-    try std.testing.expectEqual(AgentSessionEvent.CompactionReason.threshold, end_event.compaction_end.reason);
+    try std.testing.expectEqual(
+        session_events.AgentSessionEvent.CompactionReason.threshold,
+        end_event.compaction_end.reason,
+    );
     try std.testing.expect(end_event.compaction_end.result != null);
 
     var agent_start = session.drainPublicEvent().?;
@@ -3142,14 +2850,14 @@ test "agent session auto compacts after context overflow and retries once" {
         defer owned_event.deinit();
         if (owned_event == .compaction_start) {
             try std.testing.expectEqual(
-                AgentSessionEvent.CompactionReason.overflow,
+                session_events.AgentSessionEvent.CompactionReason.overflow,
                 owned_event.compaction_start.reason,
             );
             saw_overflow_start = true;
         }
         if (owned_event == .compaction_end) {
             try std.testing.expectEqual(
-                AgentSessionEvent.CompactionReason.overflow,
+                session_events.AgentSessionEvent.CompactionReason.overflow,
                 owned_event.compaction_end.reason,
             );
             try std.testing.expect(owned_event.compaction_end.will_retry);
@@ -3561,7 +3269,7 @@ fn drainAllPublicEvents(session: *AgentSession) void {
 
 fn expectNextPromptCommand(
     session: *AgentSession,
-    result: AgentSessionEvent.PromptCommandResult,
+    result: session_events.AgentSessionEvent.PromptCommandResult,
     command: []const u8,
     message: []const u8,
 ) !void {

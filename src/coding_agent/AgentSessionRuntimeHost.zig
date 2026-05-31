@@ -4,6 +4,7 @@ const ai = @import("../ai/root.zig");
 const faux = @import("../ai/providers/faux.zig");
 const runtime = @import("../runtime/root.zig");
 const AgentSession = @import("AgentSession.zig");
+const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
 const tool_registry = @import("tool_registry.zig");
@@ -68,9 +69,9 @@ pub const NewSessionResult = struct {
 
 pub const PublicEventHandler = struct {
     context: ?*anyopaque = null,
-    call_fn: *const fn (context: ?*anyopaque, event: AgentSession.AgentSessionEvent) anyerror!void,
+    call_fn: *const fn (context: ?*anyopaque, event: session_events.AgentSessionEvent) anyerror!void,
 
-    fn call(self: PublicEventHandler, event: AgentSession.AgentSessionEvent) anyerror!void {
+    fn call(self: PublicEventHandler, event: session_events.AgentSessionEvent) anyerror!void {
         try self.call_fn(self.context, event);
     }
 };
@@ -163,25 +164,25 @@ pub fn continueRun(self: *AgentSessionRuntimeHost) !void {
 pub fn compactWithPreparedSummary(
     self: *AgentSessionRuntimeHost,
     summary: []const u8,
-) !AgentSession.CompactionResult {
+) !session_events.CompactionResult {
     return self.session.compactWithPreparedSummary(summary);
 }
 
 pub fn compactWithGeneratedSummary(
     self: *AgentSessionRuntimeHost,
-) !AgentSession.CompactionResult {
+) !session_events.CompactionResult {
     return self.session.compactWithGeneratedSummary();
 }
 
 pub fn prepareCompactionSnapshot(
     self: *AgentSessionRuntimeHost,
-) !AgentSession.CompactionPreparationSnapshot {
+) !session_events.CompactionPreparationSnapshot {
     return self.session.prepareCompactionSnapshot();
 }
 
 pub fn prepareCompactionSummaryInputSnapshot(
     self: *AgentSessionRuntimeHost,
-) !AgentSession.CompactionSummaryInputSnapshot {
+) !session_events.CompactionSummaryInputSnapshot {
     return self.session.prepareCompactionSummaryInputSnapshot();
 }
 
@@ -201,7 +202,7 @@ pub fn toolSnapshot(self: *const AgentSessionRuntimeHost) AgentSession.ToolSnaps
     return self.session.toolSnapshot();
 }
 
-pub fn queueSnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !AgentSession.QueueSnapshot {
+pub fn queueSnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
     return self.session.queueSnapshot(allocator);
 }
 
@@ -209,7 +210,7 @@ pub fn publicEventCount(self: *const AgentSessionRuntimeHost) usize {
     return self.session.publicEventCount();
 }
 
-pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?AgentSession.AgentSessionEvent {
+pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?session_events.AgentSessionEvent {
     return self.session.drainPublicEvent();
 }
 
@@ -269,7 +270,7 @@ fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
     _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
 }
 
-fn ignorePublicEvent(_: ?*anyopaque, _: AgentSession.AgentSessionEvent) !void {}
+fn ignorePublicEvent(_: ?*anyopaque, _: session_events.AgentSessionEvent) !void {}
 
 fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
     const run = try host.startPromptRun(text, &.{}, .{});
@@ -315,7 +316,7 @@ const ToolLoopObservation = struct {
     agent_end_with_tool_result: bool = false,
     agent_end: bool = false,
 
-    fn onEvent(context: ?*anyopaque, event: AgentSession.AgentSessionEvent) !void {
+    fn onEvent(context: ?*anyopaque, event: session_events.AgentSessionEvent) !void {
         const self: *ToolLoopObservation = @ptrCast(@alignCast(context.?));
         if (event != .agent_event) return;
 
@@ -367,7 +368,7 @@ const BashLimitObservation = struct {
     output_limit_exceeded: bool = false,
     tool_result_message: bool = false,
 
-    fn onEvent(context: ?*anyopaque, event: AgentSession.AgentSessionEvent) !void {
+    fn onEvent(context: ?*anyopaque, event: session_events.AgentSessionEvent) !void {
         const self: *BashLimitObservation = @ptrCast(@alignCast(context.?));
         if (event != .agent_event) return;
 

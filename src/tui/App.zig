@@ -2,7 +2,7 @@ const std = @import("std");
 
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
-const AgentSession = @import("../coding_agent/AgentSession.zig");
+const session_events = @import("../coding_agent/session_events.zig");
 const composer_mod = @import("composer.zig");
 const transcript_mod = @import("transcript.zig");
 
@@ -99,7 +99,7 @@ pub fn appendSystem(self: *App, text: []const u8) !void {
     self.dirty = true;
 }
 
-pub fn applyAgentSessionEvent(self: *App, event: AgentSession.AgentSessionEvent) !void {
+pub fn applyAgentSessionEvent(self: *App, event: session_events.AgentSessionEvent) !void {
     switch (event) {
         .agent_event => |agent_event| try self.applyAgentEvent(agent_event),
         .prompt_command => |payload| try self.appendSystem(payload.message.text),
@@ -184,10 +184,10 @@ test "prompt command event appends system transcript item" {
     var app = App.init(std.testing.allocator, 80, 24);
     defer app.deinit();
 
-    var event: AgentSession.AgentSessionEvent = .{ .prompt_command = .{
-        .command = try AgentSession.EventText.init(std.testing.allocator, "missing"),
+    var event: session_events.AgentSessionEvent = .{ .prompt_command = .{
+        .command = try session_events.EventText.init(std.testing.allocator, "missing"),
         .result = .unknown,
-        .message = try AgentSession.EventText.init(std.testing.allocator, "unknown command: /missing"),
+        .message = try session_events.EventText.init(std.testing.allocator, "unknown command: /missing"),
     } };
     defer event.deinit();
 

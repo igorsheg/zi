@@ -7,6 +7,7 @@ const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_config = @import("session_config.zig");
+const session_events = @import("session_events.zig");
 const session_store = @import("session_store.zig");
 
 pub const CreateRuntimeHostOptions = struct {
@@ -337,7 +338,7 @@ fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
     _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
 }
 
-fn ignorePublicEvent(_: ?*anyopaque, _: AgentSession.AgentSessionEvent) !void {}
+fn ignorePublicEvent(_: ?*anyopaque, _: session_events.AgentSessionEvent) !void {}
 
 fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
     const run = try host.startPromptRun(text, &.{}, .{});
