@@ -25,7 +25,29 @@ pub const SessionStore = struct {
         defer manager.deinit();
         const line = try formatHeaderLine(allocator, manager.header);
         defer allocator.free(line);
-        try writeFileAtomic(io, dir, file_name, line);
+        try writeFileAtomic(allocator, io, dir, file_name, line);
+        return .{ .dir = dir, .file_name = file_name };
+    }
+
+    pub fn createInPath(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        sessions_dir: []const u8,
+        cwd: []const u8,
+        session_id: []const u8,
+        timestamp: []const u8,
+    ) !SessionStore {
+        try dir.createDirPath(io, sessions_dir);
+        const leaf_name = try std.fmt.allocPrint(allocator, "{s}_{s}.jsonl", .{ timestamp, session_id });
+        defer allocator.free(leaf_name);
+        const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, leaf_name });
+        errdefer allocator.free(file_name);
+        var manager = try session_manager.SessionManager.init(allocator, cwd, session_id, timestamp);
+        defer manager.deinit();
+        const line = try formatHeaderLine(allocator, manager.header);
+        defer allocator.free(line);
+        try writeFileAtomic(allocator, io, dir, file_name, line);
         return .{ .dir = dir, .file_name = file_name };
     }
 
@@ -52,9 +74,20 @@ pub const SessionStore = struct {
     }
 };
 
-fn writeFileAtomic(io: std.Io, dir: std.Io.Dir, file_name: []const u8, data: []const u8) !void {
-    var tmp_name_buffer: [256]u8 = undefined;
-    const tmp_name = try std.fmt.bufPrint(&tmp_name_buffer, ".{s}.tmp", .{file_name});
+fn writeFileAtomic(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    file_name: []const u8,
+    data: []const u8,
+) !void {
+    const tmp_leaf = try std.fmt.allocPrint(allocator, ".{s}.tmp", .{std.fs.path.basename(file_name)});
+    defer allocator.free(tmp_leaf);
+    const tmp_name = if (std.fs.path.dirname(file_name)) |parent|
+        try std.fs.path.join(allocator, &.{ parent, tmp_leaf })
+    else
+        try allocator.dupe(u8, tmp_leaf);
+    defer allocator.free(tmp_name);
     try dir.writeFile(io, .{ .sub_path = tmp_name, .data = data });
     try std.Io.Dir.rename(dir, tmp_name, dir, file_name, io);
 }

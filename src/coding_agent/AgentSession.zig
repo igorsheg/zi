@@ -4,6 +4,7 @@ const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const resources = @import("resources.zig");
 const session_manager = @import("session_manager.zig");
+const session_store = @import("session_store.zig");
 const system_prompt = @import("system_prompt.zig");
 const tool_registry = @import("tool_registry.zig");
 
@@ -21,6 +22,7 @@ system_prompt_state: SystemPromptState,
 builtin_tools: tool_registry.BuiltinTools,
 tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
+store: ?*session_store.SessionStore = null,
 agent: *agent_mod.Agent,
 public_event_buffer: []AgentSessionEvent,
 public_events: *PublicEventQueue,
@@ -41,6 +43,8 @@ pub const Options = struct {
     dir: std.Io.Dir = .cwd(),
     allow_paths_outside_cwd: bool = false,
     public_event_capacity: usize = public_event_capacity_default,
+    session_store: ?session_store.SessionStore = null,
+    resume_session_store: ?session_store.SessionStore = null,
 };
 
 pub const StreamingBehavior = enum {
@@ -442,7 +446,9 @@ const SystemPromptState = struct {
 
 const EventDrain = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     manager: *session_manager.SessionManager,
+    store: ?*session_store.SessionStore,
     queue_mirror: *QueueMirror,
     public_events: *PublicEventQueue,
     timestamp: []const u8,
@@ -475,7 +481,11 @@ const EventDrain = struct {
 
     fn persistEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         if (event != .message_end) return;
-        _ = try self.manager.appendMessage(event.message_end.message, self.timestamp);
+        try self.manager.ensureAppendCapacity(1);
+        const entry = try self.manager.prepareMessageEntry(event.message_end.message, self.timestamp);
+        errdefer self.manager.deinitPreparedEntry(entry);
+        if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
+        _ = self.manager.commitPreparedEntry(entry);
     }
 
     fn handleTerminalPolicy(self: *EventDrain, event: agent_mod.AgentEvent) !void {
@@ -537,21 +547,41 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     );
     errdefer system_prompt_state.deinit(allocator);
 
+    if (options.session_store != null and options.resume_session_store != null) return error.DuplicateSessionStore;
+
     const manager = try allocator.create(session_manager.SessionManager);
     errdefer allocator.destroy(manager);
-    manager.* = try session_manager.SessionManager.init(
-        allocator,
-        options.cwd,
-        options.session_id,
-        options.timestamp,
-    );
+    manager.* = if (options.resume_session_store) |resume_store|
+        try resume_store.load(allocator, io)
+    else
+        try session_manager.SessionManager.init(
+            allocator,
+            options.cwd,
+            options.session_id,
+            options.timestamp,
+        );
     errdefer manager.deinit();
+
+    const store = if (options.session_store orelse options.resume_session_store) |provided_store| blk: {
+        const store_ptr = try allocator.create(session_store.SessionStore);
+        errdefer allocator.destroy(store_ptr);
+        store_ptr.* = provided_store;
+        break :blk store_ptr;
+    } else null;
+    errdefer if (store) |store_ptr| {
+        store_ptr.deinit(allocator);
+        allocator.destroy(store_ptr);
+    };
+
+    const session_context = try manager.buildSessionContext(allocator);
+    defer manager.deinitSessionContext(allocator, session_context);
 
     var agent_options: agent_mod.Agent.Options = .{
         .system_prompt = system_prompt_state.text,
         .model = options.model,
         .thinking_level = options.thinking_level,
         .tools = tools.activeAgentTools(),
+        .messages = session_context.messages,
     };
     if (options.stream) |stream| agent_options.stream = stream;
     if (options.get_api_key) |get_api_key| agent_options.get_api_key = get_api_key;
@@ -577,7 +607,9 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     errdefer allocator.destroy(event_drain);
     event_drain.* = .{
         .allocator = allocator,
+        .io = io,
         .manager = manager,
+        .store = store,
         .queue_mirror = queue_mirror,
         .public_events = public_events,
         .timestamp = timestamp,
@@ -596,6 +628,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .builtin_tools = builtin_tools,
         .tools = tools,
         .manager = manager,
+        .store = store,
         .agent = core_agent,
         .public_event_buffer = public_event_buffer,
         .public_events = public_events,
@@ -616,6 +649,10 @@ pub fn deinit(self: *AgentSession) void {
     self.allocator.destroy(self.queue_mirror);
     self.allocator.destroy(self.public_events);
     self.allocator.free(self.public_event_buffer);
+    if (self.store) |store| {
+        store.deinit(self.allocator);
+        self.allocator.destroy(store);
+    }
     self.manager.deinit();
     self.allocator.destroy(self.manager);
     self.tools.deinit(self.allocator);

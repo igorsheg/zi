@@ -124,16 +124,41 @@ pub const SessionManager = struct {
     }
 
     pub fn appendMessage(self: *SessionManager, message: agent.AgentMessage, timestamp: []const u8) Error![]const u8 {
-        const base = try self.nextBase(timestamp);
-        const entry: SessionEntry = blk: {
-            errdefer self.deinitBase(base);
-            break :blk .{ .message = .{
-                .base = base,
-                .message = try agent.copyAgentMessage(self.allocator, message),
-            } };
-        };
+        try self.ensureAppendCapacity(1);
+        const entry = try self.prepareMessageEntry(message, timestamp);
         errdefer self.deinitEntry(entry);
-        return self.appendEntry(entry);
+        return self.commitPreparedEntry(entry);
+    }
+
+    pub fn ensureAppendCapacity(self: *SessionManager, additional_count: usize) Error!void {
+        if (additional_count > max_session_entries - self.entries.items.len) return error.EntryLimitExceeded;
+        try self.entries.ensureUnusedCapacity(self.allocator, additional_count);
+    }
+
+    pub fn prepareMessageEntry(
+        self: *SessionManager,
+        message: agent.AgentMessage,
+        timestamp: []const u8,
+    ) Error!SessionEntry {
+        const base = try self.nextBase(timestamp);
+        errdefer self.deinitBase(base);
+        return .{ .message = .{
+            .base = base,
+            .message = try agent.copyAgentMessage(self.allocator, message),
+        } };
+    }
+
+    pub fn commitPreparedEntry(self: *SessionManager, entry: SessionEntry) []const u8 {
+        std.debug.assert(self.entries.items.len < max_session_entries);
+        const id = entry.id();
+        self.entries.appendAssumeCapacity(entry);
+        self.leaf_id = id;
+        self.next_id += 1;
+        return id;
+    }
+
+    pub fn deinitPreparedEntry(self: *SessionManager, entry: SessionEntry) void {
+        self.deinitEntry(entry);
     }
 
     pub fn appendThinkingLevelChange(
@@ -332,7 +357,6 @@ pub const SessionManager = struct {
         const parent_id = if (self.leaf_id) |leaf_id| try self.allocator.dupe(u8, leaf_id) else null;
         errdefer if (parent_id) |value| self.allocator.free(value);
         const timestamp_copy = try self.allocator.dupe(u8, timestamp);
-        self.next_id += 1;
         return .{
             .id = id,
             .parent_id = parent_id,
@@ -344,6 +368,7 @@ pub const SessionManager = struct {
         const id = entry.id();
         try self.entries.append(self.allocator, entry);
         self.leaf_id = id;
+        self.next_id += 1;
         return id;
     }
 
@@ -414,6 +439,24 @@ test "append entries create parent linked branch" {
 
     try std.testing.expectEqualStrings(first, manager.entries.items[1].parentId().?);
     try std.testing.expectEqualStrings(second, manager.leaf_id.?);
+}
+
+test "prepared message entry does not mutate active leaf before commit" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    try manager.ensureAppendCapacity(1);
+    const entry = try manager.prepareMessageEntry(userMessage("one"), "t1");
+    var committed = false;
+    errdefer if (!committed) manager.deinitPreparedEntry(entry);
+
+    try std.testing.expect(manager.leaf_id == null);
+    try std.testing.expectEqual(@as(usize, 0), manager.entries.items.len);
+
+    const id = manager.commitPreparedEntry(entry);
+    committed = true;
+    try std.testing.expectEqualStrings("00000001", id);
+    try std.testing.expectEqualStrings(id, manager.leaf_id.?);
 }
 
 test "build context follows active leaf" {

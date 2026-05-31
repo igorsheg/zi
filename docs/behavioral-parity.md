@@ -57,7 +57,7 @@ ai
 | Queue snapshots expose text without copying full text into every event | `queue_update` plus queue arrays | `AgentSession` | implemented | `agent session queue update carries revision and snapshot exposes queued text` |
 | Public event drain is caller-driven | `subscribe()` over session events | `AgentSession` | implemented | `agent session public event drain is caller driven` |
 | Event order is session policy before frontend policy | `AgentSession` event subscription/persistence path | `AgentSession` | implemented | `agent session terminal policy runs after persistence` |
-| Session history is durable truth | `core/session-manager.ts` | `SessionManager` / `session_store` | partial | `session store appends entries and round trips context` |
+| Session history is durable truth | `core/session-manager.ts` | `SessionManager` / `session_store` | implemented for new SDK sessions and explicit resume; fork/import/export missing | `session store appends entries and round trips context`; `runtime host preserves session header active leaf and context after public drain`; `runtime host persists session store that loads after host deinit`; `runtime host resumes session store into agent context and appends new history`; `sdk runtime creates session store under service session path`; `sdk runtime resumes existing session store from service session path` |
 | Persistent message events are written before public drain | `AgentSession` subscription persistence | `AgentSession` | implemented | `agent session persists message_end through session event drain` |
 | Public event queue overflow is explicit | `AgentSessionEvent` listeners | `AgentSession` | implemented | `agent session public event queue overflow is explicit` |
 | Cancellation intent remains observable until terminal event | abort/cancel flow | `AgentSession` | implemented | `agent session cancel while running is observable until terminal event` |
@@ -86,9 +86,10 @@ ai
 Work down this list. Do not add a framework to satisfy a row.
 
 1. Harden durable session truth.
-   - Prove `AgentSession` writes the same durable facts regardless of frontend.
-   - Add tests around session header, active leaf, and message persistence through
-     `AgentSessionRuntimeHost`.
+   - Add listing/selection policy for resumable session files.
+   - Keep fork/import/export separate from resume.
+   - Keep frontend event drains observational; they must not alter persisted
+     history, active leaf, or session header.
 
 2. Harden the bounded process tool.
    - Add session/agent-loop behavior coverage for cancellation.

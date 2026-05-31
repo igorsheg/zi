@@ -5,6 +5,7 @@ const faux = @import("../ai/providers/faux.zig");
 const runtime = @import("../runtime/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_manager = @import("session_manager.zig");
+const session_store = @import("session_store.zig");
 const tool_registry = @import("tool_registry.zig");
 
 const AgentSessionRuntimeHost = @This();
@@ -32,6 +33,8 @@ pub const BaseOptions = struct {
 pub const SessionStart = struct {
     session_id: []const u8,
     timestamp: []const u8,
+    session_store: ?session_store.SessionStore = null,
+    resume_session_store: ?session_store.SessionStore = null,
 };
 
 pub const RebindSession = struct {
@@ -205,6 +208,8 @@ fn buildSessionOptions(base: BaseOptions, start: SessionStart) AgentSession.Opti
         .current_date = base.current_date,
         .session_id = start.session_id,
         .timestamp = start.timestamp,
+        .session_store = start.session_store,
+        .resume_session_store = start.resume_session_store,
         .model = base.model,
         .thinking_level = base.thinking_level,
         .stream = base.stream,
@@ -546,6 +551,190 @@ test "runtime host persists run messages before frontend drains public events" {
     const drained_context = try host.session.manager.buildSessionContext(std.testing.allocator);
     defer host.session.manager.deinitSessionContext(std.testing.allocator, drained_context);
     try std.testing.expectEqual(context.messages.len, drained_context.messages.len);
+}
+
+test "runtime host preserves session header active leaf and context after public drain" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    try runPromptForTest(&host, "first");
+    const first_leaf = (try host.session.manager.getLeafEntry()).?.id();
+    try runPromptForTest(&host, "second");
+
+    const header = host.sessionHeader();
+    try std.testing.expectEqualStrings("session", header.id);
+    try std.testing.expectEqualStrings("repo", header.cwd);
+    try std.testing.expectEqualStrings("2026-05-26T00:00:00Z", header.timestamp);
+
+    const leaf = (try host.session.manager.getLeafEntry()).?;
+    try std.testing.expectEqual(@as(usize, 4), host.session.manager.entries.items.len);
+    try std.testing.expectEqualStrings(first_leaf, host.session.manager.entries.items[2].parentId().?);
+    try std.testing.expectEqualStrings(host.session.manager.entries.items[2].id(), leaf.parentId().?);
+
+    const context = try host.session.manager.buildSessionContext(std.testing.allocator);
+    defer host.session.manager.deinitSessionContext(std.testing.allocator, context);
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try std.testing.expectEqualStrings("first", context.messages[0].user.content.string);
+    try std.testing.expectEqualStrings("second", context.messages[2].user.content.string);
+
+    drainHostEvents(&host);
+    const drained_leaf = (try host.session.manager.getLeafEntry()).?;
+    try std.testing.expectEqualStrings(leaf.id(), drained_leaf.id());
+    try std.testing.expectEqualStrings(host.session.manager.entries.items[2].id(), drained_leaf.parentId().?);
+}
+
+test "runtime host persists session store that loads after host deinit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var store = try session_store.SessionStore.create(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "repo",
+        "session",
+        "2026-05-26T00:00:00Z",
+    );
+    const store_file_name = try std.testing.allocator.dupe(u8, store.file_name);
+    errdefer std.testing.allocator.free(store_file_name);
+
+    {
+        var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+            .cwd = "repo",
+            .agent_dir = "agent",
+            .current_date = "2026-05-26",
+            .dir = tmp.dir,
+        }, .{
+            .session_id = "session",
+            .timestamp = "2026-05-26T00:00:00Z",
+            .session_store = store,
+        });
+        store = undefined;
+        defer {
+            host.requestShutdown();
+            drainHostEvents(&host);
+            host.deinit();
+        }
+
+        try runPromptForTest(&host, "first");
+        try runPromptForTest(&host, "second");
+    }
+
+    var loader: session_store.SessionStore = .{ .dir = tmp.dir, .file_name = store_file_name };
+    defer loader.deinit(std.testing.allocator);
+    var loaded = try loader.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+
+    try std.testing.expectEqualStrings("session", loaded.header.id);
+    try std.testing.expectEqualStrings("repo", loaded.header.cwd);
+    try std.testing.expectEqual(@as(usize, 4), loaded.entries.items.len);
+    try std.testing.expectEqualStrings(loaded.entries.items[1].id(), loaded.entries.items[2].parentId().?);
+    try std.testing.expectEqualStrings(loaded.entries.items[2].id(), loaded.entries.items[3].parentId().?);
+
+    const context = try loaded.buildSessionContext(std.testing.allocator);
+    defer loaded.deinitSessionContext(std.testing.allocator, context);
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try std.testing.expectEqualStrings("first", context.messages[0].user.content.string);
+    try std.testing.expectEqualStrings("second", context.messages[2].user.content.string);
+}
+
+test "runtime host resumes session store into agent context and appends new history" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var seed_store = try session_store.SessionStore.create(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "repo",
+        "session",
+        "2026-05-26T00:00:00Z",
+    );
+    const store_file_name = try std.testing.allocator.dupe(u8, seed_store.file_name);
+    errdefer std.testing.allocator.free(store_file_name);
+
+    {
+        var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+            .cwd = "repo",
+            .agent_dir = "agent",
+            .current_date = "2026-05-26",
+            .dir = tmp.dir,
+        }, .{
+            .session_id = "session",
+            .timestamp = "2026-05-26T00:00:00Z",
+            .session_store = seed_store,
+        });
+        seed_store = undefined;
+        defer {
+            host.requestShutdown();
+            drainHostEvents(&host);
+            host.deinit();
+        }
+
+        try runPromptForTest(&host, "seed");
+    }
+
+    const resume_file_name = try std.testing.allocator.dupe(u8, store_file_name);
+    errdefer std.testing.allocator.free(resume_file_name);
+    var resume_store: session_store.SessionStore = .{ .dir = tmp.dir, .file_name = resume_file_name };
+    {
+        var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+            .cwd = "repo",
+            .agent_dir = "agent",
+            .current_date = "2026-05-26",
+            .dir = tmp.dir,
+        }, .{
+            .session_id = "ignored",
+            .timestamp = "ignored",
+            .resume_session_store = resume_store,
+        });
+        resume_store = undefined;
+        defer {
+            host.requestShutdown();
+            drainHostEvents(&host);
+            host.deinit();
+        }
+
+        try std.testing.expectEqualStrings("session", host.sessionHeader().id);
+        try std.testing.expectEqual(@as(usize, 2), host.session.agent.state.messages.len);
+        try std.testing.expectEqualStrings("seed", host.session.agent.state.messages[0].user.content.string);
+        try runPromptForTest(&host, "after resume");
+    }
+
+    var loader: session_store.SessionStore = .{ .dir = tmp.dir, .file_name = store_file_name };
+    defer loader.deinit(std.testing.allocator);
+    var loaded = try loader.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+    const context = try loaded.buildSessionContext(std.testing.allocator);
+    defer loaded.deinitSessionContext(std.testing.allocator, context);
+
+    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+    try std.testing.expectEqualStrings("seed", context.messages[0].user.content.string);
+    try std.testing.expectEqualStrings("after resume", context.messages[2].user.content.string);
 }
 
 test "runtime host live run executes a tool and continues the assistant turn" {
