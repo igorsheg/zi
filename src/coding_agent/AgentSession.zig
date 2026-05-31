@@ -11,6 +11,7 @@ const tool_registry = @import("tool_registry.zig");
 const AgentSession = @This();
 
 pub const public_event_capacity_default = 256;
+pub const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 4096;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -945,6 +946,21 @@ pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !Com
     } });
 }
 
+pub fn compactWithGeneratedSummary(self: *AgentSession) !CompactionResult {
+    try self.ensureAcceptsContinue();
+    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
+    return self.generateAndApplyManualCompaction() catch |err| {
+        const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
+        self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
+            .reason = .manual,
+            .aborted = err == error.OperationCancelled,
+            .will_retry = false,
+            .error_message = error_message,
+        } });
+        return err;
+    };
+}
+
 pub fn prepareCompactionSnapshot(self: *AgentSession) !CompactionPreparationSnapshot {
     try self.ensureAcceptsContinue();
     var preparation = try self.manager.prepareCompaction(self.allocator, self.compaction_settings);
@@ -1159,6 +1175,103 @@ fn prepareAndApplyManualCompaction(
         preparation.first_kept_entry_id,
         preparation.tokens_before,
     );
+}
+
+fn generateAndApplyManualCompaction(self: *AgentSession) !CompactionResult {
+    var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
+    defer input.deinit();
+    const serialized_input = try input.serialize(self.allocator);
+    defer self.allocator.free(serialized_input);
+    const summary = try self.generateCompactionSummary(serialized_input);
+    defer self.allocator.free(summary);
+    return self.applyManualCompaction(
+        summary,
+        input.first_kept_entry_id,
+        input.tokens_before,
+    );
+}
+
+fn generateCompactionSummary(self: *AgentSession, serialized_input: []const u8) ![]const u8 {
+    const summary_prompt = try buildCompactionSummaryPrompt(self.allocator, serialized_input);
+    defer self.allocator.free(summary_prompt);
+    var messages = [_]ai.Message{.{ .user = .{
+        .content = .{ .string = summary_prompt },
+        .timestamp = 0,
+    } }};
+
+    var stream_options = self.agent.loop_config.options.stream;
+    var owned_api_key: ?[]const u8 = null;
+    defer if (owned_api_key) |api_key| self.allocator.free(api_key);
+    if (self.agent.loop_config.get_api_key) |get_api_key| {
+        if (try agent_mod.GetApiKeyHook.call(self.allocator, get_api_key, self.agent.state.model.provider)) |api_key| {
+            owned_api_key = api_key;
+            stream_options.api_key = api_key;
+        }
+    }
+
+    var cancel_source: runtime.CancelSource = .{};
+    var response_arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer response_arena.deinit();
+    var stream = self.agent.loop_config.stream.call(.{
+        .allocator = response_arena.allocator(),
+        .io = self.io,
+        .model = self.agent.state.model,
+        .context = .{
+            .system_prompt = null,
+            .messages = &messages,
+            .tools = &.{},
+        },
+        .options = stream_options,
+        .cancel_token = cancel_source.token(),
+    });
+    defer stream.deinit();
+
+    while (try stream.next(self.io)) |event| switch (event) {
+        .@"error" => |payload| return extractCompactionSummary(self.allocator, payload.@"error"),
+        else => {},
+    };
+    const result = stream.result() orelse return error.MissingCompactionSummary;
+    return extractCompactionSummary(self.allocator, result);
+}
+
+fn buildCompactionSummaryPrompt(
+    allocator: std.mem.Allocator,
+    serialized_input: []const u8,
+) ![]const u8 {
+    const prefix =
+        "Summarize the conversation for future continuation. Preserve user intent, decisions, files, " ++
+        "tool outcomes, and unresolved work. Return only the summary.\n\n";
+    const suffix = "\n";
+    if (serialized_input.len > max_compaction_summary_prompt_bytes - prefix.len - suffix.len) {
+        return error.CompactionSummaryPromptTooLarge;
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, serialized_input, suffix });
+}
+
+fn extractCompactionSummary(
+    allocator: std.mem.Allocator,
+    message: ai.AssistantMessage,
+) ![]const u8 {
+    if (message.stop_reason == .aborted) return error.OperationCancelled;
+    if (message.stop_reason == .error_) return error.CompactionSummaryGenerationFailed;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    for (message.content) |content| switch (content) {
+        .text => |text| try appendGeneratedSummaryText(&writer, text.text),
+        else => {},
+    };
+    if (writer.written().len == 0) return error.MissingCompactionSummary;
+    return writer.toOwnedSlice();
+}
+
+fn appendGeneratedSummaryText(writer: *std.Io.Writer.Allocating, text: []const u8) !void {
+    if (text.len > session_manager.max_compaction_summary_bytes or
+        writer.written().len > session_manager.max_compaction_summary_bytes - text.len)
+    {
+        return error.CompactionSummaryTooLarge;
+    }
+    try writer.writer.writeAll(text);
 }
 
 fn reconcileLifecycle(self: *AgentSession) void {
@@ -2343,6 +2456,65 @@ test "agent session prepared manual compaction uses session settings" {
 
     try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
     try std.testing.expectEqual(@as(u64, 4), result.tokens_before);
+}
+
+test "agent session generated manual compaction summarizes and persists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const summary_content = [_]ai.AssistantContent{ai.faux.text("generated summary")};
+    const summaries = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&summaries);
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    const kept = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    var result = try session.compactWithGeneratedSummary();
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), provider.call_count);
+    try std.testing.expectEqualStrings("generated summary", result.summary.text);
+    try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
+    try std.testing.expectEqualStrings("generated summary", session.manager.entries.items[2].compaction.summary);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        session.agent.state.messages[0].user.content.string,
+        "generated summary",
+    ) != null);
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expectEqualStrings("generated summary", end_event.compaction_end.result.?.summary.text);
 }
 
 test "agent session prepares owned compaction snapshot" {

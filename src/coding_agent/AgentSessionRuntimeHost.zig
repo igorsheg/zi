@@ -166,6 +166,12 @@ pub fn compactWithPreparedSummary(
     return self.session.compactWithPreparedSummary(summary);
 }
 
+pub fn compactWithGeneratedSummary(
+    self: *AgentSessionRuntimeHost,
+) !AgentSession.CompactionResult {
+    return self.session.compactWithGeneratedSummary();
+}
+
 pub fn prepareCompactionSnapshot(
     self: *AgentSessionRuntimeHost,
 ) !AgentSession.CompactionPreparationSnapshot {
@@ -882,6 +888,65 @@ test "runtime host compacts through public command boundary" {
     defer end_event.deinit();
     try std.testing.expect(end_event == .compaction_end);
     try std.testing.expectEqualStrings(kept, end_event.compaction_end.result.?.first_kept_entry_id.text);
+}
+
+test "runtime host compacts with generated summary through public command boundary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try faux.Provider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const summary_content = [_]ai.AssistantContent{faux.text("generated summary")};
+    const summaries = [_]ai.AssistantMessage{
+        faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&summaries);
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    _ = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    const kept = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+
+    var result = try host.compactWithGeneratedSummary();
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), provider.call_count);
+    try std.testing.expectEqualStrings("generated summary", result.summary.text);
+    try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(usize, 3), host.session.manager.entries.items.len);
+
+    var start_event = host.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = host.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expectEqualStrings("generated summary", end_event.compaction_end.result.?.summary.text);
 }
 
 test "runtime host exposes compaction preparation snapshot" {
