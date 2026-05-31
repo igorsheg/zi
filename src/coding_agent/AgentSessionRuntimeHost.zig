@@ -159,6 +159,13 @@ pub fn continueRun(self: *AgentSessionRuntimeHost) !void {
     try self.session.continueRun();
 }
 
+pub fn compactWithPreparedSummary(
+    self: *AgentSessionRuntimeHost,
+    summary: []const u8,
+) !AgentSession.CompactionResult {
+    return self.session.compactWithPreparedSummary(summary);
+}
+
 pub fn cancel(self: *AgentSessionRuntimeHost) void {
     self.session.cancel();
 }
@@ -810,6 +817,59 @@ test "runtime host live run executes a tool and continues the assistant turn" {
     try std.testing.expect(observed.agent_end_with_tool_result);
     try std.testing.expect(observed.agent_end);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+}
+
+test "runtime host compacts through public command boundary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    _ = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } }, "t2");
+    const kept = try host.session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "cccccccc" },
+        .timestamp = 0,
+    } }, "t3");
+
+    var result = try host.compactWithPreparedSummary("summary");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(usize, 4), host.session.manager.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), host.session.agent.state.messages.len);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+
+    var start_event = host.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = host.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expectEqualStrings(kept, end_event.compaction_end.result.?.first_kept_entry_id.text);
 }
 
 test "runtime host preserves bash output limit details through public events" {
