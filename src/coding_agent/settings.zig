@@ -13,12 +13,12 @@ pub const Settings = struct {
 
     pub const Compaction = struct {
         keep_recent_tokens: ?u64 = null,
-        auto_enabled: ?bool = null,
+        enabled: ?bool = null,
     };
 
     pub const Retry = struct {
         enabled: ?bool = null,
-        max_attempts: ?u64 = null,
+        max_retries: ?u64 = null,
     };
 };
 
@@ -145,7 +145,7 @@ fn optionalCompaction(value: ?std.json.Value) !?Settings.Compaction {
     if (resolved != .object) return error.InvalidSettings;
     return .{
         .keep_recent_tokens = try optionalNonNegativeInteger(resolved.object.get("keepRecentTokens")),
-        .auto_enabled = try optionalBoolAlias(resolved.object, "autoEnabled", "enabled"),
+        .enabled = try optionalBool(resolved.object.get("enabled")),
     };
 }
 
@@ -155,18 +155,8 @@ fn optionalRetry(value: ?std.json.Value) !?Settings.Retry {
     if (resolved != .object) return error.InvalidSettings;
     return .{
         .enabled = try optionalBool(resolved.object.get("enabled")),
-        .max_attempts = try optionalNonNegativeIntegerAlias(resolved.object, "maxAttempts", "maxRetries"),
+        .max_retries = try optionalNonNegativeInteger(resolved.object.get("maxRetries")),
     };
-}
-
-fn optionalBoolAlias(object: anytype, primary: []const u8, fallback: []const u8) !?bool {
-    if (try optionalBool(object.get(primary))) |value| return value;
-    return optionalBool(object.get(fallback));
-}
-
-fn optionalNonNegativeIntegerAlias(object: anytype, primary: []const u8, fallback: []const u8) !?u64 {
-    if (try optionalNonNegativeInteger(object.get(primary))) |value| return value;
-    return optionalNonNegativeInteger(object.get(fallback));
 }
 
 fn optionalString(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]const u8 {
@@ -248,8 +238,8 @@ test "settings manager loads compaction and retry settings" {
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.zi/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":1234,\"autoEnabled\":true}," ++
-            "\"retry\":{\"enabled\":true,\"maxAttempts\":2}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":1234,\"enabled\":true}," ++
+            "\"retry\":{\"enabled\":true,\"maxRetries\":2}}",
     });
 
     var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
@@ -262,65 +252,10 @@ test "settings manager loads compaction and retry settings" {
         @as(u64, 1234),
         manager.current().project.loaded.value.compaction.?.keep_recent_tokens.?,
     );
-    try std.testing.expect(manager.current().project.loaded.value.compaction.?.auto_enabled.?);
+    try std.testing.expect(manager.current().project.loaded.value.compaction.?.enabled.?);
     try std.testing.expect(manager.current().project.loaded.value.retry.?.enabled.?);
     try std.testing.expectEqual(
         @as(u64, 2),
-        manager.current().project.loaded.value.retry.?.max_attempts.?,
-    );
-}
-
-test "settings manager accepts reference setting names at boundary" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "repo/.zi/settings.json",
-        .data = "{\"compaction\":{\"enabled\":true,\"keepRecentTokens\":99}," ++
-            "\"retry\":{\"enabled\":true,\"maxRetries\":3}}",
-    });
-
-    var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
-        .paths = .{ .global_dir = "agent", .cwd = "repo" },
-        .dir = tmp.dir,
-    });
-    defer manager.deinit();
-
-    try std.testing.expect(manager.current().project.loaded.value.compaction.?.auto_enabled.?);
-    try std.testing.expectEqual(
-        @as(u64, 99),
-        manager.current().project.loaded.value.compaction.?.keep_recent_tokens.?,
-    );
-    try std.testing.expect(manager.current().project.loaded.value.retry.?.enabled.?);
-    try std.testing.expectEqual(
-        @as(u64, 3),
-        manager.current().project.loaded.value.retry.?.max_attempts.?,
-    );
-}
-
-test "settings manager canonical setting names override aliases" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "repo/.zi/settings.json",
-        .data = "{\"compaction\":{\"enabled\":true,\"autoEnabled\":false}," ++
-            "\"retry\":{\"maxRetries\":3,\"maxAttempts\":2}}",
-    });
-
-    var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
-        .paths = .{ .global_dir = "agent", .cwd = "repo" },
-        .dir = tmp.dir,
-    });
-    defer manager.deinit();
-
-    try std.testing.expect(!manager.current().project.loaded.value.compaction.?.auto_enabled.?);
-    try std.testing.expectEqual(
-        @as(u64, 2),
-        manager.current().project.loaded.value.retry.?.max_attempts.?,
+        manager.current().project.loaded.value.retry.?.max_retries.?,
     );
 }

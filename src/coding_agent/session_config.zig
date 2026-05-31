@@ -104,11 +104,11 @@ fn resolveCompactionSettings(snapshot: *const settings_mod.SettingsSnapshot) ses
     var settings: session_manager.CompactionSettings = .{};
     if (global.compaction) |compaction| {
         if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
-        if (compaction.auto_enabled) |enabled| settings.auto_enabled = enabled;
+        if (compaction.enabled) |enabled| settings.auto_enabled = enabled;
     }
     if (project.compaction) |compaction| {
         if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
-        if (compaction.auto_enabled) |enabled| settings.auto_enabled = enabled;
+        if (compaction.enabled) |enabled| settings.auto_enabled = enabled;
     }
     return settings;
 }
@@ -119,11 +119,11 @@ fn resolveRetrySettings(snapshot: *const settings_mod.SettingsSnapshot) AgentSes
     var settings: AgentSession.RetrySettings = .{};
     if (global.retry) |retry| {
         if (retry.enabled) |enabled| settings.enabled = enabled;
-        if (retry.max_attempts) |attempts| settings.max_attempts = boundedRetryAttempts(attempts);
+        if (retry.max_retries) |attempts| settings.max_attempts = boundedRetryAttempts(attempts);
     }
     if (project.retry) |retry| {
         if (retry.enabled) |enabled| settings.enabled = enabled;
-        if (retry.max_attempts) |attempts| settings.max_attempts = boundedRetryAttempts(attempts);
+        if (retry.max_retries) |attempts| settings.max_attempts = boundedRetryAttempts(attempts);
     }
     return settings;
 }
@@ -222,13 +222,13 @@ test "session config uses project compaction and retry settings before global se
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agent/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":111,\"autoEnabled\":true}," ++
-            "\"retry\":{\"enabled\":false,\"maxAttempts\":1}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":111,\"enabled\":true}," ++
+            "\"retry\":{\"enabled\":false,\"maxRetries\":1}}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.zi/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":222,\"autoEnabled\":false}," ++
-            "\"retry\":{\"enabled\":true,\"maxAttempts\":2}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":222,\"enabled\":false}," ++
+            "\"retry\":{\"enabled\":true,\"maxRetries\":2}}",
     });
 
     var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
