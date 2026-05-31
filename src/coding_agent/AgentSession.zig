@@ -864,6 +864,25 @@ pub fn compactWithSummary(
     };
 }
 
+pub fn compactPreparedWithSummary(
+    self: *AgentSession,
+    summary: []const u8,
+    settings: session_manager.CompactionSettings,
+) !CompactionResult {
+    try self.ensureAcceptsContinue();
+    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
+    return self.prepareAndApplyManualCompaction(summary, settings) catch |err| {
+        const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
+        self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
+            .reason = .manual,
+            .aborted = false,
+            .will_retry = false,
+            .error_message = error_message,
+        } });
+        return err;
+    };
+}
+
 pub fn cancel(self: *AgentSession) void {
     self.reconcileLifecycle();
     if (self.agent.state.status == .settling) return;
@@ -1014,6 +1033,20 @@ fn applyManualCompaction(
     const result = return_result;
     return_result = undefined;
     return result;
+}
+
+fn prepareAndApplyManualCompaction(
+    self: *AgentSession,
+    summary: []const u8,
+    settings: session_manager.CompactionSettings,
+) !CompactionResult {
+    var preparation = try self.manager.prepareCompaction(self.allocator, settings);
+    defer preparation.deinit();
+    return self.applyManualCompaction(
+        summary,
+        preparation.first_kept_entry_id,
+        preparation.tokens_before,
+    );
 }
 
 fn ensureEntryInActiveBranch(self: *AgentSession, entry_id: []const u8) !void {
@@ -2128,6 +2161,76 @@ test "agent session manual compaction persists and replaces agent context" {
     try std.testing.expectEqual(@as(usize, 3), loaded.entries.items.len);
     try std.testing.expect(loaded.entries.items[2] == .compaction);
     try std.testing.expectEqualStrings("summary", loaded.entries.items[2].compaction.summary);
+}
+
+test "agent session prepared manual compaction owns cutpoint selection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } } } });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } } } });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "cccccccc" },
+        .timestamp = 0,
+    } } } });
+    session.agent.finishRun();
+    drainAllPublicEvents(&session);
+
+    const kept = session.manager.entries.items[2].id();
+    var result = try session.compactPreparedWithSummary("summary", .{ .keep_recent_tokens = 2 });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
+    try std.testing.expectEqual(@as(u64, 6), result.tokens_before);
+    try std.testing.expectEqual(@as(usize, 4), session.manager.entries.items.len);
+    try std.testing.expectEqualStrings(kept, session.manager.entries.items[3].compaction.first_kept_entry_id);
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expectEqualStrings(kept, end_event.compaction_end.result.?.first_kept_entry_id.text);
+}
+
+test "agent session prepared manual compaction emits failure event" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+
+    const root = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try session.manager.appendCompaction("summary", root, 2, "t2");
+    try session.agent.replaceMessages(&.{});
+
+    try std.testing.expectError(
+        error.AlreadyCompacted,
+        session.compactPreparedWithSummary("next", .{ .keep_recent_tokens = 1 }),
+    );
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expect(end_event.compaction_end.result == null);
+    try std.testing.expectEqualStrings("AlreadyCompacted", end_event.compaction_end.error_message.?.text);
 }
 
 test "agent session terminal policy runs after persistence" {
