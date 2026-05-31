@@ -148,6 +148,37 @@ pub const EventTextList = struct {
     }
 };
 
+pub const CompactionResult = struct {
+    summary: EventText,
+    first_kept_entry_id: EventText,
+    tokens_before: u64,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        entry: session_manager.SessionEntry.Compaction,
+    ) !CompactionResult {
+        return .{
+            .summary = try EventText.init(allocator, entry.summary),
+            .first_kept_entry_id = try EventText.init(allocator, entry.first_kept_entry_id),
+            .tokens_before = entry.tokens_before,
+        };
+    }
+
+    pub fn deinit(self: *CompactionResult) void {
+        self.summary.deinit();
+        self.first_kept_entry_id.deinit();
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: CompactionResult, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("summary", stringify, self.summary);
+        try writeJsonField("firstKeptEntryId", stringify, self.first_kept_entry_id);
+        try writeJsonField("tokensBefore", stringify, self.tokens_before);
+        try stringify.endObject();
+    }
+};
+
 const Lifecycle = enum {
     accepting,
     cancel_requested,
@@ -210,9 +241,16 @@ pub const AgentSessionEvent = union(enum) {
 
     pub const CompactionEnd = struct {
         reason: CompactionReason,
+        result: ?CompactionResult = null,
         aborted: bool,
         will_retry: bool,
         error_message: ?EventText = null,
+
+        pub fn deinit(self: *CompactionEnd) void {
+            if (self.result) |*result| result.deinit();
+            if (self.error_message) |*message| message.deinit();
+            self.* = undefined;
+        }
     };
 
     pub const AutoRetryStart = struct {
@@ -237,9 +275,7 @@ pub const AgentSessionEvent = union(enum) {
             .session_info_changed => |*payload| {
                 if (payload.name) |*name| name.deinit();
             },
-            .compaction_end => |*payload| {
-                if (payload.error_message) |*message| message.deinit();
-            },
+            .compaction_end => |*payload| payload.deinit(),
             .auto_retry_start => |*payload| payload.error_message.deinit(),
             .auto_retry_end => |*payload| {
                 if (payload.final_error) |*err| err.deinit();
@@ -283,6 +319,7 @@ pub const AgentSessionEvent = union(enum) {
                 try stringify.beginObject();
                 try writeJsonField("type", stringify, "compaction_end");
                 try writeJsonField("reason", stringify, payload.reason);
+                if (payload.result) |result| try writeJsonField("result", stringify, result);
                 try writeJsonField("aborted", stringify, payload.aborted);
                 try writeJsonField("willRetry", stringify, payload.will_retry);
                 if (payload.error_message) |message| try writeJsonField("errorMessage", stringify, message);
@@ -1897,7 +1934,7 @@ test "agent session slash command event serializes public shape" {
     );
 }
 
-test "agent session compaction end event serializes owned state only" {
+test "agent session failed compaction end event omits result" {
     var event: AgentSessionEvent = .{ .compaction_end = .{
         .reason = .manual,
         .aborted = true,
@@ -1914,6 +1951,39 @@ test "agent session compaction end event serializes owned state only" {
     try std.testing.expectEqualStrings(
         "{\"type\":\"compaction_end\",\"reason\":\"manual\",\"aborted\":true," ++
             "\"willRetry\":false,\"errorMessage\":\"not implemented\"}",
+        writer.written(),
+    );
+}
+
+test "agent session compaction end event serializes owned result" {
+    var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const first_kept = try manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "kept" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try manager.appendCompaction("summary", first_kept, 42, "t2");
+
+    var event: AgentSessionEvent = .{ .compaction_end = .{
+        .reason = .manual,
+        .result = try CompactionResult.init(
+            std.testing.allocator,
+            manager.entries.items[1].compaction,
+        ),
+        .aborted = false,
+        .will_retry = false,
+    } };
+    defer event.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try std.json.Stringify.value(event, .{}, &writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"compaction_end\",\"reason\":\"manual\",\"result\":{\"summary\":\"summary\"," ++
+            "\"firstKeptEntryId\":\"00000001\",\"tokensBefore\":42},\"aborted\":false,\"willRetry\":false}",
         writer.written(),
     );
 }
