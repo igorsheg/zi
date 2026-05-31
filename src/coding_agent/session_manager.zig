@@ -32,6 +32,7 @@ pub const SessionContext = struct {
 
 pub const CompactionSettings = struct {
     keep_recent_tokens: u64 = 20_000,
+    auto_enabled: bool = false,
 
     pub fn validate(self: CompactionSettings) error{CompactionSettingsOutOfBounds}!void {
         if (self.keep_recent_tokens > max_compaction_keep_recent_tokens) return error.CompactionSettingsOutOfBounds;

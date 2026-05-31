@@ -12,6 +12,7 @@ pub const Settings = struct {
 
     pub const Compaction = struct {
         keep_recent_tokens: ?u64 = null,
+        auto_enabled: ?bool = null,
     };
 };
 
@@ -137,6 +138,7 @@ fn optionalCompaction(value: ?std.json.Value) !?Settings.Compaction {
     if (resolved != .object) return error.InvalidSettings;
     return .{
         .keep_recent_tokens = try optionalNonNegativeInteger(resolved.object.get("keepRecentTokens")),
+        .auto_enabled = try optionalBool(resolved.object.get("autoEnabled")),
     };
 }
 
@@ -157,6 +159,13 @@ fn optionalNonNegativeInteger(value: ?std.json.Value) !?u64 {
     if (resolved == .null) return null;
     if (resolved != .integer or resolved.integer < 0) return error.InvalidSettings;
     return @intCast(resolved.integer);
+}
+
+fn optionalBool(value: ?std.json.Value) !?bool {
+    const resolved = value orelse return null;
+    if (resolved == .null) return null;
+    if (resolved != .bool) return error.InvalidSettings;
+    return resolved.bool;
 }
 
 test "settings manager treats missing global and project settings as defaults" {
@@ -212,7 +221,7 @@ test "settings manager loads compaction settings" {
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.zi/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":1234}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":1234,\"autoEnabled\":true}}",
     });
 
     var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
@@ -225,4 +234,5 @@ test "settings manager loads compaction settings" {
         @as(u64, 1234),
         manager.current().project.loaded.value.compaction.?.keep_recent_tokens.?,
     );
+    try std.testing.expect(manager.current().project.loaded.value.compaction.?.auto_enabled.?);
 }

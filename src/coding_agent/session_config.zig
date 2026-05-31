@@ -103,9 +103,11 @@ fn resolveCompactionSettings(snapshot: *const settings_mod.SettingsSnapshot) ses
     var settings: session_manager.CompactionSettings = .{};
     if (global.compaction) |compaction| {
         if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
+        if (compaction.auto_enabled) |enabled| settings.auto_enabled = enabled;
     }
     if (project.compaction) |compaction| {
         if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
+        if (compaction.auto_enabled) |enabled| settings.auto_enabled = enabled;
     }
     return settings;
 }
@@ -200,11 +202,11 @@ test "session config uses project compaction settings before global settings" {
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agent/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":111}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":111,\"autoEnabled\":true}}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.zi/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":222}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":222,\"autoEnabled\":false}}",
     });
 
     var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
@@ -217,6 +219,7 @@ test "session config uses project compaction settings before global settings" {
     const base = resolve(&services, .{ .current_date = "2026-05-27", .dir = tmp.dir });
 
     try std.testing.expectEqual(@as(u64, 222), base.compaction_settings.keep_recent_tokens);
+    try std.testing.expect(!base.compaction_settings.auto_enabled);
 }
 
 test "session config keeps provider and model settings scope atomic" {

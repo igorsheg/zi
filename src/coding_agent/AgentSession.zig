@@ -949,11 +949,15 @@ pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !Com
 
 pub fn compactWithGeneratedSummary(self: *AgentSession) !CompactionResult {
     try self.ensureAcceptsContinue();
-    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
-    return self.generateAndApplyManualCompaction() catch |err| {
+    return self.runGeneratedCompaction(.manual);
+}
+
+fn runGeneratedCompaction(self: *AgentSession, reason: AgentSessionEvent.CompactionReason) !CompactionResult {
+    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = reason } });
+    return self.generateAndApplyCompaction(reason) catch |err| {
         const error_message = EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
-            .reason = .manual,
+            .reason = reason,
             .aborted = err == error.OperationCancelled,
             .will_retry = false,
             .error_message = error_message,
@@ -1124,6 +1128,7 @@ fn ensureAcceptsContinue(self: *AgentSession) Error!void {
 
 fn applyManualCompaction(
     self: *AgentSession,
+    reason: AgentSessionEvent.CompactionReason,
     summary: []const u8,
     first_kept_entry_id: []const u8,
     tokens_before: u64,
@@ -1151,7 +1156,7 @@ fn applyManualCompaction(
     try self.agent.replaceMessages(context.messages);
 
     self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
-        .reason = .manual,
+        .reason = reason,
         .result = event_result,
         .aborted = false,
         .will_retry = false,
@@ -1169,6 +1174,7 @@ fn applyManualCompactionRequest(
 ) !CompactionResult {
     return switch (request) {
         .explicit => |explicit| self.applyManualCompaction(
+            .manual,
             explicit.summary,
             explicit.first_kept_entry_id,
             explicit.tokens_before,
@@ -1188,13 +1194,17 @@ fn prepareAndApplyManualCompaction(
     var preparation = try self.manager.prepareCompaction(self.allocator, settings);
     defer preparation.deinit();
     return self.applyManualCompaction(
+        .manual,
         summary,
         preparation.first_kept_entry_id,
         preparation.tokens_before,
     );
 }
 
-fn generateAndApplyManualCompaction(self: *AgentSession) !CompactionResult {
+fn generateAndApplyCompaction(
+    self: *AgentSession,
+    reason: AgentSessionEvent.CompactionReason,
+) !CompactionResult {
     var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
     defer input.deinit();
     const serialized_input = try input.serialize(self.allocator);
@@ -1202,6 +1212,7 @@ fn generateAndApplyManualCompaction(self: *AgentSession) !CompactionResult {
     const summary = try self.generateCompactionSummary(serialized_input);
     defer self.allocator.free(summary);
     return self.applyManualCompaction(
+        reason,
         summary,
         input.first_kept_entry_id,
         input.tokens_before,
@@ -1466,7 +1477,22 @@ fn flushPendingSessionMessages(_: *AgentSession) !void {}
 
 fn checkModelPreconditions(_: *AgentSession) !void {}
 
-fn checkPrePromptCompaction(_: *AgentSession) !void {}
+fn checkPrePromptCompaction(self: *AgentSession) !void {
+    if (!self.compaction_settings.auto_enabled) return;
+    var preparation = self.manager.prepareCompaction(
+        self.allocator,
+        self.compaction_settings,
+    ) catch |err| switch (err) {
+        error.NothingToCompact, error.AlreadyCompacted => return,
+        else => return err,
+    };
+    preparation.deinit();
+    var result = self.runGeneratedCompaction(.threshold) catch |err| switch (err) {
+        error.NothingToCompact, error.AlreadyCompacted => return,
+        else => return err,
+    };
+    result.deinit();
+}
 
 fn constructUserMessage(
     self: *AgentSession,
@@ -2692,6 +2718,123 @@ test "agent session generated manual compaction cancellation is observable" {
     try std.testing.expect(end_event.compaction_end.aborted);
     try std.testing.expect(end_event.compaction_end.result == null);
     try std.testing.expectEqualStrings("OperationCancelled", end_event.compaction_end.error_message.?.text);
+}
+
+test "agent session auto compacts before prompt when enabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const summary_content = [_]ai.AssistantContent{ai.faux.text("generated summary")};
+    const prompt_content = [_]ai.AssistantContent{ai.faux.text("prompt response")};
+    const responses = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+        ai.faux.assistantMessage(&prompt_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&responses);
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 2 },
+    });
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } } } });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "bbbbbbbb" },
+        .timestamp = 0,
+    } } } });
+    session.agent.finishRun();
+    drainAllPublicEvents(&session);
+    session.compaction_settings.auto_enabled = true;
+
+    try session.prompt("next", &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
+    try std.testing.expect(session.manager.entries.items[2] == .compaction);
+    try std.testing.expectEqualStrings("generated summary", session.manager.entries.items[2].compaction.summary);
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit();
+    try std.testing.expect(start_event == .compaction_start);
+    try std.testing.expectEqual(AgentSessionEvent.CompactionReason.threshold, start_event.compaction_start.reason);
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit();
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expectEqual(AgentSessionEvent.CompactionReason.threshold, end_event.compaction_end.reason);
+    try std.testing.expect(end_event.compaction_end.result != null);
+
+    var agent_start = session.drainPublicEvent().?;
+    defer agent_start.deinit();
+    try std.testing.expect(agent_start == .agent_event);
+    try std.testing.expect(agent_start.agent_event == .agent_start);
+}
+
+test "agent session auto compaction skips already compacted branch before prompt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const prompt_content = [_]ai.AssistantContent{ai.faux.text("prompt response")};
+    const responses = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&prompt_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&responses);
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .compaction_settings = .{ .keep_recent_tokens = 2, .auto_enabled = true },
+    });
+    defer shutdownAndDeinit(&session);
+
+    const kept = try session.manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "aaaaaaaa" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try session.manager.appendCompaction("summary", kept, 2, "t2");
+    const context = try session.manager.buildSessionContext(std.testing.allocator);
+    defer session.manager.deinitSessionContext(std.testing.allocator, context);
+    try session.agent.replaceMessages(context.messages);
+
+    try session.prompt("next", &.{});
+
+    try std.testing.expectEqual(@as(usize, 1), provider.call_count);
+    try std.testing.expectEqual(@as(usize, 4), session.manager.entries.items.len);
+    var saw_agent_start = false;
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        defer owned_event.deinit();
+        try std.testing.expect(owned_event != .compaction_start);
+        try std.testing.expect(owned_event != .compaction_end);
+        if (owned_event == .agent_event and owned_event.agent_event == .agent_start) saw_agent_start = true;
+    }
+    try std.testing.expect(saw_agent_start);
 }
 
 test "agent session prepares owned compaction snapshot" {
