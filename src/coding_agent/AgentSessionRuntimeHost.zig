@@ -198,16 +198,8 @@ pub fn statusSnapshot(self: *AgentSessionRuntimeHost) AgentSession.RuntimeStatus
     return self.session.statusSnapshot();
 }
 
-pub fn toolSnapshot(self: *const AgentSessionRuntimeHost) AgentSession.ToolSnapshot {
-    return self.session.toolSnapshot();
-}
-
 pub fn queueSnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
     return self.session.queueSnapshot(allocator);
-}
-
-pub fn publicEventCount(self: *const AgentSessionRuntimeHost) usize {
-    return self.session.publicEventCount();
 }
 
 pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?session_events.AgentSessionEvent {
@@ -451,7 +443,7 @@ test "runtime host replacement invalidates old session before rebinding new sess
     try std.testing.expectEqual(@as(usize, 1), state.rebind_count);
     try std.testing.expectEqualStrings("second", state.rebound_session_id);
     try std.testing.expectEqualStrings("second", host.sessionId());
-    try std.testing.expectEqual(@as(usize, 0), host.publicEventCount());
+    try std.testing.expectEqual(@as(usize, 0), host.statusSnapshot().public_event_count);
 }
 
 test "runtime host new session replaces current session" {
@@ -542,9 +534,9 @@ test "runtime host owns current agent session public boundary" {
 
     try runPromptForTest(&host, "hello");
 
-    try std.testing.expect(host.publicEventCount() > 0);
+    try std.testing.expect(host.statusSnapshot().public_event_count > 0);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
-    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), host.toolSnapshot().active_count);
+    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), host.session.tools.activeToolNames().len);
 }
 
 test "runtime host persists run messages before frontend drains public events" {
@@ -570,7 +562,7 @@ test "runtime host persists run messages before frontend drains public events" {
     }
 
     try runPromptForTest(&host, "durable");
-    try std.testing.expect(host.publicEventCount() > 0);
+    try std.testing.expect(host.statusSnapshot().public_event_count > 0);
 
     const context = try host.session.manager.buildSessionContext(std.testing.allocator);
     defer host.session.manager.deinitSessionContext(std.testing.allocator, context);
@@ -579,7 +571,7 @@ test "runtime host persists run messages before frontend drains public events" {
     try std.testing.expectEqualStrings("durable", context.messages[0].user.content.string);
 
     drainHostEvents(&host);
-    try std.testing.expectEqual(@as(usize, 0), host.publicEventCount());
+    try std.testing.expectEqual(@as(usize, 0), host.statusSnapshot().public_event_count);
     const drained_context = try host.session.manager.buildSessionContext(std.testing.allocator);
     defer host.session.manager.deinitSessionContext(std.testing.allocator, drained_context);
     try std.testing.expectEqual(context.messages.len, drained_context.messages.len);
