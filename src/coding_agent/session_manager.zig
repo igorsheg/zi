@@ -5,6 +5,9 @@ const ai = @import("../ai/root.zig");
 pub const current_session_version = 3;
 pub const max_session_entries = 16_384;
 pub const max_branch_depth = 16_384;
+pub const max_compaction_summary_bytes = 256 * 1024;
+pub const max_compaction_first_kept_entry_id_bytes = 128;
+pub const max_compaction_keep_recent_tokens = 1_000_000;
 
 pub const SessionHeader = struct {
     version: u32 = current_session_version,
@@ -27,6 +30,10 @@ pub const SessionContext = struct {
 
 pub const CompactionSettings = struct {
     keep_recent_tokens: u64 = 20_000,
+
+    pub fn validate(self: CompactionSettings) error{CompactionSettingsOutOfBounds}!void {
+        if (self.keep_recent_tokens > max_compaction_keep_recent_tokens) return error.CompactionSettingsOutOfBounds;
+    }
 };
 
 pub const CompactionPreparation = struct {
@@ -106,6 +113,9 @@ pub const SessionManager = struct {
         DuplicateEntryId,
         AlreadyCompacted,
         NothingToCompact,
+        CompactionSummaryTooLarge,
+        CompactionFirstKeptEntryIdTooLarge,
+        CompactionSettingsOutOfBounds,
     } || std.mem.Allocator.Error;
 
     pub const LoadedEntry = struct {
@@ -256,6 +266,7 @@ pub const SessionManager = struct {
         tokens_before: u64,
         timestamp: []const u8,
     ) Error!SessionEntry {
+        try validateCompactionInput(summary, first_kept_entry_id);
         const base = try self.nextBase(timestamp);
         errdefer self.deinitBase(base);
         return blk: {
@@ -308,6 +319,7 @@ pub const SessionManager = struct {
                 } };
             },
             .compaction => |compaction| blk: {
+                try validateCompactionInput(compaction.summary, compaction.first_kept_entry_id);
                 const summary = try self.allocator.dupe(u8, compaction.summary);
                 errdefer self.allocator.free(summary);
                 const first_kept_entry_id = try self.allocator.dupe(u8, compaction.first_kept_entry_id);
@@ -480,6 +492,7 @@ pub const SessionManager = struct {
         allocator: std.mem.Allocator,
         settings: CompactionSettings,
     ) Error!CompactionPreparation {
+        try settings.validate();
         const branch_entries = try self.getBranch(allocator);
         defer allocator.free(branch_entries);
         if (branch_entries.len == 0) return error.NothingToCompact;
@@ -524,6 +537,13 @@ pub const SessionManager = struct {
             .summarize_end_index = first_kept_index,
             .previous_summary = previous_summary,
         };
+    }
+
+    fn validateCompactionInput(summary: []const u8, first_kept_entry_id: []const u8) Error!void {
+        if (summary.len > max_compaction_summary_bytes) return error.CompactionSummaryTooLarge;
+        if (first_kept_entry_id.len > max_compaction_first_kept_entry_id_bytes) {
+            return error.CompactionFirstKeptEntryIdTooLarge;
+        }
     }
 
     pub fn deinitSessionContext(_: *const SessionManager, allocator: std.mem.Allocator, context: SessionContext) void {
@@ -777,6 +797,32 @@ test "append compaction stores durable summary entry" {
     try std.testing.expectEqual(@as(u64, 1200), manager.entries.items[1].compaction.tokens_before);
 }
 
+test "append compaction enforces bounded owned fields before mutation" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const root = try manager.appendMessage(userMessage("before"), "t1");
+    const oversized_summary = try std.testing.allocator.alloc(u8, max_compaction_summary_bytes + 1);
+    defer std.testing.allocator.free(oversized_summary);
+    @memset(oversized_summary, 'a');
+
+    try std.testing.expectError(
+        error.CompactionSummaryTooLarge,
+        manager.appendCompaction(oversized_summary, root, 1, "t2"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
+
+    const oversized_id = try std.testing.allocator.alloc(u8, max_compaction_first_kept_entry_id_bytes + 1);
+    defer std.testing.allocator.free(oversized_id);
+    @memset(oversized_id, 'b');
+
+    try std.testing.expectError(
+        error.CompactionFirstKeptEntryIdTooLarge,
+        manager.appendCompaction("summary", oversized_id, 1, "t2"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
+}
+
 test "prepared message entry does not mutate active leaf before commit" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
@@ -871,6 +917,21 @@ test "prepare compaction rejects empty small and already compacted branches" {
     );
 }
 
+test "prepare compaction rejects out of bounds settings" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendMessage(userMessage("aaaaaaaa"), "t1");
+    _ = try manager.appendMessage(userMessage("bbbbbbbb"), "t2");
+
+    try std.testing.expectError(
+        error.CompactionSettingsOutOfBounds,
+        manager.prepareCompaction(std.testing.allocator, .{
+            .keep_recent_tokens = max_compaction_keep_recent_tokens + 1,
+        }),
+    );
+}
+
 test "prepare compaction keeps bounded recent suffix" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
@@ -951,6 +1012,33 @@ test "loaded entries preserve ids parent links and next generated id" {
 
     try std.testing.expectEqualStrings("0000000c", manager.entries.items[2].id());
     try std.testing.expectEqualStrings("0000000b", manager.entries.items[2].parentId().?);
+}
+
+test "loaded compaction entries enforce durable bounds" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendLoadedEntry(.{
+        .id = "00000001",
+        .parent_id = null,
+        .timestamp = "t1",
+        .value = .{ .message = userMessage("root") },
+    });
+    const oversized_summary = try std.testing.allocator.alloc(u8, max_compaction_summary_bytes + 1);
+    defer std.testing.allocator.free(oversized_summary);
+    @memset(oversized_summary, 'a');
+
+    try std.testing.expectError(error.CompactionSummaryTooLarge, manager.appendLoadedEntry(.{
+        .id = "00000002",
+        .parent_id = "00000001",
+        .timestamp = "t2",
+        .value = .{ .compaction = .{
+            .summary = oversized_summary,
+            .first_kept_entry_id = "00000001",
+            .tokens_before = 1,
+        } },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
 }
 
 test "loaded entries reject duplicate ids and missing parents" {
