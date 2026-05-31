@@ -314,3 +314,95 @@ fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, val
     try stringify.objectField(name);
     try stringify.write(value);
 }
+
+test "prompt command event serializes public shape" {
+    var unknown_event: AgentSessionEvent = .{ .prompt_command = .{
+        .command = try EventText.init(std.testing.allocator, "missing"),
+        .result = .unknown,
+        .message = try EventText.init(std.testing.allocator, "unknown command: /missing"),
+    } };
+    defer unknown_event.deinit();
+
+    var unknown_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer unknown_writer.deinit();
+
+    try std.json.Stringify.value(unknown_event, .{}, &unknown_writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"prompt_command\",\"command\":\"missing\",\"result\":\"unknown\"," ++
+            "\"message\":\"unknown command: /missing\"}",
+        unknown_writer.written(),
+    );
+
+    var handled_event: AgentSessionEvent = .{ .prompt_command = .{
+        .command = try EventText.init(std.testing.allocator, "help"),
+        .result = .handled,
+        .message = try EventText.init(std.testing.allocator, "available commands: /help, /session"),
+    } };
+    defer handled_event.deinit();
+
+    var handled_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer handled_writer.deinit();
+
+    try std.json.Stringify.value(handled_event, .{}, &handled_writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"prompt_command\",\"command\":\"help\",\"result\":\"handled\"," ++
+            "\"message\":\"available commands: /help, /session\"}",
+        handled_writer.written(),
+    );
+}
+
+test "failed compaction end event omits result" {
+    var event: AgentSessionEvent = .{ .compaction_end = .{
+        .reason = .manual,
+        .aborted = true,
+        .will_retry = false,
+        .error_message = try EventText.init(std.testing.allocator, "not implemented"),
+    } };
+    defer event.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try std.json.Stringify.value(event, .{}, &writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"compaction_end\",\"reason\":\"manual\",\"aborted\":true," ++
+            "\"willRetry\":false,\"errorMessage\":\"not implemented\"}",
+        writer.written(),
+    );
+}
+
+test "compaction end event serializes owned result" {
+    var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const first_kept = try manager.appendMessage(.{ .user = .{
+        .content = .{ .string = "kept" },
+        .timestamp = 0,
+    } }, "t1");
+    _ = try manager.appendCompaction("summary", first_kept, 42, "t2");
+
+    var event: AgentSessionEvent = .{ .compaction_end = .{
+        .reason = .manual,
+        .result = try CompactionResult.init(
+            std.testing.allocator,
+            manager.entries.items[1].compaction,
+        ),
+        .aborted = false,
+        .will_retry = false,
+    } };
+    defer event.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try std.json.Stringify.value(event, .{}, &writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"compaction_end\",\"reason\":\"manual\",\"result\":{\"summary\":\"summary\"," ++
+            "\"firstKeptEntryId\":\"00000001\",\"tokensBefore\":42},\"aborted\":false,\"willRetry\":false}",
+        writer.written(),
+    );
+}
