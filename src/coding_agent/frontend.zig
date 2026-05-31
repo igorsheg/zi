@@ -108,6 +108,7 @@ test "frontend read model applies public event stream without touching session i
         .status = .idle,
         .public_event_count = 0,
         .dropped_public_event_count = 0,
+        .context_overflow_count = 0,
     });
 
     model.apply(.{ .agent_event = .agent_start });

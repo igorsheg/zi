@@ -103,6 +103,7 @@ pub const RuntimeStatusSnapshot = struct {
     status: AgentSessionStatus,
     public_event_count: usize,
     dropped_public_event_count: usize,
+    context_overflow_count: usize,
 };
 
 pub const ToolSnapshot = struct {
@@ -595,6 +596,7 @@ const EventDrain = struct {
     timestamp: []const u8,
     dropped_public_event_count: usize = 0,
     terminal_snapshot_entry_count: usize = 0,
+    context_overflow_count: usize = 0,
 
     pub fn handle(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         try self.updateQueueMirror(event);
@@ -630,8 +632,15 @@ const EventDrain = struct {
     }
 
     fn handleTerminalPolicy(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        if (event != .agent_end) return;
-        self.terminal_snapshot_entry_count = self.manager.entries.items.len;
+        switch (event) {
+            .message_end => |payload| {
+                if (payload.message == .assistant and isContextOverflowAssistant(payload.message.assistant)) {
+                    self.context_overflow_count += 1;
+                }
+            },
+            .agent_end => self.terminal_snapshot_entry_count = self.manager.entries.items.len,
+            else => {},
+        }
     }
 
     fn emitQueueUpdate(self: *EventDrain) !void {
@@ -1056,6 +1065,7 @@ pub fn statusSnapshot(self: *AgentSession) RuntimeStatusSnapshot {
         .status = self.status(),
         .public_event_count = self.public_events.count(),
         .dropped_public_event_count = self.public_events.dropped(),
+        .context_overflow_count = self.event_drain.context_overflow_count,
     };
 }
 
@@ -1516,6 +1526,28 @@ fn userMessageText(message: ai.UserMessage) ?[]const u8 {
             if (block == .text) break block.text.text;
         } else null,
     };
+}
+
+fn isContextOverflowAssistant(message: ai.AssistantMessage) bool {
+    if (message.stop_reason != .error_) return false;
+    const text = message.error_message orelse return false;
+    if (!asciiContainsIgnoreCase(text, "context")) return false;
+    return asciiContainsIgnoreCase(text, "overflow") or
+        asciiContainsIgnoreCase(text, "too large") or
+        asciiContainsIgnoreCase(text, "maximum") or
+        asciiContainsIgnoreCase(text, "length");
+}
+
+fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    for (0..haystack.len - needle.len + 1) |start| {
+        var index: usize = 0;
+        while (index < needle.len) : (index += 1) {
+            if (std.ascii.toLower(haystack[start + index]) != std.ascii.toLower(needle[index])) break;
+        } else return true;
+    }
+    return false;
 }
 
 fn runBeforeAgentStartHooks(_: *AgentSession, _: *const PromptPreflight) !void {}
@@ -2947,6 +2979,55 @@ test "agent session terminal policy runs after persistence" {
     session.agent.finishRun();
 
     try std.testing.expectEqual(@as(usize, 1), session.event_drain.terminal_snapshot_entry_count);
+    drainAllPublicEvents(&session);
+}
+
+test "agent session terminal policy classifies context overflow errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .assistant = .{
+        .content = &.{},
+        .api = ai.KnownApi.openai_responses,
+        .provider = ai.KnownProvider.openai,
+        .model = "gpt",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .error_,
+        .error_message = "maximum context length exceeded",
+        .timestamp = 0,
+    } } } });
+    session.agent.finishRun();
+
+    try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().context_overflow_count);
+    try std.testing.expectEqual(@as(usize, 1), session.manager.entries.items.len);
+    drainAllPublicEvents(&session);
+}
+
+test "agent session terminal policy ignores non context errors for overflow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .assistant = .{
+        .content = &.{},
+        .api = ai.KnownApi.openai_responses,
+        .provider = ai.KnownProvider.openai,
+        .model = "gpt",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .error_,
+        .error_message = "rate limit exceeded",
+        .timestamp = 0,
+    } } } });
+    session.agent.finishRun();
+
+    try std.testing.expectEqual(@as(usize, 0), session.statusSnapshot().context_overflow_count);
     drainAllPublicEvents(&session);
 }
 
