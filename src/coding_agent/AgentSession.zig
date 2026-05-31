@@ -56,6 +56,13 @@ pub const PromptOptions = struct {
     streaming_behavior: ?StreamingBehavior = null,
 };
 
+const PromptCommandName = enum {
+    help,
+    session,
+};
+
+const prompt_commands: []const PromptCommandName = &.{ .help, .session };
+
 pub const LivePromptRun = struct {
     token: runtime.CancelToken,
     stream: agent_mod.loop.AgentEventStream = undefined,
@@ -94,6 +101,10 @@ pub const EventText = struct {
 
     pub fn init(allocator: std.mem.Allocator, text: []const u8) !EventText {
         return .{ .allocator = allocator, .text = try allocator.dupe(u8, text) };
+    }
+
+    fn initOwned(allocator: std.mem.Allocator, text: []const u8) EventText {
+        return .{ .allocator = allocator, .text = text };
     }
 
     pub fn deinit(self: *EventText) void {
@@ -167,6 +178,7 @@ pub const AgentSessionEvent = union(enum) {
     };
 
     pub const PromptCommandResult = enum {
+        handled,
         unknown,
     };
 
@@ -974,18 +986,67 @@ fn preparePromptInput(
 
 fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
     const command = parsePromptCommand(preflight.text) orelse return false;
-    var owned_command = try EventText.init(self.allocator, command);
-    errdefer owned_command.deinit();
-    const message_text = try std.fmt.allocPrint(self.allocator, "unknown command: /{s}", .{command});
-    defer self.allocator.free(message_text);
+
+    const command_name = parsePromptCommandName(command) orelse {
+        const unknown_message = try std.fmt.allocPrint(self.allocator, "unknown command: /{s}", .{command});
+        errdefer self.allocator.free(unknown_message);
+        try self.emitPromptCommandOwned(command, .unknown, EventText.initOwned(self.allocator, unknown_message));
+        return true;
+    };
+
+    switch (command_name) {
+        .help => try self.emitPromptCommand(command, .handled, "available commands: /help, /session"),
+        .session => {
+            const snapshot = self.statusSnapshot();
+            const tools = self.toolSnapshot();
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "session: {s}; public events: {}; dropped events: {}; active tools: {}",
+                .{
+                    @tagName(snapshot.status),
+                    snapshot.public_event_count,
+                    snapshot.dropped_public_event_count,
+                    tools.active_count,
+                },
+            );
+            errdefer self.allocator.free(message);
+            try self.emitPromptCommandOwned(command, .handled, EventText.initOwned(self.allocator, message));
+        },
+    }
+    return true;
+}
+
+fn parsePromptCommandName(command: []const u8) ?PromptCommandName {
+    for (prompt_commands) |name| {
+        if (std.mem.eql(u8, command, @tagName(name))) return name;
+    }
+    return null;
+}
+
+fn emitPromptCommand(
+    self: *AgentSession,
+    command: []const u8,
+    result: AgentSessionEvent.PromptCommandResult,
+    message_text: []const u8,
+) !void {
     var message = try EventText.init(self.allocator, message_text);
     errdefer message.deinit();
+    try self.emitPromptCommandOwned(command, result, message);
+}
+
+fn emitPromptCommandOwned(
+    self: *AgentSession,
+    command: []const u8,
+    result: AgentSessionEvent.PromptCommandResult,
+    message: EventText,
+) !void {
+    var owned_message = message;
+    errdefer owned_message.deinit();
     self.event_drain.enqueuePublicEvent(.{ .prompt_command = .{
-        .command = owned_command,
-        .result = .unknown,
-        .message = message,
+        .command = try EventText.init(self.allocator, command),
+        .result = result,
+        .message = owned_message,
     } });
-    return true;
 }
 
 fn parsePromptCommand(text: []const u8) ?[]const u8 {
@@ -1380,6 +1441,41 @@ test "agent session prompt requires streaming behavior while running" {
     try std.testing.expect(!session.agent.hasQueuedMessages());
 }
 
+test "agent session slash command while running emits command event without queueing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    defer session.agent.finishRun();
+
+    try session.promptWithOptions("/help", &.{}, .{});
+
+    try std.testing.expectEqual(@as(usize, 0), session.agent.steering_queue.count());
+    try std.testing.expectEqual(@as(usize, 0), session.agent.follow_up_queue.count());
+    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
+    try expectNextPromptCommand(&session, .handled, "help", "available commands: /help, /session");
+    try std.testing.expectEqual(@as(usize, 0), session.publicEventCount());
+}
+
+test "agent session slash command public event overflow is bounded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSessionWithCapacity(tmp.dir, 1);
+    defer shutdownAndDeinit(&session);
+
+    try session.promptWithOptions("/help", &.{}, .{});
+    try session.promptWithOptions("/session", &.{}, .{});
+
+    try std.testing.expectEqual(@as(usize, 1), session.publicEventCount());
+    try std.testing.expectEqual(@as(usize, 1), session.event_drain.dropped_public_event_count);
+    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
+    try expectNextPromptCommand(&session, .handled, "help", "available commands: /help, /session");
+}
+
 test "agent session prompt queues follow up while running" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1706,17 +1802,7 @@ test "agent session slash command emits public command event without model run" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .dir = tmp.dir,
-    });
+    var session = try initTestSession(tmp.dir);
     defer shutdownAndDeinit(&session);
 
     try session.promptWithOptions("/missing arg", &.{}, .{});
@@ -1724,12 +1810,51 @@ test "agent session slash command emits public command event without model run" 
     try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
     try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
     try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
+    try expectNextPromptCommand(&session, .unknown, "missing", "unknown command: /missing");
+    try std.testing.expectEqual(@as(usize, 0), session.publicEventCount());
+}
+
+test "agent session help command emits handled event without model run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+
+    try session.promptWithOptions("/help", &.{}, .{});
+
+    try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
+    try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
+    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
+    try expectNextPromptCommand(&session, .handled, "help", "available commands: /help, /session");
+    try std.testing.expectEqual(@as(usize, 0), session.publicEventCount());
+}
+
+test "agent session session command emits snapshot without model run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try initTestSession(tmp.dir);
+    defer shutdownAndDeinit(&session);
+
+    const expected_tools = session.toolSnapshot().active_count;
+    try session.promptWithOptions("/session", &.{}, .{});
+
+    try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
+    try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
+    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
     var event = session.drainPublicEvent().?;
     defer event.deinit();
     try std.testing.expect(event == .prompt_command);
-    try std.testing.expectEqual(AgentSessionEvent.PromptCommandResult.unknown, event.prompt_command.result);
-    try std.testing.expectEqualStrings("missing", event.prompt_command.command.text);
-    try std.testing.expectEqualStrings("unknown command: /missing", event.prompt_command.message.text);
+    try std.testing.expectEqual(AgentSessionEvent.PromptCommandResult.handled, event.prompt_command.result);
+    try std.testing.expectEqualStrings("session", event.prompt_command.command.text);
+    const expected_message = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "session: idle; public events: 0; dropped events: 0; active tools: {}",
+        .{expected_tools},
+    );
+    defer std.testing.allocator.free(expected_message);
+    try std.testing.expectEqualStrings(expected_message, event.prompt_command.message.text);
     try std.testing.expectEqual(@as(usize, 0), session.publicEventCount());
 }
 
@@ -1741,22 +1866,40 @@ test "agent session slash command parser requires command name" {
 }
 
 test "agent session slash command event serializes public shape" {
-    var event: AgentSessionEvent = .{ .prompt_command = .{
+    var unknown_event: AgentSessionEvent = .{ .prompt_command = .{
         .command = try EventText.init(std.testing.allocator, "missing"),
         .result = .unknown,
         .message = try EventText.init(std.testing.allocator, "unknown command: /missing"),
     } };
-    defer event.deinit();
+    defer unknown_event.deinit();
 
-    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer writer.deinit();
+    var unknown_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer unknown_writer.deinit();
 
-    try std.json.Stringify.value(event, .{}, &writer.writer);
+    try std.json.Stringify.value(unknown_event, .{}, &unknown_writer.writer);
 
     try std.testing.expectEqualStrings(
         "{\"type\":\"prompt_command\",\"command\":\"missing\",\"result\":\"unknown\"," ++
             "\"message\":\"unknown command: /missing\"}",
-        writer.written(),
+        unknown_writer.written(),
+    );
+
+    var handled_event: AgentSessionEvent = .{ .prompt_command = .{
+        .command = try EventText.init(std.testing.allocator, "help"),
+        .result = .handled,
+        .message = try EventText.init(std.testing.allocator, "available commands: /help, /session"),
+    } };
+    defer handled_event.deinit();
+
+    var handled_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer handled_writer.deinit();
+
+    try std.json.Stringify.value(handled_event, .{}, &handled_writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"prompt_command\",\"command\":\"help\",\"result\":\"handled\"," ++
+            "\"message\":\"available commands: /help, /session\"}",
+        handled_writer.written(),
     );
 }
 
@@ -1791,6 +1934,25 @@ test "agent session terminal policy runs after persistence" {
     drainAllPublicEvents(&session);
 }
 
+fn initTestSession(dir: std.Io.Dir) !AgentSession {
+    return initTestSessionWithCapacity(dir, public_event_capacity_default);
+}
+
+fn initTestSessionWithCapacity(dir: std.Io.Dir, public_event_capacity: usize) !AgentSession {
+    try dir.createDirPath(std.testing.io, "agent");
+    try dir.createDirPath(std.testing.io, "repo");
+
+    return AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = dir,
+        .public_event_capacity = public_event_capacity,
+    });
+}
+
 fn shutdownAndDeinit(session: *AgentSession) void {
     if (!session.agent.waitForIdle()) session.agent.finishRun();
     session.requestShutdown();
@@ -1803,6 +1965,20 @@ fn drainAllPublicEvents(session: *AgentSession) void {
         var owned_event = event;
         owned_event.deinit();
     }
+}
+
+fn expectNextPromptCommand(
+    session: *AgentSession,
+    result: AgentSessionEvent.PromptCommandResult,
+    command: []const u8,
+    message: []const u8,
+) !void {
+    var event = session.drainPublicEvent().?;
+    defer event.deinit();
+    try std.testing.expect(event == .prompt_command);
+    try std.testing.expectEqual(result, event.prompt_command.result);
+    try std.testing.expectEqualStrings(command, event.prompt_command.command.text);
+    try std.testing.expectEqualStrings(message, event.prompt_command.message.text);
 }
 
 fn expectNextUserMessageEvent(
