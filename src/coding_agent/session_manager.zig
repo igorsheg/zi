@@ -25,6 +25,25 @@ pub const SessionContext = struct {
     model: ?ModelRef,
 };
 
+pub const CompactionSettings = struct {
+    keep_recent_tokens: u64 = 20_000,
+};
+
+pub const CompactionPreparation = struct {
+    allocator: std.mem.Allocator,
+    first_kept_entry_id: []const u8,
+    tokens_before: u64,
+    summarize_start_index: usize,
+    summarize_end_index: usize,
+    previous_summary: ?[]const u8 = null,
+
+    pub fn deinit(self: *CompactionPreparation) void {
+        self.allocator.free(self.first_kept_entry_id);
+        if (self.previous_summary) |summary| self.allocator.free(summary);
+        self.* = undefined;
+    }
+};
+
 pub const SessionEntry = union(enum) {
     message: Message,
     thinking_level_change: ThinkingLevelChange,
@@ -85,6 +104,8 @@ pub const SessionManager = struct {
         BranchDepthExceeded,
         EntryNotFound,
         DuplicateEntryId,
+        AlreadyCompacted,
+        NothingToCompact,
     } || std.mem.Allocator.Error;
 
     pub const LoadedEntry = struct {
@@ -454,6 +475,57 @@ pub const SessionManager = struct {
         };
     }
 
+    pub fn prepareCompaction(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+        settings: CompactionSettings,
+    ) Error!CompactionPreparation {
+        const branch_entries = try self.getBranch(allocator);
+        defer allocator.free(branch_entries);
+        if (branch_entries.len == 0) return error.NothingToCompact;
+        if (branch_entries[branch_entries.len - 1] == .compaction) return error.AlreadyCompacted;
+
+        var previous_compaction_index: ?usize = null;
+        var index = branch_entries.len;
+        while (index > 0) {
+            index -= 1;
+            if (branch_entries[index] == .compaction) {
+                previous_compaction_index = index;
+                break;
+            }
+        }
+
+        var boundary_start: usize = 0;
+        var previous_summary: ?[]const u8 = null;
+        if (previous_compaction_index) |compaction_index| {
+            const compaction = branch_entries[compaction_index].compaction;
+            previous_summary = try allocator.dupe(u8, compaction.summary);
+            errdefer if (previous_summary) |summary| allocator.free(summary);
+            boundary_start = findEntryIndex(branch_entries, compaction.first_kept_entry_id) orelse
+                compaction_index + 1;
+        }
+
+        const first_kept_index = findCompactionCutPoint(
+            branch_entries,
+            boundary_start,
+            branch_entries.len,
+            settings.keep_recent_tokens,
+        );
+        if (first_kept_index <= boundary_start) return error.NothingToCompact;
+
+        const first_kept_entry_id = try allocator.dupe(u8, branch_entries[first_kept_index].id());
+        errdefer allocator.free(first_kept_entry_id);
+
+        return .{
+            .allocator = allocator,
+            .first_kept_entry_id = first_kept_entry_id,
+            .tokens_before = estimateBranchTokens(branch_entries),
+            .summarize_start_index = boundary_start,
+            .summarize_end_index = first_kept_index,
+            .previous_summary = previous_summary,
+        };
+    }
+
     pub fn deinitSessionContext(_: *const SessionManager, allocator: std.mem.Allocator, context: SessionContext) void {
         for (context.messages) |message| agent.deinitAgentMessage(allocator, message);
         allocator.free(context.messages);
@@ -491,6 +563,107 @@ pub const SessionManager = struct {
         message: agent.AgentMessage,
     ) std.mem.Allocator.Error!void {
         try appendContextMessage(allocator, messages, try agent.copyAgentMessage(allocator, message));
+    }
+
+    fn findCompactionCutPoint(
+        entries: []const SessionEntry,
+        start_index: usize,
+        end_index: usize,
+        keep_recent_tokens: u64,
+    ) usize {
+        var first_valid_cut = start_index;
+        while (first_valid_cut < end_index and !isValidCompactionCut(entries[first_valid_cut])) {
+            first_valid_cut += 1;
+        }
+        if (first_valid_cut == end_index) return start_index;
+
+        var accumulated_tokens: u64 = 0;
+        var cut_index = first_valid_cut;
+        var index = end_index;
+        while (index > start_index) {
+            index -= 1;
+            if (entries[index] != .message) continue;
+            accumulated_tokens +|= estimateEntryTokens(entries[index]);
+            if (accumulated_tokens >= keep_recent_tokens) {
+                cut_index = firstValidCutAtOrAfter(entries, index, end_index) orelse first_valid_cut;
+                break;
+            }
+        }
+        return cut_index;
+    }
+
+    fn firstValidCutAtOrAfter(entries: []const SessionEntry, start_index: usize, end_index: usize) ?usize {
+        for (entries[start_index..end_index], start_index..) |entry, index| {
+            if (isValidCompactionCut(entry)) return index;
+        }
+        return null;
+    }
+
+    fn isValidCompactionCut(entry: SessionEntry) bool {
+        return switch (entry) {
+            .message => |message_entry| message_entry.message != .tool_result,
+            else => false,
+        };
+    }
+
+    fn estimateBranchTokens(entries: []const SessionEntry) u64 {
+        var tokens: u64 = 0;
+        for (entries) |entry| tokens +|= estimateEntryTokens(entry);
+        return tokens;
+    }
+
+    fn estimateEntryTokens(entry: SessionEntry) u64 {
+        return switch (entry) {
+            .message => |message_entry| estimateMessageTokens(message_entry.message),
+            .compaction => |compaction| estimateTextTokens(compaction.summary),
+            else => 0,
+        };
+    }
+
+    fn estimateMessageTokens(message: agent.AgentMessage) u64 {
+        const chars: u64 = switch (message) {
+            .user => |user| switch (user.content) {
+                .string => |text| text.len,
+                .blocks => |blocks| blk: {
+                    var count: u64 = 0;
+                    for (blocks) |block| switch (block) {
+                        .text => |text| count +|= text.text.len,
+                        .image => count +|= 4800,
+                    };
+                    break :blk count;
+                },
+            },
+            .assistant => |assistant| blk: {
+                var count: u64 = 0;
+                for (assistant.content) |block| switch (block) {
+                    .text => |text| count +|= text.text.len,
+                    .thinking => |thinking| count +|= thinking.thinking.len,
+                    .tool_call => |tool_call| count +|= tool_call.name.len,
+                };
+                break :blk count;
+            },
+            .tool_result => |tool_result| blk: {
+                var count: u64 = tool_result.tool_name.len;
+                for (tool_result.content) |block| switch (block) {
+                    .text => |text| count +|= text.text.len,
+                    .image => count +|= 4800,
+                };
+                break :blk count;
+            },
+            .custom => |custom| custom.kind.len,
+        };
+        return (chars + 3) / 4;
+    }
+
+    fn estimateTextTokens(text: []const u8) u64 {
+        return (text.len + 3) / 4;
+    }
+
+    fn findEntryIndex(entries: []const SessionEntry, entry_id: []const u8) ?usize {
+        for (entries, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.id(), entry_id)) return index;
+        }
+        return null;
     }
 
     fn nextBase(self: *SessionManager, timestamp: []const u8) Error!SessionEntry.Base {
@@ -674,6 +847,64 @@ test "build context projects latest compaction summary then kept messages" {
     try std.testing.expect(std.mem.indexOf(u8, context.messages[0].user.content.string, "older summary") != null);
     try std.testing.expectEqualStrings("kept", context.messages[1].user.content.string);
     try std.testing.expectEqualStrings("after", context.messages[2].user.content.string);
+}
+
+test "prepare compaction rejects empty small and already compacted branches" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    try std.testing.expectError(
+        error.NothingToCompact,
+        manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 1 }),
+    );
+
+    const root = try manager.appendMessage(userMessage("abcd"), "t1");
+    try std.testing.expectError(
+        error.NothingToCompact,
+        manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 100 }),
+    );
+
+    _ = try manager.appendCompaction("summary", root, 1, "t2");
+    try std.testing.expectError(
+        error.AlreadyCompacted,
+        manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 1 }),
+    );
+}
+
+test "prepare compaction keeps bounded recent suffix" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendMessage(userMessage("aaaaaaaa"), "t1");
+    _ = try manager.appendMessage(userMessage("bbbbbbbb"), "t2");
+    const kept = try manager.appendMessage(userMessage("cccccccc"), "t3");
+
+    var preparation = try manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 2 });
+    defer preparation.deinit();
+
+    try std.testing.expectEqualStrings(kept, preparation.first_kept_entry_id);
+    try std.testing.expectEqual(@as(usize, 0), preparation.summarize_start_index);
+    try std.testing.expectEqual(@as(usize, 2), preparation.summarize_end_index);
+    try std.testing.expectEqual(@as(u64, 6), preparation.tokens_before);
+    try std.testing.expect(preparation.previous_summary == null);
+}
+
+test "prepare compaction reuses previous first kept boundary" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const root = try manager.appendMessage(userMessage("aaaaaaaa"), "t1");
+    _ = try manager.appendCompaction("prior", root, 2, "t2");
+    _ = try manager.appendMessage(userMessage("bbbbbbbb"), "t3");
+    const kept = try manager.appendMessage(userMessage("cccccccc"), "t4");
+
+    var preparation = try manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 2 });
+    defer preparation.deinit();
+
+    try std.testing.expectEqualStrings(kept, preparation.first_kept_entry_id);
+    try std.testing.expectEqual(@as(usize, 0), preparation.summarize_start_index);
+    try std.testing.expectEqual(@as(usize, 3), preparation.summarize_end_index);
+    try std.testing.expectEqualStrings("prior", preparation.previous_summary.?);
 }
 
 test "tree navigation returns entries leaf and children" {
