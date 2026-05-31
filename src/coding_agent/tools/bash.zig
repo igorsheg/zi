@@ -132,7 +132,7 @@ fn runProcess(
     const timeout_ms = std.math.cast(i64, args.timeout_ms) orelse return error.InvalidToolArguments;
 
     const argv = shellArgv(args.command);
-    return std.process.run(allocator, io, .{
+    const run_result = try std.process.run(allocator, io, .{
         .argv = &argv,
         .cwd = .{ .path = config.cwd },
         .stdout_limit = .limited(config.max_stdout_bytes),
@@ -142,6 +142,11 @@ fn runProcess(
             .clock = .awake,
         } },
     });
+    errdefer freeRunResult(allocator, run_result);
+    if (run_result.stdout.len >= config.max_stdout_bytes or run_result.stderr.len >= config.max_stderr_bytes) {
+        return error.StreamTooLong;
+    }
+    return run_result;
 }
 
 fn waitForCancellation(io: std.Io, token: runtime.CancelToken) anyerror!void {
@@ -310,4 +315,33 @@ test "bash tool treats nonzero exit as result data" {
 
     try std.testing.expectEqualStrings("nope", result.result.content[0].text.text);
     try std.testing.expectEqual(@as(i64, 7), result.result.details.?.object.get("exitCode").?.integer);
+}
+
+test "bash tool cancels running process through owner race" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
+    defer tool.deinit();
+
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try object.put(std.testing.allocator, "command", .{ .string = "sleep 60" });
+
+    var cancel_source: runtime.CancelSource = .{};
+    var future = std.testing.io.async(execute, .{
+        std.testing.allocator,
+        std.testing.io,
+        &tool,
+        cancel_source.token(),
+        "call",
+        std.json.Value{ .object = object },
+        null,
+    });
+    try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    cancel_source.request();
+
+    try std.testing.expectError(error.OperationCancelled, future.await(std.testing.io));
 }

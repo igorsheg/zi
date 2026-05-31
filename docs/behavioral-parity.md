@@ -75,7 +75,7 @@ ai
 | Auto compaction events and policy | `core/compaction/*` | `AgentSession` future terminal policy | protocol only | missing |
 | Manual compaction | `AgentSession.compact()` | `AgentSession` future terminal policy | missing | missing |
 | Auto retry events and policy | `auto_retry_start/end` in `AgentSession` | `AgentSession` future terminal policy | protocol only | missing |
-| Bash/process tool with timeout/cancel | `core/bash-executor.ts`, `tools/bash.ts` | `tools/BashTool` / `AgentSession` | minimal implemented: cwd-bound, sequential, no stdin/env/PTY/background/streaming | `bash tool runs one cwd-bound command`; `bash tool treats nonzero exit as result data`; `agent session initializes policy spine with definition-first builtin tools` |
+| Bash/process tool with timeout/cancel | `core/bash-executor.ts`, `tools/bash.ts` | `tools/BashTool` / `AgentSession` | minimal implemented: cwd-bound, sequential, no stdin/env/PTY/background/streaming | `bash tool runs one cwd-bound command`; `bash tool treats nonzero exit as result data`; `bash tool cancels running process through owner race`; `runtime host preserves bash output limit details through public events` |
 | Find/grep/ls tools | `core/tools/find.ts`, `grep.ts`, `ls.ts` | `tools/*` | implemented | `find tool recursively filters paths`; `grep tool searches directory files with literal pattern`; `ls tool lists one directory with bounds` |
 | Slash commands and prompt templates | `slash-commands.ts`, `prompt-templates.ts` | future frontend/session command owner | missing | missing |
 | Session fork/resume/import/export HTML | `agent-session-runtime.ts`, `export-html/*` | future host/session manager | missing | missing |
@@ -91,7 +91,7 @@ Work down this list. Do not add a framework to satisfy a row.
      `AgentSessionRuntimeHost`.
 
 2. Harden the bounded process tool.
-   - Add session/agent-loop behavior coverage for cancellation and output caps.
+   - Add session/agent-loop behavior coverage for cancellation.
    - Keep stdin, env overrides, PTY, background jobs, and streaming out until
      each has an owner, bound, and drain site.
 

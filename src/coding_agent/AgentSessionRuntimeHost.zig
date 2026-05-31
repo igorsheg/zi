@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
+const faux = @import("../ai/providers/faux.zig");
 const runtime = @import("../runtime/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_manager = @import("session_manager.zig");
@@ -326,6 +327,37 @@ const ToolLoopObservation = struct {
     }
 };
 
+const BashLimitObservation = struct {
+    tool_execution_end: bool = false,
+    output_limit_exceeded: bool = false,
+    tool_result_message: bool = false,
+
+    fn onEvent(context: ?*anyopaque, event: AgentSession.AgentSessionEvent) !void {
+        const self: *BashLimitObservation = @ptrCast(@alignCast(context.?));
+        if (event != .agent_event) return;
+
+        switch (event.agent_event) {
+            .tool_execution_end => |payload| {
+                if (!std.mem.eql(u8, payload.tool_name, "bash")) return;
+                self.tool_execution_end = true;
+                if (payload.result.details) |details| {
+                    if (details == .object) {
+                        const exceeded = details.object.get("outputLimitExceeded") orelse return;
+                        self.output_limit_exceeded = exceeded == .bool and exceeded.bool;
+                    }
+                }
+            },
+            .message_end => |payload| switch (payload.message) {
+                .tool_result => |message| {
+                    if (std.mem.eql(u8, message.tool_name, "bash")) self.tool_result_message = true;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+};
+
 test "runtime host replacement invalidates old session before rebinding new session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -517,8 +549,6 @@ test "runtime host persists run messages before frontend drains public events" {
 }
 
 test "runtime host live run executes a tool and continues the assistant turn" {
-    const faux = @import("../ai/providers/faux.zig");
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -586,5 +616,67 @@ test "runtime host live run executes a tool and continues the assistant turn" {
     try std.testing.expect(observed.final_text_delta);
     try std.testing.expect(observed.agent_end_with_tool_result);
     try std.testing.expect(observed.agent_end);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+}
+
+test "runtime host preserves bash output limit details through public events" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
+
+    var provider = try faux.Provider.init(std.testing.allocator, .{
+        .min_token_size = 128,
+        .max_token_size = 128,
+    });
+    defer provider.deinit();
+
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(std.testing.allocator);
+    try args.put(std.testing.allocator, "command", .{ .string = "printf '%070000d' 0" });
+
+    const tool_call_content = [_]ai.AssistantContent{
+        faux.toolCall("tool-1", "bash", .{ .object = args }),
+    };
+    const final_content = [_]ai.AssistantContent{
+        faux.text("done after bash"),
+    };
+    const responses = [_]ai.AssistantMessage{
+        faux.assistantMessage(&tool_call_content, .{ .stop_reason = .tool_use }),
+        faux.assistantMessage(&final_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&responses);
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = cwd_buffer[0..cwd_len],
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    const run = try host.startPromptRun("use bash", &.{}, .{});
+    defer host.destroyPromptRun(run);
+    while (try host.stepPromptRun(run)) {}
+
+    var observed: BashLimitObservation = .{};
+    _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });
+
+    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
+    try std.testing.expect(observed.tool_execution_end);
+    try std.testing.expect(observed.output_limit_exceeded);
+    try std.testing.expect(observed.tool_result_message);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
 }
