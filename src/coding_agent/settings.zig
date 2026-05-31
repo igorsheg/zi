@@ -9,10 +9,16 @@ pub const Settings = struct {
     default_model: ?[]const u8 = null,
     default_thinking_level: ?[]const u8 = null,
     compaction: ?Compaction = null,
+    retry: ?Retry = null,
 
     pub const Compaction = struct {
         keep_recent_tokens: ?u64 = null,
         auto_enabled: ?bool = null,
+    };
+
+    pub const Retry = struct {
+        enabled: ?bool = null,
+        max_attempts: ?u64 = null,
     };
 };
 
@@ -128,6 +134,7 @@ fn parseSettings(allocator: std.mem.Allocator, bytes: []const u8) !LoadedSetting
             .default_model = try optionalString(allocator, parsed.value.object.get("defaultModel")),
             .default_thinking_level = try optionalString(allocator, parsed.value.object.get("defaultThinkingLevel")),
             .compaction = try optionalCompaction(parsed.value.object.get("compaction")),
+            .retry = try optionalRetry(parsed.value.object.get("retry")),
         },
     };
 }
@@ -139,6 +146,16 @@ fn optionalCompaction(value: ?std.json.Value) !?Settings.Compaction {
     return .{
         .keep_recent_tokens = try optionalNonNegativeInteger(resolved.object.get("keepRecentTokens")),
         .auto_enabled = try optionalBool(resolved.object.get("autoEnabled")),
+    };
+}
+
+fn optionalRetry(value: ?std.json.Value) !?Settings.Retry {
+    const resolved = value orelse return null;
+    if (resolved == .null) return null;
+    if (resolved != .object) return error.InvalidSettings;
+    return .{
+        .enabled = try optionalBool(resolved.object.get("enabled")),
+        .max_attempts = try optionalNonNegativeInteger(resolved.object.get("maxAttempts")),
     };
 }
 
@@ -213,7 +230,7 @@ test "settings manager loads global and project default model settings" {
     try std.testing.expectEqualStrings("high", manager.current().project.loaded.value.default_thinking_level.?);
 }
 
-test "settings manager loads compaction settings" {
+test "settings manager loads compaction and retry settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -221,7 +238,8 @@ test "settings manager loads compaction settings" {
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.zi/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":1234,\"autoEnabled\":true}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":1234,\"autoEnabled\":true}," ++
+            "\"retry\":{\"enabled\":true,\"maxAttempts\":2}}",
     });
 
     var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
@@ -235,4 +253,9 @@ test "settings manager loads compaction settings" {
         manager.current().project.loaded.value.compaction.?.keep_recent_tokens.?,
     );
     try std.testing.expect(manager.current().project.loaded.value.compaction.?.auto_enabled.?);
+    try std.testing.expect(manager.current().project.loaded.value.retry.?.enabled.?);
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        manager.current().project.loaded.value.retry.?.max_attempts.?,
+    );
 }

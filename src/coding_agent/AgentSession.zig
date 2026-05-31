@@ -12,6 +12,7 @@ const AgentSession = @This();
 
 pub const public_event_capacity_default = 256;
 pub const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 4096;
+pub const max_auto_retry_attempts_limit = 8;
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -31,6 +32,7 @@ queue_mirror: *QueueMirror,
 event_drain: *EventDrain,
 lifecycle: Lifecycle = .accepting,
 compaction_settings: session_manager.CompactionSettings = .{},
+retry_settings: RetrySettings = .{},
 active_compaction_cancel_source: ?*runtime.CancelSource = null,
 
 pub const Options = struct {
@@ -42,6 +44,7 @@ pub const Options = struct {
     model: ai.Model = agent_mod.Agent.defaultModel(),
     thinking_level: agent_mod.ThinkingLevel = .off,
     compaction_settings: session_manager.CompactionSettings = .{},
+    retry_settings: RetrySettings = .{},
     stream: ?ai.StreamFunction = null,
     get_api_key: ?agent_mod.GetApiKeyHook = null,
     dir: std.Io.Dir = .cwd(),
@@ -58,6 +61,20 @@ pub const StreamingBehavior = enum {
 
 pub const PromptOptions = struct {
     streaming_behavior: ?StreamingBehavior = null,
+};
+
+pub const RetrySettings = struct {
+    enabled: bool = false,
+    max_attempts: u8 = 1,
+
+    pub fn validate(self: RetrySettings) error{RetrySettingsOutOfBounds}!void {
+        if (self.max_attempts > max_auto_retry_attempts_limit) return error.RetrySettingsOutOfBounds;
+    }
+};
+
+const PromptRetryPolicy = struct {
+    overflow: bool = true,
+    transient: bool = true,
 };
 
 const PromptCommandName = enum {
@@ -786,6 +803,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .event_drain = event_drain,
         .lifecycle = .accepting,
         .compaction_settings = options.compaction_settings,
+        .retry_settings = options.retry_settings,
     };
 }
 
@@ -826,7 +844,7 @@ pub fn promptWithOptions(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !void {
-    try self.promptWithOptionsInternal(text, images, options, true);
+    try self.promptWithOptionsInternal(text, images, options, .{});
 }
 
 fn promptWithOptionsInternal(
@@ -834,8 +852,9 @@ fn promptWithOptionsInternal(
     text: []const u8,
     images: []const ai.ImageContent,
     options: PromptOptions,
-    allow_overflow_retry: bool,
+    retry_policy: PromptRetryPolicy,
 ) anyerror!void {
+    try self.retry_settings.validate();
     const context_overflow_count_before = self.event_drain.context_overflow_count;
     const run = self.startPromptRun(text, images, options) catch |err| switch (err) {
         error.PromptCommandCannotStartLiveRun, error.PromptQueuedCannotStartLiveRun => return,
@@ -843,12 +862,16 @@ fn promptWithOptionsInternal(
     };
     defer self.destroyPromptRun(run);
     while (try self.stepPromptRun(run)) {}
-    const compacted = if (allow_overflow_retry)
+    const compacted = if (retry_policy.overflow)
         try self.checkPostPromptOverflowCompaction(context_overflow_count_before, true)
     else
         false;
-    if (compacted and allow_overflow_retry) {
+    if (compacted and retry_policy.overflow) {
         try self.retryPromptAfterOverflowCompaction(text, images, options);
+    } else if (retry_policy.transient) {
+        if (self.latestRetryableAssistantError()) |error_message| {
+            try self.retryPromptAfterRetryableError(text, images, options, error_message);
+        }
     }
 }
 
@@ -1571,7 +1594,7 @@ fn retryPromptAfterOverflowCompaction(
     } });
     retry_start_owns_error_message = false;
 
-    self.promptWithOptionsInternal(text, images, options, false) catch |err| {
+    self.promptWithOptionsInternal(text, images, options, .{ .overflow = false, .transient = false }) catch |err| {
         const final_error = EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
             .success = false,
@@ -1585,6 +1608,95 @@ fn retryPromptAfterOverflowCompaction(
         .success = true,
         .attempt = 1,
     } });
+}
+
+fn retryPromptAfterRetryableError(
+    self: *AgentSession,
+    _: []const u8,
+    _: []const ai.ImageContent,
+    _: PromptOptions,
+    source_error_message: []const u8,
+) anyerror!void {
+    if (!self.retry_settings.enabled or self.retry_settings.max_attempts == 0) return;
+    var current_error_message = source_error_message;
+    const max_attempts: usize = self.retry_settings.max_attempts;
+    var attempt: usize = 1;
+    while (attempt <= max_attempts) : (attempt += 1) {
+        var error_message = try EventText.init(self.allocator, current_error_message);
+        var retry_start_owns_error_message = true;
+        errdefer if (retry_start_owns_error_message) error_message.deinit();
+        self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
+            .attempt = attempt,
+            .max_attempts = max_attempts,
+            .delay_ms = 0,
+            .error_message = error_message,
+        } });
+        retry_start_owns_error_message = false;
+
+        self.removeLastAssistantRuntimeMessage() catch |err| {
+            try self.emitAutoRetryFailure(attempt, @errorName(err));
+            return err;
+        };
+
+        self.agent.continueRun() catch |err| {
+            try self.emitAutoRetryFailure(attempt, @errorName(err));
+            return err;
+        };
+
+        if (self.latestAssistantError()) |next_error| {
+            if (isRetryableAssistantErrorText(next_error) and attempt < max_attempts) {
+                current_error_message = next_error;
+                continue;
+            }
+            try self.emitAutoRetryFailure(attempt, next_error);
+            return;
+        }
+
+        self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
+            .success = true,
+            .attempt = attempt,
+        } });
+        return;
+    }
+}
+
+fn latestRetryableAssistantError(self: *const AgentSession) ?[]const u8 {
+    if (!self.retry_settings.enabled or self.retry_settings.max_attempts == 0) return null;
+    if (self.agent.state.messages.len == 0) return null;
+    const last = self.agent.state.messages[self.agent.state.messages.len - 1];
+    if (last != .assistant) return null;
+    if (!isRetryableAssistant(last.assistant)) return null;
+    return last.assistant.error_message;
+}
+
+fn latestAssistantError(self: *const AgentSession) ?[]const u8 {
+    if (self.agent.state.messages.len == 0) return null;
+    const last = self.agent.state.messages[self.agent.state.messages.len - 1];
+    if (last != .assistant) return null;
+    if (last.assistant.stop_reason != .error_) return null;
+    return last.assistant.error_message orelse "assistant error";
+}
+
+fn emitAutoRetryFailure(self: *AgentSession, attempt: usize, message: []const u8) !void {
+    const final_error = try EventText.init(self.allocator, message);
+    self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
+        .success = false,
+        .attempt = attempt,
+        .final_error = final_error,
+    } });
+}
+
+fn removeLastAssistantRuntimeMessage(self: *AgentSession) !void {
+    if (self.agent.state.messages.len == 0) return error.NoMessages;
+    const retained_len = self.agent.state.messages.len - 1;
+    const retained = try agent_mod.copyAgentMessages(self.allocator, self.agent.state.messages[0..retained_len]);
+    defer deinitOwnedAgentMessages(self.allocator, retained);
+    try self.agent.replaceMessages(retained);
+}
+
+fn deinitOwnedAgentMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) void {
+    for (messages) |message| agent_mod.deinitAgentMessage(allocator, message);
+    allocator.free(messages);
 }
 
 fn constructUserMessage(
@@ -1619,6 +1731,34 @@ fn isContextOverflowAssistant(message: ai.AssistantMessage) bool {
         asciiContainsIgnoreCase(text, "too large") or
         asciiContainsIgnoreCase(text, "maximum") or
         asciiContainsIgnoreCase(text, "length");
+}
+
+fn isRetryableAssistant(message: ai.AssistantMessage) bool {
+    if (message.stop_reason != .error_) return false;
+    if (isContextOverflowAssistant(message)) return false;
+    const text = message.error_message orelse return false;
+    return isRetryableAssistantErrorText(text);
+}
+
+fn isRetryableAssistantErrorText(text: []const u8) bool {
+    return asciiContainsIgnoreCase(text, "overloaded") or
+        asciiContainsIgnoreCase(text, "rate limit") or
+        asciiContainsIgnoreCase(text, "too many requests") or
+        asciiContainsIgnoreCase(text, "429") or
+        asciiContainsIgnoreCase(text, "500") or
+        asciiContainsIgnoreCase(text, "502") or
+        asciiContainsIgnoreCase(text, "503") or
+        asciiContainsIgnoreCase(text, "504") or
+        asciiContainsIgnoreCase(text, "service unavailable") or
+        asciiContainsIgnoreCase(text, "server error") or
+        asciiContainsIgnoreCase(text, "server_error") or
+        asciiContainsIgnoreCase(text, "internal error") or
+        asciiContainsIgnoreCase(text, "internal_error") or
+        asciiContainsIgnoreCase(text, "network") or
+        asciiContainsIgnoreCase(text, "connection") or
+        asciiContainsIgnoreCase(text, "timeout") or
+        asciiContainsIgnoreCase(text, "timed out") or
+        asciiContainsIgnoreCase(text, "terminated");
 }
 
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -3086,6 +3226,124 @@ test "agent session overflow retry does not recurse on second overflow" {
     }
     try std.testing.expectEqual(@as(usize, 1), retry_start_count);
     try std.testing.expectEqual(@as(usize, 1), overflow_compaction_count);
+}
+
+test "agent session retries transient assistant errors through continue" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const responses = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&.{}, .{
+            .stop_reason = .error_,
+            .error_message = "429 rate limit",
+        }),
+        ai.faux.assistantMessage(&.{ .{ .text = .{ .text = "retried response" } } }, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&responses);
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .retry_settings = .{ .enabled = true, .max_attempts = 1 },
+    });
+    defer shutdownAndDeinit(&session);
+
+    try session.prompt("retry request", &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
+    try std.testing.expectEqual(@as(usize, 3), session.manager.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), session.agent.state.messages.len);
+    try std.testing.expect(session.agent.state.messages[1] == .assistant);
+    try std.testing.expectEqual(.stop, session.agent.state.messages[1].assistant.stop_reason);
+
+    var saw_retry_start = false;
+    var saw_retry_end = false;
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        defer owned_event.deinit();
+        if (owned_event == .auto_retry_start) {
+            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_start.attempt);
+            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_start.max_attempts);
+            try std.testing.expectEqualStrings("429 rate limit", owned_event.auto_retry_start.error_message.text);
+            saw_retry_start = true;
+        }
+        if (owned_event == .auto_retry_end) {
+            try std.testing.expect(owned_event.auto_retry_end.success);
+            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_end.attempt);
+            saw_retry_end = true;
+        }
+    }
+    try std.testing.expect(saw_retry_start);
+    try std.testing.expect(saw_retry_end);
+}
+
+test "agent session transient retry stops at bounded attempts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const responses = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&.{}, .{
+            .stop_reason = .error_,
+            .error_message = "server_error",
+        }),
+        ai.faux.assistantMessage(&.{}, .{
+            .stop_reason = .error_,
+            .error_message = "Network connection lost.",
+        }),
+    };
+    try provider.setResponses(&responses);
+
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+        .retry_settings = .{ .enabled = true, .max_attempts = 1 },
+    });
+    defer shutdownAndDeinit(&session);
+
+    try session.prompt("retry request", &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
+    try std.testing.expectEqual(@as(usize, 3), session.manager.entries.items.len);
+
+    var retry_start_count: usize = 0;
+    var saw_failed_retry_end = false;
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        defer owned_event.deinit();
+        if (owned_event == .auto_retry_start) retry_start_count += 1;
+        if (owned_event == .auto_retry_end) {
+            try std.testing.expect(!owned_event.auto_retry_end.success);
+            try std.testing.expectEqualStrings(
+                "Network connection lost.",
+                owned_event.auto_retry_end.final_error.?.text,
+            );
+            saw_failed_retry_end = true;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), retry_start_count);
+    try std.testing.expect(saw_failed_retry_end);
 }
 
 test "agent session prepares owned compaction snapshot" {

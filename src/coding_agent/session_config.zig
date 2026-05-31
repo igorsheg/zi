@@ -27,6 +27,7 @@ pub fn resolve(services: *RuntimeServices, options: Options) AgentSessionRuntime
         .model = model,
         .thinking_level = resolveThinkingLevel(services.settings_manager.current(), options.thinking_level),
         .compaction_settings = resolveCompactionSettings(services.settings_manager.current()),
+        .retry_settings = resolveRetrySettings(services.settings_manager.current()),
         .stream = resolveStream(services, options.stream, model),
         .get_api_key = services.getApiKeyHook(),
         .dir = options.dir,
@@ -112,6 +113,25 @@ fn resolveCompactionSettings(snapshot: *const settings_mod.SettingsSnapshot) ses
     return settings;
 }
 
+fn resolveRetrySettings(snapshot: *const settings_mod.SettingsSnapshot) AgentSession.RetrySettings {
+    const global = fileSettings(snapshot.global);
+    const project = fileSettings(snapshot.project);
+    var settings: AgentSession.RetrySettings = .{};
+    if (global.retry) |retry| {
+        if (retry.enabled) |enabled| settings.enabled = enabled;
+        if (retry.max_attempts) |attempts| settings.max_attempts = boundedRetryAttempts(attempts);
+    }
+    if (project.retry) |retry| {
+        if (retry.enabled) |enabled| settings.enabled = enabled;
+        if (retry.max_attempts) |attempts| settings.max_attempts = boundedRetryAttempts(attempts);
+    }
+    return settings;
+}
+
+fn boundedRetryAttempts(attempts: u64) u8 {
+    return if (attempts > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(attempts);
+}
+
 fn fileSettings(file: settings_mod.SettingsFile) settings_mod.Settings {
     return switch (file) {
         .missing => .{},
@@ -194,7 +214,7 @@ test "session config uses project settings before global settings" {
     try std.testing.expectEqual(@as(usize, 0), services.diagnosticSlice().len);
 }
 
-test "session config uses project compaction settings before global settings" {
+test "session config uses project compaction and retry settings before global settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -202,11 +222,13 @@ test "session config uses project compaction settings before global settings" {
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agent/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":111,\"autoEnabled\":true}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":111,\"autoEnabled\":true}," ++
+            "\"retry\":{\"enabled\":false,\"maxAttempts\":1}}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.zi/settings.json",
-        .data = "{\"compaction\":{\"keepRecentTokens\":222,\"autoEnabled\":false}}",
+        .data = "{\"compaction\":{\"keepRecentTokens\":222,\"autoEnabled\":false}," ++
+            "\"retry\":{\"enabled\":true,\"maxAttempts\":2}}",
     });
 
     var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
@@ -220,6 +242,8 @@ test "session config uses project compaction settings before global settings" {
 
     try std.testing.expectEqual(@as(u64, 222), base.compaction_settings.keep_recent_tokens);
     try std.testing.expect(!base.compaction_settings.auto_enabled);
+    try std.testing.expect(base.retry_settings.enabled);
+    try std.testing.expectEqual(@as(u8, 2), base.retry_settings.max_attempts);
 }
 
 test "session config keeps provider and model settings scope atomic" {
