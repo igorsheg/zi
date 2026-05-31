@@ -29,6 +29,7 @@ pub const SessionEntry = union(enum) {
     message: Message,
     thinking_level_change: ThinkingLevelChange,
     model_change: ModelChange,
+    compaction: Compaction,
 
     pub const Base = struct {
         id: []const u8,
@@ -50,6 +51,13 @@ pub const SessionEntry = union(enum) {
         base: Base,
         provider: []const u8,
         model_id: []const u8,
+    };
+
+    pub const Compaction = struct {
+        base: Base,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
     };
 
     pub fn id(self: SessionEntry) []const u8 {
@@ -89,6 +97,13 @@ pub const SessionManager = struct {
             message: agent.AgentMessage,
             thinking_level_change: []const u8,
             model_change: ModelRef,
+            compaction: Compaction,
+
+            pub const Compaction = struct {
+                summary: []const u8,
+                first_kept_entry_id: []const u8,
+                tokens_before: u64,
+            };
         };
     };
 
@@ -200,6 +215,30 @@ pub const SessionManager = struct {
         return self.appendEntry(entry);
     }
 
+    pub fn appendCompaction(
+        self: *SessionManager,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+        timestamp: []const u8,
+    ) Error![]const u8 {
+        const base = try self.nextBase(timestamp);
+        const entry: SessionEntry = blk: {
+            errdefer self.deinitBase(base);
+            const summary_copy = try self.allocator.dupe(u8, summary);
+            errdefer self.allocator.free(summary_copy);
+            const first_kept_entry_id_copy = try self.allocator.dupe(u8, first_kept_entry_id);
+            break :blk .{ .compaction = .{
+                .base = base,
+                .summary = summary_copy,
+                .first_kept_entry_id = first_kept_entry_id_copy,
+                .tokens_before = tokens_before,
+            } };
+        };
+        errdefer self.deinitEntry(entry);
+        return self.appendEntry(entry);
+    }
+
     pub fn appendLoadedEntry(self: *SessionManager, loaded: LoadedEntry) Error![]const u8 {
         if (self.entries.items.len == max_session_entries) return error.EntryLimitExceeded;
         if (self.findEntry(loaded.id) != null) return error.DuplicateEntryId;
@@ -234,6 +273,17 @@ pub const SessionManager = struct {
                     .base = base,
                     .provider = provider,
                     .model_id = model_id,
+                } };
+            },
+            .compaction => |compaction| blk: {
+                const summary = try self.allocator.dupe(u8, compaction.summary);
+                errdefer self.allocator.free(summary);
+                const first_kept_entry_id = try self.allocator.dupe(u8, compaction.first_kept_entry_id);
+                break :blk .{ .compaction = .{
+                    .base = base,
+                    .summary = summary,
+                    .first_kept_entry_id = first_kept_entry_id,
+                    .tokens_before = compaction.tokens_before,
                 } };
             },
         };
@@ -335,6 +385,7 @@ pub const SessionManager = struct {
                     .provider = model_change.provider,
                     .model_id = model_change.model_id,
                 },
+                .compaction => {},
             }
         }
 
@@ -394,6 +445,11 @@ pub const SessionManager = struct {
                 self.allocator.free(model.provider);
                 self.allocator.free(model.model_id);
             },
+            .compaction => |compaction| {
+                self.deinitBase(compaction.base);
+                self.allocator.free(compaction.summary);
+                self.allocator.free(compaction.first_kept_entry_id);
+            },
         }
     }
 
@@ -439,6 +495,20 @@ test "append entries create parent linked branch" {
 
     try std.testing.expectEqualStrings(first, manager.entries.items[1].parentId().?);
     try std.testing.expectEqualStrings(second, manager.leaf_id.?);
+}
+
+test "append compaction stores durable summary entry" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const root = try manager.appendMessage(userMessage("before"), "t1");
+    const compacted = try manager.appendCompaction("summary", root, 1200, "t2");
+
+    try std.testing.expectEqualStrings(root, manager.entries.items[1].parentId().?);
+    try std.testing.expectEqualStrings(compacted, manager.leaf_id.?);
+    try std.testing.expectEqualStrings("summary", manager.entries.items[1].compaction.summary);
+    try std.testing.expectEqualStrings(root, manager.entries.items[1].compaction.first_kept_entry_id);
+    try std.testing.expectEqual(@as(u64, 1200), manager.entries.items[1].compaction.tokens_before);
 }
 
 test "prepared message entry does not mutate active leaf before commit" {
@@ -529,7 +599,11 @@ test "loaded entries preserve ids parent links and next generated id" {
         .id = "0000000b",
         .parent_id = "0000000a",
         .timestamp = "t2",
-        .value = .{ .thinking_level_change = "high" },
+        .value = .{ .compaction = .{
+            .summary = "summary",
+            .first_kept_entry_id = "0000000a",
+            .tokens_before = 100,
+        } },
     });
     _ = try manager.appendMessage(userMessage("next"), "t3");
 

@@ -140,6 +140,15 @@ fn formatEntryLine(allocator: std.mem.Allocator, entry: session_manager.SessionE
             try writer.writer.writeAll(",\"modelId\":");
             try std.json.Stringify.value(model.model_id, .{}, &writer.writer);
         },
+        .compaction => |compaction| {
+            try writeEntryBase("compaction", &writer.writer, compaction.base);
+            try writer.writer.writeAll(",\"summary\":");
+            try std.json.Stringify.value(compaction.summary, .{}, &writer.writer);
+            try writer.writer.writeAll(",\"firstKeptEntryId\":");
+            try std.json.Stringify.value(compaction.first_kept_entry_id, .{}, &writer.writer);
+            try writer.writer.writeAll(",\"tokensBefore\":");
+            try writer.writer.print("{}", .{compaction.tokens_before});
+        },
     }
     try writer.writer.writeAll("}\n");
     return writer.toOwnedSlice();
@@ -398,6 +407,14 @@ fn parseEntryLine(allocator: std.mem.Allocator, manager: *session_manager.Sessio
         loaded.value = .{ .model_change = .{
             .provider = try jsonString(object.get("provider") orelse return error.InvalidEntry),
             .model_id = try jsonString(object.get("modelId") orelse return error.InvalidEntry),
+        } };
+        _ = try manager.appendLoadedEntry(loaded);
+    } else if (std.mem.eql(u8, entry_type, "compaction")) {
+        var loaded = loaded_base;
+        loaded.value = .{ .compaction = .{
+            .summary = try jsonString(object.get("summary") orelse return error.InvalidEntry),
+            .first_kept_entry_id = try jsonString(object.get("firstKeptEntryId") orelse return error.InvalidEntry),
+            .tokens_before = try jsonNonNegativeInteger(object.get("tokensBefore") orelse return error.InvalidEntry),
         } };
         _ = try manager.appendLoadedEntry(loaded);
     } else {
@@ -801,4 +818,28 @@ test "session store load preserves entry ids and parent links" {
 
     _ = try loaded.appendMessage(.{ .user = .{ .content = .{ .string = "next" }, .timestamp = 0 } }, "t3");
     try std.testing.expectEqualStrings("00000003", loaded.entries.items[2].id());
+}
+
+test "session store round trips compaction entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, "/repo", "session-1", "t0");
+    defer store.deinit(std.testing.allocator);
+    var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const root = try manager.appendMessage(.{ .user = .{ .content = .{ .string = "before" }, .timestamp = 0 } }, "t1");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0]);
+    _ = try manager.appendCompaction("summary", root, 2048, "t2");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[1]);
+
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.entries.items.len);
+    try std.testing.expectEqualStrings(root, loaded.entries.items[1].parentId().?);
+    try std.testing.expectEqualStrings("summary", loaded.entries.items[1].compaction.summary);
+    try std.testing.expectEqualStrings(root, loaded.entries.items[1].compaction.first_kept_entry_id);
+    try std.testing.expectEqual(@as(u64, 2048), loaded.entries.items[1].compaction.tokens_before);
 }
