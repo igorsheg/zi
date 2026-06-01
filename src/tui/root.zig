@@ -1,16 +1,13 @@
-pub const App = @import("App.zig");
-pub const composer = @import("composer.zig");
+pub const event_pump = @import("event_pump.zig");
 pub const input = @import("input.zig");
-pub const render = @import("render.zig");
+pub const input_buffer = @import("input_buffer.zig");
 pub const terminal = @import("terminal.zig");
-pub const transcript = @import("transcript.zig");
+pub const text = @import("text.zig");
 
 test {
-    _ = App;
-    _ = composer;
+    _ = event_pump;
     _ = input;
-    _ = render;
+    _ = input_buffer;
     _ = terminal;
-    _ = transcript;
+    _ = text;
 }
-
