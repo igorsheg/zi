@@ -77,7 +77,7 @@ pub fn apply(self: *App, command: Command) !Effect {
             return .{ .submit_prompt = prompt };
         },
         .cancel_or_quit => return if (self.status == .running) .cancel else .quit,
-        .scroll_up => self.transcript_view.scrollUp(&self.transcript),
+        .scroll_up => self.transcript_view.scrollUp(&self.transcript, self.transcriptTextWidth()),
         .scroll_down => self.transcript_view.scrollDown(),
     }
     self.dirty = true;
@@ -127,6 +127,10 @@ pub fn isDirty(self: App) bool {
 
 pub fn syncViews(self: *App) void {
     self.transcript_view.sync(&self.transcript);
+}
+
+pub fn transcriptTextWidth(self: App) u16 {
+    return self.width -| 2;
 }
 
 pub fn markClean(self: *App) void {

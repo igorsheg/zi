@@ -41,9 +41,13 @@ fn drawTranscript(app: *App, win: vaxis.Window) void {
     var row: u16 = win.height;
     var row_from_bottom: usize = 0;
     while (row > 0) : (row_from_bottom += 1) {
-        const item = app.transcript_view.itemForViewportRowFromBottom(&app.transcript, row_from_bottom) orelse break;
+        const projected_row = app.transcript_view.rowForViewportRowFromBottom(
+            &app.transcript,
+            win.width -| 2,
+            row_from_bottom,
+        ) orelse break;
         row -= 1;
-        drawLineAt(win, row, itemPrefix(item.kind), item.text);
+        drawLineAt(win, row, itemPrefix(projected_row.kind), projected_row.text);
     }
 }
 
@@ -62,7 +66,7 @@ fn drawLineAt(win: vaxis.Window, row: u16, prefix: []const u8, text: []const u8)
     const child = win.child(.{ .x_off = 0, .y_off = @intCast(row), .height = 1 });
     const segments = [_]vaxis.Cell.Segment{
         .{ .text = prefix, .style = .{ .bold = true } },
-        .{ .text = tailForWidth(text, win.width -| @as(u16, @intCast(prefix.len))), .style = .{} },
+        .{ .text = text, .style = .{} },
     };
     _ = child.print(&segments, .{ .wrap = .none });
 }
@@ -83,10 +87,4 @@ fn itemPrefix(kind: Transcript.Kind) []const u8 {
         .assistant => "a ",
         .tool => "t ",
     };
-}
-
-fn tailForWidth(text: []const u8, width: u16) []const u8 {
-    if (width == 0) return "";
-    if (text.len <= width) return text;
-    return text[text.len - width ..];
 }
