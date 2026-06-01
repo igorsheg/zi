@@ -1,7 +1,7 @@
 const std = @import("std");
 const zio = @import("zio");
 
-const runtime = @import("../runtime/root.zig");
+const runtime = @import("../../runtime/root.zig");
 const terminal = @import("terminal.zig");
 
 pub const TerminalEvents = struct {

@@ -43,33 +43,40 @@ that libvaxis cannot own.
 
 ## decision
 
-`src/tui` is reset to low-level primitives only. Each primitive must either be a
-thin boundary around libvaxis/zio ownership or a small mechanism that libvaxis
-does not provide in the needed ownership shape:
+`src/tui` owns the whole TUI stack, but it is internally layered. The current
+implemented layers are substrate and primitive. Product semantics are rebuilt in
+`src/tui/product` after those lower layers settle.
+
+Each substrate or primitive module must either be a thin boundary around
+libvaxis/zio ownership or a small mechanism that libvaxis does not provide in
+the needed ownership shape:
 
 ```text
-terminal.zig
-  libvaxis lifecycle, alternate screen, resize, event loop boundary
+substrate/
+  terminal.zig
+    libvaxis lifecycle, alternate screen, resize, event loop boundary
 
-event_pump.zig
-  zio-backed bounded terminal event queue
+  event_pump.zig
+    zio-backed bounded terminal event queue
 
-input.zig
-  vaxis key -> semantic-free input intent
+primitive/
+  input.zig
+    vaxis key -> semantic-free input intent
 
-text.zig
-  only helpers that compose libvaxis grapheme/width APIs without becoming a
-  second text engine
+  text.zig
+    only helpers that compose libvaxis grapheme/width APIs without becoming a
+    second text engine
 
-input_buffer.zig
-  bounded editable UTF-8 byte buffer with cursor movement, kept only if
-  libvaxis widgets would import unwanted widget/product policy
+  input_buffer.zig
+    bounded editable UTF-8 byte buffer with cursor movement, kept only if
+    libvaxis widgets would import unwanted widget/product policy
 
-viewport.zig
-  deferred unless a product-independent owner proves it is needed
+  render_smoke.zig
+    tests Zi's intended direct use of libvaxis print measurement
 
-frame.zig
-  deferred unless libvaxis windows are insufficient for deterministic tests
+product/
+  root.zig
+    intentionally empty until product semantics are rebuilt
 ```
 
 The current `coding_agent.tui_mode` product entrypoint is intentionally disabled
@@ -79,10 +86,14 @@ input-buffer mechanics inline.
 
 ## invariants
 
-- `src/tui` must not import `agent`, `ai`, `coding_agent`, session, provider,
-  tool, persistence, auth, or model-selection modules.
-- substrate modules must not mention transcript, composer, assistant, user,
-  tool, system, prompt, model, or session concepts.
+- `src/tui/substrate` and `src/tui/primitive` must not import `agent`, `ai`,
+  `coding_agent`, session, provider, tool, persistence, auth, or
+  model-selection modules.
+- substrate and primitive modules must not mention transcript, composer,
+  assistant, user, tool, system, prompt, model, or session concepts.
+- product semantics belong in `src/tui/product`, not in `src/coding_agent`, but
+  product code must depend downward on substrate/primitive instead of leaking
+  product policy into them.
 - every queue, buffer, and loop has a named bound.
 - libvaxis remains the terminal mechanism; Zi does not wrap it into a second UI
   framework.

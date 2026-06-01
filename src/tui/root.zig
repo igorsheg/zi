@@ -1,15 +1,9 @@
-pub const event_pump = @import("event_pump.zig");
-pub const input = @import("input.zig");
-pub const input_buffer = @import("input_buffer.zig");
-pub const render_smoke = @import("render_smoke.zig");
-pub const terminal = @import("terminal.zig");
-pub const text = @import("text.zig");
+pub const primitive = @import("primitive/root.zig");
+pub const product = @import("product/root.zig");
+pub const substrate = @import("substrate/root.zig");
 
 test {
-    _ = event_pump;
-    _ = input;
-    _ = input_buffer;
-    _ = render_smoke;
-    _ = terminal;
-    _ = text;
+    _ = primitive;
+    _ = product;
+    _ = substrate;
 }
