@@ -4,6 +4,7 @@ const App = @import("App.zig");
 const Transcript = @import("transcript.zig").Transcript;
 
 pub fn render(app: *App, root: vaxis.Window) void {
+    app.syncViews();
     root.clear();
     root.hideCursor();
     if (root.width == 0 or root.height == 0) {
@@ -38,10 +39,9 @@ pub fn render(app: *App, root: vaxis.Window) void {
 fn drawTranscript(app: *App, win: vaxis.Window) void {
     if (win.width == 0 or win.height == 0) return;
     var row: u16 = win.height;
-    var index = app.transcript.count;
-    while (index > 0 and row > 0) {
-        index -= 1;
-        const item = app.transcript.items[index];
+    var row_from_bottom: usize = 0;
+    while (row > 0) : (row_from_bottom += 1) {
+        const item = app.transcript_view.itemForViewportRowFromBottom(&app.transcript, row_from_bottom) orelse break;
         row -= 1;
         drawLineAt(win, row, itemPrefix(item.kind), item.text);
     }

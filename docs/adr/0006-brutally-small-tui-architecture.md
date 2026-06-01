@@ -12,6 +12,13 @@ supersedes:
   a second real owner or layout pressure proves them.
 - adr 0005. The broad layering vocabulary was too large for the current TUI.
 
+qualified by:
+
+- adr 0008. The future vocabulary is still buffer, view, surface, slot,
+  command, event, and handle, but each primitive is staged around a proven
+  owner. The first allowed step is a transcript-shaped view, not a generic
+  registry stack.
+
 ## context
 
 The first TUI implementation jumped ahead of the product. It introduced generic
@@ -86,6 +93,7 @@ App
   run_status
   composer
   transcript
+  transcript_view
   dirty
 ```
 
@@ -176,8 +184,10 @@ drop oldest resident item that is safe to drop
 or fail before mutation with error.TranscriptFull
 ```
 
-There is no projection buffer as source of truth. The renderer asks the
-transcript for visible rows for the current viewport.
+There is no projection buffer as source of truth. The transcript owns resident
+domain data and exposes a monotonic content version. `TranscriptView` owns
+scroll/follow-tail projection state. The renderer asks the view for visible
+items for the current viewport.
 
 Streaming assistant text mutates one active assistant item:
 

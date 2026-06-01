@@ -1,6 +1,6 @@
 # adr 0002: own the tui runtime and expose buffer-oriented extension surfaces
 
-status: superseded by adr 0006 for the next implementation slice
+status: superseded by adr 0006 and adr 0008
 
 date: 2026-05-30
 
@@ -15,7 +15,12 @@ pi-mono's extension system is powerful enough to affect both agent behavior and 
 - drive ui primitives such as selectors, confirmations, inputs, editors, notifications, status lines, widgets, custom headers/footers, custom editors, overlays, autocomplete, and raw terminal input.
 - inject user/custom messages during active runs with explicit delivery semantics.
 
-zi should support that level of product capability, but pi-mono is a behavioral reference, not a port target. zi's tui will not be a pi-mono-style editor sandwich with `render() => string[]` widgets. zi should support full viewport ownership, retained ui state, z-index/surface ordering, explicit layout and positioning, and a lua api that feels closer to neovim's buffer-oriented extension model.
+zi should support that level of product capability, but pi-mono is a behavioral reference, not a port target. zi's tui will not be a pi-mono-style editor sandwich with `render() => string[]` widgets. zi should eventually support viewport ownership, retained ui state, z-index/surface ordering, explicit layout and positioning, and a lua api with buffer/view-shaped capabilities.
+
+adr 0006 supersedes this document for the current implementation slice. adr
+0008 supersedes it for staging: buffer, view, surface, slot, command, event, and
+handle are future vocabulary to introduce only when a concrete owner needs each
+primitive.
 
 the terminal substrate decision is also open between:
 
@@ -26,9 +31,10 @@ in both cases, zi intends to own the semantic ui layer above the terminal substr
 
 ## decision
 
-zi will build a zi-owned retained tui runtime over a low-level terminal/rendering substrate. the preferred substrate is libvaxis, subject to a compatibility spike with the project's zig 0.16 toolchain. opentui remains a fallback reference if libvaxis fails the spike or lacks required terminal behavior.
+zi will build a zi-owned tui runtime over a low-level terminal/rendering substrate. libvaxis is the current substrate. opentui remains a rendering and text-layout reference, not an architecture to vendor.
 
-the tui architecture will be buffer-oriented:
+the long-term tui vocabulary remains buffer-oriented, but this is not the
+current implementation architecture:
 
 ```text
 +----------------------+       +------------------------+
@@ -62,7 +68,7 @@ the tui architecture will be buffer-oriented:
 +---------------------------------------------------------+
 ```
 
-lua extensions will target zi concepts, not terminal cells:
+future lua extensions will target zi concepts, not terminal cells:
 
 ```text
 buffers

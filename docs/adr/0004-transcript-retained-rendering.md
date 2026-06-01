@@ -82,15 +82,20 @@ the byte values above are starting bounds, not promises of final tuning. changin
 
 ## immediate implementation rule
 
-the first renderer slice must remove transcript/chat dual-write:
+the first renderer slice removes transcript/chat dual-write and keeps the
+projection transcript-shaped:
 
 ```text
 commands and agent events mutate transcript items
-transcript renderer updates the transcript projection
-surface compositor paints buffers
+TranscriptView owns scroll/follow-tail state
+render asks TranscriptView for visible rows
+libvaxis paints cells
 ```
 
 there must be one transcript mutation path and one projection path. no caller may append formatted transcript text directly into the transcript projection buffer.
+
+adr 0008 defers the generic transcript renderer registry, surface compositor,
+and buffer/view registries until a second concrete owner proves the abstraction.
 
 ## future work
 

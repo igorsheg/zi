@@ -13,6 +13,7 @@ width: u16,
 height: u16,
 composer: composer_mod.Composer = .{},
 transcript: transcript_mod.Transcript = .{},
+transcript_view: transcript_mod.TranscriptView = .{},
 status: Status = .idle,
 dirty: bool = true,
 
@@ -76,7 +77,8 @@ pub fn apply(self: *App, command: Command) !Effect {
             return .{ .submit_prompt = prompt };
         },
         .cancel_or_quit => return if (self.status == .running) .cancel else .quit,
-        .scroll_up, .scroll_down => {},
+        .scroll_up => self.transcript_view.scrollUp(&self.transcript),
+        .scroll_down => self.transcript_view.scrollDown(),
     }
     self.dirty = true;
     return .none;
@@ -121,6 +123,10 @@ pub fn applyAgentEvent(self: *App, event: agent.AgentEvent) !void {
 
 pub fn isDirty(self: App) bool {
     return self.dirty;
+}
+
+pub fn syncViews(self: *App) void {
+    self.transcript_view.sync(&self.transcript);
 }
 
 pub fn markClean(self: *App) void {

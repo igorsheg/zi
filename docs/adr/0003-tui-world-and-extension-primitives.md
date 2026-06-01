@@ -1,6 +1,6 @@
 # adr 0003: define the tui world as transcript, composer, slots, and surfaces
 
-status: superseded by adr 0006
+status: superseded by adr 0006 and adr 0008
 
 date: 2026-05-30
 
@@ -18,11 +18,14 @@ the target ux has:
 - future extension support that can deeply augment the ui without mutating renderer internals directly.
 - popovers, modals, autocomplete menus, command palettes, confirmations, notifications, and other z-indexed surfaces.
 
-the design must avoid encoding the built-in shell as the architecture. the built-in shell should be one composition over generic tui primitives.
+the design must avoid encoding the built-in shell as the architecture. adr 0006
+keeps the current implementation intentionally small. adr 0008 keeps the
+buffer/view/surface vocabulary but requires each primitive to be introduced only
+after a concrete owner proves it.
 
 ## decision
 
-zi will model the tui world with these domain concepts:
+the long-term tui world may grow into these domain concepts:
 
 ```text
 bridge App
@@ -45,7 +48,7 @@ future extension systems
   KeymapRegistry
 ```
 
-the built-in shell is a default composition:
+the built-in shell may later become a default composition:
 
 ```text
 RootSurface
@@ -58,7 +61,9 @@ RootSurface
     ComposerFooterSlot
 ```
 
-this shell is not hardcoded as the only possible layout. it is a zi-provided arrangement of buffers, views, surfaces, and slots.
+this shell should not become the only possible layout. In the current
+implementation, however, the shell remains a single `App` plus render path until
+a second real surface or contribution point exists.
 
 ## substrate versus domain
 
@@ -432,7 +437,7 @@ rejected:
 - letting extensions mutate session, layout, surfaces, or vaxis windows directly.
 - building the command palette, autocomplete, modal, and status systems as unrelated widgets.
 
-## next implementation slices
+## deferred implementation slices
 
 ```text
 src/tui/primitive/slot.zig
@@ -446,3 +451,18 @@ src/tui/bridge/event.zig
 future slices should preserve the same ownership rule: agent events become
 transcript items, transcript renderers write projection buffers, and
 buffers/views/surfaces render through the bridge-owned vaxis frame renderer.
+
+adr 0008 narrows the next slice to transcript-shaped primitives first:
+
+```text
+Transcript
+  bounded resident transcript data
+  monotonic content_version
+
+TranscriptView
+  scroll/follow-tail projection state
+  visible-row selection bounded by viewport rows
+```
+
+Do not add `BufferStore`, `ViewStore`, `SurfaceStack`, `SlotRegistry`, or
+extension registries until another concrete owner needs them.

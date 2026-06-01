@@ -14,7 +14,10 @@ pub const Composer = struct {
 
     pub fn insert(self: *Composer, allocator: std.mem.Allocator, text: []const u8) !void {
         try validateInsert(text);
-        if (self.bytes.items.len + text.len > bytes_max) return error.ComposerFull;
+        std.debug.assert(self.cursor <= self.bytes.items.len);
+        const byte_count_after_insert = std.math.add(usize, self.bytes.items.len, text.len) catch
+            return error.ComposerFull;
+        if (byte_count_after_insert > bytes_max) return error.ComposerFull;
         try self.bytes.insertSlice(allocator, self.cursor, text);
         self.cursor += text.len;
     }
@@ -33,7 +36,9 @@ pub const Composer = struct {
 
     pub fn moveRight(self: *Composer) void {
         if (self.cursor >= self.bytes.items.len) return;
-        self.cursor += nextGraphemeLen(self.bytes.items[self.cursor..]);
+        const next_len = nextGraphemeLen(self.bytes.items[self.cursor..]);
+        std.debug.assert(next_len <= self.bytes.items.len - self.cursor);
+        self.cursor += next_len;
     }
 
     pub fn clear(self: *Composer) void {
@@ -81,4 +86,13 @@ test "composer rejects newline before mutation" {
     try composer.insert(std.testing.allocator, "abc");
     try std.testing.expectError(error.NewlineUnsupported, composer.insert(std.testing.allocator, "\n"));
     try std.testing.expectEqualStrings("abc", composer.bytes.items);
+}
+
+test "composer rejects insert past byte bound" {
+    var composer: Composer = .{};
+    defer composer.deinit(std.testing.allocator);
+
+    try composer.insert(std.testing.allocator, "a" ** Composer.bytes_max);
+    try std.testing.expectError(error.ComposerFull, composer.insert(std.testing.allocator, "b"));
+    try std.testing.expectEqual(@as(usize, Composer.bytes_max), composer.bytes.items.len);
 }
