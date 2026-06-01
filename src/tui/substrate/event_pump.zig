@@ -14,6 +14,7 @@ pub const TerminalEvents = struct {
     buffer: [capacity_count]terminal.Event = undefined,
     channel: Channel = undefined,
     pump: zio.JoinHandle(anyerror!void),
+    loop_started: bool = false,
 
     pub fn init(
         self: *TerminalEvents,
@@ -22,10 +23,20 @@ pub const TerminalEvents = struct {
     ) !void {
         self.loop = loop;
         self.channel = Channel.init(&self.buffer);
+        try loop.start();
+        self.loop_started = true;
+        errdefer {
+            self.loop.stop();
+            self.loop_started = false;
+        }
         self.pump = try zio_runtime.spawn(pumpTerminalEvents, .{ loop, &self.channel });
     }
 
     pub fn deinit(self: *TerminalEvents) void {
+        if (self.loop_started) {
+            self.loop.stop();
+            self.loop_started = false;
+        }
         self.channel.close(.immediate);
         self.pump.cancel();
         self.pump.result catch |err| switch (err) {
@@ -95,8 +106,15 @@ test "terminal events bridge forwards vaxis queue events through zio channel" {
     defer zio_runtime.deinit();
     const io = zio_runtime.io();
 
-    var tty: vaxis.Tty = undefined;
-    var vx: vaxis.Vaxis = undefined;
+    var env_map = try std.testing.environ.createMap(std.testing.allocator);
+    defer env_map.deinit();
+
+    var tty = try vaxis.Tty.init(io, &.{});
+    defer tty.deinit();
+
+    var vx = try vaxis.init(io, std.testing.allocator, &env_map, .{});
+    defer vx.deinit(std.testing.allocator, tty.writer());
+
     var loop = terminal.EventLoop.init(io, &tty, &vx);
     var terminal_events: TerminalEvents = undefined;
     try terminal_events.init(zio_runtime, &loop);

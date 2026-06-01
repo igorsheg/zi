@@ -18,30 +18,53 @@ pub const CliError = error{
     UnsupportedCliFeature,
 };
 
-pub fn main(process: runtime.Process, args_source: std.process.Args) !void {
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), process.io, &stdout_buffer);
-    const stdout = &stdout_file_writer.interface;
+const stdout_buffer_size_bytes = 4096;
+const stderr_buffer_size_bytes = 1024;
 
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), process.io, &stderr_buffer);
-    const stderr = &stderr_file_writer.interface;
+const CliIo = struct {
+    stdout_buffer: [stdout_buffer_size_bytes]u8 = undefined,
+    stderr_buffer: [stderr_buffer_size_bytes]u8 = undefined,
+    stdout_file_writer: std.Io.File.Writer,
+    stderr_file_writer: std.Io.File.Writer,
+
+    fn init(self: *CliIo, io: std.Io) void {
+        self.stdout_file_writer = .initStreaming(.stdout(), io, &self.stdout_buffer);
+        self.stderr_file_writer = .initStreaming(.stderr(), io, &self.stderr_buffer);
+    }
+
+    fn stdout(self: *CliIo) *std.Io.Writer {
+        return &self.stdout_file_writer.interface;
+    }
+
+    fn stderr(self: *CliIo) *std.Io.Writer {
+        return &self.stderr_file_writer.interface;
+    }
+
+    fn flush(self: *CliIo) !void {
+        try self.stdout().flush();
+        try self.stderr().flush();
+    }
+};
+
+pub fn main(process: runtime.Process, args_source: std.process.Args) !void {
+    var cli_io: CliIo = undefined;
+    cli_io.init(process.io);
 
     var args = try std.process.Args.Iterator.initAllocator(args_source, process.gpa);
     defer args.deinit();
 
-    run(process, &args, stdout, stderr) catch |err| switch (err) {
+    run(process, &args, cli_io.stdout(), cli_io.stderr()) catch |err| switch (err) {
         error.OutputClosed => return,
         error.InvalidCliUsage, error.NoResumableSession, error.UnsupportedCliFeature => {
-            try flushOutputs(stdout, stderr);
+            try cli_io.flush();
             std.process.exit(2);
         },
         else => |unexpected| {
-            flushOutputs(stdout, stderr) catch return unexpected;
+            cli_io.flush() catch return unexpected;
             return unexpected;
         },
     };
-    try flushOutputs(stdout, stderr);
+    try cli_io.flush();
 }
 
 pub fn run(
@@ -216,11 +239,6 @@ fn unknownFlag(stderr: *std.Io.Writer, name: []const u8) !void {
 fn usage(stderr: *std.Io.Writer) !void {
     try args_mod.writeUsage(stderr);
     return error.InvalidCliUsage;
-}
-
-fn flushOutputs(stdout: *std.Io.Writer, stderr: *std.Io.Writer) !void {
-    try stdout.flush();
-    try stderr.flush();
 }
 
 test "cli auth logout dispatches to auth mode" {

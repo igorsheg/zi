@@ -25,6 +25,31 @@ pub fn nextGraphemeLen(text: []const u8) usize {
     return grapheme.len;
 }
 
+pub fn wrappedRowCount(bytes: []const u8, width_columns: u16) usize {
+    if (bytes.len == 0) return 1;
+    if (width_columns == 0) return 0;
+
+    var count: usize = 1;
+    var column: u16 = 0;
+    var iter = vaxis.unicode.graphemeIterator(bytes);
+    while (iter.next()) |grapheme| {
+        if (bytes[grapheme.start] == '\n') {
+            count += 1;
+            column = 0;
+            continue;
+        }
+
+        const grapheme_width = displayWidth(bytes[grapheme.start..][0..grapheme.len]);
+        if (grapheme_width == 0) continue;
+        if (column != 0 and column + grapheme_width > width_columns) {
+            count += 1;
+            column = 0;
+        }
+        column = @min(width_columns, column + grapheme_width);
+    }
+    return count;
+}
+
 test "text measures display width through libvaxis" {
     try std.testing.expectEqual(@as(u16, 4), displayWidth("a🙂b"));
 }
@@ -32,4 +57,11 @@ test "text measures display width through libvaxis" {
 test "text cursor movement uses grapheme boundaries" {
     try std.testing.expectEqual(@as(usize, 1), previousGraphemeStart("a🙂"));
     try std.testing.expectEqual(@as(usize, 4), nextGraphemeLen("🙂b"));
+}
+
+test "text counts wrapped rows without splitting graphemes" {
+    try std.testing.expectEqual(@as(usize, 1), wrappedRowCount("", 4));
+    try std.testing.expectEqual(@as(usize, 2), wrappedRowCount("abcd", 3));
+    try std.testing.expectEqual(@as(usize, 2), wrappedRowCount("a🙂b", 3));
+    try std.testing.expectEqual(@as(usize, 2), wrappedRowCount("a\nb", 80));
 }

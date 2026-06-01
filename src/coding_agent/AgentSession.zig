@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
@@ -230,6 +231,7 @@ const EventDrain = struct {
     store: ?*session_store.SessionStore,
     queue_mirror: *QueueMirror,
     public_events: *PublicEventQueue,
+    public_event_wake: zio.ResetEvent = .init,
     timestamp: []const u8,
     context_overflow_count: usize = 0,
 
@@ -291,6 +293,7 @@ const EventDrain = struct {
     fn enqueuePublicEvent(self: *EventDrain, event: session_events.AgentSessionEvent) void {
         var owned_event = event;
         if (!self.public_events.pushOrDrop(owned_event)) owned_event.deinit();
+        self.public_event_wake.set();
     }
 };
 
@@ -791,6 +794,31 @@ pub fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !s
 
 pub fn drainPublicEvent(self: *AgentSession) ?session_events.AgentSessionEvent {
     return self.public_events.pop();
+}
+
+pub fn publicEventWake(self: *AgentSession) *zio.ResetEvent {
+    return &self.event_drain.public_event_wake;
+}
+
+test "agent session public event enqueue sets coalesced wake" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var session = try initTestSession(zio_runtime, tmp.dir);
+    defer shutdownAndDeinit(&session);
+
+    try std.testing.expect(!session.publicEventWake().isSet());
+
+    session.event_drain.enqueuePublicEvent(.{ .agent_event = .agent_start });
+
+    try std.testing.expect(session.publicEventWake().isSet());
+    session.publicEventWake().reset();
+    try std.testing.expect(!session.publicEventWake().isSet());
+
+    var event = session.drainPublicEvent().?;
+    defer event.deinit();
+    try std.testing.expectEqual(agent_mod.AgentEvent.agent_start, event.agent_event);
 }
 
 fn ensureAcceptsPrompt(self: *AgentSession) Error!void {

@@ -231,6 +231,10 @@ pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?session_events.AgentSes
     return self.session.drainPublicEvent();
 }
 
+pub fn publicEventWake(self: *AgentSessionRuntimeHost) *zio.ResetEvent {
+    return self.session.publicEventWake();
+}
+
 pub fn drainPublicEvents(self: *AgentSessionRuntimeHost, handler: PublicEventHandler) !usize {
     var count: usize = 0;
     while (self.drainPublicEvent()) |event| {
