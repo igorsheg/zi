@@ -24,7 +24,14 @@ pub const Completion = union(enum) {
     },
 };
 
-pub const CompletionQueue = runtime.CompletionQueue(Completion);
+pub const CompletionQueue = runtime.CompletionQueue(Completion, completionIsTerminal);
+
+fn completionIsTerminal(completion: Completion) bool {
+    return switch (completion) {
+        .done, .failed, .canceled => true,
+        .event => false,
+    };
+}
 
 pub const Operation = struct {
     id: runtime.OperationId,
@@ -119,7 +126,7 @@ pub const Operation = struct {
     }
 };
 
-test "runtime stream forwards provider events as operation completions" {
+test "provider stream stepper forwards provider events as operation completions" {
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var provider = try faux.Provider.init(std.testing.allocator, .{});
@@ -128,7 +135,7 @@ test "runtime stream forwards provider events as operation completions" {
     try provider.setResponses(&.{faux.assistantMessage(&.{faux.text("ok")}, .{})});
     var completion_buffer: [8]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
-    var table: runtime.OperationTable = .{};
+    var table: runtime.OperationIds = .{};
     var op = try Operation.start(table.reserve(), &registry, testRequest(provider.getModel()), null);
 
     while (try op.step(&queue)) {}
@@ -147,7 +154,7 @@ test "runtime stream forwards provider events as operation completions" {
     try std.testing.expectEqual(@as(usize, 1), done_count);
 }
 
-test "runtime stream cancellation before first event emits only aborted terminal" {
+test "provider stream stepper cancellation before first event emits only aborted terminal" {
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var provider = try faux.Provider.init(std.testing.allocator, .{ .min_token_size = 1, .max_token_size = 1 });
@@ -157,7 +164,7 @@ test "runtime stream cancellation before first event emits only aborted terminal
     var completion_buffer: [4]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
     var source: runtime.CancelSource = .{};
-    var table: runtime.OperationTable = .{};
+    var table: runtime.OperationIds = .{};
     var op = try Operation.start(
         table.reserve(),
         &registry,
@@ -165,7 +172,7 @@ test "runtime stream cancellation before first event emits only aborted terminal
         source.token(),
     );
 
-    source.request();
+    source.requestWithWake(std.Io.failing);
     try std.testing.expect(!try op.step(&queue));
 
     const completion = queue.pop().?.canceled;
@@ -174,7 +181,7 @@ test "runtime stream cancellation before first event emits only aborted terminal
     try std.testing.expect(queue.pop() == null);
 }
 
-test "runtime stream cancellation after text delta omits text end and emits aborted terminal" {
+test "provider stream stepper cancellation after text delta omits text end and emits aborted terminal" {
     try expectCancelAfterDelta(
         &.{faux.text("abcdefghijklmnopqrstuvwxyz")},
         .text_delta,
@@ -182,7 +189,7 @@ test "runtime stream cancellation after text delta omits text end and emits abor
     );
 }
 
-test "runtime stream cancellation after thinking delta omits thinking end and emits aborted terminal" {
+test "provider stream stepper cancellation after thinking delta omits thinking end and emits aborted terminal" {
     try expectCancelAfterDelta(
         &.{faux.thinking("abcdefghijklmnopqrstuvwxyz")},
         .thinking_delta,
@@ -190,7 +197,7 @@ test "runtime stream cancellation after thinking delta omits thinking end and em
     );
 }
 
-test "runtime stream cancellation after toolcall delta omits toolcall end and emits aborted terminal" {
+test "provider stream stepper cancellation after toolcall delta omits toolcall end and emits aborted terminal" {
     var arguments = try jsonObjectWithString(std.testing.allocator, "text", "abcdefghijklmnopqrstuvwxyz");
     defer arguments.deinit(std.testing.allocator);
     try expectCancelAfterDelta(
@@ -214,7 +221,7 @@ fn expectCancelAfterDelta(
     var completion_buffer: [32]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
     var source: runtime.CancelSource = .{};
-    var table: runtime.OperationTable = .{};
+    var table: runtime.OperationIds = .{};
     var op = try Operation.start(
         table.reserve(),
         &registry,
@@ -232,7 +239,7 @@ fn expectCancelAfterDelta(
         if (source.token().isRequested() and tag == forbidden_after_cancel) saw_forbidden_after_cancel = true;
         if (tag == cancel_after) {
             target_delta_count += 1;
-            source.request();
+            source.requestWithWake(std.Io.failing);
         }
     }
 

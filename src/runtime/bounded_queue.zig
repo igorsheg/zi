@@ -4,7 +4,8 @@ const std = @import("std");
 ///
 /// BoundedQueue never allocates and never destroys queued values. It is a
 /// mechanism for non-owning values or values whose cleanup is handled by the
-/// owner after pop(). Calling clear() forgets queued values without cleanup.
+/// owner after pop(). Calling discardQueuedItems() forgets queued values
+/// without cleanup.
 pub fn BoundedQueue(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -63,7 +64,7 @@ pub fn BoundedQueue(comptime T: type) type {
             return item;
         }
 
-        pub fn clear(self: *Self) void {
+        pub fn discardQueuedItems(self: *Self) void {
             self.head = 0;
             self.tail = 0;
             self.len = 0;
@@ -101,14 +102,14 @@ test "bounded queue pushOrDrop counts explicit drops" {
     try std.testing.expectEqual(@as(?u8, 1), queue.pop());
 }
 
-test "bounded queue clear keeps drop accounting observable" {
+test "bounded queue discard keeps drop accounting observable" {
     const Queue = BoundedQueue(u8);
     var buffer: [1]u8 = undefined;
     var queue = Queue.init(&buffer);
 
     try queue.push(1);
     _ = queue.pushOrDrop(2);
-    queue.clear();
+    queue.discardQueuedItems();
 
     try std.testing.expect(queue.empty());
     try std.testing.expectEqual(@as(usize, 1), queue.dropped());

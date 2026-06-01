@@ -23,7 +23,7 @@ pub fn appendPath(
 }
 
 pub fn readBoundedBody(allocator: std.mem.Allocator, reader: anytype, max_bytes: usize) ![]u8 {
-    var body = mem.ByteBuilder.init(allocator);
+    var body = mem.ByteBuilder.initBounded(allocator, max_bytes);
     errdefer body.deinit();
 
     while (body.items().len < max_bytes) {
@@ -37,6 +37,14 @@ pub fn readBoundedBody(allocator: std.mem.Allocator, reader: anytype, max_bytes:
         if (n == 0) continue;
         try body.append(chunk[0..n]);
     }
+
+    var extra: [1]u8 = undefined;
+    var extra_writer: std.Io.Writer = .fixed(&extra);
+    const extra_count = reader.stream(&extra_writer, .limited(extra.len)) catch |err| switch (err) {
+        error.EndOfStream => return body.toOwnedSlice(),
+        else => return err,
+    };
+    if (extra_count > 0) return error.BodyTooLarge;
 
     return body.toOwnedSlice();
 }
@@ -56,4 +64,18 @@ test "bearerHeader formats authorization header" {
     const value = try bearerHeader(std.testing.allocator, "token");
     defer std.testing.allocator.free(value);
     try std.testing.expectEqualStrings("Bearer token", value);
+}
+
+test "readBoundedBody returns body at limit when stream ends" {
+    var reader = std.Io.Reader.fixed("abcd");
+    const body = try readBoundedBody(std.testing.allocator, &reader, 4);
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expectEqualStrings("abcd", body);
+}
+
+test "readBoundedBody rejects body larger than limit" {
+    var reader = std.Io.Reader.fixed("abcde");
+
+    try std.testing.expectError(error.BodyTooLarge, readBoundedBody(std.testing.allocator, &reader, 4));
 }

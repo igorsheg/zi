@@ -156,7 +156,7 @@ fn openWithRetries(state: *CodexResponseStream) !void {
             error.RetryableRequestFailed => {
                 last_error = err;
                 if (attempt == retry_count_max) return err;
-                try runtime.sleep(
+                try runtime.sleepUntilCancel(
                     state.request.io,
                     retryDelay(attempt, state.request.options.max_retry_delay_ms),
                     state.request.cancel_token,
@@ -166,7 +166,7 @@ fn openWithRetries(state: *CodexResponseStream) !void {
             else => |other| {
                 last_error = other;
                 if (attempt == retry_count_max or !isRetryableTransportError(other)) return other;
-                try runtime.sleep(
+                try runtime.sleepUntilCancel(
                     state.request.io,
                     retryDelay(attempt, state.request.options.max_retry_delay_ms),
                     state.request.cancel_token,

@@ -18,7 +18,7 @@ steering_queue: PendingMessageQueue = .{},
 follow_up_queue: PendingMessageQueue = .{},
 loop_config: agent.AgentLoopConfig,
 listeners: std.ArrayList(?Listener) = .empty,
-operations: runtime.OperationTable = .{},
+operations: runtime.OperationIds = .{},
 cancel_source: runtime.CancelSource = .{},
 active_run: ?runtime.OperationId = null,
 
@@ -181,7 +181,7 @@ pub fn hasQueuedMessages(self: *const Agent) bool {
 }
 
 pub fn abort(self: *Agent) void {
-    if (self.active_run != null) self.cancel_source.request();
+    if (self.active_run != null) self.cancel_source.requestWithWake(self.io);
 }
 
 pub fn signal(self: *Agent) ?runtime.CancelToken {
@@ -195,7 +195,7 @@ pub fn reset(self: *Agent) void {
     _ = self.message_arena.reset(.retain_capacity);
     self.state.messages = self.messages.items;
     self.state.status = .idle;
-    self.cancel_source.reset();
+    self.cancel_source.resetAfterDrain();
     self.active_run = null;
 }
 
@@ -218,7 +218,7 @@ pub fn unsubscribe(self: *Agent, handle: usize) void {
 
 pub fn beginRun(self: *Agent) Error!runtime.CancelToken {
     if (self.active_run != null) return error.AlreadyRunning;
-    self.cancel_source.reset();
+    self.cancel_source.resetAfterDrain();
     self.active_run = self.operations.reserve();
     self.state.status = .{ .running = .{} };
     return self.cancel_source.token();
@@ -226,7 +226,7 @@ pub fn beginRun(self: *Agent) Error!runtime.CancelToken {
 
 pub fn finishRun(self: *Agent) void {
     if (self.state.status != .failed) self.state.status = .idle;
-    self.cancel_source.reset();
+    self.cancel_source.resetAfterDrain();
     self.active_run = null;
 }
 

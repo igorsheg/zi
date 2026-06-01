@@ -7,6 +7,7 @@ pub const event_pipe = @import("event_pipe.zig");
 pub const json_owned = @import("json_owned.zig");
 pub const operation = @import("operation.zig");
 pub const race = @import("race.zig");
+pub const task_group = @import("task_group.zig");
 
 pub const BoundedQueue = bounded_queue.BoundedQueue;
 pub const ByteBuilder = @import("byte_builder.zig").ByteBuilder;
@@ -16,12 +17,14 @@ pub const CompletionQueue = completion_queue.CompletionQueue;
 pub const EventPipe = event_pipe.EventPipe;
 pub const JsonOwned = json_owned.JsonOwned;
 pub const OperationId = operation.OperationId;
+pub const OperationIds = operation.OperationIds;
 pub const OperationState = operation.OperationState;
-pub const OperationTable = operation.OperationTable;
 pub const Race = race.Race;
+pub const TaskGroup = task_group.TaskGroup;
+pub const sleepUntilCancel = cancel.sleepUntilCancel;
 pub const cloneJsonValue = json_owned.cloneJsonValue;
 pub const freeJsonValue = json_owned.freeJsonValue;
-pub const sleep = cancel.sleep;
+pub const waitForCancelWake = cancel.waitForCancelWake;
 
 test {
     _ = @import("Process.zig");
@@ -33,4 +36,5 @@ test {
     _ = @import("json_owned.zig");
     _ = @import("operation.zig");
     _ = @import("race.zig");
+    _ = @import("task_group.zig");
 }

@@ -8,7 +8,9 @@ pub const OperationId = enum(u64) {
     }
 
     pub fn next(self: OperationId) OperationId {
-        return @enumFromInt(@intFromEnum(self) + 1);
+        const value = @intFromEnum(self);
+        std.debug.assert(value < std.math.maxInt(u64));
+        return @enumFromInt(value + 1);
     }
 };
 
@@ -21,21 +23,21 @@ pub const OperationState = union(enum) {
     canceled,
 };
 
-pub const OperationTable = struct {
+pub const OperationIds = struct {
     next_id: OperationId = OperationId.first(),
 
-    pub fn reserve(self: *OperationTable) OperationId {
+    pub fn reserve(self: *OperationIds) OperationId {
         const id = self.next_id;
         self.next_id = id.next();
         return id;
     }
 };
 
-test "operation table reserves monotonic nonzero ids" {
-    var table: OperationTable = .{};
+test "operation ids reserve monotonic nonzero ids" {
+    var ids: OperationIds = .{};
 
-    const first = table.reserve();
-    const second = table.reserve();
+    const first = ids.reserve();
+    const second = ids.reserve();
 
     try std.testing.expectEqual(@as(u64, 1), @intFromEnum(first));
     try std.testing.expectEqual(@as(u64, 2), @intFromEnum(second));

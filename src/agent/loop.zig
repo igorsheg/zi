@@ -22,7 +22,6 @@ pub const AgentEventStream = struct {
     pipe: AgentEventPipe,
     event_arena: std.heap.ArenaAllocator,
     future: ?std.Io.Future(anyerror!void) = null,
-    terminal_messages: ?[]const agent.AgentMessage = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, buffer: []agent.AgentEvent) AgentEventStream {
         return .{
@@ -98,7 +97,10 @@ fn runPromptStreamProducer(
     token: runtime.CancelToken,
     stream: *AgentEventStream,
 ) anyerror!void {
-    try runPrompt(allocator, io, prompts, context, config, token, streamSink(stream));
+    runPrompt(allocator, io, prompts, context, config, token, streamSink(stream)) catch |err| {
+        stream.pipe.sink().abort(io);
+        return err;
+    };
 }
 
 fn runContinueStreamProducer(
@@ -109,7 +111,10 @@ fn runContinueStreamProducer(
     token: runtime.CancelToken,
     stream: *AgentEventStream,
 ) anyerror!void {
-    try runContinue(allocator, io, context, config, token, streamSink(stream));
+    runContinue(allocator, io, context, config, token, streamSink(stream)) catch |err| {
+        stream.pipe.sink().abort(io);
+        return err;
+    };
 }
 
 pub const Error = error{
@@ -229,7 +234,6 @@ fn streamSinkEmit(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     switch (event) {
         .agent_end => |end| {
             const messages = try copyTerminalMessages(stream.event_arena.allocator(), end.messages);
-            stream.terminal_messages = messages;
             try stream.pipe.sink().end(stream.io, .{ .agent_end = .{ .messages = messages } }, messages);
         },
         else => try stream.pipe.sink().emit(stream.io, try copyStreamEvent(stream.event_arena.allocator(), event)),
@@ -600,12 +604,18 @@ const FinalizedToolCall = struct {
 const ToolWorkerEvent = union(enum) {
     update: ToolUpdate,
     complete: ExecutedToolCall,
+    failed: ToolFailure,
 
     const ToolUpdate = struct {
         tool_call_id: []const u8,
         tool_name: []const u8,
         args: std.json.Value,
         partial_result: agent.AgentToolResult,
+    };
+
+    const ToolFailure = struct {
+        prepared: PreparedToolCall,
+        error_name: []const u8,
     };
 };
 
@@ -634,16 +644,21 @@ fn executeToolCallsParallel(
     var queue_buffer: [agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch]ToolWorkerEvent = undefined;
     var queue = ToolWorkerQueue.init(&queue_buffer);
     var update_count: std.atomic.Value(usize) = .init(0);
-    var futures: [agent.max_tool_calls_per_turn]std.Io.Future(anyerror!void) = undefined;
+    var group = runtime.TaskGroup.init(io, agent.max_tool_calls_per_turn);
+    defer group.deinit();
 
-    for (prepared[0..prepared_count], 0..) |item, index| {
-        futures[index] = io.async(
+    for (prepared[0..prepared_count]) |item| {
+        try group.spawn(
             executePreparedToolCallWorker,
             .{ allocator, io, item, token, &queue, &update_count },
         );
     }
+    errdefer cancelParallelToolWorkers(io, &group, &queue);
 
     var executed: [agent.max_tool_calls_per_turn]ExecutedToolCall = undefined;
+    var executed_owned: [agent.max_tool_calls_per_turn]bool = @splat(false);
+    errdefer deinitOwnedExecutedToolCalls(&executed, &executed_owned);
+
     var completed_count: usize = 0;
     while (completed_count < prepared_count) {
         const event = try queue.getOne(io);
@@ -656,18 +671,33 @@ fn executeToolCallsParallel(
             } }),
             .complete => |complete| {
                 executed[complete.prepared.index()] = complete;
+                executed_owned[complete.prepared.index()] = true;
+                completed_count += 1;
+            },
+            .failed => |failed| {
+                executed[failed.prepared.index()] = .{
+                    .prepared = failed.prepared,
+                    .result = try createErrorToolResultFmt(
+                        allocator,
+                        "tool worker failed: {s}",
+                        .{failed.error_name},
+                    ),
+                    .is_error = true,
+                };
+                executed_owned[failed.prepared.index()] = true;
                 completed_count += 1;
             },
         }
     }
 
-    for (futures[0..prepared_count]) |*future| try future.await(io);
+    try group.await();
 
     var messages = std.ArrayList(ai.ToolResultMessage).empty;
     errdefer deinitToolResultMessages(allocator, messages.items, &messages);
     var terminate_count: usize = 0;
 
     for (executed[0..prepared_count]) |item| {
+        executed_owned[item.prepared.index()] = false;
         var finalized = try finalizeExecutedToolCall(allocator, current, assistant, config, token, item);
         if (finalized.result.result.terminate) terminate_count += 1;
         emitFinalizedToolCall(allocator, emit, item.prepared.toolCall(), finalized, &messages) catch |err| {
@@ -681,6 +711,40 @@ fn executeToolCallsParallel(
         .messages = try messages.toOwnedSlice(allocator),
         .terminate = prepared_count > 0 and terminate_count == prepared_count,
     };
+}
+
+fn cancelParallelToolWorkers(
+    io: std.Io,
+    group: *runtime.TaskGroup,
+    queue: *ToolWorkerQueue,
+) void {
+    group.cancel();
+    drainPendingToolWorkerEvents(io, queue);
+}
+
+fn drainPendingToolWorkerEvents(io: std.Io, queue: *ToolWorkerQueue) void {
+    var buffer: [agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch]ToolWorkerEvent = undefined;
+    while (true) {
+        const count = queue.getUncancelable(io, &buffer, 0) catch break;
+        if (count == 0) break;
+        for (buffer[0..count]) |*event| deinitToolWorkerEvent(event);
+    }
+}
+
+fn deinitToolWorkerEvent(event: *ToolWorkerEvent) void {
+    switch (event.*) {
+        .update, .failed => {},
+        .complete => |*complete| complete.result.deinit(),
+    }
+}
+
+fn deinitOwnedExecutedToolCalls(
+    executed: *[agent.max_tool_calls_per_turn]ExecutedToolCall,
+    owned: *[agent.max_tool_calls_per_turn]bool,
+) void {
+    for (owned, 0..) |is_owned, index| {
+        if (is_owned) executed[index].result.deinit();
+    }
 }
 
 fn prepareParallelToolCalls(
@@ -721,9 +785,18 @@ fn executePreparedToolCallWorker(
     token: runtime.CancelToken,
     queue: *ToolWorkerQueue,
     update_count: *std.atomic.Value(usize),
-) anyerror!void {
-    const executed = try executePreparedToolCall(allocator, io, prepared, token, queue, update_count);
-    try queue.putOne(io, .{ .complete = executed });
+) std.Io.Cancelable!void {
+    var executed = executePreparedToolCall(allocator, io, prepared, token, queue, update_count) catch |err| {
+        queue.putOne(io, .{ .failed = .{ .prepared = prepared, .error_name = @errorName(err) } }) catch |queue_err| {
+            if (queue_err == error.Canceled) return error.Canceled;
+            return;
+        };
+        return;
+    };
+    queue.putOne(io, .{ .complete = executed }) catch |queue_err| {
+        executed.result.deinit();
+        if (queue_err == error.Canceled) return error.Canceled;
+    };
 }
 
 fn prepareToolCall(
@@ -752,7 +825,9 @@ fn prepareToolCall(
     else
         tool_call.arguments;
 
-    // TODO: Validate args against tool.parameters before tool execution.
+    // Debt owner: agent. Reason: JSON-schema validation needs one shared
+    // validator for sequential and parallel tool paths. Remove this when
+    // `agent.AgentTool.parameters` has an executable validator.
     if (config.before_tool_call) |before| {
         const before_result = before.call(token, .{
             .assistant_message = assistant,
@@ -1179,6 +1254,11 @@ fn testSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     try events.append(std.testing.allocator, try copyEventForTest(event));
 }
 
+fn failOnToolUpdateSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
+    if (event == .tool_execution_update) return error.TestSinkFailed;
+    try testSink(context, event);
+}
+
 fn copyEventForTest(event: agent.AgentEvent) !agent.AgentEvent {
     return switch (event) {
         .message_start => |payload| .{ .message_start = .{ .message = try copyMessageForTest(payload.message) } },
@@ -1228,6 +1308,10 @@ fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEven
     const sink = stream.sink();
     sink.endDone(request.io, .stop, assistantMessage("ok")) catch unreachable;
     return stream;
+}
+
+fn emptyStream(_: ?*anyopaque, _: ai.StreamRequest) ai.AssistantMessageEventStream {
+    return ai.AssistantMessageEventStream.initBuffered();
 }
 
 fn testToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
@@ -1357,7 +1441,7 @@ test "run prompt emits prompt assistant and agent end events" {
 
     try runPrompt(
         std.testing.allocator,
-        std.Io.failing,
+        std.testing.io,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
         .{
@@ -1401,6 +1485,33 @@ test "prompt stream exposes events and terminal messages through event pipe" {
     try std.testing.expectEqual(@as(usize, 2), stream.result().?.len);
 }
 
+test "prompt stream closes event pipe when producer fails before terminal event" {
+    var cancel: runtime.CancelSource = .{};
+    const prompt = userMessage("hello");
+    var buffer: [8]agent.AgentEvent = undefined;
+    var stream: AgentEventStream = undefined;
+
+    startPromptStream(
+        &stream,
+        std.testing.allocator,
+        std.Io.failing,
+        &.{prompt},
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
+        .{
+            .model = testModel(),
+            .stream = .{ .call_fn = emptyStream },
+            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+        },
+        cancel.token(),
+        &buffer,
+    );
+    defer stream.deinit();
+
+    while (try stream.next(std.Io.failing)) |_| {}
+    try std.testing.expectError(error.MissingAssistantResult, stream.awaitProducer());
+    try std.testing.expectEqual(@as(?[]const agent.AgentMessage, null), stream.result());
+}
+
 test "run prompt executes tool result then continues assistant turn" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
@@ -1417,9 +1528,9 @@ test "run prompt executes tool result then continues assistant turn" {
         .execute = .{ .context = &tool_calls, .call_fn = echoTool },
     };
 
-    try runPrompt(
-        std.testing.allocator,
-        std.Io.failing,
+	    try runPrompt(
+	        std.testing.allocator,
+	        std.testing.io,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
         .{
@@ -1454,7 +1565,7 @@ test "parallel tool calls emit bounded live updates through owner" {
 
     try runPrompt(
         std.testing.allocator,
-        std.Io.failing,
+        std.testing.io,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
         .{
@@ -1476,6 +1587,40 @@ test "parallel tool calls emit bounded live updates through owner" {
     try std.testing.expectEqual(@as(usize, 1), update_count);
 }
 
+test "parallel tool calls cancel and drain workers when owner update drain fails" {
+    var events = std.ArrayList(agent.AgentEvent).empty;
+    defer events.deinit(std.testing.allocator);
+    defer deinitTestEvents(events.items);
+    var cancel: runtime.CancelSource = .{};
+    var stream_calls: usize = 0;
+    var tool_calls: usize = 0;
+    const prompt = userMessage("hello");
+    const tool: agent.AgentTool = .{
+        .name = "echo",
+        .description = "Echo",
+        .parameters = .{ .object = .empty },
+        .label = "Echo",
+        .execute = .{ .context = &tool_calls, .call_fn = updatingTool },
+    };
+
+    try std.testing.expectError(error.TestSinkFailed, runPrompt(
+        std.testing.allocator,
+        std.testing.io,
+        &.{prompt},
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
+        .{
+            .model = testModel(),
+            .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
+            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .tool_execution = .parallel,
+        },
+        cancel.token(),
+        .{ .context = &events, .call_fn = failOnToolUpdateSink },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), tool_calls);
+}
+
 test "parallel tool calls finalize results in assistant source order" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
@@ -1494,7 +1639,7 @@ test "parallel tool calls finalize results in assistant source order" {
 
     try runPrompt(
         std.testing.allocator,
-        std.Io.failing,
+        std.testing.io,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
         .{

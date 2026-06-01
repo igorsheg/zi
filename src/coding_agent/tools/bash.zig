@@ -112,7 +112,7 @@ fn execute(
     defer race.deinit();
     try race.concurrent(.process, runProcess, .{ allocator, io, self.config, args });
     errdefer race.cancelAndDrain(allocator, drainCompletion);
-    try race.concurrent(.cancel, waitForCancellation, .{ io, token });
+    try race.concurrent(.cancel, runtime.waitForCancelWake, .{ io, token });
 
     const completion = race.await() catch |err| {
         race.cancelAndDrain(allocator, drainCompletion);
@@ -162,13 +162,6 @@ fn runProcess(
         return error.StreamTooLong;
     }
     return run_result;
-}
-
-fn waitForCancellation(io: std.Io, token: runtime.CancelToken) anyerror!void {
-    while (true) {
-        try token.throwIfRequested();
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
 }
 
 fn drainCompletion(allocator: std.mem.Allocator, completion: ProcessCompletion) void {
@@ -399,7 +392,7 @@ test "bash tool cancels running process through owner race" {
         null,
     });
     try std.testing.io.sleep(.fromMilliseconds(10), .awake);
-    cancel_source.request();
+    cancel_source.requestWithWake(std.testing.io);
 
     try std.testing.expectError(error.OperationCancelled, future.await(std.testing.io));
 }

@@ -668,7 +668,7 @@ pub fn cancel(self: *AgentSession) void {
         if (self.lifecycle == .shutdown_requested or self.lifecycle == .stopped) return;
         if (self.lifecycle == .cancel_requested) return;
         self.lifecycle = .cancel_requested;
-        source.request();
+        source.requestWithWake(self.io);
         return;
     }
     if (self.agent.state.status == .settling) return;
@@ -687,7 +687,7 @@ pub fn requestShutdown(self: *AgentSession) void {
     }
     if (self.active_compaction_cancel_source) |source| {
         self.lifecycle = .shutdown_requested;
-        source.request();
+        source.requestWithWake(self.io);
         return;
     }
     if (self.agent.state.status == .settling) {

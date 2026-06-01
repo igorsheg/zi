@@ -42,10 +42,10 @@ pub const Parser = struct {
         return .{
             .allocator = allocator,
             .limits = limits,
-            .pending_line = mem.ByteBuilder.init(allocator),
-            .event_name = mem.ByteBuilder.init(allocator),
-            .data = mem.ByteBuilder.init(allocator),
-            .id = mem.ByteBuilder.init(allocator),
+            .pending_line = mem.ByteBuilder.initBounded(allocator, limits.max_line_bytes),
+            .event_name = mem.ByteBuilder.initBounded(allocator, limits.max_event_name_bytes),
+            .data = mem.ByteBuilder.initBounded(allocator, limits.max_data_bytes),
+            .id = mem.ByteBuilder.initBounded(allocator, limits.max_id_bytes),
         };
     }
 

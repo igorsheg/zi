@@ -4,9 +4,16 @@ pub const ByteBuilder = struct {
     allocator: std.mem.Allocator,
     buf: []u8 = &.{},
     len: usize = 0,
+    capacity_max: ?usize = null,
+
+    pub const Error = std.mem.Allocator.Error || error{CapacityExceeded};
 
     pub fn init(allocator: std.mem.Allocator) ByteBuilder {
         return .{ .allocator = allocator };
+    }
+
+    pub fn initBounded(allocator: std.mem.Allocator, capacity_max: usize) ByteBuilder {
+        return .{ .allocator = allocator, .capacity_max = capacity_max };
     }
 
     pub fn deinit(self: *ByteBuilder) void {
@@ -28,33 +35,37 @@ pub const ByteBuilder = struct {
         return self.buf[0..self.len];
     }
 
-    pub fn ensureUnusedCapacity(self: *ByteBuilder, additional: usize) std.mem.Allocator.Error!void {
+    pub fn ensureUnusedCapacity(self: *ByteBuilder, additional: usize) Error!void {
         std.debug.assert(self.len <= self.buf.len);
         if (additional <= self.buf.len - self.len) return;
         const needed = std.math.add(usize, self.len, additional) catch return error.OutOfMemory;
         try self.ensureTotalCapacity(needed);
     }
 
-    pub fn ensureTotalCapacity(self: *ByteBuilder, needed: usize) std.mem.Allocator.Error!void {
+    pub fn ensureTotalCapacity(self: *ByteBuilder, needed: usize) Error!void {
+        if (self.capacity_max) |max| {
+            if (needed > max) return error.CapacityExceeded;
+        }
         if (needed <= self.buf.len) return;
         var capacity = if (self.buf.len == 0) @as(usize, 64) else self.buf.len;
         while (capacity < needed) {
             capacity = std.math.mul(usize, capacity, 2) catch needed;
             if (capacity < needed) capacity = needed;
         }
+        if (self.capacity_max) |max| capacity = @min(capacity, max);
         const next = try self.allocator.alloc(u8, capacity);
         @memcpy(next[0..self.len], self.buf[0..self.len]);
         self.allocator.free(self.buf);
         self.buf = next;
     }
 
-    pub fn append(self: *ByteBuilder, bytes: []const u8) std.mem.Allocator.Error!void {
+    pub fn append(self: *ByteBuilder, bytes: []const u8) Error!void {
         try self.ensureUnusedCapacity(bytes.len);
         @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
         self.len += bytes.len;
     }
 
-    pub fn appendByte(self: *ByteBuilder, byte: u8) std.mem.Allocator.Error!void {
+    pub fn appendByte(self: *ByteBuilder, byte: u8) Error!void {
         try self.ensureUnusedCapacity(1);
         self.buf[self.len] = byte;
         self.len += 1;
@@ -99,4 +110,13 @@ test "ByteBuilder toOwnedSlice transfers ownership and resets" {
     try std.testing.expectEqualStrings("abc", owned);
     try std.testing.expectEqual(@as(usize, 0), builder.items().len);
     try std.testing.expectEqual(@as(usize, 0), builder.buf.len);
+}
+
+test "ByteBuilder bounded mode rejects growth past capacity" {
+    var builder = ByteBuilder.initBounded(std.testing.allocator, 3);
+    defer builder.deinit();
+
+    try builder.append("abc");
+    try std.testing.expectError(error.CapacityExceeded, builder.appendByte('d'));
+    try std.testing.expectEqualStrings("abc", builder.items());
 }

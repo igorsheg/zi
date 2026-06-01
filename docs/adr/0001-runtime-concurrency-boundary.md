@@ -21,9 +21,9 @@ in a node/typescript product this is usually hidden behind `Promise.race`, the e
 
 zi already has the start of a runtime vocabulary:
 
-- `src/runtime/operation.zig`: operation ids, operation states, operation table.
+- `src/runtime/operation.zig`: operation ids and operation states.
 - `src/runtime/completion_queue.zig`: bounded completion queue.
-- `src/runtime/cancel.zig`: cancel source/token and cooperative sleep.
+- `src/runtime/cancel.zig`: wakeable cancel source/token and cancelable sleep races.
 - `src/runtime/event_pipe.zig`: queue-backed producer/consumer event pipe.
 
 but zi does not yet have a clear boundary for blocking operations that must run concurrently with owner code. the oauth login bug made this visible: printing the auth URL and prompt without flushing caused the process to appear to do nothing, then fixing the flush exposed the deeper serialization bug: manual input is requested before the callback server waits for the browser redirect.
@@ -45,7 +45,7 @@ workers and backend tasks may block, read, accept, stream, run tools, or perform
 
 for the first implementation, zi will use zig 0.16 `std.Io` primitives before building or copying a custom os backend:
 
-- use `std.Io.Threaded` when operations must run concurrently.
+- use `std.Io` concurrency primitives when operations must run concurrently.
 - use `std.Io.Select` for race-shaped waits.
 - use existing zi operation ids, cancel tokens, and bounded queues where product-level lifecycle needs identity and draining.
 - add small zi runtime adapters only where stdlib primitives do not encode product ownership.
@@ -268,7 +268,7 @@ success criteria:
 
 ### phase 2: introduce oauth input race
 
-use `std.Io.Threaded` and `std.Io.Select` for required concurrency:
+use `std.Io` concurrency support and `std.Io.Select` for required concurrency:
 
 ```text
 const OAuthInput = union(enum) {
@@ -276,13 +276,8 @@ const OAuthInput = union(enum) {
     manual: anyerror![]const u8,
 };
 
-var threaded = std.Io.Threaded.init(allocator, .{
-    .concurrent_limit = .limited(2),
-});
-defer threaded.deinit();
-
 var buffer: [2]OAuthInput = undefined;
-var select = std.Io.Select(OAuthInput).init(threaded.io(), &buffer);
+var select = std.Io.Select(OAuthInput).init(io, &buffer);
 
 try select.concurrent(.callback, waitForCallbackInput, .{ ... });
 try select.concurrent(.manual, waitForManualInput, .{ ... });
@@ -291,16 +286,16 @@ const winner = try select.await();
 while (select.cancel()) |loser| freeLoser(loser);
 ```
 
-important caveat: cancellation only works at `std.Io` cancellation points. stdin and accept may still require explicit wake/close behavior. the first implementation must prove loser lifecycle empirically and avoid claiming cancellation semantics it does not have.
+important caveat: cancellation only works at `std.Io` cancellation points. app-level cancellation must use wakeable tokens or explicit resource close behavior; do not claim cancellation completion until the owner has drained the loser.
 
 ### phase 3: extract a zi runtime adapter
 
-only after oauth proves the seam, add a small helper to `src/runtime`, likely one of:
+only after product paths prove the shape, add small helpers to `src/runtime`, such as:
 
 ```text
-runtime.BlockingGroup
 runtime.Race
-runtime.WorkGroup
+runtime.TaskGroup
+runtime.sleepUntilCancel
 ```
 
 required properties:
@@ -311,18 +306,49 @@ required properties:
 - owner drains all completions or cancels and joins.
 - no callback path mutates product state.
 - tests can drive deterministic completion order.
+- concurrency unavailable is an explicit error, not serialized fallback.
 
 ### phase 4: apply to other pressure points
 
 known pressure points:
 
 1. provider http/sse streaming in `src/ai/providers/*`.
-2. `ai.runtime_stream` producer/consumer boundaries.
+2. `ai.provider_stream_stepper` producer/consumer boundaries.
 3. agent turn lifecycle in `src/agent/Agent.zig` and `src/agent/loop.zig`.
 4. parallel tool execution and result collection.
 5. `coding_agent.AgentSession` event hooks, persistence, public events, and terminal policy.
 
 apply the same rule each time: producer emits data, owner drains and mutates.
+
+## 2026-06 runtime hardening pass
+
+current `src/runtime` primitives are intentionally small, but they now encode
+the ownership rules instead of relying on caller memory:
+
+- `runtime.Race` wraps `std.Io.Select` and makes loser drain mandatory before
+  `deinit`.
+- `runtime.TaskGroup` wraps `std.Io.Group.concurrent` with an explicit
+  capacity. If the chosen `std.Io` cannot provide concurrency,
+  `error.ConcurrencyUnavailable` is returned instead of silently serializing
+  work.
+- `runtime.CancelSource` owns a wake channel. App-level cancellation closes the
+  channel with `requestWithWake(io)` so all waiters wake; token reuse reopens a
+  fresh generation with `resetAfterDrain()`.
+- `runtime.sleepUntilCancel` races real `std.Io.sleep` against a wakeable
+  cancel token. There is no sleep-polling cancel path.
+- `runtime.EventPipe` has both terminal close and abort close, so producer
+  errors cannot leave consumers blocked forever.
+- `runtime.CompletionQueue` requires the owner to provide the terminal
+  predicate; runtime does not infer product semantics from union tag names.
+- `runtime.OperationIds` is only an id allocator. It is not a scheduler or
+  operation table.
+- `runtime.ByteBuilder` supports bounded capacity for stream/parser paths that
+  have externally sized input.
+
+do not add a worker pool until a concrete product path proves that `std.Io`
+concurrency plus `TaskGroup`/`Race` is insufficient. The current blocking-tool
+path is bounded by tool-call limits and owner-drained races; adding a pool now
+would introduce scheduling policy before there is evidence for it.
 
 ## consequences
 

@@ -458,9 +458,10 @@ fn emitDeltas(
     min_token_size: usize,
     max_token_size: usize,
     delay_per_delta_ms: u32,
-) (protocol.AssistantMessageEventSinkEmitError || std.mem.Allocator.Error || std.Io.Writer.Error || error{
+) (protocol.AssistantMessageEventSinkEmitError || mem.ByteBuilder.Error || std.Io.Writer.Error || error{
     OperationCancelled,
     Canceled,
+    ConcurrencyUnavailable,
 })!void {
     const io = request.io;
     const message = response.value;
@@ -554,9 +555,10 @@ fn emitTextDeltas(
     max_token_size: usize,
     delay_per_delta_ms: u32,
     kind: DeltaKind,
-) (protocol.AssistantMessageEventSinkEmitError || std.mem.Allocator.Error || error{
+) (protocol.AssistantMessageEventSinkEmitError || mem.ByteBuilder.Error || error{
     OperationCancelled,
     Canceled,
+    ConcurrencyUnavailable,
 })!void {
     const io = request.io;
     var index: usize = 0;
@@ -608,7 +610,7 @@ fn emitToolCallDeltas(
     min_token_size: usize,
     max_token_size: usize,
     delay_per_delta_ms: u32,
-) (protocol.AssistantMessageEventSinkEmitError || error{ OperationCancelled, Canceled })!void {
+) (protocol.AssistantMessageEventSinkEmitError || error{ OperationCancelled, Canceled, ConcurrencyUnavailable })!void {
     const io = request.io;
     var index: usize = 0;
     while (index < value.len) {
@@ -627,10 +629,10 @@ fn emitToolCallDeltas(
 fn waitBeforeDelta(
     request: protocol.StreamRequest,
     delay_per_delta_ms: u32,
-) error{ OperationCancelled, Canceled }!void {
+) error{ OperationCancelled, Canceled, ConcurrencyUnavailable }!void {
     if (request.cancel_token) |token| try token.throwIfRequested();
     if (delay_per_delta_ms == 0) return;
-    try mem.sleep(
+    try mem.sleepUntilCancel(
         request.io,
         .fromMilliseconds(delay_per_delta_ms),
         request.cancel_token,

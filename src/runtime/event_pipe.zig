@@ -6,6 +6,7 @@ pub fn EventPipe(comptime Event: type, comptime Result: type) type {
         const Queue = std.Io.Queue(Event);
 
         queue: Queue,
+        closed: bool = false,
         terminal_result: ?Result = null,
 
         pub const EmitError = error{
@@ -45,6 +46,10 @@ pub fn EventPipe(comptime Event: type, comptime Result: type) type {
             pub fn end(self: Sink, io: std.Io, event: Event, terminal_result: Result) EmitError!void {
                 try self.pipe.end(io, event, terminal_result);
             }
+
+            pub fn abort(self: Sink, io: std.Io) void {
+                self.pipe.abort(io);
+            }
         };
 
         pub const Stream = struct {
@@ -60,14 +65,21 @@ pub fn EventPipe(comptime Event: type, comptime Result: type) type {
         };
 
         fn emit(self: *Self, io: std.Io, event: Event) EmitError!void {
-            if (self.terminal_result != null) return error.Terminal;
+            if (self.closed) return error.Terminal;
             try self.queue.putOne(io, event);
         }
 
         fn end(self: *Self, io: std.Io, event: Event, terminal_result: Result) EmitError!void {
-            if (self.terminal_result != null) return error.Terminal;
+            if (self.closed) return error.Terminal;
             try self.queue.putOne(io, event);
             self.terminal_result = terminal_result;
+            self.closed = true;
+            self.queue.close(io);
+        }
+
+        fn abort(self: *Self, io: std.Io) void {
+            if (self.closed) return;
+            self.closed = true;
             self.queue.close(io);
         }
 
@@ -116,6 +128,22 @@ test "event pipe rejects events after terminal" {
 
     try sink.end(std.Io.failing, 1, 9);
     try std.testing.expectError(error.Terminal, sink.emit(std.Io.failing, 2));
+}
+
+test "event pipe abort drains queued events without terminal result" {
+    const Pipe = EventPipe(u8, u8);
+    var buffer: [2]u8 = undefined;
+    var pipe = Pipe.init(&buffer);
+    const sink = pipe.sink();
+    const stream = pipe.stream();
+
+    try sink.emit(std.Io.failing, 1);
+    sink.abort(std.Io.failing);
+
+    try std.testing.expectError(error.Terminal, sink.emit(std.Io.failing, 2));
+    try std.testing.expectEqual(@as(?u8, 1), try stream.next(std.Io.failing));
+    try std.testing.expectEqual(@as(?u8, null), try stream.next(std.Io.failing));
+    try std.testing.expectEqual(@as(?u8, null), stream.result());
 }
 
 test "event pipe leaves terminal empty when nonterminal event is queued" {

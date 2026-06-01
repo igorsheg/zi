@@ -1,7 +1,10 @@
 const std = @import("std");
 const operation = @import("operation.zig");
 
-pub fn CompletionQueue(comptime Completion: type) type {
+pub fn CompletionQueue(
+    comptime Completion: type,
+    comptime isTerminal: fn (Completion) bool,
+) type {
     return struct {
         const Self = @This();
 
@@ -9,7 +12,7 @@ pub fn CompletionQueue(comptime Completion: type) type {
         head: usize = 0,
         tail: usize = 0,
         len: usize = 0,
-        terminal_count: usize = 0,
+        terminal_pushed_count: usize = 0,
 
         pub const PushError = error{Full};
 
@@ -31,7 +34,7 @@ pub fn CompletionQueue(comptime Completion: type) type {
             self.buffer[self.tail] = completion;
             self.tail = (self.tail + 1) % self.buffer.len;
             self.len += 1;
-            if (isTerminal(completion)) self.terminal_count += 1;
+            if (isTerminal(completion)) self.terminal_pushed_count += 1;
         }
 
         pub fn pop(self: *Self) ?Completion {
@@ -42,8 +45,8 @@ pub fn CompletionQueue(comptime Completion: type) type {
             return completion;
         }
 
-        pub fn terminalCompletions(self: *const Self) usize {
-            return self.terminal_count;
+        pub fn terminalPushedCount(self: *const Self) usize {
+            return self.terminal_pushed_count;
         }
     };
 }
@@ -55,7 +58,7 @@ pub const TestCompletion = union(enum) {
     canceled: operation.OperationId,
 };
 
-pub fn isTerminal(completion: anytype) bool {
+pub fn testCompletionIsTerminal(completion: TestCompletion) bool {
     return switch (completion) {
         .done, .failed, .canceled => true,
         else => false,
@@ -63,7 +66,7 @@ pub fn isTerminal(completion: anytype) bool {
 }
 
 test "completion queue is bounded and preserves fifo order" {
-    const Queue = CompletionQueue(TestCompletion);
+    const Queue = CompletionQueue(TestCompletion, testCompletionIsTerminal);
     var buffer: [2]TestCompletion = undefined;
     var queue = Queue.init(&buffer);
     const first = operation.OperationId.first();
@@ -78,8 +81,8 @@ test "completion queue is bounded and preserves fifo order" {
     try std.testing.expect(queue.pop() == null);
 }
 
-test "completion queue counts terminal completions without dropping them silently" {
-    const Queue = CompletionQueue(TestCompletion);
+test "completion queue counts terminal pushes without dropping them silently" {
+    const Queue = CompletionQueue(TestCompletion, testCompletionIsTerminal);
     var buffer: [4]TestCompletion = undefined;
     var queue = Queue.init(&buffer);
     const id = operation.OperationId.first();
@@ -87,5 +90,5 @@ test "completion queue counts terminal completions without dropping them silentl
     try queue.push(.{ .event = id });
     try queue.push(.{ .canceled = id });
 
-    try std.testing.expectEqual(@as(usize, 1), queue.terminalCompletions());
+    try std.testing.expectEqual(@as(usize, 1), queue.terminalPushedCount());
 }

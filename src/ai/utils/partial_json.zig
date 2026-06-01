@@ -4,6 +4,7 @@ const mem = @import("../../runtime/root.zig");
 const max_depth: u16 = 128;
 
 pub const ParseError = error{
+    CapacityExceeded,
     DepthExceeded,
     OutOfMemory,
 };
@@ -23,6 +24,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Result 
 
     const value = parser.parseValue() catch |err| switch (err) {
         error.DepthExceeded => return error.DepthExceeded,
+        error.CapacityExceeded => return error.CapacityExceeded,
         error.OutOfMemory => return error.OutOfMemory,
         error.Invalid => return .{ .value = null, .complete = false, .consumed = 0 },
     };
