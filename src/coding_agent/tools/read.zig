@@ -254,7 +254,8 @@ test "read tool reads bounded text with offset and limit" {
     try object.put(std.testing.allocator, "offset", .{ .integer = 2 });
     try object.put(std.testing.allocator, "limit", .{ .integer = 2 });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
         std.testing.io,
@@ -325,7 +326,8 @@ test "read tool rejects offset beyond end" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "offset", .{ .integer = 3 });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     try std.testing.expectError(error.OffsetBeyondEndOfFile, execute(
         std.testing.allocator,
         std.testing.io,

@@ -381,7 +381,8 @@ test "bash tool cancels running process through owner race" {
     defer object.deinit(std.testing.allocator);
     try putCommand(&object, "sleep 60");
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     var future = std.testing.io.async(execute, .{
         std.testing.allocator,
         std.testing.io,
@@ -419,7 +420,8 @@ fn executeTestCommand(tool: *BashTool, command: []const u8) !agent.ToolExecution
     defer object.deinit(std.testing.allocator);
     try putCommand(&object, command);
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     return execute(std.testing.allocator, std.testing.io, tool, cancel_source.token(), "call", .{
         .object = object,
     }, null);

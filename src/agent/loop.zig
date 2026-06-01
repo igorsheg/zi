@@ -621,6 +621,51 @@ const ToolWorkerEvent = union(enum) {
 
 const ToolWorkerQueue = std.Io.Queue(ToolWorkerEvent);
 
+const ToolWorkerGroup = struct {
+    io: std.Io,
+    group: std.Io.Group = .init,
+    started: usize = 0,
+    closed: bool = false,
+    drained: bool = true,
+
+    const SpawnError = error{TooManyTools} || std.Io.ConcurrentError;
+
+    fn init(io: std.Io) ToolWorkerGroup {
+        return .{ .io = io };
+    }
+
+    fn deinit(self: *ToolWorkerGroup) void {
+        if (self.started > 0 and !self.drained) @panic("ToolWorkerGroup deinit before await or cancel");
+        self.* = undefined;
+    }
+
+    fn spawn(
+        self: *ToolWorkerGroup,
+        function: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(function)),
+    ) SpawnError!void {
+        std.debug.assert(!self.closed);
+        if (self.started == agent.max_tool_calls_per_turn) return error.TooManyTools;
+        try self.group.concurrent(self.io, function, args);
+        self.started += 1;
+        self.drained = false;
+    }
+
+    fn await(self: *ToolWorkerGroup) std.Io.Cancelable!void {
+        std.debug.assert(!self.closed);
+        try self.group.await(self.io);
+        self.closed = true;
+        self.drained = true;
+    }
+
+    fn cancel(self: *ToolWorkerGroup) void {
+        if (self.closed) return;
+        self.group.cancel(self.io);
+        self.closed = true;
+        self.drained = true;
+    }
+};
+
 const ParallelToolUpdateContext = struct {
     io: std.Io,
     queue: *ToolWorkerQueue,
@@ -644,7 +689,7 @@ fn executeToolCallsParallel(
     var queue_buffer: [agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch]ToolWorkerEvent = undefined;
     var queue = ToolWorkerQueue.init(&queue_buffer);
     var update_count: std.atomic.Value(usize) = .init(0);
-    var group = runtime.TaskGroup.init(io, agent.max_tool_calls_per_turn);
+    var group = ToolWorkerGroup.init(io);
     defer group.deinit();
 
     for (prepared[0..prepared_count]) |item| {
@@ -715,7 +760,7 @@ fn executeToolCallsParallel(
 
 fn cancelParallelToolWorkers(
     io: std.Io,
-    group: *runtime.TaskGroup,
+    group: *ToolWorkerGroup,
     queue: *ToolWorkerQueue,
 ) void {
     group.cancel();
@@ -1436,7 +1481,8 @@ test "run prompt emits prompt assistant and agent end events" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel: runtime.CancelSource = .{};
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
     const prompt = userMessage("hello");
 
     try runPrompt(
@@ -1458,7 +1504,8 @@ test "run prompt emits prompt assistant and agent end events" {
 }
 
 test "prompt stream exposes events and terminal messages through event pipe" {
-    var cancel: runtime.CancelSource = .{};
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
     const prompt = userMessage("hello");
     var buffer: [8]agent.AgentEvent = undefined;
     var stream: AgentEventStream = undefined;
@@ -1486,7 +1533,8 @@ test "prompt stream exposes events and terminal messages through event pipe" {
 }
 
 test "prompt stream closes event pipe when producer fails before terminal event" {
-    var cancel: runtime.CancelSource = .{};
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
     const prompt = userMessage("hello");
     var buffer: [8]agent.AgentEvent = undefined;
     var stream: AgentEventStream = undefined;
@@ -1516,7 +1564,8 @@ test "run prompt executes tool result then continues assistant turn" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel: runtime.CancelSource = .{};
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
     const prompt = userMessage("hello");
@@ -1551,7 +1600,8 @@ test "parallel tool calls emit bounded live updates through owner" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel: runtime.CancelSource = .{};
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
     const prompt = userMessage("hello");
@@ -1591,7 +1641,8 @@ test "parallel tool calls cancel and drain workers when owner update drain fails
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel: runtime.CancelSource = .{};
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
     const prompt = userMessage("hello");
@@ -1625,7 +1676,8 @@ test "parallel tool calls finalize results in assistant source order" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel: runtime.CancelSource = .{};
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
     const prompt = userMessage("hello");
@@ -1670,7 +1722,8 @@ test "run continue rejects assistant tail" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel: runtime.CancelSource = .{};
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
     const assistant: agent.AgentMessage = .{ .assistant = assistantMessage("done") };
 
     try std.testing.expectError(error.CannotContinueFromAssistant, runContinue(

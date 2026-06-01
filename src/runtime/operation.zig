@@ -14,19 +14,10 @@ pub const OperationId = enum(u64) {
     }
 };
 
-pub const OperationState = union(enum) {
-    queued,
-    running,
-    cancel_requested,
-    completed,
-    failed,
-    canceled,
-};
-
-pub const OperationIds = struct {
+pub const OperationIdAllocator = struct {
     next_id: OperationId = OperationId.first(),
 
-    pub fn reserve(self: *OperationIds) OperationId {
+    pub fn reserve(self: *OperationIdAllocator) OperationId {
         const id = self.next_id;
         self.next_id = id.next();
         return id;
@@ -34,24 +25,11 @@ pub const OperationIds = struct {
 };
 
 test "operation ids reserve monotonic nonzero ids" {
-    var ids: OperationIds = .{};
+    var ids: OperationIdAllocator = .{};
 
     const first = ids.reserve();
     const second = ids.reserve();
 
     try std.testing.expectEqual(@as(u64, 1), @intFromEnum(first));
     try std.testing.expectEqual(@as(u64, 2), @intFromEnum(second));
-}
-
-test "operation state encodes lifecycle without boolean modes" {
-    const states = [_]OperationState{
-        .queued,
-        .running,
-        .cancel_requested,
-        .completed,
-        .failed,
-        .canceled,
-    };
-
-    try std.testing.expectEqual(@as(usize, 6), states.len);
 }

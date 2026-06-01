@@ -193,7 +193,8 @@ test "write tool creates parent directories and writes content" {
     try object.put(std.testing.allocator, "path", .{ .string = "dir/file.txt" });
     try object.put(std.testing.allocator, "content", .{ .string = "hello" });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
         std.testing.io,
@@ -229,7 +230,8 @@ test "write tool rejects oversized content" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "content", .{ .string = "hello" });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     try std.testing.expectError(error.WriteTooLarge, execute(
         std.testing.allocator,
         std.testing.io,

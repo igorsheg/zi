@@ -11,6 +11,10 @@ pub const ProcessError = error{
     OutOfMemory,
 };
 
+const max_stream_text_block_bytes = 4 * 1024 * 1024;
+const max_stream_thinking_block_bytes = 4 * 1024 * 1024;
+const max_stream_tool_arguments_bytes = 1024 * 1024;
+
 pub fn errorStream(request: protocol.StreamRequest, err: anyerror) protocol.AssistantMessageEventStream {
     var stream = protocol.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
@@ -376,7 +380,10 @@ pub const ResponseStreamReducer = struct {
             const index = self.content.items.len - 1;
             self.current = .{ .thinking = .{
                 .content_index = index,
-                .bytes = mem.ByteBuilder.init(self.arena.allocator()),
+                .bytes = mem.ByteBuilder.initBounded(
+                    self.arena.allocator(),
+                    max_stream_thinking_block_bytes,
+                ),
             } };
             try sink.emit(io, .{ .thinking_start = .{ .content_index = index, .partial = try self.partial() } });
         } else if (std.mem.eql(u8, item_type, "message")) {
@@ -384,7 +391,10 @@ pub const ResponseStreamReducer = struct {
             const index = self.content.items.len - 1;
             self.current = .{ .text = .{
                 .content_index = index,
-                .bytes = mem.ByteBuilder.init(self.arena.allocator()),
+                .bytes = mem.ByteBuilder.initBounded(
+                    self.arena.allocator(),
+                    max_stream_text_block_bytes,
+                ),
             } };
             try sink.emit(io, .{ .text_start = .{ .content_index = index, .partial = try self.partial() } });
         } else if (std.mem.eql(u8, item_type, "function_call")) {
@@ -400,7 +410,10 @@ pub const ResponseStreamReducer = struct {
             const index = self.content.items.len - 1;
             self.current = .{ .tool_call = .{
                 .content_index = index,
-                .partial_json = mem.ByteBuilder.init(self.backing_allocator),
+                .partial_json = mem.ByteBuilder.initBounded(
+                    self.backing_allocator,
+                    max_stream_tool_arguments_bytes,
+                ),
             } };
             if (jsonString(item.get("arguments"))) |arguments| {
                 try self.current.tool_call.partial_json.append(arguments);

@@ -24,20 +24,22 @@ pub const Completion = union(enum) {
     },
 };
 
-pub const CompletionQueue = runtime.CompletionQueue(Completion, completionIsTerminal);
+pub const CompletionQueue = runtime.BoundedQueue(Completion);
 
-fn completionIsTerminal(completion: Completion) bool {
-    return switch (completion) {
-        .done, .failed, .canceled => true,
-        .event => false,
-    };
-}
+pub const OperationState = union(enum) {
+    queued,
+    running,
+    cancel_requested,
+    completed,
+    failed,
+    canceled,
+};
 
 pub const Operation = struct {
     id: runtime.OperationId,
     request: protocol.StreamRequest,
     stream: protocol.AssistantMessageEventStream,
-    state: runtime.OperationState = .running,
+    state: OperationState = .running,
     cancel_token: ?runtime.CancelToken = null,
     latest_partial: ?protocol.AssistantMessage = null,
 
@@ -135,7 +137,7 @@ test "provider stream stepper forwards provider events as operation completions"
     try provider.setResponses(&.{faux.assistantMessage(&.{faux.text("ok")}, .{})});
     var completion_buffer: [8]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
-    var table: runtime.OperationIds = .{};
+    var table: runtime.OperationIdAllocator = .{};
     var op = try Operation.start(table.reserve(), &registry, testRequest(provider.getModel()), null);
 
     while (try op.step(&queue)) {}
@@ -163,8 +165,9 @@ test "provider stream stepper cancellation before first event emits only aborted
     try provider.setResponses(&.{faux.assistantMessage(&.{faux.text("abcdefghijklmnopqrstuvwxyz")}, .{})});
     var completion_buffer: [4]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
-    var source: runtime.CancelSource = .{};
-    var table: runtime.OperationIds = .{};
+    var source = try runtime.CancelSource.init(std.testing.allocator);
+    defer source.deinit();
+    var table: runtime.OperationIdAllocator = .{};
     var op = try Operation.start(
         table.reserve(),
         &registry,
@@ -220,8 +223,9 @@ fn expectCancelAfterDelta(
     try provider.setResponses(&.{faux.assistantMessage(content, .{ .stop_reason = .tool_use })});
     var completion_buffer: [32]Completion = undefined;
     var queue = CompletionQueue.init(&completion_buffer);
-    var source: runtime.CancelSource = .{};
-    var table: runtime.OperationIds = .{};
+    var source = try runtime.CancelSource.init(std.testing.allocator);
+    defer source.deinit();
+    var table: runtime.OperationIdAllocator = .{};
     var op = try Operation.start(
         table.reserve(),
         &registry,
@@ -258,7 +262,7 @@ fn expectCancelAfterDelta(
     try std.testing.expectEqual(@as(usize, 1), target_delta_count);
     try std.testing.expectEqual(@as(usize, 1), canceled_count);
     try std.testing.expect(!saw_forbidden_after_cancel);
-    try std.testing.expectEqual(runtime.OperationState.canceled, op.state);
+    try std.testing.expectEqual(OperationState.canceled, op.state);
 }
 
 fn jsonObjectWithString(

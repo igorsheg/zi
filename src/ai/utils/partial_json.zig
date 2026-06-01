@@ -186,7 +186,7 @@ const Parser = struct {
     fn parseString(self: *Parser) InternalError![]const u8 {
         std.debug.assert(self.input[self.index] == '"');
         self.index += 1;
-        var out = mem.ByteBuilder.init(self.allocator);
+        var out = mem.ByteBuilder.initBounded(self.allocator, self.input.len);
         errdefer out.deinit();
 
         while (self.index < self.input.len) {

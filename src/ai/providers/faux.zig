@@ -370,8 +370,8 @@ const PartialBuilder = struct {
             .allocator = allocator,
             .final_message = response.value,
             .content = .empty,
-            .text_bytes = mem.ByteBuilder.init(allocator),
-            .thinking_bytes = mem.ByteBuilder.init(allocator),
+            .text_bytes = mem.ByteBuilder.initBounded(allocator, maxTextBlockBytes(response.value.content)),
+            .thinking_bytes = mem.ByteBuilder.initBounded(allocator, maxThinkingBlockBytes(response.value.content)),
             .partial = .{
                 .content = &.{},
                 .api = response.value.api,
@@ -450,6 +450,24 @@ const PartialBuilder = struct {
         self.active = .none;
     }
 };
+
+fn maxTextBlockBytes(content: []const protocol.AssistantContent) usize {
+    var max: usize = 0;
+    for (content) |block| switch (block) {
+        .text => |block_text| max = @max(max, block_text.text.len),
+        else => {},
+    };
+    return max;
+}
+
+fn maxThinkingBlockBytes(content: []const protocol.AssistantContent) usize {
+    var max: usize = 0;
+    for (content) |block| switch (block) {
+        .thinking => |block_thinking| max = @max(max, block_thinking.thinking.len),
+        else => {},
+    };
+    return max;
+}
 
 fn emitDeltas(
     request: protocol.StreamRequest,

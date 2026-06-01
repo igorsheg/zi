@@ -24,6 +24,8 @@ pub fn Race(comptime Completion: type) type {
         awaited: bool = false,
         drained: bool = false,
 
+        pub const ConcurrentError = error{Full} || std.Io.ConcurrentError;
+
         pub fn init(io: std.Io, buffer: []Completion) Self {
             std.debug.assert(buffer.len > 0);
             return .{
@@ -46,9 +48,9 @@ pub fn Race(comptime Completion: type) type {
             comptime field: Field,
             function: anytype,
             args: std.meta.ArgsTuple(@TypeOf(function)),
-        ) !void {
+        ) ConcurrentError!void {
             std.debug.assert(!self.awaited);
-            std.debug.assert(self.started < self.capacity);
+            if (self.started == self.capacity) return error.Full;
             try self.select.concurrent(field, function, args);
             self.started += 1;
             self.drained = false;
@@ -88,3 +90,19 @@ test "race initializes with caller-owned completion capacity" {
     try std.testing.expectEqual(@as(usize, 2), race.capacity);
     try std.testing.expectEqual(@as(usize, 0), race.started);
 }
+
+fn returnOne() anyerror!u8 {
+    return 1;
+}
+
+test "race returns full when caller exceeds completion capacity" {
+    var buffer: [1]TestCompletion = undefined;
+    var race = Race(TestCompletion).init(std.testing.io, &buffer);
+    defer race.deinit();
+
+    try race.concurrent(.first, returnOne, .{});
+    try std.testing.expectError(error.Full, race.concurrent(.second, returnOne, .{}));
+    race.cancelAndDrain({}, drainTestCompletion);
+}
+
+fn drainTestCompletion(_: void, _: TestCompletion) void {}

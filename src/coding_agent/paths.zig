@@ -79,7 +79,8 @@ pub const PersistencePaths = struct {
 };
 
 pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
-    var out = mem.ByteBuilder.init(allocator);
+    const capacity_max = std.math.add(usize, cwd.len, 4) catch return error.OutOfMemory;
+    var out = mem.ByteBuilder.initBounded(allocator, capacity_max);
     errdefer out.deinit();
     try out.append("--");
     const start: usize = if (cwd.len > 0 and (cwd[0] == '/' or cwd[0] == '\\')) 1 else 0;

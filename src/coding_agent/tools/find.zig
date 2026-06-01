@@ -160,7 +160,8 @@ test "find tool recursively filters paths" {
     try object.put(std.testing.allocator, "path", .{ .string = "." });
     try object.put(std.testing.allocator, "name", .{ .string = ".zig" });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     var result = try execute(std.testing.allocator, std.testing.io, &tool, cancel_source.token(), "call", .{
         .object = object,
     }, null);

@@ -149,7 +149,8 @@ test "ls tool lists one directory with bounds" {
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "path", .{ .string = "dir" });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     var result = try execute(std.testing.allocator, std.testing.io, &tool, cancel_source.token(), "call", .{
         .object = object,
     }, null);

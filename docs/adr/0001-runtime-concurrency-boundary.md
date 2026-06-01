@@ -21,8 +21,8 @@ in a node/typescript product this is usually hidden behind `Promise.race`, the e
 
 zi already has the start of a runtime vocabulary:
 
-- `src/runtime/operation.zig`: operation ids and operation states.
-- `src/runtime/completion_queue.zig`: bounded completion queue.
+- `src/runtime/operation.zig`: operation ids.
+- `src/runtime/bounded_queue.zig`: bounded FIFO for owner-drained event paths.
 - `src/runtime/cancel.zig`: wakeable cancel source/token and cancelable sleep races.
 - `src/runtime/event_pipe.zig`: queue-backed producer/consumer event pipe.
 
@@ -294,7 +294,6 @@ only after product paths prove the shape, add small helpers to `src/runtime`, su
 
 ```text
 runtime.Race
-runtime.TaskGroup
 runtime.sleepUntilCancel
 ```
 
@@ -327,28 +326,24 @@ the ownership rules instead of relying on caller memory:
 
 - `runtime.Race` wraps `std.Io.Select` and makes loser drain mandatory before
   `deinit`.
-- `runtime.TaskGroup` wraps `std.Io.Group.concurrent` with an explicit
-  capacity. If the chosen `std.Io` cannot provide concurrency,
-  `error.ConcurrencyUnavailable` is returned instead of silently serializing
-  work.
-- `runtime.CancelSource` owns a wake channel. App-level cancellation closes the
-  channel with `requestWithWake(io)` so all waiters wake; token reuse reopens a
-  fresh generation with `resetAfterDrain()`.
+- `runtime.CancelSource` owns heap-stable wake storage. App-level cancellation
+  closes the wake channel with `requestWithWake(io)` so all waiters wake; token
+  reuse reopens a fresh generation with `resetAfterDrain()`, and stale tokens
+  fail closed instead of observing a later run.
 - `runtime.sleepUntilCancel` races real `std.Io.sleep` against a wakeable
   cancel token. There is no sleep-polling cancel path.
 - `runtime.EventPipe` has both terminal close and abort close, so producer
   errors cannot leave consumers blocked forever.
-- `runtime.CompletionQueue` requires the owner to provide the terminal
-  predicate; runtime does not infer product semantics from union tag names.
-- `runtime.OperationIds` is only an id allocator. It is not a scheduler or
-  operation table.
+- `runtime.OperationIdAllocator` is only an id allocator. It is not a
+  scheduler or operation table.
 - `runtime.ByteBuilder` supports bounded capacity for stream/parser paths that
   have externally sized input.
 
 do not add a worker pool until a concrete product path proves that `std.Io`
-concurrency plus `TaskGroup`/`Race` is insufficient. The current blocking-tool
-path is bounded by tool-call limits and owner-drained races; adding a pool now
-would introduce scheduling policy before there is evidence for it.
+concurrency plus owner-local `std.Io.Group`/`Race` usage is insufficient. The
+current blocking-tool path is bounded by tool-call limits and an owner-local
+worker group; adding a pool now would introduce scheduling policy before there
+is evidence for it.
 
 ## consequences
 

@@ -18,8 +18,8 @@ steering_queue: PendingMessageQueue = .{},
 follow_up_queue: PendingMessageQueue = .{},
 loop_config: agent.AgentLoopConfig,
 listeners: std.ArrayList(?Listener) = .empty,
-operations: runtime.OperationIds = .{},
-cancel_source: runtime.CancelSource = .{},
+operations: runtime.OperationIdAllocator = .{},
+cancel_source: runtime.CancelSource,
 active_run: ?runtime.OperationId = null,
 
 pub const QueueMode = enum {
@@ -71,6 +71,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !Agent {
     var self: Agent = .{
         .allocator = allocator,
         .io = io,
+        .cancel_source = try runtime.CancelSource.init(allocator),
         .message_arena = std.heap.ArenaAllocator.init(allocator),
         .state = .{
             .system_prompt = options.system_prompt,
@@ -110,6 +111,7 @@ pub fn deinit(self: *Agent) void {
     self.steering_queue.deinit(self.allocator);
     self.follow_up_queue.deinit(self.allocator);
     self.listeners.deinit(self.allocator);
+    self.cancel_source.deinit();
     self.message_arena.deinit();
     self.* = undefined;
 }

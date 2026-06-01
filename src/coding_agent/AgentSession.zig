@@ -890,7 +890,8 @@ fn generateCompactionSummary(self: *AgentSession, serialized_input: []const u8) 
         }
     }
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(self.allocator);
+    defer cancel_source.deinit();
     std.debug.assert(self.active_compaction_cancel_source == null);
     self.active_compaction_cancel_source = &cancel_source;
     defer self.active_compaction_cancel_source = null;

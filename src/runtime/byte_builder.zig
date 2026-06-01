@@ -8,7 +8,9 @@ pub const ByteBuilder = struct {
 
     pub const Error = std.mem.Allocator.Error || error{CapacityExceeded};
 
-    pub fn init(allocator: std.mem.Allocator) ByteBuilder {
+    /// Creates a builder without an internal capacity ceiling. Use this only
+    /// when the caller owns an external bound for all appended data.
+    pub fn initUnbounded(allocator: std.mem.Allocator) ByteBuilder {
         return .{ .allocator = allocator };
     }
 
@@ -38,7 +40,10 @@ pub const ByteBuilder = struct {
     pub fn ensureUnusedCapacity(self: *ByteBuilder, additional: usize) Error!void {
         std.debug.assert(self.len <= self.buf.len);
         if (additional <= self.buf.len - self.len) return;
-        const needed = std.math.add(usize, self.len, additional) catch return error.OutOfMemory;
+        const needed = std.math.add(usize, self.len, additional) catch {
+            if (self.capacity_max != null) return error.CapacityExceeded;
+            return error.OutOfMemory;
+        };
         try self.ensureTotalCapacity(needed);
     }
 
@@ -86,7 +91,7 @@ pub const ByteBuilder = struct {
 };
 
 test "ByteBuilder appends and clears while retaining capacity" {
-    var builder = ByteBuilder.init(std.testing.allocator);
+    var builder = ByteBuilder.initUnbounded(std.testing.allocator);
     defer builder.deinit();
 
     try builder.append("hello");
@@ -100,7 +105,7 @@ test "ByteBuilder appends and clears while retaining capacity" {
 }
 
 test "ByteBuilder toOwnedSlice transfers ownership and resets" {
-    var builder = ByteBuilder.init(std.testing.allocator);
+    var builder = ByteBuilder.initUnbounded(std.testing.allocator);
     defer builder.deinit();
 
     try builder.append("abc");

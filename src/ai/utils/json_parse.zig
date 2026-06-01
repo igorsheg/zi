@@ -20,7 +20,8 @@ pub const StreamingJson = struct {
 };
 
 pub fn repairJson(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
-    var repaired = mem.ByteBuilder.init(allocator);
+    const capacity_max = std.math.mul(usize, json.len, 6) catch return error.CapacityExceeded;
+    var repaired = mem.ByteBuilder.initBounded(allocator, capacity_max);
     errdefer repaired.deinit();
     var in_string = false;
     var index: usize = 0;

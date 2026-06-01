@@ -298,7 +298,8 @@ test "edit tool applies multiple exact replacements against original content" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "edits", .{ .array = edits });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
         std.testing.io,

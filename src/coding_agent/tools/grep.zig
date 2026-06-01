@@ -218,7 +218,8 @@ test "grep tool searches directory files with literal pattern" {
     try object.put(std.testing.allocator, "path", .{ .string = "src" });
     try object.put(std.testing.allocator, "pattern", .{ .string = "hello" });
 
-    var cancel_source: runtime.CancelSource = .{};
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
     var result = try execute(std.testing.allocator, std.testing.io, &tool, cancel_source.token(), "call", .{
         .object = object,
     }, null);

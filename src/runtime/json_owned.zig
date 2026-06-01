@@ -7,7 +7,7 @@ pub fn JsonOwned(comptime T: type) type {
 
         const Self = @This();
 
-        pub fn initArena(backing_allocator: std.mem.Allocator) !Self {
+        fn initArena(backing_allocator: std.mem.Allocator) !Self {
             const arena = try backing_allocator.create(std.heap.ArenaAllocator);
             errdefer backing_allocator.destroy(arena);
             arena.* = std.heap.ArenaAllocator.init(backing_allocator);

@@ -3,41 +3,65 @@ const race = @import("race.zig");
 
 pub const CancelSource = struct {
     const WakeQueue = std.Io.Queue(u8);
+    const WakeStorage = struct {
+        buffer: [1]u8 = undefined,
+        queue: WakeQueue,
+
+        fn initInPlace(self: *WakeStorage) void {
+            self.queue = WakeQueue.init(&self.buffer);
+        }
+    };
 
     requested: std.atomic.Value(bool) = .init(false),
-    wake_buffer: [1]u8 = undefined,
-    wake_queue: WakeQueue = undefined,
-    wake_queue_initialized: bool = false,
+    generation: std.atomic.Value(u64) = .init(0),
+    allocator: std.mem.Allocator,
+    wake_storage: *WakeStorage,
+
+    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!CancelSource {
+        const wake_storage = try allocator.create(WakeStorage);
+        wake_storage.initInPlace();
+        return .{
+            .allocator = allocator,
+            .wake_storage = wake_storage,
+        };
+    }
+
+    pub fn deinit(self: *CancelSource) void {
+        self.allocator.destroy(self.wake_storage);
+        self.* = undefined;
+    }
 
     pub fn token(self: *CancelSource) CancelToken {
-        self.ensureWakeQueue();
-        return .{ .requested = &self.requested, .wake_queue = &self.wake_queue };
+        return .{
+            .requested = &self.requested,
+            .generation = &self.generation,
+            .generation_value = self.generation.load(.acquire),
+            .wake_queue = &self.wake_storage.queue,
+        };
     }
 
     pub fn requestWithWake(self: *CancelSource, io: std.Io) void {
-        self.ensureWakeQueue();
         if (self.requested.swap(true, .acq_rel)) return;
-        self.wake_queue.close(io);
+        self.wake_storage.queue.close(io);
     }
 
     pub fn resetAfterDrain(self: *CancelSource) void {
-        self.ensureWakeQueue();
         self.requested.store(false, .release);
-        self.wake_queue = WakeQueue.init(&self.wake_buffer);
-    }
-
-    fn ensureWakeQueue(self: *CancelSource) void {
-        if (self.wake_queue_initialized) return;
-        self.wake_queue = WakeQueue.init(&self.wake_buffer);
-        self.wake_queue_initialized = true;
+        const generation = self.generation.load(.acquire);
+        std.debug.assert(generation < std.math.maxInt(u64));
+        self.generation.store(generation + 1, .release);
+        self.wake_storage.initInPlace();
     }
 };
 
 pub const CancelToken = struct {
     requested: *const std.atomic.Value(bool),
+    generation: *const std.atomic.Value(u64),
+    generation_value: u64,
     wake_queue: *CancelSource.WakeQueue,
 
     pub fn isRequested(self: CancelToken) bool {
+        if (self.generation.load(.acquire) != self.generation_value) return true;
         return self.requested.load(.acquire);
     }
 
@@ -77,9 +101,15 @@ pub fn sleepUntilCancel(
     var sleep_race = race.Race(SleepCancelCompletion).init(io, &completion_buffer);
     defer sleep_race.deinit();
 
-    try sleep_race.concurrent(.sleep, sleepTask, .{ io, duration });
+    sleep_race.concurrent(.sleep, sleepTask, .{ io, duration }) catch |err| switch (err) {
+        error.Full => unreachable,
+        error.ConcurrencyUnavailable => return error.ConcurrencyUnavailable,
+    };
     errdefer sleep_race.cancelAndDrain({}, drainSleepCancelCompletion);
-    try sleep_race.concurrent(.cancel, waitForCancelWake, .{ io, token.? });
+    sleep_race.concurrent(.cancel, waitForCancelWake, .{ io, token.? }) catch |err| switch (err) {
+        error.Full => unreachable,
+        error.ConcurrencyUnavailable => return error.ConcurrencyUnavailable,
+    };
 
     const completion = sleep_race.await() catch |err| {
         sleep_race.cancelAndDrain({}, drainSleepCancelCompletion);
@@ -104,18 +134,21 @@ pub fn waitForCancelWake(io: std.Io, token: CancelToken) error{ OperationCancell
 }
 
 test "cancel source owns mutation and token only observes" {
-    var source: CancelSource = .{};
+    var source = try CancelSource.init(std.testing.allocator);
+    defer source.deinit();
     const token = source.token();
 
     try std.testing.expect(!token.isRequested());
     source.requestWithWake(std.testing.io);
     try std.testing.expect(token.isRequested());
     source.resetAfterDrain();
-    try std.testing.expect(!token.isRequested());
+    try std.testing.expect(token.isRequested());
+    try std.testing.expect(!source.token().isRequested());
 }
 
 test "cancel token wait wakes without sleep polling" {
-    var source: CancelSource = .{};
+    var source = try CancelSource.init(std.testing.allocator);
+    defer source.deinit();
     const token = source.token();
     var future = std.testing.io.async(waitForCancelWake, .{ std.testing.io, token });
 
@@ -125,7 +158,8 @@ test "cancel token wait wakes without sleep polling" {
 }
 
 test "cancel request wakes all current waiters" {
-    var source: CancelSource = .{};
+    var source = try CancelSource.init(std.testing.allocator);
+    defer source.deinit();
     const token = source.token();
     var first = std.testing.io.async(waitForCancelWake, .{ std.testing.io, token });
     var second = std.testing.io.async(waitForCancelWake, .{ std.testing.io, token });
@@ -137,13 +171,14 @@ test "cancel request wakes all current waiters" {
 }
 
 test "cancel source reopens wake channel after owner drain" {
-    var source: CancelSource = .{};
+    var source = try CancelSource.init(std.testing.allocator);
+    defer source.deinit();
     const first = source.token();
     source.requestWithWake(std.testing.io);
     source.resetAfterDrain();
 
     const second = source.token();
-    try std.testing.expect(!first.isRequested());
+    try std.testing.expect(first.isRequested());
     try std.testing.expect(!second.isRequested());
 
     var future = std.testing.io.async(waitForCancelWake, .{ std.testing.io, second });
@@ -151,8 +186,21 @@ test "cancel source reopens wake channel after owner drain" {
     try std.testing.expectError(error.OperationCancelled, future.await(std.testing.io));
 }
 
+test "cancel source can move after init without invalidating token wake storage" {
+    const source = try CancelSource.init(std.testing.allocator);
+    var moved = source;
+    defer moved.deinit();
+    const token = moved.token();
+    var future = std.testing.io.async(waitForCancelWake, .{ std.testing.io, token });
+
+    moved.requestWithWake(std.testing.io);
+
+    try std.testing.expectError(error.OperationCancelled, future.await(std.testing.io));
+}
+
 test "sleep returns immediately when token is already canceled" {
-    var source: CancelSource = .{};
+    var source = try CancelSource.init(std.testing.allocator);
+    defer source.deinit();
     source.requestWithWake(std.testing.io);
 
     try std.testing.expectError(
@@ -162,7 +210,7 @@ test "sleep returns immediately when token is already canceled" {
 }
 
 const SleepWorkerState = struct {
-    source: CancelSource = .{},
+    source: *CancelSource,
     entered: std.atomic.Value(bool) = .init(false),
 };
 
@@ -172,7 +220,9 @@ fn cancelableSleepWorker(io: std.Io, state: *SleepWorkerState) !void {
 }
 
 test "sleep observes cancellation during retry delay" {
-    var state: SleepWorkerState = .{};
+    var source = try CancelSource.init(std.testing.allocator);
+    defer source.deinit();
+    var state: SleepWorkerState = .{ .source = &source };
     var future = std.testing.io.async(cancelableSleepWorker, .{ std.testing.io, &state });
 
     while (!state.entered.load(.acquire)) {
