@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
+const runtime = @import("../runtime/root.zig");
 const auth_mod = @import("auth.zig");
 const model_registry_mod = @import("model_registry.zig");
 const paths_mod = @import("paths.zig");
@@ -9,6 +10,8 @@ const settings_mod = @import("settings.zig");
 pub const RuntimeServices = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *runtime.Runtime,
+    zio_runtime_owner: RuntimeOwner,
     cwd: []const u8,
     agent_dir: []const u8,
     settings_manager: settings_mod.SettingsManager,
@@ -25,13 +28,22 @@ pub const RuntimeServices = struct {
         agent_dir: []const u8,
         dir: std.Io.Dir = .cwd(),
         environ: ?*const std.process.Environ.Map = null,
+        zio_runtime: ?*runtime.Runtime = null,
     };
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !RuntimeServices {
+    const RuntimeOwner = enum {
+        owned,
+        borrowed,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, options: Options) !RuntimeServices {
         const cwd = try allocator.dupe(u8, options.cwd);
         errdefer allocator.free(cwd);
         const agent_dir = try allocator.dupe(u8, options.agent_dir);
         errdefer allocator.free(agent_dir);
+        const zio_runtime = options.zio_runtime orelse try runtime.Runtime.init(allocator, .{});
+        errdefer if (options.zio_runtime == null) zio_runtime.deinit();
+        const io = zio_runtime.io();
 
         const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = agent_dir, .cwd = cwd };
         var settings_manager = try settings_mod.SettingsManager.init(allocator, io, .{
@@ -67,6 +79,8 @@ pub const RuntimeServices = struct {
         return .{
             .allocator = allocator,
             .io = io,
+            .zio_runtime = zio_runtime,
+            .zio_runtime_owner = if (options.zio_runtime == null) .owned else .borrowed,
             .cwd = cwd,
             .agent_dir = agent_dir,
             .settings_manager = settings_manager,
@@ -118,6 +132,10 @@ pub const RuntimeServices = struct {
 
     pub fn deinit(self: *RuntimeServices) void {
         self.provider_registry.deinit();
+        switch (self.zio_runtime_owner) {
+            .owned => self.zio_runtime.deinit(),
+            .borrowed => {},
+        }
         self.allocator.destroy(self.openai_codex_provider);
         self.allocator.destroy(self.openai_provider);
         self.auth_manager.deinit();
@@ -136,7 +154,7 @@ test "runtime services owns stable cwd, agent dir, settings manager" {
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
@@ -150,4 +168,25 @@ test "runtime services owns stable cwd, agent dir, settings manager" {
     try std.testing.expectEqualStrings(services.agent_dir, service_paths.global_dir);
     try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_responses) != null);
     try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_codex_responses) != null);
+}
+
+test "runtime services can borrow process zio runtime" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+
+    var services = try RuntimeServices.init(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .dir = tmp.dir,
+        .zio_runtime = zio_runtime,
+    });
+    defer services.deinit();
+
+    try std.testing.expect(services.zio_runtime == zio_runtime);
+    try std.testing.expectEqual(RuntimeServices.RuntimeOwner.borrowed, services.zio_runtime_owner);
 }

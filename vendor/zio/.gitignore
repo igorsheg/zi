@@ -1,0 +1,14 @@
+/.claude
+/CLAUDE.local.md
+/CLAUDE.md
+/AGENTS.md
+/notes
+/.zig-cache
+/zig-out
+/test-file
+
+# Benchmark build artifacts
+/benchmarks/target/
+/benchmarks/echo_server_go
+/benchmarks/ping_pong_go
+/benchmarks/spawn_throughput_go

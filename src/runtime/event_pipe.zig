@@ -1,13 +1,17 @@
 const std = @import("std");
+const zio = @import("zio");
+const Runtime = zio.Runtime;
 
-pub fn EventPipe(comptime Event: type, comptime Result: type) type {
+pub fn EventPipe(comptime Event: type, comptime TerminalResult: type) type {
     return struct {
         const Self = @This();
-        const Queue = std.Io.Queue(Event);
+        const Channel = zio.Channel(Event);
+        const ChannelReceive = @TypeOf(@as(*Channel, undefined).asyncReceive());
 
-        queue: Queue,
+        channel: Channel,
+        capacity_count: usize,
         closed: bool = false,
-        terminal_result: ?Result = null,
+        terminal_result: ?TerminalResult = null,
 
         pub const EmitError = error{
             Closed,
@@ -21,11 +25,14 @@ pub fn EventPipe(comptime Event: type, comptime Result: type) type {
 
         pub fn init(buffer: []Event) Self {
             std.debug.assert(buffer.len > 0);
-            return .{ .queue = Queue.init(buffer) };
+            return .{
+                .channel = Channel.init(buffer),
+                .capacity_count = buffer.len,
+            };
         }
 
         pub fn capacity(self: *const Self) usize {
-            return self.queue.capacity();
+            return self.capacity_count;
         }
 
         pub fn sink(self: *Self) Sink {
@@ -39,58 +46,114 @@ pub fn EventPipe(comptime Event: type, comptime Result: type) type {
         pub const Sink = struct {
             pipe: *Self,
 
-            pub fn emit(self: Sink, io: std.Io, event: Event) EmitError!void {
-                try self.pipe.emit(io, event);
+            pub fn emit(self: Sink, event: Event) EmitError!void {
+                try self.pipe.emit(event);
             }
 
-            pub fn end(self: Sink, io: std.Io, event: Event, terminal_result: Result) EmitError!void {
-                try self.pipe.end(io, event, terminal_result);
+            pub fn end(self: Sink, event: Event, terminal_result: TerminalResult) EmitError!void {
+                try self.pipe.end(event, terminal_result);
             }
 
-            pub fn abort(self: Sink, io: std.Io) void {
-                self.pipe.abort(io);
+            pub fn abort(self: Sink) void {
+                self.pipe.abort();
             }
         };
 
         pub const Stream = struct {
             pipe: *Self,
 
-            pub fn next(self: Stream, io: std.Io) NextError!?Event {
-                return self.pipe.next(io);
+            pub const Poll = union(enum) {
+                event: Event,
+                empty,
+                terminal,
+            };
+
+            pub fn next(self: Stream) NextError!?Event {
+                return self.pipe.next();
             }
 
-            pub fn result(self: Stream) ?Result {
+            pub fn poll(self: Stream) Poll {
+                return self.pipe.poll();
+            }
+
+            pub fn asyncNext(self: Stream) AsyncNext {
+                return .{ .receive = self.pipe.channel.asyncReceive() };
+            }
+
+            pub fn result(self: Stream) ?TerminalResult {
                 return self.pipe.result();
             }
+
+            pub const AsyncNext = struct {
+                receive: ChannelReceive,
+
+                pub const Result = ?Event;
+                pub const WaitContext = ChannelReceive.WaitContext;
+
+                pub fn asyncWait(self: *const AsyncNext, waiter: anytype, context: *WaitContext) bool {
+                    return self.receive.asyncWait(waiter, context);
+                }
+
+                pub fn asyncCancelWait(self: *const AsyncNext, waiter: anytype, context: *WaitContext) bool {
+                    return self.receive.asyncCancelWait(waiter, context);
+                }
+
+                pub fn getResult(self: *const AsyncNext, context: *WaitContext) Result {
+                    return self.receive.getResult(context) catch |err| switch (err) {
+                        error.ChannelClosed => null,
+                    };
+                }
+            };
         };
 
-        fn emit(self: *Self, io: std.Io, event: Event) EmitError!void {
+        fn emit(self: *Self, event: Event) EmitError!void {
             if (self.closed) return error.Terminal;
-            try self.queue.putOne(io, event);
+            self.channel.send(event) catch |err| switch (err) {
+                error.ChannelClosed => return error.Terminal,
+                error.Canceled => return error.Canceled,
+            };
         }
 
-        fn end(self: *Self, io: std.Io, event: Event, terminal_result: Result) EmitError!void {
+        fn end(self: *Self, event: Event, terminal_result: TerminalResult) EmitError!void {
             if (self.closed) return error.Terminal;
-            try self.queue.putOne(io, event);
             self.terminal_result = terminal_result;
             self.closed = true;
-            self.queue.close(io);
+            self.channel.send(event) catch |err| switch (err) {
+                error.ChannelClosed => {
+                    self.terminal_result = null;
+                    return error.Terminal;
+                },
+                error.Canceled => {
+                    self.terminal_result = null;
+                    self.channel.close(.graceful);
+                    return error.Canceled;
+                },
+            };
+            self.channel.close(.graceful);
         }
 
-        fn abort(self: *Self, io: std.Io) void {
+        fn abort(self: *Self) void {
             if (self.closed) return;
             self.closed = true;
-            self.queue.close(io);
+            self.channel.close(.graceful);
         }
 
-        fn next(self: *Self, io: std.Io) NextError!?Event {
-            return self.queue.getOne(io) catch |err| switch (err) {
-                error.Closed => null,
+        fn next(self: *Self) NextError!?Event {
+            return self.channel.receive() catch |err| switch (err) {
+                error.ChannelClosed => null,
                 error.Canceled => error.Canceled,
             };
         }
 
-        fn result(self: *const Self) ?Result {
+        fn poll(self: *Self) Stream.Poll {
+            const event = self.channel.tryReceive() catch |err| switch (err) {
+                error.ChannelEmpty => return .empty,
+                error.ChannelClosed => return .terminal,
+            };
+            return .{ .event = event };
+        }
+
+        fn result(self: *const Self) ?TerminalResult {
             return self.terminal_result;
         }
     };
@@ -111,12 +174,26 @@ test "event pipe drains events in order before terminal" {
     const sink = pipe.sink();
     const stream = pipe.stream();
 
-    try sink.emit(std.Io.failing, 1);
-    try sink.end(std.Io.failing, 2, 9);
+    try sink.emit(1);
+    try sink.end(2, 9);
 
-    try std.testing.expectEqual(@as(?u8, 1), try stream.next(std.Io.failing));
-    try std.testing.expectEqual(@as(?u8, 2), try stream.next(std.Io.failing));
-    try std.testing.expectEqual(@as(?u8, null), try stream.next(std.Io.failing));
+    try std.testing.expectEqual(@as(?u8, 1), try stream.next());
+    try std.testing.expectEqual(@as(?u8, 2), try stream.next());
+    try std.testing.expectEqual(@as(?u8, null), try stream.next());
+    try std.testing.expectEqual(@as(?u8, 9), stream.result());
+}
+
+test "event pipe commits terminal result before terminal event is observed" {
+    const Pipe = EventPipe(u8, u8);
+    var buffer: [1]u8 = undefined;
+    var pipe = Pipe.init(&buffer);
+    const sink = pipe.sink();
+    const stream = pipe.stream();
+
+    try sink.end(1, 9);
+
+    try std.testing.expectEqual(@as(?u8, 9), stream.result());
+    try std.testing.expectEqual(@as(?u8, 1), try stream.next());
     try std.testing.expectEqual(@as(?u8, 9), stream.result());
 }
 
@@ -126,8 +203,8 @@ test "event pipe rejects events after terminal" {
     var pipe = Pipe.init(&buffer);
     const sink = pipe.sink();
 
-    try sink.end(std.Io.failing, 1, 9);
-    try std.testing.expectError(error.Terminal, sink.emit(std.Io.failing, 2));
+    try sink.end(1, 9);
+    try std.testing.expectError(error.Terminal, sink.emit(2));
 }
 
 test "event pipe abort drains queued events without terminal result" {
@@ -137,12 +214,12 @@ test "event pipe abort drains queued events without terminal result" {
     const sink = pipe.sink();
     const stream = pipe.stream();
 
-    try sink.emit(std.Io.failing, 1);
-    sink.abort(std.Io.failing);
+    try sink.emit(1);
+    sink.abort();
 
-    try std.testing.expectError(error.Terminal, sink.emit(std.Io.failing, 2));
-    try std.testing.expectEqual(@as(?u8, 1), try stream.next(std.Io.failing));
-    try std.testing.expectEqual(@as(?u8, null), try stream.next(std.Io.failing));
+    try std.testing.expectError(error.Terminal, sink.emit(2));
+    try std.testing.expectEqual(@as(?u8, 1), try stream.next());
+    try std.testing.expectEqual(@as(?u8, null), try stream.next());
     try std.testing.expectEqual(@as(?u8, null), stream.result());
 }
 
@@ -153,44 +230,44 @@ test "event pipe leaves terminal empty when nonterminal event is queued" {
     const sink = pipe.sink();
     const stream = pipe.stream();
 
-    try sink.emit(std.Io.failing, 1);
+    try sink.emit(1);
     try std.testing.expectEqual(@as(?u8, null), stream.result());
-    try std.testing.expectEqual(@as(?u8, 1), try stream.next(std.Io.failing));
+    try std.testing.expectEqual(@as(?u8, 1), try stream.next());
 }
 
 const ConcurrentProducerState = struct {
     pipe: *EventPipe(u8, u8),
-    entered: std.atomic.Value(bool) = .init(false),
+    entered: zio.ResetEvent = .init,
 };
 
-fn produceMoreThanCapacity(io: std.Io, state: *ConcurrentProducerState) !void {
-    state.entered.store(true, .release);
+fn produceMoreThanCapacity(state: *ConcurrentProducerState) !void {
+    state.entered.set();
     const sink = state.pipe.sink();
-    try sink.emit(io, 1);
-    try sink.emit(io, 2);
-    try sink.emit(io, 3);
-    try sink.end(io, 4, 9);
+    try sink.emit(1);
+    try sink.emit(2);
+    try sink.emit(3);
+    try sink.end(4, 9);
 }
 
 test "event pipe supports bounded concurrent producer and owner drain" {
+    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
     const Pipe = EventPipe(u8, u8);
     var buffer: [1]u8 = undefined;
     var pipe = Pipe.init(&buffer);
     var state: ConcurrentProducerState = .{ .pipe = &pipe };
-    var future = std.testing.io.async(produceMoreThanCapacity, .{ std.testing.io, &state });
+    var future = try zio_runtime.spawn(produceMoreThanCapacity, .{&state});
+    defer future.cancel();
 
-    while (!state.entered.load(.acquire)) {
-        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch |err| switch (err) {
-            error.Canceled => return err,
-        };
-    }
+    try state.entered.wait();
 
     const stream = pipe.stream();
-    try std.testing.expectEqual(@as(?u8, 1), try stream.next(std.testing.io));
-    try std.testing.expectEqual(@as(?u8, 2), try stream.next(std.testing.io));
-    try std.testing.expectEqual(@as(?u8, 3), try stream.next(std.testing.io));
-    try std.testing.expectEqual(@as(?u8, 4), try stream.next(std.testing.io));
-    try std.testing.expectEqual(@as(?u8, null), try stream.next(std.testing.io));
+    try std.testing.expectEqual(@as(?u8, 1), try stream.next());
+    try std.testing.expectEqual(@as(?u8, 2), try stream.next());
+    try std.testing.expectEqual(@as(?u8, 3), try stream.next());
+    try std.testing.expectEqual(@as(?u8, 4), try stream.next());
+    try std.testing.expectEqual(@as(?u8, null), try stream.next());
     try std.testing.expectEqual(@as(?u8, 9), stream.result());
-    try future.await(std.testing.io);
+    try future.join();
 }

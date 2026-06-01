@@ -23,7 +23,7 @@ zi already has the start of a runtime vocabulary:
 
 - `src/runtime/operation.zig`: operation ids.
 - `src/runtime/bounded_queue.zig`: bounded FIFO for owner-drained event paths.
-- `src/runtime/cancel.zig`: wakeable cancel source/token and cancelable sleep races.
+- `src/runtime/cancel.zig`: wakeable cancel source/token and cancelable sleeps.
 - `src/runtime/event_pipe.zig`: queue-backed producer/consumer event pipe.
 
 but zi does not yet have a clear boundary for blocking operations that must run concurrently with owner code. the oauth login bug made this visible: printing the auth URL and prompt without flushing caused the process to appear to do nothing, then fixing the flush exposed the deeper serialization bug: manual input is requested before the callback server waits for the browser redirect.
@@ -36,21 +36,35 @@ all blocking or long-running work must follow this shape:
 
 ```text
 operation request
-  -> backend / worker / std.Io task
+  -> zio task / backend / worker
   -> bounded completion path
   -> owner drain/apply site
 ```
 
 workers and backend tasks may block, read, accept, stream, run tools, or perform provider I/O. they must not mutate auth, session, transcript, persistence, or ui state. owners drain completions and perform all product mutation.
 
-for the first implementation, zi will use zig 0.16 `std.Io` primitives before building or copying a custom os backend:
+current direction: zi uses zio as the process/runtime substrate while keeping
+zio behind Zi-owned runtime boundaries:
 
-- use `std.Io` concurrency primitives when operations must run concurrently.
-- use `std.Io.Select` for race-shaped waits.
+- use zio task handles/groups when operations must run concurrently.
+- use `zio.select` for race-shaped waits.
+- use `zio.Channel(T)` for bounded worker-to-owner handoff when zio tasks are
+  the producers.
 - use existing zi operation ids, cancel tokens, and bounded queues where product-level lifecycle needs identity and draining.
-- add small zi runtime adapters only where stdlib primitives do not encode product ownership.
+- add small zi runtime adapters only where zio primitives do not encode product ownership.
 
 zi will not verbatim copy `prise`, `zag`, or `pz` runtime code. instead, zi will adopt the specific lifecycle disciplines that match its invariants.
+
+retained Zi primitives must justify themselves:
+
+- `CancelSource` owns cancellation generation and uses `zio.ResetEvent` for
+  broadcast wakeup. resetting a source after owner drain invalidates old tokens;
+  a stale token remains canceled, preventing accidental reuse across operations.
+- `EventPipe` owns a stream plus one terminal result. It is a Zi semantic
+  wrapper over `zio.Channel(Event)` because the terminal event and terminal
+  result must remain paired.
+- public session event queues remain Zi-owned because their overflow/drop and
+  snapshot policy is product behavior, not runtime scheduling.
 
 ## core invariant
 
@@ -121,7 +135,7 @@ prise's linux backend submits io_uring operations and maps cqes back to pending 
 - `/Users/igors/.cache/checkouts/github.com/rockorager/prise/src/io/io_uring.zig:285-311` submits and drains completion queue entries.
 - `/Users/igors/.cache/checkouts/github.com/rockorager/prise/src/io/io_uring.zig:350-356` maps canceled cqes to `error.Canceled`.
 
-prise is useful because it shows clear operation ids, pending tables, explicit cancellation, and deterministic test backends. it is not a direct copy target because zig 0.16 already provides `std.Io.Threaded`, `std.Io.Kqueue`, `std.Io.Uring`, `std.Io.Queue`, `std.Io.Select`, futures, groups, and cancellation points. copying prise would import a zig 0.15 backend layer and callback-first control flow that fights zi's owner-drain rule.
+prise is useful because it shows clear operation ids, pending tables, explicit cancellation, and deterministic test backends. it is not a direct copy target because zio provides the runtime substrate Zi needs without importing a zig 0.15 backend layer and callback-first control flow that fights zi's owner-drain rule.
 
 ## what to borrow from prise
 
@@ -268,7 +282,10 @@ success criteria:
 
 ### phase 2: introduce oauth input race
 
-use `std.Io` concurrency support and `std.Io.Select` for required concurrency:
+historical note: this phase originally used `std.Io.Select`. that was useful
+for proving owner-drained races, but the zio migration supersedes it for new
+runtime code. new race-shaped waits should use zio tasks plus `zio.select`
+inside a Zi-owned runtime primitive.
 
 ```text
 const OAuthInput = union(enum) {
@@ -277,23 +294,27 @@ const OAuthInput = union(enum) {
 };
 
 var buffer: [2]OAuthInput = undefined;
-var select = std.Io.Select(OAuthInput).init(io, &buffer);
+var callback = try zio_runtime.spawn(waitForCallbackInput, .{ ... });
+defer callback.cancel();
+var manual = try zio_runtime.spawn(waitForManualInput, .{ ... });
+defer manual.cancel();
 
-try select.concurrent(.callback, waitForCallbackInput, .{ ... });
-try select.concurrent(.manual, waitForManualInput, .{ ... });
-
-const winner = try select.await();
-while (select.cancel()) |loser| freeLoser(loser);
+const winner = try zio.select(.{
+    .callback = &callback,
+    .manual = &manual,
+});
 ```
 
-important caveat: cancellation only works at `std.Io` cancellation points. app-level cancellation must use wakeable tokens or explicit resource close behavior; do not claim cancellation completion until the owner has drained the loser.
+important caveat: cancellation intent is still not cancellation completion.
+the owner must cancel or close losing resources, join/drain the losing tasks,
+and free any owned payloads before claiming the race complete.
 
 ### phase 3: extract a zi runtime adapter
 
 only after product paths prove the shape, add small helpers to `src/runtime`, such as:
 
 ```text
-runtime.Race
+runtime.runProcess
 runtime.sleepUntilCancel
 ```
 
@@ -312,7 +333,8 @@ required properties:
 known pressure points:
 
 1. provider http/sse streaming in `src/ai/providers/*`.
-2. `ai.provider_stream_stepper` producer/consumer boundaries.
+2. future provider producer/consumer boundaries, once a product owner needs
+   dynamic fan-in.
 3. agent turn lifecycle in `src/agent/Agent.zig` and `src/agent/loop.zig`.
 4. parallel tool execution and result collection.
 5. `coding_agent.AgentSession` event hooks, persistence, public events, and terminal policy.
@@ -324,26 +346,49 @@ apply the same rule each time: producer emits data, owner drains and mutates.
 current `src/runtime` primitives are intentionally small, but they now encode
 the ownership rules instead of relying on caller memory:
 
-- `runtime.Race` wraps `std.Io.Select` and makes loser drain mandatory before
-  `deinit`.
-- `runtime.CancelSource` owns heap-stable wake storage. App-level cancellation
-  closes the wake channel with `requestWithWake(io)` so all waiters wake; token
-  reuse reopens a fresh generation with `resetAfterDrain()`, and stale tokens
-  fail closed instead of observing a later run.
-- `runtime.sleepUntilCancel` races real `std.Io.sleep` against a wakeable
-  cancel token. There is no sleep-polling cancel path.
+- `runtime.runProcess` owns child wait, timeout, external
+  cancellation, stdout/stderr pipe readers, process kill, and reader drain
+  through zio tasks and `zio.select`. POSIX children run in their own process
+  group. Termination paths send TERM to the group, wait a bounded grace period,
+  send KILL to the group, and then join the existing process-wait task; they do
+  not call `Child.kill` while another task owns `Child.wait`. Once the wait
+  task completes, the process state is marked drained so later pipe-reader
+  faults cannot re-enter termination against an already-waited process id.
+- `runtime.CancelSource` owns heap-stable `zio.ResetEvent` wake storage.
+  App-level cancellation sets the event with `request()` so all waiters wake;
+  token reuse resets the event and advances generation with `resetAfterDrain()`,
+  and stale tokens fail closed instead of observing a later run.
+- `runtime.sleepUntilCancel` uses `zio.ResetEvent.timedWait` for cancelable
+  sleeps. There is no sleep-polling path and no extra task race per sleep.
+- production CLI and TUI construction share the process-owned zio runtime with
+  `RuntimeServices`; direct service owners create one runtime only when no
+  process/runtime owner is available. Session setup must not create a second
+  runtime behind the process boundary.
+- public agent/session/provider signatures name Zi's `runtime.Runtime`
+  boundary. Internal runtime mechanisms and agent-loop orchestration may use
+  zio handles, channels, and select directly where that is the actual
+  mechanism.
+- agent stream producers are spawned through an explicit runtime pointer and
+  communicate through `runtime.EventPipe`, a bounded `zio.Channel` wrapper;
+  live prompt runs use an explicit 64-event stream buffer and products still
+  drain and mutate state at the session owner.
+- parallel tool execution keeps a small Zi-owned `ToolWorkerGroup` instead of
+  `zio.Group` because the agent loop must retain one source-indexed result per
+  prepared tool call and finalize results in assistant message order. `zio.Group`
+  remains the right primitive for aggregate task completion, not ordered
+  per-worker result ownership.
 - `runtime.EventPipe` has both terminal close and abort close, so producer
-  errors cannot leave consumers blocked forever.
+  errors cannot leave consumers blocked forever while terminal results stay
+  attached to the terminal event.
 - `runtime.OperationIdAllocator` is only an id allocator. It is not a
   scheduler or operation table.
 - `runtime.ByteBuilder` supports bounded capacity for stream/parser paths that
   have externally sized input.
 
-do not add a worker pool until a concrete product path proves that `std.Io`
-concurrency plus owner-local `std.Io.Group`/`Race` usage is insufficient. The
-current blocking-tool path is bounded by tool-call limits and an owner-local
-worker group; adding a pool now would introduce scheduling policy before there
-is evidence for it.
+do not add a Zi-owned worker pool until a concrete product path proves zio
+tasks/groups/select are insufficient. The current blocking-tool path is bounded
+by tool-call limits and owner-local worker grouping; adding another pool would
+introduce scheduling policy before there is evidence for it.
 
 ## consequences
 
@@ -351,14 +396,16 @@ is evidence for it.
 
 - preserves zi's one-owner mutation rule.
 - gives auth, provider streams, tools, and hooks one shared lifecycle vocabulary.
-- avoids importing a custom pre-0.16 backend before stdlib options are tested.
+- keeps zio behind Zi-owned runtime boundaries instead of leaking backend
+  policy into products.
 - makes cancellation and shutdown visible instead of magical.
 - gives tests deterministic seams.
 
 ### negative
 
 - more explicit lifecycle code than node/pi-mono.
-- `std.Io.Select.cancel` may not fully stop blocking stdin/accept without explicit wake/close design.
+- more test harnesses now need explicit zio runtime ownership when they execute
+  live stream paths.
 - some code will be temporarily more verbose while zi discovers the right helper shape.
 - callback-style external references must be translated into owner-drained completions.
 
@@ -384,7 +431,6 @@ before marking a runtime change done, prove:
 
 ```bash
 zig build test
-ziglint src/coding_agent
+ziglint src/coding_agent src/runtime src/agent src/ai
 zig build
-zig build run -- "hello"
 ```

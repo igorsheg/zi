@@ -7,12 +7,19 @@
         .vaxis = .{
             .path = "vendor/libvaxis",
         },
+        .zio = .{
+            .path = "vendor/zio",
+        },
     },
     .paths = .{
+        ".ziglint.zon",
+        "AGENTS.md",
         "build.zig",
         "build.zig.zon",
+        "docs",
         "src",
         "vendor/libvaxis",
+        "vendor/zio",
         "LICENSE",
         "README.md",
     },

@@ -258,12 +258,15 @@ Zi owns product state. Therefore:
 ## Zig 0.16 rules
 
 Use the local Zig 0.16 toolchain as the source of truth. `zigdoc std.Io`
-describes `std.Io` as the cross-platform interface for I/O, concurrency, time,
-sleeping, queues, select, futures, and cancellation. TUI integration follows
-that shape:
+describes the process I/O boundary, and vendored zio is Zi's runtime substrate
+for interactive waits, channels, select, and cancellation. TUI integration
+follows that shape:
 
-- pass `std.Io` explicitly at the process/runtime boundary.
+- pass `std.Io` and Zi's `*runtime.Runtime` explicitly at the
+  process/runtime boundary.
 - do not hide I/O in global state.
+- drain ready terminal/session events at owner apply sites, then block on
+  zio-selectable wake sources.
 - use `std.mem.Allocator` explicitly for owned memory.
 - use `errdefer` for partially initialized owners.
 - every `deinit` releases all owned memory and then poisons `self` when practical.

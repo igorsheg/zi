@@ -1,5 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const zio = @import("zio");
 
 const runtime = @import("../runtime/root.zig");
 const tui = @import("../tui/root.zig");
@@ -39,7 +40,7 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
         null;
 
     var runtime_host = if (tui_options.resume_session_file) |session_file|
-        try sdk.resumeRuntimeHost(process.gpa, process.io, .{
+        try sdk.resumeRuntimeHost(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -48,11 +49,12 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
             .stream = explicit_stream,
             .dir = options.dir,
             .environ = options.environ,
+            .zio_runtime = process.zio_runtime,
         })
     else blk: {
         const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
         defer process.gpa.free(session_id);
-        break :blk try sdk.createRuntimeHost(process.gpa, process.io, .{
+        break :blk try sdk.createRuntimeHost(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -62,6 +64,7 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
             .stream = explicit_stream,
             .dir = options.dir,
             .environ = options.environ,
+            .zio_runtime = process.zio_runtime,
         });
     };
     defer runtime_host.deinit();
@@ -73,6 +76,10 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
     var loop = terminal.eventLoop();
     try loop.start();
     defer loop.stop();
+
+    var terminal_events: TerminalEvents = undefined;
+    try terminal_events.init(runtime_host.host.zioRuntime(), &loop);
+    defer terminal_events.deinit();
 
     try terminal.enterAltScreen();
 
@@ -90,7 +97,7 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
         .read_model = &read_model,
         .allocator = process.gpa,
         .terminal = &terminal,
-        .loop = &loop,
+        .terminal_events = &terminal_events,
         .io = process.io,
         .rendered_status = read_model.status,
         .last_winsize = .{
@@ -123,7 +130,7 @@ const Session = struct {
     read_model: *frontend.ReadModel,
     allocator: std.mem.Allocator,
     terminal: *tui.terminal.Terminal,
-    loop: *tui.terminal.EventLoop,
+    terminal_events: *TerminalEvents,
     io: std.Io,
     active_run: ?*AgentSession.LivePromptRun = null,
     rendered_status: frontend.ReadModel.Status = .idle,
@@ -150,38 +157,79 @@ const Session = struct {
         self.active_run = try self.host.startPromptRun(prompt, &.{}, .{});
     }
 
-    /// One iteration of the unified loop. While a run is active we poll the
-    /// terminal queue without blocking and step the host; when idle we block on
-    /// the next terminal event. The vaxis input thread keeps the queue filled
-    /// across steps, so there is no second event source to select over here.
+    /// One iteration of the unified loop. While a run is active we drain the
+    /// terminal queue without blocking before stepping the host. When idle, the
+    /// terminal queue is the only external wake source, so the owner blocks on
+    /// it instead of sleep polling.
     fn tick(self: *Session) !void {
-        try self.pollTerminalResize();
+        try self.refreshTerminalResize();
         if (self.active_run) |prompt_run| {
-            _ = try self.pollEvents();
+            _ = try self.drainTerminalEvents();
             if (!self.running) return;
             if (self.active_run == null) {
                 try self.renderIfDirty();
                 return;
             }
-            const more = self.host.stepPromptRun(prompt_run) catch |err| {
-                try self.handleActiveRunError(err);
-                return;
-            };
-            _ = try self.drainHost();
-            if (more) {
-                try self.maybeRender();
-            } else {
-                self.finishRun();
-                try self.renderIfDirty();
-            }
+            try self.stepActiveRun(prompt_run);
         } else {
             try self.renderIfDirty();
-            const event_count = try self.pollEvents();
+            const event_count = try self.drainTerminalEvents();
             const host_event_count = try self.drainHost();
             try self.maybeRender();
             if (event_count == 0 and host_event_count == 0 and !self.app.isDirty()) {
-                try self.io.sleep(.fromMilliseconds(16), .awake);
+                const event = try self.terminal_events.next() orelse return;
+                try self.handleEvent(event);
+                _ = try self.drainTerminalEvents();
+                _ = try self.drainHost();
+                try self.maybeRender();
             }
+        }
+    }
+
+    fn stepActiveRun(self: *Session, prompt_run: *AgentSession.LivePromptRun) !void {
+        if (try self.drainActiveRunReady(prompt_run)) return;
+
+        const terminal_wait = self.terminal_events.asyncNext();
+        var prompt_progress = self.host.promptRunProgress(prompt_run);
+
+        switch (try zio.select(.{
+            .terminal = terminal_wait,
+            .prompt = &prompt_progress,
+        })) {
+            .terminal => |result| {
+                try self.handleTerminalReceive(result);
+                _ = try self.drainTerminalEvents();
+                if (!self.running or self.active_run == null) return;
+                _ = try self.drainActiveRunReady(prompt_run);
+            },
+            .prompt => |progress| {
+                const more = self.host.applyPromptRunProgress(prompt_run, progress) catch |err| {
+                    try self.handleActiveRunError(err);
+                    return;
+                };
+                try self.afterActiveRunStep(more);
+            },
+        }
+    }
+
+    fn drainActiveRunReady(self: *Session, prompt_run: *AgentSession.LivePromptRun) !bool {
+        while (true) {
+            const maybe_more = self.host.drainPromptRunReady(prompt_run) catch |err| {
+                try self.handleActiveRunError(err);
+                return true;
+            } orelse return false;
+            try self.afterActiveRunStep(maybe_more);
+            if (!maybe_more) return true;
+        }
+    }
+
+    fn afterActiveRunStep(self: *Session, more: bool) !void {
+        _ = try self.drainHost();
+        if (more) {
+            try self.maybeRender();
+        } else {
+            self.finishRun();
+            try self.renderIfDirty();
         }
     }
 
@@ -210,10 +258,10 @@ const Session = struct {
         }
     }
 
-    fn pollEvents(self: *Session) !usize {
+    fn drainTerminalEvents(self: *Session) !usize {
         var count: usize = 0;
         while (count < terminal_events_per_tick_max) : (count += 1) {
-            const event = try self.loop.tryEvent() orelse return count;
+            const event = self.terminal_events.tryNext() orelse return count;
             try self.handleEvent(event);
             if (!self.running) return count;
         }
@@ -232,7 +280,7 @@ const Session = struct {
         }
     }
 
-    fn pollTerminalResize(self: *Session) !void {
+    fn refreshTerminalResize(self: *Session) !void {
         const winsize = try self.terminal.currentWinsize();
         if (winsize.cols == self.last_winsize.cols and winsize.rows == self.last_winsize.rows) return;
         try self.applyResize(winsize);
@@ -317,7 +365,117 @@ const Session = struct {
         self.rendered_status = self.read_model.status;
         self.app.setStatus(appStatus(self.rendered_status));
     }
+
+    fn handleTerminalReceive(
+        self: *Session,
+        result: TerminalEvents.Receive.Result,
+    ) anyerror!void {
+        const event = result orelse return;
+        try self.handleEvent(event);
+    }
 };
+
+const TerminalEvents = struct {
+    const capacity_count = 512;
+    const Channel = zio.Channel(tui.terminal.Event);
+    const ChannelReceive = @TypeOf(@as(*Channel, undefined).asyncReceive());
+
+    loop: *tui.terminal.EventLoop,
+    buffer: [capacity_count]tui.terminal.Event = undefined,
+    channel: Channel = undefined,
+    pump: zio.JoinHandle(anyerror!void),
+
+    fn init(
+        self: *TerminalEvents,
+        zio_runtime: *runtime.Runtime,
+        loop: *tui.terminal.EventLoop,
+    ) !void {
+        self.loop = loop;
+        self.channel = Channel.init(&self.buffer);
+        self.pump = try zio_runtime.spawn(pumpTerminalEvents, .{ loop, &self.channel });
+    }
+
+    fn deinit(self: *TerminalEvents) void {
+        self.channel.close(.immediate);
+        self.pump.cancel();
+        self.pump.result catch |err| switch (err) {
+            error.Canceled => {},
+            else => std.debug.panic("terminal event pump failed during shutdown: {s}", .{@errorName(err)}),
+        };
+        self.* = undefined;
+    }
+
+    fn tryNext(self: *TerminalEvents) ?tui.terminal.Event {
+        return self.channel.tryReceive() catch |err| switch (err) {
+            error.ChannelEmpty => null,
+            error.ChannelClosed => null,
+        };
+    }
+
+    fn next(self: *TerminalEvents) !?tui.terminal.Event {
+        return self.channel.receive() catch |err| switch (err) {
+            error.ChannelClosed => null,
+            error.Canceled => error.Canceled,
+        };
+    }
+
+    fn asyncNext(self: *TerminalEvents) Receive {
+        return .{ .receive = self.channel.asyncReceive() };
+    }
+
+    const Receive = struct {
+        receive: ChannelReceive,
+
+        pub const Result = ?tui.terminal.Event;
+        pub const WaitContext = ChannelReceive.WaitContext;
+
+        pub fn asyncWait(self: *const Receive, waiter: anytype, context: *WaitContext) bool {
+            return self.receive.asyncWait(waiter, context);
+        }
+
+        pub fn asyncCancelWait(self: *const Receive, waiter: anytype, context: *WaitContext) bool {
+            return self.receive.asyncCancelWait(waiter, context);
+        }
+
+        pub fn getResult(self: *const Receive, context: *WaitContext) Result {
+            return self.receive.getResult(context) catch |err| switch (err) {
+                error.ChannelClosed => null,
+            };
+        }
+    };
+};
+
+fn pumpTerminalEvents(
+    loop: *tui.terminal.EventLoop,
+    channel: *TerminalEvents.Channel,
+) anyerror!void {
+    while (true) {
+        const event = try loop.nextEvent();
+        channel.send(event) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.ChannelClosed => return,
+        };
+    }
+}
+
+test "terminal events bridge forwards vaxis queue events through zio channel" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
+
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = tui.terminal.EventLoop.init(io, &tty, &vx);
+    var terminal_events: TerminalEvents = undefined;
+    try terminal_events.init(zio_runtime, &loop);
+    defer terminal_events.deinit();
+
+    try loop.postEvent(.focus_in);
+
+    const receive = terminal_events.asyncNext();
+    const selected = try zio.select(.{ .terminal = receive });
+    try std.testing.expectEqual(tui.terminal.Event.focus_in, selected.terminal.?);
+}
 
 fn nonzero(value: u16, fallback: u16) u16 {
     return if (value == 0) fallback else value;

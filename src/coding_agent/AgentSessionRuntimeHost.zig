@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const faux = @import("../ai/providers/faux.zig");
@@ -28,6 +29,7 @@ pub const BaseOptions = struct {
     retry_settings: AgentSession.RetrySettings = .{},
     stream: ?ai.StreamFunction = null,
     get_api_key: ?agent_mod.GetApiKeyHook = null,
+    zio_runtime: *runtime.Runtime,
     dir: std.Io.Dir = .cwd(),
     allow_paths_outside_cwd: bool = false,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
@@ -153,6 +155,25 @@ pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LiveProm
     return self.session.stepPromptRun(run);
 }
 
+pub fn drainPromptRunReady(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !?bool {
+    return self.session.drainPromptRunReady(run);
+}
+
+pub fn promptRunProgress(
+    _: *AgentSessionRuntimeHost,
+    run: *AgentSession.LivePromptRun,
+) @TypeOf(AgentSession.promptRunProgress(run)) {
+    return AgentSession.promptRunProgress(run);
+}
+
+pub fn applyPromptRunProgress(
+    self: *AgentSessionRuntimeHost,
+    run: *AgentSession.LivePromptRun,
+    progress: @TypeOf(AgentSession.promptRunProgress(run)).Result,
+) !bool {
+    return self.session.applyPromptRunProgress(run, progress);
+}
+
 pub fn destroyPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) void {
     self.session.destroyPromptRun(run);
 }
@@ -198,6 +219,10 @@ pub fn statusSnapshot(self: *AgentSessionRuntimeHost) AgentSession.RuntimeStatus
     return self.session.statusSnapshot();
 }
 
+pub fn zioRuntime(self: *AgentSessionRuntimeHost) *runtime.Runtime {
+    return self.session.zio_runtime;
+}
+
 pub fn queueSnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
     return self.session.queueSnapshot(allocator);
 }
@@ -236,6 +261,7 @@ fn buildSessionOptions(base: BaseOptions, start: SessionStart) AgentSession.Opti
         .retry_settings = base.retry_settings,
         .stream = base.stream,
         .get_api_key = base.get_api_key,
+        .zio_runtime = base.zio_runtime,
         .dir = base.dir,
         .allow_paths_outside_cwd = base.allow_paths_outside_cwd,
         .public_event_capacity = base.public_event_capacity,
@@ -286,6 +312,7 @@ const EchoTool = struct {
     fn execute(
         allocator: std.mem.Allocator,
         _: std.Io,
+        _: *runtime.Runtime,
         context: ?*anyopaque,
         _: runtime.CancelToken,
         _: []const u8,
@@ -355,6 +382,7 @@ const ToolLoopObservation = struct {
 };
 
 const BashLimitObservation = struct {
+    tool_execution_start: bool = false,
     tool_execution_end: bool = false,
     tool_error: bool = false,
     output_limit_exceeded: bool = false,
@@ -365,6 +393,9 @@ const BashLimitObservation = struct {
         if (event != .agent_event) return;
 
         switch (event.agent_event) {
+            .tool_execution_start => |payload| {
+                if (std.mem.eql(u8, payload.tool_name, "bash")) self.tool_execution_start = true;
+            },
             .tool_execution_end => |payload| {
                 if (!std.mem.eql(u8, payload.tool_name, "bash")) return;
                 self.tool_execution_end = true;
@@ -387,17 +418,30 @@ const BashLimitObservation = struct {
     }
 };
 
+fn waitForBashToolStart(host: *AgentSessionRuntimeHost, observed: *BashLimitObservation) !void {
+    const yield_count_max = 1024;
+    for (0..yield_count_max) |_| {
+        _ = try host.drainPublicEvents(.{ .context = observed, .call_fn = BashLimitObservation.onEvent });
+        if (observed.tool_execution_start) return;
+        try zio.yield();
+    }
+    return error.BashToolStartNotObserved;
+}
+
 test "runtime host replacement invalidates old session before rebinding new session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     }, .{
         .session_id = "first",
@@ -452,11 +496,14 @@ test "runtime host new session replaces current session" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     }, .{
         .session_id = "first",
@@ -478,17 +525,49 @@ test "runtime host new session replaces current session" {
     try std.testing.expectEqualStrings("second", host.sessionId());
 }
 
+test "runtime host zio runtime accessor returns explicit session runtime" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
+        .dir = tmp.dir,
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    try std.testing.expect(host.base.zio_runtime == zio_runtime);
+    try std.testing.expect(host.zioRuntime() == host.session.zio_runtime);
+}
+
 test "runtime host replacement rejects active old session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     }, .{
         .session_id = "first",
@@ -516,11 +595,14 @@ test "runtime host owns current agent session public boundary" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     }, .{
         .session_id = "session",
@@ -545,11 +627,14 @@ test "runtime host persists run messages before frontend drains public events" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     }, .{
         .session_id = "session",
@@ -583,11 +668,14 @@ test "runtime host preserves session header active leaf and context after public
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     }, .{
         .session_id = "session",
@@ -644,10 +732,14 @@ test "runtime host persists session store that loads after host deinit" {
     errdefer std.testing.allocator.free(store_file_name);
 
     {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
         var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
             .cwd = "repo",
             .agent_dir = "agent",
             .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
             .dir = tmp.dir,
         }, .{
             .session_id = "session",
@@ -702,10 +794,14 @@ test "runtime host resumes session store into agent context and appends new hist
     errdefer std.testing.allocator.free(store_file_name);
 
     {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
         var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
             .cwd = "repo",
             .agent_dir = "agent",
             .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
             .dir = tmp.dir,
         }, .{
             .session_id = "session",
@@ -726,10 +822,14 @@ test "runtime host resumes session store into agent context and appends new hist
     errdefer std.testing.allocator.free(resume_file_name);
     var resume_store: session_store.SessionStore = .{ .dir = tmp.dir, .file_name = resume_file_name };
     {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
         var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
             .cwd = "repo",
             .agent_dir = "agent",
             .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
             .dir = tmp.dir,
         }, .{
             .session_id = "ignored",
@@ -785,11 +885,14 @@ test "runtime host live run executes a tool and continues the assistant turn" {
         faux.assistantMessage(&final_content, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&responses);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -832,17 +935,75 @@ test "runtime host live run executes a tool and continues the assistant turn" {
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
 }
 
-test "runtime host compacts through public command boundary" {
+test "runtime host applies prompt progress from zio stream future" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
 
+    var provider = try faux.Provider.init(std.testing.allocator, .{
+        .min_token_size = 128,
+        .max_token_size = 128,
+    });
+    defer provider.deinit();
+
+    const content = [_]ai.AssistantContent{faux.text("future progress")};
+    const responses = [_]ai.AssistantMessage{
+        faux.assistantMessage(&content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&responses);
+
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+    }, .{
+        .session_id = "session",
+        .timestamp = "2026-05-26T00:00:00Z",
+    });
+    defer {
+        host.requestShutdown();
+        drainHostEvents(&host);
+        host.deinit();
+    }
+
+    const run = try host.startPromptRun("hello", &.{}, .{});
+    defer host.destroyPromptRun(run);
+
+    var progress = host.promptRunProgress(run);
+    const selected = try zio.select(.{ .prompt = &progress });
+    const more = try host.applyPromptRunProgress(run, selected.prompt);
+    try std.testing.expect(more);
+
+    while (try host.stepPromptRun(run)) {}
+
+    try std.testing.expectEqual(@as(usize, 1), provider.call_count);
+    try std.testing.expect(host.statusSnapshot().public_event_count > 0);
+}
+
+test "runtime host compacts through public command boundary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .compaction_settings = .{ .keep_recent_tokens = 2 },
     }, .{
@@ -899,11 +1060,14 @@ test "runtime host compacts with generated summary through public command bounda
         faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&summaries);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -950,11 +1114,14 @@ test "runtime host exposes compaction preparation snapshot" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .compaction_settings = .{ .keep_recent_tokens = 2 },
     }, .{
@@ -989,11 +1156,14 @@ test "runtime host exposes compaction summary input snapshot" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .compaction_settings = .{ .keep_recent_tokens = 2 },
     }, .{
@@ -1024,6 +1194,10 @@ test "runtime host exposes compaction summary input snapshot" {
 }
 
 test "runtime host preserves bash output limit details through public events" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1054,10 +1228,11 @@ test "runtime host preserves bash output limit details through public events" {
     };
     try provider.setResponses(&responses);
 
-    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, io, .{
         .cwd = cwd_buffer[0..cwd_len],
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -1086,6 +1261,10 @@ test "runtime host preserves bash output limit details through public events" {
 }
 
 test "runtime host cancellation reaches running bash tool through agent loop" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1112,10 +1291,11 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
     };
     try provider.setResponses(&responses);
 
-    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, io, .{
         .cwd = cwd_buffer[0..cwd_len],
         .agent_dir = "agent",
         .current_date = "2026-05-26",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -1129,15 +1309,17 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
         host.deinit();
     }
 
-    var future = std.testing.io.async(runPromptForTest, .{ &host, "use bash" });
-    try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+    var future = try zio_runtime.spawn(runPromptForTest, .{ &host, "use bash" });
+    defer future.cancel();
+    var observed: BashLimitObservation = .{};
+    try waitForBashToolStart(&host, &observed);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.running, host.statusSnapshot().status);
     host.cancel();
 
-    try future.await(std.testing.io);
-    var observed: BashLimitObservation = .{};
+    try future.join();
     _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });
 
+    try std.testing.expect(observed.tool_execution_start);
     try std.testing.expect(observed.tool_execution_end);
     try std.testing.expect(observed.tool_error);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);

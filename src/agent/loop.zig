@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 const agent = @import("root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
@@ -15,31 +16,44 @@ pub const EventSink = struct {
 const AgentEventPipe = runtime.EventPipe(agent.AgentEvent, []const agent.AgentMessage);
 pub const AgentEventStreamNextError = AgentEventPipe.NextError;
 pub const AgentEventStreamEmitError = AgentEventPipe.EmitError;
+pub const AgentEventStreamPoll = AgentEventPipe.Stream.Poll;
 
 pub const AgentEventStream = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
     pipe: AgentEventPipe,
     event_arena: std.heap.ArenaAllocator,
-    future: ?std.Io.Future(anyerror!void) = null,
+    producer: Producer = .settled,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, buffer: []agent.AgentEvent) AgentEventStream {
+    const Producer = union(enum) {
+        running: zio.JoinHandle(anyerror!void),
+        spawn_failed: anyerror,
+        settled,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, buffer: []agent.AgentEvent) AgentEventStream {
         return .{
             .allocator = allocator,
-            .io = io,
             .pipe = AgentEventPipe.init(buffer),
             .event_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *AgentEventStream) void {
-        std.debug.assert(self.future == null);
+        std.debug.assert(self.producer == .settled);
         self.event_arena.deinit();
         self.* = undefined;
     }
 
-    pub fn next(self: *AgentEventStream, io: std.Io) AgentEventStreamNextError!?agent.AgentEvent {
-        return self.pipe.stream().next(io);
+    pub fn next(self: *AgentEventStream) AgentEventStreamNextError!?agent.AgentEvent {
+        return self.pipe.stream().next();
+    }
+
+    pub fn poll(self: *AgentEventStream) AgentEventStreamPoll {
+        return self.pipe.stream().poll();
+    }
+
+    pub fn asyncNext(self: *AgentEventStream) @TypeOf(self.pipe.stream().asyncNext()) {
+        return self.pipe.stream().asyncNext();
     }
 
     pub fn result(self: *AgentEventStream) ?[]const agent.AgentMessage {
@@ -47,16 +61,31 @@ pub const AgentEventStream = struct {
     }
 
     pub fn awaitProducer(self: *AgentEventStream) anyerror!void {
-        if (self.future) |*future| {
-            defer self.future = null;
-            try future.await(self.io);
+        switch (self.producer) {
+            .running => |*handle| {
+                defer self.producer = .settled;
+                try handle.join();
+            },
+            .spawn_failed => |err| {
+                self.producer = .settled;
+                return err;
+            },
+            .settled => {},
         }
     }
 
     pub fn cancelProducer(self: *AgentEventStream) anyerror!void {
-        if (self.future) |*future| {
-            defer self.future = null;
-            try future.cancel(self.io);
+        switch (self.producer) {
+            .running => |*handle| {
+                defer self.producer = .settled;
+                handle.cancel();
+                try handle.result;
+            },
+            .spawn_failed => |err| {
+                self.producer = .settled;
+                return err;
+            },
+            .settled => {},
         }
     }
 };
@@ -64,28 +93,44 @@ pub const AgentEventStream = struct {
 pub fn startPromptStream(
     stream: *AgentEventStream,
     allocator: std.mem.Allocator,
-    io: std.Io,
+    zio_runtime: *runtime.Runtime,
     prompts: []const agent.AgentMessage,
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
     buffer: []agent.AgentEvent,
 ) void {
-    stream.* = AgentEventStream.init(allocator, io, buffer);
-    stream.future = io.async(runPromptStreamProducer, .{ allocator, io, prompts, context, config, token, stream });
+    const stream_io = zio_runtime.io();
+    stream.* = AgentEventStream.init(allocator, buffer);
+    stream.producer = .{ .running = zio_runtime.spawn(
+        runPromptStreamProducer,
+        .{ allocator, stream_io, prompts, context, config, token, zio_runtime, stream },
+    ) catch |err| {
+        stream.pipe.sink().abort();
+        stream.producer = .{ .spawn_failed = err };
+        return;
+    } };
 }
 
 pub fn startContinueStream(
     stream: *AgentEventStream,
     allocator: std.mem.Allocator,
-    io: std.Io,
+    zio_runtime: *runtime.Runtime,
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
     buffer: []agent.AgentEvent,
 ) void {
-    stream.* = AgentEventStream.init(allocator, io, buffer);
-    stream.future = io.async(runContinueStreamProducer, .{ allocator, io, context, config, token, stream });
+    const stream_io = zio_runtime.io();
+    stream.* = AgentEventStream.init(allocator, buffer);
+    stream.producer = .{ .running = zio_runtime.spawn(
+        runContinueStreamProducer,
+        .{ allocator, stream_io, context, config, token, zio_runtime, stream },
+    ) catch |err| {
+        stream.pipe.sink().abort();
+        stream.producer = .{ .spawn_failed = err };
+        return;
+    } };
 }
 
 fn runPromptStreamProducer(
@@ -95,10 +140,11 @@ fn runPromptStreamProducer(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
+    zio_runtime: *runtime.Runtime,
     stream: *AgentEventStream,
 ) anyerror!void {
-    runPrompt(allocator, io, prompts, context, config, token, streamSink(stream)) catch |err| {
-        stream.pipe.sink().abort(io);
+    runPrompt(allocator, io, prompts, context, config, token, zio_runtime, streamSink(stream)) catch |err| {
+        stream.pipe.sink().abort();
         return err;
     };
 }
@@ -109,10 +155,11 @@ fn runContinueStreamProducer(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
+    zio_runtime: *runtime.Runtime,
     stream: *AgentEventStream,
 ) anyerror!void {
-    runContinue(allocator, io, context, config, token, streamSink(stream)) catch |err| {
-        stream.pipe.sink().abort(io);
+    runContinue(allocator, io, context, config, token, zio_runtime, streamSink(stream)) catch |err| {
+        stream.pipe.sink().abort();
         return err;
     };
 }
@@ -234,9 +281,9 @@ fn streamSinkEmit(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     switch (event) {
         .agent_end => |end| {
             const messages = try copyTerminalMessages(stream.event_arena.allocator(), end.messages);
-            try stream.pipe.sink().end(stream.io, .{ .agent_end = .{ .messages = messages } }, messages);
+            try stream.pipe.sink().end(.{ .agent_end = .{ .messages = messages } }, messages);
         },
-        else => try stream.pipe.sink().emit(stream.io, try copyStreamEvent(stream.event_arena.allocator(), event)),
+        else => try stream.pipe.sink().emit(try copyStreamEvent(stream.event_arena.allocator(), event)),
     }
 }
 
@@ -247,6 +294,7 @@ pub fn runPrompt(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
+    zio_runtime: *runtime.Runtime,
     emit: EventSink,
 ) !void {
     var current = try Context.init(allocator, context);
@@ -261,7 +309,7 @@ pub fn runPrompt(
     }
 
     current.owned_tool_results_start = current.messages.items.len;
-    try runLoop(allocator, io, &current, config, token, emit);
+    try runLoop(allocator, io, &current, config, token, zio_runtime, emit);
 }
 
 pub fn runContinue(
@@ -270,6 +318,7 @@ pub fn runContinue(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
+    zio_runtime: *runtime.Runtime,
     emit: EventSink,
 ) !void {
     if (context.messages.len == 0) return error.NoMessages;
@@ -280,7 +329,7 @@ pub fn runContinue(
 
     try emit.emit(.agent_start);
     try emit.emit(.turn_start);
-    try runLoop(allocator, io, &current, config, token, emit);
+    try runLoop(allocator, io, &current, config, token, zio_runtime, emit);
 }
 
 fn runLoop(
@@ -289,6 +338,7 @@ fn runLoop(
     current: *Context,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
+    zio_runtime: *runtime.Runtime,
     emit: EventSink,
 ) !void {
     var first_turn = true;
@@ -328,6 +378,7 @@ fn runLoop(
                 current,
                 config,
                 token,
+                zio_runtime,
                 emit,
             );
             errdefer if (owned_assistant) |assistant| ai.owned.deinitAssistantMessage(allocator, assistant);
@@ -342,9 +393,9 @@ fn runLoop(
             }
 
             const tool_results = if (shouldExecuteToolsSequential(current.tools, assistant, config.tool_execution))
-                try executeToolCallsSequential(allocator, io, current, assistant, config, token, emit)
+                try executeToolCallsSequential(allocator, io, zio_runtime, current, assistant, config, token, emit)
             else
-                try executeToolCallsParallel(allocator, io, current, assistant, config, token, emit);
+                try executeToolCallsParallel(allocator, io, current, assistant, config, token, zio_runtime, emit);
             defer allocator.free(tool_results.messages);
             var moved_tool_results: usize = 0;
             errdefer {
@@ -402,6 +453,7 @@ fn streamAssistantResponse(
     current: *Context,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
+    zio_runtime: *runtime.Runtime,
     emit: EventSink,
 ) !ai.AssistantMessage {
     const agent_messages = if (config.transform_context) |hook|
@@ -431,6 +483,7 @@ fn streamAssistantResponse(
     var stream = config.stream.call(.{
         .allocator = response_arena.allocator(),
         .io = io,
+        .zio_runtime = zio_runtime,
         .model = config.model,
         .context = .{
             .system_prompt = current.system_prompt,
@@ -510,6 +563,7 @@ fn shouldExecuteToolsSequential(
 fn executeToolCallsSequential(
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *runtime.Runtime,
     current: *Context,
     assistant: ai.AssistantMessage,
     config: agent.AgentLoopConfig,
@@ -531,7 +585,17 @@ fn executeToolCallsSequential(
             .args = tool_call.arguments,
         } });
 
-        var finalized = try executeOneToolCall(allocator, io, current, assistant, tool_call, config, token, emit);
+        var finalized = try executeOneToolCall(
+            allocator,
+            io,
+            zio_runtime,
+            current,
+            assistant,
+            tool_call,
+            config,
+            token,
+            emit,
+        );
         finalized_count += 1;
         if (finalized.result.result.terminate) terminate_count += 1;
 
@@ -619,23 +683,30 @@ const ToolWorkerEvent = union(enum) {
     };
 };
 
-const ToolWorkerQueue = std.Io.Queue(ToolWorkerEvent);
+const ToolWorkerChannel = zio.Channel(ToolWorkerEvent);
+const tool_worker_event_capacity_count = agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch;
 
+// zio.Group only reports aggregate completion/failure. The agent loop needs a
+// fixed, source-indexed result slot for each prepared tool call so finalization
+// remains deterministic even when workers complete out of order.
 const ToolWorkerGroup = struct {
-    io: std.Io,
-    group: std.Io.Group = .init,
+    zio_runtime: *runtime.Runtime,
+    handles: [agent.max_tool_calls_per_turn]zio.JoinHandle(anyerror!void) = undefined,
     started: usize = 0,
-    closed: bool = false,
-    drained: bool = true,
+    state: State = .idle,
 
-    const SpawnError = error{TooManyTools} || std.Io.ConcurrentError;
+    const State = enum {
+        idle,
+        active,
+        drained,
+    };
 
-    fn init(io: std.Io) ToolWorkerGroup {
-        return .{ .io = io };
+    fn init(zio_runtime: *runtime.Runtime) ToolWorkerGroup {
+        return .{ .zio_runtime = zio_runtime };
     }
 
     fn deinit(self: *ToolWorkerGroup) void {
-        if (self.started > 0 and !self.drained) @panic("ToolWorkerGroup deinit before await or cancel");
+        if (self.state == .active) @panic("ToolWorkerGroup deinit before await or cancel");
         self.* = undefined;
     }
 
@@ -643,32 +714,35 @@ const ToolWorkerGroup = struct {
         self: *ToolWorkerGroup,
         function: anytype,
         args: std.meta.ArgsTuple(@TypeOf(function)),
-    ) SpawnError!void {
-        std.debug.assert(!self.closed);
+    ) anyerror!void {
         if (self.started == agent.max_tool_calls_per_turn) return error.TooManyTools;
-        try self.group.concurrent(self.io, function, args);
+        std.debug.assert(self.state == .idle or self.state == .active);
+        self.handles[self.started] = try self.zio_runtime.spawn(function, args);
         self.started += 1;
-        self.drained = false;
+        self.state = .active;
     }
 
-    fn await(self: *ToolWorkerGroup) std.Io.Cancelable!void {
-        std.debug.assert(!self.closed);
-        try self.group.await(self.io);
-        self.closed = true;
-        self.drained = true;
+    fn await(self: *ToolWorkerGroup) anyerror!void {
+        std.debug.assert(self.state != .drained);
+        var first_error: ?anyerror = null;
+        for (self.handles[0..self.started]) |*handle| {
+            handle.join() catch |err| {
+                if (first_error == null) first_error = err;
+            };
+        }
+        self.state = .drained;
+        if (first_error) |err| return err;
     }
 
     fn cancel(self: *ToolWorkerGroup) void {
-        if (self.closed) return;
-        self.group.cancel(self.io);
-        self.closed = true;
-        self.drained = true;
+        if (self.state != .active) return;
+        for (self.handles[0..self.started]) |*handle| handle.cancel();
+        self.state = .drained;
     }
 };
 
 const ParallelToolUpdateContext = struct {
-    io: std.Io,
-    queue: *ToolWorkerQueue,
+    channel: *ToolWorkerChannel,
     tool_call: ai.ToolCall,
     args: std.json.Value,
     update_count: *std.atomic.Value(usize),
@@ -681,24 +755,27 @@ fn executeToolCallsParallel(
     assistant: ai.AssistantMessage,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
+    zio_runtime: *runtime.Runtime,
     emit: EventSink,
 ) !ToolBatch {
     var prepared: [agent.max_tool_calls_per_turn]PreparedToolCall = undefined;
     const prepared_count = try prepareParallelToolCalls(allocator, current, assistant, config, token, emit, &prepared);
+    if (prepared_count == 0) return .{ .messages = &.{}, .terminate = false };
 
-    var queue_buffer: [agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch]ToolWorkerEvent = undefined;
-    var queue = ToolWorkerQueue.init(&queue_buffer);
+    std.debug.assert(prepared_count <= agent.max_tool_calls_per_turn);
+    var channel_buffer: [tool_worker_event_capacity_count]ToolWorkerEvent = undefined;
+    var channel = ToolWorkerChannel.init(&channel_buffer);
     var update_count: std.atomic.Value(usize) = .init(0);
-    var group = ToolWorkerGroup.init(io);
+    var group = ToolWorkerGroup.init(zio_runtime);
     defer group.deinit();
+    errdefer cancelParallelToolWorkers(&group, &channel);
 
     for (prepared[0..prepared_count]) |item| {
         try group.spawn(
             executePreparedToolCallWorker,
-            .{ allocator, io, item, token, &queue, &update_count },
+            .{ allocator, io, zio_runtime, item, token, &channel, &update_count },
         );
     }
-    errdefer cancelParallelToolWorkers(io, &group, &queue);
 
     var executed: [agent.max_tool_calls_per_turn]ExecutedToolCall = undefined;
     var executed_owned: [agent.max_tool_calls_per_turn]bool = @splat(false);
@@ -706,7 +783,7 @@ fn executeToolCallsParallel(
 
     var completed_count: usize = 0;
     while (completed_count < prepared_count) {
-        const event = try queue.getOne(io);
+        const event = try channel.receive();
         switch (event) {
             .update => |update| try emit.emit(.{ .tool_execution_update = .{
                 .tool_call_id = update.tool_call_id,
@@ -758,21 +835,26 @@ fn executeToolCallsParallel(
     };
 }
 
-fn cancelParallelToolWorkers(
-    io: std.Io,
-    group: *ToolWorkerGroup,
-    queue: *ToolWorkerQueue,
-) void {
-    group.cancel();
-    drainPendingToolWorkerEvents(io, queue);
+fn assistantHasToolCall(assistant: ai.AssistantMessage) bool {
+    for (assistant.content) |content| {
+        if (content == .tool_call) return true;
+    }
+    return false;
 }
 
-fn drainPendingToolWorkerEvents(io: std.Io, queue: *ToolWorkerQueue) void {
-    var buffer: [agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch]ToolWorkerEvent = undefined;
+fn cancelParallelToolWorkers(
+    group: *ToolWorkerGroup,
+    channel: *ToolWorkerChannel,
+) void {
+    group.cancel();
+    channel.close(.graceful);
+    drainPendingToolWorkerEvents(channel);
+}
+
+fn drainPendingToolWorkerEvents(channel: *ToolWorkerChannel) void {
     while (true) {
-        const count = queue.getUncancelable(io, &buffer, 0) catch break;
-        if (count == 0) break;
-        for (buffer[0..count]) |*event| deinitToolWorkerEvent(event);
+        var event = channel.tryReceive() catch break;
+        deinitToolWorkerEvent(&event);
     }
 }
 
@@ -826,21 +908,30 @@ fn prepareParallelToolCalls(
 fn executePreparedToolCallWorker(
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *runtime.Runtime,
     prepared: PreparedToolCall,
     token: runtime.CancelToken,
-    queue: *ToolWorkerQueue,
+    channel: *ToolWorkerChannel,
     update_count: *std.atomic.Value(usize),
-) std.Io.Cancelable!void {
-    var executed = executePreparedToolCall(allocator, io, prepared, token, queue, update_count) catch |err| {
-        queue.putOne(io, .{ .failed = .{ .prepared = prepared, .error_name = @errorName(err) } }) catch |queue_err| {
-            if (queue_err == error.Canceled) return error.Canceled;
+) anyerror!void {
+    var executed = executePreparedToolCall(
+        allocator,
+        io,
+        zio_runtime,
+        prepared,
+        token,
+        channel,
+        update_count,
+    ) catch |err| {
+        channel.send(.{ .failed = .{ .prepared = prepared, .error_name = @errorName(err) } }) catch |channel_err| {
+            if (channel_err == error.Canceled) return error.Canceled;
             return;
         };
         return;
     };
-    queue.putOne(io, .{ .complete = executed }) catch |queue_err| {
+    channel.send(.{ .complete = executed }) catch |channel_err| {
         executed.result.deinit();
-        if (queue_err == error.Canceled) return error.Canceled;
+        if (channel_err == error.Canceled) return error.Canceled;
     };
 }
 
@@ -871,8 +962,11 @@ fn prepareToolCall(
         tool_call.arguments;
 
     // Debt owner: agent. Reason: JSON-schema validation needs one shared
-    // validator for sequential and parallel tool paths. Remove this when
-    // `agent.AgentTool.parameters` has an executable validator.
+    // validator for sequential and parallel tool paths. Scope: before-tool
+    // policy may block or rewrite arguments, but schema validation is not yet
+    // executable here. Remove when `agent.AgentTool.parameters` has an
+    // executable validator. Current behavior is covered by prepare/block tests
+    // on sequential and parallel tool paths.
     if (config.before_tool_call) |before| {
         const before_result = before.call(token, .{
             .assistant_message = assistant,
@@ -897,9 +991,10 @@ fn prepareToolCall(
 fn executePreparedToolCall(
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *runtime.Runtime,
     prepared: PreparedToolCall,
     token: runtime.CancelToken,
-    queue: *ToolWorkerQueue,
+    channel: *ToolWorkerChannel,
     update_count: *std.atomic.Value(usize),
 ) anyerror!ExecutedToolCall {
     switch (prepared) {
@@ -920,8 +1015,7 @@ fn executePreparedToolCall(
         },
         .executable => |item| {
             var update_context: ParallelToolUpdateContext = .{
-                .io = io,
-                .queue = queue,
+                .channel = channel,
                 .tool_call = item.tool_call,
                 .args = item.args,
                 .update_count = update_count,
@@ -933,6 +1027,7 @@ fn executePreparedToolCall(
             const result = agent.ExecuteToolHook.call(
                 allocator,
                 io,
+                zio_runtime,
                 item.tool.execute,
                 token,
                 item.tool_call.id,
@@ -1022,6 +1117,7 @@ fn emitFinalizedToolCall(
 fn executeOneToolCall(
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *runtime.Runtime,
     current: *Context,
     assistant: ai.AssistantMessage,
     tool_call: ai.ToolCall,
@@ -1074,6 +1170,7 @@ fn executeOneToolCall(
     var result = agent.ExecuteToolHook.call(
         allocator,
         io,
+        zio_runtime,
         tool.execute,
         token,
         tool_call.id,
@@ -1125,7 +1222,7 @@ fn enqueueToolUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult
     const update: *ParallelToolUpdateContext = @ptrCast(@alignCast(context.?));
     const previous_count = update.update_count.fetchAdd(1, .monotonic);
     if (previous_count >= agent.max_tool_updates_per_batch) return error.TooManyTools;
-    try update.queue.putOne(update.io, .{ .update = .{
+    try update.channel.send(.{ .update = .{
         .tool_call_id = update.tool_call.id,
         .tool_name = update.tool_call.name,
         .args = update.args,
@@ -1443,6 +1540,7 @@ fn userMessage(text: []const u8) agent.AgentMessage {
 fn echoTool(
     allocator: std.mem.Allocator,
     _: std.Io,
+    _: *runtime.Runtime,
     context: ?*anyopaque,
     _: runtime.CancelToken,
     _: []const u8,
@@ -1457,6 +1555,7 @@ fn echoTool(
 fn updatingTool(
     allocator: std.mem.Allocator,
     _: std.Io,
+    _: *runtime.Runtime,
     context: ?*anyopaque,
     _: runtime.CancelToken,
     _: []const u8,
@@ -1471,6 +1570,42 @@ fn updatingTool(
     return toolTextResult(allocator, "done");
 }
 
+fn overflowingUpdatesTool(
+    allocator: std.mem.Allocator,
+    _: std.Io,
+    _: *runtime.Runtime,
+    context: ?*anyopaque,
+    _: runtime.CancelToken,
+    _: []const u8,
+    _: std.json.Value,
+    on_update: ?agent.AgentToolUpdateCallback,
+) anyerror!agent.ToolExecutionResult {
+    const calls: *usize = @ptrCast(@alignCast(context.?));
+    calls.* += 1;
+    if (on_update) |callback| {
+        for (0..agent.max_tool_updates_per_batch + 1) |_| {
+            try callback.call(.{ .content = &.{.{ .text = .{ .text = "partial" } }} });
+        }
+    }
+    return toolTextResult(allocator, "unreachable");
+}
+
+fn sleepingTool(
+    _: std.mem.Allocator,
+    _: std.Io,
+    _: *runtime.Runtime,
+    context: ?*anyopaque,
+    _: runtime.CancelToken,
+    _: []const u8,
+    _: std.json.Value,
+    _: ?agent.AgentToolUpdateCallback,
+) anyerror!agent.ToolExecutionResult {
+    const entered: *zio.ResetEvent = @ptrCast(@alignCast(context.?));
+    entered.set();
+    try zio.sleep(.fromSeconds(60));
+    return error.TestUnexpectedResult;
+}
+
 fn toolTextResult(allocator: std.mem.Allocator, text: []const u8) !agent.ToolExecutionResult {
     const content = try allocator.alloc(ai.ToolResultContent, 1);
     content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
@@ -1478,6 +1613,8 @@ fn toolTextResult(allocator: std.mem.Allocator, text: []const u8) !agent.ToolExe
 }
 
 test "run prompt emits prompt assistant and agent end events" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1496,6 +1633,7 @@ test "run prompt emits prompt assistant and agent end events" {
             .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
         },
         cancel.token(),
+        zio_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1504,6 +1642,8 @@ test "run prompt emits prompt assistant and agent end events" {
 }
 
 test "prompt stream exposes events and terminal messages through event pipe" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
@@ -1513,7 +1653,7 @@ test "prompt stream exposes events and terminal messages through event pipe" {
     startPromptStream(
         &stream,
         std.testing.allocator,
-        std.Io.failing,
+        zio_runtime,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
         .{
@@ -1526,13 +1666,15 @@ test "prompt stream exposes events and terminal messages through event pipe" {
     );
     defer stream.deinit();
 
-    try std.testing.expectEqual(agent.AgentEvent.agent_start, (try stream.next(std.Io.failing)).?);
-    while (try stream.next(std.Io.failing)) |_| {}
+    try std.testing.expectEqual(agent.AgentEvent.agent_start, (try stream.next()).?);
+    while (try stream.next()) |_| {}
     try stream.awaitProducer();
     try std.testing.expectEqual(@as(usize, 2), stream.result().?.len);
 }
 
 test "prompt stream closes event pipe when producer fails before terminal event" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
@@ -1542,7 +1684,7 @@ test "prompt stream closes event pipe when producer fails before terminal event"
     startPromptStream(
         &stream,
         std.testing.allocator,
-        std.Io.failing,
+        zio_runtime,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
         .{
@@ -1555,12 +1697,84 @@ test "prompt stream closes event pipe when producer fails before terminal event"
     );
     defer stream.deinit();
 
-    while (try stream.next(std.Io.failing)) |_| {}
+    while (try stream.next()) |_| {}
     try std.testing.expectError(error.MissingAssistantResult, stream.awaitProducer());
     try std.testing.expectEqual(@as(?[]const agent.AgentMessage, null), stream.result());
 }
 
+test "prompt stream cancellation drains producer blocked on bounded event pipe" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
+    const prompt = userMessage("hello");
+    var buffer: [1]agent.AgentEvent = undefined;
+    var stream: AgentEventStream = undefined;
+
+    startPromptStream(
+        &stream,
+        std.testing.allocator,
+        zio_runtime,
+        &.{prompt},
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
+        .{
+            .model = testModel(),
+            .stream = .{ .call_fn = testStream },
+            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+        },
+        cancel.token(),
+        &buffer,
+    );
+    defer stream.deinit();
+
+    try std.testing.expectEqual(agent.AgentEvent.agent_start, (try stream.next()).?);
+    try std.testing.expectError(error.Canceled, stream.cancelProducer());
+}
+
+test "prompt stream cancellation while tool is running drains as canceled" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
+    const prompt = userMessage("hello");
+    var stream_calls: usize = 0;
+    var entered: zio.ResetEvent = .init;
+    const tool: agent.AgentTool = .{
+        .name = "echo",
+        .description = "Echo",
+        .parameters = .{ .object = .empty },
+        .label = "Echo",
+        .execute = .{ .context = &entered, .call_fn = sleepingTool },
+    };
+    var buffer: [16]agent.AgentEvent = undefined;
+    var stream: AgentEventStream = undefined;
+
+    startPromptStream(
+        &stream,
+        std.testing.allocator,
+        zio_runtime,
+        &.{prompt},
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
+        .{
+            .model = testModel(),
+            .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
+            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+        },
+        cancel.token(),
+        &buffer,
+    );
+    defer stream.deinit();
+
+    try entered.wait();
+
+    try std.testing.expectError(error.Canceled, stream.cancelProducer());
+    try std.testing.expectEqual(@as(?[]const agent.AgentMessage, null), stream.result());
+}
+
 test "run prompt executes tool result then continues assistant turn" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1577,9 +1791,9 @@ test "run prompt executes tool result then continues assistant turn" {
         .execute = .{ .context = &tool_calls, .call_fn = echoTool },
     };
 
-	    try runPrompt(
-	        std.testing.allocator,
-	        std.testing.io,
+    try runPrompt(
+        std.testing.allocator,
+        io,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
         .{
@@ -1588,6 +1802,7 @@ test "run prompt executes tool result then continues assistant turn" {
             .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
         },
         cancel.token(),
+        zio_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1597,6 +1812,9 @@ test "run prompt executes tool result then continues assistant turn" {
 }
 
 test "parallel tool calls emit bounded live updates through owner" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1615,7 +1833,7 @@ test "parallel tool calls emit bounded live updates through owner" {
 
     try runPrompt(
         std.testing.allocator,
-        std.testing.io,
+        io,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
         .{
@@ -1625,6 +1843,7 @@ test "parallel tool calls emit bounded live updates through owner" {
             .tool_execution = .parallel,
         },
         cancel.token(),
+        zio_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1638,6 +1857,9 @@ test "parallel tool calls emit bounded live updates through owner" {
 }
 
 test "parallel tool calls cancel and drain workers when owner update drain fails" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1656,7 +1878,7 @@ test "parallel tool calls cancel and drain workers when owner update drain fails
 
     try std.testing.expectError(error.TestSinkFailed, runPrompt(
         std.testing.allocator,
-        std.testing.io,
+        io,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
         .{
@@ -1666,13 +1888,71 @@ test "parallel tool calls cancel and drain workers when owner update drain fails
             .tool_execution = .parallel,
         },
         cancel.token(),
+        zio_runtime,
         .{ .context = &events, .call_fn = failOnToolUpdateSink },
     ));
 
     try std.testing.expectEqual(@as(usize, 1), tool_calls);
 }
 
+test "parallel tool calls bound live updates before completing worker result" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
+    var events = std.ArrayList(agent.AgentEvent).empty;
+    defer events.deinit(std.testing.allocator);
+    defer deinitTestEvents(events.items);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
+    var stream_calls: usize = 0;
+    var tool_calls: usize = 0;
+    const prompt = userMessage("hello");
+    const tool: agent.AgentTool = .{
+        .name = "echo",
+        .description = "Echo",
+        .parameters = .{ .object = .empty },
+        .label = "Echo",
+        .execute = .{ .context = &tool_calls, .call_fn = overflowingUpdatesTool },
+    };
+
+    try runPrompt(
+        std.testing.allocator,
+        io,
+        &.{prompt},
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
+        .{
+            .model = testModel(),
+            .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
+            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .tool_execution = .parallel,
+        },
+        cancel.token(),
+        zio_runtime,
+        .{ .context = &events, .call_fn = testSink },
+    );
+
+    var update_count: usize = 0;
+    var end_count: usize = 0;
+    var saw_bound_error = false;
+    for (events.items) |event| switch (event) {
+        .tool_execution_update => update_count += 1,
+        .tool_execution_end => |end| {
+            end_count += 1;
+            saw_bound_error = end.is_error;
+        },
+        else => {},
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), tool_calls);
+    try std.testing.expectEqual(@as(usize, agent.max_tool_updates_per_batch), update_count);
+    try std.testing.expectEqual(@as(usize, 1), end_count);
+    try std.testing.expect(saw_bound_error);
+}
+
 test "parallel tool calls finalize results in assistant source order" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1691,7 +1971,7 @@ test "parallel tool calls finalize results in assistant source order" {
 
     try runPrompt(
         std.testing.allocator,
-        std.testing.io,
+        io,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
         .{
@@ -1701,6 +1981,7 @@ test "parallel tool calls finalize results in assistant source order" {
             .tool_execution = .parallel,
         },
         cancel.token(),
+        zio_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1719,6 +2000,8 @@ test "parallel tool calls finalize results in assistant source order" {
 }
 
 test "run continue rejects assistant tail" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1736,6 +2019,7 @@ test "run continue rejects assistant tail" {
             .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
         },
         cancel.token(),
+        zio_runtime,
         .{ .context = &events, .call_fn = testSink },
     ));
 }

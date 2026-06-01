@@ -14,6 +14,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     zi.addImport("vaxis", vaxis_dep.module("vaxis"));
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    zi.addImport("zio", zio_dep.module("zio"));
 
     const exe = b.addExecutable(.{
         .name = "zi",
@@ -23,6 +28,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zi", .module = zi },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
             },
         }),
     });

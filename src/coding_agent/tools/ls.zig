@@ -68,6 +68,7 @@ pub const LsTool = struct {
 fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
+    _: *agent.ToolRuntime,
     context: ?*anyopaque,
     token: runtime.CancelToken,
     _: []const u8,
@@ -149,15 +150,23 @@ test "ls tool lists one directory with bounds" {
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "path", .{ .string = "dir" });
 
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    var result = try execute(std.testing.allocator, std.testing.io, &tool, cancel_source.token(), "call", .{
-        .object = object,
-    }, null);
+    var result = try execute(
+        std.testing.allocator,
+        zio_runtime.io(),
+        zio_runtime,
+        &tool,
+        cancel_source.token(),
+        "call",
+        .{ .object = object },
+        null,
+    );
     defer result.deinit();
 
     const text = result.result.content[0].text.text;
     try std.testing.expect(std.mem.indexOf(u8, text, "a.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "nested/") != null);
 }
-

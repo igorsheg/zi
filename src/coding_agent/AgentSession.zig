@@ -14,9 +14,11 @@ const AgentSession = @This();
 pub const public_event_capacity_default = 256;
 pub const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 4096;
 pub const max_auto_retry_attempts_limit = 8;
+pub const live_prompt_event_capacity_count = 64;
 
 allocator: std.mem.Allocator,
 io: std.Io,
+zio_runtime: *runtime.Runtime,
 cwd: []const u8,
 current_date: []const u8,
 timestamp: []const u8,
@@ -53,6 +55,7 @@ pub const Options = struct {
     public_event_capacity: usize = public_event_capacity_default,
     session_store: ?session_store.SessionStore = null,
     resume_session_store: ?session_store.SessionStore = null,
+    zio_runtime: *runtime.Runtime,
 };
 
 pub const StreamingBehavior = enum {
@@ -104,7 +107,7 @@ const ManualCompactionRequest = union(enum) {
 pub const LivePromptRun = struct {
     token: runtime.CancelToken,
     stream: agent_mod.loop.AgentEventStream = undefined,
-    buffer: [64]agent_mod.AgentEvent = undefined,
+    buffer: [live_prompt_event_capacity_count]agent_mod.AgentEvent = undefined,
     prompts: [1]agent_mod.AgentMessage = undefined,
     active: bool = false,
 };
@@ -292,6 +295,8 @@ const EventDrain = struct {
 };
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSession {
+    const zio_runtime = options.zio_runtime;
+
     const cwd = try allocator.dupe(u8, options.cwd);
     errdefer allocator.free(cwd);
     const current_date = try allocator.dupe(u8, options.current_date);
@@ -362,6 +367,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .thinking_level = options.thinking_level,
         .tools = tools.activeAgentTools(),
         .messages = session_context.messages,
+        .zio_runtime = zio_runtime,
     };
     if (options.stream) |stream| agent_options.stream = stream;
     if (options.get_api_key) |get_api_key| agent_options.get_api_key = get_api_key;
@@ -400,6 +406,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     return .{
         .allocator = allocator,
         .io = io,
+        .zio_runtime = zio_runtime,
         .cwd = cwd,
         .current_date = current_date,
         .timestamp = timestamp,
@@ -522,7 +529,7 @@ fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight
     agent_mod.loop.startPromptStream(
         &run.stream,
         self.allocator,
-        self.io,
+        self.zio_runtime,
         &run.prompts,
         .{
             .system_prompt = self.agent.state.system_prompt,
@@ -539,10 +546,43 @@ fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight
 
 pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
     if (!run.active) return false;
-    if (try run.stream.next(self.io)) |event| {
-        try self.agent.emitEvent(event);
-        return true;
+    if (try run.stream.next()) |event| {
+        return self.applyPromptRunEvent(run, event);
     }
+    return self.finishPromptRun(run);
+}
+
+pub fn drainPromptRunReady(self: *AgentSession, run: *LivePromptRun) !?bool {
+    if (!run.active) return false;
+    return switch (run.stream.poll()) {
+        .event => |event| try self.applyPromptRunEvent(run, event),
+        .terminal => try self.finishPromptRun(run),
+        .empty => null,
+    };
+}
+
+pub fn promptRunProgress(run: *LivePromptRun) @TypeOf(run.stream.asyncNext()) {
+    return run.stream.asyncNext();
+}
+
+pub fn applyPromptRunProgress(
+    self: *AgentSession,
+    run: *LivePromptRun,
+    progress: @TypeOf(run.stream.asyncNext()).Result,
+) !bool {
+    if (!run.active) return false;
+    const event = progress orelse return self.finishPromptRun(run);
+    return self.applyPromptRunEvent(run, event);
+}
+
+fn applyPromptRunEvent(self: *AgentSession, run: *LivePromptRun, event: agent_mod.AgentEvent) !bool {
+    std.debug.assert(run.active);
+    try self.agent.emitEvent(event);
+    return true;
+}
+
+fn finishPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
+    std.debug.assert(run.active);
     run.stream.awaitProducer() catch |err| {
         try self.agent.failRun(run.token, @errorName(err));
         self.agent.finishRun();
@@ -668,7 +708,7 @@ pub fn cancel(self: *AgentSession) void {
         if (self.lifecycle == .shutdown_requested or self.lifecycle == .stopped) return;
         if (self.lifecycle == .cancel_requested) return;
         self.lifecycle = .cancel_requested;
-        source.requestWithWake(self.io);
+        source.request();
         return;
     }
     if (self.agent.state.status == .settling) return;
@@ -687,7 +727,7 @@ pub fn requestShutdown(self: *AgentSession) void {
     }
     if (self.active_compaction_cancel_source) |source| {
         self.lifecycle = .shutdown_requested;
-        source.requestWithWake(self.io);
+        source.request();
         return;
     }
     if (self.agent.state.status == .settling) {
@@ -900,6 +940,7 @@ fn generateCompactionSummary(self: *AgentSession, serialized_input: []const u8) 
     var stream = self.agent.loop_config.stream.call(.{
         .allocator = response_arena.allocator(),
         .io = self.io,
+        .zio_runtime = self.zio_runtime,
         .model = self.agent.state.model,
         .context = .{
             .system_prompt = null,
@@ -1401,6 +1442,8 @@ test "agent session initializes policy spine with definition-first builtin tools
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/AGENTS.md", .data = "global" });
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1408,6 +1451,7 @@ test "agent session initializes policy spine with definition-first builtin tools
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1421,12 +1465,22 @@ test "agent session initializes policy spine with definition-first builtin tools
     try std.testing.expect(std.mem.indexOf(u8, session.system_prompt_text, "global") != null);
 }
 
+test "live prompt run uses explicit bounded event buffer" {
+    try std.testing.expectEqual(@as(usize, 64), live_prompt_event_capacity_count);
+    try std.testing.expectEqual(
+        live_prompt_event_capacity_count,
+        @typeInfo(@FieldType(LivePromptRun, "buffer")).array.len,
+    );
+}
+
 test "agent session persists message_end through session event drain" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1434,6 +1488,7 @@ test "agent session persists message_end through session event drain" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1455,6 +1510,8 @@ test "agent session cancel while running is observable until terminal event" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1462,6 +1519,7 @@ test "agent session cancel while running is observable until terminal event" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1487,6 +1545,8 @@ test "agent session shutdown complete requires stopped idle and drained events" 
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1494,6 +1554,7 @@ test "agent session shutdown complete requires stopped idle and drained events" 
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1509,6 +1570,8 @@ test "agent session shutdown rejects new prompts" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1516,6 +1579,7 @@ test "agent session shutdown rejects new prompts" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1533,6 +1597,8 @@ test "agent session continue while running returns session busy" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1540,6 +1606,7 @@ test "agent session continue while running returns session busy" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1556,6 +1623,8 @@ test "agent session shutdown while running stops after terminal event" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1563,6 +1632,7 @@ test "agent session shutdown while running stops after terminal event" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1587,6 +1657,8 @@ test "agent session active tool changes rebuild prompt and agent tools" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1594,6 +1666,7 @@ test "agent session active tool changes rebuild prompt and agent tools" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1612,6 +1685,8 @@ test "agent session active tool change validates before mutation" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1619,6 +1694,7 @@ test "agent session active tool change validates before mutation" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1638,6 +1714,8 @@ test "agent session rejects active tool changes while running" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1645,6 +1723,7 @@ test "agent session rejects active tool changes while running" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1661,6 +1740,8 @@ test "agent session prompt uses preflight spine before agent submission" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1668,6 +1749,7 @@ test "agent session prompt uses preflight spine before agent submission" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1685,6 +1767,8 @@ test "agent session prompt requires streaming behavior while running" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1692,6 +1776,7 @@ test "agent session prompt requires streaming behavior while running" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1706,8 +1791,10 @@ test "agent session prompt requires streaming behavior while running" {
 test "agent session slash command while running emits command event without queueing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
@@ -1725,8 +1812,10 @@ test "agent session slash command while running emits command event without queu
 test "agent session slash command public event overflow is bounded" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSessionWithCapacity(tmp.dir, 1);
+    var session = try initTestSessionWithCapacity(zio_runtime, tmp.dir, 1);
     defer shutdownAndDeinit(&session);
 
     try session.promptWithOptions("/help", &.{}, .{});
@@ -1744,6 +1833,8 @@ test "agent session prompt queues follow up while running" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1751,6 +1842,7 @@ test "agent session prompt queues follow up while running" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1776,6 +1868,8 @@ test "agent session prompt queues steering while running" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1783,6 +1877,7 @@ test "agent session prompt queues steering while running" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1808,6 +1903,8 @@ test "agent session public events are caller drained after message persistence" 
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1815,6 +1912,7 @@ test "agent session public events are caller drained after message persistence" 
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1846,6 +1944,8 @@ test "agent session queue update carries revision and snapshot exposes queued te
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1853,6 +1953,7 @@ test "agent session queue update carries revision and snapshot exposes queued te
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1890,6 +1991,8 @@ test "agent session queue update consumes block user message text" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1897,6 +2000,7 @@ test "agent session queue update consumes block user message text" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1933,6 +2037,8 @@ test "agent session queue update is emitted before queued user message start" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1940,6 +2046,7 @@ test "agent session queue update is emitted before queued user message start" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -1974,6 +2081,8 @@ test "agent session snapshots expose status and active tool read models" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -1981,6 +2090,7 @@ test "agent session snapshots expose status and active tool read models" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .public_event_capacity = 1,
     });
@@ -2005,6 +2115,8 @@ test "agent session public event queue overflow is explicit" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2012,6 +2124,7 @@ test "agent session public event queue overflow is explicit" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .public_event_capacity = 1,
     });
@@ -2038,6 +2151,8 @@ test "agent session public event drain is caller driven" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2045,6 +2160,7 @@ test "agent session public event drain is caller driven" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -2062,8 +2178,10 @@ test "agent session public event drain is caller driven" {
 test "agent session slash command emits public command event without model run" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
 
     try session.promptWithOptions("/missing arg", &.{}, .{});
@@ -2078,8 +2196,10 @@ test "agent session slash command emits public command event without model run" 
 test "agent session help command emits handled event without model run" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
 
     try session.promptWithOptions("/help", &.{}, .{});
@@ -2094,8 +2214,10 @@ test "agent session help command emits handled event without model run" {
 test "agent session session command emits snapshot without model run" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
 
     const expected_tools = session.tools.activeToolNames().len;
@@ -2143,6 +2265,8 @@ test "agent session manual compaction persists and replaces agent context" {
         "session",
         "2026-05-25T00:00:00Z",
     );
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2150,6 +2274,7 @@ test "agent session manual compaction persists and replaces agent context" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .session_store = store,
     });
@@ -2205,8 +2330,10 @@ test "agent session manual compaction persists and replaces agent context" {
 test "agent session prepared manual compaction owns cutpoint selection" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
@@ -2249,6 +2376,8 @@ test "agent session prepared manual compaction uses session settings" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2256,6 +2385,7 @@ test "agent session prepared manual compaction uses session settings" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .compaction_settings = .{ .keep_recent_tokens = 2 },
     });
@@ -2295,6 +2425,8 @@ test "agent session generated manual compaction summarizes and persists" {
         ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&summaries);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2302,6 +2434,7 @@ test "agent session generated manual compaction summarizes and persists" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2349,6 +2482,8 @@ test "agent session generated manual compaction failure does not mutate history"
 
     var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
     defer provider.deinit();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2356,6 +2491,7 @@ test "agent session generated manual compaction failure does not mutate history"
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2409,6 +2545,8 @@ test "agent session generated manual compaction oversized summary does not mutat
         ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&summaries);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2416,6 +2554,7 @@ test "agent session generated manual compaction oversized summary does not mutat
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2456,6 +2595,8 @@ test "agent session generated manual compaction cancellation is observable" {
     defer provider.deinit();
     var factory_state: CancelGeneratedCompactionFactory = .{};
     try provider.appendFactory(.{ .context = &factory_state, .call_fn = CancelGeneratedCompactionFactory.call });
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2463,6 +2604,7 @@ test "agent session generated manual compaction cancellation is observable" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2513,6 +2655,8 @@ test "agent session auto compacts before prompt when enabled" {
         ai.faux.assistantMessage(&prompt_content, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&responses);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2520,6 +2664,7 @@ test "agent session auto compacts before prompt when enabled" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2582,6 +2727,8 @@ test "agent session auto compaction skips already compacted branch before prompt
         ai.faux.assistantMessage(&prompt_content, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&responses);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2589,6 +2736,7 @@ test "agent session auto compaction skips already compacted branch before prompt
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2636,9 +2784,11 @@ test "agent session auto compacts after context overflow and retries once" {
             .error_message = "maximum context length exceeded",
         }),
         ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
-        ai.faux.assistantMessage(&.{ .{ .text = .{ .text = "retried response" } } }, .{ .stop_reason = .stop }),
+        ai.faux.assistantMessage(&.{.{ .text = .{ .text = "retried response" } }}, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&responses);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2646,6 +2796,7 @@ test "agent session auto compacts after context overflow and retries once" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2722,6 +2873,8 @@ test "agent session overflow retry does not recurse on second overflow" {
         }),
     };
     try provider.setResponses(&responses);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2729,6 +2882,7 @@ test "agent session overflow retry does not recurse on second overflow" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2770,9 +2924,11 @@ test "agent session retries transient assistant errors through continue" {
             .stop_reason = .error_,
             .error_message = "429 rate limit",
         }),
-        ai.faux.assistantMessage(&.{ .{ .text = .{ .text = "retried response" } } }, .{ .stop_reason = .stop }),
+        ai.faux.assistantMessage(&.{.{ .text = .{ .text = "retried response" } }}, .{ .stop_reason = .stop }),
     };
     try provider.setResponses(&responses);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2780,6 +2936,7 @@ test "agent session retries transient assistant errors through continue" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2836,6 +2993,8 @@ test "agent session transient retry stops at bounded attempts" {
         }),
     };
     try provider.setResponses(&responses);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2843,6 +3002,7 @@ test "agent session transient retry stops at bounded attempts" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
@@ -2877,8 +3037,10 @@ test "agent session transient retry stops at bounded attempts" {
 test "agent session prepares owned compaction snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
     session.compaction_settings = .{ .keep_recent_tokens = 2 };
 
@@ -2902,8 +3064,10 @@ test "agent session prepares owned compaction snapshot" {
 test "agent session prepares owned compaction summary input snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
     session.compaction_settings = .{ .keep_recent_tokens = 2 };
 
@@ -2930,8 +3094,10 @@ test "agent session prepares owned compaction summary input snapshot" {
 test "agent session prepared manual compaction emits failure event" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
 
     const root = try session.manager.appendMessage(.{ .user = .{
@@ -2962,6 +3128,8 @@ test "agent session terminal policy runs after persistence" {
 
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -2969,6 +3137,7 @@ test "agent session terminal policy runs after persistence" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
     });
     defer shutdownAndDeinit(&session);
@@ -3011,6 +3180,8 @@ test "agent session terminal policy runs when persistence fails" {
     };
     var store_needs_deinit = true;
     errdefer if (store_needs_deinit) store.deinit(std.testing.allocator);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -3018,6 +3189,7 @@ test "agent session terminal policy runs when persistence fails" {
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .session_store = store,
     });
@@ -3048,8 +3220,10 @@ test "agent session terminal policy runs when persistence fails" {
 test "agent session terminal policy classifies context overflow errors" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
@@ -3073,8 +3247,10 @@ test "agent session terminal policy classifies context overflow errors" {
 test "agent session terminal policy ignores non context errors for overflow" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
-    var session = try initTestSession(tmp.dir);
+    var session = try initTestSession(zio_runtime, tmp.dir);
     defer shutdownAndDeinit(&session);
 
     _ = try session.agent.beginRun();
@@ -3094,8 +3270,8 @@ test "agent session terminal policy ignores non context errors for overflow" {
     drainAllPublicEvents(&session);
 }
 
-fn initTestSession(dir: std.Io.Dir) !AgentSession {
-    return initTestSessionWithCapacity(dir, public_event_capacity_default);
+fn initTestSession(zio_runtime: *runtime.Runtime, dir: std.Io.Dir) !AgentSession {
+    return initTestSessionWithCapacity(zio_runtime, dir, public_event_capacity_default);
 }
 
 const CancelGeneratedCompactionFactory = struct {
@@ -3116,7 +3292,11 @@ const CancelGeneratedCompactionFactory = struct {
     }
 };
 
-fn initTestSessionWithCapacity(dir: std.Io.Dir, public_event_capacity: usize) !AgentSession {
+fn initTestSessionWithCapacity(
+    zio_runtime: *runtime.Runtime,
+    dir: std.Io.Dir,
+    public_event_capacity: usize,
+) !AgentSession {
     try dir.createDirPath(std.testing.io, "agent");
     try dir.createDirPath(std.testing.io, "repo");
 
@@ -3126,6 +3306,7 @@ fn initTestSessionWithCapacity(dir: std.Io.Dir, public_event_capacity: usize) !A
         .current_date = "2026-05-25",
         .session_id = "session",
         .timestamp = "2026-05-25T00:00:00Z",
+        .zio_runtime = zio_runtime,
         .dir = dir,
         .public_event_capacity = public_event_capacity,
     });

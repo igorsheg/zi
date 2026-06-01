@@ -49,6 +49,7 @@ pub fn BoundedQueue(comptime T: type) type {
         pub fn pushOrDrop(self: *Self, item: T) bool {
             self.push(item) catch |err| switch (err) {
                 error.Full => {
+                    std.debug.assert(self.dropped_count < std.math.maxInt(usize));
                     self.dropped_count += 1;
                     return false;
                 },

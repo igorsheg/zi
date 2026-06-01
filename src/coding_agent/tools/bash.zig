@@ -89,14 +89,10 @@ const Args = struct {
     timeout_ms: u64,
 };
 
-const ProcessCompletion = union(enum) {
-    process: anyerror!std.process.RunResult,
-    cancel: anyerror!void,
-};
-
 fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *agent.ToolRuntime,
     context: ?*anyopaque,
     token: runtime.CancelToken,
     _: []const u8,
@@ -107,71 +103,35 @@ fn execute(
     const self: *BashTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(self.config, params);
 
-    var completion_buffer: [2]ProcessCompletion = undefined;
-    var race = runtime.Race(ProcessCompletion).init(io, &completion_buffer);
-    defer race.deinit();
-    try race.concurrent(.process, runProcess, .{ allocator, io, self.config, args });
-    errdefer race.cancelAndDrain(allocator, drainCompletion);
-    try race.concurrent(.cancel, runtime.waitForCancelWake, .{ io, token });
-
-    const completion = race.await() catch |err| {
-        race.cancelAndDrain(allocator, drainCompletion);
-        return err;
+    const run_result = runProcess(allocator, io, zio_runtime, self.config, args, token) catch |err| switch (err) {
+        error.Timeout => return resultFromFailure(allocator, "bash timed out", .timeout),
+        error.StreamTooLong => return resultFromFailure(allocator, "bash output limit exceeded", .output_limit),
+        else => |unexpected| return unexpected,
     };
-    switch (completion) {
-        .process => |result| {
-            race.cancelAndDrain(allocator, drainCompletion);
-            const run_result = result catch |err| switch (err) {
-                error.Timeout => return resultFromFailure(allocator, "bash timed out", .timeout),
-                error.StreamTooLong => return resultFromFailure(allocator, "bash output limit exceeded", .output_limit),
-                else => |unexpected| return unexpected,
-            };
-            defer freeRunResult(allocator, run_result);
-            try token.throwIfRequested();
-            return resultFromRun(allocator, run_result);
-        },
-        .cancel => |result| {
-            race.cancelAndDrain(allocator, drainCompletion);
-            try result;
-            return error.OperationCancelled;
-        },
-    }
+    defer freeRunResult(allocator, run_result);
+    try token.throwIfRequested();
+    return resultFromRun(allocator, run_result);
 }
 
 fn runProcess(
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *agent.ToolRuntime,
     config: BashTool.Config,
     args: Args,
+    token: runtime.CancelToken,
 ) anyerror!std.process.RunResult {
-    const timeout_ms = std.math.cast(i64, args.timeout_ms) orelse return error.InvalidToolArguments;
-
     const argv = shellArgv(args.command);
-    const run_result = try std.process.run(allocator, io, .{
+    const run_result = try runtime.runProcess(allocator, io, zio_runtime, .{
         .argv = &argv,
-        .cwd = .{ .path = config.cwd },
-        .stdout_limit = .limited(config.max_stdout_bytes),
-        .stderr_limit = .limited(config.max_stderr_bytes),
-        .timeout = .{ .duration = .{
-            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
-            .clock = .awake,
-        } },
+        .cwd = config.cwd,
+        .timeout_ms = args.timeout_ms,
+        .max_stdout_bytes = config.max_stdout_bytes,
+        .max_stderr_bytes = config.max_stderr_bytes,
+        .cancel_token = token,
     });
     errdefer freeRunResult(allocator, run_result);
-    if (run_result.stdout.len >= config.max_stdout_bytes or run_result.stderr.len >= config.max_stderr_bytes) {
-        return error.StreamTooLong;
-    }
     return run_result;
-}
-
-fn drainCompletion(allocator: std.mem.Allocator, completion: ProcessCompletion) void {
-    switch (completion) {
-        .process => |result| {
-            const run_result = result catch return;
-            freeRunResult(allocator, run_result);
-        },
-        .cancel => {},
-    }
 }
 
 fn freeRunResult(allocator: std.mem.Allocator, run_result: std.process.RunResult) void {
@@ -278,6 +238,9 @@ fn termDetails(allocator: std.mem.Allocator, term: std.process.Child.Term) !std.
 }
 
 test "bash tool runs one cwd-bound command" {
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -287,7 +250,7 @@ test "bash tool runs one cwd-bound command" {
     var tool = try initTestTool(tmp.dir, "repo", .{});
     defer tool.deinit();
 
-    var result = try executeTestCommand(&tool, "pwd; cat file.txt");
+    var result = try executeTestCommand(zio_runtime, &tool, "pwd; cat file.txt");
     defer result.deinit();
 
     try std.testing.expect(std.mem.endsWith(u8, result.result.content[0].text.text, "repo\nok"));
@@ -295,13 +258,16 @@ test "bash tool runs one cwd-bound command" {
 }
 
 test "bash tool treats nonzero exit as result data" {
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var tool = try initTestTool(tmp.dir, ".", .{});
     defer tool.deinit();
 
-    var result = try executeTestCommand(&tool, "printf nope; exit 7");
+    var result = try executeTestCommand(zio_runtime, &tool, "printf nope; exit 7");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("nope", result.result.content[0].text.text);
@@ -309,13 +275,16 @@ test "bash tool treats nonzero exit as result data" {
 }
 
 test "bash tool treats timeout as bounded result data" {
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var tool = try initTestTool(tmp.dir, ".", .{ .timeout_ms = 1 });
     defer tool.deinit();
 
-    var result = try executeTestCommand(&tool, "sleep 60");
+    var result = try executeTestCommand(zio_runtime, &tool, "sleep 60");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("bash timed out", result.result.content[0].text.text);
@@ -324,13 +293,16 @@ test "bash tool treats timeout as bounded result data" {
 }
 
 test "bash tool treats output limit as bounded result data" {
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var tool = try initTestTool(tmp.dir, ".", .{ .max_stdout_bytes = 4 });
     defer tool.deinit();
 
-    var result = try executeTestCommand(&tool, "printf abcdef");
+    var result = try executeTestCommand(zio_runtime, &tool, "printf abcdef");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("bash output limit exceeded", result.result.content[0].text.text);
@@ -339,6 +311,9 @@ test "bash tool treats output limit as bounded result data" {
 }
 
 test "bash tool rejects oversized commands before process start" {
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -349,7 +324,7 @@ test "bash tool rejects oversized commands before process start" {
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'x');
 
-    try std.testing.expectError(error.InvalidToolArguments, executeTestCommand(&tool, oversized));
+    try std.testing.expectError(error.InvalidToolArguments, executeTestCommand(zio_runtime, &tool, oversized));
 }
 
 test "bash tool rejects invalid config bounds" {
@@ -371,6 +346,10 @@ test "bash tool rejects invalid config bounds" {
 }
 
 test "bash tool cancels running process through owner race" {
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const io = zio_runtime.io();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -383,19 +362,19 @@ test "bash tool cancels running process through owner race" {
 
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    var future = std.testing.io.async(execute, .{
+    var future = try zio_runtime.spawn(execute, .{
         std.testing.allocator,
-        std.testing.io,
+        io,
+        zio_runtime,
         &tool,
         cancel_source.token(),
         "call",
         std.json.Value{ .object = object },
         null,
     });
-    try std.testing.io.sleep(.fromMilliseconds(10), .awake);
-    cancel_source.requestWithWake(std.testing.io);
+    cancel_source.request();
 
-    try std.testing.expectError(error.OperationCancelled, future.await(std.testing.io));
+    try std.testing.expectError(error.OperationCancelled, future.join());
 }
 
 fn initTestTool(dir: std.Io.Dir, sub_path: []const u8, config: struct {
@@ -415,14 +394,18 @@ fn putCommand(object: *std.json.ObjectMap, command: []const u8) !void {
     try object.put(std.testing.allocator, "command", .{ .string = command });
 }
 
-fn executeTestCommand(tool: *BashTool, command: []const u8) !agent.ToolExecutionResult {
+fn executeTestCommand(
+    zio_runtime: *agent.ToolRuntime,
+    tool: *BashTool,
+    command: []const u8,
+) !agent.ToolExecutionResult {
     var object: std.json.ObjectMap = .empty;
     defer object.deinit(std.testing.allocator);
     try putCommand(&object, command);
 
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    return execute(std.testing.allocator, std.testing.io, tool, cancel_source.token(), "call", .{
+    return execute(std.testing.allocator, zio_runtime.io(), zio_runtime, tool, cancel_source.token(), "call", .{
         .object = object,
     }, null);
 }

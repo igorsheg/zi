@@ -105,6 +105,7 @@ const Match = struct {
 fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
+    _: *agent.ToolRuntime,
     context: ?*anyopaque,
     token: runtime.CancelToken,
     _: []const u8,
@@ -298,11 +299,14 @@ test "edit tool applies multiple exact replacements against original content" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "edits", .{ .array = edits });
 
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        std.testing.io,
+        zio_runtime.io(),
+        zio_runtime,
         &edit_tool,
         cancel_source.token(),
         "call-1",

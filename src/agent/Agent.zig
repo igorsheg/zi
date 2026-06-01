@@ -10,6 +10,7 @@ pub const max_listeners = 32;
 
 allocator: std.mem.Allocator,
 io: std.Io,
+zio_runtime: *runtime.Runtime,
 message_arena: std.heap.ArenaAllocator,
 state: agent.AgentState,
 messages: std.ArrayList(agent.AgentMessage) = .empty,
@@ -41,6 +42,7 @@ pub const Options = struct {
     get_api_key: ?agent.GetApiKeyHook = null,
     before_tool_call: ?agent.BeforeToolCallHook = null,
     after_tool_call: ?agent.AfterToolCallHook = null,
+    zio_runtime: *runtime.Runtime,
 };
 
 pub const Error = error{
@@ -71,6 +73,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !Agent {
     var self: Agent = .{
         .allocator = allocator,
         .io = io,
+        .zio_runtime = options.zio_runtime,
         .cancel_source = try runtime.CancelSource.init(allocator),
         .message_arena = std.heap.ArenaAllocator.init(allocator),
         .state = .{
@@ -183,7 +186,7 @@ pub fn hasQueuedMessages(self: *const Agent) bool {
 }
 
 pub fn abort(self: *Agent) void {
-    if (self.active_run != null) self.cancel_source.requestWithWake(self.io);
+    if (self.active_run != null) self.cancel_source.request();
 }
 
 pub fn signal(self: *Agent) ?runtime.CancelToken {
@@ -269,6 +272,7 @@ fn runPromptMessages(self: *Agent, messages: []const agent.AgentMessage, skip_in
         self.contextSnapshot(),
         config,
         token,
+        self.zio_runtime,
         .{ .context = self, .call_fn = emitFromLoop },
     ) catch |err| {
         try self.recordRunFailure(token, @errorName(err));
@@ -309,6 +313,7 @@ pub fn continueRun(self: *Agent) !void {
         self.contextSnapshot(),
         self.loop_config,
         token,
+        self.zio_runtime,
         .{ .context = self, .call_fn = emitFromLoop },
     ) catch |err| {
         try self.recordRunFailure(token, @errorName(err));
@@ -639,6 +644,30 @@ const ListenerProbe = struct {
     saw_cancel_requested: bool = false,
 };
 
+const TestAgent = struct {
+    zio_runtime: *runtime.Runtime,
+    agent: Agent,
+
+    fn init(options: anytype) !TestAgent {
+        const zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+        errdefer zio_runtime.deinit();
+        var resolved_options: Options = .{ .zio_runtime = zio_runtime };
+        inline for (@typeInfo(@TypeOf(options)).@"struct".fields) |field| {
+            @field(resolved_options, field.name) = @field(options, field.name);
+        }
+        return .{
+            .zio_runtime = zio_runtime,
+            .agent = try Agent.init(std.testing.allocator, zio_runtime.io(), resolved_options),
+        };
+    }
+
+    fn deinit(self: *TestAgent) void {
+        self.agent.deinit();
+        self.zio_runtime.deinit();
+        self.* = undefined;
+    }
+};
+
 fn countListener(_: std.Io, context: ?*anyopaque, _: agent.AgentEvent, token: runtime.CancelToken) anyerror!void {
     const probe: *ListenerProbe = @ptrCast(@alignCast(context.?));
     probe.calls += 1;
@@ -646,8 +675,9 @@ fn countListener(_: std.Io, context: ?*anyopaque, _: agent.AgentEvent, token: ru
 }
 
 test "agent creates default state" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
 
     try std.testing.expectEqualStrings("", self.state.system_prompt);
     try std.testing.expectEqual(agent.ThinkingLevel.off, self.state.thinking_level);
@@ -663,8 +693,9 @@ test "agent owns copied initial message strings" {
     var text = [_]u8{ 'h', 'e', 'l', 'l', 'o' };
     const message = userMessage(&text);
     var messages = [_]agent.AgentMessage{message};
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{ .messages = &messages });
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{ .messages = &messages });
+    defer fixture.deinit();
+    const self = &fixture.agent;
 
     messages[0] = userMessage("changed");
     text[0] = 'j';
@@ -674,8 +705,9 @@ test "agent owns copied initial message strings" {
 }
 
 test "state mutators do not use event path" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
 
     self.setSystemPrompt("custom");
     self.setThinkingLevel(.high);
@@ -685,8 +717,9 @@ test "state mutators do not use event path" {
 }
 
 test "steering and follow-up queues do not mutate transcript" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
 
     try self.steer(userMessage("steer"));
     try self.followUp(userMessage("follow"));
@@ -722,8 +755,9 @@ test "pending message queue has explicit maximum" {
 }
 
 test "abort without active run is a no-op" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
 
     self.abort();
 
@@ -731,8 +765,9 @@ test "abort without active run is a no-op" {
 }
 
 test "reset clears transcript runtime state and queues" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
 
     try self.appendMessage(userMessage("hello"));
     try self.steer(userMessage("steer"));
@@ -746,8 +781,9 @@ test "reset clears transcript runtime state and queues" {
 }
 
 test "begin run rejects concurrent run and exposes cancel token" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
 
     const token = try self.beginRun();
     try std.testing.expect(self.state.isStreaming());
@@ -761,8 +797,9 @@ test "begin run rejects concurrent run and exposes cancel token" {
 }
 
 test "emit event reduces state before notifying listeners" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
     var probe: ListenerProbe = .{};
     _ = try self.subscribe(.{ .context = &probe, .call_fn = countListener });
     _ = try self.beginRun();
@@ -780,8 +817,9 @@ test "emit event reduces state before notifying listeners" {
 }
 
 test "agent end enters settling until finish run" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
     _ = try self.beginRun();
 
     try self.emitEvent(.{ .agent_end = .{ .messages = &.{} } });
@@ -793,8 +831,9 @@ test "agent end enters settling until finish run" {
 }
 
 test "tool execution events track pending tool calls" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
     _ = try self.beginRun();
     defer self.finishRun();
 
@@ -815,8 +854,9 @@ test "tool execution events track pending tool calls" {
 }
 
 test "turn end records assistant error message" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
     _ = try self.beginRun();
     defer self.finishRun();
     var message = assistantMessage("");
@@ -829,8 +869,9 @@ test "turn end records assistant error message" {
 }
 
 test "prompt text emits lifecycle and appends user message" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
     var probe: ListenerProbe = .{};
     _ = try self.subscribe(.{ .context = &probe, .call_fn = countListener });
 
@@ -844,8 +885,9 @@ test "prompt text emits lifecycle and appends user message" {
 }
 
 test "prompt rejects while active run exists" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
     _ = try self.beginRun();
     defer self.finishRun();
 
@@ -853,15 +895,17 @@ test "prompt rejects while active run exists" {
 }
 
 test "continue rejects empty transcript" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
 
     try std.testing.expectError(error.NoMessages, self.continueRun());
 }
 
 test "continue from assistant drains one steering batch" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
     try self.appendMessage(assistantMessage("done"));
     try self.steer(userMessage("one"));
     try self.steer(userMessage("two"));
@@ -876,8 +920,9 @@ test "continue from assistant drains one steering batch" {
 }
 
 test "continue from assistant drains follow up when steering empty" {
-    var self = try Agent.init(std.testing.allocator, std.Io.failing, .{});
-    defer self.deinit();
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
     try self.appendMessage(assistantMessage("done"));
     try self.followUp(userMessage("next"));
 

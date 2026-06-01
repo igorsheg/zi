@@ -30,6 +30,7 @@ pub fn resolve(services: *RuntimeServices, options: Options) AgentSessionRuntime
         .retry_settings = resolveRetrySettings(services.settings_manager.current()),
         .stream = resolveStream(services, options.stream, model),
         .get_api_key = services.getApiKeyHook(),
+        .zio_runtime = services.zio_runtime,
         .dir = options.dir,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
@@ -157,7 +158,7 @@ test "session config uses explicit model thinking and stream before settings" {
         .data = "{\"defaultProvider\":\"openai\",\"defaultModel\":\"gpt-5.1\",\"defaultThinkingLevel\":\"high\"}",
     });
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
@@ -198,7 +199,7 @@ test "session config uses project settings before global settings" {
             "\"defaultThinkingLevel\":\"xhigh\"}",
     });
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
@@ -231,7 +232,7 @@ test "session config uses project compaction and retry settings before global se
             "\"retry\":{\"enabled\":true,\"maxRetries\":2}}",
     });
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
@@ -264,7 +265,7 @@ test "session config keeps provider and model settings scope atomic" {
         .data = "{\"defaultModel\":\"gpt-5.1-codex-max\"}",
     });
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
@@ -290,7 +291,7 @@ test "session config falls back when settings are absent or unresolved" {
         .data = "{\"defaultProvider\":\"missing\",\"defaultModel\":\"missing\",\"defaultThinkingLevel\":\"nope\"}",
     });
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
@@ -317,7 +318,7 @@ test "session config exposes auth hook from runtime services" {
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
@@ -343,7 +344,7 @@ test "session config skips unauthed codex settings and falls back to available m
         .data = "{\"defaultProvider\":\"openai-codex\",\"defaultModel\":\"gpt-5.1-codex-max\"}",
     });
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
@@ -375,7 +376,7 @@ test "session config resolves codex settings when oauth credentials are stored" 
         .data = "{\"defaultProvider\":\"openai-codex\",\"defaultModel\":\"gpt-5.1-codex-max\"}",
     });
 
-    var services = try RuntimeServices.init(std.testing.allocator, std.testing.io, .{
+    var services = try RuntimeServices.init(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,

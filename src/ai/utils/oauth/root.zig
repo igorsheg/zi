@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol = @import("../../protocol.zig");
+const runtime = @import("../../../runtime/root.zig");
 
 pub const openai_codex = @import("openai_codex.zig");
 pub const page = @import("page.zig");
@@ -60,7 +61,13 @@ pub const OAuthProviderInterface = struct {
     name: []const u8,
     uses_callback_server: bool = false,
     context: ?*anyopaque = null,
-    login_fn: *const fn (std.mem.Allocator, std.Io, ?*anyopaque, OAuthLoginCallbacks) anyerror!OAuthCredentials,
+    login_fn: *const fn (
+        std.mem.Allocator,
+        std.Io,
+        *runtime.Runtime,
+        ?*anyopaque,
+        OAuthLoginCallbacks,
+    ) anyerror!OAuthCredentials,
     refresh_token_fn: *const fn (std.mem.Allocator, std.Io, ?*anyopaque, OAuthCredentials) anyerror!OAuthCredentials,
     get_api_key_fn: *const fn (?*anyopaque, OAuthCredentials) anyerror![]const u8,
     modify_models_fn: ?*const fn (?*anyopaque, []protocol.Model, OAuthCredentials) anyerror![]protocol.Model = null,
@@ -69,9 +76,10 @@ pub const OAuthProviderInterface = struct {
         self: OAuthProviderInterface,
         allocator: std.mem.Allocator,
         io: std.Io,
+        zio_runtime: *runtime.Runtime,
         callbacks: OAuthLoginCallbacks,
     ) !OAuthCredentials {
-        return self.login_fn(allocator, io, self.context, callbacks);
+        return self.login_fn(allocator, io, zio_runtime, self.context, callbacks);
     }
 
     pub fn refreshToken(
@@ -145,6 +153,8 @@ test "oauth callbacks route through context" {
 }
 
 test "oauth provider interface delegates to callbacks" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var calls: ProviderCalls = .{};
     const provider: OAuthProviderInterface = .{
         .id = "test-provider",
@@ -157,7 +167,7 @@ test "oauth provider interface delegates to callbacks" {
         .modify_models_fn = testModifyModels,
     };
     const callbacks: OAuthLoginCallbacks = .{ .on_auth_fn = noopOnAuth, .on_prompt_fn = noopOnPrompt };
-    const credentials = try provider.login(std.testing.allocator, std.Io.failing, callbacks);
+    const credentials = try provider.login(std.testing.allocator, zio_runtime.io(), zio_runtime, callbacks);
     const refreshed = try provider.refreshToken(std.testing.allocator, std.Io.failing, credentials);
     const api_key = try provider.getApiKey(refreshed);
     var models = [_]protocol.Model{testModel()};
@@ -216,6 +226,7 @@ const ProviderCalls = struct {
 fn testLogin(
     _: std.mem.Allocator,
     _: std.Io,
+    _: *runtime.Runtime,
     context: ?*anyopaque,
     callbacks: OAuthLoginCallbacks,
 ) !OAuthCredentials {

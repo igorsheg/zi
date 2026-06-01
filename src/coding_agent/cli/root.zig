@@ -79,7 +79,15 @@ fn runAuth(
     options: auth_mode.Options,
 ) !void {
     return switch (command.action) {
-        .login => auth_mode.login(process.gpa, process.io, stdout, stderr, command.provider, options),
+        .login => auth_mode.login(
+            process.gpa,
+            process.io,
+            process.zio_runtime,
+            stdout,
+            stderr,
+            command.provider,
+            options,
+        ),
         .logout => auth_mode.logout(process.gpa, process.io, stdout, command.provider, options),
         .status => auth_mode.status(process.gpa, process.io, stdout, command.provider, options),
     };
@@ -134,18 +142,19 @@ fn runPrompt(
 
     var app = if (try selectResumeSession(process, stderr, app_args, options)) |session_file| blk: {
         defer process.gpa.free(session_file);
-        break :blk try sdk.resumeRuntimeHost(process.gpa, process.io, .{
+        break :blk try sdk.resumeRuntimeHost(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
             .session_file_name = session_file,
             .dir = options.dir,
             .environ = options.environ,
+            .zio_runtime = process.zio_runtime,
         });
     } else blk: {
         const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
         defer process.gpa.free(session_id);
-        break :blk try sdk.createRuntimeHost(process.gpa, process.io, .{
+        break :blk try sdk.createRuntimeHost(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -153,6 +162,7 @@ fn runPrompt(
             .timestamp = timestamp_text,
             .dir = options.dir,
             .environ = options.environ,
+            .zio_runtime = process.zio_runtime,
         });
     };
     defer app.deinit();
@@ -226,7 +236,9 @@ test "cli auth logout dispatches to auth mode" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    const process = testProcess(&environ);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const process = testProcess(zio_runtime, &environ);
     var output_buffer: [128]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [128]u8 = undefined;
@@ -259,7 +271,9 @@ test "cli auth status dispatches to auth mode" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    const process = testProcess(&environ);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const process = testProcess(zio_runtime, &environ);
     var output_buffer: [128]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [128]u8 = undefined;
@@ -286,7 +300,9 @@ test "cli selects newest resumable session through sdk policy" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    const process = testProcess(&environ);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const process = testProcess(zio_runtime, &environ);
 
     try createCliStoredSession(tmp.dir, "first", "2026-05-27T00:00:00Z");
     try createCliStoredSession(tmp.dir, "second", "2026-05-28T00:00:00Z");
@@ -313,7 +329,9 @@ test "cli selects explicit resumable session through sdk policy" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    const process = testProcess(&environ);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const process = testProcess(zio_runtime, &environ);
 
     try createCliStoredSession(tmp.dir, "session", "2026-05-27T00:00:00Z");
 
@@ -339,7 +357,9 @@ test "cli reports absent resumable session" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    const process = testProcess(&environ);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const process = testProcess(zio_runtime, &environ);
     var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
     const app = (try args_mod.parse(&.{"--resume-latest"})).app;
@@ -360,7 +380,9 @@ test "cli reports invalid explicit resume session file" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    const process = testProcess(&environ);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const process = testProcess(zio_runtime, &environ);
     var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
     const app = (try args_mod.parse(&.{ "--resume", "../outside.jsonl" })).app;
@@ -377,7 +399,9 @@ test "cli reports invalid explicit resume session file" {
 test "cli usage returns an error instead of exiting" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    const process = testProcess(&environ);
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const process = testProcess(zio_runtime, &environ);
     var output_buffer: [128]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [256]u8 = undefined;
@@ -391,11 +415,12 @@ test "cli usage returns an error instead of exiting" {
     try std.testing.expect(std.mem.startsWith(u8, stderr.buffered(), "usage: zi [options] [prompt]"));
 }
 
-fn testProcess(environ: *std.process.Environ.Map) runtime.Process {
+fn testProcess(zio_runtime: *runtime.Runtime, environ: *std.process.Environ.Map) runtime.Process {
     return .{
         .arena = std.testing.allocator,
         .gpa = std.testing.allocator,
         .io = std.testing.io,
+        .zio_runtime = zio_runtime,
         .environ = environ,
     };
 }
@@ -406,7 +431,7 @@ fn createCliTestDirs(dir: std.Io.Dir) !void {
 }
 
 fn createCliStoredSession(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {
-    var app_runtime = try sdk.createRuntimeHost(std.testing.allocator, std.testing.io, .{
+    var app_runtime = try sdk.createRuntimeHost(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",

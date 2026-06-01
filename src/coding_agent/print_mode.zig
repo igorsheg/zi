@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
+const runtime = @import("../runtime/root.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
@@ -155,11 +156,14 @@ test "print mode emits assistant text from injected stream" {
     const content = [_]ai.AssistantContent{ai.faux.text("hi")};
     const message = ai.faux.assistantMessage(&content, .{});
     try provider.setResponses(&.{message});
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-27",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
     }, .{
@@ -194,11 +198,14 @@ test "json print mode streams session header and public events" {
     const content = [_]ai.AssistantContent{ai.faux.text("hi")};
     const message = ai.faux.assistantMessage(&content, .{});
     try provider.setResponses(&.{message});
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
 
     var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-27",
+        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
     }, .{

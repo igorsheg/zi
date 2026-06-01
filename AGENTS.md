@@ -70,8 +70,8 @@ ai
 
 runtime
   owns operation ids, cancel tokens, bounded completion/event queues, event pipes,
-  races, byte builders, json ownership helpers, and wake/shutdown mechanisms. no
-  app policy.
+  zio-backed process execution, byte builders, json ownership helpers, and
+  wake/shutdown mechanisms. no app policy.
 ```
 
 ## coding-agent spine
@@ -154,8 +154,10 @@ tui invariants:
 - extensions request; owners mutate.
 - TUI must not touch `host.currentSession().agent`, provider internals, session
   manager internals, or tool internals.
-- TUI should use `startPromptRun`, `stepPromptRun`, `cancel`, `continueRun`,
-  `drainPublicEvent`, and owned snapshots.
+- TUI should use `startPromptRun`, `drainPromptRunReady`, `promptRunProgress`,
+  `applyPromptRunProgress`, `cancel`, `continueRun`, `drainPublicEvent`, and
+  owned snapshots. `stepPromptRun` is for simple blocking frontends, not the
+  interactive zio-select loop.
 
 tui source boundaries:
 
@@ -221,7 +223,7 @@ run before claiming done:
 
 ```sh
 zig build test
-ziglint src/coding_agent
+ziglint src/coding_agent src/runtime src/agent src/ai
 zig build
 ```
 

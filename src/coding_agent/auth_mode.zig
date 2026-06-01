@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const auth_mod = @import("auth.zig");
 const paths_mod = @import("paths.zig");
+const runtime = @import("../runtime/root.zig");
 
 pub const max_manual_input_bytes = 16 * 1024;
 
@@ -16,6 +17,7 @@ pub const Options = struct {
 pub fn login(
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *runtime.Runtime,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     provider: ai.Provider,
@@ -35,7 +37,7 @@ pub fn login(
         .stderr = stderr,
         .stdin = options.stdin orelse &stdin_file_reader.interface,
     };
-    try auth.loginOAuth(io, oauth_provider, .{
+    try auth.loginOAuth(io, zio_runtime, oauth_provider, .{
         .context = &callbacks,
         .on_auth_fn = LoginCallbacks.onAuth,
         .on_prompt_fn = LoginCallbacks.onPrompt,
@@ -136,6 +138,8 @@ const LoginCallbacks = struct {
 };
 
 test "auth mode login rejects unsupported oauth provider" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var stdout_buffer: [128]u8 = undefined;
@@ -145,7 +149,7 @@ test "auth mode login rejects unsupported oauth provider" {
 
     try std.testing.expectError(
         error.UnsupportedOAuthProvider,
-        login(std.testing.allocator, std.testing.io, &stdout, &stderr, "missing", .{
+        login(std.testing.allocator, zio_runtime.io(), zio_runtime, &stdout, &stderr, "missing", .{
             .cwd = "repo",
             .agent_dir_override = "agent",
             .dir = tmp.dir,

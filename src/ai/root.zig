@@ -15,7 +15,6 @@ pub const openai_responses_shared = @import("providers/openai_responses_shared.z
 pub const openai_responses = @import("providers/openai_responses.zig");
 pub const openai_codex_responses = @import("providers/openai_codex_responses.zig");
 pub const provider_registry = @import("provider_registry.zig");
-pub const provider_stream_stepper = @import("provider_stream_stepper.zig");
 pub const stream_api = @import("stream.zig");
 pub const sse_api = @import("sse.zig");
 
@@ -104,9 +103,6 @@ pub const NormalizeToolCallId = transform_messages.NormalizeToolCallId;
 pub const OpenAiResponsesStreamReducer = openai_responses_shared.ResponseStreamReducer;
 pub const OpenAiResponsesProvider = openai_responses.Provider;
 pub const OpenAiCodexResponsesProvider = openai_codex_responses.Provider;
-pub const ProviderStreamOperation = provider_stream_stepper.Operation;
-pub const ProviderStreamCompletion = provider_stream_stepper.Completion;
-pub const ProviderStreamCompletionQueue = provider_stream_stepper.CompletionQueue;
 pub const SseParser = sse_api.Parser;
 pub const SseEvent = sse_api.Event;
 pub const SseLimits = sse_api.Limits;
@@ -133,7 +129,6 @@ test {
     _ = openai_responses_shared;
     _ = openai_responses;
     _ = openai_codex_responses;
-    _ = provider_stream_stepper;
     _ = protocol;
     _ = provider_registry;
     _ = stream_api;

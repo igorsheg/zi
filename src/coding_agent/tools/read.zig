@@ -70,6 +70,7 @@ pub const ReadTool = struct {
 fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
+    _: *agent.ToolRuntime,
     context: ?*anyopaque,
     token: runtime.CancelToken,
     _: []const u8,
@@ -254,11 +255,14 @@ test "read tool reads bounded text with offset and limit" {
     try object.put(std.testing.allocator, "offset", .{ .integer = 2 });
     try object.put(std.testing.allocator, "limit", .{ .integer = 2 });
 
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        std.testing.io,
+        zio_runtime.io(),
+        zio_runtime,
         &read_tool,
         cancel_source.token(),
         "call-1",
@@ -326,11 +330,14 @@ test "read tool rejects offset beyond end" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "offset", .{ .integer = 3 });
 
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     try std.testing.expectError(error.OffsetBeyondEndOfFile, execute(
         std.testing.allocator,
-        std.testing.io,
+        zio_runtime.io(),
+        zio_runtime,
         &read_tool,
         cancel_source.token(),
         "call-1",

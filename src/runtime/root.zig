@@ -1,11 +1,14 @@
-pub const Process = @import("Process.zig").Process;
+const zio = @import("zio");
 
-pub const bounded_queue = @import("bounded_queue.zig");
-pub const cancel = @import("cancel.zig");
-pub const event_pipe = @import("event_pipe.zig");
-pub const json_owned = @import("json_owned.zig");
-pub const operation = @import("operation.zig");
-pub const race = @import("race.zig");
+pub const Process = @import("Process.zig").Process;
+pub const Runtime = zio.Runtime;
+
+const bounded_queue = @import("bounded_queue.zig");
+const cancel = @import("cancel.zig");
+const event_pipe = @import("event_pipe.zig");
+const json_owned = @import("json_owned.zig");
+const operation = @import("operation.zig");
+const process_runner = @import("process_runner.zig");
 
 pub const BoundedQueue = bounded_queue.BoundedQueue;
 pub const ByteBuilder = @import("byte_builder.zig").ByteBuilder;
@@ -15,11 +18,10 @@ pub const EventPipe = event_pipe.EventPipe;
 pub const JsonOwned = json_owned.JsonOwned;
 pub const OperationId = operation.OperationId;
 pub const OperationIdAllocator = operation.OperationIdAllocator;
-pub const Race = race.Race;
 pub const sleepUntilCancel = cancel.sleepUntilCancel;
 pub const cloneJsonValue = json_owned.cloneJsonValue;
 pub const freeJsonValue = json_owned.freeJsonValue;
-pub const waitForCancelWake = cancel.waitForCancelWake;
+pub const runProcess = process_runner.run;
 
 test {
     _ = @import("Process.zig");
@@ -29,5 +31,5 @@ test {
     _ = @import("event_pipe.zig");
     _ = @import("json_owned.zig");
     _ = @import("operation.zig");
-    _ = @import("race.zig");
+    _ = @import("process_runner.zig");
 }

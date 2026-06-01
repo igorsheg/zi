@@ -2,6 +2,7 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const faux = @import("../ai/providers/faux.zig");
+const runtime_mod = @import("../runtime/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const paths_mod = @import("paths.zig");
@@ -21,6 +22,7 @@ pub const CreateRuntimeHostOptions = struct {
     stream: ?ai.StreamFunction = null,
     dir: std.Io.Dir = .cwd(),
     environ: ?*const std.process.Environ.Map = null,
+    zio_runtime: ?*runtime_mod.Runtime = null,
     allow_paths_outside_cwd: bool = false,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
@@ -35,6 +37,7 @@ pub const ResumeRuntimeHostOptions = struct {
     stream: ?ai.StreamFunction = null,
     dir: std.Io.Dir = .cwd(),
     environ: ?*const std.process.Environ.Map = null,
+    zio_runtime: ?*runtime_mod.Runtime = null,
     allow_paths_outside_cwd: bool = false,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
@@ -84,7 +87,6 @@ pub const Runtime = struct {
 
 pub fn createRuntimeHost(
     allocator: std.mem.Allocator,
-    io: std.Io,
     options: CreateRuntimeHostOptions,
 ) !Runtime {
     const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
@@ -93,11 +95,12 @@ pub fn createRuntimeHost(
         try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
     defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
 
-    var services = try RuntimeServices.init(allocator, io, .{
+    var services = try RuntimeServices.init(allocator, .{
         .cwd = options.cwd,
         .agent_dir = resolved_agent_dir,
         .dir = options.dir,
         .environ = options.environ,
+        .zio_runtime = options.zio_runtime,
     });
     errdefer services.deinit();
 
@@ -115,7 +118,7 @@ pub fn createRuntimeHost(
     defer allocator.free(sessions_dir);
     var store = try session_store.SessionStore.createInPath(
         allocator,
-        io,
+        services.io,
         options.dir,
         sessions_dir,
         services.cwd,
@@ -124,7 +127,7 @@ pub fn createRuntimeHost(
     );
     errdefer store.deinit(allocator);
 
-    const host = try AgentSessionRuntimeHost.init(allocator, io, base, .{
+    const host = try AgentSessionRuntimeHost.init(allocator, services.io, base, .{
         .session_id = options.session_id,
         .timestamp = options.timestamp,
         .session_store = store,
@@ -144,7 +147,7 @@ pub fn listRuntimeSessions(
     io: std.Io,
     options: SessionListOptions,
 ) !SessionList {
-    const sessions_dir = try runtimeSessionsDir(allocator, io, .{
+    const sessions_dir = try runtimeSessionsDir(allocator, .{
         .cwd = options.cwd,
         .dir = options.dir,
         .agent_dir_override = options.agent_dir_override,
@@ -203,7 +206,7 @@ pub fn selectRuntimeSession(
 ) !?[]const u8 {
     if (options.explicit_file_name) |file_name| {
         if (!isSessionLeafName(file_name)) return error.InvalidSessionFileName;
-        const sessions_dir = try runtimeSessionsDir(allocator, io, .{
+        const sessions_dir = try runtimeSessionsDir(allocator, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .dir = options.dir,
@@ -243,7 +246,6 @@ pub fn selectRuntimeSession(
 
 pub fn resumeRuntimeHost(
     allocator: std.mem.Allocator,
-    io: std.Io,
     options: ResumeRuntimeHostOptions,
 ) !Runtime {
     if (!std.mem.eql(u8, std.fs.path.basename(options.session_file_name), options.session_file_name)) {
@@ -256,11 +258,12 @@ pub fn resumeRuntimeHost(
         try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
     defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
 
-    var services = try RuntimeServices.init(allocator, io, .{
+    var services = try RuntimeServices.init(allocator, .{
         .cwd = options.cwd,
         .agent_dir = resolved_agent_dir,
         .dir = options.dir,
         .environ = options.environ,
+        .zio_runtime = options.zio_runtime,
     });
     errdefer services.deinit();
 
@@ -280,7 +283,7 @@ pub fn resumeRuntimeHost(
     errdefer allocator.free(file_name);
     const store: session_store.SessionStore = .{ .dir = options.dir, .file_name = file_name };
 
-    const host = try AgentSessionRuntimeHost.init(allocator, io, base, .{
+    const host = try AgentSessionRuntimeHost.init(allocator, services.io, base, .{
         .session_id = "resume",
         .timestamp = "resume",
         .resume_session_store = store,
@@ -304,7 +307,6 @@ const RuntimeSessionDirOptions = struct {
 
 fn runtimeSessionsDir(
     allocator: std.mem.Allocator,
-    io: std.Io,
     options: RuntimeSessionDirOptions,
 ) ![]const u8 {
     const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
@@ -313,7 +315,7 @@ fn runtimeSessionsDir(
         try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
     defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
 
-    var services = try RuntimeServices.init(allocator, io, .{
+    var services = try RuntimeServices.init(allocator, .{
         .cwd = options.cwd,
         .agent_dir = resolved_agent_dir,
         .dir = options.dir,
@@ -352,7 +354,7 @@ fn createTestDirs(dir: std.Io.Dir) !void {
 }
 
 fn createStoredSessionForTest(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {
-    var runtime = try createRuntimeHost(std.testing.allocator, std.testing.io, .{
+    var runtime = try createRuntimeHost(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",
@@ -369,7 +371,7 @@ test "sdk runtime owns services before host and deinitializes in order" {
 
     try createTestDirs(tmp.dir);
 
-    var runtime = try createRuntimeHost(std.testing.allocator, std.testing.io, .{
+    var runtime = try createRuntimeHost(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",
@@ -397,7 +399,7 @@ test "sdk runtime creates session store under service session path" {
     defer provider.deinit();
     try provider.setResponses(&.{faux.assistantMessage(&.{faux.text("stored")}, .{})});
 
-    var runtime = try createRuntimeHost(std.testing.allocator, std.testing.io, .{
+    var runtime = try createRuntimeHost(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",
@@ -603,7 +605,7 @@ test "sdk runtime resumes existing session store from service session path" {
 
     const session_file_name = "2026-05-27T00:00:00Z_session.jsonl";
     {
-        var runtime = try createRuntimeHost(std.testing.allocator, std.testing.io, .{
+        var runtime = try createRuntimeHost(std.testing.allocator, .{
             .cwd = "repo",
             .agent_dir_override = "agent",
             .current_date = "2026-05-27",
@@ -619,7 +621,7 @@ test "sdk runtime resumes existing session store from service session path" {
     }
 
     try provider.setResponses(&.{faux.assistantMessage(&.{faux.text("second response")}, .{})});
-    var resumed = try resumeRuntimeHost(std.testing.allocator, std.testing.io, .{
+    var resumed = try resumeRuntimeHost(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",

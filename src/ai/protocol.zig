@@ -102,6 +102,7 @@ pub const Model = struct {
 pub const StreamRequest = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    zio_runtime: *runtime.Runtime,
     model: Model,
     context: Context,
     options: StreamOptions = .{},
@@ -710,10 +711,13 @@ pub fn emptyUsage() Usage {
 }
 
 test "stream function calls provider implementation with request" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var calls: usize = 0;
     const request: StreamRequest = .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
+        .zio_runtime = zio_runtime,
         .model = emptyModel(),
         .context = .{ .messages = &.{} },
     };
@@ -773,9 +777,12 @@ test "assistant stream derives terminal message from error event" {
 }
 
 test "empty assistant message from request preserves provider identity" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     const request: StreamRequest = .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
+        .zio_runtime = zio_runtime,
         .model = emptyModel(),
         .context = .{ .messages = &.{} },
     };

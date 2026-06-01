@@ -3,6 +3,7 @@ const env_api_keys = @import("../utils/env_api_keys.zig");
 const http_utils = @import("../utils/http.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
+const runtime = @import("../../runtime/root.zig");
 const shared = @import("openai_responses_shared.zig");
 const simple_options = @import("simple_options.zig");
 const transform_messages = @import("transform_messages.zig");
@@ -315,8 +316,10 @@ test "provider registers openai responses api" {
 }
 
 test "provider stream without auth emits missing api key error" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
     var provider = Provider.init(.{});
-    var stream = provider.apiProvider().stream.call(testRequest());
+    var stream = provider.apiProvider().stream.call(testRequest(zio_runtime));
 
     const err = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, err.reason);
@@ -331,7 +334,9 @@ test "endpoint url appends responses path" {
 }
 
 test "request body includes model stream input and tools" {
-    const request = testRequest();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    const request = testRequest(zio_runtime);
     const body = try buildRequestBody(std.testing.allocator, request);
     defer std.testing.allocator.free(body);
 
@@ -342,7 +347,9 @@ test "request body includes model stream input and tools" {
 }
 
 test "request body writes OpenAI call id for tool results" {
-    var request = testRequest();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var request = testRequest(zio_runtime);
     request.context.messages = &.{
         .{ .assistant = .{
             .content = &.{.{ .tool_call = .{
@@ -373,10 +380,11 @@ test "request body writes OpenAI call id for tool results" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":\"call_123456789|fc_123456789\"") == null);
 }
 
-fn testRequest() protocol.StreamRequest {
+fn testRequest(zio_runtime: *runtime.Runtime) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
+        .zio_runtime = zio_runtime,
         .model = .{
             .id = "gpt-test",
             .name = "GPT Test",

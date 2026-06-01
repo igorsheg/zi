@@ -14,6 +14,7 @@ pub const ToolExecutionMode = enum {
 };
 
 pub const AgentToolCall = ai.ToolCall;
+pub const ToolRuntime = runtime.Runtime;
 
 pub const BeforeToolCallResult = union(enum) {
     allow,
@@ -441,6 +442,7 @@ pub const ExecuteToolHook = struct {
     call_fn: *const fn (
         std.mem.Allocator,
         std.Io,
+        *ToolRuntime,
         ?*anyopaque,
         runtime.CancelToken,
         []const u8,
@@ -451,13 +453,14 @@ pub const ExecuteToolHook = struct {
     pub fn call(
         allocator: std.mem.Allocator,
         io: std.Io,
+        zio_runtime: *ToolRuntime,
         self: ExecuteToolHook,
         token: runtime.CancelToken,
         tool_call_id: []const u8,
         params: std.json.Value,
         on_update: ?AgentToolUpdateCallback,
     ) anyerror!ToolExecutionResult {
-        return self.call_fn(allocator, io, self.context, token, tool_call_id, params, on_update);
+        return self.call_fn(allocator, io, zio_runtime, self.context, token, tool_call_id, params, on_update);
     }
 };
 
@@ -774,6 +777,7 @@ test "agent tool exposes llm tool shape" {
 fn testExecuteTool(
     allocator: std.mem.Allocator,
     _: std.Io,
+    _: *ToolRuntime,
     _: ?*anyopaque,
     _: runtime.CancelToken,
     _: []const u8,
