@@ -4,9 +4,6 @@
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xa0675a7fe10398b2,
     .dependencies = .{
-        .vaxis = .{
-            .path = "vendor/libvaxis",
-        },
         .zio = .{
             .path = "vendor/zio",
         },
@@ -18,7 +15,6 @@
         "build.zig.zon",
         "docs",
         "src",
-        "vendor/libvaxis",
         "vendor/zio",
         "LICENSE",
         "README.md",

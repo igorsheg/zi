@@ -1,8 +1,15 @@
 # adr 0011: keep libvaxis terminal IO behind a zio-selectable bridge
 
-status: accepted
+status: superseded by adr 0013
 
 date: 2026-06-01
+
+## supersession note
+
+ADR 0013 replaces this ADR. Zi no longer uses libvaxis. The surviving runtime
+principle is still owner-drained terminal input through explicit bounded
+runtime completions, without callbacks, hidden task spawning, unbounded queues,
+or sleep polling.
 
 ## context
 

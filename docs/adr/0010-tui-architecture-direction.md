@@ -1,8 +1,15 @@
 # adr 0010: use libvaxis substrate with store/view separation
 
-status: accepted
+status: partially superseded by adr 0013
 
 date: 2026-06-01
+
+## supersession note
+
+ADR 0013 replaces this ADR's libvaxis substrate decision. The surviving
+principles are retained truth versus views, deterministic frame construction,
+command-only product mutation, bounded surfaces/slots when earned, and strict
+separation between TUI product code and coding-agent session policy.
 
 ## context
 

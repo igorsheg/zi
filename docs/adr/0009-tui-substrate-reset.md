@@ -1,6 +1,6 @@
 # adr 0009: reset tui work to substrate primitives
 
-status: accepted
+status: partially superseded by adr 0013
 
 date: 2026-06-01
 
@@ -10,6 +10,12 @@ supersedes:
   a spike, but it pulled substrate work into transcript and composer semantics.
 - adr 0008 for current implementation. The staging principle remains correct,
   but the first concrete step is lower than transcript-shaped primitives.
+
+## supersession note
+
+ADR 0013 replaces this ADR's libvaxis decision. The surviving principle is that
+TUI product semantics must wait until substrate, infra, and primitive contracts
+are stable.
 
 ## context
 
