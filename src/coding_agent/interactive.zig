@@ -1,8 +1,10 @@
 const std = @import("std");
 const runtime = @import("../runtime/root.zig");
+const agent_mod = @import("../agent/root.zig");
 const tui = @import("../tui/root.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const AgentSession = @import("AgentSession.zig");
+const session_events = @import("session_events.zig");
 const sdk = @import("sdk.zig");
 
 pub const Options = struct {
@@ -29,6 +31,42 @@ fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     return now_ns - last >= frame_budget_ns;
 }
 
+const TranscriptEventAppend = struct {
+    role: tui.product.transcript.TranscriptRole,
+    text: []const u8,
+};
+
+fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptEventAppend {
+    return switch (event) {
+        .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event),
+        .prompt_command => |payload| .{ .role = .system, .text = payload.message.text },
+        .compaction_start => .{ .role = .system, .text = "compaction started" },
+        .compaction_end => .{ .role = .system, .text = "compaction ended" },
+        .auto_retry_start => .{ .role = .system, .text = "auto retry started" },
+        .auto_retry_end => .{ .role = .system, .text = "auto retry ended" },
+        .public_event_overflow => .{ .role = .system, .text = "public event overflow" },
+        .queue_update, .session_info_changed => null,
+    };
+}
+
+fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptEventAppend {
+    return switch (event) {
+        .agent_start => .{ .role = .system, .text = "agent started" },
+        .agent_end => .{ .role = .system, .text = "agent ended" },
+        .turn_start => .{ .role = .system, .text = "turn started" },
+        .turn_end => .{ .role = .system, .text = "turn ended" },
+        .message_update => |payload| switch (payload.assistant_message_event) {
+            .text_delta => |delta| .{ .role = .assistant, .text = delta.delta },
+            .@"error" => .{ .role = .system, .text = "assistant error" },
+            else => null,
+        },
+        .tool_execution_start => .{ .role = .system, .text = "tool execution started" },
+        .tool_execution_update => .{ .role = .system, .text = "tool execution updated" },
+        .tool_execution_end => .{ .role = .system, .text = "tool execution ended" },
+        .message_start, .message_end => null,
+    };
+}
+
 const InteractiveLoop = struct {
     process: runtime.Process,
     host: *AgentSessionRuntimeHost,
@@ -40,12 +78,13 @@ const InteractiveLoop = struct {
     last_render_ns: ?i128 = null,
     effects: [effect_count_max]tui.product.Effect = undefined,
 
-    fn startPrompt(self: *InteractiveLoop, text: []const u8) !void {
+    fn startPrompt(self: *InteractiveLoop, text: []const u8) !bool {
         if (self.active_run != null) {
             try self.stderr.writeAll("prompt already running; submit ignored\n");
-            return;
+            return false;
         }
         self.active_run = try self.host.startPromptRun(text, &.{}, .{});
+        return true;
     }
 
     fn requestShutdown(self: *InteractiveLoop) void {
@@ -64,6 +103,7 @@ const InteractiveLoop = struct {
             const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
             if (frameDue(now_ns, self.last_render_ns)) {
                 try self.terminal_loop.renderIfDirty(self.stdout);
+                try self.stdout.flush();
                 self.last_render_ns = now_ns;
             }
         }
@@ -114,7 +154,9 @@ const InteractiveLoop = struct {
     fn applyEffects(self: *InteractiveLoop, count: usize) !void {
         for (self.effects[0..count]) |effect| {
             switch (effect) {
-                .submit_text => |text| try self.startPrompt(text),
+                .submit_text => |text| {
+                    if (try self.startPrompt(text)) try self.appendTranscript(.user, text);
+                },
                 .request_shutdown => self.requestShutdown(),
             }
         }
@@ -142,9 +184,20 @@ const InteractiveLoop = struct {
         var count: usize = 0;
         while (count < limit) : (count += 1) {
             var event = self.host.drainPublicEvent() orelse return count;
-            event.deinit();
+            defer event.deinit();
+            try self.applyPublicEventTranscript(event);
         }
         return count;
+    }
+
+    fn applyPublicEventTranscript(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
+        if (transcriptAppendFromEvent(event)) |append| try self.appendTranscript(append.role, append.text);
+    }
+
+    fn appendTranscript(self: *InteractiveLoop, role: tui.product.transcript.TranscriptRole, text: []const u8) !void {
+        _ = try self.terminal_loop.product.app.apply(self.process.gpa, .{
+            .append_transcript = .{ .role = role, .text = text },
+        });
     }
 
     fn shutdown(self: *InteractiveLoop) void {
@@ -180,7 +233,11 @@ pub fn run(
     defer terminal_loop.deinit();
 
     try terminal_loop.setup(stdout);
-    defer terminal_loop.shutdown(stdout) catch {};
+    try stdout.flush();
+    defer {
+        terminal_loop.shutdown(stdout) catch {};
+        stdout.flush() catch {};
+    }
 
     var loop: InteractiveLoop = .{
         .process = process,
@@ -191,9 +248,12 @@ pub fn run(
     };
     defer loop.shutdown();
 
-    if (options.initial_prompt) |prompt| try loop.startPrompt(prompt);
+    if (options.initial_prompt) |prompt| {
+        if (try loop.startPrompt(prompt)) try loop.appendTranscript(.user, prompt);
+    }
     _ = try loop.drainPublicEventsBounded(public_events_per_tick_max);
     try terminal_loop.renderIfDirty(stdout);
+    try stdout.flush();
 
     while (terminal_loop.running) try loop.tick();
 }
@@ -308,4 +368,16 @@ test "interactive loop bounds stay responsive" {
     try std.testing.expectEqual(@as(usize, 16), public_events_per_tick_max);
     try std.testing.expectEqual(@as(usize, 1), render_attempts_per_tick_max);
     try std.testing.expectEqual(@as(usize, 30), shutdown_drain_ticks_max);
+}
+
+test "interactive maps simple public events to transcript appends" {
+    const start = transcriptAppendFromEvent(.{ .agent_event = .agent_start }).?;
+    try std.testing.expectEqual(tui.product.transcript.TranscriptRole.system, start.role);
+    try std.testing.expectEqualStrings("agent started", start.text);
+
+    const overflow = transcriptAppendFromEvent(.{ .public_event_overflow = .{ .dropped_count = 4 } }).?;
+    try std.testing.expectEqual(tui.product.transcript.TranscriptRole.system, overflow.role);
+    try std.testing.expectEqualStrings("public event overflow", overflow.text);
+
+    try std.testing.expect(transcriptAppendFromEvent(.{ .session_info_changed = .{ .name = null } }) == null);
 }

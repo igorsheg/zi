@@ -2,11 +2,13 @@ const std = @import("std");
 const substrate = @import("../substrate/root.zig");
 const composer_mod = @import("composer.zig");
 const frame_mod = @import("frame.zig");
+const transcript = @import("transcript.zig");
 
 pub const ProductApp = struct {
     width: u16,
     height: u16,
     composer: composer_mod.ComposerBuffer = .{},
+    transcript: transcript.TranscriptBuffer = .{},
     dirty: bool = true,
 
     pub fn init(width: u16, height: u16) !ProductApp {
@@ -15,6 +17,7 @@ pub const ProductApp = struct {
     }
 
     pub fn deinit(self: *ProductApp, allocator: std.mem.Allocator) void {
+        self.transcript.deinit(allocator);
         self.composer.deinit(allocator);
         self.* = undefined;
     }
@@ -33,6 +36,11 @@ pub const ProductApp = struct {
             .input => |event| return try self.applyInput(allocator, event),
             .clear_composer => {
                 self.composer.clear();
+                self.dirty = true;
+                return null;
+            },
+            .append_transcript => |append| {
+                try self.transcript.append(allocator, append);
                 self.dirty = true;
                 return null;
             },
@@ -69,6 +77,7 @@ pub const Command = union(enum) {
     resize: Size,
     input: substrate.input.InputEvent,
     clear_composer,
+    append_transcript: transcript.TranscriptAppend,
 };
 
 pub const Size = struct {
@@ -100,4 +109,19 @@ test "product app applies input through one mutation path" {
     defer effect.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("hello", effect.submit_text);
     try std.testing.expectEqualStrings("", app.composer.text());
+}
+
+test "product app applies transcript append through apply" {
+    var app = try ProductApp.init(20, 4);
+    defer app.deinit(std.testing.allocator);
+
+    var source = [_]u8{ 'o', 'k' };
+    try std.testing.expect(try app.apply(std.testing.allocator, .{
+        .append_transcript = .{ .role = .assistant, .text = &source },
+    }) == null);
+    source[0] = 'n';
+
+    try std.testing.expect(app.dirty);
+    try std.testing.expectEqual(@as(usize, 1), app.transcript.lines.items.len);
+    try std.testing.expectEqualStrings("ok", app.transcript.lines.items[0].text);
 }
