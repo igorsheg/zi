@@ -47,8 +47,31 @@ pub const TerminalLoop = struct {
     }
 
     pub fn shutdown(self: *TerminalLoop, writer: *std.Io.Writer) !void {
-        self.running = false;
+        self.requestStop();
         try self.terminal.shutdown(writer);
+    }
+
+    pub fn requestStop(self: *TerminalLoop) void {
+        self.running = false;
+    }
+
+    pub fn isRunning(self: *const TerminalLoop) bool {
+        return self.running;
+    }
+
+    pub fn applyCommand(self: *TerminalLoop, command: app_mod.Command) !?app_mod.Effect {
+        return self.product.app.apply(self.product.allocator, command);
+    }
+
+    pub fn readAvailableInput(self: *TerminalLoop, effects: []app_mod.Effect) !StepResult {
+        const read_count = try std.posix.read(self.terminal.input_fd, &self.read_buffer);
+        if (read_count == 0) {
+            self.requestStop();
+            return .{ .eof = true, .shutdown_requested = true };
+        }
+        var result = try self.feedInputBytes(self.read_buffer[0..read_count], effects);
+        result.bytes_read = read_count;
+        return result;
     }
 
     pub fn stepRead(
@@ -56,10 +79,8 @@ pub const TerminalLoop = struct {
         writer: *std.Io.Writer,
         effects: []app_mod.Effect,
     ) !StepResult {
-        const read_count = try std.posix.read(self.terminal.input_fd, &self.read_buffer);
-        if (read_count == 0) return .{ .eof = true, .shutdown_requested = true };
-        var result = try self.stepBytes(self.read_buffer[0..read_count], writer, effects);
-        result.bytes_read = read_count;
+        const result = try self.readAvailableInput(effects);
+        _ = try self.renderIfDirty(writer);
         return result;
     }
 
@@ -69,19 +90,19 @@ pub const TerminalLoop = struct {
         writer: *std.Io.Writer,
         effects: []app_mod.Effect,
     ) !StepResult {
-        const result = try self.feedBytes(bytes, effects);
+        const result = try self.feedInputBytes(bytes, effects);
         _ = try self.renderIfDirty(writer);
         return result;
     }
 
-    pub fn feedBytes(
+    pub fn feedInputBytes(
         self: *TerminalLoop,
         bytes: []const u8,
         effects: []app_mod.Effect,
     ) !StepResult {
         const feed = try self.product.feedBytes(bytes, effects);
         const result = stepResultFromFeed(feed, effects[0..feed.effect_count]);
-        if (result.shutdown_requested) self.running = false;
+        if (result.shutdown_requested) self.requestStop();
         return result;
     }
 
@@ -90,11 +111,16 @@ pub const TerminalLoop = struct {
         writer: *std.Io.Writer,
         effects: []app_mod.Effect,
     ) !StepResult {
+        const result = try self.flushPendingInput(effects);
+        _ = try self.product.renderIfDirty(writer);
+        return result;
+    }
+
+    pub fn flushPendingInput(self: *TerminalLoop, effects: []app_mod.Effect) !StepResult {
         const feed = try self.product.flushInput(effects);
         var result = stepResultFromFeed(feed, effects[0..feed.effect_count]);
         result.shutdown_requested = containsShutdown(effects[0..feed.effect_count]);
-        if (result.shutdown_requested) self.running = false;
-        _ = try self.product.renderIfDirty(writer);
+        if (result.shutdown_requested) self.requestStop();
         return result;
     }
 
@@ -157,6 +183,28 @@ test "terminal loop step bytes feeds renders and returns effects" {
     try std.testing.expectEqualStrings("hello", effects[0].submit_text);
     try std.testing.expect(loop.running);
     try std.testing.expect(!loop.product.app.dirty);
+}
+
+test "terminal loop ctrl-c requests shutdown without coding agent policy" {
+    var loop = try TerminalLoop.init(
+        std.testing.allocator,
+        std.testing.io,
+        20,
+        4,
+        loop_mod.output_size_bytes_default,
+    );
+    defer loop.deinit();
+    loop.running = true;
+
+    var effects: [effects_per_step_max]app_mod.Effect = undefined;
+    var storage: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+
+    const result = try loop.stepBytes("\x03", &writer, &effects);
+    defer for (effects[0..result.effect_count]) |effect| effect.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.shutdown_requested);
+    try std.testing.expect(!loop.running);
 }
 
 test "terminal loop escape requests shutdown without coding agent policy" {

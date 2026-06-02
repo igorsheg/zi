@@ -65,6 +65,7 @@ pub const ProductApp = struct {
                     return .{ .submit_text = text };
                 },
                 .escape => return .request_shutdown,
+                .ctrl => |c| if (c == 0x03) return .request_shutdown,
                 else => {},
             },
             else => {},
@@ -110,6 +111,22 @@ test "product app applies input through one mutation path" {
     try std.testing.expectEqualStrings("hello", effect.submit_text);
     try std.testing.expectEqualStrings("", app.composer.text());
 }
+
+test "product app maps escape and ctrl-c to shutdown" {
+    var app = try ProductApp.init(20, 4);
+    defer app.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(
+        app_mod_effect_request_shutdown,
+        try app.apply(std.testing.allocator, .{ .input = .{ .key = .escape } }),
+    );
+    try std.testing.expectEqual(
+        app_mod_effect_request_shutdown,
+        try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x03 } } }),
+    );
+}
+
+const app_mod_effect_request_shutdown: ?Effect = .request_shutdown;
 
 test "product app applies transcript append through apply" {
     var app = try ProductApp.init(20, 4);

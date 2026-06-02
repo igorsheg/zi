@@ -236,6 +236,14 @@ test "input decoder split csi focus paste alt trunc flush" {
     try std.testing.expect(ev[0].key == .escape);
 }
 
+test "input decoder maps ctrl-c byte" {
+    var d: InputDecoder = .{};
+    var ev: [1]InputEvent = undefined;
+
+    try std.testing.expectEqual(@as(usize, 1), d.feed("\x03", &ev).count);
+    try std.testing.expectEqual(@as(u8, 0x03), ev[0].key.ctrl);
+}
+
 test "input decoder buffers utf8 scalar across feeds" {
     var d: InputDecoder = .{};
     var ev: [2]InputEvent = undefined;

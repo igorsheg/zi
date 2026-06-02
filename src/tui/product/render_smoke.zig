@@ -37,6 +37,35 @@ test "product frame renders through deterministic vscreen harness" {
     harness.commit();
 }
 
+test "product frame wraps long transcript text from bottom" {
+    var storage: [4096]u8 = undefined;
+    var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 12, 5, &storage);
+    defer harness.deinit();
+
+    try std.testing.expect(try harness.apply(.{
+        .append_transcript = .{ .role = .assistant, .text = "abcdefghij0123456789" },
+    }) == null);
+
+    _ = try harness.render();
+    try expectCellText(&harness, 0, 1, "assistant: a");
+    try expectCellText(&harness, 0, 2, "bcdefghij012");
+    try expectCellText(&harness, 0, 3, "3456789");
+}
+
+test "product frame wraps graphemes without splitting wide cells" {
+    var storage: [4096]u8 = undefined;
+    var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 10, 4, &storage);
+    defer harness.deinit();
+
+    try std.testing.expect(try harness.apply(.{
+        .append_transcript = .{ .role = .assistant, .text = "o\u{0300}中👩🏽‍🚀b" },
+    }) == null);
+
+    _ = try harness.render();
+    try expectCellText(&harness, 0, 1, "assistant:");
+    try expectCellText(&harness, 0, 2, "o\u{0300}中👩🏽‍🚀b");
+}
+
 test "product frame shows newest transcript lines and preserves composer row" {
     var storage: [4096]u8 = undefined;
     var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 40, 5, &storage);

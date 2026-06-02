@@ -89,7 +89,7 @@ const InteractiveLoop = struct {
     }
 
     fn requestShutdown(self: *InteractiveLoop) void {
-        self.terminal_loop.running = false;
+        self.terminal_loop.requestStop();
         if (!self.cancel_requested and self.active_run != null) {
             self.host.cancel();
             self.cancel_requested = true;
@@ -118,13 +118,16 @@ const InteractiveLoop = struct {
             .revents = 0,
         }};
         _ = try std.posix.poll(&fds, timeout_ms);
-        if ((fds[0].revents & std.posix.POLL.IN) == 0) return;
+        if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+            const result = try self.terminal_loop.flushPendingInput(&self.effects);
+            defer self.deinitEffects(result.effect_count);
+            try self.handleStepResult(result);
+            try self.applyEffects(result.effect_count);
+            return;
+        }
         var reads: usize = 0;
         while (reads < input_reads_per_tick_max) : (reads += 1) {
-            const read_count = std.posix.read(
-                self.terminal_loop.inputFd(),
-                &self.terminal_loop.read_buffer,
-            ) catch |err| switch (err) {
+            const result = self.terminal_loop.readAvailableInput(&self.effects) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => {
                     try self.stderr.writeAll("terminal read failed; shutting down\n");
@@ -132,14 +135,6 @@ const InteractiveLoop = struct {
                     return;
                 },
             };
-            if (read_count == 0) {
-                self.requestShutdown();
-                return;
-            }
-            const result = try self.terminal_loop.feedBytes(
-                self.terminal_loop.read_buffer[0..read_count],
-                &self.effects,
-            );
             defer self.deinitEffects(result.effect_count);
             try self.handleStepResult(result);
             try self.applyEffects(result.effect_count);
@@ -203,7 +198,7 @@ const InteractiveLoop = struct {
     }
 
     fn appendTranscript(self: *InteractiveLoop, append: TranscriptEventAppend) !void {
-        _ = try self.terminal_loop.product.app.apply(self.process.gpa, .{
+        _ = try self.terminal_loop.applyCommand(.{
             .append_transcript = .{ .role = append.role, .text = append.text, .mode = append.mode },
         });
     }
@@ -263,7 +258,7 @@ pub fn run(
     try terminal_loop.renderIfDirty(stdout);
     try stdout.flush();
 
-    while (terminal_loop.running) try loop.tick();
+    while (terminal_loop.isRunning()) try loop.tick();
 }
 
 fn createHost(

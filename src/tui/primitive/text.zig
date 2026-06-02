@@ -15,6 +15,12 @@ pub const Grapheme = struct {
     width: u2,
 };
 
+pub const VisualLine = struct {
+    start: usize,
+    end: usize,
+    width: u16,
+};
+
 pub fn nextScalar(bytes: []const u8) DecodedScalar {
     if (bytes.len == 0) return .{ .scalar = replacement, .len = 0 };
     const first = bytes[0];
@@ -67,6 +73,26 @@ pub fn displayWidth(bytes: []const u8) usize {
     return uucode.grapheme.utf8Wcwidth(bytes);
 }
 
+pub fn nextVisualLine(bytes: []const u8, start: usize, max_width: u16) VisualLine {
+    std.debug.assert(start <= bytes.len);
+    if (start == bytes.len or max_width == 0) return .{ .start = start, .end = start, .width = 0 };
+
+    var index = start;
+    var width: u16 = 0;
+    while (index < bytes.len) {
+        const grapheme = nextGrapheme(bytes[index..]);
+        if (grapheme.end == 0) break;
+        const next_width = width + grapheme.width;
+        if (next_width > max_width) {
+            if (index == start) return .{ .start = start, .end = index + grapheme.end, .width = 0 };
+            break;
+        }
+        index += grapheme.end;
+        width = next_width;
+    }
+    return .{ .start = start, .end = index, .width = width };
+}
+
 pub fn scalarWidth(scalar: u21) u2 {
     if (scalar == 0 or scalar < 0x20 or scalar == 0x7f) return 1;
     return clampWidth(uucode.get(.wcwidth_standalone, scalar));
@@ -112,6 +138,25 @@ test "text uses uucode grapheme width" {
     try std.testing.expectEqual(@as(usize, 1), displayWidth("o\u{0300}"));
     try std.testing.expectEqual(@as(usize, 2), displayWidth("👩🏽‍🚀"));
     try std.testing.expectEqual(replacement, nextScalar("\xff").scalar);
+}
+
+test "visual lines wrap on grapheme boundaries" {
+    const value = "ao\u{0300}中👩🏽‍🚀b";
+    var line = nextVisualLine(value, 0, 3);
+    try std.testing.expectEqualStrings("ao\u{0300}", value[line.start..line.end]);
+    try std.testing.expectEqual(@as(u16, 2), line.width);
+    line = nextVisualLine(value, line.end, 3);
+    try std.testing.expectEqualStrings("中", value[line.start..line.end]);
+    try std.testing.expectEqual(@as(u16, 2), line.width);
+    line = nextVisualLine(value, line.end, 3);
+    try std.testing.expectEqualStrings("👩🏽‍🚀b", value[line.start..line.end]);
+    try std.testing.expectEqual(@as(u16, 3), line.width);
+}
+
+test "visual line advances over too-wide first grapheme" {
+    const line = nextVisualLine("中", 0, 1);
+    try std.testing.expectEqual(@as(usize, "中".len), line.end);
+    try std.testing.expectEqual(@as(u16, 0), line.width);
 }
 
 test "grapheme cursor movement preserves clusters" {
