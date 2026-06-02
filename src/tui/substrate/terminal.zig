@@ -1,7 +1,27 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
+const primitive = @import("../primitive/root.zig");
+
 pub const Event = union(enum) {
+    key_press: primitive.input.KeyPress,
+    winsize: vaxis.Winsize,
+    focus_in,
+    focus_out,
+    mouse: vaxis.Mouse,
+
+    pub fn copyFromVaxis(event: VaxisEvent) !Event {
+        return switch (event) {
+            .key_press => |key| .{ .key_press = try primitive.input.KeyPress.copyFromVaxis(key) },
+            .winsize => |winsize| .{ .winsize = winsize },
+            .focus_in => .focus_in,
+            .focus_out => .focus_out,
+            .mouse => |mouse| .{ .mouse = mouse },
+        };
+    }
+};
+
+pub const VaxisEvent = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
     focus_in,
@@ -9,7 +29,7 @@ pub const Event = union(enum) {
     mouse: vaxis.Mouse,
 };
 
-pub const EventLoop = vaxis.Loop(Event);
+pub const EventLoop = vaxis.Loop(VaxisEvent);
 
 pub const Terminal = struct {
     allocator: std.mem.Allocator,
@@ -51,9 +71,10 @@ pub const Terminal = struct {
         return .init(self.io, &self.tty, &self.vx);
     }
 
-    pub fn enterAltScreen(self: *Terminal) !void {
+    pub fn setupStartedEventLoop(self: *Terminal, loop: *EventLoop) !void {
         try self.vx.enterAltScreen(self.tty.writer());
         self.alt_screen_entered = true;
+        if (!self.vx.state.in_band_resize) try loop.installResizeHandler();
     }
 
     pub fn resize(self: *Terminal, winsize: vaxis.Winsize) !void {

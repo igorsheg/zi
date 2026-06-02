@@ -86,6 +86,7 @@ test "renderer draws transcript rows and composer at bottom" {
     _ = try app.apply(std.testing.allocator, .{
         .append_transcript_text = .{ .item_id = item_id, .bytes = "hello" },
     });
+    try app.ensureTranscriptRows(std.testing.allocator);
     _ = try app.apply(std.testing.allocator, .{ .insert_composer_text = "ask" });
     var frame_scratch: frame_mod.Scratch = .{};
     const model = try frame_scratch.build(&app);

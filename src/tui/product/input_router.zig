@@ -27,7 +27,7 @@ pub const Scratch = struct {
         };
     }
 
-    fn routeKey(self: *Scratch, key_event: vaxis.Key) !?RouteResult {
+    fn routeKey(self: *Scratch, key_event: primitive.input.KeyPress) !?RouteResult {
         const input = primitive.input.inputFromKey(key_event) orelse return null;
         return switch (input) {
             .cancel => .cancel,
@@ -48,8 +48,8 @@ pub const Scratch = struct {
     }
 };
 
-fn testKey(codepoint: u21, text: ?[]const u8) vaxis.Key {
-    return .{ .codepoint = codepoint, .text = text };
+fn testKey(codepoint: u21, text: ?[]const u8) primitive.input.KeyPress {
+    return primitive.input.KeyPress.copyFromVaxis(.{ .codepoint = codepoint, .text = text }) catch unreachable;
 }
 
 test "input router copies printable key text into scratch command" {
@@ -105,19 +105,9 @@ test "input router maps resize and scrolling" {
     );
 }
 
-test "input router rejects oversized borrowed text" {
-    var scratch: Scratch = .{};
-    const bytes = "x" ** (text_size_bytes_max + 1);
-
-    try std.testing.expectError(
-        error.InputRouteTextTooLarge,
-        scratch.route(.{ .key_press = testKey('x', bytes) }),
-    );
-}
-
 test "input router ignores unknown and non-key events" {
     var scratch: Scratch = .{};
 
     try std.testing.expect((try scratch.route(.focus_in)) == null);
-    try std.testing.expect((try scratch.route(.{ .key_press = .{ .codepoint = 0 } })) == null);
+    try std.testing.expect((try scratch.route(.{ .key_press = testKey(0, null) })) == null);
 }

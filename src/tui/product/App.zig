@@ -70,6 +70,7 @@ pub const ProductApp = struct {
     transcript: transcript_mod.Transcript,
     transcript_viewport: primitive.viewport.Viewport = .{},
     transcript_render_rows: primitive.render_list.RenderList = .{},
+    transcript_rows_stale: bool = true,
     size: Size = .{ .width_columns = transcript_width_columns_default, .height_rows = 24 },
     effects: EffectQueue = .{},
     dirty: bool = true,
@@ -126,7 +127,7 @@ pub const ProductApp = struct {
             .submit_composer => return try self.submitComposer(allocator),
             .append_transcript_item => |kind| {
                 const item_id = (try self.transcript.apply(allocator, .{ .append_item = kind })).?;
-                try self.rebuildTranscriptRows(allocator);
+                self.transcript_rows_stale = true;
                 self.dirty = true;
                 return item_id;
             },
@@ -134,13 +135,13 @@ pub const ProductApp = struct {
                 _ = try self.transcript.apply(allocator, .{
                     .append_text = .{ .item_id = payload.item_id, .bytes = payload.bytes },
                 });
-                try self.rebuildTranscriptRows(allocator);
+                self.transcript_rows_stale = true;
                 self.dirty = true;
                 return null;
             },
             .seal_transcript_item => |item_id| {
                 _ = try self.transcript.apply(allocator, .{ .seal_item = item_id });
-                try self.rebuildTranscriptRows(allocator);
+                self.transcript_rows_stale = true;
                 self.dirty = true;
                 return null;
             },
@@ -150,11 +151,13 @@ pub const ProductApp = struct {
                 return null;
             },
             .scroll_transcript_down => |row_count| {
+                try self.ensureTranscriptRows(allocator);
                 self.transcript_viewport.scrollDown(row_count, self.transcript_render_rows.rows.items.len);
                 self.dirty = true;
                 return null;
             },
             .jump_transcript_tail => {
+                try self.ensureTranscriptRows(allocator);
                 self.transcript_viewport.jumpToTail(self.transcript_render_rows.rows.items.len);
                 self.dirty = true;
                 return null;
@@ -175,6 +178,12 @@ pub const ProductApp = struct {
         return self.transcript_render_rows.rows.items[index_start..index_end];
     }
 
+    pub fn ensureTranscriptRows(self: *ProductApp, allocator: std.mem.Allocator) !void {
+        if (!self.transcript_rows_stale) return;
+        try self.rebuildTranscriptRows(allocator);
+        self.transcript_rows_stale = false;
+    }
+
     fn submitComposer(self: *ProductApp, allocator: std.mem.Allocator) !?transcript_mod.ItemId {
         const prompt = try self.composer.submit(allocator);
         errdefer allocator.free(prompt);
@@ -183,7 +192,7 @@ pub const ProductApp = struct {
         errdefer self.rollbackTailTranscriptItem(allocator, item_id);
         _ = try self.transcript.apply(allocator, .{ .append_text = .{ .item_id = item_id, .bytes = prompt } });
         _ = try self.transcript.apply(allocator, .{ .seal_item = item_id });
-        try self.rebuildTranscriptRows(allocator);
+        self.transcript_rows_stale = true;
         try self.effects.push(.{ .submit_prompt = prompt });
         self.dirty = true;
         return item_id;
@@ -250,6 +259,7 @@ test "product app transcript viewport follows tail until scrolled" {
     _ = try app.apply(std.testing.allocator, .{
         .append_transcript_text = .{ .item_id = item_id, .bytes = "abcdefghijkl" },
     });
+    try app.ensureTranscriptRows(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 3), app.transcript_render_rows.rows.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.transcript_viewport.scroll_row_offset);

@@ -44,12 +44,12 @@ pub fn run(process: runtime.Process, options: auth_mode.Options, tui_options: Op
     var terminal: tui.substrate.terminal.Terminal = undefined;
     try terminal.init(process.gpa, process.io, process.environ);
     defer terminal.deinit();
-    try terminal.enterAltScreen();
 
     var event_loop = terminal.eventLoop();
     var terminal_events: tui.substrate.event_pump.TerminalEvents = undefined;
     try terminal_events.init(process.zio_runtime, &event_loop);
     defer terminal_events.deinit();
+    try terminal.setupStartedEventLoop(&event_loop);
 
     var owner = tui_owner.OwnerLoop.init(process.gpa, &app_runtime.host, &terminal, &terminal_events);
     defer owner.deinit();

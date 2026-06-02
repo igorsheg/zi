@@ -31,6 +31,7 @@ test "frame borrows transcript rows and composer projection" {
     _ = try app.apply(std.testing.allocator, .{
         .append_transcript_text = .{ .item_id = item_id, .bytes = "abcdefgh" },
     });
+    try app.ensureTranscriptRows(std.testing.allocator);
     var scratch: Scratch = .{};
 
     const model = try scratch.build(&app);

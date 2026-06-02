@@ -2,7 +2,12 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
+const event_drain_mod = @import("event_drain.zig");
+const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
+const prompt_command = @import("prompt_command.zig");
+const prompt_input = @import("prompt_input.zig");
+const queue_mirror_mod = @import("queue_mirror.zig");
 const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
@@ -30,9 +35,9 @@ manager: *session_manager.SessionManager,
 store: ?*session_store.SessionStore = null,
 agent: *agent_mod.Agent,
 public_event_buffer: []session_events.AgentSessionEvent,
-public_events: *PublicEventQueue,
-queue_mirror: *QueueMirror,
-event_drain: *EventDrain,
+public_events: *event_drain_mod.PublicEventQueue,
+queue_mirror: *queue_mirror_mod.QueueMirror,
+event_drain: *event_drain_mod.EventDrain,
 lifecycle: Lifecycle = .accepting,
 compaction_settings: session_manager.CompactionSettings = .{},
 retry_settings: RetrySettings = .{},
@@ -58,14 +63,8 @@ pub const Options = struct {
     zio_runtime: *runtime.Runtime,
 };
 
-pub const StreamingBehavior = enum {
-    steer,
-    follow_up,
-};
-
-pub const PromptOptions = struct {
-    streaming_behavior: ?StreamingBehavior = null,
-};
+pub const StreamingBehavior = prompt_input.StreamingBehavior;
+pub const PromptOptions = prompt_input.Options;
 
 pub const RetrySettings = struct {
     enabled: bool = false,
@@ -80,13 +79,6 @@ const PromptRetryPolicy = struct {
     overflow: bool = true,
     transient: bool = true,
 };
-
-const PromptCommandName = enum {
-    help,
-    session,
-};
-
-const prompt_commands: []const PromptCommandName = &.{ .help, .session };
 
 const ManualCompactionRequest = union(enum) {
     explicit: Explicit,
@@ -140,162 +132,6 @@ const Lifecycle = enum {
     stopped,
 };
 
-const QueueMirror = struct {
-    steering: std.ArrayList([]const u8) = .empty,
-    follow_up: std.ArrayList([]const u8) = .empty,
-    revision: u64 = 0,
-
-    fn deinit(self: *QueueMirror, allocator: std.mem.Allocator) void {
-        self.clearList(allocator, &self.steering);
-        self.clearList(allocator, &self.follow_up);
-        self.steering.deinit(allocator);
-        self.follow_up.deinit(allocator);
-        self.* = undefined;
-    }
-
-    fn appendSteering(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) !void {
-        try self.append(allocator, &self.steering, text);
-    }
-
-    fn appendFollowUp(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) !void {
-        try self.append(allocator, &self.follow_up, text);
-    }
-
-    fn removeUserText(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) bool {
-        return self.remove(allocator, &self.steering, text) or self.remove(allocator, &self.follow_up, text);
-    }
-
-    fn removeSteeringText(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) bool {
-        return self.remove(allocator, &self.steering, text);
-    }
-
-    fn removeFollowUpText(self: *QueueMirror, allocator: std.mem.Allocator, text: []const u8) bool {
-        return self.remove(allocator, &self.follow_up, text);
-    }
-
-    fn snapshot(self: *const QueueMirror, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
-        var steering = try session_events.EventTextList.init(allocator, self.steering.items);
-        errdefer steering.deinit();
-        var follow_up = try session_events.EventTextList.init(allocator, self.follow_up.items);
-        errdefer follow_up.deinit();
-        return .{
-            .revision = self.revision,
-            .steering = steering,
-            .follow_up = follow_up,
-        };
-    }
-
-    fn append(
-        self: *QueueMirror,
-        allocator: std.mem.Allocator,
-        list: *std.ArrayList([]const u8),
-        text: []const u8,
-    ) !void {
-        const owned = try allocator.dupe(u8, text);
-        errdefer allocator.free(owned);
-        try list.append(allocator, owned);
-        self.revision += 1;
-    }
-
-    fn remove(
-        self: *QueueMirror,
-        allocator: std.mem.Allocator,
-        list: *std.ArrayList([]const u8),
-        text: []const u8,
-    ) bool {
-        for (list.items, 0..) |queued, index| {
-            if (!std.mem.eql(u8, queued, text)) continue;
-            allocator.free(queued);
-            const remaining = list.items.len - index - 1;
-            if (remaining > 0) @memmove(list.items[index .. index + remaining], list.items[index + 1 ..]);
-            list.shrinkRetainingCapacity(list.items.len - 1);
-            self.revision += 1;
-            return true;
-        }
-        return false;
-    }
-
-    fn clearList(_: *QueueMirror, allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
-        for (list.items) |text| allocator.free(text);
-        list.clearRetainingCapacity();
-    }
-};
-
-const PublicEventQueue = runtime.BoundedQueue(session_events.AgentSessionEvent);
-
-const EventDrain = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    manager: *session_manager.SessionManager,
-    store: ?*session_store.SessionStore,
-    queue_mirror: *QueueMirror,
-    public_events: *PublicEventQueue,
-    public_event_wake: runtime.ResetEvent = .init,
-    timestamp: []const u8,
-    context_overflow_count: usize = 0,
-
-    pub fn handle(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        try self.updateQueueMirror(event);
-        self.emitPublicEvent(event);
-        var persist_error: ?anyerror = null;
-        self.persistEvent(event) catch |err| {
-            persist_error = err;
-        };
-        try self.handleTerminalPolicy(event);
-        if (persist_error) |err| return err;
-    }
-
-    fn updateQueueMirror(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        if (event != .message_start) return;
-        if (event.message_start.message != .user) return;
-        const text = userMessageText(event.message_start.message.user) orelse return;
-        if (!self.queue_mirror.removeUserText(self.allocator, text)) return;
-        try self.emitQueueUpdate();
-    }
-
-    fn emitPublicEvent(self: *EventDrain, event: agent_mod.AgentEvent) void {
-        self.enqueuePublicEvent(.{ .agent_event = event });
-    }
-
-    fn persistEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        if (event != .message_end) return;
-        try self.manager.ensureAppendCapacity(1);
-        const entry = try self.manager.prepareMessageEntry(event.message_end.message, self.timestamp);
-        errdefer self.manager.deinitPreparedEntry(entry);
-        if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
-        _ = self.manager.commitPreparedEntry(entry);
-    }
-
-    fn handleTerminalPolicy(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        switch (event) {
-            .message_end => |payload| {
-                if (payload.message == .assistant and isContextOverflowAssistant(payload.message.assistant)) {
-                    self.context_overflow_count += 1;
-                }
-            },
-            else => {},
-        }
-    }
-
-    fn emitQueueUpdate(self: *EventDrain) !void {
-        var steering = try session_events.EventTextList.init(self.allocator, self.queue_mirror.steering.items);
-        errdefer steering.deinit();
-        var follow_up = try session_events.EventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
-        errdefer follow_up.deinit();
-        self.enqueuePublicEvent(.{ .queue_update = .{
-            .steering = steering,
-            .follow_up = follow_up,
-            .revision = self.queue_mirror.revision,
-        } });
-    }
-
-    fn enqueuePublicEvent(self: *EventDrain, event: session_events.AgentSessionEvent) void {
-        var owned_event = event;
-        if (!self.public_events.pushOrDrop(owned_event)) owned_event.deinit();
-        self.public_event_wake.set();
-    }
-};
-
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSession {
     const zio_runtime = options.zio_runtime;
 
@@ -322,7 +158,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     var tools: tool_registry.ToolRegistry = .{};
     errdefer tools.deinit(allocator);
     try builtin_tools.appendDefinitions(&tools);
-    try tools.setActiveToolsByName(allocator, &.{ "read", "ls", "grep", "find", "bash", "edit", "write" });
+    try tools.setActiveToolsByName(allocator, tool_registry.default_active_tool_names);
 
     const system_prompt_text = try buildSystemPromptText(
         allocator,
@@ -382,16 +218,16 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     if (options.public_event_capacity == 0) return error.PublicEventCapacityZero;
     const public_event_buffer = try allocator.alloc(session_events.AgentSessionEvent, options.public_event_capacity);
     errdefer allocator.free(public_event_buffer);
-    const public_events = try allocator.create(PublicEventQueue);
+    const public_events = try allocator.create(event_drain_mod.PublicEventQueue);
     errdefer allocator.destroy(public_events);
-    public_events.* = PublicEventQueue.init(public_event_buffer);
+    public_events.* = event_drain_mod.PublicEventQueue.init(public_event_buffer);
 
-    const queue_mirror = try allocator.create(QueueMirror);
+    const queue_mirror = try allocator.create(queue_mirror_mod.QueueMirror);
     errdefer allocator.destroy(queue_mirror);
     queue_mirror.* = .{};
     errdefer queue_mirror.deinit(allocator);
 
-    const event_drain = try allocator.create(EventDrain);
+    const event_drain = try allocator.create(event_drain_mod.EventDrain);
     errdefer allocator.destroy(event_drain);
     event_drain.* = .{
         .allocator = allocator,
@@ -1083,16 +919,7 @@ fn buildSystemPromptText(
     });
 }
 
-const PromptPreflight = struct {
-    text: []const u8,
-    images: []const ai.ImageContent,
-    streaming_behavior: ?StreamingBehavior,
-
-    fn deinit(self: *PromptPreflight, allocator: std.mem.Allocator) void {
-        allocator.free(self.text);
-        self.* = undefined;
-    }
-};
+const PromptPreflight = prompt_input.Preflight;
 
 fn preparePromptInput(
     self: *AgentSession,
@@ -1100,18 +927,14 @@ fn preparePromptInput(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !PromptPreflight {
-    return .{
-        .text = try self.allocator.dupe(u8, text),
-        .images = images,
-        .streaming_behavior = options.streaming_behavior,
-    };
+    return PromptPreflight.init(self.allocator, text, images, options);
 }
 
 fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
-    const command = parsePromptCommand(preflight.text) orelse return false;
+    const command = prompt_command.parse(preflight.text) orelse return false;
 
-    const command_name = parsePromptCommandName(command) orelse {
-        const unknown_message = try std.fmt.allocPrint(self.allocator, "unknown command: /{s}", .{command});
+    const command_name = prompt_command.parseName(command) orelse {
+        const unknown_message = try prompt_command.unknownText(self.allocator, command);
         errdefer self.allocator.free(unknown_message);
         try self.emitPromptCommandOwned(
             command,
@@ -1122,19 +945,15 @@ fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight
     };
 
     switch (command_name) {
-        .help => try self.emitPromptCommand(command, .handled, "available commands: /help, /session"),
+        .help => try self.emitPromptCommand(command, .handled, prompt_command.helpText()),
         .session => {
             const snapshot = self.statusSnapshot();
-            const message = try std.fmt.allocPrint(
-                self.allocator,
-                "session: {s}; public events: {}; dropped events: {}; active tools: {}",
-                .{
-                    @tagName(snapshot.status),
-                    snapshot.public_event_count,
-                    snapshot.dropped_public_event_count,
-                    self.tools.activeToolNames().len,
-                },
-            );
+            const message = try prompt_command.sessionText(self.allocator, .{
+                .status_name = @tagName(snapshot.status),
+                .public_event_count = snapshot.public_event_count,
+                .dropped_public_event_count = snapshot.dropped_public_event_count,
+                .active_tool_count = self.tools.activeToolNames().len,
+            });
             errdefer self.allocator.free(message);
             try self.emitPromptCommandOwned(
                 command,
@@ -1144,13 +963,6 @@ fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight
         },
     }
     return true;
-}
-
-fn parsePromptCommandName(command: []const u8) ?PromptCommandName {
-    for (prompt_commands) |name| {
-        if (std.mem.eql(u8, command, @tagName(name))) return name;
-    }
-    return null;
 }
 
 fn emitPromptCommand(
@@ -1177,14 +989,6 @@ fn emitPromptCommandOwned(
         .result = result,
         .message = owned_message,
     } });
-}
-
-fn parsePromptCommand(text: []const u8) ?[]const u8 {
-    if (text.len < 2 or text[0] != '/') return null;
-    var end: usize = 1;
-    while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
-    if (end == 1) return null;
-    return text[1..end];
 }
 
 fn queuePromptIfStreaming(self: *AgentSession, preflight: *const PromptPreflight) !bool {
@@ -1323,7 +1127,7 @@ fn retryPromptAfterRetryableError(
         };
 
         if (self.latestAssistantError()) |next_error| {
-            if (isRetryableAssistantErrorText(next_error) and attempt < max_attempts) {
+            if (message_policy.isRetryableAssistantErrorText(next_error) and attempt < max_attempts) {
                 current_error_message = next_error;
                 continue;
             }
@@ -1344,7 +1148,7 @@ fn latestRetryableAssistantError(self: *const AgentSession) ?[]const u8 {
     if (self.agent.state.messages.len == 0) return null;
     const last = self.agent.state.messages[self.agent.state.messages.len - 1];
     if (last != .assistant) return null;
-    if (!isRetryableAssistant(last.assistant)) return null;
+    if (!message_policy.isRetryableAssistant(last.assistant)) return null;
     return last.assistant.error_message;
 }
 
@@ -1393,72 +1197,13 @@ fn rollbackQueuedPrompt(self: *AgentSession, behavior: StreamingBehavior, text: 
     }
 }
 
-fn userMessageText(message: ai.UserMessage) ?[]const u8 {
-    return switch (message.content) {
-        .string => |text| text,
-        .blocks => |blocks| for (blocks) |block| {
-            if (block == .text) break block.text.text;
-        } else null,
-    };
-}
-
-fn isContextOverflowAssistant(message: ai.AssistantMessage) bool {
-    if (message.stop_reason != .error_) return false;
-    const text = message.error_message orelse return false;
-    if (!asciiContainsIgnoreCase(text, "context")) return false;
-    return asciiContainsIgnoreCase(text, "overflow") or
-        asciiContainsIgnoreCase(text, "too large") or
-        asciiContainsIgnoreCase(text, "maximum") or
-        asciiContainsIgnoreCase(text, "length");
-}
-
-fn isRetryableAssistant(message: ai.AssistantMessage) bool {
-    if (message.stop_reason != .error_) return false;
-    if (isContextOverflowAssistant(message)) return false;
-    const text = message.error_message orelse return false;
-    return isRetryableAssistantErrorText(text);
-}
-
-fn isRetryableAssistantErrorText(text: []const u8) bool {
-    return asciiContainsIgnoreCase(text, "overloaded") or
-        asciiContainsIgnoreCase(text, "rate limit") or
-        asciiContainsIgnoreCase(text, "too many requests") or
-        asciiContainsIgnoreCase(text, "429") or
-        asciiContainsIgnoreCase(text, "500") or
-        asciiContainsIgnoreCase(text, "502") or
-        asciiContainsIgnoreCase(text, "503") or
-        asciiContainsIgnoreCase(text, "504") or
-        asciiContainsIgnoreCase(text, "service unavailable") or
-        asciiContainsIgnoreCase(text, "server error") or
-        asciiContainsIgnoreCase(text, "server_error") or
-        asciiContainsIgnoreCase(text, "internal error") or
-        asciiContainsIgnoreCase(text, "internal_error") or
-        asciiContainsIgnoreCase(text, "network") or
-        asciiContainsIgnoreCase(text, "connection") or
-        asciiContainsIgnoreCase(text, "timeout") or
-        asciiContainsIgnoreCase(text, "timed out") or
-        asciiContainsIgnoreCase(text, "terminated");
-}
-
-fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    for (0..haystack.len - needle.len + 1) |start| {
-        var index: usize = 0;
-        while (index < needle.len) : (index += 1) {
-            if (std.ascii.toLower(haystack[start + index]) != std.ascii.toLower(needle[index])) break;
-        } else return true;
-    }
-    return false;
-}
-
 fn drainAgentEvent(
     _: std.Io,
     context: ?*anyopaque,
     event: agent_mod.AgentEvent,
     _: runtime.CancelToken,
 ) anyerror!void {
-    const drain: *EventDrain = @ptrCast(@alignCast(context.?));
+    const drain: *event_drain_mod.EventDrain = @ptrCast(@alignCast(context.?));
     try drain.handle(event);
 }
 
@@ -2269,13 +2014,6 @@ test "agent session session command emits snapshot without model run" {
     defer std.testing.allocator.free(expected_message);
     try std.testing.expectEqualStrings(expected_message, event.prompt_command.message.text);
     try std.testing.expectEqual(@as(usize, 0), session.statusSnapshot().public_event_count);
-}
-
-test "agent session slash command parser requires command name" {
-    try std.testing.expect(parsePromptCommand("hello") == null);
-    try std.testing.expect(parsePromptCommand("/") == null);
-    try std.testing.expect(parsePromptCommand("/ missing") == null);
-    try std.testing.expectEqualStrings("missing", parsePromptCommand("/missing arg").?);
 }
 
 test "agent session manual compaction persists and replaces agent context" {
@@ -3396,5 +3134,5 @@ fn expectUserMessageEvent(
     };
     try std.testing.expectEqual(.user, std.meta.activeTag(message));
     const user = message.user;
-    try std.testing.expectEqualStrings(text, userMessageText(user).?);
+    try std.testing.expectEqualStrings(text, message_policy.userText(user).?);
 }

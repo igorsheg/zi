@@ -1,4 +1,6 @@
 const std = @import("std");
+
+const primitive = @import("../primitive/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const terminal = @import("terminal.zig");
 
@@ -89,7 +91,11 @@ fn pumpTerminalEvents(
     channel: *TerminalEvents.Channel,
 ) anyerror!void {
     while (true) {
-        const event = try loop.nextEvent();
+        const event = terminal.Event.copyFromVaxis(try loop.nextEvent()) catch |err| switch (err) {
+            // The terminal event queue carries owned, fixed-size key text. Drop
+            // oversized key payloads at the substrate boundary as invalid input.
+            error.KeyTextTooLarge => continue,
+        };
         channel.send(event) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.ChannelClosed => return,
@@ -123,4 +129,27 @@ test "terminal events bridge forwards vaxis queue events through zio channel" {
     const receive = terminal_events.asyncNext();
     const selected = try runtime.select(.{ .terminal = receive });
     try std.testing.expectEqual(terminal.Event.focus_in, selected.terminal.?);
+}
+
+test "terminal events copy key text before crossing zio channel boundary" {
+    var source = [_]u8{ 'h', 'i' };
+
+    const event = try terminal.Event.copyFromVaxis(.{
+        .key_press = .{
+            .codepoint = 'h',
+            .text = source[0..],
+        },
+    });
+    source[0] = 'b';
+
+    try std.testing.expectEqualStrings("hi", event.key_press.text().?);
+}
+
+test "terminal events reject oversized key text before queueing" {
+    const bytes = "x" ** (primitive.input.key_text_size_bytes_max + 1);
+
+    try std.testing.expectError(
+        error.KeyTextTooLarge,
+        terminal.Event.copyFromVaxis(.{ .key_press = .{ .codepoint = 'x', .text = bytes } }),
+    );
 }

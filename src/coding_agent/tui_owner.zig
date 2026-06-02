@@ -11,6 +11,11 @@ const sdk = @import("sdk.zig");
 const session_events = @import("session_events.zig");
 const tui = @import("../tui/root.zig");
 
+const terminal_event_drain_count_max = 64;
+// Public events are already queued and bounded; drain a bounded batch per tick
+// so terminal input and render cannot be starved by a busy model stream.
+const public_event_drain_count_max = 64;
+
 pub const OwnerLoop = struct {
     allocator: std.mem.Allocator,
     host: *AgentSessionRuntimeHost,
@@ -95,8 +100,16 @@ pub const OwnerLoop = struct {
                 .host_event => self.host.publicEventWake().reset(),
             }
         }
+        try self.drainReadyTerminalEvents();
         try self.drainPublicEvents();
         try self.renderIfDirty();
+    }
+
+    fn drainReadyTerminalEvents(self: *OwnerLoop) !void {
+        for (0..terminal_event_drain_count_max) |_| {
+            const event = self.terminal_events.tryNext() orelse return;
+            try self.applyTerminalEvent(event);
+        }
     }
 
     fn applyTerminalEvent(
@@ -155,7 +168,8 @@ pub const OwnerLoop = struct {
     }
 
     fn drainPublicEvents(self: *OwnerLoop) !void {
-        while (self.host.drainPublicEvent()) |event| {
+        for (0..public_event_drain_count_max) |_| {
+            const event = self.host.drainPublicEvent() orelse return;
             var owned_event = event;
             defer owned_event.deinit();
             applyPublicEvent(&self.read_model, owned_event);
@@ -166,10 +180,13 @@ pub const OwnerLoop = struct {
     pub fn renderIfDirty(self: *OwnerLoop) !void {
         if (!self.app.dirty) return;
         const winsize = try self.terminal.currentWinsize();
-        _ = try self.app.apply(self.allocator, .{ .resize = .{
-            .width_columns = winsize.cols,
-            .height_rows = winsize.rows,
-        } });
+        if (winsize.cols != self.app.size.width_columns or winsize.rows != self.app.size.height_rows) {
+            _ = try self.app.apply(self.allocator, .{ .resize = .{
+                .width_columns = winsize.cols,
+                .height_rows = winsize.rows,
+            } });
+        }
+        try self.app.ensureTranscriptRows(self.allocator);
         const frame = try self.frame_scratch.build(&self.app);
         const win = self.terminal.vx.window();
         win.hideCursor();
@@ -458,7 +475,7 @@ test "tui owner terminal text event mutates composer through product owner" {
     var scratch: tui.product.input_router.Scratch = .{};
 
     const action = try handleTerminalEvent(std.testing.allocator, &app, &scratch, .{
-        .key_press = .{ .codepoint = 'h', .text = "h" },
+        .key_press = testKey('h', "h"),
     });
 
     try std.testing.expect(action == null);
@@ -470,11 +487,11 @@ test "tui owner terminal submit drains product submit effect" {
     defer app.deinit(std.testing.allocator);
     var scratch: tui.product.input_router.Scratch = .{};
     _ = try handleTerminalEvent(std.testing.allocator, &app, &scratch, .{
-        .key_press = .{ .codepoint = 'h', .text = "h" },
+        .key_press = testKey('h', "h"),
     });
 
     const action = (try handleTerminalEvent(std.testing.allocator, &app, &scratch, .{
-        .key_press = .{ .codepoint = vaxis.Key.enter },
+        .key_press = testKey(vaxis.Key.enter, null),
     })).?;
     defer deinitFrontendAction(std.testing.allocator, action);
 
@@ -487,11 +504,15 @@ test "tui owner terminal cancel returns frontend cancel without mutating compose
     var scratch: tui.product.input_router.Scratch = .{};
 
     const action = (try handleTerminalEvent(std.testing.allocator, &app, &scratch, .{
-        .key_press = .{ .codepoint = vaxis.Key.escape },
+        .key_press = testKey(vaxis.Key.escape, null),
     })).?;
 
     try std.testing.expectEqual(frontend.FrontendAction.cancel_run, action);
     try std.testing.expectEqualStrings("", app.composer.buffer.bytes.items);
+}
+
+fn testKey(codepoint: u21, text: ?[]const u8) tui.primitive.input.KeyPress {
+    return tui.primitive.input.KeyPress.copyFromVaxis(.{ .codepoint = codepoint, .text = text }) catch unreachable;
 }
 
 test "tui owner terminal resize mutates product size" {

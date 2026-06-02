@@ -1,6 +1,10 @@
 const std = @import("std");
 const zi = @import("zi");
 
+pub const std_options: std.Options = .{
+    .log_level = .info,
+};
+
 pub fn main(init: std.process.Init) !void {
     var zio_runtime = try zi.runtime.Runtime.init(init.gpa, .{});
     defer zio_runtime.deinit();
