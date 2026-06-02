@@ -96,8 +96,9 @@ const InteractiveLoop = struct {
     }
 
     fn tick(self: *InteractiveLoop) !void {
-        try self.pollInputOnce();
-        _ = try self.drainPromptReadyBounded(prompt_progress_per_tick_max);
+        try self.pollInputOnce(if (self.active_run == null) input_poll_timeout_ms else 0);
+        _ = try self.drainPromptProgressBounded(prompt_progress_per_tick_max);
+        try self.pollInputOnce(0);
         _ = try self.drainPublicEventsBounded(public_events_per_tick_max);
         if (render_attempts_per_tick_max > 0 and self.terminal_loop.isDirty()) {
             const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
@@ -109,13 +110,13 @@ const InteractiveLoop = struct {
         }
     }
 
-    fn pollInputOnce(self: *InteractiveLoop) !void {
+    fn pollInputOnce(self: *InteractiveLoop, timeout_ms: i32) !void {
         var fds = [_]std.posix.pollfd{.{
             .fd = self.terminal_loop.inputFd(),
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        _ = try std.posix.poll(&fds, input_poll_timeout_ms);
+        _ = try std.posix.poll(&fds, timeout_ms);
         if ((fds[0].revents & std.posix.POLL.IN) == 0) return;
         var reads: usize = 0;
         while (reads < input_reads_per_tick_max) : (reads += 1) {
@@ -166,15 +167,21 @@ const InteractiveLoop = struct {
         for (self.effects[0..count]) |effect| effect.deinit(self.process.gpa);
     }
 
-    fn drainPromptReadyBounded(self: *InteractiveLoop, limit: usize) !usize {
+    fn drainPromptProgressBounded(self: *InteractiveLoop, limit: usize) !usize {
         const prompt_run = self.active_run orelse return 0;
         var count: usize = 0;
-        while (count < limit) : (count += 1) {
-            const ready = try self.host.drainPromptRunReady(prompt_run) orelse return count;
-            if (!ready) {
-                self.host.destroyPromptRun(prompt_run);
-                self.active_run = null;
-                return count + 1;
+        while (count < limit and self.active_run != null) : (count += 1) {
+            var progress = self.host.promptRunProgress(prompt_run);
+            var frame_timeout = runtime.Timeout.fromMilliseconds(if (count == 0) input_poll_timeout_ms else 0);
+            switch (try runtime.select(.{ .prompt = &progress, .frame = &frame_timeout })) {
+                .prompt => |result| {
+                    const more = try self.host.applyPromptRunProgress(prompt_run, result);
+                    if (!more) {
+                        self.host.destroyPromptRun(prompt_run);
+                        self.active_run = null;
+                    }
+                },
+                .frame => return count,
             }
         }
         return count;
@@ -207,7 +214,7 @@ const InteractiveLoop = struct {
         }
         var ticks: usize = 0;
         while (self.active_run != null and ticks < shutdown_drain_ticks_max) : (ticks += 1) {
-            _ = self.drainPromptReadyBounded(prompt_progress_per_tick_max) catch break;
+            _ = self.drainPromptProgressBounded(prompt_progress_per_tick_max) catch break;
         }
         if (self.active_run) |prompt_run| {
             self.host.destroyPromptRun(prompt_run);
