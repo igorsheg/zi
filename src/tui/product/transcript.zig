@@ -6,9 +6,12 @@ pub const append_size_bytes_max: usize = 8 * 1024;
 
 pub const TranscriptRole = enum { user, assistant, system };
 
+pub const TranscriptAppendMode = enum { new_line, extend_previous_same_role };
+
 pub const TranscriptAppend = struct {
     role: TranscriptRole,
     text: []const u8,
+    mode: TranscriptAppendMode = .new_line,
 };
 
 pub const TranscriptLine = struct {
@@ -29,6 +32,17 @@ pub const TranscriptBuffer = struct {
     pub fn append(self: *TranscriptBuffer, allocator: std.mem.Allocator, item: TranscriptAppend) !void {
         if (item.text.len > append_size_bytes_max) return error.TranscriptAppendTooLarge;
         if (!std.unicode.utf8ValidateSlice(item.text)) return error.InvalidUtf8;
+
+        if (item.mode == .extend_previous_same_role and self.lines.items.len > 0) {
+            const last = &self.lines.items[self.lines.items.len - 1];
+            if (last.role == item.role) {
+                last.text = try allocator.realloc(last.text, last.text.len + item.text.len);
+                @memcpy(last.text[last.text.len - item.text.len ..], item.text);
+                self.total_size_bytes += item.text.len;
+                self.evictUntilBounded(allocator);
+                return;
+            }
+        }
 
         const copy = try allocator.dupe(u8, item.text);
         errdefer allocator.free(copy);
@@ -63,6 +77,19 @@ test "transcript owns copied text and accepts empty append" {
     try std.testing.expectEqual(@as(usize, 2), buffer.lines.items.len);
     try std.testing.expectEqualStrings("hi", buffer.lines.items[0].text);
     try std.testing.expectEqualStrings("", buffer.lines.items[1].text);
+}
+
+test "transcript can extend previous line with same role" {
+    var buffer: TranscriptBuffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+
+    try buffer.append(std.testing.allocator, .{ .role = .assistant, .text = "hel" });
+    try buffer.append(std.testing.allocator, .{ .role = .assistant, .text = "lo", .mode = .extend_previous_same_role });
+    try buffer.append(std.testing.allocator, .{ .role = .user, .text = "stop", .mode = .extend_previous_same_role });
+
+    try std.testing.expectEqual(@as(usize, 2), buffer.lines.items.len);
+    try std.testing.expectEqualStrings("hello", buffer.lines.items[0].text);
+    try std.testing.expectEqualStrings("stop", buffer.lines.items[1].text);
 }
 
 test "transcript rejects invalid utf8 and oversized single append before allocation" {

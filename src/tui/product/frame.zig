@@ -32,7 +32,7 @@ fn drawShell(app: anytype, renderer: *infra.Renderer) !void {
             const y: u16 = @intCast(index + 1);
             const prefix = rolePrefix(line.role);
             try renderer.writeText(0, y, prefix, transcript_style);
-            try renderer.writeText(@intCast(prefix.len), y, line.text, transcript_style);
+            try renderer.writeText(@intCast(primitive.text.displayWidth(prefix)), y, line.text, transcript_style);
         }
     }
     if (app.height > 0) {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_primitive = @import("../primitive/text.zig");
 
 pub const buffer_size_bytes_max: usize = 16 * 1024;
 pub const submit_size_bytes_max: usize = buffer_size_bytes_max;
@@ -30,19 +31,19 @@ pub const ComposerBuffer = struct {
 
     pub fn backspace(self: *ComposerBuffer) void {
         if (self.cursor_byte_index == 0) return;
-        const start = previousScalarStart(self.bytes.items, self.cursor_byte_index);
+        const start = text_primitive.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
         self.bytes.replaceRangeAssumeCapacity(start, self.cursor_byte_index - start, "");
         self.cursor_byte_index = start;
     }
 
     pub fn moveLeft(self: *ComposerBuffer) void {
         if (self.cursor_byte_index == 0) return;
-        self.cursor_byte_index = previousScalarStart(self.bytes.items, self.cursor_byte_index);
+        self.cursor_byte_index = text_primitive.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
     }
 
     pub fn moveRight(self: *ComposerBuffer) void {
         if (self.cursor_byte_index >= self.bytes.items.len) return;
-        self.cursor_byte_index = nextScalarEnd(self.bytes.items, self.cursor_byte_index);
+        self.cursor_byte_index = text_primitive.nextGraphemeEnd(self.bytes.items, self.cursor_byte_index);
     }
 
     pub fn takeSubmit(self: *ComposerBuffer, allocator: std.mem.Allocator) !?[]u8 {
@@ -54,35 +55,14 @@ pub const ComposerBuffer = struct {
     }
 };
 
-fn previousScalarStart(bytes: []const u8, cursor: usize) usize {
-    std.debug.assert(cursor <= bytes.len);
-    var index = cursor - 1;
-    while (index > 0 and (bytes[index] & 0xc0) == 0x80) : (index -= 1) {}
-    return index;
-}
-
-fn nextScalarEnd(bytes: []const u8, cursor: usize) usize {
-    std.debug.assert(cursor < bytes.len);
-    const first = bytes[cursor];
-    const len: usize = if (first < 0x80)
-        1
-    else if ((first & 0xe0) == 0xc0)
-        2
-    else if ((first & 0xf0) == 0xe0)
-        3
-    else if ((first & 0xf8) == 0xf0)
-        4
-    else
-        1;
-    return @min(cursor + len, bytes.len);
-}
-
-test "composer inserts utf8 moves and backspaces by scalar" {
+test "composer inserts utf8 moves and backspaces by grapheme" {
     var composer: ComposerBuffer = .{};
     defer composer.deinit(std.testing.allocator);
 
-    try composer.insertUtf8(std.testing.allocator, "a中b");
+    try composer.insertUtf8(std.testing.allocator, "ao\u{0300}👩🏽‍🚀b");
     composer.moveLeft();
+    composer.backspace();
+    try std.testing.expectEqualStrings("ao\u{0300}b", composer.text());
     composer.backspace();
     try std.testing.expectEqualStrings("ab", composer.text());
 

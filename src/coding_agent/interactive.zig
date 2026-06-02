@@ -34,6 +34,7 @@ fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
 const TranscriptEventAppend = struct {
     role: tui.product.transcript.TranscriptRole,
     text: []const u8,
+    mode: tui.product.transcript.TranscriptAppendMode = .new_line,
 };
 
 fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptEventAppend {
@@ -56,7 +57,7 @@ fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptEventA
         .turn_start => .{ .role = .system, .text = "turn started" },
         .turn_end => .{ .role = .system, .text = "turn ended" },
         .message_update => |payload| switch (payload.assistant_message_event) {
-            .text_delta => |delta| .{ .role = .assistant, .text = delta.delta },
+            .text_delta => |delta| .{ .role = .assistant, .text = delta.delta, .mode = .extend_previous_same_role },
             .@"error" => .{ .role = .system, .text = "assistant error" },
             else => null,
         },
@@ -156,7 +157,7 @@ const InteractiveLoop = struct {
         for (self.effects[0..count]) |effect| {
             switch (effect) {
                 .submit_text => |text| {
-                    if (try self.startPrompt(text)) try self.appendTranscript(.user, text);
+                    if (try self.startPrompt(text)) try self.appendTranscript(.{ .role = .user, .text = text });
                 },
                 .request_shutdown => self.requestShutdown(),
             }
@@ -198,12 +199,12 @@ const InteractiveLoop = struct {
     }
 
     fn applyPublicEventTranscript(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
-        if (transcriptAppendFromEvent(event)) |append| try self.appendTranscript(append.role, append.text);
+        if (transcriptAppendFromEvent(event)) |append| try self.appendTranscript(append);
     }
 
-    fn appendTranscript(self: *InteractiveLoop, role: tui.product.transcript.TranscriptRole, text: []const u8) !void {
+    fn appendTranscript(self: *InteractiveLoop, append: TranscriptEventAppend) !void {
         _ = try self.terminal_loop.product.app.apply(self.process.gpa, .{
-            .append_transcript = .{ .role = role, .text = text },
+            .append_transcript = .{ .role = append.role, .text = append.text, .mode = append.mode },
         });
     }
 
@@ -256,7 +257,7 @@ pub fn run(
     defer loop.shutdown();
 
     if (options.initial_prompt) |prompt| {
-        if (try loop.startPrompt(prompt)) try loop.appendTranscript(.user, prompt);
+        if (try loop.startPrompt(prompt)) try loop.appendTranscript(.{ .role = .user, .text = prompt });
     }
     _ = try loop.drainPublicEventsBounded(public_events_per_tick_max);
     try terminal_loop.renderIfDirty(stdout);

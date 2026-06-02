@@ -4,6 +4,7 @@ pub const frame = @import("frame.zig");
 pub const transcript = @import("transcript.zig");
 pub const loop = @import("loop.zig");
 pub const terminal_loop = @import("terminal_loop.zig");
+pub const vscreen_harness = @import("vscreen_harness.zig");
 const render_smoke = @import("render_smoke.zig");
 
 pub const ProductApp = app.ProductApp;
@@ -12,6 +13,7 @@ pub const Effect = app.Effect;
 pub const Frame = frame.Frame;
 pub const ProductLoop = loop.ProductLoop;
 pub const TerminalLoop = terminal_loop.TerminalLoop;
+pub const VScreenHarness = vscreen_harness.VScreenHarness;
 
 test {
     _ = app;
@@ -20,5 +22,6 @@ test {
     _ = transcript;
     _ = loop;
     _ = terminal_loop;
+    _ = vscreen_harness;
     _ = render_smoke;
 }

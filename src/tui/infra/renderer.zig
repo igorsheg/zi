@@ -92,13 +92,11 @@ fn isValidContinuation(buffer: CellBuffer, x: u16, y: u16) bool {
 }
 
 fn writeCell(cell: Cell, out: *FrameOutput) !void {
-    const scalar = cell.renderScalar() orelse ' ';
-    var enc: [4]u8 = undefined;
-    const len = std.unicode.utf8Encode(scalar, &enc) catch blk: {
-        enc[0] = '?';
-        break :blk 1;
+    const inline_text = cell.renderText() orelse {
+        try out.append(" ");
+        return;
     };
-    try out.append(enc[0..len]);
+    try out.append(inline_text.slice());
 }
 fn writeStyleTransition(current: *Style, next: Style, out: *FrameOutput) !void {
     if (!colorEql(current.fg, next.fg)) try writeColor(next.fg, true, out);
@@ -151,6 +149,35 @@ test "renderer stages commits retries style and wide continuation skip" {
     r.commit();
 }
 
+test "renderer emits complete grapheme bytes" {
+    var r = try Renderer.init(std.testing.allocator, 8, 1, 8);
+    defer r.deinit();
+    var storage: [512]u8 = undefined;
+    var out = FrameOutput.init(&storage);
+
+    try r.writeText(0, 0, "o\u{0300}中👩🏽‍🚀", .{});
+    const diff = try r.stage(&out);
+    try std.testing.expectEqual(@as(usize, 3), diff.changed);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "o\u{0300}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "中") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "👩🏽‍🚀") != null);
+    r.commit();
+}
+
+test "renderer clips wide grapheme at right edge" {
+    var r = try Renderer.init(std.testing.allocator, 1, 1, 1);
+    defer r.deinit();
+    var storage: [128]u8 = undefined;
+    var out = FrameOutput.init(&storage);
+
+    try r.writeText(0, 0, "中", .{});
+    const diff = try r.stage(&out);
+    try std.testing.expectEqual(@as(usize, 0), diff.changed);
+    try std.testing.expect((try r.next.get(0, 0)).kind == .empty);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "中") == null);
+    r.commit();
+}
+
 test "renderer rolls back on no space" {
     var r = try Renderer.init(std.testing.allocator, 1, 1, 1);
     defer r.deinit();
@@ -159,4 +186,35 @@ test "renderer rolls back on no space" {
     var out = FrameOutput.init(&storage);
     try std.testing.expectError(error.NoSpaceLeft, r.stage(&out));
     try std.testing.expectEqual(@as(usize, 0), out.len());
+}
+
+test "renderer failed stage leaves transaction uncommitted" {
+    var r = try Renderer.init(std.testing.allocator, 1, 1, 1);
+    defer r.deinit();
+    try r.set(0, 0, Cell.scalar('x', .{}));
+    var storage: [2]u8 = undefined;
+    var out = FrameOutput.init(&storage);
+
+    try std.testing.expectError(error.NoSpaceLeft, r.stage(&out));
+    try std.testing.expect(!r.staged);
+    try std.testing.expect((try r.current.get(0, 0)).kind == .empty);
+    try std.testing.expectEqual(@as(u21, 'x'), (try r.next.get(0, 0)).renderScalar().?);
+}
+
+test "renderer discard does not update current" {
+    var r = try Renderer.init(std.testing.allocator, 2, 1, 2);
+    defer r.deinit();
+    var storage: [128]u8 = undefined;
+    var out = FrameOutput.init(&storage);
+
+    try r.writeText(0, 0, "x", .{});
+    _ = try r.stage(&out);
+    r.discard();
+    try std.testing.expect(!r.staged);
+    try std.testing.expect((try r.current.get(0, 0)).kind == .empty);
+
+    out.reset();
+    _ = try r.stage(&out);
+    r.commit();
+    try std.testing.expectEqual(@as(u21, 'x'), (try r.current.get(0, 0)).renderScalar().?);
 }

@@ -1,8 +1,33 @@
 const std = @import("std");
 const Style = @import("../primitive/style.zig").Style;
-const text_width = @import("../primitive/text_width.zig");
+const text = @import("../primitive/text.zig");
 
-pub const CellKind = union(enum) { empty, scalar: u21, wide_head: u21, wide_continuation };
+pub const InlineText = struct {
+    bytes: [text.grapheme_bytes_max]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn from(bytes: []const u8) InlineText {
+        var result: InlineText = .{};
+        if (bytes.len > result.bytes.len) {
+            result.bytes[0] = '?';
+            result.len = 1;
+            return result;
+        }
+        @memcpy(result.bytes[0..bytes.len], bytes);
+        result.len = @intCast(bytes.len);
+        return result;
+    }
+
+    pub fn slice(self: *const InlineText) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn eql(a: InlineText, b: InlineText) bool {
+        return std.mem.eql(u8, a.bytes[0..a.len], b.bytes[0..b.len]);
+    }
+};
+
+pub const CellKind = union(enum) { empty, grapheme: InlineText, wide_head: InlineText, wide_continuation };
 pub const Cell = struct {
     kind: CellKind = .empty,
     style: Style = .{},
@@ -11,32 +36,44 @@ pub const Cell = struct {
         return kindEql(a.kind, b.kind) and a.style.eql(b.style);
     }
     pub fn scalar(ch: u21, style: Style) Cell {
-        return .{ .kind = .{ .scalar = ch }, .style = style };
+        var bytes: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(ch, &bytes) catch blk: {
+            bytes[0] = '?';
+            break :blk 1;
+        };
+        return textCell(bytes[0..len], style);
     }
-    pub fn wideHead(ch: u21, style: Style) Cell {
-        return .{ .kind = .{ .wide_head = ch }, .style = style };
+    pub fn textCell(bytes: []const u8, style: Style) Cell {
+        return .{ .kind = .{ .grapheme = InlineText.from(bytes) }, .style = style };
+    }
+    pub fn wideHead(bytes: []const u8, style: Style) Cell {
+        return .{ .kind = .{ .wide_head = InlineText.from(bytes) }, .style = style };
     }
     pub fn empty(style: Style) Cell {
         return .{ .kind = .empty, .style = style };
     }
-    pub fn renderScalar(self: Cell) ?u21 {
+    pub fn renderText(self: Cell) ?InlineText {
         return switch (self.kind) {
-            .scalar => |c| c,
-            .wide_head => |c| c,
+            .grapheme => |t| t,
+            .wide_head => |t| t,
             else => null,
         };
+    }
+    pub fn renderScalar(self: Cell) ?u21 {
+        const inline_text = self.renderText() orelse return null;
+        return std.unicode.utf8Decode(inline_text.slice()) catch null;
     }
 };
 fn kindEql(a: CellKind, b: CellKind) bool {
     return switch (a) {
         .empty => b == .empty,
         .wide_continuation => b == .wide_continuation,
-        .scalar => |x| switch (b) {
-            .scalar => |y| x == y,
+        .grapheme => |x| switch (b) {
+            .grapheme => |y| x.eql(y),
             else => false,
         },
         .wide_head => |x| switch (b) {
-            .wide_head => |y| x == y,
+            .wide_head => |y| x.eql(y),
             else => false,
         },
     };
@@ -100,27 +137,27 @@ pub const CellBuffer = struct {
         var col = x;
         var i: usize = 0;
         while (i < bytes.len and col < self.width) {
-            const grapheme = text_width.nextGrapheme(bytes[i..]);
+            const grapheme = text.nextGrapheme(bytes[i..]);
             if (grapheme.end == 0) break;
-            const decoded = text_width.nextScalar(bytes[i..][grapheme.start..grapheme.end]);
+            const grapheme_bytes = bytes[i..][grapheme.start..grapheme.end];
             i += grapheme.end;
             if (grapheme.width == 0) continue;
             if (grapheme.width == 2) {
                 if (col + 1 >= self.width) break;
-                try self.setWide(col, y, decoded.scalar, style);
+                try self.setWide(col, y, grapheme_bytes, style);
                 col += 2;
             } else {
-                try self.set(col, y, Cell.scalar(decoded.scalar, style));
+                try self.set(col, y, Cell.textCell(grapheme_bytes, style));
                 col += 1;
             }
         }
     }
-    fn setWide(self: *CellBuffer, x: u16, y: u16, scalar_value: u21, style: Style) Error!void {
+    fn setWide(self: *CellBuffer, x: u16, y: u16, bytes: []const u8, style: Style) Error!void {
         const head = try self.index(x, y);
         const tail = try self.index(x + 1, y);
         self.clearPairedAt(head);
         self.clearPairedAt(tail);
-        self.cells[head] = Cell.wideHead(scalar_value, style);
+        self.cells[head] = Cell.wideHead(bytes, style);
         self.cells[tail] = .{ .kind = .wide_continuation, .style = style };
     }
 
@@ -168,7 +205,21 @@ test "cell buffer wide pairs do not cross rows" {
     try b.set(0, 1, Cell.scalar('x', .{}));
     try std.testing.expect((try b.get(1, 0)).kind == .wide_continuation);
     try b.set(1, 0, Cell.scalar('y', .{}));
-    try std.testing.expect((try b.get(0, 1)).kind == .scalar);
+    try std.testing.expect((try b.get(0, 1)).kind == .grapheme);
+}
+
+test "cell buffer keeps grapheme bytes in one cell" {
+    var b = try CellBuffer.init(std.testing.allocator, 4, 1, 4);
+    defer b.deinit();
+
+    try b.writeText(0, 0, "o\u{0300}👩🏽‍🚀", .{});
+    const first = try b.get(0, 0);
+    const second = try b.get(1, 0);
+    const first_text = first.renderText().?;
+    const second_text = second.renderText().?;
+    try std.testing.expectEqualStrings("o\u{0300}", first_text.slice());
+    try std.testing.expectEqualStrings("👩🏽‍🚀", second_text.slice());
+    try std.testing.expect((try b.get(2, 0)).kind == .wide_continuation);
 }
 
 test "cell buffer wide write clears old pairs at both target columns" {
@@ -181,4 +232,33 @@ test "cell buffer wide write clears old pairs at both target columns" {
     try std.testing.expect((try b.get(0, 0)).kind == .wide_head);
     try std.testing.expect((try b.get(1, 0)).kind == .wide_continuation);
     try std.testing.expect((try b.get(2, 0)).kind == .empty);
+}
+
+test "cell buffer overwrite clears wide and grapheme cells" {
+    var b = try CellBuffer.init(std.testing.allocator, 4, 1, 4);
+    defer b.deinit();
+
+    try b.writeText(0, 0, "中a", .{});
+    try b.writeText(1, 0, "o\u{0300}", .{});
+    try std.testing.expect((try b.get(0, 0)).kind == .empty);
+    const middle = (try b.get(1, 0)).renderText().?;
+    try std.testing.expectEqualStrings("o\u{0300}", middle.slice());
+    try std.testing.expectEqual(@as(u21, 'a'), (try b.get(2, 0)).renderScalar().?);
+
+    try b.writeText(1, 0, "界", .{});
+    try std.testing.expect((try b.get(0, 0)).kind == .empty);
+    try std.testing.expect((try b.get(1, 0)).kind == .wide_head);
+    try std.testing.expect((try b.get(2, 0)).kind == .wide_continuation);
+}
+
+test "cell buffer clear rect clears intersecting wide pairs" {
+    var b = try CellBuffer.init(std.testing.allocator, 4, 1, 4);
+    defer b.deinit();
+
+    try b.writeText(0, 0, "a中b", .{});
+    try b.clearRect(2, 0, 1, 1);
+    try std.testing.expectEqual(@as(u21, 'a'), (try b.get(0, 0)).renderScalar().?);
+    try std.testing.expect((try b.get(1, 0)).kind == .empty);
+    try std.testing.expect((try b.get(2, 0)).kind == .empty);
+    try std.testing.expectEqual(@as(u21, 'b'), (try b.get(3, 0)).renderScalar().?);
 }
