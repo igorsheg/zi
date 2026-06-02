@@ -1,7 +1,18 @@
 const std = @import("std");
+const uucode = @import("uucode");
 
 pub const replacement: u21 = 0xfffd;
-pub const DecodedScalar = struct { scalar: u21, len: usize };
+
+pub const DecodedScalar = struct {
+    scalar: u21,
+    len: usize,
+};
+
+pub const Grapheme = struct {
+    start: usize,
+    end: usize,
+    width: u2,
+};
 
 pub fn nextScalar(bytes: []const u8) DecodedScalar {
     if (bytes.len == 0) return .{ .scalar = replacement, .len = 0 };
@@ -16,6 +27,32 @@ pub fn nextScalar(bytes: []const u8) DecodedScalar {
     return .{ .scalar = std.unicode.utf8Decode(slice) catch replacement, .len = len };
 }
 
+pub fn nextGrapheme(bytes: []const u8) Grapheme {
+    if (bytes.len == 0) return .{ .start = 0, .end = 0, .width = 0 };
+    if (!std.unicode.utf8ValidateSlice(bytes)) return .{ .start = 0, .end = 1, .width = 1 };
+
+    var iterator = uucode.grapheme.utf8Iterator(bytes);
+    const grapheme = iterator.nextGrapheme() orelse return .{ .start = 0, .end = 0, .width = 0 };
+    const width = uucode.grapheme.wcwidth(uucode.grapheme.utf8Iterator(bytes[grapheme.start..grapheme.end]));
+    return .{ .start = grapheme.start, .end = grapheme.end, .width = clampWidth(width) };
+}
+
+pub fn utf8Width(bytes: []const u8) usize {
+    if (!std.unicode.utf8ValidateSlice(bytes)) return bytes.len;
+    return uucode.grapheme.utf8Wcwidth(bytes);
+}
+
+pub fn scalarWidth(scalar: u21) u2 {
+    if (scalar == 0 or scalar < 0x20 or scalar == 0x7f) return 1;
+    return clampWidth(uucode.get(.wcwidth_standalone, scalar));
+}
+
+fn clampWidth(width: usize) u2 {
+    if (width == 0) return 0;
+    if (width > 2) return 2;
+    return @intCast(width);
+}
+
 fn utf8SequenceLen(first: u8) usize {
     if ((first & 0xe0) == 0xc0) return 2;
     if ((first & 0xf0) == 0xe0) return 3;
@@ -23,53 +60,21 @@ fn utf8SequenceLen(first: u8) usize {
     return 1;
 }
 
-pub fn scalarWidth(scalar: u21) u2 {
-    if (scalar == 0 or scalar < 0x20 or scalar == 0x7f) return 1;
-    if (isWideScalar(scalar)) return 2;
-    return 1;
-}
-
-fn isWideScalar(scalar: u21) bool {
-    // Bounded terminal-width policy for common fullwidth, CJK, and emoji scalar ranges.
-    // This is scalar-based, not grapheme-based; product text can later swap this file
-    // for uucode without leaking that dependency into renderer or product types.
-    return (scalar >= 0x1100 and scalar <= 0x115f) or
-        (scalar >= 0x231a and scalar <= 0x231b) or
-        (scalar >= 0x2329 and scalar <= 0x232a) or
-        (scalar >= 0x23e9 and scalar <= 0x23ec) or
-        (scalar >= 0x23f0 and scalar <= 0x23f0) or
-        (scalar >= 0x23f3 and scalar <= 0x23f3) or
-        (scalar >= 0x25fd and scalar <= 0x25fe) or
-        (scalar >= 0x2614 and scalar <= 0x2615) or
-        (scalar >= 0x2648 and scalar <= 0x2653) or
-        (scalar >= 0x267f and scalar <= 0x267f) or
-        (scalar >= 0x2693 and scalar <= 0x2693) or
-        (scalar >= 0x26a1 and scalar <= 0x26a1) or
-        (scalar >= 0x26aa and scalar <= 0x26ab) or
-        (scalar >= 0x26bd and scalar <= 0x26be) or
-        (scalar >= 0x26c4 and scalar <= 0x26c5) or
-        (scalar >= 0x26ce and scalar <= 0x26ce) or
-        (scalar >= 0x26d4 and scalar <= 0x26d4) or
-        (scalar >= 0x26ea and scalar <= 0x26ea) or
-        (scalar >= 0x26f2 and scalar <= 0x26f3) or
-        (scalar >= 0x26f5 and scalar <= 0x26f5) or
-        (scalar >= 0x26fa and scalar <= 0x26fa) or
-        (scalar >= 0x26fd and scalar <= 0x26fd) or
-        (scalar >= 0x2705 and scalar <= 0x2705) or
-        (scalar >= 0x270a and scalar <= 0x270b) or
-        (scalar >= 0x2728 and scalar <= 0x2728) or
-        (scalar >= 0x274c and scalar <= 0x274c) or
-        (scalar >= 0x2e80 and scalar <= 0xa4cf) or
-        (scalar >= 0xac00 and scalar <= 0xd7a3) or
-        (scalar >= 0xf900 and scalar <= 0xfaff) or
-        (scalar >= 0xff01 and scalar <= 0xff60) or
-        (scalar >= 0xffe0 and scalar <= 0xffe6) or
-        (scalar >= 0x1f300 and scalar <= 0x1f64f) or
-        (scalar >= 0x1f900 and scalar <= 0x1f9ff);
-}
-
-test "text width conservative utf8" {
+test "text width uses uucode grapheme width" {
     try std.testing.expectEqual(@as(u21, 'a'), nextScalar("a").scalar);
     try std.testing.expectEqual(@as(u2, 2), scalarWidth(nextScalar("中").scalar));
+    try std.testing.expectEqual(@as(usize, 1), utf8Width("o\u{0300}"));
+    try std.testing.expectEqual(@as(usize, 2), utf8Width("👩🏽‍🚀"));
     try std.testing.expectEqual(replacement, nextScalar("\xff").scalar);
+}
+
+test "next grapheme returns byte range and terminal width" {
+    const text = "o\u{0300}中";
+    const first = nextGrapheme(text);
+    try std.testing.expectEqual(@as(usize, 0), first.start);
+    try std.testing.expectEqual(@as(usize, 3), first.end);
+    try std.testing.expectEqual(@as(u2, 1), first.width);
+
+    const second = nextGrapheme(text[first.end..]);
+    try std.testing.expectEqual(@as(u2, 2), second.width);
 }

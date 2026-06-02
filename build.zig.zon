@@ -7,6 +7,9 @@
         .zio = .{
             .path = "vendor/zio",
         },
+        .uucode = .{
+            .path = "vendor/uucode",
+        },
     },
     .paths = .{
         ".ziglint.zon",
@@ -16,6 +19,7 @@
         "docs",
         "src",
         "vendor/zio",
+        "vendor/uucode",
         "LICENSE",
         "README.md",
     },

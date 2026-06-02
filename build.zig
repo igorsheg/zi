@@ -15,6 +15,19 @@ pub fn build(b: *std.Build) void {
     });
     zi.addImport("zio", zio_dep.module("zio"));
 
+    const uucode_dep = b.dependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{
+            "grapheme_break",
+            "is_emoji_modifier_base",
+            "is_emoji_vs_base",
+            "wcwidth_standalone",
+            "wcwidth_zero_in_grapheme",
+        }),
+    });
+    zi.addImport("uucode", uucode_dep.module("uucode"));
+
     const exe = b.addExecutable(.{
         .name = "zi",
         .root_module = b.createModule(.{

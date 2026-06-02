@@ -100,10 +100,12 @@ pub const CellBuffer = struct {
         var col = x;
         var i: usize = 0;
         while (i < bytes.len and col < self.width) {
-            const decoded = text_width.nextScalar(bytes[i..]);
-            i += decoded.len;
-            const w = text_width.scalarWidth(decoded.scalar);
-            if (w == 2) {
+            const grapheme = text_width.nextGrapheme(bytes[i..]);
+            if (grapheme.end == 0) break;
+            const decoded = text_width.nextScalar(bytes[i..][grapheme.start..grapheme.end]);
+            i += grapheme.end;
+            if (grapheme.width == 0) continue;
+            if (grapheme.width == 2) {
                 if (col + 1 >= self.width) break;
                 try self.setWide(col, y, decoded.scalar, style);
                 col += 2;
