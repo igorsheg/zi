@@ -1,8 +1,16 @@
 # adr 0012: split pi-mono interactive mode across Zi boundaries
 
-status: accepted
+status: partially superseded by adr 0013 and current grug simplification
 
 date: 2026-06-01
+
+## supersession note
+
+The split into `tui_mode.zig`, `tui_owner.zig`, and `frontend.zig` was too much
+ceremony for the current Zi shape. Current direction keeps `sdk.zig` as the
+public create/resume/list host API and rebuilds interactive integration as one
+small coding-agent TUI file when needed. No separate `frontend.zig` protocol
+exists until multiple real frontends prove a shared read/action vocabulary.
 
 ## context
 

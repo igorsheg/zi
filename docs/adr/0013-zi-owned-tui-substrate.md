@@ -48,10 +48,9 @@ src/tui/product
   absent until substrate/infra primitives are solid
 ```
 
-`src/tui` must not import coding-agent product/session policy. Integration with
-coding-agent will be rebuilt later in `src/coding_agent/tui_mode.zig` and
-`src/coding_agent/tui_owner.zig`, after the TUI substrate and product layer have
-clear contracts.
+`src/tui` must not import coding-agent product/session policy. Integration with coding-agent will be rebuilt later as one small coding-agent
+TUI integration file, after the TUI substrate and product layer have clear
+contracts.
 
 ## reference use
 
@@ -127,9 +126,8 @@ into a bounded buffer before terminal state is committed.
 4. Add runtime terminal event integration only after substrate input is real.
 5. Rebuild `src/tui/product` around composer buffer/view, transcript
    document/viewport, immutable frame construction, and command-only mutation.
-6. Rebuild `src/coding_agent/tui_mode.zig` and `src/coding_agent/tui_owner.zig`
-   as integration modules that observe/request through public coding-agent
-   boundaries.
+6. Rebuild coding-agent TUI integration as one small file that observes and
+   requests through public `sdk.zig` / `AgentSessionRuntimeHost` boundaries.
 
 ## rejected alternatives
 
