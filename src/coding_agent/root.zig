@@ -4,6 +4,7 @@ pub const auth = @import("auth.zig");
 pub const auth_mode = @import("auth_mode.zig");
 pub const cli = @import("cli/root.zig");
 pub const event_drain = @import("event_drain.zig");
+pub const interactive = @import("interactive.zig");
 pub const message_policy = @import("message_policy.zig");
 pub const paths = @import("paths.zig");
 pub const print_mode = @import("print_mode.zig");
@@ -61,6 +62,7 @@ pub fn testsReachable() void {
     _ = auth_mode;
     _ = cli;
     _ = event_drain;
+    _ = interactive;
     _ = message_policy;
     _ = paths;
     _ = print_mode;
@@ -90,6 +92,7 @@ test {
     _ = auth_mode;
     _ = cli;
     _ = event_drain;
+    _ = interactive;
     _ = message_policy;
     _ = paths;
     _ = print_mode;

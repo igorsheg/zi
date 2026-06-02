@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime = @import("../../runtime/root.zig");
 const auth_mode = @import("../auth_mode.zig");
 const args_mod = @import("args.zig");
+const interactive = @import("../interactive.zig");
 const print_mode = @import("../print_mode.zig");
 const sdk = @import("../sdk.zig");
 
@@ -138,7 +139,15 @@ fn runApp(
         .rpc => unsupported(stderr, "rpc mode is not implemented yet"),
         .interactive => {
             if (app.messages.count > 1) return usage(stderr);
-            return unsupported(stderr, "interactive TUI is temporarily unavailable during substrate rebuild");
+            return interactive.run(process, stdout, stderr, .{
+                .cwd = options.cwd,
+                .agent_dir_override = options.agent_dir_override,
+                .dir = options.dir,
+                .environ = options.environ,
+                .resume_session_file = app.resume_session_file,
+                .resume_latest = app.resume_latest,
+                .initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null,
+            });
         },
     };
 }
