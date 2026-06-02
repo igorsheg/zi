@@ -175,6 +175,7 @@ pub const OwnerLoop = struct {
             applyPublicEvent(&self.read_model, owned_event);
             try self.transcript_adapter.apply(self.allocator, &self.app, owned_event);
         }
+        if (self.host.hasPublicEvents()) self.host.publicEventWake().set();
     }
 
     pub fn renderIfDirty(self: *OwnerLoop) !void {
@@ -296,6 +297,7 @@ const TranscriptAdapter = struct {
             .compaction_end,
             .auto_retry_start,
             .auto_retry_end,
+            .public_event_overflow,
             => {},
         }
     }

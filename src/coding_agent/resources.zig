@@ -113,7 +113,7 @@ pub const PromptResources = struct {
         self.* = undefined;
     }
 
-    pub fn customPrompt(self: *const PromptResources) ?[]const u8 {
+    pub fn systemPromptFileContent(self: *const PromptResources) ?[]const u8 {
         return if (self.system_prompt.file) |file| file.content else null;
     }
 
@@ -300,7 +300,7 @@ test "prompt resources load context and prompt overrides" {
 
     try std.testing.expectEqual(@as(usize, 2), prompt_resources.context_files.files.len);
     try std.testing.expectEqual(@as(usize, 0), prompt_resources.skills.skills.len);
-    try std.testing.expectEqualStrings("system", prompt_resources.customPrompt().?);
+    try std.testing.expectEqualStrings("system", prompt_resources.systemPromptFileContent().?);
     try std.testing.expectEqualStrings("append", prompt_resources.appendSystemPrompt().?);
 }
 
@@ -316,7 +316,7 @@ test "prompt resources returns null prompts when files are missing" {
     defer prompt_resources.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), prompt_resources.context_files.files.len);
-    try std.testing.expect(prompt_resources.customPrompt() == null);
+    try std.testing.expect(prompt_resources.systemPromptFileContent() == null);
     try std.testing.expect(prompt_resources.appendSystemPrompt() == null);
 }
 

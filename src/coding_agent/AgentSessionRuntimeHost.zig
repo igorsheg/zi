@@ -34,11 +34,19 @@ pub const BaseOptions = struct {
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
-pub const SessionStart = struct {
-    session_id: []const u8,
-    timestamp: []const u8,
-    session_store: ?session_store.SessionStore = null,
-    resume_session_store: ?session_store.SessionStore = null,
+pub const SessionStart = union(enum) {
+    create: Create,
+    @"resume": Resume,
+
+    pub const Create = struct {
+        session_id: []const u8,
+        timestamp: []const u8,
+        session_store: ?session_store.SessionStore = null,
+    };
+
+    pub const Resume = struct {
+        resume_session_store: session_store.SessionStore,
+    };
 };
 
 pub const RebindSession = struct {
@@ -60,13 +68,10 @@ pub const BeforeSessionInvalidate = struct {
 };
 
 pub const ReplaceResult = struct {
-    old_event_count: usize,
+    discarded_public_event_count: usize,
 };
 
-pub const NewSessionResult = struct {
-    cancelled: bool = false,
-    old_event_count: usize,
-};
+pub const NewSessionResult = ReplaceResult;
 
 pub const PublicEventHandler = struct {
     context: ?*anyopaque = null,
@@ -93,7 +98,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *AgentSessionRuntimeHost) void {
-    self.session.deinit();
+    shutdownAndDeinitSession(&self.session);
     self.* = undefined;
 }
 
@@ -118,7 +123,7 @@ pub fn setBeforeSessionInvalidate(
 
 pub fn newSession(self: *AgentSessionRuntimeHost, start: SessionStart) !NewSessionResult {
     const result = try self.replaceSession(start);
-    return .{ .old_event_count = result.old_event_count };
+    return result;
 }
 
 pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !ReplaceResult {
@@ -129,7 +134,7 @@ pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !Repl
     errdefer if (next_session_needs_deinit) shutdownAndDeinitSession(&next_session);
 
     self.session.requestShutdown();
-    const old_event_count = drainSessionEvents(&self.session);
+    const discarded_public_event_count = drainSessionEvents(&self.session);
     if (!self.session.shutdownComplete()) return error.SessionReplacementRequiresShutdownComplete;
 
     if (self.before_session_invalidate) |callback| callback.call();
@@ -138,7 +143,7 @@ pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !Repl
     self.session = next_session;
 
     if (self.rebind_session) |callback| callback.call(&self.session);
-    return .{ .old_event_count = old_event_count };
+    return .{ .discarded_public_event_count = discarded_public_event_count };
 }
 
 pub fn startPromptRun(
@@ -249,15 +254,17 @@ pub fn shutdownComplete(self: *AgentSessionRuntimeHost) bool {
     return self.session.shutdownComplete();
 }
 
+pub fn hasPublicEvents(self: *const AgentSessionRuntimeHost) bool {
+    return self.session.public_events.count() > 0;
+}
+
 fn buildSessionOptions(base: BaseOptions, start: SessionStart) AgentSession.Options {
-    return .{
+    var options: AgentSession.Options = .{
         .cwd = base.cwd,
         .agent_dir = base.agent_dir,
         .current_date = base.current_date,
-        .session_id = start.session_id,
-        .timestamp = start.timestamp,
-        .session_store = start.session_store,
-        .resume_session_store = start.resume_session_store,
+        .session_id = "",
+        .timestamp = "",
         .model = base.model,
         .thinking_level = base.thinking_level,
         .compaction_settings = base.compaction_settings,
@@ -269,6 +276,17 @@ fn buildSessionOptions(base: BaseOptions, start: SessionStart) AgentSession.Opti
         .allow_paths_outside_cwd = base.allow_paths_outside_cwd,
         .public_event_capacity = base.public_event_capacity,
     };
+    switch (start) {
+        .create => |create| {
+            options.session_id = create.session_id;
+            options.timestamp = create.timestamp;
+            options.session_store = create.session_store;
+        },
+        .@"resume" => |resume_start| {
+            options.resume_session_store = resume_start.resume_session_store;
+        },
+    }
+    return options;
 }
 
 fn shutdownAndDeinitSession(session: *AgentSession) void {
@@ -446,10 +464,10 @@ test "runtime host replacement invalidates old session before rebinding new sess
         .current_date = "2026-05-26",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
-    }, .{
+    }, .{ .create = .{
         .session_id = "first",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -480,12 +498,12 @@ test "runtime host replacement invalidates old session before rebinding new sess
     host.setRebindSession(.{ .context = &state, .call_fn = State.rebind });
 
     try runPromptForTest(&host, "old event");
-    const result = try host.replaceSession(.{
+    const result = try host.replaceSession(.{ .create = .{
         .session_id = "second",
         .timestamp = "2026-05-26T00:00:01Z",
-    });
+    } });
 
-    try std.testing.expect(result.old_event_count > 0);
+    try std.testing.expect(result.discarded_public_event_count > 0);
     try std.testing.expectEqual(@as(usize, 1), state.before_count);
     try std.testing.expectEqual(@as(usize, 1), state.rebind_count);
     try std.testing.expectEqualStrings("second", state.rebound_session_id);
@@ -508,23 +526,22 @@ test "runtime host new session replaces current session" {
         .current_date = "2026-05-26",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
-    }, .{
+    }, .{ .create = .{
         .session_id = "first",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
 
-    const result = try host.newSession(.{
+    const result = try host.newSession(.{ .create = .{
         .session_id = "second",
         .timestamp = "2026-05-26T00:00:01Z",
-    });
+    } });
 
-    try std.testing.expect(!result.cancelled);
-    try std.testing.expectEqual(@as(usize, 0), result.old_event_count);
+    try std.testing.expectEqual(@as(usize, 0), result.discarded_public_event_count);
     try std.testing.expectEqualStrings("second", host.sessionId());
 }
 
@@ -543,10 +560,10 @@ test "runtime host zio runtime accessor returns explicit session runtime" {
         .current_date = "2026-05-26",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -572,10 +589,10 @@ test "runtime host replacement rejects active old session" {
         .current_date = "2026-05-26",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
-    }, .{
+    }, .{ .create = .{
         .session_id = "first",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         if (!host.session.agent.waitForIdle()) host.session.agent.finishRun();
         host.requestShutdown();
@@ -585,10 +602,10 @@ test "runtime host replacement rejects active old session" {
 
     _ = try host.session.agent.beginRun();
 
-    try std.testing.expectError(error.SessionReplacementRequiresIdle, host.replaceSession(.{
+    try std.testing.expectError(error.SessionReplacementRequiresIdle, host.replaceSession(.{ .create = .{
         .session_id = "second",
         .timestamp = "2026-05-26T00:00:01Z",
-    }));
+    } }));
     try std.testing.expectEqualStrings("first", host.sessionId());
 }
 
@@ -607,10 +624,10 @@ test "runtime host owns current agent session public boundary" {
         .current_date = "2026-05-26",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -639,10 +656,10 @@ test "runtime host persists run messages before frontend drains public events" {
         .current_date = "2026-05-26",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -680,10 +697,10 @@ test "runtime host preserves session header active leaf and context after public
         .current_date = "2026-05-26",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -735,20 +752,20 @@ test "runtime host persists session store that loads after host deinit" {
     errdefer std.testing.allocator.free(store_file_name);
 
     {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+        var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+        defer zio_runtime.deinit();
 
         var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
             .cwd = "repo",
             .agent_dir = "agent",
             .current_date = "2026-05-26",
-        .zio_runtime = zio_runtime,
+            .zio_runtime = zio_runtime,
             .dir = tmp.dir,
-        }, .{
+        }, .{ .create = .{
             .session_id = "session",
             .timestamp = "2026-05-26T00:00:00Z",
             .session_store = store,
-        });
+        } });
         store = undefined;
         defer {
             host.requestShutdown();
@@ -797,20 +814,20 @@ test "runtime host resumes session store into agent context and appends new hist
     errdefer std.testing.allocator.free(store_file_name);
 
     {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+        var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+        defer zio_runtime.deinit();
 
         var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
             .cwd = "repo",
             .agent_dir = "agent",
             .current_date = "2026-05-26",
-        .zio_runtime = zio_runtime,
+            .zio_runtime = zio_runtime,
             .dir = tmp.dir,
-        }, .{
+        }, .{ .create = .{
             .session_id = "session",
             .timestamp = "2026-05-26T00:00:00Z",
             .session_store = seed_store,
-        });
+        } });
         seed_store = undefined;
         defer {
             host.requestShutdown();
@@ -825,20 +842,18 @@ test "runtime host resumes session store into agent context and appends new hist
     errdefer std.testing.allocator.free(resume_file_name);
     var resume_store: session_store.SessionStore = .{ .dir = tmp.dir, .file_name = resume_file_name };
     {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+        var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+        defer zio_runtime.deinit();
 
         var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
             .cwd = "repo",
             .agent_dir = "agent",
             .current_date = "2026-05-26",
-        .zio_runtime = zio_runtime,
+            .zio_runtime = zio_runtime,
             .dir = tmp.dir,
-        }, .{
-            .session_id = "ignored",
-            .timestamp = "ignored",
+        }, .{ .@"resume" = .{
             .resume_session_store = resume_store,
-        });
+        } });
         resume_store = undefined;
         defer {
             host.requestShutdown();
@@ -899,10 +914,10 @@ test "runtime host live run executes a tool and continues the assistant turn" {
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -969,10 +984,10 @@ test "runtime host applies prompt progress from zio stream future" {
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -1009,10 +1024,10 @@ test "runtime host compacts through public command boundary" {
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .compaction_settings = .{ .keep_recent_tokens = 2 },
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -1075,10 +1090,10 @@ test "runtime host compacts with generated summary through public command bounda
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
         .compaction_settings = .{ .keep_recent_tokens = 2 },
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -1127,10 +1142,10 @@ test "runtime host exposes compaction preparation snapshot" {
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .compaction_settings = .{ .keep_recent_tokens = 2 },
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -1169,10 +1184,10 @@ test "runtime host exposes compaction summary input snapshot" {
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .compaction_settings = .{ .keep_recent_tokens = 2 },
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -1239,10 +1254,10 @@ test "runtime host preserves bash output limit details through public events" {
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);
@@ -1302,10 +1317,10 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
         .dir = tmp.dir,
         .model = provider.getModel(),
         .stream = provider.apiProvider().stream,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-26T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainHostEvents(&host);

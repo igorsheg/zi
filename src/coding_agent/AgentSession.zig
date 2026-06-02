@@ -341,7 +341,6 @@ fn startPromptRun(
 ) !*LivePromptRun {
     try self.ensureAcceptsPrompt();
     var preflight = try self.preparePromptInput(text, images, options);
-    defer preflight.deinit(self.allocator);
     if (try self.tryHandlePromptCommand(&preflight)) return error.PromptCommandCannotStartLiveRun;
     if (try self.queuePromptIfStreaming(&preflight)) return error.PromptQueuedCannotStartLiveRun;
     try self.checkPrePromptCompaction();
@@ -448,7 +447,7 @@ pub fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
 }
 
 pub fn continueRun(self: *AgentSession) !void {
-    try self.ensureAcceptsContinue();
+    try self.ensureAcceptsIdleCommand();
     try self.agent.continueRun();
 }
 
@@ -484,7 +483,7 @@ pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !ses
 }
 
 pub fn compactWithGeneratedSummary(self: *AgentSession) !session_events.CompactionResult {
-    try self.ensureAcceptsContinue();
+    try self.ensureAcceptsIdleCommand();
     return self.runGeneratedCompaction(.manual, false);
 }
 
@@ -507,14 +506,14 @@ fn runGeneratedCompaction(
 }
 
 pub fn prepareCompactionSnapshot(self: *AgentSession) !session_events.CompactionPreparationSnapshot {
-    try self.ensureAcceptsContinue();
+    try self.ensureAcceptsIdleCommand();
     var preparation = try self.manager.prepareCompaction(self.allocator, self.compaction_settings);
     defer preparation.deinit();
     return session_events.CompactionPreparationSnapshot.init(self.allocator, preparation);
 }
 
 pub fn prepareCompactionSummaryInputSnapshot(self: *AgentSession) !session_events.CompactionSummaryInputSnapshot {
-    try self.ensureAcceptsContinue();
+    try self.ensureAcceptsIdleCommand();
     var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
     defer input.deinit();
     const serialized_input = try input.serialize(self.allocator);
@@ -526,7 +525,7 @@ fn runManualCompaction(
     self: *AgentSession,
     request: ManualCompactionRequest,
 ) !session_events.CompactionResult {
-    try self.ensureAcceptsContinue();
+    try self.ensureAcceptsIdleCommand();
     self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
     return self.applyManualCompactionRequest(request) catch |err| {
         const error_message = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
@@ -628,7 +627,9 @@ pub fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !s
 }
 
 pub fn drainPublicEvent(self: *AgentSession) ?session_events.AgentSessionEvent {
-    return self.public_events.pop();
+    const event = self.public_events.pop() orelse return null;
+    self.event_drain.enqueuePendingPublicEventOverflow();
+    return event;
 }
 
 pub fn publicEventWake(self: *AgentSession) *runtime.ResetEvent {
@@ -666,7 +667,7 @@ fn ensureAcceptsPrompt(self: *AgentSession) Error!void {
     if (self.active_compaction_cancel_source != null) return error.SessionBusy;
 }
 
-fn ensureAcceptsContinue(self: *AgentSession) Error!void {
+fn ensureAcceptsIdleCommand(self: *AgentSession) Error!void {
     self.reconcileLifecycle();
     switch (self.lifecycle) {
         .accepting => {},
@@ -914,7 +915,7 @@ fn buildSystemPromptText(
         .prompt_guidelines = guidelines.items,
         .context_files = prompt_resources.context_files.files,
         .skills = prompt_resources.skills.skills,
-        .custom_prompt = prompt_resources.customPrompt(),
+        .custom_prompt = prompt_resources.systemPromptFileContent(),
         .append_system_prompt = prompt_resources.appendSystemPrompt(),
     });
 }
@@ -931,13 +932,13 @@ fn preparePromptInput(
 }
 
 fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
-    const command = prompt_command.parse(preflight.text) orelse return false;
+    const parsed = prompt_command.parse(preflight.text) orelse return false;
 
-    const command_name = prompt_command.parseName(command) orelse {
-        const unknown_message = try prompt_command.unknownText(self.allocator, command);
+    const command_name = parsed.name orelse {
+        const unknown_message = try prompt_command.unknownText(self.allocator, parsed.text);
         errdefer self.allocator.free(unknown_message);
         try self.emitPromptCommandOwned(
-            command,
+            parsed.text,
             .unknown,
             session_events.EventText.initOwned(self.allocator, unknown_message),
         );
@@ -945,7 +946,7 @@ fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight
     };
 
     switch (command_name) {
-        .help => try self.emitPromptCommand(command, .handled, prompt_command.helpText()),
+        .help => try self.emitPromptCommand(parsed.text, .handled, prompt_command.helpText()),
         .session => {
             const snapshot = self.statusSnapshot();
             const message = try prompt_command.sessionText(self.allocator, .{
@@ -956,7 +957,7 @@ fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight
             });
             errdefer self.allocator.free(message);
             try self.emitPromptCommandOwned(
-                command,
+                parsed.text,
                 .handled,
                 session_events.EventText.initOwned(self.allocator, message),
             );

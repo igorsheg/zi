@@ -166,10 +166,10 @@ test "print mode emits assistant text from injected stream" {
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-27T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainAllPublicEvents(&host);
@@ -208,10 +208,10 @@ test "json print mode streams session header and public events" {
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
-    }, .{
+    }, .{ .create = .{
         .session_id = "session",
         .timestamp = "2026-05-27T00:00:00Z",
-    });
+    } });
     defer {
         host.requestShutdown();
         drainAllPublicEvents(&host);

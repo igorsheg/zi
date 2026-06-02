@@ -47,23 +47,23 @@ pub const SessionListOptions = session_listing.SessionListOptions;
 pub const SessionSelectionOptions = session_listing.SessionSelectionOptions;
 pub const SessionList = session_listing.SessionList;
 
-pub const Runtime = struct {
+pub const RuntimeHostHandle = struct {
     services: RuntimeServices,
     host: AgentSessionRuntimeHost,
 
-    pub fn deinit(self: *Runtime) void {
-        self.host.requestShutdown();
-        drainHostEvents(&self.host);
+    pub fn deinit(self: *RuntimeHostHandle) void {
         self.host.deinit();
         self.services.deinit();
         self.* = undefined;
     }
 };
 
+pub const Runtime = RuntimeHostHandle;
+
 pub fn createRuntimeHost(
     allocator: std.mem.Allocator,
     options: CreateRuntimeHostOptions,
-) !Runtime {
+) !RuntimeHostHandle {
     const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
         agent_dir_override
     else
@@ -102,11 +102,11 @@ pub fn createRuntimeHost(
     );
     errdefer store.deinit(allocator);
 
-    const host = try AgentSessionRuntimeHost.init(allocator, services.io, base, .{
+    const host = try AgentSessionRuntimeHost.init(allocator, services.io, base, .{ .create = .{
         .session_id = options.session_id,
         .timestamp = options.timestamp,
         .session_store = store,
-    });
+    } });
     errdefer {
         var host_copy = host;
         host_copy.requestShutdown();
@@ -123,7 +123,7 @@ pub const selectRuntimeSession = session_listing.selectRuntimeSession;
 pub fn resumeRuntimeHost(
     allocator: std.mem.Allocator,
     options: ResumeRuntimeHostOptions,
-) !Runtime {
+) !RuntimeHostHandle {
     if (!std.mem.eql(u8, std.fs.path.basename(options.session_file_name), options.session_file_name)) {
         return error.InvalidSessionFileName;
     }
@@ -159,11 +159,9 @@ pub fn resumeRuntimeHost(
     errdefer allocator.free(file_name);
     const store: session_store.SessionStore = .{ .dir = options.dir, .file_name = file_name };
 
-    const host = try AgentSessionRuntimeHost.init(allocator, services.io, base, .{
-        .session_id = "resume",
-        .timestamp = "resume",
+    const host = try AgentSessionRuntimeHost.init(allocator, services.io, base, .{ .@"resume" = .{
         .resume_session_store = store,
-    });
+    } });
     errdefer {
         var host_copy = host;
         host_copy.requestShutdown();

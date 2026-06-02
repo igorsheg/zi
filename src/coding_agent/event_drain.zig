@@ -20,6 +20,7 @@ pub const EventDrain = struct {
     public_event_wake: runtime.ResetEvent = .init,
     timestamp: []const u8,
     context_overflow_count: usize = 0,
+    pending_public_event_overflow_count: usize = 0,
 
     pub fn handle(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         try self.updateQueueMirror(event);
@@ -46,7 +47,19 @@ pub const EventDrain = struct {
 
     pub fn enqueuePublicEvent(self: *EventDrain, event: session_events.AgentSessionEvent) void {
         var owned_event = event;
-        if (!self.public_events.pushOrDrop(owned_event)) owned_event.deinit();
+        if (!self.public_events.pushOrDrop(owned_event)) {
+            owned_event.deinit();
+            std.debug.assert(self.pending_public_event_overflow_count < std.math.maxInt(usize));
+            self.pending_public_event_overflow_count += 1;
+        }
+        self.public_event_wake.set();
+    }
+
+    pub fn enqueuePendingPublicEventOverflow(self: *EventDrain) void {
+        if (self.pending_public_event_overflow_count == 0) return;
+        const dropped_count = self.pending_public_event_overflow_count;
+        if (!self.public_events.pushOrDrop(.{ .public_event_overflow = .{ .dropped_count = dropped_count } })) return;
+        self.pending_public_event_overflow_count = 0;
         self.public_event_wake.set();
     }
 

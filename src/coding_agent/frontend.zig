@@ -59,6 +59,7 @@ pub const ReadModel = struct {
             .compaction_end => {},
             .auto_retry_start => {},
             .auto_retry_end => {},
+            .public_event_overflow => {},
         }
     }
 

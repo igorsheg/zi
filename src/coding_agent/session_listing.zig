@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const paths_mod = @import("paths.zig");
-const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 
 pub const SessionListOptions = struct {
     cwd: []const u8 = ".",
@@ -152,15 +151,11 @@ fn runtimeSessionsDir(
         try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
     defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
 
-    var services = try RuntimeServices.init(allocator, .{
+    const paths: paths_mod.PersistencePaths = .{
+        .global_dir = resolved_agent_dir,
         .cwd = options.cwd,
-        .agent_dir = resolved_agent_dir,
-        .dir = options.dir,
-        .environ = options.environ,
-    });
-    defer services.deinit();
-
-    return services.paths().sessionsDirForCwd(allocator);
+    };
+    return paths.sessionsDirForCwd(allocator);
 }
 
 fn isSessionLeafName(file_name: []const u8) bool {

@@ -50,7 +50,7 @@ fn resolveStream(services: *RuntimeServices, explicit: ?ai.StreamFunction, model
 
 fn resolveModel(services: *RuntimeServices, explicit: ?ai.Model) ai.Model {
     if (explicit) |model| return model;
-    if (effectiveModelSettings(services.settings_manager.current())) |settings| {
+    if (modelSelectionFromSettings(services.settings_manager.current())) |settings| {
         if (settings.provider) |provider| {
             if (settings.model) |model_id| {
                 if (services.model_registry.findAvailable(provider, model_id)) |model| return model;
@@ -69,7 +69,7 @@ fn resolveThinkingLevel(
     explicit: ?agent_mod.ThinkingLevel,
 ) agent_mod.ThinkingLevel {
     if (explicit) |level| return level;
-    const settings = effectiveThinkingSettings(snapshot);
+    const settings = thinkingLevelFromSettings(snapshot);
     if (settings.default_thinking_level) |level_text| {
         if (parseThinkingLevel(level_text)) |level| return level;
     }
@@ -81,7 +81,7 @@ const ModelSettings = struct {
     model: ?[]const u8,
 };
 
-fn effectiveModelSettings(snapshot: *const settings_mod.SettingsSnapshot) ?ModelSettings {
+fn modelSelectionFromSettings(snapshot: *const settings_mod.SettingsSnapshot) ?ModelSettings {
     const global = fileSettings(snapshot.global);
     const project = fileSettings(snapshot.project);
     if (project.default_provider != null or project.default_model != null) {
@@ -93,7 +93,7 @@ fn effectiveModelSettings(snapshot: *const settings_mod.SettingsSnapshot) ?Model
     return null;
 }
 
-fn effectiveThinkingSettings(snapshot: *const settings_mod.SettingsSnapshot) settings_mod.Settings {
+fn thinkingLevelFromSettings(snapshot: *const settings_mod.SettingsSnapshot) settings_mod.Settings {
     const global = fileSettings(snapshot.global);
     const project = fileSettings(snapshot.project);
     return .{ .default_thinking_level = project.default_thinking_level orelse global.default_thinking_level };

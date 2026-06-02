@@ -147,6 +147,7 @@ pub const AgentSessionEvent = union(enum) {
     compaction_end: CompactionEnd,
     auto_retry_start: AutoRetryStart,
     auto_retry_end: AutoRetryEnd,
+    public_event_overflow: PublicEventOverflow,
 
     pub const QueueUpdate = struct {
         steering: EventTextList,
@@ -218,6 +219,10 @@ pub const AgentSessionEvent = union(enum) {
         final_error: ?EventText = null,
     };
 
+    pub const PublicEventOverflow = struct {
+        dropped_count: usize,
+    };
+
     pub fn deinit(self: *AgentSessionEvent) void {
         switch (self.*) {
             .agent_event => {},
@@ -232,6 +237,7 @@ pub const AgentSessionEvent = union(enum) {
             .auto_retry_end => |*payload| {
                 if (payload.final_error) |*err| err.deinit();
             },
+            .public_event_overflow => {},
         }
         self.* = undefined;
     }
@@ -292,6 +298,12 @@ pub const AgentSessionEvent = union(enum) {
                 try writeJsonField("success", stringify, payload.success);
                 try writeJsonField("attempt", stringify, payload.attempt);
                 if (payload.final_error) |err| try writeJsonField("finalError", stringify, err);
+                try stringify.endObject();
+            },
+            .public_event_overflow => |payload| {
+                try stringify.beginObject();
+                try writeJsonField("type", stringify, "public_event_overflow");
+                try writeJsonField("droppedCount", stringify, payload.dropped_count);
                 try stringify.endObject();
             },
         }

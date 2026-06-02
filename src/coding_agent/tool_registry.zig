@@ -4,7 +4,7 @@ const tools = @import("tools/root.zig");
 
 pub const max_tool_definitions = 64;
 pub const max_active_tools = 64;
-pub const builtin_tool_count = 7;
+pub const builtin_tool_count = default_active_tool_names.len;
 pub const default_active_tool_names: []const []const u8 = &.{ "read", "ls", "grep", "find", "bash", "edit", "write" };
 
 pub const ToolSource = union(enum) {

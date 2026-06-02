@@ -7,19 +7,21 @@ pub const CommandName = enum {
 
 const commands: []const CommandName = &.{ .help, .session };
 
-pub fn parse(text: []const u8) ?[]const u8 {
+pub const Parsed = struct {
+    text: []const u8,
+    name: ?CommandName,
+};
+
+pub fn parse(text: []const u8) ?Parsed {
     if (text.len < 2 or text[0] != '/') return null;
     var end: usize = 1;
     while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
     if (end == 1) return null;
-    return text[1..end];
-}
-
-pub fn parseName(command: []const u8) ?CommandName {
+    const command = text[1..end];
     for (commands) |name| {
-        if (std.mem.eql(u8, command, @tagName(name))) return name;
+        if (std.mem.eql(u8, command, @tagName(name))) return .{ .text = command, .name = name };
     }
-    return null;
+    return .{ .text = command, .name = null };
 }
 
 pub fn helpText() []const u8 {
@@ -50,16 +52,14 @@ pub fn sessionText(allocator: std.mem.Allocator, info: SessionInfo) ![]const u8 
     );
 }
 
-test "prompt command parser requires slash command name" {
-    try std.testing.expectEqual(@as(?[]const u8, null), parse(""));
-    try std.testing.expectEqual(@as(?[]const u8, null), parse("/"));
-    try std.testing.expectEqual(@as(?[]const u8, null), parse("hello"));
-    try std.testing.expectEqualStrings("help", parse("/help") orelse return error.ExpectedCommand);
-    try std.testing.expectEqualStrings("help", parse("/help now") orelse return error.ExpectedCommand);
-}
-
-test "prompt command names are known commands only" {
-    try std.testing.expectEqual(CommandName.help, parseName("help").?);
-    try std.testing.expectEqual(CommandName.session, parseName("session").?);
-    try std.testing.expectEqual(@as(?CommandName, null), parseName("nope"));
+test "prompt command parser returns text and known name" {
+    try std.testing.expectEqual(@as(?Parsed, null), parse(""));
+    try std.testing.expectEqual(@as(?Parsed, null), parse("/"));
+    try std.testing.expectEqual(@as(?Parsed, null), parse("hello"));
+    const help = parse("/help now") orelse return error.ExpectedCommand;
+    try std.testing.expectEqualStrings("help", help.text);
+    try std.testing.expectEqual(CommandName.help, help.name.?);
+    const unknown = parse("/nope") orelse return error.ExpectedCommand;
+    try std.testing.expectEqualStrings("nope", unknown.text);
+    try std.testing.expectEqual(@as(?CommandName, null), unknown.name);
 }
