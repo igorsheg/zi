@@ -69,11 +69,19 @@ pub const TerminalLoop = struct {
         writer: *std.Io.Writer,
         effects: []app_mod.Effect,
     ) !StepResult {
+        const result = try self.feedBytes(bytes, effects);
+        _ = try self.renderIfDirty(writer);
+        return result;
+    }
+
+    pub fn feedBytes(
+        self: *TerminalLoop,
+        bytes: []const u8,
+        effects: []app_mod.Effect,
+    ) !StepResult {
         const feed = try self.product.feedBytes(bytes, effects);
-        var result = stepResultFromFeed(feed);
-        result.shutdown_requested = containsShutdown(effects[0..feed.effect_count]);
+        const result = stepResultFromFeed(feed, effects[0..feed.effect_count]);
         if (result.shutdown_requested) self.running = false;
-        _ = try self.product.renderIfDirty(writer);
         return result;
     }
 
@@ -83,11 +91,23 @@ pub const TerminalLoop = struct {
         effects: []app_mod.Effect,
     ) !StepResult {
         const feed = try self.product.flushInput(effects);
-        var result = stepResultFromFeed(feed);
+        var result = stepResultFromFeed(feed, effects[0..feed.effect_count]);
         result.shutdown_requested = containsShutdown(effects[0..feed.effect_count]);
         if (result.shutdown_requested) self.running = false;
         _ = try self.product.renderIfDirty(writer);
         return result;
+    }
+
+    pub fn inputFd(self: *const TerminalLoop) std.posix.fd_t {
+        return self.terminal.input_fd;
+    }
+
+    pub fn isDirty(self: *const TerminalLoop) bool {
+        return self.product.app.dirty;
+    }
+
+    pub fn renderIfDirty(self: *TerminalLoop, writer: *std.Io.Writer) !void {
+        _ = try self.product.renderIfDirty(writer);
     }
 
     pub fn resizeFromTerminal(self: *TerminalLoop) !void {
@@ -96,13 +116,14 @@ pub const TerminalLoop = struct {
     }
 };
 
-fn stepResultFromFeed(feed: loop_mod.FeedResult) StepResult {
+fn stepResultFromFeed(feed: loop_mod.FeedResult, effects: []const app_mod.Effect) StepResult {
     return .{
         .input_event_count = feed.input_event_count,
         .effect_count = feed.effect_count,
         .input_overflow = feed.input_overflow,
         .effect_overflow = feed.effect_overflow,
         .truncated = feed.truncated,
+        .shutdown_requested = containsShutdown(effects),
     };
 }
 

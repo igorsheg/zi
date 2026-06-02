@@ -2,6 +2,7 @@ const std = @import("std");
 const runtime = @import("../runtime/root.zig");
 const tui = @import("../tui/root.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
+const AgentSession = @import("AgentSession.zig");
 const sdk = @import("sdk.zig");
 
 pub const Options = struct {
@@ -15,6 +16,152 @@ pub const Options = struct {
 };
 
 const effect_count_max = tui.product.terminal_loop.effects_per_step_max;
+const frame_budget_ns = 33 * std.time.ns_per_ms;
+const input_poll_timeout_ms: i32 = 33;
+const input_reads_per_tick_max = 1;
+const prompt_progress_per_tick_max = 8;
+const public_events_per_tick_max = 16;
+const render_attempts_per_tick_max = 1;
+const shutdown_drain_ticks_max = 30;
+
+fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
+    const last = last_render_ns orelse return true;
+    return now_ns - last >= frame_budget_ns;
+}
+
+const InteractiveLoop = struct {
+    process: runtime.Process,
+    host: *AgentSessionRuntimeHost,
+    terminal_loop: *tui.product.TerminalLoop,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    active_run: ?*AgentSession.LivePromptRun = null,
+    cancel_requested: bool = false,
+    last_render_ns: ?i128 = null,
+    effects: [effect_count_max]tui.product.Effect = undefined,
+
+    fn startPrompt(self: *InteractiveLoop, text: []const u8) !void {
+        if (self.active_run != null) {
+            try self.stderr.writeAll("prompt already running; submit ignored\n");
+            return;
+        }
+        self.active_run = try self.host.startPromptRun(text, &.{}, .{});
+    }
+
+    fn requestShutdown(self: *InteractiveLoop) void {
+        self.terminal_loop.running = false;
+        if (!self.cancel_requested and self.active_run != null) {
+            self.host.cancel();
+            self.cancel_requested = true;
+        }
+    }
+
+    fn tick(self: *InteractiveLoop) !void {
+        try self.pollInputOnce();
+        _ = try self.drainPromptReadyBounded(prompt_progress_per_tick_max);
+        _ = try self.drainPublicEventsBounded(public_events_per_tick_max);
+        if (render_attempts_per_tick_max > 0 and self.terminal_loop.isDirty()) {
+            const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
+            if (frameDue(now_ns, self.last_render_ns)) {
+                try self.terminal_loop.renderIfDirty(self.stdout);
+                self.last_render_ns = now_ns;
+            }
+        }
+    }
+
+    fn pollInputOnce(self: *InteractiveLoop) !void {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.terminal_loop.inputFd(),
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = try std.posix.poll(&fds, input_poll_timeout_ms);
+        if ((fds[0].revents & std.posix.POLL.IN) == 0) return;
+        var reads: usize = 0;
+        while (reads < input_reads_per_tick_max) : (reads += 1) {
+            const read_count = std.posix.read(
+                self.terminal_loop.inputFd(),
+                &self.terminal_loop.read_buffer,
+            ) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => {
+                    try self.stderr.writeAll("terminal read failed; shutting down\n");
+                    self.requestShutdown();
+                    return;
+                },
+            };
+            if (read_count == 0) {
+                self.requestShutdown();
+                return;
+            }
+            const result = try self.terminal_loop.feedBytes(
+                self.terminal_loop.read_buffer[0..read_count],
+                &self.effects,
+            );
+            defer self.deinitEffects(result.effect_count);
+            try self.handleStepResult(result);
+            try self.applyEffects(result.effect_count);
+        }
+    }
+
+    fn handleStepResult(self: *InteractiveLoop, result: tui.product.terminal_loop.StepResult) !void {
+        if (result.input_overflow) try self.stderr.writeAll("terminal input overflow\n");
+        if (result.effect_overflow) try self.stderr.writeAll("terminal effect overflow\n");
+        if (result.truncated) try self.stderr.writeAll("terminal input truncated\n");
+        if (result.shutdown_requested or result.eof) self.requestShutdown();
+    }
+
+    fn applyEffects(self: *InteractiveLoop, count: usize) !void {
+        for (self.effects[0..count]) |effect| {
+            switch (effect) {
+                .submit_text => |text| try self.startPrompt(text),
+                .request_shutdown => self.requestShutdown(),
+            }
+        }
+    }
+
+    fn deinitEffects(self: *InteractiveLoop, count: usize) void {
+        for (self.effects[0..count]) |effect| effect.deinit(self.process.gpa);
+    }
+
+    fn drainPromptReadyBounded(self: *InteractiveLoop, limit: usize) !usize {
+        const prompt_run = self.active_run orelse return 0;
+        var count: usize = 0;
+        while (count < limit) : (count += 1) {
+            const ready = try self.host.drainPromptRunReady(prompt_run) orelse return count;
+            if (!ready) {
+                self.host.destroyPromptRun(prompt_run);
+                self.active_run = null;
+                return count + 1;
+            }
+        }
+        return count;
+    }
+
+    fn drainPublicEventsBounded(self: *InteractiveLoop, limit: usize) !usize {
+        var count: usize = 0;
+        while (count < limit) : (count += 1) {
+            var event = self.host.drainPublicEvent() orelse return count;
+            event.deinit();
+        }
+        return count;
+    }
+
+    fn shutdown(self: *InteractiveLoop) void {
+        if (self.active_run != null and !self.cancel_requested) {
+            self.host.cancel();
+            self.cancel_requested = true;
+        }
+        var ticks: usize = 0;
+        while (self.active_run != null and ticks < shutdown_drain_ticks_max) : (ticks += 1) {
+            _ = self.drainPromptReadyBounded(prompt_progress_per_tick_max) catch break;
+        }
+        if (self.active_run) |prompt_run| {
+            self.host.destroyPromptRun(prompt_run);
+            self.active_run = null;
+        }
+    }
+};
 
 pub fn run(
     process: runtime.Process,
@@ -35,24 +182,20 @@ pub fn run(
     try terminal_loop.setup(stdout);
     defer terminal_loop.shutdown(stdout) catch {};
 
-    if (options.initial_prompt) |prompt| try runPromptBlocking(&host_handle.host, prompt);
-    try drainAndDiscardPublicEvents(&host_handle.host);
+    var loop: InteractiveLoop = .{
+        .process = process,
+        .host = &host_handle.host,
+        .terminal_loop = &terminal_loop,
+        .stdout = stdout,
+        .stderr = stderr,
+    };
+    defer loop.shutdown();
 
-    var effects: [effect_count_max]tui.product.Effect = undefined;
-    _ = try terminal_loop.product.renderIfDirty(stdout);
-    while (terminal_loop.running) {
-        const result = try terminal_loop.stepRead(stdout, &effects);
-        defer for (effects[0..result.effect_count]) |effect| effect.deinit(process.gpa);
+    if (options.initial_prompt) |prompt| try loop.startPrompt(prompt);
+    _ = try loop.drainPublicEventsBounded(public_events_per_tick_max);
+    try terminal_loop.renderIfDirty(stdout);
 
-        for (effects[0..result.effect_count]) |effect| {
-            switch (effect) {
-                .submit_text => |text| try runPromptBlocking(&host_handle.host, text),
-                .request_shutdown => terminal_loop.running = false,
-            }
-        }
-        try drainAndDiscardPublicEvents(&host_handle.host);
-        if (result.eof) terminal_loop.running = false;
-    }
+    while (terminal_loop.running) try loop.tick();
 }
 
 fn createHost(
@@ -132,15 +275,37 @@ fn selectResumeSession(
     return selected;
 }
 
-fn runPromptBlocking(host: *AgentSessionRuntimeHost, text: []const u8) !void {
-    const run_handle = try host.startPromptRun(text, &.{}, .{});
-    defer host.destroyPromptRun(run_handle);
-    while (try host.stepPromptRun(run_handle)) {}
+test "interactive overflow status is explicit" {
+    var err_storage: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&err_storage);
+    var loop: InteractiveLoop = undefined;
+    loop.stderr = &stderr;
+
+    try loop.handleStepResult(.{
+        .input_overflow = true,
+        .effect_overflow = true,
+        .truncated = true,
+    });
+
+    const written = err_storage[0..stderr.end];
+    try std.testing.expect(std.mem.indexOf(u8, written, "terminal input overflow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "terminal effect overflow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "terminal input truncated") != null);
 }
 
-fn drainAndDiscardPublicEvents(host: *AgentSessionRuntimeHost) !void {
-    while (host.drainPublicEvent()) |event| {
-        var owned = event;
-        owned.deinit();
-    }
+test "interactive frame due enforces thirty fps cadence" {
+    try std.testing.expect(frameDue(1000, null));
+    try std.testing.expect(!frameDue(1000 + frame_budget_ns - 1, 1000));
+    try std.testing.expect(frameDue(1000 + frame_budget_ns, 1000));
+    try std.testing.expect(frameDue(1000 + frame_budget_ns + 1, 1000));
+}
+
+test "interactive loop bounds stay responsive" {
+    try std.testing.expect(frame_budget_ns <= 33 * std.time.ns_per_ms);
+    try std.testing.expect(input_poll_timeout_ms <= 33);
+    try std.testing.expectEqual(@as(usize, 1), input_reads_per_tick_max);
+    try std.testing.expectEqual(@as(usize, 8), prompt_progress_per_tick_max);
+    try std.testing.expectEqual(@as(usize, 16), public_events_per_tick_max);
+    try std.testing.expectEqual(@as(usize, 1), render_attempts_per_tick_max);
+    try std.testing.expectEqual(@as(usize, 30), shutdown_drain_ticks_max);
 }
