@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const faux = @import("../ai/providers/faux.zig");
@@ -231,7 +230,7 @@ pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?session_events.AgentSes
     return self.session.drainPublicEvent();
 }
 
-pub fn publicEventWake(self: *AgentSessionRuntimeHost) *zio.ResetEvent {
+pub fn publicEventWake(self: *AgentSessionRuntimeHost) *runtime.ResetEvent {
     return self.session.publicEventWake();
 }
 
@@ -427,7 +426,7 @@ fn waitForBashToolStart(host: *AgentSessionRuntimeHost, observed: *BashLimitObse
     for (0..yield_count_max) |_| {
         _ = try host.drainPublicEvents(.{ .context = observed, .call_fn = BashLimitObservation.onEvent });
         if (observed.tool_execution_start) return;
-        try zio.yield();
+        try runtime.yield();
     }
     return error.BashToolStartNotObserved;
 }
@@ -984,7 +983,7 @@ test "runtime host applies prompt progress from zio stream future" {
     defer host.destroyPromptRun(run);
 
     var progress = host.promptRunProgress(run);
-    const selected = try zio.select(.{ .prompt = &progress });
+    const selected = try runtime.select(.{ .prompt = &progress });
     const more = try host.applyPromptRunProgress(run, selected.prompt);
     try std.testing.expect(more);
 

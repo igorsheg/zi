@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
@@ -231,7 +230,7 @@ const EventDrain = struct {
     store: ?*session_store.SessionStore,
     queue_mirror: *QueueMirror,
     public_events: *PublicEventQueue,
-    public_event_wake: zio.ResetEvent = .init,
+    public_event_wake: runtime.ResetEvent = .init,
     timestamp: []const u8,
     context_overflow_count: usize = 0,
 
@@ -796,7 +795,7 @@ pub fn drainPublicEvent(self: *AgentSession) ?session_events.AgentSessionEvent {
     return self.public_events.pop();
 }
 
-pub fn publicEventWake(self: *AgentSession) *zio.ResetEvent {
+pub fn publicEventWake(self: *AgentSession) *runtime.ResetEvent {
     return &self.event_drain.public_event_wake;
 }
 

@@ -1,6 +1,5 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const zio = @import("zio");
 
 const ai = @import("../ai/root.zig");
 const agent_mod = @import("../agent/root.zig");
@@ -67,7 +66,7 @@ pub const OwnerLoop = struct {
         if (self.active_run) |prompt_run| {
             var terminal_receive = self.terminal_events.asyncNext();
             const prompt_progress = self.host.promptRunProgress(prompt_run);
-            const selected = try zio.select(.{
+            const selected = try runtime.select(.{
                 .terminal = &terminal_receive,
                 .prompt = prompt_progress,
                 .host_event = self.host.publicEventWake(),
@@ -81,7 +80,7 @@ pub const OwnerLoop = struct {
             }
         } else {
             var terminal_receive = self.terminal_events.asyncNext();
-            const selected = try zio.select(.{
+            const selected = try runtime.select(.{
                 .terminal = &terminal_receive,
                 .host_event = self.host.publicEventWake(),
             });

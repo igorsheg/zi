@@ -1,19 +1,17 @@
 const std = @import("std");
-const zio = @import("zio");
-
 const runtime = @import("../../runtime/root.zig");
 const terminal = @import("terminal.zig");
 
 pub const TerminalEvents = struct {
     pub const capacity_count = 512;
 
-    const Channel = zio.Channel(terminal.Event);
+    const Channel = runtime.Channel(terminal.Event);
     const ChannelReceive = @TypeOf(@as(*Channel, undefined).asyncReceive());
 
     loop: *terminal.EventLoop,
     buffer: [capacity_count]terminal.Event = undefined,
     channel: Channel = undefined,
-    pump: zio.JoinHandle(anyerror!void),
+    pump: runtime.JoinHandle(anyerror!void),
     loop_started: bool = false,
 
     pub fn init(
@@ -123,6 +121,6 @@ test "terminal events bridge forwards vaxis queue events through zio channel" {
     try loop.postEvent(.focus_in);
 
     const receive = terminal_events.asyncNext();
-    const selected = try zio.select(.{ .terminal = receive });
+    const selected = try runtime.select(.{ .terminal = receive });
     try std.testing.expectEqual(terminal.Event.focus_in, selected.terminal.?);
 }

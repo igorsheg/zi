@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const agent = @import("root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
@@ -25,7 +24,7 @@ pub const AgentEventStream = struct {
     producer: Producer = .settled,
 
     const Producer = union(enum) {
-        running: zio.JoinHandle(anyerror!void),
+        running: runtime.JoinHandle(anyerror!void),
         spawn_failed: anyerror,
         settled,
     };
@@ -683,15 +682,15 @@ const ToolWorkerEvent = union(enum) {
     };
 };
 
-const ToolWorkerChannel = zio.Channel(ToolWorkerEvent);
+const ToolWorkerChannel = runtime.Channel(ToolWorkerEvent);
 const tool_worker_event_capacity_count = agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch;
 
-// zio.Group only reports aggregate completion/failure. The agent loop needs a
-// fixed, source-indexed result slot for each prepared tool call so finalization
-// remains deterministic even when workers complete out of order.
+// Runtime task groups only report aggregate completion/failure. The agent loop
+// needs a fixed, source-indexed result slot for each prepared tool call so
+// finalization remains deterministic even when workers complete out of order.
 const ToolWorkerGroup = struct {
     zio_runtime: *runtime.Runtime,
-    handles: [agent.max_tool_calls_per_turn]zio.JoinHandle(anyerror!void) = undefined,
+    handles: [agent.max_tool_calls_per_turn]runtime.JoinHandle(anyerror!void) = undefined,
     started: usize = 0,
     state: State = .idle,
 
@@ -1600,9 +1599,9 @@ fn sleepingTool(
     _: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
 ) anyerror!agent.ToolExecutionResult {
-    const entered: *zio.ResetEvent = @ptrCast(@alignCast(context.?));
+    const entered: *runtime.ResetEvent = @ptrCast(@alignCast(context.?));
     entered.set();
-    try zio.sleep(.fromSeconds(60));
+    try runtime.sleep(.fromSeconds(60));
     return error.TestUnexpectedResult;
 }
 
@@ -1738,7 +1737,7 @@ test "prompt stream cancellation while tool is running drains as canceled" {
     defer cancel.deinit();
     const prompt = userMessage("hello");
     var stream_calls: usize = 0;
-    var entered: zio.ResetEvent = .init;
+    var entered: runtime.ResetEvent = .init;
     const tool: agent.AgentTool = .{
         .name = "echo",
         .description = "Echo",

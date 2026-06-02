@@ -28,7 +28,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zi", .module = zi },
-                .{ .name = "zio", .module = zio_dep.module("zio") },
             },
         }),
     });

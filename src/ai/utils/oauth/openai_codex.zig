@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const http_utils = @import("../http.zig");
 const runtime = @import("../../../runtime/root.zig");
 const oauth = @import("root.zig");
@@ -246,7 +245,7 @@ const LoginCodeTaskState = enum {
 };
 
 const LoginCodeTask = struct {
-    handle: zio.JoinHandle(LoginCodeResult),
+    handle: runtime.JoinHandle(LoginCodeResult),
     state: LoginCodeTaskState = .active,
 
     fn cancelAndDiscard(self: *LoginCodeTask, allocator: std.mem.Allocator) void {
@@ -283,7 +282,7 @@ fn raceLoginCode(
     };
     errdefer manual.cancelAndDiscard(allocator);
 
-    switch (try zio.select(.{
+    switch (try runtime.select(.{
         .callback = &callback.handle,
         .manual = &manual.handle,
     })) {
@@ -681,12 +680,12 @@ fn unavailableManualInput(context: ?*anyopaque) ![]const u8 {
 fn delayedManualInput(context: ?*anyopaque) ![]const u8 {
     const state: *LoginRaceTestState = @ptrCast(@alignCast(context.?));
     _ = state.manual_count.fetchAdd(1, .monotonic);
-    try zio.sleep(.fromMilliseconds(250));
+    try runtime.sleep(.fromMilliseconds(250));
     return state.manual_input;
 }
 
 fn sendCallbackRequest(io: std.Io, state: []const u8, code: []const u8) !void {
-    try zio.sleep(.fromMilliseconds(10));
+    try runtime.sleep(.fromMilliseconds(10));
     const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(callback_port) };
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
     defer stream.close(io);

@@ -2,6 +2,31 @@ const zio = @import("zio");
 
 pub const Process = @import("Process.zig").Process;
 pub const Runtime = zio.Runtime;
+pub const ResetEvent = zio.ResetEvent;
+pub const Duration = zio.Duration;
+pub const Timeout = zio.Timeout;
+pub const Pipe = zio.Pipe;
+pub const Cancelable = zio.Cancelable;
+
+pub fn Channel(comptime Event: type) type {
+    return zio.Channel(Event);
+}
+
+pub fn JoinHandle(comptime Result: type) type {
+    return zio.JoinHandle(Result);
+}
+
+pub fn select(args: anytype) @TypeOf(zio.select(args)) {
+    return zio.select(args);
+}
+
+pub fn sleep(duration: Duration) Cancelable!void {
+    return zio.sleep(duration);
+}
+
+pub fn yield() Cancelable!void {
+    return zio.yield();
+}
 
 const bounded_queue = @import("bounded_queue.zig");
 const cancel = @import("cancel.zig");
