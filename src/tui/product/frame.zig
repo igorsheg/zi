@@ -3,14 +3,10 @@ const infra = @import("../infra/root.zig");
 const primitive = @import("../primitive/root.zig");
 const app_mod = @import("App.zig");
 const transcript_mod = @import("transcript.zig");
+const transcript_projection = @import("transcript_projection.zig");
 
 pub const size_cells_max: usize = 500_000;
 const transcript_visual_rows_max: usize = 512;
-
-const TranscriptRenderItem = struct {
-    prefix: []const u8,
-    text: []const u8,
-};
 
 const TranscriptVisualRow = struct {
     prefix: []const u8,
@@ -57,7 +53,10 @@ pub fn transcriptVisibleRows(height: u16) usize {
 pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
     if (width == 0 or visible_rows == 0) return 0;
     var total_rows: usize = 0;
-    for (transcript.items.items) |item| total_rows += countWrappedTranscriptRows(renderItem(item), width);
+    for (transcript.items.items) |item| {
+        total_rows += countWrappedTranscriptRows(transcript_projection.itemPrimary(item), width);
+        total_rows += countOmissionRows(item, width);
+    }
     return if (total_rows > visible_rows) total_rows - visible_rows else 0;
 }
 
@@ -71,8 +70,9 @@ fn drawTranscript(app: anytype, renderer: *infra.Renderer, style: primitive.Styl
     var line_index = app.transcript.items.items.len;
     while (line_index > 0 and row_count < row_limit) {
         line_index -= 1;
-        const item = renderItem(app.transcript.items.items[line_index]);
-        const line_rows = countWrappedTranscriptRows(item, app.width);
+        const item = app.transcript.items.items[line_index];
+        const projected = transcript_projection.itemPrimary(item);
+        const line_rows = countWrappedTranscriptRows(projected, app.width) + countOmissionRows(item, app.width);
         if (skipped_rows + line_rows <= app.transcript_scroll_rows) {
             skipped_rows += line_rows;
             continue;
@@ -81,10 +81,20 @@ fn drawTranscript(app: anytype, renderer: *infra.Renderer, style: primitive.Styl
             &rows,
             &row_count,
             row_limit,
-            item,
+            projected,
             app.width,
             app.transcript_scroll_rows - skipped_rows,
         );
+        if (item == .tool and row_count < row_limit) {
+            appendToolOmissionNotice(
+                &rows,
+                &row_count,
+                row_limit,
+                item.tool,
+                app.width,
+                app.transcript_scroll_rows - skipped_rows,
+            );
+        }
         skipped_rows = app.transcript_scroll_rows;
     }
 
@@ -109,7 +119,7 @@ fn appendWrappedTranscriptLine(
     rows: *[transcript_visual_rows_max]TranscriptVisualRow,
     row_count: *usize,
     row_limit: usize,
-    item: TranscriptRenderItem,
+    item: transcript_projection.RenderItem,
     frame_width: u16,
     skip_newest_rows: usize,
 ) void {
@@ -125,7 +135,7 @@ fn appendWrappedTranscriptLine(
     }
 }
 
-fn countWrappedTranscriptRows(item: TranscriptRenderItem, frame_width: u16) usize {
+fn countWrappedTranscriptRows(item: transcript_projection.RenderItem, frame_width: u16) usize {
     const prefix_width: u16 = @intCast(@min(primitive.text.displayWidth(item.prefix), frame_width));
     var line_rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
     return collectWrappedTranscriptLine(&line_rows, item, frame_width, prefix_width);
@@ -133,7 +143,7 @@ fn countWrappedTranscriptRows(item: TranscriptRenderItem, frame_width: u16) usiz
 
 fn collectWrappedTranscriptLine(
     line_rows: *[transcript_visual_rows_max]TranscriptVisualRow,
-    item: TranscriptRenderItem,
+    item: transcript_projection.RenderItem,
     frame_width: u16,
     prefix_width: u16,
 ) usize {
@@ -164,42 +174,31 @@ fn collectWrappedTranscriptLine(
     return line_row_count;
 }
 
-fn renderItem(item: transcript_mod.TranscriptItem) TranscriptRenderItem {
-    return switch (item) {
-        .message => |message| .{ .prefix = rolePrefix(message.role), .text = message.text },
-        .status => |status| .{ .prefix = statusPrefix(status.level), .text = status.text },
-        .tool => |tool| .{ .prefix = toolPrefix(tool.status), .text = toolText(tool) },
-    };
+fn countOmissionRows(item: transcript_mod.TranscriptItem, frame_width: u16) usize {
+    if (item != .tool) return 0;
+    var buffer: [96]u8 = undefined;
+    const notice = transcript_projection.toolOmissionNotice(item.tool, &buffer) orelse return 0;
+    return countWrappedTranscriptRows(.{ .prefix = "", .text = notice }, frame_width);
 }
 
-fn rolePrefix(role: transcript_mod.TranscriptRole) []const u8 {
-    return switch (role) {
-        .user => "user: ",
-        .assistant => "assistant: ",
-        .system => "system: ",
-    };
-}
-
-fn statusPrefix(level: transcript_mod.TranscriptStatusLevel) []const u8 {
-    return switch (level) {
-        .info => "status: ",
-        .warning => "warning: ",
-        .err => "error: ",
-    };
-}
-
-fn toolText(tool: transcript_mod.TranscriptTool) []const u8 {
-    if (tool.output_preview.len > 0) return tool.output_preview;
-    if (tool.subject.len > 0) return tool.subject;
-    return tool.name;
-}
-
-fn toolPrefix(status: transcript_mod.TranscriptToolStatus) []const u8 {
-    return switch (status) {
-        .started => "tool started: ",
-        .completed => "tool completed: ",
-        .failed => "tool failed: ",
-    };
+fn appendToolOmissionNotice(
+    rows: *[transcript_visual_rows_max]TranscriptVisualRow,
+    row_count: *usize,
+    row_limit: usize,
+    tool: transcript_mod.TranscriptTool,
+    frame_width: u16,
+    skip_newest_rows: usize,
+) void {
+    var buffer: [96]u8 = undefined;
+    const notice = transcript_projection.toolOmissionNotice(tool, &buffer) orelse return;
+    appendWrappedTranscriptLine(
+        rows,
+        row_count,
+        row_limit,
+        .{ .prefix = "", .text = notice },
+        frame_width,
+        skip_newest_rows,
+    );
 }
 
 pub fn checkSize(width: u16, height: u16) !void {

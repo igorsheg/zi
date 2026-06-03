@@ -13,6 +13,38 @@ pub const RunOptions = struct {
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
     cancel_token: ?cancel.CancelToken = null,
+    on_output: ?OutputObserver = null,
+};
+
+pub const OutputStream = enum { stdout, stderr };
+
+pub const OutputObserver = struct {
+    context: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, OutputStream, []const u8) anyerror!void,
+
+    pub fn call(self: OutputObserver, stream: OutputStream, bytes: []const u8) anyerror!void {
+        try self.call_fn(self.context, stream, bytes);
+    }
+};
+
+const output_chunk_bytes_max = 4096;
+const output_chunk_queue_capacity = 64;
+
+const OutputChunk = struct {
+    stream: OutputStream,
+    bytes: [output_chunk_bytes_max]u8 = undefined,
+    len: usize = 0,
+
+    fn init(stream: OutputStream, data: []const u8) OutputChunk {
+        std.debug.assert(data.len <= output_chunk_bytes_max);
+        var result: OutputChunk = .{ .stream = stream, .len = data.len };
+        @memcpy(result.bytes[0..data.len], data);
+        return result;
+    }
+
+    fn slice(self: *const OutputChunk) []const u8 {
+        return self.bytes[0..self.len];
+    }
 };
 
 const OutputBuffer = struct {
@@ -65,6 +97,9 @@ pub fn run(
     child.stderr = null;
 
     var output_fault: zio.ResetEvent = .init;
+    var output_chunks_storage: [output_chunk_queue_capacity]OutputChunk = undefined;
+    var output_chunks = zio.Channel(OutputChunk).init(&output_chunks_storage);
+    defer output_chunks.close(.immediate);
 
     var stdout_buffer: OutputBuffer = .{
         .bytes = ByteBuilder.initBounded(allocator, options.max_stdout_bytes),
@@ -80,11 +115,15 @@ pub fn run(
     var stdout_reader = try zio_runtime.spawn(readPipeToBuffer, .{
         zio.Pipe.fromFd(stdout_file.handle),
         &stdout_buffer,
+        OutputStream.stdout,
+        &output_chunks,
     });
     defer stdout_reader.cancel();
     var stderr_reader = try zio_runtime.spawn(readPipeToBuffer, .{
         zio.Pipe.fromFd(stderr_file.handle),
         &stderr_buffer,
+        OutputStream.stderr,
+        &output_chunks,
     });
     defer stderr_reader.cancel();
 
@@ -113,90 +152,112 @@ pub fn run(
     const term = if (options.cancel_token) |cancel_token| blk: {
         var cancel_wait = try zio_runtime.spawn(waitForCancel, .{cancel_token});
         defer cancel_wait.cancel();
-        break :blk switch (try zio.select(.{
-            .process = &process_wait,
-            .timeout = &timeout_wait,
-            .cancel = &cancel_wait,
-            .output_fault = &output_fault,
-        })) {
-            .process => |result| try completeProcessWait(result, &process_wait_state),
-            .timeout => {
-                try terminateAndDrainProcess(
-                    zio_runtime,
-                    &child,
-                    &process_wait,
-                    options.termination_grace_ms,
-                    &process_wait_state,
-                    &stdout_reader,
-                    &stderr_reader,
-                );
-                return error.Timeout;
-            },
-            .cancel => |result| {
-                result catch |err| switch (err) {
-                    error.OperationCancelled => {
-                        try terminateAndDrainProcess(
-                            zio_runtime,
-                            &child,
-                            &process_wait,
-                            options.termination_grace_ms,
-                            &process_wait_state,
-                            &stdout_reader,
-                            &stderr_reader,
-                        );
-                        return error.OperationCancelled;
-                    },
-                    error.Canceled => return error.Canceled,
-                };
-                unreachable;
-            },
-            .output_fault => {
-                try terminateAndDrainProcess(
-                    zio_runtime,
-                    &child,
-                    &process_wait,
-                    options.termination_grace_ms,
-                    &process_wait_state,
-                    &stdout_reader,
-                    &stderr_reader,
-                );
-                if (stdout_buffer.err) |err| return err;
-                if (stderr_buffer.err) |err| return err;
-                return error.StreamTooLong;
-            },
-        };
-    } else switch (try zio.select(.{
-        .process = &process_wait,
-        .timeout = &timeout_wait,
-        .output_fault = &output_fault,
-    })) {
-        .process => |result| try completeProcessWait(result, &process_wait_state),
-        .timeout => {
-            try terminateAndDrainProcess(
-                zio_runtime,
-                &child,
-                &process_wait,
-                options.termination_grace_ms,
-                &process_wait_state,
-                &stdout_reader,
-                &stderr_reader,
-            );
-            return error.Timeout;
-        },
-        .output_fault => {
-            try terminateAndDrainProcess(
-                zio_runtime,
-                &child,
-                &process_wait,
-                options.termination_grace_ms,
-                &process_wait_state,
-                &stdout_reader,
-                &stderr_reader,
-            );
-            if (stdout_buffer.err) |err| return err;
-            if (stderr_buffer.err) |err| return err;
-            return error.StreamTooLong;
-        },
+        while (true) {
+            const output_receive = output_chunks.asyncReceive();
+            switch (try zio.select(.{
+                .process = &process_wait,
+                .timeout = &timeout_wait,
+                .cancel = &cancel_wait,
+                .output_fault = &output_fault,
+                .output = output_receive,
+            })) {
+                .process => |result| break :blk try completeProcessWait(result, &process_wait_state),
+                .timeout => {
+                    try terminateAndDrainProcess(
+                        zio_runtime,
+                        &child,
+                        &process_wait,
+                        options.termination_grace_ms,
+                        &process_wait_state,
+                        &stdout_reader,
+                        &stderr_reader,
+                    );
+                    return error.Timeout;
+                },
+                .cancel => |result| {
+                    result catch |err| switch (err) {
+                        error.OperationCancelled => {
+                            try terminateAndDrainProcess(
+                                zio_runtime,
+                                &child,
+                                &process_wait,
+                                options.termination_grace_ms,
+                                &process_wait_state,
+                                &stdout_reader,
+                                &stderr_reader,
+                            );
+                            return error.OperationCancelled;
+                        },
+                        error.Canceled => return error.Canceled,
+                    };
+                    unreachable;
+                },
+                .output_fault => {
+                    try terminateAndDrainProcess(
+                        zio_runtime,
+                        &child,
+                        &process_wait,
+                        options.termination_grace_ms,
+                        &process_wait_state,
+                        &stdout_reader,
+                        &stderr_reader,
+                    );
+                    if (stdout_buffer.err) |err| return err;
+                    if (stderr_buffer.err) |err| return err;
+                    return error.StreamTooLong;
+                },
+                .output => |result| {
+                    const chunk = result catch |err| switch (err) {
+                        error.ChannelClosed => continue,
+                    };
+                    if (options.on_output) |observer| try observer.call(chunk.stream, chunk.slice());
+                },
+            }
+        }
+    } else blk: {
+        while (true) {
+            const output_receive = output_chunks.asyncReceive();
+            switch (try zio.select(.{
+                .process = &process_wait,
+                .timeout = &timeout_wait,
+                .output_fault = &output_fault,
+                .output = output_receive,
+            })) {
+                .process => |result| break :blk try completeProcessWait(result, &process_wait_state),
+                .timeout => {
+                    try terminateAndDrainProcess(
+                        zio_runtime,
+                        &child,
+                        &process_wait,
+                        options.termination_grace_ms,
+                        &process_wait_state,
+                        &stdout_reader,
+                        &stderr_reader,
+                    );
+                    return error.Timeout;
+                },
+                .output_fault => {
+                    try terminateAndDrainProcess(
+                        zio_runtime,
+                        &child,
+                        &process_wait,
+                        options.termination_grace_ms,
+                        &process_wait_state,
+                        &stdout_reader,
+                        &stderr_reader,
+                    );
+                    if (stdout_buffer.err) |err| return err;
+                    if (stderr_buffer.err) |err| return err;
+                    return error.StreamTooLong;
+                },
+                .output => |result| {
+                    const chunk = result catch |err| switch (err) {
+                        error.ChannelClosed => continue,
+                    };
+                    if (options.on_output) |observer| try observer.call(chunk.stream, chunk.slice());
+                },
+            }
+        }
     };
 
     stdout_reader.join();
@@ -291,7 +352,12 @@ fn requestChildTermination(process_id: ?std.process.Child.Id, mode: TerminationM
     }
 }
 
-fn readPipeToBuffer(pipe: zio.Pipe, output: *OutputBuffer) void {
+fn readPipeToBuffer(
+    pipe: zio.Pipe,
+    output: *OutputBuffer,
+    stream: OutputStream,
+    chunks: *zio.Channel(OutputChunk),
+) void {
     defer pipe.close();
     var buffer: [4096]u8 = undefined;
     while (true) {
@@ -314,6 +380,7 @@ fn readPipeToBuffer(pipe: zio.Pipe, output: *OutputBuffer) void {
                 return;
             },
         };
+        chunks.send(OutputChunk.init(stream, buffer[0..count])) catch return;
     }
 }
 

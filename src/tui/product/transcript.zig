@@ -1,10 +1,10 @@
 const std = @import("std");
+const transcript_preview = @import("transcript_preview.zig");
 
 pub const item_count_max: usize = 200;
 pub const line_count_max: usize = item_count_max;
 pub const total_size_bytes_max: usize = 64 * 1024;
 pub const append_size_bytes_max: usize = 8 * 1024;
-pub const tool_output_preview_bytes_max: usize = 12 * 1024;
 
 pub const TranscriptRole = enum { user, assistant, system };
 pub const TranscriptStatusLevel = enum { info, warning, err };
@@ -45,6 +45,7 @@ pub const TranscriptTool = struct {
     subject: []u8,
     output_preview: []u8,
     output_truncated_head_bytes: usize = 0,
+    output_truncated_head_lines: usize = 0,
 
     pub fn sizeBytes(self: TranscriptTool) usize {
         return self.tool_call_id.len + self.name.len + self.summary.len + self.subject.len + self.output_preview.len;
@@ -111,11 +112,12 @@ pub const TranscriptBuffer = struct {
         const index = self.findTool(tool_call_id) orelse return;
         const tool = &self.items.items[index].tool;
         const old_size = tool.sizeBytes();
-        const next = try appendTailBounded(allocator, tool.output_preview, output_delta, tool_output_preview_bytes_max);
+        const next = try transcript_preview.appendTail(allocator, tool.output_preview, output_delta);
         errdefer allocator.free(next.bytes);
         allocator.free(tool.output_preview);
         tool.output_preview = next.bytes;
         tool.output_truncated_head_bytes += next.dropped_bytes;
+        tool.output_truncated_head_lines += next.dropped_lines;
         const next_size = tool.sizeBytes();
         self.total_size_bytes = self.total_size_bytes - old_size + next_size;
         self.evictUntilBounded(allocator);
@@ -217,6 +219,7 @@ pub const TranscriptBuffer = struct {
                 .subject = next_subject,
                 .output_preview = old.output_preview,
                 .output_truncated_head_bytes = old.output_truncated_head_bytes,
+                .output_truncated_head_lines = old.output_truncated_head_lines,
             };
             self.total_size_bytes = self.total_size_bytes - old_size + next_size;
             return;
@@ -253,30 +256,6 @@ pub const TranscriptBuffer = struct {
         }
     }
 };
-
-const TailAppendResult = struct {
-    bytes: []u8,
-    dropped_bytes: usize,
-};
-
-fn appendTailBounded(
-    allocator: std.mem.Allocator,
-    old: []const u8,
-    delta: []const u8,
-    max_bytes: usize,
-) !TailAppendResult {
-    const combined_len = old.len + delta.len;
-    const keep_len = @min(combined_len, max_bytes);
-    const combined_drop = combined_len - keep_len;
-    const delta_start = if (combined_drop > old.len) combined_drop - old.len else 0;
-    const old_start = if (combined_drop < old.len) combined_drop else old.len;
-    const old_keep = old[old_start..];
-    const delta_keep = delta[delta_start..];
-    const bytes = try allocator.alloc(u8, old_keep.len + delta_keep.len);
-    @memcpy(bytes[0..old_keep.len], old_keep);
-    @memcpy(bytes[old_keep.len..], delta_keep);
-    return .{ .bytes = bytes, .dropped_bytes = combined_drop };
-}
 
 test "transcript owns copied message text and accepts empty append" {
     var buffer: TranscriptBuffer = .{};

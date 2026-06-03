@@ -3,6 +3,8 @@ pub const composer = @import("composer.zig");
 pub const frame = @import("frame.zig");
 pub const keys = @import("keys.zig");
 pub const transcript = @import("transcript.zig");
+pub const transcript_preview = @import("transcript_preview.zig");
+pub const transcript_projection = @import("transcript_projection.zig");
 pub const loop = @import("loop.zig");
 pub const terminal_loop = @import("terminal_loop.zig");
 pub const vscreen_harness = @import("vscreen_harness.zig");
@@ -22,6 +24,8 @@ test {
     _ = frame;
     _ = keys;
     _ = transcript;
+    _ = transcript_preview;
+    _ = transcript_projection;
     _ = loop;
     _ = terminal_loop;
     _ = vscreen_harness;

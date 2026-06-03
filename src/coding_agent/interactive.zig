@@ -27,6 +27,9 @@ const prompt_progress_per_tick_max = 8;
 const public_events_per_tick_max = 16;
 const render_attempts_per_tick_max = 1;
 const shutdown_drain_ticks_max = 30;
+const pending_tool_outputs_max = 32;
+const pending_tool_id_bytes_max = 128;
+const pending_tool_output_bytes_max = tool_output_policy.tool_update_bytes_max;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     const last = last_render_ns orelse return true;
@@ -156,6 +159,45 @@ fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjec
     };
 }
 
+const PendingToolOutput = struct {
+    tool_call_id: [pending_tool_id_bytes_max]u8 = undefined,
+    tool_call_id_len: usize = 0,
+    text: [pending_tool_output_bytes_max]u8 = undefined,
+    text_len: usize = 0,
+
+    fn id(self: *const PendingToolOutput) []const u8 {
+        return self.tool_call_id[0..self.tool_call_id_len];
+    }
+
+    fn body(self: *const PendingToolOutput) []const u8 {
+        return self.text[0..self.text_len];
+    }
+
+    fn init(tool_call_id: []const u8, text: []const u8) PendingToolOutput {
+        var result: PendingToolOutput = .{};
+        result.tool_call_id_len = @min(tool_call_id.len, pending_tool_id_bytes_max);
+        @memcpy(result.tool_call_id[0..result.tool_call_id_len], tool_call_id[0..result.tool_call_id_len]);
+        result.append(text);
+        return result;
+    }
+
+    fn append(self: *PendingToolOutput, text: []const u8) void {
+        const keep = @min(text.len, pending_tool_output_bytes_max);
+        const source = text[text.len - keep ..];
+        if (self.text_len + source.len <= pending_tool_output_bytes_max) {
+            @memcpy(self.text[self.text_len .. self.text_len + source.len], source);
+            self.text_len += source.len;
+            return;
+        }
+        var overflow = self.text_len + source.len - pending_tool_output_bytes_max;
+        while (overflow < self.text_len and (self.text[overflow] & 0xc0) == 0x80) : (overflow += 1) {}
+        @memmove(self.text[0 .. self.text_len - overflow], self.text[overflow..self.text_len]);
+        self.text_len -= overflow;
+        @memcpy(self.text[self.text_len .. self.text_len + source.len], source);
+        self.text_len += source.len;
+    }
+};
+
 const InteractiveLoop = struct {
     process: runtime.Process,
     host: *AgentSessionRuntimeHost,
@@ -166,6 +208,8 @@ const InteractiveLoop = struct {
     cancel_requested: bool = false,
     last_render_ns: ?i128 = null,
     effects: [effect_count_max]tui.product.Effect = undefined,
+    pending_tool_outputs: [pending_tool_outputs_max]PendingToolOutput = undefined,
+    pending_tool_output_count: usize = 0,
 
     fn startPrompt(self: *InteractiveLoop, text: []const u8) !bool {
         if (self.active_run != null) {
@@ -274,10 +318,14 @@ const InteractiveLoop = struct {
     fn drainPublicEventsBounded(self: *InteractiveLoop, limit: usize) !usize {
         var count: usize = 0;
         while (count < limit) : (count += 1) {
-            var event = self.host.drainPublicEvent() orelse return count;
+            var event = self.host.drainPublicEvent() orelse {
+                try self.flushToolOutputCoalescer();
+                return count;
+            };
             defer event.deinit();
             try self.applyPublicEventTranscript(event);
         }
+        try self.flushToolOutputCoalescer();
         return count;
     }
 
@@ -288,10 +336,34 @@ const InteractiveLoop = struct {
     fn applyTranscriptProjection(self: *InteractiveLoop, projection: TranscriptProjection) !void {
         switch (projection) {
             .append => |append| try self.appendTranscript(append),
-            .tool_output_delta => |delta| _ = try self.terminal_loop.applyCommand(.{
-                .tool_output_delta = .{ .tool_call_id = delta.tool_call_id, .text = delta.text },
-            }),
+            .tool_output_delta => |delta| try self.queueToolOutput(delta.tool_call_id, delta.text),
         }
+    }
+
+    fn queueToolOutput(self: *InteractiveLoop, tool_call_id: []const u8, text: []const u8) !void {
+        if (text.len == 0) return;
+        const capped_id = tool_call_id[0..@min(tool_call_id.len, pending_tool_id_bytes_max)];
+        for (self.pending_tool_outputs[0..self.pending_tool_output_count]) |*pending| {
+            if (std.mem.eql(u8, pending.id(), capped_id)) {
+                pending.append(text);
+                return;
+            }
+        }
+        if (self.pending_tool_output_count == self.pending_tool_outputs.len) {
+            try self.flushToolOutputCoalescer();
+        }
+        if (self.pending_tool_output_count == self.pending_tool_outputs.len) return error.TooManyTools;
+        self.pending_tool_outputs[self.pending_tool_output_count] = PendingToolOutput.init(capped_id, text);
+        self.pending_tool_output_count += 1;
+    }
+
+    fn flushToolOutputCoalescer(self: *InteractiveLoop) !void {
+        for (self.pending_tool_outputs[0..self.pending_tool_output_count]) |*pending| {
+            _ = try self.terminal_loop.applyCommand(.{
+                .tool_output_delta = .{ .tool_call_id = pending.id(), .text = pending.body() },
+            });
+        }
+        self.pending_tool_output_count = 0;
     }
 
     fn appendTranscript(self: *InteractiveLoop, append: TranscriptAppend) !void {

@@ -47,6 +47,7 @@ pub const sleepUntilCancel = cancel.sleepUntilCancel;
 pub const cloneJsonValue = json_owned.cloneJsonValue;
 pub const freeJsonValue = json_owned.freeJsonValue;
 pub const runProcess = process_runner.run;
+pub const OutputStream = process_runner.OutputStream;
 
 test {
     _ = @import("Process.zig");

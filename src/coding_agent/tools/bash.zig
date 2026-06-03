@@ -97,13 +97,22 @@ fn execute(
     token: runtime.CancelToken,
     _: []const u8,
     params: std.json.Value,
-    _: ?agent.AgentToolUpdateCallback,
+    on_update: ?agent.AgentToolUpdateCallback,
 ) anyerror!agent.ToolExecutionResult {
     try token.throwIfRequested();
     const self: *BashTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(self.config, params);
 
-    const run_result = runProcess(allocator, io, zio_runtime, self.config, args, token) catch |err| switch (err) {
+    var update_context: BashUpdateContext = .{ .allocator = allocator, .on_update = on_update };
+    const run_result = runProcess(
+        allocator,
+        io,
+        zio_runtime,
+        self.config,
+        args,
+        token,
+        &update_context,
+    ) catch |err| switch (err) {
         error.Timeout => return resultFromFailure(allocator, "bash timed out", .timeout),
         error.StreamTooLong => return resultFromFailure(allocator, "bash output limit exceeded", .output_limit),
         else => |unexpected| return unexpected,
@@ -120,6 +129,7 @@ fn runProcess(
     config: BashTool.Config,
     args: Args,
     token: runtime.CancelToken,
+    update_context: *BashUpdateContext,
 ) anyerror!std.process.RunResult {
     const argv = shellArgv(args.command);
     const run_result = try runtime.runProcess(allocator, io, zio_runtime, .{
@@ -129,9 +139,30 @@ fn runProcess(
         .max_stdout_bytes = config.max_stdout_bytes,
         .max_stderr_bytes = config.max_stderr_bytes,
         .cancel_token = token,
+        .on_output = .{ .context = update_context, .call_fn = emitBashOutputUpdate },
     });
     errdefer freeRunResult(allocator, run_result);
     return run_result;
+}
+
+const BashUpdateContext = struct {
+    allocator: std.mem.Allocator,
+    on_update: ?agent.AgentToolUpdateCallback,
+};
+
+fn emitBashOutputUpdate(
+    context: ?*anyopaque,
+    _: runtime.OutputStream,
+    bytes: []const u8,
+) anyerror!void {
+    const self: *BashUpdateContext = @ptrCast(@alignCast(context orelse return));
+    const on_update = self.on_update orelse return;
+    const text = try self.allocator.dupe(u8, bytes);
+    defer self.allocator.free(text);
+    const content = try self.allocator.alloc(ai.ToolResultContent, 1);
+    defer self.allocator.free(content);
+    content[0] = .{ .text = .{ .text = text } };
+    try on_update.call(.{ .content = content });
 }
 
 fn freeRunResult(allocator: std.mem.Allocator, run_result: std.process.RunResult) void {
