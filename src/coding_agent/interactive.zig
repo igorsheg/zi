@@ -5,6 +5,7 @@ const tui = @import("../tui/root.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
+const session_history_snapshot = @import("session_history_snapshot.zig");
 const sdk = @import("sdk.zig");
 
 pub const Options = struct {
@@ -251,6 +252,7 @@ pub fn run(
     };
     defer loop.shutdown();
 
+    try seedTranscriptFromSession(process.gpa, &terminal_loop, &host_handle.host);
     if (options.initial_prompt) |prompt| {
         if (try loop.startPrompt(prompt)) try loop.appendTranscript(.{ .role = .user, .text = prompt });
     }
@@ -259,6 +261,36 @@ pub fn run(
     try stdout.flush();
 
     while (terminal_loop.isRunning()) try loop.tick();
+}
+
+fn seedTranscriptFromSession(
+    allocator: std.mem.Allocator,
+    terminal_loop: *tui.product.TerminalLoop,
+    host: *AgentSessionRuntimeHost,
+) !void {
+    var snapshot = try host.publicHistorySnapshot(allocator);
+    defer snapshot.deinit(allocator);
+    try seedTranscriptFromSnapshot(terminal_loop, snapshot.items);
+}
+
+fn seedTranscriptFromSnapshot(
+    terminal_loop: *tui.product.TerminalLoop,
+    items: []const session_history_snapshot.Item,
+) !void {
+    for (items) |item| {
+        _ = try terminal_loop.applyCommand(.{ .append_transcript = .{
+            .role = transcriptRoleFromHistory(item.role),
+            .text = item.text,
+        } });
+    }
+}
+
+fn transcriptRoleFromHistory(role: session_history_snapshot.Role) tui.product.transcript.TranscriptRole {
+    return switch (role) {
+        .user => .user,
+        .assistant => .assistant,
+        .system => .system,
+    };
 }
 
 fn createHost(
@@ -383,4 +415,32 @@ test "interactive maps simple public events to transcript appends" {
     try std.testing.expectEqualStrings("public event overflow", overflow.text);
 
     try std.testing.expect(transcriptAppendFromEvent(.{ .session_info_changed = .{ .name = null } }) == null);
+}
+
+test "interactive seeds tui transcript from public history snapshot" {
+    var terminal_loop = try tui.product.TerminalLoop.init(
+        std.testing.allocator,
+        std.testing.io,
+        20,
+        4,
+        tui.product.loop.output_size_bytes_default,
+    );
+    defer terminal_loop.deinit();
+
+    const user_text = try std.testing.allocator.dupe(u8, "hello");
+    defer std.testing.allocator.free(user_text);
+    const assistant_text = try std.testing.allocator.dupe(u8, "hi");
+    defer std.testing.allocator.free(assistant_text);
+    const items = [_]session_history_snapshot.Item{
+        .{ .role = .user, .text = user_text },
+        .{ .role = .assistant, .text = assistant_text },
+    };
+
+    try seedTranscriptFromSnapshot(&terminal_loop, &items);
+
+    try std.testing.expectEqual(@as(usize, 2), terminal_loop.product.app.transcript.lines.items.len);
+    try std.testing.expectEqual(.user, terminal_loop.product.app.transcript.lines.items[0].role);
+    try std.testing.expectEqualStrings("hello", terminal_loop.product.app.transcript.lines.items[0].text);
+    try std.testing.expectEqual(.assistant, terminal_loop.product.app.transcript.lines.items[1].role);
+    try std.testing.expectEqualStrings("hi", terminal_loop.product.app.transcript.lines.items[1].text);
 }

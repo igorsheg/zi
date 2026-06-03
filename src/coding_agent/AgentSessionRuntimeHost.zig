@@ -110,6 +110,13 @@ pub fn sessionId(self: *const AgentSessionRuntimeHost) []const u8 {
     return self.session.manager.header.id;
 }
 
+pub fn publicHistorySnapshot(
+    self: *const AgentSessionRuntimeHost,
+    allocator: std.mem.Allocator,
+) !AgentSession.PublicHistorySnapshot {
+    return self.session.publicHistorySnapshot(allocator);
+}
+
 pub fn setRebindSession(self: *AgentSessionRuntimeHost, rebind_session: ?RebindSession) void {
     self.rebind_session = rebind_session;
 }
