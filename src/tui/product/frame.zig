@@ -168,7 +168,7 @@ fn renderItem(item: transcript_mod.TranscriptItem) TranscriptRenderItem {
     return switch (item) {
         .message => |message| .{ .prefix = rolePrefix(message.role), .text = message.text },
         .status => |status| .{ .prefix = statusPrefix(status.level), .text = status.text },
-        .tool => |tool| .{ .prefix = "tool: ", .text = toolSummary(tool) },
+        .tool => |tool| .{ .prefix = toolPrefix(tool.status), .text = tool.name },
     };
 }
 
@@ -188,12 +188,11 @@ fn statusPrefix(level: transcript_mod.TranscriptStatusLevel) []const u8 {
     };
 }
 
-fn toolSummary(tool: transcript_mod.TranscriptTool) []const u8 {
-    if (tool.summary.len > 0) return tool.summary;
-    return switch (tool.status) {
-        .started => "started",
-        .completed => "completed",
-        .failed => "failed",
+fn toolPrefix(status: transcript_mod.TranscriptToolStatus) []const u8 {
+    return switch (status) {
+        .started => "tool started: ",
+        .completed => "tool completed: ",
+        .failed => "tool failed: ",
     };
 }
 
@@ -286,6 +285,58 @@ test "frame scroll max counts hard newline visual rows" {
         @as(usize, 1),
         transcriptScrollMax(app.transcript, app.width, transcriptVisibleRows(app.height)),
     );
+}
+
+test "frame renders typed tool rows with name and state" {
+    var app = try app_mod.ProductApp.init(40, 5);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .status = .started,
+        .summary = "started",
+    } });
+    try app.transcript.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-2",
+        .name = "read",
+        .status = .failed,
+        .summary = "failed",
+    } });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(app, &renderer);
+
+    try expectCellText(renderer.next, 0, 1, "tool started: bash");
+    try expectCellText(renderer.next, 0, 2, "tool failed: read");
+}
+
+test "frame renders updated tool row once" {
+    var app = try app_mod.ProductApp.init(40, 5);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .status = .started,
+        .summary = "started",
+    } });
+    try app.transcript.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .status = .completed,
+        .summary = "completed",
+    } });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(app, &renderer);
+
+    try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
+    try expectCellText(renderer.next, 0, 1, "tool completed: bash");
+    const empty = try renderer.next.get(0, 2);
+    try std.testing.expect(empty.renderScalar() == null);
 }
 
 test "frame renders transcript scrolled by newest visual rows" {

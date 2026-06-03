@@ -26,6 +26,7 @@ pub const TranscriptAppend = union(enum) {
         text: []const u8,
     };
     pub const ToolAppend = struct {
+        tool_call_id: []const u8,
         name: []const u8,
         status: TranscriptToolStatus,
         summary: []const u8 = "",
@@ -34,7 +35,12 @@ pub const TranscriptAppend = union(enum) {
 
 pub const TranscriptMessage = struct { role: TranscriptRole, text: []u8 };
 pub const TranscriptStatus = struct { level: TranscriptStatusLevel, text: []u8 };
-pub const TranscriptTool = struct { name: []u8, status: TranscriptToolStatus, summary: []u8 };
+pub const TranscriptTool = struct {
+    tool_call_id: []u8,
+    name: []u8,
+    status: TranscriptToolStatus,
+    summary: []u8,
+};
 
 pub const TranscriptItem = union(enum) {
     message: TranscriptMessage,
@@ -46,6 +52,7 @@ pub const TranscriptItem = union(enum) {
             .message => |item| allocator.free(item.text),
             .status => |item| allocator.free(item.text),
             .tool => |item| {
+                allocator.free(item.tool_call_id);
                 allocator.free(item.name);
                 allocator.free(item.summary);
             },
@@ -57,7 +64,7 @@ pub const TranscriptItem = union(enum) {
         return switch (self) {
             .message => |item| item.text.len,
             .status => |item| item.text.len,
-            .tool => |item| item.name.len + item.summary.len,
+            .tool => |item| item.tool_call_id.len + item.name.len + item.summary.len,
         };
     }
 };
@@ -136,21 +143,55 @@ pub const TranscriptBuffer = struct {
         allocator: std.mem.Allocator,
         tool: TranscriptAppend.ToolAppend,
     ) !void {
-        if (tool.name.len + tool.summary.len > append_size_bytes_max) return error.TranscriptAppendTooLarge;
-        if (!std.unicode.utf8ValidateSlice(tool.name) or
+        const append_size = tool.tool_call_id.len + tool.name.len + tool.summary.len;
+        if (append_size > append_size_bytes_max) return error.TranscriptAppendTooLarge;
+        if (!std.unicode.utf8ValidateSlice(tool.tool_call_id) or
+            !std.unicode.utf8ValidateSlice(tool.name) or
             !std.unicode.utf8ValidateSlice(tool.summary))
         {
             return error.InvalidUtf8;
         }
+
+        const tool_call_id = try allocator.dupe(u8, tool.tool_call_id);
+        errdefer allocator.free(tool_call_id);
         const name = try allocator.dupe(u8, tool.name);
         errdefer allocator.free(name);
         const summary = try allocator.dupe(u8, tool.summary);
         errdefer allocator.free(summary);
+
+        if (self.findTool(tool.tool_call_id)) |index| {
+            const old = &self.items.items[index].tool;
+            const old_size = old.tool_call_id.len + old.name.len + old.summary.len;
+            allocator.free(old.tool_call_id);
+            allocator.free(old.name);
+            allocator.free(old.summary);
+            old.* = .{
+                .tool_call_id = tool_call_id,
+                .name = name,
+                .status = tool.status,
+                .summary = summary,
+            };
+            self.total_size_bytes = self.total_size_bytes - old_size + append_size;
+            return;
+        }
+
         try self.items.append(allocator, .{
-            .tool = .{ .name = name, .status = tool.status, .summary = summary },
+            .tool = .{
+                .tool_call_id = tool_call_id,
+                .name = name,
+                .status = tool.status,
+                .summary = summary,
+            },
         });
-        self.total_size_bytes += name.len + summary.len;
+        self.total_size_bytes += append_size;
         self.evictUntilBounded(allocator);
+    }
+
+    fn findTool(self: TranscriptBuffer, tool_call_id: []const u8) ?usize {
+        for (self.items.items, 0..) |item, index| {
+            if (item == .tool and std.mem.eql(u8, item.tool.tool_call_id, tool_call_id)) return index;
+        }
+        return null;
     }
 
     fn evictUntilBounded(self: *TranscriptBuffer, allocator: std.mem.Allocator) void {
@@ -204,6 +245,7 @@ test "transcript owns status and tool items" {
     var name = [_]u8{ 'b', 'a', 's', 'h' };
     try buffer.append(std.testing.allocator, .{ .status = .{ .level = .warning, .text = "careful" } });
     try buffer.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
         .name = &name,
         .status = .started,
         .summary = "running",
@@ -211,8 +253,31 @@ test "transcript owns status and tool items" {
     name[0] = 'x';
 
     try std.testing.expectEqual(.warning, buffer.items.items[0].status.level);
+    try std.testing.expectEqualStrings("call-1", buffer.items.items[1].tool.tool_call_id);
     try std.testing.expectEqualStrings("bash", buffer.items.items[1].tool.name);
     try std.testing.expectEqualStrings("running", buffer.items.items[1].tool.summary);
+}
+
+test "transcript updates existing tool by call id" {
+    var buffer: TranscriptBuffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+
+    try buffer.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .status = .started,
+        .summary = "started",
+    } });
+    try buffer.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .status = .completed,
+        .summary = "completed",
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), buffer.items.items.len);
+    try std.testing.expectEqual(.completed, buffer.items.items[0].tool.status);
+    try std.testing.expectEqualStrings("completed", buffer.items.items[0].tool.summary);
 }
 
 test "transcript rejects invalid utf8 and oversized single append before allocation" {
