@@ -2,6 +2,7 @@ const std = @import("std");
 const substrate = @import("../substrate/root.zig");
 const composer_mod = @import("composer.zig");
 const frame_mod = @import("frame.zig");
+const keys = @import("keys.zig");
 const transcript = @import("transcript.zig");
 
 pub const ProductApp = struct {
@@ -51,29 +52,25 @@ pub const ProductApp = struct {
     }
 
     fn applyInput(self: *ProductApp, allocator: std.mem.Allocator, event: substrate.input.InputEvent) !?Effect {
-        switch (event) {
-            .text => |bytes| {
+        switch (keys.resolve(event)) {
+            .composer_insert => |bytes| {
                 try self.composer.insertUtf8(allocator, bytes.slice());
                 self.dirty = true;
             },
-            .key => |key| switch (key) {
-                .backspace => {
-                    self.composer.backspace();
-                    self.dirty = true;
-                },
-                .arrow_left => self.composer.moveLeft(),
-                .arrow_right => self.composer.moveRight(),
-                .enter => if (try self.composer.takeSubmit(allocator)) |text| {
-                    self.dirty = true;
-                    return .{ .submit_text = text };
-                },
-                .page_up => self.scrollTranscript(frame_mod.transcriptVisibleRows(self.height)),
-                .page_down => self.scrollTranscriptDown(frame_mod.transcriptVisibleRows(self.height)),
-                .escape => return .request_shutdown,
-                .ctrl => |c| if (c == 0x03) return .request_shutdown,
-                else => {},
+            .composer_backspace => {
+                self.composer.backspace();
+                self.dirty = true;
             },
-            else => {},
+            .composer_left => self.composer.moveLeft(),
+            .composer_right => self.composer.moveRight(),
+            .composer_submit => if (try self.composer.takeSubmit(allocator)) |text| {
+                self.dirty = true;
+                return .{ .submit_text = text };
+            },
+            .transcript_page_up => self.scrollTranscript(frame_mod.transcriptVisibleRows(self.height)),
+            .transcript_page_down => self.scrollTranscriptDown(frame_mod.transcriptVisibleRows(self.height)),
+            .request_shutdown => return .request_shutdown,
+            .none => {},
         }
         return null;
     }
@@ -171,6 +168,21 @@ test "product app applies transcript append through apply" {
     try std.testing.expect(app.dirty);
     try std.testing.expectEqual(@as(usize, 1), app.transcript.lines.items.len);
     try std.testing.expectEqualStrings("ok", app.transcript.lines.items[0].text);
+}
+
+test "product app maps ctrl-u and ctrl-d to transcript scroll" {
+    var app = try ProductApp.init(20, 5);
+    defer app.deinit(std.testing.allocator);
+
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "one" } });
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "two" } });
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "three" } });
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "four" } });
+
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x15 } } }) == null);
+    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x04 } } }) == null);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
 }
 
 test "product app page down at bottom does not dirty" {

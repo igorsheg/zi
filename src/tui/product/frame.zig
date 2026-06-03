@@ -145,15 +145,15 @@ fn collectWrappedTranscriptLine(
             line_row_count += 1;
             continue;
         }
-        const visual = primitive.text.nextVisualLine(line.text, start, width);
-        if (visual.end == start) break;
+        const visual = primitive.text.nextVisualLineBreak(line.text, start, width);
+        if (visual.next == start) break;
         line_rows[line_row_count] = .{
             .role = line.role,
             .text = line.text[visual.start..visual.end],
             .show_prefix = visual_index == 0,
         };
         line_row_count += 1;
-        start = visual.end;
+        start = visual.next;
     }
     if (line.text.len == 0 and line_row_count < line_rows.len) {
         line_rows[line_row_count] = .{ .role = line.role, .text = "", .show_prefix = true };
@@ -221,6 +221,34 @@ test "frame keeps transcript out of tiny heights" {
     defer renderer.deinit();
     try Frame.build(app, &renderer);
     try expectCellText(renderer.next, 0, 0, "> ");
+}
+
+test "frame renders transcript hard newlines as visual rows" {
+    var app = try app_mod.ProductApp.init(40, 6);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .role = .assistant, .text = "one\ntwo\n\nthree" });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(app, &renderer);
+
+    try expectCellText(renderer.next, 0, 1, "assistant: one");
+    try expectCellText(renderer.next, 0, 2, "two");
+    const blank = try renderer.next.get(0, 3);
+    try std.testing.expectEqual(@as(?u21, null), blank.renderScalar());
+    try expectCellText(renderer.next, 0, 4, "three");
+}
+
+test "frame scroll max counts hard newline visual rows" {
+    var app = try app_mod.ProductApp.init(40, 5);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .role = .assistant, .text = "one\ntwo\nthree\nfour" });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        transcriptScrollMax(app.transcript, app.width, transcriptVisibleRows(app.height)),
+    );
 }
 
 test "frame renders transcript scrolled by newest visual rows" {

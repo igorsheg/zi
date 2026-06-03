@@ -21,6 +21,13 @@ pub const VisualLine = struct {
     width: u16,
 };
 
+pub const VisualLineBreak = struct {
+    start: usize,
+    end: usize,
+    next: usize,
+    width: u16,
+};
+
 pub fn nextScalar(bytes: []const u8) DecodedScalar {
     if (bytes.len == 0) return .{ .scalar = replacement, .len = 0 };
     const first = bytes[0];
@@ -93,6 +100,35 @@ pub fn nextVisualLine(bytes: []const u8, start: usize, max_width: u16) VisualLin
     return .{ .start = start, .end = index, .width = width };
 }
 
+pub fn nextVisualLineBreak(bytes: []const u8, start: usize, max_width: u16) VisualLineBreak {
+    std.debug.assert(start <= bytes.len);
+    if (start == bytes.len or max_width == 0) return .{ .start = start, .end = start, .next = start, .width = 0 };
+    if (bytes[start] == '\n') return .{ .start = start, .end = start, .next = start + 1, .width = 0 };
+
+    var index = start;
+    var width: u16 = 0;
+    while (index < bytes.len) {
+        if (bytes[index] == '\n') {
+            return .{ .start = start, .end = index, .next = index + 1, .width = width };
+        }
+        if (bytes[index] == '\r' and index + 1 < bytes.len and bytes[index + 1] == '\n') {
+            return .{ .start = start, .end = index, .next = index + 2, .width = width };
+        }
+        const grapheme = nextGrapheme(bytes[index..]);
+        if (grapheme.end == 0) break;
+        const next_width = width + grapheme.width;
+        if (next_width > max_width) {
+            if (index == start) {
+                return .{ .start = start, .end = index + grapheme.end, .next = index + grapheme.end, .width = 0 };
+            }
+            break;
+        }
+        index += grapheme.end;
+        width = next_width;
+    }
+    return .{ .start = start, .end = index, .next = index, .width = width };
+}
+
 pub fn scalarWidth(scalar: u21) u2 {
     if (scalar == 0 or scalar < 0x20 or scalar == 0x7f) return 1;
     return clampWidth(uucode.get(.wcwidth_standalone, scalar));
@@ -157,6 +193,36 @@ test "visual line advances over too-wide first grapheme" {
     const line = nextVisualLine("中", 0, 1);
     try std.testing.expectEqual(@as(usize, "中".len), line.end);
     try std.testing.expectEqual(@as(u16, 0), line.width);
+}
+
+test "visual line break stops at newlines without copying" {
+    const value = "one\ntwo\r\n\nthree";
+    var line = nextVisualLineBreak(value, 0, 20);
+    try std.testing.expectEqualStrings("one", value[line.start..line.end]);
+    try std.testing.expectEqual(@as(usize, 4), line.next);
+
+    line = nextVisualLineBreak(value, line.next, 20);
+    try std.testing.expectEqualStrings("two", value[line.start..line.end]);
+    try std.testing.expectEqual(@as(usize, 9), line.next);
+
+    line = nextVisualLineBreak(value, line.next, 20);
+    try std.testing.expectEqualStrings("", value[line.start..line.end]);
+    try std.testing.expectEqual(@as(usize, 10), line.next);
+
+    line = nextVisualLineBreak(value, line.next, 20);
+    try std.testing.expectEqualStrings("three", value[line.start..line.end]);
+    try std.testing.expectEqual(value.len, line.next);
+}
+
+test "visual line break wraps on grapheme boundaries and progresses" {
+    const value = "ao\u{0300}\n中";
+    var line = nextVisualLineBreak(value, 0, 1);
+    try std.testing.expectEqualStrings("a", value[line.start..line.end]);
+    try std.testing.expect(line.next > line.start);
+
+    line = nextVisualLineBreak("中", 0, 1);
+    try std.testing.expectEqualStrings("中", "中"[line.start..line.end]);
+    try std.testing.expectEqual("中".len, line.next);
 }
 
 test "grapheme cursor movement preserves clusters" {
