@@ -25,6 +25,7 @@ pub const session_store = @import("session_store.zig");
 pub const skills = @import("skills.zig");
 pub const system_prompt = @import("system_prompt.zig");
 pub const tool_registry = @import("tool_registry.zig");
+pub const tool_output_policy = @import("tool_output_policy.zig");
 pub const tools = @import("tools/root.zig");
 
 pub const PersistencePaths = paths.PersistencePaths;
@@ -84,6 +85,7 @@ pub fn testsReachable() void {
     _ = skills;
     _ = system_prompt;
     _ = tool_registry;
+    _ = tool_output_policy;
     _ = tools;
 }
 
@@ -115,5 +117,6 @@ test {
     _ = skills;
     _ = system_prompt;
     _ = tool_registry;
+    _ = tool_output_policy;
     _ = tools;
 }

@@ -168,7 +168,7 @@ fn renderItem(item: transcript_mod.TranscriptItem) TranscriptRenderItem {
     return switch (item) {
         .message => |message| .{ .prefix = rolePrefix(message.role), .text = message.text },
         .status => |status| .{ .prefix = statusPrefix(status.level), .text = status.text },
-        .tool => |tool| .{ .prefix = toolPrefix(tool.status), .text = tool.name },
+        .tool => |tool| .{ .prefix = toolPrefix(tool.status), .text = toolText(tool) },
     };
 }
 
@@ -186,6 +186,12 @@ fn statusPrefix(level: transcript_mod.TranscriptStatusLevel) []const u8 {
         .warning => "warning: ",
         .err => "error: ",
     };
+}
+
+fn toolText(tool: transcript_mod.TranscriptTool) []const u8 {
+    if (tool.output_preview.len > 0) return tool.output_preview;
+    if (tool.subject.len > 0) return tool.subject;
+    return tool.name;
 }
 
 fn toolPrefix(status: transcript_mod.TranscriptToolStatus) []const u8 {
@@ -310,6 +316,25 @@ test "frame renders typed tool rows with name and state" {
 
     try expectCellText(renderer.next, 0, 1, "tool started: bash");
     try expectCellText(renderer.next, 0, 2, "tool failed: read");
+}
+
+test "frame renders tool display text when present" {
+    var app = try app_mod.ProductApp.init(60, 5);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .status = .started,
+        .summary = "started",
+        .subject = "zig build test",
+    } });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 60, 5, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(app, &renderer);
+
+    try expectCellText(renderer.next, 0, 1, "tool started: zig build test");
 }
 
 test "frame renders updated tool row once" {

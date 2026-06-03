@@ -3,10 +3,11 @@ const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const path_utils = @import("path_utils.zig");
+const tool_output_policy = @import("../tool_output_policy.zig");
 
 pub const max_read_bytes = 1024 * 1024;
-pub const max_output_bytes = 50 * 1024;
-pub const max_output_lines = 2000;
+pub const max_output_bytes = tool_output_policy.default_max_bytes;
+pub const max_output_lines = tool_output_policy.default_max_lines;
 
 const parameters_schema =
     \\{

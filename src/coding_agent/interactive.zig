@@ -7,6 +7,7 @@ const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
 const sdk = @import("sdk.zig");
+const tool_output_policy = @import("tool_output_policy.zig");
 
 pub const Options = struct {
     cwd: []const u8 = ".",
@@ -50,13 +51,36 @@ fn toolAppend(
     tool_call_id: []const u8,
     name: []const u8,
     status: tui.product.transcript.TranscriptToolStatus,
+    subject: []const u8,
 ) TranscriptAppend {
     return .{ .tool = .{
         .tool_call_id = tool_call_id,
         .name = name,
         .status = status,
         .summary = toolStatusText(status),
+        .subject = subject,
     } };
+}
+
+fn toolSubject(tool_name: []const u8, args_value: std.json.Value) []const u8 {
+    if (std.mem.eql(u8, tool_name, "bash")) return boundedArgString(args_value, "command");
+    if (std.mem.eql(u8, tool_name, "grep")) return boundedArgString(args_value, "pattern");
+    if (std.mem.eql(u8, tool_name, "find")) return boundedArgString(args_value, "name");
+    return boundedArgString(args_value, "path");
+}
+
+fn boundedArgString(args_value: std.json.Value, key: []const u8) []const u8 {
+    if (args_value != .object) return "";
+    const value = args_value.object.get(key) orelse return "";
+    if (value != .string) return "";
+    return utf8Prefix(value.string, tool_output_policy.tool_subject_bytes_max);
+}
+
+fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
+    if (value.len <= max_bytes) return value;
+    var end = max_bytes;
+    while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return value[0..end];
 }
 
 fn toolStatusText(status: tui.product.transcript.TranscriptToolStatus) []const u8 {
@@ -67,38 +91,67 @@ fn toolStatusText(status: tui.product.transcript.TranscriptToolStatus) []const u
     };
 }
 
-fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptAppend {
+fn firstToolResultText(result: agent_mod.AgentToolResult) []const u8 {
+    for (result.content) |content| {
+        switch (content) {
+            .text => |text| return utf8Prefix(text.text, tool_output_policy.tool_update_bytes_max),
+            .image => {},
+        }
+    }
+    return "";
+}
+
+const TranscriptProjection = union(enum) {
+    append: TranscriptAppend,
+    tool_output_delta: struct { tool_call_id: []const u8, text: []const u8 },
+};
+
+fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptProjection {
+    if (text.len == 0) return null;
+    return .{ .tool_output_delta = .{ .tool_call_id = tool_call_id, .text = text } };
+}
+
+fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptProjection {
     return switch (event) {
         .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event),
-        .prompt_command => |payload| statusAppend(.info, payload.message.text),
-        .compaction_start => statusAppend(.info, "compaction started"),
-        .compaction_end => statusAppend(.info, "compaction ended"),
-        .auto_retry_start => statusAppend(.info, "auto retry started"),
-        .auto_retry_end => statusAppend(.info, "auto retry ended"),
-        .public_event_overflow => statusAppend(.warning, "public event overflow"),
+        .prompt_command => |payload| .{ .append = statusAppend(.info, payload.message.text) },
+        .compaction_start => .{ .append = statusAppend(.info, "compaction started") },
+        .compaction_end => .{ .append = statusAppend(.info, "compaction ended") },
+        .auto_retry_start => .{ .append = statusAppend(.info, "auto retry started") },
+        .auto_retry_end => .{ .append = statusAppend(.info, "auto retry ended") },
+        .public_event_overflow => .{ .append = statusAppend(.warning, "public event overflow") },
         .queue_update, .session_info_changed => null,
     };
 }
 
-fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptAppend {
+fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjection {
     return switch (event) {
         .agent_start, .agent_end, .turn_start, .turn_end => null,
         .message_update => |payload| switch (payload.assistant_message_event) {
-            .text_delta => |delta| messageAppend(
+            .text_delta => |delta| .{ .append = messageAppend(
                 .assistant,
                 delta.delta,
                 .extend_previous_assistant_message,
-            ),
-            .@"error" => statusAppend(.err, "assistant error"),
+            ) },
+            .@"error" => .{ .append = statusAppend(.err, "assistant error") },
             else => null,
         },
-        .tool_execution_start => |payload| toolAppend(payload.tool_call_id, payload.tool_name, .started),
-        .tool_execution_update => null,
-        .tool_execution_end => |payload| toolAppend(
+        .tool_execution_start => |payload| .{ .append = toolAppend(
+            payload.tool_call_id,
+            payload.tool_name,
+            .started,
+            toolSubject(payload.tool_name, payload.args),
+        ) },
+        .tool_execution_update => |payload| toolOutputAppend(
+            payload.tool_call_id,
+            firstToolResultText(payload.partial_result),
+        ),
+        .tool_execution_end => |payload| .{ .append = toolAppend(
             payload.tool_call_id,
             payload.tool_name,
             if (payload.is_error) .failed else .completed,
-        ),
+            "",
+        ) },
         .message_start, .message_end => null,
     };
 }
@@ -229,7 +282,16 @@ const InteractiveLoop = struct {
     }
 
     fn applyPublicEventTranscript(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
-        if (transcriptAppendFromEvent(event)) |append| try self.appendTranscript(append);
+        if (transcriptAppendFromEvent(event)) |projection| try self.applyTranscriptProjection(projection);
+    }
+
+    fn applyTranscriptProjection(self: *InteractiveLoop, projection: TranscriptProjection) !void {
+        switch (projection) {
+            .append => |append| try self.appendTranscript(append),
+            .tool_output_delta => |delta| _ = try self.terminal_loop.applyCommand(.{
+                .tool_output_delta = .{ .tool_call_id = delta.tool_call_id, .text = delta.text },
+            }),
+        }
     }
 
     fn appendTranscript(self: *InteractiveLoop, append: TranscriptAppend) !void {
@@ -445,9 +507,10 @@ test "interactive maps simple public events to transcript appends" {
     try std.testing.expect(transcriptAppendFromEvent(.{ .agent_event = .turn_start }) == null);
 
     const overflow = transcriptAppendFromEvent(.{ .public_event_overflow = .{ .dropped_count = 4 } }).?;
-    try std.testing.expect(overflow == .status);
-    try std.testing.expectEqual(tui.product.transcript.TranscriptStatusLevel.warning, overflow.status.level);
-    try std.testing.expectEqualStrings("public event overflow", overflow.status.text);
+    try std.testing.expect(overflow == .append);
+    try std.testing.expect(overflow.append == .status);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptStatusLevel.warning, overflow.append.status.level);
+    try std.testing.expectEqualStrings("public event overflow", overflow.append.status.text);
 
     try std.testing.expect(transcriptAppendFromEvent(.{ .session_info_changed = .{ .name = null } }) == null);
 }
@@ -458,10 +521,12 @@ test "interactive maps tool events to typed transcript items" {
         .tool_name = "bash",
         .args = .null,
     } } }).?;
-    try std.testing.expect(start == .tool);
-    try std.testing.expectEqualStrings("1", start.tool.tool_call_id);
-    try std.testing.expectEqualStrings("bash", start.tool.name);
-    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.started, start.tool.status);
+    try std.testing.expect(start == .append);
+    try std.testing.expect(start.append == .tool);
+    try std.testing.expectEqualStrings("1", start.append.tool.tool_call_id);
+    try std.testing.expectEqualStrings("bash", start.append.tool.name);
+    try std.testing.expectEqualStrings("", start.append.tool.subject);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.started, start.append.tool.status);
 
     const end = transcriptAppendFromEvent(.{ .agent_event = .{ .tool_execution_end = .{
         .tool_call_id = "1",
@@ -469,8 +534,24 @@ test "interactive maps tool events to typed transcript items" {
         .result = .{ .content = &.{} },
         .is_error = true,
     } } }).?;
-    try std.testing.expect(end == .tool);
-    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.failed, end.tool.status);
+    try std.testing.expect(end == .append);
+    try std.testing.expect(end.append == .tool);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.failed, end.append.tool.status);
+}
+
+test "interactive maps tool args to bounded subject" {
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(std.testing.allocator);
+    try args.put(std.testing.allocator, "command", .{ .string = "zig build test" });
+
+    const start = transcriptAppendFromEvent(.{ .agent_event = .{ .tool_execution_start = .{
+        .tool_call_id = "1",
+        .tool_name = "bash",
+        .args = .{ .object = args },
+    } } }).?;
+    try std.testing.expect(start == .append);
+    try std.testing.expect(start.append == .tool);
+    try std.testing.expectEqualStrings("zig build test", start.append.tool.subject);
 }
 
 test "interactive seeds tui transcript from public history snapshot" {

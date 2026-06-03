@@ -48,6 +48,12 @@ pub const ProductApp = struct {
                 self.dirty = true;
                 return null;
             },
+            .tool_output_delta => |delta| {
+                try self.transcript.appendToolOutput(allocator, delta.tool_call_id, delta.text);
+                self.clampTranscriptScroll();
+                self.dirty = true;
+                return null;
+            },
         }
     }
 
@@ -106,6 +112,12 @@ pub const Command = union(enum) {
     input: substrate.input.InputEvent,
     clear_composer,
     append_transcript: transcript.TranscriptAppend,
+    tool_output_delta: ToolOutputDelta,
+};
+
+pub const ToolOutputDelta = struct {
+    tool_call_id: []const u8,
+    text: []const u8,
 };
 
 pub const Size = struct {
