@@ -155,29 +155,35 @@ test "product app maps escape and ctrl-c to shutdown" {
 
 const app_mod_effect_request_shutdown: ?Effect = .request_shutdown;
 
+fn appendTestMessage(app: *ProductApp, role: transcript.TranscriptRole, text: []const u8) !void {
+    _ = try app.apply(std.testing.allocator, .{
+        .append_transcript = .{ .message = .{ .role = role, .text = text } },
+    });
+}
+
 test "product app applies transcript append through apply" {
     var app = try ProductApp.init(20, 4);
     defer app.deinit(std.testing.allocator);
 
     var source = [_]u8{ 'o', 'k' };
     try std.testing.expect(try app.apply(std.testing.allocator, .{
-        .append_transcript = .{ .role = .assistant, .text = &source },
+        .append_transcript = .{ .message = .{ .role = .assistant, .text = &source } },
     }) == null);
     source[0] = 'n';
 
     try std.testing.expect(app.dirty);
-    try std.testing.expectEqual(@as(usize, 1), app.transcript.lines.items.len);
-    try std.testing.expectEqualStrings("ok", app.transcript.lines.items[0].text);
+    try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
+    try std.testing.expectEqualStrings("ok", app.transcript.items.items[0].message.text);
 }
 
 test "product app maps ctrl-u and ctrl-d to transcript scroll" {
     var app = try ProductApp.init(20, 5);
     defer app.deinit(std.testing.allocator);
 
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "one" } });
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "two" } });
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "three" } });
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "four" } });
+    try appendTestMessage(&app, .system, "one");
+    try appendTestMessage(&app, .system, "two");
+    try appendTestMessage(&app, .system, "three");
+    try appendTestMessage(&app, .system, "four");
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x15 } } }) == null);
     try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
@@ -199,14 +205,14 @@ test "product app pages transcript scroll and append preserves it" {
     var app = try ProductApp.init(20, 5);
     defer app.deinit(std.testing.allocator);
 
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "one" } });
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "two" } });
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "three" } });
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "four" } });
+    try appendTestMessage(&app, .system, "one");
+    try appendTestMessage(&app, .system, "two");
+    try appendTestMessage(&app, .system, "three");
+    try appendTestMessage(&app, .system, "four");
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_up } }) == null);
     try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "five" } });
+    try appendTestMessage(&app, .system, "five");
     try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_down } }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
@@ -218,10 +224,10 @@ test "product app clamps transcript scroll after append eviction" {
 
     for (0..transcript.line_count_max + 1) |index| {
         const text = if (index == 0) "old" else "new";
-        _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = text } });
+        try appendTestMessage(&app, .system, text);
     }
     app.transcript_scroll_rows = std.math.maxInt(usize);
-    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "tail" } });
+    try appendTestMessage(&app, .system, "tail");
 
     try std.testing.expect(app.transcript_scroll_rows <= app.transcriptScrollMax());
 }

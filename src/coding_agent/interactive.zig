@@ -7,6 +7,7 @@ const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
 const sdk = @import("sdk.zig");
+const public_display = @import("public_display.zig");
 
 pub const Options = struct {
     cwd: []const u8 = ".",
@@ -35,7 +36,7 @@ fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
 const TranscriptEventAppend = struct {
     role: tui.product.transcript.TranscriptRole,
     text: []const u8,
-    mode: tui.product.transcript.TranscriptAppendMode = .new_line,
+    mode: tui.product.transcript.TranscriptAppendMode = .new_item,
 };
 
 fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptEventAppend {
@@ -53,18 +54,19 @@ fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?Transcrip
 
 fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptEventAppend {
     return switch (event) {
-        .agent_start => .{ .role = .system, .text = "agent started" },
-        .agent_end => .{ .role = .system, .text = "agent ended" },
-        .turn_start => .{ .role = .system, .text = "turn started" },
-        .turn_end => .{ .role = .system, .text = "turn ended" },
+        .agent_start, .agent_end, .turn_start, .turn_end => null,
         .message_update => |payload| switch (payload.assistant_message_event) {
-            .text_delta => |delta| .{ .role = .assistant, .text = delta.delta, .mode = .extend_previous_same_role },
+            .text_delta => |delta| .{
+                .role = .assistant,
+                .text = delta.delta,
+                .mode = .extend_previous_assistant_message,
+            },
             .@"error" => .{ .role = .system, .text = "assistant error" },
             else => null,
         },
-        .tool_execution_start => .{ .role = .system, .text = "tool execution started" },
-        .tool_execution_update => .{ .role = .system, .text = "tool execution updated" },
-        .tool_execution_end => .{ .role = .system, .text = "tool execution ended" },
+        .tool_execution_start => null,
+        .tool_execution_update => null,
+        .tool_execution_end => null,
         .message_start, .message_end => null,
     };
 }
@@ -79,6 +81,7 @@ const InteractiveLoop = struct {
     cancel_requested: bool = false,
     last_render_ns: ?i128 = null,
     effects: [effect_count_max]tui.product.Effect = undefined,
+    public_display_buffer: [public_display.text_bytes_max]u8 = undefined,
 
     fn startPrompt(self: *InteractiveLoop, text: []const u8) !bool {
         if (self.active_run != null) {
@@ -195,12 +198,17 @@ const InteractiveLoop = struct {
     }
 
     fn applyPublicEventTranscript(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
+        if (event == .agent_event) {
+            if (public_display.lineFromAgentEvent(&self.public_display_buffer, event.agent_event)) |line| {
+                try self.appendTranscript(.{ .role = .system, .text = line.text });
+            }
+        }
         if (transcriptAppendFromEvent(event)) |append| try self.appendTranscript(append);
     }
 
     fn appendTranscript(self: *InteractiveLoop, append: TranscriptEventAppend) !void {
         _ = try self.terminal_loop.applyCommand(.{
-            .append_transcript = .{ .role = append.role, .text = append.text, .mode = append.mode },
+            .append_transcript = .{ .message = .{ .role = append.role, .text = append.text, .mode = append.mode } },
         });
     }
 
@@ -278,10 +286,10 @@ fn seedTranscriptFromSnapshot(
     items: []const session_history_snapshot.Item,
 ) !void {
     for (items) |item| {
-        _ = try terminal_loop.applyCommand(.{ .append_transcript = .{
+        _ = try terminal_loop.applyCommand(.{ .append_transcript = .{ .message = .{
             .role = transcriptRoleFromHistory(item.role),
             .text = item.text,
-        } });
+        } } });
     }
 }
 
@@ -406,9 +414,8 @@ test "interactive loop bounds stay responsive" {
 }
 
 test "interactive maps simple public events to transcript appends" {
-    const start = transcriptAppendFromEvent(.{ .agent_event = .agent_start }).?;
-    try std.testing.expectEqual(tui.product.transcript.TranscriptRole.system, start.role);
-    try std.testing.expectEqualStrings("agent started", start.text);
+    try std.testing.expect(transcriptAppendFromEvent(.{ .agent_event = .agent_start }) == null);
+    try std.testing.expect(transcriptAppendFromEvent(.{ .agent_event = .turn_start }) == null);
 
     const overflow = transcriptAppendFromEvent(.{ .public_event_overflow = .{ .dropped_count = 4 } }).?;
     try std.testing.expectEqual(tui.product.transcript.TranscriptRole.system, overflow.role);
@@ -438,9 +445,9 @@ test "interactive seeds tui transcript from public history snapshot" {
 
     try seedTranscriptFromSnapshot(&terminal_loop, &items);
 
-    try std.testing.expectEqual(@as(usize, 2), terminal_loop.product.app.transcript.lines.items.len);
-    try std.testing.expectEqual(.user, terminal_loop.product.app.transcript.lines.items[0].role);
-    try std.testing.expectEqualStrings("hello", terminal_loop.product.app.transcript.lines.items[0].text);
-    try std.testing.expectEqual(.assistant, terminal_loop.product.app.transcript.lines.items[1].role);
-    try std.testing.expectEqualStrings("hi", terminal_loop.product.app.transcript.lines.items[1].text);
+    try std.testing.expectEqual(@as(usize, 2), terminal_loop.product.app.transcript.items.items.len);
+    try std.testing.expectEqual(.user, terminal_loop.product.app.transcript.items.items[0].message.role);
+    try std.testing.expectEqualStrings("hello", terminal_loop.product.app.transcript.items.items[0].message.text);
+    try std.testing.expectEqual(.assistant, terminal_loop.product.app.transcript.items.items[1].message.role);
+    try std.testing.expectEqualStrings("hi", terminal_loop.product.app.transcript.items.items[1].message.text);
 }

@@ -2,6 +2,17 @@ const std = @import("std");
 const harness_mod = @import("vscreen_harness.zig");
 const text_primitive = @import("../primitive/text.zig");
 const substrate = @import("../substrate/root.zig");
+const transcript = @import("transcript.zig");
+
+fn applyMessage(
+    harness: *harness_mod.VScreenHarness,
+    role: transcript.TranscriptRole,
+    text: []const u8,
+) !void {
+    try std.testing.expect(try harness.apply(.{
+        .append_transcript = .{ .message = .{ .role = role, .text = text } },
+    }) == null);
+}
 
 fn expectCellText(harness: *const harness_mod.VScreenHarness, x: u16, y: u16, text: []const u8) !void {
     var col: u16 = x;
@@ -43,7 +54,7 @@ test "product frame wraps long transcript text from bottom" {
     defer harness.deinit();
 
     try std.testing.expect(try harness.apply(.{
-        .append_transcript = .{ .role = .assistant, .text = "abcdefghij0123456789" },
+        .append_transcript = .{ .message = .{ .role = .assistant, .text = "abcdefghij0123456789" } },
     }) == null);
 
     _ = try harness.render();
@@ -58,7 +69,7 @@ test "product frame wraps graphemes without splitting wide cells" {
     defer harness.deinit();
 
     try std.testing.expect(try harness.apply(.{
-        .append_transcript = .{ .role = .assistant, .text = "o\u{0300}中👩🏽‍🚀b" },
+        .append_transcript = .{ .message = .{ .role = .assistant, .text = "o\u{0300}中👩🏽‍🚀b" } },
     }) == null);
 
     _ = try harness.render();
@@ -71,13 +82,17 @@ test "product frame shows newest transcript lines and preserves composer row" {
     var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 40, 5, &storage);
     defer harness.deinit();
 
-    try std.testing.expect(try harness.apply(.{ .append_transcript = .{ .role = .system, .text = "old" } }) == null);
-    try std.testing.expect(try harness.apply(.{ .append_transcript = .{ .role = .user, .text = "one" } }) == null);
-    try std.testing.expect(try harness.apply(.{ .append_transcript = .{ .role = .assistant, .text = "tw" } }) == null);
+    try applyMessage(&harness, .system, "old");
+    try applyMessage(&harness, .user, "one");
+    try applyMessage(&harness, .assistant, "tw");
     try std.testing.expect(try harness.apply(.{
-        .append_transcript = .{ .role = .assistant, .text = "o", .mode = .extend_previous_same_role },
+        .append_transcript = .{ .message = .{
+            .role = .assistant,
+            .text = "o",
+            .mode = .extend_previous_assistant_message,
+        } },
     }) == null);
-    try std.testing.expect(try harness.apply(.{ .append_transcript = .{ .role = .system, .text = "three" } }) == null);
+    try applyMessage(&harness, .system, "three");
     try std.testing.expect(try harness.apply(.{
         .input = .{ .text = substrate.input.InlineBytes.from("o\u{0300}👩🏽‍🚀") },
     }) == null);
@@ -87,6 +102,6 @@ test "product frame shows newest transcript lines and preserves composer row" {
     try expectCellText(&harness, 0, 2, "assistant: two");
     try expectCellText(&harness, 0, 3, "system: three");
     try expectCellText(&harness, 0, 4, "> o\u{0300}👩🏽‍🚀");
-    try std.testing.expectEqual(@as(usize, 4), harness.app.transcript.lines.items.len);
-    try std.testing.expectEqualStrings("two", harness.app.transcript.lines.items[2].text);
+    try std.testing.expectEqual(@as(usize, 4), harness.app.transcript.items.items.len);
+    try std.testing.expectEqualStrings("two", harness.app.transcript.items.items[2].message.text);
 }
