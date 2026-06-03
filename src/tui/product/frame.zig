@@ -33,9 +33,7 @@ fn drawShell(app: anytype, renderer: *infra.Renderer) !void {
 
     if (app.height > 0) try renderer.writeText(0, 0, "zi", label_style);
     if (app.height > 0) {
-        const composer_y = app.height - 1;
-        const available_rows: usize = if (composer_y > 1) composer_y - 1 else 0;
-        try drawTranscript(app, renderer, transcript_style, available_rows);
+        try drawTranscript(app, renderer, transcript_style, transcriptVisibleRows(app.height));
     }
     if (app.height > 0) {
         const composer_y = app.height - 1;
@@ -44,17 +42,45 @@ fn drawShell(app: anytype, renderer: *infra.Renderer) !void {
     }
 }
 
-fn drawTranscript(app: anytype, renderer: *infra.Renderer, style: primitive.Style, available_rows: usize) !void {
-    if (available_rows == 0 or app.width == 0) return;
-    const row_limit = @min(available_rows, transcript_visual_rows_max);
+pub fn transcriptVisibleRows(height: u16) usize {
+    if (height == 0) return 0;
+    const composer_y = height - 1;
+    const available_rows: usize = if (composer_y > 1) composer_y - 1 else 0;
+    return @min(available_rows, transcript_visual_rows_max);
+}
+
+pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
+    if (width == 0 or visible_rows == 0) return 0;
+    var total_rows: usize = 0;
+    for (transcript.lines.items) |line| total_rows += countWrappedTranscriptRows(line, width);
+    return if (total_rows > visible_rows) total_rows - visible_rows else 0;
+}
+
+fn drawTranscript(app: anytype, renderer: *infra.Renderer, style: primitive.Style, visible_rows: usize) !void {
+    if (visible_rows == 0 or app.width == 0) return;
+    const row_limit = @min(visible_rows, transcript_visual_rows_max);
     var rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
     var row_count: usize = 0;
+    var skipped_rows: usize = 0;
 
     var line_index = app.transcript.lines.items.len;
     while (line_index > 0 and row_count < row_limit) {
         line_index -= 1;
         const line = app.transcript.lines.items[line_index];
-        appendWrappedTranscriptLine(&rows, &row_count, row_limit, line, app.width);
+        const line_rows = countWrappedTranscriptRows(line, app.width);
+        if (skipped_rows + line_rows <= app.transcript_scroll_rows) {
+            skipped_rows += line_rows;
+            continue;
+        }
+        appendWrappedTranscriptLine(
+            &rows,
+            &row_count,
+            row_limit,
+            line,
+            app.width,
+            app.transcript_scroll_rows - skipped_rows,
+        );
+        skipped_rows = app.transcript_scroll_rows;
     }
 
     var draw_index = row_count;
@@ -81,17 +107,41 @@ fn appendWrappedTranscriptLine(
     row_limit: usize,
     line: transcript_mod.TranscriptLine,
     frame_width: u16,
+    skip_newest_rows: usize,
 ) void {
     const prefix = rolePrefix(line.role);
     const prefix_width: u16 = @intCast(@min(primitive.text.displayWidth(prefix), frame_width));
     var line_rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
+    const line_row_count = collectWrappedTranscriptLine(&line_rows, line, frame_width, prefix_width);
+    var remaining = if (skip_newest_rows < line_row_count) line_row_count - skip_newest_rows else 0;
+
+    while (remaining > 0 and row_count.* < row_limit) {
+        remaining -= 1;
+        rows[row_count.*] = line_rows[remaining];
+        row_count.* += 1;
+    }
+}
+
+fn countWrappedTranscriptRows(line: transcript_mod.TranscriptLine, frame_width: u16) usize {
+    const prefix = rolePrefix(line.role);
+    const prefix_width: u16 = @intCast(@min(primitive.text.displayWidth(prefix), frame_width));
+    var line_rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
+    return collectWrappedTranscriptLine(&line_rows, line, frame_width, prefix_width);
+}
+
+fn collectWrappedTranscriptLine(
+    line_rows: *[transcript_visual_rows_max]TranscriptVisualRow,
+    line: transcript_mod.TranscriptLine,
+    frame_width: u16,
+    prefix_width: u16,
+) usize {
     var line_row_count: usize = 0;
     var start: usize = 0;
     var visual_index: usize = 0;
     while (start < line.text.len and line_row_count < line_rows.len) : (visual_index += 1) {
         const width = if (visual_index == 0) frame_width - prefix_width else frame_width;
         if (width == 0) {
-            line_rows[line_row_count] = .{ .role = line.role, .text = "", .show_prefix = true };
+            line_rows[line_row_count] = .{ .role = line.role, .text = "", .show_prefix = visual_index == 0 };
             line_row_count += 1;
             continue;
         }
@@ -109,12 +159,7 @@ fn appendWrappedTranscriptLine(
         line_rows[line_row_count] = .{ .role = line.role, .text = "", .show_prefix = true };
         line_row_count += 1;
     }
-
-    while (line_row_count > 0 and row_count.* < row_limit) {
-        line_row_count -= 1;
-        rows[row_count.*] = line_rows[line_row_count];
-        row_count.* += 1;
-    }
+    return line_row_count;
 }
 
 fn rolePrefix(role: transcript_mod.TranscriptRole) []const u8 {
@@ -176,4 +221,23 @@ test "frame keeps transcript out of tiny heights" {
     defer renderer.deinit();
     try Frame.build(app, &renderer);
     try expectCellText(renderer.next, 0, 0, "> ");
+}
+
+test "frame renders transcript scrolled by newest visual rows" {
+    var app = try app_mod.ProductApp.init(40, 5);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .role = .system, .text = "old" });
+    try app.transcript.append(std.testing.allocator, .{ .role = .user, .text = "one" });
+    try app.transcript.append(std.testing.allocator, .{ .role = .assistant, .text = "two" });
+    try app.transcript.append(std.testing.allocator, .{ .role = .system, .text = "three" });
+    app.transcript_scroll_rows = 1;
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(app, &renderer);
+
+    try expectCellText(renderer.next, 0, 1, "system: old");
+    try expectCellText(renderer.next, 0, 2, "user: one");
+    try expectCellText(renderer.next, 0, 3, "assistant: two");
 }

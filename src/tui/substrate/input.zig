@@ -236,6 +236,16 @@ test "input decoder split csi focus paste alt trunc flush" {
     try std.testing.expect(ev[0].key == .escape);
 }
 
+test "input decoder maps page keys" {
+    var d: InputDecoder = .{};
+    var ev: [1]InputEvent = undefined;
+
+    try std.testing.expectEqual(@as(usize, 1), d.feed("\x1b[5~", &ev).count);
+    try std.testing.expect(ev[0].key == .page_up);
+    try std.testing.expectEqual(@as(usize, 1), d.feed("\x1b[6~", &ev).count);
+    try std.testing.expect(ev[0].key == .page_down);
+}
+
 test "input decoder maps ctrl-c byte" {
     var d: InputDecoder = .{};
     var ev: [1]InputEvent = undefined;

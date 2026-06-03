@@ -9,6 +9,7 @@ pub const ProductApp = struct {
     height: u16,
     composer: composer_mod.ComposerBuffer = .{},
     transcript: transcript.TranscriptBuffer = .{},
+    transcript_scroll_rows: usize = 0,
     dirty: bool = true,
 
     pub fn init(width: u16, height: u16) !ProductApp {
@@ -29,6 +30,7 @@ pub const ProductApp = struct {
                 if (self.width != size.width or self.height != size.height) {
                     self.width = size.width;
                     self.height = size.height;
+                    self.clampTranscriptScroll();
                     self.dirty = true;
                 }
                 return null;
@@ -41,6 +43,7 @@ pub const ProductApp = struct {
             },
             .append_transcript => |append| {
                 try self.transcript.append(allocator, append);
+                self.clampTranscriptScroll();
                 self.dirty = true;
                 return null;
             },
@@ -64,6 +67,8 @@ pub const ProductApp = struct {
                     self.dirty = true;
                     return .{ .submit_text = text };
                 },
+                .page_up => self.scrollTranscript(frame_mod.transcriptVisibleRows(self.height)),
+                .page_down => self.scrollTranscriptDown(frame_mod.transcriptVisibleRows(self.height)),
                 .escape => return .request_shutdown,
                 .ctrl => |c| if (c == 0x03) return .request_shutdown,
                 else => {},
@@ -71,6 +76,31 @@ pub const ProductApp = struct {
             else => {},
         }
         return null;
+    }
+
+    fn scrollTranscript(self: *ProductApp, rows: usize) void {
+        if (rows == 0) return;
+        const max = self.transcriptScrollMax();
+        const next = @min(max, self.transcript_scroll_rows + rows);
+        if (next == self.transcript_scroll_rows) return;
+        self.transcript_scroll_rows = next;
+        self.dirty = true;
+    }
+
+    fn scrollTranscriptDown(self: *ProductApp, rows: usize) void {
+        if (rows == 0) return;
+        const next = if (self.transcript_scroll_rows > rows) self.transcript_scroll_rows - rows else 0;
+        if (next == self.transcript_scroll_rows) return;
+        self.transcript_scroll_rows = next;
+        self.dirty = true;
+    }
+
+    fn clampTranscriptScroll(self: *ProductApp) void {
+        self.transcript_scroll_rows = @min(self.transcript_scroll_rows, self.transcriptScrollMax());
+    }
+
+    fn transcriptScrollMax(self: *ProductApp) usize {
+        return frame_mod.transcriptScrollMax(self.transcript, self.width, frame_mod.transcriptVisibleRows(self.height));
     }
 };
 
@@ -141,4 +171,45 @@ test "product app applies transcript append through apply" {
     try std.testing.expect(app.dirty);
     try std.testing.expectEqual(@as(usize, 1), app.transcript.lines.items.len);
     try std.testing.expectEqualStrings("ok", app.transcript.lines.items[0].text);
+}
+
+test "product app page down at bottom does not dirty" {
+    var app = try ProductApp.init(20, 5);
+    defer app.deinit(std.testing.allocator);
+    app.dirty = false;
+
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_down } }) == null);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
+    try std.testing.expect(!app.dirty);
+}
+
+test "product app pages transcript scroll and append preserves it" {
+    var app = try ProductApp.init(20, 5);
+    defer app.deinit(std.testing.allocator);
+
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "one" } });
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "two" } });
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "three" } });
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "four" } });
+
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_up } }) == null);
+    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "five" } });
+    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_down } }) == null);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
+}
+
+test "product app clamps transcript scroll after append eviction" {
+    var app = try ProductApp.init(20, 5);
+    defer app.deinit(std.testing.allocator);
+
+    for (0..transcript.line_count_max + 1) |index| {
+        const text = if (index == 0) "old" else "new";
+        _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = text } });
+    }
+    app.transcript_scroll_rows = std.math.maxInt(usize);
+    _ = try app.apply(std.testing.allocator, .{ .append_transcript = .{ .role = .system, .text = "tail" } });
+
+    try std.testing.expect(app.transcript_scroll_rows <= app.transcriptScrollMax());
 }
