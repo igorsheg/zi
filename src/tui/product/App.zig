@@ -49,7 +49,13 @@ pub const ProductApp = struct {
                 return null;
             },
             .tool_output_delta => |delta| {
-                try self.transcript.appendToolOutput(allocator, delta.tool_call_id, delta.text);
+                try self.transcript.appendToolOutput(
+                    allocator,
+                    delta.tool_call_id,
+                    delta.text,
+                    delta.dropped_head_bytes,
+                    delta.dropped_head_lines,
+                );
                 self.clampTranscriptScroll();
                 self.dirty = true;
                 return null;
@@ -118,6 +124,8 @@ pub const Command = union(enum) {
 pub const ToolOutputDelta = struct {
     tool_call_id: []const u8,
     text: []const u8,
+    dropped_head_bytes: usize = 0,
+    dropped_head_lines: usize = 0,
 };
 
 pub const Size = struct {

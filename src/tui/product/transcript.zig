@@ -8,7 +8,14 @@ pub const append_size_bytes_max: usize = 8 * 1024;
 
 pub const TranscriptRole = enum { user, assistant, system, thinking };
 pub const TranscriptStatusLevel = enum { info, warning, err };
-pub const TranscriptToolStatus = enum { started, completed, failed };
+pub const TranscriptToolEvent = enum {
+    toolcall_start,
+    toolcall_delta,
+    toolcall_end,
+    tool_execution_start,
+    tool_execution_update,
+    tool_execution_end,
+};
 
 pub const TranscriptAppendMode = enum { new_item, extend_previous_assistant_message, extend_previous_same_role };
 
@@ -29,9 +36,8 @@ pub const TranscriptAppend = union(enum) {
     pub const ToolAppend = struct {
         tool_call_id: []const u8,
         name: []const u8,
-        status: TranscriptToolStatus,
-        summary: []const u8 = "",
-        subject: []const u8 = "",
+        event: TranscriptToolEvent,
+        args_preview: []const u8 = "",
     };
 };
 
@@ -40,15 +46,17 @@ pub const TranscriptStatus = struct { level: TranscriptStatusLevel, text: []u8 }
 pub const TranscriptTool = struct {
     tool_call_id: []u8,
     name: []u8,
-    status: TranscriptToolStatus,
-    summary: []u8,
-    subject: []u8,
+    event: TranscriptToolEvent,
+    args_preview: []u8,
     output_preview: []u8,
     output_truncated_head_bytes: usize = 0,
     output_truncated_head_lines: usize = 0,
 
     pub fn sizeBytes(self: TranscriptTool) usize {
-        return self.tool_call_id.len + self.name.len + self.summary.len + self.subject.len + self.output_preview.len;
+        return self.tool_call_id.len +
+            self.name.len +
+            self.args_preview.len +
+            self.output_preview.len;
     }
 };
 
@@ -64,8 +72,7 @@ pub const TranscriptItem = union(enum) {
             .tool => |item| {
                 allocator.free(item.tool_call_id);
                 allocator.free(item.name);
-                allocator.free(item.summary);
-                allocator.free(item.subject);
+                allocator.free(item.args_preview);
                 allocator.free(item.output_preview);
             },
         }
@@ -104,6 +111,8 @@ pub const TranscriptBuffer = struct {
         allocator: std.mem.Allocator,
         tool_call_id: []const u8,
         output_delta: []const u8,
+        dropped_head_bytes: usize,
+        dropped_head_lines: usize,
     ) !void {
         if (output_delta.len > append_size_bytes_max) return error.TranscriptAppendTooLarge;
         if (!std.unicode.utf8ValidateSlice(tool_call_id) or !std.unicode.utf8ValidateSlice(output_delta)) {
@@ -116,8 +125,8 @@ pub const TranscriptBuffer = struct {
         errdefer allocator.free(next.bytes);
         allocator.free(tool.output_preview);
         tool.output_preview = next.bytes;
-        tool.output_truncated_head_bytes += next.dropped_bytes;
-        tool.output_truncated_head_lines += next.dropped_lines;
+        tool.output_truncated_head_bytes += dropped_head_bytes + next.dropped_bytes;
+        tool.output_truncated_head_lines += dropped_head_lines + next.dropped_lines;
         const next_size = tool.sizeBytes();
         self.total_size_bytes = self.total_size_bytes - old_size + next_size;
         self.evictUntilBounded(allocator);
@@ -181,12 +190,11 @@ pub const TranscriptBuffer = struct {
         allocator: std.mem.Allocator,
         tool: TranscriptAppend.ToolAppend,
     ) !void {
-        const append_size = tool.tool_call_id.len + tool.name.len + tool.summary.len + tool.subject.len;
+        const append_size = tool.tool_call_id.len + tool.name.len + tool.args_preview.len;
         if (append_size > append_size_bytes_max) return error.TranscriptAppendTooLarge;
         if (!std.unicode.utf8ValidateSlice(tool.tool_call_id) or
             !std.unicode.utf8ValidateSlice(tool.name) or
-            !std.unicode.utf8ValidateSlice(tool.summary) or
-            !std.unicode.utf8ValidateSlice(tool.subject))
+            !std.unicode.utf8ValidateSlice(tool.args_preview))
         {
             return error.InvalidUtf8;
         }
@@ -195,35 +203,35 @@ pub const TranscriptBuffer = struct {
         errdefer allocator.free(tool_call_id);
         const name = try allocator.dupe(u8, tool.name);
         errdefer allocator.free(name);
-        const summary = try allocator.dupe(u8, tool.summary);
-        errdefer allocator.free(summary);
-        const subject = try allocator.dupe(u8, tool.subject);
-        errdefer allocator.free(subject);
+        const args_preview = try allocator.dupe(u8, tool.args_preview);
+        errdefer allocator.free(args_preview);
 
         if (self.findTool(tool.tool_call_id)) |index| {
             const old = &self.items.items[index].tool;
             const old_size = old.sizeBytes();
-            const next_subject = if (tool.subject.len == 0) blk: {
-                allocator.free(subject);
-                break :blk try allocator.dupe(u8, old.subject);
-            } else subject;
-            errdefer if (tool.subject.len == 0) allocator.free(next_subject);
-            const next_size = tool_call_id.len + name.len + summary.len + next_subject.len + old.output_preview.len;
+            const next_args_preview = if (tool.args_preview.len == 0) blk: {
+                allocator.free(args_preview);
+                break :blk try allocator.dupe(u8, old.args_preview);
+            } else args_preview;
+            errdefer if (tool.args_preview.len == 0) allocator.free(next_args_preview);
+            const next_size = tool_call_id.len +
+                name.len +
+                next_args_preview.len +
+                old.output_preview.len;
             allocator.free(old.tool_call_id);
             allocator.free(old.name);
-            allocator.free(old.summary);
-            allocator.free(old.subject);
+            allocator.free(old.args_preview);
             old.* = .{
                 .tool_call_id = tool_call_id,
                 .name = name,
-                .status = tool.status,
-                .summary = summary,
-                .subject = next_subject,
+                .event = mergeToolEvent(old.event, tool.event),
+                .args_preview = next_args_preview,
                 .output_preview = old.output_preview,
                 .output_truncated_head_bytes = old.output_truncated_head_bytes,
                 .output_truncated_head_lines = old.output_truncated_head_lines,
             };
             self.total_size_bytes = self.total_size_bytes - old_size + next_size;
+            self.evictUntilBounded(allocator);
             return;
         }
 
@@ -233,14 +241,23 @@ pub const TranscriptBuffer = struct {
             .tool = .{
                 .tool_call_id = tool_call_id,
                 .name = name,
-                .status = tool.status,
-                .summary = summary,
-                .subject = subject,
+                .event = tool.event,
+                .args_preview = args_preview,
                 .output_preview = output_preview,
             },
         });
         self.total_size_bytes += append_size;
         self.evictUntilBounded(allocator);
+    }
+
+    fn mergeToolEvent(old: TranscriptToolEvent, new: TranscriptToolEvent) TranscriptToolEvent {
+        return switch (new) {
+            .toolcall_start, .toolcall_delta, .toolcall_end => switch (old) {
+                .tool_execution_start, .tool_execution_update, .tool_execution_end => old,
+                else => new,
+            },
+            .tool_execution_start, .tool_execution_update, .tool_execution_end => new,
+        };
     }
 
     fn findTool(self: TranscriptBuffer, tool_call_id: []const u8) ?usize {
@@ -303,15 +320,13 @@ test "transcript owns status and tool items" {
     try buffer.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = &name,
-        .status = .started,
-        .summary = "running",
+        .event = .tool_execution_start,
     } });
     name[0] = 'x';
 
     try std.testing.expectEqual(.warning, buffer.items.items[0].status.level);
     try std.testing.expectEqualStrings("call-1", buffer.items.items[1].tool.tool_call_id);
     try std.testing.expectEqualStrings("bash", buffer.items.items[1].tool.name);
-    try std.testing.expectEqualStrings("running", buffer.items.items[1].tool.summary);
 }
 
 test "transcript updates existing tool by call id" {
@@ -321,19 +336,16 @@ test "transcript updates existing tool by call id" {
     try buffer.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .status = .started,
-        .summary = "started",
+        .event = .tool_execution_start,
     } });
     try buffer.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .status = .completed,
-        .summary = "completed",
+        .event = .tool_execution_end,
     } });
 
     try std.testing.expectEqual(@as(usize, 1), buffer.items.items.len);
-    try std.testing.expectEqual(.completed, buffer.items.items[0].tool.status);
-    try std.testing.expectEqualStrings("completed", buffer.items.items[0].tool.summary);
+    try std.testing.expectEqual(.tool_execution_end, buffer.items.items[0].tool.event);
 }
 
 test "transcript preserves tool display text when completion updates status" {
@@ -343,20 +355,57 @@ test "transcript preserves tool display text when completion updates status" {
     try buffer.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .status = .started,
-        .summary = "started",
-        .subject = "zig build test",
+        .event = .tool_execution_start,
+        .args_preview = "zig build test",
     } });
     try buffer.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .status = .completed,
-        .summary = "completed",
+        .event = .tool_execution_end,
     } });
 
     try std.testing.expectEqual(@as(usize, 1), buffer.items.items.len);
-    try std.testing.expectEqual(.completed, buffer.items.items[0].tool.status);
-    try std.testing.expectEqualStrings("zig build test", buffer.items.items[0].tool.subject);
+    try std.testing.expectEqual(.tool_execution_end, buffer.items.items[0].tool.event);
+    try std.testing.expectEqualStrings("zig build test", buffer.items.items[0].tool.args_preview);
+}
+
+test "transcript accounts dropped tool output before transcript preview" {
+    var buffer: TranscriptBuffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+
+    try buffer.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .event = .tool_execution_start,
+    } });
+    try buffer.appendToolOutput(std.testing.allocator, "call-1", "tail", 10, 2);
+
+    try std.testing.expectEqual(@as(usize, 10), buffer.items.items[0].tool.output_truncated_head_bytes);
+    try std.testing.expectEqual(@as(usize, 2), buffer.items.items[0].tool.output_truncated_head_lines);
+    try std.testing.expectEqualStrings("tail", buffer.items.items[0].tool.output_preview);
+}
+
+test "transcript evicts after existing tool metadata grows" {
+    var buffer: TranscriptBuffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+
+    const filler = try std.testing.allocator.alloc(u8, append_size_bytes_max - 32);
+    defer std.testing.allocator.free(filler);
+    @memset(filler, 'a');
+    for (0..8) |_| try buffer.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = filler } });
+    try buffer.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .event = .toolcall_delta,
+    } });
+    try buffer.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .event = .toolcall_delta,
+        .args_preview = filler,
+    } });
+
+    try std.testing.expect(buffer.total_size_bytes <= total_size_bytes_max);
 }
 
 test "transcript rejects invalid utf8 and oversized single append before allocation" {

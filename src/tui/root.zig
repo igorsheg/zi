@@ -1,11 +1,11 @@
-pub const infra = @import("infra/root.zig");
-pub const primitive = @import("primitive/root.zig");
+const substrate = @import("substrate/root.zig");
+
 pub const product = @import("product/root.zig");
-pub const substrate = @import("substrate/root.zig");
+pub const Terminal = substrate.Terminal;
+pub const TerminalSize = substrate.terminal.Size;
 
 test {
-    _ = infra;
-    _ = primitive;
     _ = product;
-    _ = substrate;
+    _ = Terminal;
+    _ = TerminalSize;
 }

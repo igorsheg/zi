@@ -29,8 +29,8 @@ const render_attempts_per_tick_max = 1;
 const shutdown_drain_ticks_max = 30;
 const pending_tool_outputs_max = 32;
 const pending_tool_id_bytes_max = 128;
-const pending_tool_output_bytes_max = 4 * 1024;
-const tool_subject_bytes_max = 512;
+const pending_tool_output_bytes_max = tui.product.transcript.append_size_bytes_max;
+const tool_args_preview_bytes_max = 512;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     const last = last_render_ns orelse return true;
@@ -54,19 +54,18 @@ fn statusAppend(level: tui.product.transcript.TranscriptStatusLevel, text: []con
 fn toolAppend(
     tool_call_id: []const u8,
     name: []const u8,
-    status: tui.product.transcript.TranscriptToolStatus,
-    subject: []const u8,
+    event: tui.product.transcript.TranscriptToolEvent,
+    args_preview: []const u8,
 ) TranscriptAppend {
     return .{ .tool = .{
         .tool_call_id = tool_call_id,
         .name = name,
-        .status = status,
-        .summary = toolStatusText(status),
-        .subject = subject,
+        .event = event,
+        .args_preview = args_preview,
     } };
 }
 
-fn toolSubject(tool_name: []const u8, args_value: std.json.Value) []const u8 {
+fn toolArgsPreview(tool_name: []const u8, args_value: std.json.Value) []const u8 {
     if (std.mem.eql(u8, tool_name, "bash")) return boundedArgString(args_value, "command");
     if (std.mem.eql(u8, tool_name, "grep")) return boundedArgString(args_value, "pattern");
     if (std.mem.eql(u8, tool_name, "find")) return boundedArgString(args_value, "name");
@@ -77,7 +76,7 @@ fn boundedArgString(args_value: std.json.Value, key: []const u8) []const u8 {
     if (args_value != .object) return "";
     const value = args_value.object.get(key) orelse return "";
     if (value != .string) return "";
-    return utf8Prefix(value.string, tool_subject_bytes_max);
+    return utf8Prefix(value.string, tool_args_preview_bytes_max);
 }
 
 fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
@@ -87,18 +86,10 @@ fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
     return value[0..end];
 }
 
-fn toolStatusText(status: tui.product.transcript.TranscriptToolStatus) []const u8 {
-    return switch (status) {
-        .started => "started",
-        .completed => "completed",
-        .failed => "failed",
-    };
-}
-
 fn firstToolResultText(result: agent_mod.AgentToolResult) []const u8 {
     for (result.content) |content| {
         switch (content) {
-            .text => |text| return utf8Prefix(text.text, pending_tool_output_bytes_max),
+            .text => |text| return text.text,
             .image => {},
         }
     }
@@ -107,7 +98,12 @@ fn firstToolResultText(result: agent_mod.AgentToolResult) []const u8 {
 
 const TranscriptProjection = union(enum) {
     append: TranscriptAppend,
-    tool_output_delta: struct { tool_call_id: []const u8, text: []const u8 },
+    tool_output_delta: struct {
+        tool_call_id: []const u8,
+        text: []const u8,
+        dropped_head_bytes: usize = 0,
+        dropped_head_lines: usize = 0,
+    },
 };
 
 fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptProjection {
@@ -115,7 +111,11 @@ fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptProje
     return .{ .tool_output_delta = .{ .tool_call_id = tool_call_id, .text = text } };
 }
 
-fn toolCallAppend(content_index: usize, partial: ai.AssistantMessage) ?TranscriptProjection {
+fn toolCallAppend(
+    event: tui.product.transcript.TranscriptToolEvent,
+    content_index: usize,
+    partial: ai.AssistantMessage,
+) ?TranscriptProjection {
     if (content_index >= partial.content.len) return null;
     const content = partial.content[content_index];
     if (content != .tool_call) return null;
@@ -124,8 +124,8 @@ fn toolCallAppend(content_index: usize, partial: ai.AssistantMessage) ?Transcrip
     return .{ .append = toolAppend(
         tool_call.id,
         tool_call.name,
-        .started,
-        toolSubject(tool_call.name, tool_call.arguments),
+        event,
+        toolArgsPreview(tool_call.name, tool_call.arguments),
     ) };
 }
 
@@ -156,13 +156,13 @@ fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjec
                 delta.delta,
                 .extend_previous_same_role,
             ) },
-            .toolcall_start => |payload| toolCallAppend(payload.content_index, payload.partial),
-            .toolcall_delta => |payload| toolCallAppend(payload.content_index, payload.partial),
+            .toolcall_start => |payload| toolCallAppend(.toolcall_start, payload.content_index, payload.partial),
+            .toolcall_delta => |payload| toolCallAppend(.toolcall_delta, payload.content_index, payload.partial),
             .toolcall_end => |payload| .{ .append = toolAppend(
                 payload.tool_call.id,
                 payload.tool_call.name,
-                .started,
-                toolSubject(payload.tool_call.name, payload.tool_call.arguments),
+                .toolcall_end,
+                toolArgsPreview(payload.tool_call.name, payload.tool_call.arguments),
             ) },
             .@"error" => .{ .append = statusAppend(.err, "assistant error") },
             else => null,
@@ -170,8 +170,8 @@ fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjec
         .tool_execution_start => |payload| .{ .append = toolAppend(
             payload.tool_call_id,
             payload.tool_name,
-            .started,
-            toolSubject(payload.tool_name, payload.args),
+            .tool_execution_start,
+            toolArgsPreview(payload.tool_name, payload.args),
         ) },
         .tool_execution_update => |payload| toolOutputAppend(
             payload.tool_call_id,
@@ -180,7 +180,7 @@ fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjec
         .tool_execution_end => |payload| .{ .append = toolAppend(
             payload.tool_call_id,
             payload.tool_name,
-            if (payload.is_error) .failed else .completed,
+            .tool_execution_end,
             "",
         ) },
         .message_start, .message_end => null,
@@ -192,6 +192,8 @@ const PendingToolOutput = struct {
     tool_call_id_len: usize = 0,
     text: [pending_tool_output_bytes_max]u8 = undefined,
     text_len: usize = 0,
+    dropped_head_bytes: usize = 0,
+    dropped_head_lines: usize = 0,
 
     fn id(self: *const PendingToolOutput) []const u8 {
         return self.tool_call_id[0..self.tool_call_id_len];
@@ -212,6 +214,7 @@ const PendingToolOutput = struct {
     fn append(self: *PendingToolOutput, text: []const u8) void {
         const keep = @min(text.len, pending_tool_output_bytes_max);
         const source = text[text.len - keep ..];
+        if (keep < text.len) self.recordDropped(text[0 .. text.len - keep]);
         if (self.text_len + source.len <= pending_tool_output_bytes_max) {
             @memcpy(self.text[self.text_len .. self.text_len + source.len], source);
             self.text_len += source.len;
@@ -219,10 +222,16 @@ const PendingToolOutput = struct {
         }
         var overflow = self.text_len + source.len - pending_tool_output_bytes_max;
         while (overflow < self.text_len and (self.text[overflow] & 0xc0) == 0x80) : (overflow += 1) {}
+        self.recordDropped(self.text[0..overflow]);
         @memmove(self.text[0 .. self.text_len - overflow], self.text[overflow..self.text_len]);
         self.text_len -= overflow;
         @memcpy(self.text[self.text_len .. self.text_len + source.len], source);
         self.text_len += source.len;
+    }
+
+    fn recordDropped(self: *PendingToolOutput, bytes: []const u8) void {
+        self.dropped_head_bytes += bytes.len;
+        self.dropped_head_lines += std.mem.count(u8, bytes, "\n");
     }
 };
 
@@ -279,19 +288,33 @@ const InteractiveLoop = struct {
         const readable = runtime.ReadableFd.initBorrowed(self.terminal_loop.inputFd());
         var input = readable.asyncReadable();
         var frame = runtime.Timeout.fromMilliseconds(frame_interval_ms);
+        var public_event_wake = self.host.publicEventWake();
         if (self.active_run) |prompt_run| {
             var progress = self.host.promptRunProgress(prompt_run);
-            switch (try runtime.select(.{ .input = &input, .prompt = &progress, .frame = &frame })) {
+            switch (try runtime.select(.{
+                .input = &input,
+                .prompt = &progress,
+                .public_event = public_event_wake,
+                .frame = &frame,
+            })) {
                 .input => |result| return self.handleInputWaitResult(result),
                 .prompt => |result| {
                     try self.applyPromptProgressResult(prompt_run, result);
                     return false;
                 },
+                .public_event => {
+                    public_event_wake.reset();
+                    return false;
+                },
                 .frame => return false,
             }
         } else {
-            switch (try runtime.select(.{ .input = &input, .frame = &frame })) {
+            switch (try runtime.select(.{ .input = &input, .public_event = public_event_wake, .frame = &frame })) {
                 .input => |result| return self.handleInputWaitResult(result),
+                .public_event => {
+                    public_event_wake.reset();
+                    return false;
+                },
                 .frame => return false,
             }
         }
@@ -411,9 +434,12 @@ const InteractiveLoop = struct {
 
     fn queueToolOutput(self: *InteractiveLoop, tool_call_id: []const u8, text: []const u8) !void {
         if (text.len == 0) return;
-        const capped_id = tool_call_id[0..@min(tool_call_id.len, pending_tool_id_bytes_max)];
+        if (tool_call_id.len > pending_tool_id_bytes_max) {
+            try self.appendTranscript(statusAppend(.warning, "tool output omitted: tool id too long"));
+            return;
+        }
         for (self.pending_tool_outputs[0..self.pending_tool_output_count]) |*pending| {
-            if (std.mem.eql(u8, pending.id(), capped_id)) {
+            if (std.mem.eql(u8, pending.id(), tool_call_id)) {
                 pending.append(text);
                 return;
             }
@@ -422,14 +448,19 @@ const InteractiveLoop = struct {
             try self.flushToolOutputCoalescer();
         }
         if (self.pending_tool_output_count == self.pending_tool_outputs.len) return error.TooManyTools;
-        self.pending_tool_outputs[self.pending_tool_output_count] = PendingToolOutput.init(capped_id, text);
+        self.pending_tool_outputs[self.pending_tool_output_count] = PendingToolOutput.init(tool_call_id, text);
         self.pending_tool_output_count += 1;
     }
 
     fn flushToolOutputCoalescer(self: *InteractiveLoop) !void {
         for (self.pending_tool_outputs[0..self.pending_tool_output_count]) |*pending| {
             _ = try self.terminal_loop.applyCommand(.{
-                .tool_output_delta = .{ .tool_call_id = pending.id(), .text = pending.body() },
+                .tool_output_delta = .{
+                    .tool_call_id = pending.id(),
+                    .text = pending.body(),
+                    .dropped_head_bytes = pending.dropped_head_bytes,
+                    .dropped_head_lines = pending.dropped_head_lines,
+                },
             });
         }
         self.pending_tool_output_count = 0;
@@ -566,8 +597,8 @@ fn createHost(
 }
 
 fn initTerminalLoop(process: runtime.Process, stdout: *std.Io.Writer) !tui.product.TerminalLoop {
-    var terminal = tui.substrate.Terminal.init(process.io);
-    const size = terminal.size() catch tui.substrate.terminal.Size{ .width = 80, .height = 24 };
+    var terminal = tui.Terminal.init(process.io);
+    const size = terminal.size() catch tui.TerminalSize{ .width = 80, .height = 24 };
     _ = stdout;
     return tui.product.TerminalLoop.init(
         process.gpa,
@@ -666,8 +697,11 @@ test "interactive maps tool events to typed transcript items" {
     try std.testing.expect(start.append == .tool);
     try std.testing.expectEqualStrings("1", start.append.tool.tool_call_id);
     try std.testing.expectEqualStrings("bash", start.append.tool.name);
-    try std.testing.expectEqualStrings("", start.append.tool.subject);
-    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.started, start.append.tool.status);
+    try std.testing.expectEqualStrings("", start.append.tool.args_preview);
+    try std.testing.expectEqual(
+        tui.product.transcript.TranscriptToolEvent.tool_execution_start,
+        start.append.tool.event,
+    );
 
     const end = transcriptAppendFromEvent(.{ .agent_event = .{ .tool_execution_end = .{
         .tool_call_id = "1",
@@ -677,7 +711,7 @@ test "interactive maps tool events to typed transcript items" {
     } } }).?;
     try std.testing.expect(end == .append);
     try std.testing.expect(end.append == .tool);
-    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.failed, end.append.tool.status);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolEvent.tool_execution_end, end.append.tool.event);
 }
 
 fn testAssistantMessage(content: []const ai.AssistantContent) ai.AssistantMessage {
@@ -738,11 +772,11 @@ test "interactive maps tool call deltas to pending tool row" {
     try std.testing.expect(event.append == .tool);
     try std.testing.expectEqualStrings("call-1", event.append.tool.tool_call_id);
     try std.testing.expectEqualStrings("bash", event.append.tool.name);
-    try std.testing.expectEqualStrings("echo streaming", event.append.tool.subject);
-    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.started, event.append.tool.status);
+    try std.testing.expectEqualStrings("echo streaming", event.append.tool.args_preview);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolEvent.toolcall_delta, event.append.tool.event);
 }
 
-test "interactive maps tool args to bounded subject" {
+test "interactive maps tool args to bounded args_preview" {
     var args: std.json.ObjectMap = .empty;
     defer args.deinit(std.testing.allocator);
     try args.put(std.testing.allocator, "command", .{ .string = "zig build test" });
@@ -754,7 +788,7 @@ test "interactive maps tool args to bounded subject" {
     } } }).?;
     try std.testing.expect(start == .append);
     try std.testing.expect(start.append == .tool);
-    try std.testing.expectEqualStrings("zig build test", start.append.tool.subject);
+    try std.testing.expectEqualStrings("zig build test", start.append.tool.args_preview);
 }
 
 test "interactive seeds tui transcript from public history snapshot" {

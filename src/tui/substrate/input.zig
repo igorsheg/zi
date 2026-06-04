@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const input_read_size_max = 4096;
+pub const input_read_size_max = events_per_feed_max;
 pub const escape_sequence_size_max = 64;
 pub const paste_chunk_size_max = 4096;
 pub const events_per_feed_max = 128;

@@ -5,7 +5,7 @@ const app_mod = @import("App.zig");
 const transcript_mod = @import("transcript.zig");
 const transcript_projection = @import("transcript_projection.zig");
 
-pub const size_cells_max: usize = 500_000;
+pub const size_cells_max: usize = 65_536;
 const transcript_visual_rows_max: usize = 512;
 
 const TranscriptVisualRow = struct {
@@ -53,52 +53,28 @@ pub fn transcriptVisibleRows(height: u16) usize {
 
 pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
     if (width == 0 or visible_rows == 0) return 0;
-    var total_rows: usize = 0;
-    for (transcript.items.items) |item| total_rows += countItemRows(item, width);
-    return if (total_rows > visible_rows) total_rows - visible_rows else 0;
+    var sink = TranscriptRowSink.countOnly();
+    var item_index = transcript.items.items.len;
+    while (item_index > 0) {
+        item_index -= 1;
+        emitItemRowsNewestFirst(&sink, transcript.items.items[item_index], width);
+    }
+    return if (sink.total_emitted > visible_rows) sink.total_emitted - visible_rows else 0;
 }
 
 fn drawTranscript(app: anytype, renderer: *infra.Renderer, style: primitive.Style, visible_rows: usize) !void {
     if (visible_rows == 0 or app.width == 0) return;
     const row_limit = @min(visible_rows, transcript_visual_rows_max);
     var rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
-    var row_count: usize = 0;
-    var skipped_rows: usize = 0;
+    var sink = TranscriptRowSink.store(&rows, row_limit, app.transcript_scroll_rows);
 
-    var line_index = app.transcript.items.items.len;
-    while (line_index > 0 and row_count < row_limit) {
-        line_index -= 1;
-        const item = app.transcript.items.items[line_index];
-        const projected = transcript_projection.itemPrimary(item);
-        const line_rows = countItemRows(item, app.width);
-        if (skipped_rows + line_rows <= app.transcript_scroll_rows) {
-            skipped_rows += line_rows;
-            continue;
-        }
-        if (item == .tool) {
-            appendToolBlock(
-                &rows,
-                &row_count,
-                row_limit,
-                item.tool,
-                projected,
-                app.width,
-                app.transcript_scroll_rows - skipped_rows,
-            );
-        } else {
-            appendWrappedTranscriptLine(
-                &rows,
-                &row_count,
-                row_limit,
-                projected,
-                app.width,
-                app.transcript_scroll_rows - skipped_rows,
-            );
-        }
-        skipped_rows = app.transcript_scroll_rows;
+    var item_index = app.transcript.items.items.len;
+    while (item_index > 0 and sink.row_count < row_limit) {
+        item_index -= 1;
+        emitItemRowsNewestFirst(&sink, app.transcript.items.items[item_index], app.width);
     }
 
-    var draw_index = row_count;
+    var draw_index = sink.row_count;
     var y: u16 = 1;
     while (draw_index > 0) : (y += 1) {
         draw_index -= 1;
@@ -115,49 +91,125 @@ fn drawTranscript(app: anytype, renderer: *infra.Renderer, style: primitive.Styl
     }
 }
 
-fn appendWrappedTranscriptLine(
-    rows: *[transcript_visual_rows_max]TranscriptVisualRow,
-    row_count: *usize,
+// Transcript scroll and rendering have one invariant: visual-row accounting and
+// drawing must consume the same newest-first row stream.  Source transcript items
+// may contain physical newlines, wrapping, and generated tool chrome, but scroll
+// offsets are always measured after projection into visual rows.  Keep generated
+// rows and wrapped text rows flowing through this sink so count-only and render
+// modes cannot drift.
+const TranscriptRowSink = struct {
+    rows: ?*[transcript_visual_rows_max]TranscriptVisualRow,
     row_limit: usize,
-    item: transcript_projection.RenderItem,
-    frame_width: u16,
-    skip_newest_rows: usize,
-) void {
-    const prefix_width: u16 = @intCast(@min(primitive.text.displayWidth(item.prefix), frame_width));
-    var line_rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
-    const line_row_count = collectWrappedTranscriptLine(&line_rows, item, frame_width, prefix_width, false);
-    var remaining = if (skip_newest_rows < line_row_count) line_row_count - skip_newest_rows else 0;
+    row_count: usize = 0,
+    skip_remaining: usize = 0,
+    total_emitted: usize = 0,
 
-    while (remaining > 0 and row_count.* < row_limit) {
-        remaining -= 1;
-        rows[row_count.*] = line_rows[remaining];
-        row_count.* += 1;
+    fn countOnly() TranscriptRowSink {
+        return .{ .rows = null, .row_limit = 0 };
     }
+
+    fn store(
+        rows: *[transcript_visual_rows_max]TranscriptVisualRow,
+        row_limit: usize,
+        skip_newest_rows: usize,
+    ) TranscriptRowSink {
+        return .{ .rows = rows, .row_limit = row_limit, .skip_remaining = skip_newest_rows };
+    }
+
+    fn full(self: TranscriptRowSink) bool {
+        return self.rows != null and self.row_count >= self.row_limit;
+    }
+
+    fn emitBorrowed(self: *TranscriptRowSink, row: TranscriptVisualRow) void {
+        self.total_emitted += 1;
+        if (self.skip_remaining > 0) {
+            self.skip_remaining -= 1;
+            return;
+        }
+        if (self.rows) |rows| {
+            if (self.row_count >= self.row_limit) return;
+            rows[self.row_count] = row;
+            self.row_count += 1;
+        }
+    }
+
+    fn emitGenerated(
+        self: *TranscriptRowSink,
+        prefix: []const u8,
+        text: []const u8,
+        show_prefix: bool,
+    ) void {
+        self.total_emitted += 1;
+        if (self.skip_remaining > 0) {
+            self.skip_remaining -= 1;
+            return;
+        }
+        if (self.rows) |rows| {
+            if (self.row_count >= self.row_limit) return;
+            const slot = &rows[self.row_count];
+            const keep = @min(text.len, slot.storage.len);
+            @memcpy(slot.storage[0..keep], text[0..keep]);
+            slot.prefix = prefix;
+            slot.text = slot.storage[0..keep];
+            slot.show_prefix = show_prefix;
+            self.row_count += 1;
+        }
+    }
+};
+
+fn emitItemRowsNewestFirst(
+    sink: *TranscriptRowSink,
+    item: transcript_mod.TranscriptItem,
+    frame_width: u16,
+) void {
+    if (item == .tool) {
+        emitToolRowsNewestFirst(sink, item.tool, frame_width);
+        return;
+    }
+    emitWrappedRowsNewestFirst(sink, transcript_projection.itemPrimary(item), frame_width, false);
 }
 
-fn countWrappedTranscriptRows(item: transcript_projection.RenderItem, frame_width: u16) usize {
-    const prefix_width: u16 = @intCast(@min(primitive.text.displayWidth(item.prefix), frame_width));
-    var line_rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
-    return collectWrappedTranscriptLine(&line_rows, item, frame_width, prefix_width, false);
+fn emitToolRowsNewestFirst(
+    sink: *TranscriptRowSink,
+    tool: transcript_mod.TranscriptTool,
+    frame_width: u16,
+) void {
+    sink.emitGenerated("", "╰────", false);
+    if (sink.full()) return;
+
+    const projected = transcript_projection.itemPrimary(.{ .tool = tool });
+    if (projected.text.len > 0) {
+        emitWrappedRowsNewestFirst(sink, .{ .prefix = "│ ", .text = projected.text }, frame_width, true);
+        if (sink.full()) return;
+    }
+
+    var notice_buffer: [96]u8 = undefined;
+    if (transcript_projection.toolOmissionNotice(tool, &notice_buffer)) |notice| {
+        emitWrappedRowsNewestFirst(sink, .{ .prefix = "│ ", .text = notice }, frame_width, true);
+        if (sink.full()) return;
+    }
+
+    var title_buffer: [128]u8 = undefined;
+    const title = transcript_projection.toolTitle(tool, &title_buffer);
+    var top_buffer: [160]u8 = undefined;
+    const top = primitive.chrome.openTopLine(&top_buffer, .rounded, title) catch "╭─[tool]";
+    sink.emitGenerated("", top, false);
 }
 
-fn appendWrappedTranscriptLineRepeatPrefix(
-    rows: *[transcript_visual_rows_max]TranscriptVisualRow,
-    row_count: *usize,
-    row_limit: usize,
+fn emitWrappedRowsNewestFirst(
+    sink: *TranscriptRowSink,
     item: transcript_projection.RenderItem,
     frame_width: u16,
-    skip_newest_rows: usize,
+    repeat_prefix: bool,
 ) void {
     const prefix_width: u16 = @intCast(@min(primitive.text.displayWidth(item.prefix), frame_width));
     var line_rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
-    const line_row_count = collectWrappedTranscriptLine(&line_rows, item, frame_width, prefix_width, true);
-    var remaining = if (skip_newest_rows < line_row_count) line_row_count - skip_newest_rows else 0;
-
-    while (remaining > 0 and row_count.* < row_limit) {
+    const line_row_count = collectWrappedTranscriptLine(&line_rows, item, frame_width, prefix_width, repeat_prefix);
+    var remaining = line_row_count;
+    while (remaining > 0) {
         remaining -= 1;
-        rows[row_count.*] = line_rows[remaining];
-        row_count.* += 1;
+        sink.emitBorrowed(line_rows[remaining]);
+        if (sink.full()) return;
     }
 }
 
@@ -197,77 +249,6 @@ fn collectWrappedTranscriptLine(
         line_row_count += 1;
     }
     return line_row_count;
-}
-
-fn countItemRows(item: transcript_mod.TranscriptItem, frame_width: u16) usize {
-    const projected = transcript_projection.itemPrimary(item);
-    if (item != .tool) return countWrappedTranscriptRows(projected, frame_width);
-    return 2 +
-        countToolNoticeRows(item.tool, frame_width) +
-        countWrappedTranscriptRows(.{ .prefix = "│ ", .text = projected.prefix }, frame_width) +
-        countWrappedTranscriptRows(.{ .prefix = "│ ", .text = projected.text }, frame_width);
-}
-
-fn countToolNoticeRows(tool: transcript_mod.TranscriptTool, frame_width: u16) usize {
-    var buffer: [96]u8 = undefined;
-    const notice = transcript_projection.toolOmissionNotice(tool, &buffer) orelse return 0;
-    return countWrappedTranscriptRows(.{ .prefix = "│ ", .text = notice }, frame_width);
-}
-
-fn appendToolBlock(
-    rows: *[transcript_visual_rows_max]TranscriptVisualRow,
-    row_count: *usize,
-    row_limit: usize,
-    tool: transcript_mod.TranscriptTool,
-    projected: transcript_projection.RenderItem,
-    frame_width: u16,
-    skip_newest_rows: usize,
-) void {
-    appendGeneratedRow(rows, row_count, row_limit, "", "╰────", false, skip_newest_rows);
-    if (row_count.* >= row_limit) return;
-    appendWrappedTranscriptLineRepeatPrefix(
-        rows,
-        row_count,
-        row_limit,
-        .{ .prefix = "│ ", .text = projected.text },
-        frame_width,
-        skip_newest_rows,
-    );
-    if (row_count.* >= row_limit) return;
-    appendWrappedTranscriptLineRepeatPrefix(
-        rows,
-        row_count,
-        row_limit,
-        .{ .prefix = "│ ", .text = projected.prefix },
-        frame_width,
-        skip_newest_rows,
-    );
-    if (row_count.* >= row_limit) return;
-    var notice_buffer: [96]u8 = undefined;
-    if (transcript_projection.toolOmissionNotice(tool, &notice_buffer)) |notice| {
-        appendGeneratedRow(rows, row_count, row_limit, "│ ", notice, true, skip_newest_rows);
-        if (row_count.* >= row_limit) return;
-    }
-    appendGeneratedRow(rows, row_count, row_limit, "", "╭─[tool]", false, skip_newest_rows);
-}
-
-fn appendGeneratedRow(
-    rows: *[transcript_visual_rows_max]TranscriptVisualRow,
-    row_count: *usize,
-    row_limit: usize,
-    prefix: []const u8,
-    text: []const u8,
-    show_prefix: bool,
-    skip_newest_rows: usize,
-) void {
-    if (skip_newest_rows > 0 or row_count.* >= row_limit) return;
-    const slot = &rows[row_count.*];
-    const keep = @min(text.len, slot.storage.len);
-    @memcpy(slot.storage[0..keep], text[0..keep]);
-    slot.prefix = prefix;
-    slot.text = slot.storage[0..keep];
-    slot.show_prefix = show_prefix;
-    row_count.* += 1;
 }
 
 pub fn checkSize(width: u16, height: u16) !void {
@@ -384,14 +365,12 @@ test "frame renders typed tool rows with name and state" {
     try app.transcript.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .status = .started,
-        .summary = "started",
+        .event = .tool_execution_start,
     } });
     try app.transcript.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-2",
         .name = "read",
-        .status = .failed,
-        .summary = "failed",
+        .event = .tool_execution_end,
     } });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 40, 12, size_cells_max);
@@ -399,11 +378,8 @@ test "frame renders typed tool rows with name and state" {
     try Frame.build(app, &renderer);
 
     try expectGraphemeInColumn(renderer.next, 0, "╭");
-    try expectGraphemeInColumn(renderer.next, 0, "│");
-    try expectCellText(renderer.next, 2, 2, "tool started: ");
-    try expectCellText(renderer.next, 2, 3, "bash");
-    try expectCellText(renderer.next, 2, 6, "tool failed: ");
-    try expectCellText(renderer.next, 2, 7, "read");
+    try expectCellText(renderer.next, 2, 1, "[bash]");
+    try expectCellText(renderer.next, 2, 3, "[read]");
 }
 
 test "frame renders tool display text when present" {
@@ -413,9 +389,8 @@ test "frame renders tool display text when present" {
     try app.transcript.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .status = .started,
-        .summary = "started",
-        .subject = "zig build test",
+        .event = .tool_execution_start,
+        .args_preview = "zig build test",
     } });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 60, 6, size_cells_max);
@@ -423,9 +398,42 @@ test "frame renders tool display text when present" {
     try Frame.build(app, &renderer);
 
     try expectGraphemeInColumn(renderer.next, 0, "╭");
-    try expectGraphemeInColumn(renderer.next, 0, "│");
-    try expectCellText(renderer.next, 2, 2, "tool started: ");
-    try expectCellText(renderer.next, 2, 3, "zig build test");
+    try expectCellText(renderer.next, 2, 1, "[bash zig build test]");
+}
+
+test "tool visual row count includes chrome output and omission notice" {
+    var app = try app_mod.ProductApp.init(40, 4);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .event = .tool_execution_start,
+    } });
+    try app.transcript.appendToolOutput(std.testing.allocator, "call-1", "one\ntwo", 0, 3);
+
+    try std.testing.expectEqual(@as(usize, 4), transcriptScrollMax(app.transcript, app.width, 1));
+    try std.testing.expectEqual(@as(usize, 3), transcriptScrollMax(app.transcript, app.width, 2));
+}
+
+test "tool scroll skips newest rows once across whole block" {
+    var app = try app_mod.ProductApp.init(40, 4);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .event = .tool_execution_start,
+    } });
+    try app.transcript.appendToolOutput(std.testing.allocator, "call-1", "one\ntwo", 0, 0);
+    app.transcript_scroll_rows = 1;
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 4, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(app, &renderer);
+
+    try expectCellText(renderer.next, 2, 1, "one");
+    try expectCellText(renderer.next, 2, 2, "two");
 }
 
 test "frame renders updated tool row once" {
@@ -435,14 +443,12 @@ test "frame renders updated tool row once" {
     try app.transcript.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .status = .started,
-        .summary = "started",
+        .event = .tool_execution_start,
     } });
     try app.transcript.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .status = .completed,
-        .summary = "completed",
+        .event = .tool_execution_end,
     } });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
@@ -451,9 +457,7 @@ test "frame renders updated tool row once" {
 
     try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
     try expectGraphemeInColumn(renderer.next, 0, "╭");
-    try expectGraphemeInColumn(renderer.next, 0, "│");
-    try expectCellText(renderer.next, 2, 2, "tool completed: ");
-    try expectCellText(renderer.next, 2, 3, "bash");
+    try expectCellText(renderer.next, 2, 1, "[bash]");
 }
 
 test "frame renders transcript scrolled by newest visual rows" {
