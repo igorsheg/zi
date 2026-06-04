@@ -1,13 +1,13 @@
 const std = @import("std");
 const runtime = @import("../runtime/root.zig");
 const agent_mod = @import("../agent/root.zig");
+const ai = @import("../ai/root.zig");
 const tui = @import("../tui/root.zig");
 const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
 const sdk = @import("sdk.zig");
-const tool_output_policy = @import("tool_output_policy.zig");
 
 pub const Options = struct {
     cwd: []const u8 = ".",
@@ -20,8 +20,8 @@ pub const Options = struct {
 };
 
 const effect_count_max = tui.product.terminal_loop.effects_per_step_max;
-const frame_budget_ns = 33 * std.time.ns_per_ms;
-const input_poll_timeout_ms: i32 = 33;
+const frame_interval_ms: u64 = 33;
+const frame_interval_ns: i128 = frame_interval_ms * std.time.ns_per_ms;
 const input_reads_per_tick_max = 1;
 const prompt_progress_per_tick_max = 8;
 const public_events_per_tick_max = 16;
@@ -29,11 +29,12 @@ const render_attempts_per_tick_max = 1;
 const shutdown_drain_ticks_max = 30;
 const pending_tool_outputs_max = 32;
 const pending_tool_id_bytes_max = 128;
-const pending_tool_output_bytes_max = tool_output_policy.tool_update_bytes_max;
+const pending_tool_output_bytes_max = 4 * 1024;
+const tool_subject_bytes_max = 512;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     const last = last_render_ns orelse return true;
-    return now_ns - last >= frame_budget_ns;
+    return now_ns - last >= frame_interval_ns;
 }
 
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
@@ -76,7 +77,7 @@ fn boundedArgString(args_value: std.json.Value, key: []const u8) []const u8 {
     if (args_value != .object) return "";
     const value = args_value.object.get(key) orelse return "";
     if (value != .string) return "";
-    return utf8Prefix(value.string, tool_output_policy.tool_subject_bytes_max);
+    return utf8Prefix(value.string, tool_subject_bytes_max);
 }
 
 fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
@@ -97,7 +98,7 @@ fn toolStatusText(status: tui.product.transcript.TranscriptToolStatus) []const u
 fn firstToolResultText(result: agent_mod.AgentToolResult) []const u8 {
     for (result.content) |content| {
         switch (content) {
-            .text => |text| return utf8Prefix(text.text, tool_output_policy.tool_update_bytes_max),
+            .text => |text| return utf8Prefix(text.text, pending_tool_output_bytes_max),
             .image => {},
         }
     }
@@ -112,6 +113,20 @@ const TranscriptProjection = union(enum) {
 fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptProjection {
     if (text.len == 0) return null;
     return .{ .tool_output_delta = .{ .tool_call_id = tool_call_id, .text = text } };
+}
+
+fn toolCallAppend(content_index: usize, partial: ai.AssistantMessage) ?TranscriptProjection {
+    if (content_index >= partial.content.len) return null;
+    const content = partial.content[content_index];
+    if (content != .tool_call) return null;
+    const tool_call = content.tool_call;
+    if (tool_call.id.len == 0) return null;
+    return .{ .append = toolAppend(
+        tool_call.id,
+        tool_call.name,
+        .started,
+        toolSubject(tool_call.name, tool_call.arguments),
+    ) };
 }
 
 fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptProjection {
@@ -130,11 +145,24 @@ fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?Transcrip
 fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjection {
     return switch (event) {
         .agent_start, .agent_end, .turn_start, .turn_end => null,
-        .message_update => |payload| switch (payload.assistant_message_event) {
+        .message_update => |message_update| switch (message_update.assistant_message_event) {
             .text_delta => |delta| .{ .append = messageAppend(
                 .assistant,
                 delta.delta,
                 .extend_previous_assistant_message,
+            ) },
+            .thinking_delta => |delta| .{ .append = messageAppend(
+                .thinking,
+                delta.delta,
+                .extend_previous_same_role,
+            ) },
+            .toolcall_start => |payload| toolCallAppend(payload.content_index, payload.partial),
+            .toolcall_delta => |payload| toolCallAppend(payload.content_index, payload.partial),
+            .toolcall_end => |payload| .{ .append = toolAppend(
+                payload.tool_call.id,
+                payload.tool_call.name,
+                .started,
+                toolSubject(payload.tool_call.name, payload.tool_call.arguments),
             ) },
             .@"error" => .{ .append = statusAppend(.err, "assistant error") },
             else => null,
@@ -229,9 +257,13 @@ const InteractiveLoop = struct {
     }
 
     fn tick(self: *InteractiveLoop) !void {
-        try self.pollInputOnce(if (self.active_run == null) input_poll_timeout_ms else 0);
+        const input_ready = try self.waitForRuntimeWake();
+        if (input_ready) {
+            try self.drainInputReadyBounded(input_reads_per_tick_max);
+        } else {
+            try self.flushPendingInput();
+        }
         _ = try self.drainPromptProgressBounded(prompt_progress_per_tick_max);
-        try self.pollInputOnce(0);
         _ = try self.drainPublicEventsBounded(public_events_per_tick_max);
         if (render_attempts_per_tick_max > 0 and self.terminal_loop.isDirty()) {
             const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
@@ -243,24 +275,54 @@ const InteractiveLoop = struct {
         }
     }
 
-    fn pollInputOnce(self: *InteractiveLoop, timeout_ms: i32) !void {
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.terminal_loop.inputFd(),
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        _ = try std.posix.poll(&fds, timeout_ms);
-        if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-            const result = try self.terminal_loop.flushPendingInput(&self.effects);
-            defer self.deinitEffects(result.effect_count);
-            try self.handleStepResult(result);
-            try self.applyEffects(result.effect_count);
-            return;
+    fn waitForRuntimeWake(self: *InteractiveLoop) !bool {
+        const readable = runtime.ReadableFd.initBorrowed(self.terminal_loop.inputFd());
+        var input = readable.asyncReadable();
+        var frame = runtime.Timeout.fromMilliseconds(frame_interval_ms);
+        if (self.active_run) |prompt_run| {
+            var progress = self.host.promptRunProgress(prompt_run);
+            switch (try runtime.select(.{ .input = &input, .prompt = &progress, .frame = &frame })) {
+                .input => |result| return self.handleInputWaitResult(result),
+                .prompt => |result| {
+                    try self.applyPromptProgressResult(prompt_run, result);
+                    return false;
+                },
+                .frame => return false,
+            }
+        } else {
+            switch (try runtime.select(.{ .input = &input, .frame = &frame })) {
+                .input => |result| return self.handleInputWaitResult(result),
+                .frame => return false,
+            }
         }
+    }
+
+    fn handleInputWaitResult(self: *InteractiveLoop, result: runtime.ReadableFdError!void) bool {
+        result catch {
+            self.requestShutdown();
+            return false;
+        };
+        return true;
+    }
+
+    fn flushPendingInput(self: *InteractiveLoop) !void {
+        const result = try self.terminal_loop.flushPendingInput(&self.effects);
+        defer self.deinitEffects(result.effect_count);
+        try self.handleStepResult(result);
+        try self.applyEffects(result.effect_count);
+    }
+
+    fn drainInputReadyBounded(self: *InteractiveLoop, limit: usize) !void {
         var reads: usize = 0;
-        while (reads < input_reads_per_tick_max) : (reads += 1) {
+        while (reads < limit) : (reads += 1) {
             const result = self.terminal_loop.readAvailableInput(&self.effects) catch |err| switch (err) {
-                error.WouldBlock => return,
+                error.WouldBlock => {
+                    const flush = try self.terminal_loop.flushPendingInput(&self.effects);
+                    defer self.deinitEffects(flush.effect_count);
+                    try self.handleStepResult(flush);
+                    try self.applyEffects(flush.effect_count);
+                    return;
+                },
                 else => {
                     try self.stderr.writeAll("terminal read failed; shutting down\n");
                     self.requestShutdown();
@@ -300,19 +362,26 @@ const InteractiveLoop = struct {
         var count: usize = 0;
         while (count < limit and self.active_run != null) : (count += 1) {
             var progress = self.host.promptRunProgress(prompt_run);
-            var frame_timeout = runtime.Timeout.fromMilliseconds(if (count == 0) input_poll_timeout_ms else 0);
-            switch (try runtime.select(.{ .prompt = &progress, .frame = &frame_timeout })) {
-                .prompt => |result| {
-                    const more = try self.host.applyPromptRunProgress(prompt_run, result);
-                    if (!more) {
-                        self.host.destroyPromptRun(prompt_run);
-                        self.active_run = null;
-                    }
-                },
-                .frame => return count,
+            var ready = runtime.Timeout.fromMilliseconds(0);
+            switch (try runtime.select(.{ .prompt = &progress, .ready = &ready })) {
+                .prompt => |result| try self.applyPromptProgressResult(prompt_run, result),
+                .ready => return count,
             }
         }
         return count;
+    }
+
+    fn applyPromptProgressResult(
+        self: *InteractiveLoop,
+        prompt_run: *AgentSession.LivePromptRun,
+        result: anytype,
+    ) !void {
+        if (self.active_run != prompt_run) return;
+        const more = try self.host.applyPromptRunProgress(prompt_run, result);
+        if (!more) {
+            self.host.destroyPromptRun(prompt_run);
+            self.active_run = null;
+        }
     }
 
     fn drainPublicEventsBounded(self: *InteractiveLoop, limit: usize) !usize {
@@ -559,14 +628,14 @@ test "interactive overflow status is explicit" {
 
 test "interactive frame due enforces thirty fps cadence" {
     try std.testing.expect(frameDue(1000, null));
-    try std.testing.expect(!frameDue(1000 + frame_budget_ns - 1, 1000));
-    try std.testing.expect(frameDue(1000 + frame_budget_ns, 1000));
-    try std.testing.expect(frameDue(1000 + frame_budget_ns + 1, 1000));
+    try std.testing.expect(!frameDue(1000 + frame_interval_ns - 1, 1000));
+    try std.testing.expect(frameDue(1000 + frame_interval_ns, 1000));
+    try std.testing.expect(frameDue(1000 + frame_interval_ns + 1, 1000));
 }
 
 test "interactive loop bounds stay responsive" {
-    try std.testing.expect(frame_budget_ns <= 33 * std.time.ns_per_ms);
-    try std.testing.expect(input_poll_timeout_ms <= 33);
+    try std.testing.expect(frame_interval_ns <= 33 * std.time.ns_per_ms);
+    try std.testing.expect(frame_interval_ms <= 33);
     try std.testing.expectEqual(@as(usize, 1), input_reads_per_tick_max);
     try std.testing.expectEqual(@as(usize, 8), prompt_progress_per_tick_max);
     try std.testing.expectEqual(@as(usize, 16), public_events_per_tick_max);
@@ -609,6 +678,68 @@ test "interactive maps tool events to typed transcript items" {
     try std.testing.expect(end == .append);
     try std.testing.expect(end.append == .tool);
     try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.failed, end.append.tool.status);
+}
+
+fn testAssistantMessage(content: []const ai.AssistantContent) ai.AssistantMessage {
+    return .{
+        .content = content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{
+            .input = 0,
+            .output = 0,
+            .cache_read = 0,
+            .cache_write = 0,
+            .total_tokens = 0,
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0, .total = 0 },
+        },
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+}
+
+test "interactive maps thinking deltas to streaming thinking transcript" {
+    const event = transcriptAppendFromEvent(.{ .agent_event = .{ .message_update = .{
+        .message = .{ .assistant = testAssistantMessage(&.{}) },
+        .assistant_message_event = .{ .thinking_delta = .{
+            .content_index = 0,
+            .delta = "considering",
+            .partial = testAssistantMessage(&.{}),
+        } },
+    } } }).?;
+    try std.testing.expect(event == .append);
+    try std.testing.expect(event.append == .message);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptRole.thinking, event.append.message.role);
+    try std.testing.expectEqual(.extend_previous_same_role, event.append.message.mode);
+    try std.testing.expectEqualStrings("considering", event.append.message.text);
+}
+
+test "interactive maps tool call deltas to pending tool row" {
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(std.testing.allocator);
+    try args.put(std.testing.allocator, "command", .{ .string = "echo streaming" });
+    const content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "bash",
+        .arguments = .{ .object = args },
+    } }};
+    const partial = testAssistantMessage(&content);
+
+    const event = transcriptAppendFromEvent(.{ .agent_event = .{ .message_update = .{
+        .message = .{ .assistant = partial },
+        .assistant_message_event = .{ .toolcall_delta = .{
+            .content_index = 0,
+            .delta = "streaming",
+            .partial = partial,
+        } },
+    } } }).?;
+    try std.testing.expect(event == .append);
+    try std.testing.expect(event.append == .tool);
+    try std.testing.expectEqualStrings("call-1", event.append.tool.tool_call_id);
+    try std.testing.expectEqualStrings("bash", event.append.tool.name);
+    try std.testing.expectEqualStrings("echo streaming", event.append.tool.subject);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.started, event.append.tool.status);
 }
 
 test "interactive maps tool args to bounded subject" {

@@ -6,11 +6,11 @@ pub const line_count_max: usize = item_count_max;
 pub const total_size_bytes_max: usize = 64 * 1024;
 pub const append_size_bytes_max: usize = 8 * 1024;
 
-pub const TranscriptRole = enum { user, assistant, system };
+pub const TranscriptRole = enum { user, assistant, system, thinking };
 pub const TranscriptStatusLevel = enum { info, warning, err };
 pub const TranscriptToolStatus = enum { started, completed, failed };
 
-pub const TranscriptAppendMode = enum { new_item, extend_previous_assistant_message };
+pub const TranscriptAppendMode = enum { new_item, extend_previous_assistant_message, extend_previous_same_role };
 
 pub const TranscriptAppend = union(enum) {
     message: MessageAppend,
@@ -136,12 +136,14 @@ pub const TranscriptBuffer = struct {
         if (message.text.len > append_size_bytes_max) return error.TranscriptAppendTooLarge;
         if (!std.unicode.utf8ValidateSlice(message.text)) return error.InvalidUtf8;
 
-        if (message.mode == .extend_previous_assistant_message and
-            message.role == .assistant and
-            self.items.items.len > 0)
-        {
+        if (message.mode != .new_item and self.items.items.len > 0) {
             const last = &self.items.items[self.items.items.len - 1];
-            if (last.* == .message and last.message.role == .assistant) {
+            const role_matches = last.* == .message and switch (message.mode) {
+                .new_item => false,
+                .extend_previous_assistant_message => last.message.role == .assistant and message.role == .assistant,
+                .extend_previous_same_role => last.message.role == message.role,
+            };
+            if (role_matches) {
                 last.message.text = try allocator.realloc(
                     last.message.text,
                     last.message.text.len + message.text.len,

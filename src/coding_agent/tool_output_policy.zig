@@ -3,10 +3,6 @@ const std = @import("std");
 pub const default_max_lines: usize = 2000;
 pub const default_max_bytes: usize = 50 * 1024;
 pub const grep_max_line_bytes: usize = 500;
-pub const tool_subject_bytes_max: usize = 512;
-pub const tool_update_bytes_max: usize = 4 * 1024;
-pub const tool_result_preview_lines_max: usize = 20;
-pub const tool_result_preview_bytes_max: usize = 2048;
 
 pub const TruncationLimit = enum { lines, bytes };
 

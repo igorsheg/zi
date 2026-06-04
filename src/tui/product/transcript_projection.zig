@@ -1,4 +1,5 @@
 const std = @import("std");
+const primitive = @import("../primitive/root.zig");
 const transcript = @import("transcript.zig");
 
 pub const RenderItem = struct {
@@ -15,21 +16,11 @@ pub fn itemPrimary(item: transcript.TranscriptItem) RenderItem {
 }
 
 pub fn toolOmissionNotice(tool: transcript.TranscriptTool, buffer: *[96]u8) ?[]const u8 {
-    if (tool.output_truncated_head_lines > 0) {
-        return std.fmt.bufPrint(
-            buffer,
-            "... {d} earlier lines omitted ...",
-            .{tool.output_truncated_head_lines},
-        ) catch "... output omitted ...";
-    }
-    if (tool.output_truncated_head_bytes > 0) {
-        return std.fmt.bufPrint(
-            buffer,
-            "... {d} earlier bytes omitted ...",
-            .{tool.output_truncated_head_bytes},
-        ) catch "... output omitted ...";
-    }
-    return null;
+    return primitive.chrome.elisionLine(
+        buffer,
+        tool.output_truncated_head_lines,
+        tool.output_truncated_head_bytes,
+    ) catch "· ··· output omitted";
 }
 
 fn rolePrefix(role: transcript.TranscriptRole) []const u8 {
@@ -37,6 +28,7 @@ fn rolePrefix(role: transcript.TranscriptRole) []const u8 {
         .user => "user: ",
         .assistant => "assistant: ",
         .system => "system: ",
+        .thinking => "thinking: ",
     };
 }
 
@@ -87,5 +79,5 @@ test "transcript projection formats omission notice" {
         .output_truncated_head_lines = 42,
     };
     var buffer: [96]u8 = undefined;
-    try std.testing.expectEqualStrings("... 42 earlier lines omitted ...", toolOmissionNotice(tool, &buffer).?);
+    try std.testing.expectEqualStrings("· ··· 42 earlier lines", toolOmissionNotice(tool, &buffer).?);
 }
