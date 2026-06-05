@@ -30,7 +30,7 @@ const shutdown_drain_ticks_max = 30;
 const pending_tool_outputs_max = 32;
 const pending_tool_id_bytes_max = 128;
 const pending_tool_output_bytes_max = tui.product.transcript.append_size_bytes_max;
-const tool_args_preview_bytes_max = 512;
+const tool_title_bytes_max = 512;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     const last = last_render_ns orelse return true;
@@ -54,29 +54,52 @@ fn statusAppend(level: tui.product.transcript.TranscriptStatusLevel, text: []con
 fn toolAppend(
     tool_call_id: []const u8,
     name: []const u8,
-    event: tui.product.transcript.TranscriptToolEvent,
-    args_preview: []const u8,
+    status: tui.product.transcript.TranscriptToolStatus,
+    title: []const u8,
+    is_error: bool,
 ) TranscriptAppend {
     return .{ .tool = .{
         .tool_call_id = tool_call_id,
         .name = name,
-        .event = event,
-        .args_preview = args_preview,
+        .kind = toolKind(name),
+        .status = if (is_error) .err else status,
+        .body_mode = toolBodyMode(name),
+        .title = title,
     } };
 }
 
+fn toolKind(name: []const u8) tui.product.transcript.TranscriptToolKind {
+    if (std.mem.eql(u8, name, "bash")) return .bash;
+    if (std.mem.eql(u8, name, "read")) return .read;
+    if (std.mem.eql(u8, name, "edit")) return .edit;
+    return .generic;
+}
+
+fn toolBodyMode(name: []const u8) tui.product.transcript.TranscriptToolBodyMode {
+    return switch (toolKind(name)) {
+        .read, .edit => .hidden_on_success,
+        .generic, .bash => .visible,
+    };
+}
+
 fn toolArgsPreview(tool_name: []const u8, args_value: std.json.Value) []const u8 {
-    if (std.mem.eql(u8, tool_name, "bash")) return boundedArgString(args_value, "command");
+    if (std.mem.eql(u8, tool_name, "bash")) return boundedBashCommand(args_value);
     if (std.mem.eql(u8, tool_name, "grep")) return boundedArgString(args_value, "pattern");
     if (std.mem.eql(u8, tool_name, "find")) return boundedArgString(args_value, "name");
     return boundedArgString(args_value, "path");
+}
+
+fn boundedBashCommand(args_value: std.json.Value) []const u8 {
+    const command = boundedArgString(args_value, "command");
+    if (command.len == 0) return "";
+    return command;
 }
 
 fn boundedArgString(args_value: std.json.Value, key: []const u8) []const u8 {
     if (args_value != .object) return "";
     const value = args_value.object.get(key) orelse return "";
     if (value != .string) return "";
-    return utf8Prefix(value.string, tool_args_preview_bytes_max);
+    return utf8Prefix(value.string, tool_title_bytes_max);
 }
 
 fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
@@ -112,7 +135,6 @@ fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptProje
 }
 
 fn toolCallAppend(
-    event: tui.product.transcript.TranscriptToolEvent,
     content_index: usize,
     partial: ai.AssistantMessage,
 ) ?TranscriptProjection {
@@ -124,8 +146,9 @@ fn toolCallAppend(
     return .{ .append = toolAppend(
         tool_call.id,
         tool_call.name,
-        event,
+        .pending,
         toolArgsPreview(tool_call.name, tool_call.arguments),
+        false,
     ) };
 }
 
@@ -156,13 +179,14 @@ fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjec
                 delta.delta,
                 .extend_previous_same_role,
             ) },
-            .toolcall_start => |payload| toolCallAppend(.toolcall_start, payload.content_index, payload.partial),
-            .toolcall_delta => |payload| toolCallAppend(.toolcall_delta, payload.content_index, payload.partial),
+            .toolcall_start => |payload| toolCallAppend(payload.content_index, payload.partial),
+            .toolcall_delta => |payload| toolCallAppend(payload.content_index, payload.partial),
             .toolcall_end => |payload| .{ .append = toolAppend(
                 payload.tool_call.id,
                 payload.tool_call.name,
-                .toolcall_end,
+                .pending,
                 toolArgsPreview(payload.tool_call.name, payload.tool_call.arguments),
+                false,
             ) },
             .@"error" => .{ .append = statusAppend(.err, "assistant error") },
             else => null,
@@ -170,8 +194,9 @@ fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjec
         .tool_execution_start => |payload| .{ .append = toolAppend(
             payload.tool_call_id,
             payload.tool_name,
-            .tool_execution_start,
+            .pending,
             toolArgsPreview(payload.tool_name, payload.args),
+            false,
         ) },
         .tool_execution_update => |payload| toolOutputAppend(
             payload.tool_call_id,
@@ -180,8 +205,9 @@ fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjec
         .tool_execution_end => |payload| .{ .append = toolAppend(
             payload.tool_call_id,
             payload.tool_name,
-            .tool_execution_end,
+            if (payload.is_error) .err else .success,
             "",
+            payload.is_error,
         ) },
         .message_start, .message_end => null,
     };
@@ -697,10 +723,10 @@ test "interactive maps tool events to typed transcript items" {
     try std.testing.expect(start.append == .tool);
     try std.testing.expectEqualStrings("1", start.append.tool.tool_call_id);
     try std.testing.expectEqualStrings("bash", start.append.tool.name);
-    try std.testing.expectEqualStrings("", start.append.tool.args_preview);
+    try std.testing.expectEqualStrings("", start.append.tool.title);
     try std.testing.expectEqual(
-        tui.product.transcript.TranscriptToolEvent.tool_execution_start,
-        start.append.tool.event,
+        tui.product.transcript.TranscriptToolStatus.pending,
+        start.append.tool.status,
     );
 
     const end = transcriptAppendFromEvent(.{ .agent_event = .{ .tool_execution_end = .{
@@ -711,7 +737,7 @@ test "interactive maps tool events to typed transcript items" {
     } } }).?;
     try std.testing.expect(end == .append);
     try std.testing.expect(end.append == .tool);
-    try std.testing.expectEqual(tui.product.transcript.TranscriptToolEvent.tool_execution_end, end.append.tool.event);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.err, end.append.tool.status);
 }
 
 fn testAssistantMessage(content: []const ai.AssistantContent) ai.AssistantMessage {
@@ -772,11 +798,11 @@ test "interactive maps tool call deltas to pending tool row" {
     try std.testing.expect(event.append == .tool);
     try std.testing.expectEqualStrings("call-1", event.append.tool.tool_call_id);
     try std.testing.expectEqualStrings("bash", event.append.tool.name);
-    try std.testing.expectEqualStrings("echo streaming", event.append.tool.args_preview);
-    try std.testing.expectEqual(tui.product.transcript.TranscriptToolEvent.toolcall_delta, event.append.tool.event);
+    try std.testing.expectEqualStrings("echo streaming", event.append.tool.title);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.pending, event.append.tool.status);
 }
 
-test "interactive maps tool args to bounded args_preview" {
+test "interactive maps tool args to bounded title" {
     var args: std.json.ObjectMap = .empty;
     defer args.deinit(std.testing.allocator);
     try args.put(std.testing.allocator, "command", .{ .string = "zig build test" });
@@ -788,7 +814,7 @@ test "interactive maps tool args to bounded args_preview" {
     } } }).?;
     try std.testing.expect(start == .append);
     try std.testing.expect(start.append == .tool);
-    try std.testing.expectEqualStrings("zig build test", start.append.tool.args_preview);
+    try std.testing.expectEqualStrings("zig build test", start.append.tool.title);
 }
 
 test "interactive seeds tui transcript from public history snapshot" {

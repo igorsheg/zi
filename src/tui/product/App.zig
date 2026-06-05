@@ -3,6 +3,7 @@ const substrate = @import("../substrate/root.zig");
 const composer_mod = @import("composer.zig");
 const frame_mod = @import("frame.zig");
 const keys = @import("keys.zig");
+const theme_mod = @import("theme.zig");
 const transcript = @import("transcript.zig");
 
 pub const ProductApp = struct {
@@ -11,6 +12,7 @@ pub const ProductApp = struct {
     composer: composer_mod.ComposerBuffer = .{},
     transcript: transcript.TranscriptBuffer = .{},
     transcript_scroll_rows: usize = 0,
+    theme: theme_mod.Theme = theme_mod.Theme.codex(),
     dirty: bool = true,
 
     pub fn init(width: u16, height: u16) !ProductApp {
@@ -206,7 +208,7 @@ test "product app maps ctrl-u and ctrl-d to transcript scroll" {
     try appendTestMessage(&app, .system, "four");
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x15 } } }) == null);
-    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
+    try std.testing.expectEqual(@as(usize, 3), app.transcript_scroll_rows);
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x04 } } }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
 }
@@ -231,9 +233,9 @@ test "product app pages transcript scroll and append preserves it" {
     try appendTestMessage(&app, .system, "four");
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_up } }) == null);
-    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
+    try std.testing.expectEqual(@as(usize, 3), app.transcript_scroll_rows);
     try appendTestMessage(&app, .system, "five");
-    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
+    try std.testing.expectEqual(@as(usize, 3), app.transcript_scroll_rows);
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_down } }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
 }

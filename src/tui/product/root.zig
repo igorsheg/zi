@@ -7,6 +7,7 @@ pub const transcript_preview = @import("transcript_preview.zig");
 pub const transcript_projection = @import("transcript_projection.zig");
 pub const loop = @import("loop.zig");
 pub const terminal_loop = @import("terminal_loop.zig");
+pub const theme = @import("theme.zig");
 pub const vscreen_harness = @import("vscreen_harness.zig");
 const render_smoke = @import("render_smoke.zig");
 
@@ -16,6 +17,8 @@ pub const Effect = app.Effect;
 pub const Frame = frame.Frame;
 pub const ProductLoop = loop.ProductLoop;
 pub const TerminalLoop = terminal_loop.TerminalLoop;
+pub const Theme = theme.Theme;
+pub const ThemeId = theme.ThemeId;
 pub const VScreenHarness = vscreen_harness.VScreenHarness;
 
 test {
@@ -28,6 +31,7 @@ test {
     _ = transcript_projection;
     _ = loop;
     _ = terminal_loop;
+    _ = theme;
     _ = vscreen_harness;
     _ = render_smoke;
 }

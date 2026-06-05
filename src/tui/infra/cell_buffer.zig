@@ -124,12 +124,15 @@ pub const CellBuffer = struct {
         while (x < self.width) : (x += 1) try self.set(x, y, .{});
     }
     pub fn clearRect(self: *CellBuffer, x: u16, y: u16, w: u16, h: u16) Error!void {
+        try self.fillRect(x, y, w, h, .{});
+    }
+    pub fn fillRect(self: *CellBuffer, x: u16, y: u16, w: u16, h: u16, style: Style) Error!void {
         const x_end = @min(@as(usize, x) + w, self.width);
         const y_end = @min(@as(usize, y) + h, self.height);
         var yy: usize = y;
         while (yy < y_end) : (yy += 1) {
             var xx: usize = x;
-            while (xx < x_end) : (xx += 1) try self.set(@intCast(xx), @intCast(yy), .{});
+            while (xx < x_end) : (xx += 1) try self.set(@intCast(xx), @intCast(yy), Cell.empty(style));
         }
     }
     pub fn writeText(self: *CellBuffer, x: u16, y: u16, bytes: []const u8, style: Style) Error!void {

@@ -58,9 +58,8 @@ test "product frame wraps long transcript text from bottom" {
     }) == null);
 
     _ = try harness.render();
-    try expectCellText(&harness, 0, 1, "assistant: a");
-    try expectCellText(&harness, 0, 2, "bcdefghij012");
-    try expectCellText(&harness, 0, 3, "3456789");
+    try expectCellText(&harness, 1, 1, "abcdefghij");
+    try expectCellText(&harness, 1, 2, "0123456789");
 }
 
 test "product frame wraps graphemes without splitting wide cells" {
@@ -73,8 +72,7 @@ test "product frame wraps graphemes without splitting wide cells" {
     }) == null);
 
     _ = try harness.render();
-    try expectCellText(&harness, 0, 1, "assistant:");
-    try expectCellText(&harness, 0, 2, "o\u{0300}中👩🏽‍🚀b");
+    try expectCellText(&harness, 1, 1, "o\u{0300}中👩🏽‍🚀b");
 }
 
 test "product frame shows newest transcript lines and preserves composer row" {
@@ -98,9 +96,7 @@ test "product frame shows newest transcript lines and preserves composer row" {
     }) == null);
 
     _ = try harness.render();
-    try expectCellText(&harness, 0, 1, "user: one");
-    try expectCellText(&harness, 0, 2, "assistant: two");
-    try expectCellText(&harness, 0, 3, "system: three");
+    try expectCellText(&harness, 1, 2, "system: three");
     try expectCellText(&harness, 0, 4, "> o\u{0300}👩🏽‍🚀");
     try std.testing.expectEqual(@as(usize, 4), harness.app.transcript.items.items.len);
     try std.testing.expectEqualStrings("two", harness.app.transcript.items.items[2].message.text);

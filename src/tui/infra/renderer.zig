@@ -29,6 +29,9 @@ pub const Renderer = struct {
     pub fn writeText(self: *Renderer, x: u16, y: u16, bytes: []const u8, style: Style) !void {
         try self.next.writeText(x, y, bytes, style);
     }
+    pub fn fillRect(self: *Renderer, x: u16, y: u16, w: u16, h: u16, style: Style) !void {
+        try self.next.fillRect(x, y, w, h, style);
+    }
     pub fn resize(self: *Renderer, width: u16, height: u16) !void {
         std.debug.assert(!self.staged);
         var current = try CellBuffer.init(self.current.allocator, width, height, self.current.max_cells);
@@ -101,7 +104,18 @@ fn writeCell(cell: Cell, out: *FrameOutput) !void {
 fn writeStyleTransition(current: *Style, next: Style, out: *FrameOutput) !void {
     if (!colorEql(current.fg, next.fg)) try writeColor(next.fg, true, out);
     if (!colorEql(current.bg, next.bg)) try writeColor(next.bg, false, out);
-    if (current.bold != next.bold) try out.append(if (next.bold) "\x1b[1m" else "\x1b[22m");
+    if (current.bold != next.bold or current.dim != next.dim) {
+        if (!next.bold and !next.dim) {
+            try out.append("\x1b[22m");
+        } else if (current.bold or current.dim) {
+            try out.append("\x1b[22m");
+            if (next.bold) try out.append("\x1b[1m");
+            if (next.dim) try out.append("\x1b[2m");
+        } else {
+            if (next.bold) try out.append("\x1b[1m");
+            if (next.dim) try out.append("\x1b[2m");
+        }
+    }
     if (current.underline != next.underline) try out.append(if (next.underline) "\x1b[4m" else "\x1b[24m");
 }
 fn writeColor(color: Color, foreground: bool, out: *FrameOutput) !void {
@@ -147,6 +161,27 @@ test "renderer stages commits retries style and wide continuation skip" {
     _ = try r.stage(&out);
     try std.testing.expect(out.len() > len);
     r.commit();
+}
+
+test "renderer emits dim intensity transitions" {
+    var r = try Renderer.init(std.testing.allocator, 2, 1, 2);
+    defer r.deinit();
+    var storage: [256]u8 = undefined;
+    var out = FrameOutput.init(&storage);
+
+    try r.writeText(0, 0, "a", .{ .dim = true });
+    try r.writeText(1, 0, "b", .{ .bold = true });
+    _ = try r.stage(&out);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "\x1b[2m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "\x1b[22m\x1b[1m") != null);
+}
+
+test "renderer fills styled blank cells" {
+    var r = try Renderer.init(std.testing.allocator, 3, 1, 3);
+    defer r.deinit();
+    try r.fillRect(0, 0, 3, 1, .{ .bg = .{ .indexed = 236 } });
+    try std.testing.expect((try r.next.get(0, 0)).style.eql(.{ .bg = .{ .indexed = 236 } }));
+    try std.testing.expect((try r.next.get(2, 0)).style.eql(.{ .bg = .{ .indexed = 236 } }));
 }
 
 test "renderer emits complete grapheme bytes" {
