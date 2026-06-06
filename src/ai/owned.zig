@@ -61,6 +61,41 @@ pub fn deinitAssistantMessage(allocator: std.mem.Allocator, message: protocol.As
     if (message.error_message) |value| allocator.free(value);
 }
 
+pub fn deinitAssistantMessageEvent(allocator: std.mem.Allocator, event: protocol.AssistantMessageEvent) void {
+    switch (event) {
+        .start => |payload| deinitAssistantMessage(allocator, payload.partial),
+        .text_start => |payload| deinitAssistantMessage(allocator, payload.partial),
+        .text_delta => |payload| {
+            allocator.free(payload.delta);
+            deinitAssistantMessage(allocator, payload.partial);
+        },
+        .text_end => |payload| {
+            allocator.free(payload.content);
+            deinitAssistantMessage(allocator, payload.partial);
+        },
+        .thinking_start => |payload| deinitAssistantMessage(allocator, payload.partial),
+        .thinking_delta => |payload| {
+            allocator.free(payload.delta);
+            deinitAssistantMessage(allocator, payload.partial);
+        },
+        .thinking_end => |payload| {
+            allocator.free(payload.content);
+            deinitAssistantMessage(allocator, payload.partial);
+        },
+        .toolcall_start => |payload| deinitAssistantMessage(allocator, payload.partial),
+        .toolcall_delta => |payload| {
+            allocator.free(payload.delta);
+            deinitAssistantMessage(allocator, payload.partial);
+        },
+        .toolcall_end => |payload| {
+            deinitToolCall(allocator, payload.tool_call);
+            deinitAssistantMessage(allocator, payload.partial);
+        },
+        .done => |payload| deinitAssistantMessage(allocator, payload.message),
+        .@"error" => |payload| deinitAssistantMessage(allocator, payload.@"error"),
+    }
+}
+
 pub fn copyAssistantMessageEvent(
     allocator: std.mem.Allocator,
     source: protocol.AssistantMessageEvent,
@@ -120,7 +155,7 @@ pub fn copyAssistantMessageEvent(
     };
 }
 
-fn copyAssistantContentSlice(
+pub fn copyAssistantContentSlice(
     allocator: std.mem.Allocator,
     source: []const protocol.AssistantContent,
 ) ![]const protocol.AssistantContent {
@@ -137,7 +172,7 @@ fn copyAssistantContentSlice(
     return cloned;
 }
 
-fn copyAssistantContent(
+pub fn copyAssistantContent(
     allocator: std.mem.Allocator,
     source: protocol.AssistantContent,
 ) !protocol.AssistantContent {
@@ -176,7 +211,7 @@ fn copyAssistantContent(
     };
 }
 
-fn deinitAssistantContentItems(allocator: std.mem.Allocator, source: []const protocol.AssistantContent) void {
+pub fn deinitAssistantContentItems(allocator: std.mem.Allocator, source: []const protocol.AssistantContent) void {
     for (source) |content| switch (content) {
         .text => |text| {
             allocator.free(text.text);
@@ -195,13 +230,20 @@ fn deinitAssistantContentItems(allocator: std.mem.Allocator, source: []const pro
     };
 }
 
-fn deinitAssistantContentSlice(allocator: std.mem.Allocator, source: []const protocol.AssistantContent) void {
+pub fn deinitAssistantContentSlice(allocator: std.mem.Allocator, source: []const protocol.AssistantContent) void {
     deinitAssistantContentItems(allocator, source);
     allocator.free(source);
 }
 
 fn copyOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
     return if (source) |value| try allocator.dupe(u8, value) else null;
+}
+
+pub fn deinitToolCall(allocator: std.mem.Allocator, tool_call: protocol.ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    runtime.freeJsonValue(allocator, tool_call.arguments);
+    if (tool_call.thought_signature) |value| allocator.free(value);
 }
 
 fn copyToolCall(allocator: std.mem.Allocator, source: protocol.ToolCall) !protocol.ToolCall {

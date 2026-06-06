@@ -192,6 +192,45 @@ fn copyTerminalMessages(
     return cloned;
 }
 
+pub fn deinitStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) void {
+    switch (event) {
+        .message_start => |payload| agent.deinitAgentMessage(allocator, payload.message),
+        .message_update => |payload| {
+            agent.deinitAgentMessage(allocator, payload.message);
+            ai.owned.deinitAssistantMessageEvent(allocator, payload.assistant_message_event);
+        },
+        .message_end => |payload| agent.deinitAgentMessage(allocator, payload.message),
+        .turn_end => |payload| {
+            agent.deinitAgentMessage(allocator, payload.message);
+            for (payload.tool_results) |message| agent.deinitToolResultMessage(allocator, message);
+            allocator.free(payload.tool_results);
+        },
+        .agent_end => |payload| {
+            for (payload.messages) |message| agent.deinitAgentMessage(allocator, message);
+            allocator.free(payload.messages);
+        },
+        .tool_execution_start => |payload| {
+            allocator.free(payload.tool_call_id);
+            allocator.free(payload.tool_name);
+            runtime.freeJsonValue(allocator, payload.args);
+        },
+        .tool_execution_update => |payload| {
+            allocator.free(payload.tool_call_id);
+            allocator.free(payload.tool_name);
+            runtime.freeJsonValue(allocator, payload.args);
+            agent.deinitToolResultContentSlice(allocator, payload.partial_result.content);
+            if (payload.partial_result.details) |details| runtime.freeJsonValue(allocator, details);
+        },
+        .tool_execution_end => |payload| {
+            allocator.free(payload.tool_call_id);
+            allocator.free(payload.tool_name);
+            agent.deinitToolResultContentSlice(allocator, payload.result.content);
+            if (payload.result.details) |details| runtime.freeJsonValue(allocator, details);
+        },
+        .agent_start, .turn_start => {},
+    }
+}
+
 fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
     return switch (event) {
         .tool_execution_start => |payload| .{ .tool_execution_start = .{
@@ -214,13 +253,16 @@ fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
         .message_start => |payload| .{ .message_start = .{
             .message = try copyStreamMessage(allocator, payload.message),
         } },
-        .message_update => |payload| .{ .message_update = .{
-            .message = try copyStreamMessage(allocator, payload.message),
-            .assistant_message_event = try ai.owned.copyAssistantMessageEvent(
+        .message_update => |payload| blk: {
+            const assistant_message_event = try copyCompactAssistantMessageEvent(
                 allocator,
                 payload.assistant_message_event,
-            ),
-        } },
+            );
+            break :blk .{ .message_update = .{
+                .message = .{ .assistant = assistantEventPartial(assistant_message_event) },
+                .assistant_message_event = assistant_message_event,
+            } };
+        },
         .message_end => |payload| .{ .message_end = .{
             .message = try copyStreamMessage(allocator, payload.message),
         } },
@@ -232,6 +274,127 @@ fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
     };
 }
 
+const stream_tool_argument_preview_bytes_max: usize = 512;
+
+fn copyCompactAssistantMessageEvent(
+    allocator: std.mem.Allocator,
+    source: ai.AssistantMessageEvent,
+) !ai.AssistantMessageEvent {
+    return switch (source) {
+        .text_delta => |event| .{ .text_delta = .{
+            .content_index = event.content_index,
+            .delta = try allocator.dupe(u8, event.delta),
+            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .text),
+        } },
+        .thinking_delta => |event| .{ .thinking_delta = .{
+            .content_index = event.content_index,
+            .delta = try allocator.dupe(u8, event.delta),
+            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .thinking),
+        } },
+        .toolcall_delta => |event| .{ .toolcall_delta = .{
+            .content_index = event.content_index,
+            .delta = try allocator.dupe(u8, event.delta),
+            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call),
+        } },
+        else => ai.owned.copyAssistantMessageEvent(allocator, source),
+    };
+}
+
+const DeltaPartialKind = enum { text, thinking, tool_call };
+
+fn copyDeltaPartial(
+    allocator: std.mem.Allocator,
+    source: ai.AssistantMessage,
+    content_index: usize,
+    kind: DeltaPartialKind,
+) !ai.AssistantMessage {
+    if (content_index >= source.content.len) return ai.owned.copyAssistantMessage(allocator, source);
+    const content = try copyDeltaContent(allocator, source.content[content_index], content_index + 1, content_index, kind);
+    errdefer ai.owned.deinitAssistantContentSlice(allocator, content);
+    return copyAssistantMetadataWithContent(allocator, source, content);
+}
+
+fn copyDeltaContent(
+    allocator: std.mem.Allocator,
+    target: ai.AssistantContent,
+    content_len: usize,
+    target_index: usize,
+    kind: DeltaPartialKind,
+) ![]const ai.AssistantContent {
+    const content = try allocator.alloc(ai.AssistantContent, content_len);
+    errdefer allocator.free(content);
+    for (content) |*item| item.* = .{ .text = .{ .text = "" } };
+    content[target_index] = switch (kind) {
+        .text => .{ .text = .{ .text = "" } },
+        .thinking => .{ .thinking = .{ .thinking = "" } },
+        .tool_call => try copyToolCallPreviewContent(allocator, target),
+    };
+    return content;
+}
+
+fn copyToolCallPreviewContent(allocator: std.mem.Allocator, target: ai.AssistantContent) !ai.AssistantContent {
+    if (target != .tool_call) return .{ .text = .{ .text = "" } };
+    const tool_call = target.tool_call;
+    const id = try allocator.dupe(u8, tool_call.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, tool_call.name);
+    errdefer allocator.free(name);
+    const arguments = try copyToolArgumentPreview(allocator, tool_call.arguments);
+    errdefer runtime.freeJsonValue(allocator, arguments);
+    return .{ .tool_call = .{
+        .id = id,
+        .name = name,
+        .arguments = arguments,
+        .thought_signature = null,
+    } };
+}
+
+fn copyToolArgumentPreview(allocator: std.mem.Allocator, arguments: std.json.Value) !std.json.Value {
+    if (arguments != .object) return .null;
+    var object: std.json.ObjectMap = .empty;
+    errdefer runtime.freeJsonValue(allocator, .{ .object = object });
+    const keys = [_][]const u8{ "command", "path", "pattern", "name" };
+    for (keys) |key| {
+        const value = arguments.object.get(key) orelse continue;
+        if (value != .string) continue;
+        const key_copy = try allocator.dupe(u8, key);
+        errdefer allocator.free(key_copy);
+        const value_copy = try allocator.dupe(u8, utf8Prefix(value.string, stream_tool_argument_preview_bytes_max));
+        errdefer allocator.free(value_copy);
+        try object.put(allocator, key_copy, .{ .string = value_copy });
+    }
+    return .{ .object = object };
+}
+
+fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
+    if (value.len <= max_bytes) return value;
+    var end = max_bytes;
+    while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return value[0..end];
+}
+
+fn copyAssistantMetadataWithContent(
+    _: std.mem.Allocator,
+    source: ai.AssistantMessage,
+    content: []const ai.AssistantContent,
+) !ai.AssistantMessage {
+    return .{
+        .content = content,
+        .api = source.api,
+        .provider = source.provider,
+        .model = source.model,
+        .response_id = source.response_id,
+        .usage = source.usage,
+        .stop_reason = source.stop_reason,
+        .error_message = source.error_message,
+        .timestamp = source.timestamp,
+    };
+}
+
+fn copyOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
+    return if (source) |value| try allocator.dupe(u8, value) else null;
+}
+
 fn copyStreamMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) !agent.AgentMessage {
     return switch (message) {
         .tool_result => |tool_result| .{ .tool_result = try createToolResultMessage(
@@ -240,10 +403,8 @@ fn copyStreamMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) 
             .{ .content = tool_result.content, .details = tool_result.details },
             tool_result.is_error,
         ) },
-        .assistant => |assistant| blk: {
-            break :blk .{ .assistant = try ai.owned.copyAssistantMessage(allocator, assistant) };
-        },
-        else => message,
+        .assistant => |assistant| .{ .assistant = try ai.owned.copyAssistantMessage(allocator, assistant) },
+        .user, .custom => try agent.copyAgentMessage(allocator, message),
     };
 }
 
@@ -508,12 +669,12 @@ fn streamAssistantResponse(
             .thinking_delta,
             .thinking_end,
             .toolcall_start,
-            .toolcall_delta,
             .toolcall_end,
             => try emit.emit(.{ .message_update = .{
                 .message = .{ .assistant = assistantEventPartial(event) },
                 .assistant_message_event = event,
             } }),
+            .toolcall_delta => {},
             .done => |done| {
                 if (!added_partial) {
                     try emit.emit(.{ .message_start = .{ .message = .{ .assistant = done.message } } });
@@ -1530,6 +1691,46 @@ fn assistantTwoToolCallMessage() ai.AssistantMessage {
         .stop_reason = .tool_use,
         .timestamp = 0,
     };
+}
+
+test "stream event copy bounds delta partial to changed content" {
+    var args = std.json.ObjectMap.empty;
+    defer args.deinit(std.testing.allocator);
+    try args.put(std.testing.allocator, "command", .{ .string = "echo hi" });
+
+    const content = [_]ai.AssistantContent{
+        .{ .text = .{ .text = "large prior text that should not be copied into delta partial" } },
+        .{ .tool_call = .{ .id = "call-1", .name = "bash", .arguments = .{ .object = args } } },
+    };
+    const partial: ai.AssistantMessage = .{
+        .content = &content,
+        .api = "api",
+        .provider = "provider",
+        .model = "model",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const copied = try copyStreamEvent(arena.allocator(), .{ .message_update = .{
+        .message = .{ .assistant = partial },
+        .assistant_message_event = .{ .toolcall_delta = .{
+            .content_index = 1,
+            .delta = "{",
+            .partial = partial,
+        } },
+    } });
+
+    const update = copied.message_update;
+    try std.testing.expect(update.assistant_message_event == .toolcall_delta);
+    const copied_partial = update.assistant_message_event.toolcall_delta.partial;
+    try std.testing.expectEqual(@as(usize, 2), copied_partial.content.len);
+    try std.testing.expectEqualStrings("", copied_partial.content[0].text.text);
+    try std.testing.expect(copied_partial.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("bash", copied_partial.content[1].tool_call.name);
 }
 
 fn userMessage(text: []const u8) agent.AgentMessage {

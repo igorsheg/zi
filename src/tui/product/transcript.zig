@@ -90,6 +90,7 @@ pub const TranscriptItem = union(enum) {
 pub const TranscriptBuffer = struct {
     items: std.ArrayListUnmanaged(TranscriptItem) = .empty,
     total_size_bytes: usize = 0,
+    revision: u64 = 0,
 
     pub fn deinit(self: *TranscriptBuffer, allocator: std.mem.Allocator) void {
         for (self.items.items) |*item| item.deinit(allocator);
@@ -103,6 +104,7 @@ pub const TranscriptBuffer = struct {
             .status => |status| try self.appendStatus(allocator, status),
             .tool => |tool| try self.appendTool(allocator, tool),
         }
+        self.noteMutation();
     }
 
     pub fn appendToolOutput(
@@ -129,6 +131,7 @@ pub const TranscriptBuffer = struct {
         const next_size = tool.sizeBytes();
         self.total_size_bytes = self.total_size_bytes - old_size + next_size;
         self.evictUntilBounded(allocator);
+        self.noteMutation();
     }
 
     pub fn latest(self: TranscriptBuffer, count: usize) []const TranscriptItem {
@@ -265,6 +268,10 @@ pub const TranscriptBuffer = struct {
             if (item == .tool and std.mem.eql(u8, item.tool.tool_call_id, tool_call_id)) return index;
         }
         return null;
+    }
+
+    fn noteMutation(self: *TranscriptBuffer) void {
+        self.revision +%= 1;
     }
 
     fn evictUntilBounded(self: *TranscriptBuffer, allocator: std.mem.Allocator) void {

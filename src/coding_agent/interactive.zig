@@ -119,7 +119,7 @@ fn firstToolResultText(result: agent_mod.AgentToolResult) []const u8 {
     return "";
 }
 
-const TranscriptProjection = union(enum) {
+const TranscriptIngest = union(enum) {
     append: TranscriptAppend,
     tool_output_delta: struct {
         tool_call_id: []const u8,
@@ -129,7 +129,7 @@ const TranscriptProjection = union(enum) {
     },
 };
 
-fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptProjection {
+fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptIngest {
     if (text.len == 0) return null;
     return .{ .tool_output_delta = .{ .tool_call_id = tool_call_id, .text = text } };
 }
@@ -137,7 +137,7 @@ fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptProje
 fn toolCallAppend(
     content_index: usize,
     partial: ai.AssistantMessage,
-) ?TranscriptProjection {
+) ?TranscriptIngest {
     if (content_index >= partial.content.len) return null;
     const content = partial.content[content_index];
     if (content != .tool_call) return null;
@@ -152,7 +152,7 @@ fn toolCallAppend(
     ) };
 }
 
-fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptProjection {
+fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptIngest {
     return switch (event) {
         .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event),
         .prompt_command => |payload| .{ .append = statusAppend(.info, payload.message.text) },
@@ -165,7 +165,7 @@ fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?Transcrip
     };
 }
 
-fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptProjection {
+fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptIngest {
     return switch (event) {
         .agent_start, .agent_end, .turn_start, .turn_end => null,
         .message_update => |message_update| switch (message_update.assistant_message_event) {
@@ -239,15 +239,17 @@ const PendingToolOutput = struct {
 
     fn append(self: *PendingToolOutput, text: []const u8) void {
         const keep = @min(text.len, pending_tool_output_bytes_max);
-        const source = text[text.len - keep ..];
-        if (keep < text.len) self.recordDropped(text[0 .. text.len - keep]);
+        var source_start = text.len - keep;
+        while (source_start < text.len and isUtf8ContinuationByte(text[source_start])) : (source_start += 1) {}
+        const source = text[source_start..];
+        if (source_start > 0) self.recordDropped(text[0..source_start]);
         if (self.text_len + source.len <= pending_tool_output_bytes_max) {
             @memcpy(self.text[self.text_len .. self.text_len + source.len], source);
             self.text_len += source.len;
             return;
         }
         var overflow = self.text_len + source.len - pending_tool_output_bytes_max;
-        while (overflow < self.text_len and (self.text[overflow] & 0xc0) == 0x80) : (overflow += 1) {}
+        while (overflow < self.text_len and isUtf8ContinuationByte(self.text[overflow])) : (overflow += 1) {}
         self.recordDropped(self.text[0..overflow]);
         @memmove(self.text[0 .. self.text_len - overflow], self.text[overflow..self.text_len]);
         self.text_len -= overflow;
@@ -260,6 +262,10 @@ const PendingToolOutput = struct {
         self.dropped_head_lines += std.mem.count(u8, bytes, "\n");
     }
 };
+
+fn isUtf8ContinuationByte(byte: u8) bool {
+    return (byte & 0xc0) == 0x80;
+}
 
 const InteractiveLoop = struct {
     process: runtime.Process,
@@ -451,7 +457,7 @@ const InteractiveLoop = struct {
         if (transcriptAppendFromEvent(event)) |projection| try self.applyTranscriptProjection(projection);
     }
 
-    fn applyTranscriptProjection(self: *InteractiveLoop, projection: TranscriptProjection) !void {
+    fn applyTranscriptProjection(self: *InteractiveLoop, projection: TranscriptIngest) !void {
         switch (projection) {
             .append => |append| try self.appendTranscript(append),
             .tool_output_delta => |delta| try self.queueToolOutput(delta.tool_call_id, delta.text),
@@ -480,7 +486,7 @@ const InteractiveLoop = struct {
 
     fn flushToolOutputCoalescer(self: *InteractiveLoop) !void {
         for (self.pending_tool_outputs[0..self.pending_tool_output_count]) |*pending| {
-            _ = try self.terminal_loop.applyCommand(.{
+            try self.applyCommandDegrading(.{
                 .tool_output_delta = .{
                     .tool_call_id = pending.id(),
                     .text = pending.body(),
@@ -493,7 +499,22 @@ const InteractiveLoop = struct {
     }
 
     fn appendTranscript(self: *InteractiveLoop, append: TranscriptAppend) !void {
-        _ = try self.terminal_loop.applyCommand(.{ .append_transcript = append });
+        try self.applyCommandDegrading(.{ .append_transcript = append });
+    }
+
+    fn applyCommandDegrading(self: *InteractiveLoop, command: tui.product.Command) !void {
+        _ = self.terminal_loop.applyCommand(command) catch |err| switch (err) {
+            error.InvalidUtf8 => return self.appendOperationalStatus("transcript update omitted: invalid utf-8"),
+            error.TranscriptAppendTooLarge => return self.appendOperationalStatus("transcript update omitted: too large"),
+            else => return err,
+        };
+    }
+
+    fn appendOperationalStatus(self: *InteractiveLoop, text: []const u8) !void {
+        _ = self.terminal_loop.applyCommand(.{ .append_transcript = statusAppend(.warning, text) }) catch |err| switch (err) {
+            error.InvalidUtf8, error.TranscriptAppendTooLarge => return,
+            else => return err,
+        };
     }
 
     fn shutdown(self: *InteractiveLoop) void {
@@ -711,6 +732,42 @@ test "interactive maps simple public events to transcript appends" {
     try std.testing.expectEqualStrings("public event overflow", overflow.append.status.text);
 
     try std.testing.expect(transcriptAppendFromEvent(.{ .session_info_changed = .{ .name = null } }) == null);
+}
+
+test "interactive coalesced tool output keeps utf8 boundary after tail drop" {
+    var bytes: [pending_tool_output_bytes_max + 1]u8 = undefined;
+    var index: usize = 0;
+    while (index < bytes.len) : (index += 3) {
+        bytes[index] = 0xe2;
+        bytes[index + 1] = 0x82;
+        bytes[index + 2] = 0xac;
+    }
+
+    const pending = PendingToolOutput.init("tool", &bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(pending.body()));
+    try std.testing.expectEqual(@as(usize, 3), pending.dropped_head_bytes);
+    try std.testing.expectEqual(@as(usize, pending_tool_output_bytes_max - 2), pending.body().len);
+}
+
+test "interactive transcript append degrades operational invalid utf8" {
+    var terminal_loop = try tui.product.TerminalLoop.init(
+        std.testing.allocator,
+        std.testing.io,
+        20,
+        4,
+        tui.product.loop.output_size_bytes_default,
+    );
+    defer terminal_loop.deinit();
+
+    var loop: InteractiveLoop = undefined;
+    loop.terminal_loop = &terminal_loop;
+
+    try loop.appendTranscript(messageAppend(.assistant, "\xff", .extend_previous_assistant_message));
+
+    try std.testing.expectEqual(@as(usize, 1), terminal_loop.product.app.transcript.items.items.len);
+    const item = terminal_loop.product.app.transcript.items.items[0];
+    try std.testing.expect(item == .status);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptStatusLevel.warning, item.status.level);
 }
 
 test "interactive maps tool events to typed transcript items" {

@@ -12,27 +12,10 @@ pub const Style = struct {
         return a.bold == b.bold and
             a.dim == b.dim and
             a.underline == b.underline and
-            colorEql(a.fg, b.fg) and
-            colorEql(a.bg, b.bg);
+            a.fg.eql(b.fg) and
+            a.bg.eql(b.bg);
     }
 };
-
-fn colorEql(a: Color, b: Color) bool {
-    return switch (a) {
-        .default => switch (b) {
-            .default => true,
-            else => false,
-        },
-        .indexed => |i| switch (b) {
-            .indexed => |j| i == j,
-            else => false,
-        },
-        .rgb => |x| switch (b) {
-            .rgb => |y| x.r == y.r and x.g == y.g and x.b == y.b,
-            else => false,
-        },
-    };
-}
 
 test "style equality includes intensity" {
     try std.testing.expect((Style{}).eql(.{}));

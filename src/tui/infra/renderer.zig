@@ -102,8 +102,8 @@ fn writeCell(cell: Cell, out: *FrameOutput) !void {
     try out.append(inline_text.slice());
 }
 fn writeStyleTransition(current: *Style, next: Style, out: *FrameOutput) !void {
-    if (!colorEql(current.fg, next.fg)) try writeColor(next.fg, true, out);
-    if (!colorEql(current.bg, next.bg)) try writeColor(next.bg, false, out);
+    if (!current.fg.eql(next.fg)) try writeColor(next.fg, true, out);
+    if (!current.bg.eql(next.bg)) try writeColor(next.bg, false, out);
     if (current.bold != next.bold or current.dim != next.dim) {
         if (!next.bold and !next.dim) {
             try out.append("\x1b[22m");
@@ -120,31 +120,7 @@ fn writeStyleTransition(current: *Style, next: Style, out: *FrameOutput) !void {
 }
 fn writeColor(color: Color, foreground: bool, out: *FrameOutput) !void {
     var buf: [32]u8 = undefined;
-    const bytes = switch (color) {
-        .default => if (foreground) "\x1b[39m" else "\x1b[49m",
-        .indexed => |i| if (foreground)
-            try std.fmt.bufPrint(&buf, "\x1b[38;5;{d}m", .{i})
-        else
-            try std.fmt.bufPrint(&buf, "\x1b[48;5;{d}m", .{i}),
-        .rgb => |c| if (foreground)
-            try std.fmt.bufPrint(&buf, "\x1b[38;2;{d};{d};{d}m", .{ c.r, c.g, c.b })
-        else
-            try std.fmt.bufPrint(&buf, "\x1b[48;2;{d};{d};{d}m", .{ c.r, c.g, c.b }),
-    };
-    try out.append(bytes);
-}
-fn colorEql(a: Color, b: Color) bool {
-    return switch (a) {
-        .default => b == .default,
-        .indexed => |i| switch (b) {
-            .indexed => |j| i == j,
-            else => false,
-        },
-        .rgb => |x| switch (b) {
-            .rgb => |y| x.r == y.r and x.g == y.g and x.b == y.b,
-            else => false,
-        },
-    };
+    try out.append(try color.ansiBytes(foreground, &buf));
 }
 
 test "renderer stages commits retries style and wide continuation skip" {

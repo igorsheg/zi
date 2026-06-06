@@ -12,6 +12,10 @@ pub const ProductApp = struct {
     composer: composer_mod.ComposerBuffer = .{},
     transcript: transcript.TranscriptBuffer = .{},
     transcript_scroll_rows: usize = 0,
+    transcript_scroll_max_cache: usize = 0,
+    transcript_scroll_max_revision: u64 = std.math.maxInt(u64),
+    transcript_scroll_max_width: u16 = 0,
+    transcript_scroll_max_visible_rows: usize = std.math.maxInt(usize),
     theme: theme_mod.Theme = theme_mod.Theme.codex(),
     dirty: bool = true,
 
@@ -33,7 +37,6 @@ pub const ProductApp = struct {
                 if (self.width != size.width or self.height != size.height) {
                     self.width = size.width;
                     self.height = size.height;
-                    self.clampTranscriptScroll();
                     self.dirty = true;
                 }
                 return null;
@@ -46,7 +49,6 @@ pub const ProductApp = struct {
             },
             .append_transcript => |append| {
                 try self.transcript.append(allocator, append);
-                self.clampTranscriptScroll();
                 self.dirty = true;
                 return null;
             },
@@ -58,7 +60,6 @@ pub const ProductApp = struct {
                     delta.dropped_head_bytes,
                     delta.dropped_head_lines,
                 );
-                self.clampTranscriptScroll();
                 self.dirty = true;
                 return null;
             },
@@ -106,12 +107,26 @@ pub const ProductApp = struct {
         self.dirty = true;
     }
 
-    fn clampTranscriptScroll(self: *ProductApp) void {
+    pub fn clampTranscriptScroll(self: *ProductApp) void {
         self.transcript_scroll_rows = @min(self.transcript_scroll_rows, self.transcriptScrollMax());
     }
 
     fn transcriptScrollMax(self: *ProductApp) usize {
-        return frame_mod.transcriptScrollMax(self.transcript, self.width, frame_mod.transcriptVisibleRows(self.height));
+        const visible_rows = frame_mod.transcriptVisibleRows(self.height);
+        if (self.transcript_scroll_max_revision != self.transcript.revision or
+            self.transcript_scroll_max_width != self.width or
+            self.transcript_scroll_max_visible_rows != visible_rows)
+        {
+            self.transcript_scroll_max_cache = frame_mod.transcriptScrollMax(
+                self.transcript,
+                self.width,
+                visible_rows,
+            );
+            self.transcript_scroll_max_revision = self.transcript.revision;
+            self.transcript_scroll_max_width = self.width;
+            self.transcript_scroll_max_visible_rows = visible_rows;
+        }
+        return self.transcript_scroll_max_cache;
     }
 };
 
@@ -240,6 +255,19 @@ test "product app pages transcript scroll and append preserves it" {
     try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
 }
 
+test "product app scroll max cache follows direct transcript revision" {
+    var app = try ProductApp.init(20, 5);
+    defer app.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), app.transcriptScrollMax());
+    try app.transcript.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = "one" } });
+    try app.transcript.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = "two" } });
+    try app.transcript.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = "three" } });
+    try app.transcript.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = "four" } });
+
+    try std.testing.expect(app.transcriptScrollMax() > 0);
+}
+
 test "product app clamps transcript scroll after append eviction" {
     var app = try ProductApp.init(20, 5);
     defer app.deinit(std.testing.allocator);
@@ -250,6 +278,7 @@ test "product app clamps transcript scroll after append eviction" {
     }
     app.transcript_scroll_rows = std.math.maxInt(usize);
     try appendTestMessage(&app, .system, "tail");
+    app.clampTranscriptScroll();
 
     try std.testing.expect(app.transcript_scroll_rows <= app.transcriptScrollMax());
 }

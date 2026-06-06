@@ -10,20 +10,24 @@ pub const size_cells_max: usize = 65_536;
 const transcript_visual_rows_max: usize = 512;
 const transcript_item_padding_x: u16 = 1;
 const transcript_item_margin_bottom: usize = 1;
+const generated_row_text_bytes_max: usize = 128;
+const tool_notice_bytes_max: usize = 96;
+const tool_chrome_line_bytes_max: usize = 160;
 
 const TranscriptVisualRow = struct {
     prefix: []const u8,
     text: []const u8,
     show_prefix: bool,
     style: primitive.Style = .{},
-    storage: [128]u8 = undefined,
+    storage: [generated_row_text_bytes_max]u8 = undefined,
 };
 
 pub const Frame = struct {
     width: u16,
     height: u16,
 
-    pub fn build(app: anytype, renderer: *infra.Renderer) !void {
+    pub fn build(app: *app_mod.ProductApp, renderer: *infra.Renderer) !void {
+        app.clampTranscriptScroll();
         if (renderer.next.width != app.width or renderer.next.height != app.height) {
             try renderer.resize(app.width, app.height);
         }
@@ -32,7 +36,7 @@ pub const Frame = struct {
     }
 };
 
-fn drawShell(app: anytype, renderer: *infra.Renderer) !void {
+fn drawShell(app: *const app_mod.ProductApp, renderer: *infra.Renderer) !void {
     if (app.height > 0) try renderer.writeText(0, 0, "zi", app.theme.shell_label);
     if (app.height > 0) {
         try drawTranscript(app, renderer, app.theme.transcript_text, transcriptVisibleRows(app.height));
@@ -62,7 +66,7 @@ pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u
     return if (sink.total_emitted > visible_rows) sink.total_emitted - visible_rows else 0;
 }
 
-fn drawTranscript(app: anytype, renderer: *infra.Renderer, _: primitive.Style, visible_rows: usize) !void {
+fn drawTranscript(app: *const app_mod.ProductApp, renderer: *infra.Renderer, _: primitive.Style, visible_rows: usize) !void {
     if (visible_rows == 0 or app.width == 0) return;
     const row_limit = @min(visible_rows, transcript_visual_rows_max);
     var rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
@@ -71,7 +75,7 @@ fn drawTranscript(app: anytype, renderer: *infra.Renderer, _: primitive.Style, v
     var item_index = app.transcript.items.items.len;
     while (item_index > 0 and sink.row_count < row_limit) {
         item_index -= 1;
-        emitItemRowsNewestFirst(&sink, app.transcript.items.items[item_index], app.width, app.theme);
+        emitItemRowsNewestFirst(&sink, app.transcript.items.items[item_index], app.width, &app.theme);
     }
 
     var draw_index = sink.row_count;
@@ -165,7 +169,7 @@ fn emitItemRowsNewestFirst(
     sink: *TranscriptRowSink,
     item: transcript_mod.TranscriptItem,
     frame_width: u16,
-    theme: ?theme_mod.Theme,
+    theme: ?*const theme_mod.Theme,
 ) void {
     const style = transcriptItemStyle(item, theme);
     // Transcript spacing has two concepts: padding is inside an item and uses
@@ -215,18 +219,18 @@ fn emitToolRowsNewestFirst(
         if (sink.full()) return;
     }
 
-    var notice_buffer: [96]u8 = undefined;
+    var notice_buffer: [tool_notice_bytes_max]u8 = undefined;
     if (transcript_projection.toolOmissionNotice(tool, &notice_buffer)) |notice| {
         emitWrappedRowsNewestFirst(sink, .{ .prefix = "│ ", .text = notice }, frame_width, true, style);
         if (sink.full()) return;
     }
 
     const header = transcript_projection.toolHeader(tool);
-    var top_buffer: [160]u8 = undefined;
+    var top_buffer: [tool_chrome_line_bytes_max]u8 = undefined;
     const top = primitive.chrome.openTopLine(&top_buffer, .rounded, header) catch "╭─[tool]";
     sink.emitGenerated("", top, false, style);
     if (sink.full()) return;
-    var title_buffer: [160]u8 = undefined;
+    var title_buffer: [tool_chrome_line_bytes_max]u8 = undefined;
     const title = transcript_projection.toolTitle(tool, &title_buffer);
     sink.emitGenerated("", title, false, style);
 }
@@ -263,27 +267,32 @@ fn transcriptItemInnerWidth(frame_width: u16) u16 {
     return frame_width - padding_width;
 }
 
-fn transcriptItemStyle(item: transcript_mod.TranscriptItem, theme: ?theme_mod.Theme) primitive.Style {
-    const resolved = theme orelse theme_mod.Theme.codex();
+fn transcriptItemStyle(item: transcript_mod.TranscriptItem, theme: ?*const theme_mod.Theme) primitive.Style {
+    if (theme) |resolved| return transcriptItemStyleFromTheme(item, resolved);
+    const fallback = theme_mod.Theme.codex();
+    return transcriptItemStyleFromTheme(item, &fallback);
+}
+
+fn transcriptItemStyleFromTheme(item: transcript_mod.TranscriptItem, theme: *const theme_mod.Theme) primitive.Style {
     return switch (item) {
         .message => |message| switch (message.role) {
-            .user => resolved.transcript_user,
-            .assistant => resolved.transcript_text,
-            .system, .thinking => resolved.transcript_secondary,
+            .user => theme.transcript_user,
+            .assistant => theme.transcript_text,
+            .system, .thinking => theme.transcript_secondary,
         },
         .status => |status| switch (status.level) {
-            .info => resolved.status_accent,
-            .warning => resolved.status_warning,
-            .err => resolved.status_error,
+            .info => theme.status_accent,
+            .warning => theme.status_warning,
+            .err => theme.status_error,
         },
-        .tool => resolved.tool_chrome,
+        .tool => theme.tool_chrome,
     };
 }
 
 fn collectWrappedTranscriptLine(
     line_rows: *[transcript_visual_rows_max]TranscriptVisualRow,
     item: transcript_projection.RenderItem,
-    frame_width: u16,
+    inner_width: u16,
     prefix_width: u16,
     repeat_prefix: bool,
     style: primitive.Style,
@@ -292,7 +301,7 @@ fn collectWrappedTranscriptLine(
     var start: usize = 0;
     var visual_index: usize = 0;
     while (start < item.text.len and line_row_count < line_rows.len) : (visual_index += 1) {
-        const width = if (visual_index == 0) frame_width - prefix_width else frame_width;
+        const width = if (visual_index == 0) inner_width - prefix_width else inner_width;
         if (width == 0) {
             line_rows[line_row_count] = .{
                 .prefix = item.prefix,
@@ -377,7 +386,7 @@ test "frame renders newest transcript lines and preserves composer row" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try expectCellText(renderer.next, 0, 0, "zi");
     try expectCellText(renderer.next, 1, 2, "system: three");
@@ -394,7 +403,7 @@ test "frame renders user messages without label and fills background" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 20, 5, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try expectCellText(renderer.next, 1, 1, "hello");
     try std.testing.expect((try renderer.next.get(0, 1)).style.eql(app.theme.transcript_user));
@@ -408,7 +417,7 @@ test "frame renders assistant messages without label and transparent background"
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 20, 5, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try expectCellText(renderer.next, 1, 1, "hello");
     try std.testing.expect((try renderer.next.get(0, 1)).style.eql(app.theme.transcript_text));
@@ -421,7 +430,7 @@ test "frame keeps transcript out of tiny heights" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 20, 1, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
     try expectCellText(renderer.next, 0, 0, "> ");
 }
 
@@ -433,7 +442,7 @@ test "frame renders transcript hard newlines as visual rows" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try expectCellText(renderer.next, 1, 1, "two");
     const blank = try renderer.next.get(1, 2);
@@ -469,7 +478,7 @@ test "frame renders typed tool rows with name and state" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 40, 12, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try expectGraphemeInColumn(renderer.next, 1, "╭");
     try expectCellText(renderer.next, 1, 1, "bash");
@@ -491,7 +500,7 @@ test "frame renders tool display text when present" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 60, 8, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try expectGraphemeInColumn(renderer.next, 1, "╭");
     try expectCellText(renderer.next, 1, 1, "bash: zig build test");
@@ -527,7 +536,7 @@ test "tool scroll skips newest rows once across whole block" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 40, 4, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try expectCellText(renderer.next, 3, 1, "two");
 }
@@ -550,7 +559,7 @@ test "frame renders updated tool row once" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
     try expectGraphemeInColumn(renderer.next, 1, "╭");
@@ -570,7 +579,7 @@ test "frame renders transcript scrolled by newest visual rows" {
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
     defer renderer.deinit();
-    try Frame.build(app, &renderer);
+    try Frame.build(&app, &renderer);
 
     try expectCellText(renderer.next, 1, 3, "system: three");
 }
