@@ -91,7 +91,9 @@ fn execute(
     try token.throwIfRequested();
     const self: *WriteTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(params);
-    if (args.content.len > self.config.max_write_bytes) return error.WriteTooLarge;
+    if (args.content.len > self.config.max_write_bytes) {
+        return writeTooLargeResult(allocator, args.content.len, self.config.max_write_bytes);
+    }
     const resolved_path = try path_utils.resolveCreatablePath(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
@@ -170,6 +172,27 @@ fn utf8ChunkEnd(content: []const u8, start: usize, proposed_end: usize) usize {
     while (end > start and (content[end] & 0xc0) == 0x80) : (end -= 1) {}
     if (end == start) return proposed_end;
     return end;
+}
+
+fn writeTooLargeResult(
+    allocator: std.mem.Allocator,
+    content_bytes: usize,
+    max_bytes: usize,
+) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "[Write omitted: content is {d} bytes, exceeding the {d} byte limit.]",
+        .{ content_bytes, max_bytes },
+    );
+    errdefer allocator.free(message);
+    const content = try allocator.alloc(ai.ToolResultContent, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = message } };
+    var details: std.json.ObjectMap = .empty;
+    errdefer details.deinit(allocator);
+    try path_utils.putJsonField(allocator, &details, "contentBytes", .{ .integer = @intCast(content_bytes) });
+    try path_utils.putJsonField(allocator, &details, "maxBytes", .{ .integer = @intCast(max_bytes) });
+    return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = details } } };
 }
 
 fn writeResult(allocator: std.mem.Allocator, bytes_written: usize, path: []const u8) !agent.ToolExecutionResult {
@@ -307,7 +330,7 @@ test "write tool rejects oversized content" {
     defer zio_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    try std.testing.expectError(error.WriteTooLarge, execute(
+    var result = try execute(
         std.testing.allocator,
         zio_runtime.io(),
         zio_runtime,
@@ -316,7 +339,16 @@ test "write tool rejects oversized content" {
         "call-1",
         .{ .object = object },
         null,
-    ));
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "[Write omitted: content is 5 bytes, exceeding the 3 byte limit.]",
+        result.result.content[0].text.text,
+    );
+    const details = result.result.details.?.object;
+    try std.testing.expectEqual(@as(i64, 5), details.get("contentBytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), details.get("maxBytes").?.integer);
 }
 
 test "write tool rejects paths outside cwd" {
