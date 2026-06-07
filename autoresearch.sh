@@ -40,6 +40,7 @@ check_absent "edit summary-only diff" "diff omitted|bounded summary" src/coding_
 check_present "edit diff byte cap used" "diff\.len > max_diff_bytes|patch\.len > max_diff_bytes|truncate.*max_diff_bytes" src/coding_agent/tools/edit.zig
 check_present "edit diff details test" "test .*diff|\"firstChangedLine\"|\"patch\"" src/coding_agent/tools/edit.zig
 check_present "edit actionable duplicate/not-found errors" "duplicate|not found|NotFound|Duplicate" src/coding_agent/tools/edit.zig
+check_present "edit duplicate/not-found tests" "test .*duplicate|test .*not found|expectError\(error\.EditTextNotFoundOrNotUnique" src/coding_agent/tools/edit.zig
 
 # Search/listing semantics probes.
 check_present "grep ignoreCase" "ignoreCase|ignore_case" src/coding_agent/tools/grep.zig
