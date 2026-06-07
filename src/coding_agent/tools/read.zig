@@ -13,9 +13,9 @@ const parameters_schema =
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "path": { "type": "string", "description": "The file path to read" },
-    \\    "offset": { "type": "integer", "description": "Optional 1-indexed start line" },
-    \\    "limit": { "type": "integer", "description": "Optional maximum number of lines" }
+    \\    "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
+    \\    "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
+    \\    "limit": { "type": "integer", "description": "Maximum number of lines to read" }
     \\  },
     \\  "required": ["path"]
     \\}
@@ -60,7 +60,9 @@ pub const ReadTool = struct {
     pub fn tool(self: *ReadTool) agent.AgentTool {
         return .{
             .name = "read",
-            .description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit.",
+            .description = "Read the contents of a file. Supports text files. " ++
+                "Output is truncated to 2000 lines or 50KB (whichever is hit first). " ++
+                "Use offset/limit for large files. When you need the full file, continue with offset until complete.",
             .parameters = self.parsed_parameters.value,
             .label = "read",
             .execute = .{ .context = self, .call_fn = execute },
