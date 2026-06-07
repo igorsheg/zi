@@ -186,8 +186,31 @@ fn isJpeg(content: []const u8) bool {
 fn isPng(content: []const u8) bool {
     return content.len >= 16 and
         hasPrefix(content, "\x89PNG\r\n\x1a\n") and
-        std.mem.readInt(u32, content[8..12], .big) == 13 and
-        std.mem.eql(u8, content[12..16], "IHDR");
+        readU32Be(content, 8) == 13 and
+        std.mem.eql(u8, content[12..16], "IHDR") and
+        !isAnimatedPng(content);
+}
+
+fn isAnimatedPng(content: []const u8) bool {
+    var offset: usize = 8;
+    while (offset + 8 <= content.len) {
+        const chunk_len = readU32Be(content, offset);
+        const chunk_type = content[offset + 4 .. offset + 8];
+        if (std.mem.eql(u8, chunk_type, "acTL")) return true;
+        if (std.mem.eql(u8, chunk_type, "IDAT")) return false;
+
+        const next = offset + 8 + @as(usize, chunk_len) + 4;
+        if (next <= offset or next > content.len) return false;
+        offset = next;
+    }
+    return false;
+}
+
+fn readU32Be(content: []const u8, offset: usize) u32 {
+    return (@as(u32, content[offset]) << 24) |
+        (@as(u32, content[offset + 1]) << 16) |
+        (@as(u32, content[offset + 2]) << 8) |
+        @as(u32, content[offset + 3]);
 }
 
 fn isWebp(content: []const u8) bool {
@@ -552,6 +575,13 @@ test "read tool returns image attachment for supported image file" {
     try std.testing.expectEqualStrings("Read image file [image/png]", result.result.content[0].text.text);
     try std.testing.expectEqualStrings("image/png", result.result.content[1].image.mime_type);
     try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUg==", result.result.content[1].image.data);
+}
+
+test "read tool does not classify animated png as supported image" {
+    const animated_png = "\x89PNG\r\n\x1a\n" ++
+        "\x00\x00\x00\x0d" ++ "IHDR" ++ "1234567890123" ++ "\x00\x00\x00\x00" ++
+        "\x00\x00\x00\x08" ++ "acTL" ++ "12345678" ++ "\x00\x00\x00\x00";
+    try std.testing.expectEqual(@as(?[]const u8, null), detectImageMimeType("animated.png", animated_png));
 }
 
 test "read tool does not classify image extension without image signature" {
