@@ -9,6 +9,9 @@ pub const max_edit_read_bytes = 4 * 1024 * 1024;
 pub const max_edit_output_bytes = 4 * 1024 * 1024;
 pub const max_edits_per_call = 64;
 pub const edit_update_chunk_bytes = 16 * 1024;
+pub const max_diff_bytes = 16 * 1024;
+
+const utf8_bom = "\xef\xbb\xbf";
 
 var temp_file_counter: std.atomic.Value(u64) = .init(0);
 
@@ -102,6 +105,27 @@ const Match = struct {
     edit_index: usize,
 };
 
+const LineEnding = enum { lf, crlf };
+
+const TextShape = struct {
+    has_bom: bool,
+    line_ending: LineEnding,
+};
+
+const AppliedEdit = struct {
+    original_normalized: []u8,
+    normalized: []u8,
+    restored: []u8,
+    first_changed_line: usize,
+
+    fn deinit(self: *AppliedEdit, allocator: std.mem.Allocator) void {
+        allocator.free(self.original_normalized);
+        allocator.free(self.normalized);
+        allocator.free(self.restored);
+        self.* = undefined;
+    }
+};
+
 fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -116,7 +140,10 @@ fn execute(
     const self: *EditTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(allocator, params);
     defer allocator.free(args.edits);
-    const resolved_path = try resolvePath(allocator, io, self.config, args.path);
+    const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
+        .cwd = self.config.cwd,
+        .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
+    }, args.path);
     defer allocator.free(resolved_path);
 
     var guard = self.queue().lock();
@@ -131,12 +158,19 @@ fn execute(
         .limited(self.config.max_read_bytes),
     );
     defer allocator.free(original);
-    const edited = try applyEdits(allocator, original, args.edits, self.config.max_output_bytes);
-    defer allocator.free(edited);
+    var edited = try applyEditsPreservingTextShape(allocator, original, args.edits, self.config.max_output_bytes);
+    defer edited.deinit(allocator);
     try token.throwIfRequested();
-    try atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited, on_update);
+    try atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, on_update);
 
-    return editResult(allocator, args.edits.len, args.path);
+    return editResult(
+        allocator,
+        args.edits.len,
+        args.path,
+        edited.first_changed_line,
+        edited.original_normalized,
+        edited.normalized,
+    );
 }
 
 fn parseArgs(allocator: std.mem.Allocator, params: std.json.Value) !EditArgs {
@@ -162,12 +196,48 @@ fn parseReplacement(value: std.json.Value) !Replacement {
     return .{ .old_text = old_value.string, .new_text = new_value.string };
 }
 
+fn applyEditsPreservingTextShape(
+    allocator: std.mem.Allocator,
+    original: []const u8,
+    edits: []const Replacement,
+    max_output_bytes: usize,
+) !AppliedEdit {
+    const shape = detectTextShape(original);
+    const body = if (shape.has_bom) original[utf8_bom.len..] else original;
+    const normalized_original = try normalizeLineEndings(allocator, body);
+    errdefer allocator.free(normalized_original);
+
+    const normalized_edits = try allocator.alloc(Replacement, edits.len);
+    defer allocator.free(normalized_edits);
+    for (edits, normalized_edits) |edit, *normalized| {
+        normalized.old_text = try normalizeLineEndings(allocator, edit.old_text);
+        errdefer allocator.free(normalized.old_text);
+        normalized.new_text = try normalizeLineEndings(allocator, edit.new_text);
+        errdefer allocator.free(normalized.new_text);
+    }
+    defer for (normalized_edits) |normalized| {
+        allocator.free(normalized.old_text);
+        allocator.free(normalized.new_text);
+    };
+
+    const normalized = try applyEdits(allocator, normalized_original, normalized_edits, max_output_bytes);
+    errdefer allocator.free(normalized);
+    const restored = try restoreTextShape(allocator, normalized, shape, max_output_bytes);
+    errdefer allocator.free(restored);
+    return .{
+        .original_normalized = normalized_original,
+        .normalized = normalized,
+        .restored = restored,
+        .first_changed_line = firstChangedLine(normalized_original, normalized),
+    };
+}
+
 fn applyEdits(
     allocator: std.mem.Allocator,
     original: []const u8,
     edits: []const Replacement,
     max_output_bytes: usize,
-) ![]const u8 {
+) ![]u8 {
     var matches = try allocator.alloc(Match, edits.len);
     defer allocator.free(matches);
 
@@ -204,7 +274,63 @@ fn applyEdits(
     }
     const suffix = original[source_pos..];
     @memcpy(out[out_pos .. out_pos + suffix.len], suffix);
+    if (std.mem.eql(u8, out, original)) return error.NoChanges;
     return out;
+}
+
+fn detectTextShape(original: []const u8) TextShape {
+    const has_bom = std.mem.startsWith(u8, original, utf8_bom);
+    const body = if (has_bom) original[utf8_bom.len..] else original;
+    return .{
+        .has_bom = has_bom,
+        .line_ending = if (std.mem.indexOf(u8, body, "\r\n") != null) .crlf else .lf,
+    };
+}
+
+fn normalizeLineEndings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\r') {
+            try writer.writer.writeByte('\n');
+            index += if (index + 1 < text.len and text[index + 1] == '\n') 2 else 1;
+        } else {
+            try writer.writer.writeByte(text[index]);
+            index += 1;
+        }
+    }
+    return writer.toOwnedSlice();
+}
+
+fn restoreTextShape(
+    allocator: std.mem.Allocator,
+    normalized: []const u8,
+    shape: TextShape,
+    max_output_bytes: usize,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    if (shape.has_bom) try writer.writer.writeAll(utf8_bom);
+    for (normalized) |byte| {
+        if (byte == '\n' and shape.line_ending == .crlf) {
+            try writer.writer.writeAll("\r\n");
+        } else {
+            try writer.writer.writeByte(byte);
+        }
+        if (writer.written().len > max_output_bytes) return error.EditTooLarge;
+    }
+    return writer.toOwnedSlice();
+}
+
+fn firstChangedLine(before: []const u8, after: []const u8) usize {
+    var line: usize = 1;
+    var index: usize = 0;
+    const limit = @min(before.len, after.len);
+    while (index < limit and before[index] == after[index]) : (index += 1) {
+        if (before[index] == '\n') line += 1;
+    }
+    return line;
 }
 
 fn findUnique(haystack: []const u8, needle: []const u8) ?usize {
@@ -216,23 +342,6 @@ fn findUnique(haystack: []const u8, needle: []const u8) ?usize {
 
 fn lessThanMatch(_: void, a: Match, b: Match) bool {
     return a.start < b.start;
-}
-
-fn resolvePath(allocator: std.mem.Allocator, io: std.Io, config: EditTool.Config, path: []const u8) ![]const u8 {
-    const resolved = if (std.fs.path.isAbsolute(path))
-        try std.fs.path.resolve(allocator, &.{path})
-    else
-        try std.fs.path.resolve(allocator, &.{ config.cwd, path });
-    errdefer allocator.free(resolved);
-
-    if (!config.allow_paths_outside_cwd) {
-        const canonical_cwd = try std.Io.Dir.realPathFileAlloc(.cwd(), io, config.cwd, allocator);
-        defer allocator.free(canonical_cwd);
-        const canonical_path = try std.Io.Dir.realPathFileAlloc(.cwd(), io, resolved, allocator);
-        defer allocator.free(canonical_path);
-        if (!isPathInside(canonical_cwd, canonical_path)) return error.PathOutsideCwd;
-    }
-    return resolved;
 }
 
 fn atomicWriteFileStreamingUpdates(
@@ -289,16 +398,28 @@ fn utf8ChunkEnd(content: []const u8, start: usize, proposed_end: usize) usize {
     return end;
 }
 
-fn isPathInside(raw_cwd: []const u8, path: []const u8) bool {
-    var cwd = raw_cwd;
-    while (cwd.len > 1 and std.fs.path.isSep(cwd[cwd.len - 1])) cwd = cwd[0 .. cwd.len - 1];
-    if (!std.mem.startsWith(u8, path, cwd)) return false;
-    if (cwd.len == 1 and std.fs.path.isSep(cwd[0])) return true;
-    if (path.len == cwd.len) return true;
-    return std.fs.path.isSep(path[cwd.len]);
+fn lineAt(text: []const u8, wanted_line: usize) []const u8 {
+    var line: usize = 1;
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index <= text.len) : (index += 1) {
+        if (index == text.len or text[index] == '\n') {
+            if (line == wanted_line) return text[start..index];
+            line += 1;
+            start = index + 1;
+        }
+    }
+    return "";
 }
 
-fn editResult(allocator: std.mem.Allocator, replacements: usize, path: []const u8) !agent.ToolExecutionResult {
+fn editResult(
+    allocator: std.mem.Allocator,
+    replacements: usize,
+    path: []const u8,
+    first_changed_line: usize,
+    before: []const u8,
+    after: []const u8,
+) !agent.ToolExecutionResult {
     const message = try std.fmt.allocPrint(
         allocator,
         "Successfully replaced {d} block(s) in {s}.",
@@ -311,6 +432,30 @@ fn editResult(allocator: std.mem.Allocator, replacements: usize, path: []const u
     var details: std.json.ObjectMap = .empty;
     errdefer details.deinit(allocator);
     try path_utils.putJsonField(allocator, &details, "replacements", .{ .integer = @intCast(replacements) });
+    try path_utils.putJsonField(
+        allocator,
+        &details,
+        "firstChangedLine",
+        .{ .integer = @intCast(first_changed_line) },
+    );
+    const before_line = lineAt(before, first_changed_line);
+    const after_line = lineAt(after, first_changed_line);
+    const diff = try std.fmt.allocPrint(
+        allocator,
+        "@@ line {d} @@\n- {s}\n+ {s}",
+        .{ first_changed_line, before_line, after_line },
+    );
+    errdefer allocator.free(diff);
+    if (diff.len > max_diff_bytes) return error.EditTooLarge;
+    try path_utils.putJsonField(allocator, &details, "diff", .{ .string = diff });
+    const patch = try std.fmt.allocPrint(
+        allocator,
+        "--- {s}\n+++ {s}\n@@ line {d} @@\n- {s}\n+ {s}",
+        .{ path, path, first_changed_line, before_line, after_line },
+    );
+    errdefer allocator.free(patch);
+    if (patch.len > max_diff_bytes) return error.EditTooLarge;
+    try path_utils.putJsonField(allocator, &details, "patch", .{ .string = patch });
     return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = details } } };
 }
 
@@ -365,6 +510,10 @@ test "edit tool applies multiple exact replacements against original content" {
         "Successfully replaced 2 block(s) in file.txt.",
         result.result.content[0].text.text,
     );
+    const details = result.result.details.?.object;
+    try std.testing.expectEqual(@as(i64, 1), details.get("firstChangedLine").?.integer);
+    try std.testing.expect(details.get("diff").? == .string);
+    try std.testing.expect(details.get("patch").? == .string);
 }
 
 const EditUpdateCapture = struct {
@@ -384,6 +533,28 @@ fn captureEditUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult
         .text => |text| try capture.writer.writer.writeAll(text.text),
         .image => {},
     };
+}
+
+test "edit tool preserves BOM and CRLF while matching normalized text and tracks firstChangedLine" {
+    var edited = try applyEditsPreservingTextShape(
+        std.testing.allocator,
+        utf8_bom ++ "one\r\ntwo\r\n",
+        &.{.{ .old_text = "one\ntwo", .new_text = "1\n2" }},
+        max_edit_output_bytes,
+    );
+    defer edited.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(utf8_bom ++ "1\r\n2\r\n", edited.restored);
+    try std.testing.expectEqual(@as(usize, 1), edited.first_changed_line);
+}
+
+test "edit tool rejects no-op replacement" {
+    try std.testing.expectError(error.NoChanges, applyEdits(
+        std.testing.allocator,
+        "same",
+        &.{.{ .old_text = "same", .new_text = "same" }},
+        max_edit_output_bytes,
+    ));
 }
 
 test "edit tool streams utf8 safe edited content chunks" {
