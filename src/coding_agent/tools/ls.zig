@@ -180,7 +180,15 @@ fn parsePath(params: std.json.Value) ![]const u8 {
 }
 
 fn lessThanString(_: void, lhs: []u8, rhs: []u8) bool {
-    return std.mem.lessThan(u8, lhs, rhs);
+    const limit = @min(lhs.len, rhs.len);
+    var index: usize = 0;
+    while (index < limit) : (index += 1) {
+        const left = std.ascii.toLower(lhs[index]);
+        const right = std.ascii.toLower(rhs[index]);
+        if (left != right) return left < right;
+        if (lhs[index] != rhs[index]) return lhs[index] < rhs[index];
+    }
+    return lhs.len < rhs.len;
 }
 
 fn kindSuffix(kind: std.Io.File.Kind) []const u8 {
@@ -234,7 +242,7 @@ test "ls tool defaults to cwd, sorts entries, and reports empty directories" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "repo/empty");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/b.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/B.txt", .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/a.txt", .data = "" });
 
     var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -261,7 +269,7 @@ test "ls tool defaults to cwd, sorts entries, and reports empty directories" {
     );
     defer result.deinit();
 
-    try std.testing.expect(std.mem.indexOf(u8, result.result.content[0].text.text, "a.txt\nb.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.result.content[0].text.text, "a.txt\nB.txt") != null);
 
     var empty_object: std.json.ObjectMap = .empty;
     defer empty_object.deinit(std.testing.allocator);
