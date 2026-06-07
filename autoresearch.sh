@@ -46,6 +46,8 @@ check_present "edit duplicate/not-found tests" "test .*duplicate|test .*not foun
 check_present "read total bytes detail" "\"totalBytes\"|total_bytes" src/coding_agent/tools/read.zig
 check_present "read max bytes detail" "\"maxBytes\"" src/coding_agent/tools/read.zig
 check_present "read output bytes detail" "\"outputBytes\"|output_bytes" src/coding_agent/tools/read.zig
+check_present "read total lines detail" "\"totalLines\"|total_lines" src/coding_agent/tools/read.zig
+check_present "read max lines detail" "\"maxLines\"|max_output_lines" src/coding_agent/tools/read.zig
 
 # Write UX probes.
 check_present "write path detail" "\"path\"" src/coding_agent/tools/write.zig
