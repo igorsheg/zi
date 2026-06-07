@@ -446,6 +446,7 @@ fn editResult(
         .{ first_changed_line, before_line, after_line },
     );
     errdefer allocator.free(diff);
+    if (diff.len > max_diff_bytes) return error.EditTooLarge;
     try path_utils.putJsonField(allocator, &details, "diff", .{ .string = diff });
     const patch = try std.fmt.allocPrint(
         allocator,
@@ -453,6 +454,7 @@ fn editResult(
         .{ path, path, first_changed_line, before_line, after_line },
     );
     errdefer allocator.free(patch);
+    if (patch.len > max_diff_bytes) return error.EditTooLarge;
     try path_utils.putJsonField(allocator, &details, "patch", .{ .string = patch });
     return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = details } } };
 }
