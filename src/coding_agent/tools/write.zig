@@ -14,7 +14,7 @@ const parameters_schema =
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "path": { "type": "string", "description": "Path to the file to write" },
+    \\    "path": { "type": "string", "description": "Path to the file to write (relative or absolute)" },
     \\    "content": { "type": "string", "description": "Content to write to the file" }
     \\  },
     \\  "required": ["path", "content"]
