@@ -6,15 +6,16 @@ const path_utils = @import("path_utils.zig");
 const tool_output_policy = @import("../tool_output_policy.zig");
 
 pub const max_entries = 200;
+pub const max_scan_multiplier = 16;
 pub const max_output_bytes = tool_output_policy.default_max_bytes;
 
 const parameters_schema =
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "path": { "type": "string", "description": "Directory path to list" }
-    \\  },
-    \\  "required": ["path"]
+    \\    "path": { "type": "string", "description": "Directory path to list (defaults to .)" },
+    \\    "limit": { "type": "integer", "description": "Maximum entries to return, capped by tool config" }
+    \\  }
     \\}
 ;
 
@@ -79,6 +80,7 @@ fn execute(
     try token.throwIfRequested();
     const self: *LsTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const path = try parsePath(params);
+    const max_entries_value = try path_utils.parseOptionalLimit(params, self.config.max_entries);
     const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
@@ -88,24 +90,51 @@ fn execute(
     var dir = try std.Io.Dir.openDir(.cwd(), io, resolved_path, .{ .iterate = true });
     defer dir.close(io);
     var iter = dir.iterate();
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
+    var entries = std.ArrayList([]u8).empty;
+    defer {
+        for (entries.items) |entry| allocator.free(entry);
+        entries.deinit(allocator);
+    }
 
-    var emitted: usize = 0;
     var truncated = false;
+    var truncated_by: []const u8 = "entries";
+    const max_scan_entries = self.config.max_entries * max_scan_multiplier;
     while (try iter.next(io)) |entry| {
         try token.throwIfRequested();
-        if (emitted == self.config.max_entries) {
+        if (entries.items.len == max_scan_entries) {
             truncated = true;
+            truncated_by = "entries";
             break;
         }
-        if (writer.written().len + entry.name.len + 8 > self.config.max_output_bytes) {
+        const name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ entry.name, kindSuffix(entry.kind) });
+        errdefer allocator.free(name);
+        try entries.append(allocator, name);
+    }
+    std.mem.sort([]u8, entries.items, {}, lessThanString);
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var emitted: usize = 0;
+    for (entries.items) |entry| {
+        if (emitted == max_entries_value) {
             truncated = true;
+            truncated_by = "entries";
+            break;
+        }
+        const separator: usize = if (emitted == 0) 0 else 1;
+        if (writer.written().len + separator + entry.len > self.config.max_output_bytes) {
+            truncated = true;
+            truncated_by = "bytes";
             break;
         }
         if (emitted > 0) try writer.writer.writeByte('\n');
-        try writer.writer.print("{s}{s}", .{ entry.name, kindSuffix(entry.kind) });
+        try writer.writer.writeAll(entry);
         emitted += 1;
+    }
+    if (emitted == 0 and !truncated and
+        writer.written().len + empty_directory_text.len <= self.config.max_output_bytes)
+    {
+        try writer.writer.writeAll(empty_directory_text);
     }
     if (truncated and writer.written().len + 28 <= self.config.max_output_bytes) {
         try writer.writer.writeAll("\n[listing truncated]");
@@ -118,14 +147,17 @@ fn execute(
     result_content[0] = .{ .text = .{ .text = text } };
     return .{ .allocator = allocator, .result = .{
         .content = result_content,
-        .details = try listingDetails(allocator, emitted, truncated, self.config.max_entries),
+        .details = try listingDetails(allocator, emitted, truncated, truncated_by, max_entries_value),
     } };
 }
+
+const empty_directory_text = "[directory is empty]";
 
 fn listingDetails(
     allocator: std.mem.Allocator,
     entries: usize,
     truncated: bool,
+    truncated_by: []const u8,
     max_entries_value: usize,
 ) !std.json.Value {
     var object: std.json.ObjectMap = .empty;
@@ -134,7 +166,7 @@ fn listingDetails(
     var truncation: std.json.ObjectMap = .empty;
     errdefer truncation.deinit(allocator);
     try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = truncated });
-    try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", "entries");
+    try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", truncated_by);
     try path_utils.putJsonField(allocator, &truncation, "maxEntries", .{ .integer = @intCast(max_entries_value) });
     try path_utils.putJsonField(allocator, &object, "truncation", .{ .object = truncation });
     return .{ .object = object };
@@ -142,9 +174,13 @@ fn listingDetails(
 
 fn parsePath(params: std.json.Value) ![]const u8 {
     if (params != .object) return error.InvalidToolArguments;
-    const value = params.object.get("path") orelse return error.InvalidToolArguments;
+    const value = params.object.get("path") orelse return ".";
     if (value != .string or value.string.len == 0) return error.InvalidToolArguments;
     return value.string;
+}
+
+fn lessThanString(_: void, lhs: []u8, rhs: []u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
 }
 
 fn kindSuffix(kind: std.Io.File.Kind) []const u8 {
@@ -191,4 +227,55 @@ test "ls tool lists one directory with bounds" {
     const text = result.result.content[0].text.text;
     try std.testing.expect(std.mem.indexOf(u8, text, "a.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "nested/") != null);
+}
+
+test "ls tool defaults to cwd, sorts entries, and reports empty directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/empty");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/b.txt", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/a.txt", .data = "" });
+
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
+    var tool = try LsTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    defer tool.deinit();
+
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
+    var result = try execute(
+        std.testing.allocator,
+        zio_runtime.io(),
+        zio_runtime,
+        &tool,
+        cancel_source.token(),
+        "call",
+        .{ .object = object },
+        null,
+    );
+    defer result.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, result.result.content[0].text.text, "a.txt\nb.txt") != null);
+
+    var empty_object: std.json.ObjectMap = .empty;
+    defer empty_object.deinit(std.testing.allocator);
+    try empty_object.put(std.testing.allocator, "path", .{ .string = "empty" });
+    var empty_result = try execute(
+        std.testing.allocator,
+        zio_runtime.io(),
+        zio_runtime,
+        &tool,
+        cancel_source.token(),
+        "call-empty",
+        .{ .object = empty_object },
+        null,
+    );
+    defer empty_result.deinit();
+    try std.testing.expectEqualStrings("[directory is empty]", empty_result.result.content[0].text.text);
 }

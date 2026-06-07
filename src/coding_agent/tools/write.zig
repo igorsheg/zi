@@ -91,7 +91,10 @@ fn execute(
     const self: *WriteTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(params);
     if (args.content.len > self.config.max_write_bytes) return error.WriteTooLarge;
-    const resolved_path = try resolvePath(allocator, io, self.config, args.path, true);
+    const resolved_path = try path_utils.resolveCreatablePath(allocator, io, .{
+        .cwd = self.config.cwd,
+        .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
+    }, args.path);
     defer allocator.free(resolved_path);
 
     var guard = self.queue().lock();
@@ -112,45 +115,6 @@ fn parseArgs(params: std.json.Value) !WriteArgs {
     if (path_value != .string or path_value.string.len == 0) return error.InvalidToolArguments;
     if (content_value != .string) return error.InvalidToolArguments;
     return .{ .path = path_value.string, .content = content_value.string };
-}
-
-fn resolvePath(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: WriteTool.Config,
-    path: []const u8,
-    allow_missing_leaf: bool,
-) ![]const u8 {
-    const resolved = if (std.fs.path.isAbsolute(path))
-        try std.fs.path.resolve(allocator, &.{path})
-    else
-        try std.fs.path.resolve(allocator, &.{ config.cwd, path });
-    errdefer allocator.free(resolved);
-
-    if (!config.allow_paths_outside_cwd) {
-        const canonical_cwd = try std.Io.Dir.realPathFileAlloc(.cwd(), io, config.cwd, allocator);
-        defer allocator.free(canonical_cwd);
-        const canonical_path = if (allow_missing_leaf)
-            try canonicalExistingParent(allocator, io, resolved)
-        else
-            try std.Io.Dir.realPathFileAlloc(.cwd(), io, resolved, allocator);
-        defer allocator.free(canonical_path);
-        if (!isPathInside(canonical_cwd, canonical_path)) return error.PathOutsideCwd;
-    }
-    return resolved;
-}
-
-fn canonicalExistingParent(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![:0]u8 {
-    var candidate = path;
-    while (true) {
-        return std.Io.Dir.realPathFileAlloc(.cwd(), io, candidate, allocator) catch |err| switch (err) {
-            error.FileNotFound => {
-                candidate = std.fs.path.dirname(candidate) orelse return err;
-                continue;
-            },
-            else => return err,
-        };
-    }
 }
 
 fn atomicWriteFileStreamingUpdates(
@@ -205,15 +169,6 @@ fn utf8ChunkEnd(content: []const u8, start: usize, proposed_end: usize) usize {
     while (end > start and (content[end] & 0xc0) == 0x80) : (end -= 1) {}
     if (end == start) return proposed_end;
     return end;
-}
-
-fn isPathInside(raw_cwd: []const u8, path: []const u8) bool {
-    var cwd = raw_cwd;
-    while (cwd.len > 1 and std.fs.path.isSep(cwd[cwd.len - 1])) cwd = cwd[0 .. cwd.len - 1];
-    if (!std.mem.startsWith(u8, path, cwd)) return false;
-    if (cwd.len == 1 and std.fs.path.isSep(cwd[0])) return true;
-    if (path.len == cwd.len) return true;
-    return std.fs.path.isSep(path[cwd.len]);
 }
 
 fn writeResult(allocator: std.mem.Allocator, bytes_written: usize, path: []const u8) !agent.ToolExecutionResult {
@@ -367,11 +322,10 @@ test "write tool rejects paths outside cwd" {
 
     var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cwd = try tmp.dir.realPathFile(std.testing.io, "repo/app", &cwd_buffer);
-    try std.testing.expectError(error.PathOutsideCwd, resolvePath(
+    try std.testing.expectError(error.PathOutsideCwd, path_utils.resolveCreatablePath(
         std.testing.allocator,
         std.testing.io,
         .{ .cwd = cwd_buffer[0..cwd] },
         "../other/file.txt",
-        true,
     ));
 }

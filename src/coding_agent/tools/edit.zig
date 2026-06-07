@@ -9,6 +9,9 @@ pub const max_edit_read_bytes = 4 * 1024 * 1024;
 pub const max_edit_output_bytes = 4 * 1024 * 1024;
 pub const max_edits_per_call = 64;
 pub const edit_update_chunk_bytes = 16 * 1024;
+pub const max_diff_bytes = 16 * 1024;
+
+const utf8_bom = "\xef\xbb\xbf";
 
 var temp_file_counter: std.atomic.Value(u64) = .init(0);
 
@@ -102,6 +105,36 @@ const Match = struct {
     edit_index: usize,
 };
 
+const LineEnding = enum { lf, crlf };
+
+const TextShape = struct {
+    has_bom: bool,
+    line_ending: LineEnding,
+};
+
+const NormalizedReplacement = struct {
+    old_text: []u8,
+    new_text: []u8,
+
+    fn deinit(self: *NormalizedReplacement, allocator: std.mem.Allocator) void {
+        allocator.free(self.old_text);
+        allocator.free(self.new_text);
+        self.* = undefined;
+    }
+};
+
+const AppliedEdit = struct {
+    normalized: []u8,
+    restored: []u8,
+    first_changed_line: usize,
+
+    fn deinit(self: *AppliedEdit, allocator: std.mem.Allocator) void {
+        allocator.free(self.normalized);
+        allocator.free(self.restored);
+        self.* = undefined;
+    }
+};
+
 fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -116,7 +149,10 @@ fn execute(
     const self: *EditTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(allocator, params);
     defer allocator.free(args.edits);
-    const resolved_path = try resolvePath(allocator, io, self.config, args.path);
+    const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
+        .cwd = self.config.cwd,
+        .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
+    }, args.path);
     defer allocator.free(resolved_path);
 
     var guard = self.queue().lock();
@@ -218,23 +254,6 @@ fn lessThanMatch(_: void, a: Match, b: Match) bool {
     return a.start < b.start;
 }
 
-fn resolvePath(allocator: std.mem.Allocator, io: std.Io, config: EditTool.Config, path: []const u8) ![]const u8 {
-    const resolved = if (std.fs.path.isAbsolute(path))
-        try std.fs.path.resolve(allocator, &.{path})
-    else
-        try std.fs.path.resolve(allocator, &.{ config.cwd, path });
-    errdefer allocator.free(resolved);
-
-    if (!config.allow_paths_outside_cwd) {
-        const canonical_cwd = try std.Io.Dir.realPathFileAlloc(.cwd(), io, config.cwd, allocator);
-        defer allocator.free(canonical_cwd);
-        const canonical_path = try std.Io.Dir.realPathFileAlloc(.cwd(), io, resolved, allocator);
-        defer allocator.free(canonical_path);
-        if (!isPathInside(canonical_cwd, canonical_path)) return error.PathOutsideCwd;
-    }
-    return resolved;
-}
-
 fn atomicWriteFileStreamingUpdates(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -287,15 +306,6 @@ fn utf8ChunkEnd(content: []const u8, start: usize, proposed_end: usize) usize {
     while (end > start and (content[end] & 0xc0) == 0x80) : (end -= 1) {}
     if (end == start) return proposed_end;
     return end;
-}
-
-fn isPathInside(raw_cwd: []const u8, path: []const u8) bool {
-    var cwd = raw_cwd;
-    while (cwd.len > 1 and std.fs.path.isSep(cwd[cwd.len - 1])) cwd = cwd[0 .. cwd.len - 1];
-    if (!std.mem.startsWith(u8, path, cwd)) return false;
-    if (cwd.len == 1 and std.fs.path.isSep(cwd[0])) return true;
-    if (path.len == cwd.len) return true;
-    return std.fs.path.isSep(path[cwd.len]);
 }
 
 fn editResult(allocator: std.mem.Allocator, replacements: usize, path: []const u8) !agent.ToolExecutionResult {
