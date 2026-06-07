@@ -61,6 +61,7 @@ check_present "grep ignoreCase" "ignoreCase|ignore_case" src/coding_agent/tools/
 check_present "grep invalid utf8 handling" "invalid utf-8|utf8ValidateSlice" src/coding_agent/tools/grep.zig
 check_present "find visited cap" "max_visited|visited" src/coding_agent/tools/find.zig
 check_present "ls optional limit" "parseOptionalLimit|limit" src/coding_agent/tools/ls.zig
+check_present "ls case-insensitive sort" "ascii.*lower|case.*insensitive|lower" src/coding_agent/tools/ls.zig
 
 # Path normalization probes.
 check_present "shared creatable path resolution" "resolveCreatablePath" src/coding_agent/tools/path_utils.zig
