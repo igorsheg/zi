@@ -59,7 +59,8 @@ pub const WriteTool = struct {
     pub fn tool(self: *WriteTool) agent.AgentTool {
         return .{
             .name = "write",
-            .description = "Create or overwrite a text file. Creates parent directories as needed.",
+            .description = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. " ++
+                "Automatically creates parent directories.",
             .parameters = self.parsed_parameters.value,
             .label = "write",
             .execute = .{ .context = self, .call_fn = execute },
