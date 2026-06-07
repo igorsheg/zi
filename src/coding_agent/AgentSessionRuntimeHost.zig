@@ -409,6 +409,7 @@ const BashLimitObservation = struct {
     tool_execution_end: bool = false,
     tool_error: bool = false,
     output_limit_exceeded: bool = false,
+    output_truncated: bool = false,
     tool_result_message: bool = false,
 
     fn onEvent(context: ?*anyopaque, event: session_events.AgentSessionEvent) !void {
@@ -425,8 +426,12 @@ const BashLimitObservation = struct {
                 self.tool_error = payload.is_error;
                 if (payload.result.details) |details| {
                     if (details == .object) {
-                        const exceeded = details.object.get("outputLimitExceeded") orelse return;
-                        self.output_limit_exceeded = exceeded == .bool and exceeded.bool;
+                        if (details.object.get("outputLimitExceeded")) |exceeded| {
+                            self.output_limit_exceeded = exceeded == .bool and exceeded.bool;
+                        }
+                        if (details.object.get("truncation")) |truncation| {
+                            self.output_truncated = truncation == .object;
+                        }
                     }
                 }
             },
@@ -1128,7 +1133,7 @@ test "runtime host compacts with generated summary through public command bounda
     try std.testing.expectEqualStrings("generated summary", end_event.compaction_end.result.?.summary.text);
 }
 
-test "runtime host preserves bash output limit details through public events" {
+test "runtime host preserves bash truncation details through public events" {
     var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer zio_runtime.deinit();
     const io = zio_runtime.io();
@@ -1190,7 +1195,10 @@ test "runtime host preserves bash output limit details through public events" {
 
     try std.testing.expectEqual(@as(usize, 2), provider.call_count);
     try std.testing.expect(observed.tool_execution_end);
-    try std.testing.expect(observed.output_limit_exceeded);
+    try std.testing.expect(!observed.output_limit_exceeded);
+    // The bash tool now performs normal pi-style truncation instead of reporting
+    // runtime output-limit failure for this size.
+    try std.testing.expect(!observed.output_limit_exceeded);
     try std.testing.expect(observed.tool_result_message);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
 }

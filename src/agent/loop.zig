@@ -318,7 +318,13 @@ fn copyDeltaPartial(
     kind: DeltaPartialKind,
 ) !ai.AssistantMessage {
     if (content_index >= source.content.len) return ai.owned.copyAssistantMessage(allocator, source);
-    const content = try copyDeltaContent(allocator, source.content[content_index], content_index + 1, content_index, kind);
+    const content = try copyDeltaContent(
+        allocator,
+        source.content[content_index],
+        content_index + 1,
+        content_index,
+        kind,
+    );
     errdefer ai.owned.deinitAssistantContentSlice(allocator, content);
     return copyAssistantMetadataWithContent(allocator, source, content);
 }
@@ -1709,7 +1715,9 @@ test "stream event copy bounds delta partial to changed content" {
     var args = std.json.ObjectMap.empty;
     defer args.deinit(std.testing.allocator);
     try args.put(std.testing.allocator, "command", .{ .string = "echo hi" });
-    try args.put(std.testing.allocator, "content", .{ .string = "large write content must not be copied on each delta" ** 512 });
+    try args.put(std.testing.allocator, "content", .{
+        .string = "large write content must not be copied on each delta" ** 512,
+    });
 
     const content = [_]ai.AssistantContent{
         .{ .text = .{ .text = "large prior text that should not be copied into delta partial" } },

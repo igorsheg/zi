@@ -48,6 +48,18 @@ pub const BorderSpec = struct {
     style: Style = .{},
 };
 
+pub const BoxVariant = enum { open, closed };
+
+pub const MeasuredText = struct {
+    text: []const u8,
+    width: usize,
+};
+
+pub const BorderLabelPair = struct {
+    left: ?MeasuredText = null,
+    right: ?MeasuredText = null,
+};
+
 pub fn innerRect(rect: Rect, sides: BorderSides) Rect {
     if (rect.isEmpty()) return Rect.empty();
     const left_inset: u16 = if (sides.left and rect.width > 0) 1 else 0;
@@ -141,13 +153,48 @@ pub fn drawVerticalLine(
     while (yy < end) : (yy += 1) try buffer.writeText(x, yy, glyph, style);
 }
 
-pub fn openTopLine(buffer: []u8, glyphs: BorderGlyphs, title: []const u8) ![]const u8 {
+pub fn boxTopLine(
+    buffer: []u8,
+    glyphs: BorderGlyphs,
+    variant: BoxVariant,
+    inner_width: usize,
+    header: ?MeasuredText,
+) ![]const u8 {
+    return switch (variant) {
+        .open => openTopLine(buffer, glyphs, header),
+        .closed => closedTopLine(buffer, glyphs, inner_width, header),
+    };
+}
+
+pub fn openTopLine(buffer: []u8, glyphs: BorderGlyphs, header: ?MeasuredText) ![]const u8 {
     var stream = std.Io.Writer.fixed(buffer);
     try stream.writeAll(glyphs.top_left);
     try stream.writeAll(glyphs.horizontal);
-    try stream.writeByte('[');
-    try stream.writeAll(title);
-    try stream.writeByte(']');
+    if (header) |text| {
+        try stream.writeByte('[');
+        try stream.writeAll(text.text);
+        try stream.writeByte(']');
+    }
+    return stream.buffered();
+}
+
+pub fn closedTopLine(
+    buffer: []u8,
+    glyphs: BorderGlyphs,
+    inner_width: usize,
+    header: ?MeasuredText,
+) ![]const u8 {
+    var stream = std.Io.Writer.fixed(buffer);
+    try stream.writeAll(glyphs.top_left);
+    if (header) |text| {
+        try stream.writeAll(glyphs.horizontal);
+        try stream.writeAll(text.text);
+        const fill = if (inner_width > text.width + 1) inner_width - text.width - 1 else 0;
+        for (0..fill) |_| try stream.writeAll(glyphs.horizontal);
+    } else {
+        for (0..inner_width) |_| try stream.writeAll(glyphs.horizontal);
+    }
+    try stream.writeAll(glyphs.top_right);
     return stream.buffered();
 }
 
@@ -165,11 +212,76 @@ pub const OpenBlock = struct {
     }
 };
 
+pub fn boxBottomLine(
+    buffer: []u8,
+    glyphs: BorderGlyphs,
+    variant: BoxVariant,
+    inner_width: usize,
+    footer: ?MeasuredText,
+) ![]const u8 {
+    return switch (variant) {
+        .open => openBottomLine(buffer, glyphs, 5),
+        .closed => closedBottomLine(buffer, glyphs, inner_width, footer),
+    };
+}
+
 pub fn openBottomLine(buffer: []u8, glyphs: BorderGlyphs, width: usize) ![]const u8 {
     var stream = std.Io.Writer.fixed(buffer);
     try stream.writeAll(glyphs.bottom_left);
     const count = if (width > 1) width - 1 else 0;
     for (0..count) |_| try stream.writeAll(glyphs.horizontal);
+    return stream.buffered();
+}
+
+pub fn closedBottomLine(
+    buffer: []u8,
+    glyphs: BorderGlyphs,
+    inner_width: usize,
+    footer: ?MeasuredText,
+) ![]const u8 {
+    var stream = std.Io.Writer.fixed(buffer);
+    try stream.writeAll(glyphs.bottom_left);
+    if (footer) |text| {
+        const left = if (inner_width > text.width) (inner_width - text.width) / 2 else 0;
+        const right = if (inner_width > text.width + left) inner_width - text.width - left else 0;
+        for (0..left) |_| try stream.writeAll(glyphs.horizontal);
+        try stream.writeAll(text.text);
+        for (0..right) |_| try stream.writeAll(glyphs.horizontal);
+    } else {
+        for (0..inner_width) |_| try stream.writeAll(glyphs.horizontal);
+    }
+    try stream.writeAll(glyphs.bottom_right);
+    return stream.buffered();
+}
+
+pub fn borderLineLr(
+    buffer: []u8,
+    glyphs: BorderGlyphs,
+    top: bool,
+    inner_width: usize,
+    labels: BorderLabelPair,
+) ![]const u8 {
+    var stream = std.Io.Writer.fixed(buffer);
+    const left_corner = if (top) glyphs.top_left else glyphs.bottom_left;
+    const right_corner = if (top) glyphs.top_right else glyphs.bottom_right;
+    const left_width = if (labels.left) |label| label.width else 0;
+    const right_width = if (labels.right) |label| label.width else 0;
+    const fill = if (inner_width >= 2 + left_width + right_width)
+        inner_width - 2 - left_width - right_width
+    else
+        null;
+
+    try stream.writeAll(left_corner);
+    if (fill) |fill_count| {
+        try stream.writeAll(glyphs.horizontal);
+        if (labels.left) |label| try stream.writeAll(label.text);
+        for (0..fill_count) |_| try stream.writeAll(glyphs.horizontal);
+        if (labels.right) |label| try stream.writeAll(label.text);
+        try stream.writeAll(glyphs.horizontal);
+    } else {
+        for (0..inner_width) |_| try stream.writeAll(glyphs.horizontal);
+    }
+    try stream.writeAll(right_corner);
     return stream.buffered();
 }
 
@@ -233,10 +345,21 @@ test "chrome builds open transcript lines" {
     var top_buffer: [32]u8 = undefined;
     var bottom_buffer: [32]u8 = undefined;
     var elision_buffer: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("╭─[tool]", try openTopLine(&top_buffer, .rounded, "tool"));
+    try std.testing.expectEqualStrings(
+        "╭─[tool]",
+        try openTopLine(&top_buffer, .rounded, .{ .text = "tool", .width = 4 }),
+    );
     const block: OpenBlock = .{};
     try std.testing.expectEqualStrings("│ ", block.bodyPrefix());
     try std.testing.expectEqualStrings("╰────", try block.bottomLine(&bottom_buffer));
     try std.testing.expectEqualStrings("╰────", try openBottomLine(&bottom_buffer, .rounded, 5));
+    try std.testing.expectEqualStrings(
+        "╭─tool─╮",
+        try closedTopLine(&top_buffer, .rounded, 6, .{ .text = "tool", .width = 4 }),
+    );
+    try std.testing.expectEqualStrings(
+        "╰──ok──╯",
+        try closedBottomLine(&bottom_buffer, .rounded, 6, .{ .text = "ok", .width = 2 }),
+    );
     try std.testing.expectEqualStrings("· ··· 8 earlier lines", (try elisionLine(&elision_buffer, 8, 0)).?);
 }

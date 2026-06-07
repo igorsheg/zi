@@ -484,7 +484,7 @@ fn maxToolArgumentBytes(content: []const protocol.AssistantContent) usize {
     for (content) |block| switch (block) {
         .tool_call => |call| {
             var counting: std.Io.Writer.Discarding = .init(&.{});
-            std.json.Stringify.value(call.arguments, .{}, &counting.writer) catch {};
+            std.json.Stringify.value(call.arguments, .{}, &counting.writer) catch continue;
             max = @max(max, counting.fullCount());
         },
         else => {},
@@ -650,7 +650,10 @@ fn emitToolCallDeltas(
     min_token_size: usize,
     max_token_size: usize,
     delay_per_delta_ms: u32,
-) (protocol.AssistantMessageEventSinkEmitError || mem.ByteBuilder.Error || std.Io.Writer.Error || error{ OperationCancelled, Canceled, NoSpaceLeft })!void {
+) (protocol.AssistantMessageEventSinkEmitError ||
+    mem.ByteBuilder.Error ||
+    std.Io.Writer.Error ||
+    error{ OperationCancelled, Canceled, NoSpaceLeft })!void {
     const io = request.io;
     var index: usize = 0;
     while (index < value.len) {

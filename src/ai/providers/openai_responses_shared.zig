@@ -768,7 +768,8 @@ test "responses reducer exposes partial tool arguments during deltas" {
 
     try sink.emit(std.Io.failing, .{ .start = .{ .partial = try reducer.partial() } });
     try reducer.applySseData(std.Io.failing, sink,
-        \\{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write","arguments":""}}
+        \\{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1",
+        \\"call_id":"call_1","name":"write","arguments":""}}
     );
     try reducer.applySseData(std.Io.failing, sink,
         \\{"type":"response.function_call_arguments.delta","delta":"{\"content\":\"one"}

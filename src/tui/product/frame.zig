@@ -17,8 +17,12 @@ const tool_chrome_line_bytes_max: usize = 160;
 const TranscriptVisualRow = struct {
     prefix: []const u8,
     text: []const u8,
+    suffix: []const u8 = "",
     show_prefix: bool,
-    style: primitive.Style = .{},
+    prefix_style: primitive.Style = .{},
+    text_style: primitive.Style = .{},
+    suffix_style: primitive.Style = .{},
+    row_style: primitive.Style = .{},
     storage: [generated_row_text_bytes_max]u8 = undefined,
 };
 
@@ -66,7 +70,12 @@ pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u
     return if (sink.total_emitted > visible_rows) sink.total_emitted - visible_rows else 0;
 }
 
-fn drawTranscript(app: *const app_mod.ProductApp, renderer: *infra.Renderer, _: primitive.Style, visible_rows: usize) !void {
+fn drawTranscript(
+    app: *const app_mod.ProductApp,
+    renderer: *infra.Renderer,
+    _: primitive.Style,
+    visible_rows: usize,
+) !void {
     if (visible_rows == 0 or app.width == 0) return;
     const row_limit = @min(visible_rows, transcript_visual_rows_max);
     var rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
@@ -83,18 +92,24 @@ fn drawTranscript(app: *const app_mod.ProductApp, renderer: *infra.Renderer, _: 
     while (draw_index > 0) : (y += 1) {
         draw_index -= 1;
         const row = rows[draw_index];
-        try renderer.fillRect(0, y, renderer.next.width, 1, row.style);
-        const text_origin = @min(transcript_item_padding_x, renderer.next.width);
-        if (row.show_prefix) {
-            try renderer.writeText(text_origin, y, row.prefix, row.style);
-            const text_x = text_origin + primitive.text.displayWidth(row.prefix);
-            if (text_x < renderer.next.width and row.text.len > 0) {
-                try renderer.writeText(@intCast(text_x), y, row.text, row.style);
-            }
-        } else {
-            try renderer.writeText(text_origin, y, row.text, row.style);
+        try renderer.fillRect(0, y, renderer.next.width, 1, row.row_style);
+        var text_x: u16 = @min(transcript_item_padding_x, renderer.next.width);
+        if (row.show_prefix and row.prefix.len > 0) {
+            try renderer.writeText(text_x, y, row.prefix, row.prefix_style);
+            text_x = advanceX(text_x, row.prefix);
+        }
+        if (text_x < renderer.next.width and row.text.len > 0) {
+            try renderer.writeText(text_x, y, row.text, row.text_style);
+            text_x = advanceX(text_x, row.text);
+        }
+        if (text_x < renderer.next.width and row.suffix.len > 0) {
+            try renderer.writeText(text_x, y, row.suffix, row.suffix_style);
         }
     }
+}
+
+fn advanceX(x: u16, text: []const u8) u16 {
+    return @intCast(@min(@as(usize, std.math.maxInt(u16)), @as(usize, x) + primitive.text.displayWidth(text)));
 }
 
 // Transcript scroll and rendering have one invariant: visual-row accounting and
@@ -146,6 +161,18 @@ const TranscriptRowSink = struct {
         show_prefix: bool,
         style: primitive.Style,
     ) void {
+        self.emitGeneratedParts(.{
+            .prefix = prefix,
+            .text = text,
+            .show_prefix = show_prefix,
+            .prefix_style = style,
+            .text_style = style,
+            .suffix_style = style,
+            .row_style = style,
+        });
+    }
+
+    fn emitGeneratedParts(self: *TranscriptRowSink, row: TranscriptVisualRow) void {
         self.total_emitted += 1;
         if (self.skip_remaining > 0) {
             self.skip_remaining -= 1;
@@ -154,12 +181,16 @@ const TranscriptRowSink = struct {
         if (self.rows) |rows| {
             if (self.row_count >= self.row_limit) return;
             const slot = &rows[self.row_count];
-            const keep = @min(text.len, slot.storage.len);
-            @memcpy(slot.storage[0..keep], text[0..keep]);
-            slot.prefix = prefix;
+            const keep = @min(row.text.len, slot.storage.len);
+            @memcpy(slot.storage[0..keep], row.text[0..keep]);
+            slot.prefix = row.prefix;
             slot.text = slot.storage[0..keep];
-            slot.show_prefix = show_prefix;
-            slot.style = style;
+            slot.suffix = row.suffix;
+            slot.show_prefix = row.show_prefix;
+            slot.prefix_style = row.prefix_style;
+            slot.text_style = row.text_style;
+            slot.suffix_style = row.suffix_style;
+            slot.row_style = row.row_style;
             self.row_count += 1;
         }
     }
@@ -182,7 +213,7 @@ fn emitItemRowsNewestFirst(
     if (item == .tool) {
         emitToolRowsNewestFirst(sink, item.tool, frame_width, theme);
     } else {
-        emitWrappedRowsNewestFirst(sink, transcript_projection.itemPrimary(item), frame_width, false, style);
+        emitWrappedRowsNewestFirst(sink, transcript_projection.itemPrimary(item), frame_width, false, style, style);
     }
     emitVerticalPaddingRows(sink, transcriptItemPaddingY(item), style);
 }
@@ -221,23 +252,53 @@ fn emitToolRowsNewestFirst(
 
     const projected = transcript_projection.itemPrimary(.{ .tool = tool });
     if (transcript_projection.toolBodyVisible(tool)) {
-        emitWrappedRowsNewestFirst(sink, .{ .prefix = block.bodyPrefix(), .text = projected.text }, frame_width, true, resolved.tool_output);
+        emitWrappedRowsNewestFirst(
+            sink,
+            .{ .prefix = block.bodyPrefix(), .text = projected.text },
+            frame_width,
+            true,
+            resolved.tool_chrome,
+            resolved.tool_output,
+        );
         if (sink.full()) return;
     }
     if (tool.call_preview.len > 0) {
-        emitWrappedRowsNewestFirst(sink, .{ .prefix = block.bodyPrefix(), .text = tool.call_preview }, frame_width, true, resolved.tool_output);
+        emitWrappedRowsNewestFirst(
+            sink,
+            .{ .prefix = block.bodyPrefix(), .text = tool.call_preview },
+            frame_width,
+            true,
+            resolved.tool_chrome,
+            resolved.tool_output,
+        );
         if (sink.full()) return;
     }
 
     var notice_buffer: [tool_notice_bytes_max]u8 = undefined;
     if (transcript_projection.toolOmissionNotice(tool, &notice_buffer)) |notice| {
-        emitWrappedRowsNewestFirst(sink, .{ .prefix = block.bodyPrefix(), .text = notice }, frame_width, true, resolved.tool_chrome);
+        emitWrappedRowsNewestFirst(
+            sink,
+            .{ .prefix = block.bodyPrefix(), .text = notice },
+            frame_width,
+            true,
+            resolved.tool_chrome,
+            resolved.tool_chrome,
+        );
         if (sink.full()) return;
     }
 
-    var title_buffer: [tool_chrome_line_bytes_max]u8 = undefined;
-    const title = transcript_projection.toolTitle(tool, &title_buffer);
-    sink.emitGenerated("", title, false, resolved.tool_title);
+    var title_text_buffer: [tool_chrome_line_bytes_max]u8 = undefined;
+    const title_text = transcript_projection.toolTitle(tool, &title_text_buffer);
+    sink.emitGeneratedParts(.{
+        .prefix = "╭─[",
+        .text = title_text,
+        .suffix = "]",
+        .show_prefix = true,
+        .prefix_style = resolved.tool_chrome,
+        .text_style = resolved.tool_title,
+        .suffix_style = resolved.tool_chrome,
+        .row_style = resolved.tool_chrome,
+    });
 }
 
 fn emitWrappedRowsNewestFirst(
@@ -245,7 +306,8 @@ fn emitWrappedRowsNewestFirst(
     item: transcript_projection.RenderItem,
     frame_width: u16,
     repeat_prefix: bool,
-    style: primitive.Style,
+    prefix_style: primitive.Style,
+    text_style: primitive.Style,
 ) void {
     const inner_width = transcriptItemInnerWidth(frame_width);
     const prefix_width: u16 = @intCast(@min(primitive.text.displayWidth(item.prefix), inner_width));
@@ -256,7 +318,8 @@ fn emitWrappedRowsNewestFirst(
         inner_width,
         prefix_width,
         repeat_prefix,
-        style,
+        prefix_style,
+        text_style,
     );
     var remaining = line_row_count;
     while (remaining > 0) {
@@ -300,7 +363,8 @@ fn collectWrappedTranscriptLine(
     inner_width: u16,
     prefix_width: u16,
     repeat_prefix: bool,
-    style: primitive.Style,
+    prefix_style: primitive.Style,
+    text_style: primitive.Style,
 ) usize {
     var line_row_count: usize = 0;
     var start: usize = 0;
@@ -312,7 +376,10 @@ fn collectWrappedTranscriptLine(
                 .prefix = item.prefix,
                 .text = "",
                 .show_prefix = repeat_prefix or visual_index == 0,
-                .style = style,
+                .prefix_style = prefix_style,
+                .text_style = text_style,
+                .suffix_style = text_style,
+                .row_style = text_style,
             };
             line_row_count += 1;
             continue;
@@ -323,13 +390,24 @@ fn collectWrappedTranscriptLine(
             .prefix = item.prefix,
             .text = item.text[visual.start..visual.end],
             .show_prefix = repeat_prefix or visual_index == 0,
-            .style = style,
+            .prefix_style = prefix_style,
+            .text_style = text_style,
+            .suffix_style = text_style,
+            .row_style = text_style,
         };
         line_row_count += 1;
         start = visual.next;
     }
     if (item.text.len == 0 and line_row_count < line_rows.len) {
-        line_rows[line_row_count] = .{ .prefix = item.prefix, .text = "", .show_prefix = true, .style = style };
+        line_rows[line_row_count] = .{
+            .prefix = item.prefix,
+            .text = "",
+            .show_prefix = true,
+            .prefix_style = prefix_style,
+            .text_style = text_style,
+            .suffix_style = text_style,
+            .row_style = text_style,
+        };
         line_row_count += 1;
     }
     return line_row_count;
@@ -485,10 +563,12 @@ test "frame renders typed tool rows with name and state" {
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 1, 1, "bash");
-    try expectCellText(renderer.next, 1, 4, "read");
+    try expectCellGrapheme(renderer.next, 1, 1, "╭");
+    try expectCellText(renderer.next, 3, 1, "[bash]");
+    try expectCellGrapheme(renderer.next, 1, 4, "╭");
+    try expectCellText(renderer.next, 3, 4, "[read]");
     try expectGraphemeInColumn(renderer.next, 1, "╰");
-    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.tool_title));
+    try std.testing.expect((try renderer.next.get(4, 1)).style.eql(app.theme.tool_title));
 }
 
 test "frame renders tool display text when present" {
@@ -507,9 +587,10 @@ test "frame renders tool display text when present" {
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 1, 1, "bash: zig build test");
+    try expectCellGrapheme(renderer.next, 1, 1, "╭");
+    try expectCellText(renderer.next, 3, 1, "[bash: zig build test]");
     try expectGraphemeInColumn(renderer.next, 1, "╰");
-    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.tool_title));
+    try std.testing.expect((try renderer.next.get(4, 1)).style.eql(app.theme.tool_title));
 }
 
 test "frame renders tool title bold and tool output dim" {
@@ -527,10 +608,11 @@ test "frame renders tool title bold and tool output dim" {
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 1, 1, "bash");
+    try expectCellGrapheme(renderer.next, 1, 1, "╭");
+    try expectCellText(renderer.next, 3, 1, "[bash]");
     try expectCellText(renderer.next, 3, 2, "out");
     try expectGraphemeInColumn(renderer.next, 1, "╰");
-    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.tool_title));
+    try std.testing.expect((try renderer.next.get(4, 1)).style.eql(app.theme.tool_title));
     try std.testing.expect((try renderer.next.get(3, 2)).style.eql(app.theme.tool_output));
 }
 
@@ -589,9 +671,10 @@ test "frame renders updated tool row once" {
     try Frame.build(&app, &renderer);
 
     try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
-    try expectCellText(renderer.next, 1, 1, "bash");
+    try expectCellGrapheme(renderer.next, 1, 1, "╭");
+    try expectCellText(renderer.next, 3, 1, "[bash]");
     try expectGraphemeInColumn(renderer.next, 1, "╰");
-    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.tool_title));
+    try std.testing.expect((try renderer.next.get(4, 1)).style.eql(app.theme.tool_title));
 }
 
 test "frame renders transcript scrolled by newest visual rows" {

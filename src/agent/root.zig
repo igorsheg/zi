@@ -620,10 +620,15 @@ pub const AgentLoopConfig = struct {
 
 pub fn copyAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) !AgentEvent {
     return switch (event) {
-        .message_start => |payload| .{ .message_start = .{ .message = try copyAgentMessage(allocator, payload.message) } },
+        .message_start => |payload| .{ .message_start = .{
+            .message = try copyAgentMessage(allocator, payload.message),
+        } },
         .message_update => |payload| .{ .message_update = .{
             .message = try copyAgentMessage(allocator, payload.message),
-            .assistant_message_event = try ai.owned.copyAssistantMessageEvent(allocator, payload.assistant_message_event),
+            .assistant_message_event = try ai.owned.copyAssistantMessageEvent(
+                allocator,
+                payload.assistant_message_event,
+            ),
         } },
         .message_end => |payload| .{ .message_end = .{ .message = try copyAgentMessage(allocator, payload.message) } },
         .turn_end => |payload| .{ .turn_end = .{

@@ -21,6 +21,37 @@ pub const max_compaction_summary_prompt_bytes = session_manager.max_compaction_s
 pub const max_auto_retry_attempts_limit = 8;
 pub const live_prompt_event_capacity_count = 64;
 
+fn classifyToolResultAfterCall(
+    _: ?*anyopaque,
+    _: runtime.CancelToken,
+    context: agent_mod.AfterToolCallContext,
+) anyerror!?agent_mod.AfterToolCallResult {
+    if (!std.mem.eql(u8, context.tool_call.name, "bash")) return null;
+    return .{ .is_error = bashResultIsError(context.result.details, context.is_error) };
+}
+
+fn bashResultIsError(details: ?std.json.Value, fallback: bool) bool {
+    const value = details orelse return fallback;
+    if (value != .object) return fallback;
+    const object = value.object;
+    if (jsonBool(object.get("timedOut"))) |timed_out| if (timed_out) return true;
+    if (jsonBool(object.get("outputLimitExceeded"))) |limited| if (limited) return true;
+    if (jsonBool(object.get("cancelled"))) |cancelled| if (cancelled) return true;
+    if (object.get("signal") != null or object.get("stopped") != null or object.get("unknown") != null) return true;
+    if (jsonInteger(object.get("exitCode"))) |code| return code != 0;
+    return fallback;
+}
+
+fn jsonBool(value: ?std.json.Value) ?bool {
+    const resolved = value orelse return null;
+    return if (resolved == .bool) resolved.bool else null;
+}
+
+fn jsonInteger(value: ?std.json.Value) ?i64 {
+    const resolved = value orelse return null;
+    return if (resolved == .integer) resolved.integer else null;
+}
+
 allocator: std.mem.Allocator,
 io: std.Io,
 zio_runtime: *runtime.Runtime,
@@ -220,6 +251,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .tools = tools.activeAgentTools(),
         .messages = session_context.messages,
         .zio_runtime = zio_runtime,
+        .after_tool_call = .{ .call_fn = classifyToolResultAfterCall },
     };
     if (options.stream) |stream| agent_options.stream = stream;
     if (options.get_api_key) |get_api_key| agent_options.get_api_key = get_api_key;
@@ -644,7 +676,10 @@ test "agent session public event enqueue sets coalesced wake" {
 
     try std.testing.expect(!session.publicEventWake().isSet());
 
-    session.event_drain.enqueuePublicEvent(.{ .agent_event = try session_events.OwnedAgentEvent.init(std.testing.allocator, .agent_start) });
+    session.event_drain.enqueuePublicEvent(.{ .agent_event = try session_events.OwnedAgentEvent.init(
+        std.testing.allocator,
+        .agent_start,
+    ) });
 
     try std.testing.expect(session.publicEventWake().isSet());
     session.publicEventWake().reset();

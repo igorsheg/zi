@@ -6,8 +6,12 @@ pub const Rect = struct {
     width: u16,
     height: u16,
 
-    pub fn empty() Rect { return .{ .x = 0, .y = 0, .width = 0, .height = 0 }; }
-    pub fn isEmpty(self: Rect) bool { return self.width == 0 or self.height == 0; }
+    pub fn empty() Rect {
+        return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    }
+    pub fn isEmpty(self: Rect) bool {
+        return self.width == 0 or self.height == 0;
+    }
     pub fn contains(self: Rect, x: u16, y: u16) bool {
         const x2 = @as(u32, self.x) + self.width;
         const y2 = @as(u32, self.y) + self.height;

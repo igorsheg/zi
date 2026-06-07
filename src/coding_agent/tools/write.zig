@@ -274,6 +274,7 @@ const WriteUpdateCapture = struct {
 
     fn deinit(self: *WriteUpdateCapture) void {
         self.writer.deinit();
+        self.* = undefined;
     }
 };
 

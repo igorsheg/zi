@@ -115,7 +115,13 @@ fn execute(
     result_content[0] = .{ .text = .{ .text = text } };
     return .{ .allocator = allocator, .result = .{
         .content = result_content,
-        .details = try grepDetails(allocator, state.files_seen, state.matches, state.truncated, self.config.max_matches),
+        .details = try grepDetails(
+            allocator,
+            state.files_seen,
+            state.matches,
+            state.truncated,
+            self.config.max_matches,
+        ),
     } };
 }
 

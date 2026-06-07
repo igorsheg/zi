@@ -299,7 +299,11 @@ fn isPathInside(raw_cwd: []const u8, path: []const u8) bool {
 }
 
 fn editResult(allocator: std.mem.Allocator, replacements: usize, path: []const u8) !agent.ToolExecutionResult {
-    const message = try std.fmt.allocPrint(allocator, "Successfully replaced {d} block(s) in {s}.", .{ replacements, path });
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Successfully replaced {d} block(s) in {s}.",
+        .{ replacements, path },
+    );
     errdefer allocator.free(message);
     const content = try allocator.alloc(ai.ToolResultContent, 1);
     errdefer allocator.free(content);
@@ -369,6 +373,7 @@ const EditUpdateCapture = struct {
 
     fn deinit(self: *EditUpdateCapture) void {
         self.writer.deinit();
+        self.* = undefined;
     }
 };
 

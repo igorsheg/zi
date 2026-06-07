@@ -145,7 +145,8 @@ pub const TranscriptBuffer = struct {
         preview: []const u8,
     ) !void {
         if (preview.len > append_size_bytes_max) return error.TranscriptAppendTooLarge;
-        if (!std.unicode.utf8ValidateSlice(tool_call_id) or !std.unicode.utf8ValidateSlice(preview)) return error.InvalidUtf8;
+        if (!std.unicode.utf8ValidateSlice(tool_call_id) or
+            !std.unicode.utf8ValidateSlice(preview)) return error.InvalidUtf8;
         const index = self.findTool(tool_call_id) orelse return;
         const tool = &self.items.items[index].tool;
         const old_size = tool.sizeBytes();

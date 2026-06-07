@@ -7,6 +7,15 @@ pub const max_active_tools = 64;
 pub const builtin_tool_count = default_active_tool_names.len;
 pub const default_active_tool_names: []const []const u8 = &.{ "read", "ls", "grep", "find", "bash", "edit", "write" };
 
+const read_description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit. " ++
+    "Use offset/limit to continue large files.";
+const bash_description = "Run one shell command in the session cwd. Supports optional timeout in seconds. " ++
+    "Output is bounded.";
+const bash_prompt_snippet = "Run one shell command in the session cwd. " ++
+    "Prefer read/ls/grep/find/edit/write for file work.";
+const edit_prompt_snippet = "Edit a file using exact unique text replacements. " ++
+    "Use one call for multiple disjoint edits.";
+
 pub const ToolSource = union(enum) {
     builtin,
     custom: []const u8,
@@ -288,7 +297,7 @@ pub const BuiltinTools = struct {
         try registry.append(self.allocator, ToolDefinition.init(self.read, .{
             .name = "read",
             .label = "read",
-            .description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit. Use offset/limit to continue large files.",
+            .description = read_description,
             .prompt_snippet = "Read file contents. Use offset/limit for large files; continue with offset when needed.",
             .display = .{ .presentation = .file, .body_mode = .hidden_on_success },
         }));
@@ -316,8 +325,8 @@ pub const BuiltinTools = struct {
         try registry.append(self.allocator, ToolDefinition.init(self.bash, .{
             .name = "bash",
             .label = "bash",
-            .description = "Run one shell command in the session cwd. Supports optional timeout in seconds. Output is bounded.",
-            .prompt_snippet = "Run one shell command in the session cwd. Prefer read/ls/grep/find/edit/write for file work.",
+            .description = bash_description,
+            .prompt_snippet = bash_prompt_snippet,
             .execution_mode = .sequential,
             .display = .{ .presentation = .command },
         }));
@@ -325,7 +334,7 @@ pub const BuiltinTools = struct {
             .name = "edit",
             .label = "edit",
             .description = "Edit a single file using exact, unique, non-overlapping text replacements.",
-            .prompt_snippet = "Edit a file using exact unique text replacements. Use one call for multiple disjoint edits.",
+            .prompt_snippet = edit_prompt_snippet,
             .execution_mode = .sequential,
             .display = .{ .presentation = .patch, .body_mode = .hidden_on_success },
         }));
@@ -375,8 +384,14 @@ test "tool registry stores definitions first and exposes active agent tools" {
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[4].execution_mode.?);
     try std.testing.expectEqualStrings("edit", registry.activeAgentTools()[5].name);
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[5].execution_mode.?);
-    try std.testing.expectEqual(ToolDisplayPresentation.command, registry.definitions.items[4].metadata.display.presentation);
-    try std.testing.expectEqual(ToolDisplayPresentation.patch, registry.definitions.items[5].metadata.display.presentation);
+    try std.testing.expectEqual(
+        ToolDisplayPresentation.command,
+        registry.definitions.items[4].metadata.display.presentation,
+    );
+    try std.testing.expectEqual(
+        ToolDisplayPresentation.patch,
+        registry.definitions.items[5].metadata.display.presentation,
+    );
     try std.testing.expectEqual(ToolDisplayBodyMode.visible, registry.definitions.items[6].metadata.display.body_mode);
 }
 

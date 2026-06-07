@@ -4,6 +4,8 @@ pub const file_mutation_queue = @import("file_mutation_queue.zig");
 pub const find = @import("find.zig");
 pub const grep = @import("grep.zig");
 pub const ls = @import("ls.zig");
+pub const output_accumulator = @import("output_accumulator.zig");
+pub const output_tail = @import("output_tail.zig");
 pub const path_utils = @import("path_utils.zig");
 pub const read = @import("read.zig");
 pub const write = @import("write.zig");
@@ -24,6 +26,8 @@ pub fn testsReachable() void {
     _ = find;
     _ = grep;
     _ = ls;
+    _ = output_accumulator;
+    _ = output_tail;
     _ = path_utils;
     _ = read;
     _ = write;
@@ -36,6 +40,8 @@ test {
     _ = find;
     _ = grep;
     _ = ls;
+    _ = output_accumulator;
+    _ = output_tail;
     _ = path_utils;
     _ = read;
     _ = write;

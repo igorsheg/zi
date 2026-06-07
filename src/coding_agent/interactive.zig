@@ -87,7 +87,9 @@ fn toolBodyMode(name: []const u8) tui.product.transcript.TranscriptToolBodyMode 
     return .visible;
 }
 
-fn tuiPresentation(presentation: tool_registry.ToolDisplayPresentation) tui.product.transcript.TranscriptToolPresentation {
+fn tuiPresentation(
+    presentation: tool_registry.ToolDisplayPresentation,
+) tui.product.transcript.TranscriptToolPresentation {
     return switch (presentation) {
         .generic => .generic,
         .command => .command,
@@ -199,7 +201,10 @@ fn writeContentPreview(args_value: std.json.Value, buffer: []u8) ?[]const u8 {
     }
     if (content.len > 0 and content[content.len - 1] == '\n' and total_lines > 0) total_lines -= 1;
     if (total_lines > write_preview_lines_max) {
-        writer.print("\n... ({d} more lines, {d} total)", .{ total_lines - write_preview_lines_max, total_lines }) catch return writer.buffered();
+        writer.print(
+            "\n... ({d} more lines, {d} total)",
+            .{ total_lines - write_preview_lines_max, total_lines },
+        ) catch return writer.buffered();
     } else {
         writer.print("\n({d} total lines)", .{total_lines}) catch return writer.buffered();
     }
@@ -211,6 +216,100 @@ fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
     var end = max_bytes;
     while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
     return value[0..end];
+}
+
+fn sanitizeTranscriptText(input: []const u8, buffer: []u8) []const u8 {
+    var out_len: usize = 0;
+    var index: usize = 0;
+    while (index < input.len and out_len < buffer.len) {
+        const byte = input[index];
+        if (byte == 0x1b) {
+            index = skipEscapeSequence(input, index);
+            continue;
+        }
+        if (byte == '\n') {
+            buffer[out_len] = byte;
+            out_len += 1;
+            index += 1;
+            continue;
+        }
+        if (byte == '\t') {
+            const spaces = @min(@as(usize, 4), buffer.len - out_len);
+            @memset(buffer[out_len .. out_len + spaces], ' ');
+            out_len += spaces;
+            index += 1;
+            continue;
+        }
+        if (byte < 0x20 or byte == 0x7f) {
+            index += 1;
+            continue;
+        }
+        if (byte == 0xc2 and index + 1 < input.len and input[index + 1] >= 0x80 and input[index + 1] <= 0x9f) {
+            index = skipC1Control(input, index);
+            continue;
+        }
+        const scalar_len = utf8ScalarLen(input[index..]);
+        if (out_len + scalar_len > buffer.len) break;
+        @memcpy(buffer[out_len .. out_len + scalar_len], input[index .. index + scalar_len]);
+        out_len += scalar_len;
+        index += scalar_len;
+    }
+    return buffer[0..out_len];
+}
+
+fn skipC1Control(input: []const u8, start: usize) usize {
+    std.debug.assert(start + 1 < input.len);
+    std.debug.assert(input[start] == 0xc2);
+    const kind = input[start + 1];
+    if (kind == 0x9b) return skipCsiPayload(input, start + 2);
+    if (kind == 0x9d) return skipOscPayload(input, start + 2);
+    return start + 2;
+}
+
+fn skipEscapeSequence(input: []const u8, start: usize) usize {
+    std.debug.assert(start < input.len);
+    std.debug.assert(input[start] == 0x1b);
+    if (start + 1 >= input.len) return input.len;
+    const kind = input[start + 1];
+    if (kind == '[') return skipCsiPayload(input, start + 2);
+    if (kind == ']') return skipOscPayload(input, start + 2);
+    return @min(start + 2, input.len);
+}
+
+fn skipCsiPayload(input: []const u8, start: usize) usize {
+    var index = start;
+    while (index < input.len) : (index += 1) {
+        const byte = input[index];
+        if (byte >= 0x40 and byte <= 0x7e) return index + 1;
+    }
+    return input.len;
+}
+
+fn skipOscPayload(input: []const u8, start: usize) usize {
+    var index = start;
+    while (index < input.len) : (index += 1) {
+        const byte = input[index];
+        if (byte == 0x07) return index + 1;
+        if (byte == 0x1b and index + 1 < input.len and input[index + 1] == '\\') return index + 2;
+    }
+    return input.len;
+}
+
+fn utf8ScalarLen(input: []const u8) usize {
+    if (input.len == 0) return 0;
+    const first = input[0];
+    if (first < 0x80) return 1;
+    const len: usize = if ((first & 0xe0) == 0xc0)
+        2
+    else if ((first & 0xf0) == 0xe0)
+        3
+    else if ((first & 0xf8) == 0xf0)
+        4
+    else
+        1;
+    if (len > input.len) return 1;
+    if (!std.unicode.utf8ValidateSlice(input[0..len])) return 1;
+    return len;
 }
 
 fn firstToolResultText(result: agent_mod.AgentToolResult) []const u8 {
@@ -700,18 +799,25 @@ const InteractiveLoop = struct {
     }
 
     fn replaceToolCallPreview(self: *InteractiveLoop, tool_call_id: []const u8, text: []const u8) !void {
-        try self.applyCommandDegrading(.{ .replace_tool_call_preview = .{ .tool_call_id = tool_call_id, .text = text } });
+        var sanitized_buffer: [pending_tool_output_bytes_max]u8 = undefined;
+        const sanitized = sanitizeTranscriptText(text, &sanitized_buffer);
+        try self.applyCommandDegrading(.{ .replace_tool_call_preview = .{
+            .tool_call_id = tool_call_id,
+            .text = sanitized,
+        } });
     }
 
     fn queueToolOutput(self: *InteractiveLoop, tool_call_id: []const u8, text: []const u8) !void {
-        if (text.len == 0) return;
+        var sanitized_buffer: [pending_tool_output_bytes_max]u8 = undefined;
+        const sanitized = sanitizeTranscriptText(text, &sanitized_buffer);
+        if (sanitized.len == 0) return;
         if (tool_call_id.len > pending_tool_id_bytes_max) {
             try self.appendTranscript(statusAppend(.warning, "tool output omitted: tool id too long"));
             return;
         }
         for (self.pending_tool_outputs[0..self.pending_tool_output_count]) |*pending| {
             if (std.mem.eql(u8, pending.id(), tool_call_id)) {
-                pending.append(text);
+                pending.append(sanitized);
                 return;
             }
         }
@@ -719,7 +825,7 @@ const InteractiveLoop = struct {
             try self.flushToolOutputCoalescer();
         }
         if (self.pending_tool_output_count == self.pending_tool_outputs.len) return error.TooManyTools;
-        self.pending_tool_outputs[self.pending_tool_output_count] = PendingToolOutput.init(tool_call_id, text);
+        self.pending_tool_outputs[self.pending_tool_output_count] = PendingToolOutput.init(tool_call_id, sanitized);
         self.pending_tool_output_count += 1;
     }
 
@@ -744,13 +850,17 @@ const InteractiveLoop = struct {
     fn applyCommandDegrading(self: *InteractiveLoop, command: tui.product.Command) !void {
         _ = self.terminal_loop.applyCommand(command) catch |err| switch (err) {
             error.InvalidUtf8 => return self.appendOperationalStatus("transcript update omitted: invalid utf-8"),
-            error.TranscriptAppendTooLarge => return self.appendOperationalStatus("transcript update omitted: too large"),
+            error.TranscriptAppendTooLarge => return self.appendOperationalStatus(
+                "transcript update omitted: too large",
+            ),
             else => return err,
         };
     }
 
     fn appendOperationalStatus(self: *InteractiveLoop, text: []const u8) !void {
-        _ = self.terminal_loop.applyCommand(.{ .append_transcript = statusAppend(.warning, text) }) catch |err| switch (err) {
+        _ = self.terminal_loop.applyCommand(.{
+            .append_transcript = statusAppend(.warning, text),
+        }) catch |err| switch (err) {
             error.InvalidUtf8, error.TranscriptAppendTooLarge => return,
             else => return err,
         };
@@ -960,6 +1070,16 @@ test "interactive loop bounds stay responsive" {
     try std.testing.expectEqual(@as(usize, 30), shutdown_drain_ticks_max);
 }
 
+test "interactive sanitizes ansi and terminal controls for transcript text" {
+    var buffer: [128]u8 = undefined;
+    const sanitized = sanitizeTranscriptText(
+        "\x1b[31mred\x1b[0m \x1b]0;title\x07plain\r\ttail\xc2\x9b31m",
+        &buffer,
+    );
+
+    try std.testing.expectEqualStrings("red plain    tail", sanitized);
+}
+
 test "interactive maps simple public events to transcript appends" {
     try std.testing.expect(transcriptAppendFromAgentEvent(.agent_start) == null);
     try std.testing.expect(transcriptAppendFromAgentEvent(.turn_start) == null);
@@ -1024,7 +1144,10 @@ test "interactive maps tool events to typed transcript items" {
         tui.product.transcript.TranscriptToolStatus.pending,
         start.append.tool.status,
     );
-    try std.testing.expectEqual(tui.product.transcript.TranscriptToolPresentation.command, start.append.tool.presentation);
+    try std.testing.expectEqual(
+        tui.product.transcript.TranscriptToolPresentation.command,
+        start.append.tool.presentation,
+    );
     try std.testing.expectEqual(tui.product.transcript.TranscriptToolBodyMode.visible, start.append.tool.body_mode);
 
     const end = transcriptAppendFromAgentEvent(.{ .tool_execution_end = .{
@@ -1168,7 +1291,7 @@ test "interactive appends final output for non-streaming visible tools" {
     loop.tool_metadata_lookup_enabled = false;
 
     const content = [_]ai.ToolResultContent{.{ .text = .{ .text = "a.txt\nb.txt" } }};
-    var event = session_events.AgentSessionEvent{ .agent_event = try session_events.OwnedAgentEvent.init(
+    var event: session_events.AgentSessionEvent = .{ .agent_event = try session_events.OwnedAgentEvent.init(
         std.testing.allocator,
         .{ .tool_execution_end = .{
             .tool_call_id = "call-1",
