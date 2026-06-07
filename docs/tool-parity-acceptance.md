@@ -51,10 +51,10 @@ Accepted when:
 - User-requested limit continuation is not misreported as byte/line truncation.
 - Offset beyond EOF reports an actionable operational error.
 - Invalid UTF-8 is handled operationally, not leaked into TUI text.
+- Image attachments for png/jpeg/gif/webp are returned with a text note.
 
 Optional/deferred:
 
-- image attachments for png/jpeg/gif/webp
 - image resizing
 - model-vision-specific tool-time policy
 
