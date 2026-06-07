@@ -139,6 +139,8 @@ const FormattedReadOutput = struct {
     output_lines: usize,
     remaining_lines: usize,
     total_bytes: usize,
+    output_bytes: usize,
+    max_bytes: usize,
     next_offset: ?usize,
 
     fn deinit(self: FormattedReadOutput, allocator: std.mem.Allocator) void {
@@ -175,6 +177,18 @@ const FormattedReadOutput = struct {
             &truncation,
             "totalBytes",
             .{ .integer = @intCast(self.total_bytes) },
+        );
+        try path_utils.putJsonField(
+            allocator,
+            &truncation,
+            "outputBytes",
+            .{ .integer = @intCast(self.output_bytes) },
+        );
+        try path_utils.putJsonField(
+            allocator,
+            &truncation,
+            "maxBytes",
+            .{ .integer = @intCast(self.max_bytes) },
         );
         if (self.next_offset) |next_offset| {
             try path_utils.putJsonField(allocator, &object, "nextOffset", .{ .integer = @intCast(next_offset) });
@@ -246,6 +260,8 @@ fn formatReadOutput(
         .output_lines = emitted_lines,
         .remaining_lines = remaining_lines,
         .total_bytes = content.len,
+        .output_bytes = bytes_written,
+        .max_bytes = config.max_output_bytes,
         .next_offset = next_offset,
     };
 }
@@ -290,6 +306,8 @@ test "read tool reads bounded text with offset and limit" {
     );
     const truncation = result.result.details.?.object.get("truncation").?.object;
     try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), truncation.get("outputBytes").?.integer);
+    try std.testing.expectEqual(@as(i64, max_output_bytes), truncation.get("maxBytes").?.integer);
 }
 
 test "read tool can reject paths outside cwd by config" {
