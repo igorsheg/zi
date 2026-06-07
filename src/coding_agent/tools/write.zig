@@ -180,6 +180,7 @@ fn writeResult(allocator: std.mem.Allocator, bytes_written: usize, path: []const
     var details: std.json.ObjectMap = .empty;
     errdefer details.deinit(allocator);
     try path_utils.putJsonField(allocator, &details, "bytesWritten", .{ .integer = @intCast(bytes_written) });
+    try path_utils.putJsonStringField(allocator, &details, "path", path);
     return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = details } } };
 }
 
@@ -221,6 +222,8 @@ test "write tool creates parent directories and writes content" {
         "Successfully wrote 5 bytes to dir/file.txt",
         result.result.content[0].text.text,
     );
+    const details = result.result.details.?.object;
+    try std.testing.expectEqualStrings("dir/file.txt", details.get("path").?.string);
 }
 
 const WriteUpdateCapture = struct {
