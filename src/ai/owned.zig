@@ -7,13 +7,9 @@ pub const RetainedAssistantMessage = struct {
     value: protocol.AssistantMessage,
 
     pub fn copy(backing_allocator: std.mem.Allocator, source: protocol.AssistantMessage) !RetainedAssistantMessage {
-        var owned = try runtime.JsonOwned(protocol.AssistantMessage).initClone(
-            backing_allocator,
-            source,
-            copyAssistantMessage,
-        );
-        const value = owned.value;
-        const arena = owned.takeArena();
+        var arena = std.heap.ArenaAllocator.init(backing_allocator);
+        errdefer arena.deinit();
+        const value = try copyAssistantMessage(arena.allocator(), source);
         return .{ .arena = arena, .value = value };
     }
 

@@ -5,7 +5,6 @@ pub const Runtime = zio.Runtime;
 pub const ResetEvent = zio.ResetEvent;
 pub const Duration = zio.Duration;
 pub const Timeout = zio.Timeout;
-pub const Pipe = zio.Pipe;
 pub const Cancelable = zio.Cancelable;
 
 pub fn Channel(comptime Event: type) type {

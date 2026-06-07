@@ -226,6 +226,14 @@ note what is deliberately *not* built: there is no central `Operation` table,
 would be cargo-culted machinery until a concrete need (unified limits or
 operation observability) proves otherwise.
 
+`runtime` wraps `zio`, not bare `std.Io`, for a concrete reason: zio's `std.Io`
+is a proactor that cannot poll pipe/tty fds — a std.Io file read on a child pipe
+returns `WouldBlock`, or blocks uninterruptibly if made blocking. so pipe/tty
+I/O (`runProcess`, `ReadableFd`) uses zio's poll-based reactor directly,
+`std.process.run` / `Io.File.MultiReader` are unusable for child-output capture
+on zio, and coordination (`select`, channels, `ResetEvent`, tasks) stays
+zio-native by the same token. the seam is the `runtime` vocabulary, not `std.Io`.
+
 ## tui layer
 
 Zi owns its terminal substrate end to end. there is no libvaxis (removed in

@@ -89,6 +89,10 @@ rules:
   `deinit` must not race active work.
 - do not build a central operation/completion/limits table speculatively. zio
   `select` + per-owner bounded queues already provide the property.
+- `zio` is the substrate, not bare `std.Io`: zio's `std.Io` is a proactor that
+  cannot poll pipe/tty fds, so pipe/tty I/O (`runProcess`, `ReadableFd`) and
+  coordination stay zio-native. `std.process.run` / `Io.File.MultiReader` do not
+  work for child-output capture on zio — do not reach for them.
 
 ## coding-agent rules
 
