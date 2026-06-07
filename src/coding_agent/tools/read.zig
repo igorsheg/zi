@@ -153,7 +153,8 @@ const FormattedReadOutput = struct {
         allocator.free(self.text);
     }
 
-    fn details(self: FormattedReadOutput, allocator: std.mem.Allocator) !std.json.Value {
+    fn details(self: FormattedReadOutput, allocator: std.mem.Allocator) !?std.json.Value {
+        if (!self.truncated and !self.user_limit and self.next_offset == null) return null;
         var object: std.json.ObjectMap = .empty;
         errdefer object.deinit(allocator);
         var truncation: std.json.ObjectMap = .empty;
@@ -353,6 +354,42 @@ test "read tool reads bounded text with offset and limit" {
     try std.testing.expectEqual(@as(i64, max_output_bytes), truncation.get("maxBytes").?.integer);
 }
 
+test "read full untruncated file has no details" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "one\ntwo" });
+
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    defer read_tool.deinit();
+
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
+
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
+    var result = try execute(
+        std.testing.allocator,
+        zio_runtime.io(),
+        zio_runtime,
+        &read_tool,
+        cancel_source.token(),
+        "call-full",
+        .{ .object = object },
+        null,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("one\ntwo", result.result.content[0].text.text);
+    try std.testing.expect(result.result.details == null);
+}
+
 test "read tool can reject paths outside cwd by config" {
     try std.testing.expect(path_utils.isPathInside("/repo/", "/repo/file.txt"));
 
@@ -387,7 +424,7 @@ test "read tool reports first line exceeding output limit" {
         "[Line 1 exceeds 3 byte read limit. read returns complete lines only.]",
         formatted.text,
     );
-    const details = try formatted.details(std.testing.allocator);
+    const details = (try formatted.details(std.testing.allocator)).?;
     defer agent.deinitJsonValue(std.testing.allocator, details);
     const truncation = details.object.get("truncation").?.object;
     try std.testing.expectEqualStrings("bytes", truncation.get("truncatedBy").?.string);
