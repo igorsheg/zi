@@ -346,7 +346,12 @@ fn formatReadOutput(
         last_emitted_line = current_line;
     }
 
-    if (!skipped_to_start) return error.OffsetBeyondEndOfFile;
+    if (!skipped_to_start) {
+        try writer.writer.print(
+            "[Offset {d} is beyond end of file ({d} lines total).]",
+            .{ start_line, total_lines },
+        );
+    }
     const next_offset = if (remaining_lines > 0 and last_emitted_line != null) last_emitted_line.? + 1 else null;
     if (first_line_exceeds_limit) {
         var size_buffer: [32]u8 = undefined;
@@ -643,7 +648,7 @@ test "read tool reports first line exceeding output limit" {
     try std.testing.expectEqualStrings("bytes", truncation.get("truncatedBy").?.string);
 }
 
-test "read tool rejects offset beyond end" {
+test "read tool reports offset beyond end operationally" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -664,7 +669,7 @@ test "read tool rejects offset beyond end" {
     defer zio_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    try std.testing.expectError(error.OffsetBeyondEndOfFile, execute(
+    var result = try execute(
         std.testing.allocator,
         zio_runtime.io(),
         zio_runtime,
@@ -673,5 +678,11 @@ test "read tool rejects offset beyond end" {
         "call-1",
         .{ .object = object },
         null,
-    ));
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "[Offset 3 is beyond end of file (1 lines total).]",
+        result.result.content[0].text.text,
+    );
 }
