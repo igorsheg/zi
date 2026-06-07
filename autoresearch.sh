@@ -49,6 +49,7 @@ check_present "read output bytes detail" "\"outputBytes\"|output_bytes" src/codi
 check_present "read total lines detail" "\"totalLines\"|total_lines" src/coding_agent/tools/read.zig
 check_present "read max lines detail" "\"maxLines\"|max_output_lines" src/coding_agent/tools/read.zig
 check_present "read byte truncation reason" "truncated_by|TruncationLimit|\"bytes\"" src/coding_agent/tools/read.zig
+check_present "read user limit is not truncation" "user_limit|limited_by_user|limit_only" src/coding_agent/tools/read.zig
 
 # Write UX probes.
 check_present "write path detail" "\"path\"" src/coding_agent/tools/write.zig
