@@ -279,15 +279,44 @@ fn formatReadOutput(
     if (!skipped_to_start) return error.OffsetBeyondEndOfFile;
     const next_offset = if (remaining_lines > 0 and last_emitted_line != null) last_emitted_line.? + 1 else null;
     if (first_line_exceeds_limit) {
+        var size_buffer: [32]u8 = undefined;
         try writer.writer.print(
-            "[Line {d} exceeds {d} byte read limit. read returns complete lines only.]",
-            .{ start_line, config.max_output_bytes },
+            "[Line {d} exceeds {s} limit. Use bash: sed -n '{d}p' {s} | head -c {d}]",
+            .{
+                start_line,
+                formatSize(&size_buffer, config.max_output_bytes),
+                start_line,
+                args.path,
+                config.max_output_bytes,
+            },
         );
     } else if (next_offset) |offset| {
-        try writer.writer.print(
-            "\n\n[{d} more lines in file. Use offset={d} to continue.]",
-            .{ remaining_lines, offset },
-        );
+        if (output_truncated) {
+            const end_line = offset - 1;
+            if (truncated_by == .bytes) {
+                var size_buffer: [32]u8 = undefined;
+                try writer.writer.print(
+                    "\n\n[Showing lines {d}-{d} of {d} ({s} limit). Use offset={d} to continue.]",
+                    .{
+                        start_line,
+                        end_line,
+                        total_lines,
+                        formatSize(&size_buffer, config.max_output_bytes),
+                        offset,
+                    },
+                );
+            } else {
+                try writer.writer.print(
+                    "\n\n[Showing lines {d}-{d} of {d}. Use offset={d} to continue.]",
+                    .{ start_line, end_line, total_lines, offset },
+                );
+            }
+        } else {
+            try writer.writer.print(
+                "\n\n[{d} more lines in file. Use offset={d} to continue.]",
+                .{ remaining_lines, offset },
+            );
+        }
     }
     return .{
         .text = try writer.toOwnedSlice(),
@@ -304,6 +333,13 @@ fn formatReadOutput(
         .max_lines = config.max_output_lines,
         .next_offset = next_offset,
     };
+}
+
+fn formatSize(buffer: []u8, bytes: usize) []const u8 {
+    if (bytes >= 1024 and bytes % 1024 == 0) {
+        return std.fmt.bufPrint(buffer, "{d}KB", .{bytes / 1024}) catch "limit";
+    }
+    return std.fmt.bufPrint(buffer, "{d}B", .{bytes}) catch "limit";
 }
 
 test "read tool reads bounded text with offset and limit" {
@@ -352,6 +388,36 @@ test "read tool reads bounded text with offset and limit" {
     try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
     try std.testing.expectEqual(@as(i64, 9), truncation.get("outputBytes").?.integer);
     try std.testing.expectEqual(@as(i64, max_output_bytes), truncation.get("maxBytes").?.integer);
+}
+
+test "read tool reports pi-style automatic truncation ranges" {
+    const formatted = try formatReadOutput(
+        std.testing.allocator,
+        .{ .cwd = "/repo", .max_output_lines = 2, .max_output_bytes = 100 },
+        .{ .path = "file.txt", .offset = null, .limit = null },
+        "one\ntwo\nthree\nfour",
+    );
+    defer formatted.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "one\ntwo\n\n[Showing lines 1-2 of 4. Use offset=3 to continue.]",
+        formatted.text,
+    );
+}
+
+test "read tool reports pi-style byte truncation ranges" {
+    const formatted = try formatReadOutput(
+        std.testing.allocator,
+        .{ .cwd = "/repo", .max_output_lines = 20, .max_output_bytes = 8 },
+        .{ .path = "file.txt", .offset = 2, .limit = null },
+        "skip\none\ntwo\nthree",
+    );
+    defer formatted.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "one\ntwo\n\n[Showing lines 2-3 of 4 (8B limit). Use offset=4 to continue.]",
+        formatted.text,
+    );
 }
 
 test "read full untruncated file has no details" {
@@ -421,7 +487,7 @@ test "read tool reports first line exceeding output limit" {
     try std.testing.expect(formatted.first_line_exceeds_limit);
     try std.testing.expectEqual(@as(?usize, null), formatted.next_offset);
     try std.testing.expectEqualStrings(
-        "[Line 1 exceeds 3 byte read limit. read returns complete lines only.]",
+        "[Line 1 exceeds 3B limit. Use bash: sed -n '1p' file.txt | head -c 3]",
         formatted.text,
     );
     const details = (try formatted.details(std.testing.allocator)).?;
