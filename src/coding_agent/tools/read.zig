@@ -138,6 +138,7 @@ const FormattedReadOutput = struct {
     first_line_exceeds_limit: bool,
     output_lines: usize,
     remaining_lines: usize,
+    total_bytes: usize,
     next_offset: ?usize,
 
     fn deinit(self: FormattedReadOutput, allocator: std.mem.Allocator) void {
@@ -168,6 +169,12 @@ const FormattedReadOutput = struct {
             &truncation,
             "remainingLines",
             .{ .integer = @intCast(self.remaining_lines) },
+        );
+        try path_utils.putJsonField(
+            allocator,
+            &truncation,
+            "totalBytes",
+            .{ .integer = @intCast(self.total_bytes) },
         );
         if (self.next_offset) |next_offset| {
             try path_utils.putJsonField(allocator, &object, "nextOffset", .{ .integer = @intCast(next_offset) });
@@ -238,6 +245,7 @@ fn formatReadOutput(
         .first_line_exceeds_limit = first_line_exceeds_limit,
         .output_lines = emitted_lines,
         .remaining_lines = remaining_lines,
+        .total_bytes = content.len,
         .next_offset = next_offset,
     };
 }
@@ -280,6 +288,8 @@ test "read tool reads bounded text with offset and limit" {
         "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
         result.result.content[0].text.text,
     );
+    const truncation = result.result.details.?.object.get("truncation").?.object;
+    try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
 }
 
 test "read tool can reject paths outside cwd by config" {
