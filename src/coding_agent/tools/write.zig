@@ -225,6 +225,7 @@ test "write tool creates parent directories and writes content" {
     );
     const details = result.result.details.?.object;
     try std.testing.expectEqualStrings("dir/file.txt", details.get("path").?.string);
+    try std.testing.expectEqual(@as(i64, 5), details.get("bytesWritten").?.integer);
 }
 
 const WriteUpdateCapture = struct {
