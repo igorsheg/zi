@@ -160,7 +160,18 @@ fn execute(
         .limited(self.config.max_read_bytes),
     );
     defer allocator.free(original);
-    var edited = try applyEditsPreservingTextShape(allocator, original, args.edits, self.config.max_output_bytes);
+    var edited = applyEditsPreservingTextShape(
+        allocator,
+        original,
+        args.edits,
+        self.config.max_output_bytes,
+    ) catch |err| switch (err) {
+        error.NoChanges => return editOperationalErrorResult(
+            allocator,
+            "No changes: replacement output is identical.",
+        ),
+        else => return err,
+    };
     defer edited.deinit(allocator);
     try token.throwIfRequested();
     try atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, on_update);
@@ -414,6 +425,15 @@ fn lineAt(text: []const u8, wanted_line: usize) []const u8 {
     return "";
 }
 
+fn editOperationalErrorResult(allocator: std.mem.Allocator, message: []const u8) !agent.ToolExecutionResult {
+    const text = try allocator.dupe(u8, message);
+    errdefer allocator.free(text);
+    const content = try allocator.alloc(ai.ToolResultContent, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = text } };
+    return .{ .allocator = allocator, .result = .{ .content = content, .details = null } };
+}
+
 fn editResult(
     allocator: std.mem.Allocator,
     replacements: usize,
@@ -560,6 +580,54 @@ test "edit tool rejects no-op replacement" {
         &.{.{ .old_text = "same", .new_text = "same" }},
         max_edit_output_bytes,
     ));
+}
+
+test "edit tool reports no-op replacement without writing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "same" });
+
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    defer edit_tool.deinit();
+
+    var edit: std.json.ObjectMap = .empty;
+    defer edit.deinit(std.testing.allocator);
+    try edit.put(std.testing.allocator, "oldText", .{ .string = "same" });
+    try edit.put(std.testing.allocator, "newText", .{ .string = "same" });
+    var edits: std.json.Array = .init(std.testing.allocator);
+    defer edits.deinit();
+    try edits.append(.{ .object = edit });
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
+    try object.put(std.testing.allocator, "edits", .{ .array = edits });
+
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
+    var result = try execute(
+        std.testing.allocator,
+        zio_runtime.io(),
+        zio_runtime,
+        &edit_tool,
+        cancel_source.token(),
+        "call-no-op",
+        .{ .object = object },
+        null,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "No changes: replacement output is identical.",
+        result.result.content[0].text.text,
+    );
+    const written = try tmp.dir.readFileAlloc(std.testing.io, "repo/file.txt", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("same", written);
 }
 
 test "edit tool streams utf8 safe edited content chunks" {
