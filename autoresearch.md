@@ -41,4 +41,5 @@ The workload is the current Zi tool parity implementation. Each iteration should
 - Tool output ANSI/control sanitization added at transcript ingestion.
 - Path normalization batch implemented: shared existing/creatable resolution, `@` stripping, Unicode-space mapping, canonical containment, symlink escape tests.
 - Observational/listing/search batches partially implemented: ls/find/grep defaults, limits, no-match messages, deterministic sorting for collected results, `.git`/`node_modules` ignore policy, grep long-line and invalid-UTF-8 handling.
+- Read parity follow-up implemented: pi-style continuation notices for automatic truncation, pi-mono schema/description wording, image attachments for content-sniffed jpg/png/gif/webp, invalid UTF-8 omission, actionable offset-beyond-EOF output, exact first-line byte-limit accounting, and APNG exclusion.
 - Current next high-ROI target: Batch 2 edit/write UX — CRLF/BOM matching/restoration, no-op edit rejection, actionable errors, bounded diff/details metadata.
