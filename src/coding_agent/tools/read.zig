@@ -137,6 +137,7 @@ const ReadTruncatedBy = enum { lines, bytes };
 const FormattedReadOutput = struct {
     text: []const u8,
     truncated: bool,
+    user_limit: bool,
     truncated_by: ReadTruncatedBy,
     first_line_exceeds_limit: bool,
     output_lines: usize,
@@ -158,6 +159,7 @@ const FormattedReadOutput = struct {
         var truncation: std.json.ObjectMap = .empty;
         errdefer truncation.deinit(allocator);
         try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = self.truncated });
+        try path_utils.putJsonField(allocator, &truncation, "userLimit", .{ .bool = self.user_limit });
         try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", switch (self.truncated_by) {
             .lines => "lines",
             .bytes => "bytes",
@@ -236,6 +238,8 @@ fn formatReadOutput(
     var total_lines: usize = 0;
     var skipped_to_start = false;
     var first_line_exceeds_limit = false;
+    var user_limit = false;
+    var output_truncated = false;
     var truncated_by: ReadTruncatedBy = .lines;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -244,15 +248,18 @@ fn formatReadOutput(
         if (current_line < start_line) continue;
         skipped_to_start = true;
         if (args.limit) |limit| if (emitted_lines == limit) {
+            user_limit = true;
             remaining_lines += 1;
             continue;
         };
         if (emitted_lines == config.max_output_lines) {
+            output_truncated = true;
             truncated_by = .lines;
             remaining_lines += 1;
             continue;
         }
         if (bytes_written + line.len + 1 > config.max_output_bytes) {
+            output_truncated = true;
             truncated_by = .bytes;
             if (emitted_lines == 0) first_line_exceeds_limit = true;
             remaining_lines += 1;
@@ -269,8 +276,7 @@ fn formatReadOutput(
     }
 
     if (!skipped_to_start) return error.OffsetBeyondEndOfFile;
-    const truncated = remaining_lines > 0;
-    const next_offset = if (truncated and last_emitted_line != null) last_emitted_line.? + 1 else null;
+    const next_offset = if (remaining_lines > 0 and last_emitted_line != null) last_emitted_line.? + 1 else null;
     if (first_line_exceeds_limit) {
         try writer.writer.print(
             "[Line {d} exceeds {d} byte read limit. read returns complete lines only.]",
@@ -284,7 +290,8 @@ fn formatReadOutput(
     }
     return .{
         .text = try writer.toOwnedSlice(),
-        .truncated = truncated,
+        .truncated = output_truncated,
+        .user_limit = user_limit,
         .truncated_by = truncated_by,
         .first_line_exceeds_limit = first_line_exceeds_limit,
         .output_lines = emitted_lines,
@@ -337,6 +344,8 @@ test "read tool reads bounded text with offset and limit" {
         result.result.content[0].text.text,
     );
     const truncation = result.result.details.?.object.get("truncation").?.object;
+    try std.testing.expect(!truncation.get("truncated").?.bool);
+    try std.testing.expect(truncation.get("userLimit").?.bool);
     try std.testing.expectEqual(@as(i64, 4), truncation.get("totalLines").?.integer);
     try std.testing.expectEqual(@as(i64, max_output_lines), truncation.get("maxLines").?.integer);
     try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
