@@ -6,7 +6,6 @@ const event_drain_mod = @import("event_drain.zig");
 const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
 const prompt_command = @import("prompt_command.zig");
-const prompt_input = @import("prompt_input.zig");
 const queue_mirror_mod = @import("queue_mirror.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
@@ -64,8 +63,14 @@ pub const Options = struct {
     zio_runtime: *runtime.Runtime,
 };
 
-pub const StreamingBehavior = prompt_input.StreamingBehavior;
-pub const PromptOptions = prompt_input.Options;
+pub const StreamingBehavior = enum {
+    steer,
+    follow_up,
+};
+
+pub const PromptOptions = struct {
+    streaming_behavior: ?StreamingBehavior = null,
+};
 
 pub const RetrySettings = struct {
     enabled: bool = false,
@@ -347,7 +352,7 @@ fn startPromptRun(
     options: PromptOptions,
 ) !*LivePromptRun {
     try self.ensureAcceptsPrompt();
-    var preflight = try self.preparePromptInput(text, images, options);
+    var preflight = self.preparePromptInput(text, images, options);
     if (try self.tryHandlePromptCommand(&preflight)) return error.PromptCommandCannotStartLiveRun;
     if (try self.queuePromptIfStreaming(&preflight)) return error.PromptQueuedCannotStartLiveRun;
     try self.checkPrePromptCompaction();
@@ -512,22 +517,6 @@ fn runGeneratedCompaction(
     };
 }
 
-pub fn prepareCompactionSnapshot(self: *AgentSession) !session_events.CompactionPreparationSnapshot {
-    try self.ensureAcceptsIdleCommand();
-    var preparation = try self.manager.prepareCompaction(self.allocator, self.compaction_settings);
-    defer preparation.deinit();
-    return session_events.CompactionPreparationSnapshot.init(self.allocator, preparation);
-}
-
-pub fn prepareCompactionSummaryInputSnapshot(self: *AgentSession) !session_events.CompactionSummaryInputSnapshot {
-    try self.ensureAcceptsIdleCommand();
-    var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
-    defer input.deinit();
-    const serialized_input = try input.serialize(self.allocator);
-    defer self.allocator.free(serialized_input);
-    return session_events.CompactionSummaryInputSnapshot.init(self.allocator, input, serialized_input);
-}
-
 fn runManualCompaction(
     self: *AgentSession,
     request: ManualCompactionRequest,
@@ -653,7 +642,7 @@ test "agent session public event enqueue sets coalesced wake" {
 
     try std.testing.expect(!session.publicEventWake().isSet());
 
-    session.event_drain.enqueuePublicEvent(.{ .agent_event = .agent_start });
+    session.event_drain.enqueuePublicEvent(.{ .agent_event = try session_events.OwnedAgentEvent.init(std.testing.allocator, .agent_start) });
 
     try std.testing.expect(session.publicEventWake().isSet());
     session.publicEventWake().reset();
@@ -661,7 +650,7 @@ test "agent session public event enqueue sets coalesced wake" {
 
     var event = session.drainPublicEvent().?;
     defer event.deinit();
-    try std.testing.expectEqual(agent_mod.AgentEvent.agent_start, event.agent_event);
+    try std.testing.expectEqual(agent_mod.AgentEvent.agent_start, event.agent_event.event);
 }
 
 fn ensureAcceptsPrompt(self: *AgentSession) Error!void {
@@ -927,15 +916,19 @@ fn buildSystemPromptText(
     });
 }
 
-const PromptPreflight = prompt_input.Preflight;
+const PromptPreflight = struct {
+    text: []const u8,
+    images: []const ai.ImageContent,
+    streaming_behavior: ?StreamingBehavior,
+};
 
 fn preparePromptInput(
-    self: *AgentSession,
+    _: *AgentSession,
     text: []const u8,
     images: []const ai.ImageContent,
     options: PromptOptions,
-) !PromptPreflight {
-    return PromptPreflight.init(self.allocator, text, images, options);
+) PromptPreflight {
+    return .{ .text = text, .images = images, .streaming_behavior = options.streaming_behavior };
 }
 
 fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
@@ -1006,25 +999,17 @@ fn queuePromptIfStreaming(self: *AgentSession, preflight: *const PromptPreflight
         .steer => if (!self.agent.steering_queue.hasCapacity()) return error.QueueFull,
         .follow_up => if (!self.agent.follow_up_queue.hasCapacity()) return error.QueueFull,
     }
+
+    const message = try self.constructUserMessage(preflight.text, preflight.images);
+    switch (behavior) {
+        .steer => try self.agent.steer(message),
+        .follow_up => try self.agent.followUp(message),
+    }
     switch (behavior) {
         .steer => try self.queue_mirror.appendSteering(self.allocator, preflight.text),
         .follow_up => try self.queue_mirror.appendFollowUp(self.allocator, preflight.text),
     }
-    errdefer self.rollbackQueuedPrompt(behavior, preflight.text);
-    const message = try self.constructUserMessage(preflight.text, preflight.images);
     try self.event_drain.emitQueueUpdate();
-    switch (behavior) {
-        .steer => self.agent.steer(message) catch |err| {
-            self.rollbackQueuedPrompt(behavior, preflight.text);
-            try self.event_drain.emitQueueUpdate();
-            return err;
-        },
-        .follow_up => self.agent.followUp(message) catch |err| {
-            self.rollbackQueuedPrompt(behavior, preflight.text);
-            try self.event_drain.emitQueueUpdate();
-            return err;
-        },
-    }
     return true;
 }
 
@@ -1196,13 +1181,6 @@ fn constructUserMessage(
     images: []const ai.ImageContent,
 ) !agent_mod.AgentMessage {
     return self.agent.userMessageFromText(text, images);
-}
-
-fn rollbackQueuedPrompt(self: *AgentSession, behavior: StreamingBehavior, text: []const u8) void {
-    switch (behavior) {
-        .steer => _ = self.queue_mirror.removeSteeringText(self.allocator, text),
-        .follow_up => _ = self.queue_mirror.removeFollowUpText(self.allocator, text),
-    }
 }
 
 fn drainAgentEvent(
@@ -1711,10 +1689,10 @@ test "agent session public events are caller drained after message persistence" 
     try std.testing.expectEqual(@as(usize, 2), session.statusSnapshot().public_event_count);
     var start_event = session.drainPublicEvent().?;
     defer start_event.deinit();
-    try expectUserMessageEvent(.message_start, start_event.agent_event, "hello");
+    try expectUserMessageEvent(.message_start, start_event.agent_event.event, "hello");
     var end_event = session.drainPublicEvent().?;
     defer end_event.deinit();
-    try expectUserMessageEvent(.message_end, end_event.agent_event, "hello");
+    try expectUserMessageEvent(.message_end, end_event.agent_event.event, "hello");
     try std.testing.expect(session.drainPublicEvent() == null);
 }
 
@@ -1808,7 +1786,7 @@ test "agent session queue update consumes block user message text" {
     try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up.items.len);
     var message_event = session.drainPublicEvent().?;
     defer message_event.deinit();
-    try expectUserMessageEvent(.message_start, message_event.agent_event, "queued image");
+    try expectUserMessageEvent(.message_start, message_event.agent_event.event, "queued image");
 }
 
 test "agent session queue update is emitted before queued user message start" {
@@ -1852,7 +1830,7 @@ test "agent session queue update is emitted before queued user message start" {
     try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up.items.len);
     var message_event = session.drainPublicEvent().?;
     defer message_event.deinit();
-    try expectUserMessageEvent(.message_start, message_event.agent_event, "queued");
+    try expectUserMessageEvent(.message_start, message_event.agent_event.event, "queued");
 }
 
 test "agent session snapshots expose status and active tool read models" {
@@ -2483,7 +2461,7 @@ test "agent session auto compacts before prompt when enabled" {
     var agent_start = session.drainPublicEvent().?;
     defer agent_start.deinit();
     try std.testing.expect(agent_start == .agent_event);
-    try std.testing.expect(agent_start.agent_event == .agent_start);
+    try std.testing.expect(agent_start.agent_event.event == .agent_start);
 }
 
 test "agent session auto compaction skips already compacted branch before prompt" {
@@ -2536,7 +2514,7 @@ test "agent session auto compaction skips already compacted branch before prompt
         defer owned_event.deinit();
         try std.testing.expect(owned_event != .compaction_start);
         try std.testing.expect(owned_event != .compaction_end);
-        if (owned_event == .agent_event and owned_event.agent_event == .agent_start) saw_agent_start = true;
+        if (owned_event == .agent_event and owned_event.agent_event.event == .agent_start) saw_agent_start = true;
     }
     try std.testing.expect(saw_agent_start);
 }
@@ -2807,63 +2785,6 @@ test "agent session transient retry stops at bounded attempts" {
     try std.testing.expect(saw_failed_retry_end);
 }
 
-test "agent session prepares owned compaction snapshot" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try initTestSession(zio_runtime, tmp.dir);
-    defer shutdownAndDeinit(&session);
-    session.compaction_settings = .{ .keep_recent_tokens = 2 };
-
-    _ = try session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "aaaaaaaa" },
-        .timestamp = 0,
-    } }, "t1");
-    const kept = try session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "bbbbbbbb" },
-        .timestamp = 0,
-    } }, "t2");
-
-    var snapshot = try session.prepareCompactionSnapshot();
-    defer snapshot.deinit();
-
-    try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
-    try std.testing.expectEqual(@as(u64, 4), snapshot.tokens_before);
-    try std.testing.expect(!snapshot.has_previous_summary);
-}
-
-test "agent session prepares owned compaction summary input snapshot" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try initTestSession(zio_runtime, tmp.dir);
-    defer shutdownAndDeinit(&session);
-    session.compaction_settings = .{ .keep_recent_tokens = 2 };
-
-    _ = try session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "aaaaaaaa" },
-        .timestamp = 0,
-    } }, "t1");
-    const kept = try session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "bbbbbbbb" },
-        .timestamp = 0,
-    } }, "t2");
-
-    var snapshot = try session.prepareCompactionSummaryInputSnapshot();
-    defer snapshot.deinit();
-
-    try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
-    try std.testing.expectEqual(@as(u64, 4), snapshot.tokens_before);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.message_count);
-    try std.testing.expect(!snapshot.has_previous_summary);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot.serialized_input.text, "<conversation>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot.serialized_input.text, "[User]: aaaaaaaa") != null);
-}
-
 test "agent session prepared manual compaction emits failure event" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3122,8 +3043,8 @@ fn expectNextUserMessageEvent(
         var owned_event = event;
         defer owned_event.deinit();
         if (owned_event != .agent_event) continue;
-        if (std.meta.activeTag(owned_event.agent_event) != tag) continue;
-        try expectUserMessageEvent(tag, owned_event.agent_event, text);
+        if (std.meta.activeTag(owned_event.agent_event.event) != tag) continue;
+        try expectUserMessageEvent(tag, owned_event.agent_event.event, text);
         return;
     }
     return error.ExpectedUserMessageEvent;

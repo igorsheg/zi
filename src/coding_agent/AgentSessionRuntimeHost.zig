@@ -206,18 +206,6 @@ pub fn compactWithGeneratedSummary(
     return self.session.compactWithGeneratedSummary();
 }
 
-pub fn prepareCompactionSnapshot(
-    self: *AgentSessionRuntimeHost,
-) !session_events.CompactionPreparationSnapshot {
-    return self.session.prepareCompactionSnapshot();
-}
-
-pub fn prepareCompactionSummaryInputSnapshot(
-    self: *AgentSessionRuntimeHost,
-) !session_events.CompactionSummaryInputSnapshot {
-    return self.session.prepareCompactionSummaryInputSnapshot();
-}
-
 pub fn cancel(self: *AgentSessionRuntimeHost) void {
     self.session.cancel();
 }
@@ -367,7 +355,7 @@ const ToolLoopObservation = struct {
         const self: *ToolLoopObservation = @ptrCast(@alignCast(context.?));
         if (event != .agent_event) return;
 
-        switch (event.agent_event) {
+        switch (event.agent_event.event) {
             .message_end => |payload| switch (payload.message) {
                 .user => self.user_message_end = true,
                 else => {},
@@ -420,7 +408,7 @@ const BashLimitObservation = struct {
         const self: *BashLimitObservation = @ptrCast(@alignCast(context.?));
         if (event != .agent_event) return;
 
-        switch (event.agent_event) {
+        switch (event.agent_event.event) {
             .tool_execution_start => |payload| {
                 if (std.mem.eql(u8, payload.tool_name, "bash")) self.tool_execution_start = true;
             },
@@ -1131,91 +1119,6 @@ test "runtime host compacts with generated summary through public command bounda
     defer end_event.deinit();
     try std.testing.expect(end_event == .compaction_end);
     try std.testing.expectEqualStrings("generated summary", end_event.compaction_end.result.?.summary.text);
-}
-
-test "runtime host exposes compaction preparation snapshot" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-26",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-        .compaction_settings = .{ .keep_recent_tokens = 2 },
-    }, .{ .create = .{
-        .session_id = "session",
-        .timestamp = "2026-05-26T00:00:00Z",
-    } });
-    defer {
-        host.requestShutdown();
-        drainHostEvents(&host);
-        host.deinit();
-    }
-
-    _ = try host.session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "aaaaaaaa" },
-        .timestamp = 0,
-    } }, "t1");
-    const kept = try host.session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "bbbbbbbb" },
-        .timestamp = 0,
-    } }, "t2");
-
-    var snapshot = try host.prepareCompactionSnapshot();
-    defer snapshot.deinit();
-
-    try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
-    try std.testing.expectEqual(@as(u64, 4), snapshot.tokens_before);
-}
-
-test "runtime host exposes compaction summary input snapshot" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-26",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-        .compaction_settings = .{ .keep_recent_tokens = 2 },
-    }, .{ .create = .{
-        .session_id = "session",
-        .timestamp = "2026-05-26T00:00:00Z",
-    } });
-    defer {
-        host.requestShutdown();
-        drainHostEvents(&host);
-        host.deinit();
-    }
-
-    _ = try host.session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "aaaaaaaa" },
-        .timestamp = 0,
-    } }, "t1");
-    const kept = try host.session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "bbbbbbbb" },
-        .timestamp = 0,
-    } }, "t2");
-
-    var snapshot = try host.prepareCompactionSummaryInputSnapshot();
-    defer snapshot.deinit();
-
-    try std.testing.expectEqualStrings(kept, snapshot.first_kept_entry_id.text);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.message_count);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot.serialized_input.text, "[User]: aaaaaaaa") != null);
 }
 
 test "runtime host preserves bash output limit details through public events" {

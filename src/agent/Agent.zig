@@ -367,7 +367,7 @@ fn recordRunFailure(self: *Agent, token: runtime.CancelToken, message: []const u
     const assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
     try self.appendMessage(.{ .assistant = assistant });
     self.state.status = .{ .failed = message };
-    try self.emitEvent(try copyAgentEvent(
+    try self.emitEvent(try agent.copyAgentEvent(
         self.message_arena.allocator(),
         .{ .agent_end = .{ .messages = self.state.messages } },
     ));
@@ -413,7 +413,7 @@ fn contextSnapshot(self: *const Agent) agent.AgentContext {
 
 fn emitFromLoop(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const self: *Agent = @ptrCast(@alignCast(context.?));
-    try self.emitEvent(try copyAgentEvent(self.message_arena.allocator(), event));
+    try self.emitEvent(try agent.copyAgentEvent(self.message_arena.allocator(), event));
 }
 
 pub fn userMessageFromText(self: *Agent, text: []const u8, images: []const ai.ImageContent) !agent.AgentMessage {
@@ -524,57 +524,6 @@ pub const PendingMessageQueue = struct {
         return drained;
     }
 };
-
-fn copyAgentEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
-    return switch (event) {
-        .message_start => |payload| .{ .message_start = .{
-            .message = try agent.copyAgentMessage(allocator, payload.message),
-        } },
-        .message_update => |payload| .{ .message_update = .{
-            .message = try agent.copyAgentMessage(allocator, payload.message),
-            .assistant_message_event = try ai.owned.copyAssistantMessageEvent(
-                allocator,
-                payload.assistant_message_event,
-            ),
-        } },
-        .message_end => |payload| .{ .message_end = .{
-            .message = try agent.copyAgentMessage(allocator, payload.message),
-        } },
-        .turn_end => |payload| .{ .turn_end = .{
-            .message = try agent.copyAgentMessage(allocator, payload.message),
-            .tool_results = try agent.copyToolResultMessages(allocator, payload.tool_results),
-        } },
-        .agent_end => |payload| .{ .agent_end = .{
-            .messages = try agent.copyAgentMessages(allocator, payload.messages),
-        } },
-        .tool_execution_start => |payload| .{ .tool_execution_start = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .args = try runtime.cloneJsonValue(allocator, payload.args),
-        } },
-        .tool_execution_update => |payload| .{ .tool_execution_update = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .args = try runtime.cloneJsonValue(allocator, payload.args),
-            .partial_result = try copyAgentToolResult(allocator, payload.partial_result),
-        } },
-        .tool_execution_end => |payload| .{ .tool_execution_end = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .result = try copyAgentToolResult(allocator, payload.result),
-            .is_error = payload.is_error,
-        } },
-        else => event,
-    };
-}
-
-fn copyAgentToolResult(allocator: std.mem.Allocator, source: agent.AgentToolResult) !agent.AgentToolResult {
-    return .{
-        .content = try agent.copyToolResultContentSlice(allocator, source.content),
-        .details = if (source.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
-        .terminate = source.terminate,
-    };
-}
 
 fn defaultConvertToLlm(
     allocator: std.mem.Allocator,

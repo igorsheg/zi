@@ -237,6 +237,19 @@ fn deinitToolResultMessageItems(allocator: std.mem.Allocator, messages: []const 
     for (messages) |message| deinitToolResultMessage(allocator, message);
 }
 
+pub fn copyAgentToolResult(allocator: std.mem.Allocator, source: AgentToolResult) !AgentToolResult {
+    return .{
+        .content = try copyToolResultContentSlice(allocator, source.content),
+        .details = if (source.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
+        .terminate = source.terminate,
+    };
+}
+
+pub fn deinitAgentToolResult(allocator: std.mem.Allocator, result: AgentToolResult) void {
+    deinitToolResultContentSlice(allocator, result.content);
+    if (result.details) |details| runtime.freeJsonValue(allocator, details);
+}
+
 pub const ToolExecutionResult = struct {
     allocator: std.mem.Allocator,
     result: AgentToolResult,
@@ -604,6 +617,77 @@ pub const AgentLoopConfig = struct {
     before_tool_call: ?BeforeToolCallHook = null,
     after_tool_call: ?AfterToolCallHook = null,
 };
+
+pub fn copyAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) !AgentEvent {
+    return switch (event) {
+        .message_start => |payload| .{ .message_start = .{ .message = try copyAgentMessage(allocator, payload.message) } },
+        .message_update => |payload| .{ .message_update = .{
+            .message = try copyAgentMessage(allocator, payload.message),
+            .assistant_message_event = try ai.owned.copyAssistantMessageEvent(allocator, payload.assistant_message_event),
+        } },
+        .message_end => |payload| .{ .message_end = .{ .message = try copyAgentMessage(allocator, payload.message) } },
+        .turn_end => |payload| .{ .turn_end = .{
+            .message = try copyAgentMessage(allocator, payload.message),
+            .tool_results = try copyToolResultMessages(allocator, payload.tool_results),
+        } },
+        .agent_end => |payload| .{ .agent_end = .{ .messages = try copyAgentMessages(allocator, payload.messages) } },
+        .tool_execution_start => |payload| .{ .tool_execution_start = .{
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
+            .args = try runtime.cloneJsonValue(allocator, payload.args),
+        } },
+        .tool_execution_update => |payload| .{ .tool_execution_update = .{
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
+            .args = try runtime.cloneJsonValue(allocator, payload.args),
+            .partial_result = try copyAgentToolResult(allocator, payload.partial_result),
+        } },
+        .tool_execution_end => |payload| .{ .tool_execution_end = .{
+            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
+            .tool_name = try allocator.dupe(u8, payload.tool_name),
+            .result = try copyAgentToolResult(allocator, payload.result),
+            .is_error = payload.is_error,
+        } },
+        .agent_start, .turn_start => event,
+    };
+}
+
+pub fn deinitAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) void {
+    switch (event) {
+        .message_start => |payload| deinitAgentMessage(allocator, payload.message),
+        .message_update => |payload| {
+            deinitAgentMessage(allocator, payload.message);
+            ai.owned.deinitAssistantMessageEvent(allocator, payload.assistant_message_event);
+        },
+        .message_end => |payload| deinitAgentMessage(allocator, payload.message),
+        .turn_end => |payload| {
+            deinitAgentMessage(allocator, payload.message);
+            for (payload.tool_results) |message| deinitToolResultMessage(allocator, message);
+            allocator.free(payload.tool_results);
+        },
+        .agent_end => |payload| {
+            for (payload.messages) |message| deinitAgentMessage(allocator, message);
+            allocator.free(payload.messages);
+        },
+        .tool_execution_start => |payload| {
+            allocator.free(payload.tool_call_id);
+            allocator.free(payload.tool_name);
+            runtime.freeJsonValue(allocator, payload.args);
+        },
+        .tool_execution_update => |payload| {
+            allocator.free(payload.tool_call_id);
+            allocator.free(payload.tool_name);
+            runtime.freeJsonValue(allocator, payload.args);
+            deinitAgentToolResult(allocator, payload.partial_result);
+        },
+        .tool_execution_end => |payload| {
+            allocator.free(payload.tool_call_id);
+            allocator.free(payload.tool_name);
+            deinitAgentToolResult(allocator, payload.result);
+        },
+        .agent_start, .turn_start => {},
+    }
+}
 
 pub const AgentEvent = union(enum) {
     agent_start,

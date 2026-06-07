@@ -9,7 +9,6 @@ pub const message_policy = @import("message_policy.zig");
 pub const paths = @import("paths.zig");
 pub const print_mode = @import("print_mode.zig");
 pub const prompt_command = @import("prompt_command.zig");
-pub const prompt_input = @import("prompt_input.zig");
 pub const queue_mirror = @import("queue_mirror.zig");
 pub const runtime_services = @import("runtime_services.zig");
 pub const sdk = @import("sdk.zig");
@@ -69,7 +68,6 @@ pub fn testsReachable() void {
     _ = paths;
     _ = print_mode;
     _ = prompt_command;
-    _ = prompt_input;
     _ = queue_mirror;
     _ = resources;
     _ = runtime_services;
@@ -101,7 +99,6 @@ test {
     _ = paths;
     _ = print_mode;
     _ = prompt_command;
-    _ = prompt_input;
     _ = queue_mirror;
     _ = resources;
     _ = runtime_services;

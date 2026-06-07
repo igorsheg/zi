@@ -24,7 +24,7 @@ pub const EventDrain = struct {
 
     pub fn handle(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         try self.updateQueueMirror(event);
-        self.emitPublicEvent(event);
+        try self.emitPublicEvent(event);
         var persist_error: ?anyerror = null;
         self.persistEvent(event) catch |err| {
             persist_error = err;
@@ -71,8 +71,8 @@ pub const EventDrain = struct {
         try self.emitQueueUpdate();
     }
 
-    fn emitPublicEvent(self: *EventDrain, event: agent_mod.AgentEvent) void {
-        self.enqueuePublicEvent(.{ .agent_event = event });
+    fn emitPublicEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
+        self.enqueuePublicEvent(.{ .agent_event = try session_events.OwnedAgentEvent.init(self.allocator, event) });
     }
 
     fn persistEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {

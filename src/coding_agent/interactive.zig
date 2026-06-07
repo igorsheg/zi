@@ -154,7 +154,7 @@ fn toolCallAppend(
 
 fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptIngest {
     return switch (event) {
-        .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event),
+        .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event.event),
         .prompt_command => |payload| .{ .append = statusAppend(.info, payload.message.text) },
         .compaction_start => .{ .append = statusAppend(.info, "compaction started") },
         .compaction_end => .{ .append = statusAppend(.info, "compaction ended") },
@@ -722,8 +722,8 @@ test "interactive loop bounds stay responsive" {
 }
 
 test "interactive maps simple public events to transcript appends" {
-    try std.testing.expect(transcriptAppendFromEvent(.{ .agent_event = .agent_start }) == null);
-    try std.testing.expect(transcriptAppendFromEvent(.{ .agent_event = .turn_start }) == null);
+    try std.testing.expect(transcriptAppendFromAgentEvent(.agent_start) == null);
+    try std.testing.expect(transcriptAppendFromAgentEvent(.turn_start) == null);
 
     const overflow = transcriptAppendFromEvent(.{ .public_event_overflow = .{ .dropped_count = 4 } }).?;
     try std.testing.expect(overflow == .append);
@@ -771,11 +771,11 @@ test "interactive transcript append degrades operational invalid utf8" {
 }
 
 test "interactive maps tool events to typed transcript items" {
-    const start = transcriptAppendFromEvent(.{ .agent_event = .{ .tool_execution_start = .{
+    const start = transcriptAppendFromAgentEvent(.{ .tool_execution_start = .{
         .tool_call_id = "1",
         .tool_name = "bash",
         .args = .null,
-    } } }).?;
+    } }).?;
     try std.testing.expect(start == .append);
     try std.testing.expect(start.append == .tool);
     try std.testing.expectEqualStrings("1", start.append.tool.tool_call_id);
@@ -786,12 +786,12 @@ test "interactive maps tool events to typed transcript items" {
         start.append.tool.status,
     );
 
-    const end = transcriptAppendFromEvent(.{ .agent_event = .{ .tool_execution_end = .{
+    const end = transcriptAppendFromAgentEvent(.{ .tool_execution_end = .{
         .tool_call_id = "1",
         .tool_name = "bash",
         .result = .{ .content = &.{} },
         .is_error = true,
-    } } }).?;
+    } }).?;
     try std.testing.expect(end == .append);
     try std.testing.expect(end.append == .tool);
     try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.err, end.append.tool.status);
@@ -817,14 +817,14 @@ fn testAssistantMessage(content: []const ai.AssistantContent) ai.AssistantMessag
 }
 
 test "interactive maps thinking deltas to streaming thinking transcript" {
-    const event = transcriptAppendFromEvent(.{ .agent_event = .{ .message_update = .{
+    const event = transcriptAppendFromAgentEvent(.{ .message_update = .{
         .message = .{ .assistant = testAssistantMessage(&.{}) },
         .assistant_message_event = .{ .thinking_delta = .{
             .content_index = 0,
             .delta = "considering",
             .partial = testAssistantMessage(&.{}),
         } },
-    } } }).?;
+    } }).?;
     try std.testing.expect(event == .append);
     try std.testing.expect(event.append == .message);
     try std.testing.expectEqual(tui.product.transcript.TranscriptRole.thinking, event.append.message.role);
@@ -843,14 +843,14 @@ test "interactive maps tool call deltas to pending tool row" {
     } }};
     const partial = testAssistantMessage(&content);
 
-    const event = transcriptAppendFromEvent(.{ .agent_event = .{ .message_update = .{
+    const event = transcriptAppendFromAgentEvent(.{ .message_update = .{
         .message = .{ .assistant = partial },
         .assistant_message_event = .{ .toolcall_delta = .{
             .content_index = 0,
             .delta = "streaming",
             .partial = partial,
         } },
-    } } }).?;
+    } }).?;
     try std.testing.expect(event == .append);
     try std.testing.expect(event.append == .tool);
     try std.testing.expectEqualStrings("call-1", event.append.tool.tool_call_id);
@@ -864,11 +864,11 @@ test "interactive maps tool args to bounded title" {
     defer args.deinit(std.testing.allocator);
     try args.put(std.testing.allocator, "command", .{ .string = "zig build test" });
 
-    const start = transcriptAppendFromEvent(.{ .agent_event = .{ .tool_execution_start = .{
+    const start = transcriptAppendFromAgentEvent(.{ .tool_execution_start = .{
         .tool_call_id = "1",
         .tool_name = "bash",
         .args = .{ .object = args },
-    } } }).?;
+    } }).?;
     try std.testing.expect(start == .append);
     try std.testing.expect(start.append == .tool);
     try std.testing.expectEqualStrings("zig build test", start.append.tool.title);

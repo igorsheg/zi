@@ -81,7 +81,7 @@ const PrintDrain = struct {
         event: session_events.AgentSessionEvent,
     ) !void {
         switch (event) {
-            .agent_event => |agent_event| switch (agent_event) {
+            .agent_event => |agent_event| switch (agent_event.event) {
                 .message_end => |payload| switch (payload.message) {
                     .assistant => |assistant| {
                         if (assistant.error_message) |message| return printAssistantError(self.stderr, message);

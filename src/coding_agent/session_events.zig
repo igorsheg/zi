@@ -86,60 +86,26 @@ pub const CompactionResult = struct {
     }
 };
 
-pub const CompactionPreparationSnapshot = struct {
-    first_kept_entry_id: EventText,
-    tokens_before: u64,
-    has_previous_summary: bool,
+pub const OwnedAgentEvent = struct {
+    allocator: std.mem.Allocator,
+    event: agent_mod.AgentEvent,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        preparation: session_manager.CompactionPreparation,
-    ) !CompactionPreparationSnapshot {
-        return .{
-            .first_kept_entry_id = try EventText.init(allocator, preparation.first_kept_entry_id),
-            .tokens_before = preparation.tokens_before,
-            .has_previous_summary = preparation.previous_summary != null,
-        };
+    pub fn init(allocator: std.mem.Allocator, event: agent_mod.AgentEvent) !OwnedAgentEvent {
+        return .{ .allocator = allocator, .event = try agent_mod.copyAgentEvent(allocator, event) };
     }
 
-    pub fn deinit(self: *CompactionPreparationSnapshot) void {
-        self.first_kept_entry_id.deinit();
+    pub fn deinit(self: *OwnedAgentEvent) void {
+        agent_mod.deinitAgentEvent(self.allocator, self.event);
         self.* = undefined;
     }
-};
 
-pub const CompactionSummaryInputSnapshot = struct {
-    serialized_input: EventText,
-    first_kept_entry_id: EventText,
-    tokens_before: u64,
-    message_count: usize,
-    has_previous_summary: bool,
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        input: session_manager.CompactionSummaryInput,
-        serialized_input: []const u8,
-    ) !CompactionSummaryInputSnapshot {
-        var serialized = try EventText.init(allocator, serialized_input);
-        errdefer serialized.deinit();
-        return .{
-            .serialized_input = serialized,
-            .first_kept_entry_id = try EventText.init(allocator, input.first_kept_entry_id),
-            .tokens_before = input.tokens_before,
-            .message_count = input.messages.len,
-            .has_previous_summary = input.previous_summary != null,
-        };
-    }
-
-    pub fn deinit(self: *CompactionSummaryInputSnapshot) void {
-        self.serialized_input.deinit();
-        self.first_kept_entry_id.deinit();
-        self.* = undefined;
+    pub fn jsonStringify(self: OwnedAgentEvent, stringify: *std.json.Stringify) !void {
+        try stringify.write(self.event);
     }
 };
 
 pub const AgentSessionEvent = union(enum) {
-    agent_event: agent_mod.AgentEvent,
+    agent_event: OwnedAgentEvent,
     queue_update: QueueUpdate,
     prompt_command: PromptCommand,
     compaction_start: CompactionStart,
@@ -225,7 +191,7 @@ pub const AgentSessionEvent = union(enum) {
 
     pub fn deinit(self: *AgentSessionEvent) void {
         switch (self.*) {
-            .agent_event => {},
+            .agent_event => |*payload| payload.deinit(),
             .queue_update => |*payload| payload.deinit(),
             .prompt_command => |*payload| payload.deinit(),
             .compaction_start => {},
