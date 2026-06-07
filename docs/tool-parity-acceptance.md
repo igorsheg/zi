@@ -51,7 +51,7 @@ Accepted when:
 - User-requested limit continuation is not misreported as byte/line truncation.
 - Offset beyond EOF reports an actionable operational error.
 - Invalid UTF-8 is handled operationally, not leaked into TUI text.
-- Image attachments for png/jpeg/gif/webp are returned with a text note.
+- Image attachments for supported png/jpeg/gif/webp are returned with a text note; APNG is not treated as supported PNG.
 
 Optional/deferred:
 
