@@ -60,9 +60,10 @@ pub const ReadTool = struct {
     pub fn tool(self: *ReadTool) agent.AgentTool {
         return .{
             .name = "read",
-            .description = "Read the contents of a file. Supports text files. " ++
-                "Output is truncated to 2000 lines or 50KB (whichever is hit first). " ++
-                "Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+            .description = "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). " ++
+                "Images are sent as attachments. For text files, output is truncated to 2000 lines " ++
+                "or 50KB (whichever is hit first). Use offset/limit for large files. " ++
+                "When you need the full file, continue with offset until complete.",
             .parameters = self.parsed_parameters.value,
             .label = "read",
             .execute = .{ .context = self, .call_fn = execute },
