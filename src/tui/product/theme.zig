@@ -27,6 +27,8 @@ pub const Theme = struct {
     transcript_user: primitive.Style,
     transcript_secondary: primitive.Style,
     tool_chrome: primitive.Style,
+    tool_title: primitive.Style,
+    tool_output: primitive.Style,
     status_accent: primitive.Style,
     status_success: primitive.Style,
     status_warning: primitive.Style,
@@ -53,6 +55,8 @@ pub const Theme = struct {
             .transcript_user = .{ .bg = p.user_bg },
             .transcript_secondary = muted,
             .tool_chrome = muted,
+            .tool_title = .{ .bold = true },
+            .tool_output = muted,
             .status_accent = accent,
             .status_success = success,
             .status_warning = warning,
@@ -76,6 +80,9 @@ test "codex theme maps palette to semantic styles" {
     try std.testing.expect(theme.composer_prompt.eql(theme.accent));
     try std.testing.expect(theme.transcript_user.eql(.{ .bg = .{ .indexed = 236 } }));
     try std.testing.expect(theme.transcript_secondary.eql(theme.muted));
+    try std.testing.expect(theme.tool_chrome.eql(theme.muted));
+    try std.testing.expect(theme.tool_title.eql(.{ .bold = true }));
+    try std.testing.expect(theme.tool_output.eql(theme.muted));
     try std.testing.expect(theme.status_success.eql(.{ .fg = .{ .indexed = 2 }, .bold = true }));
     try std.testing.expect(theme.status_warning.eql(.{ .fg = .{ .indexed = 3 }, .bold = true }));
     try std.testing.expect(theme.status_error.eql(.{ .fg = .{ .indexed = 1 }, .bold = true }));

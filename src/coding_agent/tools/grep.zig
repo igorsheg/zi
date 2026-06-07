@@ -113,7 +113,30 @@ fn execute(
     const result_content = try allocator.alloc(ai.ToolResultContent, 1);
     errdefer allocator.free(result_content);
     result_content[0] = .{ .text = .{ .text = text } };
-    return .{ .allocator = allocator, .result = .{ .content = result_content } };
+    return .{ .allocator = allocator, .result = .{
+        .content = result_content,
+        .details = try grepDetails(allocator, state.files_seen, state.matches, state.truncated, self.config.max_matches),
+    } };
+}
+
+fn grepDetails(
+    allocator: std.mem.Allocator,
+    files_seen: usize,
+    matches: usize,
+    truncated: bool,
+    max_matches_value: usize,
+) !std.json.Value {
+    var object: std.json.ObjectMap = .empty;
+    errdefer object.deinit(allocator);
+    try path_utils.putJsonField(allocator, &object, "filesSearched", .{ .integer = @intCast(files_seen) });
+    try path_utils.putJsonField(allocator, &object, "matches", .{ .integer = @intCast(matches) });
+    var truncation: std.json.ObjectMap = .empty;
+    errdefer truncation.deinit(allocator);
+    try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = truncated });
+    try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", "matches");
+    try path_utils.putJsonField(allocator, &truncation, "maxMatches", .{ .integer = @intCast(max_matches_value) });
+    try path_utils.putJsonField(allocator, &object, "truncation", .{ .object = truncation });
+    return .{ .object = object };
 }
 
 fn searchPath(

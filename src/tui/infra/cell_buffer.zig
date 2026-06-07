@@ -144,6 +144,11 @@ pub const CellBuffer = struct {
             if (grapheme.end == 0) break;
             const grapheme_bytes = bytes[i..][grapheme.start..grapheme.end];
             i += grapheme.end;
+            if (containsTerminalControl(grapheme_bytes)) {
+                try self.set(col, y, Cell.scalar(text.replacement, style));
+                col += 1;
+                continue;
+            }
             if (grapheme.width == 0) continue;
             if (grapheme.width == 2) {
                 if (col + 1 >= self.width) break;
@@ -181,10 +186,37 @@ pub const CellBuffer = struct {
         return @as(usize, y) * self.width + x;
     }
 };
+fn containsTerminalControl(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte < 0x20 or byte == 0x7f) return true;
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const scalar = text.nextScalar(bytes[index..]);
+        if (scalar.len == 0) return false;
+        if (scalar.scalar < 0x20 or scalar.scalar == 0x7f or
+            (scalar.scalar >= 0x80 and scalar.scalar <= 0x9f)) return true;
+        index += scalar.len;
+    }
+    return false;
+}
+
 fn checkedCount(width: u16, height: u16, max_cells: usize) Error!usize {
     const count = @as(usize, width) * height;
     if (count > max_cells) return error.TooLarge;
     return count;
+}
+
+test "cell buffer replaces terminal controls instead of storing raw bytes" {
+    var b = try CellBuffer.init(std.testing.allocator, 8, 1, 8);
+    defer b.deinit();
+
+    try b.writeText(0, 0, "a\x1b[31m\r", .{});
+    try std.testing.expectEqual(@as(u21, 'a'), (try b.get(0, 0)).renderScalar().?);
+    try std.testing.expectEqual(text.replacement, (try b.get(1, 0)).renderScalar().?);
+    try std.testing.expectEqual(@as(u21, '['), (try b.get(2, 0)).renderScalar().?);
+    try std.testing.expectEqual(@as(u21, '3'), (try b.get(3, 0)).renderScalar().?);
+    try std.testing.expectEqual(@as(u21, '1'), (try b.get(4, 0)).renderScalar().?);
+    try std.testing.expectEqual(@as(u21, 'm'), (try b.get(5, 0)).renderScalar().?);
+    try std.testing.expectEqual(text.replacement, (try b.get(6, 0)).renderScalar().?);
 }
 
 test "cell buffer writes text wide overwrite and preserves on failed resize" {

@@ -63,6 +63,11 @@ pub const ProductApp = struct {
                 self.dirty = true;
                 return null;
             },
+            .replace_tool_call_preview => |preview| {
+                try self.transcript.replaceToolCallPreview(allocator, preview.tool_call_id, preview.text);
+                self.dirty = true;
+                return null;
+            },
         }
     }
 
@@ -136,6 +141,7 @@ pub const Command = union(enum) {
     clear_composer,
     append_transcript: transcript.TranscriptAppend,
     tool_output_delta: ToolOutputDelta,
+    replace_tool_call_preview: ToolCallPreview,
 };
 
 pub const ToolOutputDelta = struct {
@@ -143,6 +149,11 @@ pub const ToolOutputDelta = struct {
     text: []const u8,
     dropped_head_bytes: usize = 0,
     dropped_head_lines: usize = 0,
+};
+
+pub const ToolCallPreview = struct {
+    tool_call_id: []const u8,
+    text: []const u8,
 };
 
 pub const Size = struct {

@@ -180,7 +180,7 @@ fn emitItemRowsNewestFirst(
     emitMarginBottomRows(sink);
     emitVerticalPaddingRows(sink, transcriptItemPaddingY(item), style);
     if (item == .tool) {
-        emitToolRowsNewestFirst(sink, item.tool, frame_width, style);
+        emitToolRowsNewestFirst(sink, item.tool, frame_width, theme);
     } else {
         emitWrappedRowsNewestFirst(sink, transcript_projection.itemPrimary(item), frame_width, false, style);
     }
@@ -208,31 +208,36 @@ fn emitToolRowsNewestFirst(
     sink: *TranscriptRowSink,
     tool: transcript_mod.TranscriptTool,
     frame_width: u16,
-    style: primitive.Style,
+    theme: ?*const theme_mod.Theme,
 ) void {
-    sink.emitGenerated("", "╰────", false, style);
+    const fallback = theme_mod.Theme.codex();
+    const resolved = theme orelse &fallback;
+
+    const block: primitive.chrome.OpenBlock = .{};
+    var bottom_buffer: [tool_chrome_line_bytes_max]u8 = undefined;
+    const bottom = block.bottomLine(&bottom_buffer) catch "╰────";
+    sink.emitGenerated("", bottom, false, resolved.tool_chrome);
     if (sink.full()) return;
 
     const projected = transcript_projection.itemPrimary(.{ .tool = tool });
     if (transcript_projection.toolBodyVisible(tool)) {
-        emitWrappedRowsNewestFirst(sink, .{ .prefix = "│ ", .text = projected.text }, frame_width, true, style);
+        emitWrappedRowsNewestFirst(sink, .{ .prefix = block.bodyPrefix(), .text = projected.text }, frame_width, true, resolved.tool_output);
+        if (sink.full()) return;
+    }
+    if (tool.call_preview.len > 0) {
+        emitWrappedRowsNewestFirst(sink, .{ .prefix = block.bodyPrefix(), .text = tool.call_preview }, frame_width, true, resolved.tool_output);
         if (sink.full()) return;
     }
 
     var notice_buffer: [tool_notice_bytes_max]u8 = undefined;
     if (transcript_projection.toolOmissionNotice(tool, &notice_buffer)) |notice| {
-        emitWrappedRowsNewestFirst(sink, .{ .prefix = "│ ", .text = notice }, frame_width, true, style);
+        emitWrappedRowsNewestFirst(sink, .{ .prefix = block.bodyPrefix(), .text = notice }, frame_width, true, resolved.tool_chrome);
         if (sink.full()) return;
     }
 
-    const header = transcript_projection.toolHeader(tool);
-    var top_buffer: [tool_chrome_line_bytes_max]u8 = undefined;
-    const top = primitive.chrome.openTopLine(&top_buffer, .rounded, header) catch "╭─[tool]";
-    sink.emitGenerated("", top, false, style);
-    if (sink.full()) return;
     var title_buffer: [tool_chrome_line_bytes_max]u8 = undefined;
     const title = transcript_projection.toolTitle(tool, &title_buffer);
-    sink.emitGenerated("", title, false, style);
+    sink.emitGenerated("", title, false, resolved.tool_title);
 }
 
 fn emitWrappedRowsNewestFirst(
@@ -480,10 +485,10 @@ test "frame renders typed tool rows with name and state" {
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectGraphemeInColumn(renderer.next, 1, "╭");
     try expectCellText(renderer.next, 1, 1, "bash");
-    try expectCellText(renderer.next, 3, 2, "[running]");
-    try expectCellText(renderer.next, 1, 5, "read");
+    try expectCellText(renderer.next, 1, 4, "read");
+    try expectGraphemeInColumn(renderer.next, 1, "╰");
+    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.tool_title));
 }
 
 test "frame renders tool display text when present" {
@@ -494,7 +499,7 @@ test "frame renders tool display text when present" {
         .tool_call_id = "call-1",
         .name = "bash",
         .status = .pending,
-        .kind = .bash,
+        .presentation = .command,
         .title = "zig build test",
     } });
 
@@ -502,9 +507,31 @@ test "frame renders tool display text when present" {
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectGraphemeInColumn(renderer.next, 1, "╭");
     try expectCellText(renderer.next, 1, 1, "bash: zig build test");
-    try expectCellText(renderer.next, 3, 2, "[running]");
+    try expectGraphemeInColumn(renderer.next, 1, "╰");
+    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.tool_title));
+}
+
+test "frame renders tool title bold and tool output dim" {
+    var app = try app_mod.ProductApp.init(40, 10);
+    defer app.deinit(std.testing.allocator);
+
+    try app.transcript.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .status = .pending,
+    } });
+    try app.transcript.appendToolOutput(std.testing.allocator, "call-1", "out", 0, 0);
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 10, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellText(renderer.next, 1, 1, "bash");
+    try expectCellText(renderer.next, 3, 2, "out");
+    try expectGraphemeInColumn(renderer.next, 1, "╰");
+    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.tool_title));
+    try std.testing.expect((try renderer.next.get(3, 2)).style.eql(app.theme.tool_output));
 }
 
 test "tool visual row count includes chrome output and omission notice" {
@@ -518,11 +545,11 @@ test "tool visual row count includes chrome output and omission notice" {
     } });
     try app.transcript.appendToolOutput(std.testing.allocator, "call-1", "one\ntwo", 0, 3);
 
-    try std.testing.expectEqual(@as(usize, 6), transcriptScrollMax(app.transcript, app.width, 1));
-    try std.testing.expectEqual(@as(usize, 5), transcriptScrollMax(app.transcript, app.width, 2));
+    try std.testing.expectEqual(@as(usize, 5), transcriptScrollMax(app.transcript, app.width, 1));
+    try std.testing.expectEqual(@as(usize, 4), transcriptScrollMax(app.transcript, app.width, 2));
 }
 
-test "tool scroll skips newest rows once across whole block" {
+test "tool scroll skips newest row before tool block" {
     var app = try app_mod.ProductApp.init(40, 4);
     defer app.deinit(std.testing.allocator);
 
@@ -538,7 +565,7 @@ test "tool scroll skips newest rows once across whole block" {
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 3, 1, "two");
+    try expectCellGrapheme(renderer.next, 3, 2, "─");
 }
 
 test "frame renders updated tool row once" {
@@ -553,7 +580,7 @@ test "frame renders updated tool row once" {
     try app.transcript.append(std.testing.allocator, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .kind = .bash,
+        .presentation = .command,
         .status = .success,
     } });
 
@@ -562,9 +589,9 @@ test "frame renders updated tool row once" {
     try Frame.build(&app, &renderer);
 
     try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
-    try expectGraphemeInColumn(renderer.next, 1, "╭");
     try expectCellText(renderer.next, 1, 1, "bash");
-    try expectCellText(renderer.next, 3, 2, "[stdout]");
+    try expectGraphemeInColumn(renderer.next, 1, "╰");
+    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.tool_title));
 }
 
 test "frame renders transcript scrolled by newest visual rows" {

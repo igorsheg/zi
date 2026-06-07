@@ -20,7 +20,7 @@ const parameters_schema =
     \\      "description": "Shell command to run in the session cwd",
     \\      "maxLength": 16384
     \\    },
-    \\    "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds, max 120000" }
+    \\    "timeout": { "type": "integer", "description": "Optional timeout in seconds, max 120" }
     \\  },
     \\  "required": ["command"]
     \\}
@@ -33,6 +33,7 @@ pub const BashTool = struct {
 
     pub const Config = struct {
         cwd: []const u8,
+        environ: ?*const std.process.Environ.Map = null,
         timeout_ms: u64 = default_timeout_ms,
         max_timeout_ms: u64 = max_timeout_ms,
         max_stdout_bytes: usize = max_stdout_bytes,
@@ -48,6 +49,7 @@ pub const BashTool = struct {
             .allocator = allocator,
             .config = .{
                 .cwd = cwd,
+                .environ = config.environ,
                 .timeout_ms = config.timeout_ms,
                 .max_timeout_ms = config.max_timeout_ms,
                 .max_stdout_bytes = config.max_stdout_bytes,
@@ -135,6 +137,7 @@ fn runProcess(
     const run_result = try runtime.runProcess(allocator, io, zio_runtime, .{
         .argv = &argv,
         .cwd = config.cwd,
+        .environ = config.environ,
         .timeout_ms = args.timeout_ms,
         .max_stdout_bytes = config.max_stdout_bytes,
         .max_stderr_bytes = config.max_stderr_bytes,
@@ -176,9 +179,10 @@ fn parseArgs(config: BashTool.Config, params: std.json.Value) !Args {
     if (command_value != .string or command_value.string.len == 0) return error.InvalidToolArguments;
     if (command_value.string.len > max_command_bytes) return error.InvalidToolArguments;
 
-    const timeout_ms = if (params.object.get("timeout_ms")) |value| blk: {
+    const timeout_ms = if (params.object.get("timeout")) |value| blk: {
         if (value != .integer or value.integer < 1) return error.InvalidToolArguments;
-        const requested = std.math.cast(u64, value.integer) orelse return error.InvalidToolArguments;
+        const requested_seconds = std.math.cast(u64, value.integer) orelse return error.InvalidToolArguments;
+        const requested = std.math.mul(u64, requested_seconds, std.time.ms_per_s) catch return error.InvalidToolArguments;
         if (requested > config.max_timeout_ms) return error.InvalidToolArguments;
         break :blk requested;
     } else config.timeout_ms;
@@ -288,6 +292,31 @@ test "bash tool runs one cwd-bound command" {
     try std.testing.expectEqual(@as(i64, 0), result.result.details.?.object.get("exitCode").?.integer);
 }
 
+test "bash tool passes explicit environment to child process" {
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_BASH_ENV_TEST", "present");
+    try environ.put("PATH", "/usr/bin:/bin");
+    var tool = try BashTool.init(std.testing.allocator, .{
+        .cwd = cwd_buffer[0..cwd_len],
+        .environ = &environ,
+    });
+    defer tool.deinit();
+
+    var result = try executeTestCommand(zio_runtime, &tool, "printf %s \"$ZI_BASH_ENV_TEST\"");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("present", result.result.content[0].text.text);
+}
+
 test "bash tool treats nonzero exit as result data" {
     var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
     defer zio_runtime.deinit();
@@ -339,6 +368,16 @@ test "bash tool treats output limit as bounded result data" {
     try std.testing.expectEqualStrings("bash output limit exceeded", result.result.content[0].text.text);
     try std.testing.expect(!result.result.details.?.object.get("timedOut").?.bool);
     try std.testing.expect(result.result.details.?.object.get("outputLimitExceeded").?.bool);
+}
+
+test "bash tool accepts timeout seconds" {
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try putCommand(&object, "echo ok");
+    try object.put(std.testing.allocator, "timeout", .{ .integer = 2 });
+
+    const args = try parseArgs(.{ .cwd = ".", .timeout_ms = default_timeout_ms }, .{ .object = object });
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ms_per_s), args.timeout_ms);
 }
 
 test "bash tool rejects oversized commands before process start" {

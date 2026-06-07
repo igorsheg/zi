@@ -59,9 +59,19 @@ pub fn putJsonField(
     try object.put(allocator, owned_key, value);
 }
 
+pub fn putJsonStringField(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const owned_value = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned_value);
+    try putJsonField(allocator, object, key, .{ .string = owned_value });
+}
+
 test "path containment requires separator boundary" {
     try std.testing.expect(isPathInside("/repo", "/repo"));
     try std.testing.expect(isPathInside("/repo", "/repo/file"));
     try std.testing.expect(!isPathInside("/repo", "/repo2/file"));
 }
-

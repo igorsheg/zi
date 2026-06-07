@@ -35,11 +35,11 @@ pub fn toolHeader(tool: transcript.TranscriptTool) []const u8 {
     return switch (tool.status) {
         .pending => "running",
         .err => "error",
-        .success => switch (tool.kind) {
-            .bash => "stdout",
-            .read => "file",
-            .edit => "patch",
-            .generic => "tool",
+        .success => switch (tool.presentation) {
+            .command => "stdout",
+            .file => "file",
+            .patch => "patch",
+            .search, .directory, .generic => "tool",
         },
     };
 }
@@ -84,10 +84,11 @@ test "transcript projection uses visible tool output" {
     const item: transcript.TranscriptItem = .{ .tool = .{
         .tool_call_id = @constCast("1"),
         .name = @constCast("bash"),
-        .kind = .bash,
+        .presentation = .command,
         .status = .pending,
         .body_mode = .visible,
         .title = @constCast("$ zig build"),
+        .call_preview = @constCast(""),
         .output_preview = @constCast("test output"),
     } };
     const projected = itemPrimary(item);
@@ -104,10 +105,11 @@ test "transcript projection truncates long tool title instead of dropping it" {
     const tool: transcript.TranscriptTool = .{
         .tool_call_id = @constCast("1"),
         .name = @constCast("bash"),
-        .kind = .bash,
+        .presentation = .command,
         .status = .pending,
         .body_mode = .visible,
         .title = &title,
+        .call_preview = @constCast(""),
         .output_preview = @constCast(""),
     };
     var buffer: [160]u8 = undefined;
@@ -120,10 +122,11 @@ test "transcript projection hides successful read body" {
     const tool: transcript.TranscriptTool = .{
         .tool_call_id = @constCast("1"),
         .name = @constCast("read"),
-        .kind = .read,
+        .presentation = .file,
         .status = .success,
         .body_mode = .hidden_on_success,
         .title = @constCast("read src/main.zig"),
+        .call_preview = @constCast(""),
         .output_preview = @constCast("file contents"),
     };
     try std.testing.expect(!toolBodyVisible(tool));
@@ -133,10 +136,11 @@ test "transcript projection formats omission notice" {
     const tool: transcript.TranscriptTool = .{
         .tool_call_id = @constCast("1"),
         .name = @constCast("bash"),
-        .kind = .bash,
+        .presentation = .command,
         .status = .success,
         .body_mode = .visible,
         .title = @constCast("$ zig build"),
+        .call_preview = @constCast(""),
         .output_preview = @constCast("tail"),
         .output_truncated_head_lines = 42,
     };

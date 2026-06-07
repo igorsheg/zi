@@ -12,6 +12,14 @@ pub const ToolSource = union(enum) {
     custom: []const u8,
 };
 
+pub const ToolDisplayPresentation = enum { generic, command, file, patch, search, directory };
+pub const ToolDisplayBodyMode = enum { visible, hidden_on_success };
+
+pub const ToolDisplay = struct {
+    presentation: ToolDisplayPresentation = .generic,
+    body_mode: ToolDisplayBodyMode = .visible,
+};
+
 pub const ToolMetadata = struct {
     name: []const u8,
     label: []const u8,
@@ -20,6 +28,7 @@ pub const ToolMetadata = struct {
     prompt_guidelines: []const []const u8 = &.{},
     source: ToolSource = .builtin,
     execution_mode: ?agent.ToolExecutionMode = null,
+    display: ToolDisplay = .{},
 };
 
 pub const ToolImplementation = struct {
@@ -177,7 +186,8 @@ pub const BuiltinTools = struct {
 
     pub const Options = struct {
         cwd: []const u8,
-        allow_paths_outside_cwd: bool = false,
+        environ: ?*const std.process.Environ.Map = null,
+        allow_paths_outside_cwd: bool = true,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !BuiltinTools {
@@ -221,6 +231,7 @@ pub const BuiltinTools = struct {
         errdefer allocator.destroy(bash);
         bash.* = try tools.BashTool.init(allocator, .{
             .cwd = options.cwd,
+            .environ = options.environ,
         });
         errdefer bash.deinit();
 
@@ -277,40 +288,46 @@ pub const BuiltinTools = struct {
         try registry.append(self.allocator, ToolDefinition.init(self.read, .{
             .name = "read",
             .label = "read",
-            .description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit.",
-            .prompt_snippet = "Read a file with bounded output and optional line range.",
+            .description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit. Use offset/limit to continue large files.",
+            .prompt_snippet = "Read file contents. Use offset/limit for large files; continue with offset when needed.",
+            .display = .{ .presentation = .file, .body_mode = .hidden_on_success },
         }));
         try registry.append(self.allocator, ToolDefinition.init(self.ls, .{
             .name = "ls",
             .label = "ls",
             .description = "List one directory with bounded output.",
-            .prompt_snippet = "List one directory with bounded output.",
+            .prompt_snippet = "List one directory. Prefer this over bash ls for directory inspection.",
+            .display = .{ .presentation = .directory },
         }));
         try registry.append(self.allocator, ToolDefinition.init(self.grep, .{
             .name = "grep",
             .label = "grep",
             .description = "Search files for a literal text pattern with bounded output.",
-            .prompt_snippet = "Search files for literal text with bounded output.",
+            .prompt_snippet = "Search files for literal text. Prefer this over bash grep for simple searches.",
+            .display = .{ .presentation = .search },
         }));
         try registry.append(self.allocator, ToolDefinition.init(self.find, .{
             .name = "find",
             .label = "find",
             .description = "Recursively find paths under a directory with bounded output.",
-            .prompt_snippet = "Find paths under a directory with bounded output.",
+            .prompt_snippet = "Find paths under a directory. Prefer this over bash find for simple path discovery.",
+            .display = .{ .presentation = .directory },
         }));
         try registry.append(self.allocator, ToolDefinition.init(self.bash, .{
             .name = "bash",
             .label = "bash",
-            .description = "Run one shell command in the session cwd with timeout and bounded output.",
-            .prompt_snippet = "Run one shell command in the session cwd. Prefer file tools for simple file work.",
+            .description = "Run one shell command in the session cwd. Supports optional timeout in seconds. Output is bounded.",
+            .prompt_snippet = "Run one shell command in the session cwd. Prefer read/ls/grep/find/edit/write for file work.",
             .execution_mode = .sequential,
+            .display = .{ .presentation = .command },
         }));
         try registry.append(self.allocator, ToolDefinition.init(self.edit, .{
             .name = "edit",
             .label = "edit",
             .description = "Edit a single file using exact, unique, non-overlapping text replacements.",
-            .prompt_snippet = "Edit a file using exact unique text replacements.",
+            .prompt_snippet = "Edit a file using exact unique text replacements. Use one call for multiple disjoint edits.",
             .execution_mode = .sequential,
+            .display = .{ .presentation = .patch, .body_mode = .hidden_on_success },
         }));
         try registry.append(self.allocator, ToolDefinition.init(self.write, .{
             .name = "write",
@@ -318,6 +335,7 @@ pub const BuiltinTools = struct {
             .description = "Create or overwrite a text file. Creates parent directories as needed.",
             .prompt_snippet = "Create or overwrite a text file, creating parent directories as needed.",
             .execution_mode = .sequential,
+            .display = .{ .presentation = .file, .body_mode = .visible },
         }));
     }
 };
@@ -357,6 +375,9 @@ test "tool registry stores definitions first and exposes active agent tools" {
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[4].execution_mode.?);
     try std.testing.expectEqualStrings("edit", registry.activeAgentTools()[5].name);
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[5].execution_mode.?);
+    try std.testing.expectEqual(ToolDisplayPresentation.command, registry.definitions.items[4].metadata.display.presentation);
+    try std.testing.expectEqual(ToolDisplayPresentation.patch, registry.definitions.items[5].metadata.display.presentation);
+    try std.testing.expectEqual(ToolDisplayBodyMode.visible, registry.definitions.items[6].metadata.display.body_mode);
 }
 
 test "tool registry rejects duplicate and unknown tool names without changing active set" {

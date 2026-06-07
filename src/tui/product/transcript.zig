@@ -8,7 +8,7 @@ pub const append_size_bytes_max: usize = 8 * 1024;
 
 pub const TranscriptRole = enum { user, assistant, system, thinking };
 pub const TranscriptStatusLevel = enum { info, warning, err };
-pub const TranscriptToolKind = enum { generic, bash, read, edit };
+pub const TranscriptToolPresentation = enum { generic, command, file, patch, search, directory };
 pub const TranscriptToolStatus = enum { pending, success, err };
 pub const TranscriptToolBodyMode = enum { visible, hidden_on_success };
 
@@ -31,10 +31,11 @@ pub const TranscriptAppend = union(enum) {
     pub const ToolAppend = struct {
         tool_call_id: []const u8,
         name: []const u8,
-        kind: TranscriptToolKind = .generic,
+        presentation: TranscriptToolPresentation = .generic,
         status: TranscriptToolStatus = .pending,
         body_mode: TranscriptToolBodyMode = .visible,
         title: []const u8 = "",
+        call_preview: []const u8 = "",
     };
 };
 
@@ -43,10 +44,11 @@ pub const TranscriptStatus = struct { level: TranscriptStatusLevel, text: []u8 }
 pub const TranscriptTool = struct {
     tool_call_id: []u8,
     name: []u8,
-    kind: TranscriptToolKind,
+    presentation: TranscriptToolPresentation,
     status: TranscriptToolStatus,
     body_mode: TranscriptToolBodyMode,
     title: []u8,
+    call_preview: []u8,
     output_preview: []u8,
     output_truncated_head_bytes: usize = 0,
     output_truncated_head_lines: usize = 0,
@@ -55,6 +57,7 @@ pub const TranscriptTool = struct {
         return self.tool_call_id.len +
             self.name.len +
             self.title.len +
+            self.call_preview.len +
             self.output_preview.len;
     }
 };
@@ -72,6 +75,7 @@ pub const TranscriptItem = union(enum) {
                 allocator.free(item.tool_call_id);
                 allocator.free(item.name);
                 allocator.free(item.title);
+                allocator.free(item.call_preview);
                 allocator.free(item.output_preview);
             },
         }
@@ -128,6 +132,27 @@ pub const TranscriptBuffer = struct {
         tool.output_preview = next.bytes;
         tool.output_truncated_head_bytes += dropped_head_bytes + next.dropped_bytes;
         tool.output_truncated_head_lines += dropped_head_lines + next.dropped_lines;
+        const next_size = tool.sizeBytes();
+        self.total_size_bytes = self.total_size_bytes - old_size + next_size;
+        self.evictUntilBounded(allocator);
+        self.noteMutation();
+    }
+
+    pub fn replaceToolCallPreview(
+        self: *TranscriptBuffer,
+        allocator: std.mem.Allocator,
+        tool_call_id: []const u8,
+        preview: []const u8,
+    ) !void {
+        if (preview.len > append_size_bytes_max) return error.TranscriptAppendTooLarge;
+        if (!std.unicode.utf8ValidateSlice(tool_call_id) or !std.unicode.utf8ValidateSlice(preview)) return error.InvalidUtf8;
+        const index = self.findTool(tool_call_id) orelse return;
+        const tool = &self.items.items[index].tool;
+        const old_size = tool.sizeBytes();
+        const copy = try allocator.dupe(u8, preview);
+        errdefer allocator.free(copy);
+        allocator.free(tool.call_preview);
+        tool.call_preview = copy;
         const next_size = tool.sizeBytes();
         self.total_size_bytes = self.total_size_bytes - old_size + next_size;
         self.evictUntilBounded(allocator);
@@ -219,6 +244,7 @@ pub const TranscriptBuffer = struct {
             const next_size = tool_call_id.len +
                 name.len +
                 next_title.len +
+                old.call_preview.len +
                 old.output_preview.len;
             allocator.free(old.tool_call_id);
             allocator.free(old.name);
@@ -226,10 +252,11 @@ pub const TranscriptBuffer = struct {
             old.* = .{
                 .tool_call_id = tool_call_id,
                 .name = name,
-                .kind = tool.kind,
+                .presentation = tool.presentation,
                 .status = mergeToolStatus(old.status, tool.status),
                 .body_mode = tool.body_mode,
                 .title = next_title,
+                .call_preview = old.call_preview,
                 .output_preview = old.output_preview,
                 .output_truncated_head_bytes = old.output_truncated_head_bytes,
                 .output_truncated_head_lines = old.output_truncated_head_lines,
@@ -239,16 +266,19 @@ pub const TranscriptBuffer = struct {
             return;
         }
 
+        const call_preview = try allocator.dupe(u8, tool.call_preview);
+        errdefer allocator.free(call_preview);
         const output_preview = try allocator.dupe(u8, "");
         errdefer allocator.free(output_preview);
         try self.items.append(allocator, .{
             .tool = .{
                 .tool_call_id = tool_call_id,
                 .name = name,
-                .kind = tool.kind,
+                .presentation = tool.presentation,
                 .status = tool.status,
                 .body_mode = tool.body_mode,
                 .title = title,
+                .call_preview = call_preview,
                 .output_preview = output_preview,
             },
         });
@@ -374,6 +404,22 @@ test "transcript preserves tool display text when completion updates status" {
     try std.testing.expectEqual(@as(usize, 1), buffer.items.items.len);
     try std.testing.expectEqual(.success, buffer.items.items[0].tool.status);
     try std.testing.expectEqualStrings("zig build test", buffer.items.items[0].tool.title);
+}
+
+test "transcript replaces tool call preview separately from result output" {
+    var buffer: TranscriptBuffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+
+    try buffer.append(std.testing.allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "write",
+        .status = .pending,
+    } });
+    try buffer.replaceToolCallPreview(std.testing.allocator, "call-1", "one\ntwo");
+    try buffer.appendToolOutput(std.testing.allocator, "call-1", "error", 0, 0);
+
+    try std.testing.expectEqualStrings("one\ntwo", buffer.items.items[0].tool.call_preview);
+    try std.testing.expectEqualStrings("error", buffer.items.items[0].tool.output_preview);
 }
 
 test "transcript accounts dropped tool output before transcript preview" {

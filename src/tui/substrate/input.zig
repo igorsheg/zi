@@ -282,3 +282,61 @@ test "input decoder reprocesses byte after invalid utf8 continuation" {
     try std.testing.expect(ev[0] == .malformed);
     try std.testing.expectEqualStrings("a", ev[1].text.slice());
 }
+
+test "input decoder keeps incomplete csi buffered until final byte" {
+    var d: InputDecoder = .{};
+    var ev: [2]InputEvent = undefined;
+
+    try std.testing.expectEqual(@as(usize, 0), d.feed("\x1b[3", &ev).count);
+    try std.testing.expectEqual(@as(usize, 1), d.feed("~", &ev).count);
+    try std.testing.expect(ev[0].key == .delete);
+}
+
+test "input decoder consumes unknown complete csi" {
+    var d: InputDecoder = .{};
+    var ev: [1]InputEvent = undefined;
+
+    try std.testing.expectEqual(@as(usize, 1), d.feed("\x1b[?25h", &ev).count);
+    try std.testing.expect(ev[0] == .unknown);
+    try std.testing.expectEqualStrings("\x1b[?25h", ev[0].unknown.slice());
+
+    try std.testing.expectEqual(@as(usize, 1), d.feed("a", &ev).count);
+    try std.testing.expectEqualStrings("a", ev[0].text.slice());
+}
+
+test "input decoder reports output overflow without dropping decoder state" {
+    var d: InputDecoder = .{};
+    var ev: [1]InputEvent = undefined;
+
+    const status = d.feed("ab", &ev);
+    try std.testing.expectEqual(@as(usize, 1), status.count);
+    try std.testing.expect(status.overflow);
+    try std.testing.expectEqualStrings("a", ev[0].text.slice());
+
+    try std.testing.expectEqual(@as(usize, 1), d.feed("c", &ev).count);
+    try std.testing.expectEqualStrings("c", ev[0].text.slice());
+}
+
+test "input decoder reports oversized escape as truncated" {
+    var d: InputDecoder = .{};
+    var ev: [1]InputEvent = undefined;
+    var bytes: [escape_sequence_size_max + 1]u8 = undefined;
+    @memset(&bytes, '0');
+    bytes[0] = 0x1b;
+    bytes[1] = '[';
+
+    const status = d.feed(&bytes, &ev);
+    try std.testing.expectEqual(@as(usize, 1), status.count);
+    try std.testing.expect(status.truncated);
+    try std.testing.expect(ev[0] == .truncated);
+    try std.testing.expectEqual(@as(usize, escape_sequence_size_max), ev[0].truncated.slice().len);
+}
+
+test "input decoder maps bracketed paste boundaries" {
+    var d: InputDecoder = .{};
+    var ev: [2]InputEvent = undefined;
+
+    try std.testing.expectEqual(@as(usize, 2), d.feed("\x1b[200~\x1b[201~", &ev).count);
+    try std.testing.expect(ev[0] == .paste_begin);
+    try std.testing.expect(ev[1] == .paste_end);
+}

@@ -30,7 +30,8 @@ pub const BaseOptions = struct {
     get_api_key: ?agent_mod.GetApiKeyHook = null,
     zio_runtime: *runtime.Runtime,
     dir: std.Io.Dir = .cwd(),
-    allow_paths_outside_cwd: bool = false,
+    environ: ?*const std.process.Environ.Map = null,
+    allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
@@ -108,6 +109,11 @@ pub fn sessionHeader(self: *const AgentSessionRuntimeHost) session_manager.Sessi
 
 pub fn sessionId(self: *const AgentSessionRuntimeHost) []const u8 {
     return self.session.manager.header.id;
+}
+
+pub fn findToolMetadata(self: *const AgentSessionRuntimeHost, name: []const u8) ?tool_registry.ToolMetadata {
+    const definition = self.session.tools.findDefinition(name) orelse return null;
+    return definition.metadata;
 }
 
 pub fn publicHistorySnapshot(
@@ -268,6 +274,7 @@ fn buildSessionOptions(base: BaseOptions, start: SessionStart) AgentSession.Opti
         .get_api_key = base.get_api_key,
         .zio_runtime = base.zio_runtime,
         .dir = base.dir,
+        .environ = base.environ,
         .allow_paths_outside_cwd = base.allow_paths_outside_cwd,
         .public_event_capacity = base.public_event_capacity,
     };

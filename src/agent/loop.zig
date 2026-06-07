@@ -274,7 +274,7 @@ fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
     };
 }
 
-const stream_tool_argument_preview_bytes_max: usize = 512;
+const stream_tool_argument_preview_bytes_max: usize = 8 * 1024;
 
 fn copyCompactAssistantMessageEvent(
     allocator: std.mem.Allocator,
@@ -291,9 +291,18 @@ fn copyCompactAssistantMessageEvent(
             .delta = try allocator.dupe(u8, event.delta),
             .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .thinking),
         } },
+        .toolcall_start => |event| .{ .toolcall_start = .{
+            .content_index = event.content_index,
+            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call),
+        } },
         .toolcall_delta => |event| .{ .toolcall_delta = .{
             .content_index = event.content_index,
             .delta = try allocator.dupe(u8, event.delta),
+            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call),
+        } },
+        .toolcall_end => |event| .{ .toolcall_end = .{
+            .content_index = event.content_index,
+            .tool_call = try copyToolCallPreview(allocator, event.tool_call),
             .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call),
         } },
         else => ai.owned.copyAssistantMessageEvent(allocator, source),
@@ -334,26 +343,29 @@ fn copyDeltaContent(
 
 fn copyToolCallPreviewContent(allocator: std.mem.Allocator, target: ai.AssistantContent) !ai.AssistantContent {
     if (target != .tool_call) return .{ .text = .{ .text = "" } };
-    const tool_call = target.tool_call;
+    return .{ .tool_call = try copyToolCallPreview(allocator, target.tool_call) };
+}
+
+fn copyToolCallPreview(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
     const id = try allocator.dupe(u8, tool_call.id);
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, tool_call.name);
     errdefer allocator.free(name);
     const arguments = try copyToolArgumentPreview(allocator, tool_call.arguments);
     errdefer runtime.freeJsonValue(allocator, arguments);
-    return .{ .tool_call = .{
+    return .{
         .id = id,
         .name = name,
         .arguments = arguments,
         .thought_signature = null,
-    } };
+    };
 }
 
 fn copyToolArgumentPreview(allocator: std.mem.Allocator, arguments: std.json.Value) !std.json.Value {
     if (arguments != .object) return .null;
     var object: std.json.ObjectMap = .empty;
     errdefer runtime.freeJsonValue(allocator, .{ .object = object });
-    const keys = [_][]const u8{ "command", "path", "pattern", "name" };
+    const keys = [_][]const u8{ "command", "path", "pattern", "name", "content" };
     for (keys) |key| {
         const value = arguments.object.get(key) orelse continue;
         if (value != .string) continue;
@@ -1697,6 +1709,7 @@ test "stream event copy bounds delta partial to changed content" {
     var args = std.json.ObjectMap.empty;
     defer args.deinit(std.testing.allocator);
     try args.put(std.testing.allocator, "command", .{ .string = "echo hi" });
+    try args.put(std.testing.allocator, "content", .{ .string = "large write content must not be copied on each delta" ** 512 });
 
     const content = [_]ai.AssistantContent{
         .{ .text = .{ .text = "large prior text that should not be copied into delta partial" } },
@@ -1731,6 +1744,9 @@ test "stream event copy bounds delta partial to changed content" {
     try std.testing.expectEqualStrings("", copied_partial.content[0].text.text);
     try std.testing.expect(copied_partial.content[1] == .tool_call);
     try std.testing.expectEqualStrings("bash", copied_partial.content[1].tool_call.name);
+    const preview = copied_partial.content[1].tool_call.arguments.object.get("content").?;
+    try std.testing.expect(preview == .string);
+    try std.testing.expectEqual(@as(usize, stream_tool_argument_preview_bytes_max), preview.string.len);
 }
 
 fn userMessage(text: []const u8) agent.AgentMessage {

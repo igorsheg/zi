@@ -121,7 +121,28 @@ fn execute(
     const result_content = try allocator.alloc(ai.ToolResultContent, 1);
     errdefer allocator.free(result_content);
     result_content[0] = .{ .text = .{ .text = text } };
-    return .{ .allocator = allocator, .result = .{ .content = result_content } };
+    return .{ .allocator = allocator, .result = .{
+        .content = result_content,
+        .details = try findDetails(allocator, emitted, truncated, self.config.max_entries),
+    } };
+}
+
+fn findDetails(
+    allocator: std.mem.Allocator,
+    entries: usize,
+    truncated: bool,
+    max_entries_value: usize,
+) !std.json.Value {
+    var object: std.json.ObjectMap = .empty;
+    errdefer object.deinit(allocator);
+    try path_utils.putJsonField(allocator, &object, "entries", .{ .integer = @intCast(entries) });
+    var truncation: std.json.ObjectMap = .empty;
+    errdefer truncation.deinit(allocator);
+    try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = truncated });
+    try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", "entries");
+    try path_utils.putJsonField(allocator, &truncation, "maxEntries", .{ .integer = @intCast(max_entries_value) });
+    try path_utils.putJsonField(allocator, &object, "truncation", .{ .object = truncation });
+    return .{ .object = object };
 }
 
 fn parseArgs(params: std.json.Value) !Args {

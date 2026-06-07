@@ -3,6 +3,7 @@ const mem = @import("../../runtime/root.zig");
 const owned = @import("../owned.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
+const json_parse = @import("../utils/json_parse.zig");
 
 pub const default_api = "faux";
 pub const default_provider = "faux";
@@ -360,6 +361,7 @@ const PartialBuilder = struct {
     partial: protocol.AssistantMessage,
     text_bytes: mem.ByteBuilder,
     thinking_bytes: mem.ByteBuilder,
+    tool_argument_bytes: mem.ByteBuilder,
     active: ActiveBlock = .none,
 
     const ActiveBlock = enum { none, text, thinking };
@@ -383,6 +385,7 @@ const PartialBuilder = struct {
                 .error_message = response.value.error_message,
                 .timestamp = response.value.timestamp,
             },
+            .tool_argument_bytes = mem.ByteBuilder.initBounded(allocator, maxToolArgumentBytes(response.value.content)),
         };
     }
 
@@ -431,7 +434,14 @@ const PartialBuilder = struct {
         } });
     }
 
+    fn appendToolArguments(self: *PartialBuilder, delta: []const u8) !void {
+        try self.tool_argument_bytes.append(delta);
+        var parsed = try json_parse.parseStreamingJson(self.allocator, self.tool_argument_bytes.items());
+        self.content.items[self.content.items.len - 1].tool_call.arguments = parsed.value();
+    }
+
     fn endToolCall(self: *PartialBuilder, call: protocol.ToolCall) void {
+        self.tool_argument_bytes.clearRetainingCapacity();
         self.content.items[self.content.items.len - 1] = .{ .tool_call = call };
     }
 
@@ -469,6 +479,19 @@ fn maxThinkingBlockBytes(content: []const protocol.AssistantContent) usize {
     return max;
 }
 
+fn maxToolArgumentBytes(content: []const protocol.AssistantContent) usize {
+    var max: usize = 0;
+    for (content) |block| switch (block) {
+        .tool_call => |call| {
+            var counting: std.Io.Writer.Discarding = .init(&.{});
+            std.json.Stringify.value(call.arguments, .{}, &counting.writer) catch {};
+            max = @max(max, counting.fullCount());
+        },
+        else => {},
+    };
+    return max;
+}
+
 fn emitDeltas(
     request: protocol.StreamRequest,
     sink: protocol.AssistantMessageEventSink,
@@ -479,6 +502,7 @@ fn emitDeltas(
 ) (protocol.AssistantMessageEventSinkEmitError || mem.ByteBuilder.Error || std.Io.Writer.Error || error{
     OperationCancelled,
     Canceled,
+    NoSpaceLeft,
 })!void {
     const io = request.io;
     const message = response.value;
@@ -536,7 +560,7 @@ fn emitDeltas(
                     sink,
                     index,
                     arguments_json,
-                    try partial.message(),
+                    &partial,
                     min_token_size,
                     max_token_size,
                     delay_per_delta_ms,
@@ -622,21 +646,23 @@ fn emitToolCallDeltas(
     sink: protocol.AssistantMessageEventSink,
     content_index: usize,
     value: []const u8,
-    partial: protocol.AssistantMessage,
+    partial: *PartialBuilder,
     min_token_size: usize,
     max_token_size: usize,
     delay_per_delta_ms: u32,
-) (protocol.AssistantMessageEventSinkEmitError || error{ OperationCancelled, Canceled })!void {
+) (protocol.AssistantMessageEventSinkEmitError || mem.ByteBuilder.Error || std.Io.Writer.Error || error{ OperationCancelled, Canceled, NoSpaceLeft })!void {
     const io = request.io;
     var index: usize = 0;
     while (index < value.len) {
         try waitBeforeDelta(request, delay_per_delta_ms);
         const char_size = @max(@as(usize, 1), nextTokenSize(min_token_size, max_token_size) * 4);
         const end = @min(value.len, index + char_size);
+        const delta = value[index..end];
+        try partial.appendToolArguments(delta);
         try sink.emit(io, .{ .toolcall_delta = .{
             .content_index = content_index,
-            .delta = value[index..end],
-            .partial = partial,
+            .delta = delta,
+            .partial = try partial.message(),
         } });
         index = end;
     }
@@ -899,7 +925,9 @@ test "faux provider streams tool call argument deltas" {
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.register(&registry);
-    const message = assistantMessage(&.{toolCall("tool-1", "echo", .{ .object = .empty })}, .{});
+    var args = try jsonObjectWithString(std.testing.allocator, "content", "one");
+    defer args.deinit(std.testing.allocator);
+    const message = assistantMessage(&.{toolCall("tool-1", "write", .{ .object = args })}, .{});
     try provider.setResponses(&.{message});
     var stream = registry.get(provider.api).?.stream.call(testRequest(zio_runtime, provider.getModel()));
 
@@ -907,10 +935,21 @@ test "faux provider streams tool call argument deltas" {
     const start = (try stream.next(std.Io.failing)).?.toolcall_start;
     try std.testing.expect(start.partial.content[0].tool_call.arguments == .object);
     try std.testing.expectEqual(@as(usize, 0), start.partial.content[0].tool_call.arguments.object.count());
-    const delta = (try stream.next(std.Io.failing)).?.toolcall_delta;
-    try std.testing.expectEqualStrings("{}", delta.delta);
-    const end = (try stream.next(std.Io.failing)).?.toolcall_end;
-    try std.testing.expectEqualStrings("echo", end.partial.content[0].tool_call.name);
+    var saw_preview = false;
+    while (try stream.next(std.Io.failing)) |event| {
+        if (event == .toolcall_delta) {
+            const delta = event.toolcall_delta;
+            try std.testing.expect(delta.delta.len > 0);
+            if (delta.partial.content[0].tool_call.arguments.object.get("content")) |value| {
+                if (value == .string and std.mem.eql(u8, value.string, "one")) saw_preview = true;
+            }
+            continue;
+        }
+        try std.testing.expect(event == .toolcall_end);
+        try std.testing.expectEqualStrings("write", event.toolcall_end.partial.content[0].tool_call.name);
+        break;
+    }
+    try std.testing.expect(saw_preview);
 }
 
 test "faux provider returns terminal error when queue is empty" {

@@ -18,6 +18,7 @@ pub const RuntimeServices = struct {
     auth_manager: *auth_mod.AuthManager,
     model_registry: model_registry_mod.ModelRegistry,
     provider_registry: ai.ProviderRegistry,
+    environ: ?*const std.process.Environ.Map,
     openai_provider: *ai.OpenAiResponsesProvider,
     openai_codex_provider: *ai.OpenAiCodexResponsesProvider,
     diagnostics: [diagnostic_capacity]Diagnostic = undefined,
@@ -87,6 +88,7 @@ pub const RuntimeServices = struct {
             .auth_manager = auth_manager,
             .model_registry = model_registry,
             .provider_registry = provider_registry,
+            .environ = options.environ,
             .openai_provider = openai_provider,
             .openai_codex_provider = openai_codex_provider,
         };

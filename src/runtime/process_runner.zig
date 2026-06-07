@@ -8,6 +8,7 @@ const Runtime = zio.Runtime;
 pub const RunOptions = struct {
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
+    environ: ?*const std.process.Environ.Map = null,
     timeout_ms: u64,
     termination_grace_ms: u64 = 100,
     max_stdout_bytes: usize,
@@ -83,6 +84,7 @@ pub fn run(
     var child = try std.process.spawn(io, .{
         .argv = options.argv,
         .cwd = if (options.cwd) |cwd| .{ .path = cwd } else .inherit,
+        .environ_map = options.environ,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,

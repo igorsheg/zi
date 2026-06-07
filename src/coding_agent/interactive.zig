@@ -7,6 +7,7 @@ const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
+const tool_registry = @import("tool_registry.zig");
 const sdk = @import("sdk.zig");
 
 pub const Options = struct {
@@ -30,6 +31,7 @@ const shutdown_drain_ticks_max = 30;
 const pending_tool_outputs_max = 32;
 const pending_tool_id_bytes_max = 128;
 const pending_tool_output_bytes_max = tui.product.transcript.append_size_bytes_max;
+const tool_call_mirrors_max = 32;
 const tool_title_bytes_max = 512;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
@@ -61,32 +63,68 @@ fn toolAppend(
     return .{ .tool = .{
         .tool_call_id = tool_call_id,
         .name = name,
-        .kind = toolKind(name),
+        .presentation = toolPresentation(name),
         .status = if (is_error) .err else status,
         .body_mode = toolBodyMode(name),
         .title = title,
     } };
 }
 
-fn toolKind(name: []const u8) tui.product.transcript.TranscriptToolKind {
-    if (std.mem.eql(u8, name, "bash")) return .bash;
-    if (std.mem.eql(u8, name, "read")) return .read;
-    if (std.mem.eql(u8, name, "edit")) return .edit;
+fn toolPresentation(name: []const u8) tui.product.transcript.TranscriptToolPresentation {
+    if (std.mem.eql(u8, name, "bash")) return .command;
+    if (std.mem.eql(u8, name, "read")) return .file;
+    if (std.mem.eql(u8, name, "edit")) return .patch;
+    if (std.mem.eql(u8, name, "write")) return .file;
+    if (std.mem.eql(u8, name, "grep")) return .search;
+    if (std.mem.eql(u8, name, "find")) return .directory;
+    if (std.mem.eql(u8, name, "ls")) return .directory;
     return .generic;
 }
 
 fn toolBodyMode(name: []const u8) tui.product.transcript.TranscriptToolBodyMode {
-    return switch (toolKind(name)) {
-        .read, .edit => .hidden_on_success,
-        .generic, .bash => .visible,
+    if (std.mem.eql(u8, name, "read") or
+        std.mem.eql(u8, name, "edit")) return .hidden_on_success;
+    return .visible;
+}
+
+fn tuiPresentation(presentation: tool_registry.ToolDisplayPresentation) tui.product.transcript.TranscriptToolPresentation {
+    return switch (presentation) {
+        .generic => .generic,
+        .command => .command,
+        .file => .file,
+        .patch => .patch,
+        .search => .search,
+        .directory => .directory,
+    };
+}
+
+fn tuiBodyMode(body_mode: tool_registry.ToolDisplayBodyMode) tui.product.transcript.TranscriptToolBodyMode {
+    return switch (body_mode) {
+        .visible => .visible,
+        .hidden_on_success => .hidden_on_success,
     };
 }
 
 fn toolArgsPreview(tool_name: []const u8, args_value: std.json.Value) []const u8 {
     if (std.mem.eql(u8, tool_name, "bash")) return boundedBashCommand(args_value);
-    if (std.mem.eql(u8, tool_name, "grep")) return boundedArgString(args_value, "pattern");
-    if (std.mem.eql(u8, tool_name, "find")) return boundedArgString(args_value, "name");
-    return boundedArgString(args_value, "path");
+    return switch (toolTitleShape(tool_name)) {
+        .path => boundedArgString(args_value, "path"),
+        .search => boundedPreferredArgTitle(args_value, "pattern", "path"),
+        .find => boundedPreferredArgTitle(args_value, "path", "name"),
+        .none => "",
+    };
+}
+
+const ToolTitleShape = enum { none, path, search, find };
+
+fn toolTitleShape(tool_name: []const u8) ToolTitleShape {
+    if (std.mem.eql(u8, tool_name, "read") or
+        std.mem.eql(u8, tool_name, "edit") or
+        std.mem.eql(u8, tool_name, "write") or
+        std.mem.eql(u8, tool_name, "ls")) return .path;
+    if (std.mem.eql(u8, tool_name, "grep")) return .search;
+    if (std.mem.eql(u8, tool_name, "find")) return .find;
+    return .none;
 }
 
 fn boundedBashCommand(args_value: std.json.Value) []const u8 {
@@ -95,11 +133,77 @@ fn boundedBashCommand(args_value: std.json.Value) []const u8 {
     return command;
 }
 
+fn boundedPreferredArgTitle(args_value: std.json.Value, first_key: []const u8, second_key: []const u8) []const u8 {
+    if (args_value != .object) return "";
+    const first = boundedArgString(args_value, first_key);
+    const second = boundedArgString(args_value, second_key);
+    if (first.len == 0) return second;
+    if (second.len == 0) return first;
+    return utf8Prefix(first, tool_title_bytes_max);
+}
+
 fn boundedArgString(args_value: std.json.Value, key: []const u8) []const u8 {
     if (args_value != .object) return "";
     const value = args_value.object.get(key) orelse return "";
     if (value != .string) return "";
     return utf8Prefix(value.string, tool_title_bytes_max);
+}
+
+const write_preview_lines_max = 10;
+
+const WritePreview = struct {
+    tool_call_id: []const u8,
+    text: []const u8,
+};
+
+fn writePreviewFromMessageUpdate(update: agent_mod.AgentEvent.MessageUpdate, buffer: []u8) ?WritePreview {
+    return switch (update.assistant_message_event) {
+        .toolcall_start => |payload| writePreviewFromPartial(payload.content_index, payload.partial, buffer),
+        .toolcall_delta => |payload| writePreviewFromPartial(payload.content_index, payload.partial, buffer),
+        .toolcall_end => |payload| writePreviewFromToolCall(payload.tool_call, buffer),
+        else => null,
+    };
+}
+
+fn writePreviewFromPartial(content_index: usize, partial: ai.AssistantMessage, buffer: []u8) ?WritePreview {
+    if (content_index >= partial.content.len) return null;
+    const content = partial.content[content_index];
+    if (content != .tool_call) return null;
+    return writePreviewFromToolCall(content.tool_call, buffer);
+}
+
+fn writePreviewFromToolCall(tool_call: ai.ToolCall, buffer: []u8) ?WritePreview {
+    if (!std.mem.eql(u8, tool_call.name, "write")) return null;
+    const preview = writeContentPreview(tool_call.arguments, buffer) orelse return null;
+    return .{ .tool_call_id = tool_call.id, .text = preview };
+}
+
+fn writeContentPreview(args_value: std.json.Value, buffer: []u8) ?[]const u8 {
+    if (args_value != .object) return null;
+    const value = args_value.object.get("content") orelse return null;
+    if (value != .string) return null;
+    const content = value.string;
+    if (content.len == 0) return null;
+
+    var writer: std.Io.Writer = .fixed(buffer);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var written_lines: usize = 0;
+    var total_lines: usize = 0;
+    while (lines.next()) |line| {
+        total_lines += 1;
+        if (written_lines < write_preview_lines_max) {
+            if (written_lines > 0) writer.writeByte('\n') catch return writer.buffered();
+            writer.writeAll(line) catch return writer.buffered();
+            written_lines += 1;
+        }
+    }
+    if (content.len > 0 and content[content.len - 1] == '\n' and total_lines > 0) total_lines -= 1;
+    if (total_lines > write_preview_lines_max) {
+        writer.print("\n... ({d} more lines, {d} total)", .{ total_lines - write_preview_lines_max, total_lines }) catch return writer.buffered();
+    } else {
+        writer.print("\n({d} total lines)", .{total_lines}) catch return writer.buffered();
+    }
+    return writer.buffered();
 }
 
 fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
@@ -132,6 +236,13 @@ const TranscriptIngest = union(enum) {
 fn toolOutputAppend(tool_call_id: []const u8, text: []const u8) ?TranscriptIngest {
     if (text.len == 0) return null;
     return .{ .tool_output_delta = .{ .tool_call_id = tool_call_id, .text = text } };
+}
+
+fn shouldAppendFinalToolOutput(tool_name: []const u8, is_error: bool) bool {
+    if (std.mem.eql(u8, tool_name, "bash")) return false;
+    if (std.mem.eql(u8, tool_name, "write") and !is_error) return false;
+    if (is_error) return true;
+    return toolBodyMode(tool_name) == .visible;
 }
 
 fn toolCallAppend(
@@ -267,6 +378,35 @@ fn isUtf8ContinuationByte(byte: u8) bool {
     return (byte & 0xc0) == 0x80;
 }
 
+const ToolCallMirror = struct {
+    tool_call_id: [pending_tool_id_bytes_max]u8 = undefined,
+    tool_call_id_len: usize = 0,
+    title: [tool_title_bytes_max]u8 = undefined,
+    title_len: usize = 0,
+
+    fn id(self: *const ToolCallMirror) []const u8 {
+        return self.tool_call_id[0..self.tool_call_id_len];
+    }
+
+    fn titleText(self: *const ToolCallMirror) []const u8 {
+        return self.title[0..self.title_len];
+    }
+
+    fn init(tool_call_id: []const u8, title: []const u8) ToolCallMirror {
+        var result: ToolCallMirror = .{};
+        result.tool_call_id_len = @min(tool_call_id.len, pending_tool_id_bytes_max);
+        @memcpy(result.tool_call_id[0..result.tool_call_id_len], tool_call_id[0..result.tool_call_id_len]);
+        result.setTitle(title);
+        return result;
+    }
+
+    fn setTitle(self: *ToolCallMirror, title: []const u8) void {
+        const bounded = utf8Prefix(title, tool_title_bytes_max);
+        self.title_len = bounded.len;
+        @memcpy(self.title[0..self.title_len], bounded);
+    }
+};
+
 const InteractiveLoop = struct {
     process: runtime.Process,
     host: *AgentSessionRuntimeHost,
@@ -279,6 +419,9 @@ const InteractiveLoop = struct {
     effects: [effect_count_max]tui.product.Effect = undefined,
     pending_tool_outputs: [pending_tool_outputs_max]PendingToolOutput = undefined,
     pending_tool_output_count: usize = 0,
+    tool_call_mirrors: [tool_call_mirrors_max]ToolCallMirror = undefined,
+    tool_call_mirror_count: usize = 0,
+    tool_metadata_lookup_enabled: bool = true,
 
     fn startPrompt(self: *InteractiveLoop, text: []const u8) !bool {
         if (self.active_run != null) {
@@ -454,14 +597,110 @@ const InteractiveLoop = struct {
     }
 
     fn applyPublicEventTranscript(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
+        if (event == .agent_event and event.agent_event.event == .message_update) {
+            if (transcriptAppendFromAgentEvent(event.agent_event.event)) |projection| {
+                try self.applyTranscriptProjection(projection);
+            }
+            var preview_buffer: [pending_tool_output_bytes_max]u8 = undefined;
+            if (writePreviewFromMessageUpdate(event.agent_event.event.message_update, &preview_buffer)) |preview| {
+                try self.replaceToolCallPreview(preview.tool_call_id, preview.text);
+            }
+            return;
+        }
+        if (event == .agent_event and event.agent_event.event == .tool_execution_start) {
+            const payload = event.agent_event.event.tool_execution_start;
+            if (transcriptAppendFromAgentEvent(event.agent_event.event)) |projection| {
+                try self.applyTranscriptProjection(projection);
+            }
+            if (std.mem.eql(u8, payload.tool_name, "write")) {
+                var preview_buffer: [pending_tool_output_bytes_max]u8 = undefined;
+                if (writeContentPreview(payload.args, &preview_buffer)) |preview| {
+                    try self.replaceToolCallPreview(payload.tool_call_id, preview);
+                }
+            }
+            return;
+        }
+        if (event == .agent_event and event.agent_event.event == .tool_execution_update) {
+            const payload = event.agent_event.event.tool_execution_update;
+            if (std.mem.eql(u8, payload.tool_name, "write")) {
+                try self.replaceToolCallPreview(payload.tool_call_id, "");
+            }
+            if (transcriptAppendFromAgentEvent(event.agent_event.event)) |projection| {
+                try self.applyTranscriptProjection(projection);
+            }
+            return;
+        }
+        if (event == .agent_event and event.agent_event.event == .tool_execution_end) {
+            const payload = event.agent_event.event.tool_execution_end;
+            if (transcriptAppendFromAgentEvent(event.agent_event.event)) |projection| {
+                try self.applyTranscriptProjection(projection);
+            }
+            if (shouldAppendFinalToolOutput(payload.tool_name, payload.is_error)) {
+                if (toolOutputAppend(payload.tool_call_id, firstToolResultText(payload.result))) |projection| {
+                    try self.applyTranscriptProjection(projection);
+                }
+            }
+            return;
+        }
         if (transcriptAppendFromEvent(event)) |projection| try self.applyTranscriptProjection(projection);
     }
 
     fn applyTranscriptProjection(self: *InteractiveLoop, projection: TranscriptIngest) !void {
         switch (projection) {
-            .append => |append| try self.appendTranscript(append),
+            .append => |append| try self.appendTranscript(self.applyToolCallMirror(append)),
             .tool_output_delta => |delta| try self.queueToolOutput(delta.tool_call_id, delta.text),
         }
+    }
+
+    fn applyToolCallMirror(self: *InteractiveLoop, append: TranscriptAppend) TranscriptAppend {
+        if (append != .tool) return append;
+        var next = append;
+        const tool = &next.tool;
+        if (self.tool_metadata_lookup_enabled) {
+            if (self.host.findToolMetadata(tool.name)) |metadata| {
+                tool.presentation = tuiPresentation(metadata.display.presentation);
+                tool.body_mode = tuiBodyMode(metadata.display.body_mode);
+            }
+        }
+        if (tool.tool_call_id.len > pending_tool_id_bytes_max) return next;
+        if (tool.title.len > 0) {
+            self.rememberToolTitle(tool.tool_call_id, tool.title);
+            return next;
+        }
+        if (self.findToolMirror(tool.tool_call_id)) |index| {
+            tool.title = self.tool_call_mirrors[index].titleText();
+        }
+        return next;
+    }
+
+    fn rememberToolTitle(self: *InteractiveLoop, tool_call_id: []const u8, title: []const u8) void {
+        if (self.findToolMirror(tool_call_id)) |index| {
+            self.tool_call_mirrors[index].setTitle(title);
+            return;
+        }
+        if (self.tool_call_mirror_count == self.tool_call_mirrors.len) {
+            self.removeToolMirror(0);
+        }
+        self.tool_call_mirrors[self.tool_call_mirror_count] = ToolCallMirror.init(tool_call_id, title);
+        self.tool_call_mirror_count += 1;
+    }
+
+    fn findToolMirror(self: *const InteractiveLoop, tool_call_id: []const u8) ?usize {
+        for (self.tool_call_mirrors[0..self.tool_call_mirror_count], 0..) |*mirror, index| {
+            if (std.mem.eql(u8, mirror.id(), tool_call_id)) return index;
+        }
+        return null;
+    }
+
+    fn removeToolMirror(self: *InteractiveLoop, index: usize) void {
+        std.debug.assert(index < self.tool_call_mirror_count);
+        const last = self.tool_call_mirror_count - 1;
+        if (index != last) self.tool_call_mirrors[index] = self.tool_call_mirrors[last];
+        self.tool_call_mirror_count = last;
+    }
+
+    fn replaceToolCallPreview(self: *InteractiveLoop, tool_call_id: []const u8, text: []const u8) !void {
+        try self.applyCommandDegrading(.{ .replace_tool_call_preview = .{ .tool_call_id = tool_call_id, .text = text } });
     }
 
     fn queueToolOutput(self: *InteractiveLoop, tool_call_id: []const u8, text: []const u8) !void {
@@ -785,6 +1024,8 @@ test "interactive maps tool events to typed transcript items" {
         tui.product.transcript.TranscriptToolStatus.pending,
         start.append.tool.status,
     );
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolPresentation.command, start.append.tool.presentation);
+    try std.testing.expectEqual(tui.product.transcript.TranscriptToolBodyMode.visible, start.append.tool.body_mode);
 
     const end = transcriptAppendFromAgentEvent(.{ .tool_execution_end = .{
         .tool_call_id = "1",
@@ -857,6 +1098,130 @@ test "interactive maps tool call deltas to pending tool row" {
     try std.testing.expectEqualStrings("bash", event.append.tool.name);
     try std.testing.expectEqualStrings("echo streaming", event.append.tool.title);
     try std.testing.expectEqual(tui.product.transcript.TranscriptToolStatus.pending, event.append.tool.status);
+}
+
+test "interactive maps builtin tools to neutral display metadata" {
+    const cases = [_]struct {
+        name: []const u8,
+        presentation: tui.product.transcript.TranscriptToolPresentation,
+        body_mode: tui.product.transcript.TranscriptToolBodyMode,
+    }{
+        .{ .name = "read", .presentation = .file, .body_mode = .hidden_on_success },
+        .{ .name = "edit", .presentation = .patch, .body_mode = .hidden_on_success },
+        .{ .name = "write", .presentation = .file, .body_mode = .visible },
+        .{ .name = "grep", .presentation = .search, .body_mode = .visible },
+        .{ .name = "find", .presentation = .directory, .body_mode = .visible },
+        .{ .name = "ls", .presentation = .directory, .body_mode = .visible },
+        .{ .name = "custom", .presentation = .generic, .body_mode = .visible },
+    };
+    for (cases) |case| {
+        const event = transcriptAppendFromAgentEvent(.{ .tool_execution_start = .{
+            .tool_call_id = "1",
+            .tool_name = case.name,
+            .args = .null,
+        } }).?;
+        try std.testing.expect(event == .append);
+        try std.testing.expect(event.append == .tool);
+        try std.testing.expectEqual(case.presentation, event.append.tool.presentation);
+        try std.testing.expectEqual(case.body_mode, event.append.tool.body_mode);
+    }
+}
+
+test "interactive extracts write call preview from streamed tool args" {
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(std.testing.allocator);
+    try args.put(std.testing.allocator, "content", .{ .string = "one\ntwo" });
+    try args.put(std.testing.allocator, "path", .{ .string = "file.txt" });
+    const content = [_]ai.AssistantContent{.{ .tool_call = .{
+        .id = "call-1",
+        .name = "write",
+        .arguments = .{ .object = args },
+    } }};
+    const partial = testAssistantMessage(&content);
+    var buffer: [pending_tool_output_bytes_max]u8 = undefined;
+    const preview = writePreviewFromMessageUpdate(.{
+        .message = .{ .assistant = partial },
+        .assistant_message_event = .{ .toolcall_delta = .{
+            .content_index = 0,
+            .delta = "two",
+            .partial = partial,
+        } },
+    }, &buffer).?;
+    try std.testing.expectEqualStrings("call-1", preview.tool_call_id);
+    try std.testing.expectEqualStrings("one\ntwo\n(2 total lines)", preview.text);
+}
+
+test "interactive appends final output for non-streaming visible tools" {
+    var terminal_loop = try tui.product.TerminalLoop.init(
+        std.testing.allocator,
+        std.testing.io,
+        40,
+        8,
+        tui.product.loop.output_size_bytes_default,
+    );
+    defer terminal_loop.deinit();
+
+    var loop: InteractiveLoop = undefined;
+    loop.terminal_loop = &terminal_loop;
+    loop.pending_tool_output_count = 0;
+    loop.tool_call_mirror_count = 0;
+    loop.tool_metadata_lookup_enabled = false;
+
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = "a.txt\nb.txt" } }};
+    var event = session_events.AgentSessionEvent{ .agent_event = try session_events.OwnedAgentEvent.init(
+        std.testing.allocator,
+        .{ .tool_execution_end = .{
+            .tool_call_id = "call-1",
+            .tool_name = "ls",
+            .result = .{ .content = &content },
+            .is_error = false,
+        } },
+    ) };
+    defer event.deinit();
+
+    try loop.applyPublicEventTranscript(event);
+    try loop.flushToolOutputCoalescer();
+
+    try std.testing.expectEqual(@as(usize, 1), terminal_loop.product.app.transcript.items.items.len);
+    const tool = terminal_loop.product.app.transcript.items.items[0].tool;
+    try std.testing.expectEqualStrings("ls", tool.name);
+    try std.testing.expectEqualStrings("a.txt\nb.txt", tool.output_preview);
+}
+
+test "interactive does not duplicate final bash output after streaming updates" {
+    try std.testing.expect(!shouldAppendFinalToolOutput("bash", false));
+    try std.testing.expect(shouldAppendFinalToolOutput("grep", false));
+    try std.testing.expect(shouldAppendFinalToolOutput("read", true));
+    try std.testing.expect(!shouldAppendFinalToolOutput("read", false));
+}
+
+test "interactive preserves mirrored tool title on terminal append" {
+    var loop: InteractiveLoop = undefined;
+    loop.tool_call_mirror_count = 0;
+    loop.tool_metadata_lookup_enabled = false;
+
+    const start = loop.applyToolCallMirror(.{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .presentation = .command,
+        .status = .pending,
+        .body_mode = .visible,
+        .title = "zig build test",
+    } });
+    try std.testing.expect(start == .tool);
+    try std.testing.expectEqualStrings("zig build test", start.tool.title);
+    try std.testing.expectEqual(@as(usize, 1), loop.tool_call_mirror_count);
+
+    const end = loop.applyToolCallMirror(.{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .presentation = .command,
+        .status = .success,
+        .body_mode = .visible,
+        .title = "",
+    } });
+    try std.testing.expect(end == .tool);
+    try std.testing.expectEqualStrings("zig build test", end.tool.title);
 }
 
 test "interactive maps tool args to bounded title" {

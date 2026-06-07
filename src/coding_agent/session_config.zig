@@ -13,7 +13,7 @@ pub const Options = struct {
     thinking_level: ?agent_mod.ThinkingLevel = null,
     stream: ?ai.StreamFunction = null,
     dir: std.Io.Dir = .cwd(),
-    allow_paths_outside_cwd: bool = false,
+    allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
@@ -32,6 +32,7 @@ pub fn resolve(services: *RuntimeServices, options: Options) AgentSessionRuntime
         .get_api_key = services.getApiKeyHook(),
         .zio_runtime = services.zio_runtime,
         .dir = options.dir,
+        .environ = services.environ,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
     };

@@ -161,3 +161,34 @@ test "terminal shutdown writes enabled teardown in order" {
         writer.buffered(),
     );
 }
+
+test "terminal shutdown disables all tracked modes once" {
+    var t = Terminal.initWithFds(std.testing.io, 0, 1);
+    t.alt_screen_active = true;
+    t.cursor_hidden = true;
+    t.bracketed_paste_active = true;
+    t.focus_active = true;
+    t.mouse_active = true;
+    t.synchronized_update_active = true;
+
+    var output: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output);
+    try t.shutdown(&writer);
+    try std.testing.expectEqualStrings(
+        ansi.end_synchronized_update ++ ansi.reset ++ ansi.show_cursor ++
+            ansi.disable_mouse ++ ansi.disable_focus ++ ansi.disable_bracketed_paste ++
+            ansi.leave_alt_screen,
+        writer.buffered(),
+    );
+    try std.testing.expect(!t.synchronized_update_active);
+    try std.testing.expect(!t.cursor_hidden);
+    try std.testing.expect(!t.mouse_active);
+    try std.testing.expect(!t.focus_active);
+    try std.testing.expect(!t.bracketed_paste_active);
+    try std.testing.expect(!t.alt_screen_active);
+
+    var second_output: [32]u8 = undefined;
+    var second_writer = std.Io.Writer.fixed(&second_output);
+    try t.shutdown(&second_writer);
+    try std.testing.expectEqualStrings(ansi.reset, second_writer.buffered());
+}

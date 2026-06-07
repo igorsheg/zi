@@ -24,7 +24,7 @@ pub const CreateRuntimeHostOptions = struct {
     dir: std.Io.Dir = .cwd(),
     environ: ?*const std.process.Environ.Map = null,
     zio_runtime: ?*runtime_mod.Runtime = null,
-    allow_paths_outside_cwd: bool = false,
+    allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
@@ -39,7 +39,7 @@ pub const ResumeRuntimeHostOptions = struct {
     dir: std.Io.Dir = .cwd(),
     environ: ?*const std.process.Environ.Map = null,
     zio_runtime: ?*runtime_mod.Runtime = null,
-    allow_paths_outside_cwd: bool = false,
+    allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 

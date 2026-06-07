@@ -147,28 +147,32 @@ const FormattedReadOutput = struct {
     fn details(self: FormattedReadOutput, allocator: std.mem.Allocator) !std.json.Value {
         var object: std.json.ObjectMap = .empty;
         errdefer object.deinit(allocator);
-        try path_utils.putJsonField(allocator, &object, "truncated", .{ .bool = self.truncated });
+        var truncation: std.json.ObjectMap = .empty;
+        errdefer truncation.deinit(allocator);
+        try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = self.truncated });
+        try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", "lines");
         try path_utils.putJsonField(
             allocator,
-            &object,
+            &truncation,
             "firstLineExceedsLimit",
             .{ .bool = self.first_line_exceeds_limit },
         );
         try path_utils.putJsonField(
             allocator,
-            &object,
+            &truncation,
             "outputLines",
             .{ .integer = @intCast(self.output_lines) },
         );
         try path_utils.putJsonField(
             allocator,
-            &object,
+            &truncation,
             "remainingLines",
             .{ .integer = @intCast(self.remaining_lines) },
         );
         if (self.next_offset) |next_offset| {
             try path_utils.putJsonField(allocator, &object, "nextOffset", .{ .integer = @intCast(next_offset) });
         }
+        try path_utils.putJsonField(allocator, &object, "truncation", .{ .object = truncation });
         return .{ .object = object };
     }
 };

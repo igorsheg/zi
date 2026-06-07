@@ -151,6 +151,20 @@ pub fn openTopLine(buffer: []u8, glyphs: BorderGlyphs, title: []const u8) ![]con
     return stream.buffered();
 }
 
+pub const OpenBlock = struct {
+    glyphs: BorderGlyphs = .rounded,
+    bottom_width: usize = 5,
+
+    pub fn bodyPrefix(self: OpenBlock) []const u8 {
+        _ = self;
+        return "│ ";
+    }
+
+    pub fn bottomLine(self: OpenBlock, buffer: []u8) ![]const u8 {
+        return openBottomLine(buffer, self.glyphs, self.bottom_width);
+    }
+};
+
 pub fn openBottomLine(buffer: []u8, glyphs: BorderGlyphs, width: usize) ![]const u8 {
     var stream = std.Io.Writer.fixed(buffer);
     try stream.writeAll(glyphs.bottom_left);
@@ -220,6 +234,9 @@ test "chrome builds open transcript lines" {
     var bottom_buffer: [32]u8 = undefined;
     var elision_buffer: [32]u8 = undefined;
     try std.testing.expectEqualStrings("╭─[tool]", try openTopLine(&top_buffer, .rounded, "tool"));
+    const block: OpenBlock = .{};
+    try std.testing.expectEqualStrings("│ ", block.bodyPrefix());
+    try std.testing.expectEqualStrings("╰────", try block.bottomLine(&bottom_buffer));
     try std.testing.expectEqualStrings("╰────", try openBottomLine(&bottom_buffer, .rounded, 5));
     try std.testing.expectEqualStrings("· ··· 8 earlier lines", (try elisionLine(&elision_buffer, 8, 0)).?);
 }

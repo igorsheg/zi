@@ -515,6 +515,7 @@ pub const ResponseStreamReducer = struct {
         if (self.current != .tool_call) return;
         const state = &self.current.tool_call;
         try state.partial_json.append(delta);
+        try self.parseStreamingToolArguments(state);
         try sink.emit(io, .{ .toolcall_delta = .{
             .content_index = state.content_index,
             .delta = try dupe(self, delta),
@@ -572,6 +573,11 @@ pub const ResponseStreamReducer = struct {
     fn parseToolArguments(self: *ResponseStreamReducer, state: *ToolCallState) !void {
         const parsed = try parseJsonValueLeaky(self.arena.allocator(), state.partial_json.items());
         self.content.items[state.content_index].tool_call.arguments = parsed;
+    }
+
+    fn parseStreamingToolArguments(self: *ResponseStreamReducer, state: *ToolCallState) !void {
+        const parsed = try json_parse.parseStreamingJson(self.arena.allocator(), state.partial_json.items());
+        self.content.items[state.content_index].tool_call.arguments = parsed.value();
     }
 
     fn applyCompleted(self: *ResponseStreamReducer, response: std.json.ObjectMap) !void {
@@ -752,6 +758,42 @@ test "responses reducer parses tool call arguments and maps stop to tool use" {
     try std.testing.expectEqualStrings("ok", call.arguments.object.get("text").?.string);
     try std.testing.expectEqual(protocol.StopReason.tool_use, result.stop_reason);
 }
+
+test "responses reducer exposes partial tool arguments during deltas" {
+    const model = testModel();
+    var reducer = ResponseStreamReducer.init(std.testing.allocator, model, 123);
+    defer reducer.deinit();
+    var stream = protocol.AssistantMessageEventStream.initBuffered();
+    const sink = stream.sink();
+
+    try sink.emit(std.Io.failing, .{ .start = .{ .partial = try reducer.partial() } });
+    try reducer.applySseData(std.Io.failing, sink,
+        \\{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write","arguments":""}}
+    );
+    try reducer.applySseData(std.Io.failing, sink,
+        \\{"type":"response.function_call_arguments.delta","delta":"{\"content\":\"one"}
+    );
+
+    var handler: ToolDeltaHandler = .{};
+    while (try stream.next(std.Io.failing)) |event| try handler.onAssistantMessageEvent(event);
+    try std.testing.expectEqualStrings("one", handler.content_preview.?);
+}
+
+const ToolDeltaHandler = struct {
+    content_preview: ?[]const u8 = null,
+
+    pub fn onAssistantMessageEvent(self: *ToolDeltaHandler, event: protocol.AssistantMessageEvent) !void {
+        if (event != .toolcall_delta) return;
+        const partial = event.toolcall_delta.partial;
+        if (partial.content.len == 0 or partial.content[0] != .tool_call) return;
+        const args = partial.content[0].tool_call.arguments;
+        if (args == .object) {
+            if (args.object.get("content")) |value| {
+                if (value == .string) self.content_preview = value.string;
+            }
+        }
+    }
+};
 
 const CountingHandler = struct {
     event_count: usize = 0,

@@ -56,7 +56,8 @@ pub const Options = struct {
     stream: ?ai.StreamFunction = null,
     get_api_key: ?agent_mod.GetApiKeyHook = null,
     dir: std.Io.Dir = .cwd(),
-    allow_paths_outside_cwd: bool = false,
+    environ: ?*const std.process.Environ.Map = null,
+    allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = public_event_capacity_default,
     session_store: ?session_store.SessionStore = null,
     resume_session_store: ?session_store.SessionStore = null,
@@ -163,6 +164,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
 
     var builtin_tools = try tool_registry.BuiltinTools.init(allocator, .{
         .cwd = options.cwd,
+        .environ = options.environ,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
     });
     errdefer builtin_tools.deinit();
