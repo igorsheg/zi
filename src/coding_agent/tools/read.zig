@@ -102,6 +102,9 @@ fn execute(
     if (detectImageMimeType(resolved_path, content)) |mime_type| {
         return imageReadResult(allocator, content, mime_type);
     }
+    if (!std.unicode.utf8ValidateSlice(content)) {
+        return invalidUtf8ReadResult(allocator);
+    }
 
     const formatted = try formatReadOutput(allocator, self.config, args, content);
     errdefer formatted.deinit(allocator);
@@ -120,6 +123,18 @@ const ReadArgs = struct {
     offset: ?usize,
     limit: ?usize,
 };
+
+fn invalidUtf8ReadResult(allocator: std.mem.Allocator) !agent.ToolExecutionResult {
+    const text = try allocator.dupe(u8, "[File omitted: content is not valid UTF-8 text.]");
+    errdefer allocator.free(text);
+    const result_content = try allocator.alloc(ai.ToolResultContent, 1);
+    errdefer allocator.free(result_content);
+    result_content[0] = .{ .text = .{ .text = text } };
+    return .{
+        .allocator = allocator,
+        .result = .{ .content = result_content, .details = null },
+    };
+}
 
 fn imageReadResult(
     allocator: std.mem.Allocator,
@@ -443,6 +458,44 @@ test "read tool reads bounded text with offset and limit" {
     try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
     try std.testing.expectEqual(@as(i64, 9), truncation.get("outputBytes").?.integer);
     try std.testing.expectEqual(@as(i64, max_output_bytes), truncation.get("maxBytes").?.integer);
+}
+
+test "read tool omits invalid utf8 text operationally" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/binary.dat", .data = "ok\xffbad" });
+
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    defer read_tool.deinit();
+
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try object.put(std.testing.allocator, "path", .{ .string = "binary.dat" });
+
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
+    var result = try execute(
+        std.testing.allocator,
+        zio_runtime.io(),
+        zio_runtime,
+        &read_tool,
+        cancel_source.token(),
+        "call-invalid-utf8",
+        .{ .object = object },
+        null,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "[File omitted: content is not valid UTF-8 text.]",
+        result.result.content[0].text.text,
+    );
 }
 
 test "read tool returns image attachment for supported image file" {
