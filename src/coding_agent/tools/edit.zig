@@ -397,6 +397,15 @@ fn captureEditUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult
     };
 }
 
+test "edit tool rejects no-op replacement" {
+    try std.testing.expectError(error.NoChanges, applyEdits(
+        std.testing.allocator,
+        "same",
+        &.{.{ .old_text = "same", .new_text = "same" }},
+        max_edit_output_bytes,
+    ));
+}
+
 test "edit tool streams utf8 safe edited content chunks" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
