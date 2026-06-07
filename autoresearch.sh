@@ -42,6 +42,10 @@ check_present "edit diff details test" "test .*diff|\"firstChangedLine\"|\"patch
 check_present "edit actionable duplicate/not-found errors" "duplicate|not found|NotFound|Duplicate" src/coding_agent/tools/edit.zig
 check_present "edit duplicate/not-found tests" "test .*duplicate|test .*not found|expectError\(error\.EditTextNotFoundOrNotUnique" src/coding_agent/tools/edit.zig
 
+# Read UX probes.
+check_present "read total bytes detail" "\"totalBytes\"|total_bytes" src/coding_agent/tools/read.zig
+check_present "read max bytes detail" "\"maxBytes\"|max_output_bytes" src/coding_agent/tools/read.zig
+
 # Write UX probes.
 check_present "write path detail" "\"path\"" src/coding_agent/tools/write.zig
 check_present "write path detail test" "details\.get\(\"path\"\)|\"path\"\)\.\?\.string" src/coding_agent/tools/write.zig
