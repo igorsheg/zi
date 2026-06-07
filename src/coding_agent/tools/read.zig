@@ -132,9 +132,12 @@ fn optionalPositiveInteger(value: ?std.json.Value) !?usize {
     return std.math.cast(usize, raw.integer) orelse error.InvalidToolArguments;
 }
 
+const ReadTruncatedBy = enum { lines, bytes };
+
 const FormattedReadOutput = struct {
     text: []const u8,
     truncated: bool,
+    truncated_by: ReadTruncatedBy,
     first_line_exceeds_limit: bool,
     output_lines: usize,
     remaining_lines: usize,
@@ -155,7 +158,10 @@ const FormattedReadOutput = struct {
         var truncation: std.json.ObjectMap = .empty;
         errdefer truncation.deinit(allocator);
         try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = self.truncated });
-        try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", "lines");
+        try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", switch (self.truncated_by) {
+            .lines => "lines",
+            .bytes => "bytes",
+        });
         try path_utils.putJsonField(
             allocator,
             &truncation,
@@ -230,6 +236,7 @@ fn formatReadOutput(
     var total_lines: usize = 0;
     var skipped_to_start = false;
     var first_line_exceeds_limit = false;
+    var truncated_by: ReadTruncatedBy = .lines;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| : (current_line += 1) {
@@ -240,7 +247,13 @@ fn formatReadOutput(
             remaining_lines += 1;
             continue;
         };
-        if (emitted_lines == config.max_output_lines or bytes_written + line.len + 1 > config.max_output_bytes) {
+        if (emitted_lines == config.max_output_lines) {
+            truncated_by = .lines;
+            remaining_lines += 1;
+            continue;
+        }
+        if (bytes_written + line.len + 1 > config.max_output_bytes) {
+            truncated_by = .bytes;
             if (emitted_lines == 0) first_line_exceeds_limit = true;
             remaining_lines += 1;
             continue;
@@ -272,6 +285,7 @@ fn formatReadOutput(
     return .{
         .text = try writer.toOwnedSlice(),
         .truncated = truncated,
+        .truncated_by = truncated_by,
         .first_line_exceeds_limit = first_line_exceeds_limit,
         .output_lines = emitted_lines,
         .remaining_lines = remaining_lines,
@@ -364,6 +378,10 @@ test "read tool reports first line exceeding output limit" {
         "[Line 1 exceeds 3 byte read limit. read returns complete lines only.]",
         formatted.text,
     );
+    const details = try formatted.details(std.testing.allocator);
+    defer agent.deinitJsonValue(std.testing.allocator, details);
+    const truncation = details.object.get("truncation").?.object;
+    try std.testing.expectEqualStrings("bytes", truncation.get("truncatedBy").?.string);
 }
 
 test "read tool rejects offset beyond end" {
