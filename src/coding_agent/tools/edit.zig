@@ -240,6 +240,7 @@ fn applyEdits(
     }
     const suffix = original[source_pos..];
     @memcpy(out[out_pos .. out_pos + suffix.len], suffix);
+    if (std.mem.eql(u8, out, original)) return error.NoChanges;
     return out;
 }
 
