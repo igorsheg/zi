@@ -34,8 +34,8 @@ check_present "edit BOM handling" "BOM|bom|utf8_bom" src/coding_agent/tools/edit
 check_present "edit BOM test" "test .*BOM|test .*bom" src/coding_agent/tools/edit.zig
 check_present "edit CRLF restoration" "CRLF|crlf|line_ending" src/coding_agent/tools/edit.zig
 check_present "edit CRLF test" "test .*CRLF|test .*crlf|test .*line ending" src/coding_agent/tools/edit.zig
-check_present "edit diff details" "firstChangedLine|unified|patch|diff" src/coding_agent/tools/edit.zig
-check_present "edit diff details test" "test .*diff|firstChangedLine" src/coding_agent/tools/edit.zig
+check_present "edit diff details" "\"firstChangedLine\"|\"patch\"|\"diff\"" src/coding_agent/tools/edit.zig
+check_present "edit diff details test" "test .*diff|\"firstChangedLine\"|\"patch\"" src/coding_agent/tools/edit.zig
 check_present "edit actionable duplicate/not-found errors" "duplicate|not found|NotFound|Duplicate" src/coding_agent/tools/edit.zig
 
 # Search/listing semantics probes.
