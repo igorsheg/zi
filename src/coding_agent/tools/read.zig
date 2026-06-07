@@ -99,6 +99,10 @@ fn execute(
     defer allocator.free(content);
     try token.throwIfRequested();
 
+    if (detectImageMimeType(resolved_path, content)) |mime_type| {
+        return imageReadResult(allocator, content, mime_type);
+    }
+
     const formatted = try formatReadOutput(allocator, self.config, args, content);
     errdefer formatted.deinit(allocator);
     const text = formatted.text;
@@ -116,6 +120,55 @@ const ReadArgs = struct {
     offset: ?usize,
     limit: ?usize,
 };
+
+fn imageReadResult(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    mime_type: []const u8,
+) !agent.ToolExecutionResult {
+    const encoded_len = std.base64.standard.Encoder.calcSize(content.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    errdefer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, content);
+
+    const note = try std.fmt.allocPrint(allocator, "Read image file [{s}]", .{mime_type});
+    errdefer allocator.free(note);
+    const mime = try allocator.dupe(u8, mime_type);
+    errdefer allocator.free(mime);
+
+    const result_content = try allocator.alloc(ai.ToolResultContent, 2);
+    errdefer allocator.free(result_content);
+    result_content[0] = .{ .text = .{ .text = note } };
+    result_content[1] = .{ .image = .{ .data = encoded, .mime_type = mime } };
+    return .{
+        .allocator = allocator,
+        .result = .{ .content = result_content, .details = null },
+    };
+}
+
+fn detectImageMimeType(path: []const u8, content: []const u8) ?[]const u8 {
+    if (hasPrefix(content, "\x89PNG\r\n\x1a\n")) return "image/png";
+    if (hasPrefix(content, "GIF87a") or hasPrefix(content, "GIF89a")) return "image/gif";
+    if (content.len >= 3 and content[0] == 0xff and content[1] == 0xd8 and content[2] == 0xff) return "image/jpeg";
+    if (isWebp(content)) return "image/webp";
+
+    if (std.ascii.endsWithIgnoreCase(path, ".png")) return "image/png";
+    if (std.ascii.endsWithIgnoreCase(path, ".gif")) return "image/gif";
+    if (std.ascii.endsWithIgnoreCase(path, ".jpg")) return "image/jpeg";
+    if (std.ascii.endsWithIgnoreCase(path, ".jpeg")) return "image/jpeg";
+    if (std.ascii.endsWithIgnoreCase(path, ".webp")) return "image/webp";
+    return null;
+}
+
+fn hasPrefix(content: []const u8, prefix: []const u8) bool {
+    return content.len >= prefix.len and std.mem.eql(u8, content[0..prefix.len], prefix);
+}
+
+fn isWebp(content: []const u8) bool {
+    return content.len >= 12 and
+        std.mem.eql(u8, content[0..4], "RIFF") and
+        std.mem.eql(u8, content[8..12], "WEBP");
+}
 
 fn parseArgs(params: std.json.Value) !ReadArgs {
     if (params != .object) return error.InvalidToolArguments;
@@ -390,6 +443,45 @@ test "read tool reads bounded text with offset and limit" {
     try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
     try std.testing.expectEqual(@as(i64, 9), truncation.get("outputBytes").?.integer);
     try std.testing.expectEqual(@as(i64, max_output_bytes), truncation.get("maxBytes").?.integer);
+}
+
+test "read tool returns image attachment for supported image file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    const png_header = "\x89PNG\r\n\x1a\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/image.png", .data = png_header });
+
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    defer read_tool.deinit();
+
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try object.put(std.testing.allocator, "path", .{ .string = "image.png" });
+
+    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
+    var result = try execute(
+        std.testing.allocator,
+        zio_runtime.io(),
+        zio_runtime,
+        &read_tool,
+        cancel_source.token(),
+        "call-image",
+        .{ .object = object },
+        null,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.result.content.len);
+    try std.testing.expectEqualStrings("Read image file [image/png]", result.result.content[0].text.text);
+    try std.testing.expectEqualStrings("image/png", result.result.content[1].image.mime_type);
+    try std.testing.expectEqualStrings("iVBORw0KGgo=", result.result.content[1].image.data);
 }
 
 test "read tool reports pi-style automatic truncation ranges" {
