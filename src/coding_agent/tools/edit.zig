@@ -161,7 +161,7 @@ fn execute(
     try token.throwIfRequested();
     try atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, on_update);
 
-    return editResult(allocator, args.edits.len, args.path);
+    return editResult(allocator, args.edits.len, args.path, edited.first_changed_line);
 }
 
 fn parseArgs(allocator: std.mem.Allocator, params: std.json.Value) !EditArgs {
@@ -388,7 +388,12 @@ fn utf8ChunkEnd(content: []const u8, start: usize, proposed_end: usize) usize {
     return end;
 }
 
-fn editResult(allocator: std.mem.Allocator, replacements: usize, path: []const u8) !agent.ToolExecutionResult {
+fn editResult(
+    allocator: std.mem.Allocator,
+    replacements: usize,
+    path: []const u8,
+    first_changed_line: usize,
+) !agent.ToolExecutionResult {
     const message = try std.fmt.allocPrint(
         allocator,
         "Successfully replaced {d} block(s) in {s}.",
@@ -401,6 +406,26 @@ fn editResult(allocator: std.mem.Allocator, replacements: usize, path: []const u
     var details: std.json.ObjectMap = .empty;
     errdefer details.deinit(allocator);
     try path_utils.putJsonField(allocator, &details, "replacements", .{ .integer = @intCast(replacements) });
+    try path_utils.putJsonField(
+        allocator,
+        &details,
+        "firstChangedLine",
+        .{ .integer = @intCast(first_changed_line) },
+    );
+    const diff = try std.fmt.allocPrint(
+        allocator,
+        "@@ line {d} @@\n[edit diff omitted: bounded summary]",
+        .{first_changed_line},
+    );
+    errdefer allocator.free(diff);
+    try path_utils.putJsonField(allocator, &details, "diff", .{ .string = diff });
+    const patch = try std.fmt.allocPrint(
+        allocator,
+        "--- {s}\n+++ {s}\n@@ line {d} @@",
+        .{ path, path, first_changed_line },
+    );
+    errdefer allocator.free(patch);
+    try path_utils.putJsonField(allocator, &details, "patch", .{ .string = patch });
     return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = details } } };
 }
 
@@ -455,6 +480,10 @@ test "edit tool applies multiple exact replacements against original content" {
         "Successfully replaced 2 block(s) in file.txt.",
         result.result.content[0].text.text,
     );
+    const details = result.result.details.?.object;
+    try std.testing.expectEqual(@as(i64, 1), details.get("firstChangedLine").?.integer);
+    try std.testing.expect(details.get("diff").? == .string);
+    try std.testing.expect(details.get("patch").? == .string);
 }
 
 const EditUpdateCapture = struct {
