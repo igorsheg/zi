@@ -163,21 +163,31 @@ fn imageReadResult(
 }
 
 fn detectImageMimeType(path: []const u8, content: []const u8) ?[]const u8 {
-    if (hasPrefix(content, "\x89PNG\r\n\x1a\n")) return "image/png";
-    if (hasPrefix(content, "GIF87a") or hasPrefix(content, "GIF89a")) return "image/gif";
-    if (content.len >= 3 and content[0] == 0xff and content[1] == 0xd8 and content[2] == 0xff) return "image/jpeg";
+    _ = path;
+    if (isJpeg(content)) return "image/jpeg";
+    if (isPng(content)) return "image/png";
+    if (hasPrefix(content, "GIF")) return "image/gif";
     if (isWebp(content)) return "image/webp";
-
-    if (std.ascii.endsWithIgnoreCase(path, ".png")) return "image/png";
-    if (std.ascii.endsWithIgnoreCase(path, ".gif")) return "image/gif";
-    if (std.ascii.endsWithIgnoreCase(path, ".jpg")) return "image/jpeg";
-    if (std.ascii.endsWithIgnoreCase(path, ".jpeg")) return "image/jpeg";
-    if (std.ascii.endsWithIgnoreCase(path, ".webp")) return "image/webp";
     return null;
 }
 
 fn hasPrefix(content: []const u8, prefix: []const u8) bool {
     return content.len >= prefix.len and std.mem.eql(u8, content[0..prefix.len], prefix);
+}
+
+fn isJpeg(content: []const u8) bool {
+    return content.len >= 4 and
+        content[0] == 0xff and
+        content[1] == 0xd8 and
+        content[2] == 0xff and
+        content[3] != 0xf7;
+}
+
+fn isPng(content: []const u8) bool {
+    return content.len >= 16 and
+        hasPrefix(content, "\x89PNG\r\n\x1a\n") and
+        std.mem.readInt(u32, content[8..12], .big) == 13 and
+        std.mem.eql(u8, content[12..16], "IHDR");
 }
 
 fn isWebp(content: []const u8) bool {
@@ -510,7 +520,7 @@ test "read tool returns image attachment for supported image file" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "repo");
-    const png_header = "\x89PNG\r\n\x1a\n";
+    const png_header = "\x89PNG\r\n\x1a\n" ++ "\x00\x00\x00\x0d" ++ "IHDR";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/image.png", .data = png_header });
 
     var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -541,7 +551,11 @@ test "read tool returns image attachment for supported image file" {
     try std.testing.expectEqual(@as(usize, 2), result.result.content.len);
     try std.testing.expectEqualStrings("Read image file [image/png]", result.result.content[0].text.text);
     try std.testing.expectEqualStrings("image/png", result.result.content[1].image.mime_type);
-    try std.testing.expectEqualStrings("iVBORw0KGgo=", result.result.content[1].image.data);
+    try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUg==", result.result.content[1].image.data);
+}
+
+test "read tool does not classify image extension without image signature" {
+    try std.testing.expectEqual(@as(?[]const u8, null), detectImageMimeType("fake.png", "not an image"));
 }
 
 test "read tool reports pi-style automatic truncation ranges" {
