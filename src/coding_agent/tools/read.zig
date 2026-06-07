@@ -138,9 +138,11 @@ const FormattedReadOutput = struct {
     first_line_exceeds_limit: bool,
     output_lines: usize,
     remaining_lines: usize,
+    total_lines: usize,
     total_bytes: usize,
     output_bytes: usize,
     max_bytes: usize,
+    max_lines: usize,
     next_offset: ?usize,
 
     fn deinit(self: FormattedReadOutput, allocator: std.mem.Allocator) void {
@@ -175,6 +177,12 @@ const FormattedReadOutput = struct {
         try path_utils.putJsonField(
             allocator,
             &truncation,
+            "totalLines",
+            .{ .integer = @intCast(self.total_lines) },
+        );
+        try path_utils.putJsonField(
+            allocator,
+            &truncation,
             "totalBytes",
             .{ .integer = @intCast(self.total_bytes) },
         );
@@ -189,6 +197,12 @@ const FormattedReadOutput = struct {
             &truncation,
             "maxBytes",
             .{ .integer = @intCast(self.max_bytes) },
+        );
+        try path_utils.putJsonField(
+            allocator,
+            &truncation,
+            "maxLines",
+            .{ .integer = @intCast(self.max_lines) },
         );
         if (self.next_offset) |next_offset| {
             try path_utils.putJsonField(allocator, &object, "nextOffset", .{ .integer = @intCast(next_offset) });
@@ -213,11 +227,13 @@ fn formatReadOutput(
     var last_emitted_line: ?usize = null;
     var bytes_written: usize = 0;
     var remaining_lines: usize = 0;
+    var total_lines: usize = 0;
     var skipped_to_start = false;
     var first_line_exceeds_limit = false;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| : (current_line += 1) {
+        total_lines += 1;
         if (current_line < start_line) continue;
         skipped_to_start = true;
         if (args.limit) |limit| if (emitted_lines == limit) {
@@ -259,9 +275,11 @@ fn formatReadOutput(
         .first_line_exceeds_limit = first_line_exceeds_limit,
         .output_lines = emitted_lines,
         .remaining_lines = remaining_lines,
+        .total_lines = total_lines,
         .total_bytes = content.len,
         .output_bytes = bytes_written,
         .max_bytes = config.max_output_bytes,
+        .max_lines = config.max_output_lines,
         .next_offset = next_offset,
     };
 }
@@ -305,6 +323,8 @@ test "read tool reads bounded text with offset and limit" {
         result.result.content[0].text.text,
     );
     const truncation = result.result.details.?.object.get("truncation").?.object;
+    try std.testing.expectEqual(@as(i64, 4), truncation.get("totalLines").?.integer);
+    try std.testing.expectEqual(@as(i64, max_output_lines), truncation.get("maxLines").?.integer);
     try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
     try std.testing.expectEqual(@as(i64, 9), truncation.get("outputBytes").?.integer);
     try std.testing.expectEqual(@as(i64, max_output_bytes), truncation.get("maxBytes").?.integer);
