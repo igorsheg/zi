@@ -330,7 +330,8 @@ fn formatReadOutput(
             remaining_lines += 1;
             continue;
         }
-        if (bytes_written + line.len + 1 > config.max_output_bytes) {
+        const separator_bytes: usize = if (emitted_lines == 0) 0 else 1;
+        if (bytes_written + separator_bytes + line.len > config.max_output_bytes) {
             output_truncated = true;
             truncated_by = .bytes;
             if (emitted_lines == 0) first_line_exceeds_limit = true;
@@ -626,6 +627,22 @@ test "read tool can reject paths outside cwd by config" {
         .{ .cwd = cwd_buffer[0..cwd], .allow_paths_outside_cwd = false },
         "../other/file.txt",
     ));
+}
+
+test "read tool allows first line exactly at byte limit" {
+    const formatted = try formatReadOutput(
+        std.testing.allocator,
+        .{ .cwd = "/repo", .max_output_bytes = 3 },
+        .{ .path = "file.txt", .offset = null, .limit = null },
+        "abc\nsecond",
+    );
+    defer formatted.deinit(std.testing.allocator);
+
+    try std.testing.expect(!formatted.first_line_exceeds_limit);
+    try std.testing.expectEqualStrings(
+        "abc\n\n[Showing lines 1-1 of 2 (3B limit). Use offset=2 to continue.]",
+        formatted.text,
+    );
 }
 
 test "read tool reports first line exceeding output limit" {
