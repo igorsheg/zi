@@ -19,14 +19,14 @@ const parameters_schema =
     \\{
     \\  "type": "object",
     \\  "properties": {
-    \\    "path": { "type": "string", "description": "Path to the file to edit" },
+    \\    "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
     \\    "edits": {
     \\      "type": "array",
     \\      "items": {
     \\        "type": "object",
     \\        "properties": {
-    \\          "oldText": { "type": "string" },
-    \\          "newText": { "type": "string" }
+    \\          "oldText": { "type": "string", "description": "Exact text to replace; must match uniquely" },
+    \\          "newText": { "type": "string", "description": "Replacement text" }
     \\        },
     \\        "required": ["oldText", "newText"]
     \\      }
@@ -76,7 +76,9 @@ pub const EditTool = struct {
     pub fn tool(self: *EditTool) agent.AgentTool {
         return .{
             .name = "edit",
-            .description = "Edit a single file using exact, unique, non-overlapping text replacements.",
+            .description = "Edit a single file using exact text replacement. " ++
+                "Every oldText must match a unique, non-overlapping region. " ++
+                "If changes touch nearby lines, merge them into one edit.",
             .parameters = self.parsed_parameters.value,
             .label = "edit",
             .execute = .{ .context = self, .call_fn = execute },
