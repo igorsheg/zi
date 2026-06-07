@@ -112,17 +112,6 @@ const TextShape = struct {
     line_ending: LineEnding,
 };
 
-const NormalizedReplacement = struct {
-    old_text: []u8,
-    new_text: []u8,
-
-    fn deinit(self: *NormalizedReplacement, allocator: std.mem.Allocator) void {
-        allocator.free(self.old_text);
-        allocator.free(self.new_text);
-        self.* = undefined;
-    }
-};
-
 const AppliedEdit = struct {
     normalized: []u8,
     restored: []u8,
@@ -167,10 +156,10 @@ fn execute(
         .limited(self.config.max_read_bytes),
     );
     defer allocator.free(original);
-    const edited = try applyEdits(allocator, original, args.edits, self.config.max_output_bytes);
-    defer allocator.free(edited);
+    var edited = try applyEditsPreservingTextShape(allocator, original, args.edits, self.config.max_output_bytes);
+    defer edited.deinit(allocator);
     try token.throwIfRequested();
-    try atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited, on_update);
+    try atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, on_update);
 
     return editResult(allocator, args.edits.len, args.path);
 }
@@ -198,12 +187,47 @@ fn parseReplacement(value: std.json.Value) !Replacement {
     return .{ .old_text = old_value.string, .new_text = new_value.string };
 }
 
+fn applyEditsPreservingTextShape(
+    allocator: std.mem.Allocator,
+    original: []const u8,
+    edits: []const Replacement,
+    max_output_bytes: usize,
+) !AppliedEdit {
+    const shape = detectTextShape(original);
+    const body = if (shape.has_bom) original[utf8_bom.len..] else original;
+    const normalized_original = try normalizeLineEndings(allocator, body);
+    defer allocator.free(normalized_original);
+
+    const normalized_edits = try allocator.alloc(Replacement, edits.len);
+    defer allocator.free(normalized_edits);
+    for (edits, normalized_edits) |edit, *normalized| {
+        normalized.old_text = try normalizeLineEndings(allocator, edit.old_text);
+        errdefer allocator.free(normalized.old_text);
+        normalized.new_text = try normalizeLineEndings(allocator, edit.new_text);
+        errdefer allocator.free(normalized.new_text);
+    }
+    defer for (normalized_edits) |normalized| {
+        allocator.free(normalized.old_text);
+        allocator.free(normalized.new_text);
+    };
+
+    const normalized = try applyEdits(allocator, normalized_original, normalized_edits, max_output_bytes);
+    errdefer allocator.free(normalized);
+    const restored = try restoreTextShape(allocator, normalized, shape, max_output_bytes);
+    errdefer allocator.free(restored);
+    return .{
+        .normalized = normalized,
+        .restored = restored,
+        .first_changed_line = firstChangedLine(normalized_original, normalized),
+    };
+}
+
 fn applyEdits(
     allocator: std.mem.Allocator,
     original: []const u8,
     edits: []const Replacement,
     max_output_bytes: usize,
-) ![]const u8 {
+) ![]u8 {
     var matches = try allocator.alloc(Match, edits.len);
     defer allocator.free(matches);
 
@@ -242,6 +266,61 @@ fn applyEdits(
     @memcpy(out[out_pos .. out_pos + suffix.len], suffix);
     if (std.mem.eql(u8, out, original)) return error.NoChanges;
     return out;
+}
+
+fn detectTextShape(original: []const u8) TextShape {
+    const has_bom = std.mem.startsWith(u8, original, utf8_bom);
+    const body = if (has_bom) original[utf8_bom.len..] else original;
+    return .{
+        .has_bom = has_bom,
+        .line_ending = if (std.mem.indexOf(u8, body, "\r\n") != null) .crlf else .lf,
+    };
+}
+
+fn normalizeLineEndings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\r') {
+            try writer.writer.writeByte('\n');
+            index += if (index + 1 < text.len and text[index + 1] == '\n') 2 else 1;
+        } else {
+            try writer.writer.writeByte(text[index]);
+            index += 1;
+        }
+    }
+    return writer.toOwnedSlice();
+}
+
+fn restoreTextShape(
+    allocator: std.mem.Allocator,
+    normalized: []const u8,
+    shape: TextShape,
+    max_output_bytes: usize,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    if (shape.has_bom) try writer.writer.writeAll(utf8_bom);
+    for (normalized) |byte| {
+        if (byte == '\n' and shape.line_ending == .crlf) {
+            try writer.writer.writeAll("\r\n");
+        } else {
+            try writer.writer.writeByte(byte);
+        }
+        if (writer.written().len > max_output_bytes) return error.EditTooLarge;
+    }
+    return writer.toOwnedSlice();
+}
+
+fn firstChangedLine(before: []const u8, after: []const u8) usize {
+    var line: usize = 1;
+    var index: usize = 0;
+    const limit = @min(before.len, after.len);
+    while (index < limit and before[index] == after[index]) : (index += 1) {
+        if (before[index] == '\n') line += 1;
+    }
+    return line;
 }
 
 fn findUnique(haystack: []const u8, needle: []const u8) ?usize {
@@ -395,6 +474,19 @@ fn captureEditUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult
         .text => |text| try capture.writer.writer.writeAll(text.text),
         .image => {},
     };
+}
+
+test "edit tool preserves BOM and CRLF while matching normalized text and tracks firstChangedLine" {
+    var edited = try applyEditsPreservingTextShape(
+        std.testing.allocator,
+        utf8_bom ++ "one\r\ntwo\r\n",
+        &.{.{ .old_text = "one\ntwo", .new_text = "1\n2" }},
+        max_edit_output_bytes,
+    );
+    defer edited.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(utf8_bom ++ "1\r\n2\r\n", edited.restored);
+    try std.testing.expectEqual(@as(usize, 1), edited.first_changed_line);
 }
 
 test "edit tool rejects no-op replacement" {
