@@ -37,7 +37,7 @@ check_present "edit CRLF test" "test .*CRLF|test .*crlf|test .*line ending" src/
 check_present "edit diff details" "\"firstChangedLine\"|\"patch\"|\"diff\"" src/coding_agent/tools/edit.zig
 check_present "edit actual diff markers" "\\+\\{|\\-\\{|writeAll\\(\"\\+|writeAll\\(\"-" src/coding_agent/tools/edit.zig
 check_absent "edit summary-only diff" "diff omitted|bounded summary" src/coding_agent/tools/edit.zig
-check_present "edit diff byte cap used" "max_diff_bytes" src/coding_agent/tools/edit.zig
+check_present "edit diff byte cap used" "diff\.len > max_diff_bytes|patch\.len > max_diff_bytes|truncate.*max_diff_bytes" src/coding_agent/tools/edit.zig
 check_present "edit diff details test" "test .*diff|\"firstChangedLine\"|\"patch\"" src/coding_agent/tools/edit.zig
 check_present "edit actionable duplicate/not-found errors" "duplicate|not found|NotFound|Duplicate" src/coding_agent/tools/edit.zig
 
