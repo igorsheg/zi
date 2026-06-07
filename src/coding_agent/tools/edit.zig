@@ -433,6 +433,7 @@ fn editResult(
     content[0] = .{ .text = .{ .text = message } };
     var details: std.json.ObjectMap = .empty;
     errdefer details.deinit(allocator);
+    try path_utils.putJsonStringField(allocator, &details, "path", path);
     try path_utils.putJsonField(allocator, &details, "replacements", .{ .integer = @intCast(replacements) });
     try path_utils.putJsonField(
         allocator,
@@ -513,6 +514,8 @@ test "edit tool applies multiple exact replacements against original content" {
         result.result.content[0].text.text,
     );
     const details = result.result.details.?.object;
+    try std.testing.expectEqualStrings("file.txt", details.get("path").?.string);
+    try std.testing.expectEqual(@as(i64, 2), details.get("replacements").?.integer);
     try std.testing.expectEqual(@as(i64, 1), details.get("firstChangedLine").?.integer);
     try std.testing.expect(details.get("diff").? == .string);
     try std.testing.expect(details.get("patch").? == .string);
