@@ -118,8 +118,6 @@ pub const SlotStore = struct {
             if (n == out.len) break;
             out[n] = .{
                 .priority = item.priority,
-                .owner = item.owner,
-                .id = item.id,
                 .text = item.text,
                 .effect = item.effect,
             };
@@ -164,8 +162,6 @@ pub const SlotStore = struct {
 
 pub const SlotView = struct {
     priority: i16,
-    owner: OwnerId,
-    id: ContributionId,
     text: []const u8,
     effect: RenderEffect,
 };
