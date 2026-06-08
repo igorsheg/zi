@@ -108,8 +108,8 @@ test "status area draws ordered contributions with separator" {
     var renderer = try infra.Renderer.init(std.testing.allocator, 20, 1, 20);
     defer renderer.deinit();
     const views = [_]slots.SlotView{
-        .{ .priority = 2, .owner = 1, .id = 1, .text = "one", .effect = .none, .animation_start_tick = 0 },
-        .{ .priority = 1, .owner = 1, .id = 2, .text = "two", .effect = .none, .animation_start_tick = 0 },
+        .{ .priority = 2, .owner = 1, .id = 1, .text = "one", .effect = .none },
+        .{ .priority = 1, .owner = 1, .id = 2, .text = "two", .effect = .none },
     };
     try draw(&renderer, theme_mod.Theme.codex(), 0, 20, &views, 0);
     try expectText(renderer.next, 0, 0, "one");

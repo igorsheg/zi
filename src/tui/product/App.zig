@@ -80,9 +80,7 @@ pub const ProductApp = struct {
                 return null;
             },
             .set_slot_contribution => |contribution| {
-                var timed_contribution = contribution;
-                timed_contribution.animation_start_tick = self.animation_tick;
-                try self.slots.set(allocator, timed_contribution);
+                try self.slots.set(allocator, contribution);
                 self.dirty = true;
                 return null;
             },

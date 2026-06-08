@@ -27,7 +27,6 @@ pub const SetContribution = struct {
     priority: i16 = 0,
     text: []const u8,
     effect: RenderEffect = .none,
-    animation_start_tick: u64 = 0,
 };
 
 pub const ClearContribution = struct {
@@ -43,7 +42,6 @@ const Contribution = struct {
     priority: i16,
     text: []u8,
     effect: RenderEffect,
-    animation_start_tick: u64,
 };
 
 pub const SlotStore = struct {
@@ -73,7 +71,6 @@ pub const SlotStore = struct {
                 .priority = update.priority,
                 .text = text,
                 .effect = update.effect,
-                .animation_start_tick = update.animation_start_tick,
             };
             allocator.free(old_text);
             return;
@@ -86,7 +83,6 @@ pub const SlotStore = struct {
             .priority = update.priority,
             .text = text,
             .effect = update.effect,
-            .animation_start_tick = update.animation_start_tick,
         };
         self.len += 1;
     }
@@ -130,7 +126,6 @@ pub const SlotStore = struct {
                 .id = item.id,
                 .text = item.text,
                 .effect = item.effect,
-                .animation_start_tick = item.animation_start_tick,
             };
             n += 1;
         }
@@ -177,7 +172,6 @@ pub const SlotView = struct {
     id: ContributionId,
     text: []const u8,
     effect: RenderEffect,
-    animation_start_tick: u64,
 };
 
 fn validateSet(update: SetContribution) !void {
