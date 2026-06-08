@@ -1062,7 +1062,51 @@ pub fn run(
     const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
     defer process.gpa.free(timestamp_text);
 
-    var host_handle = try createHost(process, stderr, options, timestamp_text, timestamp);
+    var host_handle = if (options.resume_session_file != null or options.resume_latest) blk: {
+        const session_file = sdk.selectRuntimeSession(process.gpa, process.io, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .dir = options.dir,
+            .environ = options.environ,
+            .explicit_file_name = options.resume_session_file,
+        }) catch |err| switch (err) {
+            error.InvalidSessionFileName => {
+                try stderr.writeAll("invalid resume session file\n");
+                return error.InvalidCliUsage;
+            },
+            error.SessionListTruncated => {
+                try stderr.writeAll("too many sessions to choose latest safely\n");
+                return error.InvalidCliUsage;
+            },
+            else => return err,
+        } orelse {
+            try stderr.writeAll("no resumable session found\n");
+            return error.NoResumableSession;
+        };
+        defer process.gpa.free(session_file);
+        break :blk try sdk.resumeRuntimeHost(process.gpa, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = timestamp_text,
+            .session_file_name = session_file,
+            .dir = options.dir,
+            .environ = options.environ,
+            .zio_runtime = process.zio_runtime,
+        });
+    } else blk: {
+        const session_id = try std.fmt.allocPrint(process.gpa, "interactive-{d}", .{timestamp});
+        defer process.gpa.free(session_id);
+        break :blk try sdk.createRuntimeHost(process.gpa, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = timestamp_text,
+            .session_id = session_id,
+            .timestamp = timestamp_text,
+            .dir = options.dir,
+            .environ = options.environ,
+            .zio_runtime = process.zio_runtime,
+        });
+    };
     defer host_handle.deinit();
 
     var terminal = tui.Terminal.init(process.io);
@@ -1150,60 +1194,6 @@ fn seedTranscriptFromSnapshot(
             ),
         });
     }
-}
-
-fn createHost(
-    process: runtime.Process,
-    stderr: *std.Io.Writer,
-    options: Options,
-    timestamp_text: []const u8,
-    timestamp: i128,
-) !sdk.RuntimeHostHandle {
-    if (options.resume_session_file != null or options.resume_latest) {
-        const session_file = sdk.selectRuntimeSession(process.gpa, process.io, .{
-            .cwd = options.cwd,
-            .agent_dir_override = options.agent_dir_override,
-            .dir = options.dir,
-            .environ = options.environ,
-            .explicit_file_name = options.resume_session_file,
-        }) catch |err| switch (err) {
-            error.InvalidSessionFileName => {
-                try stderr.writeAll("invalid resume session file\n");
-                return error.InvalidCliUsage;
-            },
-            error.SessionListTruncated => {
-                try stderr.writeAll("too many sessions to choose latest safely\n");
-                return error.InvalidCliUsage;
-            },
-            else => return err,
-        } orelse {
-            try stderr.writeAll("no resumable session found\n");
-            return error.NoResumableSession;
-        };
-        defer process.gpa.free(session_file);
-        return sdk.resumeRuntimeHost(process.gpa, .{
-            .cwd = options.cwd,
-            .agent_dir_override = options.agent_dir_override,
-            .current_date = timestamp_text,
-            .session_file_name = session_file,
-            .dir = options.dir,
-            .environ = options.environ,
-            .zio_runtime = process.zio_runtime,
-        });
-    }
-
-    const session_id = try std.fmt.allocPrint(process.gpa, "interactive-{d}", .{timestamp});
-    defer process.gpa.free(session_id);
-    return sdk.createRuntimeHost(process.gpa, .{
-        .cwd = options.cwd,
-        .agent_dir_override = options.agent_dir_override,
-        .current_date = timestamp_text,
-        .session_id = session_id,
-        .timestamp = timestamp_text,
-        .dir = options.dir,
-        .environ = options.environ,
-        .zio_runtime = process.zio_runtime,
-    });
 }
 
 test "interactive queued text restore joins steering follow-up and draft" {
