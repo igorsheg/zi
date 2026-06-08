@@ -7,7 +7,7 @@ const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_manager = @import("session_manager.zig");
 const settings_mod = @import("settings.zig");
 
-pub const Options = struct {
+const Options = struct {
     current_date: []const u8,
     model: ?ai.Model = null,
     thinking_level: ?agent_mod.ThinkingLevel = null,
