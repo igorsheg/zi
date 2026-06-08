@@ -418,10 +418,6 @@ pub fn startPromptRun(
     if (try self.tryHandlePromptCommand(&preflight)) return error.PromptCommandCannotStartLiveRun;
     if (try self.queuePromptIfStreaming(&preflight)) return error.PromptQueuedCannotStartLiveRun;
     try self.checkPrePromptCompaction();
-    return self.startPreparedPromptRun(&preflight);
-}
-
-fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight) !*LivePromptRun {
     const run = try self.allocator.create(LivePromptRun);
     errdefer self.allocator.destroy(run);
     run.* = .{};
