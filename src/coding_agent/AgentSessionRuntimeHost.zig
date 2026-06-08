@@ -55,10 +55,6 @@ pub const ReplaceResult = struct {
 pub const PublicEventHandler = struct {
     context: ?*anyopaque = null,
     call_fn: *const fn (context: ?*anyopaque, event: session_events.AgentSessionEvent) anyerror!void,
-
-    fn call(self: PublicEventHandler, event: session_events.AgentSessionEvent) anyerror!void {
-        try self.call_fn(self.context, event);
-    }
 };
 
 pub fn init(
@@ -200,7 +196,7 @@ pub fn drainPublicEvents(self: *AgentSessionRuntimeHost, handler: PublicEventHan
     while (self.drainPublicEvent()) |event| {
         var owned_event = event;
         defer owned_event.deinit();
-        try handler.call(owned_event);
+        try handler.call_fn(handler.context, owned_event);
         count += 1;
     }
     return count;
