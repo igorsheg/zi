@@ -479,7 +479,7 @@ test "runtime host owns current agent session public boundary" {
     try runPromptForTest(&host, "hello");
 
     try std.testing.expect(host.session.statusSnapshot().public_event_count > 0);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
+    try std.testing.expectEqual(.idle, host.session.statusSnapshot().status);
     try std.testing.expectEqual(tool_registry.default_active_tool_names.len, host.session.tools.activeToolNames().len);
 }
 
@@ -792,7 +792,7 @@ test "runtime host live run executes a tool and continues the assistant turn" {
     try std.testing.expect(observed.final_text_delta);
     try std.testing.expect(observed.agent_end_with_tool_result);
     try std.testing.expect(observed.agent_end);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
+    try std.testing.expectEqual(.idle, host.session.statusSnapshot().status);
 }
 
 test "runtime host applies prompt progress from zio stream future" {
@@ -895,7 +895,7 @@ test "runtime host compacts through public command boundary" {
     try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
     try std.testing.expectEqual(@as(usize, 4), host.session.manager.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), host.session.agent.state.messages.len);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
+    try std.testing.expectEqual(.idle, host.session.statusSnapshot().status);
 
     var start_event = host.session.drainPublicEvent().?;
     defer start_event.deinit();
@@ -1035,7 +1035,7 @@ test "runtime host preserves bash truncation details through public events" {
     // runtime output-limit failure for this size.
     try std.testing.expect(!observed.output_limit_exceeded);
     try std.testing.expect(observed.tool_result_message);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
+    try std.testing.expectEqual(.idle, host.session.statusSnapshot().status);
 }
 
 test "runtime host cancellation reaches running bash tool through agent loop" {
@@ -1095,7 +1095,7 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
         if (observed.tool_execution_start) break;
         try runtime.yield();
     } else return error.BashToolStartNotObserved;
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.running, host.session.statusSnapshot().status);
+    try std.testing.expectEqual(.running, host.session.statusSnapshot().status);
     host.cancel();
 
     try future.join();
@@ -1104,5 +1104,5 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
     try std.testing.expect(observed.tool_execution_start);
     try std.testing.expect(observed.tool_execution_end);
     try std.testing.expect(observed.tool_error);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
+    try std.testing.expectEqual(.idle, host.session.statusSnapshot().status);
 }

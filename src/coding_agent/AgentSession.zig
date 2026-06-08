@@ -162,7 +162,7 @@ pub const LivePromptRun = struct {
     }
 };
 
-pub const AgentSessionStatus = enum {
+const AgentSessionStatus = enum {
     idle,
     running,
     cancel_requested,
