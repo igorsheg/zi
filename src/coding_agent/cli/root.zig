@@ -5,6 +5,7 @@ const args_mod = @import("args.zig");
 const interactive = @import("../interactive.zig");
 const print_mode = @import("../print_mode.zig");
 const sdk = @import("../sdk.zig");
+const session_listing = @import("../session_listing.zig");
 
 pub const parser = args_mod;
 pub const Command = args_mod.Command;
@@ -202,7 +203,7 @@ fn selectResumeSession(
     options: auth_mode.Options,
 ) !?[]const u8 {
     if (app.resume_session_file == null and !app.resume_latest) return null;
-    const selected = sdk.selectRuntimeSession(process.gpa, process.io, .{
+    const selected = session_listing.selectRuntimeSession(process.gpa, process.io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
         .dir = options.dir,

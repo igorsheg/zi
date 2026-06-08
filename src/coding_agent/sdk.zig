@@ -43,10 +43,6 @@ pub const ResumeRuntimeHostOptions = struct {
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
-pub const SessionListOptions = session_listing.SessionListOptions;
-pub const SessionSelectionOptions = session_listing.SessionSelectionOptions;
-pub const SessionList = session_listing.SessionList;
-
 pub const RuntimeHostHandle = struct {
     services: RuntimeServices,
     host: AgentSessionRuntimeHost,
@@ -57,8 +53,6 @@ pub const RuntimeHostHandle = struct {
         self.* = undefined;
     }
 };
-
-pub const Runtime = RuntimeHostHandle;
 
 pub fn createRuntimeHost(
     allocator: std.mem.Allocator,
@@ -116,9 +110,6 @@ pub fn createRuntimeHost(
 
     return .{ .services = services, .host = host };
 }
-
-pub const listRuntimeSessions = session_listing.listRuntimeSessions;
-pub const selectRuntimeSession = session_listing.selectRuntimeSession;
 
 pub fn resumeRuntimeHost(
     allocator: std.mem.Allocator,
@@ -278,7 +269,7 @@ test "sdk runtime lists resumable session leaf names newest first" {
     try createStoredSessionForTest(tmp.dir, "first", "2026-05-27T00:00:00Z");
     try createStoredSessionForTest(tmp.dir, "second", "2026-05-28T00:00:00Z");
 
-    var list = try listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+    var list = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .dir = tmp.dir,
@@ -309,7 +300,7 @@ test "sdk runtime session listing is bounded and ignores non session files" {
         .data = "ignore",
     });
 
-    var list = try listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+    var list = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .dir = tmp.dir,
@@ -328,7 +319,7 @@ test "sdk runtime session listing returns empty when session directory is absent
 
     try createTestDirs(tmp.dir);
 
-    var list = try listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+    var list = try session_listing.listRuntimeSessions(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .dir = tmp.dir,
@@ -346,7 +337,7 @@ test "sdk runtime selects explicit resumable session leaf name" {
     try createTestDirs(tmp.dir);
     try createStoredSessionForTest(tmp.dir, "session", "2026-05-27T00:00:00Z");
 
-    const selected = (try selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+    const selected = (try session_listing.selectRuntimeSession(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .dir = tmp.dir,
@@ -365,7 +356,7 @@ test "sdk runtime selects newest resumable session only from complete listing" {
     try createStoredSessionForTest(tmp.dir, "first", "2026-05-27T00:00:00Z");
     try createStoredSessionForTest(tmp.dir, "second", "2026-05-28T00:00:00Z");
 
-    const selected = (try selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+    const selected = (try session_listing.selectRuntimeSession(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .dir = tmp.dir,
@@ -383,7 +374,7 @@ test "sdk runtime selection rejects traversal and reports absent sessions" {
 
     try std.testing.expectError(
         error.InvalidSessionFileName,
-        selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+        session_listing.selectRuntimeSession(std.testing.allocator, std.testing.io, .{
             .cwd = "repo",
             .agent_dir_override = "agent",
             .dir = tmp.dir,
@@ -391,7 +382,7 @@ test "sdk runtime selection rejects traversal and reports absent sessions" {
         }),
     );
 
-    const selected = try selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+    const selected = try session_listing.selectRuntimeSession(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .dir = tmp.dir,
@@ -417,7 +408,7 @@ test "sdk runtime newest selection fails when listing is truncated" {
 
     try std.testing.expectError(
         error.SessionListTruncated,
-        selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+        session_listing.selectRuntimeSession(std.testing.allocator, std.testing.io, .{
             .cwd = "repo",
             .agent_dir_override = "agent",
             .dir = tmp.dir,

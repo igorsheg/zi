@@ -7,6 +7,7 @@ const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
+const session_listing = @import("session_listing.zig");
 const sdk = @import("sdk.zig");
 
 pub const Options = struct {
@@ -1063,7 +1064,7 @@ pub fn run(
     defer process.gpa.free(timestamp_text);
 
     var host_handle = if (options.resume_session_file != null or options.resume_latest) blk: {
-        const session_file = sdk.selectRuntimeSession(process.gpa, process.io, .{
+        const session_file = session_listing.selectRuntimeSession(process.gpa, process.io, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .dir = options.dir,
