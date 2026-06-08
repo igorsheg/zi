@@ -52,7 +52,14 @@ pub const Frame = struct {
                 app.theme.transcript_text,
                 transcriptVisibleRowsWithReserved(app.height, composer_rows + status_rows),
             );
-            try drawStatusArea(app, renderer, composer_rows, status_rows);
+            if (status_rows > 0 and app.height > composer_rows) {
+                var views: [slots_mod.status_area_slot_count_max]slots_mod.SlotView = undefined;
+                const count = app.slots.orderedSlot(.status_area, &views);
+                if (count > 0) {
+                    const y: u16 = @intCast(@as(usize, app.height) - composer_rows - 1);
+                    try status_area.draw(renderer, app.theme, y, app.width, views[0..count], app.animation_tick);
+                }
+            }
             try drawComposer(app, renderer, composer_rows);
         }
         if (app.modal) |confirm| try drawConfirmModal(app, renderer, confirm);
@@ -86,20 +93,6 @@ pub fn composerRows(app: *app_mod.ProductApp) usize {
 
 fn composerTextWidth(width: u16) u16 {
     return if (width > 4) width - 4 else 1;
-}
-
-fn drawStatusArea(
-    app: *app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    composer_rows: usize,
-    status_rows: usize,
-) !void {
-    if (status_rows == 0 or app.height <= composer_rows) return;
-    var views: [slots_mod.status_area_slot_count_max]slots_mod.SlotView = undefined;
-    const count = app.slots.orderedSlot(.status_area, &views);
-    if (count == 0) return;
-    const y: u16 = @intCast(@as(usize, app.height) - composer_rows - 1);
-    try status_area.draw(renderer, app.theme, y, app.width, views[0..count], app.animation_tick);
 }
 
 fn drawComposer(app: *app_mod.ProductApp, renderer: *infra.Renderer, composer_rows: usize) !void {
