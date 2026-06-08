@@ -12,7 +12,7 @@ const session_events = @import("session_events.zig");
 const session_listing = @import("session_listing.zig");
 const session_store = @import("session_store.zig");
 
-pub const CreateRuntimeHostOptions = struct {
+const CreateRuntimeHostOptions = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     current_date: []const u8,
@@ -28,7 +28,7 @@ pub const CreateRuntimeHostOptions = struct {
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
-pub const ResumeRuntimeHostOptions = struct {
+const ResumeRuntimeHostOptions = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     current_date: []const u8,
@@ -43,7 +43,7 @@ pub const ResumeRuntimeHostOptions = struct {
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
-pub const RuntimeHostHandle = struct {
+const RuntimeHostHandle = struct {
     services: RuntimeServices,
     host: AgentSessionRuntimeHost,
 
