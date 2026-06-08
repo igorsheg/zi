@@ -1163,7 +1163,7 @@ fn seedTranscriptFromSession(
     terminal_loop: *tui.product.TerminalLoop,
     host: *AgentSessionRuntimeHost,
 ) !void {
-    var snapshot = try host.publicHistorySnapshot(allocator);
+    var snapshot = try host.session.publicHistorySnapshot(allocator);
     defer snapshot.deinit(allocator);
     try seedTranscriptFromSnapshot(terminal_loop, snapshot.items);
 }

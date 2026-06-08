@@ -81,13 +81,6 @@ pub fn sessionHeader(self: *const AgentSessionRuntimeHost) session_manager.Sessi
     return self.session.manager.header;
 }
 
-pub fn publicHistorySnapshot(
-    self: *const AgentSessionRuntimeHost,
-    allocator: std.mem.Allocator,
-) !AgentSession.PublicHistorySnapshot {
-    return self.session.publicHistorySnapshot(allocator);
-}
-
 pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !ReplaceResult {
     if (self.session.statusSnapshot().status != .idle) return error.SessionReplacementRequiresIdle;
 
