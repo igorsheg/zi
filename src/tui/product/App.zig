@@ -22,6 +22,7 @@ pub const ProductApp = struct {
     transcript_scroll_max_width: u16 = 0,
     transcript_scroll_max_visible_rows: usize = std.math.maxInt(usize),
     theme: theme_mod.Theme = theme_mod.Theme.codex(),
+    animation_tick: u64 = 0,
     dirty: bool = true,
 
     pub fn init(width: u16, height: u16) !ProductApp {
@@ -79,8 +80,17 @@ pub const ProductApp = struct {
                 return null;
             },
             .set_slot_contribution => |contribution| {
-                try self.slots.set(allocator, contribution);
+                var timed_contribution = contribution;
+                timed_contribution.animation_start_tick = self.animation_tick;
+                try self.slots.set(allocator, timed_contribution);
                 self.dirty = true;
+                return null;
+            },
+            .animation_tick => |tick| {
+                if (tick != self.animation_tick) {
+                    self.animation_tick = tick;
+                    if (self.slots.hasAnimated(.status_area, tick)) self.dirty = true;
+                }
                 return null;
             },
             .clear_slot_contribution => |clear| {
@@ -189,8 +199,11 @@ pub const ProductApp = struct {
         return self.transcript_scroll_max_cache;
     }
 
-    fn transcriptVisibleRows(self: ProductApp) usize {
-        return frame_mod.transcriptVisibleRows(self.height);
+    fn transcriptVisibleRows(self: *ProductApp) usize {
+        return frame_mod.transcriptVisibleRowsWithReserved(
+            self.height,
+            frame_mod.composerRows(self) + frame_mod.statusRows(self),
+        );
     }
 };
 
@@ -203,6 +216,7 @@ pub const Command = union(enum) {
     tool_output_delta: ToolOutputDelta,
     replace_tool_call_preview: ToolCallPreview,
     set_slot_contribution: slots_mod.SetContribution,
+    animation_tick: u64,
     open_confirm: surface_mod.OpenConfirm,
     modal: surface_mod.ModalCommand,
     clear_slot_contribution: slots_mod.ClearContribution,
@@ -300,7 +314,7 @@ test "product app maps ctrl-u and ctrl-d to transcript scroll" {
     try appendTestMessage(&app, .system, "four");
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x15 } } }) == null);
-    try std.testing.expectEqual(@as(usize, 3), app.transcript_scroll_rows);
+    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x04 } } }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
 }
@@ -325,9 +339,9 @@ test "product app pages transcript scroll and append preserves it" {
     try appendTestMessage(&app, .system, "four");
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_up } }) == null);
-    try std.testing.expectEqual(@as(usize, 3), app.transcript_scroll_rows);
+    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
     try appendTestMessage(&app, .system, "five");
-    try std.testing.expectEqual(@as(usize, 3), app.transcript_scroll_rows);
+    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_down } }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
 }
@@ -404,6 +418,29 @@ test "product app rejects second modal before mutation" {
     } }));
     const effect = (try app.apply(std.testing.allocator, .{ .modal = .confirm })).?;
     try std.testing.expect(effect.confirm_result.accepted);
+}
+
+test "product app animation tick dirties only animated status" {
+    var app = try ProductApp.init(20, 5);
+    defer app.deinit(std.testing.allocator);
+
+    app.dirty = false;
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .animation_tick = 1 }) == null);
+    try std.testing.expect(!app.dirty);
+
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
+        .slot = .status_area,
+        .id = 1,
+        .owner = 1,
+        .text = "working",
+        .effect = .shimmer,
+    } }) == null);
+    app.dirty = false;
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .animation_tick = 2 }) == null);
+    try std.testing.expect(app.dirty);
+    app.dirty = false;
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .animation_tick = 2 }) == null);
+    try std.testing.expect(!app.dirty);
 }
 
 test "product app applies slot contributions atomically" {

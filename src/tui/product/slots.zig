@@ -1,14 +1,23 @@
 const std = @import("std");
+const shuffle_text = @import("shuffle_text.zig");
 
-pub const contribution_count_max: usize = 8;
+pub const contribution_count_max: usize = 16;
 pub const contribution_text_bytes_max: usize = 160;
 pub const composer_border_slot_count_max: usize = 1;
+pub const status_area_slot_count_max: usize = 8;
 
 pub const SlotName = enum {
     composer_top_left,
     composer_top_right,
     composer_bottom_left,
     composer_bottom_right,
+    status_area,
+};
+
+pub const RenderEffect = enum {
+    none,
+    shimmer,
+    shuffle_text,
 };
 
 pub const ContributionId = u32;
@@ -20,6 +29,8 @@ pub const SetContribution = struct {
     owner: OwnerId,
     priority: i16 = 0,
     text: []const u8,
+    effect: RenderEffect = .none,
+    animation_start_tick: u64 = 0,
 };
 
 pub const ClearContribution = struct {
@@ -34,6 +45,8 @@ const Contribution = struct {
     owner: OwnerId,
     priority: i16,
     text: []u8,
+    effect: RenderEffect,
+    animation_start_tick: u64,
 };
 
 pub const SlotStore = struct {
@@ -62,6 +75,8 @@ pub const SlotStore = struct {
                 .owner = update.owner,
                 .priority = update.priority,
                 .text = text,
+                .effect = update.effect,
+                .animation_start_tick = update.animation_start_tick,
             };
             allocator.free(old_text);
             return;
@@ -73,6 +88,8 @@ pub const SlotStore = struct {
             .owner = update.owner,
             .priority = update.priority,
             .text = text,
+            .effect = update.effect,
+            .animation_start_tick = update.animation_start_tick,
         };
         self.len += 1;
     }
@@ -110,7 +127,14 @@ pub const SlotStore = struct {
         for (self.items[0..self.len]) |item| {
             if (item.slot != slot) continue;
             if (n == out.len) break;
-            out[n] = .{ .priority = item.priority, .text = item.text };
+            out[n] = .{
+                .priority = item.priority,
+                .owner = item.owner,
+                .id = item.id,
+                .text = item.text,
+                .effect = item.effect,
+                .animation_start_tick = item.animation_start_tick,
+            };
             n += 1;
         }
         sortViews(out[0..n]);
@@ -121,6 +145,22 @@ pub const SlotStore = struct {
         var views: [composer_border_slot_count_max]SlotView = undefined;
         if (self.orderedSlot(slot, &views) == 0) return null;
         return views[0];
+    }
+
+    pub fn hasSlot(self: SlotStore, slot: SlotName) bool {
+        return self.count(slot) > 0;
+    }
+
+    pub fn hasAnimated(self: SlotStore, slot: SlotName, tick: u64) bool {
+        for (self.items[0..self.len]) |item| {
+            if (item.slot != slot) continue;
+            switch (item.effect) {
+                .none => {},
+                .shimmer => return true,
+                .shuffle_text => if (tick -| item.animation_start_tick <= shuffle_text.reveal_ticks * 2) return true,
+            }
+        }
+        return false;
     }
 
     fn find(self: SlotStore, slot: SlotName, id: ContributionId, owner: OwnerId) ?usize {
@@ -141,7 +181,11 @@ pub const SlotStore = struct {
 
 pub const SlotView = struct {
     priority: i16,
+    owner: OwnerId,
+    id: ContributionId,
     text: []const u8,
+    effect: RenderEffect,
+    animation_start_tick: u64,
 };
 
 fn validateSet(update: SetContribution) !void {
@@ -202,6 +246,22 @@ test "slot store sets replaces clears and bounds contributions" {
     try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_top_left));
     try std.testing.expect(slots.clearOwner(std.testing.allocator, 7));
     try std.testing.expectEqual(@as(usize, 0), slots.len);
+}
+
+test "slot store tracks animated status contributions" {
+    var slots: SlotStore = .{};
+    defer slots.deinit(std.testing.allocator);
+
+    try slots.set(std.testing.allocator, .{
+        .slot = .status_area,
+        .id = 1,
+        .owner = 1,
+        .text = "working",
+        .effect = .shimmer,
+    });
+    try std.testing.expect(slots.hasAnimated(.status_area, 100));
+    try std.testing.expect(slots.clearOwner(std.testing.allocator, 1));
+    try std.testing.expect(!slots.hasAnimated(.status_area, 100));
 }
 
 test "slot store rejects invalid text before mutation" {

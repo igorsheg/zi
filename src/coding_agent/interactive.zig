@@ -24,7 +24,7 @@ const effect_count_max = tui.product.terminal_loop.effects_per_step_max;
 const frame_interval_ms: u64 = 16;
 const frame_interval_ns: i128 = frame_interval_ms * std.time.ns_per_ms;
 const input_reads_per_tick_max = 1;
-const prompt_progress_per_tick_max = 8;
+const prompt_progress_per_tick_max = 64;
 const public_events_per_tick_max = 16;
 const render_attempts_per_tick_max = 1;
 const shutdown_drain_ticks_max = 60;
@@ -35,11 +35,21 @@ const tool_call_mirrors_max = 32;
 const tool_title_bytes_max = 512;
 const model_slot_owner: tui.product.SlotOwnerId = 1;
 const model_slot_id: tui.product.SlotContributionId = 1;
+const status_owner_run: tui.product.SlotOwnerId = 2;
+const status_id_working: tui.product.SlotContributionId = 1;
+const status_owner_policy: tui.product.SlotOwnerId = 3;
+const status_id_compaction: tui.product.SlotContributionId = 1;
+const status_id_retry: tui.product.SlotContributionId = 2;
 const confirm_id_start: tui.product.ModalId = 1;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     const last = last_render_ns orelse return true;
     return now_ns - last >= frame_interval_ns;
+}
+
+fn animationTick(now_ns: i128) u64 {
+    if (now_ns <= 0) return 0;
+    return @intCast(@divFloor(now_ns, frame_interval_ns));
 }
 
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
@@ -363,13 +373,25 @@ fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?Transcrip
     return switch (event) {
         .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event.event),
         .prompt_command => |payload| .{ .append = statusAppend(.info, payload.message.text) },
-        .compaction_start => .{ .append = statusAppend(.info, "compaction started") },
-        .compaction_end => .{ .append = statusAppend(.info, "compaction ended") },
-        .auto_retry_start => .{ .append = statusAppend(.info, "auto retry started") },
-        .auto_retry_end => .{ .append = statusAppend(.info, "auto retry ended") },
+        .compaction_start => null,
+        .compaction_end => |payload| compactionEndAppend(payload),
+        .auto_retry_start => null,
+        .auto_retry_end => |payload| autoRetryEndAppend(payload),
         .public_event_overflow => .{ .append = statusAppend(.warning, "public event overflow") },
         .queue_update, .session_info_changed => null,
     };
+}
+
+fn compactionEndAppend(payload: session_events.AgentSessionEvent.CompactionEnd) ?TranscriptIngest {
+    if (payload.error_message) |_| return .{ .append = statusAppend(.err, "compaction failed") };
+    if (payload.aborted and !payload.will_retry) return .{ .append = statusAppend(.warning, "compaction cancelled") };
+    return null;
+}
+
+fn autoRetryEndAppend(payload: session_events.AgentSessionEvent.AutoRetryEnd) ?TranscriptIngest {
+    if (payload.success) return null;
+    if (payload.final_error != null) return .{ .append = statusAppend(.err, "auto retry failed") };
+    return null;
 }
 
 fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptIngest {
@@ -555,6 +577,9 @@ const InteractiveLoop = struct {
             return false;
         }
         self.active_run = try self.host.startPromptRun(text, &.{}, .{});
+        self.setWorkingStatus() catch {
+            self.stderr.writeAll("status update failed\n") catch return true;
+        };
         return true;
     }
 
@@ -575,8 +600,9 @@ const InteractiveLoop = struct {
         }
         _ = try self.drainPromptProgressBounded(prompt_progress_per_tick_max);
         _ = try self.drainPublicEventsBounded(public_events_per_tick_max);
+        const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
+        _ = try self.terminal_loop.applyCommand(.{ .animation_tick = animationTick(now_ns) });
         if (render_attempts_per_tick_max > 0 and self.terminal_loop.isDirty()) {
-            const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
             if (frameDue(now_ns, self.last_render_ns)) {
                 try self.terminal_loop.renderIfDirty(self.stdout);
                 try self.stdout.flush();
@@ -712,6 +738,9 @@ const InteractiveLoop = struct {
         if (!more) {
             self.host.destroyPromptRun(prompt_run);
             self.active_run = null;
+            self.clearStatus(status_owner_run, status_id_working) catch {
+                self.stderr.writeAll("status clear failed\n") catch return;
+            };
         }
     }
 
@@ -723,10 +752,82 @@ const InteractiveLoop = struct {
                 return count;
             };
             defer event.deinit();
+            try self.applyPublicEventStatus(event);
             try self.applyPublicEventTranscript(event);
         }
         try self.flushToolOutputCoalescer();
         return count;
+    }
+
+    fn applyPublicEventStatus(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
+        switch (event) {
+            .agent_event => |payload| switch (payload.event) {
+                .agent_start => try self.setWorkingStatus(),
+                .agent_end => try self.clearStatus(status_owner_run, status_id_working),
+                else => {},
+            },
+            .compaction_start => try self.setStatus(
+                status_owner_policy,
+                status_id_compaction,
+                200,
+                "compacting context",
+                .shimmer,
+            ),
+            .compaction_end => try self.clearStatus(status_owner_policy, status_id_compaction),
+            .auto_retry_start => |payload| {
+                var buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
+                const seconds = (payload.delay_ms + 999) / 1000;
+                const text = std.fmt.bufPrint(
+                    &buffer,
+                    "retry {d}/{d} in {d}s",
+                    .{ payload.attempt, payload.max_attempts, seconds },
+                ) catch "retrying";
+                try self.setStatus(status_owner_policy, status_id_retry, 190, text, .shimmer);
+            },
+            .auto_retry_end => try self.clearStatus(status_owner_policy, status_id_retry),
+            else => {},
+        }
+    }
+
+    fn setWorkingStatus(self: *InteractiveLoop) !void {
+        try self.setStatus(status_owner_run, status_id_working, 100, "working", .shimmer);
+    }
+
+    fn setStatus(
+        self: *InteractiveLoop,
+        owner: tui.product.SlotOwnerId,
+        id: tui.product.SlotContributionId,
+        priority: i16,
+        text: []const u8,
+        effect: tui.product.slots.RenderEffect,
+    ) !void {
+        _ = self.terminal_loop.applyCommand(.{ .set_slot_contribution = .{
+            .slot = .status_area,
+            .id = id,
+            .owner = owner,
+            .priority = priority,
+            .text = text,
+            .effect = effect,
+        } }) catch |err| switch (err) {
+            error.InvalidSlotContribution,
+            error.SlotContributionTooLarge,
+            error.InvalidSlotContributionText,
+            error.SlotContributionLimitExceeded,
+            => return,
+            else => return err,
+        };
+    }
+
+    fn clearStatus(
+        self: *InteractiveLoop,
+        owner: tui.product.SlotOwnerId,
+        id: tui.product.SlotContributionId,
+    ) !void {
+        _ = try self.terminal_loop.applyCommand(.{ .clear_slot_contribution = .{
+            .slot = .status_area,
+            .id = id,
+            .owner = owner,
+        } });
     }
 
     fn applyPublicEventTranscript(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
@@ -963,6 +1064,7 @@ fn applyModelComposerSlot(terminal_loop: *tui.product.TerminalLoop, model: ai.Mo
         .owner = model_slot_owner,
         .priority = 100,
         .text = text,
+        .effect = .none,
     } });
 }
 
@@ -1122,7 +1224,7 @@ test "interactive loop bounds stay responsive" {
     try std.testing.expect(frame_interval_ns <= 16 * std.time.ns_per_ms);
     try std.testing.expect(frame_interval_ms <= 16);
     try std.testing.expectEqual(@as(usize, 1), input_reads_per_tick_max);
-    try std.testing.expectEqual(@as(usize, 8), prompt_progress_per_tick_max);
+    try std.testing.expectEqual(@as(usize, 64), prompt_progress_per_tick_max);
     try std.testing.expectEqual(@as(usize, 16), public_events_per_tick_max);
     try std.testing.expectEqual(@as(usize, 1), render_attempts_per_tick_max);
     try std.testing.expectEqual(@as(usize, 60), shutdown_drain_ticks_max);

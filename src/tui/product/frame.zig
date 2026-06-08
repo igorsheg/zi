@@ -5,6 +5,7 @@ const app_mod = @import("App.zig");
 const composer_mod = @import("composer.zig");
 const markdown_projection = @import("markdown_projection.zig");
 const slots_mod = @import("slots.zig");
+const status_area = @import("status_area.zig");
 const surface_mod = @import("surface.zig");
 const transcript_mod = @import("transcript.zig");
 const theme_mod = @import("theme.zig");
@@ -45,18 +46,22 @@ pub const Frame = struct {
     }
 };
 
-fn drawShell(app: *const app_mod.ProductApp, renderer: *infra.Renderer) !void {
+fn drawShell(app: *app_mod.ProductApp, renderer: *infra.Renderer) !void {
     if (app.height > 0) try renderer.writeText(0, 0, "zi", app.theme.shell_label);
     const composer_rows = composerRows(app);
+    const status_rows = statusRows(app);
     if (app.height > 0) {
         try drawTranscript(
             app,
             renderer,
             app.theme.transcript_text,
-            transcriptVisibleRowsWithReserved(app.height, composer_rows),
+            transcriptVisibleRowsWithReserved(app.height, composer_rows + status_rows),
         );
     }
-    if (app.height > 0) try drawComposer(app, renderer, composer_rows);
+    if (app.height > 0) {
+        try drawStatusArea(app, renderer, composer_rows, status_rows);
+        try drawComposer(app, renderer, composer_rows);
+    }
     if (app.modal) |modal| try drawModal(app, renderer, modal);
 }
 
@@ -72,7 +77,15 @@ pub fn transcriptVisibleRowsWithReserved(height: u16, reserved_rows: usize) usiz
     return @min(available_rows, transcript_visual_rows_max);
 }
 
-pub fn composerRows(app: *const app_mod.ProductApp) usize {
+pub fn statusRows(app: *app_mod.ProductApp) usize {
+    return status_area.visibleRows(
+        app.slots.hasSlot(.status_area),
+        app.height,
+        composerRows(app),
+    );
+}
+
+pub fn composerRows(app: *app_mod.ProductApp) usize {
     const text_width = composerTextWidth(app.width);
     return @min(app.composer.visualRows(text_width), composer_mod.visible_rows_max) + 2;
 }
@@ -81,7 +94,21 @@ fn composerTextWidth(width: u16) u16 {
     return if (width > 4) width - 4 else 1;
 }
 
-fn drawComposer(app: *const app_mod.ProductApp, renderer: *infra.Renderer, composer_rows: usize) !void {
+fn drawStatusArea(
+    app: *app_mod.ProductApp,
+    renderer: *infra.Renderer,
+    composer_rows: usize,
+    status_rows: usize,
+) !void {
+    if (status_rows == 0 or app.height <= composer_rows) return;
+    var views: [slots_mod.status_area_slot_count_max]slots_mod.SlotView = undefined;
+    const count = app.slots.orderedSlot(.status_area, &views);
+    if (count == 0) return;
+    const y: u16 = @intCast(@as(usize, app.height) - composer_rows - 1);
+    try status_area.draw(renderer, app.theme, y, app.width, views[0..count], app.animation_tick);
+}
+
+fn drawComposer(app: *app_mod.ProductApp, renderer: *infra.Renderer, composer_rows: usize) !void {
     if (composer_rows < 3 or app.height == 0 or app.width == 0) return;
     const height = @min(composer_rows, @as(usize, app.height));
     if (height < 3) return;
@@ -879,6 +906,45 @@ test "frame keeps transcript out of tiny heights" {
     try expectCellText(renderer.next, 0, 0, "zi");
 }
 
+test "frame renders status area between transcript and composer" {
+    var app = try app_mod.ProductApp.init(30, 6);
+    defer app.deinit(std.testing.allocator);
+    try appendFrameMessage(&app, .system, "visible");
+    try app.slots.set(std.testing.allocator, .{
+        .slot = .status_area,
+        .id = 1,
+        .owner = 1,
+        .priority = 10,
+        .text = "model: faux",
+    });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 30, 6, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellText(renderer.next, 0, 2, "model: faux");
+    try expectCellGrapheme(renderer.next, 0, 3, "╭");
+    try std.testing.expectEqual(@as(usize, 1), statusRows(&app));
+}
+
+test "frame omits status area on tiny terminal" {
+    var app = try app_mod.ProductApp.init(20, 3);
+    defer app.deinit(std.testing.allocator);
+    try app.slots.set(std.testing.allocator, .{
+        .slot = .status_area,
+        .id = 1,
+        .owner = 1,
+        .text = "status",
+    });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 20, 3, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try std.testing.expectEqual(@as(usize, 0), statusRows(&app));
+    try expectCellGrapheme(renderer.next, 0, 0, "╭");
+}
+
 test "frame renders composer border slots with slot style" {
     var app = try app_mod.ProductApp.init(30, 3);
     defer app.deinit(std.testing.allocator);
@@ -1137,7 +1203,7 @@ test "tool scroll skips newest row before tool block" {
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellGrapheme(renderer.next, 3, 2, "─");
+    try expectGraphemeInColumn(renderer.next, 3, "─");
 }
 
 test "frame renders updated tool row once" {
