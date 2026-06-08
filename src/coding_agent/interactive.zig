@@ -1396,7 +1396,6 @@ fn testAssistantMessage(content: []const ai.AssistantContent) ai.AssistantMessag
 
 test "interactive maps thinking deltas to streaming thinking transcript" {
     const event = transcriptAppendFromAgentEvent(.{ .message_update = .{
-        .message = .{ .assistant = testAssistantMessage(&.{}) },
         .assistant_message_event = .{ .thinking_delta = .{
             .content_index = 0,
             .delta = "considering",
@@ -1422,7 +1421,6 @@ test "interactive maps tool call deltas to pending tool row" {
     const partial = testAssistantMessage(&content);
 
     const event = transcriptAppendFromAgentEvent(.{ .message_update = .{
-        .message = .{ .assistant = partial },
         .assistant_message_event = .{ .toolcall_delta = .{
             .content_index = 0,
             .delta = "streaming",
@@ -1477,7 +1475,6 @@ test "interactive extracts write call preview from streamed tool args" {
     const partial = testAssistantMessage(&content);
     var buffer: [pending_tool_output_bytes_max]u8 = undefined;
     const preview = writePreviewFromMessageUpdate(.{
-        .message = .{ .assistant = partial },
         .assistant_message_event = .{ .toolcall_delta = .{
             .content_index = 0,
             .delta = "two",

@@ -8,6 +8,15 @@ pub const loop = @import("loop.zig");
 pub const max_tool_calls_per_turn = 32;
 pub const max_tool_updates_per_batch = 256;
 
+pub const EventSink = struct {
+    context: ?*anyopaque = null,
+    call_fn: *const fn (?*anyopaque, AgentEvent) anyerror!void,
+
+    pub fn emit(self: EventSink, event: AgentEvent) anyerror!void {
+        return self.call_fn(self.context, event);
+    }
+};
+
 pub const ToolExecutionMode = enum {
     sequential,
     parallel,
@@ -624,7 +633,6 @@ pub fn copyAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) !AgentEve
             .message = try copyAgentMessage(allocator, payload.message),
         } },
         .message_update => |payload| .{ .message_update = .{
-            .message = try copyAgentMessage(allocator, payload.message),
             .assistant_message_event = try ai.owned.copyAssistantMessageEvent(
                 allocator,
                 payload.assistant_message_event,
@@ -661,7 +669,6 @@ pub fn deinitAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) void {
     switch (event) {
         .message_start => |payload| deinitAgentMessage(allocator, payload.message),
         .message_update => |payload| {
-            deinitAgentMessage(allocator, payload.message);
             ai.owned.deinitAssistantMessageEvent(allocator, payload.assistant_message_event);
         },
         .message_end => |payload| deinitAgentMessage(allocator, payload.message),
@@ -694,6 +701,23 @@ pub fn deinitAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) void {
     }
 }
 
+pub fn assistantEventPartial(event: ai.AssistantMessageEvent) ai.AssistantMessage {
+    return switch (event) {
+        .start => |payload| payload.partial,
+        .text_start => |payload| payload.partial,
+        .text_delta => |payload| payload.partial,
+        .text_end => |payload| payload.partial,
+        .thinking_start => |payload| payload.partial,
+        .thinking_delta => |payload| payload.partial,
+        .thinking_end => |payload| payload.partial,
+        .toolcall_start => |payload| payload.partial,
+        .toolcall_delta => |payload| payload.partial,
+        .toolcall_end => |payload| payload.partial,
+        .done => |payload| payload.message,
+        .@"error" => |payload| payload.@"error",
+    };
+}
+
 pub const AgentEvent = union(enum) {
     agent_start,
     agent_end: AgentEnd,
@@ -720,7 +744,6 @@ pub const AgentEvent = union(enum) {
     };
 
     pub const MessageUpdate = struct {
-        message: AgentMessage,
         assistant_message_event: ai.AssistantMessageEvent,
     };
 
@@ -764,7 +787,6 @@ pub const AgentEvent = union(enum) {
             },
             .message_update => |payload| {
                 try writeJsonField("type", stringify, "message_update");
-                try writeJsonField("message", stringify, payload.message);
                 try writeJsonField("assistantMessageEvent", stringify, payload.assistant_message_event);
             },
             .message_end => |payload| {
