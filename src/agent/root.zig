@@ -171,7 +171,7 @@ pub fn copyToolResultContentSlice(
     const cloned = try allocator.alloc(ai.ToolResultContent, source.len);
     var initialized: usize = 0;
     errdefer {
-        deinitToolResultContentItems(allocator, cloned[0..initialized]);
+        for (cloned[0..initialized]) |content| deinitToolResultContent(allocator, content);
         allocator.free(cloned);
     }
     for (source, cloned) |content, *out| {
@@ -279,12 +279,8 @@ pub fn deinitToolResultContent(allocator: std.mem.Allocator, content: ai.ToolRes
 }
 
 pub fn deinitToolResultContentSlice(allocator: std.mem.Allocator, source: []const ai.ToolResultContent) void {
-    deinitToolResultContentItems(allocator, source);
-    allocator.free(source);
-}
-
-fn deinitToolResultContentItems(allocator: std.mem.Allocator, source: []const ai.ToolResultContent) void {
     for (source) |content| deinitToolResultContent(allocator, content);
+    allocator.free(source);
 }
 
 pub fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
