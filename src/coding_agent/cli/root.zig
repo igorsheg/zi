@@ -7,12 +7,7 @@ const print_mode = @import("../print_mode.zig");
 const sdk = @import("../sdk.zig");
 const session_listing = @import("../session_listing.zig");
 
-pub const parser = args_mod;
-pub const Command = args_mod.Command;
-pub const AppArgs = args_mod.AppArgs;
-pub const AuthCommand = args_mod.AuthCommand;
-
-pub const CliError = error{
+const CliError = error{
     InvalidCliUsage,
     NoResumableSession,
     OutputClosed,
@@ -68,7 +63,7 @@ pub fn main(process: runtime.Process, args_source: std.process.Args) !void {
     try cli_io.flush();
 }
 
-pub fn run(
+fn run(
     process: runtime.Process,
     args: *std.process.Args.Iterator,
     stdout: *std.Io.Writer,
