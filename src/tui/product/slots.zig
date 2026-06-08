@@ -7,8 +7,6 @@ pub const status_area_slot_count_max: usize = 8;
 pub const SlotName = enum {
     composer_top_left,
     composer_top_right,
-    composer_bottom_left,
-    composer_bottom_right,
     status_area,
 };
 

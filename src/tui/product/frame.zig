@@ -148,22 +148,9 @@ fn drawComposerBorder(
     height: u16,
 ) !void {
     if (app.width < 2 or height < 2) return;
-    try drawComposerBorderLine(
-        app,
-        renderer,
-        y,
-        true,
-        .composer_top_left,
-        .composer_top_right,
-    );
-    try drawComposerBorderLine(
-        app,
-        renderer,
-        y + height - 1,
-        false,
-        .composer_bottom_left,
-        .composer_bottom_right,
-    );
+    try drawComposerBorderLine(app, renderer, y, true);
+    try drawComposerBorderLabels(app, renderer, y, .composer_top_left, .composer_top_right);
+    try drawComposerBorderLine(app, renderer, y + height - 1, false);
     var row: u16 = y + 1;
     while (row + 1 < y + height) : (row += 1) {
         try renderer.writeText(0, row, primitive.chrome.BorderGlyphs.rounded.vertical, app.theme.composer_chrome);
@@ -183,8 +170,6 @@ fn drawComposerBorderLine(
     renderer: *infra.Renderer,
     y: u16,
     top: bool,
-    left_slot: slots_mod.SlotName,
-    right_slot: slots_mod.SlotName,
 ) !void {
     const glyphs = primitive.chrome.BorderGlyphs.rounded;
     const left_corner = if (top) glyphs.top_left else glyphs.bottom_left;
@@ -201,7 +186,6 @@ fn drawComposerBorderLine(
             app.theme.composer_chrome,
         );
     }
-    try drawComposerBorderLabels(app, renderer, y, left_slot, right_slot);
 }
 
 fn drawComposerBorderLabels(
@@ -931,13 +915,11 @@ test "frame omits status area on tiny terminal" {
     try expectCellGrapheme(renderer.next, 0, 0, "╭");
 }
 
-test "frame renders composer border slots with slot style" {
+test "frame renders composer top border slots with slot style" {
     var app = try app_mod.ProductApp.init(30, 3);
     defer app.deinit(std.testing.allocator);
     try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "TL" });
     try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "TR" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_bottom_left, .id = 3, .owner = 1, .text = "BL" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_bottom_right, .id = 4, .owner = 1, .text = "BR" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 30, 3, size_cells_max);
     defer renderer.deinit();
@@ -949,8 +931,6 @@ test "frame renders composer border slots with slot style" {
     try expectCellGrapheme(renderer.next, 29, 2, "╯");
     try expectCellText(renderer.next, 2, 0, "TL");
     try expectCellText(renderer.next, 26, 0, "TR");
-    try expectCellText(renderer.next, 2, 2, "BL");
-    try expectCellText(renderer.next, 26, 2, "BR");
     try std.testing.expect((try renderer.next.get(1, 0)).style.eql(app.theme.composer_chrome));
     try std.testing.expect((try renderer.next.get(2, 0)).style.eql(app.theme.composer_slot));
 }
