@@ -1065,7 +1065,15 @@ pub fn run(
     var host_handle = try createHost(process, stderr, options, timestamp_text, timestamp);
     defer host_handle.deinit();
 
-    var terminal_loop = try initTerminalLoop(process, stdout);
+    var terminal = tui.Terminal.init(process.io);
+    const terminal_size = terminal.size() catch tui.TerminalSize{ .width = 80, .height = 24 };
+    var terminal_loop = try tui.product.TerminalLoop.init(
+        process.gpa,
+        process.io,
+        terminal_size.width,
+        terminal_size.height,
+        tui.product.loop.output_size_bytes_default,
+    );
     defer terminal_loop.deinit();
 
     try terminal_loop.setup(stdout);
@@ -1176,19 +1184,6 @@ fn createHost(
         .environ = options.environ,
         .zio_runtime = process.zio_runtime,
     });
-}
-
-fn initTerminalLoop(process: runtime.Process, stdout: *std.Io.Writer) !tui.product.TerminalLoop {
-    var terminal = tui.Terminal.init(process.io);
-    const size = terminal.size() catch tui.TerminalSize{ .width = 80, .height = 24 };
-    _ = stdout;
-    return tui.product.TerminalLoop.init(
-        process.gpa,
-        process.io,
-        size.width,
-        size.height,
-        tui.product.loop.output_size_bytes_default,
-    );
 }
 
 fn selectResumeSession(
