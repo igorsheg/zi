@@ -179,7 +179,7 @@ pub fn copyToolResultContentSlice(
             .text => |text| blk: {
                 const text_copy = try allocator.dupe(u8, text.text);
                 errdefer allocator.free(text_copy);
-                const signature = try copyOptionalString(allocator, text.text_signature);
+                const signature = if (text.text_signature) |value| try allocator.dupe(u8, value) else null;
                 break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
             },
             .image => |image| blk: {
@@ -299,7 +299,7 @@ fn copyUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserCon
             .text => |text| blk: {
                 const text_copy = try allocator.dupe(u8, text.text);
                 errdefer allocator.free(text_copy);
-                const signature = try copyOptionalString(allocator, text.text_signature);
+                const signature = if (text.text_signature) |value| try allocator.dupe(u8, value) else null;
                 break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
             },
             .image => |image| blk: {
@@ -325,10 +325,6 @@ fn deinitUserContentItems(allocator: std.mem.Allocator, source: []const ai.UserC
             allocator.free(image.mime_type);
         },
     };
-}
-
-fn copyOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
-    return if (source) |value| try allocator.dupe(u8, value) else null;
 }
 
 pub const PendingToolCalls = struct {
