@@ -238,33 +238,23 @@ fn drawConfirmModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, c
     if (modal_width > 4) {
         try renderer.writeText(x + 2, y, confirm.title, app.theme.tool_title);
         try renderer.writeText(x + 2, y + 2, confirm.body, app.theme.transcript_text);
-        try drawConfirmButtons(app, renderer, confirm, x, y + modal_height - 2, modal_width);
+        const yes = if (confirm.selected_yes) "[Yes]" else " Yes ";
+        const no = if (confirm.selected_yes) " No " else "[No]";
+        const yes_width = primitive.text.displayWidth(yes);
+        const no_width = primitive.text.displayWidth(no);
+        const total_width = yes_width + 2 + no_width;
+        const centered_offset = (@as(usize, modal_width) -| total_width) / 2;
+        const start = if (total_width < modal_width) x + @as(u16, @intCast(centered_offset)) else x + 2;
+        const yes_style = if (confirm.selected_yes) app.theme.status_accent else app.theme.transcript_secondary;
+        const no_style = if (!confirm.selected_yes) app.theme.status_accent else app.theme.transcript_secondary;
+        const button_y = y + modal_height - 2;
+        try renderer.writeText(start, button_y, yes, yes_style);
+        const no_x = @as(u16, @intCast(@min(
+            @as(usize, std.math.maxInt(u16)),
+            @as(usize, start) + yes_width + 2,
+        )));
+        try renderer.writeText(no_x, button_y, no, no_style);
     }
-}
-
-fn drawConfirmButtons(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    confirm: surface_mod.Confirm,
-    x: u16,
-    y: u16,
-    modal_width: u16,
-) !void {
-    const yes = if (confirm.selected_yes) "[Yes]" else " Yes ";
-    const no = if (confirm.selected_yes) " No " else "[No]";
-    const yes_width = primitive.text.displayWidth(yes);
-    const no_width = primitive.text.displayWidth(no);
-    const total_width = yes_width + 2 + no_width;
-    const centered_offset = (@as(usize, modal_width) -| total_width) / 2;
-    const start = if (total_width < modal_width) x + @as(u16, @intCast(centered_offset)) else x + 2;
-    const yes_style = if (confirm.selected_yes) app.theme.status_accent else app.theme.transcript_secondary;
-    const no_style = if (!confirm.selected_yes) app.theme.status_accent else app.theme.transcript_secondary;
-    try renderer.writeText(start, y, yes, yes_style);
-    const no_x = @as(u16, @intCast(@min(
-        @as(usize, std.math.maxInt(u16)),
-        @as(usize, start) + yes_width + 2,
-    )));
-    try renderer.writeText(no_x, y, no, no_style);
 }
 
 fn drawTranscript(
