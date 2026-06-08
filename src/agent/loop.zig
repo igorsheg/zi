@@ -678,10 +678,16 @@ fn runLoop(
                 return;
             }
 
-            const tool_results = if (shouldExecuteToolsSequential(current.tools, assistant, config.tool_execution))
-                try executeToolCallsSequential(allocator, io, zio_runtime, current, assistant, config, token, emit)
-            else
-                try executeToolCallsParallel(allocator, io, current, assistant, config, token, zio_runtime, emit);
+            const tool_results = try ToolRunner.init(
+                allocator,
+                io,
+                zio_runtime,
+                current,
+                assistant,
+                config,
+                token,
+                emit,
+            ).run();
             defer allocator.free(tool_results.messages);
             var moved_tool_results: usize = 0;
             errdefer {
@@ -827,6 +833,68 @@ fn streamAssistantResponse(
 const ToolBatch = struct {
     messages: []const ai.ToolResultMessage,
     terminate: bool,
+};
+
+const ToolRunner = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    zio_runtime: *runtime.Runtime,
+    current: *Context,
+    assistant: ai.AssistantMessage,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    emit: EventSink,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        zio_runtime: *runtime.Runtime,
+        current: *Context,
+        assistant: ai.AssistantMessage,
+        config: agent.AgentLoopConfig,
+        token: runtime.CancelToken,
+        emit: EventSink,
+    ) ToolRunner {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .zio_runtime = zio_runtime,
+            .current = current,
+            .assistant = assistant,
+            .config = config,
+            .token = token,
+            .emit = emit,
+        };
+    }
+
+    fn run(self: ToolRunner) !ToolBatch {
+        if (shouldExecuteToolsSequential(
+            self.current.tools,
+            self.assistant,
+            self.config.tool_execution,
+        )) {
+            return executeToolCallsSequential(
+                self.allocator,
+                self.io,
+                self.zio_runtime,
+                self.current,
+                self.assistant,
+                self.config,
+                self.token,
+                self.emit,
+            );
+        }
+        return executeToolCallsParallel(
+            self.allocator,
+            self.io,
+            self.current,
+            self.assistant,
+            self.config,
+            self.token,
+            self.zio_runtime,
+            self.emit,
+        );
+    }
 };
 
 fn shouldExecuteToolsSequential(
