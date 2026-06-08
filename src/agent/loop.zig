@@ -854,16 +854,7 @@ fn defaultConvertToLlm(
 
 fn testSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const events: *std.ArrayList(agent.AgentEvent) = @ptrCast(@alignCast(context.?));
-    try events.append(std.testing.allocator, try copyEventForTest(event));
-}
-
-fn failOnToolUpdateSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
-    if (event == .tool_execution_update) return error.TestSinkFailed;
-    try testSink(context, event);
-}
-
-fn copyEventForTest(event: agent.AgentEvent) !agent.AgentEvent {
-    return switch (event) {
+    try events.append(std.testing.allocator, switch (event) {
         .message_start => |payload| .{ .message_start = .{ .message = try copyMessageForTest(payload.message) } },
         .message_update => event,
         .message_end => |payload| .{ .message_end = .{ .message = try copyMessageForTest(payload.message) } },
@@ -873,7 +864,12 @@ fn copyEventForTest(event: agent.AgentEvent) !agent.AgentEvent {
         } },
         .agent_end => |payload| .{ .agent_end = .{ .messages = payload.messages } },
         else => event,
-    };
+    });
+}
+
+fn failOnToolUpdateSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
+    if (event == .tool_execution_update) return error.TestSinkFailed;
+    try testSink(context, event);
 }
 
 fn copyMessageForTest(message: agent.AgentMessage) !agent.AgentMessage {
