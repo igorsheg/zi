@@ -179,14 +179,14 @@ pub const ToolRegistry = struct {
 
 pub const BuiltinTools = struct {
     allocator: std.mem.Allocator,
-    mutation_queue: *FileMutationQueue,
-    read: *ReadTool,
-    ls: *LsTool,
-    grep: *GrepTool,
-    find: *FindTool,
-    bash: *BashTool,
-    edit: *EditTool,
-    write: *WriteTool,
+    mutation_queue: FileMutationQueue,
+    read: ReadTool,
+    ls: LsTool,
+    grep: GrepTool,
+    find: FindTool,
+    bash: BashTool,
+    edit: EditTool,
+    write: WriteTool,
 
     pub const Options = struct {
         cwd: []const u8,
@@ -194,130 +194,108 @@ pub const BuiltinTools = struct {
         allow_paths_outside_cwd: bool = true,
     };
 
-    pub fn init(allocator: std.mem.Allocator, options: Options) !BuiltinTools {
-        const mutation_queue = try allocator.create(FileMutationQueue);
-        errdefer allocator.destroy(mutation_queue);
-        mutation_queue.* = .{};
+    pub fn init(allocator: std.mem.Allocator, options: Options) !*BuiltinTools {
+        const self = try allocator.create(BuiltinTools);
+        self.allocator = allocator;
+        self.mutation_queue = .{};
+        var read_init = false;
+        var ls_init = false;
+        var grep_init = false;
+        var find_init = false;
+        var bash_init = false;
+        var edit_init = false;
+        errdefer {
+            if (edit_init) self.edit.deinit();
+            if (bash_init) self.bash.deinit();
+            if (find_init) self.find.deinit();
+            if (grep_init) self.grep.deinit();
+            if (ls_init) self.ls.deinit();
+            if (read_init) self.read.deinit();
+            allocator.destroy(self);
+        }
 
-        const read = try allocator.create(ReadTool);
-        errdefer allocator.destroy(read);
-        read.* = try ReadTool.init(allocator, .{
+        self.read = try ReadTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         });
-        errdefer read.deinit();
-
-        const ls = try allocator.create(LsTool);
-        errdefer allocator.destroy(ls);
-        ls.* = try LsTool.init(allocator, .{
+        read_init = true;
+        self.ls = try LsTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         });
-        errdefer ls.deinit();
-
-        const grep = try allocator.create(GrepTool);
-        errdefer allocator.destroy(grep);
-        grep.* = try GrepTool.init(allocator, .{
+        ls_init = true;
+        self.grep = try GrepTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         });
-        errdefer grep.deinit();
-
-        const find = try allocator.create(FindTool);
-        errdefer allocator.destroy(find);
-        find.* = try FindTool.init(allocator, .{
+        grep_init = true;
+        self.find = try FindTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         });
-        errdefer find.deinit();
-
-        const bash = try allocator.create(BashTool);
-        errdefer allocator.destroy(bash);
-        bash.* = try BashTool.init(allocator, .{
+        find_init = true;
+        self.bash = try BashTool.init(allocator, .{
             .cwd = options.cwd,
             .environ = options.environ,
         });
-        errdefer bash.deinit();
-
-        const edit = try allocator.create(EditTool);
-        errdefer allocator.destroy(edit);
-        edit.* = try EditTool.init(allocator, .{
+        bash_init = true;
+        self.edit = try EditTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
-            .mutation_queue = mutation_queue,
+            .mutation_queue = &self.mutation_queue,
         });
-        errdefer edit.deinit();
-
-        const write = try allocator.create(WriteTool);
-        errdefer allocator.destroy(write);
-        write.* = try WriteTool.init(allocator, .{
+        edit_init = true;
+        self.write = try WriteTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
-            .mutation_queue = mutation_queue,
+            .mutation_queue = &self.mutation_queue,
         });
-
-        return .{
-            .allocator = allocator,
-            .mutation_queue = mutation_queue,
-            .read = read,
-            .ls = ls,
-            .grep = grep,
-            .find = find,
-            .bash = bash,
-            .edit = edit,
-            .write = write,
-        };
+        return self;
     }
 
     pub fn deinit(self: *BuiltinTools) void {
+        const allocator = self.allocator;
         self.write.deinit();
-        self.allocator.destroy(self.write);
         self.edit.deinit();
-        self.allocator.destroy(self.edit);
         self.bash.deinit();
-        self.allocator.destroy(self.bash);
         self.find.deinit();
-        self.allocator.destroy(self.find);
         self.grep.deinit();
-        self.allocator.destroy(self.grep);
         self.ls.deinit();
-        self.allocator.destroy(self.ls);
         self.read.deinit();
-        self.allocator.destroy(self.read);
-        self.allocator.destroy(self.mutation_queue);
         self.* = undefined;
+        allocator.destroy(self);
     }
 
     pub fn appendDefinitions(self: *BuiltinTools, registry: *ToolRegistry) !void {
-        try registry.append(ToolDefinition.init(self.read, .{
+        try registry.append(ToolDefinition.init(&self.read, .{
             .name = "read",
             .label = "read",
             .description = read_description,
             .prompt_snippet = "Read file contents. Use offset/limit for large files; continue with offset when needed.",
             .display = .{ .presentation = .file, .body_mode = .hidden_on_success },
         }));
-        try registry.append(ToolDefinition.init(self.ls, .{
+        try registry.append(ToolDefinition.init(&self.ls, .{
             .name = "ls",
             .label = "ls",
             .description = "List one directory with bounded output.",
             .prompt_snippet = "List one directory. Prefer this over bash ls for directory inspection.",
             .display = .{ .presentation = .directory },
         }));
-        try registry.append(ToolDefinition.init(self.grep, .{
+        try registry.append(ToolDefinition.init(&self.grep, .{
             .name = "grep",
             .label = "grep",
             .description = "Search files for a literal text pattern with bounded output.",
             .prompt_snippet = "Search files for literal text. Prefer this over bash grep for simple searches.",
             .display = .{ .presentation = .search },
         }));
-        try registry.append(ToolDefinition.init(self.find, .{
+        try registry.append(ToolDefinition.init(&self.find, .{
             .name = "find",
             .label = "find",
             .description = "Recursively find paths under a directory with bounded output.",
             .prompt_snippet = "Find paths under a directory. Prefer this over bash find for simple path discovery.",
             .display = .{ .presentation = .directory },
         }));
-        try registry.append(ToolDefinition.init(self.bash, .{
+        try registry.append(ToolDefinition.init(&self.bash, .{
             .name = "bash",
             .label = "bash",
             .description = bash_description,
@@ -325,7 +303,7 @@ pub const BuiltinTools = struct {
             .execution_mode = .sequential,
             .display = .{ .presentation = .command },
         }));
-        try registry.append(ToolDefinition.init(self.edit, .{
+        try registry.append(ToolDefinition.init(&self.edit, .{
             .name = "edit",
             .label = "edit",
             .description = "Edit a single file using exact, unique, non-overlapping text replacements.",
@@ -333,7 +311,7 @@ pub const BuiltinTools = struct {
             .execution_mode = .sequential,
             .display = .{ .presentation = .patch, .body_mode = .hidden_on_success },
         }));
-        try registry.append(ToolDefinition.init(self.write, .{
+        try registry.append(ToolDefinition.init(&self.write, .{
             .name = "write",
             .label = "write",
             .description = "Create or overwrite a text file. Creates parent directories as needed.",
@@ -398,7 +376,7 @@ test "tool registry rejects duplicate and unknown tool names without changing ac
     try builtins.appendDefinitions(&registry);
     try registry.setActiveToolsByName(&.{"read"});
     try std.testing.expectError(error.DuplicateToolName, registry.append(
-        ToolDefinition.init(builtins.read, .{
+        ToolDefinition.init(&builtins.read, .{
             .name = "read",
             .label = "read",
             .description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit.",

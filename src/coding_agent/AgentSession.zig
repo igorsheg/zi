@@ -52,7 +52,7 @@ current_date: []const u8,
 timestamp: []const u8,
 prompt_resources: resources.PromptResources,
 system_prompt_text: []const u8,
-builtin_tools: tool_registry.BuiltinTools,
+builtin_tools: *tool_registry.BuiltinTools,
 tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 store: ?*session_store.SessionStore = null,
@@ -207,7 +207,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     });
     errdefer prompt_resources.deinit();
 
-    var builtin_tools = try tool_registry.BuiltinTools.init(allocator, .{
+    const builtin_tools = try tool_registry.BuiltinTools.init(allocator, .{
         .cwd = options.cwd,
         .environ = options.environ,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
