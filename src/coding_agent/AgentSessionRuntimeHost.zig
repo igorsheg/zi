@@ -225,10 +225,6 @@ pub fn statusSnapshot(self: *AgentSessionRuntimeHost) AgentSession.RuntimeStatus
     return self.session.statusSnapshot();
 }
 
-pub fn zioRuntime(self: *AgentSessionRuntimeHost) *runtime.Runtime {
-    return self.session.zio_runtime;
-}
-
 pub fn queueSnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
     return self.session.queueSnapshot(allocator);
 }
@@ -579,7 +575,6 @@ test "runtime host zio runtime accessor returns explicit session runtime" {
     }
 
     try std.testing.expect(host.base.zio_runtime == zio_runtime);
-    try std.testing.expect(host.zioRuntime() == host.session.zio_runtime);
 }
 
 test "runtime host replacement rejects active old session" {
