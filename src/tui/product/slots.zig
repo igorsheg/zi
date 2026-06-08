@@ -107,7 +107,13 @@ pub const SlotStore = struct {
             };
             n += 1;
         }
-        sortViews(out[0..n]);
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const current = out[i];
+            var j = i;
+            while (j > 0 and current.priority > out[j - 1].priority) : (j -= 1) out[j] = out[j - 1];
+            out[j] = current;
+        }
         return n;
     }
 
@@ -149,16 +155,6 @@ pub const SlotView = struct {
     text: []const u8,
     effect: RenderEffect,
 };
-
-fn sortViews(items: []SlotView) void {
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        const current = items[i];
-        var j = i;
-        while (j > 0 and current.priority > items[j - 1].priority) : (j -= 1) items[j] = items[j - 1];
-        items[j] = current;
-    }
-}
 
 test "slot store sets replaces clears and bounds contributions" {
     var slots: SlotStore = .{};
