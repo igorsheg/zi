@@ -24,7 +24,7 @@ pub const RuntimeServices = struct {
     diagnostics: [diagnostic_capacity]Diagnostic = undefined,
     diagnostic_count: usize = 0,
 
-    pub const Options = struct {
+    const Options = struct {
         cwd: []const u8,
         agent_dir: []const u8,
         dir: std.Io.Dir = .cwd(),
@@ -94,18 +94,18 @@ pub const RuntimeServices = struct {
         };
     }
 
-    pub const diagnostic_capacity = 8;
+    const diagnostic_capacity = 8;
 
-    pub const Diagnostic = union(enum) {
+    const Diagnostic = union(enum) {
         unresolved_model_setting: ModelSetting,
         unresolved_stream: StreamSetting,
 
-        pub const ModelSetting = struct {
+        const ModelSetting = struct {
             provider: ?[]const u8,
             model: ?[]const u8,
         };
 
-        pub const StreamSetting = struct {
+        const StreamSetting = struct {
             api: []const u8,
         };
     };
