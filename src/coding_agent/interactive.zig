@@ -245,7 +245,13 @@ fn sanitizeTranscriptText(input: []const u8, buffer: []u8) []const u8 {
             continue;
         }
         if (byte == 0xc2 and index + 1 < input.len and input[index + 1] >= 0x80 and input[index + 1] <= 0x9f) {
-            index = skipC1Control(input, index);
+            const kind = input[index + 1];
+            index = if (kind == 0x9b)
+                skipCsiPayload(input, index + 2)
+            else if (kind == 0x9d)
+                skipOscPayload(input, index + 2)
+            else
+                index + 2;
             continue;
         }
         const scalar_len: usize = if (byte < 0x80)
@@ -266,15 +272,6 @@ fn sanitizeTranscriptText(input: []const u8, buffer: []u8) []const u8 {
         index += valid_len;
     }
     return buffer[0..out_len];
-}
-
-fn skipC1Control(input: []const u8, start: usize) usize {
-    std.debug.assert(start + 1 < input.len);
-    std.debug.assert(input[start] == 0xc2);
-    const kind = input[start + 1];
-    if (kind == 0x9b) return skipCsiPayload(input, start + 2);
-    if (kind == 0x9d) return skipOscPayload(input, start + 2);
-    return start + 2;
 }
 
 fn skipCsiPayload(input: []const u8, start: usize) usize {
