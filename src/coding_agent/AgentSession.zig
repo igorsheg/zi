@@ -170,7 +170,7 @@ const AgentSessionStatus = enum {
     stopped,
 };
 
-pub const RuntimeStatusSnapshot = struct {
+const RuntimeStatusSnapshot = struct {
     status: AgentSessionStatus,
     public_event_count: usize,
     dropped_public_event_count: usize,
