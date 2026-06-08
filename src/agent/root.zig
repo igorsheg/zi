@@ -22,7 +22,6 @@ pub const ToolExecutionMode = enum {
     parallel,
 };
 
-pub const AgentToolCall = ai.ToolCall;
 pub const ToolRuntime = runtime.Runtime;
 
 pub const BeforeToolCallResult = union(enum) {
@@ -512,14 +511,14 @@ pub const AgentContext = struct {
 
 pub const BeforeToolCallContext = struct {
     assistant_message: ai.AssistantMessage,
-    tool_call: AgentToolCall,
+    tool_call: ai.ToolCall,
     args: std.json.Value,
     agent: AgentContext,
 };
 
 pub const AfterToolCallContext = struct {
     assistant_message: ai.AssistantMessage,
-    tool_call: AgentToolCall,
+    tool_call: ai.ToolCall,
     args: std.json.Value,
     result: AgentToolResult,
     is_error: bool,
