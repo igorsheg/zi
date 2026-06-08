@@ -255,10 +255,8 @@ fn drawConfirmButtons(
     y: u16,
     modal_width: u16,
 ) !void {
-    var label_buffer: [8]u8 = undefined;
-    const yes = selectedLabel(&label_buffer, "Yes", confirm.selected_yes) catch "Yes";
-    var no_buffer: [8]u8 = undefined;
-    const no = selectedLabel(&no_buffer, "No", !confirm.selected_yes) catch "No";
+    const yes = if (confirm.selected_yes) "[Yes]" else " Yes ";
+    const no = if (confirm.selected_yes) " No " else "[No]";
     const yes_width = primitive.text.displayWidth(yes);
     const no_width = primitive.text.displayWidth(no);
     const total_width = yes_width + 2 + no_width;
@@ -272,11 +270,6 @@ fn drawConfirmButtons(
         @as(usize, start) + yes_width + 2,
     )));
     try renderer.writeText(no_x, y, no, no_style);
-}
-
-fn selectedLabel(buffer: []u8, label: []const u8, selected: bool) ![]const u8 {
-    if (selected) return std.fmt.bufPrint(buffer, "[{s}]", .{label});
-    return std.fmt.bufPrint(buffer, " {s} ", .{label});
 }
 
 fn drawTranscript(
