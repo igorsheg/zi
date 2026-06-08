@@ -127,13 +127,6 @@ pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LiveProm
     return self.session.stepPromptRun(run);
 }
 
-pub fn promptRunProgress(
-    _: *AgentSessionRuntimeHost,
-    run: *AgentSession.LivePromptRun,
-) @TypeOf(run.stream.asyncNext()) {
-    return run.stream.asyncNext();
-}
-
 pub fn applyPromptRunProgress(
     self: *AgentSessionRuntimeHost,
     run: *AgentSession.LivePromptRun,
@@ -920,7 +913,7 @@ test "runtime host applies prompt progress from zio stream future" {
     const run = try host.startPromptRun("hello", &.{}, .{});
     defer host.destroyPromptRun(run);
 
-    var progress = host.promptRunProgress(run);
+    var progress = run.stream.asyncNext();
     const selected = try runtime.select(.{ .prompt = &progress });
     const more = try host.applyPromptRunProgress(run, selected.prompt);
     try std.testing.expect(more);

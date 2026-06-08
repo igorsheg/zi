@@ -673,7 +673,7 @@ const InteractiveLoop = struct {
         var frame = runtime.Timeout.fromMilliseconds(frame_interval_ms);
         var public_event_wake = self.host.session.publicEventWake();
         if (self.active_run) |prompt_run| {
-            var progress = self.host.promptRunProgress(prompt_run);
+            var progress = prompt_run.stream.asyncNext();
             switch (try runtime.select(.{
                 .input = &input,
                 .prompt = &progress,
@@ -778,7 +778,7 @@ const InteractiveLoop = struct {
         const prompt_run = self.active_run orelse return 0;
         var count: usize = 0;
         while (count < limit and self.active_run != null) : (count += 1) {
-            var progress = self.host.promptRunProgress(prompt_run);
+            var progress = prompt_run.stream.asyncNext();
             var ready = runtime.Timeout.fromMilliseconds(0);
             switch (try runtime.select(.{ .prompt = &progress, .ready = &ready })) {
                 .prompt => |result| try self.applyPromptProgressResult(prompt_run, result),
