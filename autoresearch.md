@@ -110,3 +110,4 @@ Useful first probes:
 - Collapsed composer slot surface to the one current product label (`composer_top_right`) plus `status_area`; bottom and top-left composer slots, owner namespaces, and bulk owner clearing were test-only/future seams.
 - Removed explicit modal command surface; confirm modals now accept terminal input directly. Also collapsed fixed confirm button rendering and one-use validation helpers.
 - AgentSession prompt startup now uses one path (`startPromptRun`) with inline preconditions/retry flags instead of wrapper/helper policy structs.
+- Eliminated the remaining scoped panic-like sites by replacing test/helper `catch unreachable` with assertions for infallible buffered stream/event drain invariants.

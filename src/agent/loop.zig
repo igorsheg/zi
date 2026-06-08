@@ -945,7 +945,7 @@ fn deinitTestMessage(message: agent.AgentMessage) void {
 fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
     var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
-    sink.endDone(request.io, .stop, assistantMessage("ok")) catch unreachable;
+    sink.endDone(request.io, .stop, assistantMessage("ok")) catch std.debug.assert(false);
     return stream;
 }
 
@@ -958,16 +958,16 @@ const fast_delta_stream_count = 240;
 fn fastDeltaBufferedStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
     var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
-    sink.emit(request.io, .{ .start = .{ .partial = assistantMessage("partial") } }) catch unreachable;
+    sink.emit(request.io, .{ .start = .{ .partial = assistantMessage("partial") } }) catch std.debug.assert(false);
     var count: usize = 0;
     while (count < fast_delta_stream_count) : (count += 1) {
         sink.emit(request.io, .{ .text_delta = .{
             .content_index = 0,
             .delta = "x",
             .partial = assistantMessage("partial"),
-        } }) catch unreachable;
+        } }) catch std.debug.assert(false);
     }
-    sink.endDone(request.io, .stop, assistantMessage("done")) catch unreachable;
+    sink.endDone(request.io, .stop, assistantMessage("done")) catch std.debug.assert(false);
     return stream;
 }
 
@@ -976,9 +976,9 @@ fn testToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantM
     var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     if (calls.* == 0) {
-        sink.endDone(request.io, .tool_use, assistantToolCallMessage()) catch unreachable;
+        sink.endDone(request.io, .tool_use, assistantToolCallMessage()) catch std.debug.assert(false);
     } else {
-        sink.endDone(request.io, .stop, assistantMessage("done")) catch unreachable;
+        sink.endDone(request.io, .stop, assistantMessage("done")) catch std.debug.assert(false);
     }
     calls.* += 1;
     return stream;
@@ -989,9 +989,9 @@ fn testTwoToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.Assista
     var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     if (calls.* == 0) {
-        sink.endDone(request.io, .tool_use, assistantTwoToolCallMessage()) catch unreachable;
+        sink.endDone(request.io, .tool_use, assistantTwoToolCallMessage()) catch std.debug.assert(false);
     } else {
-        sink.endDone(request.io, .stop, assistantMessage("done")) catch unreachable;
+        sink.endDone(request.io, .stop, assistantMessage("done")) catch std.debug.assert(false);
     }
     calls.* += 1;
     return stream;
