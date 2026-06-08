@@ -18,8 +18,8 @@ const LsTool = ls_tool.LsTool;
 const ReadTool = read_tool.ReadTool;
 const WriteTool = write_tool.WriteTool;
 
-pub const max_tool_definitions = 64;
-pub const max_active_tools = 64;
+const max_tool_definitions = 64;
+const max_active_tools = 64;
 pub const builtin_tool_count = default_active_tool_names.len;
 pub const default_active_tool_names: []const []const u8 = &.{ "read", "ls", "grep", "find", "bash", "edit", "write" };
 
