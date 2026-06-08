@@ -3,16 +3,12 @@ const substrate = @import("../substrate/root.zig");
 
 pub const title_bytes_max: usize = 80;
 pub const body_bytes_max: usize = 512;
-pub const button_bytes_max: usize = 24;
-
 pub const ModalId = u32;
 
 pub const OpenConfirm = struct {
     id: ModalId,
     title: []const u8,
     body: []const u8,
-    yes_label: []const u8 = "Yes",
-    no_label: []const u8 = "No",
 };
 
 pub const ConfirmResult = struct {
@@ -32,8 +28,6 @@ pub const Confirm = struct {
     id: ModalId,
     title: []u8,
     body: []u8,
-    yes_label: []u8,
-    no_label: []u8,
     selected_yes: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, open: OpenConfirm) !Confirm {
@@ -42,21 +36,14 @@ pub const Confirm = struct {
         errdefer allocator.free(title);
         const body = try allocator.dupe(u8, open.body);
         errdefer allocator.free(body);
-        const yes_label = try allocator.dupe(u8, open.yes_label);
-        errdefer allocator.free(yes_label);
-        const no_label = try allocator.dupe(u8, open.no_label);
         return .{
             .id = open.id,
             .title = title,
             .body = body,
-            .yes_label = yes_label,
-            .no_label = no_label,
         };
     }
 
     pub fn deinit(self: *Confirm, allocator: std.mem.Allocator) void {
-        allocator.free(self.no_label);
-        allocator.free(self.yes_label);
         allocator.free(self.body);
         allocator.free(self.title);
         self.* = undefined;
@@ -108,8 +95,6 @@ fn validateOpen(open: OpenConfirm) !void {
     if (open.id == 0) return error.InvalidModal;
     try validateText(open.title, title_bytes_max);
     try validateText(open.body, body_bytes_max);
-    try validateText(open.yes_label, button_bytes_max);
-    try validateText(open.no_label, button_bytes_max);
 }
 
 fn validateText(bytes: []const u8, max: usize) !void {

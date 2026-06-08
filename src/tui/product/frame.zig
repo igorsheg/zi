@@ -286,18 +286,10 @@ fn drawConfirmButtons(
     y: u16,
     modal_width: u16,
 ) !void {
-    var label_buffer: [surface_mod.button_bytes_max * 2 + 8]u8 = undefined;
-    const yes = selectedLabel(
-        &label_buffer,
-        confirm.yes_label,
-        confirm.selected_yes,
-    ) catch confirm.yes_label;
-    var no_buffer: [surface_mod.button_bytes_max * 2 + 8]u8 = undefined;
-    const no = selectedLabel(
-        &no_buffer,
-        confirm.no_label,
-        !confirm.selected_yes,
-    ) catch confirm.no_label;
+    var label_buffer: [8]u8 = undefined;
+    const yes = selectedLabel(&label_buffer, "Yes", confirm.selected_yes) catch "Yes";
+    var no_buffer: [8]u8 = undefined;
+    const no = selectedLabel(&no_buffer, "No", !confirm.selected_yes) catch "No";
     const yes_width = primitive.text.displayWidth(yes);
     const no_width = primitive.text.displayWidth(no);
     const total_width = yes_width + 2 + no_width;
