@@ -32,20 +32,20 @@ const bash_prompt_snippet = "Run one shell command in the session cwd. " ++
 const edit_prompt_snippet = "Edit a file using exact unique text replacements. " ++
     "Use one call for multiple disjoint edits.";
 
-pub const ToolSource = union(enum) {
+const ToolSource = union(enum) {
     builtin,
     custom: []const u8,
 };
 
-pub const ToolDisplayPresentation = enum { generic, command, file, patch, search, directory };
-pub const ToolDisplayBodyMode = enum { visible, hidden_on_success };
+const ToolDisplayPresentation = enum { generic, command, file, patch, search, directory };
+const ToolDisplayBodyMode = enum { visible, hidden_on_success };
 
-pub const ToolDisplay = struct {
+const ToolDisplay = struct {
     presentation: ToolDisplayPresentation = .generic,
     body_mode: ToolDisplayBodyMode = .visible,
 };
 
-pub const ToolMetadata = struct {
+const ToolMetadata = struct {
     name: []const u8,
     label: []const u8,
     description: []const u8,
@@ -56,7 +56,7 @@ pub const ToolMetadata = struct {
     display: ToolDisplay = .{},
 };
 
-pub const ToolImplementation = struct {
+const ToolImplementation = struct {
     context: *anyopaque,
     as_agent_tool_fn: *const fn (*anyopaque) agent.AgentTool,
 
@@ -105,7 +105,7 @@ pub const ToolDefinition = struct {
     }
 };
 
-pub const ActiveToolSet = struct {
+const ActiveToolSet = struct {
     names: []const []const u8,
     agent_tools: []const agent.AgentTool,
 
@@ -401,14 +401,14 @@ test "tool registry stores definitions first and exposes active agent tools" {
     try std.testing.expectEqualStrings("edit", registry.activeAgentTools()[5].name);
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[5].execution_mode.?);
     try std.testing.expectEqual(
-        ToolDisplayPresentation.command,
+        .command,
         registry.definitions.items[4].metadata.display.presentation,
     );
     try std.testing.expectEqual(
-        ToolDisplayPresentation.patch,
+        .patch,
         registry.definitions.items[5].metadata.display.presentation,
     );
-    try std.testing.expectEqual(ToolDisplayBodyMode.visible, registry.definitions.items[6].metadata.display.body_mode);
+    try std.testing.expectEqual(.visible, registry.definitions.items[6].metadata.display.body_mode);
 }
 
 test "tool registry rejects duplicate and unknown tool names without changing active set" {
