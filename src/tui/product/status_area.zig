@@ -6,6 +6,14 @@ const slots = @import("slots.zig");
 const theme_mod = @import("theme.zig");
 
 const separator = " · ";
+const status_shimmer_config: shimmer.Config = .{
+    .lead_pad_cols = 6,
+    .tail_pad_cols = 10,
+    .band_half_width = 2,
+    .base_style = .{ .dim = true },
+    .edge_style = .{ .fg = .{ .rgb = .{ .r = 120, .g = 120, .b = 120 } } },
+    .peak_style = .{ .fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } }, .bold = true },
+};
 
 pub fn visibleRows(has_status: bool, height: u16, composer_rows: usize) usize {
     if (!has_status) return 0;
@@ -51,22 +59,10 @@ pub fn draw(
                 try renderer.writeText(x, y, text, theme.transcript_secondary);
                 break :blk advance(x, primitive.text.displayWidth(text));
             },
-            .shimmer => try shimmer.writeSmooth(renderer, x, y, text, tick / 3, shimmerConfig(theme), 48),
+            .shimmer => try shimmer.writeSmooth(renderer, x, y, text, tick / 3, status_shimmer_config, 48),
         };
         rendered_any = true;
     }
-}
-
-fn shimmerConfig(theme: theme_mod.Theme) shimmer.Config {
-    _ = theme;
-    return .{
-        .lead_pad_cols = 6,
-        .tail_pad_cols = 10,
-        .band_half_width = 2,
-        .base_style = .{ .dim = true },
-        .edge_style = .{ .fg = .{ .rgb = .{ .r = 120, .g = 120, .b = 120 } } },
-        .peak_style = .{ .fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } }, .bold = true },
-    };
 }
 
 fn fitPrefix(text: []const u8, max_width: u16) []const u8 {
