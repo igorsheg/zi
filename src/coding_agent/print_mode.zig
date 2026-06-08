@@ -58,7 +58,12 @@ fn drainEvents(
         .stderr = stderr,
         .output = output,
     };
-    _ = try host.drainPublicEvents(.{ .context = &drain, .call_fn = PrintDrain.onEvent });
+    while (host.session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        errdefer owned_event.deinit();
+        try PrintDrain.onEvent(&drain, owned_event);
+        owned_event.deinit();
+    }
     if (output == .text and drain.wrote_text) try stdout.writeByte('\n');
 }
 
@@ -239,7 +244,8 @@ test "json print mode streams session header and public events" {
 }
 
 fn drainAllPublicEvents(host: *AgentSessionRuntimeHost) void {
-    _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
+    while (host.session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        owned_event.deinit();
+    }
 }
-
-fn ignorePublicEvent(_: ?*anyopaque, _: session_events.AgentSessionEvent) !void {}

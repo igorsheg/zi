@@ -8,7 +8,6 @@ const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_config = @import("session_config.zig");
-const session_events = @import("session_events.zig");
 const session_listing = @import("session_listing.zig");
 const session_store = @import("session_store.zig");
 
@@ -153,10 +152,11 @@ fn initRuntimeHostBase(allocator: std.mem.Allocator, options: anytype) !RuntimeH
 }
 
 fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
-    _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
+    while (host.session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        owned_event.deinit();
+    }
 }
-
-fn ignorePublicEvent(_: ?*anyopaque, _: session_events.AgentSessionEvent) !void {}
 
 fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
     const run = try host.session.startPromptRun(text, &.{}, .{});

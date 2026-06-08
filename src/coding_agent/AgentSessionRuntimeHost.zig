@@ -52,11 +52,6 @@ const ReplaceResult = struct {
     discarded_public_event_count: usize,
 };
 
-const PublicEventHandler = struct {
-    context: ?*anyopaque = null,
-    call_fn: *const fn (context: ?*anyopaque, event: session_events.AgentSessionEvent) anyerror!void,
-};
-
 pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -92,17 +87,6 @@ pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !Repl
     next_session_needs_deinit = false;
     self.session = next_session;
     return .{ .discarded_public_event_count = discarded_public_event_count };
-}
-
-pub fn drainPublicEvents(self: *AgentSessionRuntimeHost, handler: PublicEventHandler) !usize {
-    var count: usize = 0;
-    while (self.session.drainPublicEvent()) |event| {
-        var owned_event = event;
-        defer owned_event.deinit();
-        try handler.call_fn(handler.context, owned_event);
-        count += 1;
-    }
-    return count;
 }
 
 fn buildSessionOptions(base: BaseOptions, start: SessionStart) AgentSession.Options {
@@ -757,7 +741,12 @@ test "runtime host live run executes a tool and continues the assistant turn" {
     while (try host.session.stepPromptRun(run)) {}
 
     var observed: ToolLoopObservation = .{};
-    _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = ToolLoopObservation.onEvent });
+    while (host.session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        errdefer owned_event.deinit();
+        try ToolLoopObservation.onEvent(&observed, owned_event);
+        owned_event.deinit();
+    }
 
     try std.testing.expectEqual(@as(usize, 2), provider.call_count);
     try std.testing.expectEqual(@as(usize, 1), echo.call_count);
@@ -1001,7 +990,12 @@ test "runtime host preserves bash truncation details through public events" {
     while (try host.session.stepPromptRun(run)) {}
 
     var observed: BashLimitObservation = .{};
-    _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });
+    while (host.session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        errdefer owned_event.deinit();
+        try BashLimitObservation.onEvent(&observed, owned_event);
+        owned_event.deinit();
+    }
 
     try std.testing.expectEqual(@as(usize, 2), provider.call_count);
     try std.testing.expect(observed.tool_execution_end);
@@ -1066,7 +1060,11 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
     defer future.cancel();
     var observed: BashLimitObservation = .{};
     for (0..1024) |_| {
-        _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });
+        while (host.session.drainPublicEvent()) |event| {
+            var owned_event = event;
+            defer owned_event.deinit();
+            try BashLimitObservation.onEvent(&observed, owned_event);
+        }
         if (observed.tool_execution_start) break;
         try runtime.yield();
     } else return error.BashToolStartNotObserved;
@@ -1074,7 +1072,12 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
     host.session.cancel();
 
     try future.join();
-    _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });
+    while (host.session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        errdefer owned_event.deinit();
+        try BashLimitObservation.onEvent(&observed, owned_event);
+        owned_event.deinit();
+    }
 
     try std.testing.expect(observed.tool_execution_start);
     try std.testing.expect(observed.tool_execution_end);
