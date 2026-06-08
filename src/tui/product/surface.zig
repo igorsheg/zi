@@ -20,8 +20,6 @@ pub const ModalCommand = union(enum) {
     input: substrate.input.InputEvent,
     confirm,
     cancel,
-    next,
-    previous,
 };
 
 pub const Confirm = struct {
@@ -53,10 +51,6 @@ pub const Confirm = struct {
         switch (command) {
             .confirm => return self.result(self.selected_yes),
             .cancel => return self.result(false),
-            .next, .previous => {
-                self.selected_yes = !self.selected_yes;
-                return null;
-            },
             .input => |event| return self.applyInput(event),
         }
     }
@@ -113,9 +107,9 @@ test "confirm modal accepts cancels and toggles selection" {
     try std.testing.expect((confirm.apply(.{ .input = .{
         .text = substrate.input.InlineBytes.from("n"),
     } })).?.accepted == false);
-    try std.testing.expect(confirm.apply(.next) == null);
+    try std.testing.expect(confirm.apply(.{ .input = .{ .key = .arrow_right } }) == null);
     try std.testing.expect((confirm.apply(.confirm)).?.accepted == false);
-    try std.testing.expect(confirm.apply(.previous) == null);
+    try std.testing.expect(confirm.apply(.{ .input = .{ .key = .arrow_left } }) == null);
     try std.testing.expect((confirm.apply(.confirm)).?.accepted == true);
 }
 
