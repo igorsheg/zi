@@ -1,8 +1,8 @@
-pub const ai = @import("ai/root.zig");
-pub const agent = @import("agent/root.zig");
-pub const coding_agent = @import("coding_agent/root.zig");
-pub const runtime = @import("runtime/root.zig");
-pub const tui = @import("tui/root.zig");
+const ai = @import("ai/root.zig");
+const agent = @import("agent/root.zig");
+const coding_agent = @import("coding_agent/root.zig");
+const runtime = @import("runtime/root.zig");
+const tui = @import("tui/root.zig");
 
 test {
     _ = ai;
