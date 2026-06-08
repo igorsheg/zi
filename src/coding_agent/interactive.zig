@@ -1084,7 +1084,15 @@ pub fn run(
     };
     defer loop.shutdown();
 
-    try applyModelComposerSlot(&terminal_loop, host_handle.host.base.model);
+    var model_text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
+    const model_text = modelComposerSlotText(host_handle.host.base.model, &model_text_buffer);
+    _ = try terminal_loop.applyCommand(.{ .set_slot_contribution = .{
+        .slot = .composer_top_right,
+        .id = model_slot_id,
+        .priority = 100,
+        .text = model_text,
+        .effect = .none,
+    } });
     try seedTranscriptFromSession(process.gpa, &terminal_loop, &host_handle.host);
     if (options.initial_prompt) |prompt| {
         if (try loop.startPrompt(prompt) == .started) {
@@ -1096,18 +1104,6 @@ pub fn run(
     try stdout.flush();
 
     while (terminal_loop.isRunning()) try loop.tick();
-}
-
-fn applyModelComposerSlot(terminal_loop: *tui.product.TerminalLoop, model: ai.Model) !void {
-    var text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
-    const text = modelComposerSlotText(model, &text_buffer);
-    _ = try terminal_loop.applyCommand(.{ .set_slot_contribution = .{
-        .slot = .composer_top_right,
-        .id = model_slot_id,
-        .priority = 100,
-        .text = text,
-        .effect = .none,
-    } });
 }
 
 fn modelComposerSlotText(model: ai.Model, buffer: []u8) []const u8 {
