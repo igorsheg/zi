@@ -38,18 +38,13 @@ fn bashResultIsError(details: ?std.json.Value, fallback: bool) bool {
     if (jsonBool(object.get("outputLimitExceeded"))) |limited| if (limited) return true;
     if (jsonBool(object.get("cancelled"))) |cancelled| if (cancelled) return true;
     if (object.get("signal") != null or object.get("stopped") != null or object.get("unknown") != null) return true;
-    if (jsonInteger(object.get("exitCode"))) |code| return code != 0;
+    if (object.get("exitCode")) |code| if (code == .integer) return code.integer != 0;
     return fallback;
 }
 
 fn jsonBool(value: ?std.json.Value) ?bool {
     const resolved = value orelse return null;
     return if (resolved == .bool) resolved.bool else null;
-}
-
-fn jsonInteger(value: ?std.json.Value) ?i64 {
-    const resolved = value orelse return null;
-    return if (resolved == .integer) resolved.integer else null;
 }
 
 allocator: std.mem.Allocator,
