@@ -241,11 +241,22 @@ fn sanitizeTranscriptText(input: []const u8, buffer: []u8) []const u8 {
             index = skipC1Control(input, index);
             continue;
         }
-        const scalar_len = utf8ScalarLen(input[index..]);
-        if (out_len + scalar_len > buffer.len) break;
-        @memcpy(buffer[out_len .. out_len + scalar_len], input[index .. index + scalar_len]);
-        out_len += scalar_len;
-        index += scalar_len;
+        const scalar_len: usize = if (byte < 0x80)
+            1
+        else if ((byte & 0xe0) == 0xc0)
+            2
+        else if ((byte & 0xf0) == 0xe0)
+            3
+        else if ((byte & 0xf8) == 0xf0)
+            4
+        else
+            1;
+        const valid_len = if (scalar_len <= input.len - index and
+            std.unicode.utf8ValidateSlice(input[index .. index + scalar_len])) scalar_len else 1;
+        if (out_len + valid_len > buffer.len) break;
+        @memcpy(buffer[out_len .. out_len + valid_len], input[index .. index + valid_len]);
+        out_len += valid_len;
+        index += valid_len;
     }
     return buffer[0..out_len];
 }
@@ -286,23 +297,6 @@ fn skipOscPayload(input: []const u8, start: usize) usize {
         if (byte == 0x1b and index + 1 < input.len and input[index + 1] == '\\') return index + 2;
     }
     return input.len;
-}
-
-fn utf8ScalarLen(input: []const u8) usize {
-    if (input.len == 0) return 0;
-    const first = input[0];
-    if (first < 0x80) return 1;
-    const len: usize = if ((first & 0xe0) == 0xc0)
-        2
-    else if ((first & 0xf0) == 0xe0)
-        3
-    else if ((first & 0xf8) == 0xf0)
-        4
-    else
-        1;
-    if (len > input.len) return 1;
-    if (!std.unicode.utf8ValidateSlice(input[0..len])) return 1;
-    return len;
 }
 
 fn firstToolResultText(result: agent_mod.AgentToolResult) []const u8 {
