@@ -956,8 +956,8 @@ fn buildSystemPromptText(
         .prompt_guidelines = guidelines.items,
         .context_files = prompt_resources.context_files.files,
         .skills = prompt_resources.skills.skills,
-        .custom_prompt = prompt_resources.systemPromptFileContent(),
-        .append_system_prompt = prompt_resources.appendSystemPrompt(),
+        .custom_prompt = if (prompt_resources.system_prompt.file) |file| file.content else null,
+        .append_system_prompt = if (prompt_resources.append_system_prompt.file) |file| file.content else null,
     });
 }
 

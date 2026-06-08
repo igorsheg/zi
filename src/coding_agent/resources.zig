@@ -17,7 +17,7 @@ pub const PromptFile = struct {
     content: []const u8,
 };
 
-pub const LoadedPromptFile = struct {
+const LoadedPromptFile = struct {
     allocator: std.mem.Allocator,
     file: ?PromptFile,
 
@@ -44,13 +44,13 @@ pub const LoadedContextFiles = struct {
     }
 };
 
-pub const LoadProjectContextOptions = struct {
+const LoadProjectContextOptions = struct {
     dir: std.Io.Dir = .cwd(),
     agent_dir: []const u8,
     cwd: []const u8,
 };
 
-pub const DiscoverPromptFileOptions = struct {
+const DiscoverPromptFileOptions = struct {
     dir: std.Io.Dir = .cwd(),
     agent_dir: []const u8,
     cwd: []const u8,
@@ -112,17 +112,9 @@ pub const PromptResources = struct {
         self.skills.deinit();
         self.* = undefined;
     }
-
-    pub fn systemPromptFileContent(self: *const PromptResources) ?[]const u8 {
-        return if (self.system_prompt.file) |file| file.content else null;
-    }
-
-    pub fn appendSystemPrompt(self: *const PromptResources) ?[]const u8 {
-        return if (self.append_system_prompt.file) |file| file.content else null;
-    }
 };
 
-pub fn discoverSystemPromptFile(
+fn discoverSystemPromptFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: DiscoverPromptFileOptions,
@@ -130,7 +122,7 @@ pub fn discoverSystemPromptFile(
     return discoverPromptFile(allocator, io, options, paths_mod.system_prompt_file_name);
 }
 
-pub fn discoverAppendSystemPromptFile(
+fn discoverAppendSystemPromptFile(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: DiscoverPromptFileOptions,
@@ -156,7 +148,7 @@ fn discoverPromptFile(
     return .{ .allocator = allocator, .file = null };
 }
 
-pub fn loadProjectContextFiles(
+fn loadProjectContextFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: LoadProjectContextOptions,
@@ -300,8 +292,8 @@ test "prompt resources load context and prompt overrides" {
 
     try std.testing.expectEqual(@as(usize, 2), prompt_resources.context_files.files.len);
     try std.testing.expectEqual(@as(usize, 0), prompt_resources.skills.skills.len);
-    try std.testing.expectEqualStrings("system", prompt_resources.systemPromptFileContent().?);
-    try std.testing.expectEqualStrings("append", prompt_resources.appendSystemPrompt().?);
+    try std.testing.expectEqualStrings("system", prompt_resources.system_prompt.file.?.content);
+    try std.testing.expectEqualStrings("append", prompt_resources.append_system_prompt.file.?.content);
 }
 
 test "prompt resources returns null prompts when files are missing" {
@@ -316,8 +308,8 @@ test "prompt resources returns null prompts when files are missing" {
     defer prompt_resources.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), prompt_resources.context_files.files.len);
-    try std.testing.expect(prompt_resources.systemPromptFileContent() == null);
-    try std.testing.expect(prompt_resources.appendSystemPrompt() == null);
+    try std.testing.expect(prompt_resources.system_prompt.file == null);
+    try std.testing.expect(prompt_resources.append_system_prompt.file == null);
 }
 
 test "system prompt discovery rejects directory at prompt path" {
