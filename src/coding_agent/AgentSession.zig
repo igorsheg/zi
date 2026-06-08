@@ -456,10 +456,6 @@ pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
     return self.finishPromptRun(run);
 }
 
-pub fn promptRunProgress(run: *LivePromptRun) @TypeOf(run.stream.asyncNext()) {
-    return run.stream.asyncNext();
-}
-
 pub fn applyPromptRunProgress(
     self: *AgentSession,
     run: *LivePromptRun,

@@ -130,14 +130,14 @@ pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LiveProm
 pub fn promptRunProgress(
     _: *AgentSessionRuntimeHost,
     run: *AgentSession.LivePromptRun,
-) @TypeOf(AgentSession.promptRunProgress(run)) {
-    return AgentSession.promptRunProgress(run);
+) @TypeOf(run.stream.asyncNext()) {
+    return run.stream.asyncNext();
 }
 
 pub fn applyPromptRunProgress(
     self: *AgentSessionRuntimeHost,
     run: *AgentSession.LivePromptRun,
-    progress: @TypeOf(AgentSession.promptRunProgress(run)).Result,
+    progress: @TypeOf(run.stream.asyncNext()).Result,
 ) !bool {
     return self.session.applyPromptRunProgress(run, progress);
 }
