@@ -149,7 +149,7 @@ fn drawComposerBorder(
 ) !void {
     if (app.width < 2 or height < 2) return;
     try drawComposerBorderLine(app, renderer, y, true);
-    try drawComposerBorderLabels(app, renderer, y, .composer_top_left, .composer_top_right);
+    try drawComposerBorderLabel(app, renderer, y);
     try drawComposerBorderLine(app, renderer, y + height - 1, false);
     var row: u16 = y + 1;
     while (row + 1 < y + height) : (row += 1) {
@@ -188,32 +188,17 @@ fn drawComposerBorderLine(
     }
 }
 
-fn drawComposerBorderLabels(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    y: u16,
-    left_slot: slots_mod.SlotName,
-    right_slot: slots_mod.SlotName,
-) !void {
+fn drawComposerBorderLabel(app: *const app_mod.ProductApp, renderer: *infra.Renderer, y: u16) !void {
     if (app.width < 4) return;
     const inner_width = app.width - 2;
-    const left = composerBorderLabel(app, left_slot);
-    const right = composerBorderLabel(app, right_slot);
-    const left_width = if (left) |label| label.width else 0;
-    const right_width = if (right) |label| label.width else 0;
-    if (left_width == 0 and right_width == 0) return;
-    if (inner_width < 2 + left_width + right_width) return;
-
-    if (left) |label| try renderer.writeText(2, y, label.text, app.theme.composer_slot);
-    if (right) |label| {
-        const x = @as(usize, app.width) - 2 - label.width;
-        try renderer.writeText(@intCast(x), y, label.text, app.theme.composer_slot);
-    }
-}
-
-fn composerBorderLabel(app: *const app_mod.ProductApp, slot: slots_mod.SlotName) ?primitive.chrome.MeasuredText {
-    const view = app.slots.highestPriority(slot) orelse return null;
-    return .{ .text = view.text, .width = primitive.text.displayWidth(view.text) };
+    const view = app.slots.highestPriority(.composer_top_right) orelse return;
+    const label: primitive.chrome.MeasuredText = .{
+        .text = view.text,
+        .width = primitive.text.displayWidth(view.text),
+    };
+    if (inner_width < 2 + label.width) return;
+    const x = @as(usize, app.width) - 2 - label.width;
+    try renderer.writeText(@intCast(x), y, label.text, app.theme.composer_slot);
 }
 
 pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
@@ -915,11 +900,10 @@ test "frame omits status area on tiny terminal" {
     try expectCellGrapheme(renderer.next, 0, 0, "╭");
 }
 
-test "frame renders composer top border slots with slot style" {
+test "frame renders composer top border slot with slot style" {
     var app = try app_mod.ProductApp.init(30, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "TL" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "TR" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 1, .text = "TR" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 30, 3, size_cells_max);
     defer renderer.deinit();
@@ -929,17 +913,15 @@ test "frame renders composer top border slots with slot style" {
     try expectCellGrapheme(renderer.next, 29, 0, "╮");
     try expectCellGrapheme(renderer.next, 0, 2, "╰");
     try expectCellGrapheme(renderer.next, 29, 2, "╯");
-    try expectCellText(renderer.next, 2, 0, "TL");
     try expectCellText(renderer.next, 26, 0, "TR");
     try std.testing.expect((try renderer.next.get(1, 0)).style.eql(app.theme.composer_chrome));
-    try std.testing.expect((try renderer.next.get(2, 0)).style.eql(app.theme.composer_slot));
+    try std.testing.expect((try renderer.next.get(26, 0)).style.eql(app.theme.composer_slot));
 }
 
-test "frame drops composer border labels when they do not fit" {
+test "frame drops composer border label when it does not fit" {
     var app = try app_mod.ProductApp.init(10, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "left" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "right" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 1, .text = "toolong" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 10, 3, size_cells_max);
     defer renderer.deinit();
@@ -951,18 +933,16 @@ test "frame drops composer border labels when they do not fit" {
     try std.testing.expect((try renderer.next.get(2, 0)).style.eql(app.theme.composer_chrome));
 }
 
-test "frame places composer border slot labels by display width" {
+test "frame places composer border slot label by display width" {
     var app = try app_mod.ProductApp.init(12, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "中" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "R" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 1, .text = "中" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 12, 3, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellGrapheme(renderer.next, 2, 0, "中");
-    try expectCellText(renderer.next, 9, 0, "R");
+    try expectCellGrapheme(renderer.next, 8, 0, "中");
 }
 
 test "frame projects composer cursor into bordered composer" {

@@ -5,7 +5,6 @@ pub const composer_border_slot_count_max: usize = 1;
 pub const status_area_slot_count_max: usize = 8;
 
 pub const SlotName = enum {
-    composer_top_left,
     composer_top_right,
     status_area,
 };
@@ -199,21 +198,21 @@ test "slot store sets replaces clears and bounds contributions" {
     defer slots.deinit(std.testing.allocator);
 
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_top_left,
+        .slot = .composer_top_right,
         .id = 1,
         .owner = 7,
         .priority = 1,
         .text = "one",
     });
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_top_left,
+        .slot = .composer_top_right,
         .id = 2,
         .owner = 7,
         .priority = 2,
         .text = "two",
     });
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_top_left,
+        .slot = .composer_top_right,
         .id = 1,
         .owner = 7,
         .priority = 3,
@@ -221,13 +220,13 @@ test "slot store sets replaces clears and bounds contributions" {
     });
 
     var views: [2]SlotView = undefined;
-    const n = slots.orderedSlot(.composer_top_left, &views);
+    const n = slots.orderedSlot(.composer_top_right, &views);
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings("new", views[0].text);
     try std.testing.expectEqualStrings("two", views[1].text);
 
-    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_left, .id = 2, .owner = 7 }));
-    try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_top_left));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 7 }));
+    try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_top_right));
     try std.testing.expect(slots.clearOwner(std.testing.allocator, 7));
     try std.testing.expectEqual(@as(usize, 0), slots.len);
 }
@@ -252,11 +251,11 @@ test "slot store rejects invalid text before mutation" {
     var slots: SlotStore = .{};
     defer slots.deinit(std.testing.allocator);
 
-    try slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "ok" });
+    try slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 1, .text = "ok" });
     try std.testing.expectError(
         error.InvalidSlotContributionText,
         slots.set(std.testing.allocator, .{
-            .slot = .composer_top_left,
+            .slot = .composer_top_right,
             .id = 2,
             .owner = 1,
             .text = "bad\n",
