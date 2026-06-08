@@ -606,7 +606,7 @@ const InteractiveLoop = struct {
 
     fn startPrompt(self: *InteractiveLoop, text: []const u8) !PromptSubmitResult {
         if (self.active_run != null) {
-            self.host.queuePrompt(text, .steer) catch |err| {
+            self.host.queuePrompt(text) catch |err| {
                 _ = self.terminal_loop.applyCommand(.{ .insert_composer_text = text }) catch null;
                 try self.appendOperationalStatus(@errorName(err));
                 return .rejected;

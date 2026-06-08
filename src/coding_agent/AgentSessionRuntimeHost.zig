@@ -127,12 +127,8 @@ pub fn startPromptRun(
     return self.session.startLivePromptRun(text, images, options);
 }
 
-pub fn queuePrompt(
-    self: *AgentSessionRuntimeHost,
-    text: []const u8,
-    behavior: AgentSession.StreamingBehavior,
-) !void {
-    try self.session.promptWithOptions(text, &.{}, .{ .streaming_behavior = behavior });
+pub fn queuePrompt(self: *AgentSessionRuntimeHost, text: []const u8) !void {
+    try self.session.promptWithOptions(text, &.{}, .{ .streaming_behavior = .steer });
 }
 
 pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !bool {
