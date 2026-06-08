@@ -103,12 +103,11 @@ pub const ProductApp = struct {
                 self.dirty = true;
                 return null;
             },
-            .modal => |modal_command| return self.applyModal(allocator, modal_command),
         }
     }
 
     fn applyInput(self: *ProductApp, allocator: std.mem.Allocator, event: substrate.input.InputEvent) !?Effect {
-        if (self.modal != null) return self.applyModal(allocator, .{ .input = event });
+        if (self.modal != null) return self.applyModal(allocator, event);
         switch (keys.resolve(event)) {
             .composer_insert => |bytes| {
                 if (try self.applyComposer(allocator, .{ .insert_utf8 = bytes.slice() })) |effect| return effect;
@@ -144,9 +143,9 @@ pub const ProductApp = struct {
         return null;
     }
 
-    fn applyModal(self: *ProductApp, allocator: std.mem.Allocator, command: surface_mod.ModalCommand) !?Effect {
+    fn applyModal(self: *ProductApp, allocator: std.mem.Allocator, event: substrate.input.InputEvent) !?Effect {
         const modal = if (self.modal) |*modal| modal else return null;
-        if (modal.apply(command)) |result| {
+        if (modal.applyInput(event)) |result| {
             modal.deinit(allocator);
             self.modal = null;
             self.dirty = true;
@@ -227,7 +226,6 @@ pub const Command = union(enum) {
     set_slot_contribution: slots_mod.SetContribution,
     animation_tick: u64,
     open_confirm: surface_mod.OpenConfirm,
-    modal: surface_mod.ModalCommand,
     clear_slot_contribution: slots_mod.ClearContribution,
 };
 
@@ -446,7 +444,7 @@ test "product app rejects second modal before mutation" {
         .title = "Two",
         .body = "",
     } }));
-    const effect = (try app.apply(std.testing.allocator, .{ .modal = .confirm })).?;
+    const effect = (try app.apply(std.testing.allocator, .{ .input = .{ .key = .enter } })).?;
     try std.testing.expect(effect.confirm_result.accepted);
 }
 

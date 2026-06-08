@@ -16,12 +16,6 @@ pub const ConfirmResult = struct {
     accepted: bool,
 };
 
-pub const ModalCommand = union(enum) {
-    input: substrate.input.InputEvent,
-    confirm,
-    cancel,
-};
-
 pub const Confirm = struct {
     id: ModalId,
     title: []u8,
@@ -47,15 +41,7 @@ pub const Confirm = struct {
         self.* = undefined;
     }
 
-    pub fn apply(self: *Confirm, command: ModalCommand) ?ConfirmResult {
-        switch (command) {
-            .confirm => return self.result(self.selected_yes),
-            .cancel => return self.result(false),
-            .input => |event| return self.applyInput(event),
-        }
-    }
-
-    fn applyInput(self: *Confirm, event: substrate.input.InputEvent) ?ConfirmResult {
+    pub fn applyInput(self: *Confirm, event: substrate.input.InputEvent) ?ConfirmResult {
         return switch (event) {
             .text => |bytes| self.applyText(bytes.slice()),
             .key => |key| switch (key) {
@@ -104,13 +90,13 @@ test "confirm modal accepts cancels and toggles selection" {
     });
     defer confirm.deinit(std.testing.allocator);
 
-    try std.testing.expect((confirm.apply(.{ .input = .{
+    try std.testing.expect((confirm.applyInput(.{
         .text = substrate.input.InlineBytes.from("n"),
-    } })).?.accepted == false);
-    try std.testing.expect(confirm.apply(.{ .input = .{ .key = .arrow_right } }) == null);
-    try std.testing.expect((confirm.apply(.confirm)).?.accepted == false);
-    try std.testing.expect(confirm.apply(.{ .input = .{ .key = .arrow_left } }) == null);
-    try std.testing.expect((confirm.apply(.confirm)).?.accepted == true);
+    })).?.accepted == false);
+    try std.testing.expect(confirm.applyInput(.{ .key = .arrow_right }) == null);
+    try std.testing.expect((confirm.applyInput(.{ .key = .enter })).?.accepted == false);
+    try std.testing.expect(confirm.applyInput(.{ .key = .arrow_left }) == null);
+    try std.testing.expect((confirm.applyInput(.{ .key = .enter })).?.accepted == true);
 }
 
 test "confirm modal rejects invalid open before allocation" {
