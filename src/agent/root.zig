@@ -176,27 +176,23 @@ pub fn copyToolResultContentSlice(
         allocator.free(cloned);
     }
     for (source, cloned) |content, *out| {
-        out.* = try copyToolResultContent(allocator, content);
+        out.* = switch (content) {
+            .text => |text| blk: {
+                const text_copy = try allocator.dupe(u8, text.text);
+                errdefer allocator.free(text_copy);
+                const signature = try copyOptionalString(allocator, text.text_signature);
+                break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
+            },
+            .image => |image| blk: {
+                const data = try allocator.dupe(u8, image.data);
+                errdefer allocator.free(data);
+                const mime_type = try allocator.dupe(u8, image.mime_type);
+                break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
+            },
+        };
         initialized += 1;
     }
     return cloned;
-}
-
-pub fn copyToolResultContent(allocator: std.mem.Allocator, content: ai.ToolResultContent) !ai.ToolResultContent {
-    return switch (content) {
-        .text => |text| blk: {
-            const text_copy = try allocator.dupe(u8, text.text);
-            errdefer allocator.free(text_copy);
-            const signature = try copyOptionalString(allocator, text.text_signature);
-            break :blk .{ .text = .{ .text = text_copy, .text_signature = signature } };
-        },
-        .image => |image| blk: {
-            const data = try allocator.dupe(u8, image.data);
-            errdefer allocator.free(data);
-            const mime_type = try allocator.dupe(u8, image.mime_type);
-            break :blk .{ .image = .{ .data = data, .mime_type = mime_type } };
-        },
-    };
 }
 
 pub fn copyToolResultMessage(allocator: std.mem.Allocator, source: ai.ToolResultMessage) !ai.ToolResultMessage {
