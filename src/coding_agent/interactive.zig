@@ -1132,20 +1132,16 @@ fn seedTranscriptFromSnapshot(
     for (items) |item| {
         _ = try terminal_loop.applyCommand(.{
             .append_transcript = messageAppend(
-                transcriptRoleFromHistory(item.role),
+                switch (item.role) {
+                    .user => .user,
+                    .assistant => .assistant,
+                    .system => .system,
+                },
                 item.text,
                 .new_item,
             ),
         });
     }
-}
-
-fn transcriptRoleFromHistory(role: session_history_snapshot.Role) tui.product.transcript.TranscriptRole {
-    return switch (role) {
-        .user => .user,
-        .assistant => .assistant,
-        .system => .system,
-    };
 }
 
 fn createHost(
