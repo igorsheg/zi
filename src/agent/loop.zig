@@ -869,7 +869,7 @@ fn copyEventForTest(event: agent.AgentEvent) !agent.AgentEvent {
         .message_end => |payload| .{ .message_end = .{ .message = try copyMessageForTest(payload.message) } },
         .turn_end => |payload| .{ .turn_end = .{
             .message = try copyMessageForTest(payload.message),
-            .tool_results = try copyToolResultMessagesForTest(payload.tool_results),
+            .tool_results = try agent.copyToolResultMessages(std.testing.allocator, payload.tool_results),
         } },
         .agent_end => |payload| .{ .agent_end = .{ .messages = payload.messages } },
         else => event,
@@ -883,10 +883,6 @@ fn copyMessageForTest(message: agent.AgentMessage) !agent.AgentMessage {
         },
         else => message,
     };
-}
-
-fn copyToolResultMessagesForTest(source: []const ai.ToolResultMessage) ![]const ai.ToolResultMessage {
-    return agent.copyToolResultMessages(std.testing.allocator, source);
 }
 
 fn deinitTestEvents(events: []const agent.AgentEvent) void {
