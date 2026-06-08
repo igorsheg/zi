@@ -1,6 +1,22 @@
 const std = @import("std");
 const agent = @import("../agent/root.zig");
-const tools = @import("tools/root.zig");
+const bash_tool = @import("tools/bash.zig");
+const edit_tool = @import("tools/edit.zig");
+const file_mutation_queue = @import("tools/file_mutation_queue.zig");
+const find_tool = @import("tools/find.zig");
+const grep_tool = @import("tools/grep.zig");
+const ls_tool = @import("tools/ls.zig");
+const read_tool = @import("tools/read.zig");
+const write_tool = @import("tools/write.zig");
+
+const BashTool = bash_tool.BashTool;
+const EditTool = edit_tool.EditTool;
+const FileMutationQueue = file_mutation_queue.FileMutationQueue;
+const FindTool = find_tool.FindTool;
+const GrepTool = grep_tool.GrepTool;
+const LsTool = ls_tool.LsTool;
+const ReadTool = read_tool.ReadTool;
+const WriteTool = write_tool.WriteTool;
 
 pub const max_tool_definitions = 64;
 pub const max_active_tools = 64;
@@ -184,14 +200,14 @@ pub const ToolRegistry = struct {
 
 pub const BuiltinTools = struct {
     allocator: std.mem.Allocator,
-    mutation_queue: *tools.FileMutationQueue,
-    read: *tools.ReadTool,
-    ls: *tools.LsTool,
-    grep: *tools.GrepTool,
-    find: *tools.FindTool,
-    bash: *tools.BashTool,
-    edit: *tools.EditTool,
-    write: *tools.WriteTool,
+    mutation_queue: *FileMutationQueue,
+    read: *ReadTool,
+    ls: *LsTool,
+    grep: *GrepTool,
+    find: *FindTool,
+    bash: *BashTool,
+    edit: *EditTool,
+    write: *WriteTool,
 
     pub const Options = struct {
         cwd: []const u8,
@@ -200,62 +216,62 @@ pub const BuiltinTools = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !BuiltinTools {
-        const mutation_queue = try allocator.create(tools.FileMutationQueue);
+        const mutation_queue = try allocator.create(FileMutationQueue);
         errdefer allocator.destroy(mutation_queue);
         mutation_queue.* = .{};
 
-        const read = try allocator.create(tools.ReadTool);
+        const read = try allocator.create(ReadTool);
         errdefer allocator.destroy(read);
-        read.* = try tools.ReadTool.init(allocator, .{
+        read.* = try ReadTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         });
         errdefer read.deinit();
 
-        const ls = try allocator.create(tools.LsTool);
+        const ls = try allocator.create(LsTool);
         errdefer allocator.destroy(ls);
-        ls.* = try tools.LsTool.init(allocator, .{
+        ls.* = try LsTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         });
         errdefer ls.deinit();
 
-        const grep = try allocator.create(tools.GrepTool);
+        const grep = try allocator.create(GrepTool);
         errdefer allocator.destroy(grep);
-        grep.* = try tools.GrepTool.init(allocator, .{
+        grep.* = try GrepTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         });
         errdefer grep.deinit();
 
-        const find = try allocator.create(tools.FindTool);
+        const find = try allocator.create(FindTool);
         errdefer allocator.destroy(find);
-        find.* = try tools.FindTool.init(allocator, .{
+        find.* = try FindTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         });
         errdefer find.deinit();
 
-        const bash = try allocator.create(tools.BashTool);
+        const bash = try allocator.create(BashTool);
         errdefer allocator.destroy(bash);
-        bash.* = try tools.BashTool.init(allocator, .{
+        bash.* = try BashTool.init(allocator, .{
             .cwd = options.cwd,
             .environ = options.environ,
         });
         errdefer bash.deinit();
 
-        const edit = try allocator.create(tools.EditTool);
+        const edit = try allocator.create(EditTool);
         errdefer allocator.destroy(edit);
-        edit.* = try tools.EditTool.init(allocator, .{
+        edit.* = try EditTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
             .mutation_queue = mutation_queue,
         });
         errdefer edit.deinit();
 
-        const write = try allocator.create(tools.WriteTool);
+        const write = try allocator.create(WriteTool);
         errdefer allocator.destroy(write);
-        write.* = try tools.WriteTool.init(allocator, .{
+        write.* = try WriteTool.init(allocator, .{
             .cwd = options.cwd,
             .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
             .mutation_queue = mutation_queue,
