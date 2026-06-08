@@ -115,19 +115,6 @@ pub fn destroyPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LiveP
     self.session.destroyPromptRun(run);
 }
 
-pub fn compactWithPreparedSummary(
-    self: *AgentSessionRuntimeHost,
-    summary: []const u8,
-) !session_events.CompactionResult {
-    return self.session.compactWithPreparedSummary(summary);
-}
-
-pub fn compactWithGeneratedSummary(
-    self: *AgentSessionRuntimeHost,
-) !session_events.CompactionResult {
-    return self.session.compactWithGeneratedSummary();
-}
-
 pub fn cancel(self: *AgentSessionRuntimeHost) void {
     self.session.cancel();
 }
@@ -927,7 +914,7 @@ test "runtime host compacts through public command boundary" {
         .timestamp = 0,
     } }, "t3");
 
-    var result = try host.compactWithPreparedSummary("summary");
+    var result = try host.session.compactWithPreparedSummary("summary");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
@@ -989,7 +976,7 @@ test "runtime host compacts with generated summary through public command bounda
         .timestamp = 0,
     } }, "t2");
 
-    var result = try host.compactWithGeneratedSummary();
+    var result = try host.session.compactWithGeneratedSummary();
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
