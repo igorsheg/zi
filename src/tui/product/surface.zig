@@ -23,7 +23,9 @@ pub const Confirm = struct {
     selected_yes: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, open: OpenConfirm) !Confirm {
-        try validateOpen(open);
+        if (open.id == 0) return error.InvalidModal;
+        try validateText(open.title, title_bytes_max);
+        try validateText(open.body, body_bytes_max);
         const title = try allocator.dupe(u8, open.title);
         errdefer allocator.free(title);
         const body = try allocator.dupe(u8, open.body);
@@ -70,12 +72,6 @@ pub const Confirm = struct {
         return .{ .id = self.id, .accepted = accepted };
     }
 };
-
-fn validateOpen(open: OpenConfirm) !void {
-    if (open.id == 0) return error.InvalidModal;
-    try validateText(open.title, title_bytes_max);
-    try validateText(open.body, body_bytes_max);
-}
 
 fn validateText(bytes: []const u8, max: usize) !void {
     if (bytes.len > max) return error.ModalTextTooLarge;
