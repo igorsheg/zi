@@ -111,3 +111,4 @@ Useful first probes:
 - Removed explicit modal command surface; confirm modals now accept terminal input directly. Also collapsed fixed confirm button rendering and one-use validation helpers.
 - AgentSession prompt startup now uses one path (`startPromptRun`) with inline preconditions/retry flags instead of wrapper/helper policy structs.
 - Eliminated the remaining scoped panic-like sites by replacing test/helper `catch unreachable` with assertions for infallible buffered stream/event drain invariants.
+- Deleted unused TUI `shuffle_text` effect code after status effects stopped using it; the three removed tests only covered the dead module, and `autoresearch.sh` baseline test count is now 614.

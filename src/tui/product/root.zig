@@ -5,7 +5,6 @@ pub const keys = @import("keys.zig");
 pub const markdown_projection = @import("markdown_projection.zig");
 pub const slots = @import("slots.zig");
 pub const shimmer = @import("shimmer.zig");
-pub const shuffle_text = @import("shuffle_text.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const status_area = @import("status_area.zig");
 pub const surface = @import("surface.zig");
@@ -40,7 +39,6 @@ test {
     _ = markdown_projection;
     _ = slots;
     _ = shimmer;
-    _ = shuffle_text;
     _ = snapshot;
     _ = status_area;
     _ = surface;

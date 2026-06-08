@@ -7,4 +7,3 @@ Try one idea per iteration. Delete bullets once tried and log the result in `aut
 - Split `interactive.zig` only around existing ownership seams: input drain, public-event translation, render transaction. Do not create a generic TUI framework.
 - In `agent/loop.zig`, search for state carried only to satisfy callback shape; collapse callback protocol if direct turn-loop data is clearer.
 - In `frame.zig`, identify repeated rendering projection/chrome code that can be data-local without adding retained surfaces or dirty rectangles.
-- Decide whether `src/tui/product/shuffle_text.zig` should disappear entirely now that no product status effect uses it; if deleting, adjust the test-count baseline deliberately and explain why the removed tests covered dead code only.

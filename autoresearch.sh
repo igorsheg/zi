@@ -77,7 +77,7 @@ large_file_penalty_value=$(large_file_penalty)
 # Current baseline from the branch this session was created on. Protects against
 # metric gaming by deleting tests. If a legitimate simplification reduces test
 # count, explain it in ASI and adjust this baseline deliberately.
-baseline_test_count=617
+baseline_test_count=614
 test_count=$(rg '^test ' src -n --glob '*.zig' | wc -l | tr -d ' ')
 test_loss_penalty=0
 if (( test_count < baseline_test_count )); then
