@@ -119,20 +119,13 @@ fn drawComposer(app: *app_mod.ProductApp, renderer: *infra.Renderer, composer_ro
         try renderer.writeText(1, y, "> ", app.theme.composer_prompt);
         if (app.width > 3) try renderer.writeText(3, y, rows[index].text, app.theme.composer_text);
     }
-    setComposerCursor(app, renderer, box_y, projection);
-}
-
-fn setComposerCursor(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    box_y: u16,
-    projection: composer_mod.ComposerProjection,
-) void {
-    if (app.modal != null or !projection.cursor_visible) return;
-    const cursor_y = @as(usize, box_y) + 1 + projection.cursor_visible_row;
-    const cursor_x = 3 + projection.cursor_display_col;
-    if (cursor_x >= app.width or cursor_y >= app.height) return;
-    renderer.setCursor(.{ .x = @intCast(cursor_x), .y = @intCast(cursor_y) });
+    if (app.modal == null and projection.cursor_visible) {
+        const cursor_y = @as(usize, box_y) + 1 + projection.cursor_visible_row;
+        const cursor_x = 3 + projection.cursor_display_col;
+        if (cursor_x < app.width and cursor_y < app.height) {
+            renderer.setCursor(.{ .x = @intCast(cursor_x), .y = @intCast(cursor_y) });
+        }
+    }
 }
 
 fn drawComposerBorder(
