@@ -1216,13 +1216,11 @@ fn removeLastAssistantRuntimeMessage(self: *AgentSession) !void {
     if (self.agent.state.messages.len == 0) return error.NoMessages;
     const retained_len = self.agent.state.messages.len - 1;
     const retained = try agent_mod.copyAgentMessages(self.allocator, self.agent.state.messages[0..retained_len]);
-    defer deinitOwnedAgentMessages(self.allocator, retained);
+    defer {
+        for (retained) |message| agent_mod.deinitAgentMessage(self.allocator, message);
+        self.allocator.free(retained);
+    }
     try self.agent.replaceMessages(retained);
-}
-
-fn deinitOwnedAgentMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) void {
-    for (messages) |message| agent_mod.deinitAgentMessage(allocator, message);
-    allocator.free(messages);
 }
 
 fn drainAgentEvent(
