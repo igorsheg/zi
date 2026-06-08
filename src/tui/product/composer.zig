@@ -20,6 +20,8 @@ pub const ComposerCommand = union(enum) {
 pub const ComposerBuffer = struct {
     bytes: std.ArrayListUnmanaged(u8) = .empty,
     cursor_byte_index: usize = 0,
+    revision: u64 = 0,
+    projection_cache: ?ComposerProjectionCache = null,
 
     pub fn deinit(self: *ComposerBuffer, allocator: std.mem.Allocator) void {
         self.bytes.deinit(allocator);
@@ -27,8 +29,10 @@ pub const ComposerBuffer = struct {
     }
 
     pub fn clear(self: *ComposerBuffer) void {
+        if (self.bytes.items.len == 0 and self.cursor_byte_index == 0) return;
         self.bytes.clearRetainingCapacity();
         self.cursor_byte_index = 0;
+        self.bumpRevision();
     }
 
     pub fn text(self: ComposerBuffer) []const u8 {
@@ -74,9 +78,11 @@ pub const ComposerBuffer = struct {
     }
 
     fn insertNormalized(self: *ComposerBuffer, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
         if (self.bytes.items.len + bytes.len > buffer_size_bytes_max) return error.ComposerTooLarge;
         try self.bytes.insertSlice(allocator, self.cursor_byte_index, bytes);
         self.cursor_byte_index += bytes.len;
+        self.bumpRevision();
     }
 
     pub fn backspace(self: *ComposerBuffer) void {
@@ -84,34 +90,69 @@ pub const ComposerBuffer = struct {
         const start = text_primitive.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
         self.bytes.replaceRangeAssumeCapacity(start, self.cursor_byte_index - start, "");
         self.cursor_byte_index = start;
+        self.bumpRevision();
     }
 
     pub fn moveLeft(self: *ComposerBuffer) void {
         if (self.cursor_byte_index == 0) return;
         self.cursor_byte_index = text_primitive.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
+        self.bumpRevision();
     }
 
     pub fn moveRight(self: *ComposerBuffer) void {
         if (self.cursor_byte_index >= self.bytes.items.len) return;
         self.cursor_byte_index = text_primitive.nextGraphemeEnd(self.bytes.items, self.cursor_byte_index);
+        self.bumpRevision();
     }
 
     pub fn moveStart(self: *ComposerBuffer) void {
+        if (self.cursor_byte_index == 0) return;
         self.cursor_byte_index = 0;
+        self.bumpRevision();
     }
 
     pub fn moveEnd(self: *ComposerBuffer) void {
+        if (self.cursor_byte_index == self.bytes.items.len) return;
         self.cursor_byte_index = self.bytes.items.len;
+        self.bumpRevision();
     }
 
-    pub fn visualRows(self: ComposerBuffer, width: u16) usize {
-        var view: [visible_rows_max]ComposerVisualRow = undefined;
-        const projected = projectVisualRows(self, width, &view);
-        return projected.total_rows;
+    pub fn visualRows(self: *ComposerBuffer, width: u16) usize {
+        return self.cachedProjection(width).projection.total_rows;
     }
 
-    pub fn visibleRows(self: ComposerBuffer, width: u16, out: *[visible_rows_max]ComposerVisualRow) ComposerProjection {
-        return projectVisualRows(self, width, out);
+    pub fn visibleRows(
+        self: *ComposerBuffer,
+        width: u16,
+        out: *[visible_rows_max]ComposerVisualRow,
+    ) ComposerProjection {
+        const cached = self.cachedProjection(width);
+        @memcpy(
+            out[0..cached.projection.visible_count],
+            cached.rows[0..cached.projection.visible_count],
+        );
+        return cached.projection;
+    }
+
+    fn cachedProjection(self: *ComposerBuffer, width: u16) ComposerProjectionCache {
+        if (self.projection_cache) |cache| {
+            if (cache.revision == self.revision and cache.width == width) return cache;
+        }
+        var cache: ComposerProjectionCache = .{
+            .revision = self.revision,
+            .width = width,
+            .rows = undefined,
+            .projection = undefined,
+        };
+        cache.projection = projectVisualRows(self.*, width, &cache.rows);
+        self.projection_cache = cache;
+        return cache;
+    }
+
+    fn bumpRevision(self: *ComposerBuffer) void {
+        std.debug.assert(self.revision < std.math.maxInt(u64));
+        self.revision += 1;
+        self.projection_cache = null;
     }
 
     pub fn takeSubmit(self: *ComposerBuffer, allocator: std.mem.Allocator) !?[]u8 {
@@ -125,6 +166,13 @@ pub const ComposerBuffer = struct {
 
 pub const ComposerVisualRow = struct {
     text: []const u8,
+};
+
+const ComposerProjectionCache = struct {
+    revision: u64,
+    width: u16,
+    projection: ComposerProjection,
+    rows: [visible_rows_max]ComposerVisualRow,
 };
 
 pub const ComposerProjection = struct {
@@ -141,87 +189,99 @@ fn projectVisualRows(
     width: u16,
     out: *[visible_rows_max]ComposerVisualRow,
 ) ComposerProjection {
-    const total = countVisualRows(composer.text(), width);
-    const skip = if (total > visible_rows_max) total - visible_rows_max else 0;
-    var collector: ComposerRowCollector = .{ .rows = out, .skip_remaining = skip };
-    emitVisualRows(composer.text(), width, &collector);
-    const cursor = cursorPosition(composer.text(), width, composer.cursor_byte_index);
-    const cursor_visible = cursor.row >= skip and cursor.row < skip + collector.visible_count;
-    return .{
-        .first_visible_row = skip,
-        .visible_count = collector.visible_count,
-        .total_rows = total,
-        .cursor_visible = cursor_visible,
-        .cursor_visible_row = if (cursor_visible) cursor.row - skip else 0,
-        .cursor_display_col = if (cursor_visible) cursor.col else 0,
-    };
-}
-
-fn countVisualRows(bytes: []const u8, width: u16) usize {
-    var collector: ComposerRowCollector = .{ .rows = null };
-    emitVisualRows(bytes, width, &collector);
-    return collector.total_rows;
+    std.debug.assert(composer.cursor_byte_index <= composer.text().len);
+    var builder: ComposerProjectionBuilder = .{ .out = out, .cursor_byte_index = composer.cursor_byte_index };
+    builder.project(composer.text(), width);
+    return builder.finish();
 }
 
 const CursorPosition = struct {
-    row: usize,
-    col: usize,
+    row: usize = 0,
+    col: usize = 0,
+    found: bool = false,
 };
 
-fn cursorPosition(bytes: []const u8, width: u16, cursor: usize) CursorPosition {
-    std.debug.assert(cursor <= bytes.len);
-    if (bytes.len == 0) return .{ .row = 0, .col = 0 };
-    const wrap_width = @max(width, 1);
-    var row: usize = 0;
-    var start: usize = 0;
-    while (start < bytes.len) {
-        const line = text_primitive.nextVisualLineBreak(bytes, start, wrap_width);
-        if (cursor >= line.start and cursor <= line.end) {
-            return .{ .row = row, .col = text_primitive.displayWidth(bytes[line.start..cursor]) };
-        }
-        if (line.next == start) break;
-        start = line.next;
-        row += 1;
-    }
-    if (bytes[bytes.len - 1] == '\n' and cursor == bytes.len) return .{ .row = row, .col = 0 };
-    return .{ .row = if (row == 0) 0 else row - 1, .col = 0 };
-}
-
-const ComposerRowCollector = struct {
-    rows: ?*[visible_rows_max]ComposerVisualRow,
-    skip_remaining: usize = 0,
-    visible_count: usize = 0,
+const ComposerProjectionBuilder = struct {
+    out: *[visible_rows_max]ComposerVisualRow,
+    cursor_byte_index: usize,
     total_rows: usize = 0,
+    cursor: CursorPosition = .{},
 
-    fn emit(self: *ComposerRowCollector, row: ComposerVisualRow) void {
-        self.total_rows += 1;
-        if (self.skip_remaining > 0) {
-            self.skip_remaining -= 1;
+    fn project(self: *ComposerProjectionBuilder, bytes: []const u8, width: u16) void {
+        if (bytes.len == 0) {
+            self.cursor = .{ .row = 0, .col = 0, .found = true };
+            self.emit(.{ .text = "" });
             return;
         }
-        if (self.rows) |rows| {
-            if (self.visible_count >= rows.len) return;
-            rows[self.visible_count] = row;
-            self.visible_count += 1;
+
+        const wrap_width = @max(width, 1);
+        var start: usize = 0;
+        while (start < bytes.len) {
+            const line = text_primitive.nextVisualLineBreak(bytes, start, wrap_width);
+            if (line.next == start) break;
+            self.captureCursor(bytes, line);
+            self.emit(.{ .text = bytes[line.start..line.end] });
+            start = line.next;
+        }
+        if (bytes[bytes.len - 1] == '\n') {
+            if (self.cursor_byte_index == bytes.len) self.cursor = .{
+                .row = self.total_rows,
+                .col = 0,
+                .found = true,
+            };
+            self.emit(.{ .text = "" });
         }
     }
-};
 
-fn emitVisualRows(bytes: []const u8, width: u16, collector: *ComposerRowCollector) void {
-    if (bytes.len == 0) {
-        collector.emit(.{ .text = "" });
-        return;
+    fn captureCursor(self: *ComposerProjectionBuilder, bytes: []const u8, line: text_primitive.VisualLineBreak) void {
+        if (self.cursor.found) return;
+        if (self.cursor_byte_index < line.start or self.cursor_byte_index > line.end) return;
+        const col = if (self.cursor_byte_index == line.end)
+            line.width
+        else
+            text_primitive.displayWidth(bytes[line.start..self.cursor_byte_index]);
+        self.cursor = .{ .row = self.total_rows, .col = col, .found = true };
     }
-    const wrap_width = @max(width, 1);
-    var start: usize = 0;
-    while (start < bytes.len) {
-        const line = text_primitive.nextVisualLineBreak(bytes, start, wrap_width);
-        if (line.next == start) break;
-        collector.emit(.{ .text = bytes[line.start..line.end] });
-        start = line.next;
+
+    fn emit(self: *ComposerProjectionBuilder, row: ComposerVisualRow) void {
+        self.out[self.total_rows % visible_rows_max] = row;
+        self.total_rows += 1;
     }
-    if (bytes.len > 0 and bytes[bytes.len - 1] == '\n') collector.emit(.{ .text = "" });
-}
+
+    fn finish(self: *ComposerProjectionBuilder) ComposerProjection {
+        if (!self.cursor.found) self.cursor = .{
+            .row = if (self.total_rows == 0) 0 else self.total_rows - 1,
+            .col = 0,
+            .found = true,
+        };
+        const visible_count = @min(self.total_rows, visible_rows_max);
+        const first_visible_row = self.total_rows - visible_count;
+        self.rotateVisibleRows(first_visible_row, visible_count);
+        const cursor_visible = self.cursor.row >= first_visible_row and
+            self.cursor.row < first_visible_row + visible_count;
+        return .{
+            .first_visible_row = first_visible_row,
+            .visible_count = visible_count,
+            .total_rows = self.total_rows,
+            .cursor_visible = cursor_visible,
+            .cursor_visible_row = if (cursor_visible) self.cursor.row - first_visible_row else 0,
+            .cursor_display_col = if (cursor_visible) self.cursor.col else 0,
+        };
+    }
+
+    fn rotateVisibleRows(
+        self: *ComposerProjectionBuilder,
+        first_visible_row: usize,
+        visible_count: usize,
+    ) void {
+        var ordered: [visible_rows_max]ComposerVisualRow = undefined;
+        var index: usize = 0;
+        while (index < visible_count) : (index += 1) {
+            ordered[index] = self.out[(first_visible_row + index) % visible_rows_max];
+        }
+        @memcpy(self.out[0..visible_count], ordered[0..visible_count]);
+    }
+};
 
 test "composer inserts utf8 moves and backspaces by grapheme" {
     var composer: ComposerBuffer = .{};
@@ -339,6 +399,27 @@ test "composer projection reports cursor on visible tail row" {
     try std.testing.expect(projection.cursor_visible);
     try std.testing.expectEqual(@as(usize, 3), projection.cursor_visible_row);
     try std.testing.expectEqual(@as(usize, 4), projection.cursor_display_col);
+}
+
+// Composer projection is cached because status animations can render at 60 FPS
+// while the editor text is unchanged. Mutations must invalidate the cache.
+test "composer projection cache follows text and cursor revisions" {
+    var composer: ComposerBuffer = .{};
+    defer composer.deinit(std.testing.allocator);
+
+    try composer.insertUtf8(std.testing.allocator, "abc");
+    var rows: [visible_rows_max]ComposerVisualRow = undefined;
+    _ = composer.visibleRows(20, &rows);
+    try std.testing.expectEqualStrings("abc", rows[0].text);
+
+    composer.moveLeft();
+    const cursor_projection = composer.visibleRows(20, &rows);
+    try std.testing.expectEqual(@as(usize, 2), cursor_projection.cursor_display_col);
+
+    try composer.insertUtf8(std.testing.allocator, "Z");
+    const text_projection = composer.visibleRows(20, &rows);
+    try std.testing.expectEqual(@as(usize, 1), text_projection.visible_count);
+    try std.testing.expectEqualStrings("abZc", rows[0].text);
 }
 
 test "composer command contract owns editing and submit" {
