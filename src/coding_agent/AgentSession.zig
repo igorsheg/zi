@@ -5,7 +5,6 @@ const runtime = @import("../runtime/root.zig");
 const event_drain_mod = @import("event_drain.zig");
 const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
-const prompt_command = @import("prompt_command.zig");
 const queue_mirror_mod = @import("queue_mirror.zig");
 const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
@@ -968,39 +967,48 @@ const PromptPreflight = struct {
     streaming_behavior: ?StreamingBehavior,
 };
 
+const PromptCommand = enum { help, session };
+
 fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
-    const parsed = prompt_command.parse(preflight.text) orelse return false;
-
-    const command_name = parsed.name orelse {
-        const unknown_message = try prompt_command.unknownText(self.allocator, parsed.text);
-        errdefer self.allocator.free(unknown_message);
-        try self.emitPromptCommandOwned(
-            parsed.text,
-            .unknown,
-            session_events.EventText.initOwned(self.allocator, unknown_message),
-        );
-        return true;
-    };
-
-    switch (command_name) {
-        .help => try self.emitPromptCommand(parsed.text, .handled, prompt_command.helpText()),
+    const parsed = parsePromptCommand(preflight.text) orelse return false;
+    const command_text, const command = parsed;
+    if (command) |known| switch (known) {
+        .help => try self.emitPromptCommand(command_text, .handled, "available commands: /help, /session"),
         .session => {
             const snapshot = self.statusSnapshot();
-            const message = try prompt_command.sessionText(self.allocator, .{
-                .status_name = @tagName(snapshot.status),
-                .public_event_count = snapshot.public_event_count,
-                .dropped_public_event_count = snapshot.dropped_public_event_count,
-                .active_tool_count = self.tools.activeToolNames().len,
-            });
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "session: {s}; public events: {}; dropped events: {}; active tools: {}",
+                .{ @tagName(snapshot.status), snapshot.public_event_count, snapshot.dropped_public_event_count, self.tools.activeToolNames().len },
+            );
             errdefer self.allocator.free(message);
             try self.emitPromptCommandOwned(
-                parsed.text,
+                command_text,
                 .handled,
                 session_events.EventText.initOwned(self.allocator, message),
             );
         },
+    } else {
+        const unknown_message = try std.fmt.allocPrint(self.allocator, "unknown command: /{s}", .{command_text});
+        errdefer self.allocator.free(unknown_message);
+        try self.emitPromptCommandOwned(
+            command_text,
+            .unknown,
+            session_events.EventText.initOwned(self.allocator, unknown_message),
+        );
     }
     return true;
+}
+
+fn parsePromptCommand(text: []const u8) ?struct { []const u8, ?PromptCommand } {
+    if (text.len < 2 or text[0] != '/') return null;
+    var end: usize = 1;
+    while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
+    if (end == 1) return null;
+    const command = text[1..end];
+    if (std.mem.eql(u8, command, "help")) return .{ command, .help };
+    if (std.mem.eql(u8, command, "session")) return .{ command, .session };
+    return .{ command, null };
 }
 
 fn emitPromptCommand(

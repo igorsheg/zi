@@ -7,7 +7,6 @@ const interactive = @import("interactive.zig");
 const message_policy = @import("message_policy.zig");
 const paths = @import("paths.zig");
 const print_mode = @import("print_mode.zig");
-const prompt_command = @import("prompt_command.zig");
 const queue_mirror = @import("queue_mirror.zig");
 const runtime_services = @import("runtime_services.zig");
 const settings = @import("settings.zig");
@@ -33,7 +32,6 @@ test {
     _ = message_policy;
     _ = paths;
     _ = print_mode;
-    _ = prompt_command;
     _ = queue_mirror;
     _ = resources;
     _ = runtime_services;

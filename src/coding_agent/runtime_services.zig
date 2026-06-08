@@ -108,14 +108,6 @@ pub const RuntimeServices = struct {
         };
     };
 
-    pub fn paths(self: *const RuntimeServices) paths_mod.PersistencePaths {
-        return .{ .global_dir = self.agent_dir, .cwd = self.cwd };
-    }
-
-    pub fn getApiKeyHook(self: *const RuntimeServices) agent_mod.GetApiKeyHook {
-        return self.auth_manager.hook();
-    }
-
     fn findAvailableModel(self: *const RuntimeServices, provider: ai.Provider, model_id: []const u8) ?ai.Model {
         const model = ai.getModel(provider, model_id) orelse return null;
         return if (self.auth_manager.hasAuth(model.provider)) model else null;
@@ -128,20 +120,6 @@ pub const RuntimeServices = struct {
             }
         }
         return null;
-    }
-
-    pub fn clearDiagnostics(self: *RuntimeServices) void {
-        self.diagnostic_count = 0;
-    }
-
-    pub fn appendDiagnostic(self: *RuntimeServices, diagnostic: Diagnostic) void {
-        if (self.diagnostic_count == diagnostic_capacity) return;
-        self.diagnostics[self.diagnostic_count] = diagnostic;
-        self.diagnostic_count += 1;
-    }
-
-    pub fn diagnosticSlice(self: *const RuntimeServices) []const Diagnostic {
-        return self.diagnostics[0..self.diagnostic_count];
     }
 
     pub fn deinit(self: *RuntimeServices) void {
@@ -207,7 +185,7 @@ pub fn createSessionRuntime(allocator: std.mem.Allocator, options: CreateSession
     var init_result = try initSessionRuntimeBase(allocator, options);
     errdefer init_result.services.deinit();
 
-    const sessions_dir = try init_result.services.paths().sessionsDirForCwd(allocator);
+    const sessions_dir = try (paths_mod.PersistencePaths{ .global_dir = init_result.services.agent_dir, .cwd = init_result.services.cwd }).sessionsDirForCwd(allocator);
     defer allocator.free(sessions_dir);
     var store = try session_store.SessionStore.createInPath(
         allocator,
@@ -237,7 +215,7 @@ pub fn resumeSessionRuntime(allocator: std.mem.Allocator, options: ResumeSession
     var init_result = try initSessionRuntimeBase(allocator, options);
     errdefer init_result.services.deinit();
 
-    const sessions_dir = try init_result.services.paths().sessionsDirForCwd(allocator);
+    const sessions_dir = try (paths_mod.PersistencePaths{ .global_dir = init_result.services.agent_dir, .cwd = init_result.services.cwd }).sessionsDirForCwd(allocator);
     defer allocator.free(sessions_dir);
     const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, options.session_file_name });
     errdefer allocator.free(file_name);
@@ -301,7 +279,7 @@ const SessionOptionsInput = struct {
 };
 
 fn resolveSessionOptions(services: *RuntimeServices, options: SessionOptionsInput) AgentSession.Options {
-    services.clearDiagnostics();
+    services.diagnostic_count = 0;
     const model = resolveModel(services, options.model);
     return .{
         .cwd = services.cwd,
@@ -314,7 +292,7 @@ fn resolveSessionOptions(services: *RuntimeServices, options: SessionOptionsInpu
         .compaction_settings = resolveCompactionSettings(services.settings_manager.current()),
         .retry_settings = resolveRetrySettings(services.settings_manager.current()),
         .stream = resolveStream(services, options.stream, model),
-        .get_api_key = services.getApiKeyHook(),
+        .get_api_key = services.auth_manager.hook(),
         .zio_runtime = services.zio_runtime,
         .dir = options.dir,
         .environ = services.environ,
@@ -326,7 +304,10 @@ fn resolveSessionOptions(services: *RuntimeServices, options: SessionOptionsInpu
 fn resolveStream(services: *RuntimeServices, explicit: ?ai.StreamFunction, model: ai.Model) ?ai.StreamFunction {
     if (explicit) |stream| return stream;
     const provider = services.provider_registry.get(model.api) orelse {
-        if (!std.mem.eql(u8, model.api, "unknown")) services.appendDiagnostic(.{ .unresolved_stream = .{ .api = model.api } });
+        if (!std.mem.eql(u8, model.api, "unknown") and services.diagnostic_count < RuntimeServices.diagnostic_capacity) {
+            services.diagnostics[services.diagnostic_count] = .{ .unresolved_stream = .{ .api = model.api } };
+            services.diagnostic_count += 1;
+        }
         return null;
     };
     return provider.stream_simple;
@@ -334,63 +315,61 @@ fn resolveStream(services: *RuntimeServices, explicit: ?ai.StreamFunction, model
 
 fn resolveModel(services: *RuntimeServices, explicit: ?ai.Model) ai.Model {
     if (explicit) |model| return model;
-    if (modelSelectionFromSettings(services.settings_manager.current())) |settings| {
-        if (settings.provider) |provider| if (settings.model) |model_id| {
-            if (services.findAvailableModel(provider, model_id)) |model| return model;
+    const snapshot = services.settings_manager.current();
+    const project = fileSettings(snapshot.project);
+    const global = fileSettings(snapshot.global);
+    const provider = project.default_provider orelse global.default_provider;
+    const model_id = project.default_model orelse global.default_model;
+    if (provider != null or model_id != null) {
+        if (provider) |provider_name| if (model_id) |id| {
+            if (services.findAvailableModel(provider_name, id)) |model| return model;
         };
-        services.appendDiagnostic(.{ .unresolved_model_setting = .{ .provider = settings.provider, .model = settings.model } });
+        if (services.diagnostic_count < RuntimeServices.diagnostic_capacity) {
+            services.diagnostics[services.diagnostic_count] = .{ .unresolved_model_setting = .{ .provider = provider, .model = model_id } };
+            services.diagnostic_count += 1;
+        }
     }
     return services.firstAvailableModel() orelse agent_mod.Agent.defaultModel();
 }
 
-const ModelSettings = struct { provider: ?[]const u8, model: ?[]const u8 };
-
-fn modelSelectionFromSettings(snapshot: *const settings_mod.SettingsSnapshot) ?ModelSettings {
-    const project = fileSettings(snapshot.project);
-    if (project.default_provider != null or project.default_model != null) return .{ .provider = project.default_provider, .model = project.default_model };
-    const global = fileSettings(snapshot.global);
-    if (global.default_provider != null or global.default_model != null) return .{ .provider = global.default_provider, .model = global.default_model };
-    return null;
-}
-
 fn resolveThinkingLevel(snapshot: *const settings_mod.SettingsSnapshot, explicit: ?agent_mod.ThinkingLevel) agent_mod.ThinkingLevel {
     if (explicit) |level| return level;
-    if (thinkingLevelFromSettings(snapshot).default_thinking_level) |level_text| if (parseThinkingLevel(level_text)) |level| return level;
-    return .off;
-}
-
-fn thinkingLevelFromSettings(snapshot: *const settings_mod.SettingsSnapshot) settings_mod.Settings {
     const global = fileSettings(snapshot.global);
     const project = fileSettings(snapshot.project);
-    return .{ .default_thinking_level = project.default_thinking_level orelse global.default_thinking_level };
+    if (project.default_thinking_level orelse global.default_thinking_level) |level_text| {
+        if (parseThinkingLevel(level_text)) |level| return level;
+    }
+    return .off;
 }
 
 fn resolveCompactionSettings(snapshot: *const settings_mod.SettingsSnapshot) session_manager.CompactionSettings {
     const global = fileSettings(snapshot.global);
     const project = fileSettings(snapshot.project);
     var settings: session_manager.CompactionSettings = .{};
-    if (global.compaction) |compaction| applyCompaction(&settings, compaction);
-    if (project.compaction) |compaction| applyCompaction(&settings, compaction);
+    if (global.compaction) |compaction| {
+        if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
+        if (compaction.enabled) |enabled| settings.auto_enabled = enabled;
+    }
+    if (project.compaction) |compaction| {
+        if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
+        if (compaction.enabled) |enabled| settings.auto_enabled = enabled;
+    }
     return settings;
-}
-
-fn applyCompaction(out: *session_manager.CompactionSettings, compaction: settings_mod.Settings.Compaction) void {
-    if (compaction.keep_recent_tokens) |tokens| out.keep_recent_tokens = tokens;
-    if (compaction.enabled) |enabled| out.auto_enabled = enabled;
 }
 
 fn resolveRetrySettings(snapshot: *const settings_mod.SettingsSnapshot) AgentSession.RetrySettings {
     const global = fileSettings(snapshot.global);
     const project = fileSettings(snapshot.project);
     var settings: AgentSession.RetrySettings = .{};
-    if (global.retry) |retry| applyRetry(&settings, retry);
-    if (project.retry) |retry| applyRetry(&settings, retry);
+    if (global.retry) |retry| {
+        if (retry.enabled) |enabled| settings.enabled = enabled;
+        if (retry.max_retries) |attempts| settings.max_attempts = if (attempts > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(attempts);
+    }
+    if (project.retry) |retry| {
+        if (retry.enabled) |enabled| settings.enabled = enabled;
+        if (retry.max_retries) |attempts| settings.max_attempts = if (attempts > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(attempts);
+    }
     return settings;
-}
-
-fn applyRetry(out: *AgentSession.RetrySettings, retry: settings_mod.Settings.Retry) void {
-    if (retry.enabled) |enabled| out.enabled = enabled;
-    if (retry.max_retries) |attempts| out.max_attempts = if (attempts > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(attempts);
 }
 
 fn fileSettings(file: settings_mod.SettingsFile) settings_mod.Settings {
@@ -426,9 +405,8 @@ test "runtime services owns stable cwd, agent dir, settings manager" {
 
     try std.testing.expectEqualStrings("repo", services.cwd);
     try std.testing.expectEqualStrings("agent", services.agent_dir);
-    const service_paths = services.paths();
-    try std.testing.expectEqualStrings(services.cwd, service_paths.cwd);
-    try std.testing.expectEqualStrings(services.agent_dir, service_paths.global_dir);
+    try std.testing.expectEqualStrings("repo", services.cwd);
+    try std.testing.expectEqualStrings("agent", services.agent_dir);
     try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_responses) != null);
     try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_codex_responses) != null);
 }
