@@ -4,7 +4,6 @@ const ai = @import("../ai/root.zig");
 const faux = @import("../ai/providers/faux.zig");
 const runtime_mod = @import("../runtime/root.zig");
 const AgentSession = @import("AgentSession.zig");
-const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_config = @import("session_config.zig");
@@ -44,10 +43,10 @@ const ResumeRuntimeHostOptions = struct {
 
 const RuntimeHostHandle = struct {
     services: RuntimeServices,
-    host: AgentSessionRuntimeHost,
+    session: AgentSession,
 
     pub fn deinit(self: *RuntimeHostHandle) void {
-        self.host.deinit();
+        shutdownAndDeinitSession(&self.session);
         self.services.deinit();
         self.* = undefined;
     }
@@ -73,19 +72,14 @@ pub fn createRuntimeHost(
     );
     errdefer store.deinit(allocator);
 
-    const host = try AgentSessionRuntimeHost.init(allocator, runtime_init.services.io, runtime_init.base, .{ .create = .{
-        .session_id = options.session_id,
-        .timestamp = options.timestamp,
-        .session_store = store,
-    } });
-    errdefer {
-        var host_copy = host;
-        host_copy.session.requestShutdown();
-        drainHostEvents(&host_copy);
-        host_copy.deinit();
-    }
+    var session_options = runtime_init.options;
+    session_options.session_id = options.session_id;
+    session_options.timestamp = options.timestamp;
+    session_options.session_store = store;
+    var session = try AgentSession.init(allocator, runtime_init.services.io, session_options);
+    errdefer shutdownAndDeinitSession(&session);
 
-    return .{ .services = runtime_init.services, .host = host };
+    return .{ .services = runtime_init.services, .session = session };
 }
 
 pub fn resumeRuntimeHost(
@@ -105,22 +99,17 @@ pub fn resumeRuntimeHost(
     errdefer allocator.free(file_name);
     const store: session_store.SessionStore = .{ .dir = options.dir, .file_name = file_name };
 
-    const host = try AgentSessionRuntimeHost.init(allocator, runtime_init.services.io, runtime_init.base, .{ .@"resume" = .{
-        .resume_session_store = store,
-    } });
-    errdefer {
-        var host_copy = host;
-        host_copy.session.requestShutdown();
-        drainHostEvents(&host_copy);
-        host_copy.deinit();
-    }
+    var session_options = runtime_init.options;
+    session_options.resume_session_store = store;
+    var session = try AgentSession.init(allocator, runtime_init.services.io, session_options);
+    errdefer shutdownAndDeinitSession(&session);
 
-    return .{ .services = runtime_init.services, .host = host };
+    return .{ .services = runtime_init.services, .session = session };
 }
 
 const RuntimeHostInit = struct {
     services: RuntimeServices,
-    base: AgentSessionRuntimeHost.BaseOptions,
+    options: AgentSession.Options,
 };
 
 fn initRuntimeHostBase(allocator: std.mem.Allocator, options: anytype) !RuntimeHostInit {
@@ -139,7 +128,7 @@ fn initRuntimeHostBase(allocator: std.mem.Allocator, options: anytype) !RuntimeH
     });
     errdefer services.deinit();
 
-    const base = session_config.resolve(&services, .{
+    const session_options = session_config.resolve(&services, .{
         .current_date = options.current_date,
         .model = options.model,
         .thinking_level = options.thinking_level,
@@ -148,20 +137,22 @@ fn initRuntimeHostBase(allocator: std.mem.Allocator, options: anytype) !RuntimeH
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
     });
-    return .{ .services = services, .base = base };
+    return .{ .services = services, .options = session_options };
 }
 
-fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
-    while (host.session.drainPublicEvent()) |event| {
+fn shutdownAndDeinitSession(session: *AgentSession) void {
+    session.requestShutdown();
+    while (session.drainPublicEvent()) |event| {
         var owned_event = event;
         owned_event.deinit();
     }
+    session.deinit();
 }
 
-fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
-    const run = try host.session.startPromptRun(text, &.{}, .{});
-    defer host.session.destroyPromptRun(run);
-    while (try host.session.stepPromptRun(run)) {}
+fn runPromptForTest(session: *AgentSession, text: []const u8) !void {
+    const run = try session.startPromptRun(text, &.{}, .{});
+    defer session.destroyPromptRun(run);
+    while (try session.stepPromptRun(run)) {}
 }
 
 fn createTestDirs(dir: std.Io.Dir) !void {
@@ -169,7 +160,7 @@ fn createTestDirs(dir: std.Io.Dir) !void {
     try dir.createDirPath(std.testing.io, "repo");
 }
 
-test "sdk runtime owns services before host and deinitializes in order" {
+test "sdk runtime owns services before session and deinitializes in order" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -186,8 +177,8 @@ test "sdk runtime owns services before host and deinitializes in order" {
     defer runtime.deinit();
 
     try std.testing.expectEqualStrings("repo", runtime.services.cwd);
-    try std.testing.expectEqualStrings(runtime.services.cwd, runtime.host.base.cwd);
-    try std.testing.expectEqualStrings("session", runtime.host.session.manager.header.id);
+    try std.testing.expectEqualStrings(runtime.services.cwd, runtime.session.cwd);
+    try std.testing.expectEqualStrings("session", runtime.session.manager.header.id);
 }
 
 test "sdk runtime creates session store under service session path" {
@@ -222,7 +213,7 @@ test "sdk runtime creates session store under service session path" {
     );
     errdefer std.testing.allocator.free(store_file_name);
 
-    try runPromptForTest(&runtime.host, "persist me");
+    try runPromptForTest(&runtime.session, "persist me");
     runtime.deinit();
 
     var loader: session_store.SessionStore = .{ .dir = tmp.dir, .file_name = store_file_name };
@@ -265,7 +256,7 @@ test "sdk runtime resumes existing session store from service session path" {
         });
         defer runtime.deinit();
 
-        try runPromptForTest(&runtime.host, "first prompt");
+        try runPromptForTest(&runtime.session, "first prompt");
     }
 
     try provider.setResponses(&.{faux.assistantMessage(&.{faux.text("second response")}, .{})});
@@ -284,13 +275,13 @@ test "sdk runtime resumes existing session store from service session path" {
     const store_file_name = try std.fs.path.join(std.testing.allocator, &.{ sessions_dir, session_file_name });
     errdefer std.testing.allocator.free(store_file_name);
 
-    try std.testing.expectEqualStrings("session", resumed.host.session.manager.header.id);
-    try std.testing.expectEqual(@as(usize, 2), resumed.host.session.agent.state.messages.len);
+    try std.testing.expectEqualStrings("session", resumed.session.manager.header.id);
+    try std.testing.expectEqual(@as(usize, 2), resumed.session.agent.state.messages.len);
     try std.testing.expectEqualStrings(
         "first prompt",
-        resumed.host.session.agent.state.messages[0].user.content.string,
+        resumed.session.agent.state.messages[0].user.content.string,
     );
-    try runPromptForTest(&resumed.host, "second prompt");
+    try runPromptForTest(&resumed.session, "second prompt");
     resumed.deinit();
 
     var loader: session_store.SessionStore = .{ .dir = tmp.dir, .file_name = store_file_name };

@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
-const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
+const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
 
@@ -20,35 +20,35 @@ const Options = struct {
 };
 
 pub fn run(
-    host: *AgentSessionRuntimeHost,
+    session: *AgentSession,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     options: Options,
 ) !void {
-    return runInner(host, stdout, stderr, options) catch |err| switch (err) {
+    return runInner(session, stdout, stderr, options) catch |err| switch (err) {
         error.WriteFailed => error.OutputClosed,
         else => |unexpected| return unexpected,
     };
 }
 
 fn runInner(
-    host: *AgentSessionRuntimeHost,
+    session: *AgentSession,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     options: Options,
 ) !void {
     const json_output = options.output == .json;
-    if (json_output) try writeSessionHeader(host, stdout);
-    const prompt_run = try host.session.startPromptRun(options.prompt, &.{}, .{});
-    defer host.session.destroyPromptRun(prompt_run);
-    while (try host.session.stepPromptRun(prompt_run)) {
-        try drainEvents(host, stdout, stderr, options.output);
+    if (json_output) try writeSessionHeader(session, stdout);
+    const prompt_run = try session.startPromptRun(options.prompt, &.{}, .{});
+    defer session.destroyPromptRun(prompt_run);
+    while (try session.stepPromptRun(prompt_run)) {
+        try drainEvents(session, stdout, stderr, options.output);
     }
-    try drainEvents(host, stdout, stderr, options.output);
+    try drainEvents(session, stdout, stderr, options.output);
 }
 
 fn drainEvents(
-    host: *AgentSessionRuntimeHost,
+    session: *AgentSession,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     output: OutputMode,
@@ -58,7 +58,7 @@ fn drainEvents(
         .stderr = stderr,
         .output = output,
     };
-    while (host.session.drainPublicEvent()) |event| {
+    while (session.drainPublicEvent()) |event| {
         var owned_event = event;
         errdefer owned_event.deinit();
         try PrintDrain.onEvent(&drain, owned_event);
@@ -123,10 +123,10 @@ fn drainJsonEvent(
 }
 
 fn writeSessionHeader(
-    host: *AgentSessionRuntimeHost,
+    session: *AgentSession,
     stdout: *std.Io.Writer,
 ) !void {
-    try writeJsonSessionHeader(host.session.manager.header, stdout);
+    try writeJsonSessionHeader(session.manager.header, stdout);
 }
 
 fn writeJsonSessionHeader(
@@ -164,21 +164,20 @@ test "print mode emits assistant text from injected stream" {
     var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer zio_runtime.deinit();
 
-    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-27",
+        .session_id = "session",
+        .timestamp = "2026-05-27T00:00:00Z",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
-    }, .{ .create = .{
-        .session_id = "session",
-        .timestamp = "2026-05-27T00:00:00Z",
-    } });
+    });
     defer {
-        host.session.requestShutdown();
-        drainAllPublicEvents(&host);
-        host.deinit();
+        session.requestShutdown();
+        drainAllPublicEvents(&session);
+        session.deinit();
     }
 
     var stdout_buffer: [64]u8 = undefined;
@@ -186,7 +185,7 @@ test "print mode emits assistant text from injected stream" {
     var stderr_buffer: [64]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
 
-    try run(&host, &stdout, &stderr, .{ .prompt = "hello" });
+    try run(&session, &stdout, &stderr, .{ .prompt = "hello" });
     try std.testing.expectEqualStrings("hi\n", stdout.buffered());
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
@@ -206,21 +205,20 @@ test "json print mode streams session header and public events" {
     var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer zio_runtime.deinit();
 
-    var host = try AgentSessionRuntimeHost.init(std.testing.allocator, std.testing.io, .{
+    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
         .agent_dir = "agent",
         .current_date = "2026-05-27",
+        .session_id = "session",
+        .timestamp = "2026-05-27T00:00:00Z",
         .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
-    }, .{ .create = .{
-        .session_id = "session",
-        .timestamp = "2026-05-27T00:00:00Z",
-    } });
+    });
     defer {
-        host.session.requestShutdown();
-        drainAllPublicEvents(&host);
-        host.deinit();
+        session.requestShutdown();
+        drainAllPublicEvents(&session);
+        session.deinit();
     }
 
     var stdout_buffer: [8192]u8 = undefined;
@@ -228,7 +226,7 @@ test "json print mode streams session header and public events" {
     var stderr_buffer: [64]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
 
-    try run(&host, &stdout, &stderr, .{ .prompt = "hello", .output = .json });
+    try run(&session, &stdout, &stderr, .{ .prompt = "hello", .output = .json });
     const output = stdout.buffered();
     try std.testing.expect(std.mem.startsWith(u8, output, "{\"type\":\"session\",\"version\":3"));
     try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"message_start\"") != null);
@@ -243,8 +241,8 @@ test "json print mode streams session header and public events" {
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
-fn drainAllPublicEvents(host: *AgentSessionRuntimeHost) void {
-    while (host.session.drainPublicEvent()) |event| {
+fn drainAllPublicEvents(session: *AgentSession) void {
+    while (session.drainPublicEvent()) |event| {
         var owned_event = event;
         owned_event.deinit();
     }

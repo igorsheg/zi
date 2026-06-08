@@ -2,7 +2,6 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const AgentSession = @import("AgentSession.zig");
-const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_manager = @import("session_manager.zig");
 const settings_mod = @import("settings.zig");
@@ -17,13 +16,15 @@ const Options = struct {
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
-pub fn resolve(services: *RuntimeServices, options: Options) AgentSessionRuntimeHost.BaseOptions {
+pub fn resolve(services: *RuntimeServices, options: Options) AgentSession.Options {
     services.clearDiagnostics();
     const model = resolveModel(services, options.model);
     return .{
         .cwd = services.cwd,
         .agent_dir = services.agent_dir,
         .current_date = options.current_date,
+        .session_id = "",
+        .timestamp = "",
         .model = model,
         .thinking_level = resolveThinkingLevel(services.settings_manager.current(), options.thinking_level),
         .compaction_settings = resolveCompactionSettings(services.settings_manager.current()),

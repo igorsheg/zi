@@ -1,5 +1,4 @@
 const AgentSession = @import("AgentSession.zig");
-const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const auth = @import("auth.zig");
 const auth_mode = @import("auth_mode.zig");
 pub const cli = @import("cli/root.zig");
@@ -29,7 +28,6 @@ const tools = @import("tools/root.zig");
 
 test {
     _ = AgentSession;
-    _ = AgentSessionRuntimeHost;
     _ = auth;
     _ = auth_mode;
     _ = cli;

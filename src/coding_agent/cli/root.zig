@@ -188,7 +188,7 @@ fn runPrompt(
     };
     defer app.deinit();
 
-    try print_mode.run(&app.host, stdout, stderr, .{
+    try print_mode.run(&app.session, stdout, stderr, .{
         .prompt = prompt,
         .output = if (json_output) .json else .text,
     });
