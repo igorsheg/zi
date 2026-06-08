@@ -58,45 +58,23 @@ pub fn createRuntimeHost(
     allocator: std.mem.Allocator,
     options: CreateRuntimeHostOptions,
 ) !RuntimeHostHandle {
-    const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
-        agent_dir_override
-    else
-        try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
-    defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
+    var runtime_init = try initRuntimeHostBase(allocator, options);
+    errdefer runtime_init.services.deinit();
 
-    var services = try RuntimeServices.init(allocator, .{
-        .cwd = options.cwd,
-        .agent_dir = resolved_agent_dir,
-        .dir = options.dir,
-        .environ = options.environ,
-        .zio_runtime = options.zio_runtime,
-    });
-    errdefer services.deinit();
-
-    const base = session_config.resolve(&services, .{
-        .current_date = options.current_date,
-        .model = options.model,
-        .thinking_level = options.thinking_level,
-        .stream = options.stream,
-        .dir = options.dir,
-        .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
-        .public_event_capacity = options.public_event_capacity,
-    });
-
-    const sessions_dir = try services.paths().sessionsDirForCwd(allocator);
+    const sessions_dir = try runtime_init.services.paths().sessionsDirForCwd(allocator);
     defer allocator.free(sessions_dir);
     var store = try session_store.SessionStore.createInPath(
         allocator,
-        services.io,
+        runtime_init.services.io,
         options.dir,
         sessions_dir,
-        services.cwd,
+        runtime_init.services.cwd,
         options.session_id,
         options.timestamp,
     );
     errdefer store.deinit(allocator);
 
-    const host = try AgentSessionRuntimeHost.init(allocator, services.io, base, .{ .create = .{
+    const host = try AgentSessionRuntimeHost.init(allocator, runtime_init.services.io, runtime_init.base, .{ .create = .{
         .session_id = options.session_id,
         .timestamp = options.timestamp,
         .session_store = store,
@@ -108,7 +86,7 @@ pub fn createRuntimeHost(
         host_copy.deinit();
     }
 
-    return .{ .services = services, .host = host };
+    return .{ .services = runtime_init.services, .host = host };
 }
 
 pub fn resumeRuntimeHost(
@@ -119,6 +97,34 @@ pub fn resumeRuntimeHost(
         return error.InvalidSessionFileName;
     }
 
+    var runtime_init = try initRuntimeHostBase(allocator, options);
+    errdefer runtime_init.services.deinit();
+
+    const sessions_dir = try runtime_init.services.paths().sessionsDirForCwd(allocator);
+    defer allocator.free(sessions_dir);
+    const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, options.session_file_name });
+    errdefer allocator.free(file_name);
+    const store: session_store.SessionStore = .{ .dir = options.dir, .file_name = file_name };
+
+    const host = try AgentSessionRuntimeHost.init(allocator, runtime_init.services.io, runtime_init.base, .{ .@"resume" = .{
+        .resume_session_store = store,
+    } });
+    errdefer {
+        var host_copy = host;
+        host_copy.requestShutdown();
+        drainHostEvents(&host_copy);
+        host_copy.deinit();
+    }
+
+    return .{ .services = runtime_init.services, .host = host };
+}
+
+const RuntimeHostInit = struct {
+    services: RuntimeServices,
+    base: AgentSessionRuntimeHost.BaseOptions,
+};
+
+fn initRuntimeHostBase(allocator: std.mem.Allocator, options: anytype) !RuntimeHostInit {
     const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
         agent_dir_override
     else
@@ -143,24 +149,7 @@ pub fn resumeRuntimeHost(
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
     });
-
-    const sessions_dir = try services.paths().sessionsDirForCwd(allocator);
-    defer allocator.free(sessions_dir);
-    const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, options.session_file_name });
-    errdefer allocator.free(file_name);
-    const store: session_store.SessionStore = .{ .dir = options.dir, .file_name = file_name };
-
-    const host = try AgentSessionRuntimeHost.init(allocator, services.io, base, .{ .@"resume" = .{
-        .resume_session_store = store,
-    } });
-    errdefer {
-        var host_copy = host;
-        host_copy.requestShutdown();
-        drainHostEvents(&host_copy);
-        host_copy.deinit();
-    }
-
-    return .{ .services = services, .host = host };
+    return .{ .services = services, .base = base };
 }
 
 fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
