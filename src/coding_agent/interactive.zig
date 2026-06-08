@@ -7,7 +7,6 @@ const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
-const tool_registry = @import("tool_registry.zig");
 const sdk = @import("sdk.zig");
 
 pub const Options = struct {
@@ -116,26 +115,6 @@ fn toolBodyMode(name: []const u8) tui.product.transcript.TranscriptToolBodyMode 
     if (std.mem.eql(u8, name, "read") or
         std.mem.eql(u8, name, "edit")) return .hidden_on_success;
     return .visible;
-}
-
-fn tuiPresentation(
-    presentation: tool_registry.ToolDisplayPresentation,
-) tui.product.transcript.TranscriptToolPresentation {
-    return switch (presentation) {
-        .generic => .generic,
-        .command => .command,
-        .file => .file,
-        .patch => .patch,
-        .search => .search,
-        .directory => .directory,
-    };
-}
-
-fn tuiBodyMode(body_mode: tool_registry.ToolDisplayBodyMode) tui.product.transcript.TranscriptToolBodyMode {
-    return switch (body_mode) {
-        .visible => .visible,
-        .hidden_on_success => .hidden_on_success,
-    };
 }
 
 fn toolArgsPreview(tool_name: []const u8, args_value: std.json.Value) []const u8 {
@@ -960,8 +939,18 @@ const InteractiveLoop = struct {
         const tool = &next.tool;
         if (self.tool_metadata_lookup_enabled) {
             if (self.host.session.tools.findDefinition(tool.name)) |definition| {
-                tool.presentation = tuiPresentation(definition.metadata.display.presentation);
-                tool.body_mode = tuiBodyMode(definition.metadata.display.body_mode);
+                tool.presentation = switch (definition.metadata.display.presentation) {
+                    .generic => .generic,
+                    .command => .command,
+                    .file => .file,
+                    .patch => .patch,
+                    .search => .search,
+                    .directory => .directory,
+                };
+                tool.body_mode = switch (definition.metadata.display.body_mode) {
+                    .visible => .visible,
+                    .hidden_on_success => .hidden_on_success,
+                };
             }
         }
         if (tool.tool_call_id.len > pending_tool_id_bytes_max) return next;
