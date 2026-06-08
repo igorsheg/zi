@@ -255,7 +255,7 @@ fn drainSessionEvents(session: *AgentSession) usize {
 }
 
 fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
-    _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch unreachable;
+    _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch std.debug.assert(false);
 }
 
 fn ignorePublicEvent(_: ?*anyopaque, _: session_events.AgentSessionEvent) !void {}
