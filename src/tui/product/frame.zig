@@ -136,7 +136,16 @@ fn drawComposerBorder(
 ) !void {
     if (app.width < 2 or height < 2) return;
     try drawComposerBorderLine(app, renderer, y, true);
-    try drawComposerBorderLabel(app, renderer, y);
+    if (app.width >= 4) {
+        const inner_width = app.width - 2;
+        if (app.slots.highestPriority(.composer_top_right)) |view| {
+            const label_width = primitive.text.displayWidth(view.text);
+            if (inner_width >= 2 + label_width) {
+                const x = @as(usize, app.width) - 2 - label_width;
+                try renderer.writeText(@intCast(x), y, view.text, app.theme.composer_slot);
+            }
+        }
+    }
     try drawComposerBorderLine(app, renderer, y + height - 1, false);
     var row: u16 = y + 1;
     while (row + 1 < y + height) : (row += 1) {
@@ -173,19 +182,6 @@ fn drawComposerBorderLine(
             app.theme.composer_chrome,
         );
     }
-}
-
-fn drawComposerBorderLabel(app: *const app_mod.ProductApp, renderer: *infra.Renderer, y: u16) !void {
-    if (app.width < 4) return;
-    const inner_width = app.width - 2;
-    const view = app.slots.highestPriority(.composer_top_right) orelse return;
-    const label: primitive.chrome.MeasuredText = .{
-        .text = view.text,
-        .width = primitive.text.displayWidth(view.text),
-    };
-    if (inner_width < 2 + label.width) return;
-    const x = @as(usize, app.width) - 2 - label.width;
-    try renderer.writeText(@intCast(x), y, label.text, app.theme.composer_slot);
 }
 
 pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
