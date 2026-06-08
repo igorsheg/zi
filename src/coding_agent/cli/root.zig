@@ -126,11 +126,11 @@ fn runApp(
     return switch (args_mod.resolveAppMode(app, stdin_is_tty)) {
         .text => {
             if (app.messages.count != 1) return usage(stderr);
-            return runPrompt(process, stdout, stderr, app.messages.slice()[0], .text, app, options);
+            return runPrompt(process, stdout, stderr, app.messages.slice()[0], false, app, options);
         },
         .json => {
             if (app.messages.count != 1) return usage(stderr);
-            return runPrompt(process, stdout, stderr, app.messages.slice()[0], .json, app, options);
+            return runPrompt(process, stdout, stderr, app.messages.slice()[0], true, app, options);
         },
         .rpc => unsupported(stderr, "rpc mode is not implemented yet"),
         .interactive => {
@@ -153,7 +153,7 @@ fn runPrompt(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     prompt: []const u8,
-    output: print_mode.OutputMode,
+    json_output: bool,
     app_args: args_mod.AppArgs,
     options: auth_mode.Options,
 ) !void {
@@ -188,7 +188,10 @@ fn runPrompt(
     };
     defer app.deinit();
 
-    try print_mode.run(&app.host, stdout, stderr, .{ .prompt = prompt, .output = output });
+    try print_mode.run(&app.host, stdout, stderr, .{
+        .prompt = prompt,
+        .output = if (json_output) .json else .text,
+    });
 }
 
 fn selectResumeSession(

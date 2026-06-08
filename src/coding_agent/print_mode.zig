@@ -5,7 +5,7 @@ const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
 
-pub const OutputMode = enum {
+const OutputMode = enum {
     text,
     json,
 };
