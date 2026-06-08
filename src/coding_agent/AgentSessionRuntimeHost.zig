@@ -15,8 +15,6 @@ allocator: std.mem.Allocator,
 io: std.Io,
 base: BaseOptions,
 session: AgentSession,
-rebind_session: ?RebindSession = null,
-before_session_invalidate: ?BeforeSessionInvalidate = null,
 
 pub const BaseOptions = struct {
     cwd: []const u8,
@@ -48,24 +46,6 @@ pub const SessionStart = union(enum) {
     pub const Resume = struct {
         resume_session_store: session_store.SessionStore,
     };
-};
-
-pub const RebindSession = struct {
-    context: ?*anyopaque = null,
-    call_fn: *const fn (context: ?*anyopaque, session: *AgentSession) void,
-
-    fn call(self: RebindSession, session: *AgentSession) void {
-        self.call_fn(self.context, session);
-    }
-};
-
-pub const BeforeSessionInvalidate = struct {
-    context: ?*anyopaque = null,
-    call_fn: *const fn (context: ?*anyopaque) void,
-
-    fn call(self: BeforeSessionInvalidate) void {
-        self.call_fn(self.context);
-    }
 };
 
 pub const ReplaceResult = struct {
@@ -121,17 +101,6 @@ pub fn publicHistorySnapshot(
     return self.session.publicHistorySnapshot(allocator);
 }
 
-pub fn setRebindSession(self: *AgentSessionRuntimeHost, rebind_session: ?RebindSession) void {
-    self.rebind_session = rebind_session;
-}
-
-pub fn setBeforeSessionInvalidate(
-    self: *AgentSessionRuntimeHost,
-    before_session_invalidate: ?BeforeSessionInvalidate,
-) void {
-    self.before_session_invalidate = before_session_invalidate;
-}
-
 pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !ReplaceResult {
     if (self.session.statusSnapshot().status != .idle) return error.SessionReplacementRequiresIdle;
 
@@ -143,12 +112,9 @@ pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !Repl
     const discarded_public_event_count = drainSessionEvents(&self.session);
     if (!self.session.shutdownComplete()) return error.SessionReplacementRequiresShutdownComplete;
 
-    if (self.before_session_invalidate) |callback| callback.call();
     self.session.deinit();
     next_session_needs_deinit = false;
     self.session = next_session;
-
-    if (self.rebind_session) |callback| callback.call(&self.session);
     return .{ .discarded_public_event_count = discarded_public_event_count };
 }
 
@@ -453,7 +419,7 @@ fn waitForBashToolStart(host: *AgentSessionRuntimeHost, observed: *BashLimitObse
     return error.BashToolStartNotObserved;
 }
 
-test "runtime host replacement invalidates old session before rebinding new session" {
+test "runtime host replacement drains old public events before new session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -478,29 +444,6 @@ test "runtime host replacement invalidates old session before rebinding new sess
         host.deinit();
     }
 
-    const State = struct {
-        before_count: usize = 0,
-        rebind_count: usize = 0,
-        rebound_session_id: []const u8 = "",
-
-        const Self = @This();
-
-        fn before(context: ?*anyopaque) void {
-            const state: *Self = @ptrCast(@alignCast(context.?));
-            state.before_count += 1;
-        }
-
-        fn rebind(context: ?*anyopaque, session: *AgentSession) void {
-            const state: *Self = @ptrCast(@alignCast(context.?));
-            state.rebind_count += 1;
-            state.rebound_session_id = session.manager.header.id;
-        }
-    };
-
-    var state: State = .{};
-    host.setBeforeSessionInvalidate(.{ .context = &state, .call_fn = State.before });
-    host.setRebindSession(.{ .context = &state, .call_fn = State.rebind });
-
     try runPromptForTest(&host, "old event");
     const result = try host.replaceSession(.{ .create = .{
         .session_id = "second",
@@ -508,9 +451,6 @@ test "runtime host replacement invalidates old session before rebinding new sess
     } });
 
     try std.testing.expect(result.discarded_public_event_count > 0);
-    try std.testing.expectEqual(@as(usize, 1), state.before_count);
-    try std.testing.expectEqual(@as(usize, 1), state.rebind_count);
-    try std.testing.expectEqualStrings("second", state.rebound_session_id);
     try std.testing.expectEqualStrings("second", host.sessionId());
     try std.testing.expectEqual(@as(usize, 0), host.statusSnapshot().public_event_count);
 }
