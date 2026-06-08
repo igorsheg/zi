@@ -808,7 +808,7 @@ const InteractiveLoop = struct {
     fn drainPublicEventsBounded(self: *InteractiveLoop, limit: usize) !usize {
         var count: usize = 0;
         while (count < limit) : (count += 1) {
-            var event = self.host.drainPublicEvent() orelse {
+            var event = self.host.session.drainPublicEvent() orelse {
                 try self.flushToolOutputCoalescer();
                 return count;
             };

@@ -123,13 +123,9 @@ pub fn requestShutdown(self: *AgentSessionRuntimeHost) void {
     self.session.requestShutdown();
 }
 
-pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?session_events.AgentSessionEvent {
-    return self.session.drainPublicEvent();
-}
-
 pub fn drainPublicEvents(self: *AgentSessionRuntimeHost, handler: PublicEventHandler) !usize {
     var count: usize = 0;
-    while (self.drainPublicEvent()) |event| {
+    while (self.session.drainPublicEvent()) |event| {
         var owned_event = event;
         defer owned_event.deinit();
         try handler.call_fn(handler.context, owned_event);
@@ -918,10 +914,10 @@ test "runtime host compacts through public command boundary" {
     try std.testing.expectEqual(@as(usize, 2), host.session.agent.state.messages.len);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
 
-    var start_event = host.drainPublicEvent().?;
+    var start_event = host.session.drainPublicEvent().?;
     defer start_event.deinit();
     try std.testing.expect(start_event == .compaction_start);
-    var end_event = host.drainPublicEvent().?;
+    var end_event = host.session.drainPublicEvent().?;
     defer end_event.deinit();
     try std.testing.expect(end_event == .compaction_end);
     try std.testing.expectEqualStrings(kept, end_event.compaction_end.result.?.first_kept_entry_id.text);
@@ -980,10 +976,10 @@ test "runtime host compacts with generated summary through public command bounda
     try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
     try std.testing.expectEqual(@as(usize, 3), host.session.manager.entries.items.len);
 
-    var start_event = host.drainPublicEvent().?;
+    var start_event = host.session.drainPublicEvent().?;
     defer start_event.deinit();
     try std.testing.expect(start_event == .compaction_start);
-    var end_event = host.drainPublicEvent().?;
+    var end_event = host.session.drainPublicEvent().?;
     defer end_event.deinit();
     try std.testing.expect(end_event == .compaction_end);
     try std.testing.expectEqualStrings("generated summary", end_event.compaction_end.result.?.summary.text);
