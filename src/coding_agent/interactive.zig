@@ -794,7 +794,7 @@ const InteractiveLoop = struct {
         result: anytype,
     ) !void {
         if (self.active_run != prompt_run) return;
-        const more = try self.host.applyPromptRunProgress(prompt_run, result);
+        const more = try self.host.session.applyPromptRunProgress(prompt_run, result);
         if (!more) {
             self.host.destroyPromptRun(prompt_run);
             self.active_run = null;
