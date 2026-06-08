@@ -221,29 +221,24 @@ fn drawConfirmModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, c
 
     try renderer.fillRect(0, 0, app.width, app.height, .{ .dim = true });
     try renderer.fillRect(x, y, modal_width, modal_height, .{});
-    try drawBox(renderer, x, y, modal_width, modal_height, app.theme.tool_chrome);
+    try renderer.writeText(x, y, "╭", app.theme.tool_chrome);
+    try renderer.writeText(x + modal_width - 1, y, "╮", app.theme.tool_chrome);
+    try renderer.writeText(x, y + modal_height - 1, "╰", app.theme.tool_chrome);
+    try renderer.writeText(x + modal_width - 1, y + modal_height - 1, "╯", app.theme.tool_chrome);
+    var xx: u16 = x + 1;
+    while (xx + 1 < x + modal_width) : (xx += 1) {
+        try renderer.writeText(xx, y, "─", app.theme.tool_chrome);
+        try renderer.writeText(xx, y + modal_height - 1, "─", app.theme.tool_chrome);
+    }
+    var yy: u16 = y + 1;
+    while (yy + 1 < y + modal_height) : (yy += 1) {
+        try renderer.writeText(x, yy, "│", app.theme.tool_chrome);
+        try renderer.writeText(x + modal_width - 1, yy, "│", app.theme.tool_chrome);
+    }
     if (modal_width > 4) {
         try renderer.writeText(x + 2, y, confirm.title, app.theme.tool_title);
         try renderer.writeText(x + 2, y + 2, confirm.body, app.theme.transcript_text);
         try drawConfirmButtons(app, renderer, confirm, x, y + modal_height - 2, modal_width);
-    }
-}
-
-fn drawBox(renderer: *infra.Renderer, x: u16, y: u16, w: u16, h: u16, style: primitive.Style) !void {
-    if (w < 2 or h < 2) return;
-    try renderer.writeText(x, y, "╭", style);
-    try renderer.writeText(x + w - 1, y, "╮", style);
-    try renderer.writeText(x, y + h - 1, "╰", style);
-    try renderer.writeText(x + w - 1, y + h - 1, "╯", style);
-    var xx: u16 = x + 1;
-    while (xx + 1 < x + w) : (xx += 1) {
-        try renderer.writeText(xx, y, "─", style);
-        try renderer.writeText(xx, y + h - 1, "─", style);
-    }
-    var yy: u16 = y + 1;
-    while (yy + 1 < y + h) : (yy += 1) {
-        try renderer.writeText(x, yy, "│", style);
-        try renderer.writeText(x + w - 1, yy, "│", style);
     }
 }
 
