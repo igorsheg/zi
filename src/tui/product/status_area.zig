@@ -44,10 +44,19 @@ pub fn draw(
         if (text_width == 0) continue;
         const available = remaining - @as(u16, @intCast(sep_width));
         if (available == 0) return;
-        const text = if (rendered_any or text_width > available)
-            fitPrefix(view.text, available)
-        else
-            view.text;
+        var text = view.text;
+        if (rendered_any or text_width > available) {
+            var index: usize = 0;
+            var fit_width: usize = 0;
+            while (index < view.text.len) {
+                const grapheme = primitive.text.nextGrapheme(view.text[index..]);
+                if (grapheme.end == 0) break;
+                if (fit_width + grapheme.width > available) break;
+                fit_width += grapheme.width;
+                index += grapheme.end;
+            }
+            text = view.text[0..index];
+        }
         if (text.len == 0) continue;
 
         if (rendered_any) {
@@ -63,19 +72,6 @@ pub fn draw(
         };
         rendered_any = true;
     }
-}
-
-fn fitPrefix(text: []const u8, max_width: u16) []const u8 {
-    var index: usize = 0;
-    var width: usize = 0;
-    while (index < text.len) {
-        const grapheme = primitive.text.nextGrapheme(text[index..]);
-        if (grapheme.end == 0) break;
-        if (width + grapheme.width > max_width) break;
-        width += grapheme.width;
-        index += grapheme.end;
-    }
-    return text[0..index];
 }
 
 fn advance(x: u16, width: usize) u16 {
