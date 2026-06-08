@@ -217,7 +217,14 @@ fn sanitizeTranscriptText(input: []const u8, buffer: []u8) []const u8 {
     while (index < input.len and out_len < buffer.len) {
         const byte = input[index];
         if (byte == 0x1b) {
-            index = skipEscapeSequence(input, index);
+            if (index + 1 >= input.len) return buffer[0..out_len];
+            const kind = input[index + 1];
+            index = if (kind == '[')
+                skipCsiPayload(input, index + 2)
+            else if (kind == ']')
+                skipOscPayload(input, index + 2)
+            else
+                @min(index + 2, input.len);
             continue;
         }
         if (byte == '\n') {
@@ -268,16 +275,6 @@ fn skipC1Control(input: []const u8, start: usize) usize {
     if (kind == 0x9b) return skipCsiPayload(input, start + 2);
     if (kind == 0x9d) return skipOscPayload(input, start + 2);
     return start + 2;
-}
-
-fn skipEscapeSequence(input: []const u8, start: usize) usize {
-    std.debug.assert(start < input.len);
-    std.debug.assert(input[start] == 0x1b);
-    if (start + 1 >= input.len) return input.len;
-    const kind = input[start + 1];
-    if (kind == '[') return skipCsiPayload(input, start + 2);
-    if (kind == ']') return skipOscPayload(input, start + 2);
-    return @min(start + 2, input.len);
 }
 
 fn skipCsiPayload(input: []const u8, start: usize) usize {
