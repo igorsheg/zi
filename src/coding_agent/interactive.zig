@@ -21,13 +21,13 @@ pub const Options = struct {
 };
 
 const effect_count_max = tui.product.terminal_loop.effects_per_step_max;
-const frame_interval_ms: u64 = 33;
+const frame_interval_ms: u64 = 16;
 const frame_interval_ns: i128 = frame_interval_ms * std.time.ns_per_ms;
 const input_reads_per_tick_max = 1;
 const prompt_progress_per_tick_max = 8;
 const public_events_per_tick_max = 16;
 const render_attempts_per_tick_max = 1;
-const shutdown_drain_ticks_max = 30;
+const shutdown_drain_ticks_max = 60;
 const pending_tool_outputs_max = 32;
 const pending_tool_id_bytes_max = 128;
 const pending_tool_output_bytes_max = tui.product.transcript.append_size_bytes_max;
@@ -1111,7 +1111,7 @@ test "interactive overflow status is explicit" {
     try std.testing.expect(std.mem.indexOf(u8, written, "terminal input truncated") != null);
 }
 
-test "interactive frame due enforces thirty fps cadence" {
+test "interactive frame due enforces sixty fps cadence" {
     try std.testing.expect(frameDue(1000, null));
     try std.testing.expect(!frameDue(1000 + frame_interval_ns - 1, 1000));
     try std.testing.expect(frameDue(1000 + frame_interval_ns, 1000));
@@ -1119,13 +1119,13 @@ test "interactive frame due enforces thirty fps cadence" {
 }
 
 test "interactive loop bounds stay responsive" {
-    try std.testing.expect(frame_interval_ns <= 33 * std.time.ns_per_ms);
-    try std.testing.expect(frame_interval_ms <= 33);
+    try std.testing.expect(frame_interval_ns <= 16 * std.time.ns_per_ms);
+    try std.testing.expect(frame_interval_ms <= 16);
     try std.testing.expectEqual(@as(usize, 1), input_reads_per_tick_max);
     try std.testing.expectEqual(@as(usize, 8), prompt_progress_per_tick_max);
     try std.testing.expectEqual(@as(usize, 16), public_events_per_tick_max);
     try std.testing.expectEqual(@as(usize, 1), render_attempts_per_tick_max);
-    try std.testing.expectEqual(@as(usize, 30), shutdown_drain_ticks_max);
+    try std.testing.expectEqual(@as(usize, 60), shutdown_drain_ticks_max);
 }
 
 test "interactive sanitizes ansi and terminal controls for transcript text" {

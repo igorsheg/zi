@@ -2,6 +2,7 @@ pub const app = @import("App.zig");
 pub const composer = @import("composer.zig");
 pub const frame = @import("frame.zig");
 pub const keys = @import("keys.zig");
+pub const markdown_projection = @import("markdown_projection.zig");
 pub const slots = @import("slots.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const surface = @import("surface.zig");
@@ -34,6 +35,7 @@ test {
     _ = composer;
     _ = frame;
     _ = keys;
+    _ = markdown_projection;
     _ = slots;
     _ = snapshot;
     _ = surface;

@@ -3,6 +3,7 @@ const infra = @import("../infra/root.zig");
 const primitive = @import("../primitive/root.zig");
 const app_mod = @import("App.zig");
 const composer_mod = @import("composer.zig");
+const markdown_projection = @import("markdown_projection.zig");
 const slots_mod = @import("slots.zig");
 const surface_mod = @import("surface.zig");
 const transcript_mod = @import("transcript.zig");
@@ -438,6 +439,8 @@ fn emitItemRowsNewestFirst(
     emitVerticalPaddingRows(sink, transcriptItemPaddingY(item), style);
     if (item == .tool) {
         emitToolRowsNewestFirst(sink, item.tool, frame_width, theme);
+    } else if (item == .message and item.message.role == .assistant) {
+        emitMarkdownRowsNewestFirst(sink, item.message.text, frame_width, theme);
     } else {
         emitWrappedRowsNewestFirst(sink, transcript_projection.itemPrimary(item), frame_width, false, style, style);
     }
@@ -460,6 +463,77 @@ fn emitVerticalPaddingRows(sink: *TranscriptRowSink, count: usize, style: primit
     var index: usize = 0;
     while (index < count) : (index += 1) sink.emitGenerated("", "", false, style);
 }
+
+fn emitMarkdownRowsNewestFirst(
+    sink: *TranscriptRowSink,
+    text: []const u8,
+    frame_width: u16,
+    theme: ?*const theme_mod.Theme,
+) void {
+    const fallback = theme_mod.Theme.codex();
+    const resolved = theme orelse &fallback;
+    const inner_width = transcriptItemInnerWidth(frame_width);
+    var markdown_state: markdown_projection.State = .{};
+    var item_rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
+    var item_row_count: usize = 0;
+
+    var iterator: PhysicalLineIterator = .{ .text = text };
+    while (iterator.next()) |line| {
+        var generated: [markdown_projection.generated_text_bytes_max]u8 = undefined;
+        const projected = markdown_projection.classifyLine(&markdown_state, line, resolved, &generated);
+        const prefix_width: u16 = @intCast(@min(primitive.text.displayWidth(projected.prefix), inner_width));
+        item_row_count += collectWrappedTranscriptLine(
+            item_rows[item_row_count..],
+            .{ .prefix = projected.prefix, .text = projected.text },
+            inner_width,
+            prefix_width,
+            projected.repeat_prefix,
+            projected.prefix_style,
+            projected.text_style,
+            projected.row_style,
+        );
+        if (item_row_count >= item_rows.len) break;
+    }
+    if (text.len == 0 and item_row_count == 0) {
+        item_rows[0] = .{
+            .prefix = "",
+            .text = "",
+            .show_prefix = false,
+            .prefix_style = resolved.transcript_text,
+            .text_style = resolved.transcript_text,
+            .suffix_style = resolved.transcript_text,
+            .row_style = resolved.transcript_text,
+        };
+        item_row_count = 1;
+    }
+
+    var remaining = item_row_count;
+    while (remaining > 0) {
+        remaining -= 1;
+        sink.emitBorrowed(item_rows[remaining]);
+        if (sink.full()) return;
+    }
+}
+
+const PhysicalLineIterator = struct {
+    text: []const u8,
+    start: usize = 0,
+    emitted_trailing_empty: bool = false,
+
+    fn next(self: *PhysicalLineIterator) ?[]const u8 {
+        if (self.start >= self.text.len) {
+            if (!self.emitted_trailing_empty and self.text.len > 0 and self.text[self.text.len - 1] == '\n') {
+                self.emitted_trailing_empty = true;
+                return "";
+            }
+            return null;
+        }
+        const end = std.mem.indexOfScalarPos(u8, self.text, self.start, '\n') orelse self.text.len;
+        const line = self.text[self.start..end];
+        self.start = if (end < self.text.len) end + 1 else end;
+        return line;
+    }
+};
 
 fn emitToolRowsNewestFirst(
     sink: *TranscriptRowSink,
@@ -546,6 +620,7 @@ fn emitWrappedRowsNewestFirst(
         repeat_prefix,
         prefix_style,
         text_style,
+        text_style,
     );
     var remaining = line_row_count;
     while (remaining > 0) {
@@ -584,13 +659,14 @@ fn transcriptItemStyleFromTheme(item: transcript_mod.TranscriptItem, theme: *con
 }
 
 fn collectWrappedTranscriptLine(
-    line_rows: *[transcript_visual_rows_max]TranscriptVisualRow,
+    line_rows: []TranscriptVisualRow,
     item: transcript_projection.RenderItem,
     inner_width: u16,
     prefix_width: u16,
     repeat_prefix: bool,
     prefix_style: primitive.Style,
     text_style: primitive.Style,
+    row_style: primitive.Style,
 ) usize {
     var line_row_count: usize = 0;
     var start: usize = 0;
@@ -605,7 +681,7 @@ fn collectWrappedTranscriptLine(
                 .prefix_style = prefix_style,
                 .text_style = text_style,
                 .suffix_style = text_style,
-                .row_style = text_style,
+                .row_style = row_style,
             };
             line_row_count += 1;
             continue;
@@ -619,7 +695,7 @@ fn collectWrappedTranscriptLine(
             .prefix_style = prefix_style,
             .text_style = text_style,
             .suffix_style = text_style,
-            .row_style = text_style,
+            .row_style = row_style,
         };
         line_row_count += 1;
         start = visual.next;
@@ -632,7 +708,7 @@ fn collectWrappedTranscriptLine(
             .prefix_style = prefix_style,
             .text_style = text_style,
             .suffix_style = text_style,
-            .row_style = text_style,
+            .row_style = row_style,
         };
         line_row_count += 1;
     }
@@ -749,6 +825,47 @@ test "frame renders assistant messages without label and transparent background"
     try Frame.build(&app, &renderer);
 
     try expectTextInColumn(renderer.next, 1, "hello");
+}
+
+test "frame renders assistant markdown heading" {
+    var app = try app_mod.ProductApp.init(40, 6);
+    defer app.deinit(std.testing.allocator);
+    try appendFrameMessage(&app, .assistant, "# Title");
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellText(renderer.next, 1, 1, "Title");
+    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.status_accent));
+}
+
+test "frame renders assistant markdown quote and code fence" {
+    var app = try app_mod.ProductApp.init(40, 10);
+    defer app.deinit(std.testing.allocator);
+    try appendFrameMessage(&app, .assistant, "> quoted\n```zig\n# not heading\n```");
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 10, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectGraphemeInColumn(renderer.next, 1, "│");
+    try expectTextInColumn(renderer.next, 3, "quoted");
+    try expectTextInColumn(renderer.next, 3, "# not heading");
+}
+
+test "frame renders assistant markdown list marker" {
+    var app = try app_mod.ProductApp.init(40, 6);
+    defer app.deinit(std.testing.allocator);
+    try appendFrameMessage(&app, .assistant, "- item");
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellText(renderer.next, 1, 1, "- ");
+    try expectCellText(renderer.next, 3, 1, "item");
+    try std.testing.expect((try renderer.next.get(1, 1)).style.eql(app.theme.status_accent));
 }
 
 test "frame keeps transcript out of tiny heights" {
