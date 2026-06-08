@@ -10,11 +10,11 @@ pub const OutputMode = enum {
     json,
 };
 
-pub const Error = error{
+const Error = error{
     OutputClosed,
 };
 
-pub const Options = struct {
+const Options = struct {
     prompt: []const u8,
     output: OutputMode = .text,
 };
