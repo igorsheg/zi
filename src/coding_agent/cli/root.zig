@@ -4,7 +4,7 @@ const auth_mode = @import("../auth_mode.zig");
 const args_mod = @import("args.zig");
 const interactive = @import("../interactive.zig");
 const print_mode = @import("../print_mode.zig");
-const sdk = @import("../sdk.zig");
+const runtime_services = @import("../runtime_services.zig");
 const session_listing = @import("../session_listing.zig");
 
 const CliError = error{
@@ -163,7 +163,7 @@ fn runPrompt(
 
     var app = if (try selectResumeSession(process, stderr, app_args, options)) |session_file| blk: {
         defer process.gpa.free(session_file);
-        break :blk try sdk.resumeRuntimeHost(process.gpa, .{
+        break :blk try runtime_services.resumeSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -175,7 +175,7 @@ fn runPrompt(
     } else blk: {
         const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
         defer process.gpa.free(session_id);
-        break :blk try sdk.createRuntimeHost(process.gpa, .{
+        break :blk try runtime_services.createSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -312,7 +312,7 @@ test "cli auth status dispatches to auth mode" {
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
-test "cli selects newest resumable session through sdk policy" {
+test "cli selects newest resumable session through runtime policy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try createCliTestDirs(tmp.dir);
@@ -341,7 +341,7 @@ test "cli selects newest resumable session through sdk policy" {
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
-test "cli selects explicit resumable session through sdk policy" {
+test "cli selects explicit resumable session through runtime policy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try createCliTestDirs(tmp.dir);
@@ -450,7 +450,7 @@ fn createCliTestDirs(dir: std.Io.Dir) !void {
 }
 
 fn createCliStoredSession(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {
-    var app_runtime = try sdk.createRuntimeHost(std.testing.allocator, .{
+    var app_runtime = try runtime_services.createSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",
