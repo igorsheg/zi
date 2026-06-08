@@ -179,10 +179,11 @@ fn drainSessionEvents(session: *AgentSession) usize {
 }
 
 fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
-    _ = host.drainPublicEvents(.{ .call_fn = ignorePublicEvent }) catch std.debug.assert(false);
+    while (host.session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        owned_event.deinit();
+    }
 }
-
-fn ignorePublicEvent(_: ?*anyopaque, _: session_events.AgentSessionEvent) !void {}
 
 fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
     const run = try host.startPromptRun(text, &.{}, .{});
