@@ -670,23 +670,6 @@ pub fn deinitAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) void {
     }
 }
 
-pub fn assistantEventPartial(event: ai.AssistantMessageEvent) ai.AssistantMessage {
-    return switch (event) {
-        .start => |payload| payload.partial,
-        .text_start => |payload| payload.partial,
-        .text_delta => |payload| payload.partial,
-        .text_end => |payload| payload.partial,
-        .thinking_start => |payload| payload.partial,
-        .thinking_delta => |payload| payload.partial,
-        .thinking_end => |payload| payload.partial,
-        .toolcall_start => |payload| payload.partial,
-        .toolcall_delta => |payload| payload.partial,
-        .toolcall_end => |payload| payload.partial,
-        .done => |payload| payload.message,
-        .@"error" => |payload| payload.@"error",
-    };
-}
-
 pub const AgentEvent = union(enum) {
     agent_start,
     agent_end: AgentEnd,

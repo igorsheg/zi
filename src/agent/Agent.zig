@@ -335,9 +335,23 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
     switch (event) {
         .agent_start, .turn_start => {},
         .message_start => |message_event| try self.setStreamingMessage(message_event.message),
-        .message_update => |message_update| try self.setStreamingMessage(.{
-            .assistant = agent.assistantEventPartial(message_update.assistant_message_event),
-        }),
+        .message_update => |message_update| {
+            const partial = switch (message_update.assistant_message_event) {
+                .start => |payload| payload.partial,
+                .text_start => |payload| payload.partial,
+                .text_delta => |payload| payload.partial,
+                .text_end => |payload| payload.partial,
+                .thinking_start => |payload| payload.partial,
+                .thinking_delta => |payload| payload.partial,
+                .thinking_end => |payload| payload.partial,
+                .toolcall_start => |payload| payload.partial,
+                .toolcall_delta => |payload| payload.partial,
+                .toolcall_end => |payload| payload.partial,
+                .done => |payload| payload.message,
+                .@"error" => |payload| payload.@"error",
+            };
+            try self.setStreamingMessage(.{ .assistant = partial });
+        },
         .message_end => |message_event| {
             self.clearStreamingMessage();
             try self.appendMessage(message_event.message);
