@@ -39,7 +39,9 @@ test "product frame renders through deterministic vscreen harness" {
     try std.testing.expect(diff.changed > 0);
     try std.testing.expect(std.mem.indexOf(u8, harness.output.bytes(), "h") != null);
     try expectCellText(&harness, 0, 0, "zi");
-    try expectCellText(&harness, 0, 3, "> hello");
+    try expectCellText(&harness, 0, 1, "╭");
+    try expectCellText(&harness, 1, 2, "> ");
+    try expectCellText(&harness, 3, 2, "hello");
 
     harness.output.reset();
     try harness.build();
@@ -50,7 +52,7 @@ test "product frame renders through deterministic vscreen harness" {
 
 test "product frame wraps long transcript text from bottom" {
     var storage: [4096]u8 = undefined;
-    var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 12, 5, &storage);
+    var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 12, 7, &storage);
     defer harness.deinit();
 
     try std.testing.expect(try harness.apply(.{
@@ -64,7 +66,7 @@ test "product frame wraps long transcript text from bottom" {
 
 test "product frame wraps graphemes without splitting wide cells" {
     var storage: [4096]u8 = undefined;
-    var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 10, 4, &storage);
+    var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 10, 6, &storage);
     defer harness.deinit();
 
     try std.testing.expect(try harness.apply(.{
@@ -77,7 +79,7 @@ test "product frame wraps graphemes without splitting wide cells" {
 
 test "product frame shows newest transcript lines and preserves composer row" {
     var storage: [4096]u8 = undefined;
-    var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 40, 5, &storage);
+    var harness = try harness_mod.VScreenHarness.init(std.testing.allocator, 40, 7, &storage);
     defer harness.deinit();
 
     try applyMessage(&harness, .system, "old");
@@ -96,8 +98,9 @@ test "product frame shows newest transcript lines and preserves composer row" {
     }) == null);
 
     _ = try harness.render();
-    try expectCellText(&harness, 1, 2, "system: three");
-    try expectCellText(&harness, 0, 4, "> o\u{0300}👩🏽‍🚀");
+
+    try expectCellText(&harness, 1, 5, "> ");
+    try expectCellText(&harness, 3, 5, "o\u{0300}👩🏽‍🚀");
     try std.testing.expectEqual(@as(usize, 4), harness.app.transcript.items.items.len);
     try std.testing.expectEqualStrings("two", harness.app.transcript.items.items[2].message.text);
 }

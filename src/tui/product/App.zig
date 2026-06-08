@@ -190,8 +190,7 @@ pub const ProductApp = struct {
     }
 
     fn transcriptVisibleRows(self: ProductApp) usize {
-        const footer_rows = @min(self.slots.count(.composer_footer), slots_mod.composer_footer_rows_max);
-        return frame_mod.transcriptVisibleRowsWithFooter(self.height, footer_rows);
+        return frame_mod.transcriptVisibleRows(self.height);
     }
 };
 
@@ -412,27 +411,27 @@ test "product app applies slot contributions atomically" {
     defer app.deinit(std.testing.allocator);
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
-        .slot = .composer_footer,
+        .slot = .composer_top_left,
         .id = 1,
         .owner = 9,
         .text = "model: faux",
     } }) == null);
     try std.testing.expect(app.dirty);
-    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_footer));
+    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_left));
 
     app.dirty = false;
     try std.testing.expectError(
         error.InvalidSlotContributionText,
         app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
-            .slot = .composer_footer,
+            .slot = .composer_top_left,
             .id = 2,
             .owner = 9,
             .text = "bad\n",
         } }),
     );
     try std.testing.expect(!app.dirty);
-    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_footer));
+    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_left));
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .clear_slot_owner = 9 }) == null);
-    try std.testing.expectEqual(@as(usize, 0), app.slots.count(.composer_footer));
+    try std.testing.expectEqual(@as(usize, 0), app.slots.count(.composer_top_left));
 }

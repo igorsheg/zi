@@ -131,6 +131,9 @@ pub const ComposerProjection = struct {
     first_visible_row: usize,
     visible_count: usize,
     total_rows: usize,
+    cursor_visible: bool,
+    cursor_visible_row: usize,
+    cursor_display_col: usize,
 };
 
 fn projectVisualRows(
@@ -142,13 +145,46 @@ fn projectVisualRows(
     const skip = if (total > visible_rows_max) total - visible_rows_max else 0;
     var collector: ComposerRowCollector = .{ .rows = out, .skip_remaining = skip };
     emitVisualRows(composer.text(), width, &collector);
-    return .{ .first_visible_row = skip, .visible_count = collector.visible_count, .total_rows = total };
+    const cursor = cursorPosition(composer.text(), width, composer.cursor_byte_index);
+    const cursor_visible = cursor.row >= skip and cursor.row < skip + collector.visible_count;
+    return .{
+        .first_visible_row = skip,
+        .visible_count = collector.visible_count,
+        .total_rows = total,
+        .cursor_visible = cursor_visible,
+        .cursor_visible_row = if (cursor_visible) cursor.row - skip else 0,
+        .cursor_display_col = if (cursor_visible) cursor.col else 0,
+    };
 }
 
 fn countVisualRows(bytes: []const u8, width: u16) usize {
     var collector: ComposerRowCollector = .{ .rows = null };
     emitVisualRows(bytes, width, &collector);
     return collector.total_rows;
+}
+
+const CursorPosition = struct {
+    row: usize,
+    col: usize,
+};
+
+fn cursorPosition(bytes: []const u8, width: u16, cursor: usize) CursorPosition {
+    std.debug.assert(cursor <= bytes.len);
+    if (bytes.len == 0) return .{ .row = 0, .col = 0 };
+    const wrap_width = @max(width, 1);
+    var row: usize = 0;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const line = text_primitive.nextVisualLineBreak(bytes, start, wrap_width);
+        if (cursor >= line.start and cursor <= line.end) {
+            return .{ .row = row, .col = text_primitive.displayWidth(bytes[line.start..cursor]) };
+        }
+        if (line.next == start) break;
+        start = line.next;
+        row += 1;
+    }
+    if (bytes[bytes.len - 1] == '\n' and cursor == bytes.len) return .{ .row = row, .col = 0 };
+    return .{ .row = if (row == 0) 0 else row - 1, .col = 0 };
 }
 
 const ComposerRowCollector = struct {
@@ -276,6 +312,33 @@ test "composer visible rows tail wrapped output" {
     try std.testing.expectEqualStrings("333", rows[0].text);
     try std.testing.expectEqualStrings("555", rows[2].text);
     try std.testing.expectEqualStrings("55", rows[3].text);
+}
+
+test "composer projection reports visible cursor display column" {
+    var composer: ComposerBuffer = .{};
+    defer composer.deinit(std.testing.allocator);
+
+    try composer.insertUtf8(std.testing.allocator, "a中b");
+    composer.moveLeft();
+
+    var rows: [visible_rows_max]ComposerVisualRow = undefined;
+    const projection = composer.visibleRows(20, &rows);
+    try std.testing.expect(projection.cursor_visible);
+    try std.testing.expectEqual(@as(usize, 0), projection.cursor_visible_row);
+    try std.testing.expectEqual(@as(usize, 3), projection.cursor_display_col);
+}
+
+test "composer projection reports cursor on visible tail row" {
+    var composer: ComposerBuffer = .{};
+    defer composer.deinit(std.testing.allocator);
+
+    try composer.insertUtf8(std.testing.allocator, "one\ntwo\nthree\nfour\nfive");
+
+    var rows: [visible_rows_max]ComposerVisualRow = undefined;
+    const projection = composer.visibleRows(20, &rows);
+    try std.testing.expect(projection.cursor_visible);
+    try std.testing.expectEqual(@as(usize, 3), projection.cursor_visible_row);
+    try std.testing.expectEqual(@as(usize, 4), projection.cursor_display_col);
 }
 
 test "composer command contract owns editing and submit" {

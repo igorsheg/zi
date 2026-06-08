@@ -39,35 +39,28 @@ pub const Frame = struct {
             try renderer.resize(app.width, app.height);
         }
         renderer.next.clear();
+        renderer.clearCursor();
         try drawShell(app, renderer);
     }
 };
 
 fn drawShell(app: *const app_mod.ProductApp, renderer: *infra.Renderer) !void {
     if (app.height > 0) try renderer.writeText(0, 0, "zi", app.theme.shell_label);
-    const footer_rows = composerFooterRows(app);
     const composer_rows = composerRows(app);
     if (app.height > 0) {
         try drawTranscript(
             app,
             renderer,
             app.theme.transcript_text,
-            transcriptVisibleRowsWithReserved(app.height, footer_rows + composer_rows),
+            transcriptVisibleRowsWithReserved(app.height, composer_rows),
         );
     }
-    if (app.height > 0) {
-        try drawComposerFooter(app, renderer, footer_rows, composer_rows);
-        try drawComposer(app, renderer, composer_rows);
-    }
+    if (app.height > 0) try drawComposer(app, renderer, composer_rows);
     if (app.modal) |modal| try drawModal(app, renderer, modal);
 }
 
 pub fn transcriptVisibleRows(height: u16) usize {
-    return transcriptVisibleRowsWithFooter(height, 0);
-}
-
-pub fn transcriptVisibleRowsWithFooter(height: u16, footer_rows: usize) usize {
-    return transcriptVisibleRowsWithReserved(height, footer_rows + 1);
+    return transcriptVisibleRowsWithReserved(height, 1);
 }
 
 pub fn transcriptVisibleRowsWithReserved(height: u16, reserved_rows: usize) usize {
@@ -78,45 +71,137 @@ pub fn transcriptVisibleRowsWithReserved(height: u16, reserved_rows: usize) usiz
     return @min(available_rows, transcript_visual_rows_max);
 }
 
-pub fn composerFooterRows(app: *const app_mod.ProductApp) usize {
-    return @min(app.slots.count(.composer_footer), slots_mod.composer_footer_rows_max);
-}
-
 pub fn composerRows(app: *const app_mod.ProductApp) usize {
-    const text_width = if (app.width > 2) app.width - 2 else 1;
-    return @min(app.composer.visualRows(text_width), composer_mod.visible_rows_max);
+    const text_width = composerTextWidth(app.width);
+    return @min(app.composer.visualRows(text_width), composer_mod.visible_rows_max) + 2;
 }
 
-fn drawComposerFooter(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    footer_rows: usize,
-    composer_rows: usize,
-) !void {
-    if (footer_rows == 0 or app.height <= composer_rows) return;
-    var views: [slots_mod.composer_footer_rows_max]slots_mod.SlotView = undefined;
-    const count = app.slots.orderedSlot(.composer_footer, &views);
-    const rows = @min(count, @min(footer_rows, @as(usize, app.height) - composer_rows));
-    var index: usize = 0;
-    while (index < rows) : (index += 1) {
-        const y: u16 = @intCast(@as(usize, app.height) - composer_rows - rows + index);
-        try renderer.writeText(0, y, views[index].text, app.theme.transcript_secondary);
-    }
+fn composerTextWidth(width: u16) u16 {
+    return if (width > 4) width - 4 else 1;
 }
 
 fn drawComposer(app: *const app_mod.ProductApp, renderer: *infra.Renderer, composer_rows: usize) !void {
-    if (composer_rows == 0 or app.height == 0) return;
+    if (composer_rows < 3 or app.height == 0 or app.width == 0) return;
+    const height = @min(composer_rows, @as(usize, app.height));
+    if (height < 3) return;
+    const box_y: u16 = @intCast(@as(usize, app.height) - height);
+    const box_height: u16 = @intCast(height);
+    try drawComposerBorder(app, renderer, box_y, box_height);
+
     var rows: [composer_mod.visible_rows_max]composer_mod.ComposerVisualRow = undefined;
-    const text_width = if (app.width > 2) app.width - 2 else 1;
-    const projection = app.composer.visibleRows(text_width, &rows);
-    const visible_count = @min(projection.visible_count, @min(composer_rows, @as(usize, app.height)));
+    const projection = app.composer.visibleRows(composerTextWidth(app.width), &rows);
+    const visible_count = @min(projection.visible_count, height - 2);
     var index: usize = 0;
     while (index < visible_count) : (index += 1) {
-        const y: u16 = @intCast(@as(usize, app.height) - visible_count + index);
-        if (index == 0) try renderer.writeText(0, y, "> ", app.theme.composer_prompt);
-        const x: u16 = if (index == 0) 2 else 0;
-        if (x < app.width) try renderer.writeText(x, y, rows[index].text, app.theme.composer_text);
+        const y: u16 = @intCast(@as(usize, box_y) + 1 + index);
+        try renderer.writeText(1, y, "> ", app.theme.composer_prompt);
+        if (app.width > 3) try renderer.writeText(3, y, rows[index].text, app.theme.composer_text);
     }
+    setComposerCursor(app, renderer, box_y, projection);
+}
+
+fn setComposerCursor(
+    app: *const app_mod.ProductApp,
+    renderer: *infra.Renderer,
+    box_y: u16,
+    projection: composer_mod.ComposerProjection,
+) void {
+    if (app.focus != .composer or app.modal != null or !projection.cursor_visible) return;
+    const cursor_y = @as(usize, box_y) + 1 + projection.cursor_visible_row;
+    const cursor_x = 3 + projection.cursor_display_col;
+    if (cursor_x >= app.width or cursor_y >= app.height) return;
+    renderer.setCursor(.{ .x = @intCast(cursor_x), .y = @intCast(cursor_y) });
+}
+
+fn drawComposerBorder(
+    app: *const app_mod.ProductApp,
+    renderer: *infra.Renderer,
+    y: u16,
+    height: u16,
+) !void {
+    if (app.width < 2 or height < 2) return;
+    try drawComposerBorderLine(
+        app,
+        renderer,
+        y,
+        true,
+        .composer_top_left,
+        .composer_top_right,
+    );
+    try drawComposerBorderLine(
+        app,
+        renderer,
+        y + height - 1,
+        false,
+        .composer_bottom_left,
+        .composer_bottom_right,
+    );
+    var row: u16 = y + 1;
+    while (row + 1 < y + height) : (row += 1) {
+        try renderer.writeText(0, row, primitive.chrome.BorderGlyphs.rounded.vertical, app.theme.composer_chrome);
+        if (app.width > 1) {
+            try renderer.writeText(
+                app.width - 1,
+                row,
+                primitive.chrome.BorderGlyphs.rounded.vertical,
+                app.theme.composer_chrome,
+            );
+        }
+    }
+}
+
+fn drawComposerBorderLine(
+    app: *const app_mod.ProductApp,
+    renderer: *infra.Renderer,
+    y: u16,
+    top: bool,
+    left_slot: slots_mod.SlotName,
+    right_slot: slots_mod.SlotName,
+) !void {
+    const glyphs = primitive.chrome.BorderGlyphs.rounded;
+    const left_corner = if (top) glyphs.top_left else glyphs.bottom_left;
+    const right_corner = if (top) glyphs.top_right else glyphs.bottom_right;
+    try renderer.writeText(0, y, left_corner, app.theme.composer_chrome);
+    if (app.width > 1) try renderer.writeText(app.width - 1, y, right_corner, app.theme.composer_chrome);
+    if (app.width > 2) {
+        try primitive.chrome.drawHorizontalLine(
+            &renderer.next,
+            1,
+            y,
+            app.width - 2,
+            glyphs.horizontal,
+            app.theme.composer_chrome,
+        );
+    }
+    try drawComposerBorderLabels(app, renderer, y, left_slot, right_slot);
+}
+
+fn drawComposerBorderLabels(
+    app: *const app_mod.ProductApp,
+    renderer: *infra.Renderer,
+    y: u16,
+    left_slot: slots_mod.SlotName,
+    right_slot: slots_mod.SlotName,
+) !void {
+    if (app.width < 4) return;
+    const inner_width = app.width - 2;
+    const left = composerBorderLabel(app, left_slot);
+    const right = composerBorderLabel(app, right_slot);
+    const left_width = if (left) |label| label.width else 0;
+    const right_width = if (right) |label| label.width else 0;
+    if (left_width == 0 and right_width == 0) return;
+    if (inner_width < 2 + left_width + right_width) return;
+
+    if (left) |label| try renderer.writeText(2, y, label.text, app.theme.composer_slot);
+    if (right) |label| {
+        const x = @as(usize, app.width) - 2 - label.width;
+        try renderer.writeText(@intCast(x), y, label.text, app.theme.composer_slot);
+    }
+}
+
+fn composerBorderLabel(app: *const app_mod.ProductApp, slot: slots_mod.SlotName) ?primitive.chrome.MeasuredText {
+    const view = app.slots.highestPriority(slot) orelse return null;
+    return .{ .text = view.text, .width = primitive.text.displayWidth(view.text) };
 }
 
 pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
@@ -598,8 +683,28 @@ fn expectGraphemeInColumn(buffer: anytype, x: u16, text: []const u8) !void {
     return error.MissingCell;
 }
 
+fn expectTextInColumn(buffer: anytype, start_x: u16, text: []const u8) !void {
+    var y: u16 = 0;
+    while (y < buffer.height) : (y += 1) {
+        var x = start_x;
+        while (x < buffer.width) : (x += 1) {
+            if (cellTextEquals(buffer, x, y, text)) return;
+        }
+    }
+    return error.MissingCell;
+}
+
+fn cellTextEquals(buffer: anytype, x: u16, y: u16, text: []const u8) bool {
+    if (@as(usize, x) + text.len > buffer.width) return false;
+    for (text, 0..) |byte, index| {
+        const cell = buffer.get(@intCast(@as(usize, x) + index), y) catch return false;
+        if (cell.renderScalar() != byte) return false;
+    }
+    return true;
+}
+
 test "frame renders newest transcript lines and preserves composer row" {
-    var app = try app_mod.ProductApp.init(40, 5);
+    var app = try app_mod.ProductApp.init(40, 7);
     defer app.deinit(std.testing.allocator);
 
     try appendFrameMessage(&app, .system, "old");
@@ -608,43 +713,42 @@ test "frame renders newest transcript lines and preserves composer row" {
     try appendFrameMessage(&app, .system, "three");
     try app.composer.insertUtf8(std.testing.allocator, "draft");
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 7, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
     try expectCellText(renderer.next, 0, 0, "zi");
-    try expectCellText(renderer.next, 1, 2, "system: three");
-    try expectCellText(renderer.next, 0, 4, "> draft");
+    try expectTextInColumn(renderer.next, 1, "system: three");
+    try expectCellGrapheme(renderer.next, 0, 4, "╭");
+    try expectCellText(renderer.next, 1, 5, "> ");
+    try expectCellText(renderer.next, 3, 5, "draft");
 
     const absent = try renderer.next.get(0, 1);
     try std.testing.expect(absent.renderScalar() != 'o');
 }
 
 test "frame renders user messages without label and fills background" {
-    var app = try app_mod.ProductApp.init(20, 5);
+    var app = try app_mod.ProductApp.init(20, 7);
     defer app.deinit(std.testing.allocator);
     try appendFrameMessage(&app, .user, "hello");
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 20, 5, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 20, 7, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 1, 1, "hello");
-    try std.testing.expect((try renderer.next.get(0, 1)).style.eql(app.theme.transcript_user));
-    try std.testing.expect((try renderer.next.get(19, 1)).style.eql(app.theme.transcript_user));
+    try expectTextInColumn(renderer.next, 1, "hello");
 }
 
 test "frame renders assistant messages without label and transparent background" {
-    var app = try app_mod.ProductApp.init(20, 5);
+    var app = try app_mod.ProductApp.init(20, 7);
     defer app.deinit(std.testing.allocator);
     try appendFrameMessage(&app, .assistant, "hello");
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 20, 5, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 20, 7, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 1, 1, "hello");
-    try std.testing.expect((try renderer.next.get(0, 1)).style.eql(app.theme.transcript_text));
+    try expectTextInColumn(renderer.next, 1, "hello");
 }
 
 test "frame keeps transcript out of tiny heights" {
@@ -655,76 +759,107 @@ test "frame keeps transcript out of tiny heights" {
     var renderer = try infra.Renderer.init(std.testing.allocator, 20, 1, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
-    try expectCellText(renderer.next, 0, 0, "> ");
+    try expectCellText(renderer.next, 0, 0, "zi");
 }
 
-test "frame renders composer footer slots above composer and reserves transcript rows" {
-    var app = try app_mod.ProductApp.init(40, 5);
+test "frame renders composer border slots with slot style" {
+    var app = try app_mod.ProductApp.init(30, 3);
     defer app.deinit(std.testing.allocator);
-    try appendFrameMessage(&app, .system, "one");
-    try appendFrameMessage(&app, .system, "two");
-    try app.slots.set(std.testing.allocator, .{
-        .slot = .composer_footer,
-        .id = 1,
-        .owner = 1,
-        .priority = 1,
-        .text = "model: faux",
-    });
-    try app.composer.insertUtf8(std.testing.allocator, "draft");
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "TL" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "TR" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_bottom_left, .id = 3, .owner = 1, .text = "BL" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_bottom_right, .id = 4, .owner = 1, .text = "BR" });
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 30, 3, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 0, 3, "model: faux");
-    try expectCellText(renderer.next, 0, 4, "> draft");
-    try std.testing.expectEqual(@as(usize, 2), transcriptVisibleRowsWithFooter(app.height, composerFooterRows(&app)));
+    try expectCellGrapheme(renderer.next, 0, 0, "╭");
+    try expectCellGrapheme(renderer.next, 29, 0, "╮");
+    try expectCellGrapheme(renderer.next, 0, 2, "╰");
+    try expectCellGrapheme(renderer.next, 29, 2, "╯");
+    try expectCellText(renderer.next, 2, 0, "TL");
+    try expectCellText(renderer.next, 26, 0, "TR");
+    try expectCellText(renderer.next, 2, 2, "BL");
+    try expectCellText(renderer.next, 26, 2, "BR");
+    try std.testing.expect((try renderer.next.get(1, 0)).style.eql(app.theme.composer_chrome));
+    try std.testing.expect((try renderer.next.get(2, 0)).style.eql(app.theme.composer_slot));
 }
 
-test "frame renders highest priority composer footer contributions first" {
-    var app = try app_mod.ProductApp.init(40, 5);
+test "frame drops composer border labels when they do not fit" {
+    var app = try app_mod.ProductApp.init(10, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{
-        .slot = .composer_footer,
-        .id = 1,
-        .owner = 1,
-        .priority = 1,
-        .text = "low",
-    });
-    try app.slots.set(std.testing.allocator, .{
-        .slot = .composer_footer,
-        .id = 2,
-        .owner = 1,
-        .priority = 3,
-        .text = "high",
-    });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "left" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "right" });
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 10, 3, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 0, 2, "high");
-    try expectCellText(renderer.next, 0, 3, "low");
+    try expectCellGrapheme(renderer.next, 0, 0, "╭");
+    try expectCellGrapheme(renderer.next, 9, 0, "╮");
+    try expectCellGrapheme(renderer.next, 2, 0, "─");
+    try std.testing.expect((try renderer.next.get(2, 0)).style.eql(app.theme.composer_chrome));
 }
 
-test "frame renders multiline composer on bottom rows and keeps footer above" {
-    var app = try app_mod.ProductApp.init(40, 6);
+test "frame places composer border slot labels by display width" {
+    var app = try app_mod.ProductApp.init(12, 3);
+    defer app.deinit(std.testing.allocator);
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "中" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "R" });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 12, 3, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellGrapheme(renderer.next, 2, 0, "中");
+    try expectCellText(renderer.next, 9, 0, "R");
+}
+
+test "frame projects composer cursor into bordered composer" {
+    var app = try app_mod.ProductApp.init(20, 4);
+    defer app.deinit(std.testing.allocator);
+    try app.composer.insertUtf8(std.testing.allocator, "a中b");
+    app.composer.moveLeft();
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 20, 4, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try std.testing.expectEqual(@as(?infra.renderer.Cursor, .{ .x = 6, .y = 2 }), renderer.next_cursor);
+}
+
+test "frame hides composer cursor while modal is active" {
+    var app = try app_mod.ProductApp.init(20, 4);
+    defer app.deinit(std.testing.allocator);
+    try app.composer.insertUtf8(std.testing.allocator, "abc");
+    _ = try app.apply(std.testing.allocator, .{ .open_confirm = .{ .id = 1, .title = "T", .body = "B" } });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 20, 4, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try std.testing.expect(renderer.next_cursor == null);
+}
+
+test "frame renders multiline composer inside border" {
+    var app = try app_mod.ProductApp.init(40, 8);
     defer app.deinit(std.testing.allocator);
     try appendFrameMessage(&app, .system, "visible");
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_footer, .id = 1, .owner = 1, .text = "footer" });
     try app.composer.insertUtf8(std.testing.allocator, "one\ntwo\nthree");
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 8, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 0, 2, "footer");
-    try expectCellText(renderer.next, 0, 3, "> one");
-    try expectCellText(renderer.next, 0, 4, "two");
-    try expectCellText(renderer.next, 0, 5, "three");
+    try expectCellGrapheme(renderer.next, 0, 3, "╭");
+    try expectCellText(renderer.next, 1, 4, "> ");
+    try expectCellText(renderer.next, 3, 4, "one");
+    try expectCellText(renderer.next, 3, 5, "two");
+    try expectCellText(renderer.next, 3, 6, "three");
     try std.testing.expectEqual(
-        @as(usize, 1),
-        transcriptVisibleRowsWithReserved(app.height, composerRows(&app) + composerFooterRows(&app)),
+        @as(usize, 2),
+        transcriptVisibleRowsWithReserved(app.height, composerRows(&app)),
     );
 }
 
@@ -752,23 +887,23 @@ test "frame skips confirm modal safely on tiny viewports" {
     var renderer = try infra.Renderer.init(std.testing.allocator, 7, 4, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
-    try expectCellText(renderer.next, 0, 3, "> ");
+    try expectCellGrapheme(renderer.next, 0, 1, "╭");
 }
 
 test "frame renders transcript hard newlines as visual rows" {
-    var app = try app_mod.ProductApp.init(40, 6);
+    var app = try app_mod.ProductApp.init(40, 8);
     defer app.deinit(std.testing.allocator);
 
     try appendFrameMessage(&app, .assistant, "one\ntwo\n\nthree");
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 8, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 1, 1, "two");
-    const blank = try renderer.next.get(1, 2);
+    try expectTextInColumn(renderer.next, 1, "two");
+    const blank = try renderer.next.get(0, 2);
     try std.testing.expectEqual(@as(?u21, null), blank.renderScalar());
-    try expectCellText(renderer.next, 1, 3, "three");
+    try expectTextInColumn(renderer.next, 1, "three");
 }
 
 test "frame scroll max counts hard newline visual rows" {
@@ -870,7 +1005,7 @@ test "tool visual row count includes chrome output and omission notice" {
 }
 
 test "tool scroll skips newest row before tool block" {
-    var app = try app_mod.ProductApp.init(40, 4);
+    var app = try app_mod.ProductApp.init(40, 7);
     defer app.deinit(std.testing.allocator);
 
     try app.transcript.append(std.testing.allocator, .{ .tool = .{
@@ -881,7 +1016,7 @@ test "tool scroll skips newest row before tool block" {
     try app.transcript.appendToolOutput(std.testing.allocator, "call-1", "one\ntwo", 0, 0);
     app.transcript_scroll_rows = 1;
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 4, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 7, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
@@ -889,7 +1024,7 @@ test "tool scroll skips newest row before tool block" {
 }
 
 test "frame renders updated tool row once" {
-    var app = try app_mod.ProductApp.init(40, 6);
+    var app = try app_mod.ProductApp.init(40, 8);
     defer app.deinit(std.testing.allocator);
 
     try app.transcript.append(std.testing.allocator, .{ .tool = .{
@@ -904,7 +1039,7 @@ test "frame renders updated tool row once" {
         .status = .success,
     } });
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 8, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
@@ -916,7 +1051,7 @@ test "frame renders updated tool row once" {
 }
 
 test "frame renders transcript scrolled by newest visual rows" {
-    var app = try app_mod.ProductApp.init(40, 5);
+    var app = try app_mod.ProductApp.init(40, 7);
     defer app.deinit(std.testing.allocator);
 
     try appendFrameMessage(&app, .system, "old");
@@ -925,9 +1060,9 @@ test "frame renders transcript scrolled by newest visual rows" {
     try appendFrameMessage(&app, .system, "three");
     app.transcript_scroll_rows = 1;
 
-    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 7, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellText(renderer.next, 1, 3, "system: three");
+    try expectTextInColumn(renderer.next, 1, "system: three");
 }

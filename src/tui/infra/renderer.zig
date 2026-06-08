@@ -6,11 +6,27 @@ const ansi = @import("../substrate/ansi.zig");
 const Style = @import("../primitive/style.zig").Style;
 const Color = @import("../primitive/color.zig").Color;
 
-pub const FrameDiff = struct { changed: usize = 0, mark: usize = 0 };
+pub const FrameDiff = struct {
+    changed: usize = 0,
+    cursor_changed: bool = false,
+    mark: usize = 0,
+};
+
+pub const Cursor = struct {
+    x: u16,
+    y: u16,
+
+    pub fn eql(a: Cursor, b: Cursor) bool {
+        return a.x == b.x and a.y == b.y;
+    }
+};
 
 pub const Renderer = struct {
     current: CellBuffer,
     next: CellBuffer,
+    current_cursor: ?Cursor = null,
+    next_cursor: ?Cursor = null,
+    staged_cursor: ?Cursor = null,
     staged: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, width: u16, height: u16, max_cells: usize) !Renderer {
@@ -31,6 +47,16 @@ pub const Renderer = struct {
     }
     pub fn fillRect(self: *Renderer, x: u16, y: u16, w: u16, h: u16, style: Style) !void {
         try self.next.fillRect(x, y, w, h, style);
+    }
+    pub fn clearCursor(self: *Renderer) void {
+        self.next_cursor = null;
+    }
+    pub fn setCursor(self: *Renderer, cursor: Cursor) void {
+        if (cursor.x >= self.next.width or cursor.y >= self.next.height) {
+            self.next_cursor = null;
+            return;
+        }
+        self.next_cursor = cursor;
     }
     pub fn resize(self: *Renderer, width: u16, height: u16) !void {
         std.debug.assert(!self.staged);
@@ -68,23 +94,47 @@ pub const Renderer = struct {
                 diff.changed += 1;
             }
         }
+        diff.cursor_changed = !cursorEql(self.current_cursor, self.next_cursor);
         try out.append(ansi.reset);
+        try self.stageCursor(out);
+        self.staged_cursor = self.next_cursor;
         self.staged = true;
         return diff;
     }
     pub fn commit(self: *Renderer) void {
         std.debug.assert(self.staged);
         @memcpy(self.current.cells, self.next.cells);
+        self.current_cursor = self.staged_cursor;
+        self.staged_cursor = null;
         self.staged = false;
     }
     pub fn discard(self: *Renderer) void {
+        self.staged_cursor = null;
         self.staged = false;
     }
     pub fn render(self: *Renderer, out: *FrameOutput) !void {
         _ = try self.stage(out);
         self.commit();
     }
+
+    fn stageCursor(self: *Renderer, out: *FrameOutput) !void {
+        if (self.next_cursor) |cursor_value| {
+            var buf: [32]u8 = undefined;
+            try out.append(try ansi.cursor(&buf, cursor_value.y + 1, cursor_value.x + 1));
+            try out.append(ansi.show_cursor);
+            return;
+        }
+        if (self.current_cursor != null) try out.append(ansi.hide_cursor);
+    }
 };
+
+fn cursorEql(a: ?Cursor, b: ?Cursor) bool {
+    if (a) |cursor_a| {
+        if (b) |cursor_b| return cursor_a.eql(cursor_b);
+        return false;
+    }
+    return b == null;
+}
 
 fn isValidContinuation(buffer: CellBuffer, x: u16, y: u16) bool {
     const cell = buffer.get(x, y) catch return false;
@@ -131,6 +181,7 @@ test "renderer stages commits retries style and wide continuation skip" {
     try r.writeText(0, 0, "中", .{ .fg = .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } }, .bold = true });
     const d = try r.stage(&out);
     try std.testing.expectEqual(@as(usize, 1), d.changed);
+    try std.testing.expect(!d.cursor_changed);
     try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "\x1b[38;2;1;2;3m") != null);
     r.discard();
     const len = out.len();
@@ -210,6 +261,38 @@ test "renderer failed stage leaves transaction uncommitted" {
     try std.testing.expect(!r.staged);
     try std.testing.expect((try r.current.get(0, 0)).kind == .empty);
     try std.testing.expectEqual(@as(u21, 'x'), (try r.next.get(0, 0)).renderScalar().?);
+}
+
+test "renderer stages visible cursor after frame bytes" {
+    var r = try Renderer.init(std.testing.allocator, 4, 2, 8);
+    defer r.deinit();
+    var storage: [256]u8 = undefined;
+    var out = FrameOutput.init(&storage);
+
+    try r.writeText(0, 0, "x", .{});
+    r.setCursor(.{ .x = 2, .y = 1 });
+    const diff = try r.stage(&out);
+    try std.testing.expectEqual(@as(usize, 1), diff.changed);
+    try std.testing.expect(diff.cursor_changed);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), "\x1b[2;3H" ++ ansi.show_cursor) != null);
+    r.commit();
+    try std.testing.expectEqual(@as(?Cursor, .{ .x = 2, .y = 1 }), r.current_cursor);
+}
+
+test "renderer stages cursor hide when desired cursor is absent" {
+    var r = try Renderer.init(std.testing.allocator, 4, 2, 8);
+    defer r.deinit();
+    var storage: [256]u8 = undefined;
+    var out = FrameOutput.init(&storage);
+
+    r.current_cursor = .{ .x = 1, .y = 1 };
+    const diff = try r.stage(&out);
+    try std.testing.expectEqual(@as(usize, 0), diff.changed);
+    try std.testing.expect(diff.cursor_changed);
+    try std.testing.expect(std.mem.indexOf(u8, out.bytes(), ansi.hide_cursor) != null);
+    r.commit();
+    try std.testing.expect(r.current_cursor == null);
 }
 
 test "renderer discard does not update current" {

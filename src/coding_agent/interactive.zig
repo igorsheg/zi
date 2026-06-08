@@ -942,7 +942,7 @@ pub fn run(
     };
     defer loop.shutdown();
 
-    try applyModelFooterSlot(&terminal_loop, host_handle.host.base.model);
+    try applyModelComposerSlot(&terminal_loop, host_handle.host.base.model);
     try seedTranscriptFromSession(process.gpa, &terminal_loop, &host_handle.host);
     if (options.initial_prompt) |prompt| {
         if (try loop.startPrompt(prompt)) try loop.appendTranscript(messageAppend(.user, prompt, .new_item));
@@ -954,11 +954,11 @@ pub fn run(
     while (terminal_loop.isRunning()) try loop.tick();
 }
 
-fn applyModelFooterSlot(terminal_loop: *tui.product.TerminalLoop, model: ai.Model) !void {
+fn applyModelComposerSlot(terminal_loop: *tui.product.TerminalLoop, model: ai.Model) !void {
     var text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
-    const text = modelFooterText(model, &text_buffer);
+    const text = modelComposerSlotText(model, &text_buffer);
     _ = try terminal_loop.applyCommand(.{ .set_slot_contribution = .{
-        .slot = .composer_footer,
+        .slot = .composer_top_right,
         .id = model_slot_id,
         .owner = model_slot_owner,
         .priority = 100,
@@ -966,7 +966,7 @@ fn applyModelFooterSlot(terminal_loop: *tui.product.TerminalLoop, model: ai.Mode
     } });
 }
 
-fn modelFooterText(model: ai.Model, buffer: []u8) []const u8 {
+fn modelComposerSlotText(model: ai.Model, buffer: []u8) []const u8 {
     return std.fmt.bufPrint(buffer, "model: {s}/{s}", .{ model.provider, model.id }) catch blk: {
         if (buffer.len == 0) break :blk "";
         const prefix = "model: ";
@@ -1184,10 +1184,10 @@ test "interactive confirm bridge ignores stale result ids" {
     try std.testing.expectEqual(true, loop.takeConfirmResult(7).?);
 }
 
-test "interactive model footer text is bounded" {
+test "interactive model composer slot text is bounded" {
     var buffer: [32]u8 = undefined;
     const model = agent_mod.Agent.defaultModel();
-    const text = modelFooterText(model, &buffer);
+    const text = modelComposerSlotText(model, &buffer);
     try std.testing.expect(text.len <= buffer.len);
     try std.testing.expect(std.mem.startsWith(u8, text, "model: "));
 }

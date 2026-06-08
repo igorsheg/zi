@@ -2,10 +2,13 @@ const std = @import("std");
 
 pub const contribution_count_max: usize = 8;
 pub const contribution_text_bytes_max: usize = 160;
-pub const composer_footer_rows_max: usize = 2;
+pub const composer_border_slot_count_max: usize = 1;
 
 pub const SlotName = enum {
-    composer_footer,
+    composer_top_left,
+    composer_top_right,
+    composer_bottom_left,
+    composer_bottom_right,
 };
 
 pub const ContributionId = u32;
@@ -114,6 +117,12 @@ pub const SlotStore = struct {
         return n;
     }
 
+    pub fn highestPriority(self: SlotStore, slot: SlotName) ?SlotView {
+        var views: [composer_border_slot_count_max]SlotView = undefined;
+        if (self.orderedSlot(slot, &views) == 0) return null;
+        return views[0];
+    }
+
     fn find(self: SlotStore, slot: SlotName, id: ContributionId, owner: OwnerId) ?usize {
         for (self.items[0..self.len], 0..) |item, index| {
             if (item.slot == slot and item.id == id and item.owner == owner) return index;
@@ -162,21 +171,21 @@ test "slot store sets replaces clears and bounds contributions" {
     defer slots.deinit(std.testing.allocator);
 
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_footer,
+        .slot = .composer_top_left,
         .id = 1,
         .owner = 7,
         .priority = 1,
         .text = "one",
     });
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_footer,
+        .slot = .composer_top_left,
         .id = 2,
         .owner = 7,
         .priority = 2,
         .text = "two",
     });
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_footer,
+        .slot = .composer_top_left,
         .id = 1,
         .owner = 7,
         .priority = 3,
@@ -184,13 +193,13 @@ test "slot store sets replaces clears and bounds contributions" {
     });
 
     var views: [2]SlotView = undefined;
-    const n = slots.orderedSlot(.composer_footer, &views);
+    const n = slots.orderedSlot(.composer_top_left, &views);
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings("new", views[0].text);
     try std.testing.expectEqualStrings("two", views[1].text);
 
-    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_footer, .id = 2, .owner = 7 }));
-    try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_footer));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_left, .id = 2, .owner = 7 }));
+    try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_top_left));
     try std.testing.expect(slots.clearOwner(std.testing.allocator, 7));
     try std.testing.expectEqual(@as(usize, 0), slots.len);
 }
@@ -199,11 +208,11 @@ test "slot store rejects invalid text before mutation" {
     var slots: SlotStore = .{};
     defer slots.deinit(std.testing.allocator);
 
-    try slots.set(std.testing.allocator, .{ .slot = .composer_footer, .id = 1, .owner = 1, .text = "ok" });
+    try slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "ok" });
     try std.testing.expectError(
         error.InvalidSlotContributionText,
         slots.set(std.testing.allocator, .{
-            .slot = .composer_footer,
+            .slot = .composer_top_left,
             .id = 2,
             .owner = 1,
             .text = "bad\n",

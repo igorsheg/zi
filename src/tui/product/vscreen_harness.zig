@@ -123,5 +123,11 @@ test "vscreen harness dumps normalized screen text" {
     const dump = try harness.dumpTextAlloc();
     defer std.testing.allocator.free(dump);
 
-    try std.testing.expectEqualStrings("zi\n\n\n> hello", dump);
+    try std.testing.expectEqualStrings(
+        "zi\n" ++
+            "╭──────────────────╮\n" ++
+            "│> hello           │\n" ++
+            "╰──────────────────╯",
+        dump,
+    );
 }
