@@ -4,14 +4,10 @@ const auth_mode = @import("../auth_mode.zig");
 const args_mod = @import("args.zig");
 const interactive = @import("../interactive.zig");
 const print_mode = @import("../print_mode.zig");
-const sdk = @import("../sdk.zig");
+const runtime_services = @import("../runtime_services.zig");
+const session_listing = @import("../session_listing.zig");
 
-pub const parser = args_mod;
-pub const Command = args_mod.Command;
-pub const AppArgs = args_mod.AppArgs;
-pub const AuthCommand = args_mod.AuthCommand;
-
-pub const CliError = error{
+const CliError = error{
     InvalidCliUsage,
     NoResumableSession,
     OutputClosed,
@@ -67,7 +63,7 @@ pub fn main(process: runtime.Process, args_source: std.process.Args) !void {
     try cli_io.flush();
 }
 
-pub fn run(
+fn run(
     process: runtime.Process,
     args: *std.process.Args.Iterator,
     stdout: *std.Io.Writer,
@@ -98,7 +94,7 @@ fn runAuth(
     process: runtime.Process,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    command: args_mod.AuthCommand,
+    command: anytype,
     options: auth_mode.Options,
 ) !void {
     return switch (command.action) {
@@ -120,7 +116,7 @@ fn runApp(
     process: runtime.Process,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    app: args_mod.AppArgs,
+    app: anytype,
     options: auth_mode.Options,
 ) !void {
     if (app.help) return args_mod.writeHelp(stdout);
@@ -130,11 +126,11 @@ fn runApp(
     return switch (args_mod.resolveAppMode(app, stdin_is_tty)) {
         .text => {
             if (app.messages.count != 1) return usage(stderr);
-            return runPrompt(process, stdout, stderr, app.messages.slice()[0], .text, app, options);
+            return runPrompt(process, stdout, stderr, app.messages.slice()[0], false, app, options);
         },
         .json => {
             if (app.messages.count != 1) return usage(stderr);
-            return runPrompt(process, stdout, stderr, app.messages.slice()[0], .json, app, options);
+            return runPrompt(process, stdout, stderr, app.messages.slice()[0], true, app, options);
         },
         .rpc => unsupported(stderr, "rpc mode is not implemented yet"),
         .interactive => {
@@ -157,8 +153,8 @@ fn runPrompt(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     prompt: []const u8,
-    output: print_mode.OutputMode,
-    app_args: args_mod.AppArgs,
+    json_output: bool,
+    app_args: anytype,
     options: auth_mode.Options,
 ) !void {
     const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
@@ -167,7 +163,7 @@ fn runPrompt(
 
     var app = if (try selectResumeSession(process, stderr, app_args, options)) |session_file| blk: {
         defer process.gpa.free(session_file);
-        break :blk try sdk.resumeRuntimeHost(process.gpa, .{
+        break :blk try runtime_services.resumeSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -179,7 +175,7 @@ fn runPrompt(
     } else blk: {
         const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
         defer process.gpa.free(session_id);
-        break :blk try sdk.createRuntimeHost(process.gpa, .{
+        break :blk try runtime_services.createSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -192,17 +188,20 @@ fn runPrompt(
     };
     defer app.deinit();
 
-    try print_mode.run(&app.host, stdout, stderr, .{ .prompt = prompt, .output = output });
+    try print_mode.run(&app.session, stdout, stderr, .{
+        .prompt = prompt,
+        .output = if (json_output) .json else .text,
+    });
 }
 
 fn selectResumeSession(
     process: runtime.Process,
     stderr: *std.Io.Writer,
-    app: args_mod.AppArgs,
+    app: anytype,
     options: auth_mode.Options,
 ) !?[]const u8 {
     if (app.resume_session_file == null and !app.resume_latest) return null;
-    const selected = sdk.selectRuntimeSession(process.gpa, process.io, .{
+    const selected = session_listing.selectRuntimeSession(process.gpa, process.io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
         .dir = options.dir,
@@ -313,7 +312,7 @@ test "cli auth status dispatches to auth mode" {
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
-test "cli selects newest resumable session through sdk policy" {
+test "cli selects newest resumable session through runtime policy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try createCliTestDirs(tmp.dir);
@@ -342,7 +341,7 @@ test "cli selects newest resumable session through sdk policy" {
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
-test "cli selects explicit resumable session through sdk policy" {
+test "cli selects explicit resumable session through runtime policy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try createCliTestDirs(tmp.dir);
@@ -451,7 +450,7 @@ fn createCliTestDirs(dir: std.Io.Dir) !void {
 }
 
 fn createCliStoredSession(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {
-    var app_runtime = try sdk.createRuntimeHost(std.testing.allocator, .{
+    var app_runtime = try runtime_services.createSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",

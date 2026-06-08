@@ -4,7 +4,7 @@ const auth_mod = @import("auth.zig");
 const paths_mod = @import("paths.zig");
 const runtime = @import("../runtime/root.zig");
 
-pub const max_manual_input_bytes = 16 * 1024;
+const max_manual_input_bytes = 16 * 1024;
 
 pub const Options = struct {
     cwd: []const u8 = ".",

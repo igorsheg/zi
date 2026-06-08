@@ -335,9 +335,23 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
     switch (event) {
         .agent_start, .turn_start => {},
         .message_start => |message_event| try self.setStreamingMessage(message_event.message),
-        .message_update => |message_update| try self.setStreamingMessage(.{
-            .assistant = agent.assistantEventPartial(message_update.assistant_message_event),
-        }),
+        .message_update => |message_update| {
+            const partial = switch (message_update.assistant_message_event) {
+                .start => |payload| payload.partial,
+                .text_start => |payload| payload.partial,
+                .text_delta => |payload| payload.partial,
+                .text_end => |payload| payload.partial,
+                .thinking_start => |payload| payload.partial,
+                .thinking_delta => |payload| payload.partial,
+                .thinking_end => |payload| payload.partial,
+                .toolcall_start => |payload| payload.partial,
+                .toolcall_delta => |payload| payload.partial,
+                .toolcall_end => |payload| payload.partial,
+                .done => |payload| payload.message,
+                .@"error" => |payload| payload.@"error",
+            };
+            try self.setStreamingMessage(.{ .assistant = partial });
+        },
         .message_end => |message_event| {
             self.clearStreamingMessage();
             try self.appendMessage(message_event.message);
@@ -441,7 +455,7 @@ fn setStreamingMessage(self: *Agent, message: agent.AgentMessage) !void {
     switch (self.state.status) {
         .running => |*running| running.streaming_message = owned,
         .idle => self.state.status = .{ .running = .{ .streaming_message = owned } },
-        .settling, .failed => std.debug.panic("invalid transition to running", .{}),
+        .settling, .failed => std.debug.assert(false),
     }
 }
 
@@ -463,7 +477,7 @@ fn addPendingToolCall(self: *Agent, id: []const u8) Error!void {
             self.state.status = .{ .running = .{} };
             self.state.status.running.pending_tool_calls.append(owned_id) catch return error.TooManyToolCalls;
         },
-        .settling, .failed => std.debug.panic("invalid transition to running", .{}),
+        .settling, .failed => std.debug.assert(false),
     }
 }
 
@@ -547,7 +561,7 @@ fn defaultStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageE
         .usage = ai.protocol.emptyUsage(),
         .stop_reason = .stop,
         .timestamp = 0,
-    }) catch unreachable;
+    }) catch std.debug.assert(false);
     return stream;
 }
 

@@ -705,7 +705,7 @@ test "read tool reports first line exceeding output limit" {
         formatted.text,
     );
     const details = (try formatted.details(std.testing.allocator)).?;
-    defer agent.deinitJsonValue(std.testing.allocator, details);
+    defer runtime.freeJsonValue(std.testing.allocator, details);
     const truncation = details.object.get("truncation").?.object;
     try std.testing.expectEqualStrings("bytes", truncation.get("truncatedBy").?.string);
 }

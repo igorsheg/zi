@@ -113,27 +113,6 @@ pub fn startPromptStream(
     } };
 }
 
-pub fn startContinueStream(
-    stream: *AgentEventStream,
-    allocator: std.mem.Allocator,
-    zio_runtime: *runtime.Runtime,
-    context: agent.AgentContext,
-    config: agent.AgentLoopConfig,
-    token: runtime.CancelToken,
-    buffer: []agent.AgentEvent,
-) void {
-    const stream_io = zio_runtime.io();
-    stream.* = AgentEventStream.init(allocator, buffer);
-    stream.producer = .{ .running = zio_runtime.spawn(
-        runContinueStreamProducer,
-        .{ allocator, stream_io, context, config, token, zio_runtime, stream },
-    ) catch |err| {
-        stream.pipe.sink().abort();
-        stream.producer = .{ .spawn_failed = err };
-        return;
-    } };
-}
-
 fn runPromptStreamProducer(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -145,21 +124,6 @@ fn runPromptStreamProducer(
     stream: *AgentEventStream,
 ) anyerror!void {
     runPrompt(allocator, io, prompts, context, config, token, zio_runtime, streamSink(stream)) catch |err| {
-        stream.pipe.sink().abort();
-        return err;
-    };
-}
-
-fn runContinueStreamProducer(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    context: agent.AgentContext,
-    config: agent.AgentLoopConfig,
-    token: runtime.CancelToken,
-    zio_runtime: *runtime.Runtime,
-    stream: *AgentEventStream,
-) anyerror!void {
-    runContinue(allocator, io, context, config, token, zio_runtime, streamSink(stream)) catch |err| {
         stream.pipe.sink().abort();
         return err;
     };
@@ -890,26 +854,22 @@ fn defaultConvertToLlm(
 
 fn testSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const events: *std.ArrayList(agent.AgentEvent) = @ptrCast(@alignCast(context.?));
-    try events.append(std.testing.allocator, try copyEventForTest(event));
-}
-
-fn failOnToolUpdateSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
-    if (event == .tool_execution_update) return error.TestSinkFailed;
-    try testSink(context, event);
-}
-
-fn copyEventForTest(event: agent.AgentEvent) !agent.AgentEvent {
-    return switch (event) {
+    try events.append(std.testing.allocator, switch (event) {
         .message_start => |payload| .{ .message_start = .{ .message = try copyMessageForTest(payload.message) } },
         .message_update => event,
         .message_end => |payload| .{ .message_end = .{ .message = try copyMessageForTest(payload.message) } },
         .turn_end => |payload| .{ .turn_end = .{
             .message = try copyMessageForTest(payload.message),
-            .tool_results = try copyToolResultMessagesForTest(payload.tool_results),
+            .tool_results = try agent.copyToolResultMessages(std.testing.allocator, payload.tool_results),
         } },
         .agent_end => |payload| .{ .agent_end = .{ .messages = payload.messages } },
         else => event,
-    };
+    });
+}
+
+fn failOnToolUpdateSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
+    if (event == .tool_execution_update) return error.TestSinkFailed;
+    try testSink(context, event);
 }
 
 fn copyMessageForTest(message: agent.AgentMessage) !agent.AgentMessage {
@@ -919,10 +879,6 @@ fn copyMessageForTest(message: agent.AgentMessage) !agent.AgentMessage {
         },
         else => message,
     };
-}
-
-fn copyToolResultMessagesForTest(source: []const ai.ToolResultMessage) ![]const ai.ToolResultMessage {
-    return agent.copyToolResultMessages(std.testing.allocator, source);
 }
 
 fn deinitTestEvents(events: []const agent.AgentEvent) void {
@@ -945,7 +901,7 @@ fn deinitTestMessage(message: agent.AgentMessage) void {
 fn testStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
     var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
-    sink.endDone(request.io, .stop, assistantMessage("ok")) catch unreachable;
+    sink.endDone(request.io, .stop, assistantMessage("ok")) catch std.debug.assert(false);
     return stream;
 }
 
@@ -958,16 +914,16 @@ const fast_delta_stream_count = 240;
 fn fastDeltaBufferedStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
     var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
-    sink.emit(request.io, .{ .start = .{ .partial = assistantMessage("partial") } }) catch unreachable;
+    sink.emit(request.io, .{ .start = .{ .partial = assistantMessage("partial") } }) catch std.debug.assert(false);
     var count: usize = 0;
     while (count < fast_delta_stream_count) : (count += 1) {
         sink.emit(request.io, .{ .text_delta = .{
             .content_index = 0,
             .delta = "x",
             .partial = assistantMessage("partial"),
-        } }) catch unreachable;
+        } }) catch std.debug.assert(false);
     }
-    sink.endDone(request.io, .stop, assistantMessage("done")) catch unreachable;
+    sink.endDone(request.io, .stop, assistantMessage("done")) catch std.debug.assert(false);
     return stream;
 }
 
@@ -976,9 +932,9 @@ fn testToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantM
     var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     if (calls.* == 0) {
-        sink.endDone(request.io, .tool_use, assistantToolCallMessage()) catch unreachable;
+        sink.endDone(request.io, .tool_use, assistantToolCallMessage()) catch std.debug.assert(false);
     } else {
-        sink.endDone(request.io, .stop, assistantMessage("done")) catch unreachable;
+        sink.endDone(request.io, .stop, assistantMessage("done")) catch std.debug.assert(false);
     }
     calls.* += 1;
     return stream;
@@ -989,9 +945,9 @@ fn testTwoToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.Assista
     var stream = ai.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     if (calls.* == 0) {
-        sink.endDone(request.io, .tool_use, assistantTwoToolCallMessage()) catch unreachable;
+        sink.endDone(request.io, .tool_use, assistantTwoToolCallMessage()) catch std.debug.assert(false);
     } else {
-        sink.endDone(request.io, .stop, assistantMessage("done")) catch unreachable;
+        sink.endDone(request.io, .stop, assistantMessage("done")) catch std.debug.assert(false);
     }
     calls.* += 1;
     return stream;

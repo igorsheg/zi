@@ -42,28 +42,29 @@ pub const Frame = struct {
         }
         renderer.next.clear();
         renderer.clearCursor();
-        try drawShell(app, renderer);
+        if (app.height > 0) try renderer.writeText(0, 0, "zi", app.theme.shell_label);
+        const composer_rows = composerRows(app);
+        const status_rows = statusRows(app);
+        if (app.height > 0) {
+            try drawTranscript(
+                app,
+                renderer,
+                app.theme.transcript_text,
+                transcriptVisibleRowsWithReserved(app.height, composer_rows + status_rows),
+            );
+            if (status_rows > 0 and app.height > composer_rows) {
+                var views: [slots_mod.status_area_slot_count_max]slots_mod.SlotView = undefined;
+                const count = app.slots.orderedSlot(.status_area, &views);
+                if (count > 0) {
+                    const y: u16 = @intCast(@as(usize, app.height) - composer_rows - 1);
+                    try status_area.draw(renderer, app.theme, y, app.width, views[0..count], app.animation_tick);
+                }
+            }
+            try drawComposer(app, renderer, composer_rows);
+        }
+        if (app.modal) |confirm| try drawConfirmModal(app, renderer, confirm);
     }
 };
-
-fn drawShell(app: *app_mod.ProductApp, renderer: *infra.Renderer) !void {
-    if (app.height > 0) try renderer.writeText(0, 0, "zi", app.theme.shell_label);
-    const composer_rows = composerRows(app);
-    const status_rows = statusRows(app);
-    if (app.height > 0) {
-        try drawTranscript(
-            app,
-            renderer,
-            app.theme.transcript_text,
-            transcriptVisibleRowsWithReserved(app.height, composer_rows + status_rows),
-        );
-    }
-    if (app.height > 0) {
-        try drawStatusArea(app, renderer, composer_rows, status_rows);
-        try drawComposer(app, renderer, composer_rows);
-    }
-    if (app.modal) |modal| try drawModal(app, renderer, modal);
-}
 
 pub fn transcriptVisibleRows(height: u16) usize {
     return transcriptVisibleRowsWithReserved(height, 1);
@@ -79,7 +80,7 @@ pub fn transcriptVisibleRowsWithReserved(height: u16, reserved_rows: usize) usiz
 
 pub fn statusRows(app: *app_mod.ProductApp) usize {
     return status_area.visibleRows(
-        app.slots.hasSlot(.status_area),
+        app.slots.count(.status_area) > 0,
         app.height,
         composerRows(app),
     );
@@ -94,27 +95,38 @@ fn composerTextWidth(width: u16) u16 {
     return if (width > 4) width - 4 else 1;
 }
 
-fn drawStatusArea(
-    app: *app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    composer_rows: usize,
-    status_rows: usize,
-) !void {
-    if (status_rows == 0 or app.height <= composer_rows) return;
-    var views: [slots_mod.status_area_slot_count_max]slots_mod.SlotView = undefined;
-    const count = app.slots.orderedSlot(.status_area, &views);
-    if (count == 0) return;
-    const y: u16 = @intCast(@as(usize, app.height) - composer_rows - 1);
-    try status_area.draw(renderer, app.theme, y, app.width, views[0..count], app.animation_tick);
-}
-
 fn drawComposer(app: *app_mod.ProductApp, renderer: *infra.Renderer, composer_rows: usize) !void {
     if (composer_rows < 3 or app.height == 0 or app.width == 0) return;
     const height = @min(composer_rows, @as(usize, app.height));
     if (height < 3) return;
     const box_y: u16 = @intCast(@as(usize, app.height) - height);
     const box_height: u16 = @intCast(height);
-    try drawComposerBorder(app, renderer, box_y, box_height);
+    if (app.width >= 2 and box_height >= 2) {
+        try drawComposerBorderLine(app, renderer, box_y, true);
+        if (app.width >= 4) {
+            const inner_width = app.width - 2;
+            if (app.slots.highestPriority(.composer_top_right)) |view| {
+                const label_width = primitive.text.displayWidth(view.text);
+                if (inner_width >= 2 + label_width) {
+                    const x = @as(usize, app.width) - 2 - label_width;
+                    try renderer.writeText(@intCast(x), box_y, view.text, app.theme.composer_slot);
+                }
+            }
+        }
+        try drawComposerBorderLine(app, renderer, box_y + box_height - 1, false);
+        var row: u16 = box_y + 1;
+        while (row + 1 < box_y + box_height) : (row += 1) {
+            try renderer.writeText(0, row, primitive.chrome.BorderGlyphs.rounded.vertical, app.theme.composer_chrome);
+            if (app.width > 1) {
+                try renderer.writeText(
+                    app.width - 1,
+                    row,
+                    primitive.chrome.BorderGlyphs.rounded.vertical,
+                    app.theme.composer_chrome,
+                );
+            }
+        }
+    }
 
     var rows: [composer_mod.visible_rows_max]composer_mod.ComposerVisualRow = undefined;
     const projection = app.composer.visibleRows(composerTextWidth(app.width), &rows);
@@ -125,55 +137,11 @@ fn drawComposer(app: *app_mod.ProductApp, renderer: *infra.Renderer, composer_ro
         try renderer.writeText(1, y, "> ", app.theme.composer_prompt);
         if (app.width > 3) try renderer.writeText(3, y, rows[index].text, app.theme.composer_text);
     }
-    setComposerCursor(app, renderer, box_y, projection);
-}
-
-fn setComposerCursor(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    box_y: u16,
-    projection: composer_mod.ComposerProjection,
-) void {
-    if (app.focus != .composer or app.modal != null or !projection.cursor_visible) return;
-    const cursor_y = @as(usize, box_y) + 1 + projection.cursor_visible_row;
-    const cursor_x = 3 + projection.cursor_display_col;
-    if (cursor_x >= app.width or cursor_y >= app.height) return;
-    renderer.setCursor(.{ .x = @intCast(cursor_x), .y = @intCast(cursor_y) });
-}
-
-fn drawComposerBorder(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    y: u16,
-    height: u16,
-) !void {
-    if (app.width < 2 or height < 2) return;
-    try drawComposerBorderLine(
-        app,
-        renderer,
-        y,
-        true,
-        .composer_top_left,
-        .composer_top_right,
-    );
-    try drawComposerBorderLine(
-        app,
-        renderer,
-        y + height - 1,
-        false,
-        .composer_bottom_left,
-        .composer_bottom_right,
-    );
-    var row: u16 = y + 1;
-    while (row + 1 < y + height) : (row += 1) {
-        try renderer.writeText(0, row, primitive.chrome.BorderGlyphs.rounded.vertical, app.theme.composer_chrome);
-        if (app.width > 1) {
-            try renderer.writeText(
-                app.width - 1,
-                row,
-                primitive.chrome.BorderGlyphs.rounded.vertical,
-                app.theme.composer_chrome,
-            );
+    if (app.modal == null and projection.cursor_visible) {
+        const cursor_y = @as(usize, box_y) + 1 + projection.cursor_visible_row;
+        const cursor_x = 3 + projection.cursor_display_col;
+        if (cursor_x < app.width and cursor_y < app.height) {
+            renderer.setCursor(.{ .x = @intCast(cursor_x), .y = @intCast(cursor_y) });
         }
     }
 }
@@ -183,8 +151,6 @@ fn drawComposerBorderLine(
     renderer: *infra.Renderer,
     y: u16,
     top: bool,
-    left_slot: slots_mod.SlotName,
-    right_slot: slots_mod.SlotName,
 ) !void {
     const glyphs = primitive.chrome.BorderGlyphs.rounded;
     const left_corner = if (top) glyphs.top_left else glyphs.bottom_left;
@@ -201,35 +167,6 @@ fn drawComposerBorderLine(
             app.theme.composer_chrome,
         );
     }
-    try drawComposerBorderLabels(app, renderer, y, left_slot, right_slot);
-}
-
-fn drawComposerBorderLabels(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    y: u16,
-    left_slot: slots_mod.SlotName,
-    right_slot: slots_mod.SlotName,
-) !void {
-    if (app.width < 4) return;
-    const inner_width = app.width - 2;
-    const left = composerBorderLabel(app, left_slot);
-    const right = composerBorderLabel(app, right_slot);
-    const left_width = if (left) |label| label.width else 0;
-    const right_width = if (right) |label| label.width else 0;
-    if (left_width == 0 and right_width == 0) return;
-    if (inner_width < 2 + left_width + right_width) return;
-
-    if (left) |label| try renderer.writeText(2, y, label.text, app.theme.composer_slot);
-    if (right) |label| {
-        const x = @as(usize, app.width) - 2 - label.width;
-        try renderer.writeText(@intCast(x), y, label.text, app.theme.composer_slot);
-    }
-}
-
-fn composerBorderLabel(app: *const app_mod.ProductApp, slot: slots_mod.SlotName) ?primitive.chrome.MeasuredText {
-    const view = app.slots.highestPriority(slot) orelse return null;
-    return .{ .text = view.text, .width = primitive.text.displayWidth(view.text) };
 }
 
 pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
@@ -243,12 +180,6 @@ pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u
     return if (sink.total_emitted > visible_rows) sink.total_emitted - visible_rows else 0;
 }
 
-fn drawModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, modal: surface_mod.Modal) !void {
-    switch (modal) {
-        .confirm => |confirm| try drawConfirmModal(app, renderer, confirm),
-    }
-}
-
 fn drawConfirmModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, confirm: surface_mod.Confirm) !void {
     if (app.width < 8 or app.height < 5) return;
     const modal_width = @min(app.width, @max(@as(u16, 24), app.width * 3 / 5));
@@ -258,70 +189,40 @@ fn drawConfirmModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, c
 
     try renderer.fillRect(0, 0, app.width, app.height, .{ .dim = true });
     try renderer.fillRect(x, y, modal_width, modal_height, .{});
-    try drawBox(renderer, x, y, modal_width, modal_height, app.theme.tool_chrome);
+    try renderer.writeText(x, y, "╭", app.theme.tool_chrome);
+    try renderer.writeText(x + modal_width - 1, y, "╮", app.theme.tool_chrome);
+    try renderer.writeText(x, y + modal_height - 1, "╰", app.theme.tool_chrome);
+    try renderer.writeText(x + modal_width - 1, y + modal_height - 1, "╯", app.theme.tool_chrome);
+    var xx: u16 = x + 1;
+    while (xx + 1 < x + modal_width) : (xx += 1) {
+        try renderer.writeText(xx, y, "─", app.theme.tool_chrome);
+        try renderer.writeText(xx, y + modal_height - 1, "─", app.theme.tool_chrome);
+    }
+    var yy: u16 = y + 1;
+    while (yy + 1 < y + modal_height) : (yy += 1) {
+        try renderer.writeText(x, yy, "│", app.theme.tool_chrome);
+        try renderer.writeText(x + modal_width - 1, yy, "│", app.theme.tool_chrome);
+    }
     if (modal_width > 4) {
         try renderer.writeText(x + 2, y, confirm.title, app.theme.tool_title);
         try renderer.writeText(x + 2, y + 2, confirm.body, app.theme.transcript_text);
-        try drawConfirmButtons(app, renderer, confirm, x, y + modal_height - 2, modal_width);
+        const yes = if (confirm.selected_yes) "[Yes]" else " Yes ";
+        const no = if (confirm.selected_yes) " No " else "[No]";
+        const yes_width = primitive.text.displayWidth(yes);
+        const no_width = primitive.text.displayWidth(no);
+        const total_width = yes_width + 2 + no_width;
+        const centered_offset = (@as(usize, modal_width) -| total_width) / 2;
+        const start = if (total_width < modal_width) x + @as(u16, @intCast(centered_offset)) else x + 2;
+        const yes_style = if (confirm.selected_yes) app.theme.status_accent else app.theme.transcript_secondary;
+        const no_style = if (!confirm.selected_yes) app.theme.status_accent else app.theme.transcript_secondary;
+        const button_y = y + modal_height - 2;
+        try renderer.writeText(start, button_y, yes, yes_style);
+        const no_x = @as(u16, @intCast(@min(
+            @as(usize, std.math.maxInt(u16)),
+            @as(usize, start) + yes_width + 2,
+        )));
+        try renderer.writeText(no_x, button_y, no, no_style);
     }
-}
-
-fn drawBox(renderer: *infra.Renderer, x: u16, y: u16, w: u16, h: u16, style: primitive.Style) !void {
-    if (w < 2 or h < 2) return;
-    try renderer.writeText(x, y, "╭", style);
-    try renderer.writeText(x + w - 1, y, "╮", style);
-    try renderer.writeText(x, y + h - 1, "╰", style);
-    try renderer.writeText(x + w - 1, y + h - 1, "╯", style);
-    var xx: u16 = x + 1;
-    while (xx + 1 < x + w) : (xx += 1) {
-        try renderer.writeText(xx, y, "─", style);
-        try renderer.writeText(xx, y + h - 1, "─", style);
-    }
-    var yy: u16 = y + 1;
-    while (yy + 1 < y + h) : (yy += 1) {
-        try renderer.writeText(x, yy, "│", style);
-        try renderer.writeText(x + w - 1, yy, "│", style);
-    }
-}
-
-fn drawConfirmButtons(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    confirm: surface_mod.Confirm,
-    x: u16,
-    y: u16,
-    modal_width: u16,
-) !void {
-    var label_buffer: [surface_mod.button_bytes_max * 2 + 8]u8 = undefined;
-    const yes = selectedLabel(
-        &label_buffer,
-        confirm.yes_label,
-        confirm.selected == .yes,
-    ) catch confirm.yes_label;
-    var no_buffer: [surface_mod.button_bytes_max * 2 + 8]u8 = undefined;
-    const no = selectedLabel(
-        &no_buffer,
-        confirm.no_label,
-        confirm.selected == .no,
-    ) catch confirm.no_label;
-    const yes_width = primitive.text.displayWidth(yes);
-    const no_width = primitive.text.displayWidth(no);
-    const total_width = yes_width + 2 + no_width;
-    const centered_offset = (@as(usize, modal_width) -| total_width) / 2;
-    const start = if (total_width < modal_width) x + @as(u16, @intCast(centered_offset)) else x + 2;
-    const yes_style = if (confirm.selected == .yes) app.theme.status_accent else app.theme.transcript_secondary;
-    const no_style = if (confirm.selected == .no) app.theme.status_accent else app.theme.transcript_secondary;
-    try renderer.writeText(start, y, yes, yes_style);
-    const no_x = @as(u16, @intCast(@min(
-        @as(usize, std.math.maxInt(u16)),
-        @as(usize, start) + yes_width + 2,
-    )));
-    try renderer.writeText(no_x, y, no, no_style);
-}
-
-fn selectedLabel(buffer: []u8, label: []const u8, selected: bool) ![]const u8 {
-    if (selected) return std.fmt.bufPrint(buffer, "[{s}]", .{label});
-    return std.fmt.bufPrint(buffer, " {s} ", .{label});
 }
 
 fn drawTranscript(
@@ -913,7 +814,6 @@ test "frame renders status area between transcript and composer" {
     try app.slots.set(std.testing.allocator, .{
         .slot = .status_area,
         .id = 1,
-        .owner = 1,
         .priority = 10,
         .text = "model: faux",
     });
@@ -933,7 +833,6 @@ test "frame omits status area on tiny terminal" {
     try app.slots.set(std.testing.allocator, .{
         .slot = .status_area,
         .id = 1,
-        .owner = 1,
         .text = "status",
     });
 
@@ -945,13 +844,10 @@ test "frame omits status area on tiny terminal" {
     try expectCellGrapheme(renderer.next, 0, 0, "╭");
 }
 
-test "frame renders composer border slots with slot style" {
+test "frame renders composer top border slot with slot style" {
     var app = try app_mod.ProductApp.init(30, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "TL" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "TR" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_bottom_left, .id = 3, .owner = 1, .text = "BL" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_bottom_right, .id = 4, .owner = 1, .text = "BR" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .text = "TR" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 30, 3, size_cells_max);
     defer renderer.deinit();
@@ -961,19 +857,15 @@ test "frame renders composer border slots with slot style" {
     try expectCellGrapheme(renderer.next, 29, 0, "╮");
     try expectCellGrapheme(renderer.next, 0, 2, "╰");
     try expectCellGrapheme(renderer.next, 29, 2, "╯");
-    try expectCellText(renderer.next, 2, 0, "TL");
     try expectCellText(renderer.next, 26, 0, "TR");
-    try expectCellText(renderer.next, 2, 2, "BL");
-    try expectCellText(renderer.next, 26, 2, "BR");
     try std.testing.expect((try renderer.next.get(1, 0)).style.eql(app.theme.composer_chrome));
-    try std.testing.expect((try renderer.next.get(2, 0)).style.eql(app.theme.composer_slot));
+    try std.testing.expect((try renderer.next.get(26, 0)).style.eql(app.theme.composer_slot));
 }
 
-test "frame drops composer border labels when they do not fit" {
+test "frame drops composer border label when it does not fit" {
     var app = try app_mod.ProductApp.init(10, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "left" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "right" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .text = "toolong" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 10, 3, size_cells_max);
     defer renderer.deinit();
@@ -985,18 +877,16 @@ test "frame drops composer border labels when they do not fit" {
     try std.testing.expect((try renderer.next.get(2, 0)).style.eql(app.theme.composer_chrome));
 }
 
-test "frame places composer border slot labels by display width" {
+test "frame places composer border slot label by display width" {
     var app = try app_mod.ProductApp.init(12, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "中" });
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 1, .text = "R" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .text = "中" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 12, 3, size_cells_max);
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
 
-    try expectCellGrapheme(renderer.next, 2, 0, "中");
-    try expectCellText(renderer.next, 9, 0, "R");
+    try expectCellGrapheme(renderer.next, 8, 0, "中");
 }
 
 test "frame projects composer cursor into bordered composer" {

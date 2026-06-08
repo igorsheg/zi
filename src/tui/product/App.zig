@@ -14,8 +14,7 @@ pub const ProductApp = struct {
     composer: composer_mod.ComposerBuffer = .{},
     transcript: transcript.TranscriptBuffer = .{},
     slots: slots_mod.SlotStore = .{},
-    modal: ?surface_mod.Modal = null,
-    focus: surface_mod.FocusTarget = .composer,
+    modal: ?surface_mod.Confirm = null,
     transcript_scroll_rows: usize = 0,
     transcript_scroll_max_cache: usize = 0,
     transcript_scroll_max_revision: u64 = std.math.maxInt(u64),
@@ -81,16 +80,14 @@ pub const ProductApp = struct {
                 return null;
             },
             .set_slot_contribution => |contribution| {
-                var timed_contribution = contribution;
-                timed_contribution.animation_start_tick = self.animation_tick;
-                try self.slots.set(allocator, timed_contribution);
+                try self.slots.set(allocator, contribution);
                 self.dirty = true;
                 return null;
             },
             .animation_tick => |tick| {
                 if (tick != self.animation_tick) {
                     self.animation_tick = tick;
-                    if (self.slots.hasAnimated(.status_area, tick)) self.dirty = true;
+                    if (self.slots.hasAnimated(.status_area)) self.dirty = true;
                 }
                 return null;
             },
@@ -98,25 +95,19 @@ pub const ProductApp = struct {
                 if (self.slots.clear(allocator, clear)) self.dirty = true;
                 return null;
             },
-            .clear_slot_owner => |owner| {
-                if (self.slots.clearOwner(allocator, owner)) self.dirty = true;
-                return null;
-            },
             .open_confirm => |open| {
                 if (self.modal != null) return error.ModalAlreadyOpen;
-                var modal: surface_mod.Modal = .{ .confirm = try surface_mod.Confirm.init(allocator, open) };
-                errdefer modal.deinit(allocator);
-                self.focus = modal.focusTarget();
-                self.modal = modal;
+                var confirm = try surface_mod.Confirm.init(allocator, open);
+                errdefer confirm.deinit(allocator);
+                self.modal = confirm;
                 self.dirty = true;
                 return null;
             },
-            .modal => |modal_command| return self.applyModal(allocator, modal_command),
         }
     }
 
     fn applyInput(self: *ProductApp, allocator: std.mem.Allocator, event: substrate.input.InputEvent) !?Effect {
-        if (self.modal != null) return self.applyModal(allocator, .{ .input = event });
+        if (self.modal != null) return self.applyModal(allocator, event);
         switch (keys.resolve(event)) {
             .composer_insert => |bytes| {
                 if (try self.applyComposer(allocator, .{ .insert_utf8 = bytes.slice() })) |effect| return effect;
@@ -152,12 +143,11 @@ pub const ProductApp = struct {
         return null;
     }
 
-    fn applyModal(self: *ProductApp, allocator: std.mem.Allocator, command: surface_mod.ModalCommand) !?Effect {
+    fn applyModal(self: *ProductApp, allocator: std.mem.Allocator, event: substrate.input.InputEvent) !?Effect {
         const modal = if (self.modal) |*modal| modal else return null;
-        if (modal.apply(command)) |result| {
+        if (modal.applyInput(event)) |result| {
             modal.deinit(allocator);
             self.modal = null;
-            self.focus = .composer;
             self.dirty = true;
             return .{ .confirm_result = result };
         }
@@ -236,9 +226,7 @@ pub const Command = union(enum) {
     set_slot_contribution: slots_mod.SetContribution,
     animation_tick: u64,
     open_confirm: surface_mod.OpenConfirm,
-    modal: surface_mod.ModalCommand,
     clear_slot_contribution: slots_mod.ClearContribution,
-    clear_slot_owner: slots_mod.OwnerId,
 };
 
 pub const ToolOutputDelta = struct {
@@ -416,7 +404,7 @@ test "product app clamps transcript scroll after append eviction" {
     try std.testing.expect(app.transcript_scroll_rows <= app.transcriptScrollMax());
 }
 
-test "product app confirm modal captures input and restores composer focus" {
+test "product app confirm modal captures input until result" {
     var app = try ProductApp.init(30, 8);
     defer app.deinit(std.testing.allocator);
 
@@ -426,7 +414,6 @@ test "product app confirm modal captures input and restores composer focus" {
         .body = "Really?",
     } }) == null);
     try std.testing.expect(app.modal != null);
-    try std.testing.expect(app.focus == .confirm);
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{
         .text = substrate.input.InlineBytes.from("x"),
@@ -441,7 +428,6 @@ test "product app confirm modal captures input and restores composer focus" {
     try std.testing.expectEqual(@as(surface_mod.ModalId, 1), effect.confirm_result.id);
     try std.testing.expect(!effect.confirm_result.accepted);
     try std.testing.expect(app.modal == null);
-    try std.testing.expect(app.focus == .composer);
 }
 
 test "product app rejects second modal before mutation" {
@@ -458,7 +444,7 @@ test "product app rejects second modal before mutation" {
         .title = "Two",
         .body = "",
     } }));
-    const effect = (try app.apply(std.testing.allocator, .{ .modal = .confirm })).?;
+    const effect = (try app.apply(std.testing.allocator, .{ .input = .{ .key = .enter } })).?;
     try std.testing.expect(effect.confirm_result.accepted);
 }
 
@@ -473,7 +459,6 @@ test "product app animation tick dirties only animated status" {
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
         .slot = .status_area,
         .id = 1,
-        .owner = 1,
         .text = "working",
         .effect = .shimmer,
     } }) == null);
@@ -490,27 +475,28 @@ test "product app applies slot contributions atomically" {
     defer app.deinit(std.testing.allocator);
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
-        .slot = .composer_top_left,
+        .slot = .composer_top_right,
         .id = 1,
-        .owner = 9,
         .text = "model: faux",
     } }) == null);
     try std.testing.expect(app.dirty);
-    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_left));
+    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_right));
 
     app.dirty = false;
     try std.testing.expectError(
         error.InvalidSlotContributionText,
         app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
-            .slot = .composer_top_left,
+            .slot = .composer_top_right,
             .id = 2,
-            .owner = 9,
             .text = "bad\n",
         } }),
     );
     try std.testing.expect(!app.dirty);
-    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_left));
+    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_right));
 
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .clear_slot_owner = 9 }) == null);
-    try std.testing.expectEqual(@as(usize, 0), app.slots.count(.composer_top_left));
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .clear_slot_contribution = .{
+        .slot = .composer_top_right,
+        .id = 1,
+    } }) == null);
+    try std.testing.expectEqual(@as(usize, 0), app.slots.count(.composer_top_right));
 }

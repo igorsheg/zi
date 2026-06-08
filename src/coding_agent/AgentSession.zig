@@ -5,10 +5,8 @@ const runtime = @import("../runtime/root.zig");
 const event_drain_mod = @import("event_drain.zig");
 const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
-const prompt_command = @import("prompt_command.zig");
 const queue_mirror_mod = @import("queue_mirror.zig");
 const session_events = @import("session_events.zig");
-const session_history_snapshot = @import("session_history_snapshot.zig");
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
 const system_prompt = @import("system_prompt.zig");
@@ -17,9 +15,9 @@ const tool_registry = @import("tool_registry.zig");
 const AgentSession = @This();
 
 pub const public_event_capacity_default = 256;
-pub const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 4096;
-pub const max_auto_retry_attempts_limit = 8;
-pub const live_prompt_event_capacity_count = 64;
+const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 4096;
+const max_auto_retry_attempts_limit = 8;
+const live_prompt_event_capacity_count = 64;
 
 fn classifyToolResultAfterCall(
     _: ?*anyopaque,
@@ -27,29 +25,22 @@ fn classifyToolResultAfterCall(
     context: agent_mod.AfterToolCallContext,
 ) anyerror!?agent_mod.AfterToolCallResult {
     if (!std.mem.eql(u8, context.tool_call.name, "bash")) return null;
-    return .{ .is_error = bashResultIsError(context.result.details, context.is_error) };
-}
-
-fn bashResultIsError(details: ?std.json.Value, fallback: bool) bool {
-    const value = details orelse return fallback;
-    if (value != .object) return fallback;
+    const value = context.result.details orelse return .{ .is_error = context.is_error };
+    if (value != .object) return .{ .is_error = context.is_error };
     const object = value.object;
-    if (jsonBool(object.get("timedOut"))) |timed_out| if (timed_out) return true;
-    if (jsonBool(object.get("outputLimitExceeded"))) |limited| if (limited) return true;
-    if (jsonBool(object.get("cancelled"))) |cancelled| if (cancelled) return true;
-    if (object.get("signal") != null or object.get("stopped") != null or object.get("unknown") != null) return true;
-    if (jsonInteger(object.get("exitCode"))) |code| return code != 0;
-    return fallback;
+    if (jsonBool(object.get("timedOut"))) |timed_out| if (timed_out) return .{ .is_error = true };
+    if (jsonBool(object.get("outputLimitExceeded"))) |limited| if (limited) return .{ .is_error = true };
+    if (jsonBool(object.get("cancelled"))) |cancelled| if (cancelled) return .{ .is_error = true };
+    if (object.get("signal") != null or object.get("stopped") != null or object.get("unknown") != null) {
+        return .{ .is_error = true };
+    }
+    if (object.get("exitCode")) |code| if (code == .integer) return .{ .is_error = code.integer != 0 };
+    return .{ .is_error = context.is_error };
 }
 
 fn jsonBool(value: ?std.json.Value) ?bool {
     const resolved = value orelse return null;
     return if (resolved == .bool) resolved.bool else null;
-}
-
-fn jsonInteger(value: ?std.json.Value) ?i64 {
-    const resolved = value orelse return null;
-    return if (resolved == .integer) resolved.integer else null;
 }
 
 allocator: std.mem.Allocator,
@@ -60,7 +51,7 @@ current_date: []const u8,
 timestamp: []const u8,
 prompt_resources: resources.PromptResources,
 system_prompt_text: []const u8,
-builtin_tools: tool_registry.BuiltinTools,
+builtin_tools: *tool_registry.BuiltinTools,
 tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 store: ?*session_store.SessionStore = null,
@@ -95,27 +86,18 @@ pub const Options = struct {
     zio_runtime: *runtime.Runtime,
 };
 
-pub const StreamingBehavior = enum {
+const StreamingBehavior = enum {
     steer,
     follow_up,
 };
 
-pub const PromptOptions = struct {
+const PromptOptions = struct {
     streaming_behavior: ?StreamingBehavior = null,
 };
 
 pub const RetrySettings = struct {
     enabled: bool = false,
     max_attempts: u8 = 1,
-
-    pub fn validate(self: RetrySettings) error{RetrySettingsOutOfBounds}!void {
-        if (self.max_attempts > max_auto_retry_attempts_limit) return error.RetrySettingsOutOfBounds;
-    }
-};
-
-const PromptRetryPolicy = struct {
-    overflow: bool = true,
-    transient: bool = true,
 };
 
 const ManualCompactionRequest = union(enum) {
@@ -179,7 +161,7 @@ pub const LivePromptRun = struct {
     }
 };
 
-pub const AgentSessionStatus = enum {
+const AgentSessionStatus = enum {
     idle,
     running,
     cancel_requested,
@@ -187,20 +169,14 @@ pub const AgentSessionStatus = enum {
     stopped,
 };
 
-pub const RuntimeStatusSnapshot = struct {
+const RuntimeStatusSnapshot = struct {
     status: AgentSessionStatus,
     public_event_count: usize,
     dropped_public_event_count: usize,
     context_overflow_count: usize,
 };
 
-pub const PublicHistorySnapshot = session_history_snapshot.Snapshot;
-
-pub fn publicHistorySnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !PublicHistorySnapshot {
-    return session_history_snapshot.build(allocator, self.manager);
-}
-
-pub const Error = error{
+const Error = error{
     SessionBusy,
     SessionCancelling,
     SessionShuttingDown,
@@ -230,7 +206,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     });
     errdefer prompt_resources.deinit();
 
-    var builtin_tools = try tool_registry.BuiltinTools.init(allocator, .{
+    const builtin_tools = try tool_registry.BuiltinTools.init(allocator, .{
         .cwd = options.cwd,
         .environ = options.environ,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
@@ -238,9 +214,8 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     errdefer builtin_tools.deinit();
 
     var tools: tool_registry.ToolRegistry = .{};
-    errdefer tools.deinit(allocator);
     try builtin_tools.appendDefinitions(&tools);
-    try tools.setActiveToolsByName(allocator, tool_registry.default_active_tool_names);
+    try tools.setActiveToolsByName(tool_registry.default_active_tool_names);
 
     const system_prompt_text = try buildSystemPromptText(
         allocator,
@@ -365,7 +340,6 @@ pub fn deinit(self: *AgentSession) void {
     }
     self.manager.deinit();
     self.allocator.destroy(self.manager);
-    self.tools.deinit(self.allocator);
     self.builtin_tools.deinit();
     self.allocator.free(self.system_prompt_text);
     self.prompt_resources.deinit();
@@ -385,7 +359,7 @@ pub fn promptWithOptions(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !void {
-    try self.promptWithOptionsInternal(text, images, options, .{});
+    try self.promptWithOptionsInternal(text, images, options, true, true);
 }
 
 fn promptWithOptionsInternal(
@@ -393,9 +367,10 @@ fn promptWithOptionsInternal(
     text: []const u8,
     images: []const ai.ImageContent,
     options: PromptOptions,
-    retry_policy: PromptRetryPolicy,
+    retry_overflow: bool,
+    retry_transient: bool,
 ) anyerror!void {
-    try self.retry_settings.validate();
+    if (self.retry_settings.max_attempts > max_auto_retry_attempts_limit) return error.RetrySettingsOutOfBounds;
     const context_overflow_count_before = self.event_drain.context_overflow_count;
     const run = self.startPromptRun(text, images, options) catch |err| switch (err) {
         error.PromptCommandCannotStartLiveRun, error.PromptQueuedCannotStartLiveRun => return,
@@ -403,26 +378,32 @@ fn promptWithOptionsInternal(
     };
     defer self.destroyPromptRun(run);
     while (try self.stepPromptRun(run)) {}
-    const compacted = if (retry_policy.overflow)
+    const compacted = if (retry_overflow)
         try self.checkPostPromptOverflowCompaction(context_overflow_count_before, true)
     else
         false;
-    if (compacted and retry_policy.overflow) {
+    if (compacted and retry_overflow) {
         try self.retryPromptAfterOverflowCompaction(text, images, options);
-    } else if (retry_policy.transient) {
+    } else if (retry_transient) {
         if (self.latestRetryableAssistantError()) |error_message| {
             try self.retryPromptAfterRetryableError(text, images, options, error_message);
         }
     }
 }
 
-fn startPromptRun(
+pub fn startPromptRun(
     self: *AgentSession,
     text: []const u8,
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !*LivePromptRun {
-    try self.ensureAcceptsPrompt();
+    self.reconcileLifecycle();
+    switch (self.lifecycle) {
+        .accepting => {},
+        .cancel_requested => return error.SessionCancelling,
+        .shutdown_requested, .stopped => return error.SessionShuttingDown,
+    }
+    if (self.active_compaction_cancel_source != null) return error.SessionBusy;
     const preflight: PromptPreflight = .{
         .text = text,
         .images = images,
@@ -431,19 +412,6 @@ fn startPromptRun(
     if (try self.tryHandlePromptCommand(&preflight)) return error.PromptCommandCannotStartLiveRun;
     if (try self.queuePromptIfStreaming(&preflight)) return error.PromptQueuedCannotStartLiveRun;
     try self.checkPrePromptCompaction();
-    return self.startPreparedPromptRun(&preflight);
-}
-
-pub fn startLivePromptRun(
-    self: *AgentSession,
-    text: []const u8,
-    images: []const ai.ImageContent,
-    options: PromptOptions,
-) !*LivePromptRun {
-    return self.startPromptRun(text, images, options);
-}
-
-fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight) !*LivePromptRun {
     const run = try self.allocator.create(LivePromptRun);
     errdefer self.allocator.destroy(run);
     run.* = .{};
@@ -476,19 +444,6 @@ pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
     return self.finishPromptRun(run);
 }
 
-pub fn drainPromptRunReady(self: *AgentSession, run: *LivePromptRun) !?bool {
-    if (!run.isActive()) return false;
-    return switch (run.stream.poll()) {
-        .event => |event| try self.applyPromptRunEvent(run, event),
-        .terminal => try self.finishPromptRun(run),
-        .empty => null,
-    };
-}
-
-pub fn promptRunProgress(run: *LivePromptRun) @TypeOf(run.stream.asyncNext()) {
-    return run.stream.asyncNext();
-}
-
 pub fn applyPromptRunProgress(
     self: *AgentSession,
     run: *LivePromptRun,
@@ -507,12 +462,14 @@ fn applyPromptRunEvent(self: *AgentSession, run: *LivePromptRun, event: agent_mo
 }
 
 fn finishPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
-    const token = run.terminalToken() orelse unreachable;
+    std.debug.assert(run.isActive());
+    const token = run.terminalToken().?;
     run.stream.awaitProducer() catch |err| {
         try self.settlePromptRunFailure(run, token, @errorName(err));
         return err;
     };
-    self.settlePromptRunSuccess(run);
+    self.agent.finishRun();
+    run.markSettled();
     return false;
 }
 
@@ -529,12 +486,6 @@ pub fn cancelPromptRun(self: *AgentSession, run: *LivePromptRun) !void {
     try self.settlePromptRunFailure(run, token, "aborted");
 }
 
-fn settlePromptRunSuccess(self: *AgentSession, run: *LivePromptRun) void {
-    std.debug.assert(run.isActive());
-    self.agent.finishRun();
-    run.markSettled();
-}
-
 fn settlePromptRunFailure(
     self: *AgentSession,
     run: *LivePromptRun,
@@ -548,25 +499,17 @@ fn settlePromptRunFailure(
 }
 
 pub fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
-    if (run.isActive()) self.forceSettlePromptRunForDestroy(run);
+    if (run.isActive()) {
+        _ = run.markCancelRequested();
+        run.stream.cancelProducer() catch |err| {
+            const ignored_cleanup_error = @errorName(err);
+            _ = ignored_cleanup_error;
+        };
+        self.agent.finishRun();
+        run.markSettled();
+    }
     run.stream.deinit();
     self.allocator.destroy(run);
-}
-
-fn forceSettlePromptRunForDestroy(self: *AgentSession, run: *LivePromptRun) void {
-    std.debug.assert(run.isActive());
-    _ = run.markCancelRequested();
-    run.stream.cancelProducer() catch |err| {
-        const ignored_cleanup_error = @errorName(err);
-        _ = ignored_cleanup_error;
-    };
-    self.agent.finishRun();
-    run.markSettled();
-}
-
-pub fn continueRun(self: *AgentSession) !void {
-    try self.ensureAcceptsIdleCommand();
-    try self.agent.continueRun();
 }
 
 fn compactWithSummary(
@@ -711,13 +654,11 @@ pub fn shutdownComplete(self: *AgentSession) bool {
 pub fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !void {
     if (!self.agent.waitForIdle()) return error.SessionBusy;
     if (self.active_compaction_cancel_source != null) return error.SessionBusy;
-    var active_set = try self.tools.buildActiveToolSet(self.allocator, names);
-    defer active_set.deinit(self.allocator);
-    const next_prompt = try self.buildPromptForActiveNames(active_set.names);
+    const active_set = try self.tools.buildActiveToolSet(names);
+    const next_prompt = try self.buildPromptForActiveNames(active_set.nameSlice());
     errdefer self.allocator.free(next_prompt);
 
-    try self.tools.ensureActiveCapacity(self.allocator, active_set.names.len);
-    try self.agent.setTools(active_set.agent_tools);
+    try self.agent.setTools(active_set.agentToolSlice());
     self.tools.commitActiveToolSet(active_set);
     self.agent.setSystemPrompt(next_prompt);
     self.allocator.free(self.system_prompt_text);
@@ -765,16 +706,6 @@ test "agent session public event enqueue sets coalesced wake" {
     var event = session.drainPublicEvent().?;
     defer event.deinit();
     try std.testing.expectEqual(agent_mod.AgentEvent.agent_start, event.agent_event.event);
-}
-
-fn ensureAcceptsPrompt(self: *AgentSession) Error!void {
-    self.reconcileLifecycle();
-    switch (self.lifecycle) {
-        .accepting => {},
-        .cancel_requested => return error.SessionCancelling,
-        .shutdown_requested, .stopped => return error.SessionShuttingDown,
-    }
-    if (self.active_compaction_cancel_source != null) return error.SessionBusy;
 }
 
 fn ensureAcceptsIdleCommand(self: *AgentSession) Error!void {
@@ -1025,8 +956,8 @@ fn buildSystemPromptText(
         .prompt_guidelines = guidelines.items,
         .context_files = prompt_resources.context_files.files,
         .skills = prompt_resources.skills.skills,
-        .custom_prompt = prompt_resources.systemPromptFileContent(),
-        .append_system_prompt = prompt_resources.appendSystemPrompt(),
+        .custom_prompt = if (prompt_resources.system_prompt.file) |file| file.content else null,
+        .append_system_prompt = if (prompt_resources.append_system_prompt.file) |file| file.content else null,
     });
 }
 
@@ -1036,39 +967,48 @@ const PromptPreflight = struct {
     streaming_behavior: ?StreamingBehavior,
 };
 
+const PromptCommand = enum { help, session };
+
 fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
-    const parsed = prompt_command.parse(preflight.text) orelse return false;
-
-    const command_name = parsed.name orelse {
-        const unknown_message = try prompt_command.unknownText(self.allocator, parsed.text);
-        errdefer self.allocator.free(unknown_message);
-        try self.emitPromptCommandOwned(
-            parsed.text,
-            .unknown,
-            session_events.EventText.initOwned(self.allocator, unknown_message),
-        );
-        return true;
-    };
-
-    switch (command_name) {
-        .help => try self.emitPromptCommand(parsed.text, .handled, prompt_command.helpText()),
+    const parsed = parsePromptCommand(preflight.text) orelse return false;
+    const command_text, const command = parsed;
+    if (command) |known| switch (known) {
+        .help => try self.emitPromptCommand(command_text, .handled, "available commands: /help, /session"),
         .session => {
             const snapshot = self.statusSnapshot();
-            const message = try prompt_command.sessionText(self.allocator, .{
-                .status_name = @tagName(snapshot.status),
-                .public_event_count = snapshot.public_event_count,
-                .dropped_public_event_count = snapshot.dropped_public_event_count,
-                .active_tool_count = self.tools.activeToolNames().len,
-            });
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "session: {s}; public events: {}; dropped events: {}; active tools: {}",
+                .{ @tagName(snapshot.status), snapshot.public_event_count, snapshot.dropped_public_event_count, self.tools.activeToolNames().len },
+            );
             errdefer self.allocator.free(message);
             try self.emitPromptCommandOwned(
-                parsed.text,
+                command_text,
                 .handled,
                 session_events.EventText.initOwned(self.allocator, message),
             );
         },
+    } else {
+        const unknown_message = try std.fmt.allocPrint(self.allocator, "unknown command: /{s}", .{command_text});
+        errdefer self.allocator.free(unknown_message);
+        try self.emitPromptCommandOwned(
+            command_text,
+            .unknown,
+            session_events.EventText.initOwned(self.allocator, unknown_message),
+        );
     }
     return true;
+}
+
+fn parsePromptCommand(text: []const u8) ?struct { []const u8, ?PromptCommand } {
+    if (text.len < 2 or text[0] != '/') return null;
+    var end: usize = 1;
+    while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
+    if (end == 1) return null;
+    const command = text[1..end];
+    if (std.mem.eql(u8, command, "help")) return .{ command, .help };
+    if (std.mem.eql(u8, command, "session")) return .{ command, .session };
+    return .{ command, null };
 }
 
 fn emitPromptCommand(
@@ -1175,7 +1115,7 @@ fn retryPromptAfterOverflowCompaction(
     } });
     retry_start_owns_error_message = false;
 
-    self.promptWithOptionsInternal(text, images, options, .{ .overflow = false, .transient = false }) catch |err| {
+    self.promptWithOptionsInternal(text, images, options, false, false) catch |err| {
         const final_error = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
             .success = false,
@@ -1271,13 +1211,11 @@ fn removeLastAssistantRuntimeMessage(self: *AgentSession) !void {
     if (self.agent.state.messages.len == 0) return error.NoMessages;
     const retained_len = self.agent.state.messages.len - 1;
     const retained = try agent_mod.copyAgentMessages(self.allocator, self.agent.state.messages[0..retained_len]);
-    defer deinitOwnedAgentMessages(self.allocator, retained);
+    defer {
+        for (retained) |message| agent_mod.deinitAgentMessage(self.allocator, message);
+        self.allocator.free(retained);
+    }
     try self.agent.replaceMessages(retained);
-}
-
-fn deinitOwnedAgentMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) void {
-    for (messages) |message| agent_mod.deinitAgentMessage(allocator, message);
-    allocator.free(messages);
 }
 
 fn drainAgentEvent(
@@ -1311,8 +1249,8 @@ test "agent session initializes policy spine with definition-first builtin tools
     });
     defer shutdownAndDeinit(&session);
 
-    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.tools.definitions.items.len);
-    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.agent.state.tools.len);
+    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.tools.definition_count);
+    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.agent.state.tools.len);
     try std.testing.expectEqualStrings("read", session.tools.activeToolNames()[0]);
     try std.testing.expectEqualStrings("bash", session.tools.activeToolNames()[4]);
     try std.testing.expectEqualStrings("bash", session.agent.state.tools[4].name);
@@ -1443,33 +1381,6 @@ test "agent session shutdown rejects new prompts" {
 
     try std.testing.expectEqual(AgentSessionStatus.stopped, session.status());
     try std.testing.expectError(error.SessionShuttingDown, session.prompt("blocked", &.{}));
-    try std.testing.expectError(error.SessionShuttingDown, session.continueRun());
-}
-
-test "agent session continue while running returns session busy" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-
-    try std.testing.expectError(error.SessionBusy, session.continueRun());
 }
 
 test "agent session shutdown while running stops after terminal event" {
@@ -1961,7 +1872,7 @@ test "agent session snapshots expose status and active tool read models" {
     try std.testing.expectEqual(@as(usize, 1), status_snapshot.public_event_count);
     try std.testing.expectEqual(@as(usize, 1), status_snapshot.dropped_public_event_count);
 
-    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.tools.activeToolNames().len);
+    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.tools.activeToolNames().len);
 }
 
 test "agent session public event queue overflow is explicit" {

@@ -1,10 +1,10 @@
 const std = @import("std");
 
-pub const argument_count_max = 16;
-pub const message_count_max = 4;
-pub const unknown_flag_count_max = 8;
+const argument_count_max = 16;
+const message_count_max = 4;
+const unknown_flag_count_max = 8;
 
-pub const ParseError = error{
+const ParseError = error{
     TooManyArguments,
     TooManyMessages,
     TooManyUnknownFlags,
@@ -13,20 +13,20 @@ pub const ParseError = error{
     InvalidOptionValue,
 };
 
-pub const AppMode = enum {
+const AppMode = enum {
     interactive,
     text,
     json,
     rpc,
 };
 
-pub const OutputMode = enum {
+const OutputMode = enum {
     text,
     json,
     rpc,
 };
 
-pub const AppArgs = struct {
+const AppArgs = struct {
     help: bool = false,
     print: bool = false,
     mode: ?OutputMode = null,
@@ -36,7 +36,7 @@ pub const AppArgs = struct {
     unknown_flags: UnknownFlagList = .{},
 };
 
-pub const AuthCommand = struct {
+const AuthCommand = struct {
     action: Action,
     provider: []const u8,
 
@@ -47,12 +47,12 @@ pub const AuthCommand = struct {
     };
 };
 
-pub const Command = union(enum) {
+const Command = union(enum) {
     app: AppArgs,
     auth: AuthCommand,
 };
 
-pub const UnknownFlag = struct {
+const UnknownFlag = struct {
     name: []const u8,
     value: Value,
 

@@ -233,7 +233,7 @@ const ToolWorkerGroup = struct {
     }
 
     fn deinit(self: *ToolWorkerGroup) void {
-        if (self.state == .active) @panic("ToolWorkerGroup deinit before await or cancel");
+        std.debug.assert(self.state != .active);
         self.* = undefined;
     }
 
@@ -778,7 +778,7 @@ fn replaceToolResultDetails(result: *agent.ToolExecutionResult, details: std.jso
     const cloned = try runtime.cloneJsonValue(result.allocator, details);
     const previous = result.result.details;
     result.result.details = cloned;
-    if (previous) |value| agent.deinitJsonValue(result.allocator, value);
+    if (previous) |value| runtime.freeJsonValue(result.allocator, value);
 }
 
 pub fn createToolResultMessage(
@@ -794,7 +794,7 @@ pub fn createToolResultMessage(
     const content = try agent.copyToolResultContentSlice(allocator, result.content);
     errdefer agent.deinitToolResultContentSlice(allocator, content);
     const details = if (result.details) |value| try runtime.cloneJsonValue(allocator, value) else null;
-    errdefer if (details) |value| agent.deinitJsonValue(allocator, value);
+    errdefer if (details) |value| runtime.freeJsonValue(allocator, value);
     return .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,

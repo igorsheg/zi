@@ -1,52 +1,39 @@
 const std = @import("std");
-const shuffle_text = @import("shuffle_text.zig");
-
 pub const contribution_count_max: usize = 16;
 pub const contribution_text_bytes_max: usize = 160;
-pub const composer_border_slot_count_max: usize = 1;
 pub const status_area_slot_count_max: usize = 8;
 
 pub const SlotName = enum {
-    composer_top_left,
     composer_top_right,
-    composer_bottom_left,
-    composer_bottom_right,
     status_area,
 };
 
 pub const RenderEffect = enum {
     none,
     shimmer,
-    shuffle_text,
 };
 
 pub const ContributionId = u32;
-pub const OwnerId = u32;
 
 pub const SetContribution = struct {
     slot: SlotName,
     id: ContributionId,
-    owner: OwnerId,
     priority: i16 = 0,
     text: []const u8,
     effect: RenderEffect = .none,
-    animation_start_tick: u64 = 0,
 };
 
 pub const ClearContribution = struct {
     slot: SlotName,
     id: ContributionId,
-    owner: OwnerId,
 };
 
 const Contribution = struct {
     slot: SlotName,
     id: ContributionId,
-    owner: OwnerId,
     priority: i16,
     text: []u8,
     effect: RenderEffect,
-    animation_start_tick: u64,
 };
 
 pub const SlotStore = struct {
@@ -60,8 +47,12 @@ pub const SlotStore = struct {
     }
 
     pub fn set(self: *SlotStore, allocator: std.mem.Allocator, update: SetContribution) !void {
-        try validateSet(update);
-        const existing = self.find(update.slot, update.id, update.owner);
+        if (update.id == 0) return error.InvalidSlotContribution;
+        if (update.text.len > contribution_text_bytes_max) return error.SlotContributionTooLarge;
+        if (!std.unicode.utf8ValidateSlice(update.text)) return error.InvalidSlotContributionText;
+        if (std.mem.indexOfScalar(u8, update.text, '\n') != null) return error.InvalidSlotContributionText;
+        if (std.mem.indexOfScalar(u8, update.text, '\r') != null) return error.InvalidSlotContributionText;
+        const existing = self.find(update.slot, update.id);
         if (existing == null and self.len == self.items.len) return error.SlotContributionLimitExceeded;
 
         const text = try allocator.dupe(u8, update.text);
@@ -72,11 +63,9 @@ pub const SlotStore = struct {
             self.items[index] = .{
                 .slot = update.slot,
                 .id = update.id,
-                .owner = update.owner,
                 .priority = update.priority,
                 .text = text,
                 .effect = update.effect,
-                .animation_start_tick = update.animation_start_tick,
             };
             allocator.free(old_text);
             return;
@@ -85,33 +74,17 @@ pub const SlotStore = struct {
         self.items[self.len] = .{
             .slot = update.slot,
             .id = update.id,
-            .owner = update.owner,
             .priority = update.priority,
             .text = text,
             .effect = update.effect,
-            .animation_start_tick = update.animation_start_tick,
         };
         self.len += 1;
     }
 
     pub fn clear(self: *SlotStore, allocator: std.mem.Allocator, request: ClearContribution) bool {
-        const index = self.find(request.slot, request.id, request.owner) orelse return false;
+        const index = self.find(request.slot, request.id) orelse return false;
         self.removeAt(allocator, index);
         return true;
-    }
-
-    pub fn clearOwner(self: *SlotStore, allocator: std.mem.Allocator, owner: OwnerId) bool {
-        var removed = false;
-        var index: usize = 0;
-        while (index < self.len) {
-            if (self.items[index].owner == owner) {
-                self.removeAt(allocator, index);
-                removed = true;
-                continue;
-            }
-            index += 1;
-        }
-        return removed;
     }
 
     pub fn count(self: SlotStore, slot: SlotName) usize {
@@ -129,43 +102,41 @@ pub const SlotStore = struct {
             if (n == out.len) break;
             out[n] = .{
                 .priority = item.priority,
-                .owner = item.owner,
-                .id = item.id,
                 .text = item.text,
                 .effect = item.effect,
-                .animation_start_tick = item.animation_start_tick,
             };
             n += 1;
         }
-        sortViews(out[0..n]);
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const current = out[i];
+            var j = i;
+            while (j > 0 and current.priority > out[j - 1].priority) : (j -= 1) out[j] = out[j - 1];
+            out[j] = current;
+        }
         return n;
     }
 
     pub fn highestPriority(self: SlotStore, slot: SlotName) ?SlotView {
-        var views: [composer_border_slot_count_max]SlotView = undefined;
+        var views: [1]SlotView = undefined;
         if (self.orderedSlot(slot, &views) == 0) return null;
         return views[0];
     }
 
-    pub fn hasSlot(self: SlotStore, slot: SlotName) bool {
-        return self.count(slot) > 0;
-    }
-
-    pub fn hasAnimated(self: SlotStore, slot: SlotName, tick: u64) bool {
+    pub fn hasAnimated(self: SlotStore, slot: SlotName) bool {
         for (self.items[0..self.len]) |item| {
             if (item.slot != slot) continue;
             switch (item.effect) {
                 .none => {},
                 .shimmer => return true,
-                .shuffle_text => if (tick -| item.animation_start_tick <= shuffle_text.reveal_ticks * 2) return true,
             }
         }
         return false;
     }
 
-    fn find(self: SlotStore, slot: SlotName, id: ContributionId, owner: OwnerId) ?usize {
+    fn find(self: SlotStore, slot: SlotName, id: ContributionId) ?usize {
         for (self.items[0..self.len], 0..) |item, index| {
-            if (item.slot == slot and item.id == id and item.owner == owner) return index;
+            if (item.slot == slot and item.id == id) return index;
         }
         return null;
     }
@@ -181,70 +152,42 @@ pub const SlotStore = struct {
 
 pub const SlotView = struct {
     priority: i16,
-    owner: OwnerId,
-    id: ContributionId,
     text: []const u8,
     effect: RenderEffect,
-    animation_start_tick: u64,
 };
-
-fn validateSet(update: SetContribution) !void {
-    if (update.id == 0 or update.owner == 0) return error.InvalidSlotContribution;
-    if (update.text.len > contribution_text_bytes_max) return error.SlotContributionTooLarge;
-    if (!std.unicode.utf8ValidateSlice(update.text)) return error.InvalidSlotContributionText;
-    if (std.mem.indexOfScalar(u8, update.text, '\n') != null) return error.InvalidSlotContributionText;
-    if (std.mem.indexOfScalar(u8, update.text, '\r') != null) return error.InvalidSlotContributionText;
-}
-
-fn sortViews(items: []SlotView) void {
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        const current = items[i];
-        var j = i;
-        while (j > 0 and before(current, items[j - 1])) : (j -= 1) items[j] = items[j - 1];
-        items[j] = current;
-    }
-}
-
-fn before(a: SlotView, b: SlotView) bool {
-    return a.priority > b.priority;
-}
 
 test "slot store sets replaces clears and bounds contributions" {
     var slots: SlotStore = .{};
     defer slots.deinit(std.testing.allocator);
 
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_top_left,
+        .slot = .composer_top_right,
         .id = 1,
-        .owner = 7,
         .priority = 1,
         .text = "one",
     });
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_top_left,
+        .slot = .composer_top_right,
         .id = 2,
-        .owner = 7,
         .priority = 2,
         .text = "two",
     });
     try slots.set(std.testing.allocator, .{
-        .slot = .composer_top_left,
+        .slot = .composer_top_right,
         .id = 1,
-        .owner = 7,
         .priority = 3,
         .text = "new",
     });
 
     var views: [2]SlotView = undefined;
-    const n = slots.orderedSlot(.composer_top_left, &views);
+    const n = slots.orderedSlot(.composer_top_right, &views);
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings("new", views[0].text);
     try std.testing.expectEqualStrings("two", views[1].text);
 
-    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_left, .id = 2, .owner = 7 }));
-    try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_top_left));
-    try std.testing.expect(slots.clearOwner(std.testing.allocator, 7));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2 }));
+    try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_top_right));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1 }));
     try std.testing.expectEqual(@as(usize, 0), slots.len);
 }
 
@@ -255,26 +198,24 @@ test "slot store tracks animated status contributions" {
     try slots.set(std.testing.allocator, .{
         .slot = .status_area,
         .id = 1,
-        .owner = 1,
         .text = "working",
         .effect = .shimmer,
     });
-    try std.testing.expect(slots.hasAnimated(.status_area, 100));
-    try std.testing.expect(slots.clearOwner(std.testing.allocator, 1));
-    try std.testing.expect(!slots.hasAnimated(.status_area, 100));
+    try std.testing.expect(slots.hasAnimated(.status_area));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .status_area, .id = 1 }));
+    try std.testing.expect(!slots.hasAnimated(.status_area));
 }
 
 test "slot store rejects invalid text before mutation" {
     var slots: SlotStore = .{};
     defer slots.deinit(std.testing.allocator);
 
-    try slots.set(std.testing.allocator, .{ .slot = .composer_top_left, .id = 1, .owner = 1, .text = "ok" });
+    try slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .text = "ok" });
     try std.testing.expectError(
         error.InvalidSlotContributionText,
         slots.set(std.testing.allocator, .{
-            .slot = .composer_top_left,
+            .slot = .composer_top_right,
             .id = 2,
-            .owner = 1,
             .text = "bad\n",
         }),
     );

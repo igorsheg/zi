@@ -3,14 +3,13 @@ const runtime = @import("../runtime/root.zig");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const tui = @import("../tui/root.zig");
-const AgentSessionRuntimeHost = @import("AgentSessionRuntimeHost.zig");
 const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
-const tool_registry = @import("tool_registry.zig");
-const sdk = @import("sdk.zig");
+const session_listing = @import("session_listing.zig");
+const runtime_services = @import("runtime_services.zig");
 
-pub const Options = struct {
+const Options = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     dir: std.Io.Dir = .cwd(),
@@ -33,15 +32,11 @@ const pending_tool_id_bytes_max = 128;
 const pending_tool_output_bytes_max = tui.product.transcript.append_size_bytes_max;
 const tool_call_mirrors_max = 32;
 const tool_title_bytes_max = 512;
-const model_slot_owner: tui.product.SlotOwnerId = 1;
 const model_slot_id: tui.product.SlotContributionId = 1;
-const status_owner_run: tui.product.SlotOwnerId = 2;
 const status_id_working: tui.product.SlotContributionId = 1;
-const status_owner_policy: tui.product.SlotOwnerId = 3;
-const status_id_compaction: tui.product.SlotContributionId = 1;
-const status_id_retry: tui.product.SlotContributionId = 2;
-const status_owner_queue: tui.product.SlotOwnerId = 4;
-const status_id_queue: tui.product.SlotContributionId = 1;
+const status_id_compaction: tui.product.SlotContributionId = 2;
+const status_id_retry: tui.product.SlotContributionId = 3;
+const status_id_queue: tui.product.SlotContributionId = 4;
 const confirm_id_start: tui.product.ModalId = 1;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
@@ -49,16 +44,7 @@ fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     return now_ns - last >= frame_interval_ns;
 }
 
-fn animationTick(now_ns: i128) u64 {
-    if (now_ns <= 0) return 0;
-    return @intCast(@divFloor(now_ns, frame_interval_ns));
-}
-
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
-
-fn queuedMessagesText(snapshot: *const session_events.QueueSnapshot, buffer: []u8) ?[]const u8 {
-    return queuedMessagesAndDraftText(snapshot, "", buffer);
-}
 
 fn queuedMessagesAndDraftText(
     snapshot: *const session_events.QueueSnapshot,
@@ -131,46 +117,15 @@ fn toolBodyMode(name: []const u8) tui.product.transcript.TranscriptToolBodyMode 
     return .visible;
 }
 
-fn tuiPresentation(
-    presentation: tool_registry.ToolDisplayPresentation,
-) tui.product.transcript.TranscriptToolPresentation {
-    return switch (presentation) {
-        .generic => .generic,
-        .command => .command,
-        .file => .file,
-        .patch => .patch,
-        .search => .search,
-        .directory => .directory,
-    };
-}
-
-fn tuiBodyMode(body_mode: tool_registry.ToolDisplayBodyMode) tui.product.transcript.TranscriptToolBodyMode {
-    return switch (body_mode) {
-        .visible => .visible,
-        .hidden_on_success => .hidden_on_success,
-    };
-}
-
 fn toolArgsPreview(tool_name: []const u8, args_value: std.json.Value) []const u8 {
     if (std.mem.eql(u8, tool_name, "bash")) return boundedArgString(args_value, "command");
-    return switch (toolTitleShape(tool_name)) {
-        .path => boundedArgString(args_value, "path"),
-        .search => boundedPreferredArgTitle(args_value, "pattern", "path"),
-        .find => boundedPreferredArgTitle(args_value, "path", "name"),
-        .none => "",
-    };
-}
-
-const ToolTitleShape = enum { none, path, search, find };
-
-fn toolTitleShape(tool_name: []const u8) ToolTitleShape {
     if (std.mem.eql(u8, tool_name, "read") or
         std.mem.eql(u8, tool_name, "edit") or
         std.mem.eql(u8, tool_name, "write") or
-        std.mem.eql(u8, tool_name, "ls")) return .path;
-    if (std.mem.eql(u8, tool_name, "grep")) return .search;
-    if (std.mem.eql(u8, tool_name, "find")) return .find;
-    return .none;
+        std.mem.eql(u8, tool_name, "ls")) return boundedArgString(args_value, "path");
+    if (std.mem.eql(u8, tool_name, "grep")) return boundedPreferredArgTitle(args_value, "pattern", "path");
+    if (std.mem.eql(u8, tool_name, "find")) return boundedPreferredArgTitle(args_value, "path", "name");
+    return "";
 }
 
 fn boundedPreferredArgTitle(args_value: std.json.Value, first_key: []const u8, second_key: []const u8) []const u8 {
@@ -262,7 +217,14 @@ fn sanitizeTranscriptText(input: []const u8, buffer: []u8) []const u8 {
     while (index < input.len and out_len < buffer.len) {
         const byte = input[index];
         if (byte == 0x1b) {
-            index = skipEscapeSequence(input, index);
+            if (index + 1 >= input.len) return buffer[0..out_len];
+            const kind = input[index + 1];
+            index = if (kind == '[')
+                skipCsiPayload(input, index + 2)
+            else if (kind == ']')
+                skipOscPayload(input, index + 2)
+            else
+                @min(index + 2, input.len);
             continue;
         }
         if (byte == '\n') {
@@ -283,35 +245,33 @@ fn sanitizeTranscriptText(input: []const u8, buffer: []u8) []const u8 {
             continue;
         }
         if (byte == 0xc2 and index + 1 < input.len and input[index + 1] >= 0x80 and input[index + 1] <= 0x9f) {
-            index = skipC1Control(input, index);
+            const kind = input[index + 1];
+            index = if (kind == 0x9b)
+                skipCsiPayload(input, index + 2)
+            else if (kind == 0x9d)
+                skipOscPayload(input, index + 2)
+            else
+                index + 2;
             continue;
         }
-        const scalar_len = utf8ScalarLen(input[index..]);
-        if (out_len + scalar_len > buffer.len) break;
-        @memcpy(buffer[out_len .. out_len + scalar_len], input[index .. index + scalar_len]);
-        out_len += scalar_len;
-        index += scalar_len;
+        const scalar_len: usize = if (byte < 0x80)
+            1
+        else if ((byte & 0xe0) == 0xc0)
+            2
+        else if ((byte & 0xf0) == 0xe0)
+            3
+        else if ((byte & 0xf8) == 0xf0)
+            4
+        else
+            1;
+        const valid_len = if (scalar_len <= input.len - index and
+            std.unicode.utf8ValidateSlice(input[index .. index + scalar_len])) scalar_len else 1;
+        if (out_len + valid_len > buffer.len) break;
+        @memcpy(buffer[out_len .. out_len + valid_len], input[index .. index + valid_len]);
+        out_len += valid_len;
+        index += valid_len;
     }
     return buffer[0..out_len];
-}
-
-fn skipC1Control(input: []const u8, start: usize) usize {
-    std.debug.assert(start + 1 < input.len);
-    std.debug.assert(input[start] == 0xc2);
-    const kind = input[start + 1];
-    if (kind == 0x9b) return skipCsiPayload(input, start + 2);
-    if (kind == 0x9d) return skipOscPayload(input, start + 2);
-    return start + 2;
-}
-
-fn skipEscapeSequence(input: []const u8, start: usize) usize {
-    std.debug.assert(start < input.len);
-    std.debug.assert(input[start] == 0x1b);
-    if (start + 1 >= input.len) return input.len;
-    const kind = input[start + 1];
-    if (kind == '[') return skipCsiPayload(input, start + 2);
-    if (kind == ']') return skipOscPayload(input, start + 2);
-    return @min(start + 2, input.len);
 }
 
 fn skipCsiPayload(input: []const u8, start: usize) usize {
@@ -331,23 +291,6 @@ fn skipOscPayload(input: []const u8, start: usize) usize {
         if (byte == 0x1b and index + 1 < input.len and input[index + 1] == '\\') return index + 2;
     }
     return input.len;
-}
-
-fn utf8ScalarLen(input: []const u8) usize {
-    if (input.len == 0) return 0;
-    const first = input[0];
-    if (first < 0x80) return 1;
-    const len: usize = if ((first & 0xe0) == 0xc0)
-        2
-    else if ((first & 0xf0) == 0xe0)
-        3
-    else if ((first & 0xf8) == 0xf0)
-        4
-    else
-        1;
-    if (len > input.len) return 1;
-    if (!std.unicode.utf8ValidateSlice(input[0..len])) return 1;
-    return len;
 }
 
 fn firstToolResultText(result: agent_mod.AgentToolResult) []const u8 {
@@ -405,24 +348,20 @@ fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?Transcrip
         .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event.event),
         .prompt_command => |payload| .{ .append = statusAppend(.info, payload.message.text) },
         .compaction_start => null,
-        .compaction_end => |payload| compactionEndAppend(payload),
+        .compaction_end => |payload| if (payload.error_message != null)
+            .{ .append = statusAppend(.err, "compaction failed") }
+        else if (payload.aborted and !payload.will_retry)
+            .{ .append = statusAppend(.warning, "compaction cancelled") }
+        else
+            null,
         .auto_retry_start => null,
-        .auto_retry_end => |payload| autoRetryEndAppend(payload),
+        .auto_retry_end => |payload| if (!payload.success and payload.final_error != null)
+            .{ .append = statusAppend(.err, "auto retry failed") }
+        else
+            null,
         .public_event_overflow => .{ .append = statusAppend(.warning, "public event overflow") },
         .queue_update, .session_info_changed => null,
     };
-}
-
-fn compactionEndAppend(payload: session_events.AgentSessionEvent.CompactionEnd) ?TranscriptIngest {
-    if (payload.error_message) |_| return .{ .append = statusAppend(.err, "compaction failed") };
-    if (payload.aborted and !payload.will_retry) return .{ .append = statusAppend(.warning, "compaction cancelled") };
-    return null;
-}
-
-fn autoRetryEndAppend(payload: session_events.AgentSessionEvent.AutoRetryEnd) ?TranscriptIngest {
-    if (payload.success) return null;
-    if (payload.final_error != null) return .{ .append = statusAppend(.err, "auto retry failed") };
-    return null;
 }
 
 fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptIngest {
@@ -563,7 +502,7 @@ const PendingConfirm = struct {
 
 const InteractiveLoop = struct {
     process: runtime.Process,
-    host: *AgentSessionRuntimeHost,
+    session: *AgentSession,
     terminal_loop: *tui.product.TerminalLoop,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
@@ -606,14 +545,14 @@ const InteractiveLoop = struct {
 
     fn startPrompt(self: *InteractiveLoop, text: []const u8) !PromptSubmitResult {
         if (self.active_run != null) {
-            self.host.queuePrompt(text, .steer) catch |err| {
+            self.session.promptWithOptions(text, &.{}, .{ .streaming_behavior = .steer }) catch |err| {
                 _ = self.terminal_loop.applyCommand(.{ .insert_composer_text = text }) catch null;
                 try self.appendOperationalStatus(@errorName(err));
                 return .rejected;
             };
             return .queued;
         }
-        self.active_run = try self.host.startPromptRun(text, &.{}, .{});
+        self.active_run = try self.session.startPromptRun(text, &.{}, .{});
         self.cancel_requested = false;
         self.setWorkingStatus() catch {
             self.stderr.writeAll("status update failed\n") catch return .started;
@@ -628,32 +567,32 @@ const InteractiveLoop = struct {
             self.stderr.writeAll("queue restore failed\n") catch return;
         };
         self.cancel_requested = true;
-        self.host.cancelPromptRun(prompt_run) catch |err| {
+        self.session.cancelPromptRun(prompt_run) catch |err| {
             self.stderr.writeAll("cancel failed; waiting for run to settle\n") catch return;
-            self.host.cancel();
+            self.session.cancel();
             self.setWorkingStatusText(@errorName(err)) catch return;
             return;
         };
-        self.host.destroyPromptRun(prompt_run);
+        self.session.destroyPromptRun(prompt_run);
         self.active_run = null;
         self.cancel_requested = false;
-        self.clearStatus(status_owner_run, status_id_working) catch {
+        self.clearStatus(status_id_working) catch {
             self.stderr.writeAll("status clear failed\n") catch return;
         };
     }
 
     fn restoreQueuedMessagesToComposer(self: *InteractiveLoop) !void {
-        var snapshot = try self.host.queueSnapshot(self.process.gpa);
+        var snapshot = try self.session.queueSnapshot(self.process.gpa);
         defer snapshot.deinit();
         if (snapshot.steering.items.len == 0 and snapshot.follow_up.items.len == 0) return;
         var buffer: [tui.product.composer.buffer_size_bytes_max]u8 = undefined;
         const draft = self.terminal_loop.product.app.composer.text();
         const text = queuedMessagesAndDraftText(&snapshot, draft, &buffer) orelse {
-            try self.host.clearQueue();
+            try self.session.clearQueue();
             try self.appendOperationalStatus("queued messages too large to restore");
             return;
         };
-        try self.host.clearQueue();
+        try self.session.clearQueue();
         _ = try self.terminal_loop.applyCommand(.clear_composer);
         _ = try self.terminal_loop.applyCommand(.{ .insert_composer_text = text });
     }
@@ -661,7 +600,7 @@ const InteractiveLoop = struct {
     fn requestShutdown(self: *InteractiveLoop) void {
         self.terminal_loop.requestStop();
         if (!self.cancel_requested and self.active_run != null) {
-            self.host.cancel();
+            self.session.cancel();
             self.cancel_requested = true;
         }
     }
@@ -676,7 +615,8 @@ const InteractiveLoop = struct {
         _ = try self.drainPromptProgressBounded(prompt_progress_per_tick_max);
         _ = try self.drainPublicEventsBounded(public_events_per_tick_max);
         const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
-        _ = try self.terminal_loop.applyCommand(.{ .animation_tick = animationTick(now_ns) });
+        const animation_tick: u64 = if (now_ns <= 0) 0 else @intCast(@divFloor(now_ns, frame_interval_ns));
+        _ = try self.terminal_loop.applyCommand(.{ .animation_tick = animation_tick });
         if (render_attempts_per_tick_max > 0 and self.terminal_loop.isDirty()) {
             if (frameDue(now_ns, self.last_render_ns)) {
                 try self.terminal_loop.renderIfDirty(self.stdout);
@@ -690,9 +630,9 @@ const InteractiveLoop = struct {
         const readable = runtime.ReadableFd.initBorrowed(self.terminal_loop.inputFd());
         var input = readable.asyncReadable();
         var frame = runtime.Timeout.fromMilliseconds(frame_interval_ms);
-        var public_event_wake = self.host.publicEventWake();
+        var public_event_wake = self.session.publicEventWake();
         if (self.active_run) |prompt_run| {
-            var progress = self.host.promptRunProgress(prompt_run);
+            var progress = prompt_run.stream.asyncNext();
             switch (try runtime.select(.{
                 .input = &input,
                 .prompt = &progress,
@@ -797,7 +737,7 @@ const InteractiveLoop = struct {
         const prompt_run = self.active_run orelse return 0;
         var count: usize = 0;
         while (count < limit and self.active_run != null) : (count += 1) {
-            var progress = self.host.promptRunProgress(prompt_run);
+            var progress = prompt_run.stream.asyncNext();
             var ready = runtime.Timeout.fromMilliseconds(0);
             switch (try runtime.select(.{ .prompt = &progress, .ready = &ready })) {
                 .prompt => |result| try self.applyPromptProgressResult(prompt_run, result),
@@ -813,12 +753,12 @@ const InteractiveLoop = struct {
         result: anytype,
     ) !void {
         if (self.active_run != prompt_run) return;
-        const more = try self.host.applyPromptRunProgress(prompt_run, result);
+        const more = try self.session.applyPromptRunProgress(prompt_run, result);
         if (!more) {
-            self.host.destroyPromptRun(prompt_run);
+            self.session.destroyPromptRun(prompt_run);
             self.active_run = null;
             self.cancel_requested = false;
-            self.clearStatus(status_owner_run, status_id_working) catch {
+            self.clearStatus(status_id_working) catch {
                 self.stderr.writeAll("status clear failed\n") catch return;
             };
         }
@@ -827,7 +767,7 @@ const InteractiveLoop = struct {
     fn drainPublicEventsBounded(self: *InteractiveLoop, limit: usize) !usize {
         var count: usize = 0;
         while (count < limit) : (count += 1) {
-            var event = self.host.drainPublicEvent() orelse {
+            var event = self.session.drainPublicEvent() orelse {
                 try self.flushToolOutputCoalescer();
                 return count;
             };
@@ -843,17 +783,16 @@ const InteractiveLoop = struct {
         switch (event) {
             .agent_event => |payload| switch (payload.event) {
                 .agent_start => try self.setWorkingStatus(),
-                .agent_end => try self.clearStatus(status_owner_run, status_id_working),
+                .agent_end => try self.clearStatus(status_id_working),
                 else => {},
             },
             .compaction_start => try self.setStatus(
-                status_owner_policy,
                 status_id_compaction,
                 200,
                 "compacting context (Esc to cancel)",
                 .shimmer,
             ),
-            .compaction_end => try self.clearStatus(status_owner_policy, status_id_compaction),
+            .compaction_end => try self.clearStatus(status_id_compaction),
             .auto_retry_start => |payload| {
                 var buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
                 const seconds = (payload.delay_ms + 999) / 1000;
@@ -862,9 +801,9 @@ const InteractiveLoop = struct {
                     "retry {d}/{d} in {d}s (Esc to cancel)",
                     .{ payload.attempt, payload.max_attempts, seconds },
                 ) catch "retrying (Esc to cancel)";
-                try self.setStatus(status_owner_policy, status_id_retry, 190, text, .shimmer);
+                try self.setStatus(status_id_retry, 190, text, .shimmer);
             },
-            .auto_retry_end => try self.clearStatus(status_owner_policy, status_id_retry),
+            .auto_retry_end => try self.clearStatus(status_id_retry),
             .queue_update => |payload| try self.applyQueueStatus(payload),
             else => {},
         }
@@ -872,7 +811,7 @@ const InteractiveLoop = struct {
 
     fn applyQueueStatus(self: *InteractiveLoop, payload: session_events.AgentSessionEvent.QueueUpdate) !void {
         if (payload.steering.items.len == 0 and payload.follow_up.items.len == 0) {
-            try self.clearStatus(status_owner_queue, status_id_queue);
+            try self.clearStatus(status_id_queue);
             return;
         }
         var buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
@@ -881,7 +820,7 @@ const InteractiveLoop = struct {
             "queued steer:{d} follow-up:{d}",
             .{ payload.steering.items.len, payload.follow_up.items.len },
         ) catch "queued messages";
-        try self.setStatus(status_owner_queue, status_id_queue, 80, text, .none);
+        try self.setStatus(status_id_queue, 80, text, .none);
     }
 
     fn setWorkingStatus(self: *InteractiveLoop) !void {
@@ -889,12 +828,11 @@ const InteractiveLoop = struct {
     }
 
     fn setWorkingStatusText(self: *InteractiveLoop, text: []const u8) !void {
-        try self.setStatus(status_owner_run, status_id_working, 100, text, .shimmer);
+        try self.setStatus(status_id_working, 100, text, .shimmer);
     }
 
     fn setStatus(
         self: *InteractiveLoop,
-        owner: tui.product.SlotOwnerId,
         id: tui.product.SlotContributionId,
         priority: i16,
         text: []const u8,
@@ -903,7 +841,6 @@ const InteractiveLoop = struct {
         _ = self.terminal_loop.applyCommand(.{ .set_slot_contribution = .{
             .slot = .status_area,
             .id = id,
-            .owner = owner,
             .priority = priority,
             .text = text,
             .effect = effect,
@@ -917,15 +854,10 @@ const InteractiveLoop = struct {
         };
     }
 
-    fn clearStatus(
-        self: *InteractiveLoop,
-        owner: tui.product.SlotOwnerId,
-        id: tui.product.SlotContributionId,
-    ) !void {
+    fn clearStatus(self: *InteractiveLoop, id: tui.product.SlotContributionId) !void {
         _ = try self.terminal_loop.applyCommand(.{ .clear_slot_contribution = .{
             .slot = .status_area,
             .id = id,
-            .owner = owner,
         } });
     }
 
@@ -990,9 +922,19 @@ const InteractiveLoop = struct {
         var next = append;
         const tool = &next.tool;
         if (self.tool_metadata_lookup_enabled) {
-            if (self.host.findToolMetadata(tool.name)) |metadata| {
-                tool.presentation = tuiPresentation(metadata.display.presentation);
-                tool.body_mode = tuiBodyMode(metadata.display.body_mode);
+            if (self.session.tools.findDefinition(tool.name)) |definition| {
+                tool.presentation = switch (definition.metadata.display.presentation) {
+                    .generic => .generic,
+                    .command => .command,
+                    .file => .file,
+                    .patch => .patch,
+                    .search => .search,
+                    .directory => .directory,
+                };
+                tool.body_mode = switch (definition.metadata.display.body_mode) {
+                    .visible => .visible,
+                    .hidden_on_success => .hidden_on_success,
+                };
             }
         }
         if (tool.tool_call_id.len > pending_tool_id_bytes_max) return next;
@@ -1096,7 +1038,7 @@ const InteractiveLoop = struct {
 
     fn shutdown(self: *InteractiveLoop) void {
         if (self.active_run != null and !self.cancel_requested) {
-            self.host.cancel();
+            self.session.cancel();
             self.cancel_requested = true;
         }
         var ticks: usize = 0;
@@ -1104,7 +1046,7 @@ const InteractiveLoop = struct {
             _ = self.drainPromptProgressBounded(prompt_progress_per_tick_max) catch break;
         }
         if (self.active_run) |prompt_run| {
-            self.host.destroyPromptRun(prompt_run);
+            self.session.destroyPromptRun(prompt_run);
             self.active_run = null;
         }
     }
@@ -1120,10 +1062,62 @@ pub fn run(
     const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
     defer process.gpa.free(timestamp_text);
 
-    var host_handle = try createHost(process, stderr, options, timestamp_text, timestamp);
+    var host_handle = if (options.resume_session_file != null or options.resume_latest) blk: {
+        const session_file = session_listing.selectRuntimeSession(process.gpa, process.io, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .dir = options.dir,
+            .environ = options.environ,
+            .explicit_file_name = options.resume_session_file,
+        }) catch |err| switch (err) {
+            error.InvalidSessionFileName => {
+                try stderr.writeAll("invalid resume session file\n");
+                return error.InvalidCliUsage;
+            },
+            error.SessionListTruncated => {
+                try stderr.writeAll("too many sessions to choose latest safely\n");
+                return error.InvalidCliUsage;
+            },
+            else => return err,
+        } orelse {
+            try stderr.writeAll("no resumable session found\n");
+            return error.NoResumableSession;
+        };
+        defer process.gpa.free(session_file);
+        break :blk try runtime_services.resumeSessionRuntime(process.gpa, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = timestamp_text,
+            .session_file_name = session_file,
+            .dir = options.dir,
+            .environ = options.environ,
+            .zio_runtime = process.zio_runtime,
+        });
+    } else blk: {
+        const session_id = try std.fmt.allocPrint(process.gpa, "interactive-{d}", .{timestamp});
+        defer process.gpa.free(session_id);
+        break :blk try runtime_services.createSessionRuntime(process.gpa, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = timestamp_text,
+            .session_id = session_id,
+            .timestamp = timestamp_text,
+            .dir = options.dir,
+            .environ = options.environ,
+            .zio_runtime = process.zio_runtime,
+        });
+    };
     defer host_handle.deinit();
 
-    var terminal_loop = try initTerminalLoop(process, stdout);
+    var terminal = tui.Terminal.init(process.io);
+    const terminal_size = terminal.size() catch tui.TerminalSize{ .width = 80, .height = 24 };
+    var terminal_loop = try tui.product.TerminalLoop.init(
+        process.gpa,
+        process.io,
+        terminal_size.width,
+        terminal_size.height,
+        tui.product.loop.output_size_bytes_default,
+    );
     defer terminal_loop.deinit();
 
     try terminal_loop.setup(stdout);
@@ -1135,15 +1129,25 @@ pub fn run(
 
     var loop: InteractiveLoop = .{
         .process = process,
-        .host = &host_handle.host,
+        .session = &host_handle.session,
         .terminal_loop = &terminal_loop,
         .stdout = stdout,
         .stderr = stderr,
     };
     defer loop.shutdown();
 
-    try applyModelComposerSlot(&terminal_loop, host_handle.host.base.model);
-    try seedTranscriptFromSession(process.gpa, &terminal_loop, &host_handle.host);
+    var model_text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
+    const model_text = modelComposerSlotText(host_handle.session.agent.state.model, &model_text_buffer);
+    _ = try terminal_loop.applyCommand(.{ .set_slot_contribution = .{
+        .slot = .composer_top_right,
+        .id = model_slot_id,
+        .priority = 100,
+        .text = model_text,
+        .effect = .none,
+    } });
+    var history_snapshot = try session_history_snapshot.build(process.gpa, host_handle.session.manager);
+    defer history_snapshot.deinit(process.gpa);
+    try seedTranscriptFromSnapshot(&terminal_loop, history_snapshot.items);
     if (options.initial_prompt) |prompt| {
         if (try loop.startPrompt(prompt) == .started) {
             try loop.appendTranscript(messageAppend(.user, prompt, .new_item));
@@ -1154,19 +1158,6 @@ pub fn run(
     try stdout.flush();
 
     while (terminal_loop.isRunning()) try loop.tick();
-}
-
-fn applyModelComposerSlot(terminal_loop: *tui.product.TerminalLoop, model: ai.Model) !void {
-    var text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
-    const text = modelComposerSlotText(model, &text_buffer);
-    _ = try terminal_loop.applyCommand(.{ .set_slot_contribution = .{
-        .slot = .composer_top_right,
-        .id = model_slot_id,
-        .owner = model_slot_owner,
-        .priority = 100,
-        .text = text,
-        .effect = .none,
-    } });
 }
 
 fn modelComposerSlotText(model: ai.Model, buffer: []u8) []const u8 {
@@ -1186,16 +1177,6 @@ fn modelComposerSlotText(model: ai.Model, buffer: []u8) []const u8 {
     };
 }
 
-fn seedTranscriptFromSession(
-    allocator: std.mem.Allocator,
-    terminal_loop: *tui.product.TerminalLoop,
-    host: *AgentSessionRuntimeHost,
-) !void {
-    var snapshot = try host.publicHistorySnapshot(allocator);
-    defer snapshot.deinit(allocator);
-    try seedTranscriptFromSnapshot(terminal_loop, snapshot.items);
-}
-
 fn seedTranscriptFromSnapshot(
     terminal_loop: *tui.product.TerminalLoop,
     items: []const session_history_snapshot.Item,
@@ -1203,97 +1184,16 @@ fn seedTranscriptFromSnapshot(
     for (items) |item| {
         _ = try terminal_loop.applyCommand(.{
             .append_transcript = messageAppend(
-                transcriptRoleFromHistory(item.role),
+                switch (item.role) {
+                    .user => .user,
+                    .assistant => .assistant,
+                    .system => .system,
+                },
                 item.text,
                 .new_item,
             ),
         });
     }
-}
-
-fn transcriptRoleFromHistory(role: session_history_snapshot.Role) tui.product.transcript.TranscriptRole {
-    return switch (role) {
-        .user => .user,
-        .assistant => .assistant,
-        .system => .system,
-    };
-}
-
-fn createHost(
-    process: runtime.Process,
-    stderr: *std.Io.Writer,
-    options: Options,
-    timestamp_text: []const u8,
-    timestamp: i128,
-) !sdk.RuntimeHostHandle {
-    if (try selectResumeSession(process, stderr, options)) |session_file| {
-        defer process.gpa.free(session_file);
-        return sdk.resumeRuntimeHost(process.gpa, .{
-            .cwd = options.cwd,
-            .agent_dir_override = options.agent_dir_override,
-            .current_date = timestamp_text,
-            .session_file_name = session_file,
-            .dir = options.dir,
-            .environ = options.environ,
-            .zio_runtime = process.zio_runtime,
-        });
-    }
-
-    const session_id = try std.fmt.allocPrint(process.gpa, "interactive-{d}", .{timestamp});
-    defer process.gpa.free(session_id);
-    return sdk.createRuntimeHost(process.gpa, .{
-        .cwd = options.cwd,
-        .agent_dir_override = options.agent_dir_override,
-        .current_date = timestamp_text,
-        .session_id = session_id,
-        .timestamp = timestamp_text,
-        .dir = options.dir,
-        .environ = options.environ,
-        .zio_runtime = process.zio_runtime,
-    });
-}
-
-fn initTerminalLoop(process: runtime.Process, stdout: *std.Io.Writer) !tui.product.TerminalLoop {
-    var terminal = tui.Terminal.init(process.io);
-    const size = terminal.size() catch tui.TerminalSize{ .width = 80, .height = 24 };
-    _ = stdout;
-    return tui.product.TerminalLoop.init(
-        process.gpa,
-        process.io,
-        size.width,
-        size.height,
-        tui.product.loop.output_size_bytes_default,
-    );
-}
-
-fn selectResumeSession(
-    process: runtime.Process,
-    stderr: *std.Io.Writer,
-    options: Options,
-) !?[]const u8 {
-    if (options.resume_session_file == null and !options.resume_latest) return null;
-    const selected = sdk.selectRuntimeSession(process.gpa, process.io, .{
-        .cwd = options.cwd,
-        .agent_dir_override = options.agent_dir_override,
-        .dir = options.dir,
-        .environ = options.environ,
-        .explicit_file_name = options.resume_session_file,
-    }) catch |err| switch (err) {
-        error.InvalidSessionFileName => {
-            try stderr.writeAll("invalid resume session file\n");
-            return error.InvalidCliUsage;
-        },
-        error.SessionListTruncated => {
-            try stderr.writeAll("too many sessions to choose latest safely\n");
-            return error.InvalidCliUsage;
-        },
-        else => return err,
-    };
-    if (selected == null) {
-        try stderr.writeAll("no resumable session found\n");
-        return error.NoResumableSession;
-    }
-    return selected;
 }
 
 test "interactive queued text restore joins steering follow-up and draft" {

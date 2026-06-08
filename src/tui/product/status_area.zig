@@ -2,11 +2,18 @@ const std = @import("std");
 const infra = @import("../infra/root.zig");
 const primitive = @import("../primitive/root.zig");
 const shimmer = @import("shimmer.zig");
-const shuffle_text = @import("shuffle_text.zig");
 const slots = @import("slots.zig");
 const theme_mod = @import("theme.zig");
 
 const separator = " · ";
+const status_shimmer_config: shimmer.Config = .{
+    .lead_pad_cols = 6,
+    .tail_pad_cols = 10,
+    .band_half_width = 2,
+    .base_style = .{ .dim = true },
+    .edge_style = .{ .fg = .{ .rgb = .{ .r = 120, .g = 120, .b = 120 } } },
+    .peak_style = .{ .fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } }, .bold = true },
+};
 
 pub fn visibleRows(has_status: bool, height: u16, composer_rows: usize) usize {
     if (!has_status) return 0;
@@ -37,69 +44,34 @@ pub fn draw(
         if (text_width == 0) continue;
         const available = remaining - @as(u16, @intCast(sep_width));
         if (available == 0) return;
-        const text = if (rendered_any or text_width > available)
-            fitPrefix(view.text, available)
-        else
-            view.text;
+        var text = view.text;
+        if (rendered_any or text_width > available) {
+            var index: usize = 0;
+            var fit_width: usize = 0;
+            while (index < view.text.len) {
+                const grapheme = primitive.text.nextGrapheme(view.text[index..]);
+                if (grapheme.end == 0) break;
+                if (fit_width + grapheme.width > available) break;
+                fit_width += grapheme.width;
+                index += grapheme.end;
+            }
+            text = view.text[0..index];
+        }
         if (text.len == 0) continue;
 
         if (rendered_any) {
             try renderer.writeText(x, y, separator, theme.transcript_secondary);
             x = advance(x, sep_width);
         }
-        x = try drawContribution(renderer, theme, x, y, text, view, tick);
+        x = switch (view.effect) {
+            .none => blk: {
+                try renderer.writeText(x, y, text, theme.transcript_secondary);
+                break :blk advance(x, primitive.text.displayWidth(text));
+            },
+            .shimmer => try shimmer.writeSmooth(renderer, x, y, text, tick / 3, status_shimmer_config, 48),
+        };
         rendered_any = true;
     }
-}
-
-fn drawContribution(
-    renderer: *infra.Renderer,
-    theme: theme_mod.Theme,
-    x: u16,
-    y: u16,
-    text: []const u8,
-    view: slots.SlotView,
-    tick: u64,
-) !u16 {
-    return switch (view.effect) {
-        .none => blk: {
-            try renderer.writeText(x, y, text, theme.transcript_secondary);
-            break :blk advance(x, primitive.text.displayWidth(text));
-        },
-        .shuffle_text => blk: {
-            var buffer: [slots.contribution_text_bytes_max]u8 = undefined;
-            const local_tick = tick -| view.animation_start_tick;
-            const projected = shuffle_text.project(&buffer, text, local_tick / 2, view.owner ^ view.id);
-            try renderer.writeText(x, y, projected, theme.status_accent);
-            break :blk advance(x, primitive.text.displayWidth(projected));
-        },
-        .shimmer => try shimmer.writeSmooth(renderer, x, y, text, tick / 3, shimmerConfig(theme), 48),
-    };
-}
-
-fn shimmerConfig(theme: theme_mod.Theme) shimmer.Config {
-    _ = theme;
-    return .{
-        .lead_pad_cols = 6,
-        .tail_pad_cols = 10,
-        .band_half_width = 2,
-        .base_style = .{ .dim = true },
-        .edge_style = .{ .fg = .{ .rgb = .{ .r = 120, .g = 120, .b = 120 } } },
-        .peak_style = .{ .fg = .{ .rgb = .{ .r = 255, .g = 255, .b = 255 } }, .bold = true },
-    };
-}
-
-fn fitPrefix(text: []const u8, max_width: u16) []const u8 {
-    var index: usize = 0;
-    var width: usize = 0;
-    while (index < text.len) {
-        const grapheme = primitive.text.nextGrapheme(text[index..]);
-        if (grapheme.end == 0) break;
-        if (width + grapheme.width > max_width) break;
-        width += grapheme.width;
-        index += grapheme.end;
-    }
-    return text[0..index];
 }
 
 fn advance(x: u16, width: usize) u16 {
@@ -116,8 +88,8 @@ test "status area draws ordered contributions with separator" {
     var renderer = try infra.Renderer.init(std.testing.allocator, 20, 1, 20);
     defer renderer.deinit();
     const views = [_]slots.SlotView{
-        .{ .priority = 2, .owner = 1, .id = 1, .text = "one", .effect = .none, .animation_start_tick = 0 },
-        .{ .priority = 1, .owner = 1, .id = 2, .text = "two", .effect = .none, .animation_start_tick = 0 },
+        .{ .priority = 2, .text = "one", .effect = .none },
+        .{ .priority = 1, .text = "two", .effect = .none },
     };
     try draw(&renderer, theme_mod.Theme.codex(), 0, 20, &views, 0);
     try expectText(renderer.next, 0, 0, "one");

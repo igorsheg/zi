@@ -2,8 +2,10 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
+const AgentSession = @import("AgentSession.zig");
 const auth_mod = @import("auth.zig");
-const model_registry_mod = @import("model_registry.zig");
+const session_manager = @import("session_manager.zig");
+const session_store = @import("session_store.zig");
 const paths_mod = @import("paths.zig");
 const settings_mod = @import("settings.zig");
 
@@ -16,7 +18,6 @@ pub const RuntimeServices = struct {
     agent_dir: []const u8,
     settings_manager: settings_mod.SettingsManager,
     auth_manager: *auth_mod.AuthManager,
-    model_registry: model_registry_mod.ModelRegistry,
     provider_registry: ai.ProviderRegistry,
     environ: ?*const std.process.Environ.Map,
     openai_provider: *ai.OpenAiResponsesProvider,
@@ -24,7 +25,7 @@ pub const RuntimeServices = struct {
     diagnostics: [diagnostic_capacity]Diagnostic = undefined,
     diagnostic_count: usize = 0,
 
-    pub const Options = struct {
+    const Options = struct {
         cwd: []const u8,
         agent_dir: []const u8,
         dir: std.Io.Dir = .cwd(),
@@ -62,8 +63,6 @@ pub const RuntimeServices = struct {
         });
         errdefer auth_manager.deinit();
 
-        const model_registry = model_registry_mod.ModelRegistry.init(auth_manager);
-
         const openai_provider = try allocator.create(ai.OpenAiResponsesProvider);
         errdefer allocator.destroy(openai_provider);
         openai_provider.* = ai.OpenAiResponsesProvider.init(.{});
@@ -86,7 +85,6 @@ pub const RuntimeServices = struct {
             .agent_dir = agent_dir,
             .settings_manager = settings_manager,
             .auth_manager = auth_manager,
-            .model_registry = model_registry,
             .provider_registry = provider_registry,
             .environ = options.environ,
             .openai_provider = openai_provider,
@@ -94,42 +92,34 @@ pub const RuntimeServices = struct {
         };
     }
 
-    pub const diagnostic_capacity = 8;
+    const diagnostic_capacity = 8;
 
-    pub const Diagnostic = union(enum) {
+    const Diagnostic = union(enum) {
         unresolved_model_setting: ModelSetting,
         unresolved_stream: StreamSetting,
 
-        pub const ModelSetting = struct {
+        const ModelSetting = struct {
             provider: ?[]const u8,
             model: ?[]const u8,
         };
 
-        pub const StreamSetting = struct {
+        const StreamSetting = struct {
             api: []const u8,
         };
     };
 
-    pub fn paths(self: *const RuntimeServices) paths_mod.PersistencePaths {
-        return .{ .global_dir = self.agent_dir, .cwd = self.cwd };
+    fn findAvailableModel(self: *const RuntimeServices, provider: ai.Provider, model_id: []const u8) ?ai.Model {
+        const model = ai.getModel(provider, model_id) orelse return null;
+        return if (self.auth_manager.hasAuth(model.provider)) model else null;
     }
 
-    pub fn getApiKeyHook(self: *const RuntimeServices) agent_mod.GetApiKeyHook {
-        return self.auth_manager.hook();
-    }
-
-    pub fn clearDiagnostics(self: *RuntimeServices) void {
-        self.diagnostic_count = 0;
-    }
-
-    pub fn appendDiagnostic(self: *RuntimeServices, diagnostic: Diagnostic) void {
-        if (self.diagnostic_count == diagnostic_capacity) return;
-        self.diagnostics[self.diagnostic_count] = diagnostic;
-        self.diagnostic_count += 1;
-    }
-
-    pub fn diagnosticSlice(self: *const RuntimeServices) []const Diagnostic {
-        return self.diagnostics[0..self.diagnostic_count];
+    fn firstAvailableModel(self: *const RuntimeServices) ?ai.Model {
+        for (ai.getProviders()) |provider| {
+            for (ai.getModels(provider)) |model| {
+                if (self.auth_manager.hasAuth(model.provider)) return model;
+            }
+        }
+        return null;
     }
 
     pub fn deinit(self: *RuntimeServices) void {
@@ -149,6 +139,256 @@ pub const RuntimeServices = struct {
     }
 };
 
+const CreateSessionRuntimeOptions = struct {
+    cwd: []const u8 = ".",
+    agent_dir_override: ?[]const u8 = null,
+    current_date: []const u8,
+    session_id: []const u8,
+    timestamp: []const u8,
+    model: ?ai.Model = null,
+    thinking_level: ?agent_mod.ThinkingLevel = null,
+    stream: ?ai.StreamFunction = null,
+    dir: std.Io.Dir = .cwd(),
+    environ: ?*const std.process.Environ.Map = null,
+    zio_runtime: ?*runtime.Runtime = null,
+    allow_paths_outside_cwd: bool = true,
+    public_event_capacity: usize = AgentSession.public_event_capacity_default,
+};
+
+const ResumeSessionRuntimeOptions = struct {
+    cwd: []const u8 = ".",
+    agent_dir_override: ?[]const u8 = null,
+    current_date: []const u8,
+    session_file_name: []const u8,
+    model: ?ai.Model = null,
+    thinking_level: ?agent_mod.ThinkingLevel = null,
+    stream: ?ai.StreamFunction = null,
+    dir: std.Io.Dir = .cwd(),
+    environ: ?*const std.process.Environ.Map = null,
+    zio_runtime: ?*runtime.Runtime = null,
+    allow_paths_outside_cwd: bool = true,
+    public_event_capacity: usize = AgentSession.public_event_capacity_default,
+};
+
+pub const SessionRuntime = struct {
+    services: RuntimeServices,
+    session: AgentSession,
+
+    pub fn deinit(self: *SessionRuntime) void {
+        shutdownAndDeinitSession(&self.session);
+        self.services.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn createSessionRuntime(allocator: std.mem.Allocator, options: CreateSessionRuntimeOptions) !SessionRuntime {
+    var init_result = try initSessionRuntimeBase(allocator, options);
+    errdefer init_result.services.deinit();
+
+    const sessions_dir = try (paths_mod.PersistencePaths{ .global_dir = init_result.services.agent_dir, .cwd = init_result.services.cwd }).sessionsDirForCwd(allocator);
+    defer allocator.free(sessions_dir);
+    var store = try session_store.SessionStore.createInPath(
+        allocator,
+        init_result.services.io,
+        options.dir,
+        sessions_dir,
+        init_result.services.cwd,
+        options.session_id,
+        options.timestamp,
+    );
+    errdefer store.deinit(allocator);
+
+    var session_options = init_result.options;
+    session_options.session_id = options.session_id;
+    session_options.timestamp = options.timestamp;
+    session_options.session_store = store;
+    var session = try AgentSession.init(allocator, init_result.services.io, session_options);
+    errdefer shutdownAndDeinitSession(&session);
+    return .{ .services = init_result.services, .session = session };
+}
+
+pub fn resumeSessionRuntime(allocator: std.mem.Allocator, options: ResumeSessionRuntimeOptions) !SessionRuntime {
+    if (!std.mem.eql(u8, std.fs.path.basename(options.session_file_name), options.session_file_name)) {
+        return error.InvalidSessionFileName;
+    }
+
+    var init_result = try initSessionRuntimeBase(allocator, options);
+    errdefer init_result.services.deinit();
+
+    const sessions_dir = try (paths_mod.PersistencePaths{ .global_dir = init_result.services.agent_dir, .cwd = init_result.services.cwd }).sessionsDirForCwd(allocator);
+    defer allocator.free(sessions_dir);
+    const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, options.session_file_name });
+    errdefer allocator.free(file_name);
+
+    var session_options = init_result.options;
+    session_options.resume_session_store = .{ .dir = options.dir, .file_name = file_name };
+    var session = try AgentSession.init(allocator, init_result.services.io, session_options);
+    errdefer shutdownAndDeinitSession(&session);
+    return .{ .services = init_result.services, .session = session };
+}
+
+const SessionRuntimeInit = struct {
+    services: RuntimeServices,
+    options: AgentSession.Options,
+};
+
+fn initSessionRuntimeBase(allocator: std.mem.Allocator, options: anytype) !SessionRuntimeInit {
+    const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
+        agent_dir_override
+    else
+        try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
+    defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
+
+    var services = try RuntimeServices.init(allocator, .{
+        .cwd = options.cwd,
+        .agent_dir = resolved_agent_dir,
+        .dir = options.dir,
+        .environ = options.environ,
+        .zio_runtime = options.zio_runtime,
+    });
+    errdefer services.deinit();
+
+    return .{ .services = services, .options = resolveSessionOptions(&services, .{
+        .current_date = options.current_date,
+        .model = options.model,
+        .thinking_level = options.thinking_level,
+        .stream = options.stream,
+        .dir = options.dir,
+        .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
+        .public_event_capacity = options.public_event_capacity,
+    }) };
+}
+
+fn shutdownAndDeinitSession(session: *AgentSession) void {
+    session.requestShutdown();
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        owned_event.deinit();
+    }
+    session.deinit();
+}
+
+const SessionOptionsInput = struct {
+    current_date: []const u8,
+    model: ?ai.Model = null,
+    thinking_level: ?agent_mod.ThinkingLevel = null,
+    stream: ?ai.StreamFunction = null,
+    dir: std.Io.Dir = .cwd(),
+    allow_paths_outside_cwd: bool = true,
+    public_event_capacity: usize = AgentSession.public_event_capacity_default,
+};
+
+fn resolveSessionOptions(services: *RuntimeServices, options: SessionOptionsInput) AgentSession.Options {
+    services.diagnostic_count = 0;
+    const model = resolveModel(services, options.model);
+    return .{
+        .cwd = services.cwd,
+        .agent_dir = services.agent_dir,
+        .current_date = options.current_date,
+        .session_id = "",
+        .timestamp = "",
+        .model = model,
+        .thinking_level = resolveThinkingLevel(services.settings_manager.current(), options.thinking_level),
+        .compaction_settings = resolveCompactionSettings(services.settings_manager.current()),
+        .retry_settings = resolveRetrySettings(services.settings_manager.current()),
+        .stream = resolveStream(services, options.stream, model),
+        .get_api_key = services.auth_manager.hook(),
+        .zio_runtime = services.zio_runtime,
+        .dir = options.dir,
+        .environ = services.environ,
+        .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
+        .public_event_capacity = options.public_event_capacity,
+    };
+}
+
+fn resolveStream(services: *RuntimeServices, explicit: ?ai.StreamFunction, model: ai.Model) ?ai.StreamFunction {
+    if (explicit) |stream| return stream;
+    const provider = services.provider_registry.get(model.api) orelse {
+        if (!std.mem.eql(u8, model.api, "unknown") and services.diagnostic_count < RuntimeServices.diagnostic_capacity) {
+            services.diagnostics[services.diagnostic_count] = .{ .unresolved_stream = .{ .api = model.api } };
+            services.diagnostic_count += 1;
+        }
+        return null;
+    };
+    return provider.stream_simple;
+}
+
+fn resolveModel(services: *RuntimeServices, explicit: ?ai.Model) ai.Model {
+    if (explicit) |model| return model;
+    const snapshot = services.settings_manager.current();
+    const project = fileSettings(snapshot.project);
+    const global = fileSettings(snapshot.global);
+    const provider = project.default_provider orelse global.default_provider;
+    const model_id = project.default_model orelse global.default_model;
+    if (provider != null or model_id != null) {
+        if (provider) |provider_name| if (model_id) |id| {
+            if (services.findAvailableModel(provider_name, id)) |model| return model;
+        };
+        if (services.diagnostic_count < RuntimeServices.diagnostic_capacity) {
+            services.diagnostics[services.diagnostic_count] = .{ .unresolved_model_setting = .{ .provider = provider, .model = model_id } };
+            services.diagnostic_count += 1;
+        }
+    }
+    return services.firstAvailableModel() orelse agent_mod.Agent.defaultModel();
+}
+
+fn resolveThinkingLevel(snapshot: *const settings_mod.SettingsSnapshot, explicit: ?agent_mod.ThinkingLevel) agent_mod.ThinkingLevel {
+    if (explicit) |level| return level;
+    const global = fileSettings(snapshot.global);
+    const project = fileSettings(snapshot.project);
+    if (project.default_thinking_level orelse global.default_thinking_level) |level_text| {
+        if (parseThinkingLevel(level_text)) |level| return level;
+    }
+    return .off;
+}
+
+fn resolveCompactionSettings(snapshot: *const settings_mod.SettingsSnapshot) session_manager.CompactionSettings {
+    const global = fileSettings(snapshot.global);
+    const project = fileSettings(snapshot.project);
+    var settings: session_manager.CompactionSettings = .{};
+    if (global.compaction) |compaction| {
+        if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
+        if (compaction.enabled) |enabled| settings.auto_enabled = enabled;
+    }
+    if (project.compaction) |compaction| {
+        if (compaction.keep_recent_tokens) |tokens| settings.keep_recent_tokens = tokens;
+        if (compaction.enabled) |enabled| settings.auto_enabled = enabled;
+    }
+    return settings;
+}
+
+fn resolveRetrySettings(snapshot: *const settings_mod.SettingsSnapshot) AgentSession.RetrySettings {
+    const global = fileSettings(snapshot.global);
+    const project = fileSettings(snapshot.project);
+    var settings: AgentSession.RetrySettings = .{};
+    if (global.retry) |retry| {
+        if (retry.enabled) |enabled| settings.enabled = enabled;
+        if (retry.max_retries) |attempts| settings.max_attempts = if (attempts > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(attempts);
+    }
+    if (project.retry) |retry| {
+        if (retry.enabled) |enabled| settings.enabled = enabled;
+        if (retry.max_retries) |attempts| settings.max_attempts = if (attempts > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(attempts);
+    }
+    return settings;
+}
+
+fn fileSettings(file: settings_mod.SettingsFile) settings_mod.Settings {
+    return switch (file) {
+        .missing => .{},
+        .loaded => |settings| settings.value,
+    };
+}
+
+fn parseThinkingLevel(text: []const u8) ?agent_mod.ThinkingLevel {
+    if (std.ascii.eqlIgnoreCase(text, "minimal")) return .minimal;
+    if (std.ascii.eqlIgnoreCase(text, "low")) return .low;
+    if (std.ascii.eqlIgnoreCase(text, "medium")) return .medium;
+    if (std.ascii.eqlIgnoreCase(text, "high")) return .high;
+    if (std.ascii.eqlIgnoreCase(text, "xhigh")) return .xhigh;
+    if (std.ascii.eqlIgnoreCase(text, "off")) return .off;
+    return null;
+}
+
 test "runtime services owns stable cwd, agent dir, settings manager" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -165,9 +405,8 @@ test "runtime services owns stable cwd, agent dir, settings manager" {
 
     try std.testing.expectEqualStrings("repo", services.cwd);
     try std.testing.expectEqualStrings("agent", services.agent_dir);
-    const service_paths = services.paths();
-    try std.testing.expectEqualStrings(services.cwd, service_paths.cwd);
-    try std.testing.expectEqualStrings(services.agent_dir, service_paths.global_dir);
+    try std.testing.expectEqualStrings("repo", services.cwd);
+    try std.testing.expectEqualStrings("agent", services.agent_dir);
     try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_responses) != null);
     try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_codex_responses) != null);
 }
