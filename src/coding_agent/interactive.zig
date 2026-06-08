@@ -609,7 +609,7 @@ const InteractiveLoop = struct {
             self.stderr.writeAll("queue restore failed\n") catch return;
         };
         self.cancel_requested = true;
-        self.host.cancelPromptRun(prompt_run) catch |err| {
+        self.host.session.cancelPromptRun(prompt_run) catch |err| {
             self.stderr.writeAll("cancel failed; waiting for run to settle\n") catch return;
             self.host.cancel();
             self.setWorkingStatusText(@errorName(err)) catch return;

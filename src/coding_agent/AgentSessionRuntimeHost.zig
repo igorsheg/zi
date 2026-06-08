@@ -135,10 +135,6 @@ pub fn applyPromptRunProgress(
     return self.session.applyPromptRunProgress(run, progress);
 }
 
-pub fn cancelPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !void {
-    try self.session.cancelPromptRun(run);
-}
-
 pub fn destroyPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) void {
     self.session.destroyPromptRun(run);
 }
