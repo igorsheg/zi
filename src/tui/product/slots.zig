@@ -47,7 +47,11 @@ pub const SlotStore = struct {
     }
 
     pub fn set(self: *SlotStore, allocator: std.mem.Allocator, update: SetContribution) !void {
-        try validateSet(update);
+        if (update.id == 0) return error.InvalidSlotContribution;
+        if (update.text.len > contribution_text_bytes_max) return error.SlotContributionTooLarge;
+        if (!std.unicode.utf8ValidateSlice(update.text)) return error.InvalidSlotContributionText;
+        if (std.mem.indexOfScalar(u8, update.text, '\n') != null) return error.InvalidSlotContributionText;
+        if (std.mem.indexOfScalar(u8, update.text, '\r') != null) return error.InvalidSlotContributionText;
         const existing = self.find(update.slot, update.id);
         if (existing == null and self.len == self.items.len) return error.SlotContributionLimitExceeded;
 
@@ -145,14 +149,6 @@ pub const SlotView = struct {
     text: []const u8,
     effect: RenderEffect,
 };
-
-fn validateSet(update: SetContribution) !void {
-    if (update.id == 0) return error.InvalidSlotContribution;
-    if (update.text.len > contribution_text_bytes_max) return error.SlotContributionTooLarge;
-    if (!std.unicode.utf8ValidateSlice(update.text)) return error.InvalidSlotContributionText;
-    if (std.mem.indexOfScalar(u8, update.text, '\n') != null) return error.InvalidSlotContributionText;
-    if (std.mem.indexOfScalar(u8, update.text, '\r') != null) return error.InvalidSlotContributionText;
-}
 
 fn sortViews(items: []SlotView) void {
     var i: usize = 1;
