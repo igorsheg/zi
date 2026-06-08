@@ -216,7 +216,7 @@ pub fn copyToolResultMessages(
     const cloned = try allocator.alloc(ai.ToolResultMessage, source.len);
     var initialized: usize = 0;
     errdefer {
-        deinitToolResultMessageItems(allocator, cloned[0..initialized]);
+        for (cloned[0..initialized]) |message| deinitToolResultMessage(allocator, message);
         allocator.free(cloned);
     }
     for (source, cloned) |message, *out| {
@@ -231,10 +231,6 @@ pub fn deinitToolResultMessage(allocator: std.mem.Allocator, message: ai.ToolRes
     allocator.free(message.tool_name);
     deinitToolResultContentSlice(allocator, message.content);
     if (message.details) |details| runtime.freeJsonValue(allocator, details);
-}
-
-fn deinitToolResultMessageItems(allocator: std.mem.Allocator, messages: []const ai.ToolResultMessage) void {
-    for (messages) |message| deinitToolResultMessage(allocator, message);
 }
 
 pub fn copyAgentToolResult(allocator: std.mem.Allocator, source: AgentToolResult) !AgentToolResult {
