@@ -162,10 +162,6 @@ pub fn destroyPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LiveP
     self.session.destroyPromptRun(run);
 }
 
-pub fn continueRun(self: *AgentSessionRuntimeHost) !void {
-    try self.session.continueRun();
-}
-
 pub fn compactWithPreparedSummary(
     self: *AgentSessionRuntimeHost,
     summary: []const u8,
