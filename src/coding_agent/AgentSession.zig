@@ -551,11 +551,6 @@ fn forceSettlePromptRunForDestroy(self: *AgentSession, run: *LivePromptRun) void
     run.markSettled();
 }
 
-pub fn continueRun(self: *AgentSession) !void {
-    try self.ensureAcceptsIdleCommand();
-    try self.agent.continueRun();
-}
-
 fn compactWithSummary(
     self: *AgentSession,
     summary: []const u8,
@@ -1430,33 +1425,6 @@ test "agent session shutdown rejects new prompts" {
 
     try std.testing.expectEqual(AgentSessionStatus.stopped, session.status());
     try std.testing.expectError(error.SessionShuttingDown, session.prompt("blocked", &.{}));
-    try std.testing.expectError(error.SessionShuttingDown, session.continueRun());
-}
-
-test "agent session continue while running returns session busy" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-
-    try std.testing.expectError(error.SessionBusy, session.continueRun());
 }
 
 test "agent session shutdown while running stops after terminal event" {
