@@ -79,7 +79,7 @@ pub fn transcriptVisibleRowsWithReserved(height: u16, reserved_rows: usize) usiz
 
 pub fn statusRows(app: *app_mod.ProductApp) usize {
     return status_area.visibleRows(
-        app.slots.hasSlot(.status_area),
+        app.slots.count(.status_area) > 0,
         app.height,
         composerRows(app),
     );

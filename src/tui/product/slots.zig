@@ -147,10 +147,6 @@ pub const SlotStore = struct {
         return views[0];
     }
 
-    pub fn hasSlot(self: SlotStore, slot: SlotName) bool {
-        return self.count(slot) > 0;
-    }
-
     pub fn hasAnimated(self: SlotStore, slot: SlotName, tick: u64) bool {
         for (self.items[0..self.len]) |item| {
             if (item.slot != slot) continue;
