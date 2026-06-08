@@ -409,7 +409,13 @@ pub fn startPromptRun(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !*LivePromptRun {
-    try self.ensureAcceptsPrompt();
+    self.reconcileLifecycle();
+    switch (self.lifecycle) {
+        .accepting => {},
+        .cancel_requested => return error.SessionCancelling,
+        .shutdown_requested, .stopped => return error.SessionShuttingDown,
+    }
+    if (self.active_compaction_cancel_source != null) return error.SessionBusy;
     const preflight: PromptPreflight = .{
         .text = text,
         .images = images,
@@ -726,16 +732,6 @@ test "agent session public event enqueue sets coalesced wake" {
     var event = session.drainPublicEvent().?;
     defer event.deinit();
     try std.testing.expectEqual(agent_mod.AgentEvent.agent_start, event.agent_event.event);
-}
-
-fn ensureAcceptsPrompt(self: *AgentSession) Error!void {
-    self.reconcileLifecycle();
-    switch (self.lifecycle) {
-        .accepting => {},
-        .cancel_requested => return error.SessionCancelling,
-        .shutdown_requested, .stopped => return error.SessionShuttingDown,
-    }
-    if (self.active_compaction_cancel_source != null) return error.SessionBusy;
 }
 
 fn ensureAcceptsIdleCommand(self: *AgentSession) Error!void {
