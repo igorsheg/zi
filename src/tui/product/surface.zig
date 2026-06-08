@@ -35,29 +35,6 @@ pub const ModalCommand = union(enum) {
     previous,
 };
 
-pub const Modal = union(enum) {
-    confirm: Confirm,
-
-    pub fn deinit(self: *Modal, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .confirm => |*confirm| confirm.deinit(allocator),
-        }
-        self.* = undefined;
-    }
-
-    pub fn focusTarget(self: Modal) FocusTarget {
-        return switch (self) {
-            .confirm => |confirm| .{ .confirm = confirm.id },
-        };
-    }
-
-    pub fn apply(self: *Modal, command: ModalCommand) ?ConfirmResult {
-        return switch (self.*) {
-            .confirm => |*confirm| confirm.apply(command),
-        };
-    }
-};
-
 pub const Confirm = struct {
     id: ModalId,
     title: []u8,
@@ -154,20 +131,20 @@ fn validateText(bytes: []const u8, max: usize) !void {
 }
 
 test "confirm modal accepts cancels and toggles selection" {
-    var modal: Modal = .{ .confirm = try Confirm.init(std.testing.allocator, .{
+    var confirm = try Confirm.init(std.testing.allocator, .{
         .id = 1,
         .title = "Title",
         .body = "Body",
-    }) };
-    defer modal.deinit(std.testing.allocator);
+    });
+    defer confirm.deinit(std.testing.allocator);
 
-    try std.testing.expect((modal.apply(.{ .input = .{
+    try std.testing.expect((confirm.apply(.{ .input = .{
         .text = substrate.input.InlineBytes.from("n"),
     } })).?.accepted == false);
-    try std.testing.expect(modal.apply(.next) == null);
-    try std.testing.expect((modal.apply(.confirm)).?.accepted == false);
-    try std.testing.expect(modal.apply(.previous) == null);
-    try std.testing.expect((modal.apply(.confirm)).?.accepted == true);
+    try std.testing.expect(confirm.apply(.next) == null);
+    try std.testing.expect((confirm.apply(.confirm)).?.accepted == false);
+    try std.testing.expect(confirm.apply(.previous) == null);
+    try std.testing.expect((confirm.apply(.confirm)).?.accepted == true);
 }
 
 test "confirm modal rejects invalid open before allocation" {

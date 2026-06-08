@@ -62,7 +62,7 @@ fn drawShell(app: *app_mod.ProductApp, renderer: *infra.Renderer) !void {
         try drawStatusArea(app, renderer, composer_rows, status_rows);
         try drawComposer(app, renderer, composer_rows);
     }
-    if (app.modal) |modal| try drawModal(app, renderer, modal);
+    if (app.modal) |confirm| try drawConfirmModal(app, renderer, confirm);
 }
 
 pub fn transcriptVisibleRows(height: u16) usize {
@@ -241,12 +241,6 @@ pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u
         emitItemRowsNewestFirst(&sink, transcript.items.items[item_index], width, null);
     }
     return if (sink.total_emitted > visible_rows) sink.total_emitted - visible_rows else 0;
-}
-
-fn drawModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, modal: surface_mod.Modal) !void {
-    switch (modal) {
-        .confirm => |confirm| try drawConfirmModal(app, renderer, confirm),
-    }
 }
 
 fn drawConfirmModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, confirm: surface_mod.Confirm) !void {

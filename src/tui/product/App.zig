@@ -14,7 +14,7 @@ pub const ProductApp = struct {
     composer: composer_mod.ComposerBuffer = .{},
     transcript: transcript.TranscriptBuffer = .{},
     slots: slots_mod.SlotStore = .{},
-    modal: ?surface_mod.Modal = null,
+    modal: ?surface_mod.Confirm = null,
     focus: surface_mod.FocusTarget = .composer,
     transcript_scroll_rows: usize = 0,
     transcript_scroll_max_cache: usize = 0,
@@ -104,10 +104,10 @@ pub const ProductApp = struct {
             },
             .open_confirm => |open| {
                 if (self.modal != null) return error.ModalAlreadyOpen;
-                var modal: surface_mod.Modal = .{ .confirm = try surface_mod.Confirm.init(allocator, open) };
-                errdefer modal.deinit(allocator);
-                self.focus = modal.focusTarget();
-                self.modal = modal;
+                var confirm = try surface_mod.Confirm.init(allocator, open);
+                errdefer confirm.deinit(allocator);
+                self.focus = .{ .confirm = confirm.id };
+                self.modal = confirm;
                 self.dirty = true;
                 return null;
             },
