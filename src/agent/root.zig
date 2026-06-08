@@ -131,7 +131,10 @@ pub fn deinitAgentMessage(allocator: std.mem.Allocator, message: AgentMessage) v
     switch (message) {
         .user => |user| switch (user.content) {
             .string => |text| allocator.free(text),
-            .blocks => |blocks| deinitUserContentSlice(allocator, blocks),
+            .blocks => |blocks| {
+                deinitUserContentItems(allocator, blocks);
+                allocator.free(blocks);
+            },
         },
         .assistant => |assistant| ai.owned.deinitAssistantMessage(allocator, assistant),
         .tool_result => |tool_result| {
@@ -313,11 +316,6 @@ fn copyUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserCon
         initialized += 1;
     }
     return cloned;
-}
-
-fn deinitUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserContent) void {
-    deinitUserContentItems(allocator, source);
-    allocator.free(source);
 }
 
 fn deinitUserContentItems(allocator: std.mem.Allocator, source: []const ai.UserContent) void {
