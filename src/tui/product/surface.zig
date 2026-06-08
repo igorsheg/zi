@@ -7,8 +7,6 @@ pub const button_bytes_max: usize = 24;
 
 pub const ModalId = u32;
 
-pub const ConfirmChoice = enum { no, yes };
-
 pub const OpenConfirm = struct {
     id: ModalId,
     title: []const u8,
@@ -36,7 +34,7 @@ pub const Confirm = struct {
     body: []u8,
     yes_label: []u8,
     no_label: []u8,
-    selected: ConfirmChoice = .yes,
+    selected_yes: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, open: OpenConfirm) !Confirm {
         try validateOpen(open);
@@ -66,13 +64,10 @@ pub const Confirm = struct {
 
     pub fn apply(self: *Confirm, command: ModalCommand) ?ConfirmResult {
         switch (command) {
-            .confirm => return self.result(self.selected == .yes),
+            .confirm => return self.result(self.selected_yes),
             .cancel => return self.result(false),
             .next, .previous => {
-                self.selected = switch (self.selected) {
-                    .yes => .no,
-                    .no => .yes,
-                };
+                self.selected_yes = !self.selected_yes;
                 return null;
             },
             .input => |event| return self.applyInput(event),
@@ -83,13 +78,10 @@ pub const Confirm = struct {
         return switch (event) {
             .text => |bytes| self.applyText(bytes.slice()),
             .key => |key| switch (key) {
-                .enter => self.result(self.selected == .yes),
+                .enter => self.result(self.selected_yes),
                 .escape => self.result(false),
                 .arrow_left, .arrow_right, .tab, .backtab => blk: {
-                    self.selected = switch (self.selected) {
-                        .yes => .no,
-                        .no => .yes,
-                    };
+                    self.selected_yes = !self.selected_yes;
                     break :blk null;
                 },
                 .ctrl => |c| if (c == 0x03) self.result(false) else null,

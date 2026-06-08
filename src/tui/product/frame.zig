@@ -290,21 +290,21 @@ fn drawConfirmButtons(
     const yes = selectedLabel(
         &label_buffer,
         confirm.yes_label,
-        confirm.selected == .yes,
+        confirm.selected_yes,
     ) catch confirm.yes_label;
     var no_buffer: [surface_mod.button_bytes_max * 2 + 8]u8 = undefined;
     const no = selectedLabel(
         &no_buffer,
         confirm.no_label,
-        confirm.selected == .no,
+        !confirm.selected_yes,
     ) catch confirm.no_label;
     const yes_width = primitive.text.displayWidth(yes);
     const no_width = primitive.text.displayWidth(no);
     const total_width = yes_width + 2 + no_width;
     const centered_offset = (@as(usize, modal_width) -| total_width) / 2;
     const start = if (total_width < modal_width) x + @as(u16, @intCast(centered_offset)) else x + 2;
-    const yes_style = if (confirm.selected == .yes) app.theme.status_accent else app.theme.transcript_secondary;
-    const no_style = if (confirm.selected == .no) app.theme.status_accent else app.theme.transcript_secondary;
+    const yes_style = if (confirm.selected_yes) app.theme.status_accent else app.theme.transcript_secondary;
+    const no_style = if (!confirm.selected_yes) app.theme.status_accent else app.theme.transcript_secondary;
     try renderer.writeText(start, y, yes, yes_style);
     const no_x = @as(u16, @intCast(@min(
         @as(usize, std.math.maxInt(u16)),
