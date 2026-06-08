@@ -46,27 +46,15 @@ pub fn draw(
             try renderer.writeText(x, y, separator, theme.transcript_secondary);
             x = advance(x, sep_width);
         }
-        x = try drawContribution(renderer, theme, x, y, text, view, tick);
+        x = switch (view.effect) {
+            .none => blk: {
+                try renderer.writeText(x, y, text, theme.transcript_secondary);
+                break :blk advance(x, primitive.text.displayWidth(text));
+            },
+            .shimmer => try shimmer.writeSmooth(renderer, x, y, text, tick / 3, shimmerConfig(theme), 48),
+        };
         rendered_any = true;
     }
-}
-
-fn drawContribution(
-    renderer: *infra.Renderer,
-    theme: theme_mod.Theme,
-    x: u16,
-    y: u16,
-    text: []const u8,
-    view: slots.SlotView,
-    tick: u64,
-) !u16 {
-    return switch (view.effect) {
-        .none => blk: {
-            try renderer.writeText(x, y, text, theme.transcript_secondary);
-            break :blk advance(x, primitive.text.displayWidth(text));
-        },
-        .shimmer => try shimmer.writeSmooth(renderer, x, y, text, tick / 3, shimmerConfig(theme), 48),
-    };
 }
 
 fn shimmerConfig(theme: theme_mod.Theme) shimmer.Config {
