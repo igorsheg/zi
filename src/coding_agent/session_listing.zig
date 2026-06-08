@@ -167,3 +167,157 @@ fn isSessionLeafName(file_name: []const u8) bool {
 fn newerSessionFile(_: void, left: []const u8, right: []const u8) bool {
     return std.mem.order(u8, left, right) == .gt;
 }
+
+fn createSessionListingTestDirs(dir: std.Io.Dir) !void {
+    try dir.createDirPath(std.testing.io, "agent");
+    try dir.createDirPath(std.testing.io, "repo");
+}
+
+fn writeSessionListingTestFile(dir: std.Io.Dir, file_name: []const u8) !void {
+    try dir.createDirPath(std.testing.io, "agent/sessions/--repo--");
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "agent/sessions/--repo--/{s}", .{file_name});
+    try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "{}\n" });
+}
+
+test "session listing returns resumable leaf names newest first" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createSessionListingTestDirs(tmp.dir);
+    try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl");
+    try writeSessionListingTestFile(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl");
+
+    var list = try listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+    });
+    defer list.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), list.file_names.len);
+    try std.testing.expect(!list.truncated);
+    try std.testing.expectEqualStrings("2026-05-28T00:00:00Z_second.jsonl", list.file_names[0]);
+    try std.testing.expectEqualStrings("2026-05-27T00:00:00Z_first.jsonl", list.file_names[1]);
+}
+
+test "session listing is bounded and ignores non session files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeSessionListingTestFile(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl");
+    try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/sessions/--repo--/notes.txt",
+        .data = "ignore",
+    });
+
+    var list = try listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .max_sessions = 1,
+    });
+    defer list.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), list.file_names.len);
+    try std.testing.expect(list.truncated);
+    try std.testing.expect(std.mem.endsWith(u8, list.file_names[0], ".jsonl"));
+}
+
+test "session listing returns empty when session directory is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createSessionListingTestDirs(tmp.dir);
+
+    var list = try listRuntimeSessions(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+    });
+    defer list.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), list.file_names.len);
+    try std.testing.expect(!list.truncated);
+}
+
+test "session selection accepts explicit resumable leaf name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createSessionListingTestDirs(tmp.dir);
+    try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_session.jsonl");
+
+    const selected = (try selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .explicit_file_name = "2026-05-27T00:00:00Z_session.jsonl",
+    })).?;
+    defer std.testing.allocator.free(selected);
+
+    try std.testing.expectEqualStrings("2026-05-27T00:00:00Z_session.jsonl", selected);
+}
+
+test "session selection chooses newest only from complete listing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createSessionListingTestDirs(tmp.dir);
+    try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl");
+    try writeSessionListingTestFile(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl");
+
+    const selected = (try selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+    })).?;
+    defer std.testing.allocator.free(selected);
+
+    try std.testing.expectEqualStrings("2026-05-28T00:00:00Z_second.jsonl", selected);
+}
+
+test "session selection rejects traversal and reports absent sessions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createSessionListingTestDirs(tmp.dir);
+
+    try std.testing.expectError(
+        error.InvalidSessionFileName,
+        selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+            .cwd = "repo",
+            .agent_dir_override = "agent",
+            .dir = tmp.dir,
+            .explicit_file_name = "../outside.jsonl",
+        }),
+    );
+
+    const selected = try selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .explicit_file_name = "2026-05-27T00:00:00Z_missing.jsonl",
+    });
+
+    try std.testing.expect(selected == null);
+}
+
+test "session selection fails when newest listing is truncated" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl");
+    try writeSessionListingTestFile(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl");
+
+    try std.testing.expectError(
+        error.SessionListTruncated,
+        selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+            .cwd = "repo",
+            .agent_dir_override = "agent",
+            .dir = tmp.dir,
+            .max_sessions = 1,
+        }),
+    );
+}
