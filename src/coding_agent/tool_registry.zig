@@ -20,7 +20,7 @@ const WriteTool = write_tool.WriteTool;
 
 const max_tool_definitions = 64;
 const max_active_tools = 64;
-pub const builtin_tool_count = default_active_tool_names.len;
+const builtin_tool_count = default_active_tool_names.len;
 pub const default_active_tool_names: []const []const u8 = &.{ "read", "ls", "grep", "find", "bash", "edit", "write" };
 
 const read_description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit. " ++

@@ -480,7 +480,7 @@ test "runtime host owns current agent session public boundary" {
 
     try std.testing.expect(host.session.statusSnapshot().public_event_count > 0);
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
-    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), host.session.tools.activeToolNames().len);
+    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, host.session.tools.activeToolNames().len);
 }
 
 test "runtime host persists run messages before frontend drains public events" {

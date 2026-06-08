@@ -1245,8 +1245,8 @@ test "agent session initializes policy spine with definition-first builtin tools
     });
     defer shutdownAndDeinit(&session);
 
-    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.tools.definitions.items.len);
-    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.agent.state.tools.len);
+    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.tools.definitions.items.len);
+    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.agent.state.tools.len);
     try std.testing.expectEqualStrings("read", session.tools.activeToolNames()[0]);
     try std.testing.expectEqualStrings("bash", session.tools.activeToolNames()[4]);
     try std.testing.expectEqualStrings("bash", session.agent.state.tools[4].name);
@@ -1868,7 +1868,7 @@ test "agent session snapshots expose status and active tool read models" {
     try std.testing.expectEqual(@as(usize, 1), status_snapshot.public_event_count);
     try std.testing.expectEqual(@as(usize, 1), status_snapshot.dropped_public_event_count);
 
-    try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), session.tools.activeToolNames().len);
+    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.tools.activeToolNames().len);
 }
 
 test "agent session public event queue overflow is explicit" {
