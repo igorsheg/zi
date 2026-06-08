@@ -113,27 +113,6 @@ pub fn startPromptStream(
     } };
 }
 
-pub fn startContinueStream(
-    stream: *AgentEventStream,
-    allocator: std.mem.Allocator,
-    zio_runtime: *runtime.Runtime,
-    context: agent.AgentContext,
-    config: agent.AgentLoopConfig,
-    token: runtime.CancelToken,
-    buffer: []agent.AgentEvent,
-) void {
-    const stream_io = zio_runtime.io();
-    stream.* = AgentEventStream.init(allocator, buffer);
-    stream.producer = .{ .running = zio_runtime.spawn(
-        runContinueStreamProducer,
-        .{ allocator, stream_io, context, config, token, zio_runtime, stream },
-    ) catch |err| {
-        stream.pipe.sink().abort();
-        stream.producer = .{ .spawn_failed = err };
-        return;
-    } };
-}
-
 fn runPromptStreamProducer(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -145,21 +124,6 @@ fn runPromptStreamProducer(
     stream: *AgentEventStream,
 ) anyerror!void {
     runPrompt(allocator, io, prompts, context, config, token, zio_runtime, streamSink(stream)) catch |err| {
-        stream.pipe.sink().abort();
-        return err;
-    };
-}
-
-fn runContinueStreamProducer(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    context: agent.AgentContext,
-    config: agent.AgentLoopConfig,
-    token: runtime.CancelToken,
-    zio_runtime: *runtime.Runtime,
-    stream: *AgentEventStream,
-) anyerror!void {
-    runContinue(allocator, io, context, config, token, zio_runtime, streamSink(stream)) catch |err| {
         stream.pipe.sink().abort();
         return err;
     };
