@@ -77,10 +77,6 @@ pub fn deinit(self: *AgentSessionRuntimeHost) void {
     self.* = undefined;
 }
 
-pub fn sessionHeader(self: *const AgentSessionRuntimeHost) session_manager.SessionHeader {
-    return self.session.manager.header;
-}
-
 pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !ReplaceResult {
     if (self.session.statusSnapshot().status != .idle) return error.SessionReplacementRequiresIdle;
 
@@ -363,7 +359,7 @@ test "runtime host replacement drains old public events before new session" {
     } });
 
     try std.testing.expect(result.discarded_public_event_count > 0);
-    try std.testing.expectEqualStrings("second", host.sessionHeader().id);
+    try std.testing.expectEqualStrings("second", host.session.manager.header.id);
     try std.testing.expectEqual(@as(usize, 0), host.session.statusSnapshot().public_event_count);
 }
 
@@ -398,7 +394,7 @@ test "runtime host new session replaces current session" {
     } });
 
     try std.testing.expectEqual(@as(usize, 0), result.discarded_public_event_count);
-    try std.testing.expectEqualStrings("second", host.sessionHeader().id);
+    try std.testing.expectEqualStrings("second", host.session.manager.header.id);
 }
 
 test "runtime host zio runtime accessor returns explicit session runtime" {
@@ -461,7 +457,7 @@ test "runtime host replacement rejects active old session" {
         .session_id = "second",
         .timestamp = "2026-05-26T00:00:01Z",
     } }));
-    try std.testing.expectEqualStrings("first", host.sessionHeader().id);
+    try std.testing.expectEqualStrings("first", host.session.manager.header.id);
 }
 
 test "runtime host owns current agent session public boundary" {
@@ -566,7 +562,7 @@ test "runtime host preserves session header active leaf and context after public
     const first_leaf = (try host.session.manager.getLeafEntry()).?.id();
     try runPromptForTest(&host, "second");
 
-    const header = host.sessionHeader();
+    const header = host.session.manager.header;
     try std.testing.expectEqualStrings("session", header.id);
     try std.testing.expectEqualStrings("repo", header.cwd);
     try std.testing.expectEqualStrings("2026-05-26T00:00:00Z", header.timestamp);
@@ -716,7 +712,7 @@ test "runtime host resumes session store into agent context and appends new hist
             host.deinit();
         }
 
-        try std.testing.expectEqualStrings("session", host.sessionHeader().id);
+        try std.testing.expectEqualStrings("session", host.session.manager.header.id);
         try std.testing.expectEqual(@as(usize, 2), host.session.agent.state.messages.len);
         try std.testing.expectEqualStrings("seed", host.session.agent.state.messages[0].user.content.string);
         try runPromptForTest(&host, "after resume");

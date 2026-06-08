@@ -121,7 +121,7 @@ fn writeSessionHeader(
     host: *AgentSessionRuntimeHost,
     stdout: *std.Io.Writer,
 ) !void {
-    try writeJsonSessionHeader(host.sessionHeader(), stdout);
+    try writeJsonSessionHeader(host.session.manager.header, stdout);
 }
 
 fn writeJsonSessionHeader(
