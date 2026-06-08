@@ -2,7 +2,6 @@ const std = @import("std");
 const infra = @import("../infra/root.zig");
 const primitive = @import("../primitive/root.zig");
 const shimmer = @import("shimmer.zig");
-const shuffle_text = @import("shuffle_text.zig");
 const slots = @import("slots.zig");
 const theme_mod = @import("theme.zig");
 
@@ -65,13 +64,6 @@ fn drawContribution(
         .none => blk: {
             try renderer.writeText(x, y, text, theme.transcript_secondary);
             break :blk advance(x, primitive.text.displayWidth(text));
-        },
-        .shuffle_text => blk: {
-            var buffer: [slots.contribution_text_bytes_max]u8 = undefined;
-            const local_tick = tick -| view.animation_start_tick;
-            const projected = shuffle_text.project(&buffer, text, local_tick / 2, view.owner ^ view.id);
-            try renderer.writeText(x, y, projected, theme.status_accent);
-            break :blk advance(x, primitive.text.displayWidth(projected));
         },
         .shimmer => try shimmer.writeSmooth(renderer, x, y, text, tick / 3, shimmerConfig(theme), 48),
     };

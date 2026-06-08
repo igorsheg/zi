@@ -89,7 +89,7 @@ pub const ProductApp = struct {
             .animation_tick => |tick| {
                 if (tick != self.animation_tick) {
                     self.animation_tick = tick;
-                    if (self.slots.hasAnimated(.status_area, tick)) self.dirty = true;
+                    if (self.slots.hasAnimated(.status_area)) self.dirty = true;
                 }
                 return null;
             },

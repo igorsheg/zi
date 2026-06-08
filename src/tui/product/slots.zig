@@ -1,6 +1,4 @@
 const std = @import("std");
-const shuffle_text = @import("shuffle_text.zig");
-
 pub const contribution_count_max: usize = 16;
 pub const contribution_text_bytes_max: usize = 160;
 pub const composer_border_slot_count_max: usize = 1;
@@ -17,7 +15,6 @@ pub const SlotName = enum {
 pub const RenderEffect = enum {
     none,
     shimmer,
-    shuffle_text,
 };
 
 pub const ContributionId = u32;
@@ -147,13 +144,12 @@ pub const SlotStore = struct {
         return views[0];
     }
 
-    pub fn hasAnimated(self: SlotStore, slot: SlotName, tick: u64) bool {
+    pub fn hasAnimated(self: SlotStore, slot: SlotName) bool {
         for (self.items[0..self.len]) |item| {
             if (item.slot != slot) continue;
             switch (item.effect) {
                 .none => {},
                 .shimmer => return true,
-                .shuffle_text => if (tick -| item.animation_start_tick <= shuffle_text.reveal_ticks * 2) return true,
             }
         }
         return false;
@@ -255,9 +251,9 @@ test "slot store tracks animated status contributions" {
         .text = "working",
         .effect = .shimmer,
     });
-    try std.testing.expect(slots.hasAnimated(.status_area, 100));
+    try std.testing.expect(slots.hasAnimated(.status_area));
     try std.testing.expect(slots.clearOwner(std.testing.allocator, 1));
-    try std.testing.expect(!slots.hasAnimated(.status_area, 100));
+    try std.testing.expect(!slots.hasAnimated(.status_area));
 }
 
 test "slot store rejects invalid text before mutation" {

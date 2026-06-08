@@ -101,4 +101,8 @@ Useful first probes:
 - Split giant files only if the split removes coupling. Moving code without simplifying is not a win.
 
 ## What's Been Tried
-Fresh Andrew Kelley loop created from the old builtin-tool-parity autoresearch artifacts. No simplification experiments have been logged in this session yet.
+- Replaced internal agent state-machine panics/unreachable prompt-token unwraps with `std.debug.assert` preconditions where the failure is programmer misuse, not operational input.
+- Deleted a one-caller `SlotStore.hasSlot` helper; status row visibility now uses the existing slot count directly.
+- Collapsed the single-variant TUI modal wrapper into direct `Confirm` ownership, then removed duplicate focus state derived from modal presence.
+- Simplified confirm modal state: fixed Yes/No labels are current behavior, and selection is a direct `selected_yes` field.
+- Found `shuffle_text` status effect had no current setter. First deletion attempt failed checks because `hasAnimated` kept an unused tick parameter; retry removes the parameter too.
