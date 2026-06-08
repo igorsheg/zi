@@ -318,16 +318,6 @@ const BashLimitObservation = struct {
     }
 };
 
-fn waitForBashToolStart(host: *AgentSessionRuntimeHost, observed: *BashLimitObservation) !void {
-    const yield_count_max = 1024;
-    for (0..yield_count_max) |_| {
-        _ = try host.drainPublicEvents(.{ .context = observed, .call_fn = BashLimitObservation.onEvent });
-        if (observed.tool_execution_start) return;
-        try runtime.yield();
-    }
-    return error.BashToolStartNotObserved;
-}
-
 test "runtime host replacement drains old public events before new session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1100,7 +1090,11 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
     var future = try zio_runtime.spawn(runPromptForTest, .{ &host, "use bash" });
     defer future.cancel();
     var observed: BashLimitObservation = .{};
-    try waitForBashToolStart(&host, &observed);
+    for (0..1024) |_| {
+        _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });
+        if (observed.tool_execution_start) break;
+        try runtime.yield();
+    } else return error.BashToolStartNotObserved;
     try std.testing.expectEqual(AgentSession.AgentSessionStatus.running, host.session.statusSnapshot().status);
     host.cancel();
 
