@@ -102,10 +102,6 @@ pub const PromptOptions = struct {
 pub const RetrySettings = struct {
     enabled: bool = false,
     max_attempts: u8 = 1,
-
-    pub fn validate(self: RetrySettings) error{RetrySettingsOutOfBounds}!void {
-        if (self.max_attempts > max_auto_retry_attempts_limit) return error.RetrySettingsOutOfBounds;
-    }
 };
 
 const ManualCompactionRequest = union(enum) {
@@ -386,7 +382,7 @@ fn promptWithOptionsInternal(
     retry_overflow: bool,
     retry_transient: bool,
 ) anyerror!void {
-    try self.retry_settings.validate();
+    if (self.retry_settings.max_attempts > max_auto_retry_attempts_limit) return error.RetrySettingsOutOfBounds;
     const context_overflow_count_before = self.event_drain.context_overflow_count;
     const run = self.startPromptRun(text, images, options) catch |err| switch (err) {
         error.PromptCommandCannotStartLiveRun, error.PromptQueuedCannotStartLiveRun => return,
