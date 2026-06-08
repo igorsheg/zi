@@ -507,7 +507,8 @@ fn applyPromptRunEvent(self: *AgentSession, run: *LivePromptRun, event: agent_mo
 }
 
 fn finishPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
-    const token = run.terminalToken() orelse unreachable;
+    std.debug.assert(run.isActive());
+    const token = run.terminalToken().?;
     run.stream.awaitProducer() catch |err| {
         try self.settlePromptRunFailure(run, token, @errorName(err));
         return err;
