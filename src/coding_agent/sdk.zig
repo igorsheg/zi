@@ -219,7 +219,7 @@ test "sdk runtime owns services before host and deinitializes in order" {
 
     try std.testing.expectEqualStrings("repo", runtime.services.cwd);
     try std.testing.expectEqualStrings(runtime.services.cwd, runtime.host.base.cwd);
-    try std.testing.expectEqualStrings("session", runtime.host.sessionId());
+    try std.testing.expectEqualStrings("session", runtime.host.sessionHeader().id);
 }
 
 test "sdk runtime creates session store under service session path" {

@@ -85,10 +85,6 @@ pub fn sessionHeader(self: *const AgentSessionRuntimeHost) session_manager.Sessi
     return self.session.manager.header;
 }
 
-pub fn sessionId(self: *const AgentSessionRuntimeHost) []const u8 {
-    return self.session.manager.header.id;
-}
-
 pub fn findToolMetadata(self: *const AgentSessionRuntimeHost, name: []const u8) ?tool_registry.ToolMetadata {
     const definition = self.session.tools.findDefinition(name) orelse return null;
     return definition.metadata;
@@ -443,7 +439,7 @@ test "runtime host replacement drains old public events before new session" {
     } });
 
     try std.testing.expect(result.discarded_public_event_count > 0);
-    try std.testing.expectEqualStrings("second", host.sessionId());
+    try std.testing.expectEqualStrings("second", host.sessionHeader().id);
     try std.testing.expectEqual(@as(usize, 0), host.statusSnapshot().public_event_count);
 }
 
@@ -478,7 +474,7 @@ test "runtime host new session replaces current session" {
     } });
 
     try std.testing.expectEqual(@as(usize, 0), result.discarded_public_event_count);
-    try std.testing.expectEqualStrings("second", host.sessionId());
+    try std.testing.expectEqualStrings("second", host.sessionHeader().id);
 }
 
 test "runtime host zio runtime accessor returns explicit session runtime" {
@@ -541,7 +537,7 @@ test "runtime host replacement rejects active old session" {
         .session_id = "second",
         .timestamp = "2026-05-26T00:00:01Z",
     } }));
-    try std.testing.expectEqualStrings("first", host.sessionId());
+    try std.testing.expectEqualStrings("first", host.sessionHeader().id);
 }
 
 test "runtime host owns current agent session public boundary" {
