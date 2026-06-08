@@ -33,26 +33,26 @@ pub const BaseOptions = struct {
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
 };
 
-pub const SessionStart = union(enum) {
+const SessionStart = union(enum) {
     create: Create,
     @"resume": Resume,
 
-    pub const Create = struct {
+    const Create = struct {
         session_id: []const u8,
         timestamp: []const u8,
         session_store: ?session_store.SessionStore = null,
     };
 
-    pub const Resume = struct {
+    const Resume = struct {
         resume_session_store: session_store.SessionStore,
     };
 };
 
-pub const ReplaceResult = struct {
+const ReplaceResult = struct {
     discarded_public_event_count: usize,
 };
 
-pub const PublicEventHandler = struct {
+const PublicEventHandler = struct {
     context: ?*anyopaque = null,
     call_fn: *const fn (context: ?*anyopaque, event: session_events.AgentSessionEvent) anyerror!void,
 };
