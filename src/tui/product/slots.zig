@@ -89,20 +89,6 @@ pub const SlotStore = struct {
         return true;
     }
 
-    pub fn clearOwner(self: *SlotStore, allocator: std.mem.Allocator, owner: OwnerId) bool {
-        var removed = false;
-        var index: usize = 0;
-        while (index < self.len) {
-            if (self.items[index].owner == owner) {
-                self.removeAt(allocator, index);
-                removed = true;
-                continue;
-            }
-            index += 1;
-        }
-        return removed;
-    }
-
     pub fn count(self: SlotStore, slot: SlotName) usize {
         var n: usize = 0;
         for (self.items[0..self.len]) |item| {
@@ -222,7 +208,7 @@ test "slot store sets replaces clears and bounds contributions" {
 
     try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 7 }));
     try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_top_right));
-    try std.testing.expect(slots.clearOwner(std.testing.allocator, 7));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 7 }));
     try std.testing.expectEqual(@as(usize, 0), slots.len);
 }
 
@@ -238,7 +224,7 @@ test "slot store tracks animated status contributions" {
         .effect = .shimmer,
     });
     try std.testing.expect(slots.hasAnimated(.status_area));
-    try std.testing.expect(slots.clearOwner(std.testing.allocator, 1));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .status_area, .id = 1, .owner = 1 }));
     try std.testing.expect(!slots.hasAnimated(.status_area));
 }
 

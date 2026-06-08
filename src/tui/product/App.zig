@@ -95,10 +95,6 @@ pub const ProductApp = struct {
                 if (self.slots.clear(allocator, clear)) self.dirty = true;
                 return null;
             },
-            .clear_slot_owner => |owner| {
-                if (self.slots.clearOwner(allocator, owner)) self.dirty = true;
-                return null;
-            },
             .open_confirm => |open| {
                 if (self.modal != null) return error.ModalAlreadyOpen;
                 var confirm = try surface_mod.Confirm.init(allocator, open);
@@ -233,7 +229,6 @@ pub const Command = union(enum) {
     open_confirm: surface_mod.OpenConfirm,
     modal: surface_mod.ModalCommand,
     clear_slot_contribution: slots_mod.ClearContribution,
-    clear_slot_owner: slots_mod.OwnerId,
 };
 
 pub const ToolOutputDelta = struct {
@@ -504,6 +499,10 @@ test "product app applies slot contributions atomically" {
     try std.testing.expect(!app.dirty);
     try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_right));
 
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .clear_slot_owner = 9 }) == null);
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .clear_slot_contribution = .{
+        .slot = .composer_top_right,
+        .id = 1,
+        .owner = 9,
+    } }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.slots.count(.composer_top_right));
 }
