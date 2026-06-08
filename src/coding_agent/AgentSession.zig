@@ -108,11 +108,6 @@ pub const RetrySettings = struct {
     }
 };
 
-const PromptRetryPolicy = struct {
-    overflow: bool = true,
-    transient: bool = true,
-};
-
 const ManualCompactionRequest = union(enum) {
     explicit: Explicit,
     prepared: Prepared,
@@ -380,7 +375,7 @@ pub fn promptWithOptions(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) !void {
-    try self.promptWithOptionsInternal(text, images, options, .{});
+    try self.promptWithOptionsInternal(text, images, options, true, true);
 }
 
 fn promptWithOptionsInternal(
@@ -388,7 +383,8 @@ fn promptWithOptionsInternal(
     text: []const u8,
     images: []const ai.ImageContent,
     options: PromptOptions,
-    retry_policy: PromptRetryPolicy,
+    retry_overflow: bool,
+    retry_transient: bool,
 ) anyerror!void {
     try self.retry_settings.validate();
     const context_overflow_count_before = self.event_drain.context_overflow_count;
@@ -398,13 +394,13 @@ fn promptWithOptionsInternal(
     };
     defer self.destroyPromptRun(run);
     while (try self.stepPromptRun(run)) {}
-    const compacted = if (retry_policy.overflow)
+    const compacted = if (retry_overflow)
         try self.checkPostPromptOverflowCompaction(context_overflow_count_before, true)
     else
         false;
-    if (compacted and retry_policy.overflow) {
+    if (compacted and retry_overflow) {
         try self.retryPromptAfterOverflowCompaction(text, images, options);
-    } else if (retry_policy.transient) {
+    } else if (retry_transient) {
         if (self.latestRetryableAssistantError()) |error_message| {
             try self.retryPromptAfterRetryableError(text, images, options, error_message);
         }
@@ -1157,7 +1153,7 @@ fn retryPromptAfterOverflowCompaction(
     } });
     retry_start_owns_error_message = false;
 
-    self.promptWithOptionsInternal(text, images, options, .{ .overflow = false, .transient = false }) catch |err| {
+    self.promptWithOptionsInternal(text, images, options, false, false) catch |err| {
         const final_error = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
             .success = false,
