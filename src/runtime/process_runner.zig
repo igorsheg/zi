@@ -301,19 +301,6 @@ fn completeProcessWait(
     return completed_term;
 }
 
-fn terminateAndWaitForProcess(
-    zio_runtime: *Runtime,
-    child: *std.process.Child,
-    process_wait: *zio.JoinHandle(ProcessWaitResult),
-    termination_grace_ms: u64,
-) !void {
-    const process_id = child.id;
-    requestChildTermination(process_id, .graceful);
-    var kill_after_grace = try zio_runtime.spawn(killAfterGrace, .{ process_id, termination_grace_ms });
-    defer kill_after_grace.cancel();
-    _ = try process_wait.join();
-}
-
 fn terminateAndDrainProcess(
     zio_runtime: *Runtime,
     child: *std.process.Child,
@@ -324,7 +311,11 @@ fn terminateAndDrainProcess(
     stderr_reader: *zio.JoinHandle(void),
 ) !void {
     std.debug.assert(process_wait_state.* == .active);
-    try terminateAndWaitForProcess(zio_runtime, child, process_wait, termination_grace_ms);
+    const process_id = child.id;
+    requestChildTermination(process_id, .graceful);
+    var kill_after_grace = try zio_runtime.spawn(killAfterGrace, .{ process_id, termination_grace_ms });
+    defer kill_after_grace.cancel();
+    _ = try process_wait.join();
     process_wait_state.* = .drained;
     stdout_reader.cancel();
     stderr_reader.cancel();
