@@ -587,7 +587,7 @@ const InteractiveLoop = struct {
 
     fn startPrompt(self: *InteractiveLoop, text: []const u8) !PromptSubmitResult {
         if (self.active_run != null) {
-            self.host.queuePrompt(text) catch |err| {
+            self.host.session.promptWithOptions(text, &.{}, .{ .streaming_behavior = .steer }) catch |err| {
                 _ = self.terminal_loop.applyCommand(.{ .insert_composer_text = text }) catch null;
                 try self.appendOperationalStatus(@errorName(err));
                 return .rejected;
