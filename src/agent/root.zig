@@ -117,7 +117,7 @@ pub fn copyAgentMessages(allocator: std.mem.Allocator, source: []const AgentMess
     const cloned = try allocator.alloc(AgentMessage, source.len);
     var initialized: usize = 0;
     errdefer {
-        deinitAgentMessageItems(allocator, cloned[0..initialized]);
+        for (cloned[0..initialized]) |message| deinitAgentMessage(allocator, message);
         allocator.free(cloned);
     }
     for (source, cloned) |message, *out| {
@@ -145,10 +145,6 @@ pub fn deinitAgentMessage(allocator: std.mem.Allocator, message: AgentMessage) v
             runtime.freeJsonValue(allocator, custom.payload);
         },
     }
-}
-
-fn deinitAgentMessageItems(allocator: std.mem.Allocator, messages: []const AgentMessage) void {
-    for (messages) |message| deinitAgentMessage(allocator, message);
 }
 
 pub const AgentToolResult = struct {
