@@ -671,7 +671,7 @@ const InteractiveLoop = struct {
         const readable = runtime.ReadableFd.initBorrowed(self.terminal_loop.inputFd());
         var input = readable.asyncReadable();
         var frame = runtime.Timeout.fromMilliseconds(frame_interval_ms);
-        var public_event_wake = self.host.publicEventWake();
+        var public_event_wake = self.host.session.publicEventWake();
         if (self.active_run) |prompt_run| {
             var progress = self.host.promptRunProgress(prompt_run);
             switch (try runtime.select(.{
