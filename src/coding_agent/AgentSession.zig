@@ -16,9 +16,9 @@ const tool_registry = @import("tool_registry.zig");
 const AgentSession = @This();
 
 pub const public_event_capacity_default = 256;
-pub const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 4096;
-pub const max_auto_retry_attempts_limit = 8;
-pub const live_prompt_event_capacity_count = 64;
+const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 4096;
+const max_auto_retry_attempts_limit = 8;
+const live_prompt_event_capacity_count = 64;
 
 fn classifyToolResultAfterCall(
     _: ?*anyopaque,
@@ -87,7 +87,7 @@ pub const Options = struct {
     zio_runtime: *runtime.Runtime,
 };
 
-pub const StreamingBehavior = enum {
+const StreamingBehavior = enum {
     steer,
     follow_up,
 };
@@ -177,7 +177,7 @@ const RuntimeStatusSnapshot = struct {
     context_overflow_count: usize,
 };
 
-pub const Error = error{
+const Error = error{
     SessionBusy,
     SessionCancelling,
     SessionShuttingDown,
