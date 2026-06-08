@@ -135,11 +135,32 @@ const ManualCompactionRequest = union(enum) {
 };
 
 pub const LivePromptRun = struct {
-    token: runtime.CancelToken,
+    state: State = .settled,
     stream: agent_mod.loop.AgentEventStream = undefined,
     buffer: [live_prompt_event_capacity_count]agent_mod.AgentEvent = undefined,
     prompts: [1]agent_mod.AgentMessage = undefined,
-    active: bool = false,
+
+    const State = union(enum) {
+        running: runtime.CancelToken,
+        settled,
+    };
+
+    fn runningToken(self: *const LivePromptRun) ?runtime.CancelToken {
+        return switch (self.state) {
+            .running => |token| token,
+            .settled => null,
+        };
+    }
+
+    fn markRunning(self: *LivePromptRun, token: runtime.CancelToken) void {
+        std.debug.assert(self.state == .settled);
+        self.state = .{ .running = token };
+    }
+
+    fn markSettled(self: *LivePromptRun) void {
+        std.debug.assert(self.state == .running);
+        self.state = .settled;
+    }
 };
 
 pub const AgentSessionStatus = enum {
@@ -409,9 +430,9 @@ pub fn startLivePromptRun(
 fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight) !*LivePromptRun {
     const run = try self.allocator.create(LivePromptRun);
     errdefer self.allocator.destroy(run);
-    run.* = .{ .token = undefined };
+    run.* = .{};
     run.prompts[0] = try self.agent.userMessageFromText(preflight.text, preflight.images);
-    run.token = try self.agent.beginRun();
+    const token = try self.agent.beginRun();
     errdefer self.agent.finishRun();
     agent_mod.loop.startPromptStream(
         &run.stream,
@@ -424,15 +445,15 @@ fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight
             .tools = self.agent.state.tools,
         },
         self.agent.loop_config,
-        run.token,
+        token,
         &run.buffer,
     );
-    run.active = true;
+    run.markRunning(token);
     return run;
 }
 
 pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
-    if (!run.active) return false;
+    if (run.runningToken() == null) return false;
     if (try run.stream.next()) |event| {
         return self.applyPromptRunEvent(run, event);
     }
@@ -440,7 +461,7 @@ pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
 }
 
 pub fn drainPromptRunReady(self: *AgentSession, run: *LivePromptRun) !?bool {
-    if (!run.active) return false;
+    if (run.runningToken() == null) return false;
     return switch (run.stream.poll()) {
         .event => |event| try self.applyPromptRunEvent(run, event),
         .terminal => try self.finishPromptRun(run),
@@ -457,32 +478,33 @@ pub fn applyPromptRunProgress(
     run: *LivePromptRun,
     progress: @TypeOf(run.stream.asyncNext()).Result,
 ) !bool {
-    if (!run.active) return false;
+    if (run.runningToken() == null) return false;
     const event = progress orelse return self.finishPromptRun(run);
     return self.applyPromptRunEvent(run, event);
 }
 
 fn applyPromptRunEvent(self: *AgentSession, run: *LivePromptRun, event: agent_mod.AgentEvent) !bool {
-    std.debug.assert(run.active);
+    std.debug.assert(run.runningToken() != null);
+    defer agent_mod.loop.deinitStreamEvent(self.allocator, event);
     try self.agent.emitEvent(event);
     return true;
 }
 
 fn finishPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
-    std.debug.assert(run.active);
+    const token = run.runningToken() orelse unreachable;
     run.stream.awaitProducer() catch |err| {
-        try self.agent.failRun(run.token, @errorName(err));
+        try self.agent.failRun(token, @errorName(err));
         self.agent.finishRun();
-        run.active = false;
+        run.markSettled();
         return err;
     };
     self.agent.finishRun();
-    run.active = false;
+    run.markSettled();
     return false;
 }
 
 pub fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
-    if (run.active) {
+    if (run.runningToken() != null) {
         // Cancellation is cleanup. The producer may finish with its own error
         // while being drained; the invariant here is that ownership is settled.
         run.stream.cancelProducer() catch |err| {
@@ -490,7 +512,7 @@ pub fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
             _ = ignored_cleanup_error;
         };
         self.agent.finishRun();
-        run.active = false;
+        run.markSettled();
     }
     run.stream.deinit();
     self.allocator.destroy(run);

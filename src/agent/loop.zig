@@ -20,7 +20,6 @@ pub const AgentEventStreamPoll = AgentEventPipe.Stream.Poll;
 pub const AgentEventStream = struct {
     allocator: std.mem.Allocator,
     pipe: AgentEventPipe,
-    event_arena: std.heap.ArenaAllocator,
     producer: Producer = .settled,
 
     const Producer = union(enum) {
@@ -33,13 +32,13 @@ pub const AgentEventStream = struct {
         return .{
             .allocator = allocator,
             .pipe = AgentEventPipe.init(buffer),
-            .event_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *AgentEventStream) void {
         std.debug.assert(self.producer == .settled);
-        self.event_arena.deinit();
+        self.discardPendingEvents();
+        if (self.result()) |messages| deinitStreamMessages(self.allocator, messages);
         self.* = undefined;
     }
 
@@ -85,6 +84,15 @@ pub const AgentEventStream = struct {
                 return err;
             },
             .settled => {},
+        }
+    }
+
+    fn discardPendingEvents(self: *AgentEventStream) void {
+        while (true) {
+            switch (self.pipe.stream().poll()) {
+                .event => |event| deinitStreamEvent(self.allocator, event),
+                .empty, .terminal => return,
+            }
         }
     }
 };
@@ -175,28 +183,28 @@ fn copyTerminalMessages(
     messages: []const agent.AgentMessage,
 ) ![]const agent.AgentMessage {
     const cloned = try allocator.alloc(agent.AgentMessage, messages.len);
+    var initialized: usize = 0;
+    errdefer {
+        deinitStreamMessages(allocator, cloned[0..initialized]);
+        allocator.free(cloned);
+    }
     for (messages, cloned) |message, *out| {
-        out.* = switch (message) {
-            .tool_result => |tool_result| .{ .tool_result = try createToolResultMessage(
-                allocator,
-                .{ .id = tool_result.tool_call_id, .name = tool_result.tool_name, .arguments = .null },
-                .{ .content = tool_result.content, .details = tool_result.details },
-                tool_result.is_error,
-            ) },
-            .assistant => |assistant| blk: {
-                break :blk .{ .assistant = try ai.owned.copyAssistantMessage(allocator, assistant) };
-            },
-            else => message,
-        };
+        out.* = try copyStreamMessage(allocator, message);
+        initialized += 1;
     }
     return cloned;
+}
+
+fn deinitStreamMessages(allocator: std.mem.Allocator, messages: []const agent.AgentMessage) void {
+    for (messages) |message| agent.deinitAgentMessage(allocator, message);
+    allocator.free(messages);
 }
 
 pub fn deinitStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) void {
     switch (event) {
         .message_start => |payload| agent.deinitAgentMessage(allocator, payload.message),
         .message_update => |payload| {
-            agent.deinitAgentMessage(allocator, payload.message);
+            // The compact stream message is a borrowed view of assistant_message_event.partial.
             ai.owned.deinitAssistantMessageEvent(allocator, payload.assistant_message_event);
         },
         .message_end => |payload| agent.deinitAgentMessage(allocator, payload.message),
@@ -205,10 +213,7 @@ pub fn deinitStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) 
             for (payload.tool_results) |message| agent.deinitToolResultMessage(allocator, message);
             allocator.free(payload.tool_results);
         },
-        .agent_end => |payload| {
-            for (payload.messages) |message| agent.deinitAgentMessage(allocator, message);
-            allocator.free(payload.messages);
-        },
+        .agent_end => |payload| deinitStreamMessages(allocator, payload.messages),
         .tool_execution_start => |payload| {
             allocator.free(payload.tool_call_id);
             allocator.free(payload.tool_name);
@@ -218,14 +223,12 @@ pub fn deinitStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) 
             allocator.free(payload.tool_call_id);
             allocator.free(payload.tool_name);
             runtime.freeJsonValue(allocator, payload.args);
-            agent.deinitToolResultContentSlice(allocator, payload.partial_result.content);
-            if (payload.partial_result.details) |details| runtime.freeJsonValue(allocator, details);
+            deinitCopiedAgentToolResult(allocator, payload.partial_result);
         },
         .tool_execution_end => |payload| {
             allocator.free(payload.tool_call_id);
             allocator.free(payload.tool_name);
-            agent.deinitToolResultContentSlice(allocator, payload.result.content);
-            if (payload.result.details) |details| runtime.freeJsonValue(allocator, details);
+            deinitCopiedAgentToolResult(allocator, payload.result);
         },
         .agent_start, .turn_start => {},
     }
@@ -233,23 +236,49 @@ pub fn deinitStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) 
 
 fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
     return switch (event) {
-        .tool_execution_start => |payload| .{ .tool_execution_start = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .args = try runtime.cloneJsonValue(allocator, payload.args),
-        } },
-        .tool_execution_update => |payload| .{ .tool_execution_update = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .args = try runtime.cloneJsonValue(allocator, payload.args),
-            .partial_result = try copyAgentToolResult(allocator, payload.partial_result),
-        } },
-        .tool_execution_end => |payload| .{ .tool_execution_end = .{
-            .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
-            .tool_name = try allocator.dupe(u8, payload.tool_name),
-            .result = try copyAgentToolResult(allocator, payload.result),
-            .is_error = payload.is_error,
-        } },
+        .tool_execution_start => |payload| blk: {
+            const tool_call_id = try allocator.dupe(u8, payload.tool_call_id);
+            errdefer allocator.free(tool_call_id);
+            const tool_name = try allocator.dupe(u8, payload.tool_name);
+            errdefer allocator.free(tool_name);
+            const args = try runtime.cloneJsonValue(allocator, payload.args);
+            errdefer runtime.freeJsonValue(allocator, args);
+            break :blk .{ .tool_execution_start = .{
+                .tool_call_id = tool_call_id,
+                .tool_name = tool_name,
+                .args = args,
+            } };
+        },
+        .tool_execution_update => |payload| blk: {
+            const tool_call_id = try allocator.dupe(u8, payload.tool_call_id);
+            errdefer allocator.free(tool_call_id);
+            const tool_name = try allocator.dupe(u8, payload.tool_name);
+            errdefer allocator.free(tool_name);
+            const args = try runtime.cloneJsonValue(allocator, payload.args);
+            errdefer runtime.freeJsonValue(allocator, args);
+            const partial_result = try copyAgentToolResult(allocator, payload.partial_result);
+            errdefer deinitCopiedAgentToolResult(allocator, partial_result);
+            break :blk .{ .tool_execution_update = .{
+                .tool_call_id = tool_call_id,
+                .tool_name = tool_name,
+                .args = args,
+                .partial_result = partial_result,
+            } };
+        },
+        .tool_execution_end => |payload| blk: {
+            const tool_call_id = try allocator.dupe(u8, payload.tool_call_id);
+            errdefer allocator.free(tool_call_id);
+            const tool_name = try allocator.dupe(u8, payload.tool_name);
+            errdefer allocator.free(tool_name);
+            const result = try copyAgentToolResult(allocator, payload.result);
+            errdefer deinitCopiedAgentToolResult(allocator, result);
+            break :blk .{ .tool_execution_end = .{
+                .tool_call_id = tool_call_id,
+                .tool_name = tool_name,
+                .result = result,
+                .is_error = payload.is_error,
+            } };
+        },
         .message_start => |payload| .{ .message_start = .{
             .message = try copyStreamMessage(allocator, payload.message),
         } },
@@ -266,10 +295,19 @@ fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
         .message_end => |payload| .{ .message_end = .{
             .message = try copyStreamMessage(allocator, payload.message),
         } },
-        .turn_end => |payload| .{ .turn_end = .{
-            .message = try copyStreamMessage(allocator, payload.message),
-            .tool_results = try copyStreamToolResultMessages(allocator, payload.tool_results),
-        } },
+        .turn_end => |payload| blk: {
+            const message = try copyStreamMessage(allocator, payload.message);
+            errdefer agent.deinitAgentMessage(allocator, message);
+            const tool_results = try copyStreamToolResultMessages(allocator, payload.tool_results);
+            errdefer {
+                for (tool_results) |tool_result| agent.deinitToolResultMessage(allocator, tool_result);
+                allocator.free(tool_results);
+            }
+            break :blk .{ .turn_end = .{
+                .message = message,
+                .tool_results = tool_results,
+            } };
+        },
         else => event,
     };
 }
@@ -281,30 +319,58 @@ fn copyCompactAssistantMessageEvent(
     source: ai.AssistantMessageEvent,
 ) !ai.AssistantMessageEvent {
     return switch (source) {
-        .text_delta => |event| .{ .text_delta = .{
-            .content_index = event.content_index,
-            .delta = try allocator.dupe(u8, event.delta),
-            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .text),
-        } },
-        .thinking_delta => |event| .{ .thinking_delta = .{
-            .content_index = event.content_index,
-            .delta = try allocator.dupe(u8, event.delta),
-            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .thinking),
-        } },
-        .toolcall_start => |event| .{ .toolcall_start = .{
-            .content_index = event.content_index,
-            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call),
-        } },
-        .toolcall_delta => |event| .{ .toolcall_delta = .{
-            .content_index = event.content_index,
-            .delta = try allocator.dupe(u8, event.delta),
-            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call),
-        } },
-        .toolcall_end => |event| .{ .toolcall_end = .{
-            .content_index = event.content_index,
-            .tool_call = try copyToolCallPreview(allocator, event.tool_call),
-            .partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call),
-        } },
+        .text_delta => |event| blk: {
+            const delta = try allocator.dupe(u8, event.delta);
+            errdefer allocator.free(delta);
+            const partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .text);
+            errdefer ai.owned.deinitAssistantMessage(allocator, partial);
+            break :blk .{ .text_delta = .{
+                .content_index = event.content_index,
+                .delta = delta,
+                .partial = partial,
+            } };
+        },
+        .thinking_delta => |event| blk: {
+            const delta = try allocator.dupe(u8, event.delta);
+            errdefer allocator.free(delta);
+            const partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .thinking);
+            errdefer ai.owned.deinitAssistantMessage(allocator, partial);
+            break :blk .{ .thinking_delta = .{
+                .content_index = event.content_index,
+                .delta = delta,
+                .partial = partial,
+            } };
+        },
+        .toolcall_start => |event| blk: {
+            const partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call);
+            errdefer ai.owned.deinitAssistantMessage(allocator, partial);
+            break :blk .{ .toolcall_start = .{
+                .content_index = event.content_index,
+                .partial = partial,
+            } };
+        },
+        .toolcall_delta => |event| blk: {
+            const delta = try allocator.dupe(u8, event.delta);
+            errdefer allocator.free(delta);
+            const partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call);
+            errdefer ai.owned.deinitAssistantMessage(allocator, partial);
+            break :blk .{ .toolcall_delta = .{
+                .content_index = event.content_index,
+                .delta = delta,
+                .partial = partial,
+            } };
+        },
+        .toolcall_end => |event| blk: {
+            const tool_call = try copyToolCallPreview(allocator, event.tool_call);
+            errdefer ai.owned.deinitToolCall(allocator, tool_call);
+            const partial = try copyDeltaPartial(allocator, event.partial, event.content_index, .tool_call);
+            errdefer ai.owned.deinitAssistantMessage(allocator, partial);
+            break :blk .{ .toolcall_end = .{
+                .content_index = event.content_index,
+                .tool_call = tool_call,
+                .partial = partial,
+            } };
+        },
         else => ai.owned.copyAssistantMessageEvent(allocator, source),
     };
 }
@@ -451,6 +517,11 @@ fn copyStreamToolResultMessages(
     source: []const ai.ToolResultMessage,
 ) ![]const ai.ToolResultMessage {
     const cloned = try allocator.alloc(ai.ToolResultMessage, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |message| agent.deinitToolResultMessage(allocator, message);
+        allocator.free(cloned);
+    }
     for (source, cloned) |message, *out| {
         out.* = try createToolResultMessage(
             allocator,
@@ -458,16 +529,26 @@ fn copyStreamToolResultMessages(
             .{ .content = message.content, .details = message.details },
             message.is_error,
         );
+        initialized += 1;
     }
     return cloned;
 }
 
 fn copyAgentToolResult(allocator: std.mem.Allocator, result: agent.AgentToolResult) !agent.AgentToolResult {
+    const content = try agent.copyToolResultContentSlice(allocator, result.content);
+    errdefer agent.deinitToolResultContentSlice(allocator, content);
+    const details = if (result.details) |value| try runtime.cloneJsonValue(allocator, value) else null;
+    errdefer if (details) |value| runtime.freeJsonValue(allocator, value);
     return .{
-        .content = try agent.copyToolResultContentSlice(allocator, result.content),
-        .details = if (result.details) |details| try runtime.cloneJsonValue(allocator, details) else null,
+        .content = content,
+        .details = details,
         .terminate = result.terminate,
     };
+}
+
+fn deinitCopiedAgentToolResult(allocator: std.mem.Allocator, result: agent.AgentToolResult) void {
+    agent.deinitToolResultContentSlice(allocator, result.content);
+    if (result.details) |details| runtime.freeJsonValue(allocator, details);
 }
 
 fn streamSink(stream: *AgentEventStream) EventSink {
@@ -478,10 +559,17 @@ fn streamSinkEmit(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const stream: *AgentEventStream = @ptrCast(@alignCast(context.?));
     switch (event) {
         .agent_end => |end| {
-            const messages = try copyTerminalMessages(stream.event_arena.allocator(), end.messages);
-            try stream.pipe.sink().end(.{ .agent_end = .{ .messages = messages } }, messages);
+            const event_messages = try copyTerminalMessages(stream.allocator, end.messages);
+            errdefer deinitStreamMessages(stream.allocator, event_messages);
+            const terminal_messages = try copyTerminalMessages(stream.allocator, end.messages);
+            errdefer deinitStreamMessages(stream.allocator, terminal_messages);
+            try stream.pipe.sink().end(.{ .agent_end = .{ .messages = event_messages } }, terminal_messages);
         },
-        else => try stream.pipe.sink().emit(try copyStreamEvent(stream.event_arena.allocator(), event)),
+        else => {
+            const stream_event = try copyStreamEvent(stream.allocator, event);
+            errdefer deinitStreamEvent(stream.allocator, stream_event);
+            try stream.pipe.sink().emit(stream_event);
+        },
     }
 }
 
@@ -1903,8 +1991,10 @@ test "prompt stream exposes events and terminal messages through event pipe" {
     );
     defer stream.deinit();
 
-    try std.testing.expectEqual(agent.AgentEvent.agent_start, (try stream.next()).?);
-    while (try stream.next()) |_| {}
+    const start_event = (try stream.next()).?;
+    defer deinitStreamEvent(std.testing.allocator, start_event);
+    try std.testing.expectEqual(agent.AgentEvent.agent_start, start_event);
+    while (try stream.next()) |event| deinitStreamEvent(std.testing.allocator, event);
     try stream.awaitProducer();
     try std.testing.expectEqual(@as(usize, 2), stream.result().?.len);
 }
@@ -1934,7 +2024,7 @@ test "prompt stream closes event pipe when producer fails before terminal event"
     );
     defer stream.deinit();
 
-    while (try stream.next()) |_| {}
+    while (try stream.next()) |event| deinitStreamEvent(std.testing.allocator, event);
     try std.testing.expectError(error.MissingAssistantResult, stream.awaitProducer());
     try std.testing.expectEqual(@as(?[]const agent.AgentMessage, null), stream.result());
 }
@@ -1964,7 +2054,9 @@ test "prompt stream cancellation drains producer blocked on bounded event pipe" 
     );
     defer stream.deinit();
 
-    try std.testing.expectEqual(agent.AgentEvent.agent_start, (try stream.next()).?);
+    const start_event = (try stream.next()).?;
+    defer deinitStreamEvent(std.testing.allocator, start_event);
+    try std.testing.expectEqual(agent.AgentEvent.agent_start, start_event);
     try std.testing.expectError(error.Canceled, stream.cancelProducer());
 }
 
