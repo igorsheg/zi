@@ -515,20 +515,17 @@ fn settlePromptRunFailure(
 }
 
 pub fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
-    if (run.isActive()) self.forceSettlePromptRunForDestroy(run);
+    if (run.isActive()) {
+        _ = run.markCancelRequested();
+        run.stream.cancelProducer() catch |err| {
+            const ignored_cleanup_error = @errorName(err);
+            _ = ignored_cleanup_error;
+        };
+        self.agent.finishRun();
+        run.markSettled();
+    }
     run.stream.deinit();
     self.allocator.destroy(run);
-}
-
-fn forceSettlePromptRunForDestroy(self: *AgentSession, run: *LivePromptRun) void {
-    std.debug.assert(run.isActive());
-    _ = run.markCancelRequested();
-    run.stream.cancelProducer() catch |err| {
-        const ignored_cleanup_error = @errorName(err);
-        _ = ignored_cleanup_error;
-    };
-    self.agent.finishRun();
-    run.markSettled();
 }
 
 fn compactWithSummary(
