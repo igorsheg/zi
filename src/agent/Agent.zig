@@ -547,7 +547,7 @@ fn defaultStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageE
         .usage = ai.protocol.emptyUsage(),
         .stop_reason = .stop,
         .timestamp = 0,
-    }) catch unreachable;
+    }) catch std.debug.assert(false);
     return stream;
 }
 
