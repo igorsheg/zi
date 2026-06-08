@@ -360,24 +360,20 @@ fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?Transcrip
         .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event.event),
         .prompt_command => |payload| .{ .append = statusAppend(.info, payload.message.text) },
         .compaction_start => null,
-        .compaction_end => |payload| compactionEndAppend(payload),
+        .compaction_end => |payload| if (payload.error_message != null)
+            .{ .append = statusAppend(.err, "compaction failed") }
+        else if (payload.aborted and !payload.will_retry)
+            .{ .append = statusAppend(.warning, "compaction cancelled") }
+        else
+            null,
         .auto_retry_start => null,
-        .auto_retry_end => |payload| autoRetryEndAppend(payload),
+        .auto_retry_end => |payload| if (!payload.success and payload.final_error != null)
+            .{ .append = statusAppend(.err, "auto retry failed") }
+        else
+            null,
         .public_event_overflow => .{ .append = statusAppend(.warning, "public event overflow") },
         .queue_update, .session_info_changed => null,
     };
-}
-
-fn compactionEndAppend(payload: session_events.AgentSessionEvent.CompactionEnd) ?TranscriptIngest {
-    if (payload.error_message) |_| return .{ .append = statusAppend(.err, "compaction failed") };
-    if (payload.aborted and !payload.will_retry) return .{ .append = statusAppend(.warning, "compaction cancelled") };
-    return null;
-}
-
-fn autoRetryEndAppend(payload: session_events.AgentSessionEvent.AutoRetryEnd) ?TranscriptIngest {
-    if (payload.success) return null;
-    if (payload.final_error != null) return .{ .append = statusAppend(.err, "auto retry failed") };
-    return null;
 }
 
 fn transcriptAppendFromAgentEvent(event: agent_mod.AgentEvent) ?TranscriptIngest {
