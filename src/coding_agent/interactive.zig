@@ -149,24 +149,13 @@ fn tuiBodyMode(body_mode: tool_registry.ToolDisplayBodyMode) tui.product.transcr
 
 fn toolArgsPreview(tool_name: []const u8, args_value: std.json.Value) []const u8 {
     if (std.mem.eql(u8, tool_name, "bash")) return boundedArgString(args_value, "command");
-    return switch (toolTitleShape(tool_name)) {
-        .path => boundedArgString(args_value, "path"),
-        .search => boundedPreferredArgTitle(args_value, "pattern", "path"),
-        .find => boundedPreferredArgTitle(args_value, "path", "name"),
-        .none => "",
-    };
-}
-
-const ToolTitleShape = enum { none, path, search, find };
-
-fn toolTitleShape(tool_name: []const u8) ToolTitleShape {
     if (std.mem.eql(u8, tool_name, "read") or
         std.mem.eql(u8, tool_name, "edit") or
         std.mem.eql(u8, tool_name, "write") or
-        std.mem.eql(u8, tool_name, "ls")) return .path;
-    if (std.mem.eql(u8, tool_name, "grep")) return .search;
-    if (std.mem.eql(u8, tool_name, "find")) return .find;
-    return .none;
+        std.mem.eql(u8, tool_name, "ls")) return boundedArgString(args_value, "path");
+    if (std.mem.eql(u8, tool_name, "grep")) return boundedPreferredArgTitle(args_value, "pattern", "path");
+    if (std.mem.eql(u8, tool_name, "find")) return boundedPreferredArgTitle(args_value, "path", "name");
+    return "";
 }
 
 fn boundedPreferredArgTitle(args_value: std.json.Value, first_key: []const u8, second_key: []const u8) []const u8 {
