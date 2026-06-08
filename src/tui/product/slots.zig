@@ -1,7 +1,6 @@
 const std = @import("std");
 pub const contribution_count_max: usize = 16;
 pub const contribution_text_bytes_max: usize = 160;
-pub const composer_border_slot_count_max: usize = 1;
 pub const status_area_slot_count_max: usize = 8;
 
 pub const SlotName = enum {
@@ -131,7 +130,7 @@ pub const SlotStore = struct {
     }
 
     pub fn highestPriority(self: SlotStore, slot: SlotName) ?SlotView {
-        var views: [composer_border_slot_count_max]SlotView = undefined;
+        var views: [1]SlotView = undefined;
         if (self.orderedSlot(slot, &views) == 0) return null;
         return views[0];
     }
