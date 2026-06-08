@@ -56,10 +56,6 @@ fn animationTick(now_ns: i128) u64 {
 
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
 
-fn queuedMessagesText(snapshot: *const session_events.QueueSnapshot, buffer: []u8) ?[]const u8 {
-    return queuedMessagesAndDraftText(snapshot, "", buffer);
-}
-
 fn queuedMessagesAndDraftText(
     snapshot: *const session_events.QueueSnapshot,
     draft: []const u8,
