@@ -256,7 +256,7 @@ pub const ToolExecutionResult = struct {
     pub fn deinit(self: *ToolExecutionResult) void {
         for (self.result.content) |content| deinitToolResultContent(self.allocator, content);
         self.allocator.free(self.result.content);
-        if (self.result.details) |details| deinitJsonValue(self.allocator, details);
+        if (self.result.details) |details| runtime.freeJsonValue(self.allocator, details);
         self.* = undefined;
     }
 
@@ -281,10 +281,6 @@ pub fn deinitToolResultContent(allocator: std.mem.Allocator, content: ai.ToolRes
 pub fn deinitToolResultContentSlice(allocator: std.mem.Allocator, source: []const ai.ToolResultContent) void {
     for (source) |content| deinitToolResultContent(allocator, content);
     allocator.free(source);
-}
-
-pub fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    runtime.freeJsonValue(allocator, value);
 }
 
 fn copyUserContentSlice(allocator: std.mem.Allocator, source: []const ai.UserContent) ![]const ai.UserContent {
