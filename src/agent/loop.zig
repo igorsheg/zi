@@ -337,19 +337,34 @@ fn copyDeltaContent(
     kind: DeltaPartialKind,
 ) ![]const ai.AssistantContent {
     const content = try allocator.alloc(ai.AssistantContent, content_len);
-    errdefer allocator.free(content);
-    for (content) |*item| item.* = .{ .text = .{ .text = "" } };
-    content[target_index] = switch (kind) {
-        .text => .{ .text = .{ .text = "" } },
-        .thinking => .{ .thinking = .{ .thinking = "" } },
-        .tool_call => try copyToolCallPreviewContent(allocator, target),
-    };
+    var initialized: usize = 0;
+    errdefer {
+        ai.owned.deinitAssistantContentItems(allocator, content[0..initialized]);
+        allocator.free(content);
+    }
+    for (content, 0..) |*item, index| {
+        item.* = if (index == target_index)
+            try copyDeltaContentTarget(allocator, target, kind)
+        else
+            .{ .text = .{ .text = try allocator.dupe(u8, "") } };
+        initialized += 1;
+    }
     return content;
 }
 
-fn copyToolCallPreviewContent(allocator: std.mem.Allocator, target: ai.AssistantContent) !ai.AssistantContent {
-    if (target != .tool_call) return .{ .text = .{ .text = "" } };
-    return .{ .tool_call = try copyToolCallPreview(allocator, target.tool_call) };
+fn copyDeltaContentTarget(
+    allocator: std.mem.Allocator,
+    target: ai.AssistantContent,
+    kind: DeltaPartialKind,
+) !ai.AssistantContent {
+    return switch (kind) {
+        .text => .{ .text = .{ .text = try allocator.dupe(u8, "") } },
+        .thinking => .{ .thinking = .{ .thinking = try allocator.dupe(u8, "") } },
+        .tool_call => if (target == .tool_call)
+            .{ .tool_call = try copyToolCallPreview(allocator, target.tool_call) }
+        else
+            .{ .text = .{ .text = try allocator.dupe(u8, "") } },
+    };
 }
 
 fn copyToolCallPreview(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
@@ -392,25 +407,30 @@ fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
 }
 
 fn copyAssistantMetadataWithContent(
-    _: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     source: ai.AssistantMessage,
     content: []const ai.AssistantContent,
 ) !ai.AssistantMessage {
+    const api = try allocator.dupe(u8, source.api);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, source.provider);
+    errdefer allocator.free(provider);
+    const model = try allocator.dupe(u8, source.model);
+    errdefer allocator.free(model);
+    const response_id = if (source.response_id) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (response_id) |value| allocator.free(value);
+    const error_message = if (source.error_message) |value| try allocator.dupe(u8, value) else null;
     return .{
         .content = content,
-        .api = source.api,
-        .provider = source.provider,
-        .model = source.model,
-        .response_id = source.response_id,
+        .api = api,
+        .provider = provider,
+        .model = model,
+        .response_id = response_id,
         .usage = source.usage,
         .stop_reason = source.stop_reason,
-        .error_message = source.error_message,
+        .error_message = error_message,
         .timestamp = source.timestamp,
     };
-}
-
-fn copyOptionalString(allocator: std.mem.Allocator, source: ?[]const u8) !?[]const u8 {
-    return if (source) |value| try allocator.dupe(u8, value) else null;
 }
 
 fn copyStreamMessage(allocator: std.mem.Allocator, message: agent.AgentMessage) !agent.AgentMessage {
@@ -1011,13 +1031,6 @@ fn executeToolCallsParallel(
         .messages = try messages.toOwnedSlice(allocator),
         .terminate = prepared_count > 0 and terminate_count == prepared_count,
     };
-}
-
-fn assistantHasToolCall(assistant: ai.AssistantMessage) bool {
-    for (assistant.content) |content| {
-        if (content == .tool_call) return true;
-    }
-    return false;
 }
 
 fn cancelParallelToolWorkers(

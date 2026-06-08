@@ -252,10 +252,6 @@ pub fn promptMessages(self: *Agent, messages: []const agent.AgentMessage) !void 
     try self.runPromptMessages(messages, false);
 }
 
-fn promptMessagesSkipInitialSteering(self: *Agent, messages: []const agent.AgentMessage) !void {
-    try self.runPromptMessages(messages, true);
-}
-
 fn runPromptMessages(self: *Agent, messages: []const agent.AgentMessage, skip_initial_steering: bool) !void {
     const token = try self.beginRun();
     errdefer self.finishRun();
@@ -293,7 +289,7 @@ pub fn continueRun(self: *Agent) !void {
         if (self.steering_queue.hasItems()) {
             const drained = try self.steering_queue.drain(self.allocator);
             defer self.allocator.free(drained);
-            try self.promptMessagesSkipInitialSteering(drained);
+            try self.runPromptMessages(drained, true);
             return;
         }
         if (self.follow_up_queue.hasItems()) {
@@ -346,7 +342,10 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
         },
         .tool_execution_start => |tool_event| try self.addPendingToolCall(tool_event.tool_call_id),
         .tool_execution_update => {},
-        .tool_execution_end => |tool_event| self.removePendingToolCall(tool_event.tool_call_id),
+        .tool_execution_end => |tool_event| switch (self.state.status) {
+            .running => |*running| running.pending_tool_calls.remove(tool_event.tool_call_id),
+            else => {},
+        },
         .turn_end => |turn_end| {
             if (turn_end.message == .assistant) {
                 if (turn_end.message.assistant.error_message) |message| {
@@ -463,13 +462,6 @@ fn addPendingToolCall(self: *Agent, id: []const u8) Error!void {
             self.state.status.running.pending_tool_calls.append(owned_id) catch return error.TooManyToolCalls;
         },
         .settling, .failed => std.debug.panic("invalid transition to running", .{}),
-    }
-}
-
-fn removePendingToolCall(self: *Agent, id: []const u8) void {
-    switch (self.state.status) {
-        .running => |*running| running.pending_tool_calls.remove(id),
-        else => {},
     }
 }
 

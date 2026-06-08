@@ -108,7 +108,7 @@ fn tuiBodyMode(body_mode: tool_registry.ToolDisplayBodyMode) tui.product.transcr
 }
 
 fn toolArgsPreview(tool_name: []const u8, args_value: std.json.Value) []const u8 {
-    if (std.mem.eql(u8, tool_name, "bash")) return boundedBashCommand(args_value);
+    if (std.mem.eql(u8, tool_name, "bash")) return boundedArgString(args_value, "command");
     return switch (toolTitleShape(tool_name)) {
         .path => boundedArgString(args_value, "path"),
         .search => boundedPreferredArgTitle(args_value, "pattern", "path"),
@@ -127,12 +127,6 @@ fn toolTitleShape(tool_name: []const u8) ToolTitleShape {
     if (std.mem.eql(u8, tool_name, "grep")) return .search;
     if (std.mem.eql(u8, tool_name, "find")) return .find;
     return .none;
-}
-
-fn boundedBashCommand(args_value: std.json.Value) []const u8 {
-    const command = boundedArgString(args_value, "command");
-    if (command.len == 0) return "";
-    return command;
 }
 
 fn boundedPreferredArgTitle(args_value: std.json.Value, first_key: []const u8, second_key: []const u8) []const u8 {
@@ -778,7 +772,8 @@ const InteractiveLoop = struct {
             return;
         }
         if (self.tool_call_mirror_count == self.tool_call_mirrors.len) {
-            self.removeToolMirror(0);
+            self.tool_call_mirrors[0] = self.tool_call_mirrors[self.tool_call_mirror_count - 1];
+            self.tool_call_mirror_count -= 1;
         }
         self.tool_call_mirrors[self.tool_call_mirror_count] = ToolCallMirror.init(tool_call_id, title);
         self.tool_call_mirror_count += 1;
@@ -789,13 +784,6 @@ const InteractiveLoop = struct {
             if (std.mem.eql(u8, mirror.id(), tool_call_id)) return index;
         }
         return null;
-    }
-
-    fn removeToolMirror(self: *InteractiveLoop, index: usize) void {
-        std.debug.assert(index < self.tool_call_mirror_count);
-        const last = self.tool_call_mirror_count - 1;
-        if (index != last) self.tool_call_mirrors[index] = self.tool_call_mirrors[last];
-        self.tool_call_mirror_count = last;
     }
 
     fn replaceToolCallPreview(self: *InteractiveLoop, tool_call_id: []const u8, text: []const u8) !void {

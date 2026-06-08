@@ -386,7 +386,11 @@ fn startPromptRun(
     options: PromptOptions,
 ) !*LivePromptRun {
     try self.ensureAcceptsPrompt();
-    var preflight = self.preparePromptInput(text, images, options);
+    const preflight: PromptPreflight = .{
+        .text = text,
+        .images = images,
+        .streaming_behavior = options.streaming_behavior,
+    };
     if (try self.tryHandlePromptCommand(&preflight)) return error.PromptCommandCannotStartLiveRun;
     if (try self.queuePromptIfStreaming(&preflight)) return error.PromptQueuedCannotStartLiveRun;
     try self.checkPrePromptCompaction();
@@ -406,7 +410,7 @@ fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight
     const run = try self.allocator.create(LivePromptRun);
     errdefer self.allocator.destroy(run);
     run.* = .{ .token = undefined };
-    run.prompts[0] = try self.constructUserMessage(preflight.text, preflight.images);
+    run.prompts[0] = try self.agent.userMessageFromText(preflight.text, preflight.images);
     run.token = try self.agent.beginRun();
     errdefer self.agent.finishRun();
     agent_mod.loop.startPromptStream(
@@ -959,15 +963,6 @@ const PromptPreflight = struct {
     streaming_behavior: ?StreamingBehavior,
 };
 
-fn preparePromptInput(
-    _: *AgentSession,
-    text: []const u8,
-    images: []const ai.ImageContent,
-    options: PromptOptions,
-) PromptPreflight {
-    return .{ .text = text, .images = images, .streaming_behavior = options.streaming_behavior };
-}
-
 fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
     const parsed = prompt_command.parse(preflight.text) orelse return false;
 
@@ -1037,7 +1032,7 @@ fn queuePromptIfStreaming(self: *AgentSession, preflight: *const PromptPreflight
         .follow_up => if (!self.agent.follow_up_queue.hasCapacity()) return error.QueueFull,
     }
 
-    const message = try self.constructUserMessage(preflight.text, preflight.images);
+    const message = try self.agent.userMessageFromText(preflight.text, preflight.images);
     switch (behavior) {
         .steer => try self.agent.steer(message),
         .follow_up => try self.agent.followUp(message),
@@ -1210,14 +1205,6 @@ fn removeLastAssistantRuntimeMessage(self: *AgentSession) !void {
 fn deinitOwnedAgentMessages(allocator: std.mem.Allocator, messages: []const agent_mod.AgentMessage) void {
     for (messages) |message| agent_mod.deinitAgentMessage(allocator, message);
     allocator.free(messages);
-}
-
-fn constructUserMessage(
-    self: *AgentSession,
-    text: []const u8,
-    images: []const ai.ImageContent,
-) !agent_mod.AgentMessage {
-    return self.agent.userMessageFromText(text, images);
 }
 
 fn drainAgentEvent(

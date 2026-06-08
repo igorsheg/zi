@@ -72,8 +72,6 @@ pub const ReplaceResult = struct {
     discarded_public_event_count: usize,
 };
 
-pub const NewSessionResult = ReplaceResult;
-
 pub const PublicEventHandler = struct {
     context: ?*anyopaque = null,
     call_fn: *const fn (context: ?*anyopaque, event: session_events.AgentSessionEvent) anyerror!void,
@@ -132,11 +130,6 @@ pub fn setBeforeSessionInvalidate(
     before_session_invalidate: ?BeforeSessionInvalidate,
 ) void {
     self.before_session_invalidate = before_session_invalidate;
-}
-
-pub fn newSession(self: *AgentSessionRuntimeHost, start: SessionStart) !NewSessionResult {
-    const result = try self.replaceSession(start);
-    return result;
 }
 
 pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !ReplaceResult {
@@ -543,7 +536,7 @@ test "runtime host new session replaces current session" {
         host.deinit();
     }
 
-    const result = try host.newSession(.{ .create = .{
+    const result = try host.replaceSession(.{ .create = .{
         .session_id = "second",
         .timestamp = "2026-05-26T00:00:01Z",
     } });

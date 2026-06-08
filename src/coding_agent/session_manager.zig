@@ -797,18 +797,17 @@ pub const SessionManager = struct {
             if (entries[index] != .message) continue;
             accumulated_tokens +|= estimateEntryTokens(entries[index]);
             if (accumulated_tokens >= keep_recent_tokens) {
-                cut_index = firstValidCutAtOrAfter(entries, index, end_index) orelse first_valid_cut;
+                cut_index = first_valid_cut;
+                for (entries[index..end_index], index..) |entry, candidate_index| {
+                    if (isValidCompactionCut(entry)) {
+                        cut_index = candidate_index;
+                        break;
+                    }
+                }
                 break;
             }
         }
         return cut_index;
-    }
-
-    fn firstValidCutAtOrAfter(entries: []const SessionEntry, start_index: usize, end_index: usize) ?usize {
-        for (entries[start_index..end_index], start_index..) |entry, index| {
-            if (isValidCompactionCut(entry)) return index;
-        }
-        return null;
     }
 
     fn isValidCompactionCut(entry: SessionEntry) bool {
@@ -827,7 +826,7 @@ pub const SessionManager = struct {
     fn estimateEntryTokens(entry: SessionEntry) u64 {
         return switch (entry) {
             .message => |message_entry| estimateMessageTokens(message_entry.message),
-            .compaction => |compaction| estimateTextTokens(compaction.summary),
+            .compaction => |compaction| (compaction.summary.len + 3) / 4,
             else => 0,
         };
     }
@@ -865,10 +864,6 @@ pub const SessionManager = struct {
             .custom => |custom| custom.kind.len,
         };
         return (chars + 3) / 4;
-    }
-
-    fn estimateTextTokens(text: []const u8) u64 {
-        return (text.len + 3) / 4;
     }
 
     fn findEntryIndex(entries: []const SessionEntry, entry_id: []const u8) ?usize {
