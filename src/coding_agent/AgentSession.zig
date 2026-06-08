@@ -27,19 +27,17 @@ fn classifyToolResultAfterCall(
     context: agent_mod.AfterToolCallContext,
 ) anyerror!?agent_mod.AfterToolCallResult {
     if (!std.mem.eql(u8, context.tool_call.name, "bash")) return null;
-    return .{ .is_error = bashResultIsError(context.result.details, context.is_error) };
-}
-
-fn bashResultIsError(details: ?std.json.Value, fallback: bool) bool {
-    const value = details orelse return fallback;
-    if (value != .object) return fallback;
+    const value = context.result.details orelse return .{ .is_error = context.is_error };
+    if (value != .object) return .{ .is_error = context.is_error };
     const object = value.object;
-    if (jsonBool(object.get("timedOut"))) |timed_out| if (timed_out) return true;
-    if (jsonBool(object.get("outputLimitExceeded"))) |limited| if (limited) return true;
-    if (jsonBool(object.get("cancelled"))) |cancelled| if (cancelled) return true;
-    if (object.get("signal") != null or object.get("stopped") != null or object.get("unknown") != null) return true;
-    if (object.get("exitCode")) |code| if (code == .integer) return code.integer != 0;
-    return fallback;
+    if (jsonBool(object.get("timedOut"))) |timed_out| if (timed_out) return .{ .is_error = true };
+    if (jsonBool(object.get("outputLimitExceeded"))) |limited| if (limited) return .{ .is_error = true };
+    if (jsonBool(object.get("cancelled"))) |cancelled| if (cancelled) return .{ .is_error = true };
+    if (object.get("signal") != null or object.get("stopped") != null or object.get("unknown") != null) {
+        return .{ .is_error = true };
+    }
+    if (object.get("exitCode")) |code| if (code == .integer) return .{ .is_error = code.integer != 0 };
+    return .{ .is_error = context.is_error };
 }
 
 fn jsonBool(value: ?std.json.Value) ?bool {
