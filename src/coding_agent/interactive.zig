@@ -963,9 +963,9 @@ const InteractiveLoop = struct {
         var next = append;
         const tool = &next.tool;
         if (self.tool_metadata_lookup_enabled) {
-            if (self.host.findToolMetadata(tool.name)) |metadata| {
-                tool.presentation = tuiPresentation(metadata.display.presentation);
-                tool.body_mode = tuiBodyMode(metadata.display.body_mode);
+            if (self.host.session.tools.findDefinition(tool.name)) |definition| {
+                tool.presentation = tuiPresentation(definition.metadata.display.presentation);
+                tool.body_mode = tuiBodyMode(definition.metadata.display.body_mode);
             }
         }
         if (tool.tool_call_id.len > pending_tool_id_bytes_max) return next;

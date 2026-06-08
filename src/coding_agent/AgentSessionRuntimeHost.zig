@@ -81,11 +81,6 @@ pub fn sessionHeader(self: *const AgentSessionRuntimeHost) session_manager.Sessi
     return self.session.manager.header;
 }
 
-pub fn findToolMetadata(self: *const AgentSessionRuntimeHost, name: []const u8) ?tool_registry.ToolMetadata {
-    const definition = self.session.tools.findDefinition(name) orelse return null;
-    return definition.metadata;
-}
-
 pub fn publicHistorySnapshot(
     self: *const AgentSessionRuntimeHost,
     allocator: std.mem.Allocator,
