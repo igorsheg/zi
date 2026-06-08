@@ -476,15 +476,6 @@ pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
     return self.finishPromptRun(run);
 }
 
-pub fn drainPromptRunReady(self: *AgentSession, run: *LivePromptRun) !?bool {
-    if (!run.isActive()) return false;
-    return switch (run.stream.poll()) {
-        .event => |event| try self.applyPromptRunEvent(run, event),
-        .terminal => try self.finishPromptRun(run),
-        .empty => null,
-    };
-}
-
 pub fn promptRunProgress(run: *LivePromptRun) @TypeOf(run.stream.asyncNext()) {
     return run.stream.asyncNext();
 }

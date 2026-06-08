@@ -173,10 +173,6 @@ pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LiveProm
     return self.session.stepPromptRun(run);
 }
 
-pub fn drainPromptRunReady(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !?bool {
-    return self.session.drainPromptRunReady(run);
-}
-
 pub fn promptRunProgress(
     _: *AgentSessionRuntimeHost,
     run: *AgentSession.LivePromptRun,
