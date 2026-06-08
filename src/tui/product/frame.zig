@@ -42,28 +42,22 @@ pub const Frame = struct {
         }
         renderer.next.clear();
         renderer.clearCursor();
-        try drawShell(app, renderer);
+        if (app.height > 0) try renderer.writeText(0, 0, "zi", app.theme.shell_label);
+        const composer_rows = composerRows(app);
+        const status_rows = statusRows(app);
+        if (app.height > 0) {
+            try drawTranscript(
+                app,
+                renderer,
+                app.theme.transcript_text,
+                transcriptVisibleRowsWithReserved(app.height, composer_rows + status_rows),
+            );
+            try drawStatusArea(app, renderer, composer_rows, status_rows);
+            try drawComposer(app, renderer, composer_rows);
+        }
+        if (app.modal) |confirm| try drawConfirmModal(app, renderer, confirm);
     }
 };
-
-fn drawShell(app: *app_mod.ProductApp, renderer: *infra.Renderer) !void {
-    if (app.height > 0) try renderer.writeText(0, 0, "zi", app.theme.shell_label);
-    const composer_rows = composerRows(app);
-    const status_rows = statusRows(app);
-    if (app.height > 0) {
-        try drawTranscript(
-            app,
-            renderer,
-            app.theme.transcript_text,
-            transcriptVisibleRowsWithReserved(app.height, composer_rows + status_rows),
-        );
-    }
-    if (app.height > 0) {
-        try drawStatusArea(app, renderer, composer_rows, status_rows);
-        try drawComposer(app, renderer, composer_rows);
-    }
-    if (app.modal) |confirm| try drawConfirmModal(app, renderer, confirm);
-}
 
 pub fn transcriptVisibleRows(height: u16) usize {
     return transcriptVisibleRowsWithReserved(height, 1);
