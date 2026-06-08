@@ -10,7 +10,7 @@ const session_history_snapshot = @import("session_history_snapshot.zig");
 const session_listing = @import("session_listing.zig");
 const sdk = @import("sdk.zig");
 
-pub const Options = struct {
+const Options = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     dir: std.Io.Dir = .cwd(),
