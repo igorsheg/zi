@@ -124,7 +124,7 @@ pub fn startPromptRun(
     images: []const ai.ImageContent,
     options: AgentSession.PromptOptions,
 ) !*AgentSession.LivePromptRun {
-    return self.session.startLivePromptRun(text, images, options);
+    return self.session.startPromptRun(text, images, options);
 }
 
 pub fn queuePrompt(self: *AgentSessionRuntimeHost, text: []const u8) !void {

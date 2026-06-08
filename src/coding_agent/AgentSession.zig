@@ -403,7 +403,7 @@ fn promptWithOptionsInternal(
     }
 }
 
-fn startPromptRun(
+pub fn startPromptRun(
     self: *AgentSession,
     text: []const u8,
     images: []const ai.ImageContent,
@@ -419,15 +419,6 @@ fn startPromptRun(
     if (try self.queuePromptIfStreaming(&preflight)) return error.PromptQueuedCannotStartLiveRun;
     try self.checkPrePromptCompaction();
     return self.startPreparedPromptRun(&preflight);
-}
-
-pub fn startLivePromptRun(
-    self: *AgentSession,
-    text: []const u8,
-    images: []const ai.ImageContent,
-    options: PromptOptions,
-) !*LivePromptRun {
-    return self.startPromptRun(text, images, options);
 }
 
 fn startPreparedPromptRun(self: *AgentSession, preflight: *const PromptPreflight) !*LivePromptRun {
