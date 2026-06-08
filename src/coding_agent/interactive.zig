@@ -1159,7 +1159,27 @@ fn createHost(
     timestamp_text: []const u8,
     timestamp: i128,
 ) !sdk.RuntimeHostHandle {
-    if (try selectResumeSession(process, stderr, options)) |session_file| {
+    if (options.resume_session_file != null or options.resume_latest) {
+        const session_file = sdk.selectRuntimeSession(process.gpa, process.io, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .dir = options.dir,
+            .environ = options.environ,
+            .explicit_file_name = options.resume_session_file,
+        }) catch |err| switch (err) {
+            error.InvalidSessionFileName => {
+                try stderr.writeAll("invalid resume session file\n");
+                return error.InvalidCliUsage;
+            },
+            error.SessionListTruncated => {
+                try stderr.writeAll("too many sessions to choose latest safely\n");
+                return error.InvalidCliUsage;
+            },
+            else => return err,
+        } orelse {
+            try stderr.writeAll("no resumable session found\n");
+            return error.NoResumableSession;
+        };
         defer process.gpa.free(session_file);
         return sdk.resumeRuntimeHost(process.gpa, .{
             .cwd = options.cwd,
@@ -1184,36 +1204,6 @@ fn createHost(
         .environ = options.environ,
         .zio_runtime = process.zio_runtime,
     });
-}
-
-fn selectResumeSession(
-    process: runtime.Process,
-    stderr: *std.Io.Writer,
-    options: Options,
-) !?[]const u8 {
-    if (options.resume_session_file == null and !options.resume_latest) return null;
-    const selected = sdk.selectRuntimeSession(process.gpa, process.io, .{
-        .cwd = options.cwd,
-        .agent_dir_override = options.agent_dir_override,
-        .dir = options.dir,
-        .environ = options.environ,
-        .explicit_file_name = options.resume_session_file,
-    }) catch |err| switch (err) {
-        error.InvalidSessionFileName => {
-            try stderr.writeAll("invalid resume session file\n");
-            return error.InvalidCliUsage;
-        },
-        error.SessionListTruncated => {
-            try stderr.writeAll("too many sessions to choose latest safely\n");
-            return error.InvalidCliUsage;
-        },
-        else => return err,
-    };
-    if (selected == null) {
-        try stderr.writeAll("no resumable session found\n");
-        return error.NoResumableSession;
-    }
-    return selected;
 }
 
 test "interactive queued text restore joins steering follow-up and draft" {
