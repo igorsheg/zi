@@ -461,7 +461,6 @@ test "product app animation tick dirties only animated status" {
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
         .slot = .status_area,
         .id = 1,
-        .owner = 1,
         .text = "working",
         .effect = .shimmer,
     } }) == null);
@@ -480,7 +479,6 @@ test "product app applies slot contributions atomically" {
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
         .slot = .composer_top_right,
         .id = 1,
-        .owner = 9,
         .text = "model: faux",
     } }) == null);
     try std.testing.expect(app.dirty);
@@ -492,7 +490,6 @@ test "product app applies slot contributions atomically" {
         app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
             .slot = .composer_top_right,
             .id = 2,
-            .owner = 9,
             .text = "bad\n",
         } }),
     );
@@ -502,7 +499,6 @@ test "product app applies slot contributions atomically" {
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .clear_slot_contribution = .{
         .slot = .composer_top_right,
         .id = 1,
-        .owner = 9,
     } }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.slots.count(.composer_top_right));
 }

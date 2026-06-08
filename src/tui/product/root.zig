@@ -28,7 +28,6 @@ pub const Theme = theme.Theme;
 pub const ThemeId = theme.ThemeId;
 pub const SlotName = slots.SlotName;
 pub const SlotContributionId = slots.ContributionId;
-pub const SlotOwnerId = slots.OwnerId;
 pub const ModalId = surface.ModalId;
 pub const ConfirmResult = surface.ConfirmResult;
 pub const VScreenHarness = vscreen_harness.VScreenHarness;

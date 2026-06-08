@@ -868,7 +868,6 @@ test "frame renders status area between transcript and composer" {
     try app.slots.set(std.testing.allocator, .{
         .slot = .status_area,
         .id = 1,
-        .owner = 1,
         .priority = 10,
         .text = "model: faux",
     });
@@ -888,7 +887,6 @@ test "frame omits status area on tiny terminal" {
     try app.slots.set(std.testing.allocator, .{
         .slot = .status_area,
         .id = 1,
-        .owner = 1,
         .text = "status",
     });
 
@@ -903,7 +901,7 @@ test "frame omits status area on tiny terminal" {
 test "frame renders composer top border slot with slot style" {
     var app = try app_mod.ProductApp.init(30, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 1, .text = "TR" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .text = "TR" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 30, 3, size_cells_max);
     defer renderer.deinit();
@@ -921,7 +919,7 @@ test "frame renders composer top border slot with slot style" {
 test "frame drops composer border label when it does not fit" {
     var app = try app_mod.ProductApp.init(10, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 1, .text = "toolong" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .text = "toolong" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 10, 3, size_cells_max);
     defer renderer.deinit();
@@ -936,7 +934,7 @@ test "frame drops composer border label when it does not fit" {
 test "frame places composer border slot label by display width" {
     var app = try app_mod.ProductApp.init(12, 3);
     defer app.deinit(std.testing.allocator);
-    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 1, .text = "中" });
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .text = "中" });
 
     var renderer = try infra.Renderer.init(std.testing.allocator, 12, 3, size_cells_max);
     defer renderer.deinit();

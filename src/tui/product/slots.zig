@@ -14,12 +14,10 @@ pub const RenderEffect = enum {
 };
 
 pub const ContributionId = u32;
-pub const OwnerId = u32;
 
 pub const SetContribution = struct {
     slot: SlotName,
     id: ContributionId,
-    owner: OwnerId,
     priority: i16 = 0,
     text: []const u8,
     effect: RenderEffect = .none,
@@ -28,13 +26,11 @@ pub const SetContribution = struct {
 pub const ClearContribution = struct {
     slot: SlotName,
     id: ContributionId,
-    owner: OwnerId,
 };
 
 const Contribution = struct {
     slot: SlotName,
     id: ContributionId,
-    owner: OwnerId,
     priority: i16,
     text: []u8,
     effect: RenderEffect,
@@ -52,7 +48,7 @@ pub const SlotStore = struct {
 
     pub fn set(self: *SlotStore, allocator: std.mem.Allocator, update: SetContribution) !void {
         try validateSet(update);
-        const existing = self.find(update.slot, update.id, update.owner);
+        const existing = self.find(update.slot, update.id);
         if (existing == null and self.len == self.items.len) return error.SlotContributionLimitExceeded;
 
         const text = try allocator.dupe(u8, update.text);
@@ -63,7 +59,6 @@ pub const SlotStore = struct {
             self.items[index] = .{
                 .slot = update.slot,
                 .id = update.id,
-                .owner = update.owner,
                 .priority = update.priority,
                 .text = text,
                 .effect = update.effect,
@@ -75,7 +70,6 @@ pub const SlotStore = struct {
         self.items[self.len] = .{
             .slot = update.slot,
             .id = update.id,
-            .owner = update.owner,
             .priority = update.priority,
             .text = text,
             .effect = update.effect,
@@ -84,7 +78,7 @@ pub const SlotStore = struct {
     }
 
     pub fn clear(self: *SlotStore, allocator: std.mem.Allocator, request: ClearContribution) bool {
-        const index = self.find(request.slot, request.id, request.owner) orelse return false;
+        const index = self.find(request.slot, request.id) orelse return false;
         self.removeAt(allocator, index);
         return true;
     }
@@ -130,9 +124,9 @@ pub const SlotStore = struct {
         return false;
     }
 
-    fn find(self: SlotStore, slot: SlotName, id: ContributionId, owner: OwnerId) ?usize {
+    fn find(self: SlotStore, slot: SlotName, id: ContributionId) ?usize {
         for (self.items[0..self.len], 0..) |item, index| {
-            if (item.slot == slot and item.id == id and item.owner == owner) return index;
+            if (item.slot == slot and item.id == id) return index;
         }
         return null;
     }
@@ -153,7 +147,7 @@ pub const SlotView = struct {
 };
 
 fn validateSet(update: SetContribution) !void {
-    if (update.id == 0 or update.owner == 0) return error.InvalidSlotContribution;
+    if (update.id == 0) return error.InvalidSlotContribution;
     if (update.text.len > contribution_text_bytes_max) return error.SlotContributionTooLarge;
     if (!std.unicode.utf8ValidateSlice(update.text)) return error.InvalidSlotContributionText;
     if (std.mem.indexOfScalar(u8, update.text, '\n') != null) return error.InvalidSlotContributionText;
@@ -181,21 +175,18 @@ test "slot store sets replaces clears and bounds contributions" {
     try slots.set(std.testing.allocator, .{
         .slot = .composer_top_right,
         .id = 1,
-        .owner = 7,
         .priority = 1,
         .text = "one",
     });
     try slots.set(std.testing.allocator, .{
         .slot = .composer_top_right,
         .id = 2,
-        .owner = 7,
         .priority = 2,
         .text = "two",
     });
     try slots.set(std.testing.allocator, .{
         .slot = .composer_top_right,
         .id = 1,
-        .owner = 7,
         .priority = 3,
         .text = "new",
     });
@@ -206,9 +197,9 @@ test "slot store sets replaces clears and bounds contributions" {
     try std.testing.expectEqualStrings("new", views[0].text);
     try std.testing.expectEqualStrings("two", views[1].text);
 
-    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2, .owner = 7 }));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 2 }));
     try std.testing.expectEqual(@as(usize, 1), slots.count(.composer_top_right));
-    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 7 }));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1 }));
     try std.testing.expectEqual(@as(usize, 0), slots.len);
 }
 
@@ -219,12 +210,11 @@ test "slot store tracks animated status contributions" {
     try slots.set(std.testing.allocator, .{
         .slot = .status_area,
         .id = 1,
-        .owner = 1,
         .text = "working",
         .effect = .shimmer,
     });
     try std.testing.expect(slots.hasAnimated(.status_area));
-    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .status_area, .id = 1, .owner = 1 }));
+    try std.testing.expect(slots.clear(std.testing.allocator, .{ .slot = .status_area, .id = 1 }));
     try std.testing.expect(!slots.hasAnimated(.status_area));
 }
 
@@ -232,13 +222,12 @@ test "slot store rejects invalid text before mutation" {
     var slots: SlotStore = .{};
     defer slots.deinit(std.testing.allocator);
 
-    try slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .owner = 1, .text = "ok" });
+    try slots.set(std.testing.allocator, .{ .slot = .composer_top_right, .id = 1, .text = "ok" });
     try std.testing.expectError(
         error.InvalidSlotContributionText,
         slots.set(std.testing.allocator, .{
             .slot = .composer_top_right,
             .id = 2,
-            .owner = 1,
             .text = "bad\n",
         }),
     );
