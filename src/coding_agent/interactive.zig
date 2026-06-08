@@ -45,11 +45,6 @@ fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     return now_ns - last >= frame_interval_ns;
 }
 
-fn animationTick(now_ns: i128) u64 {
-    if (now_ns <= 0) return 0;
-    return @intCast(@divFloor(now_ns, frame_interval_ns));
-}
-
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
 
 fn queuedMessagesAndDraftText(
@@ -657,7 +652,8 @@ const InteractiveLoop = struct {
         _ = try self.drainPromptProgressBounded(prompt_progress_per_tick_max);
         _ = try self.drainPublicEventsBounded(public_events_per_tick_max);
         const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
-        _ = try self.terminal_loop.applyCommand(.{ .animation_tick = animationTick(now_ns) });
+        const animation_tick: u64 = if (now_ns <= 0) 0 else @intCast(@divFloor(now_ns, frame_interval_ns));
+        _ = try self.terminal_loop.applyCommand(.{ .animation_tick = animation_tick });
         if (render_attempts_per_tick_max > 0 and self.terminal_loop.isDirty()) {
             if (frameDue(now_ns, self.last_render_ns)) {
                 try self.terminal_loop.renderIfDirty(self.stdout);
