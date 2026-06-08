@@ -94,7 +94,7 @@ fn runAuth(
     process: runtime.Process,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    command: args_mod.AuthCommand,
+    command: anytype,
     options: auth_mode.Options,
 ) !void {
     return switch (command.action) {
@@ -116,7 +116,7 @@ fn runApp(
     process: runtime.Process,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    app: args_mod.AppArgs,
+    app: anytype,
     options: auth_mode.Options,
 ) !void {
     if (app.help) return args_mod.writeHelp(stdout);
@@ -154,7 +154,7 @@ fn runPrompt(
     stderr: *std.Io.Writer,
     prompt: []const u8,
     json_output: bool,
-    app_args: args_mod.AppArgs,
+    app_args: anytype,
     options: auth_mode.Options,
 ) !void {
     const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
@@ -197,7 +197,7 @@ fn runPrompt(
 fn selectResumeSession(
     process: runtime.Process,
     stderr: *std.Io.Writer,
-    app: args_mod.AppArgs,
+    app: anytype,
     options: auth_mode.Options,
 ) !?[]const u8 {
     if (app.resume_session_file == null and !app.resume_latest) return null;
