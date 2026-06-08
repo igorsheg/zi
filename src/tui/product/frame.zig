@@ -101,7 +101,32 @@ fn drawComposer(app: *app_mod.ProductApp, renderer: *infra.Renderer, composer_ro
     if (height < 3) return;
     const box_y: u16 = @intCast(@as(usize, app.height) - height);
     const box_height: u16 = @intCast(height);
-    try drawComposerBorder(app, renderer, box_y, box_height);
+    if (app.width >= 2 and box_height >= 2) {
+        try drawComposerBorderLine(app, renderer, box_y, true);
+        if (app.width >= 4) {
+            const inner_width = app.width - 2;
+            if (app.slots.highestPriority(.composer_top_right)) |view| {
+                const label_width = primitive.text.displayWidth(view.text);
+                if (inner_width >= 2 + label_width) {
+                    const x = @as(usize, app.width) - 2 - label_width;
+                    try renderer.writeText(@intCast(x), box_y, view.text, app.theme.composer_slot);
+                }
+            }
+        }
+        try drawComposerBorderLine(app, renderer, box_y + box_height - 1, false);
+        var row: u16 = box_y + 1;
+        while (row + 1 < box_y + box_height) : (row += 1) {
+            try renderer.writeText(0, row, primitive.chrome.BorderGlyphs.rounded.vertical, app.theme.composer_chrome);
+            if (app.width > 1) {
+                try renderer.writeText(
+                    app.width - 1,
+                    row,
+                    primitive.chrome.BorderGlyphs.rounded.vertical,
+                    app.theme.composer_chrome,
+                );
+            }
+        }
+    }
 
     var rows: [composer_mod.visible_rows_max]composer_mod.ComposerVisualRow = undefined;
     const projection = app.composer.visibleRows(composerTextWidth(app.width), &rows);
@@ -117,39 +142,6 @@ fn drawComposer(app: *app_mod.ProductApp, renderer: *infra.Renderer, composer_ro
         const cursor_x = 3 + projection.cursor_display_col;
         if (cursor_x < app.width and cursor_y < app.height) {
             renderer.setCursor(.{ .x = @intCast(cursor_x), .y = @intCast(cursor_y) });
-        }
-    }
-}
-
-fn drawComposerBorder(
-    app: *const app_mod.ProductApp,
-    renderer: *infra.Renderer,
-    y: u16,
-    height: u16,
-) !void {
-    if (app.width < 2 or height < 2) return;
-    try drawComposerBorderLine(app, renderer, y, true);
-    if (app.width >= 4) {
-        const inner_width = app.width - 2;
-        if (app.slots.highestPriority(.composer_top_right)) |view| {
-            const label_width = primitive.text.displayWidth(view.text);
-            if (inner_width >= 2 + label_width) {
-                const x = @as(usize, app.width) - 2 - label_width;
-                try renderer.writeText(@intCast(x), y, view.text, app.theme.composer_slot);
-            }
-        }
-    }
-    try drawComposerBorderLine(app, renderer, y + height - 1, false);
-    var row: u16 = y + 1;
-    while (row + 1 < y + height) : (row += 1) {
-        try renderer.writeText(0, row, primitive.chrome.BorderGlyphs.rounded.vertical, app.theme.composer_chrome);
-        if (app.width > 1) {
-            try renderer.writeText(
-                app.width - 1,
-                row,
-                primitive.chrome.BorderGlyphs.rounded.vertical,
-                app.theme.composer_chrome,
-            );
         }
     }
 }
