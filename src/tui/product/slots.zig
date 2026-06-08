@@ -155,13 +155,9 @@ fn sortViews(items: []SlotView) void {
     while (i < items.len) : (i += 1) {
         const current = items[i];
         var j = i;
-        while (j > 0 and before(current, items[j - 1])) : (j -= 1) items[j] = items[j - 1];
+        while (j > 0 and current.priority > items[j - 1].priority) : (j -= 1) items[j] = items[j - 1];
         items[j] = current;
     }
-}
-
-fn before(a: SlotView, b: SlotView) bool {
-    return a.priority > b.priority;
 }
 
 test "slot store sets replaces clears and bounds contributions" {
