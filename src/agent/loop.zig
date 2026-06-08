@@ -1735,6 +1735,24 @@ fn emptyStream(_: ?*anyopaque, _: ai.StreamRequest) ai.AssistantMessageEventStre
     return ai.AssistantMessageEventStream.initBuffered();
 }
 
+const fast_delta_stream_count = 240;
+
+fn fastDeltaBufferedStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
+    var stream = ai.AssistantMessageEventStream.initBuffered();
+    const sink = stream.sink();
+    sink.emit(request.io, .{ .start = .{ .partial = assistantMessage("partial") } }) catch unreachable;
+    var count: usize = 0;
+    while (count < fast_delta_stream_count) : (count += 1) {
+        sink.emit(request.io, .{ .text_delta = .{
+            .content_index = 0,
+            .delta = "x",
+            .partial = assistantMessage("partial"),
+        } }) catch unreachable;
+    }
+    sink.endDone(request.io, .stop, assistantMessage("done")) catch unreachable;
+    return stream;
+}
+
 fn testToolStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
     const calls: *usize = @ptrCast(@alignCast(context.?));
     var stream = ai.AssistantMessageEventStream.initBuffered();
@@ -1996,6 +2014,41 @@ test "prompt stream exposes events and terminal messages through event pipe" {
     try std.testing.expectEqual(agent.AgentEvent.agent_start, start_event);
     while (try stream.next()) |event| deinitStreamEvent(std.testing.allocator, event);
     try stream.awaitProducer();
+    try std.testing.expectEqual(@as(usize, 2), stream.result().?.len);
+}
+
+test "prompt stream drains many fast deltas through bounded pipe" {
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
+    const prompt = userMessage("hello");
+    var buffer: [8]agent.AgentEvent = undefined;
+    var stream: AgentEventStream = undefined;
+
+    startPromptStream(
+        &stream,
+        std.testing.allocator,
+        zio_runtime,
+        &.{prompt},
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
+        .{
+            .model = testModel(),
+            .stream = .{ .call_fn = fastDeltaBufferedStream },
+            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+        },
+        cancel.token(),
+        &buffer,
+    );
+    defer stream.deinit();
+
+    var update_count: usize = 0;
+    while (try stream.next()) |event| {
+        defer deinitStreamEvent(std.testing.allocator, event);
+        if (event == .message_update) update_count += 1;
+    }
+    try stream.awaitProducer();
+    try std.testing.expectEqual(@as(usize, fast_delta_stream_count), update_count);
     try std.testing.expectEqual(@as(usize, 2), stream.result().?.len);
 }
 
