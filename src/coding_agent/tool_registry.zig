@@ -106,92 +106,71 @@ pub const ToolDefinition = struct {
 };
 
 const ActiveToolSet = struct {
-    names: []const []const u8,
-    agent_tools: []const agent.AgentTool,
+    names: [max_active_tools][]const u8 = undefined,
+    agent_tools: [max_active_tools]agent.AgentTool = undefined,
+    count: usize = 0,
 
-    pub fn deinit(self: *ActiveToolSet, allocator: std.mem.Allocator) void {
-        allocator.free(self.agent_tools);
-        allocator.free(self.names);
-        self.* = undefined;
+    pub fn nameSlice(self: *const ActiveToolSet) []const []const u8 {
+        return self.names[0..self.count];
+    }
+
+    pub fn agentToolSlice(self: *const ActiveToolSet) []const agent.AgentTool {
+        return self.agent_tools[0..self.count];
     }
 };
 
 pub const ToolRegistry = struct {
-    definitions: std.ArrayList(ToolDefinition) = .empty,
-    active_names: std.ArrayList([]const u8) = .empty,
-    agent_tools: std.ArrayList(agent.AgentTool) = .empty,
+    definitions: [max_tool_definitions]ToolDefinition = undefined,
+    definition_count: usize = 0,
+    active_names: [max_active_tools][]const u8 = undefined,
+    active_agent_tools: [max_active_tools]agent.AgentTool = undefined,
+    active_count: usize = 0,
 
-    pub fn deinit(self: *ToolRegistry, allocator: std.mem.Allocator) void {
-        self.agent_tools.deinit(allocator);
-        self.active_names.deinit(allocator);
-        self.definitions.deinit(allocator);
-        self.* = undefined;
-    }
-
-    pub fn append(self: *ToolRegistry, allocator: std.mem.Allocator, definition: ToolDefinition) !void {
-        if (self.definitions.items.len == max_tool_definitions) return error.ToolDefinitionLimitExceeded;
+    pub fn append(self: *ToolRegistry, definition: ToolDefinition) !void {
+        if (self.definition_count == max_tool_definitions) return error.ToolDefinitionLimitExceeded;
         if (self.findDefinition(definition.metadata.name) != null) return error.DuplicateToolName;
-        try self.definitions.append(allocator, definition);
+        self.definitions[self.definition_count] = definition;
+        self.definition_count += 1;
     }
 
-    pub fn buildActiveToolSet(
-        self: *const ToolRegistry,
-        allocator: std.mem.Allocator,
-        names: []const []const u8,
-    ) !ActiveToolSet {
-        var active_names = std.ArrayList([]const u8).empty;
-        errdefer active_names.deinit(allocator);
-        var active_agent_tools = std.ArrayList(agent.AgentTool).empty;
-        errdefer active_agent_tools.deinit(allocator);
-
-        try active_names.ensureTotalCapacity(allocator, @min(names.len, max_active_tools));
-        try active_agent_tools.ensureTotalCapacity(allocator, @min(names.len, max_active_tools));
+    pub fn buildActiveToolSet(self: *const ToolRegistry, names: []const []const u8) !ActiveToolSet {
+        var active_set: ActiveToolSet = .{};
         for (names) |name| {
-            if (containsName(active_names.items, name)) continue;
-            if (active_names.items.len == max_active_tools) return error.ActiveToolLimitExceeded;
+            if (containsName(active_set.nameSlice(), name)) continue;
+            if (active_set.count == max_active_tools) return error.ActiveToolLimitExceeded;
             const definition = self.findDefinition(name) orelse return error.UnknownToolName;
-            active_names.appendAssumeCapacity(definition.metadata.name);
-            active_agent_tools.appendAssumeCapacity(definition.asAgentTool());
+            active_set.names[active_set.count] = definition.metadata.name;
+            active_set.agent_tools[active_set.count] = definition.asAgentTool();
+            active_set.count += 1;
         }
-
-        return .{
-            .names = try active_names.toOwnedSlice(allocator),
-            .agent_tools = try active_agent_tools.toOwnedSlice(allocator),
-        };
-    }
-
-    pub fn ensureActiveCapacity(self: *ToolRegistry, allocator: std.mem.Allocator, capacity: usize) !void {
-        if (capacity > max_active_tools) return error.ActiveToolLimitExceeded;
-        try self.active_names.ensureTotalCapacity(allocator, capacity);
-        try self.agent_tools.ensureTotalCapacity(allocator, capacity);
+        return active_set;
     }
 
     pub fn commitActiveToolSet(self: *ToolRegistry, active_set: ActiveToolSet) void {
-        std.debug.assert(self.active_names.capacity >= active_set.names.len);
-        std.debug.assert(self.agent_tools.capacity >= active_set.agent_tools.len);
-        self.active_names.clearRetainingCapacity();
-        self.agent_tools.clearRetainingCapacity();
-        self.active_names.appendSliceAssumeCapacity(active_set.names);
-        self.agent_tools.appendSliceAssumeCapacity(active_set.agent_tools);
+        @memcpy(self.active_names[0..active_set.count], active_set.names[0..active_set.count]);
+        @memcpy(self.active_agent_tools[0..active_set.count], active_set.agent_tools[0..active_set.count]);
+        self.active_count = active_set.count;
     }
 
-    pub fn setActiveToolsByName(self: *ToolRegistry, allocator: std.mem.Allocator, names: []const []const u8) !void {
-        var active_set = try self.buildActiveToolSet(allocator, names);
-        defer active_set.deinit(allocator);
-        try self.ensureActiveCapacity(allocator, active_set.names.len);
+    pub fn setActiveToolsByName(self: *ToolRegistry, names: []const []const u8) !void {
+        const active_set = try self.buildActiveToolSet(names);
         self.commitActiveToolSet(active_set);
     }
 
     pub fn activeAgentTools(self: *const ToolRegistry) []const agent.AgentTool {
-        return self.agent_tools.items;
+        return self.active_agent_tools[0..self.active_count];
     }
 
     pub fn activeToolNames(self: *const ToolRegistry) []const []const u8 {
-        return self.active_names.items;
+        return self.active_names[0..self.active_count];
+    }
+
+    pub fn definitionSlice(self: *const ToolRegistry) []const ToolDefinition {
+        return self.definitions[0..self.definition_count];
     }
 
     pub fn findDefinition(self: *const ToolRegistry, name: []const u8) ?ToolDefinition {
-        for (self.definitions.items) |definition| {
+        for (self.definitionSlice()) |definition| {
             if (std.mem.eql(u8, definition.metadata.name, name)) return definition;
         }
         return null;
@@ -310,35 +289,35 @@ pub const BuiltinTools = struct {
     }
 
     pub fn appendDefinitions(self: *BuiltinTools, registry: *ToolRegistry) !void {
-        try registry.append(self.allocator, ToolDefinition.init(self.read, .{
+        try registry.append(ToolDefinition.init(self.read, .{
             .name = "read",
             .label = "read",
             .description = read_description,
             .prompt_snippet = "Read file contents. Use offset/limit for large files; continue with offset when needed.",
             .display = .{ .presentation = .file, .body_mode = .hidden_on_success },
         }));
-        try registry.append(self.allocator, ToolDefinition.init(self.ls, .{
+        try registry.append(ToolDefinition.init(self.ls, .{
             .name = "ls",
             .label = "ls",
             .description = "List one directory with bounded output.",
             .prompt_snippet = "List one directory. Prefer this over bash ls for directory inspection.",
             .display = .{ .presentation = .directory },
         }));
-        try registry.append(self.allocator, ToolDefinition.init(self.grep, .{
+        try registry.append(ToolDefinition.init(self.grep, .{
             .name = "grep",
             .label = "grep",
             .description = "Search files for a literal text pattern with bounded output.",
             .prompt_snippet = "Search files for literal text. Prefer this over bash grep for simple searches.",
             .display = .{ .presentation = .search },
         }));
-        try registry.append(self.allocator, ToolDefinition.init(self.find, .{
+        try registry.append(ToolDefinition.init(self.find, .{
             .name = "find",
             .label = "find",
             .description = "Recursively find paths under a directory with bounded output.",
             .prompt_snippet = "Find paths under a directory. Prefer this over bash find for simple path discovery.",
             .display = .{ .presentation = .directory },
         }));
-        try registry.append(self.allocator, ToolDefinition.init(self.bash, .{
+        try registry.append(ToolDefinition.init(self.bash, .{
             .name = "bash",
             .label = "bash",
             .description = bash_description,
@@ -346,7 +325,7 @@ pub const BuiltinTools = struct {
             .execution_mode = .sequential,
             .display = .{ .presentation = .command },
         }));
-        try registry.append(self.allocator, ToolDefinition.init(self.edit, .{
+        try registry.append(ToolDefinition.init(self.edit, .{
             .name = "edit",
             .label = "edit",
             .description = "Edit a single file using exact, unique, non-overlapping text replacements.",
@@ -354,7 +333,7 @@ pub const BuiltinTools = struct {
             .execution_mode = .sequential,
             .display = .{ .presentation = .patch, .body_mode = .hidden_on_success },
         }));
-        try registry.append(self.allocator, ToolDefinition.init(self.write, .{
+        try registry.append(ToolDefinition.init(self.write, .{
             .name = "write",
             .label = "write",
             .description = "Create or overwrite a text file. Creates parent directories as needed.",
@@ -382,15 +361,10 @@ test "tool registry stores definitions first and exposes active agent tools" {
     var builtins = try BuiltinTools.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
     defer builtins.deinit();
     var registry: ToolRegistry = .{};
-    defer registry.deinit(std.testing.allocator);
-
     try builtins.appendDefinitions(&registry);
-    try registry.setActiveToolsByName(
-        std.testing.allocator,
-        &.{ "read", "ls", "grep", "find", "bash", "edit", "write" },
-    );
+    try registry.setActiveToolsByName(&.{ "read", "ls", "grep", "find", "bash", "edit", "write" });
 
-    try std.testing.expectEqual(@as(usize, builtin_tool_count), registry.definitions.items.len);
+    try std.testing.expectEqual(@as(usize, builtin_tool_count), registry.definition_count);
     try std.testing.expectEqual(@as(usize, builtin_tool_count), registry.activeAgentTools().len);
     try std.testing.expectEqualStrings("read", registry.activeAgentTools()[0].name);
     try std.testing.expectEqualStrings("ls", registry.activeAgentTools()[1].name);
@@ -402,13 +376,13 @@ test "tool registry stores definitions first and exposes active agent tools" {
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[5].execution_mode.?);
     try std.testing.expectEqual(
         .command,
-        registry.definitions.items[4].metadata.display.presentation,
+        registry.definitions[4].metadata.display.presentation,
     );
     try std.testing.expectEqual(
         .patch,
-        registry.definitions.items[5].metadata.display.presentation,
+        registry.definitions[5].metadata.display.presentation,
     );
-    try std.testing.expectEqual(.visible, registry.definitions.items[6].metadata.display.body_mode);
+    try std.testing.expectEqual(.visible, registry.definitions[6].metadata.display.body_mode);
 }
 
 test "tool registry rejects duplicate and unknown tool names without changing active set" {
@@ -421,22 +395,16 @@ test "tool registry rejects duplicate and unknown tool names without changing ac
     var builtins = try BuiltinTools.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
     defer builtins.deinit();
     var registry: ToolRegistry = .{};
-    defer registry.deinit(std.testing.allocator);
-
     try builtins.appendDefinitions(&registry);
-    try registry.setActiveToolsByName(std.testing.allocator, &.{"read"});
+    try registry.setActiveToolsByName(&.{"read"});
     try std.testing.expectError(error.DuplicateToolName, registry.append(
-        std.testing.allocator,
         ToolDefinition.init(builtins.read, .{
             .name = "read",
             .label = "read",
             .description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit.",
         }),
     ));
-    try std.testing.expectError(error.UnknownToolName, registry.setActiveToolsByName(
-        std.testing.allocator,
-        &.{ "edit", "missing" },
-    ));
+    try std.testing.expectError(error.UnknownToolName, registry.setActiveToolsByName(&.{ "edit", "missing" }));
     try std.testing.expectEqual(@as(usize, 1), registry.activeToolNames().len);
     try std.testing.expectEqualStrings("read", registry.activeToolNames()[0]);
 }

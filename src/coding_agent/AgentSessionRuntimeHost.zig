@@ -727,7 +727,6 @@ test "runtime host live run executes a tool and continues the assistant turn" {
 
     var echo: EchoTool = .{};
     try host.session.tools.append(
-        std.testing.allocator,
         tool_registry.ToolDefinition.init(&echo, .{
             .name = "echo",
             .label = "echo",

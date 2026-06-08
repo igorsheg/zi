@@ -215,9 +215,8 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     errdefer builtin_tools.deinit();
 
     var tools: tool_registry.ToolRegistry = .{};
-    errdefer tools.deinit(allocator);
     try builtin_tools.appendDefinitions(&tools);
-    try tools.setActiveToolsByName(allocator, tool_registry.default_active_tool_names);
+    try tools.setActiveToolsByName(tool_registry.default_active_tool_names);
 
     const system_prompt_text = try buildSystemPromptText(
         allocator,
@@ -342,7 +341,6 @@ pub fn deinit(self: *AgentSession) void {
     }
     self.manager.deinit();
     self.allocator.destroy(self.manager);
-    self.tools.deinit(self.allocator);
     self.builtin_tools.deinit();
     self.allocator.free(self.system_prompt_text);
     self.prompt_resources.deinit();
@@ -657,13 +655,11 @@ pub fn shutdownComplete(self: *AgentSession) bool {
 pub fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !void {
     if (!self.agent.waitForIdle()) return error.SessionBusy;
     if (self.active_compaction_cancel_source != null) return error.SessionBusy;
-    var active_set = try self.tools.buildActiveToolSet(self.allocator, names);
-    defer active_set.deinit(self.allocator);
-    const next_prompt = try self.buildPromptForActiveNames(active_set.names);
+    const active_set = try self.tools.buildActiveToolSet(names);
+    const next_prompt = try self.buildPromptForActiveNames(active_set.nameSlice());
     errdefer self.allocator.free(next_prompt);
 
-    try self.tools.ensureActiveCapacity(self.allocator, active_set.names.len);
-    try self.agent.setTools(active_set.agent_tools);
+    try self.agent.setTools(active_set.agentToolSlice());
     self.tools.commitActiveToolSet(active_set);
     self.agent.setSystemPrompt(next_prompt);
     self.allocator.free(self.system_prompt_text);
@@ -1245,7 +1241,7 @@ test "agent session initializes policy spine with definition-first builtin tools
     });
     defer shutdownAndDeinit(&session);
 
-    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.tools.definitions.items.len);
+    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.tools.definition_count);
     try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.agent.state.tools.len);
     try std.testing.expectEqualStrings("read", session.tools.activeToolNames()[0]);
     try std.testing.expectEqualStrings("bash", session.tools.activeToolNames()[4]);
