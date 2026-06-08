@@ -260,10 +260,6 @@ pub fn shutdownComplete(self: *AgentSessionRuntimeHost) bool {
     return self.session.shutdownComplete();
 }
 
-pub fn hasPublicEvents(self: *const AgentSessionRuntimeHost) bool {
-    return self.session.public_events.count() > 0;
-}
-
 fn buildSessionOptions(base: BaseOptions, start: SessionStart) AgentSession.Options {
     var options: AgentSession.Options = .{
         .cwd = base.cwd,
