@@ -233,7 +233,7 @@ const ToolWorkerGroup = struct {
     }
 
     fn deinit(self: *ToolWorkerGroup) void {
-        if (self.state == .active) @panic("ToolWorkerGroup deinit before await or cancel");
+        std.debug.assert(self.state != .active);
         self.* = undefined;
     }
 

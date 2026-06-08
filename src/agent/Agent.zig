@@ -441,7 +441,7 @@ fn setStreamingMessage(self: *Agent, message: agent.AgentMessage) !void {
     switch (self.state.status) {
         .running => |*running| running.streaming_message = owned,
         .idle => self.state.status = .{ .running = .{ .streaming_message = owned } },
-        .settling, .failed => std.debug.panic("invalid transition to running", .{}),
+        .settling, .failed => std.debug.assert(false),
     }
 }
 
@@ -463,7 +463,7 @@ fn addPendingToolCall(self: *Agent, id: []const u8) Error!void {
             self.state.status = .{ .running = .{} };
             self.state.status.running.pending_tool_calls.append(owned_id) catch return error.TooManyToolCalls;
         },
-        .settling, .failed => std.debug.panic("invalid transition to running", .{}),
+        .settling, .failed => std.debug.assert(false),
     }
 }
 
