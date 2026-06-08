@@ -553,7 +553,7 @@ const InteractiveLoop = struct {
             };
             return .queued;
         }
-        self.active_run = try self.host.startPromptRun(text, &.{}, .{});
+        self.active_run = try self.host.startPromptRun(text, &.{});
         self.cancel_requested = false;
         self.setWorkingStatus() catch {
             self.stderr.writeAll("status update failed\n") catch return .started;

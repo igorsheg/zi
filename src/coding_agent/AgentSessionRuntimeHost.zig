@@ -98,9 +98,8 @@ pub fn startPromptRun(
     self: *AgentSessionRuntimeHost,
     text: []const u8,
     images: []const ai.ImageContent,
-    options: AgentSession.PromptOptions,
 ) !*AgentSession.LivePromptRun {
-    return self.session.startPromptRun(text, images, options);
+    return self.session.startPromptRun(text, images, .{});
 }
 
 pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !bool {
@@ -186,7 +185,7 @@ fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
 }
 
 fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
-    const run = try host.startPromptRun(text, &.{}, .{});
+    const run = try host.startPromptRun(text, &.{});
     defer host.destroyPromptRun(run);
     while (try host.stepPromptRun(run)) {}
 }
@@ -777,7 +776,7 @@ test "runtime host live run executes a tool and continues the assistant turn" {
     );
     try host.session.setActiveToolsByName(&.{"echo"});
 
-    const run = try host.startPromptRun("use the tool", &.{}, .{});
+    const run = try host.startPromptRun("use the tool", &.{});
     defer host.destroyPromptRun(run);
     while (try host.stepPromptRun(run)) {}
 
@@ -836,7 +835,7 @@ test "runtime host applies prompt progress from zio stream future" {
         host.deinit();
     }
 
-    const run = try host.startPromptRun("hello", &.{}, .{});
+    const run = try host.startPromptRun("hello", &.{});
     defer host.destroyPromptRun(run);
 
     var progress = run.stream.asyncNext();
@@ -1021,7 +1020,7 @@ test "runtime host preserves bash truncation details through public events" {
         host.deinit();
     }
 
-    const run = try host.startPromptRun("use bash", &.{}, .{});
+    const run = try host.startPromptRun("use bash", &.{});
     defer host.destroyPromptRun(run);
     while (try host.stepPromptRun(run)) {}
 

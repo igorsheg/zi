@@ -159,7 +159,7 @@ fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
 fn ignorePublicEvent(_: ?*anyopaque, _: session_events.AgentSessionEvent) !void {}
 
 fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
-    const run = try host.startPromptRun(text, &.{}, .{});
+    const run = try host.startPromptRun(text, &.{});
     defer host.destroyPromptRun(run);
     while (try host.stepPromptRun(run)) {}
 }

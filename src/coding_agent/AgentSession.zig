@@ -92,7 +92,7 @@ const StreamingBehavior = enum {
     follow_up,
 };
 
-pub const PromptOptions = struct {
+const PromptOptions = struct {
     streaming_behavior: ?StreamingBehavior = null,
 };
 

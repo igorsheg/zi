@@ -39,7 +39,7 @@ fn runInner(
 ) !void {
     const json_output = options.output == .json;
     if (json_output) try writeSessionHeader(host, stdout);
-    const prompt_run = try host.startPromptRun(options.prompt, &.{}, .{});
+    const prompt_run = try host.startPromptRun(options.prompt, &.{});
     defer host.destroyPromptRun(prompt_run);
     while (try host.stepPromptRun(prompt_run)) {
         try drainEvents(host, stdout, stderr, options.output);
