@@ -484,7 +484,8 @@ fn finishPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
         try self.settlePromptRunFailure(run, token, @errorName(err));
         return err;
     };
-    self.settlePromptRunSuccess(run);
+    self.agent.finishRun();
+    run.markSettled();
     return false;
 }
 
@@ -499,12 +500,6 @@ pub fn cancelPromptRun(self: *AgentSession, run: *LivePromptRun) !void {
         },
     };
     try self.settlePromptRunFailure(run, token, "aborted");
-}
-
-fn settlePromptRunSuccess(self: *AgentSession, run: *LivePromptRun) void {
-    std.debug.assert(run.isActive());
-    self.agent.finishRun();
-    run.markSettled();
 }
 
 fn settlePromptRunFailure(
