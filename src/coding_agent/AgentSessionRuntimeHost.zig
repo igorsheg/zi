@@ -156,14 +156,6 @@ pub fn statusSnapshot(self: *AgentSessionRuntimeHost) AgentSession.RuntimeStatus
     return self.session.statusSnapshot();
 }
 
-pub fn queueSnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
-    return self.session.queueSnapshot(allocator);
-}
-
-pub fn clearQueue(self: *AgentSessionRuntimeHost) !void {
-    try self.session.clearQueue();
-}
-
 pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?session_events.AgentSessionEvent {
     return self.session.drainPublicEvent();
 }

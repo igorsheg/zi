@@ -624,17 +624,17 @@ const InteractiveLoop = struct {
     }
 
     fn restoreQueuedMessagesToComposer(self: *InteractiveLoop) !void {
-        var snapshot = try self.host.queueSnapshot(self.process.gpa);
+        var snapshot = try self.host.session.queueSnapshot(self.process.gpa);
         defer snapshot.deinit();
         if (snapshot.steering.items.len == 0 and snapshot.follow_up.items.len == 0) return;
         var buffer: [tui.product.composer.buffer_size_bytes_max]u8 = undefined;
         const draft = self.terminal_loop.product.app.composer.text();
         const text = queuedMessagesAndDraftText(&snapshot, draft, &buffer) orelse {
-            try self.host.clearQueue();
+            try self.host.session.clearQueue();
             try self.appendOperationalStatus("queued messages too large to restore");
             return;
         };
-        try self.host.clearQueue();
+        try self.host.session.clearQueue();
         _ = try self.terminal_loop.applyCommand(.clear_composer);
         _ = try self.terminal_loop.applyCommand(.{ .insert_composer_text = text });
     }
