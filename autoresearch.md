@@ -1,114 +1,79 @@
-# Autoresearch: Andrew Kelley Delete Loop
+# Autoresearch: Andrew Pi-Mono in Zig
 
 ## Objective
-Keep deleting, collapsing, and simplifying Zi until the remaining system is obviously necessary.
+Reimagine Zi as: **pi-mono product behavior, implemented in Zig as if Andrew Kelley designed and wrote it.**
 
-This is not a performance loop. It is a maintainability loop with a hard correctness gate. Each iteration should remove code, remove concepts, collapse boundaries, or make invalid states unrepresentable while preserving Zi's current behavior and architecture contracts.
+This loop is allowed to make large refactors and break Zi's current public API. The desired shape is an executable-first coding agent with boring direct ownership, explicit bounds, and minimal abstraction. Pi-mono is a behavioral reference, not an architecture to port. We keep the user-visible product promises that matter today: model/auth/settings resolution, sessions and resume, prompt resources, tools, print/json/interactive modes, bounded TUI rendering, observable cancellation, and durable history.
 
-The loop's Andrew-style question is:
+The Andrew-style question is now larger than helper deletion:
 
-> Can this code disappear, or become boring direct code, without losing a tested behavior or a real ownership boundary?
+> If this were written from scratch in Zig for this product, would this boundary/type/API exist?
 
-Prefer negative work: delete unused seams, collapse speculative abstractions, shrink owner files, replace ambient discipline with types/assertions, and turn runtime surprises into compile-time structure. Do not add a new framework to make deletion easier.
+Prefer deleting or collapsing whole seams over shaving names. Breaking library/sdk API is acceptable when it removes a compatibility-shaped layer that the executable does not need.
 
 ## Metrics
-- **Primary**: `complexity_score` (weighted static score, lower is better) — proxy for unnecessary surface area in the current complexity hotspots.
+- **Primary**: `andrew_score` (weighted static architecture score, lower is better) — combines resident code size, large-file pressure, public/API surface, indirection vocabulary, one-caller helper pressure, and boundary violations.
 - **Secondary**:
-  - `scoped_loc` — total lines in the hotspot files.
+  - `scoped_loc` — Zig lines in the main app/agent/TUI/product runtime scope.
   - `large_file_penalty` — pressure from files too large to audit locally.
-  - `speculative_name_count` — names that often indicate extra machinery (`Manager`, `Registry`, `Policy`, `Mirror`, `Slot`, `Surface`, etc.). Treat as a prompt to inspect, not an automatic rename target.
-  - `panic_like_count` — `catch unreachable`, `@panic`, `std.debug.panic`, and raw `unreachable` sightings.
-  - `todo_count` — unfinished or deferred work markers.
-  - `test_count` — guardrail; dropping tests is suspicious.
+  - `public_api_count` — exported declarations in scoped code. Public surface is now suspicious unless it is a real package boundary.
+  - `sdk_host_loc` — lines in `sdk.zig` and `AgentSessionRuntimeHost.zig`; this is compatibility/host pressure, not sacred API.
+  - `indirection_name_count` — architecture smell words (`Host`, `Manager`, `Registry`, `Mirror`, `Surface`, `Slot`, `Policy`, `Adapter`, etc.). This is a prompt to inspect, not a rename target.
+  - `one_caller_fn_count` — local functions whose names appear only at definition + one call in the same file. Useful for finding wrappers, but do not blindly inline when readability worsens.
+  - `test_count` — guardrail. Deleting tests is suspicious unless they cover deleted dead code or deleted API only.
   - `fmt_status` — 0 pass, 1 fail.
   - `boundary_violations` — forbidden import-direction violations; any nonzero value is a hard failure.
 
-The metric is a compass, not the truth. A rename that lowers `speculative_name_count` without reducing machinery is cheating. A deletion that preserves behavior and lowers `scoped_loc` is the ideal win.
+The metric is a compass. Do not cheat it with renames, hiding code outside scope, or deleting behavior. A good kept change should remove a real concept, ownership seam, mutation path, compatibility layer, or invalid state.
 
 ## How to Run
-`./autoresearch.sh` — fast static scoring. It prints `METRIC name=value` lines.
+`./autoresearch.sh` — fast static architecture scoring. It prints `METRIC name=value` lines.
 
-Full correctness gates live in `./autoresearch.checks.sh` and must pass before keeping any code change.
+Full correctness gates live in `./autoresearch.checks.sh` and must pass before logging `keep`.
 
 ## Files in Scope
-Primary simplification targets:
+Broad refactors are allowed in these areas:
 
-- `src/coding_agent/AgentSession.zig` — session owner, lifecycle, prompt run, event drain integration, retry/compaction policy. Highest-value shrink target.
-- `src/coding_agent/AgentSessionRuntimeHost.zig` — session replacement and host API. Collapse if it is just forwarding without protecting ownership.
-- `src/coding_agent/interactive.zig` — TUI/session bridge. Keep as the only bridge, but split/collapse local state if it reduces owner-loop complexity.
-- `src/coding_agent/session_manager.zig` — resident history/session state. Keep durable truth separate from runtime context; delete duplicate facts.
-- `src/agent/loop.zig` — generic turn loop. Keep product policy out; make state transitions simpler and deterministic.
-- `src/agent/Agent.zig` — transcript/runtime context owner. Prefer explicit state over callback protocol.
-- `src/agent/tool_runner.zig` — tool execution. Keep bounded parallelism only if tests prove need.
-- `src/agent/root.zig` — public agent vocabulary. Move helpers out or delete exported concepts that have one caller and no boundary value.
-- `src/runtime/process_runner.zig` — mechanism only. Simplify only when preserving zio/process/cancel behavior.
-- `src/tui/product/App.zig` — single TUI product owner. Commands mutate; effects are returned data.
-- `src/tui/product/frame.zig` — full-frame renderer. Shrink projection/drawing code without adding retained surfaces or dirty rectangles.
-- `src/tui/product/slots.zig`, `src/tui/product/surface.zig`, `src/tui/product/status_area.zig` — likely extension-ish/product machinery. Delete or collapse if current behavior does not require the seam.
-- `src/tui/product/loop.zig`, `src/tui/product/terminal_loop.zig` — terminal owner loops. Keep transactionality and bounded drains.
-
-Supporting files may be edited only when required by a simplification:
-
-- Tests next to touched code.
-- `CONTEXT.md`, `AGENTS.md`, or ADRs only to remove stale claims after code changes.
-- `autoresearch.md`, `autoresearch.sh`, `autoresearch.checks.sh`, `autoresearch.ideas.md`.
+- `src/coding_agent/` — product/session/CLI policy. Highest-value target. Break SDK/API if it lets the executable become direct.
+- `src/agent/` — generic turn loop and transcript/tool execution owner. Collapse callback protocols and duplicate event shapes when current behavior can be direct.
+- `src/tui/product/` — current Zi TUI product. Delete extension/framework seams until a current product owner needs them.
+- `src/runtime/process_runner.zig`, `src/runtime/cancel.zig`, `src/runtime/event_pipe.zig`, `src/runtime/bounded_queue.zig` — mechanism only; simplify without weakening cancellation, deadlines, or bounded queues.
+- `src/main.zig`, `src/root.zig`, `build.zig` — only when needed to remove public/API pressure or wire a new direct executable shape.
+- `CONTEXT.md`, `AGENTS.md`, ADR/docs — update only to remove stale architecture claims after code changes.
+- `.references/pi-mono/` — read-only behavioral reference.
 
 ## Off Limits
-- Do not break import boundaries:
+- Do not port pi-mono's TypeScript architecture. Preserve product behavior, not package shapes.
+- Do not break import direction:
   - `tui` must not import `runtime`, `ai`, `agent`, or `coding_agent`.
   - `agent` must not import `coding_agent` or `tui`.
   - `ai` must not import `agent`, `coding_agent`, or `tui`.
   - `runtime` must not import product modules.
-- Do not replace one abstraction with two smaller abstractions unless the code becomes easier to audit.
-- Do not remove tests to improve the metric.
-- Do not weaken bounds, cancellation, shutdown, path policy, or durable session history.
-- Do not add new dependencies.
-- Do not port pi-mono shapes.
-- Do not introduce global state, callback mutation paths, unbounded queues, or ambient I/O.
-- Do not change public behavior unless the old behavior is demonstrably wrong and tests/docs are updated.
+- Do not remove durable session history, path policy, auth/settings/model behavior, tool output bounds, cancellation observability, or render transactionality.
+- Do not introduce global state, ambient I/O, unbounded queues, new dependencies, callback mutation paths, or hidden lifecycle hooks.
+- Do not move code out of metric scope to improve the number.
+- Do not rename concepts just to lower `indirection_name_count`.
 
 ## Constraints
-- Before logging `keep`, run `./autoresearch.checks.sh` successfully.
-- Every kept change must either:
-  1. delete code/concepts,
-  2. collapse duplicate state/mutation paths,
-  3. make an invariant compile-time/state-machine enforced, or
-  4. replace crash/silent corruption with a clear programmer assertion or operational error.
-- If `complexity_score` improves but code becomes cleverer, discard.
-- If `complexity_score` is equal but code is smaller and more obvious, keeping is allowed; explain why in ASI.
-- If a change increases `complexity_score`, keep only when it deletes a real bug class and the ASI names the invariant now enforced.
-- Keep changes small. One deletion/refactor idea per iteration.
-- Update this file's "What's Been Tried" after meaningful discoveries.
+- Breaking public API is allowed. Breaking current executable behavior is not.
+- Before logging `keep`, `./autoresearch.checks.sh` must pass.
+- Every kept change must do at least one of:
+  1. delete/collapse a compatibility layer, framework seam, or duplicate owner;
+  2. make one mutation owner obvious;
+  3. make an invariant explicit in type/state instead of discipline;
+  4. replace callback/protocol indirection with direct state-machine code;
+  5. delete dead behavior with the tests/docs that only covered that behavior.
+- If `andrew_score` improves but code becomes cleverer or less bounded, discard.
+- If `andrew_score` is equal but a real concept disappears, keeping is allowed; explain why in ASI.
+- Large refactors are allowed, but land them as understandable steps with checks passing.
 
-## Loop Method
-For every iteration:
-
-1. Read one hotspot deeply. Identify the owner, mutation path, bounds, and failure modes.
-2. Ask: "What can be deleted without changing behavior?"
-3. Make the smallest deletion/collapse.
-4. Add or keep behavior tests if the simplification touches behavior.
-5. Run `./autoresearch.sh`.
-6. If the primary metric improved, run `./autoresearch.checks.sh`.
-7. Log with ASI that captures what was learned, especially why the removed concept was unnecessary.
-
-Useful first probes:
-
-- Find fields in `AgentSession` that mirror another owner and can become derived snapshots.
-- Find `interactive.zig` branches that duplicate session policy instead of translating events/effects.
-- Inspect TUI slots/surfaces: are they current product needs or future extension seams?
-- Audit non-test `catch unreachable`; either prove locally with type/state or handle explicitly.
-- Collapse one-caller helper types that obscure ownership.
-- Split giant files only if the split removes coupling. Moving code without simplifying is not a win.
+## Starting Hypotheses
+- `AgentSessionRuntimeHost` and `sdk.zig` likely contain executable-unnecessary compatibility surface. Collapse host/session construction into CLI modes where possible.
+- `AgentSession` may own too many mirrors (`queue_mirror`, event drain, public event queue, manager). Seek one event/log owner and derived projections.
+- `tool_registry` may be dynamic machinery for a static built-in tool set. Prefer a compile-time table until real dynamic tools/extensions exist.
+- TUI `surface`, `slots`, `snapshot`, and status abstractions should survive only if current product behavior needs the seam.
+- `agent/loop.zig` copying/event-sink helpers may exist to satisfy callback protocols rather than a direct turn state machine.
+- Print/json/interactive should be thin frontends over one direct session owner, not consumers of a broad host API.
 
 ## What's Been Tried
-- Replaced internal agent state-machine panics/unreachable prompt-token unwraps with `std.debug.assert` preconditions where the failure is programmer misuse, not operational input.
-- Deleted a one-caller `SlotStore.hasSlot` helper; status row visibility now uses the existing slot count directly.
-- Collapsed the single-variant TUI modal wrapper into direct `Confirm` ownership, then removed duplicate focus state derived from modal presence.
-- Simplified confirm modal state: fixed Yes/No labels are current behavior, and selection is a direct `selected_yes` field.
-- Found `shuffle_text` status effect had no current setter. First deletion attempt failed checks because `hasAnimated` kept an unused tick parameter; retry removed the parameter too.
-- Removed unused session-host surfaces: ready-poll prompt draining, public-event presence probe, runtime accessor, replacement callbacks, host continue forwarding, and session-level continue API. The continue API deletion removed one test that only covered the deleted method; `autoresearch.sh` baseline test count is now 617.
-- Collapsed composer slot surface to the one current product label (`composer_top_right`) plus `status_area`; bottom and top-left composer slots, owner namespaces, and bulk owner clearing were test-only/future seams.
-- Removed explicit modal command surface; confirm modals now accept terminal input directly. Also collapsed fixed confirm button rendering and one-use validation helpers.
-- AgentSession prompt startup now uses one path (`startPromptRun`) with inline preconditions/retry flags instead of wrapper/helper policy structs.
-- Eliminated the remaining scoped panic-like sites by replacing test/helper `catch unreachable` with assertions for infallible buffered stream/event drain invariants.
-- Deleted unused TUI `shuffle_text` effect code after status effects stopped using it; the three removed tests only covered the dead module, and `autoresearch.sh` baseline test count is now 614.
+- New session begins after the Andrew Kelley Delete Loop. Old autoresearch artifacts were removed. Prior loop got `complexity_score` from 41446 to 37571, mostly by deleting small wrappers and dead seams. This new loop intentionally changes target from local deletion to executable-first rearchitecture.

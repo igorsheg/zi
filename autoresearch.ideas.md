@@ -1,9 +1,12 @@
-# Andrew Kelley Delete Loop Ideas
+# Andrew Pi-Mono in Zig Ideas
 
 Try one idea per iteration. Delete bullets once tried and log the result in `autoresearch.md` / `autoresearch.jsonl`.
 
-- Audit `src/coding_agent/AgentSession.zig` for fields that duplicate facts already owned by `agent.Agent`, `session_manager`, `queue_mirror`, or `event_drain`; replace mirrors with derived snapshots where practical.
-- Look for one-caller public types/functions in `src/agent/root.zig`; make private, move closer to owner, or delete.
-- Split `interactive.zig` only around existing ownership seams: input drain, public-event translation, render transaction. Do not create a generic TUI framework.
-- In `agent/loop.zig`, search for state carried only to satisfy callback shape; collapse callback protocol if direct turn-loop data is clearer.
-- In `frame.zig`, identify repeated rendering projection/chrome code that can be data-local without adding retained surfaces or dirty rectangles.
+- Collapse or delete `src/coding_agent/AgentSessionRuntimeHost.zig` if CLI modes can own session creation/replacement directly. Breaking SDK API is allowed.
+- Shrink `src/coding_agent/sdk.zig` to only current executable/resume helpers, or delete it entirely if CLI can call lower-level constructors.
+- Replace dynamic `tool_registry` with a static built-in tool table unless a current shipped behavior requires dynamic registration.
+- Audit `AgentSession` mirrors: `queue_mirror`, event drain state, public queue, and `session_manager`. Keep one mutation owner and derive projections.
+- Make print/json/interactive call one direct session API rather than host forwarding methods.
+- In `agent/loop.zig`, collapse `EventSink`/stream copy protocol if direct event application can preserve bounded streaming and tests.
+- In TUI product, delete `surface`, `slots`, `snapshot`, or `shimmer` seams that only serve future extension/general-framework needs.
+- Read `.references/pi-mono/packages/coding-agent` for product behavior before deleting Zi behavior that may look unused locally.
