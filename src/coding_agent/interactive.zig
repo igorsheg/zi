@@ -1093,7 +1093,9 @@ pub fn run(
         .text = model_text,
         .effect = .none,
     } });
-    try seedTranscriptFromSession(process.gpa, &terminal_loop, &host_handle.host);
+    var history_snapshot = try session_history_snapshot.build(process.gpa, host_handle.host.session.manager);
+    defer history_snapshot.deinit(process.gpa);
+    try seedTranscriptFromSnapshot(&terminal_loop, history_snapshot.items);
     if (options.initial_prompt) |prompt| {
         if (try loop.startPrompt(prompt) == .started) {
             try loop.appendTranscript(messageAppend(.user, prompt, .new_item));
@@ -1121,16 +1123,6 @@ fn modelComposerSlotText(model: ai.Model, buffer: []u8) []const u8 {
         }
         break :blk buffer[0..len];
     };
-}
-
-fn seedTranscriptFromSession(
-    allocator: std.mem.Allocator,
-    terminal_loop: *tui.product.TerminalLoop,
-    host: *AgentSessionRuntimeHost,
-) !void {
-    var snapshot = try session_history_snapshot.build(allocator, host.session.manager);
-    defer snapshot.deinit(allocator);
-    try seedTranscriptFromSnapshot(terminal_loop, snapshot.items);
 }
 
 fn seedTranscriptFromSnapshot(
