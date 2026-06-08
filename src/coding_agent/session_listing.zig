@@ -2,7 +2,7 @@ const std = @import("std");
 
 const paths_mod = @import("paths.zig");
 
-pub const SessionListOptions = struct {
+const SessionListOptions = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     dir: std.Io.Dir = .cwd(),
@@ -11,7 +11,7 @@ pub const SessionListOptions = struct {
     max_directory_entries: usize = 512,
 };
 
-pub const SessionSelectionOptions = struct {
+const SessionSelectionOptions = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     dir: std.Io.Dir = .cwd(),
@@ -21,7 +21,7 @@ pub const SessionSelectionOptions = struct {
     max_directory_entries: usize = 512,
 };
 
-pub const SessionList = struct {
+const SessionList = struct {
     file_names: [][]const u8,
     truncated: bool,
 
@@ -32,7 +32,7 @@ pub const SessionList = struct {
     }
 };
 
-pub fn listRuntimeSessions(
+fn listRuntimeSessions(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: SessionListOptions,
