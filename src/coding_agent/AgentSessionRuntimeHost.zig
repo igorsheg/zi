@@ -134,10 +134,6 @@ pub fn drainPublicEvents(self: *AgentSessionRuntimeHost, handler: PublicEventHan
     return count;
 }
 
-pub fn shutdownComplete(self: *AgentSessionRuntimeHost) bool {
-    return self.session.shutdownComplete();
-}
-
 fn buildSessionOptions(base: BaseOptions, start: SessionStart) AgentSession.Options {
     var options: AgentSession.Options = .{
         .cwd = base.cwd,
