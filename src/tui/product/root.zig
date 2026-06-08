@@ -2,6 +2,9 @@ pub const app = @import("App.zig");
 pub const composer = @import("composer.zig");
 pub const frame = @import("frame.zig");
 pub const keys = @import("keys.zig");
+pub const slots = @import("slots.zig");
+pub const snapshot = @import("snapshot.zig");
+pub const surface = @import("surface.zig");
 pub const transcript = @import("transcript.zig");
 pub const transcript_preview = @import("transcript_preview.zig");
 pub const transcript_projection = @import("transcript_projection.zig");
@@ -19,6 +22,11 @@ pub const ProductLoop = loop.ProductLoop;
 pub const TerminalLoop = terminal_loop.TerminalLoop;
 pub const Theme = theme.Theme;
 pub const ThemeId = theme.ThemeId;
+pub const SlotName = slots.SlotName;
+pub const SlotContributionId = slots.ContributionId;
+pub const SlotOwnerId = slots.OwnerId;
+pub const ModalId = surface.ModalId;
+pub const ConfirmResult = surface.ConfirmResult;
 pub const VScreenHarness = vscreen_harness.VScreenHarness;
 
 test {
@@ -26,6 +34,9 @@ test {
     _ = composer;
     _ = frame;
     _ = keys;
+    _ = slots;
+    _ = snapshot;
+    _ = surface;
     _ = transcript;
     _ = transcript_preview;
     _ = transcript_projection;

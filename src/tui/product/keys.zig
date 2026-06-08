@@ -6,6 +6,8 @@ pub const KeyAction = union(enum) {
     composer_backspace,
     composer_left,
     composer_right,
+    composer_start,
+    composer_end,
     composer_submit,
     transcript_page_up,
     transcript_page_down,
@@ -26,6 +28,8 @@ fn resolveKey(key: substrate.input.Key) KeyAction {
         .backspace => .composer_backspace,
         .arrow_left => .composer_left,
         .arrow_right => .composer_right,
+        .home => .composer_start,
+        .end => .composer_end,
         .enter => .composer_submit,
         .page_up => .transcript_page_up,
         .page_down => .transcript_page_down,
@@ -46,6 +50,8 @@ test "product keys resolve composer actions" {
     try std.testing.expect(resolve(.{ .key = .backspace }) == .composer_backspace);
     try std.testing.expect(resolve(.{ .key = .arrow_left }) == .composer_left);
     try std.testing.expect(resolve(.{ .key = .arrow_right }) == .composer_right);
+    try std.testing.expect(resolve(.{ .key = .home }) == .composer_start);
+    try std.testing.expect(resolve(.{ .key = .end }) == .composer_end);
     try std.testing.expect(resolve(.{ .key = .enter }) == .composer_submit);
 }
 

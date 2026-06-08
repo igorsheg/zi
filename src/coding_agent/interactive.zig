@@ -33,6 +33,9 @@ const pending_tool_id_bytes_max = 128;
 const pending_tool_output_bytes_max = tui.product.transcript.append_size_bytes_max;
 const tool_call_mirrors_max = 32;
 const tool_title_bytes_max = 512;
+const model_slot_owner: tui.product.SlotOwnerId = 1;
+const model_slot_id: tui.product.SlotContributionId = 1;
+const confirm_id_start: tui.product.ModalId = 1;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
     const last = last_render_ns orelse return true;
@@ -500,6 +503,11 @@ const ToolCallMirror = struct {
     }
 };
 
+const PendingConfirm = struct {
+    id: tui.product.ModalId,
+    result: ?bool = null,
+};
+
 const InteractiveLoop = struct {
     process: runtime.Process,
     host: *AgentSessionRuntimeHost,
@@ -515,6 +523,31 @@ const InteractiveLoop = struct {
     tool_call_mirrors: [tool_call_mirrors_max]ToolCallMirror = undefined,
     tool_call_mirror_count: usize = 0,
     tool_metadata_lookup_enabled: bool = true,
+    pending_confirm: ?PendingConfirm = null,
+    next_confirm_id: tui.product.ModalId = confirm_id_start,
+
+    fn requestConfirm(self: *InteractiveLoop, title: []const u8, body: []const u8) !tui.product.ModalId {
+        if (self.pending_confirm != null) return error.ConfirmAlreadyPending;
+        const id = self.nextConfirmId();
+        _ = try self.terminal_loop.applyCommand(.{ .open_confirm = .{ .id = id, .title = title, .body = body } });
+        self.pending_confirm = .{ .id = id };
+        return id;
+    }
+
+    fn nextConfirmId(self: *InteractiveLoop) tui.product.ModalId {
+        const id = self.next_confirm_id;
+        self.next_confirm_id +%= 1;
+        if (self.next_confirm_id == 0) self.next_confirm_id = confirm_id_start;
+        return id;
+    }
+
+    fn takeConfirmResult(self: *InteractiveLoop, id: tui.product.ModalId) ?bool {
+        const pending = self.pending_confirm orelse return null;
+        if (pending.id != id or pending.result == null) return null;
+        const result = pending.result.?;
+        self.pending_confirm = null;
+        return result;
+    }
 
     fn startPrompt(self: *InteractiveLoop, text: []const u8) !bool {
         if (self.active_run != null) {
@@ -640,7 +673,14 @@ const InteractiveLoop = struct {
                     if (try self.startPrompt(text)) try self.appendTranscript(messageAppend(.user, text, .new_item));
                 },
                 .request_shutdown => self.requestShutdown(),
+                .confirm_result => |result| self.applyConfirmResult(result),
             }
+        }
+    }
+
+    fn applyConfirmResult(self: *InteractiveLoop, result: tui.product.ConfirmResult) void {
+        if (self.pending_confirm) |*pending| {
+            if (pending.id == result.id) pending.result = result.accepted;
         }
     }
 
@@ -902,6 +942,7 @@ pub fn run(
     };
     defer loop.shutdown();
 
+    try applyModelFooterSlot(&terminal_loop, host_handle.host.base.model);
     try seedTranscriptFromSession(process.gpa, &terminal_loop, &host_handle.host);
     if (options.initial_prompt) |prompt| {
         if (try loop.startPrompt(prompt)) try loop.appendTranscript(messageAppend(.user, prompt, .new_item));
@@ -911,6 +952,35 @@ pub fn run(
     try stdout.flush();
 
     while (terminal_loop.isRunning()) try loop.tick();
+}
+
+fn applyModelFooterSlot(terminal_loop: *tui.product.TerminalLoop, model: ai.Model) !void {
+    var text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
+    const text = modelFooterText(model, &text_buffer);
+    _ = try terminal_loop.applyCommand(.{ .set_slot_contribution = .{
+        .slot = .composer_footer,
+        .id = model_slot_id,
+        .owner = model_slot_owner,
+        .priority = 100,
+        .text = text,
+    } });
+}
+
+fn modelFooterText(model: ai.Model, buffer: []u8) []const u8 {
+    return std.fmt.bufPrint(buffer, "model: {s}/{s}", .{ model.provider, model.id }) catch blk: {
+        if (buffer.len == 0) break :blk "";
+        const prefix = "model: ";
+        var len: usize = 0;
+        const prefix_len = @min(prefix.len, buffer.len);
+        @memcpy(buffer[0..prefix_len], prefix[0..prefix_len]);
+        len += prefix_len;
+        if (len < buffer.len) {
+            const id = utf8Prefix(model.id, buffer.len - len);
+            @memcpy(buffer[len..][0..id.len], id);
+            len += id.len;
+        }
+        break :blk buffer[0..len];
+    };
 }
 
 fn seedTranscriptFromSession(
@@ -1066,6 +1136,60 @@ test "interactive sanitizes ansi and terminal controls for transcript text" {
     );
 
     try std.testing.expectEqualStrings("red plain    tail", sanitized);
+}
+
+test "interactive confirm bridge resolves product modal result" {
+    var terminal_loop = try tui.product.TerminalLoop.init(
+        std.testing.allocator,
+        std.testing.io,
+        40,
+        10,
+        tui.product.loop.output_size_bytes_default,
+    );
+    defer terminal_loop.deinit();
+
+    var loop: InteractiveLoop = undefined;
+    loop.terminal_loop = &terminal_loop;
+    loop.effects = undefined;
+    loop.pending_confirm = null;
+    loop.next_confirm_id = confirm_id_start;
+
+    const id = try loop.requestConfirm("Import session", "Replace current session?");
+    try std.testing.expectEqual(confirm_id_start, id);
+    try std.testing.expect(terminal_loop.product.app.modal != null);
+
+    const fed = try terminal_loop.feedInputBytes("n", &loop.effects);
+    try std.testing.expectEqual(@as(usize, 1), fed.effect_count);
+    try loop.applyEffects(fed.effect_count);
+    try std.testing.expectEqual(false, loop.takeConfirmResult(id).?);
+    try std.testing.expect(terminal_loop.product.app.modal == null);
+}
+
+test "interactive confirm bridge ignores stale result ids" {
+    var terminal_loop = try tui.product.TerminalLoop.init(
+        std.testing.allocator,
+        std.testing.io,
+        40,
+        10,
+        tui.product.loop.output_size_bytes_default,
+    );
+    defer terminal_loop.deinit();
+
+    var loop: InteractiveLoop = undefined;
+    loop.terminal_loop = &terminal_loop;
+    loop.pending_confirm = .{ .id = 7 };
+    loop.applyConfirmResult(.{ .id = 8, .accepted = true });
+    try std.testing.expect(loop.takeConfirmResult(7) == null);
+    loop.applyConfirmResult(.{ .id = 7, .accepted = true });
+    try std.testing.expectEqual(true, loop.takeConfirmResult(7).?);
+}
+
+test "interactive model footer text is bounded" {
+    var buffer: [32]u8 = undefined;
+    const model = agent_mod.Agent.defaultModel();
+    const text = modelFooterText(model, &buffer);
+    try std.testing.expect(text.len <= buffer.len);
+    try std.testing.expect(std.mem.startsWith(u8, text, "model: "));
 }
 
 test "interactive maps simple public events to transcript appends" {

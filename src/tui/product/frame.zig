@@ -2,6 +2,9 @@ const std = @import("std");
 const infra = @import("../infra/root.zig");
 const primitive = @import("../primitive/root.zig");
 const app_mod = @import("App.zig");
+const composer_mod = @import("composer.zig");
+const slots_mod = @import("slots.zig");
+const surface_mod = @import("surface.zig");
 const transcript_mod = @import("transcript.zig");
 const theme_mod = @import("theme.zig");
 const transcript_projection = @import("transcript_projection.zig");
@@ -42,21 +45,78 @@ pub const Frame = struct {
 
 fn drawShell(app: *const app_mod.ProductApp, renderer: *infra.Renderer) !void {
     if (app.height > 0) try renderer.writeText(0, 0, "zi", app.theme.shell_label);
+    const footer_rows = composerFooterRows(app);
+    const composer_rows = composerRows(app);
     if (app.height > 0) {
-        try drawTranscript(app, renderer, app.theme.transcript_text, transcriptVisibleRows(app.height));
+        try drawTranscript(
+            app,
+            renderer,
+            app.theme.transcript_text,
+            transcriptVisibleRowsWithReserved(app.height, footer_rows + composer_rows),
+        );
     }
     if (app.height > 0) {
-        const composer_y = app.height - 1;
-        try renderer.writeText(0, composer_y, "> ", app.theme.composer_prompt);
-        if (app.width > 2) try renderer.writeText(2, composer_y, app.composer.text(), app.theme.composer_text);
+        try drawComposerFooter(app, renderer, footer_rows, composer_rows);
+        try drawComposer(app, renderer, composer_rows);
     }
+    if (app.modal) |modal| try drawModal(app, renderer, modal);
 }
 
 pub fn transcriptVisibleRows(height: u16) usize {
+    return transcriptVisibleRowsWithFooter(height, 0);
+}
+
+pub fn transcriptVisibleRowsWithFooter(height: u16, footer_rows: usize) usize {
+    return transcriptVisibleRowsWithReserved(height, footer_rows + 1);
+}
+
+pub fn transcriptVisibleRowsWithReserved(height: u16, reserved_rows: usize) usize {
     if (height == 0) return 0;
-    const composer_y = height - 1;
-    const available_rows: usize = if (composer_y > 1) composer_y - 1 else 0;
+    const body_rows = height - 1;
+    const reserved = @min(reserved_rows, body_rows);
+    const available_rows = body_rows - reserved;
     return @min(available_rows, transcript_visual_rows_max);
+}
+
+pub fn composerFooterRows(app: *const app_mod.ProductApp) usize {
+    return @min(app.slots.count(.composer_footer), slots_mod.composer_footer_rows_max);
+}
+
+pub fn composerRows(app: *const app_mod.ProductApp) usize {
+    const text_width = if (app.width > 2) app.width - 2 else 1;
+    return @min(app.composer.visualRows(text_width), composer_mod.visible_rows_max);
+}
+
+fn drawComposerFooter(
+    app: *const app_mod.ProductApp,
+    renderer: *infra.Renderer,
+    footer_rows: usize,
+    composer_rows: usize,
+) !void {
+    if (footer_rows == 0 or app.height <= composer_rows) return;
+    var views: [slots_mod.composer_footer_rows_max]slots_mod.SlotView = undefined;
+    const count = app.slots.orderedSlot(.composer_footer, &views);
+    const rows = @min(count, @min(footer_rows, @as(usize, app.height) - composer_rows));
+    var index: usize = 0;
+    while (index < rows) : (index += 1) {
+        const y: u16 = @intCast(@as(usize, app.height) - composer_rows - rows + index);
+        try renderer.writeText(0, y, views[index].text, app.theme.transcript_secondary);
+    }
+}
+
+fn drawComposer(app: *const app_mod.ProductApp, renderer: *infra.Renderer, composer_rows: usize) !void {
+    if (composer_rows == 0 or app.height == 0) return;
+    var rows: [composer_mod.visible_rows_max]composer_mod.ComposerVisualRow = undefined;
+    const text_width = if (app.width > 2) app.width - 2 else 1;
+    const projection = app.composer.visibleRows(text_width, &rows);
+    const visible_count = @min(projection.visible_count, @min(composer_rows, @as(usize, app.height)));
+    var index: usize = 0;
+    while (index < visible_count) : (index += 1) {
+        const y: u16 = @intCast(@as(usize, app.height) - visible_count + index);
+        if (index == 0) try renderer.writeText(0, y, "> ", app.theme.composer_prompt);
+        const x: u16 = if (index == 0) 2 else 0;
+        if (x < app.width) try renderer.writeText(x, y, rows[index].text, app.theme.composer_text);
+    }
 }
 
 pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
@@ -68,6 +128,87 @@ pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u
         emitItemRowsNewestFirst(&sink, transcript.items.items[item_index], width, null);
     }
     return if (sink.total_emitted > visible_rows) sink.total_emitted - visible_rows else 0;
+}
+
+fn drawModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, modal: surface_mod.Modal) !void {
+    switch (modal) {
+        .confirm => |confirm| try drawConfirmModal(app, renderer, confirm),
+    }
+}
+
+fn drawConfirmModal(app: *const app_mod.ProductApp, renderer: *infra.Renderer, confirm: surface_mod.Confirm) !void {
+    if (app.width < 8 or app.height < 5) return;
+    const modal_width = @min(app.width, @max(@as(u16, 24), app.width * 3 / 5));
+    const modal_height: u16 = 5;
+    const x = (app.width - modal_width) / 2;
+    const y = (app.height - modal_height) / 2;
+
+    try renderer.fillRect(0, 0, app.width, app.height, .{ .dim = true });
+    try renderer.fillRect(x, y, modal_width, modal_height, .{});
+    try drawBox(renderer, x, y, modal_width, modal_height, app.theme.tool_chrome);
+    if (modal_width > 4) {
+        try renderer.writeText(x + 2, y, confirm.title, app.theme.tool_title);
+        try renderer.writeText(x + 2, y + 2, confirm.body, app.theme.transcript_text);
+        try drawConfirmButtons(app, renderer, confirm, x, y + modal_height - 2, modal_width);
+    }
+}
+
+fn drawBox(renderer: *infra.Renderer, x: u16, y: u16, w: u16, h: u16, style: primitive.Style) !void {
+    if (w < 2 or h < 2) return;
+    try renderer.writeText(x, y, "╭", style);
+    try renderer.writeText(x + w - 1, y, "╮", style);
+    try renderer.writeText(x, y + h - 1, "╰", style);
+    try renderer.writeText(x + w - 1, y + h - 1, "╯", style);
+    var xx: u16 = x + 1;
+    while (xx + 1 < x + w) : (xx += 1) {
+        try renderer.writeText(xx, y, "─", style);
+        try renderer.writeText(xx, y + h - 1, "─", style);
+    }
+    var yy: u16 = y + 1;
+    while (yy + 1 < y + h) : (yy += 1) {
+        try renderer.writeText(x, yy, "│", style);
+        try renderer.writeText(x + w - 1, yy, "│", style);
+    }
+}
+
+fn drawConfirmButtons(
+    app: *const app_mod.ProductApp,
+    renderer: *infra.Renderer,
+    confirm: surface_mod.Confirm,
+    x: u16,
+    y: u16,
+    modal_width: u16,
+) !void {
+    var label_buffer: [surface_mod.button_bytes_max * 2 + 8]u8 = undefined;
+    const yes = selectedLabel(
+        &label_buffer,
+        confirm.yes_label,
+        confirm.selected == .yes,
+    ) catch confirm.yes_label;
+    var no_buffer: [surface_mod.button_bytes_max * 2 + 8]u8 = undefined;
+    const no = selectedLabel(
+        &no_buffer,
+        confirm.no_label,
+        confirm.selected == .no,
+    ) catch confirm.no_label;
+    const yes_width = primitive.text.displayWidth(yes);
+    const no_width = primitive.text.displayWidth(no);
+    const total_width = yes_width + 2 + no_width;
+    const centered_offset = (@as(usize, modal_width) -| total_width) / 2;
+    const start = if (total_width < modal_width) x + @as(u16, @intCast(centered_offset)) else x + 2;
+    const yes_style = if (confirm.selected == .yes) app.theme.status_accent else app.theme.transcript_secondary;
+    const no_style = if (confirm.selected == .no) app.theme.status_accent else app.theme.transcript_secondary;
+    try renderer.writeText(start, y, yes, yes_style);
+    const no_x = @as(u16, @intCast(@min(
+        @as(usize, std.math.maxInt(u16)),
+        @as(usize, start) + yes_width + 2,
+    )));
+    try renderer.writeText(no_x, y, no, no_style);
+}
+
+fn selectedLabel(buffer: []u8, label: []const u8, selected: bool) ![]const u8 {
+    if (selected) return std.fmt.bufPrint(buffer, "[{s}]", .{label});
+    return std.fmt.bufPrint(buffer, " {s} ", .{label});
 }
 
 fn drawTranscript(
@@ -515,6 +656,103 @@ test "frame keeps transcript out of tiny heights" {
     defer renderer.deinit();
     try Frame.build(&app, &renderer);
     try expectCellText(renderer.next, 0, 0, "> ");
+}
+
+test "frame renders composer footer slots above composer and reserves transcript rows" {
+    var app = try app_mod.ProductApp.init(40, 5);
+    defer app.deinit(std.testing.allocator);
+    try appendFrameMessage(&app, .system, "one");
+    try appendFrameMessage(&app, .system, "two");
+    try app.slots.set(std.testing.allocator, .{
+        .slot = .composer_footer,
+        .id = 1,
+        .owner = 1,
+        .priority = 1,
+        .text = "model: faux",
+    });
+    try app.composer.insertUtf8(std.testing.allocator, "draft");
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellText(renderer.next, 0, 3, "model: faux");
+    try expectCellText(renderer.next, 0, 4, "> draft");
+    try std.testing.expectEqual(@as(usize, 2), transcriptVisibleRowsWithFooter(app.height, composerFooterRows(&app)));
+}
+
+test "frame renders highest priority composer footer contributions first" {
+    var app = try app_mod.ProductApp.init(40, 5);
+    defer app.deinit(std.testing.allocator);
+    try app.slots.set(std.testing.allocator, .{
+        .slot = .composer_footer,
+        .id = 1,
+        .owner = 1,
+        .priority = 1,
+        .text = "low",
+    });
+    try app.slots.set(std.testing.allocator, .{
+        .slot = .composer_footer,
+        .id = 2,
+        .owner = 1,
+        .priority = 3,
+        .text = "high",
+    });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 5, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellText(renderer.next, 0, 2, "high");
+    try expectCellText(renderer.next, 0, 3, "low");
+}
+
+test "frame renders multiline composer on bottom rows and keeps footer above" {
+    var app = try app_mod.ProductApp.init(40, 6);
+    defer app.deinit(std.testing.allocator);
+    try appendFrameMessage(&app, .system, "visible");
+    try app.slots.set(std.testing.allocator, .{ .slot = .composer_footer, .id = 1, .owner = 1, .text = "footer" });
+    try app.composer.insertUtf8(std.testing.allocator, "one\ntwo\nthree");
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 6, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellText(renderer.next, 0, 2, "footer");
+    try expectCellText(renderer.next, 0, 3, "> one");
+    try expectCellText(renderer.next, 0, 4, "two");
+    try expectCellText(renderer.next, 0, 5, "three");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        transcriptVisibleRowsWithReserved(app.height, composerRows(&app) + composerFooterRows(&app)),
+    );
+}
+
+test "frame renders confirm modal above base frame" {
+    var app = try app_mod.ProductApp.init(40, 10);
+    defer app.deinit(std.testing.allocator);
+    try appendFrameMessage(&app, .system, "base");
+    _ = try app.apply(std.testing.allocator, .{ .open_confirm = .{ .id = 1, .title = "Confirm", .body = "Proceed?" } });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 40, 10, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+
+    try expectCellGrapheme(renderer.next, 8, 2, "╭");
+    try expectCellText(renderer.next, 10, 2, "Confirm");
+    try expectCellText(renderer.next, 10, 4, "Proceed?");
+    try expectCellText(renderer.next, 14, 5, "[Yes]");
+}
+
+test "frame skips confirm modal safely on tiny viewports" {
+    var app = try app_mod.ProductApp.init(7, 4);
+    defer app.deinit(std.testing.allocator);
+    _ = try app.apply(std.testing.allocator, .{ .open_confirm = .{ .id = 1, .title = "Confirm", .body = "Proceed?" } });
+
+    var renderer = try infra.Renderer.init(std.testing.allocator, 7, 4, size_cells_max);
+    defer renderer.deinit();
+    try Frame.build(&app, &renderer);
+    try expectCellText(renderer.next, 0, 3, "> ");
 }
 
 test "frame renders transcript hard newlines as visual rows" {
