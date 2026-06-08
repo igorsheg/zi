@@ -8,7 +8,6 @@ const resources = @import("resources.zig");
 const prompt_command = @import("prompt_command.zig");
 const queue_mirror_mod = @import("queue_mirror.zig");
 const session_events = @import("session_events.zig");
-const session_history_snapshot = @import("session_history_snapshot.zig");
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
 const system_prompt = @import("system_prompt.zig");
@@ -177,12 +176,6 @@ pub const RuntimeStatusSnapshot = struct {
     dropped_public_event_count: usize,
     context_overflow_count: usize,
 };
-
-pub const PublicHistorySnapshot = session_history_snapshot.Snapshot;
-
-pub fn publicHistorySnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !PublicHistorySnapshot {
-    return session_history_snapshot.build(allocator, self.manager);
-}
 
 pub const Error = error{
     SessionBusy,
