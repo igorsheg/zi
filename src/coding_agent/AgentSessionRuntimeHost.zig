@@ -123,10 +123,6 @@ pub fn requestShutdown(self: *AgentSessionRuntimeHost) void {
     self.session.requestShutdown();
 }
 
-pub fn statusSnapshot(self: *AgentSessionRuntimeHost) AgentSession.RuntimeStatusSnapshot {
-    return self.session.statusSnapshot();
-}
-
 pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?session_events.AgentSessionEvent {
     return self.session.drainPublicEvent();
 }
@@ -376,7 +372,7 @@ test "runtime host replacement drains old public events before new session" {
 
     try std.testing.expect(result.discarded_public_event_count > 0);
     try std.testing.expectEqualStrings("second", host.sessionHeader().id);
-    try std.testing.expectEqual(@as(usize, 0), host.statusSnapshot().public_event_count);
+    try std.testing.expectEqual(@as(usize, 0), host.session.statusSnapshot().public_event_count);
 }
 
 test "runtime host new session replaces current session" {
@@ -503,8 +499,8 @@ test "runtime host owns current agent session public boundary" {
 
     try runPromptForTest(&host, "hello");
 
-    try std.testing.expect(host.statusSnapshot().public_event_count > 0);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+    try std.testing.expect(host.session.statusSnapshot().public_event_count > 0);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
     try std.testing.expectEqual(@as(usize, tool_registry.builtin_tool_count), host.session.tools.activeToolNames().len);
 }
 
@@ -534,7 +530,7 @@ test "runtime host persists run messages before frontend drains public events" {
     }
 
     try runPromptForTest(&host, "durable");
-    try std.testing.expect(host.statusSnapshot().public_event_count > 0);
+    try std.testing.expect(host.session.statusSnapshot().public_event_count > 0);
 
     const context = try host.session.manager.buildSessionContext(std.testing.allocator);
     defer host.session.manager.deinitSessionContext(std.testing.allocator, context);
@@ -543,7 +539,7 @@ test "runtime host persists run messages before frontend drains public events" {
     try std.testing.expectEqualStrings("durable", context.messages[0].user.content.string);
 
     drainHostEvents(&host);
-    try std.testing.expectEqual(@as(usize, 0), host.statusSnapshot().public_event_count);
+    try std.testing.expectEqual(@as(usize, 0), host.session.statusSnapshot().public_event_count);
     const drained_context = try host.session.manager.buildSessionContext(std.testing.allocator);
     defer host.session.manager.deinitSessionContext(std.testing.allocator, drained_context);
     try std.testing.expectEqual(context.messages.len, drained_context.messages.len);
@@ -817,7 +813,7 @@ test "runtime host live run executes a tool and continues the assistant turn" {
     try std.testing.expect(observed.final_text_delta);
     try std.testing.expect(observed.agent_end_with_tool_result);
     try std.testing.expect(observed.agent_end);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
 }
 
 test "runtime host applies prompt progress from zio stream future" {
@@ -872,7 +868,7 @@ test "runtime host applies prompt progress from zio stream future" {
     while (try host.stepPromptRun(run)) {}
 
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
-    try std.testing.expect(host.statusSnapshot().public_event_count > 0);
+    try std.testing.expect(host.session.statusSnapshot().public_event_count > 0);
 }
 
 test "runtime host compacts through public command boundary" {
@@ -920,7 +916,7 @@ test "runtime host compacts through public command boundary" {
     try std.testing.expectEqualStrings(kept, result.first_kept_entry_id.text);
     try std.testing.expectEqual(@as(usize, 4), host.session.manager.entries.items.len);
     try std.testing.expectEqual(@as(usize, 2), host.session.agent.state.messages.len);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
 
     var start_event = host.drainPublicEvent().?;
     defer start_event.deinit();
@@ -1060,7 +1056,7 @@ test "runtime host preserves bash truncation details through public events" {
     // runtime output-limit failure for this size.
     try std.testing.expect(!observed.output_limit_exceeded);
     try std.testing.expect(observed.tool_result_message);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
 }
 
 test "runtime host cancellation reaches running bash tool through agent loop" {
@@ -1116,7 +1112,7 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
     defer future.cancel();
     var observed: BashLimitObservation = .{};
     try waitForBashToolStart(&host, &observed);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.running, host.statusSnapshot().status);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.running, host.session.statusSnapshot().status);
     host.cancel();
 
     try future.join();
@@ -1125,5 +1121,5 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
     try std.testing.expect(observed.tool_execution_start);
     try std.testing.expect(observed.tool_execution_end);
     try std.testing.expect(observed.tool_error);
-    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.statusSnapshot().status);
+    try std.testing.expectEqual(AgentSession.AgentSessionStatus.idle, host.session.statusSnapshot().status);
 }
