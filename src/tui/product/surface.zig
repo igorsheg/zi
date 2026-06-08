@@ -7,11 +7,6 @@ pub const button_bytes_max: usize = 24;
 
 pub const ModalId = u32;
 
-pub const FocusTarget = union(enum) {
-    composer,
-    confirm: ModalId,
-};
-
 pub const ConfirmChoice = enum { no, yes };
 
 pub const OpenConfirm = struct {

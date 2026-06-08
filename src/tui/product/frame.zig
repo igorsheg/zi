@@ -134,7 +134,7 @@ fn setComposerCursor(
     box_y: u16,
     projection: composer_mod.ComposerProjection,
 ) void {
-    if (app.focus != .composer or app.modal != null or !projection.cursor_visible) return;
+    if (app.modal != null or !projection.cursor_visible) return;
     const cursor_y = @as(usize, box_y) + 1 + projection.cursor_visible_row;
     const cursor_x = 3 + projection.cursor_display_col;
     if (cursor_x >= app.width or cursor_y >= app.height) return;
