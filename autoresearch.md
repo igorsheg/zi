@@ -105,4 +105,5 @@ Useful first probes:
 - Deleted a one-caller `SlotStore.hasSlot` helper; status row visibility now uses the existing slot count directly.
 - Collapsed the single-variant TUI modal wrapper into direct `Confirm` ownership, then removed duplicate focus state derived from modal presence.
 - Simplified confirm modal state: fixed Yes/No labels are current behavior, and selection is a direct `selected_yes` field.
-- Found `shuffle_text` status effect had no current setter. First deletion attempt failed checks because `hasAnimated` kept an unused tick parameter; retry removes the parameter too.
+- Found `shuffle_text` status effect had no current setter. First deletion attempt failed checks because `hasAnimated` kept an unused tick parameter; retry removed the parameter too.
+- Removed unused session-host surfaces: ready-poll prompt draining, public-event presence probe, runtime accessor, replacement callbacks, host continue forwarding, and session-level continue API. The continue API deletion removed one test that only covered the deleted method; `autoresearch.sh` baseline test count is now 617.
