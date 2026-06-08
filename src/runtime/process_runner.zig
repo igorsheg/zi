@@ -192,7 +192,8 @@ pub fn run(
                         },
                         error.Canceled => return error.Canceled,
                     };
-                    unreachable;
+                    std.debug.assert(false);
+                    return error.Canceled;
                 },
                 .output_fault => {
                     try terminateAndDrainProcess(
