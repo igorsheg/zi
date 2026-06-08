@@ -11,6 +11,9 @@ pub const KeyAction = union(enum) {
     composer_submit,
     transcript_page_up,
     transcript_page_down,
+    interrupt,
+    clear_or_exit,
+    exit_if_composer_empty,
     request_shutdown,
     none,
 };
@@ -33,11 +36,11 @@ fn resolveKey(key: substrate.input.Key) KeyAction {
         .enter => .composer_submit,
         .page_up => .transcript_page_up,
         .page_down => .transcript_page_down,
-        .escape => .request_shutdown,
+        .escape => .interrupt,
         .ctrl => |c| switch (c) {
-            0x03 => .request_shutdown,
+            0x03 => .clear_or_exit,
             0x15 => .transcript_page_up,
-            0x04 => .transcript_page_down,
+            0x04 => .exit_if_composer_empty,
             else => .none,
         },
         else => .none,
@@ -55,12 +58,12 @@ test "product keys resolve composer actions" {
     try std.testing.expect(resolve(.{ .key = .enter }) == .composer_submit);
 }
 
-test "product keys resolve transcript and shutdown actions" {
+test "product keys resolve transcript and app actions" {
     try std.testing.expect(resolve(.{ .key = .page_up }) == .transcript_page_up);
     try std.testing.expect(resolve(.{ .key = .page_down }) == .transcript_page_down);
     try std.testing.expect(resolve(.{ .key = .{ .ctrl = 0x15 } }) == .transcript_page_up);
-    try std.testing.expect(resolve(.{ .key = .{ .ctrl = 0x04 } }) == .transcript_page_down);
-    try std.testing.expect(resolve(.{ .key = .escape }) == .request_shutdown);
-    try std.testing.expect(resolve(.{ .key = .{ .ctrl = 0x03 } }) == .request_shutdown);
+    try std.testing.expect(resolve(.{ .key = .{ .ctrl = 0x04 } }) == .exit_if_composer_empty);
+    try std.testing.expect(resolve(.{ .key = .escape }) == .interrupt);
+    try std.testing.expect(resolve(.{ .key = .{ .ctrl = 0x03 } }) == .clear_or_exit);
     try std.testing.expect(resolve(.{ .key = .arrow_up }) == .none);
 }

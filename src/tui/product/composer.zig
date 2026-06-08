@@ -158,7 +158,12 @@ pub const ComposerBuffer = struct {
     pub fn takeSubmit(self: *ComposerBuffer, allocator: std.mem.Allocator) !?[]u8 {
         if (self.bytes.items.len == 0) return null;
         if (self.bytes.items.len > submit_size_bytes_max) return error.ComposerTooLarge;
-        const owned = try allocator.dupe(u8, self.bytes.items);
+        const trimmed = std.mem.trim(u8, self.bytes.items, " \t\n\r");
+        if (trimmed.len == 0) {
+            self.clear();
+            return null;
+        }
+        const owned = try allocator.dupe(u8, trimmed);
         self.clear();
         return owned;
     }
@@ -420,6 +425,20 @@ test "composer projection cache follows text and cursor revisions" {
     const text_projection = composer.visibleRows(20, &rows);
     try std.testing.expectEqual(@as(usize, 1), text_projection.visible_count);
     try std.testing.expectEqualStrings("abZc", rows[0].text);
+}
+
+test "composer submit trims whitespace and ignores empty" {
+    var composer: ComposerBuffer = .{};
+    defer composer.deinit(std.testing.allocator);
+
+    try composer.insertUtf8(std.testing.allocator, "  hello\n");
+    const submitted = (try composer.apply(std.testing.allocator, .submit)).?;
+    defer std.testing.allocator.free(submitted);
+    try std.testing.expectEqualStrings("hello", submitted);
+
+    try composer.insertUtf8(std.testing.allocator, "  \n\t ");
+    try std.testing.expect(try composer.apply(std.testing.allocator, .submit) == null);
+    try std.testing.expectEqualStrings("", composer.text());
 }
 
 test "composer command contract owns editing and submit" {

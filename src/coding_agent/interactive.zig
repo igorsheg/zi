@@ -40,6 +40,8 @@ const status_id_working: tui.product.SlotContributionId = 1;
 const status_owner_policy: tui.product.SlotOwnerId = 3;
 const status_id_compaction: tui.product.SlotContributionId = 1;
 const status_id_retry: tui.product.SlotContributionId = 2;
+const status_owner_queue: tui.product.SlotOwnerId = 4;
+const status_id_queue: tui.product.SlotContributionId = 1;
 const confirm_id_start: tui.product.ModalId = 1;
 
 fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
@@ -53,6 +55,35 @@ fn animationTick(now_ns: i128) u64 {
 }
 
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
+
+fn queuedMessagesText(snapshot: *const session_events.QueueSnapshot, buffer: []u8) ?[]const u8 {
+    return queuedMessagesAndDraftText(snapshot, "", buffer);
+}
+
+fn queuedMessagesAndDraftText(
+    snapshot: *const session_events.QueueSnapshot,
+    draft: []const u8,
+    buffer: []u8,
+) ?[]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    var wrote_any = false;
+    if (!writeQueuedList(&writer, snapshot.steering.items, &wrote_any)) return null;
+    if (!writeQueuedList(&writer, snapshot.follow_up.items, &wrote_any)) return null;
+    if (std.mem.trim(u8, draft, " \t\n\r").len > 0) {
+        if (wrote_any) writer.writeAll("\n\n") catch return null;
+        writer.writeAll(draft) catch return null;
+    }
+    return buffer[0..writer.end];
+}
+
+fn writeQueuedList(writer: *std.Io.Writer, items: []const []const u8, wrote_any: *bool) bool {
+    for (items) |item| {
+        if (wrote_any.*) writer.writeAll("\n\n") catch return false;
+        writer.writeAll(item) catch return false;
+        wrote_any.* = true;
+    }
+    return true;
+}
 
 fn messageAppend(
     role: tui.product.transcript.TranscriptRole,
@@ -571,16 +602,60 @@ const InteractiveLoop = struct {
         return result;
     }
 
-    fn startPrompt(self: *InteractiveLoop, text: []const u8) !bool {
+    const PromptSubmitResult = enum { started, queued, rejected };
+
+    fn startPrompt(self: *InteractiveLoop, text: []const u8) !PromptSubmitResult {
         if (self.active_run != null) {
-            try self.stderr.writeAll("prompt already running; submit ignored\n");
-            return false;
+            self.host.queuePrompt(text, .steer) catch |err| {
+                _ = self.terminal_loop.applyCommand(.{ .insert_composer_text = text }) catch null;
+                try self.appendOperationalStatus(@errorName(err));
+                return .rejected;
+            };
+            return .queued;
         }
         self.active_run = try self.host.startPromptRun(text, &.{}, .{});
+        self.cancel_requested = false;
         self.setWorkingStatus() catch {
-            self.stderr.writeAll("status update failed\n") catch return true;
+            self.stderr.writeAll("status update failed\n") catch return .started;
         };
-        return true;
+        return .started;
+    }
+
+    fn interrupt(self: *InteractiveLoop) void {
+        const prompt_run = self.active_run orelse return;
+        if (self.cancel_requested) return;
+        self.restoreQueuedMessagesToComposer() catch {
+            self.stderr.writeAll("queue restore failed\n") catch return;
+        };
+        self.cancel_requested = true;
+        self.host.cancelPromptRun(prompt_run) catch |err| {
+            self.stderr.writeAll("cancel failed; waiting for run to settle\n") catch return;
+            self.host.cancel();
+            self.setWorkingStatusText(@errorName(err)) catch return;
+            return;
+        };
+        self.host.destroyPromptRun(prompt_run);
+        self.active_run = null;
+        self.cancel_requested = false;
+        self.clearStatus(status_owner_run, status_id_working) catch {
+            self.stderr.writeAll("status clear failed\n") catch return;
+        };
+    }
+
+    fn restoreQueuedMessagesToComposer(self: *InteractiveLoop) !void {
+        var snapshot = try self.host.queueSnapshot(self.process.gpa);
+        defer snapshot.deinit();
+        if (snapshot.steering.items.len == 0 and snapshot.follow_up.items.len == 0) return;
+        var buffer: [tui.product.composer.buffer_size_bytes_max]u8 = undefined;
+        const draft = self.terminal_loop.product.app.composer.text();
+        const text = queuedMessagesAndDraftText(&snapshot, draft, &buffer) orelse {
+            try self.host.clearQueue();
+            try self.appendOperationalStatus("queued messages too large to restore");
+            return;
+        };
+        try self.host.clearQueue();
+        _ = try self.terminal_loop.applyCommand(.clear_composer);
+        _ = try self.terminal_loop.applyCommand(.{ .insert_composer_text = text });
     }
 
     fn requestShutdown(self: *InteractiveLoop) void {
@@ -696,8 +771,12 @@ const InteractiveLoop = struct {
         for (self.effects[0..count]) |effect| {
             switch (effect) {
                 .submit_text => |text| {
-                    if (try self.startPrompt(text)) try self.appendTranscript(messageAppend(.user, text, .new_item));
+                    switch (try self.startPrompt(text)) {
+                        .started => try self.appendTranscript(messageAppend(.user, text, .new_item)),
+                        .queued, .rejected => {},
+                    }
                 },
+                .interrupt => self.interrupt(),
                 .request_shutdown => self.requestShutdown(),
                 .confirm_result => |result| self.applyConfirmResult(result),
             }
@@ -738,6 +817,7 @@ const InteractiveLoop = struct {
         if (!more) {
             self.host.destroyPromptRun(prompt_run);
             self.active_run = null;
+            self.cancel_requested = false;
             self.clearStatus(status_owner_run, status_id_working) catch {
                 self.stderr.writeAll("status clear failed\n") catch return;
             };
@@ -770,7 +850,7 @@ const InteractiveLoop = struct {
                 status_owner_policy,
                 status_id_compaction,
                 200,
-                "compacting context",
+                "compacting context (Esc to cancel)",
                 .shimmer,
             ),
             .compaction_end => try self.clearStatus(status_owner_policy, status_id_compaction),
@@ -779,18 +859,37 @@ const InteractiveLoop = struct {
                 const seconds = (payload.delay_ms + 999) / 1000;
                 const text = std.fmt.bufPrint(
                     &buffer,
-                    "retry {d}/{d} in {d}s",
+                    "retry {d}/{d} in {d}s (Esc to cancel)",
                     .{ payload.attempt, payload.max_attempts, seconds },
-                ) catch "retrying";
+                ) catch "retrying (Esc to cancel)";
                 try self.setStatus(status_owner_policy, status_id_retry, 190, text, .shimmer);
             },
             .auto_retry_end => try self.clearStatus(status_owner_policy, status_id_retry),
+            .queue_update => |payload| try self.applyQueueStatus(payload),
             else => {},
         }
     }
 
+    fn applyQueueStatus(self: *InteractiveLoop, payload: session_events.AgentSessionEvent.QueueUpdate) !void {
+        if (payload.steering.items.len == 0 and payload.follow_up.items.len == 0) {
+            try self.clearStatus(status_owner_queue, status_id_queue);
+            return;
+        }
+        var buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buffer,
+            "queued steer:{d} follow-up:{d}",
+            .{ payload.steering.items.len, payload.follow_up.items.len },
+        ) catch "queued messages";
+        try self.setStatus(status_owner_queue, status_id_queue, 80, text, .none);
+    }
+
     fn setWorkingStatus(self: *InteractiveLoop) !void {
-        try self.setStatus(status_owner_run, status_id_working, 100, "working", .shimmer);
+        try self.setWorkingStatusText("working (Esc to cancel)");
+    }
+
+    fn setWorkingStatusText(self: *InteractiveLoop, text: []const u8) !void {
+        try self.setStatus(status_owner_run, status_id_working, 100, text, .shimmer);
     }
 
     fn setStatus(
@@ -1046,7 +1145,9 @@ pub fn run(
     try applyModelComposerSlot(&terminal_loop, host_handle.host.base.model);
     try seedTranscriptFromSession(process.gpa, &terminal_loop, &host_handle.host);
     if (options.initial_prompt) |prompt| {
-        if (try loop.startPrompt(prompt)) try loop.appendTranscript(messageAppend(.user, prompt, .new_item));
+        if (try loop.startPrompt(prompt) == .started) {
+            try loop.appendTranscript(messageAppend(.user, prompt, .new_item));
+        }
     }
     _ = try loop.drainPublicEventsBounded(public_events_per_tick_max);
     try terminal_loop.renderIfDirty(stdout);
@@ -1195,6 +1296,21 @@ fn selectResumeSession(
     return selected;
 }
 
+test "interactive queued text restore joins steering follow-up and draft" {
+    var steering = try session_events.EventTextList.init(std.testing.allocator, &.{ "one", "two" });
+    defer steering.deinit();
+    var follow_up = try session_events.EventTextList.init(std.testing.allocator, &.{"three"});
+    defer follow_up.deinit();
+    const snapshot: session_events.QueueSnapshot = .{
+        .revision = 1,
+        .steering = steering,
+        .follow_up = follow_up,
+    };
+    var buffer: [64]u8 = undefined;
+    const text = queuedMessagesAndDraftText(&snapshot, "draft", &buffer).?;
+    try std.testing.expectEqualStrings("one\n\ntwo\n\nthree\n\ndraft", text);
+}
+
 test "interactive overflow status is explicit" {
     var err_storage: [256]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&err_storage);
@@ -1292,6 +1408,52 @@ test "interactive model composer slot text is bounded" {
     const text = modelComposerSlotText(model, &buffer);
     try std.testing.expect(text.len <= buffer.len);
     try std.testing.expect(std.mem.startsWith(u8, text, "model: "));
+}
+
+test "interactive status events include cancel hints and queue counts" {
+    var terminal_loop = try tui.product.TerminalLoop.init(
+        std.testing.allocator,
+        std.testing.io,
+        40,
+        10,
+        tui.product.loop.output_size_bytes_default,
+    );
+    defer terminal_loop.deinit();
+
+    var loop: InteractiveLoop = undefined;
+    loop.terminal_loop = &terminal_loop;
+
+    try loop.applyPublicEventStatus(.{ .compaction_start = .{ .reason = .manual } });
+    var status = terminal_loop.product.app.slots.highestPriority(.status_area).?;
+    try std.testing.expect(std.mem.indexOf(u8, status.text, "Esc to cancel") != null);
+
+    var error_message = try session_events.EventText.init(std.testing.allocator, "temporary");
+    defer error_message.deinit();
+    try loop.applyPublicEventStatus(.{ .auto_retry_start = .{
+        .attempt = 1,
+        .max_attempts = 3,
+        .delay_ms = 1500,
+        .error_message = error_message,
+    } });
+    status = terminal_loop.product.app.slots.highestPriority(.status_area).?;
+    try std.testing.expect(std.mem.indexOf(u8, status.text, "Esc to cancel") != null);
+
+    var steering = try session_events.EventTextList.init(std.testing.allocator, &.{"next"});
+    defer steering.deinit();
+    var follow_up = try session_events.EventTextList.init(std.testing.allocator, &.{});
+    defer follow_up.deinit();
+    try loop.applyPublicEventStatus(.{ .queue_update = .{
+        .steering = steering,
+        .follow_up = follow_up,
+        .revision = 1,
+    } });
+    var views: [tui.product.slots.status_area_slot_count_max]tui.product.slots.SlotView = undefined;
+    const count = terminal_loop.product.app.slots.orderedSlot(.status_area, &views);
+    var found_queue = false;
+    for (views[0..count]) |view| {
+        if (std.mem.indexOf(u8, view.text, "queued steer:1") != null) found_queue = true;
+    }
+    try std.testing.expect(found_queue);
 }
 
 test "interactive maps simple public events to transcript appends" {

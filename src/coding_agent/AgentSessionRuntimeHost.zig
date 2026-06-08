@@ -161,6 +161,14 @@ pub fn startPromptRun(
     return self.session.startLivePromptRun(text, images, options);
 }
 
+pub fn queuePrompt(
+    self: *AgentSessionRuntimeHost,
+    text: []const u8,
+    behavior: AgentSession.StreamingBehavior,
+) !void {
+    try self.session.promptWithOptions(text, &.{}, .{ .streaming_behavior = behavior });
+}
+
 pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !bool {
     return self.session.stepPromptRun(run);
 }
@@ -182,6 +190,10 @@ pub fn applyPromptRunProgress(
     progress: @TypeOf(AgentSession.promptRunProgress(run)).Result,
 ) !bool {
     return self.session.applyPromptRunProgress(run, progress);
+}
+
+pub fn cancelPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !void {
+    try self.session.cancelPromptRun(run);
 }
 
 pub fn destroyPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) void {
@@ -223,6 +235,10 @@ pub fn zioRuntime(self: *AgentSessionRuntimeHost) *runtime.Runtime {
 
 pub fn queueSnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
     return self.session.queueSnapshot(allocator);
+}
+
+pub fn clearQueue(self: *AgentSessionRuntimeHost) !void {
+    try self.session.clearQueue();
 }
 
 pub fn drainPublicEvent(self: *AgentSessionRuntimeHost) ?session_events.AgentSessionEvent {

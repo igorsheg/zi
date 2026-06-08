@@ -185,7 +185,7 @@ test "terminal loop step bytes feeds renders and returns effects" {
     try std.testing.expect(!loop.product.app.dirty);
 }
 
-test "terminal loop ctrl-c requests shutdown without coding agent policy" {
+test "terminal loop ctrl-c clears without stopping on first press" {
     var loop = try TerminalLoop.init(
         std.testing.allocator,
         std.testing.io,
@@ -200,14 +200,15 @@ test "terminal loop ctrl-c requests shutdown without coding agent policy" {
     var storage: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&storage);
 
-    const result = try loop.stepBytes("\x03", &writer, &effects);
+    const result = try loop.stepBytes("draft\x03", &writer, &effects);
     defer for (effects[0..result.effect_count]) |effect| effect.deinit(std.testing.allocator);
 
-    try std.testing.expect(result.shutdown_requested);
-    try std.testing.expect(!loop.running);
+    try std.testing.expect(!result.shutdown_requested);
+    try std.testing.expect(loop.running);
+    try std.testing.expectEqualStrings("", loop.product.app.composer.text());
 }
 
-test "terminal loop escape requests shutdown without coding agent policy" {
+test "terminal loop escape emits interrupt without stopping" {
     var loop = try TerminalLoop.init(
         std.testing.allocator,
         std.testing.io,
@@ -226,6 +227,8 @@ test "terminal loop escape requests shutdown without coding agent policy" {
     const result = try loop.flushInput(&writer, &effects);
     defer for (effects[0..result.effect_count]) |effect| effect.deinit(std.testing.allocator);
 
-    try std.testing.expect(result.shutdown_requested);
-    try std.testing.expect(!loop.running);
+    try std.testing.expect(!result.shutdown_requested);
+    try std.testing.expect(loop.running);
+    try std.testing.expectEqual(@as(usize, 1), result.effect_count);
+    try std.testing.expect(effects[0] == .interrupt);
 }

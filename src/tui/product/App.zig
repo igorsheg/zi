@@ -23,6 +23,7 @@ pub const ProductApp = struct {
     transcript_scroll_max_visible_rows: usize = std.math.maxInt(usize),
     theme: theme_mod.Theme = theme_mod.Theme.codex(),
     animation_tick: u64 = 0,
+    last_clear_tick: ?u64 = null,
     dirty: bool = true,
 
     pub fn init(width: u16, height: u16) !ProductApp {
@@ -128,9 +129,26 @@ pub const ProductApp = struct {
             .composer_submit => if (try self.applyComposer(allocator, .submit)) |effect| return effect,
             .transcript_page_up => self.scrollTranscript(self.transcriptVisibleRows()),
             .transcript_page_down => self.scrollTranscriptDown(self.transcriptVisibleRows()),
+            .interrupt => return .interrupt,
+            .clear_or_exit => if (try self.clearOrExit(allocator)) |effect| return effect,
+            .exit_if_composer_empty => if (self.composer.text().len == 0) return .request_shutdown,
             .request_shutdown => return .request_shutdown,
             .none => {},
         }
+        return null;
+    }
+
+    fn clearOrExit(self: *ProductApp, allocator: std.mem.Allocator) !?Effect {
+        const double_press_window_ticks = 32;
+        if (self.last_clear_tick) |last_tick| {
+            if (self.animation_tick >= last_tick and
+                self.animation_tick - last_tick <= double_press_window_ticks)
+            {
+                return .request_shutdown;
+            }
+        }
+        _ = try self.applyComposer(allocator, .clear);
+        self.last_clear_tick = self.animation_tick;
         return null;
     }
 
@@ -243,12 +261,13 @@ pub const Size = struct {
 pub const Effect = union(enum) {
     submit_text: []u8,
     request_shutdown,
+    interrupt,
     confirm_result: surface_mod.ConfirmResult,
 
     pub fn deinit(self: Effect, allocator: std.mem.Allocator) void {
         switch (self) {
             .submit_text => |text| allocator.free(text),
-            .request_shutdown, .confirm_result => {},
+            .request_shutdown, .interrupt, .confirm_result => {},
         }
     }
 };
@@ -267,20 +286,17 @@ test "product app applies input through one mutation path" {
     try std.testing.expectEqualStrings("", app.composer.text());
 }
 
-test "product app maps escape and ctrl-c to shutdown" {
+test "product app maps escape to interrupt not shutdown" {
     var app = try ProductApp.init(20, 4);
     defer app.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(
-        app_mod_effect_request_shutdown,
+        app_mod_effect_interrupt,
         try app.apply(std.testing.allocator, .{ .input = .{ .key = .escape } }),
-    );
-    try std.testing.expectEqual(
-        app_mod_effect_request_shutdown,
-        try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x03 } } }),
     );
 }
 
+const app_mod_effect_interrupt: ?Effect = .interrupt;
 const app_mod_effect_request_shutdown: ?Effect = .request_shutdown;
 
 fn appendTestMessage(app: *ProductApp, role: transcript.TranscriptRole, text: []const u8) !void {
@@ -304,7 +320,7 @@ test "product app applies transcript append through apply" {
     try std.testing.expectEqualStrings("ok", app.transcript.items.items[0].message.text);
 }
 
-test "product app maps ctrl-u and ctrl-d to transcript scroll" {
+test "product app maps ctrl-u to transcript scroll" {
     var app = try ProductApp.init(20, 5);
     defer app.deinit(std.testing.allocator);
 
@@ -315,8 +331,34 @@ test "product app maps ctrl-u and ctrl-d to transcript scroll" {
 
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x15 } } }) == null);
     try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
+}
+
+test "product app ctrl-c clears then double press exits" {
+    var app = try ProductApp.init(20, 4);
+    defer app.deinit(std.testing.allocator);
+
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .insert_composer_text = "draft" }) == null);
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .animation_tick = 10 }) == null);
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x03 } } }) == null);
+    try std.testing.expectEqualStrings("", app.composer.text());
+    try std.testing.expectEqual(
+        app_mod_effect_request_shutdown,
+        try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x03 } } }),
+    );
+}
+
+test "product app ctrl-d exits only when composer is empty" {
+    var app = try ProductApp.init(20, 4);
+    defer app.deinit(std.testing.allocator);
+
+    try std.testing.expect(try app.apply(std.testing.allocator, .{ .insert_composer_text = "draft" }) == null);
     try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x04 } } }) == null);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
+    try std.testing.expectEqualStrings("draft", app.composer.text());
+    _ = try app.apply(std.testing.allocator, .clear_composer);
+    try std.testing.expectEqual(
+        app_mod_effect_request_shutdown,
+        try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x04 } } }),
+    );
 }
 
 test "product app page down at bottom does not dirty" {

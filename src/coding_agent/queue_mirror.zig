@@ -35,6 +35,14 @@ pub const QueueMirror = struct {
         return self.remove(allocator, &self.follow_up, text);
     }
 
+    pub fn clear(self: *QueueMirror, allocator: std.mem.Allocator) bool {
+        if (self.steering.items.len == 0 and self.follow_up.items.len == 0) return false;
+        self.clearList(allocator, &self.steering);
+        self.clearList(allocator, &self.follow_up);
+        self.revision += 1;
+        return true;
+    }
+
     pub fn snapshot(self: *const QueueMirror, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
         var steering = try session_events.EventTextList.init(allocator, self.steering.items);
         errdefer steering.deinit();
