@@ -1,9 +1,9 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const generated = @import("models.generated.zig");
+const catalog = @import("model_catalog.zig");
 
-pub const models = generated.models;
-pub const providers = generated.providers;
+pub const models = catalog.models;
+pub const providers = catalog.providers;
 
 // TODO: Replace static catalog lookups with an owned ModelRegistry when runtime providers can register models.
 pub fn getModel(provider: protocol.Provider, model_id: []const u8) ?protocol.Model {

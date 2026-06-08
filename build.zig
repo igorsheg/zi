@@ -47,18 +47,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run zi").dependOn(&run_cmd.step);
 
-    const generate_models = b.addExecutable(.{
-        .name = "generate-models",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("scripts/generate-models.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const generate_models_cmd = b.addRunArtifact(generate_models);
-    generate_models_cmd.addArg("src/ai/models.generated.zig");
-    b.step("generate-models", "Generate AI model table").dependOn(&generate_models_cmd.step);
-
     const lib_tests = b.addTest(.{ .root_module = zi });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
 
