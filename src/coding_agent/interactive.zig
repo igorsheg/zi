@@ -553,7 +553,7 @@ const InteractiveLoop = struct {
             };
             return .queued;
         }
-        self.active_run = try self.host.startPromptRun(text, &.{});
+        self.active_run = try self.host.session.startPromptRun(text, &.{}, .{});
         self.cancel_requested = false;
         self.setWorkingStatus() catch {
             self.stderr.writeAll("status update failed\n") catch return .started;
@@ -570,11 +570,11 @@ const InteractiveLoop = struct {
         self.cancel_requested = true;
         self.host.session.cancelPromptRun(prompt_run) catch |err| {
             self.stderr.writeAll("cancel failed; waiting for run to settle\n") catch return;
-            self.host.cancel();
+            self.host.session.cancel();
             self.setWorkingStatusText(@errorName(err)) catch return;
             return;
         };
-        self.host.destroyPromptRun(prompt_run);
+        self.host.session.destroyPromptRun(prompt_run);
         self.active_run = null;
         self.cancel_requested = false;
         self.clearStatus(status_id_working) catch {
@@ -601,7 +601,7 @@ const InteractiveLoop = struct {
     fn requestShutdown(self: *InteractiveLoop) void {
         self.terminal_loop.requestStop();
         if (!self.cancel_requested and self.active_run != null) {
-            self.host.cancel();
+            self.host.session.cancel();
             self.cancel_requested = true;
         }
     }
@@ -756,7 +756,7 @@ const InteractiveLoop = struct {
         if (self.active_run != prompt_run) return;
         const more = try self.host.session.applyPromptRunProgress(prompt_run, result);
         if (!more) {
-            self.host.destroyPromptRun(prompt_run);
+            self.host.session.destroyPromptRun(prompt_run);
             self.active_run = null;
             self.cancel_requested = false;
             self.clearStatus(status_id_working) catch {
@@ -1039,7 +1039,7 @@ const InteractiveLoop = struct {
 
     fn shutdown(self: *InteractiveLoop) void {
         if (self.active_run != null and !self.cancel_requested) {
-            self.host.cancel();
+            self.host.session.cancel();
             self.cancel_requested = true;
         }
         var ticks: usize = 0;
@@ -1047,7 +1047,7 @@ const InteractiveLoop = struct {
             _ = self.drainPromptProgressBounded(prompt_progress_per_tick_max) catch break;
         }
         if (self.active_run) |prompt_run| {
-            self.host.destroyPromptRun(prompt_run);
+            self.host.session.destroyPromptRun(prompt_run);
             self.active_run = null;
         }
     }

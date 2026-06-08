@@ -94,30 +94,6 @@ pub fn replaceSession(self: *AgentSessionRuntimeHost, start: SessionStart) !Repl
     return .{ .discarded_public_event_count = discarded_public_event_count };
 }
 
-pub fn startPromptRun(
-    self: *AgentSessionRuntimeHost,
-    text: []const u8,
-    images: []const ai.ImageContent,
-) !*AgentSession.LivePromptRun {
-    return self.session.startPromptRun(text, images, .{});
-}
-
-pub fn stepPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) !bool {
-    return self.session.stepPromptRun(run);
-}
-
-pub fn destroyPromptRun(self: *AgentSessionRuntimeHost, run: *AgentSession.LivePromptRun) void {
-    self.session.destroyPromptRun(run);
-}
-
-pub fn cancel(self: *AgentSessionRuntimeHost) void {
-    self.session.cancel();
-}
-
-pub fn requestShutdown(self: *AgentSessionRuntimeHost) void {
-    self.session.requestShutdown();
-}
-
 pub fn drainPublicEvents(self: *AgentSessionRuntimeHost, handler: PublicEventHandler) !usize {
     var count: usize = 0;
     while (self.session.drainPublicEvent()) |event| {
@@ -185,9 +161,9 @@ fn drainHostEvents(host: *AgentSessionRuntimeHost) void {
 }
 
 fn runPromptForTest(host: *AgentSessionRuntimeHost, text: []const u8) !void {
-    const run = try host.startPromptRun(text, &.{});
-    defer host.destroyPromptRun(run);
-    while (try host.stepPromptRun(run)) {}
+    const run = try host.session.startPromptRun(text, &.{}, .{});
+    defer host.session.destroyPromptRun(run);
+    while (try host.session.stepPromptRun(run)) {}
 }
 
 const EchoTool = struct {
@@ -337,7 +313,7 @@ test "runtime host replacement drains old public events before new session" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -373,7 +349,7 @@ test "runtime host new session replaces current session" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -407,7 +383,7 @@ test "runtime host zio runtime accessor returns explicit session runtime" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -436,7 +412,7 @@ test "runtime host replacement rejects active old session" {
     } });
     defer {
         if (!host.session.agent.waitForIdle()) host.session.agent.finishRun();
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -470,7 +446,7 @@ test "runtime host owns current agent session public boundary" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -502,7 +478,7 @@ test "runtime host persists run messages before frontend drains public events" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -543,7 +519,7 @@ test "runtime host preserves session header active leaf and context after public
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -609,7 +585,7 @@ test "runtime host persists session store that loads after host deinit" {
         } });
         store = undefined;
         defer {
-            host.requestShutdown();
+            host.session.requestShutdown();
             drainHostEvents(&host);
             host.deinit();
         }
@@ -671,7 +647,7 @@ test "runtime host resumes session store into agent context and appends new hist
         } });
         seed_store = undefined;
         defer {
-            host.requestShutdown();
+            host.session.requestShutdown();
             drainHostEvents(&host);
             host.deinit();
         }
@@ -697,7 +673,7 @@ test "runtime host resumes session store into agent context and appends new hist
         } });
         resume_store = undefined;
         defer {
-            host.requestShutdown();
+            host.session.requestShutdown();
             drainHostEvents(&host);
             host.deinit();
         }
@@ -760,7 +736,7 @@ test "runtime host live run executes a tool and continues the assistant turn" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -776,9 +752,9 @@ test "runtime host live run executes a tool and continues the assistant turn" {
     );
     try host.session.setActiveToolsByName(&.{"echo"});
 
-    const run = try host.startPromptRun("use the tool", &.{});
-    defer host.destroyPromptRun(run);
-    while (try host.stepPromptRun(run)) {}
+    const run = try host.session.startPromptRun("use the tool", &.{}, .{});
+    defer host.session.destroyPromptRun(run);
+    while (try host.session.stepPromptRun(run)) {}
 
     var observed: ToolLoopObservation = .{};
     _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = ToolLoopObservation.onEvent });
@@ -830,20 +806,20 @@ test "runtime host applies prompt progress from zio stream future" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
 
-    const run = try host.startPromptRun("hello", &.{});
-    defer host.destroyPromptRun(run);
+    const run = try host.session.startPromptRun("hello", &.{}, .{});
+    defer host.session.destroyPromptRun(run);
 
     var progress = run.stream.asyncNext();
     const selected = try runtime.select(.{ .prompt = &progress });
     const more = try host.session.applyPromptRunProgress(run, selected.prompt);
     try std.testing.expect(more);
 
-    while (try host.stepPromptRun(run)) {}
+    while (try host.session.stepPromptRun(run)) {}
 
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
     try std.testing.expect(host.session.statusSnapshot().public_event_count > 0);
@@ -870,7 +846,7 @@ test "runtime host compacts through public command boundary" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -936,7 +912,7 @@ test "runtime host compacts with generated summary through public command bounda
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -1015,14 +991,14 @@ test "runtime host preserves bash truncation details through public events" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
 
-    const run = try host.startPromptRun("use bash", &.{});
-    defer host.destroyPromptRun(run);
-    while (try host.stepPromptRun(run)) {}
+    const run = try host.session.startPromptRun("use bash", &.{}, .{});
+    defer host.session.destroyPromptRun(run);
+    while (try host.session.stepPromptRun(run)) {}
 
     var observed: BashLimitObservation = .{};
     _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });
@@ -1081,7 +1057,7 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
         .timestamp = "2026-05-26T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainHostEvents(&host);
         host.deinit();
     }
@@ -1095,7 +1071,7 @@ test "runtime host cancellation reaches running bash tool through agent loop" {
         try runtime.yield();
     } else return error.BashToolStartNotObserved;
     try std.testing.expectEqual(.running, host.session.statusSnapshot().status);
-    host.cancel();
+    host.session.cancel();
 
     try future.join();
     _ = try host.drainPublicEvents(.{ .context = &observed, .call_fn = BashLimitObservation.onEvent });

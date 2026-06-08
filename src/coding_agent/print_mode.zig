@@ -39,9 +39,9 @@ fn runInner(
 ) !void {
     const json_output = options.output == .json;
     if (json_output) try writeSessionHeader(host, stdout);
-    const prompt_run = try host.startPromptRun(options.prompt, &.{});
-    defer host.destroyPromptRun(prompt_run);
-    while (try host.stepPromptRun(prompt_run)) {
+    const prompt_run = try host.session.startPromptRun(options.prompt, &.{}, .{});
+    defer host.session.destroyPromptRun(prompt_run);
+    while (try host.session.stepPromptRun(prompt_run)) {
         try drainEvents(host, stdout, stderr, options.output);
     }
     try drainEvents(host, stdout, stderr, options.output);
@@ -171,7 +171,7 @@ test "print mode emits assistant text from injected stream" {
         .timestamp = "2026-05-27T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainAllPublicEvents(&host);
         host.deinit();
     }
@@ -213,7 +213,7 @@ test "json print mode streams session header and public events" {
         .timestamp = "2026-05-27T00:00:00Z",
     } });
     defer {
-        host.requestShutdown();
+        host.session.requestShutdown();
         drainAllPublicEvents(&host);
         host.deinit();
     }
