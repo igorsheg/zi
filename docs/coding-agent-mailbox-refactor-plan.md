@@ -328,7 +328,7 @@ AgentSession.zig is imported by session_runtime.zig, not frontends
 | 0. Baseline | done | | `zig build test`, `zig build`, `zig fmt --check src`, `./autoresearch.sh` pass on alpha after merge. |
 | 1. Typed protocol | done | | Added `client_protocol.zig` with typed command/event envelopes and deinit tests. |
 | 2. SessionRuntime owner | done | | Added `session_runtime.zig`; moved session runtime creation out of `runtime_services.zig`; CLI/interactive now construct through `session_runtime`. |
-| 3. Print mode mailbox | pending | | |
+| 3. Print mode mailbox | done | | `print_mode.zig` now submits `ClientCommand.submit_prompt` to `SessionRuntime` and drains `ClientEvent`; no direct prompt run lifecycle remains. |
 | 4. Interactive mailbox | pending | | |
 | 5. Privatize AgentSession API | pending | | |
 | 6. Wire decision | pending | | |

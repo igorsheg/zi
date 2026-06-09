@@ -68,6 +68,10 @@ pub const SessionRuntime = struct {
         return &self.wake_event;
     }
 
+    pub fn sessionHeader(self: *const SessionRuntime) session_manager.SessionHeader {
+        return self.session.manager.header;
+    }
+
     pub fn step(self: *SessionRuntime) !void {
         while (self.commands.pop()) |envelope| {
             var command = envelope;
