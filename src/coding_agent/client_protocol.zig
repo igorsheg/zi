@@ -11,6 +11,10 @@ pub const event_queue_capacity_default = 256;
 pub const CommandQueue = runtime.BoundedQueue(CommandEnvelope);
 pub const EventQueue = runtime.BoundedQueue(EventEnvelope);
 
+pub const EventText = session_events.EventText;
+pub const EventTextList = session_events.EventTextList;
+pub const OwnedAgentEvent = session_events.OwnedAgentEvent;
+
 pub const CommandEnvelope = struct {
     id: ?RequestId = null,
     command: ClientCommand,
@@ -56,19 +60,61 @@ pub const EventEnvelope = struct {
 };
 
 pub const ClientEvent = union(enum) {
-    accepted: RequestId,
     rejected: Rejection,
     response: Response,
-    session_event: session_events.AgentSessionEvent,
-    shutdown_complete,
+    agent_event: OwnedAgentEvent,
+    queue_update: session_events.AgentSessionEvent.QueueUpdate,
+    prompt_command: session_events.AgentSessionEvent.PromptCommand,
+    compaction_start: session_events.AgentSessionEvent.CompactionStart,
+    session_info_changed: session_events.AgentSessionEvent.SessionInfoChanged,
+    compaction_end: session_events.AgentSessionEvent.CompactionEnd,
+    auto_retry_start: session_events.AgentSessionEvent.AutoRetryStart,
+    auto_retry_end: session_events.AgentSessionEvent.AutoRetryEnd,
+    event_overflow: session_events.AgentSessionEvent.PublicEventOverflow,
+
+    pub fn fromSessionEvent(event: session_events.AgentSessionEvent) ClientEvent {
+        return switch (event) {
+            .agent_event => |payload| .{ .agent_event = payload },
+            .queue_update => |payload| .{ .queue_update = payload },
+            .prompt_command => |payload| .{ .prompt_command = payload },
+            .compaction_start => |payload| .{ .compaction_start = payload },
+            .session_info_changed => |payload| .{ .session_info_changed = payload },
+            .compaction_end => |payload| .{ .compaction_end = payload },
+            .auto_retry_start => |payload| .{ .auto_retry_start = payload },
+            .auto_retry_end => |payload| .{ .auto_retry_end = payload },
+            .public_event_overflow => |payload| .{ .event_overflow = payload },
+        };
+    }
 
     pub fn deinit(self: *ClientEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .rejected => |rejection| allocator.free(rejection.message),
-            .session_event => |*event| event.deinit(),
-            .accepted, .response, .shutdown_complete => {},
+            .agent_event => |*payload| payload.deinit(),
+            .queue_update => |*payload| payload.deinit(),
+            .prompt_command => |*payload| payload.deinit(),
+            .session_info_changed => |*payload| if (payload.name) |*name| name.deinit(),
+            .compaction_end => |*payload| payload.deinit(),
+            .auto_retry_start => |*payload| payload.error_message.deinit(),
+            .auto_retry_end => |*payload| if (payload.final_error) |*err| err.deinit(),
+            .response, .compaction_start, .event_overflow => {},
         }
         self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: ClientEvent, stringify: *std.json.Stringify) !void {
+        switch (self) {
+            .agent_event => |payload| try stringify.write(session_events.AgentSessionEvent{ .agent_event = payload }),
+            .queue_update => |payload| try stringify.write(session_events.AgentSessionEvent{ .queue_update = payload }),
+            .prompt_command => |payload| try stringify.write(session_events.AgentSessionEvent{ .prompt_command = payload }),
+            .compaction_start => |payload| try stringify.write(session_events.AgentSessionEvent{ .compaction_start = payload }),
+            .session_info_changed => |payload| try stringify.write(session_events.AgentSessionEvent{ .session_info_changed = payload }),
+            .compaction_end => |payload| try stringify.write(session_events.AgentSessionEvent{ .compaction_end = payload }),
+            .auto_retry_start => |payload| try stringify.write(session_events.AgentSessionEvent{ .auto_retry_start = payload }),
+            .auto_retry_end => |payload| try stringify.write(session_events.AgentSessionEvent{ .auto_retry_end = payload }),
+            .event_overflow => |payload| try stringify.write(session_events.AgentSessionEvent{ .public_event_overflow = payload }),
+            .rejected => |payload| try stringify.write(.{ .type = "rejected", .message = payload.message }),
+            .response => |payload| try stringify.write(.{ .type = "response", .response = payload }),
+        }
     }
 };
 
@@ -101,11 +147,11 @@ test "command envelope owns prompt text" {
     try std.testing.expectEqualStrings("hello", envelope.command.submit_prompt.text);
 }
 
-test "event envelope deinitializes owned session event" {
-    var event: EventEnvelope = .{ .event = .{ .session_event = .{ .prompt_command = .{
+test "event envelope deinitializes owned client event" {
+    var event: EventEnvelope = .{ .event = .{ .prompt_command = .{
         .command = try session_events.EventText.init(std.testing.allocator, "help"),
         .result = .handled,
         .message = try session_events.EventText.init(std.testing.allocator, "ok"),
-    } } } };
+    } } };
     event.deinit(std.testing.allocator);
 }

@@ -330,5 +330,5 @@ AgentSession.zig is imported by session_runtime.zig, not frontends
 | 2. SessionRuntime owner | done | | Added `session_runtime.zig`; moved session runtime creation out of `runtime_services.zig`; CLI/interactive now construct through `session_runtime`. |
 | 3. Print mode mailbox | done | | `print_mode.zig` now submits `ClientCommand.submit_prompt` to `SessionRuntime` and drains `ClientEvent`; no direct prompt run lifecycle remains. |
 | 4. Interactive mailbox | done | | `interactive.zig` no longer imports `AgentSession` or touches prompt run/session internals; it submits commands to `SessionRuntime`, waits through `SessionRuntime`, and drains `ClientEvent`. |
-| 5. Privatize AgentSession API | pending | | |
+| 5. Privatize AgentSession API | done | | Prompt run, queue, public event, prompt, cancel, status, tool, and compaction helpers are private on `AgentSession`; `SessionRuntime` uses the narrow `RuntimeAccess` owner seam. Frontends no longer import `session_events` or receive `AgentSessionEvent` unions. |
 | 6. Wire decision | pending | | |

@@ -59,7 +59,7 @@ pub const SessionRuntime = struct {
     commands: client_protocol.CommandQueue,
     events: client_protocol.EventQueue,
     wake_event: runtime.ResetEvent = .init,
-    active_run: ?*AgentSession.LivePromptRun = null,
+    active_run: ?*AgentSession.RuntimeAccess.PromptRun = null,
     active_request_id: ?client_protocol.RequestId = null,
 
     pub fn submit(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
@@ -92,11 +92,11 @@ pub const SessionRuntime = struct {
     }
 
     pub fn queuedMessagesSnapshot(self: *const SessionRuntime, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
-        return self.session.queueSnapshot(allocator);
+        return AgentSession.RuntimeAccess.queueSnapshot(&self.session, allocator);
     }
 
     pub fn dropQueuedMessages(self: *SessionRuntime) !void {
-        try self.session.clearQueue();
+        try AgentSession.RuntimeAccess.clearQueue(&self.session);
         try self.drainSessionEvents(null);
     }
 
@@ -104,7 +104,7 @@ pub const SessionRuntime = struct {
         const readable = runtime.ReadableFd.initBorrowed(input_fd);
         var input = readable.asyncReadable();
         var frame = runtime.Timeout.fromMilliseconds(frame_ms);
-        var public_event_wake = self.session.publicEventWake();
+        var public_event_wake = AgentSession.RuntimeAccess.publicEventWake(&self.session);
         if (self.active_run) |run| {
             var progress = run.stream.asyncNext();
             switch (try runtime.select(.{ .input = &input, .prompt = &progress, .public_event = public_event_wake, .frame = &frame })) {
@@ -164,7 +164,7 @@ pub const SessionRuntime = struct {
 
     pub fn deinit(self: *SessionRuntime) void {
         if (self.active_run) |run| {
-            self.session.destroyPromptRun(run);
+            AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
             self.active_run = null;
         }
         drainQueuedCommands(self);
@@ -180,14 +180,14 @@ pub const SessionRuntime = struct {
         switch (envelope.command) {
             .submit_prompt => |prompt| {
                 if (self.active_run != null) {
-                    self.session.promptWithOptions(prompt.text, &.{}, .{ .streaming_behavior = .steer }) catch |err| {
+                    AgentSession.RuntimeAccess.promptWithOptions(&self.session, prompt.text, &.{}, .{ .streaming_behavior = .steer }) catch |err| {
                         try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                         return;
                     };
                     try self.drainSessionEvents(envelope.id);
                     return;
                 }
-                self.active_run = self.session.startPromptRun(prompt.text, &.{}, .{}) catch |err| {
+                self.active_run = AgentSession.RuntimeAccess.startPromptRun(&self.session, prompt.text, &.{}, .{}) catch |err| {
                     try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                     return;
                 };
@@ -196,11 +196,11 @@ pub const SessionRuntime = struct {
             },
             .cancel => {
                 if (self.active_run) |run| {
-                    self.session.cancelPromptRun(run) catch self.session.cancel();
-                    self.session.destroyPromptRun(run);
+                    AgentSession.RuntimeAccess.cancelPromptRun(&self.session, run) catch AgentSession.RuntimeAccess.cancel(&self.session);
+                    AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
                     self.active_run = null;
                     self.active_request_id = null;
-                } else self.session.cancel();
+                } else AgentSession.RuntimeAccess.cancel(&self.session);
                 try self.drainSessionEvents(envelope.id);
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .canceled } });
             },
@@ -210,19 +210,19 @@ pub const SessionRuntime = struct {
             },
             .request_snapshot => try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .snapshot_sent } }),
             .shutdown => {
-                self.session.requestShutdown();
+                AgentSession.RuntimeAccess.requestShutdown(&self.session);
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .shutdown_started } });
             },
         }
     }
 
-    fn applyPromptProgressResult(self: *SessionRuntime, run: *AgentSession.LivePromptRun, result: anytype) !void {
+    fn applyPromptProgressResult(self: *SessionRuntime, run: *AgentSession.RuntimeAccess.PromptRun, result: anytype) !void {
         if (self.active_run != run) return;
         const request_id = self.active_request_id;
-        const more = try self.session.applyPromptRunProgress(run, result);
+        const more = try AgentSession.RuntimeAccess.applyPromptRunProgress(&self.session, run, result);
         try self.drainSessionEvents(request_id);
         if (!more) {
-            self.session.destroyPromptRun(run);
+            AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
             self.active_run = null;
             self.active_request_id = null;
             try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .response = .prompt_finished } });
@@ -230,8 +230,8 @@ pub const SessionRuntime = struct {
     }
 
     fn drainSessionEvents(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
-        while (self.session.drainPublicEvent()) |event| {
-            try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .session_event = event } });
+        while (AgentSession.RuntimeAccess.drainPublicEvent(&self.session)) |event| {
+            try self.enqueueEvent(.{ .request_id = request_id, .event = client_protocol.ClientEvent.fromSessionEvent(event) });
         }
     }
 
@@ -359,8 +359,8 @@ fn initSessionRuntimeBase(allocator: std.mem.Allocator, options: anytype) !Sessi
 }
 
 fn shutdownAndDeinitSession(session: *AgentSession) void {
-    session.requestShutdown();
-    while (session.drainPublicEvent()) |event| {
+    AgentSession.RuntimeAccess.requestShutdown(session);
+    while (AgentSession.RuntimeAccess.drainPublicEvent(session)) |event| {
         var owned_event = event;
         owned_event.deinit();
     }

@@ -4,7 +4,6 @@ const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const tui = @import("../tui/root.zig");
 const client_protocol = @import("client_protocol.zig");
-const session_events = @import("session_events.zig");
 const session_listing = @import("session_listing.zig");
 const session_runtime = @import("session_runtime.zig");
 
@@ -23,7 +22,7 @@ const frame_interval_ms: u64 = 16;
 const frame_interval_ns: i128 = frame_interval_ms * std.time.ns_per_ms;
 const input_reads_per_tick_max = 1;
 const prompt_progress_per_tick_max = 64;
-const public_events_per_tick_max = 16;
+const client_events_per_tick_max = 16;
 const render_attempts_per_tick_max = 1;
 const shutdown_drain_ticks_max = 60;
 const pending_tool_outputs_max = 32;
@@ -46,7 +45,7 @@ fn frameDue(now_ns: i128, last_render_ns: ?i128) bool {
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
 
 fn queuedMessagesAndDraftText(
-    snapshot: *const session_events.QueueSnapshot,
+    snapshot: anytype,
     draft: []const u8,
     buffer: []u8,
 ) ?[]const u8 {
@@ -342,7 +341,7 @@ fn toolCallAppend(
     ) };
 }
 
-fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?TranscriptIngest {
+fn transcriptAppendFromEvent(event: client_protocol.ClientEvent) ?TranscriptIngest {
     return switch (event) {
         .agent_event => |agent_event| transcriptAppendFromAgentEvent(agent_event.event),
         .prompt_command => |payload| .{ .append = statusAppend(.info, payload.message.text) },
@@ -358,8 +357,9 @@ fn transcriptAppendFromEvent(event: session_events.AgentSessionEvent) ?Transcrip
             .{ .append = statusAppend(.err, "auto retry failed") }
         else
             null,
-        .public_event_overflow => .{ .append = statusAppend(.warning, "public event overflow") },
+        .event_overflow => .{ .append = statusAppend(.warning, "public event overflow") },
         .queue_update, .session_info_changed => null,
+        .rejected, .response => null,
     };
 }
 
@@ -604,7 +604,7 @@ const InteractiveLoop = struct {
         }
         try self.app.step();
         _ = try self.drainPromptProgressBounded(prompt_progress_per_tick_max);
-        _ = try self.drainPublicEventsBounded(public_events_per_tick_max);
+        _ = try self.drainClientEventsBounded(client_events_per_tick_max);
         const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
         const animation_tick: u64 = if (now_ns <= 0) 0 else @intCast(@divFloor(now_ns, frame_interval_ns));
         _ = try self.terminal_loop.applyCommand(.{ .animation_tick = animation_tick });
@@ -688,7 +688,7 @@ const InteractiveLoop = struct {
         return self.app.stepPromptProgressBounded(limit);
     }
 
-    fn drainPublicEventsBounded(self: *InteractiveLoop, limit: usize) !usize {
+    fn drainClientEventsBounded(self: *InteractiveLoop, limit: usize) !usize {
         var count: usize = 0;
         while (count < limit) : (count += 1) {
             var envelope = self.app.drainEvent() orelse {
@@ -697,9 +697,18 @@ const InteractiveLoop = struct {
             };
             defer envelope.deinit(self.app.allocator);
             switch (envelope.event) {
-                .session_event => |event| {
-                    try self.applyPublicEventStatus(event);
-                    try self.applyPublicEventTranscript(event);
+                .agent_event,
+                .queue_update,
+                .prompt_command,
+                .compaction_start,
+                .session_info_changed,
+                .compaction_end,
+                .auto_retry_start,
+                .auto_retry_end,
+                .event_overflow,
+                => {
+                    try self.applyClientEventStatus(envelope.event);
+                    try self.applyClientEventTranscript(envelope.event);
                 },
                 .rejected => |rejection| try self.appendOperationalStatus(rejection.message),
                 .response => |response| switch (response) {
@@ -711,14 +720,13 @@ const InteractiveLoop = struct {
                     },
                     else => {},
                 },
-                .accepted, .shutdown_complete => {},
             }
         }
         try self.flushToolOutputCoalescer();
         return count;
     }
 
-    fn applyPublicEventStatus(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
+    fn applyClientEventStatus(self: *InteractiveLoop, event: client_protocol.ClientEvent) !void {
         switch (event) {
             .agent_event => |payload| switch (payload.event) {
                 .agent_start => try self.setWorkingStatus(),
@@ -748,7 +756,7 @@ const InteractiveLoop = struct {
         }
     }
 
-    fn applyQueueStatus(self: *InteractiveLoop, payload: session_events.AgentSessionEvent.QueueUpdate) !void {
+    fn applyQueueStatus(self: *InteractiveLoop, payload: anytype) !void {
         if (payload.steering.items.len == 0 and payload.follow_up.items.len == 0) {
             try self.clearStatus(status_id_queue);
             return;
@@ -800,20 +808,22 @@ const InteractiveLoop = struct {
         } });
     }
 
-    fn applyPublicEventTranscript(self: *InteractiveLoop, event: session_events.AgentSessionEvent) !void {
+    fn applyClientEventTranscript(self: *InteractiveLoop, event: client_protocol.ClientEvent) !void {
         if (event == .agent_event and event.agent_event.event == .message_update) {
-            if (transcriptAppendFromAgentEvent(event.agent_event.event)) |projection| {
+            const agent_event = event.agent_event.event;
+            if (transcriptAppendFromAgentEvent(agent_event)) |projection| {
                 try self.applyTranscriptProjection(projection);
             }
             var preview_buffer: [pending_tool_output_bytes_max]u8 = undefined;
-            if (writePreviewFromMessageUpdate(event.agent_event.event.message_update, &preview_buffer)) |preview| {
+            if (writePreviewFromMessageUpdate(agent_event.message_update, &preview_buffer)) |preview| {
                 try self.replaceToolCallPreview(preview.tool_call_id, preview.text);
             }
             return;
         }
         if (event == .agent_event and event.agent_event.event == .tool_execution_start) {
-            const payload = event.agent_event.event.tool_execution_start;
-            if (transcriptAppendFromAgentEvent(event.agent_event.event)) |projection| {
+            const agent_event = event.agent_event.event;
+            const payload = agent_event.tool_execution_start;
+            if (transcriptAppendFromAgentEvent(agent_event)) |projection| {
                 try self.applyTranscriptProjection(projection);
             }
             if (std.mem.eql(u8, payload.tool_name, "write")) {
@@ -825,18 +835,20 @@ const InteractiveLoop = struct {
             return;
         }
         if (event == .agent_event and event.agent_event.event == .tool_execution_update) {
-            const payload = event.agent_event.event.tool_execution_update;
+            const agent_event = event.agent_event.event;
+            const payload = agent_event.tool_execution_update;
             if (std.mem.eql(u8, payload.tool_name, "write")) {
                 try self.replaceToolCallPreview(payload.tool_call_id, "");
             }
-            if (transcriptAppendFromAgentEvent(event.agent_event.event)) |projection| {
+            if (transcriptAppendFromAgentEvent(agent_event)) |projection| {
                 try self.applyTranscriptProjection(projection);
             }
             return;
         }
         if (event == .agent_event and event.agent_event.event == .tool_execution_end) {
-            const payload = event.agent_event.event.tool_execution_end;
-            if (transcriptAppendFromAgentEvent(event.agent_event.event)) |projection| {
+            const agent_event = event.agent_event.event;
+            const payload = agent_event.tool_execution_end;
+            if (transcriptAppendFromAgentEvent(agent_event)) |projection| {
                 try self.applyTranscriptProjection(projection);
             }
             if (shouldAppendFinalToolOutput(payload.tool_name, payload.is_error)) {
@@ -983,7 +995,7 @@ const InteractiveLoop = struct {
         var ticks: usize = 0;
         while (ticks < shutdown_drain_ticks_max) : (ticks += 1) {
             self.app.step() catch break;
-            _ = self.drainPublicEventsBounded(public_events_per_tick_max) catch break;
+            _ = self.drainClientEventsBounded(client_events_per_tick_max) catch break;
         }
     }
 };
@@ -1087,7 +1099,7 @@ pub fn run(
     if (options.initial_prompt) |prompt| {
         _ = try loop.startPrompt(prompt);
     }
-    _ = try loop.drainPublicEventsBounded(public_events_per_tick_max);
+    _ = try loop.drainClientEventsBounded(client_events_per_tick_max);
     try terminal_loop.renderIfDirty(stdout);
     try stdout.flush();
 
@@ -1131,11 +1143,11 @@ fn seedTranscriptFromSnapshot(
 }
 
 test "interactive queued text restore joins steering follow-up and draft" {
-    var steering = try session_events.EventTextList.init(std.testing.allocator, &.{ "one", "two" });
+    var steering = try client_protocol.EventTextList.init(std.testing.allocator, &.{ "one", "two" });
     defer steering.deinit();
-    var follow_up = try session_events.EventTextList.init(std.testing.allocator, &.{"three"});
+    var follow_up = try client_protocol.EventTextList.init(std.testing.allocator, &.{"three"});
     defer follow_up.deinit();
-    const snapshot: session_events.QueueSnapshot = .{
+    const snapshot = .{
         .revision = 1,
         .steering = steering,
         .follow_up = follow_up,
@@ -1175,7 +1187,7 @@ test "interactive loop bounds stay responsive" {
     try std.testing.expect(frame_interval_ms <= 16);
     try std.testing.expectEqual(@as(usize, 1), input_reads_per_tick_max);
     try std.testing.expectEqual(@as(usize, 64), prompt_progress_per_tick_max);
-    try std.testing.expectEqual(@as(usize, 16), public_events_per_tick_max);
+    try std.testing.expectEqual(@as(usize, 16), client_events_per_tick_max);
     try std.testing.expectEqual(@as(usize, 1), render_attempts_per_tick_max);
     try std.testing.expectEqual(@as(usize, 60), shutdown_drain_ticks_max);
 }
@@ -1257,13 +1269,13 @@ test "interactive status events include cancel hints and queue counts" {
     var loop: InteractiveLoop = undefined;
     loop.terminal_loop = &terminal_loop;
 
-    try loop.applyPublicEventStatus(.{ .compaction_start = .{ .reason = .manual } });
+    try loop.applyClientEventStatus(.{ .compaction_start = .{ .reason = .manual } });
     var status = terminal_loop.product.app.slots.highestPriority(.status_area).?;
     try std.testing.expect(std.mem.indexOf(u8, status.text, "Esc to cancel") != null);
 
-    var error_message = try session_events.EventText.init(std.testing.allocator, "temporary");
+    var error_message = try client_protocol.EventText.init(std.testing.allocator, "temporary");
     defer error_message.deinit();
-    try loop.applyPublicEventStatus(.{ .auto_retry_start = .{
+    try loop.applyClientEventStatus(.{ .auto_retry_start = .{
         .attempt = 1,
         .max_attempts = 3,
         .delay_ms = 1500,
@@ -1272,11 +1284,11 @@ test "interactive status events include cancel hints and queue counts" {
     status = terminal_loop.product.app.slots.highestPriority(.status_area).?;
     try std.testing.expect(std.mem.indexOf(u8, status.text, "Esc to cancel") != null);
 
-    var steering = try session_events.EventTextList.init(std.testing.allocator, &.{"next"});
+    var steering = try client_protocol.EventTextList.init(std.testing.allocator, &.{"next"});
     defer steering.deinit();
-    var follow_up = try session_events.EventTextList.init(std.testing.allocator, &.{});
+    var follow_up = try client_protocol.EventTextList.init(std.testing.allocator, &.{});
     defer follow_up.deinit();
-    try loop.applyPublicEventStatus(.{ .queue_update = .{
+    try loop.applyClientEventStatus(.{ .queue_update = .{
         .steering = steering,
         .follow_up = follow_up,
         .revision = 1,
@@ -1294,7 +1306,7 @@ test "interactive maps simple public events to transcript appends" {
     try std.testing.expect(transcriptAppendFromAgentEvent(.agent_start) == null);
     try std.testing.expect(transcriptAppendFromAgentEvent(.turn_start) == null);
 
-    const overflow = transcriptAppendFromEvent(.{ .public_event_overflow = .{ .dropped_count = 4 } }).?;
+    const overflow = transcriptAppendFromEvent(.{ .event_overflow = .{ .dropped_count = 4 } }).?;
     try std.testing.expect(overflow == .append);
     try std.testing.expect(overflow.append == .status);
     try std.testing.expectEqual(tui.product.transcript.TranscriptStatusLevel.warning, overflow.append.status.level);
@@ -1498,7 +1510,7 @@ test "interactive appends final output for non-streaming visible tools" {
     loop.tool_metadata_lookup_enabled = false;
 
     const content = [_]ai.ToolResultContent{.{ .text = .{ .text = "a.txt\nb.txt" } }};
-    var event: session_events.AgentSessionEvent = .{ .agent_event = try session_events.OwnedAgentEvent.init(
+    var event: client_protocol.ClientEvent = .{ .agent_event = try client_protocol.OwnedAgentEvent.init(
         std.testing.allocator,
         .{ .tool_execution_end = .{
             .tool_call_id = "call-1",
@@ -1507,9 +1519,9 @@ test "interactive appends final output for non-streaming visible tools" {
             .is_error = false,
         } },
     ) };
-    defer event.deinit();
+    defer event.deinit(std.testing.allocator);
 
-    try loop.applyPublicEventTranscript(event);
+    try loop.applyClientEventTranscript(event);
     try loop.flushToolOutputCoalescer();
 
     try std.testing.expectEqual(@as(usize, 1), terminal_loop.product.app.transcript.items.items.len);

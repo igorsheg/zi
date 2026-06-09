@@ -116,7 +116,7 @@ const ManualCompactionRequest = union(enum) {
     };
 };
 
-pub const LivePromptRun = struct {
+const LivePromptRun = struct {
     state: State = .settled,
     stream: agent_mod.loop.AgentEventStream = undefined,
     buffer: [live_prompt_event_capacity_count]agent_mod.AgentEvent = undefined,
@@ -349,11 +349,11 @@ pub fn deinit(self: *AgentSession) void {
     self.* = undefined;
 }
 
-pub fn prompt(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
+fn prompt(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
     try self.promptWithOptions(text, images, .{});
 }
 
-pub fn promptWithOptions(
+fn promptWithOptions(
     self: *AgentSession,
     text: []const u8,
     images: []const ai.ImageContent,
@@ -391,7 +391,7 @@ fn promptWithOptionsInternal(
     }
 }
 
-pub fn startPromptRun(
+fn startPromptRun(
     self: *AgentSession,
     text: []const u8,
     images: []const ai.ImageContent,
@@ -436,7 +436,7 @@ pub fn startPromptRun(
     return run;
 }
 
-pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
+fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
     if (!run.isActive()) return false;
     if (try run.stream.next()) |event| {
         return self.applyPromptRunEvent(run, event);
@@ -444,7 +444,7 @@ pub fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
     return self.finishPromptRun(run);
 }
 
-pub fn applyPromptRunProgress(
+fn applyPromptRunProgress(
     self: *AgentSession,
     run: *LivePromptRun,
     progress: @TypeOf(run.stream.asyncNext()).Result,
@@ -473,7 +473,7 @@ fn finishPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
     return false;
 }
 
-pub fn cancelPromptRun(self: *AgentSession, run: *LivePromptRun) !void {
+fn cancelPromptRun(self: *AgentSession, run: *LivePromptRun) !void {
     const token = run.markCancelRequested() orelse return;
     self.agent.abort();
     run.stream.cancelProducer() catch |err| switch (err) {
@@ -498,7 +498,7 @@ fn settlePromptRunFailure(
     run.markSettled();
 }
 
-pub fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
+fn destroyPromptRun(self: *AgentSession, run: *LivePromptRun) void {
     if (run.isActive()) {
         _ = run.markCancelRequested();
         run.stream.cancelProducer() catch |err| {
@@ -536,14 +536,14 @@ fn compactPreparedWithSummary(
     } });
 }
 
-pub fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !session_events.CompactionResult {
+fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !session_events.CompactionResult {
     return self.runManualCompaction(.{ .prepared = .{
         .summary = summary,
         .settings = self.compaction_settings,
     } });
 }
 
-pub fn compactWithGeneratedSummary(self: *AgentSession) !session_events.CompactionResult {
+fn compactWithGeneratedSummary(self: *AgentSession) !session_events.CompactionResult {
     try self.ensureAcceptsIdleCommand();
     return self.runGeneratedCompaction(.manual, false);
 }
@@ -584,7 +584,7 @@ fn runManualCompaction(
     };
 }
 
-pub fn cancel(self: *AgentSession) void {
+fn cancel(self: *AgentSession) void {
     self.reconcileLifecycle();
     if (self.active_compaction_cancel_source) |source| {
         if (self.lifecycle == .shutdown_requested or self.lifecycle == .stopped) return;
@@ -601,7 +601,7 @@ pub fn cancel(self: *AgentSession) void {
     self.agent.abort();
 }
 
-pub fn requestShutdown(self: *AgentSession) void {
+fn requestShutdown(self: *AgentSession) void {
     self.reconcileLifecycle();
     switch (self.lifecycle) {
         .stopped, .shutdown_requested => return,
@@ -624,7 +624,7 @@ pub fn requestShutdown(self: *AgentSession) void {
     }
 }
 
-pub fn status(self: *AgentSession) AgentSessionStatus {
+fn status(self: *AgentSession) AgentSessionStatus {
     self.reconcileLifecycle();
     return switch (self.lifecycle) {
         .stopped => .stopped,
@@ -635,7 +635,7 @@ pub fn status(self: *AgentSession) AgentSessionStatus {
     };
 }
 
-pub fn statusSnapshot(self: *AgentSession) RuntimeStatusSnapshot {
+fn statusSnapshot(self: *AgentSession) RuntimeStatusSnapshot {
     return .{
         .status = self.status(),
         .public_event_count = self.public_events.count(),
@@ -644,14 +644,14 @@ pub fn statusSnapshot(self: *AgentSession) RuntimeStatusSnapshot {
     };
 }
 
-pub fn shutdownComplete(self: *AgentSession) bool {
+fn shutdownComplete(self: *AgentSession) bool {
     self.reconcileLifecycle();
     return self.lifecycle == .stopped and
         self.agent.waitForIdle() and
         self.public_events.empty();
 }
 
-pub fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !void {
+fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !void {
     if (!self.agent.waitForIdle()) return error.SessionBusy;
     if (self.active_compaction_cancel_source != null) return error.SessionBusy;
     const active_set = try self.tools.buildActiveToolSet(names);
@@ -665,24 +665,39 @@ pub fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !voi
     self.system_prompt_text = next_prompt;
 }
 
-pub fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
+fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
     return self.queue_mirror.snapshot(allocator);
 }
 
-pub fn clearQueue(self: *AgentSession) !void {
+fn clearQueue(self: *AgentSession) !void {
     self.agent.clearAllQueues();
     if (self.queue_mirror.clear(self.allocator)) try self.event_drain.emitQueueUpdate();
 }
 
-pub fn drainPublicEvent(self: *AgentSession) ?session_events.AgentSessionEvent {
+fn drainPublicEvent(self: *AgentSession) ?session_events.AgentSessionEvent {
     const event = self.public_events.pop() orelse return null;
     self.event_drain.enqueuePendingPublicEventOverflow();
     return event;
 }
 
-pub fn publicEventWake(self: *AgentSession) *runtime.ResetEvent {
+fn publicEventWake(self: *AgentSession) *runtime.ResetEvent {
     return &self.event_drain.public_event_wake;
 }
+
+pub const RuntimeAccess = struct {
+    pub const PromptRun = LivePromptRun;
+    pub const promptWithOptions = AgentSession.promptWithOptions;
+    pub const cancel = AgentSession.cancel;
+    pub const requestShutdown = AgentSession.requestShutdown;
+    pub const startPromptRun = AgentSession.startPromptRun;
+    pub const applyPromptRunProgress = AgentSession.applyPromptRunProgress;
+    pub const cancelPromptRun = AgentSession.cancelPromptRun;
+    pub const destroyPromptRun = AgentSession.destroyPromptRun;
+    pub const publicEventWake = AgentSession.publicEventWake;
+    pub const drainPublicEvent = AgentSession.drainPublicEvent;
+    pub const queueSnapshot = AgentSession.queueSnapshot;
+    pub const clearQueue = AgentSession.clearQueue;
+};
 
 test "agent session public event enqueue sets coalesced wake" {
     var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});

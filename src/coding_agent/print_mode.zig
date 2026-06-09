@@ -2,7 +2,6 @@ const std = @import("std");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const client_protocol = @import("client_protocol.zig");
-const session_events = @import("session_events.zig");
 const session_manager = @import("session_manager.zig");
 const session_runtime = @import("session_runtime.zig");
 
@@ -70,7 +69,16 @@ fn drainEvents(
         var owned_event = event;
         defer owned_event.deinit(app.allocator);
         switch (owned_event.event) {
-            .session_event => |session_event| try PrintDrain.onEvent(&drain, session_event),
+            .agent_event,
+            .queue_update,
+            .prompt_command,
+            .compaction_start,
+            .session_info_changed,
+            .compaction_end,
+            .auto_retry_start,
+            .auto_retry_end,
+            .event_overflow,
+            => try drain.onEvent(owned_event.event),
             .response => |response| switch (response) {
                 .prompt_finished => done = true,
                 else => {},
@@ -79,7 +87,6 @@ fn drainEvents(
                 try printAssistantError(stderr, rejection.message);
                 done = true;
             },
-            .accepted, .shutdown_complete => {},
         }
     }
     if (output == .text and drain.wrote_text) try stdout.writeByte('\n');
@@ -92,8 +99,7 @@ const PrintDrain = struct {
     output: OutputMode,
     wrote_text: bool = false,
 
-    fn onEvent(context: ?*anyopaque, event: session_events.AgentSessionEvent) !void {
-        const self: *PrintDrain = @ptrCast(@alignCast(context.?));
+    fn onEvent(self: *PrintDrain, event: client_protocol.ClientEvent) !void {
         switch (self.output) {
             .text => try self.onTextEvent(event),
             .json => try drainJsonEvent(event, self.stdout),
@@ -102,7 +108,7 @@ const PrintDrain = struct {
 
     fn onTextEvent(
         self: *PrintDrain,
-        event: session_events.AgentSessionEvent,
+        event: client_protocol.ClientEvent,
     ) !void {
         switch (event) {
             .agent_event => |agent_event| switch (agent_event.event) {
@@ -133,7 +139,7 @@ fn printAssistantError(stderr: *std.Io.Writer, message: []const u8) !void {
 }
 
 fn drainJsonEvent(
-    event: session_events.AgentSessionEvent,
+    event: client_protocol.ClientEvent,
     stdout: *std.Io.Writer,
 ) !void {
     try std.json.Stringify.value(event, .{}, stdout);
