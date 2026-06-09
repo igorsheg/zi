@@ -7,7 +7,7 @@ const client_protocol = @import("../../coding_agent/client_protocol.zig");
 const session_listing = @import("../../coding_agent/session_listing.zig");
 const session_runtime = @import("../../coding_agent/session_runtime.zig");
 
-const Options = struct {
+pub const Options = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     dir: std.Io.Dir = .cwd(),
@@ -733,6 +733,7 @@ const InteractiveLoop = struct {
                     try self.applyClientEventStatus(envelope.event);
                     try self.applyClientEventTranscript(envelope.event);
                 },
+                .snapshot => |snapshot| try self.applySnapshot(snapshot),
                 .rejected => |rejection| try self.appendOperationalStatus(rejection.message.text),
                 .response => |response| switch (response) {
                     .prompt_finished, .canceled => {

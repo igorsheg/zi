@@ -22,7 +22,7 @@ src/frontends/print/
   print_mode.zig           text/json adapter over SessionRuntime + ClientEvent
 
 src/frontends/tui/
-  interactive.zig          dormant/wire-later TUI adapter; imports coding_agent + tui
+  interactive.zig          TUI adapter; imports coding_agent + tui
 
 src/frontends/rpc/
   stdio.zig                future JSONL transport owner
@@ -337,9 +337,9 @@ Done when:
 
 - Transport design is recorded and ready for a future RPC implementation.
 
-## Phase 5 — Rewire TUI later through completed mailbox
+## Phase 5 — Rewire TUI through completed mailbox
 
-Status: pending, not part of current core cleanup
+Status: done
 
 Intent:
 
@@ -347,11 +347,11 @@ TUI comes back only as a concrete frontend adapter over the completed client pro
 
 Tasks:
 
-- [ ] Top-level dispatch calls `src/frontends/tui/interactive.zig`.
-- [ ] TUI adapter initializes from `ClientEvent.snapshot`.
-- [ ] TUI adapter maps raw `ClientEvent.agent_event` to `tui.product.Command` locally.
-- [ ] TUI adapter maps `tui.product.Effect` to `ClientCommand` locally.
-- [ ] No `coding_agent` import of `tui` returns.
+- [x] Top-level dispatch calls `src/frontends/tui/interactive.zig`.
+- [x] TUI adapter initializes from `ClientEvent.snapshot`.
+- [x] TUI adapter maps raw `ClientEvent.agent_event` to `tui.product.Command` locally.
+- [x] TUI adapter maps `tui.product.Effect` to `ClientCommand` locally.
+- [x] No `coding_agent` import of `tui` returns.
 
 Deletion gates:
 
@@ -363,6 +363,39 @@ Deletion gates:
 Done when:
 
 - Interactive mode works again without violating core/frontend boundaries.
+
+## Phase 6 — Implement RPC stdio JSONL frontend
+
+Status: done
+
+Intent:
+
+Prove the mailbox protocol with a second concrete frontend that does not import
+`tui` and does not mutate session state outside `SessionRuntime`.
+
+Implemented:
+
+- [x] Added `src/frontends/rpc/stdio.zig`.
+- [x] Top-level CLI dispatches `--mode rpc` to the RPC frontend.
+- [x] RPC stdin uses strict JSONL decoded by `coding_agent/wire_protocol.zig`.
+- [x] RPC stdout emits only wire-protocol JSONL events.
+- [x] RPC stderr is diagnostics only.
+- [x] Malformed lines emit bounded rejection and the loop continues.
+- [x] Command queue full emits `queue_full` rejection.
+- [x] `request_snapshot` and `shutdown` are covered by frontend tests.
+- [x] CLI RPC uses an fd/select loop so prompt progress and stdin commands can
+  advance concurrently.
+
+Concurrency rule:
+
+- `frontends/rpc/stdio.runFd` waits on stdin readiness and `SessionRuntime` wake
+  sources, drains events after each wake, and does not block command intake while
+  a prompt is streaming. The reader-only `run` helper remains for narrow codec
+  tests.
+
+Done when:
+
+- RPC mode is a concrete frontend over `wire_protocol` + `SessionRuntime`.
 
 ## Raw AgentEvent decision
 
@@ -395,18 +428,19 @@ A projected event may be promoted only when at least two concrete clients duplic
 | 2. First-class snapshot event | done | Added `ClientEvent.snapshot`; `request_snapshot` emits an owned bounded snapshot; print/TUI frontends no longer call session helper getters. |
 | 3. Backpressure-safe SessionRuntime | done | `SessionRuntime` now parks one pending lossless event and stops consuming/progressing while the frontend event queue is full. |
 | 4. JSONL transport design | done | Added `coding_agent/wire_protocol.zig` constants and leaf JSONL encode/decode helpers; stdio transport remains deferred. |
-| 5. Rewire TUI through mailbox | pending | later |
+| 5. Rewire TUI through mailbox | done | Top-level CLI dispatches interactive mode to `frontends/tui`; TUI seeds from mailbox snapshot and keeps event/effect mapping local. |
+| 6. RPC stdio JSONL frontend | done | Added `frontends/rpc/stdio.zig` and wired `--mode rpc`; CLI path uses fd/select so input and session progress advance concurrently. |
 
 ## Final acceptance criteria
 
-- [ ] `src/coding_agent` has no TUI or frontend adapter imports.
-- [ ] `src/tui` has no `coding_agent` imports.
-- [ ] Concrete CLI/print/TUI/RPC adapters live outside `src/coding_agent`.
-- [ ] `SessionRuntime + client_protocol` is sufficient for frontend state initialization and commands.
-- [ ] Raw `agent.AgentEvent` remains the only agent-loop event truth.
-- [ ] Snapshot payloads are bounded, owned, and tested.
-- [ ] Event queue pressure has explicit policy and tests.
-- [ ] No operational frontend lag tears down the session owner loop.
-- [ ] `zig build test` passes.
-- [ ] `zig build` passes.
-- [ ] `zig fmt --check src` passes.
+- [x] `src/coding_agent` has no TUI or frontend adapter imports.
+- [x] `src/tui` has no `coding_agent` imports.
+- [x] Concrete CLI/print/TUI/RPC adapters live outside `src/coding_agent`.
+- [x] `SessionRuntime + client_protocol` is sufficient for frontend state initialization and commands.
+- [x] Raw `agent.AgentEvent` remains the only agent-loop event truth.
+- [x] Snapshot payloads are bounded, owned, and tested.
+- [x] Event queue pressure has explicit policy and tests.
+- [x] No operational frontend lag tears down the session owner loop.
+- [x] `zig build test` passes.
+- [x] `zig build` passes.
+- [x] `zig fmt --check src` passes.

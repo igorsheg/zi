@@ -153,10 +153,7 @@ pub const AgentSessionRuntimeHost = struct {
                 },
                 .public_event => {
                     public_event_wake.reset();
-                    self.drainSessionEvents(null) catch |err| switch (err) {
-                        error.EventQueueFull => return .session,
-                        else => return err,
-                    };
+                    self.drainSessionEvents(null) catch return .session;
                     return .session;
                 },
                 .frame => return .frame,
@@ -169,10 +166,7 @@ pub const AgentSessionRuntimeHost = struct {
             },
             .public_event => {
                 public_event_wake.reset();
-                self.drainSessionEvents(null) catch |err| switch (err) {
-                    error.EventQueueFull => return .session,
-                    else => return err,
-                };
+                self.drainSessionEvents(null) catch return .session;
                 return .session;
             },
             .frame => return .frame,

@@ -327,9 +327,11 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\
         \\Examples:
+        \\  zi
+        \\  zi "explain this repo"
         \\  zi -p "hello"
         \\  zi --mode json "explain this repo"
-        \\  zi --resume-latest -p "continue"
+        \\  zi --resume-latest
         \\  zi auth status openai-codex
         \\
     );

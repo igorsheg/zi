@@ -37,7 +37,7 @@ src/
   cli/           process CLI parsing and concrete mode dispatch
   runtime/       zio-backed mechanism: process, select, bounded queues, cancel, process runner
   tui/           Zi-owned terminal UI (substrate/infra/primitive/product)
-  frontends/     concrete client adapters; print today, TUI dormant
+  frontends/     concrete client adapters; print and TUI today
   main.zig       process init -> runtime.Runtime -> cli.main
   root.zig       public package surface (ai, agent, coding_agent, runtime, tui)
 ```
@@ -78,7 +78,7 @@ cli/
     print/text   -> frontends/print        (--print or non-tty stdin)
     json         -> frontends/print (json) (--mode json)
     rpc          -> rejected (not implemented yet)
-    interactive  -> rejected until the TUI frontend adapter is wired
+    interactive  -> frontends/tui          (default on a tty)
     auth         -> coding_agent auth_mode login/logout/status
   resume/list selection runs through coding_agent session listing before a host is created.
 

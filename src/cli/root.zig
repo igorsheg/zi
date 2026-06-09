@@ -3,6 +3,8 @@ const runtime = @import("../runtime/root.zig");
 const auth_mode = @import("../coding_agent/auth_mode.zig");
 const args_mod = @import("args.zig");
 const print_mode = @import("../frontends/print/print_mode.zig");
+const rpc_mode = @import("../frontends/rpc/stdio.zig");
+const interactive = @import("../frontends/tui/interactive.zig");
 const session_runtime = @import("../coding_agent/session_runtime.zig");
 const session_listing = @import("../coding_agent/session_listing.zig");
 
@@ -135,8 +137,22 @@ fn runApp(
             if (app.messages.count != 1) return usage(stderr);
             return runPrompt(process, stdout, stderr, app.messages.slice()[0], true, app, options);
         },
-        .rpc => unsupported(stderr, "rpc mode is not implemented yet"),
-        .interactive => unsupported(stderr, "interactive frontend is not wired yet"),
+        .rpc => {
+            if (app.messages.count > 1) return usage(stderr);
+            return runRpc(process, stdout, stderr, app, options);
+        },
+        .interactive => {
+            if (app.messages.count > 1) return usage(stderr);
+            return interactive.run(process, stdout, stderr, .{
+                .cwd = options.cwd,
+                .agent_dir_override = options.agent_dir_override,
+                .dir = options.dir,
+                .environ = options.environ,
+                .resume_session_file = app.resume_session_file,
+                .resume_latest = app.resume_latest,
+                .initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null,
+            });
+        },
     };
 }
 
@@ -182,6 +198,49 @@ fn runPrompt(
         .prompt = prompt,
         .output = if (json_output) .json else .text,
     });
+}
+
+fn runRpc(
+    process: runtime.Process,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    app_args: anytype,
+    options: auth_mode.Options,
+) !void {
+    const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
+    const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
+    defer process.gpa.free(timestamp_text);
+
+    var app = if (try selectResumeSession(process, stderr, app_args, options)) |session_file| blk: {
+        defer process.gpa.free(session_file);
+        break :blk try session_runtime.resumeSessionRuntime(process.gpa, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = timestamp_text,
+            .session_file_name = session_file,
+            .dir = options.dir,
+            .environ = options.environ,
+        });
+    } else blk: {
+        const session_id = try std.fmt.allocPrint(process.gpa, "rpc-{d}", .{timestamp});
+        defer process.gpa.free(session_id);
+        break :blk try session_runtime.createSessionRuntime(process.gpa, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = timestamp_text,
+            .session_id = session_id,
+            .timestamp = timestamp_text,
+            .dir = options.dir,
+            .environ = options.environ,
+        });
+    };
+    defer app.deinit();
+
+    if (app_args.messages.count == 1) {
+        try rpc_mode.runPrompt(&app, stdout, app_args.messages.slice()[0]);
+        return;
+    }
+    try rpc_mode.runFd(&app, std.posix.STDIN_FILENO, stdout, stderr);
 }
 
 fn selectResumeSession(
