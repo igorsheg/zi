@@ -4,7 +4,6 @@ const auth_mode = @import("../coding_agent/auth_mode.zig");
 const args_mod = @import("args.zig");
 const print_mode = @import("../frontends/print/print_mode.zig");
 const rpc_mode = @import("../frontends/rpc/stdio.zig");
-const interactive = @import("../frontends/tui/interactive.zig");
 const session_runtime = @import("../coding_agent/session_runtime.zig");
 const session_listing = @import("../coding_agent/session_listing.zig");
 
@@ -140,18 +139,6 @@ fn runApp(
         .rpc => {
             if (app.messages.count > 1) return usage(stderr);
             return runRpc(process, stdout, stderr, app, options);
-        },
-        .interactive => {
-            if (app.messages.count > 1) return usage(stderr);
-            return interactive.run(process, stdout, stderr, .{
-                .cwd = options.cwd,
-                .agent_dir_override = options.agent_dir_override,
-                .dir = options.dir,
-                .environ = options.environ,
-                .resume_session_file = app.resume_session_file,
-                .resume_latest = app.resume_latest,
-                .initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null,
-            });
         },
     };
 }

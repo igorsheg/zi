@@ -62,13 +62,9 @@ pub const EventDrain = struct {
     }
 
     pub fn emitQueueUpdate(self: *EventDrain) !void {
-        var steering = try client_protocol.EventTextList.init(self.allocator, self.queue_mirror.steering.items);
-        errdefer steering.deinit();
-        var follow_up = try client_protocol.EventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
-        errdefer follow_up.deinit();
-        self.enqueuePublicEvent(.{ .queue_update = .{
-            .steering = steering,
-            .follow_up = follow_up,
+        self.enqueuePublicEvent(.{ .queue_changed = .{
+            .steering_count = self.queue_mirror.steering.items.len,
+            .follow_up_count = self.queue_mirror.follow_up.items.len,
             .revision = self.queue_mirror.revision,
         } });
     }

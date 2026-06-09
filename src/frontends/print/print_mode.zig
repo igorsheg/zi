@@ -2,7 +2,6 @@ const std = @import("std");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const client_protocol = @import("../../coding_agent/client_protocol.zig");
-const session_manager = @import("../../coding_agent/session_manager.zig");
 const session_runtime = @import("../../coding_agent/session_runtime.zig");
 
 const OutputMode = enum {
@@ -37,9 +36,6 @@ fn runInner(
     stderr: *std.Io.Writer,
     options: Options,
 ) !void {
-    const json_output = options.output == .json;
-    if (json_output) try writeSessionHeader(app, stdout);
-
     var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(app.allocator, 1, options.prompt);
     var envelope_owned = true;
     defer if (envelope_owned) envelope.deinit(app.allocator);
@@ -70,8 +66,7 @@ fn drainEvents(
         defer owned_event.deinit(app.allocator);
         switch (owned_event.event) {
             .agent_event,
-            .queue_update,
-            .prompt_command,
+            .queue_changed,
             .snapshot,
             .compaction_start,
             .session_info_changed,
@@ -79,10 +74,17 @@ fn drainEvents(
             .auto_retry_start,
             .auto_retry_end,
             .event_overflow,
+            .replay,
+            .replay_gap,
+            .operation_started,
+            .shutdown_started,
             => try drain.onEvent(owned_event.event),
-            .response => |response| switch (response) {
-                .prompt_finished => done = true,
-                else => {},
+            .operation_finished => |operation| {
+                try drain.onEvent(owned_event.event);
+                switch (operation.reason) {
+                    .completed, .canceled, .failed => done = true,
+                    .queue_cleared => {},
+                }
             },
             .rejected => |rejection| {
                 try printAssistantError(stderr, rejection.message.text);
@@ -148,33 +150,6 @@ fn drainJsonEvent(
     try stdout.flush();
 }
 
-fn writeSessionHeader(
-    app: *const session_runtime.SessionRuntime,
-    stdout: *std.Io.Writer,
-) !void {
-    try writeJsonSessionHeader(app.sessionHeader(), stdout);
-}
-
-fn writeJsonSessionHeader(
-    header: session_manager.SessionHeader,
-    stdout: *std.Io.Writer,
-) !void {
-    try stdout.writeAll("{\"type\":\"session\",\"version\":");
-    try stdout.print("{}", .{header.version});
-    try stdout.writeAll(",\"id\":");
-    try std.json.Stringify.value(header.id, .{}, stdout);
-    try stdout.writeAll(",\"timestamp\":");
-    try std.json.Stringify.value(header.timestamp, .{}, stdout);
-    try stdout.writeAll(",\"cwd\":");
-    try std.json.Stringify.value(header.cwd, .{}, stdout);
-    if (header.parent_session) |parent_session| {
-        try stdout.writeAll(",\"parentSession\":");
-        try std.json.Stringify.value(parent_session, .{}, stdout);
-    }
-    try stdout.writeAll("}\n");
-    try stdout.flush();
-}
-
 test "print mode emits assistant text from injected stream" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -211,7 +186,7 @@ test "print mode emits assistant text from injected stream" {
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
-test "json print mode streams session header and public events" {
+test "json print mode streams client protocol events" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -244,7 +219,7 @@ test "json print mode streams session header and public events" {
 
     try run(&app, &stdout, &stderr, .{ .prompt = "hello", .output = .json });
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.startsWith(u8, output, "{\"type\":\"session\",\"version\":3"));
+    try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"operation_started\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"message_start\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"message_update\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"assistantMessageEvent\":{\"type\":\"text_delta\"") != null);
@@ -253,6 +228,5 @@ test "json print mode streams session header and public events" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"totalTokens\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"message_end\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "{\"type\":\"agent_end\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"agent_event\"") == null);
     try std.testing.expectEqualStrings("", stderr.buffered());
 }

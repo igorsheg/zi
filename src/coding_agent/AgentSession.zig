@@ -625,10 +625,11 @@ test "agent session public event enqueue sets coalesced wake" {
 
     try std.testing.expect(!session.publicEventWake().isSet());
 
-    session.event_drain.enqueuePublicEvent(.{ .agent_event = try client_protocol.OwnedAgentEvent.init(
-        std.testing.allocator,
-        .agent_start,
-    ) });
+    session.event_drain.enqueuePublicEvent(.{ .queue_changed = .{
+        .steering_count = 0,
+        .follow_up_count = 0,
+        .revision = 1,
+    } });
 
     try std.testing.expect(session.publicEventWake().isSet());
     session.publicEventWake().reset();
@@ -636,7 +637,8 @@ test "agent session public event enqueue sets coalesced wake" {
 
     var event = session.drainPublicEvent().?;
     defer event.deinit();
-    try std.testing.expectEqual(agent_mod.AgentEvent.agent_start, event.agent_event.event);
+    try std.testing.expect(event == .queue_changed);
+    try std.testing.expectEqual(@as(u64, 1), event.queue_changed.revision);
 }
 
 fn ensureAcceptsIdleCommand(self: *AgentSession) Error!void {
@@ -1247,10 +1249,15 @@ test "agent session snapshots expose status and active tool read models" {
     });
     defer shutdownAndDeinit(&session);
 
+    const message: agent_mod.AgentMessage = .{ .user = .{
+        .content = .{ .string = "status" },
+        .timestamp = 0,
+    } };
+
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
-    try session.agent.emitEvent(.agent_start);
-    try session.agent.emitEvent(.agent_start);
+    try session.agent.emitEvent(.{ .message_end = .{ .message = message } });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = message } });
 
     const status_snapshot = session.statusSnapshot();
     try std.testing.expectEqual(AgentSessionStatus.running, status_snapshot.status);
@@ -1288,8 +1295,8 @@ test "agent session public event queue overflow is explicit" {
 
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
-    try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
-    try session.agent.emitEvent(.agent_start);
+    try session.agent.emitEvent(.{ .message_end = .{ .message = message } });
+    try session.agent.emitEvent(.{ .message_end = .{ .message = message } });
 
     try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().public_event_count);
     try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().dropped_public_event_count);
@@ -1316,9 +1323,14 @@ test "agent session public event drain is caller driven" {
     });
     defer shutdownAndDeinit(&session);
 
+    const message: agent_mod.AgentMessage = .{ .user = .{
+        .content = .{ .string = "drain" },
+        .timestamp = 0,
+    } };
+
     _ = try session.agent.beginRun();
     defer session.agent.finishRun();
-    try session.agent.emitEvent(.agent_start);
+    try session.agent.emitEvent(.{ .message_end = .{ .message = message } });
 
     try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().public_event_count);
     var event = session.drainPublicEvent().?;
@@ -1893,6 +1905,38 @@ test "agent session terminal policy ignores non context errors for overflow" {
     drainAllPublicEvents(&session);
 }
 
+fn expectNextUserMessageEvent(
+    comptime tag: std.meta.Tag(agent_mod.AgentEvent),
+    session: *AgentSession,
+    text: []const u8,
+) !void {
+    while (session.drainPublicEvent()) |event| {
+        var owned_event = event;
+        defer owned_event.deinit();
+        if (owned_event != .agent_event) continue;
+        if (std.meta.activeTag(owned_event.agent_event.event) != tag) continue;
+        try expectUserMessageEvent(tag, owned_event.agent_event.event, text);
+        return;
+    }
+    return error.ExpectedUserMessageEvent;
+}
+
+fn expectUserMessageEvent(
+    comptime tag: std.meta.Tag(agent_mod.AgentEvent),
+    event: agent_mod.AgentEvent,
+    text: []const u8,
+) !void {
+    try std.testing.expectEqual(tag, std.meta.activeTag(event));
+    const message = switch (event) {
+        .message_start => |payload| payload.message,
+        .message_end => |payload| payload.message,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(.user, std.meta.activeTag(message));
+    const user = message.user;
+    try std.testing.expectEqualStrings(text, message_policy.userText(user).?);
+}
+
 fn initTestSession(task_runtime: *runtime.Runtime, dir: std.Io.Dir) !AgentSession {
     return initTestSessionWithCapacity(task_runtime, dir, public_event_capacity_default);
 }
@@ -1947,50 +1991,4 @@ fn drainAllPublicEvents(session: *AgentSession) void {
         var owned_event = event;
         owned_event.deinit();
     }
-}
-
-fn expectNextPromptCommand(
-    session: *AgentSession,
-    result: client_protocol.PromptCommandResult,
-    command: []const u8,
-    message: []const u8,
-) !void {
-    var event = session.drainPublicEvent().?;
-    defer event.deinit();
-    try std.testing.expect(event == .prompt_command);
-    try std.testing.expectEqual(result, event.prompt_command.result);
-    try std.testing.expectEqualStrings(command, event.prompt_command.command.text);
-    try std.testing.expectEqualStrings(message, event.prompt_command.message.text);
-}
-
-fn expectNextUserMessageEvent(
-    comptime tag: std.meta.Tag(agent_mod.AgentEvent),
-    session: *AgentSession,
-    text: []const u8,
-) !void {
-    while (session.drainPublicEvent()) |event| {
-        var owned_event = event;
-        defer owned_event.deinit();
-        if (owned_event != .agent_event) continue;
-        if (std.meta.activeTag(owned_event.agent_event.event) != tag) continue;
-        try expectUserMessageEvent(tag, owned_event.agent_event.event, text);
-        return;
-    }
-    return error.ExpectedUserMessageEvent;
-}
-
-fn expectUserMessageEvent(
-    comptime tag: std.meta.Tag(agent_mod.AgentEvent),
-    event: agent_mod.AgentEvent,
-    text: []const u8,
-) !void {
-    try std.testing.expectEqual(tag, std.meta.activeTag(event));
-    const message = switch (event) {
-        .message_start => |payload| payload.message,
-        .message_end => |payload| payload.message,
-        else => unreachable,
-    };
-    try std.testing.expectEqual(.user, std.meta.activeTag(message));
-    const user = message.user;
-    try std.testing.expectEqualStrings(text, message_policy.userText(user).?);
 }

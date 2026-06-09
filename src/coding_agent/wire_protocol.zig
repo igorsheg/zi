@@ -43,15 +43,18 @@ pub fn decodeCommandLine(
     if (type_value != .string) return error.InvalidMessage;
     const command_type = type_value.string;
 
-    if (std.mem.eql(u8, command_type, "submit_prompt")) {
+    if (std.mem.eql(u8, command_type, "submit")) {
         const text_value = object.get("text") orelse return error.InvalidMessage;
         if (text_value != .string) return error.InvalidMessage;
         if (text_value.string.len > max_prompt_text_bytes) return error.PromptTooLarge;
-        return try client_protocol.CommandEnvelope.initSubmitPrompt(allocator, id, text_value.string);
+        var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(allocator, id, text_value.string);
+        envelope.command.submit.mode = try decodeSubmitMode(object.get("mode"));
+        return envelope;
     }
-    if (std.mem.eql(u8, command_type, "cancel")) return .{ .id = id, .command = .cancel };
-    if (std.mem.eql(u8, command_type, "clear_queue")) return .{ .id = id, .command = .clear_queue };
-    if (std.mem.eql(u8, command_type, "request_snapshot")) return .{ .id = id, .command = .request_snapshot };
+    if (std.mem.eql(u8, command_type, "cancel")) return .{ .id = id, .command = .{ .cancel = try decodeCancel(object.get("target")) } };
+    if (std.mem.eql(u8, command_type, "queue.clear")) return .{ .id = id, .command = .{ .queue = .clear } };
+    if (std.mem.eql(u8, command_type, "snapshot")) return .{ .id = id, .command = .{ .snapshot = .{} } };
+    if (std.mem.eql(u8, command_type, "replay")) return .{ .id = id, .command = .{ .replay = try decodeReplay(object) } };
     if (std.mem.eql(u8, command_type, "shutdown")) return .{ .id = id, .command = .shutdown };
     return error.UnknownCommand;
 }
@@ -60,24 +63,9 @@ pub fn encodeEventEnvelope(
     allocator: std.mem.Allocator,
     envelope: client_protocol.EventEnvelope,
 ) EncodeError![]u8 {
-    var event_json: std.Io.Writer.Allocating = .init(allocator);
-    defer event_json.deinit();
-    try std.json.Stringify.value(envelope.event, .{}, &event_json.writer);
-    const event_bytes = event_json.written();
-    if (event_bytes.len < 2 or event_bytes[0] != '{' or event_bytes[event_bytes.len - 1] != '}') {
-        return error.EventJsonNotObject;
-    }
-
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    if (envelope.request_id) |id| {
-        try output.writer.writeByte('{');
-        try output.writer.print("\"id\":{},", .{id});
-        try output.writer.writeAll(event_bytes[1 .. event_bytes.len - 1]);
-        try output.writer.writeByte('}');
-    } else {
-        try output.writer.writeAll(event_bytes);
-    }
+    try std.json.Stringify.value(envelope, .{}, &output.writer);
     try output.writer.writeByte('\n');
     if (output.written().len > max_output_event_bytes) return error.OutputEventTooLarge;
     return try output.toOwnedSlice();
@@ -95,13 +83,52 @@ fn decodeRequestId(value: ?std.json.Value) DecodeError!?client_protocol.RequestI
     return @intCast(raw.integer);
 }
 
+fn decodeSubmitMode(value: ?std.json.Value) DecodeError!client_protocol.Submit.Mode {
+    const raw = value orelse return .auto;
+    if (raw != .string) return error.InvalidMessage;
+    if (std.mem.eql(u8, raw.string, "auto")) return .auto;
+    if (std.mem.eql(u8, raw.string, "start")) return .start;
+    if (std.mem.eql(u8, raw.string, "enqueue")) return .enqueue;
+    if (std.mem.eql(u8, raw.string, "steer")) return .steer;
+    return error.InvalidMessage;
+}
+
+fn decodeCancel(value: ?std.json.Value) DecodeError!client_protocol.Cancel {
+    const raw = value orelse return .{};
+    if (raw == .string) {
+        if (std.mem.eql(u8, raw.string, "active")) return .{};
+        return error.InvalidMessage;
+    }
+    if (raw != .object) return error.InvalidMessage;
+    if (raw.object.get("requestId")) |id| {
+        return .{ .target = .{ .request_id = try decodeRequiredId(id) } };
+    }
+    if (raw.object.get("operationId")) |id| {
+        return .{ .target = .{ .operation_id = try decodeRequiredId(id) } };
+    }
+    return error.InvalidMessage;
+}
+
+fn decodeRequiredId(raw: std.json.Value) DecodeError!client_protocol.RequestId {
+    if (raw != .integer) return error.InvalidRequestId;
+    if (raw.integer < 0) return error.InvalidRequestId;
+    return @intCast(raw.integer);
+}
+
+fn decodeReplay(object: std.json.ObjectMap) DecodeError!client_protocol.ReplayRequest {
+    const after_value = object.get("after") orelse return error.InvalidMessage;
+    if (after_value != .integer or after_value.integer < 0) return error.InvalidMessage;
+    return .{ .after = @intCast(after_value.integer) };
+}
+
 test "wire protocol decodes submit prompt command" {
-    var envelope = (try decodeCommandLine(std.testing.allocator, "{\"id\":1,\"type\":\"submit_prompt\",\"text\":\"hello\"}")) orelse unreachable;
+    var envelope = (try decodeCommandLine(std.testing.allocator, "{\"id\":1,\"type\":\"submit\",\"text\":\"hello\",\"mode\":\"start\"}")) orelse unreachable;
     defer envelope.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 1), envelope.id);
-    try std.testing.expect(envelope.command == .submit_prompt);
-    try std.testing.expectEqualStrings("hello", envelope.command.submit_prompt.text);
+    try std.testing.expect(envelope.command == .submit);
+    try std.testing.expectEqualStrings("hello", envelope.command.submit.text);
+    try std.testing.expectEqual(client_protocol.Submit.Mode.start, envelope.command.submit.mode);
 }
 
 test "wire protocol decodes CRLF and ignores empty lines" {
@@ -111,6 +138,14 @@ test "wire protocol decodes CRLF and ignores empty lines" {
     try std.testing.expect(envelope.command == .cancel);
 }
 
+// Cancel targets identify work without giving clients mutation authority.
+test "wire protocol decodes cancel operation target" {
+    var envelope = (try decodeCommandLine(std.testing.allocator, "{\"type\":\"cancel\",\"target\":{\"operationId\":9}}")) orelse unreachable;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expect(envelope.command == .cancel);
+    try std.testing.expectEqual(@as(client_protocol.OperationId, 9), envelope.command.cancel.target.operation_id);
+}
+
 test "wire protocol rejects malformed and oversized commands" {
     try std.testing.expectError(error.InvalidJson, decodeCommandLine(std.testing.allocator, "{"));
     try std.testing.expectError(error.UnknownCommand, decodeCommandLine(std.testing.allocator, "{\"type\":\"wat\"}"));
@@ -118,23 +153,24 @@ test "wire protocol rejects malformed and oversized commands" {
     const oversized = "a" ** (max_prompt_text_bytes + 1);
     var line = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer line.deinit();
-    try line.writer.writeAll("{\"type\":\"submit_prompt\",\"text\":\"");
+    try line.writer.writeAll("{\"type\":\"submit\",\"text\":\"");
     try line.writer.writeAll(oversized);
     try line.writer.writeAll("\"}");
     try std.testing.expectError(error.PromptTooLarge, decodeCommandLine(std.testing.allocator, line.written()));
 }
 
-test "wire protocol encodes event envelope with top-level id" {
+test "wire protocol encodes event envelope object directly" {
     var message = try client_protocol.EventText.init(std.testing.allocator, "nope");
     defer message.deinit();
     const event: client_protocol.EventEnvelope = .{
+        .seq = 3,
         .request_id = 7,
         .event = .{ .rejected = .{ .code = .invalid_command, .message = message } },
     };
     const encoded = try encodeEventEnvelope(std.testing.allocator, event);
     defer std.testing.allocator.free(encoded);
 
-    try std.testing.expect(std.mem.startsWith(u8, encoded, "{\"id\":7,"));
+    try std.testing.expect(std.mem.startsWith(u8, encoded, "{\"seq\":3,\"id\":7,\"event\":{"));
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"type\":\"rejected\"") != null);
     try std.testing.expect(encoded[encoded.len - 1] == '\n');
 }

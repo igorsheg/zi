@@ -14,7 +14,6 @@ const ParseError = error{
 };
 
 const AppMode = enum {
-    interactive,
     text,
     json,
     rpc,
@@ -189,8 +188,8 @@ pub fn resolveAppMode(args: AppArgs, stdin_is_tty: bool) AppMode {
             .rpc => .rpc,
         };
     }
-    if (args.print or !stdin_is_tty) return .text;
-    return .interactive;
+    _ = stdin_is_tty;
+    return .text;
 }
 
 fn parseAuth(args: []const []const u8) ParseError!AuthCommand {
@@ -327,7 +326,6 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\
         \\Examples:
-        \\  zi
         \\  zi "explain this repo"
         \\  zi -p "hello"
         \\  zi --mode json "explain this repo"
@@ -438,7 +436,7 @@ test "captures unknown long flags for future extension ownership" {
 test "resolves app mode from flags and stdin" {
     try std.testing.expectEqual(.text, resolveAppMode((try parse(&.{"-p"})).app, true));
     try std.testing.expectEqual(.text, resolveAppMode((try parse(&.{})).app, false));
-    try std.testing.expectEqual(.interactive, resolveAppMode((try parse(&.{})).app, true));
+    try std.testing.expectEqual(.text, resolveAppMode((try parse(&.{})).app, true));
 }
 
 test "parses auth command" {

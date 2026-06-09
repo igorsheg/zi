@@ -6,9 +6,14 @@ const runtime = @import("../runtime/root.zig");
 const session_manager = @import("session_manager.zig");
 
 pub const RequestId = u64;
+pub const OperationId = u64;
+pub const EventSeq = u64;
 
 pub const command_queue_capacity_default = 64;
 pub const event_queue_capacity_default = 256;
+pub const retained_event_count_default = 256;
+pub const retained_event_bytes_default = 512 * 1024;
+pub const replay_event_count_max = 64;
 pub const snapshot_history_items_max = 512;
 pub const snapshot_history_item_text_bytes_max = 16 * 1024;
 pub const snapshot_history_total_text_bytes_max = 128 * 1024;
@@ -22,7 +27,7 @@ pub const CommandEnvelope = struct {
     command: ClientCommand,
 
     pub fn initSubmitPrompt(allocator: std.mem.Allocator, id: ?RequestId, text: []const u8) !CommandEnvelope {
-        return .{ .id = id, .command = .{ .submit_prompt = .{ .text = try allocator.dupe(u8, text) } } };
+        return .{ .id = id, .command = .{ .submit = .{ .text = try allocator.dupe(u8, text), .mode = .auto } } };
     }
 
     pub fn deinit(self: *CommandEnvelope, allocator: std.mem.Allocator) void {
@@ -32,27 +37,56 @@ pub const CommandEnvelope = struct {
 };
 
 pub const ClientCommand = union(enum) {
-    submit_prompt: SubmitPrompt,
-    cancel,
-    clear_queue,
-    request_snapshot,
+    submit: Submit,
+    cancel: Cancel,
+    queue: QueueCommand,
+    snapshot: SnapshotRequest,
+    replay: ReplayRequest,
     shutdown,
 
     pub fn deinit(self: *ClientCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .submit_prompt => |prompt| allocator.free(prompt.text),
-            .cancel, .clear_queue, .request_snapshot, .shutdown => {},
+            .submit => |prompt| allocator.free(prompt.text),
+            .cancel, .queue, .snapshot, .replay, .shutdown => {},
         }
         self.* = undefined;
     }
 };
 
-pub const SubmitPrompt = struct {
+pub const Submit = struct {
     text: []u8,
+    mode: Mode = .auto,
+
+    pub const Mode = enum { auto, start, enqueue, steer };
+};
+
+pub const Cancel = struct {
+    target: Target = .active,
+
+    pub const Target = union(enum) {
+        active,
+        request_id: RequestId,
+        operation_id: OperationId,
+    };
+};
+
+pub const QueueCommand = union(enum) {
+    clear,
+};
+
+pub const SnapshotRequest = struct {
+    max_bytes: usize = snapshot_history_total_text_bytes_max,
+};
+
+pub const ReplayRequest = struct {
+    after: EventSeq,
+    max_events: usize = replay_event_count_max,
 };
 
 pub const EventEnvelope = struct {
+    seq: EventSeq = 0,
     request_id: ?RequestId = null,
+    operation_id: ?OperationId = null,
     event: ClientEvent,
 
     pub fn deinit(self: *EventEnvelope, allocator: std.mem.Allocator) void {
@@ -60,15 +94,27 @@ pub const EventEnvelope = struct {
         self.event.deinit();
         self.* = undefined;
     }
+
+    pub fn jsonStringify(self: EventEnvelope, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("seq", stringify, self.seq);
+        if (self.request_id) |id| try writeJsonField("id", stringify, id);
+        if (self.operation_id) |id| try writeJsonField("operationId", stringify, id);
+        try writeJsonField("event", stringify, self.event);
+        try stringify.endObject();
+    }
 };
 
 pub const ClientEvent = union(enum) {
     rejected: Rejection,
-    response: Response,
+    operation_started: OperationStarted,
+    operation_finished: OperationFinished,
+    shutdown_started,
     agent_event: OwnedAgentEvent,
-    queue_update: QueueUpdate,
-    prompt_command: PromptCommand,
+    queue_changed: QueueChanged,
     snapshot: Snapshot,
+    replay: ReplayBatch,
+    replay_gap: ReplayGap,
     compaction_start: CompactionStart,
     session_info_changed: SessionInfoChanged,
     compaction_end: CompactionEnd,
@@ -80,14 +126,13 @@ pub const ClientEvent = union(enum) {
         switch (self.*) {
             .rejected => |*rejection| rejection.message.deinit(),
             .agent_event => |*payload| payload.deinit(),
-            .queue_update => |*payload| payload.deinit(),
-            .prompt_command => |*payload| payload.deinit(),
             .snapshot => |*payload| payload.deinit(),
+            .replay => |*payload| payload.deinit(),
             .session_info_changed => |*payload| if (payload.name) |*name| name.deinit(),
             .compaction_end => |*payload| payload.deinit(),
             .auto_retry_start => |*payload| payload.error_message.deinit(),
             .auto_retry_end => |*payload| if (payload.final_error) |*err| err.deinit(),
-            .response, .compaction_start, .event_overflow => {},
+            .operation_started, .operation_finished, .shutdown_started, .queue_changed, .replay_gap, .compaction_start, .event_overflow => {},
         }
         self.* = undefined;
     }
@@ -95,23 +140,17 @@ pub const ClientEvent = union(enum) {
     pub fn jsonStringify(self: ClientEvent, stringify: *std.json.Stringify) !void {
         switch (self) {
             .agent_event => |event| try stringify.write(event),
-            .queue_update => |payload| {
+            .queue_changed => |payload| {
                 try stringify.beginObject();
-                try writeJsonField("type", stringify, "queue_update");
-                try writeJsonField("steering", stringify, payload.steering);
-                try writeJsonField("followUp", stringify, payload.follow_up);
+                try writeJsonField("type", stringify, "queue_changed");
+                try writeJsonField("steeringCount", stringify, payload.steering_count);
+                try writeJsonField("followUpCount", stringify, payload.follow_up_count);
                 try writeJsonField("revision", stringify, payload.revision);
                 try stringify.endObject();
             },
-            .prompt_command => |payload| {
-                try stringify.beginObject();
-                try writeJsonField("type", stringify, "prompt_command");
-                try writeJsonField("command", stringify, payload.command);
-                try writeJsonField("result", stringify, payload.result);
-                try writeJsonField("message", stringify, payload.message);
-                try stringify.endObject();
-            },
             .snapshot => |payload| try stringify.write(payload),
+            .replay => |payload| try stringify.write(payload),
+            .replay_gap => |payload| try stringify.write(payload),
             .compaction_start => |payload| {
                 try stringify.beginObject();
                 try writeJsonField("type", stringify, "compaction_start");
@@ -153,12 +192,14 @@ pub const ClientEvent = union(enum) {
             },
             .event_overflow => |payload| {
                 try stringify.beginObject();
-                try writeJsonField("type", stringify, "public_event_overflow");
+                try writeJsonField("type", stringify, "event_overflow");
                 try writeJsonField("droppedCount", stringify, payload.dropped_count);
                 try stringify.endObject();
             },
-            .rejected => |payload| try stringify.write(.{ .type = "rejected", .message = payload.message.text }),
-            .response => |payload| try stringify.write(.{ .type = "response", .response = payload }),
+            .rejected => |payload| try stringify.write(.{ .type = "rejected", .code = payload.code, .message = payload.message.text }),
+            .operation_started => |payload| try stringify.write(payload),
+            .operation_finished => |payload| try stringify.write(payload),
+            .shutdown_started => try stringify.write(.{ .type = "shutdown_started" }),
         }
     }
 };
@@ -176,11 +217,35 @@ pub const Rejection = struct {
     };
 };
 
-pub const Response = union(enum) {
-    prompt_finished,
-    canceled,
-    queue_cleared,
-    shutdown_started,
+pub const OperationStarted = struct {
+    kind: Kind = .prompt,
+
+    pub const Kind = enum { prompt };
+
+    pub fn jsonStringify(self: OperationStarted, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "operation_started");
+        try writeJsonField("kind", stringify, self.kind);
+        try stringify.endObject();
+    }
+};
+
+pub const OperationFinished = struct {
+    reason: Reason,
+
+    pub const Reason = enum {
+        completed,
+        canceled,
+        failed,
+        queue_cleared,
+    };
+
+    pub fn jsonStringify(self: OperationFinished, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "operation_finished");
+        try writeJsonField("reason", stringify, self.reason);
+        try stringify.endObject();
+    }
 };
 
 pub const EventText = struct {
@@ -285,33 +350,10 @@ pub const OwnedAgentEvent = struct {
     }
 };
 
-pub const QueueUpdate = struct {
-    steering: EventTextList,
-    follow_up: EventTextList,
+pub const QueueChanged = struct {
+    steering_count: usize,
+    follow_up_count: usize,
     revision: u64,
-
-    pub fn deinit(self: *QueueUpdate) void {
-        self.steering.deinit();
-        self.follow_up.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const PromptCommandResult = enum {
-    handled,
-    unknown,
-};
-
-pub const PromptCommand = struct {
-    command: EventText,
-    result: PromptCommandResult,
-    message: EventText,
-
-    pub fn deinit(self: *PromptCommand) void {
-        self.command.deinit();
-        self.message.deinit();
-        self.* = undefined;
-    }
 };
 
 pub const CompactionReason = enum {
@@ -357,6 +399,95 @@ pub const AutoRetryEnd = struct {
 
 pub const EventOverflow = struct {
     dropped_count: usize,
+};
+
+pub const RetainedEvent = struct {
+    seq: EventSeq,
+    json: EventText,
+
+    pub const Source = struct {
+        seq: EventSeq,
+        json: []const u8,
+    };
+
+    pub fn deinit(self: *RetainedEvent) void {
+        self.json.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const ReplayBatch = struct {
+    allocator: std.mem.Allocator,
+    requested_after: EventSeq,
+    first_retained_seq: EventSeq,
+    last_retained_seq: EventSeq,
+    events: []RetainedEvent,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        requested_after: EventSeq,
+        first_retained_seq: EventSeq,
+        last_retained_seq: EventSeq,
+        source: []const RetainedEvent.Source,
+    ) !ReplayBatch {
+        const events = try allocator.alloc(RetainedEvent, source.len);
+        errdefer allocator.free(events);
+        var initialized: usize = 0;
+        errdefer {
+            for (events[0..initialized]) |*event| event.deinit();
+        }
+        for (source) |event| {
+            events[initialized] = .{
+                .seq = event.seq,
+                .json = try EventText.init(allocator, event.json),
+            };
+            initialized += 1;
+        }
+        return .{
+            .allocator = allocator,
+            .requested_after = requested_after,
+            .first_retained_seq = first_retained_seq,
+            .last_retained_seq = last_retained_seq,
+            .events = events,
+        };
+    }
+
+    pub fn deinit(self: *ReplayBatch) void {
+        for (self.events) |*event| event.deinit();
+        self.allocator.free(self.events);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: ReplayBatch, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "replay");
+        try writeJsonField("requestedAfter", stringify, self.requested_after);
+        try writeJsonField("firstRetainedSeq", stringify, self.first_retained_seq);
+        try writeJsonField("lastRetainedSeq", stringify, self.last_retained_seq);
+        try stringify.objectField("events");
+        try stringify.beginArray();
+        for (self.events, 0..) |event, index| {
+            if (index != 0) try stringify.writer.writeByte(',');
+            try stringify.writer.writeAll(event.json.text);
+        }
+        try stringify.endArray();
+        try stringify.endObject();
+    }
+};
+
+pub const ReplayGap = struct {
+    requested_after: EventSeq,
+    first_retained_seq: EventSeq,
+    last_retained_seq: EventSeq,
+
+    pub fn jsonStringify(self: ReplayGap, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "replay_gap");
+        try writeJsonField("requestedAfter", stringify, self.requested_after);
+        try writeJsonField("firstRetainedSeq", stringify, self.first_retained_seq);
+        try writeJsonField("lastRetainedSeq", stringify, self.last_retained_seq);
+        try stringify.endObject();
+    }
 };
 
 pub const Snapshot = struct {
@@ -592,14 +723,13 @@ test "command envelope owns prompt text" {
     defer envelope.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(?RequestId, 7), envelope.id);
-    try std.testing.expectEqualStrings("hello", envelope.command.submit_prompt.text);
+    try std.testing.expectEqualStrings("hello", envelope.command.submit.text);
 }
 
 test "event envelope deinitializes owned client event" {
-    var event: EventEnvelope = .{ .event = .{ .prompt_command = .{
-        .command = try EventText.init(std.testing.allocator, "help"),
-        .result = .handled,
-        .message = try EventText.init(std.testing.allocator, "ok"),
+    var event: EventEnvelope = .{ .event = .{ .rejected = .{
+        .code = .invalid_command,
+        .message = try EventText.init(std.testing.allocator, "no"),
     } } };
     event.deinit(std.testing.allocator);
 }
@@ -626,44 +756,6 @@ test "history snapshot caps text bytes and reports truncation" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
     try std.testing.expectEqual(@as(usize, 4), snapshot.dropped_text_bytes);
     try std.testing.expectEqual(@as(usize, snapshot_history_item_text_bytes_max), snapshot.items[0].text.text.len);
-}
-
-test "prompt command event serializes public shape" {
-    var unknown_event: ClientEvent = .{ .prompt_command = .{
-        .command = try EventText.init(std.testing.allocator, "missing"),
-        .result = .unknown,
-        .message = try EventText.init(std.testing.allocator, "unknown command: /missing"),
-    } };
-    defer unknown_event.deinit();
-
-    var unknown_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer unknown_writer.deinit();
-
-    try std.json.Stringify.value(unknown_event, .{}, &unknown_writer.writer);
-
-    try std.testing.expectEqualStrings(
-        "{\"type\":\"prompt_command\",\"command\":\"missing\",\"result\":\"unknown\"," ++
-            "\"message\":\"unknown command: /missing\"}",
-        unknown_writer.written(),
-    );
-
-    var handled_event: ClientEvent = .{ .prompt_command = .{
-        .command = try EventText.init(std.testing.allocator, "help"),
-        .result = .handled,
-        .message = try EventText.init(std.testing.allocator, "available commands: /help, /session"),
-    } };
-    defer handled_event.deinit();
-
-    var handled_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer handled_writer.deinit();
-
-    try std.json.Stringify.value(handled_event, .{}, &handled_writer.writer);
-
-    try std.testing.expectEqualStrings(
-        "{\"type\":\"prompt_command\",\"command\":\"help\",\"result\":\"handled\"," ++
-            "\"message\":\"available commands: /help, /session\"}",
-        handled_writer.written(),
-    );
 }
 
 test "failed compaction end event omits result" {

@@ -207,13 +207,13 @@ fn drainEvents(
 
 fn isTerminalEvent(event: client_protocol.ClientEvent) bool {
     return switch (event) {
-        .rejected, .response, .snapshot => true,
+        .rejected, .operation_finished, .snapshot, .shutdown_started => true,
         else => false,
     };
 }
 
 fn isShutdownEvent(event: client_protocol.ClientEvent) bool {
-    return event == .response and event.response == .shutdown_started;
+    return event == .shutdown_started;
 }
 
 fn writeEvent(
@@ -267,7 +267,7 @@ test "rpc stdio decodes commands and emits snapshot and shutdown" {
     defer app.deinit();
 
     var input = std.Io.Reader.fixed(
-        \\{"id":1,"type":"request_snapshot"}
+        \\{"id":1,"type":"snapshot"}
         \\{"id":2,"type":"shutdown"}
         \\
     );
@@ -284,6 +284,58 @@ test "rpc stdio decodes commands and emits snapshot and shutdown" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"id\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"shutdown_started\"") != null);
     try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "rpc input accepts targeted cancel while prompt is active" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .session_id = "rpc-session",
+        .timestamp = "2026-06-09T00:00:00Z",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer app.deinit();
+
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first");
+    var prompt_owned = true;
+    defer if (prompt_owned) prompt.deinit(std.testing.allocator);
+    try app.submit(prompt);
+    prompt_owned = false;
+    try app.step();
+
+    var started = app.drainEvent().?;
+    defer started.deinit(std.testing.allocator);
+    try std.testing.expect(started.event == .operation_started);
+    const operation_id = started.operation_id.?;
+
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var state: InputState = .{};
+    const line = try std.fmt.allocPrint(std.testing.allocator, "{{\"id\":2,\"type\":\"cancel\",\"target\":{{\"operationId\":{}}}}}\n", .{operation_id});
+    defer std.testing.allocator.free(line);
+
+    try std.testing.expectEqual(InputResult.active, try state.feed(line, &app, &stdout, &stderr));
+    try app.step();
+
+    var found_canceled = false;
+    while (app.drainEvent()) |event| {
+        var owned = event;
+        defer owned.deinit(std.testing.allocator);
+        if (owned.event == .operation_finished and owned.event.operation_finished.reason == .canceled) {
+            found_canceled = true;
+        }
+    }
+    try std.testing.expect(found_canceled);
 }
 
 test "rpc stdio reports malformed json and continues" {

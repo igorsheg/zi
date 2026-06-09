@@ -37,7 +37,7 @@ src/
   cli/           process CLI parsing and concrete mode dispatch
   runtime/       zio-backed mechanism: process, select, bounded queues, cancel, process runner
   tui/           Zi-owned terminal UI (substrate/infra/primitive/product)
-  frontends/     concrete client adapters; print and TUI today
+  frontends/     concrete client adapters; print and RPC today
   main.zig       process init -> runtime.Runtime -> cli.main
   root.zig       public package surface (ai, agent, coding_agent, runtime, tui)
 ```
@@ -56,8 +56,9 @@ coding_agent  depends on std, ai, agent, and runtime. no tui or concrete fronten
 two facts follow from this and are load-bearing:
 
 - `src/tui` is agent-agnostic. it never names a session, provider, tool, or
-  agent event. any bridge between `tui` and `coding_agent` lives outside both
-  modules as a concrete frontend adapter.
+  agent event. there is intentionally no TUI frontend adapter today; the next
+  one must be rebuilt from the client protocol, not revived as a compatibility
+  shim.
 - `src/agent` is product-agnostic. it runs any tool set against any provider;
   Zi-specific policy lives in `coding_agent`.
 
@@ -75,10 +76,9 @@ main.zig
 
 cli/
   parses args, resolves a mode, dispatches concrete clients:
-    print/text   -> frontends/print        (--print or non-tty stdin)
+    text         -> frontends/print        (--print, tty, or non-tty stdin)
     json         -> frontends/print (json) (--mode json)
-    rpc          -> rejected (not implemented yet)
-    interactive  -> frontends/tui          (default on a tty)
+    rpc          -> frontends/rpc          (--mode rpc)
     auth         -> coding_agent auth_mode login/logout/status
   resume/list selection runs through coding_agent session listing before a host is created.
 
