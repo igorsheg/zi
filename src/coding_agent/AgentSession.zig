@@ -844,9 +844,15 @@ fn generateCompactionSummary(self: *AgentSession, serialized_input: []const u8) 
     var owned_api_key: ?[]const u8 = null;
     defer if (owned_api_key) |api_key| self.allocator.free(api_key);
     if (self.agent.loop_config.get_api_key) |get_api_key| {
-        if (try agent_mod.GetApiKeyHook.call(self.allocator, get_api_key, self.agent.state.model.provider)) |api_key| {
-            owned_api_key = api_key;
-            stream_options.api_key = api_key;
+        const credential = try agent_mod.GetApiKeyHook.call(
+            self.allocator,
+            get_api_key,
+            self.agent.state.model.provider,
+        );
+        if (credential) |value| {
+            owned_api_key = value.api_key;
+            stream_options.api_key = value.api_key;
+            stream_options.auth_extra = value.auth_extra;
         }
     }
 

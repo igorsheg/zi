@@ -723,9 +723,10 @@ fn streamAssistantResponse(
     var owned_api_key: ?[]const u8 = null;
     defer if (owned_api_key) |api_key| allocator.free(api_key);
     if (config.get_api_key) |get_api_key| {
-        if (try agent.GetApiKeyHook.call(allocator, get_api_key, config.model.provider)) |api_key| {
-            owned_api_key = api_key;
-            stream_options.api_key = api_key;
+        if (try agent.GetApiKeyHook.call(allocator, get_api_key, config.model.provider)) |credential| {
+            owned_api_key = credential.api_key;
+            stream_options.api_key = credential.api_key;
+            stream_options.auth_extra = credential.auth_extra;
         }
     }
 

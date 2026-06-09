@@ -125,7 +125,7 @@ const CodexResponseStream = shared.SsePullStream(CodexResponseOwner, .{
 fn createCodexResponseStream(request: protocol.StreamRequest) !*CodexResponseStream {
     const allocator = request.allocator;
     const api_key = request.options.api_key orelse resolveApiKey(request) orelse return error.MissingApiKey;
-    const account_id = try oauth_openai_codex.getAccountId(allocator, api_key) orelse return error.MissingAccountId;
+    const account_id = try oauth_openai_codex.resolveAccountId(allocator, api_key, request.options.auth_extra);
     errdefer allocator.free(account_id);
     const authorization = try http_utils.bearerHeader(allocator, api_key);
     errdefer allocator.free(authorization);

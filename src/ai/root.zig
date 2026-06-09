@@ -28,6 +28,7 @@ pub const CacheRetention = protocol.CacheRetention;
 pub const Transport = protocol.Transport;
 pub const ProviderResponse = protocol.ProviderResponse;
 pub const StreamOptions = protocol.StreamOptions;
+pub const ApiCredential = protocol.ApiCredential;
 pub const ThinkingBudgets = protocol.ThinkingBudgets;
 pub const SimpleStreamOptions = protocol.SimpleStreamOptions;
 pub const Model = protocol.Model;

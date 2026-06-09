@@ -49,6 +49,7 @@ pub const StreamOptions = struct {
     temperature: ?f64 = null,
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
+    auth_extra: ?std.json.Value = null,
     transport: ?Transport = null,
     cache_retention: ?CacheRetention = null,
     session_id: ?[]const u8 = null,
@@ -64,6 +65,12 @@ pub const ThinkingBudgets = struct {
     low: ?u32 = null,
     medium: ?u32 = null,
     high: ?u32 = null,
+};
+
+pub const ApiCredential = struct {
+    api_key: []const u8,
+    // Borrowed provider context used synchronously while opening a stream.
+    auth_extra: ?std.json.Value = null,
 };
 
 pub const SimpleStreamOptions = struct {

@@ -227,17 +227,15 @@ pub const AuthManager = struct {
         allocator: std.mem.Allocator,
         context: ?*anyopaque,
         provider: ai.Provider,
-    ) anyerror!?[]const u8 {
+    ) anyerror!?ai.ApiCredential {
         const self: *const AuthManager = @ptrCast(@alignCast(context.?));
         if (self.findEnvApiKey(provider)) |key| {
-            const owned = try allocator.dupe(u8, key.value);
-            return owned;
+            return .{ .api_key = try allocator.dupe(u8, key.value) };
         }
         if (self.findOAuthCredentials(provider)) |credentials| {
             if (std.mem.eql(u8, provider, ai.openai_codex_oauth_provider.id)) {
                 const api_key = try ai.openai_codex_oauth_provider.getApiKey(credentials);
-                const owned = try allocator.dupe(u8, api_key);
-                return owned;
+                return .{ .api_key = try allocator.dupe(u8, api_key), .auth_extra = credentials.extra };
             }
         }
         return null;
@@ -387,9 +385,9 @@ test "auth manager returns configured env api key" {
     });
     defer auth.deinit();
     const key = try agent_mod.GetApiKeyHook.call(std.testing.allocator, auth.hook(), ai.KnownProvider.openai);
-    defer std.testing.allocator.free(key.?);
+    defer std.testing.allocator.free(key.?.api_key);
 
-    try std.testing.expectEqualStrings("secret", key.?);
+    try std.testing.expectEqualStrings("secret", key.?.api_key);
 }
 
 test "auth manager treats missing env and store as absent auth" {
@@ -404,7 +402,7 @@ test "auth manager treats missing env and store as absent auth" {
     defer auth.deinit();
     const key = try agent_mod.GetApiKeyHook.call(std.testing.allocator, auth.hook(), ai.KnownProvider.openai);
 
-    try std.testing.expectEqual(@as(?[]const u8, null), key);
+    try std.testing.expectEqual(@as(?ai.ApiCredential, null), key);
 }
 
 test "auth store loads oauth credentials from global auth file" {
@@ -423,13 +421,14 @@ test "auth store loads oauth credentials from global auth file" {
     });
     defer auth.deinit();
     const key = try agent_mod.GetApiKeyHook.call(std.testing.allocator, auth.hook(), ai.KnownProvider.openai_codex);
-    defer std.testing.allocator.free(key.?);
+    defer std.testing.allocator.free(key.?.api_key);
     try auth.store.save(std.testing.io);
     const saved = try tmp.dir.readFileAlloc(std.testing.io, "agent/auth.json", std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(saved);
 
     try std.testing.expect(auth.hasAuth(ai.KnownProvider.openai_codex));
-    try std.testing.expectEqualStrings("access-token", key.?);
+    try std.testing.expectEqualStrings("access-token", key.?.api_key);
+    try std.testing.expect(key.?.auth_extra.? == .object);
     try std.testing.expectEqualStrings(
         "{\"openai-codex\":{\"type\":\"oauth\",\"refresh\":\"refresh-token\"," ++
             "\"access\":\"access-token\",\"expires\":123,\"extra\":{\"account\":\"a1\"}}}\n",

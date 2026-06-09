@@ -73,18 +73,99 @@ pub fn parseAuthorizationInput(input: []const u8) AuthorizationInput {
 }
 
 pub fn getAccountId(allocator: std.mem.Allocator, access_token: []const u8) !?[]u8 {
-    const payload_segment = jwtPayloadSegment(access_token) orelse return null;
-    const decoded = try decodeBase64Url(allocator, payload_segment);
+    var context = try parseJwtAuthContext(allocator, access_token) orelse return null;
+    defer context.deinit(allocator);
+    if (context.chatgpt_account_id) |account_id| return @as(?[]u8, try allocator.dupe(u8, account_id));
+    if (context.organization_account_id) |account_id| return @as(?[]u8, try allocator.dupe(u8, account_id));
+    return null;
+}
+
+pub fn getAccountIdFromExtra(allocator: std.mem.Allocator, extra: ?std.json.Value) !?[]u8 {
+    const value = extra orelse return null;
+    if (value != .object) return null;
+    if (nonEmptyJsonString(value.object.get("chatgpt_account_id"))) |account_id| {
+        return @as(?[]u8, try allocator.dupe(u8, account_id));
+    }
+    if (nonEmptyJsonString(value.object.get("account_id"))) |account_id| {
+        return @as(?[]u8, try allocator.dupe(u8, account_id));
+    }
+    return null;
+}
+
+pub fn resolveAccountId(
+    allocator: std.mem.Allocator,
+    access_token: []const u8,
+    auth_extra: ?std.json.Value,
+) ![]u8 {
+    if (try getAccountIdFromExtra(allocator, auth_extra)) |account_id| return account_id;
+    return try getAccountId(allocator, access_token) orelse error.MissingAccountId;
+}
+
+const JwtAuthContext = struct {
+    chatgpt_account_id: ?[]u8 = null,
+    organization_account_id: ?[]u8 = null,
+    chatgpt_user_id: ?[]u8 = null,
+    email: ?[]u8 = null,
+    plan: ?[]u8 = null,
+
+    fn deinit(self: *JwtAuthContext, allocator: std.mem.Allocator) void {
+        if (self.chatgpt_account_id) |value| allocator.free(value);
+        if (self.organization_account_id) |value| allocator.free(value);
+        if (self.chatgpt_user_id) |value| allocator.free(value);
+        if (self.email) |value| allocator.free(value);
+        if (self.plan) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+fn parseJwtAuthContext(allocator: std.mem.Allocator, token: []const u8) !?JwtAuthContext {
+    const payload_segment = jwtPayloadSegment(token) orelse return null;
+    const decoded = decodeBase64Url(allocator, payload_segment) catch return null;
     defer allocator.free(decoded);
 
     var parsed = runtime.JsonOwned(std.json.Value).parseJson(allocator, decoded, .{}) catch return null;
     defer parsed.deinit();
-    const auth = parsed.value.object.get(jwt_claim_path) orelse return null;
-    if (auth != .object) return null;
-    const account_id = auth.object.get("chatgpt_account_id") orelse return null;
-    if (account_id != .string or account_id.string.len == 0) return null;
-    const owned_account_id = try allocator.dupe(u8, account_id.string);
-    return owned_account_id;
+    if (parsed.value != .object) return null;
+
+    var context: JwtAuthContext = .{};
+    errdefer context.deinit(allocator);
+    if (nonEmptyJsonString(parsed.value.object.get("email"))) |email| {
+        context.email = try allocator.dupe(u8, email);
+    }
+
+    const auth = parsed.value.object.get(jwt_claim_path) orelse return context;
+    if (auth != .object) return context;
+    if (nonEmptyJsonString(auth.object.get("chatgpt_account_id"))) |account_id| {
+        context.chatgpt_account_id = try allocator.dupe(u8, account_id);
+    }
+    context.organization_account_id = try organizationAccountId(allocator, auth.object);
+    const user_id = nonEmptyJsonString(auth.object.get("chatgpt_user_id")) orelse
+        nonEmptyJsonString(auth.object.get("user_id"));
+    if (user_id) |value| context.chatgpt_user_id = try allocator.dupe(u8, value);
+    if (nonEmptyJsonString(auth.object.get("chatgpt_plan_type"))) |plan| {
+        context.plan = try allocator.dupe(u8, plan);
+    }
+    return context;
+}
+
+fn organizationAccountId(allocator: std.mem.Allocator, auth: std.json.ObjectMap) !?[]u8 {
+    const organizations_value = auth.get("organizations") orelse return null;
+    if (organizations_value != .array) return null;
+
+    var first_id: ?[]const u8 = null;
+    for (organizations_value.array.items) |organization_value| {
+        if (organization_value != .object) continue;
+        const id = nonEmptyJsonString(organization_value.object.get("id")) orelse continue;
+        if (first_id == null) first_id = id;
+        const is_default = if (organization_value.object.get("is_default")) |default_value| switch (default_value) {
+            .bool => |value| value,
+            else => false,
+        } else false;
+        if (is_default) return @as(?[]u8, try allocator.dupe(u8, id));
+    }
+
+    if (first_id) |id| return @as(?[]u8, try allocator.dupe(u8, id));
+    return null;
 }
 
 fn createState(allocator: std.mem.Allocator, random: std.Random) ![]u8 {
@@ -203,8 +284,11 @@ fn beginLogin(
     io: std.Io,
     callbacks: oauth.OAuthLoginCallbacks,
 ) !LoginAttempt {
-    var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Clock.awake.now(io).nanoseconds));
-    var flow = try createAuthorizationFlow(allocator, prng.random(), "zi");
+    var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+    io.random(&seed);
+    defer std.crypto.secureZero(u8, &seed);
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    var flow = try createAuthorizationFlow(allocator, csprng.random(), "zi");
     errdefer flow.deinit(allocator);
 
     var callback_server = CallbackServer.start(io) catch null;
@@ -478,14 +562,80 @@ fn parseTokenResponse(allocator: std.mem.Allocator, io: std.Io, body: []const u8
     const access = jsonString(object.get("access_token")) orelse return error.InvalidTokenResponse;
     const refresh = jsonString(object.get("refresh_token")) orelse return error.InvalidTokenResponse;
     const expires_in = jsonI64(object.get("expires_in")) orelse return error.InvalidTokenResponse;
-    const account_id = try getAccountId(allocator, access) orelse return error.MissingAccountId;
-    allocator.free(account_id);
-    const now_ms: i64 = @intCast(@divTrunc(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000));
+    const id_token = nonEmptyJsonString(object.get("id_token"));
+    const response_account_id = nonEmptyJsonString(object.get("account_id"));
+    const extra = try buildAuthExtra(allocator, access, id_token, response_account_id);
+    errdefer if (extra) |value| runtime.freeJsonValue(allocator, value);
+    const now_ms: i64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
     return .{
         .access = try allocator.dupe(u8, access),
         .refresh = try allocator.dupe(u8, refresh),
         .expires = now_ms + expires_in * 1000,
+        .extra = extra,
     };
+}
+
+fn buildAuthExtra(
+    allocator: std.mem.Allocator,
+    access_token: []const u8,
+    id_token: ?[]const u8,
+    response_account_id: ?[]const u8,
+) !?std.json.Value {
+    var access_context = try parseJwtAuthContext(allocator, access_token) orelse JwtAuthContext{};
+    defer access_context.deinit(allocator);
+    var id_context = if (id_token) |token| try parseJwtAuthContext(allocator, token) else null;
+    defer if (id_context) |*context| context.deinit(allocator);
+
+    const jwt_account_id = firstString(&.{
+        if (id_context) |context| context.chatgpt_account_id else null,
+        access_context.chatgpt_account_id,
+    });
+    if (response_account_id) |account_id| {
+        if (jwt_account_id) |jwt_id| {
+            if (!std.mem.eql(u8, account_id, jwt_id)) return error.AccountIdMismatch;
+        }
+    }
+
+    const resolved_account_id = response_account_id orelse jwt_account_id orelse firstString(&.{
+        if (id_context) |context| context.organization_account_id else null,
+        access_context.organization_account_id,
+    }) orelse return error.MissingAccountId;
+
+    var object: std.json.ObjectMap = .empty;
+    errdefer runtime.freeJsonValue(allocator, .{ .object = object });
+    if (id_token) |token| try putStringField(allocator, &object, "id_token", token);
+    if (response_account_id) |account_id| try putStringField(allocator, &object, "account_id", account_id);
+    try putStringField(allocator, &object, "chatgpt_account_id", resolved_account_id);
+    const user_id = firstString(&.{
+        if (id_context) |context| context.chatgpt_user_id else null,
+        access_context.chatgpt_user_id,
+    });
+    if (user_id) |value| try putStringField(allocator, &object, "chatgpt_user_id", value);
+    if (firstString(&.{ if (id_context) |context| context.email else null, access_context.email })) |email| {
+        try putStringField(allocator, &object, "email", email);
+    }
+    if (firstString(&.{ if (id_context) |context| context.plan else null, access_context.plan })) |plan| {
+        try putStringField(allocator, &object, "plan", plan);
+    }
+    return .{ .object = object };
+}
+
+fn firstString(values: []const ?[]const u8) ?[]const u8 {
+    for (values) |value| if (value) |text| if (text.len > 0) return text;
+    return null;
+}
+
+fn putStringField(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    const owned_value = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned_value);
+    try object.put(allocator, owned_key, .{ .string = owned_value });
 }
 
 fn jsonString(value: ?std.json.Value) ?[]const u8 {
@@ -494,6 +644,12 @@ fn jsonString(value: ?std.json.Value) ?[]const u8 {
         .string => |string| string,
         else => null,
     };
+}
+
+fn nonEmptyJsonString(value: ?std.json.Value) ?[]const u8 {
+    const string = jsonString(value) orelse return null;
+    if (string.len == 0) return null;
+    return string;
 }
 
 fn jsonI64(value: ?std.json.Value) ?i64 {
@@ -556,9 +712,7 @@ test "token response validates account id and owns credentials" {
     const payload =
         \\{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}
     ;
-    const encoded_payload = try oauth.pkce.base64UrlEncode(std.testing.allocator, payload);
-    defer std.testing.allocator.free(encoded_payload);
-    const access = try std.fmt.allocPrint(std.testing.allocator, "header.{s}.signature", .{encoded_payload});
+    const access = try jwtForPayload(std.testing.allocator, payload);
     defer std.testing.allocator.free(access);
     const body = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -570,10 +724,115 @@ test "token response validates account id and owns credentials" {
     const credentials = try parseTokenResponse(std.testing.allocator, std.testing.io, body);
     defer std.testing.allocator.free(credentials.access);
     defer std.testing.allocator.free(credentials.refresh);
+    defer if (credentials.extra) |extra| runtime.freeJsonValue(std.testing.allocator, extra);
 
     try std.testing.expectEqualStrings(access, credentials.access);
     try std.testing.expectEqualStrings("refresh", credentials.refresh);
     try std.testing.expect(credentials.expires > 0);
+}
+
+fn jwtForPayload(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    const encoded_payload = try oauth.pkce.base64UrlEncode(allocator, payload);
+    defer allocator.free(encoded_payload);
+    return std.fmt.allocPrint(allocator, "header.{s}.signature", .{encoded_payload});
+}
+
+fn expectExtraString(extra: std.json.Value, key: []const u8, expected: []const u8) !void {
+    try std.testing.expect(extra == .object);
+    const value = nonEmptyJsonString(extra.object.get(key)) orelse return error.MissingExtraField;
+    try std.testing.expectEqualStrings(expected, value);
+}
+
+test "token response preserves id token and codex auth context" {
+    const id_payload =
+        \\{"email":"User@Example.COM","https://api.openai.com/auth":
+    ++
+        \\{"chatgpt_account_id":"acct_id","chatgpt_user_id":"user_id","chatgpt_plan_type":"pro"}}
+    ;
+    const id_token = try jwtForPayload(std.testing.allocator, id_payload);
+    defer std.testing.allocator.free(id_token);
+    const access = try jwtForPayload(std.testing.allocator, id_payload);
+    defer std.testing.allocator.free(access);
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"access_token\":\"{s}\",\"id_token\":\"{s}\"," ++
+            "\"refresh_token\":\"refresh\",\"expires_in\":60}}",
+        .{ access, id_token },
+    );
+    defer std.testing.allocator.free(body);
+
+    const credentials = try parseTokenResponse(std.testing.allocator, std.testing.io, body);
+    defer std.testing.allocator.free(credentials.access);
+    defer std.testing.allocator.free(credentials.refresh);
+    defer if (credentials.extra) |extra| runtime.freeJsonValue(std.testing.allocator, extra);
+
+    const extra = credentials.extra.?;
+    try expectExtraString(extra, "id_token", id_token);
+    try expectExtraString(extra, "chatgpt_account_id", "acct_id");
+    try expectExtraString(extra, "chatgpt_user_id", "user_id");
+    try expectExtraString(extra, "email", "User@Example.COM");
+    try expectExtraString(extra, "plan", "pro");
+}
+
+test "token response uses default organization as account context" {
+    const id_payload =
+        \\{"https://api.openai.com/auth":{"organizations":
+    ++
+        \\[{"id":"org-other","is_default":false},{"id":"org-default","is_default":true}],"user_id":"user_id"}}
+    ;
+    const id_token = try jwtForPayload(std.testing.allocator, id_payload);
+    defer std.testing.allocator.free(id_token);
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"access_token\":\"{s}\",\"id_token\":\"{s}\"," ++
+            "\"refresh_token\":\"refresh\",\"expires_in\":60}}",
+        .{ id_token, id_token },
+    );
+    defer std.testing.allocator.free(body);
+
+    const credentials = try parseTokenResponse(std.testing.allocator, std.testing.io, body);
+    defer std.testing.allocator.free(credentials.access);
+    defer std.testing.allocator.free(credentials.refresh);
+    defer if (credentials.extra) |extra| runtime.freeJsonValue(std.testing.allocator, extra);
+
+    try expectExtraString(credentials.extra.?, "chatgpt_account_id", "org-default");
+}
+
+test "token response rejects mismatched explicit account id" {
+    const payload =
+        \\{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_id"}}
+    ;
+    const token = try jwtForPayload(std.testing.allocator, payload);
+    defer std.testing.allocator.free(token);
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"access_token\":\"{s}\",\"id_token\":\"{s}\",\"account_id\":\"other\"," ++
+            "\"refresh_token\":\"refresh\",\"expires_in\":60}}",
+        .{ token, token },
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expectError(
+        error.AccountIdMismatch,
+        parseTokenResponse(std.testing.allocator, std.testing.io, body),
+    );
+}
+
+test "resolve account id prefers stored auth extra" {
+    var object: std.json.ObjectMap = .empty;
+    try putStringField(
+        std.testing.allocator,
+        &object,
+        "chatgpt_account_id",
+        "stored-account",
+    );
+    const extra: std.json.Value = .{ .object = object };
+    defer runtime.freeJsonValue(std.testing.allocator, extra);
+
+    const account_id = try resolveAccountId(std.testing.allocator, "not-a-jwt", extra);
+    defer std.testing.allocator.free(account_id);
+
+    try std.testing.expectEqualStrings("stored-account", account_id);
 }
 
 test "openai codex provider exposes access token as api key" {
