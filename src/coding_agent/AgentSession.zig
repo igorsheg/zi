@@ -6,7 +6,7 @@ const event_drain_mod = @import("event_drain.zig");
 const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
 const queue_mirror_mod = @import("queue_mirror.zig");
-const session_events = @import("session_events.zig");
+const client_protocol = @import("client_protocol.zig");
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
 const system_prompt = @import("system_prompt.zig");
@@ -56,7 +56,7 @@ tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 store: ?*session_store.SessionStore = null,
 agent: *agent_mod.Agent,
-public_event_buffer: []session_events.AgentSessionEvent,
+public_event_buffer: []client_protocol.ClientEvent,
 public_events: *event_drain_mod.PublicEventQueue,
 queue_mirror: *queue_mirror_mod.QueueMirror,
 event_drain: *event_drain_mod.EventDrain,
@@ -215,7 +215,6 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
 
     var tools: tool_registry.ToolRegistry = .{};
     try builtin_tools.appendDefinitions(&tools);
-    try tools.setActiveToolsByName(tool_registry.default_active_tool_names);
 
     const system_prompt_text = try buildSystemPromptText(
         allocator,
@@ -274,7 +273,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     errdefer core_agent.deinit();
 
     if (options.public_event_capacity == 0) return error.PublicEventCapacityZero;
-    const public_event_buffer = try allocator.alloc(session_events.AgentSessionEvent, options.public_event_capacity);
+    const public_event_buffer = try allocator.alloc(client_protocol.ClientEvent, options.public_event_capacity);
     errdefer allocator.free(public_event_buffer);
     const public_events = try allocator.create(event_drain_mod.PublicEventQueue);
     errdefer allocator.destroy(public_events);
@@ -517,7 +516,7 @@ fn compactWithSummary(
     summary: []const u8,
     first_kept_entry_id: []const u8,
     tokens_before: u64,
-) !session_events.CompactionResult {
+) !client_protocol.CompactionResult {
     return self.runManualCompaction(.{ .explicit = .{
         .summary = summary,
         .first_kept_entry_id = first_kept_entry_id,
@@ -529,33 +528,33 @@ fn compactPreparedWithSummary(
     self: *AgentSession,
     summary: []const u8,
     settings: session_manager.CompactionSettings,
-) !session_events.CompactionResult {
+) !client_protocol.CompactionResult {
     return self.runManualCompaction(.{ .prepared = .{
         .summary = summary,
         .settings = settings,
     } });
 }
 
-fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !session_events.CompactionResult {
+fn compactWithPreparedSummary(self: *AgentSession, summary: []const u8) !client_protocol.CompactionResult {
     return self.runManualCompaction(.{ .prepared = .{
         .summary = summary,
         .settings = self.compaction_settings,
     } });
 }
 
-fn compactWithGeneratedSummary(self: *AgentSession) !session_events.CompactionResult {
+fn compactWithGeneratedSummary(self: *AgentSession) !client_protocol.CompactionResult {
     try self.ensureAcceptsIdleCommand();
     return self.runGeneratedCompaction(.manual, false);
 }
 
 fn runGeneratedCompaction(
     self: *AgentSession,
-    reason: session_events.AgentSessionEvent.CompactionReason,
+    reason: client_protocol.CompactionReason,
     will_retry: bool,
-) !session_events.CompactionResult {
+) !client_protocol.CompactionResult {
     self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = reason } });
     return self.generateAndApplyCompaction(reason, will_retry) catch |err| {
-        const error_message = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
+        const error_message = client_protocol.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
             .reason = reason,
             .aborted = err == error.OperationCancelled,
@@ -569,11 +568,11 @@ fn runGeneratedCompaction(
 fn runManualCompaction(
     self: *AgentSession,
     request: ManualCompactionRequest,
-) !session_events.CompactionResult {
+) !client_protocol.CompactionResult {
     try self.ensureAcceptsIdleCommand();
     self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = .manual } });
     return self.applyManualCompactionRequest(request) catch |err| {
-        const error_message = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
+        const error_message = client_protocol.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
             .reason = .manual,
             .aborted = false,
@@ -651,21 +650,7 @@ fn shutdownComplete(self: *AgentSession) bool {
         self.public_events.empty();
 }
 
-fn setActiveToolsByName(self: *AgentSession, names: []const []const u8) !void {
-    if (!self.agent.waitForIdle()) return error.SessionBusy;
-    if (self.active_compaction_cancel_source != null) return error.SessionBusy;
-    const active_set = try self.tools.buildActiveToolSet(names);
-    const next_prompt = try self.buildPromptForActiveNames(active_set.nameSlice());
-    errdefer self.allocator.free(next_prompt);
-
-    try self.agent.setTools(active_set.agentToolSlice());
-    self.tools.commitActiveToolSet(active_set);
-    self.agent.setSystemPrompt(next_prompt);
-    self.allocator.free(self.system_prompt_text);
-    self.system_prompt_text = next_prompt;
-}
-
-fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
+fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
     return self.queue_mirror.snapshot(allocator);
 }
 
@@ -674,7 +659,7 @@ fn clearQueue(self: *AgentSession) !void {
     if (self.queue_mirror.clear(self.allocator)) try self.event_drain.emitQueueUpdate();
 }
 
-fn drainPublicEvent(self: *AgentSession) ?session_events.AgentSessionEvent {
+fn drainPublicEvent(self: *AgentSession) ?client_protocol.ClientEvent {
     const event = self.public_events.pop() orelse return null;
     self.event_drain.enqueuePendingPublicEventOverflow();
     return event;
@@ -709,7 +694,7 @@ test "agent session public event enqueue sets coalesced wake" {
 
     try std.testing.expect(!session.publicEventWake().isSet());
 
-    session.event_drain.enqueuePublicEvent(.{ .agent_event = try session_events.OwnedAgentEvent.init(
+    session.event_drain.enqueuePublicEvent(.{ .agent_event = try client_protocol.OwnedAgentEvent.init(
         std.testing.allocator,
         .agent_start,
     ) });
@@ -736,12 +721,12 @@ fn ensureAcceptsIdleCommand(self: *AgentSession) Error!void {
 
 fn applyManualCompaction(
     self: *AgentSession,
-    reason: session_events.AgentSessionEvent.CompactionReason,
+    reason: client_protocol.CompactionReason,
     will_retry: bool,
     summary: []const u8,
     first_kept_entry_id: []const u8,
     tokens_before: u64,
-) !session_events.CompactionResult {
+) !client_protocol.CompactionResult {
     try self.manager.ensureAppendCapacity(1);
     const entry = try self.manager.prepareCompactionEntry(
         summary,
@@ -753,9 +738,9 @@ fn applyManualCompaction(
 
     if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
 
-    var event_result = try session_events.CompactionResult.init(self.allocator, entry.compaction);
+    var event_result = try client_protocol.CompactionResult.init(self.allocator, entry.compaction);
     errdefer event_result.deinit();
-    var return_result = try session_events.CompactionResult.init(self.allocator, entry.compaction);
+    var return_result = try client_protocol.CompactionResult.init(self.allocator, entry.compaction);
     errdefer return_result.deinit();
 
     _ = self.manager.commitPreparedEntry(entry);
@@ -780,7 +765,7 @@ fn applyManualCompaction(
 fn applyManualCompactionRequest(
     self: *AgentSession,
     request: ManualCompactionRequest,
-) !session_events.CompactionResult {
+) !client_protocol.CompactionResult {
     return switch (request) {
         .explicit => |explicit| self.applyManualCompaction(
             .manual,
@@ -800,7 +785,7 @@ fn prepareAndApplyManualCompaction(
     self: *AgentSession,
     summary: []const u8,
     settings: session_manager.CompactionSettings,
-) !session_events.CompactionResult {
+) !client_protocol.CompactionResult {
     var preparation = try self.manager.prepareCompaction(self.allocator, settings);
     defer preparation.deinit();
     return self.applyManualCompaction(
@@ -814,9 +799,9 @@ fn prepareAndApplyManualCompaction(
 
 fn generateAndApplyCompaction(
     self: *AgentSession,
-    reason: session_events.AgentSessionEvent.CompactionReason,
+    reason: client_protocol.CompactionReason,
     will_retry: bool,
-) !session_events.CompactionResult {
+) !client_protocol.CompactionResult {
     var input = try self.manager.buildCompactionSummaryInput(self.allocator, self.compaction_settings);
     defer input.deinit();
     const serialized_input = try input.serialize(self.allocator);
@@ -956,16 +941,10 @@ fn buildSystemPromptText(
 ) ![]const u8 {
     var snippets = std.ArrayList(system_prompt.ToolSnippet).empty;
     defer snippets.deinit(allocator);
-    var guidelines = std.ArrayList([]const u8).empty;
-    defer guidelines.deinit(allocator);
-
     for (active_names) |name| {
         const definition = tools.findDefinition(name) orelse return error.UnknownToolName;
         if (definition.metadata.prompt_snippet) |snippet| {
             try snippets.append(allocator, .{ .name = definition.metadata.name, .snippet = snippet });
-        }
-        for (definition.metadata.prompt_guidelines) |guideline| {
-            try guidelines.append(allocator, guideline);
         }
     }
 
@@ -974,7 +953,6 @@ fn buildSystemPromptText(
         .current_date = current_date,
         .selected_tools = active_names,
         .tool_snippets = snippets.items,
-        .prompt_guidelines = guidelines.items,
         .context_files = prompt_resources.context_files.files,
         .skills = prompt_resources.skills.skills,
         .custom_prompt = if (prompt_resources.system_prompt.file) |file| file.content else null,
@@ -1006,7 +984,7 @@ fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight
             try self.emitPromptCommandOwned(
                 command_text,
                 .handled,
-                session_events.EventText.initOwned(self.allocator, message),
+                client_protocol.EventText.initOwned(self.allocator, message),
             );
         },
     } else {
@@ -1015,7 +993,7 @@ fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight
         try self.emitPromptCommandOwned(
             command_text,
             .unknown,
-            session_events.EventText.initOwned(self.allocator, unknown_message),
+            client_protocol.EventText.initOwned(self.allocator, unknown_message),
         );
     }
     return true;
@@ -1035,10 +1013,10 @@ fn parsePromptCommand(text: []const u8) ?struct { []const u8, ?PromptCommand } {
 fn emitPromptCommand(
     self: *AgentSession,
     command: []const u8,
-    result: session_events.AgentSessionEvent.PromptCommandResult,
+    result: client_protocol.PromptCommandResult,
     message_text: []const u8,
 ) !void {
-    var message = try session_events.EventText.init(self.allocator, message_text);
+    var message = try client_protocol.EventText.init(self.allocator, message_text);
     errdefer message.deinit();
     try self.emitPromptCommandOwned(command, result, message);
 }
@@ -1046,13 +1024,13 @@ fn emitPromptCommand(
 fn emitPromptCommandOwned(
     self: *AgentSession,
     command: []const u8,
-    result: session_events.AgentSessionEvent.PromptCommandResult,
-    message: session_events.EventText,
+    result: client_protocol.PromptCommandResult,
+    message: client_protocol.EventText,
 ) !void {
     var owned_message = message;
     errdefer owned_message.deinit();
     self.event_drain.enqueuePublicEvent(.{ .prompt_command = .{
-        .command = try session_events.EventText.init(self.allocator, command),
+        .command = try client_protocol.EventText.init(self.allocator, command),
         .result = result,
         .message = owned_message,
     } });
@@ -1125,7 +1103,7 @@ fn retryPromptAfterOverflowCompaction(
     images: []const ai.ImageContent,
     options: PromptOptions,
 ) anyerror!void {
-    var error_message = try session_events.EventText.init(self.allocator, "context overflow");
+    var error_message = try client_protocol.EventText.init(self.allocator, "context overflow");
     var retry_start_owns_error_message = true;
     errdefer if (retry_start_owns_error_message) error_message.deinit();
     self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
@@ -1137,7 +1115,7 @@ fn retryPromptAfterOverflowCompaction(
     retry_start_owns_error_message = false;
 
     self.promptWithOptionsInternal(text, images, options, false, false) catch |err| {
-        const final_error = session_events.EventText.init(self.allocator, @errorName(err)) catch return err;
+        const final_error = client_protocol.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
             .success = false,
             .attempt = 1,
@@ -1164,7 +1142,7 @@ fn retryPromptAfterRetryableError(
     const max_attempts: usize = self.retry_settings.max_attempts;
     var attempt: usize = 1;
     while (attempt <= max_attempts) : (attempt += 1) {
-        var error_message = try session_events.EventText.init(self.allocator, current_error_message);
+        var error_message = try client_protocol.EventText.init(self.allocator, current_error_message);
         var retry_start_owns_error_message = true;
         errdefer if (retry_start_owns_error_message) error_message.deinit();
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
@@ -1220,7 +1198,7 @@ fn latestAssistantError(self: *const AgentSession) ?[]const u8 {
 }
 
 fn emitAutoRetryFailure(self: *AgentSession, attempt: usize, message: []const u8) !void {
-    const final_error = try session_events.EventText.init(self.allocator, message);
+    const final_error = try client_protocol.EventText.init(self.allocator, message);
     self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
         .success = false,
         .attempt = attempt,
@@ -1436,89 +1414,6 @@ test "agent session shutdown while running stops after terminal event" {
 
     try std.testing.expectEqual(AgentSessionStatus.stopped, session.status());
     drainAllPublicEvents(&session);
-}
-
-test "agent session active tool changes rebuild prompt and agent tools" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    try session.setActiveToolsByName(&.{"read"});
-
-    try std.testing.expectEqual(@as(usize, 1), session.agent.state.tools.len);
-    try std.testing.expectEqualStrings("read", session.agent.state.tools[0].name);
-    try std.testing.expect(std.mem.indexOf(u8, session.system_prompt_text, "- read:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, session.system_prompt_text, "- edit:") == null);
-}
-
-test "agent session active tool change validates before mutation" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    try session.setActiveToolsByName(&.{"read"});
-    try std.testing.expectError(error.UnknownToolName, session.setActiveToolsByName(&.{ "edit", "missing" }));
-
-    try std.testing.expectEqual(@as(usize, 1), session.agent.state.tools.len);
-    try std.testing.expectEqualStrings("read", session.agent.state.tools[0].name);
-    try std.testing.expectEqual(@as(usize, 1), session.tools.activeToolNames().len);
-    try std.testing.expectEqualStrings("read", session.tools.activeToolNames()[0]);
-}
-
-test "agent session rejects active tool changes while running" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-
-    try std.testing.expectError(error.SessionBusy, session.setActiveToolsByName(&.{"read"}));
 }
 
 test "agent session prompt uses preflight spine before agent submission" {
@@ -2017,7 +1912,7 @@ test "agent session session command emits snapshot without model run" {
     defer event.deinit();
     try std.testing.expect(event == .prompt_command);
     try std.testing.expectEqual(
-        session_events.AgentSessionEvent.PromptCommandResult.handled,
+        client_protocol.PromptCommandResult.handled,
         event.prompt_command.result,
     );
     try std.testing.expectEqualStrings("session", event.prompt_command.command.text);
@@ -2089,7 +1984,7 @@ test "agent session manual compaction persists and replaces agent context" {
     defer start_event.deinit();
     try std.testing.expect(start_event == .compaction_start);
     try std.testing.expectEqual(
-        session_events.AgentSessionEvent.CompactionReason.manual,
+        client_protocol.CompactionReason.manual,
         start_event.compaction_start.reason,
     );
 
@@ -2475,14 +2370,14 @@ test "agent session auto compacts before prompt when enabled" {
     defer start_event.deinit();
     try std.testing.expect(start_event == .compaction_start);
     try std.testing.expectEqual(
-        session_events.AgentSessionEvent.CompactionReason.threshold,
+        client_protocol.CompactionReason.threshold,
         start_event.compaction_start.reason,
     );
     var end_event = session.drainPublicEvent().?;
     defer end_event.deinit();
     try std.testing.expect(end_event == .compaction_end);
     try std.testing.expectEqual(
-        session_events.AgentSessionEvent.CompactionReason.threshold,
+        client_protocol.CompactionReason.threshold,
         end_event.compaction_end.reason,
     );
     try std.testing.expect(end_event.compaction_end.result != null);
@@ -2601,14 +2496,14 @@ test "agent session auto compacts after context overflow and retries once" {
         defer owned_event.deinit();
         if (owned_event == .compaction_start) {
             try std.testing.expectEqual(
-                session_events.AgentSessionEvent.CompactionReason.overflow,
+                client_protocol.CompactionReason.overflow,
                 owned_event.compaction_start.reason,
             );
             saw_overflow_start = true;
         }
         if (owned_event == .compaction_end) {
             try std.testing.expectEqual(
-                session_events.AgentSessionEvent.CompactionReason.overflow,
+                client_protocol.CompactionReason.overflow,
                 owned_event.compaction_end.reason,
             );
             try std.testing.expect(owned_event.compaction_end.will_retry);
@@ -3051,7 +2946,7 @@ fn drainAllPublicEvents(session: *AgentSession) void {
 
 fn expectNextPromptCommand(
     session: *AgentSession,
-    result: session_events.AgentSessionEvent.PromptCommandResult,
+    result: client_protocol.PromptCommandResult,
     command: []const u8,
     message: []const u8,
 ) !void {

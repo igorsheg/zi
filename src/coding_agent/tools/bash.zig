@@ -272,25 +272,6 @@ const FailureKind = enum {
     canceled,
 };
 
-fn resultFromFailure(
-    allocator: std.mem.Allocator,
-    message: []const u8,
-    kind: FailureKind,
-) !agent.ToolExecutionResult {
-    const text = try allocator.dupe(u8, message);
-    errdefer allocator.free(text);
-    const result_content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(result_content);
-    result_content[0] = .{ .text = .{ .text = text } };
-    return .{
-        .allocator = allocator,
-        .result = .{
-            .content = result_content,
-            .details = try failureDetails(allocator, kind),
-        },
-    };
-}
-
 fn resultFromRun(
     allocator: std.mem.Allocator,
     run_result: std.process.RunResult,

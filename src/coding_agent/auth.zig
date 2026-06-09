@@ -143,19 +143,11 @@ pub const AuthStore = struct {
         try writeFileAtomic(self.allocator, io, dir, auth_path, data);
     }
 
-    pub fn format(self: *const AuthStore, allocator: std.mem.Allocator) ![]const u8 {
-        return formatCredentials(allocator, self.credentials);
-    }
-
     pub fn findOAuth(self: *const AuthStore, provider: ai.Provider) ?ai.OAuthCredentials {
         for (self.credentials) |credential| {
             if (std.mem.eql(u8, credential.provider, provider)) return credential.credentials;
         }
         return null;
-    }
-
-    pub fn hasOAuth(self: *const AuthStore, provider: ai.Provider) bool {
-        return self.findOAuth(provider) != null;
     }
 };
 

@@ -19,7 +19,6 @@ const ReadTool = read_tool.ReadTool;
 const WriteTool = write_tool.WriteTool;
 
 const max_tool_definitions = 64;
-const max_active_tools = 64;
 const builtin_tool_count = default_active_tool_names.len;
 pub const default_active_tool_names: []const []const u8 = &.{ "read", "ls", "grep", "find", "bash", "edit", "write" };
 
@@ -31,11 +30,6 @@ const bash_prompt_snippet = "Run one shell command in the session cwd. " ++
     "Prefer read/ls/grep/find/edit/write for file work.";
 const edit_prompt_snippet = "Edit a file using exact unique text replacements. " ++
     "Use one call for multiple disjoint edits.";
-
-const ToolSource = union(enum) {
-    builtin,
-    custom: []const u8,
-};
 
 const ToolDisplayPresentation = enum { generic, command, file, patch, search, directory };
 const ToolDisplayBodyMode = enum { visible, hidden_on_success };
@@ -50,8 +44,6 @@ const ToolMetadata = struct {
     label: []const u8,
     description: []const u8,
     prompt_snippet: ?[]const u8 = null,
-    prompt_guidelines: []const []const u8 = &.{},
-    source: ToolSource = .builtin,
     execution_mode: ?agent.ToolExecutionMode = null,
     display: ToolDisplay = .{},
 };
@@ -105,64 +97,25 @@ pub const ToolDefinition = struct {
     }
 };
 
-const ActiveToolSet = struct {
-    names: [max_active_tools][]const u8 = undefined,
-    agent_tools: [max_active_tools]agent.AgentTool = undefined,
-    count: usize = 0,
-
-    pub fn nameSlice(self: *const ActiveToolSet) []const []const u8 {
-        return self.names[0..self.count];
-    }
-
-    pub fn agentToolSlice(self: *const ActiveToolSet) []const agent.AgentTool {
-        return self.agent_tools[0..self.count];
-    }
-};
-
 pub const ToolRegistry = struct {
     definitions: [max_tool_definitions]ToolDefinition = undefined,
+    active_agent_tools: [max_tool_definitions]agent.AgentTool = undefined,
     definition_count: usize = 0,
-    active_names: [max_active_tools][]const u8 = undefined,
-    active_agent_tools: [max_active_tools]agent.AgentTool = undefined,
-    active_count: usize = 0,
 
     pub fn append(self: *ToolRegistry, definition: ToolDefinition) !void {
         if (self.definition_count == max_tool_definitions) return error.ToolDefinitionLimitExceeded;
         if (self.findDefinition(definition.metadata.name) != null) return error.DuplicateToolName;
         self.definitions[self.definition_count] = definition;
+        self.active_agent_tools[self.definition_count] = definition.asAgentTool();
         self.definition_count += 1;
     }
 
-    pub fn buildActiveToolSet(self: *const ToolRegistry, names: []const []const u8) !ActiveToolSet {
-        var active_set: ActiveToolSet = .{};
-        for (names) |name| {
-            if (containsName(active_set.nameSlice(), name)) continue;
-            if (active_set.count == max_active_tools) return error.ActiveToolLimitExceeded;
-            const definition = self.findDefinition(name) orelse return error.UnknownToolName;
-            active_set.names[active_set.count] = definition.metadata.name;
-            active_set.agent_tools[active_set.count] = definition.asAgentTool();
-            active_set.count += 1;
-        }
-        return active_set;
-    }
-
-    pub fn commitActiveToolSet(self: *ToolRegistry, active_set: ActiveToolSet) void {
-        @memcpy(self.active_names[0..active_set.count], active_set.names[0..active_set.count]);
-        @memcpy(self.active_agent_tools[0..active_set.count], active_set.agent_tools[0..active_set.count]);
-        self.active_count = active_set.count;
-    }
-
-    pub fn setActiveToolsByName(self: *ToolRegistry, names: []const []const u8) !void {
-        const active_set = try self.buildActiveToolSet(names);
-        self.commitActiveToolSet(active_set);
-    }
-
     pub fn activeAgentTools(self: *const ToolRegistry) []const agent.AgentTool {
-        return self.active_agent_tools[0..self.active_count];
+        return self.active_agent_tools[0..self.definition_count];
     }
 
-    pub fn activeToolNames(self: *const ToolRegistry) []const []const u8 {
-        return self.active_names[0..self.active_count];
+    pub fn activeToolNames(_: *const ToolRegistry) []const []const u8 {
+        return default_active_tool_names;
     }
 
     pub fn definitionSlice(self: *const ToolRegistry) []const ToolDefinition {
@@ -322,13 +275,6 @@ pub const BuiltinTools = struct {
     }
 };
 
-fn containsName(names: []const []const u8, needle: []const u8) bool {
-    for (names) |name| {
-        if (std.mem.eql(u8, name, needle)) return true;
-    }
-    return false;
-}
-
 test "tool registry stores definitions first and exposes active agent tools" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -340,8 +286,6 @@ test "tool registry stores definitions first and exposes active agent tools" {
     defer builtins.deinit();
     var registry: ToolRegistry = .{};
     try builtins.appendDefinitions(&registry);
-    try registry.setActiveToolsByName(&.{ "read", "ls", "grep", "find", "bash", "edit", "write" });
-
     try std.testing.expectEqual(@as(usize, builtin_tool_count), registry.definition_count);
     try std.testing.expectEqual(@as(usize, builtin_tool_count), registry.activeAgentTools().len);
     try std.testing.expectEqualStrings("read", registry.activeAgentTools()[0].name);
@@ -363,7 +307,7 @@ test "tool registry stores definitions first and exposes active agent tools" {
     try std.testing.expectEqual(.visible, registry.definitions[6].metadata.display.body_mode);
 }
 
-test "tool registry rejects duplicate and unknown tool names without changing active set" {
+test "tool registry rejects duplicate tool names" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -374,7 +318,6 @@ test "tool registry rejects duplicate and unknown tool names without changing ac
     defer builtins.deinit();
     var registry: ToolRegistry = .{};
     try builtins.appendDefinitions(&registry);
-    try registry.setActiveToolsByName(&.{"read"});
     try std.testing.expectError(error.DuplicateToolName, registry.append(
         ToolDefinition.init(&builtins.read, .{
             .name = "read",
@@ -382,7 +325,4 @@ test "tool registry rejects duplicate and unknown tool names without changing ac
             .description = "Read a text file with bounded output. Supports optional 1-indexed offset and line limit.",
         }),
     ));
-    try std.testing.expectError(error.UnknownToolName, registry.setActiveToolsByName(&.{ "edit", "missing" }));
-    try std.testing.expectEqual(@as(usize, 1), registry.activeToolNames().len);
-    try std.testing.expectEqualStrings("read", registry.activeToolNames()[0]);
 }

@@ -13,7 +13,6 @@ const client_protocol = @import("client_protocol.zig");
 const session_runtime = @import("session_runtime.zig");
 const settings = @import("settings.zig");
 const resources = @import("resources.zig");
-const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
 const session_listing = @import("session_listing.zig");
 const session_manager = @import("session_manager.zig");
@@ -40,7 +39,6 @@ test {
     _ = client_protocol;
     _ = session_runtime;
     _ = settings;
-    _ = session_events;
     _ = session_history_snapshot;
     _ = session_listing;
     _ = session_manager;

@@ -478,10 +478,6 @@ pub const SessionManager = struct {
         self.leaf_id = (try self.getEntry(id)).id();
     }
 
-    pub fn resetLeaf(self: *SessionManager) void {
-        self.leaf_id = null;
-    }
-
     pub fn getEntry(self: *const SessionManager, id: []const u8) Error!*const SessionEntry {
         return self.findEntry(id) orelse error.EntryNotFound;
     }

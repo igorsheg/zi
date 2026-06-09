@@ -8,7 +8,6 @@ const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
-const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
 const settings_mod = @import("settings.zig");
 const tool_registry = @import("tool_registry.zig");
@@ -91,7 +90,7 @@ pub const SessionRuntime = struct {
         return self.session.tools.findDefinition(name);
     }
 
-    pub fn queuedMessagesSnapshot(self: *const SessionRuntime, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
+    pub fn queuedMessagesSnapshot(self: *const SessionRuntime, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
         return AgentSession.RuntimeAccess.queueSnapshot(&self.session, allocator);
     }
 
@@ -231,7 +230,7 @@ pub const SessionRuntime = struct {
 
     fn drainSessionEvents(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
         while (AgentSession.RuntimeAccess.drainPublicEvent(&self.session)) |event| {
-            try self.enqueueEvent(.{ .request_id = request_id, .event = client_protocol.ClientEvent.fromSessionEvent(event) });
+            try self.enqueueEvent(.{ .request_id = request_id, .event = event });
         }
     }
 
@@ -241,8 +240,7 @@ pub const SessionRuntime = struct {
         code: client_protocol.Rejection.Code,
         message: []const u8,
     ) !void {
-        const owned_message = try self.allocator.dupe(u8, message);
-        errdefer self.allocator.free(owned_message);
+        const owned_message = try client_protocol.EventText.init(self.allocator, message);
         try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .rejected = .{ .code = code, .message = owned_message } } });
     }
 

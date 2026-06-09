@@ -84,7 +84,7 @@ fn drainEvents(
                 else => {},
             },
             .rejected => |rejection| {
-                try printAssistantError(stderr, rejection.message);
+                try printAssistantError(stderr, rejection.message.text);
                 done = true;
             },
         }

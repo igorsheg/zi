@@ -259,23 +259,52 @@ Done when: `AgentSession` is not a frontend contract.
 
 ### Phase 6 — External RPC/wire decision
 
-Only after internal typed protocol is stable.
+Decision: build an RPC mode like pi-mono's product behavior, encoded first as strict JSONL.
 
-Decision options:
+Why:
 
-1. JSON lines
-   - easiest to debug
-   - larger payloads
-   - good first external daemon protocol
+- RPC is the contract shape: command in, response/event out.
+- JSONL is only the first wire encoding for that contract.
+- `SessionRuntime` already owns typed `ClientCommand` / `ClientEvent`, so RPC should be a leaf adapter:
+  - stdin JSONL -> parsed wire command -> typed `ClientCommand`
+  - typed `ClientEvent` -> JSONL event/response on stdout
+- JSONL is inspectable with logs, `jq`, shell scripts, and golden tests while the protocol is young.
+- CBOR/MsgPack add codec machinery, dependency/code-size pressure, binary debugging pain, and schema/version policy before there is a measured need.
+- pi-mono proves the useful product behavior: subprocess-friendly RPC over stdin/stdout with async streamed events. Zi should copy that behavior, not port its TypeScript architecture or its full command surface.
 
-2. CBOR/MsgPack
-   - smaller
-   - more machinery
-   - only justified if measurable or if Flow-style interop is required
+Initial RPC shape should stay narrow:
+
+```json
+{"id":1,"type":"prompt","message":"hello"}
+{"id":2,"type":"cancel"}
+{"id":3,"type":"clear_queue"}
+{"id":4,"type":"snapshot"}
+{"id":5,"type":"shutdown"}
+```
+
+Output shape:
+
+```json
+{"id":1,"type":"response","ok":true,"result":"prompt_started"}
+{"type":"event","event":"agent_event"}
+{"id":1,"type":"response","ok":true,"result":"prompt_finished"}
+```
+
+Protocol rules:
+
+- strict JSONL framing; split only on LF (`\n`)
+- accept CRLF input by trimming one trailing `\r`
+- bound maximum input line length
+- stdout is protocol only
+- stderr is human diagnostics only
+- no JSON-RPC 2.0 ceremony
+- no generic actor registry
+- no stringly dispatch inside the core; strings terminate at the wire adapter
+- CBOR/MsgPack may be added later only as an alternate leaf codec over the same typed protocol, after measurement or an interoperability requirement
 
 Rule: wire encoding is a leaf adapter. It must not affect internal `ClientCommand` / `ClientEvent` ownership.
 
-Done when: a wire ADR is written, not before.
+Done when: a wire ADR records this JSONL-first RPC decision and the first narrow adapter lands or is explicitly scheduled.
 
 ## Required deletion gates before completion
 
@@ -331,4 +360,4 @@ AgentSession.zig is imported by session_runtime.zig, not frontends
 | 3. Print mode mailbox | done | | `print_mode.zig` now submits `ClientCommand.submit_prompt` to `SessionRuntime` and drains `ClientEvent`; no direct prompt run lifecycle remains. |
 | 4. Interactive mailbox | done | | `interactive.zig` no longer imports `AgentSession` or touches prompt run/session internals; it submits commands to `SessionRuntime`, waits through `SessionRuntime`, and drains `ClientEvent`. |
 | 5. Privatize AgentSession API | done | | Prompt run, queue, public event, prompt, cancel, status, tool, and compaction helpers are private on `AgentSession`; `SessionRuntime` uses the narrow `RuntimeAccess` owner seam. Frontends no longer import `session_events` or receive `AgentSessionEvent` unions. |
-| 6. Wire decision | pending | | |
+| 6. Wire decision | decided | | Use pi-mono-style subprocess RPC behavior over strict JSONL first. Defer CBOR/MsgPack until measured need or interop requirement; keep codecs as leaf adapters over `ClientCommand` / `ClientEvent`. |

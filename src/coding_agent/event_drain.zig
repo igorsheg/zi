@@ -4,11 +4,11 @@ const agent_mod = @import("../agent/root.zig");
 const runtime = @import("../runtime/root.zig");
 const message_policy = @import("message_policy.zig");
 const queue_mirror_mod = @import("queue_mirror.zig");
-const session_events = @import("session_events.zig");
+const client_protocol = @import("client_protocol.zig");
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
 
-pub const PublicEventQueue = runtime.BoundedQueue(session_events.AgentSessionEvent);
+pub const PublicEventQueue = runtime.BoundedQueue(client_protocol.ClientEvent);
 
 pub const EventDrain = struct {
     allocator: std.mem.Allocator,
@@ -34,9 +34,9 @@ pub const EventDrain = struct {
     }
 
     pub fn emitQueueUpdate(self: *EventDrain) !void {
-        var steering = try session_events.EventTextList.init(self.allocator, self.queue_mirror.steering.items);
+        var steering = try client_protocol.EventTextList.init(self.allocator, self.queue_mirror.steering.items);
         errdefer steering.deinit();
-        var follow_up = try session_events.EventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
+        var follow_up = try client_protocol.EventTextList.init(self.allocator, self.queue_mirror.follow_up.items);
         errdefer follow_up.deinit();
         self.enqueuePublicEvent(.{ .queue_update = .{
             .steering = steering,
@@ -45,7 +45,7 @@ pub const EventDrain = struct {
         } });
     }
 
-    pub fn enqueuePublicEvent(self: *EventDrain, event: session_events.AgentSessionEvent) void {
+    pub fn enqueuePublicEvent(self: *EventDrain, event: client_protocol.ClientEvent) void {
         var owned_event = event;
         if (!self.public_events.pushOrDrop(owned_event)) {
             owned_event.deinit();
@@ -58,7 +58,7 @@ pub const EventDrain = struct {
     pub fn enqueuePendingPublicEventOverflow(self: *EventDrain) void {
         if (self.pending_public_event_overflow_count == 0) return;
         const dropped_count = self.pending_public_event_overflow_count;
-        if (!self.public_events.pushOrDrop(.{ .public_event_overflow = .{ .dropped_count = dropped_count } })) return;
+        if (!self.public_events.pushOrDrop(.{ .event_overflow = .{ .dropped_count = dropped_count } })) return;
         self.pending_public_event_overflow_count = 0;
         self.public_event_wake.set();
     }
@@ -72,7 +72,7 @@ pub const EventDrain = struct {
     }
 
     fn emitPublicEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        self.enqueuePublicEvent(.{ .agent_event = try session_events.OwnedAgentEvent.init(self.allocator, event) });
+        self.enqueuePublicEvent(.{ .agent_event = try client_protocol.OwnedAgentEvent.init(self.allocator, event) });
     }
 
     fn persistEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {

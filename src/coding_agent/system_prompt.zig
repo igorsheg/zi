@@ -4,7 +4,7 @@ const skills_mod = @import("skills.zig");
 
 pub const max_prompt_bytes = 512 * 1024;
 pub const max_tool_snippets = 128;
-pub const max_guidelines = 128;
+const max_guidelines = 128;
 
 pub const ToolSnippet = struct {
     name: []const u8,
@@ -16,7 +16,6 @@ pub const BuildOptions = struct {
     current_date: []const u8,
     selected_tools: []const []const u8 = &.{ "read", "bash", "edit", "write" },
     tool_snippets: []const ToolSnippet = &.{},
-    prompt_guidelines: []const []const u8 = &.{},
     context_files: []const resources.ContextFile = &.{},
     skills: []const skills_mod.Skill = &.{},
     custom_prompt: ?[]const u8 = null,
@@ -29,7 +28,6 @@ pub const BuildOptions = struct {
 pub fn build(allocator: std.mem.Allocator, options: BuildOptions) ![]u8 {
     if (options.selected_tools.len > max_tool_snippets) return error.ToolSnippetLimitExceeded;
     if (options.tool_snippets.len > max_tool_snippets) return error.ToolSnippetLimitExceeded;
-    if (options.prompt_guidelines.len > max_guidelines) return error.GuidelineLimitExceeded;
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -55,7 +53,7 @@ pub fn build(allocator: std.mem.Allocator, options: BuildOptions) ![]u8 {
         "\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\n",
     );
     try appendBounded(&writer, "Guidelines:\n");
-    try appendGuidelines(&writer, options.selected_tools, options.prompt_guidelines);
+    try appendGuidelines(&writer, options.selected_tools);
     try appendPiDocumentation(&writer, options);
     try appendAppendSystemPrompt(&writer, options.append_system_prompt);
     try appendProjectContext(&writer, options.context_files);
@@ -86,7 +84,6 @@ fn appendTools(
 fn appendGuidelines(
     writer: *std.Io.Writer.Allocating,
     selected_tools: []const []const u8,
-    prompt_guidelines: []const []const u8,
 ) !void {
     var guidelines: [max_guidelines][]const u8 = undefined;
     var len: usize = 0;
@@ -103,11 +100,6 @@ fn appendGuidelines(
             &len,
             "Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)",
         );
-    }
-
-    for (prompt_guidelines) |guideline| {
-        const trimmed = std.mem.trim(u8, guideline, " \t\r\n");
-        if (trimmed.len > 0) try appendGuideline(&guidelines, &len, trimmed);
     }
 
     try appendGuideline(&guidelines, &len, "Be concise in your responses");
@@ -273,19 +265,6 @@ test "tool snippets are shown only for selected tools with snippets" {
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- dynamic: Run dynamic behavior") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- read:") == null);
-}
-
-test "guidelines dedupe and trim" {
-    const prompt = try build(std.testing.allocator, .{
-        .cwd = "/repo",
-        .current_date = "2026-05-25",
-        .selected_tools = &.{"read"},
-        .prompt_guidelines = &.{ "Use read carefully.", "  Use read carefully.  ", "   " },
-    });
-    defer std.testing.allocator.free(prompt);
-
-    const first = std.mem.indexOf(u8, prompt, "- Use read carefully.") orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.indexOfPos(u8, prompt, first + 1, "- Use read carefully.") == null);
 }
 
 test "default prompt includes pi documentation paths" {

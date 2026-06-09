@@ -710,7 +710,7 @@ const InteractiveLoop = struct {
                     try self.applyClientEventStatus(envelope.event);
                     try self.applyClientEventTranscript(envelope.event);
                 },
-                .rejected => |rejection| try self.appendOperationalStatus(rejection.message),
+                .rejected => |rejection| try self.appendOperationalStatus(rejection.message.text),
                 .response => |response| switch (response) {
                     .prompt_finished, .canceled => {
                         self.cancel_requested = false;
@@ -1519,7 +1519,7 @@ test "interactive appends final output for non-streaming visible tools" {
             .is_error = false,
         } },
     ) };
-    defer event.deinit(std.testing.allocator);
+    defer event.deinit();
 
     try loop.applyClientEventTranscript(event);
     try loop.flushToolOutputCoalescer();
