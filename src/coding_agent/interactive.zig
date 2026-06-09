@@ -3,9 +3,8 @@ const runtime = @import("../runtime/root.zig");
 const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const tui = @import("../tui/root.zig");
-const AgentSession = @import("AgentSession.zig");
+const client_protocol = @import("client_protocol.zig");
 const session_events = @import("session_events.zig");
-const session_history_snapshot = @import("session_history_snapshot.zig");
 const session_listing = @import("session_listing.zig");
 const session_runtime = @import("session_runtime.zig");
 
@@ -502,11 +501,10 @@ const PendingConfirm = struct {
 
 const InteractiveLoop = struct {
     process: runtime.Process,
-    session: *AgentSession,
+    app: *session_runtime.SessionRuntime,
     terminal_loop: *tui.product.TerminalLoop,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    active_run: ?*AgentSession.LivePromptRun = null,
     cancel_requested: bool = false,
     last_render_ns: ?i128 = null,
     effects: [effect_count_max]tui.product.Effect = undefined,
@@ -544,63 +542,55 @@ const InteractiveLoop = struct {
     const PromptSubmitResult = enum { started, queued, rejected };
 
     fn startPrompt(self: *InteractiveLoop, text: []const u8) !PromptSubmitResult {
-        if (self.active_run != null) {
-            self.session.promptWithOptions(text, &.{}, .{ .streaming_behavior = .steer }) catch |err| {
-                _ = self.terminal_loop.applyCommand(.{ .insert_composer_text = text }) catch null;
-                try self.appendOperationalStatus(@errorName(err));
-                return .rejected;
-            };
-            return .queued;
-        }
-        self.active_run = try self.session.startPromptRun(text, &.{}, .{});
-        self.cancel_requested = false;
-        self.setWorkingStatus() catch {
-            self.stderr.writeAll("status update failed\n") catch return .started;
+        var envelope = client_protocol.CommandEnvelope.initSubmitPrompt(self.process.gpa, null, text) catch |err| {
+            _ = self.terminal_loop.applyCommand(.{ .insert_composer_text = text }) catch null;
+            try self.appendOperationalStatus(@errorName(err));
+            return .rejected;
         };
+        var envelope_owned = true;
+        defer if (envelope_owned) envelope.deinit(self.process.gpa);
+        self.app.submit(envelope) catch |err| {
+            _ = self.terminal_loop.applyCommand(.{ .insert_composer_text = text }) catch null;
+            try self.appendOperationalStatus(@errorName(err));
+            return .rejected;
+        };
+        envelope_owned = false;
+        self.cancel_requested = false;
         return .started;
     }
 
     fn interrupt(self: *InteractiveLoop) void {
-        const prompt_run = self.active_run orelse return;
         if (self.cancel_requested) return;
         self.restoreQueuedMessagesToComposer() catch {
             self.stderr.writeAll("queue restore failed\n") catch return;
         };
         self.cancel_requested = true;
-        self.session.cancelPromptRun(prompt_run) catch |err| {
-            self.stderr.writeAll("cancel failed; waiting for run to settle\n") catch return;
-            self.session.cancel();
-            self.setWorkingStatusText(@errorName(err)) catch return;
+        self.app.submit(.{ .command = .cancel }) catch {
+            self.stderr.writeAll("cancel submit failed\n") catch return;
             return;
-        };
-        self.session.destroyPromptRun(prompt_run);
-        self.active_run = null;
-        self.cancel_requested = false;
-        self.clearStatus(status_id_working) catch {
-            self.stderr.writeAll("status clear failed\n") catch return;
         };
     }
 
     fn restoreQueuedMessagesToComposer(self: *InteractiveLoop) !void {
-        var snapshot = try self.session.queueSnapshot(self.process.gpa);
+        var snapshot = try self.app.queuedMessagesSnapshot(self.process.gpa);
         defer snapshot.deinit();
         if (snapshot.steering.items.len == 0 and snapshot.follow_up.items.len == 0) return;
         var buffer: [tui.product.composer.buffer_size_bytes_max]u8 = undefined;
         const draft = self.terminal_loop.product.app.composer.text();
         const text = queuedMessagesAndDraftText(&snapshot, draft, &buffer) orelse {
-            try self.session.clearQueue();
+            try self.app.dropQueuedMessages();
             try self.appendOperationalStatus("queued messages too large to restore");
             return;
         };
-        try self.session.clearQueue();
+        try self.app.dropQueuedMessages();
         _ = try self.terminal_loop.applyCommand(.clear_composer);
         _ = try self.terminal_loop.applyCommand(.{ .insert_composer_text = text });
     }
 
     fn requestShutdown(self: *InteractiveLoop) void {
         self.terminal_loop.requestStop();
-        if (!self.cancel_requested and self.active_run != null) {
-            self.session.cancel();
+        if (!self.cancel_requested) {
+            self.app.submit(.{ .command = .shutdown }) catch {};
             self.cancel_requested = true;
         }
     }
@@ -612,6 +602,7 @@ const InteractiveLoop = struct {
         } else {
             try self.flushPendingInput();
         }
+        try self.app.step();
         _ = try self.drainPromptProgressBounded(prompt_progress_per_tick_max);
         _ = try self.drainPublicEventsBounded(public_events_per_tick_max);
         const now_ns = std.Io.Timestamp.now(self.process.io, .awake).nanoseconds;
@@ -627,47 +618,10 @@ const InteractiveLoop = struct {
     }
 
     fn waitForRuntimeWake(self: *InteractiveLoop) !bool {
-        const readable = runtime.ReadableFd.initBorrowed(self.terminal_loop.inputFd());
-        var input = readable.asyncReadable();
-        var frame = runtime.Timeout.fromMilliseconds(frame_interval_ms);
-        var public_event_wake = self.session.publicEventWake();
-        if (self.active_run) |prompt_run| {
-            var progress = prompt_run.stream.asyncNext();
-            switch (try runtime.select(.{
-                .input = &input,
-                .prompt = &progress,
-                .public_event = public_event_wake,
-                .frame = &frame,
-            })) {
-                .input => |result| return self.handleInputWaitResult(result),
-                .prompt => |result| {
-                    try self.applyPromptProgressResult(prompt_run, result);
-                    return false;
-                },
-                .public_event => {
-                    public_event_wake.reset();
-                    return false;
-                },
-                .frame => return false,
-            }
-        } else {
-            switch (try runtime.select(.{ .input = &input, .public_event = public_event_wake, .frame = &frame })) {
-                .input => |result| return self.handleInputWaitResult(result),
-                .public_event => {
-                    public_event_wake.reset();
-                    return false;
-                },
-                .frame => return false,
-            }
-        }
-    }
-
-    fn handleInputWaitResult(self: *InteractiveLoop, result: runtime.ReadableFdError!void) bool {
-        result catch {
-            self.requestShutdown();
-            return false;
+        return switch (try self.app.waitForWake(self.terminal_loop.inputFd(), frame_interval_ms)) {
+            .input => true,
+            .session, .frame => false,
         };
-        return true;
     }
 
     fn flushPendingInput(self: *InteractiveLoop) !void {
@@ -711,10 +665,7 @@ const InteractiveLoop = struct {
         for (self.effects[0..count]) |effect| {
             switch (effect) {
                 .submit_text => |text| {
-                    switch (try self.startPrompt(text)) {
-                        .started => try self.appendTranscript(messageAppend(.user, text, .new_item)),
-                        .queued, .rejected => {},
-                    }
+                    _ = try self.startPrompt(text);
                 },
                 .interrupt => self.interrupt(),
                 .request_shutdown => self.requestShutdown(),
@@ -734,46 +685,34 @@ const InteractiveLoop = struct {
     }
 
     fn drainPromptProgressBounded(self: *InteractiveLoop, limit: usize) !usize {
-        const prompt_run = self.active_run orelse return 0;
-        var count: usize = 0;
-        while (count < limit and self.active_run != null) : (count += 1) {
-            var progress = prompt_run.stream.asyncNext();
-            var ready = runtime.Timeout.fromMilliseconds(0);
-            switch (try runtime.select(.{ .prompt = &progress, .ready = &ready })) {
-                .prompt => |result| try self.applyPromptProgressResult(prompt_run, result),
-                .ready => return count,
-            }
-        }
-        return count;
-    }
-
-    fn applyPromptProgressResult(
-        self: *InteractiveLoop,
-        prompt_run: *AgentSession.LivePromptRun,
-        result: anytype,
-    ) !void {
-        if (self.active_run != prompt_run) return;
-        const more = try self.session.applyPromptRunProgress(prompt_run, result);
-        if (!more) {
-            self.session.destroyPromptRun(prompt_run);
-            self.active_run = null;
-            self.cancel_requested = false;
-            self.clearStatus(status_id_working) catch {
-                self.stderr.writeAll("status clear failed\n") catch return;
-            };
-        }
+        return self.app.stepPromptProgressBounded(limit);
     }
 
     fn drainPublicEventsBounded(self: *InteractiveLoop, limit: usize) !usize {
         var count: usize = 0;
         while (count < limit) : (count += 1) {
-            var event = self.session.drainPublicEvent() orelse {
+            var envelope = self.app.drainEvent() orelse {
                 try self.flushToolOutputCoalescer();
                 return count;
             };
-            defer event.deinit();
-            try self.applyPublicEventStatus(event);
-            try self.applyPublicEventTranscript(event);
+            defer envelope.deinit(self.app.allocator);
+            switch (envelope.event) {
+                .session_event => |event| {
+                    try self.applyPublicEventStatus(event);
+                    try self.applyPublicEventTranscript(event);
+                },
+                .rejected => |rejection| try self.appendOperationalStatus(rejection.message),
+                .response => |response| switch (response) {
+                    .prompt_finished, .canceled => {
+                        self.cancel_requested = false;
+                        self.clearStatus(status_id_working) catch {
+                            self.stderr.writeAll("status clear failed\n") catch return count;
+                        };
+                    },
+                    else => {},
+                },
+                .accepted, .shutdown_complete => {},
+            }
         }
         try self.flushToolOutputCoalescer();
         return count;
@@ -922,7 +861,7 @@ const InteractiveLoop = struct {
         var next = append;
         const tool = &next.tool;
         if (self.tool_metadata_lookup_enabled) {
-            if (self.session.tools.findDefinition(tool.name)) |definition| {
+            if (self.app.findToolDefinition(tool.name)) |definition| {
                 tool.presentation = switch (definition.metadata.display.presentation) {
                     .generic => .generic,
                     .command => .command,
@@ -1037,17 +976,14 @@ const InteractiveLoop = struct {
     }
 
     fn shutdown(self: *InteractiveLoop) void {
-        if (self.active_run != null and !self.cancel_requested) {
-            self.session.cancel();
+        if (!self.cancel_requested) {
+            self.app.submit(.{ .command = .shutdown }) catch {};
             self.cancel_requested = true;
         }
         var ticks: usize = 0;
-        while (self.active_run != null and ticks < shutdown_drain_ticks_max) : (ticks += 1) {
-            _ = self.drainPromptProgressBounded(prompt_progress_per_tick_max) catch break;
-        }
-        if (self.active_run) |prompt_run| {
-            self.session.destroyPromptRun(prompt_run);
-            self.active_run = null;
+        while (ticks < shutdown_drain_ticks_max) : (ticks += 1) {
+            self.app.step() catch break;
+            _ = self.drainPublicEventsBounded(public_events_per_tick_max) catch break;
         }
     }
 };
@@ -1129,7 +1065,7 @@ pub fn run(
 
     var loop: InteractiveLoop = .{
         .process = process,
-        .session = &host_handle.session,
+        .app = &host_handle,
         .terminal_loop = &terminal_loop,
         .stdout = stdout,
         .stderr = stderr,
@@ -1137,7 +1073,7 @@ pub fn run(
     defer loop.shutdown();
 
     var model_text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
-    const model_text = modelComposerSlotText(host_handle.session.agent.state.model, &model_text_buffer);
+    const model_text = modelComposerSlotText(host_handle.model(), &model_text_buffer);
     _ = try terminal_loop.applyCommand(.{ .set_slot_contribution = .{
         .slot = .composer_top_right,
         .id = model_slot_id,
@@ -1145,13 +1081,11 @@ pub fn run(
         .text = model_text,
         .effect = .none,
     } });
-    var history_snapshot = try session_history_snapshot.build(process.gpa, host_handle.session.manager);
+    var history_snapshot = try host_handle.buildHistorySnapshot(process.gpa);
     defer history_snapshot.deinit(process.gpa);
     try seedTranscriptFromSnapshot(&terminal_loop, history_snapshot.items);
     if (options.initial_prompt) |prompt| {
-        if (try loop.startPrompt(prompt) == .started) {
-            try loop.appendTranscript(messageAppend(.user, prompt, .new_item));
-        }
+        _ = try loop.startPrompt(prompt);
     }
     _ = try loop.drainPublicEventsBounded(public_events_per_tick_max);
     try terminal_loop.renderIfDirty(stdout);
@@ -1179,7 +1113,7 @@ fn modelComposerSlotText(model: ai.Model, buffer: []u8) []const u8 {
 
 fn seedTranscriptFromSnapshot(
     terminal_loop: *tui.product.TerminalLoop,
-    items: []const session_history_snapshot.Item,
+    items: anytype,
 ) !void {
     for (items) |item| {
         _ = try terminal_loop.applyCommand(.{
@@ -1649,7 +1583,8 @@ test "interactive seeds tui transcript from public history snapshot" {
     defer std.testing.allocator.free(user_text);
     const assistant_text = try std.testing.allocator.dupe(u8, "hi");
     defer std.testing.allocator.free(assistant_text);
-    const items = [_]session_history_snapshot.Item{
+    const TestRole = enum { user, assistant, system };
+    const items = [_]struct { role: TestRole, text: []u8 }{
         .{ .role = .user, .text = user_text },
         .{ .role = .assistant, .text = assistant_text },
     };

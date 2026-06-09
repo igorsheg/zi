@@ -8,7 +8,10 @@ const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
+const session_events = @import("session_events.zig");
+const session_history_snapshot = @import("session_history_snapshot.zig");
 const settings_mod = @import("settings.zig");
+const tool_registry = @import("tool_registry.zig");
 
 const CreateOptions = struct {
     cwd: []const u8 = ".",
@@ -45,6 +48,8 @@ const ResumeOptions = struct {
     event_capacity: usize = client_protocol.event_queue_capacity_default,
 };
 
+pub const WakeResult = enum { input, session, frame };
+
 pub const SessionRuntime = struct {
     allocator: std.mem.Allocator,
     services: RuntimeServices,
@@ -54,6 +59,8 @@ pub const SessionRuntime = struct {
     commands: client_protocol.CommandQueue,
     events: client_protocol.EventQueue,
     wake_event: runtime.ResetEvent = .init,
+    active_run: ?*AgentSession.LivePromptRun = null,
+    active_request_id: ?client_protocol.RequestId = null,
 
     pub fn submit(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
         try self.commands.push(envelope);
@@ -72,16 +79,94 @@ pub const SessionRuntime = struct {
         return self.session.manager.header;
     }
 
+    pub fn model(self: *const SessionRuntime) ai.Model {
+        return self.session.agent.state.model;
+    }
+
+    pub fn buildHistorySnapshot(self: *const SessionRuntime, allocator: std.mem.Allocator) !session_history_snapshot.Snapshot {
+        return session_history_snapshot.build(allocator, self.session.manager);
+    }
+
+    pub fn findToolDefinition(self: *const SessionRuntime, name: []const u8) ?tool_registry.ToolDefinition {
+        return self.session.tools.findDefinition(name);
+    }
+
+    pub fn queuedMessagesSnapshot(self: *const SessionRuntime, allocator: std.mem.Allocator) !session_events.QueueSnapshot {
+        return self.session.queueSnapshot(allocator);
+    }
+
+    pub fn dropQueuedMessages(self: *SessionRuntime) !void {
+        try self.session.clearQueue();
+        try self.drainSessionEvents(null);
+    }
+
+    pub fn waitForWake(self: *SessionRuntime, input_fd: std.posix.fd_t, frame_ms: u64) !WakeResult {
+        const readable = runtime.ReadableFd.initBorrowed(input_fd);
+        var input = readable.asyncReadable();
+        var frame = runtime.Timeout.fromMilliseconds(frame_ms);
+        var public_event_wake = self.session.publicEventWake();
+        if (self.active_run) |run| {
+            var progress = run.stream.asyncNext();
+            switch (try runtime.select(.{ .input = &input, .prompt = &progress, .public_event = public_event_wake, .frame = &frame })) {
+                .input => |result| {
+                    result catch return .session;
+                    return .input;
+                },
+                .prompt => |result| {
+                    try self.applyPromptProgressResult(run, result);
+                    return .session;
+                },
+                .public_event => {
+                    public_event_wake.reset();
+                    try self.drainSessionEvents(null);
+                    return .session;
+                },
+                .frame => return .frame,
+            }
+        }
+        switch (try runtime.select(.{ .input = &input, .public_event = public_event_wake, .frame = &frame })) {
+            .input => |result| {
+                result catch return .session;
+                return .input;
+            },
+            .public_event => {
+                public_event_wake.reset();
+                try self.drainSessionEvents(null);
+                return .session;
+            },
+            .frame => return .frame,
+        }
+    }
+
+    pub fn stepPromptProgressBounded(self: *SessionRuntime, limit: usize) !usize {
+        const run = self.active_run orelse return 0;
+        var count: usize = 0;
+        while (count < limit and self.active_run != null) : (count += 1) {
+            var progress = run.stream.asyncNext();
+            var ready = runtime.Timeout.fromMilliseconds(0);
+            switch (try runtime.select(.{ .prompt = &progress, .ready = &ready })) {
+                .prompt => |result| try self.applyPromptProgressResult(run, result),
+                .ready => return count,
+            }
+        }
+        return count;
+    }
+
     pub fn step(self: *SessionRuntime) !void {
         while (self.commands.pop()) |envelope| {
             var command = envelope;
             defer command.deinit(self.allocator);
             try self.applyCommand(command);
         }
+        _ = try self.stepPromptProgressBounded(64);
         try self.drainSessionEvents(null);
     }
 
     pub fn deinit(self: *SessionRuntime) void {
+        if (self.active_run) |run| {
+            self.session.destroyPromptRun(run);
+            self.active_run = null;
+        }
         drainQueuedCommands(self);
         drainQueuedEvents(self);
         shutdownAndDeinitSession(&self.session);
@@ -94,21 +179,33 @@ pub const SessionRuntime = struct {
     fn applyCommand(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
         switch (envelope.command) {
             .submit_prompt => |prompt| {
-                const run = self.session.startPromptRun(prompt.text, &.{}, .{}) catch |err| {
+                if (self.active_run != null) {
+                    self.session.promptWithOptions(prompt.text, &.{}, .{ .streaming_behavior = .steer }) catch |err| {
+                        try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
+                        return;
+                    };
+                    try self.drainSessionEvents(envelope.id);
+                    return;
+                }
+                self.active_run = self.session.startPromptRun(prompt.text, &.{}, .{}) catch |err| {
                     try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                     return;
                 };
-                defer self.session.destroyPromptRun(run);
-                while (try self.session.stepPromptRun(run)) try self.drainSessionEvents(envelope.id);
+                self.active_request_id = envelope.id;
                 try self.drainSessionEvents(envelope.id);
-                try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .prompt_finished } });
             },
             .cancel => {
-                self.session.cancel();
+                if (self.active_run) |run| {
+                    self.session.cancelPromptRun(run) catch self.session.cancel();
+                    self.session.destroyPromptRun(run);
+                    self.active_run = null;
+                    self.active_request_id = null;
+                } else self.session.cancel();
+                try self.drainSessionEvents(envelope.id);
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .canceled } });
             },
             .clear_queue => {
-                try self.session.clearQueue();
+                try self.dropQueuedMessages();
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .queue_cleared } });
             },
             .request_snapshot => try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .snapshot_sent } }),
@@ -116,6 +213,19 @@ pub const SessionRuntime = struct {
                 self.session.requestShutdown();
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .shutdown_started } });
             },
+        }
+    }
+
+    fn applyPromptProgressResult(self: *SessionRuntime, run: *AgentSession.LivePromptRun, result: anytype) !void {
+        if (self.active_run != run) return;
+        const request_id = self.active_request_id;
+        const more = try self.session.applyPromptRunProgress(run, result);
+        try self.drainSessionEvents(request_id);
+        if (!more) {
+            self.session.destroyPromptRun(run);
+            self.active_run = null;
+            self.active_request_id = null;
+            try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .response = .prompt_finished } });
         }
     }
 
