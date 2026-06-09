@@ -7,7 +7,7 @@ const AgentSession = @import("AgentSession.zig");
 const session_events = @import("session_events.zig");
 const session_history_snapshot = @import("session_history_snapshot.zig");
 const session_listing = @import("session_listing.zig");
-const runtime_services = @import("runtime_services.zig");
+const session_runtime = @import("session_runtime.zig");
 
 const Options = struct {
     cwd: []const u8 = ".",
@@ -1084,7 +1084,7 @@ pub fn run(
             return error.NoResumableSession;
         };
         defer process.gpa.free(session_file);
-        break :blk try runtime_services.resumeSessionRuntime(process.gpa, .{
+        break :blk try session_runtime.resumeSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -1096,7 +1096,7 @@ pub fn run(
     } else blk: {
         const session_id = try std.fmt.allocPrint(process.gpa, "interactive-{d}", .{timestamp});
         defer process.gpa.free(session_id);
-        break :blk try runtime_services.createSessionRuntime(process.gpa, .{
+        break :blk try session_runtime.createSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,

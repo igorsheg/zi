@@ -9,6 +9,8 @@ const paths = @import("paths.zig");
 const print_mode = @import("print_mode.zig");
 const queue_mirror = @import("queue_mirror.zig");
 const runtime_services = @import("runtime_services.zig");
+const client_protocol = @import("client_protocol.zig");
+const session_runtime = @import("session_runtime.zig");
 const settings = @import("settings.zig");
 const resources = @import("resources.zig");
 const session_events = @import("session_events.zig");
@@ -35,6 +37,8 @@ test {
     _ = queue_mirror;
     _ = resources;
     _ = runtime_services;
+    _ = client_protocol;
+    _ = session_runtime;
     _ = settings;
     _ = session_events;
     _ = session_history_snapshot;

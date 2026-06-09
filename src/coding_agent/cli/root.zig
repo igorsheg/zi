@@ -4,7 +4,7 @@ const auth_mode = @import("../auth_mode.zig");
 const args_mod = @import("args.zig");
 const interactive = @import("../interactive.zig");
 const print_mode = @import("../print_mode.zig");
-const runtime_services = @import("../runtime_services.zig");
+const session_runtime = @import("../session_runtime.zig");
 const session_listing = @import("../session_listing.zig");
 
 const CliError = error{
@@ -163,7 +163,7 @@ fn runPrompt(
 
     var app = if (try selectResumeSession(process, stderr, app_args, options)) |session_file| blk: {
         defer process.gpa.free(session_file);
-        break :blk try runtime_services.resumeSessionRuntime(process.gpa, .{
+        break :blk try session_runtime.resumeSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -175,7 +175,7 @@ fn runPrompt(
     } else blk: {
         const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
         defer process.gpa.free(session_id);
-        break :blk try runtime_services.createSessionRuntime(process.gpa, .{
+        break :blk try session_runtime.createSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = timestamp_text,
@@ -450,7 +450,7 @@ fn createCliTestDirs(dir: std.Io.Dir) !void {
 }
 
 fn createCliStoredSession(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {
-    var app_runtime = try runtime_services.createSessionRuntime(std.testing.allocator, .{
+    var app_runtime = try session_runtime.createSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",
