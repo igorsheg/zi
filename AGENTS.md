@@ -45,11 +45,12 @@ agent          generic agent loop: transcript, tool execution, steering/follow-u
                queues, agent events, cancel source. must not import coding_agent or tui.
 runtime        zio-backed mechanism: process, select, bounded queues, cancel
                tokens, event pipes, process runner, byte/json ownership. no app policy.
-coding_agent   the app: resources, settings, model/session config, tools, prompt
-               preflight, persistence, public events, host replacement, CLI, modes.
-               the only module that wires ai + agent + runtime + tui together.
+coding_agent   the app core: resources, settings, model/session config, tools,
+               prompt preflight, persistence, public events, host replacement,
+               CLI, and typed client protocol. no TUI or concrete frontend policy.
 tui            terminal UI product + substrate. agent-agnostic. observes
-               coding_agent only through commands/effects/events/snapshots.
+               coding_agent only through commands/effects/events/snapshots via an
+               external frontend adapter.
 ```
 
 import rules (enforced by review; they are real today):
@@ -58,8 +59,9 @@ import rules (enforced by review; they are real today):
 - `agent` imports std, ai, runtime. never coding_agent or tui.
 - `runtime` imports std + vendored zio. never product modules.
 - `tui` imports std + vendored uucode only. never runtime, ai, agent, coding_agent.
-- `coding_agent` may import everything below it. the tui bridge lives in exactly
-  one file: `src/coding_agent/interactive.zig`.
+- `coding_agent` imports ai, agent, runtime, and std. never tui or frontend adapters.
+- concrete frontends live outside `src/coding_agent`; a TUI adapter may import both
+  coding_agent and tui, but it is not part of the core.
 
 ## runtime discipline
 
@@ -128,8 +130,8 @@ agent event
   transition or commits completely; it never mutates and then fails on a derived
   event, projection, or render.
 - the TUI is agent-agnostic. commands carry the domain-neutral `TranscriptAppend`
-  (message / status / tool). the `AgentSessionEvent -> Command` translation lives
-  in `coding_agent/interactive.zig`, not in `src/tui`.
+  (message / status / tool). any `ClientEvent -> Command` translation lives in a
+  frontend adapter outside `src/tui` and outside `src/coding_agent`.
 - rendering is a transaction: `frame.build` paints into the next cell buffer,
   `Renderer.stage` diffs into a bounded `FrameOutput`, bytes are written, then
   `commit` swaps. on write failure, `discard` and stay dirty. terminal output is

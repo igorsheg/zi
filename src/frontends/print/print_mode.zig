@@ -1,9 +1,9 @@
 const std = @import("std");
-const ai = @import("../ai/root.zig");
-const runtime = @import("../runtime/root.zig");
-const client_protocol = @import("client_protocol.zig");
-const session_manager = @import("session_manager.zig");
-const session_runtime = @import("session_runtime.zig");
+const ai = @import("../../ai/root.zig");
+const runtime = @import("../../runtime/root.zig");
+const client_protocol = @import("../../coding_agent/client_protocol.zig");
+const session_manager = @import("../../coding_agent/session_manager.zig");
+const session_runtime = @import("../../coding_agent/session_runtime.zig");
 
 const OutputMode = enum {
     text,
@@ -72,6 +72,7 @@ fn drainEvents(
             .agent_event,
             .queue_update,
             .prompt_command,
+            .snapshot,
             .compaction_start,
             .session_info_changed,
             .compaction_end,
@@ -186,8 +187,8 @@ test "print mode emits assistant text from injected stream" {
     const content = [_]ai.AssistantContent{ai.faux.text("hi")};
     const message = ai.faux.assistantMessage(&content, .{});
     try provider.setResponses(&.{message});
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
@@ -195,7 +196,6 @@ test "print mode emits assistant text from injected stream" {
         .current_date = "2026-05-27",
         .session_id = "session",
         .timestamp = "2026-05-27T00:00:00Z",
-        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
     });
@@ -223,8 +223,8 @@ test "json print mode streams session header and public events" {
     const content = [_]ai.AssistantContent{ai.faux.text("hi")};
     const message = ai.faux.assistantMessage(&content, .{});
     try provider.setResponses(&.{message});
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
@@ -232,7 +232,6 @@ test "json print mode streams session header and public events" {
         .current_date = "2026-05-27",
         .session_id = "session",
         .timestamp = "2026-05-27T00:00:00Z",
-        .zio_runtime = zio_runtime,
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
     });

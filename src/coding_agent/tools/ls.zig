@@ -216,14 +216,14 @@ test "ls tool lists one directory with bounds" {
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "path", .{ .string = "dir" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call",
@@ -253,14 +253,14 @@ test "ls tool defaults to cwd, sorts entries, and reports empty directories" {
     var object: std.json.ObjectMap = .empty;
     defer object.deinit(std.testing.allocator);
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call",
@@ -276,8 +276,8 @@ test "ls tool defaults to cwd, sorts entries, and reports empty directories" {
     try empty_object.put(std.testing.allocator, "path", .{ .string = "empty" });
     var empty_result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call-empty",

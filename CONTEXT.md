@@ -33,10 +33,12 @@ wrong; fix them.
 src/
   ai/            provider protocol, model catalog, provider registry, wire adapters, streams
   agent/         generic agent loop: transcript, tool execution, steering/follow-up queues, events
-  coding_agent/  Zi product/session policy, CLI, and modes (the app)
+  coding_agent/  Zi core product/session policy and typed client protocol
+  cli/           process CLI parsing and concrete mode dispatch
   runtime/       zio-backed mechanism: process, select, bounded queues, cancel, process runner
   tui/           Zi-owned terminal UI (substrate/infra/primitive/product)
-  main.zig       process init -> runtime.Runtime -> coding_agent.cli.main
+  frontends/     concrete client adapters; print today, TUI dormant
+  main.zig       process init -> runtime.Runtime -> cli.main
   root.zig       public package surface (ai, agent, coding_agent, runtime, tui)
 ```
 
@@ -48,14 +50,14 @@ ai        depends on std (+ runtime mechanism for I/O). knows nothing above it.
 agent     depends on std, ai, runtime. must not import coding_agent or tui.
 runtime   depends on std + vendored zio. pure mechanism, no product policy.
 tui       depends on std + vendored uucode only. no runtime, agent, ai, or coding_agent.
-coding_agent  depends on all of the above. it is the only place that wires them together.
+coding_agent  depends on std, ai, agent, and runtime. no tui or concrete frontend adapters.
 ```
 
 two facts follow from this and are load-bearing:
 
 - `src/tui` is agent-agnostic. it never names a session, provider, tool, or
-  agent event. the only file that bridges `tui` and `coding_agent` is
-  `src/coding_agent/interactive.zig`.
+  agent event. any bridge between `tui` and `coding_agent` lives outside both
+  modules as a concrete frontend adapter.
 - `src/agent` is product-agnostic. it runs any tool set against any provider;
   Zi-specific policy lives in `coding_agent`.
 
@@ -68,17 +70,17 @@ generated into `src/ai/models.generated.zig` via `zig build generate-models`.
 
 ```text
 main.zig
-  builds runtime.Runtime, wraps it in runtime.Process, calls coding_agent.cli.main.
+  builds runtime.Runtime, wraps it in runtime.Process, calls top-level cli.main.
   owns no session or product policy.
 
-coding_agent/cli
-  parses args, resolves a mode, dispatches. modes:
-    interactive  -> interactive.run        (TUI; default on a tty)
-    print/text   -> print_mode             (--print or non-tty stdin)
-    json         -> print_mode (json)      (--mode json)
+cli/
+  parses args, resolves a mode, dispatches concrete clients:
+    print/text   -> frontends/print        (--print or non-tty stdin)
+    json         -> frontends/print (json) (--mode json)
     rpc          -> rejected (not implemented yet)
-    auth         -> auth_mode login/logout/status
-  resume/list selection runs through sdk before a host is created.
+    interactive  -> rejected until the TUI frontend adapter is wired
+    auth         -> coding_agent auth_mode login/logout/status
+  resume/list selection runs through coding_agent session listing before a host is created.
 
 coding_agent.sdk
   the public host API: createRuntimeHost, resumeRuntimeHost, selectRuntimeSession,
@@ -267,11 +269,10 @@ bounded `FrameOutput`; the bytes are written; only then does `commit` swap
 buffers. a write failure `discard`s and leaves state dirty, so the next frame
 re-paints. terminal output is single-owner and synchronous at the render site.
 
-the bridge is `coding_agent/interactive.zig` — the one small integration file
-ADR 0013 anticipated. it owns the wake loop (zio `select` over terminal input,
-prompt progress, public-event wake, and a 30fps frame deadline), translates
-`AgentSessionEvent` into TUI `Command`s, and turns TUI `Effect`s into host calls
-(`startPromptRun`, `cancel`). every drain in that loop is bounded.
+no TUI bridge is part of `coding_agent`. A future concrete frontend adapter will
+own the wake loop, translate `ClientEvent` into TUI `Command`s, and turn TUI
+`Effect`s into `ClientCommand`s. Until that adapter is wired, interactive mode is
+explicitly unsupported.
 
 transcript is bounded resident state (item and byte caps, oldest-first eviction).
 wrapping and scrolling are measured in display rows, not newline counts. visible
@@ -284,8 +285,8 @@ transcript mutation cannot silently leave stale layout facts.
 
 preserve these behaviors (the pi-mono lessons), not any TypeScript shape:
 
-- `AgentSession` is shared by interactive, print, and tests. it is not a TUI
-  object.
+- `AgentSession` is shared by print, the session runtime, and tests. it is not a
+  TUI object.
 - `prompt()` is session preflight, not a raw `Agent.prompt` call.
 - agent events are serialized and ordered through one drain.
 - queue changes are visible to clients, but full queue text is read through a

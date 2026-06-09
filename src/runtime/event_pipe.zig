@@ -250,14 +250,14 @@ fn produceMoreThanCapacity(state: *ConcurrentProducerState) !void {
 }
 
 test "event pipe supports bounded concurrent producer and owner drain" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     const Pipe = EventPipe(u8, u8);
     var buffer: [1]u8 = undefined;
     var pipe = Pipe.init(&buffer);
     var state: ConcurrentProducerState = .{ .pipe = &pipe };
-    var future = try zio_runtime.spawn(produceMoreThanCapacity, .{&state});
+    var future = try task_runtime.spawn(produceMoreThanCapacity, .{&state});
     defer future.cancel();
 
     try state.entered.wait();

@@ -1,20 +1,16 @@
 const std = @import("std");
-const zio = @import("zio");
-const Runtime = zio.Runtime;
 
 pub const Process = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *Runtime,
     environ: *std.process.Environ.Map,
 
-    pub fn init(zio_runtime: *Runtime, process: std.process.Init) Process {
+    pub fn init(process: std.process.Init) Process {
         return .{
             .arena = process.arena.allocator(),
             .gpa = process.gpa,
-            .io = zio_runtime.io(),
-            .zio_runtime = zio_runtime,
+            .io = process.io,
             .environ = process.environ_map,
         };
     }
@@ -28,16 +24,13 @@ pub const Process = struct {
     }
 };
 
-test "process runtime stores explicit resources" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+test "process stores explicit resources" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
     const process: Process = .{
         .arena = std.testing.allocator,
         .gpa = std.testing.allocator,
-        .io = zio_runtime.io(),
-        .zio_runtime = zio_runtime,
+        .io = std.testing.io,
         .environ = &environ,
     };
 
@@ -47,8 +40,6 @@ test "process runtime stores explicit resources" {
 }
 
 test "process exposes environment resources" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
     try environ.put("HOME", "/home/me");
@@ -56,8 +47,7 @@ test "process exposes environment resources" {
     const process: Process = .{
         .arena = std.testing.allocator,
         .gpa = std.testing.allocator,
-        .io = zio_runtime.io(),
-        .zio_runtime = zio_runtime,
+        .io = std.testing.io,
         .environ = &environ,
     };
 

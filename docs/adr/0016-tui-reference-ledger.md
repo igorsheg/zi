@@ -87,7 +87,7 @@ Borrowed behavior must enter Zi through one of these owners:
 - `tui/infra` for cell buffers, renderer output, and staging;
 - `tui/primitive` for value types and text policy;
 - `tui/product` for command/effect-owned product behavior;
-- `coding_agent/interactive.zig` for agent-session integration.
+- a frontend adapter outside `coding_agent` and `tui` for agent-session integration.
 
 It must not introduce:
 

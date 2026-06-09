@@ -1,5 +1,9 @@
 # Coding Agent Mailbox Refactor Plan
 
+Status note: completed as the internal mailbox refactor, then superseded in one
+respect by the frontend decoupling refactor: `src/coding_agent` no longer owns or
+imports an interactive TUI adapter.
+
 Goal: make `src/coding_agent/` a small, client-facing core with one explicit frontend contract, then delete the direct `AgentSession` paths that currently bind interactive/print mode to implementation details.
 
 This is a nuclear refactor plan, not an additive abstraction plan. Every phase must remove or privatize old paths before it is considered done.
@@ -236,8 +240,8 @@ Done when: print tests pass and no print mode direct session calls remain.
 Deletion gates:
 
 ```sh
-! rg "AgentSession|session\." src/coding_agent/interactive.zig
-! rg "session_history_snapshot|manager|agent\.state|queueSnapshot|clearQueue|publicEventWake|drainPublicEvent" src/coding_agent/interactive.zig
+! rg "AgentSession|session\." src/frontends/tui/interactive.zig
+! rg "session_history_snapshot|manager|agent\.state|queueSnapshot|clearQueue|publicEventWake|drainPublicEvent" src/frontends/tui/interactive.zig
 ```
 
 Done when: interactive tests pass and `interactive.zig` knows only `SessionRuntime` + `client_protocol`.
@@ -311,10 +315,10 @@ Done when: a wire ADR records this JSONL-first RPC decision and the first narrow
 The refactor is not complete while any of these remain in frontend files:
 
 ```sh
-rg "AgentSession" src/coding_agent/interactive.zig src/coding_agent/print_mode.zig
-rg "startPromptRun|stepPromptRun|destroyPromptRun|cancelPromptRun" src/coding_agent/interactive.zig src/coding_agent/print_mode.zig
-rg "drainPublicEvent|publicEventWake|queueSnapshot|clearQueue" src/coding_agent/interactive.zig src/coding_agent/print_mode.zig
-rg "session_history_snapshot|\.manager|agent\.state" src/coding_agent/interactive.zig
+rg "AgentSession" src/frontends/tui/interactive.zig src/coding_agent/print_mode.zig
+rg "startPromptRun|stepPromptRun|destroyPromptRun|cancelPromptRun" src/frontends/tui/interactive.zig src/coding_agent/print_mode.zig
+rg "drainPublicEvent|publicEventWake|queueSnapshot|clearQueue" src/frontends/tui/interactive.zig src/coding_agent/print_mode.zig
+rg "session_history_snapshot|\.manager|agent\.state" src/frontends/tui/interactive.zig
 ```
 
 Expected final state:

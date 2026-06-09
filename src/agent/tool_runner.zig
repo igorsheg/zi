@@ -11,7 +11,7 @@ pub const Batch = struct {
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     context: agent.AgentContext,
     assistant: ai.AssistantMessage,
     config: agent.AgentLoopConfig,
@@ -21,7 +21,7 @@ pub const Runner = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
-        zio_runtime: *runtime.Runtime,
+        task_runtime: *runtime.Runtime,
         context: agent.AgentContext,
         assistant: ai.AssistantMessage,
         config: agent.AgentLoopConfig,
@@ -31,7 +31,7 @@ pub const Runner = struct {
         return .{
             .allocator = allocator,
             .io = io,
-            .zio_runtime = zio_runtime,
+            .task_runtime = task_runtime,
             .context = context,
             .assistant = assistant,
             .config = config,
@@ -49,7 +49,7 @@ pub const Runner = struct {
             return executeToolCallsSequential(
                 self.allocator,
                 self.io,
-                self.zio_runtime,
+                self.task_runtime,
                 self.context,
                 self.assistant,
                 self.config,
@@ -64,7 +64,7 @@ pub const Runner = struct {
             self.assistant,
             self.config,
             self.token,
-            self.zio_runtime,
+            self.task_runtime,
             self.emit,
         );
     }
@@ -90,7 +90,7 @@ fn shouldExecuteToolsSequential(
 fn executeToolCallsSequential(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     context: agent.AgentContext,
     assistant: ai.AssistantMessage,
     config: agent.AgentLoopConfig,
@@ -115,7 +115,7 @@ fn executeToolCallsSequential(
         var finalized = try executeOneToolCall(
             allocator,
             io,
-            zio_runtime,
+            task_runtime,
             context,
             assistant,
             tool_call,
@@ -217,8 +217,8 @@ const tool_worker_event_capacity_count = agent.max_tool_calls_per_turn + agent.m
 // needs a fixed, source-indexed result slot for each prepared tool call so
 // finalization remains deterministic even when workers complete out of order.
 const ToolWorkerGroup = struct {
-    zio_runtime: *runtime.Runtime,
-    handles: [agent.max_tool_calls_per_turn]runtime.JoinHandle(anyerror!void) = undefined,
+    task_runtime: *runtime.Runtime,
+    handles: [agent.max_tool_calls_per_turn]runtime.Task(anyerror!void) = undefined,
     started: usize = 0,
     state: State = .idle,
 
@@ -228,8 +228,8 @@ const ToolWorkerGroup = struct {
         drained,
     };
 
-    fn init(zio_runtime: *runtime.Runtime) ToolWorkerGroup {
-        return .{ .zio_runtime = zio_runtime };
+    fn init(task_runtime: *runtime.Runtime) ToolWorkerGroup {
+        return .{ .task_runtime = task_runtime };
     }
 
     fn deinit(self: *ToolWorkerGroup) void {
@@ -244,7 +244,7 @@ const ToolWorkerGroup = struct {
     ) anyerror!void {
         if (self.started == agent.max_tool_calls_per_turn) return error.TooManyTools;
         std.debug.assert(self.state == .idle or self.state == .active);
-        self.handles[self.started] = try self.zio_runtime.spawn(function, args);
+        self.handles[self.started] = try self.task_runtime.spawn(function, args);
         self.started += 1;
         self.state = .active;
     }
@@ -282,7 +282,7 @@ fn executeToolCallsParallel(
     assistant: ai.AssistantMessage,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     emit: agent.EventSink,
 ) !Batch {
     var prepared: [agent.max_tool_calls_per_turn]PreparedToolCall = undefined;
@@ -293,14 +293,14 @@ fn executeToolCallsParallel(
     var channel_buffer: [tool_worker_event_capacity_count]ToolWorkerEvent = undefined;
     var channel = ToolWorkerChannel.init(&channel_buffer);
     var update_count: std.atomic.Value(usize) = .init(0);
-    var group = ToolWorkerGroup.init(zio_runtime);
+    var group = ToolWorkerGroup.init(task_runtime);
     defer group.deinit();
     errdefer cancelParallelToolWorkers(&group, &channel);
 
     for (prepared[0..prepared_count]) |item| {
         try group.spawn(
             executePreparedToolCallWorker,
-            .{ allocator, io, zio_runtime, item, token, &channel, &update_count },
+            .{ allocator, io, task_runtime, item, token, &channel, &update_count },
         );
     }
 
@@ -428,7 +428,7 @@ fn prepareParallelToolCalls(
 fn executePreparedToolCallWorker(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     prepared: PreparedToolCall,
     token: runtime.CancelToken,
     channel: *ToolWorkerChannel,
@@ -437,7 +437,7 @@ fn executePreparedToolCallWorker(
     var executed = executePreparedToolCall(
         allocator,
         io,
-        zio_runtime,
+        task_runtime,
         prepared,
         token,
         channel,
@@ -511,7 +511,7 @@ fn prepareToolCall(
 fn executePreparedToolCall(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     prepared: PreparedToolCall,
     token: runtime.CancelToken,
     channel: *ToolWorkerChannel,
@@ -547,7 +547,7 @@ fn executePreparedToolCall(
             const result = agent.ExecuteToolHook.call(
                 allocator,
                 io,
-                zio_runtime,
+                task_runtime,
                 item.tool.execute,
                 token,
                 item.tool_call.id,
@@ -637,7 +637,7 @@ fn emitFinalizedToolCall(
 fn executeOneToolCall(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     context: agent.AgentContext,
     assistant: ai.AssistantMessage,
     tool_call: ai.ToolCall,
@@ -690,7 +690,7 @@ fn executeOneToolCall(
     var result = agent.ExecuteToolHook.call(
         allocator,
         io,
-        zio_runtime,
+        task_runtime,
         tool.execute,
         token,
         tool_call.id,

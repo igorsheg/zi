@@ -1,30 +1,30 @@
-const zio = @import("zio");
+const async_runtime = @import("Runtime.zig");
 
 pub const Process = @import("Process.zig").Process;
-pub const Runtime = zio.Runtime;
-pub const ResetEvent = zio.ResetEvent;
-pub const Duration = zio.Duration;
-pub const Timeout = zio.Timeout;
-pub const Cancelable = zio.Cancelable;
+pub const Runtime = async_runtime.Runtime;
+pub const ResetEvent = async_runtime.ResetEvent;
+pub const Duration = async_runtime.Duration;
+pub const Timeout = async_runtime.Timeout;
+pub const Cancelable = async_runtime.Cancelable;
 
 pub fn Channel(comptime Event: type) type {
-    return zio.Channel(Event);
+    return async_runtime.Channel(Event);
 }
 
-pub fn JoinHandle(comptime Result: type) type {
-    return zio.JoinHandle(Result);
+pub fn Task(comptime Result: type) type {
+    return async_runtime.Task(Result);
 }
 
-pub fn select(args: anytype) @TypeOf(zio.select(args)) {
-    return zio.select(args);
+pub fn select(args: anytype) @TypeOf(async_runtime.select(args)) {
+    return async_runtime.select(args);
 }
 
 pub fn sleep(duration: Duration) Cancelable!void {
-    return zio.sleep(duration);
+    return async_runtime.sleep(duration);
 }
 
 pub fn yield() Cancelable!void {
-    return zio.yield();
+    return async_runtime.yield();
 }
 
 const bounded_queue = @import("bounded_queue.zig");
@@ -53,6 +53,7 @@ pub const OutputStream = process_runner.OutputStream;
 
 test {
     _ = @import("Process.zig");
+    _ = @import("Runtime.zig");
     _ = @import("bounded_queue.zig");
     _ = @import("byte_builder.zig");
     _ = @import("cancel.zig");

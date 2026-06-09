@@ -678,7 +678,7 @@ fn waitBeforeDelta(
     if (request.cancel_token) |token| try token.throwIfRequested();
     if (delay_per_delta_ms == 0) return;
     try mem.sleepUntilCancel(
-        request.zio_runtime,
+        request.io,
         .fromMilliseconds(delay_per_delta_ms),
         request.cancel_token,
     );
@@ -896,8 +896,6 @@ fn estimateTokens(chars: usize) u64 {
 }
 
 test "faux provider streams queued text response" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
@@ -905,7 +903,7 @@ test "faux provider streams queued text response" {
     try provider.register(&registry);
     const message = assistantMessage(&.{text("hello world")}, .{});
     try provider.setResponses(&.{message});
-    var stream = registry.get(provider.api).?.stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel()));
 
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
     try std.testing.expectEqual(@as(usize, 0), provider.pendingResponseCount());
@@ -921,8 +919,6 @@ test "faux provider streams queued text response" {
 }
 
 test "faux provider streams tool call argument deltas" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
@@ -932,7 +928,7 @@ test "faux provider streams tool call argument deltas" {
     defer args.deinit(std.testing.allocator);
     const message = assistantMessage(&.{toolCall("tool-1", "write", .{ .object = args })}, .{});
     try provider.setResponses(&.{message});
-    var stream = registry.get(provider.api).?.stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel()));
 
     _ = try stream.next(std.Io.failing);
     const start = (try stream.next(std.Io.failing)).?.toolcall_start;
@@ -956,14 +952,12 @@ test "faux provider streams tool call argument deltas" {
 }
 
 test "faux provider returns terminal error when queue is empty" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.register(&registry);
-    var stream = registry.get(provider.api).?.stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel()));
 
     const event = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, event.reason);
@@ -979,15 +973,13 @@ test "faux provider supports custom model definitions" {
 }
 
 test "faux provider response factory receives call state" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.register(&registry);
     try provider.appendFactory(.{ .call_fn = testFactory });
-    var stream = registry.get(provider.api).?.stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = registry.get(provider.api).?.stream.call(testRequest(provider.getModel()));
 
     _ = try stream.next(std.Io.failing);
     _ = try stream.next(std.Io.failing);
@@ -996,8 +988,6 @@ test "faux provider response factory receives call state" {
 }
 
 test "faux provider prompt cache accounts common prefix" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
@@ -1005,10 +995,10 @@ test "faux provider prompt cache accounts common prefix" {
     try provider.register(&registry);
     const message = assistantMessage(&.{text("ok")}, .{});
     try provider.setResponses(&.{ message, message });
-    const first_request = testRequestWithSession(zio_runtime, provider.getModel(), "s1");
+    const first_request = testRequestWithSession(provider.getModel(), "s1");
     var first = registry.get(provider.api).?.stream.call(first_request);
     while (try first.next(std.Io.failing)) |_| {}
-    const second_request = testRequestWithSession(zio_runtime, provider.getModel(), "s1");
+    const second_request = testRequestWithSession(provider.getModel(), "s1");
     var second = registry.get(provider.api).?.stream.call(second_request);
     while (try second.next(std.Io.failing)) |_| {}
 
@@ -1112,12 +1102,10 @@ test "faux provider can replace and append queued responses" {
 }
 
 test "faux provider emits an error when a response factory fails" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.appendFactory(.{ .call_fn = failingFactory });
-    var stream = provider.apiProvider().stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
 
     const event = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, event.reason);
@@ -1126,8 +1114,6 @@ test "faux provider emits an error when a response factory fails" {
 }
 
 test "faux provider estimates prompt and output tokens from serialized context" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.setResponses(&.{assistantMessage(&.{text("done")}, .{})});
@@ -1144,7 +1130,7 @@ test "faux provider estimates prompt and output tokens from serialized context" 
             .timestamp = 2,
         } },
     };
-    var request = testRequest(zio_runtime, provider.getModel());
+    var request = testRequest(provider.getModel());
     request.context = .{ .system_prompt = "sys", .messages = &messages };
 
     var stream = provider.apiProvider().stream.call(request);
@@ -1193,8 +1179,6 @@ test "faux provider does not simulate caching when cache retention is none" {
 }
 
 test "faux provider streams exact event order for fixed-size chunks" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var provider = try Provider.init(std.testing.allocator, .{ .min_token_size = 1, .max_token_size = 1 });
     defer provider.deinit();
     try provider.setResponses(&.{assistantMessage(&.{
@@ -1202,7 +1186,7 @@ test "faux provider streams exact event order for fixed-size chunks" {
         text("ok"),
         toolCall("tool-1", "echo", .{ .object = .empty }),
     }, .{ .stop_reason = .tool_use })});
-    var stream = provider.apiProvider().stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
 
     const expected = [_]std.meta.Tag(protocol.AssistantMessageEvent){
         .start,
@@ -1222,15 +1206,13 @@ test "faux provider streams exact event order for fixed-size chunks" {
 }
 
 test "faux provider streams multiple tool calls in one message" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.setResponses(&.{assistantMessage(&.{
         toolCall("tool-1", "echo", .{ .object = .empty }),
         toolCall("tool-2", "echo", .{ .object = .empty }),
     }, .{ .stop_reason = .tool_use })});
-    var stream = provider.apiProvider().stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
     var start_count: usize = 0;
     var end_count: usize = 0;
 
@@ -1245,15 +1227,13 @@ test "faux provider streams multiple tool calls in one message" {
 }
 
 test "faux provider streams explicit assistant error as terminal error" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.setResponses(&.{assistantMessage(&.{text("partial")}, .{
         .stop_reason = .error_,
         .error_message = "upstream failed",
     })});
-    var stream = provider.apiProvider().stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
 
     while (try stream.next(std.Io.failing)) |event| {
         if (event == .@"error") {
@@ -1267,15 +1247,13 @@ test "faux provider streams explicit assistant error as terminal error" {
 }
 
 test "faux provider streams explicit assistant aborted as terminal error" {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var provider = try Provider.init(std.testing.allocator, .{});
     defer provider.deinit();
     try provider.setResponses(&.{assistantMessage(&.{text("partial")}, .{
         .stop_reason = .aborted,
         .error_message = "Request was aborted",
     })});
-    var stream = provider.apiProvider().stream.call(testRequest(zio_runtime, provider.getModel()));
+    var stream = provider.apiProvider().stream.call(testRequest(provider.getModel()));
 
     while (try stream.next(std.Io.failing)) |event| {
         if (event == .@"error") {
@@ -1332,9 +1310,7 @@ fn completeProvider(
     provider: *Provider,
     model: protocol.Model,
 ) !protocol.AssistantMessage {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    var stream = provider.apiProvider().stream.call(testRequest(zio_runtime, model));
+    var stream = provider.apiProvider().stream.call(testRequest(model));
     while (try stream.next(std.Io.failing)) |_| {}
     return stream.result() orelse error.MissingResult;
 }
@@ -1344,9 +1320,7 @@ fn completeWithSession(
     session_id: []const u8,
     cache_retention: protocol.CacheRetention,
 ) !protocol.AssistantMessage {
-    var zio_runtime = try mem.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    var request = testRequestWithSession(zio_runtime, provider.getModel(), session_id);
+    var request = testRequestWithSession(provider.getModel(), session_id);
     request.options.cache_retention = cache_retention;
     var stream = provider.apiProvider().stream.call(request);
     while (try stream.next(std.Io.failing)) |_| {}
@@ -1364,22 +1338,20 @@ fn jsonObjectWithString(
     return object;
 }
 
-fn testRequest(zio_runtime: *mem.Runtime, model: protocol.Model) protocol.StreamRequest {
+fn testRequest(model: protocol.Model) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
-        .zio_runtime = zio_runtime,
         .model = model,
         .context = .{ .messages = &.{.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }} },
     };
 }
 
 fn testRequestWithSession(
-    zio_runtime: *mem.Runtime,
     model: protocol.Model,
     session_id: []const u8,
 ) protocol.StreamRequest {
-    var request = testRequest(zio_runtime, model);
+    var request = testRequest(model);
     request.options.session_id = session_id;
     return request;
 }

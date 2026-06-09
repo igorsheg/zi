@@ -115,7 +115,7 @@ const Args = struct {
 fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *agent.ToolRuntime,
+    task_runtime: *agent.ToolRuntime,
     context: ?*anyopaque,
     token: runtime.CancelToken,
     _: []const u8,
@@ -138,7 +138,7 @@ fn execute(
     const run_result = runProcess(
         allocator,
         io,
-        zio_runtime,
+        task_runtime,
         self.config,
         args,
         token,
@@ -173,7 +173,7 @@ fn execute(
 fn runProcess(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *agent.ToolRuntime,
+    task_runtime: *agent.ToolRuntime,
     config: BashTool.Config,
     args: Args,
     token: runtime.CancelToken,
@@ -188,7 +188,7 @@ fn runProcess(
     try command_writer.writer.writeAll(args.command);
     if (command_writer.written().len > max_command_bytes) return error.InvalidToolArguments;
     const argv = shellArgv(config, command_writer.written());
-    const run_result = try runtime.runProcess(allocator, io, zio_runtime, .{
+    const run_result = try runtime.runProcess(allocator, io, task_runtime, .{
         .argv = &argv,
         .cwd = config.cwd,
         .environ = config.environ,
@@ -492,8 +492,8 @@ fn truncationDetails(
 }
 
 test "bash tool runs one cwd-bound command" {
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -504,7 +504,7 @@ test "bash tool runs one cwd-bound command" {
     var tool = try initTestTool(tmp.dir, "repo", .{});
     defer tool.deinit();
 
-    var result = try executeTestCommand(zio_runtime, &tool, "pwd; cat file.txt");
+    var result = try executeTestCommand(task_runtime, &tool, "pwd; cat file.txt");
     defer result.deinit();
 
     try std.testing.expect(std.mem.endsWith(u8, result.result.content[0].text.text, "repo\nok"));
@@ -512,8 +512,8 @@ test "bash tool runs one cwd-bound command" {
 }
 
 test "bash tool passes explicit environment to child process" {
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -530,15 +530,15 @@ test "bash tool passes explicit environment to child process" {
     });
     defer tool.deinit();
 
-    var result = try executeTestCommand(zio_runtime, &tool, "printf %s \"$ZI_BASH_ENV_TEST\"");
+    var result = try executeTestCommand(task_runtime, &tool, "printf %s \"$ZI_BASH_ENV_TEST\"");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("present", result.result.content[0].text.text);
 }
 
 test "bash tool treats nonzero exit as result data" {
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -546,7 +546,7 @@ test "bash tool treats nonzero exit as result data" {
     var tool = try initTestTool(tmp.dir, ".", .{});
     defer tool.deinit();
 
-    var result = try executeTestCommand(zio_runtime, &tool, "printf nope; exit 7");
+    var result = try executeTestCommand(task_runtime, &tool, "printf nope; exit 7");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -557,8 +557,8 @@ test "bash tool treats nonzero exit as result data" {
 }
 
 test "bash tool treats timeout as bounded result data" {
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -566,7 +566,7 @@ test "bash tool treats timeout as bounded result data" {
     var tool = try initTestTool(tmp.dir, ".", .{ .timeout_ms = 1 });
     defer tool.deinit();
 
-    var result = try executeTestCommand(zio_runtime, &tool, "sleep 60");
+    var result = try executeTestCommand(task_runtime, &tool, "sleep 60");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -578,8 +578,8 @@ test "bash tool treats timeout as bounded result data" {
 }
 
 test "bash tool treats output limit as bounded result data" {
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -587,7 +587,7 @@ test "bash tool treats output limit as bounded result data" {
     var tool = try initTestTool(tmp.dir, ".", .{ .max_stdout_bytes = 4 });
     defer tool.deinit();
 
-    var result = try executeTestCommand(zio_runtime, &tool, "printf abcdef");
+    var result = try executeTestCommand(task_runtime, &tool, "printf abcdef");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -599,8 +599,8 @@ test "bash tool treats output limit as bounded result data" {
 }
 
 test "bash tool applies command prefix" {
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -608,7 +608,7 @@ test "bash tool applies command prefix" {
     var tool = try initTestTool(tmp.dir, ".", .{ .command_prefix = "ZI_PREFIX_VALUE=ok" });
     defer tool.deinit();
 
-    var result = try executeTestCommand(zio_runtime, &tool, "printf %s \"$ZI_PREFIX_VALUE\"");
+    var result = try executeTestCommand(task_runtime, &tool, "printf %s \"$ZI_PREFIX_VALUE\"");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("ok", result.result.content[0].text.text);
@@ -617,8 +617,8 @@ test "bash tool applies command prefix" {
 test "bash tool applies configured shell path" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -626,7 +626,7 @@ test "bash tool applies configured shell path" {
     var tool = try initTestTool(tmp.dir, ".", .{ .shell_path = "/bin/sh" });
     defer tool.deinit();
 
-    var result = try executeTestCommand(zio_runtime, &tool, "printf shell-ok");
+    var result = try executeTestCommand(task_runtime, &tool, "printf shell-ok");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("shell-ok", result.result.content[0].text.text);
@@ -643,8 +643,8 @@ test "bash tool accepts timeout seconds" {
 }
 
 test "bash tool rejects oversized commands before process start" {
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -656,7 +656,7 @@ test "bash tool rejects oversized commands before process start" {
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'x');
 
-    try std.testing.expectError(error.InvalidToolArguments, executeTestCommand(zio_runtime, &tool, oversized));
+    try std.testing.expectError(error.InvalidToolArguments, executeTestCommand(task_runtime, &tool, oversized));
 }
 
 test "bash tool rejects invalid config bounds" {
@@ -678,9 +678,9 @@ test "bash tool rejects invalid config bounds" {
 }
 
 test "bash tool cancels running process through owner race" {
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -694,10 +694,10 @@ test "bash tool cancels running process through owner race" {
 
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    var future = try zio_runtime.spawn(execute, .{
+    var future = try task_runtime.spawn(execute, .{
         std.testing.allocator,
         io,
-        zio_runtime,
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call",
@@ -731,7 +731,7 @@ fn putCommand(object: *std.json.ObjectMap, command: []const u8) !void {
 }
 
 fn executeTestCommand(
-    zio_runtime: *agent.ToolRuntime,
+    task_runtime: *agent.ToolRuntime,
     tool: *BashTool,
     command: []const u8,
 ) !agent.ToolExecutionResult {
@@ -741,7 +741,7 @@ fn executeTestCommand(
 
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    return execute(std.testing.allocator, zio_runtime.io(), zio_runtime, tool, cancel_source.token(), "call", .{
+    return execute(std.testing.allocator, task_runtime.io(), task_runtime, tool, cancel_source.token(), "call", .{
         .object = object,
     }, null);
 }

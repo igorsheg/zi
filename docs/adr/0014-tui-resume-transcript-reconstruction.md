@@ -30,7 +30,7 @@ The data path is:
 ```text
 session durable history
   -> coding_agent public/owned history snapshot
-  -> src/coding_agent/interactive.zig adapter
+  -> frontend adapter outside src/coding_agent and src/tui
   -> tui product commands
   -> src/tui/product/transcript.zig bounded resident transcript
   -> product frame projection

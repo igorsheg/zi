@@ -444,14 +444,14 @@ pub const ExecuteToolHook = struct {
     pub fn call(
         allocator: std.mem.Allocator,
         io: std.Io,
-        zio_runtime: *ToolRuntime,
+        task_runtime: *ToolRuntime,
         self: ExecuteToolHook,
         token: runtime.CancelToken,
         tool_call_id: []const u8,
         params: std.json.Value,
         on_update: ?AgentToolUpdateCallback,
     ) anyerror!ToolExecutionResult {
-        return self.call_fn(allocator, io, zio_runtime, self.context, token, tool_call_id, params, on_update);
+        return self.call_fn(allocator, io, task_runtime, self.context, token, tool_call_id, params, on_update);
     }
 };
 

@@ -17,7 +17,7 @@ pub const AgentEventStream = struct {
     producer: Producer = .settled,
 
     const Producer = union(enum) {
-        running: runtime.JoinHandle(anyerror!void),
+        running: runtime.Task(anyerror!void),
         spawn_failed: anyerror,
         settled,
     };
@@ -94,18 +94,18 @@ pub const AgentEventStream = struct {
 pub fn startPromptStream(
     stream: *AgentEventStream,
     allocator: std.mem.Allocator,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     prompts: []const agent.AgentMessage,
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
     buffer: []agent.AgentEvent,
 ) void {
-    const stream_io = zio_runtime.io();
+    const stream_io = task_runtime.io();
     stream.* = AgentEventStream.init(allocator, buffer);
-    stream.producer = .{ .running = zio_runtime.spawn(
+    stream.producer = .{ .running = task_runtime.spawn(
         runPromptStreamProducer,
-        .{ allocator, stream_io, prompts, context, config, token, zio_runtime, stream },
+        .{ allocator, stream_io, prompts, context, config, token, task_runtime, stream },
     ) catch |err| {
         stream.pipe.sink().abort();
         stream.producer = .{ .spawn_failed = err };
@@ -120,10 +120,10 @@ fn runPromptStreamProducer(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     stream: *AgentEventStream,
 ) anyerror!void {
-    runPrompt(allocator, io, prompts, context, config, token, zio_runtime, streamSink(stream)) catch |err| {
+    runPrompt(allocator, io, prompts, context, config, token, task_runtime, streamSink(stream)) catch |err| {
         stream.pipe.sink().abort();
         return err;
     };
@@ -536,7 +536,7 @@ pub fn runPrompt(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     emit: EventSink,
 ) !void {
     var current = try Context.init(allocator, context);
@@ -551,7 +551,7 @@ pub fn runPrompt(
     }
 
     current.owned_tool_results_start = current.messages.items.len;
-    try runLoop(allocator, io, &current, config, token, zio_runtime, emit);
+    try runLoop(allocator, io, &current, config, token, task_runtime, emit);
 }
 
 pub fn runContinue(
@@ -560,7 +560,7 @@ pub fn runContinue(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     emit: EventSink,
 ) !void {
     if (context.messages.len == 0) return error.NoMessages;
@@ -571,7 +571,7 @@ pub fn runContinue(
 
     try emit.emit(.agent_start);
     try emit.emit(.turn_start);
-    try runLoop(allocator, io, &current, config, token, zio_runtime, emit);
+    try runLoop(allocator, io, &current, config, token, task_runtime, emit);
 }
 
 fn runLoop(
@@ -580,7 +580,7 @@ fn runLoop(
     current: *Context,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     emit: EventSink,
 ) !void {
     var first_turn = true;
@@ -620,7 +620,7 @@ fn runLoop(
                 current,
                 config,
                 token,
-                zio_runtime,
+                task_runtime,
                 emit,
             );
             errdefer if (owned_assistant) |assistant| ai.owned.deinitAssistantMessage(allocator, assistant);
@@ -637,7 +637,7 @@ fn runLoop(
             const tool_results = try tool_runner.Runner.init(
                 allocator,
                 io,
-                zio_runtime,
+                task_runtime,
                 .{
                     .system_prompt = current.system_prompt,
                     .messages = current.messages.items,
@@ -705,7 +705,7 @@ fn streamAssistantResponse(
     current: *Context,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    zio_runtime: *runtime.Runtime,
+    _: *runtime.Runtime,
     emit: EventSink,
 ) !ai.AssistantMessage {
     const agent_messages = if (config.transform_context) |hook|
@@ -736,7 +736,6 @@ fn streamAssistantResponse(
     var stream = config.stream.call(.{
         .allocator = response_arena.allocator(),
         .io = io,
-        .zio_runtime = zio_runtime,
         .model = config.model,
         .context = .{
             .system_prompt = current.system_prompt,
@@ -1130,8 +1129,8 @@ fn toolTextResult(allocator: std.mem.Allocator, text: []const u8) !agent.ToolExe
 }
 
 test "run prompt emits prompt assistant and agent end events" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1150,7 +1149,7 @@ test "run prompt emits prompt assistant and agent end events" {
             .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
         },
         cancel.token(),
-        zio_runtime,
+        task_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1159,8 +1158,8 @@ test "run prompt emits prompt assistant and agent end events" {
 }
 
 test "prompt stream exposes events and terminal messages through event pipe" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
@@ -1170,7 +1169,7 @@ test "prompt stream exposes events and terminal messages through event pipe" {
     startPromptStream(
         &stream,
         std.testing.allocator,
-        zio_runtime,
+        task_runtime,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
         .{
@@ -1192,8 +1191,8 @@ test "prompt stream exposes events and terminal messages through event pipe" {
 }
 
 test "prompt stream drains many fast deltas through bounded pipe" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
@@ -1203,7 +1202,7 @@ test "prompt stream drains many fast deltas through bounded pipe" {
     startPromptStream(
         &stream,
         std.testing.allocator,
-        zio_runtime,
+        task_runtime,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
         .{
@@ -1227,8 +1226,8 @@ test "prompt stream drains many fast deltas through bounded pipe" {
 }
 
 test "prompt stream closes event pipe when producer fails before terminal event" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
@@ -1238,7 +1237,7 @@ test "prompt stream closes event pipe when producer fails before terminal event"
     startPromptStream(
         &stream,
         std.testing.allocator,
-        zio_runtime,
+        task_runtime,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
         .{
@@ -1257,8 +1256,8 @@ test "prompt stream closes event pipe when producer fails before terminal event"
 }
 
 test "prompt stream cancellation drains producer blocked on bounded event pipe" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
@@ -1268,7 +1267,7 @@ test "prompt stream cancellation drains producer blocked on bounded event pipe" 
     startPromptStream(
         &stream,
         std.testing.allocator,
-        zio_runtime,
+        task_runtime,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
         .{
@@ -1288,8 +1287,8 @@ test "prompt stream cancellation drains producer blocked on bounded event pipe" 
 }
 
 test "prompt stream cancellation while tool is running drains as canceled" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
@@ -1308,7 +1307,7 @@ test "prompt stream cancellation while tool is running drains as canceled" {
     startPromptStream(
         &stream,
         std.testing.allocator,
-        zio_runtime,
+        task_runtime,
         &.{prompt},
         .{ .system_prompt = "", .messages = &.{}, .tools = &.{tool} },
         .{
@@ -1328,9 +1327,9 @@ test "prompt stream cancellation while tool is running drains as canceled" {
 }
 
 test "run prompt executes tool result then continues assistant turn" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1358,7 +1357,7 @@ test "run prompt executes tool result then continues assistant turn" {
             .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
         },
         cancel.token(),
-        zio_runtime,
+        task_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1368,9 +1367,9 @@ test "run prompt executes tool result then continues assistant turn" {
 }
 
 test "parallel tool calls emit bounded live updates through owner" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1399,7 +1398,7 @@ test "parallel tool calls emit bounded live updates through owner" {
             .tool_execution = .parallel,
         },
         cancel.token(),
-        zio_runtime,
+        task_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1413,9 +1412,9 @@ test "parallel tool calls emit bounded live updates through owner" {
 }
 
 test "parallel tool calls cancel and drain workers when owner update drain fails" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1444,7 +1443,7 @@ test "parallel tool calls cancel and drain workers when owner update drain fails
             .tool_execution = .parallel,
         },
         cancel.token(),
-        zio_runtime,
+        task_runtime,
         .{ .context = &events, .call_fn = failOnToolUpdateSink },
     ));
 
@@ -1452,9 +1451,9 @@ test "parallel tool calls cancel and drain workers when owner update drain fails
 }
 
 test "parallel tool calls bound live updates before completing worker result" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1483,7 +1482,7 @@ test "parallel tool calls bound live updates before completing worker result" {
             .tool_execution = .parallel,
         },
         cancel.token(),
-        zio_runtime,
+        task_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1506,9 +1505,9 @@ test "parallel tool calls bound live updates before completing worker result" {
 }
 
 test "parallel tool calls finalize results in assistant source order" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1537,7 +1536,7 @@ test "parallel tool calls finalize results in assistant source order" {
             .tool_execution = .parallel,
         },
         cancel.token(),
-        zio_runtime,
+        task_runtime,
         .{ .context = &events, .call_fn = testSink },
     );
 
@@ -1556,8 +1555,8 @@ test "parallel tool calls finalize results in assistant source order" {
 }
 
 test "run continue rejects assistant tail" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
@@ -1575,7 +1574,7 @@ test "run continue rejects assistant tail" {
             .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
         },
         cancel.token(),
-        zio_runtime,
+        task_runtime,
         .{ .context = &events, .call_fn = testSink },
     ));
 }

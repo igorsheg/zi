@@ -10,7 +10,7 @@ All builtin tools must satisfy these criteria:
 
 - Tool policy stays in `src/coding_agent/tools` or `src/coding_agent/tool_output_policy.zig`.
 - Runtime remains mechanism only: process, cancellation, bounded capture, and drain.
-- TUI remains agent-agnostic. Tool/session mapping lives in `src/coding_agent/interactive.zig`.
+- TUI remains agent-agnostic. Tool/session mapping lives in a frontend adapter outside `src/coding_agent` and `src/tui`.
 - Every resident buffer has a named cap and tested overflow behavior.
 - Operational input errors return actionable tool output or typed tool errors; they do not crash owner loops.
 - Programmer errors fail fast with assertions where appropriate.

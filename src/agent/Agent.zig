@@ -10,7 +10,7 @@ pub const max_listeners = 32;
 
 allocator: std.mem.Allocator,
 io: std.Io,
-zio_runtime: *runtime.Runtime,
+task_runtime: *runtime.Runtime,
 message_arena: std.heap.ArenaAllocator,
 state: agent.AgentState,
 messages: std.ArrayList(agent.AgentMessage) = .empty,
@@ -42,7 +42,7 @@ pub const Options = struct {
     get_api_key: ?agent.GetApiKeyHook = null,
     before_tool_call: ?agent.BeforeToolCallHook = null,
     after_tool_call: ?agent.AfterToolCallHook = null,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
 };
 
 pub const Error = error{
@@ -73,7 +73,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !Agent {
     var self: Agent = .{
         .allocator = allocator,
         .io = io,
-        .zio_runtime = options.zio_runtime,
+        .task_runtime = options.task_runtime,
         .cancel_source = try runtime.CancelSource.init(allocator),
         .message_arena = std.heap.ArenaAllocator.init(allocator),
         .state = .{
@@ -268,7 +268,7 @@ fn runPromptMessages(self: *Agent, messages: []const agent.AgentMessage, skip_in
         self.contextSnapshot(),
         config,
         token,
-        self.zio_runtime,
+        self.task_runtime,
         .{ .context = self, .call_fn = emitFromLoop },
     ) catch |err| {
         try self.recordRunFailure(token, @errorName(err));
@@ -309,7 +309,7 @@ pub fn continueRun(self: *Agent) !void {
         self.contextSnapshot(),
         self.loop_config,
         token,
-        self.zio_runtime,
+        self.task_runtime,
         .{ .context = self, .call_fn = emitFromLoop },
     ) catch |err| {
         try self.recordRunFailure(token, @errorName(err));
@@ -602,25 +602,25 @@ const ListenerProbe = struct {
 };
 
 const TestAgent = struct {
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     agent: Agent,
 
     fn init(options: anytype) !TestAgent {
-        const zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-        errdefer zio_runtime.deinit();
-        var resolved_options: Options = .{ .zio_runtime = zio_runtime };
+        const task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+        errdefer task_runtime.deinit();
+        var resolved_options: Options = .{ .task_runtime = task_runtime };
         inline for (@typeInfo(@TypeOf(options)).@"struct".fields) |field| {
             @field(resolved_options, field.name) = @field(options, field.name);
         }
         return .{
-            .zio_runtime = zio_runtime,
-            .agent = try Agent.init(std.testing.allocator, zio_runtime.io(), resolved_options),
+            .task_runtime = task_runtime,
+            .agent = try Agent.init(std.testing.allocator, task_runtime.io(), resolved_options),
         };
     }
 
     fn deinit(self: *TestAgent) void {
         self.agent.deinit();
-        self.zio_runtime.deinit();
+        self.task_runtime.deinit();
         self.* = undefined;
     }
 };

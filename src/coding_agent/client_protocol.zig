@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const agent_mod = @import("../agent/root.zig");
+const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const session_manager = @import("session_manager.zig");
 
@@ -8,6 +9,10 @@ pub const RequestId = u64;
 
 pub const command_queue_capacity_default = 64;
 pub const event_queue_capacity_default = 256;
+pub const snapshot_history_items_max = 512;
+pub const snapshot_history_item_text_bytes_max = 16 * 1024;
+pub const snapshot_history_total_text_bytes_max = 128 * 1024;
+pub const snapshot_model_text_bytes_max = 256;
 
 pub const CommandQueue = runtime.BoundedQueue(CommandEnvelope);
 pub const EventQueue = runtime.BoundedQueue(EventEnvelope);
@@ -63,6 +68,7 @@ pub const ClientEvent = union(enum) {
     agent_event: OwnedAgentEvent,
     queue_update: QueueUpdate,
     prompt_command: PromptCommand,
+    snapshot: Snapshot,
     compaction_start: CompactionStart,
     session_info_changed: SessionInfoChanged,
     compaction_end: CompactionEnd,
@@ -76,6 +82,7 @@ pub const ClientEvent = union(enum) {
             .agent_event => |*payload| payload.deinit(),
             .queue_update => |*payload| payload.deinit(),
             .prompt_command => |*payload| payload.deinit(),
+            .snapshot => |*payload| payload.deinit(),
             .session_info_changed => |*payload| if (payload.name) |*name| name.deinit(),
             .compaction_end => |*payload| payload.deinit(),
             .auto_retry_start => |*payload| payload.error_message.deinit(),
@@ -104,6 +111,7 @@ pub const ClientEvent = union(enum) {
                 try writeJsonField("message", stringify, payload.message);
                 try stringify.endObject();
             },
+            .snapshot => |payload| try stringify.write(payload),
             .compaction_start => |payload| {
                 try stringify.beginObject();
                 try writeJsonField("type", stringify, "compaction_start");
@@ -172,7 +180,6 @@ pub const Response = union(enum) {
     prompt_finished,
     canceled,
     queue_cleared,
-    snapshot_sent,
     shutdown_started,
 };
 
@@ -352,6 +359,202 @@ pub const EventOverflow = struct {
     dropped_count: usize,
 };
 
+pub const Snapshot = struct {
+    header: SessionHeaderSnapshot,
+    model: ModelSnapshot,
+    queue: QueueSnapshot,
+    active_request_id: ?RequestId,
+    history: HistorySnapshot,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        header: session_manager.SessionHeader,
+        model: ai.Model,
+        queue: QueueSnapshot,
+        active_request_id: ?RequestId,
+        history_items: []const HistorySnapshotItem.Source,
+    ) !Snapshot {
+        var owned_header = try SessionHeaderSnapshot.init(allocator, header);
+        errdefer owned_header.deinit();
+        var owned_model = try ModelSnapshot.init(allocator, model);
+        errdefer owned_model.deinit();
+        var owned_history = try HistorySnapshot.init(allocator, history_items);
+        errdefer owned_history.deinit();
+        return .{
+            .header = owned_header,
+            .model = owned_model,
+            .queue = queue,
+            .active_request_id = active_request_id,
+            .history = owned_history,
+        };
+    }
+
+    pub fn deinit(self: *Snapshot) void {
+        self.header.deinit();
+        self.model.deinit();
+        self.queue.deinit();
+        self.history.deinit();
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: Snapshot, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("type", stringify, "snapshot");
+        try writeJsonField("header", stringify, self.header);
+        try writeJsonField("model", stringify, self.model);
+        try writeJsonField("queue", stringify, self.queue);
+        if (self.active_request_id) |id| try writeJsonField("activeRequestId", stringify, id);
+        try writeJsonField("history", stringify, self.history);
+        try stringify.endObject();
+    }
+};
+
+pub const SessionHeaderSnapshot = struct {
+    id: EventText,
+    timestamp: EventText,
+    cwd: EventText,
+    parent_session: ?EventText = null,
+    version: u32,
+
+    pub fn init(allocator: std.mem.Allocator, header: session_manager.SessionHeader) !SessionHeaderSnapshot {
+        var id = try EventText.init(allocator, header.id);
+        errdefer id.deinit();
+        var timestamp = try EventText.init(allocator, header.timestamp);
+        errdefer timestamp.deinit();
+        var cwd = try EventText.init(allocator, header.cwd);
+        errdefer cwd.deinit();
+        var parent_session: ?EventText = if (header.parent_session) |parent|
+            try EventText.init(allocator, parent)
+        else
+            null;
+        errdefer if (parent_session) |*parent| parent.deinit();
+        return .{
+            .id = id,
+            .timestamp = timestamp,
+            .cwd = cwd,
+            .parent_session = parent_session,
+            .version = header.version,
+        };
+    }
+
+    pub fn deinit(self: *SessionHeaderSnapshot) void {
+        self.id.deinit();
+        self.timestamp.deinit();
+        self.cwd.deinit();
+        if (self.parent_session) |*parent| parent.deinit();
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: SessionHeaderSnapshot, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("version", stringify, self.version);
+        try writeJsonField("id", stringify, self.id);
+        try writeJsonField("timestamp", stringify, self.timestamp);
+        try writeJsonField("cwd", stringify, self.cwd);
+        if (self.parent_session) |parent| try writeJsonField("parentSession", stringify, parent);
+        try stringify.endObject();
+    }
+};
+
+pub const ModelSnapshot = struct {
+    provider: EventText,
+    id: EventText,
+
+    pub fn init(allocator: std.mem.Allocator, model: ai.Model) !ModelSnapshot {
+        var provider = try EventText.init(allocator, utf8Prefix(model.provider, snapshot_model_text_bytes_max));
+        errdefer provider.deinit();
+        var id = try EventText.init(allocator, utf8Prefix(model.id, snapshot_model_text_bytes_max));
+        errdefer id.deinit();
+        return .{ .provider = provider, .id = id };
+    }
+
+    pub fn deinit(self: *ModelSnapshot) void {
+        self.provider.deinit();
+        self.id.deinit();
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: ModelSnapshot, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("provider", stringify, self.provider);
+        try writeJsonField("id", stringify, self.id);
+        try stringify.endObject();
+    }
+};
+
+pub const HistorySnapshot = struct {
+    items: []HistorySnapshotItem,
+    allocator: std.mem.Allocator,
+    dropped_items: usize = 0,
+    dropped_text_bytes: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, source: []const HistorySnapshotItem.Source) !HistorySnapshot {
+        const keep_count = @min(source.len, snapshot_history_items_max);
+        const dropped_items = source.len - keep_count;
+        const start = source.len - keep_count;
+        var items = try allocator.alloc(HistorySnapshotItem, keep_count);
+        errdefer allocator.free(items);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| item.deinit();
+        }
+        var total_text_bytes: usize = 0;
+        var dropped_text_bytes: usize = 0;
+        for (source[start..]) |item| {
+            const text = utf8Prefix(item.text, snapshot_history_item_text_bytes_max);
+            dropped_text_bytes += item.text.len - text.len;
+            if (total_text_bytes + text.len > snapshot_history_total_text_bytes_max) {
+                dropped_text_bytes += text.len;
+                continue;
+            }
+            items[initialized] = try HistorySnapshotItem.init(allocator, item.role, text);
+            initialized += 1;
+            total_text_bytes += text.len;
+        }
+        return .{
+            .items = try allocator.realloc(items, initialized),
+            .allocator = allocator,
+            .dropped_items = dropped_items + (keep_count - initialized),
+            .dropped_text_bytes = dropped_text_bytes,
+        };
+    }
+
+    pub fn deinit(self: *HistorySnapshot) void {
+        for (self.items) |*item| item.deinit();
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: HistorySnapshot, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("items", stringify, self.items);
+        try writeJsonField("droppedItems", stringify, self.dropped_items);
+        try writeJsonField("droppedTextBytes", stringify, self.dropped_text_bytes);
+        try stringify.endObject();
+    }
+};
+
+pub const HistorySnapshotItem = struct {
+    role: Role,
+    text: EventText,
+
+    pub const Source = struct {
+        role: Role,
+        text: []const u8,
+    };
+
+    pub const Role = enum { user, assistant, system };
+
+    pub fn init(allocator: std.mem.Allocator, role: Role, text: []const u8) !HistorySnapshotItem {
+        return .{ .role = role, .text = try EventText.init(allocator, text) };
+    }
+
+    pub fn deinit(self: *HistorySnapshotItem) void {
+        self.text.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const QueueSnapshot = struct {
     revision: u64,
     steering: EventTextList,
@@ -362,7 +565,22 @@ pub const QueueSnapshot = struct {
         self.follow_up.deinit();
         self.* = undefined;
     }
+
+    pub fn jsonStringify(self: QueueSnapshot, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("revision", stringify, self.revision);
+        try writeJsonField("steering", stringify, self.steering);
+        try writeJsonField("followUp", stringify, self.follow_up);
+        try stringify.endObject();
+    }
 };
+
+fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
+    if (value.len <= max_bytes) return value;
+    var end = max_bytes;
+    while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return value[0..end];
+}
 
 fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, value: anytype) !void {
     try stringify.objectField(name);
@@ -384,6 +602,30 @@ test "event envelope deinitializes owned client event" {
         .message = try EventText.init(std.testing.allocator, "ok"),
     } } };
     event.deinit(std.testing.allocator);
+}
+
+test "history snapshot caps item count" {
+    var source: [snapshot_history_items_max + 1]HistorySnapshotItem.Source = undefined;
+    for (&source, 0..) |*item, index| {
+        item.* = .{ .role = .user, .text = if (index == 0) "drop" else "keep" };
+    }
+
+    var snapshot = try HistorySnapshot.init(std.testing.allocator, &source);
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(@as(usize, snapshot_history_items_max), snapshot.items.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.dropped_items);
+    try std.testing.expectEqualStrings("keep", snapshot.items[0].text.text);
+}
+
+test "history snapshot caps text bytes and reports truncation" {
+    const oversized = "a" ** (snapshot_history_item_text_bytes_max + 4);
+    var snapshot = try HistorySnapshot.init(std.testing.allocator, &.{.{ .role = .assistant, .text = oversized }});
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
+    try std.testing.expectEqual(@as(usize, 4), snapshot.dropped_text_bytes);
+    try std.testing.expectEqual(@as(usize, snapshot_history_item_text_bytes_max), snapshot.items[0].text.text.len);
 }
 
 test "prompt command event serializes public shape" {

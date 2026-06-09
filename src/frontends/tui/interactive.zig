@@ -1,11 +1,11 @@
 const std = @import("std");
-const runtime = @import("../runtime/root.zig");
-const agent_mod = @import("../agent/root.zig");
-const ai = @import("../ai/root.zig");
-const tui = @import("../tui/root.zig");
-const client_protocol = @import("client_protocol.zig");
-const session_listing = @import("session_listing.zig");
-const session_runtime = @import("session_runtime.zig");
+const runtime = @import("../../runtime/root.zig");
+const agent_mod = @import("../../agent/root.zig");
+const ai = @import("../../ai/root.zig");
+const tui = @import("../../tui/root.zig");
+const client_protocol = @import("../../coding_agent/client_protocol.zig");
+const session_listing = @import("../../coding_agent/session_listing.zig");
+const session_runtime = @import("../../coding_agent/session_runtime.zig");
 
 const Options = struct {
     cwd: []const u8 = ".",
@@ -358,7 +358,7 @@ fn transcriptAppendFromEvent(event: client_protocol.ClientEvent) ?TranscriptInge
         else
             null,
         .event_overflow => .{ .append = statusAppend(.warning, "public event overflow") },
-        .queue_update, .session_info_changed => null,
+        .queue_update, .session_info_changed, .snapshot => null,
         .rejected, .response => null,
     };
 }
@@ -572,19 +572,42 @@ const InteractiveLoop = struct {
     }
 
     fn restoreQueuedMessagesToComposer(self: *InteractiveLoop) !void {
-        var snapshot = try self.app.queuedMessagesSnapshot(self.process.gpa);
-        defer snapshot.deinit();
-        if (snapshot.steering.items.len == 0 and snapshot.follow_up.items.len == 0) return;
-        var buffer: [tui.product.composer.buffer_size_bytes_max]u8 = undefined;
-        const draft = self.terminal_loop.product.app.composer.text();
-        const text = queuedMessagesAndDraftText(&snapshot, draft, &buffer) orelse {
-            try self.app.dropQueuedMessages();
-            try self.appendOperationalStatus("queued messages too large to restore");
-            return;
-        };
-        try self.app.dropQueuedMessages();
-        _ = try self.terminal_loop.applyCommand(.clear_composer);
-        _ = try self.terminal_loop.applyCommand(.{ .insert_composer_text = text });
+        try self.submitSnapshotRequest();
+        while (self.app.drainEvent()) |event| {
+            var owned_event = event;
+            defer owned_event.deinit(self.app.allocator);
+            switch (owned_event.event) {
+                .snapshot => |snapshot| {
+                    const queue = snapshot.queue;
+                    if (queue.steering.items.len == 0 and queue.follow_up.items.len == 0) return;
+                    var buffer: [tui.product.composer.buffer_size_bytes_max]u8 = undefined;
+                    const draft = self.terminal_loop.product.app.composer.text();
+                    const text = queuedMessagesAndDraftText(&queue, draft, &buffer) orelse {
+                        try self.clearQueuedMessages();
+                        try self.appendOperationalStatus("queued messages too large to restore");
+                        return;
+                    };
+                    try self.clearQueuedMessages();
+                    _ = try self.terminal_loop.applyCommand(.clear_composer);
+                    _ = try self.terminal_loop.applyCommand(.{ .insert_composer_text = text });
+                    return;
+                },
+                else => {
+                    try self.applyClientEventStatus(owned_event.event);
+                    try self.applyClientEventTranscript(owned_event.event);
+                },
+            }
+        }
+    }
+
+    fn submitSnapshotRequest(self: *InteractiveLoop) !void {
+        try self.app.submit(.{ .command = .request_snapshot });
+        try self.app.step();
+    }
+
+    fn clearQueuedMessages(self: *InteractiveLoop) !void {
+        try self.app.submit(.{ .command = .clear_queue });
+        try self.app.step();
     }
 
     fn requestShutdown(self: *InteractiveLoop) void {
@@ -872,22 +895,6 @@ const InteractiveLoop = struct {
         if (append != .tool) return append;
         var next = append;
         const tool = &next.tool;
-        if (self.tool_metadata_lookup_enabled) {
-            if (self.app.findToolDefinition(tool.name)) |definition| {
-                tool.presentation = switch (definition.metadata.display.presentation) {
-                    .generic => .generic,
-                    .command => .command,
-                    .file => .file,
-                    .patch => .patch,
-                    .search => .search,
-                    .directory => .directory,
-                };
-                tool.body_mode = switch (definition.metadata.display.body_mode) {
-                    .visible => .visible,
-                    .hidden_on_success => .hidden_on_success,
-                };
-            }
-        }
         if (tool.tool_call_id.len > pending_tool_id_bytes_max) return next;
         if (tool.title.len > 0) {
             self.rememberToolTitle(tool.tool_call_id, tool.title);
@@ -987,6 +994,42 @@ const InteractiveLoop = struct {
         };
     }
 
+    fn seedFromSnapshot(self: *InteractiveLoop) !void {
+        try self.submitSnapshotRequest();
+        while (self.app.drainEvent()) |event| {
+            var owned_event = event;
+            defer owned_event.deinit(self.app.allocator);
+            switch (owned_event.event) {
+                .snapshot => |snapshot| {
+                    try self.applySnapshot(snapshot);
+                    return;
+                },
+                else => {
+                    try self.applyClientEventStatus(owned_event.event);
+                    try self.applyClientEventTranscript(owned_event.event);
+                },
+            }
+        }
+        return error.SnapshotUnavailable;
+    }
+
+    fn applySnapshot(self: *InteractiveLoop, snapshot: client_protocol.Snapshot) !void {
+        var model_text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
+        const model_text = modelComposerSlotText(
+            snapshot.model.provider.text,
+            snapshot.model.id.text,
+            &model_text_buffer,
+        );
+        _ = try self.terminal_loop.applyCommand(.{ .set_slot_contribution = .{
+            .slot = .composer_top_right,
+            .id = model_slot_id,
+            .priority = 100,
+            .text = model_text,
+            .effect = .none,
+        } });
+        try seedTranscriptFromSnapshot(self.terminal_loop, snapshot.history.items);
+    }
+
     fn shutdown(self: *InteractiveLoop) void {
         if (!self.cancel_requested) {
             self.app.submit(.{ .command = .shutdown }) catch {};
@@ -1039,7 +1082,6 @@ pub fn run(
             .session_file_name = session_file,
             .dir = options.dir,
             .environ = options.environ,
-            .zio_runtime = process.zio_runtime,
         });
     } else blk: {
         const session_id = try std.fmt.allocPrint(process.gpa, "interactive-{d}", .{timestamp});
@@ -1052,7 +1094,6 @@ pub fn run(
             .timestamp = timestamp_text,
             .dir = options.dir,
             .environ = options.environ,
-            .zio_runtime = process.zio_runtime,
         });
     };
     defer host_handle.deinit();
@@ -1084,18 +1125,7 @@ pub fn run(
     };
     defer loop.shutdown();
 
-    var model_text_buffer: [tui.product.slots.contribution_text_bytes_max]u8 = undefined;
-    const model_text = modelComposerSlotText(host_handle.model(), &model_text_buffer);
-    _ = try terminal_loop.applyCommand(.{ .set_slot_contribution = .{
-        .slot = .composer_top_right,
-        .id = model_slot_id,
-        .priority = 100,
-        .text = model_text,
-        .effect = .none,
-    } });
-    var history_snapshot = try host_handle.buildHistorySnapshot(process.gpa);
-    defer history_snapshot.deinit(process.gpa);
-    try seedTranscriptFromSnapshot(&terminal_loop, history_snapshot.items);
+    try loop.seedFromSnapshot();
     if (options.initial_prompt) |prompt| {
         _ = try loop.startPrompt(prompt);
     }
@@ -1106,8 +1136,8 @@ pub fn run(
     while (terminal_loop.isRunning()) try loop.tick();
 }
 
-fn modelComposerSlotText(model: ai.Model, buffer: []u8) []const u8 {
-    return std.fmt.bufPrint(buffer, "model: {s}/{s}", .{ model.provider, model.id }) catch blk: {
+fn modelComposerSlotText(provider: []const u8, model_id: []const u8, buffer: []u8) []const u8 {
+    return std.fmt.bufPrint(buffer, "model: {s}/{s}", .{ provider, model_id }) catch blk: {
         if (buffer.len == 0) break :blk "";
         const prefix = "model: ";
         var len: usize = 0;
@@ -1115,7 +1145,7 @@ fn modelComposerSlotText(model: ai.Model, buffer: []u8) []const u8 {
         @memcpy(buffer[0..prefix_len], prefix[0..prefix_len]);
         len += prefix_len;
         if (len < buffer.len) {
-            const id = utf8Prefix(model.id, buffer.len - len);
+            const id = utf8Prefix(model_id, buffer.len - len);
             @memcpy(buffer[len..][0..id.len], id);
             len += id.len;
         }
@@ -1135,11 +1165,18 @@ fn seedTranscriptFromSnapshot(
                     .assistant => .assistant,
                     .system => .system,
                 },
-                item.text,
+                snapshotItemText(item),
                 .new_item,
             ),
         });
     }
+}
+
+fn snapshotItemText(item: anytype) []const u8 {
+    return switch (@TypeOf(item.text)) {
+        client_protocol.EventText => item.text.text,
+        else => item.text,
+    };
 }
 
 test "interactive queued text restore joins steering follow-up and draft" {
@@ -1251,7 +1288,7 @@ test "interactive confirm bridge ignores stale result ids" {
 test "interactive model composer slot text is bounded" {
     var buffer: [32]u8 = undefined;
     const model = agent_mod.Agent.defaultModel();
-    const text = modelComposerSlotText(model, &buffer);
+    const text = modelComposerSlotText(model.provider, model.id, &buffer);
     try std.testing.expect(text.len <= buffer.len);
     try std.testing.expect(std.mem.startsWith(u8, text, "model: "));
 }

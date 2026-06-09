@@ -223,14 +223,14 @@ test "write tool creates parent directories and writes content" {
     try object.put(std.testing.allocator, "path", .{ .string = "dir/file.txt" });
     try object.put(std.testing.allocator, "content", .{ .string = "hello" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &write_tool,
         cancel_source.token(),
         "call-1",
@@ -286,16 +286,16 @@ test "write tool streams utf8 safe content chunks" {
     try object.put(std.testing.allocator, "path", .{ .string = "streamed.txt" });
     try object.put(std.testing.allocator, "content", .{ .string = content });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var capture: WriteUpdateCapture = .{ .writer = .init(std.testing.allocator) };
     defer capture.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &write_tool,
         cancel_source.token(),
         "call-1",
@@ -326,14 +326,14 @@ test "write tool rejects oversized content" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "content", .{ .string = "hello" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &write_tool,
         cancel_source.token(),
         "call-1",

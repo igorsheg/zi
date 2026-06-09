@@ -470,14 +470,14 @@ test "read tool reads bounded text with offset and limit" {
     try object.put(std.testing.allocator, "offset", .{ .integer = 2 });
     try object.put(std.testing.allocator, "limit", .{ .integer = 2 });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &read_tool,
         cancel_source.token(),
         "call-1",
@@ -516,14 +516,14 @@ test "read tool omits invalid utf8 text operationally" {
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "path", .{ .string = "binary.dat" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &read_tool,
         cancel_source.token(),
         "call-invalid-utf8",
@@ -555,14 +555,14 @@ test "read tool returns image attachment for supported image file" {
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "path", .{ .string = "image.png" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &read_tool,
         cancel_source.token(),
         "call-image",
@@ -634,14 +634,14 @@ test "read full untruncated file has no details" {
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &read_tool,
         cancel_source.token(),
         "call-full",
@@ -727,14 +727,14 @@ test "read tool reports offset beyond end operationally" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "offset", .{ .integer = 3 });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &read_tool,
         cancel_source.token(),
         "call-1",

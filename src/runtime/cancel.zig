@@ -1,10 +1,10 @@
 const std = @import("std");
-const zio = @import("zio");
-const Runtime = zio.Runtime;
+const async_runtime = @import("Runtime.zig");
+const Runtime = async_runtime.Runtime;
 
 pub const CancelSource = struct {
     const WakeStorage = struct {
-        event: zio.ResetEvent = .init,
+        event: async_runtime.ResetEvent = .init,
     };
 
     requested: std.atomic.Value(bool) = .init(false),
@@ -53,7 +53,7 @@ pub const CancelToken = struct {
     requested: *const std.atomic.Value(bool),
     generation: *const std.atomic.Value(u64),
     generation_value: u64,
-    wake_event: *zio.ResetEvent,
+    wake_event: *async_runtime.ResetEvent,
 
     pub fn isRequested(self: CancelToken) bool {
         if (self.generation.load(.acquire) != self.generation_value) return true;
@@ -74,17 +74,17 @@ pub const CancelToken = struct {
 };
 
 pub fn sleepUntilCancel(
-    zio_runtime: *Runtime,
+    io: std.Io,
     duration: std.Io.Duration,
     token: ?CancelToken,
 ) error{ OperationCancelled, Canceled }!void {
     if (token == null) {
-        try zio_runtime.sleep(toZioDuration(duration));
+        try io.sleep(duration, .awake);
         return;
     }
     const cancel_token = token.?;
     try cancel_token.throwIfRequested();
-    cancel_token.wake_event.timedWait(toZioTimeout(duration)) catch |err| switch (err) {
+    cancel_token.wake_event.timedWait(toTimeout(duration)) catch |err| switch (err) {
         error.Timeout => {
             try cancel_token.throwIfRequested();
             return;
@@ -94,13 +94,7 @@ pub fn sleepUntilCancel(
     return error.OperationCancelled;
 }
 
-fn toZioTimeout(duration: std.Io.Duration) zio.Timeout {
-    const nanoseconds = duration.toNanoseconds();
-    std.debug.assert(nanoseconds >= 0);
-    return .fromNanoseconds(std.math.cast(u64, nanoseconds) orelse std.math.maxInt(u64));
-}
-
-fn toZioDuration(duration: std.Io.Duration) zio.Duration {
+fn toTimeout(duration: std.Io.Duration) async_runtime.Timeout {
     const nanoseconds = duration.toNanoseconds();
     std.debug.assert(nanoseconds >= 0);
     return .fromNanoseconds(std.math.cast(u64, nanoseconds) orelse std.math.maxInt(u64));
@@ -124,12 +118,12 @@ test "cancel source owns mutation and token only observes" {
 }
 
 test "cancel token wait wakes without sleep polling" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var source = try CancelSource.init(std.testing.allocator);
     defer source.deinit();
     const token = source.token();
-    var future = try zio_runtime.spawn(waitForCancelWake, .{token});
+    var future = try task_runtime.spawn(waitForCancelWake, .{token});
     defer future.cancel();
 
     source.request();
@@ -138,14 +132,14 @@ test "cancel token wait wakes without sleep polling" {
 }
 
 test "cancel request wakes all current waiters" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var source = try CancelSource.init(std.testing.allocator);
     defer source.deinit();
     const token = source.token();
-    var first = try zio_runtime.spawn(waitForCancelWake, .{token});
+    var first = try task_runtime.spawn(waitForCancelWake, .{token});
     defer first.cancel();
-    var second = try zio_runtime.spawn(waitForCancelWake, .{token});
+    var second = try task_runtime.spawn(waitForCancelWake, .{token});
     defer second.cancel();
 
     source.request();
@@ -155,8 +149,8 @@ test "cancel request wakes all current waiters" {
 }
 
 test "cancel source reopens wake channel after owner drain" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var source = try CancelSource.init(std.testing.allocator);
     defer source.deinit();
     const first = source.token();
@@ -167,20 +161,20 @@ test "cancel source reopens wake channel after owner drain" {
     try std.testing.expect(first.isRequested());
     try std.testing.expect(!second.isRequested());
 
-    var future = try zio_runtime.spawn(waitForCancelWake, .{second});
+    var future = try task_runtime.spawn(waitForCancelWake, .{second});
     defer future.cancel();
     source.request();
     try std.testing.expectError(error.OperationCancelled, future.join());
 }
 
 test "cancel source can move after init without invalidating token wake storage" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const source = try CancelSource.init(std.testing.allocator);
     var moved = source;
     defer moved.deinit();
     const token = moved.token();
-    var future = try zio_runtime.spawn(waitForCancelWake, .{token});
+    var future = try task_runtime.spawn(waitForCancelWake, .{token});
     defer future.cancel();
 
     moved.request();
@@ -189,36 +183,36 @@ test "cancel source can move after init without invalidating token wake storage"
 }
 
 test "sleep returns immediately when token is already canceled" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var source = try CancelSource.init(std.testing.allocator);
     defer source.deinit();
     source.request();
 
     try std.testing.expectError(
         error.OperationCancelled,
-        sleepUntilCancel(zio_runtime, .fromSeconds(60), source.token()),
+        sleepUntilCancel(task_runtime.io(), .fromSeconds(60), source.token()),
     );
 }
 
 const SleepWorkerState = struct {
-    zio_runtime: *Runtime,
+    io: std.Io,
     source: *CancelSource,
-    entered: zio.ResetEvent = .init,
+    entered: async_runtime.ResetEvent = .init,
 };
 
 fn cancelableSleepWorker(state: *SleepWorkerState) !void {
     state.entered.set();
-    try sleepUntilCancel(state.zio_runtime, .fromSeconds(60), state.source.token());
+    try sleepUntilCancel(state.io, .fromSeconds(60), state.source.token());
 }
 
 test "sleep observes cancellation during retry delay" {
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var source = try CancelSource.init(std.testing.allocator);
     defer source.deinit();
-    var state: SleepWorkerState = .{ .zio_runtime = zio_runtime, .source = &source };
-    var future = try zio_runtime.spawn(cancelableSleepWorker, .{&state});
+    var state: SleepWorkerState = .{ .io = task_runtime.io(), .source = &source };
+    var future = try task_runtime.spawn(cancelableSleepWorker, .{&state});
     defer future.cancel();
 
     try state.entered.wait();

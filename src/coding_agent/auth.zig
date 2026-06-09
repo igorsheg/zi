@@ -202,11 +202,11 @@ pub const AuthManager = struct {
     pub fn loginOAuth(
         self: *AuthManager,
         io: std.Io,
-        zio_runtime: *runtime.Runtime,
+        task_runtime: *runtime.Runtime,
         provider: ai.OAuthProviderInterface,
         callbacks: ai.OAuthLoginCallbacks,
     ) !void {
-        var credentials = try provider.login(self.store.allocator, io, zio_runtime, callbacks);
+        var credentials = try provider.login(self.store.allocator, io, task_runtime, callbacks);
         defer deinitOAuthCredentials(self.store.allocator, &credentials);
         try self.setOAuthCredentials(io, provider.id, credentials);
     }
@@ -480,8 +480,8 @@ test "auth manager removes stored credentials" {
 }
 
 test "auth manager logs in through oauth provider and persists credentials" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var calls: OAuthLoginCalls = .{};
@@ -499,7 +499,7 @@ test "auth manager logs in through oauth provider and persists credentials" {
     });
     defer auth.deinit();
 
-    try auth.loginOAuth(zio_runtime.io(), zio_runtime, provider, .{
+    try auth.loginOAuth(task_runtime.io(), task_runtime, provider, .{
         .context = &calls,
         .on_auth_fn = testOnOAuthAuth,
         .on_prompt_fn = testOnOAuthPrompt,

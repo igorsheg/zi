@@ -510,14 +510,14 @@ test "edit tool applies multiple exact replacements against original content" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "edits", .{ .array = edits });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &edit_tool,
         cancel_source.token(),
         "call-1",
@@ -605,14 +605,14 @@ test "edit tool reports no-op replacement without writing" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "edits", .{ .array = edits });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &edit_tool,
         cancel_source.token(),
         "call-no-op",
@@ -655,16 +655,16 @@ test "edit tool streams utf8 safe edited content chunks" {
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
     try object.put(std.testing.allocator, "edits", .{ .array = edits });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var capture: EditUpdateCapture = .{ .writer = .init(std.testing.allocator) };
     defer capture.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &edit_tool,
         cancel_source.token(),
         "call-1",

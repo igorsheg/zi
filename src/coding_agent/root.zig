@@ -1,12 +1,9 @@
 const AgentSession = @import("AgentSession.zig");
 const auth = @import("auth.zig");
 const auth_mode = @import("auth_mode.zig");
-pub const cli = @import("cli/root.zig");
 const event_drain = @import("event_drain.zig");
-const interactive = @import("interactive.zig");
 const message_policy = @import("message_policy.zig");
 const paths = @import("paths.zig");
-const print_mode = @import("print_mode.zig");
 const queue_mirror = @import("queue_mirror.zig");
 const runtime_services = @import("runtime_services.zig");
 const client_protocol = @import("client_protocol.zig");
@@ -22,17 +19,15 @@ const system_prompt = @import("system_prompt.zig");
 const tool_registry = @import("tool_registry.zig");
 const tool_output_policy = @import("tool_output_policy.zig");
 const tools = @import("tools/root.zig");
+const wire_protocol = @import("wire_protocol.zig");
 
 test {
     _ = AgentSession;
     _ = auth;
     _ = auth_mode;
-    _ = cli;
     _ = event_drain;
-    _ = interactive;
     _ = message_policy;
     _ = paths;
-    _ = print_mode;
     _ = queue_mirror;
     _ = resources;
     _ = runtime_services;
@@ -48,4 +43,5 @@ test {
     _ = tool_registry;
     _ = tool_output_policy;
     _ = tools;
+    _ = wire_protocol;
 }

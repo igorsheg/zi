@@ -12,6 +12,36 @@ const session_history_snapshot = @import("session_history_snapshot.zig");
 const settings_mod = @import("settings.zig");
 const tool_registry = @import("tool_registry.zig");
 
+const CommonOptions = struct {
+    cwd: []const u8 = ".",
+    agent_dir_override: ?[]const u8 = null,
+    current_date: []const u8,
+    model: ?ai.Model = null,
+    thinking_level: ?agent_mod.ThinkingLevel = null,
+    stream: ?ai.StreamFunction = null,
+    dir: std.Io.Dir = .cwd(),
+    environ: ?*const std.process.Environ.Map = null,
+    task_runtime: ?*runtime.Runtime = null,
+    allow_paths_outside_cwd: bool = true,
+    public_event_capacity: usize = AgentSession.public_event_capacity_default,
+    command_capacity: usize = client_protocol.command_queue_capacity_default,
+    event_capacity: usize = client_protocol.event_queue_capacity_default,
+};
+
+const OpenSessionCreate = struct {
+    session_id: []const u8,
+    timestamp: []const u8,
+};
+
+const OpenSessionResume = struct {
+    session_file_name: []const u8,
+};
+
+const OpenSession = union(enum) {
+    create: OpenSessionCreate,
+    resume_existing: OpenSessionResume,
+};
+
 const CreateOptions = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
@@ -23,7 +53,7 @@ const CreateOptions = struct {
     stream: ?ai.StreamFunction = null,
     dir: std.Io.Dir = .cwd(),
     environ: ?*const std.process.Environ.Map = null,
-    zio_runtime: ?*runtime.Runtime = null,
+    task_runtime: ?*runtime.Runtime = null,
     allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
     command_capacity: usize = client_protocol.command_queue_capacity_default,
@@ -40,7 +70,7 @@ const ResumeOptions = struct {
     stream: ?ai.StreamFunction = null,
     dir: std.Io.Dir = .cwd(),
     environ: ?*const std.process.Environ.Map = null,
-    zio_runtime: ?*runtime.Runtime = null,
+    task_runtime: ?*runtime.Runtime = null,
     allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = AgentSession.public_event_capacity_default,
     command_capacity: usize = client_protocol.command_queue_capacity_default,
@@ -49,7 +79,7 @@ const ResumeOptions = struct {
 
 pub const WakeResult = enum { input, session, frame };
 
-pub const SessionRuntime = struct {
+pub const AgentSessionRuntimeHost = struct {
     allocator: std.mem.Allocator,
     services: RuntimeServices,
     session: AgentSession,
@@ -58,54 +88,55 @@ pub const SessionRuntime = struct {
     commands: client_protocol.CommandQueue,
     events: client_protocol.EventQueue,
     wake_event: runtime.ResetEvent = .init,
-    active_run: ?*AgentSession.RuntimeAccess.PromptRun = null,
+    active_run: ?*AgentSession.PromptRun = null,
     active_request_id: ?client_protocol.RequestId = null,
     active_prompt_text: ?[]u8 = null,
     active_overflow_count_before: usize = 0,
+    pending_event: ?client_protocol.EventEnvelope = null,
 
-    pub fn submit(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
+    pub fn submit(self: *AgentSessionRuntimeHost, envelope: client_protocol.CommandEnvelope) !void {
         try self.commands.push(envelope);
         self.wake_event.set();
     }
 
-    pub fn drainEvent(self: *SessionRuntime) ?client_protocol.EventEnvelope {
+    pub fn drainEvent(self: *AgentSessionRuntimeHost) ?client_protocol.EventEnvelope {
         return self.events.pop();
     }
 
-    pub fn wake(self: *SessionRuntime) *runtime.ResetEvent {
+    pub fn wake(self: *AgentSessionRuntimeHost) *runtime.ResetEvent {
         return &self.wake_event;
     }
 
-    pub fn sessionHeader(self: *const SessionRuntime) session_manager.SessionHeader {
+    pub fn sessionHeader(self: *const AgentSessionRuntimeHost) session_manager.SessionHeader {
         return self.session.manager.header;
     }
 
-    pub fn model(self: *const SessionRuntime) ai.Model {
+    pub fn model(self: *const AgentSessionRuntimeHost) ai.Model {
         return self.session.agent.state.model;
     }
 
-    pub fn buildHistorySnapshot(self: *const SessionRuntime, allocator: std.mem.Allocator) !session_history_snapshot.Snapshot {
+    pub fn buildHistorySnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !session_history_snapshot.Snapshot {
         return session_history_snapshot.build(allocator, self.session.manager);
     }
 
-    pub fn findToolDefinition(self: *const SessionRuntime, name: []const u8) ?tool_registry.ToolDefinition {
+    pub fn findToolDefinition(self: *const AgentSessionRuntimeHost, name: []const u8) ?tool_registry.ToolDefinition {
         return self.session.tools.findDefinition(name);
     }
 
-    pub fn queuedMessagesSnapshot(self: *const SessionRuntime, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
-        return AgentSession.RuntimeAccess.queueSnapshot(&self.session, allocator);
+    pub fn queuedMessagesSnapshot(self: *const AgentSessionRuntimeHost, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
+        return self.session.queueSnapshot(allocator);
     }
 
-    pub fn dropQueuedMessages(self: *SessionRuntime) !void {
-        try AgentSession.RuntimeAccess.clearQueue(&self.session);
+    pub fn dropQueuedMessages(self: *AgentSessionRuntimeHost) !void {
+        try self.session.clearQueue();
         try self.drainSessionEvents(null);
     }
 
-    pub fn waitForWake(self: *SessionRuntime, input_fd: std.posix.fd_t, frame_ms: u64) !WakeResult {
+    pub fn waitForWake(self: *AgentSessionRuntimeHost, input_fd: std.posix.fd_t, frame_ms: u64) !WakeResult {
         const readable = runtime.ReadableFd.initBorrowed(input_fd);
         var input = readable.asyncReadable();
         var frame = runtime.Timeout.fromMilliseconds(frame_ms);
-        var public_event_wake = AgentSession.RuntimeAccess.publicEventWake(&self.session);
+        var public_event_wake = self.session.publicEventWake();
         if (self.active_run) |run| {
             var progress = run.stream.asyncNext();
             switch (try runtime.select(.{ .input = &input, .prompt = &progress, .public_event = public_event_wake, .frame = &frame })) {
@@ -114,12 +145,18 @@ pub const SessionRuntime = struct {
                     return .input;
                 },
                 .prompt => |result| {
-                    try self.applyPromptProgressResult(run, result);
+                    self.applyPromptProgressResult(run, result) catch |err| switch (err) {
+                        error.EventQueueFull => return .session,
+                        else => return err,
+                    };
                     return .session;
                 },
                 .public_event => {
                     public_event_wake.reset();
-                    try self.drainSessionEvents(null);
+                    self.drainSessionEvents(null) catch |err| switch (err) {
+                        error.EventQueueFull => return .session,
+                        else => return err,
+                    };
                     return .session;
                 },
                 .frame => return .frame,
@@ -132,14 +169,17 @@ pub const SessionRuntime = struct {
             },
             .public_event => {
                 public_event_wake.reset();
-                try self.drainSessionEvents(null);
+                self.drainSessionEvents(null) catch |err| switch (err) {
+                    error.EventQueueFull => return .session,
+                    else => return err,
+                };
                 return .session;
             },
             .frame => return .frame,
         }
     }
 
-    pub fn stepPromptProgressBounded(self: *SessionRuntime, limit: usize) !usize {
+    pub fn stepPromptProgressBounded(self: *AgentSessionRuntimeHost, limit: usize) !usize {
         const run = self.active_run orelse return 0;
         var count: usize = 0;
         while (count < limit and self.active_run != null) : (count += 1) {
@@ -153,23 +193,36 @@ pub const SessionRuntime = struct {
         return count;
     }
 
-    pub fn step(self: *SessionRuntime) !void {
-        while (self.commands.pop()) |envelope| {
+    pub fn step(self: *AgentSessionRuntimeHost) !void {
+        if (!self.flushPendingEvent()) return;
+        while (self.hasEventCapacity()) {
+            const envelope = self.commands.pop() orelse break;
             var command = envelope;
             defer command.deinit(self.allocator);
-            try self.applyCommand(command);
+            self.applyCommand(command) catch |err| switch (err) {
+                error.EventQueueFull => return,
+                else => return err,
+            };
+            if (!self.flushPendingEvent()) return;
         }
-        _ = try self.stepPromptProgressBounded(64);
-        try self.drainSessionEvents(null);
+        if (!self.hasEventCapacity()) return;
+        _ = self.stepPromptProgressBounded(64) catch |err| switch (err) {
+            error.EventQueueFull => return,
+            else => return err,
+        };
+        if (!self.flushPendingEvent()) return;
+        self.drainSessionEvents(null) catch return;
     }
 
-    pub fn deinit(self: *SessionRuntime) void {
+    pub fn deinit(self: *AgentSessionRuntimeHost) void {
         if (self.active_run) |run| {
-            AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
+            self.session.destroyPromptRun(run);
             self.active_run = null;
         }
         self.clearActivePromptText();
         drainQueuedCommands(self);
+        if (self.pending_event) |*event| event.deinit(self.allocator);
+        self.pending_event = null;
         drainQueuedEvents(self);
         shutdownAndDeinitSession(&self.session);
         self.services.deinit();
@@ -178,12 +231,12 @@ pub const SessionRuntime = struct {
         self.* = undefined;
     }
 
-    fn applyCommand(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
+    fn applyCommand(self: *AgentSessionRuntimeHost, envelope: client_protocol.CommandEnvelope) !void {
         switch (envelope.command) {
             .submit_prompt => |prompt| {
                 if (try self.handlePromptCommand(envelope.id, prompt.text)) return;
                 if (self.active_run != null) {
-                    AgentSession.RuntimeAccess.queuePrompt(&self.session, prompt.text, &.{}, .steer) catch |err| {
+                    self.session.queuePrompt(prompt.text, &.{}, .steer) catch |err| {
                         try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                         return;
                     };
@@ -194,8 +247,8 @@ pub const SessionRuntime = struct {
                     try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                     return;
                 };
-                self.active_overflow_count_before = AgentSession.RuntimeAccess.contextOverflowCount(&self.session);
-                self.active_run = AgentSession.RuntimeAccess.startPromptRun(&self.session, prompt.text, &.{}) catch |err| {
+                self.active_overflow_count_before = self.session.contextOverflowCount();
+                self.active_run = self.session.startPromptRun(prompt.text, &.{}) catch |err| {
                     self.clearActivePromptText();
                     try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                     return;
@@ -205,12 +258,12 @@ pub const SessionRuntime = struct {
             },
             .cancel => {
                 if (self.active_run) |run| {
-                    AgentSession.RuntimeAccess.cancelPromptRun(&self.session, run) catch AgentSession.RuntimeAccess.cancel(&self.session);
-                    AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
+                    self.session.cancelPromptRun(run) catch self.session.cancel();
+                    self.session.destroyPromptRun(run);
                     self.active_run = null;
                     self.active_request_id = null;
                     self.clearActivePromptText();
-                } else AgentSession.RuntimeAccess.cancel(&self.session);
+                } else self.session.cancel();
                 try self.drainSessionEvents(envelope.id);
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .canceled } });
             },
@@ -218,25 +271,27 @@ pub const SessionRuntime = struct {
                 try self.dropQueuedMessages();
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .queue_cleared } });
             },
-            .request_snapshot => try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .snapshot_sent } }),
+            .request_snapshot => {
+                const snapshot = try self.buildClientSnapshot();
+                try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .snapshot = snapshot } });
+            },
             .shutdown => {
-                AgentSession.RuntimeAccess.requestShutdown(&self.session);
+                self.session.requestShutdown();
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .shutdown_started } });
             },
         }
     }
 
-    fn applyPromptProgressResult(self: *SessionRuntime, run: *AgentSession.RuntimeAccess.PromptRun, result: anytype) !void {
+    fn applyPromptProgressResult(self: *AgentSessionRuntimeHost, run: *AgentSession.PromptRun, result: anytype) !void {
         if (self.active_run != run) return;
         const request_id = self.active_request_id;
-        const more = try AgentSession.RuntimeAccess.applyPromptRunProgress(&self.session, run, result);
+        const more = try self.session.applyPromptRunProgress(run, result);
         try self.drainSessionEvents(request_id);
         if (!more) {
-            AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
+            self.session.destroyPromptRun(run);
             self.active_run = null;
             const prompt_text = self.active_prompt_text orelse "";
-            AgentSession.RuntimeAccess.afterPromptRunFinished(
-                &self.session,
+            self.session.afterPromptRunFinished(
                 self.active_overflow_count_before,
                 prompt_text,
                 &.{},
@@ -253,12 +308,12 @@ pub const SessionRuntime = struct {
         }
     }
 
-    fn clearActivePromptText(self: *SessionRuntime) void {
+    fn clearActivePromptText(self: *AgentSessionRuntimeHost) void {
         if (self.active_prompt_text) |text| self.allocator.free(text);
         self.active_prompt_text = null;
     }
 
-    fn handlePromptCommand(self: *SessionRuntime, request_id: ?client_protocol.RequestId, text: []const u8) !bool {
+    fn handlePromptCommand(self: *AgentSessionRuntimeHost, request_id: ?client_protocol.RequestId, text: []const u8) !bool {
         const parsed = parsePromptCommand(text) orelse return false;
         const command_text, const command = parsed;
         if (command) |known| switch (known) {
@@ -281,8 +336,35 @@ pub const SessionRuntime = struct {
         return true;
     }
 
+    fn buildClientSnapshot(self: *AgentSessionRuntimeHost) !client_protocol.Snapshot {
+        var queue = try self.session.queueSnapshot(self.allocator);
+        errdefer queue.deinit();
+        var history = try session_history_snapshot.build(self.allocator, self.session.manager);
+        defer history.deinit(self.allocator);
+        const history_items = try self.allocator.alloc(client_protocol.HistorySnapshotItem.Source, history.items.len);
+        defer self.allocator.free(history_items);
+        for (history.items, history_items) |item, *target| {
+            target.* = .{
+                .role = switch (item.role) {
+                    .user => .user,
+                    .assistant => .assistant,
+                    .system => .system,
+                },
+                .text = item.text,
+            };
+        }
+        return client_protocol.Snapshot.init(
+            self.allocator,
+            self.session.manager.header,
+            self.session.agent.state.model,
+            queue,
+            self.active_request_id,
+            history_items,
+        );
+    }
+
     fn enqueuePromptCommand(
-        self: *SessionRuntime,
+        self: *AgentSessionRuntimeHost,
         request_id: ?client_protocol.RequestId,
         command: []const u8,
         result: client_protocol.PromptCommandResult,
@@ -312,14 +394,15 @@ pub const SessionRuntime = struct {
         return .{ command, null };
     }
 
-    fn drainSessionEvents(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
-        while (AgentSession.RuntimeAccess.drainPublicEvent(&self.session)) |event| {
+    fn drainSessionEvents(self: *AgentSessionRuntimeHost, request_id: ?client_protocol.RequestId) !void {
+        while (self.hasEventCapacity()) {
+            const event = self.session.drainPublicEvent() orelse return;
             try self.enqueueEvent(.{ .request_id = request_id, .event = event });
         }
     }
 
     fn enqueueRejected(
-        self: *SessionRuntime,
+        self: *AgentSessionRuntimeHost,
         request_id: ?client_protocol.RequestId,
         code: client_protocol.Rejection.Code,
         message: []const u8,
@@ -328,60 +411,120 @@ pub const SessionRuntime = struct {
         try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .rejected = .{ .code = code, .message = owned_message } } });
     }
 
-    fn enqueueEvent(self: *SessionRuntime, envelope: client_protocol.EventEnvelope) !void {
+    fn enqueueEvent(self: *AgentSessionRuntimeHost, envelope: client_protocol.EventEnvelope) !void {
         if (self.events.pushOrDrop(envelope)) return;
-        var owned_envelope = envelope;
-        owned_envelope.deinit(self.allocator);
+        if (self.pending_event == null) {
+            self.pending_event = envelope;
+        } else {
+            var owned_envelope = envelope;
+            owned_envelope.deinit(self.allocator);
+        }
         return error.EventQueueFull;
+    }
+
+    fn hasEventCapacity(self: *const AgentSessionRuntimeHost) bool {
+        return self.pending_event == null and self.events.count() < self.events.capacity();
+    }
+
+    fn flushPendingEvent(self: *AgentSessionRuntimeHost) bool {
+        const event = self.pending_event orelse return true;
+        if (self.events.pushOrDrop(event)) {
+            self.pending_event = null;
+            return true;
+        }
+        return false;
     }
 };
 
-pub fn createSessionRuntime(allocator: std.mem.Allocator, options: CreateOptions) !SessionRuntime {
+pub const SessionRuntime = AgentSessionRuntimeHost;
+
+pub fn createSessionRuntime(allocator: std.mem.Allocator, options: CreateOptions) !AgentSessionRuntimeHost {
+    return openSessionRuntime(allocator, commonOptionsFromCreate(options), .{ .create = .{
+        .session_id = options.session_id,
+        .timestamp = options.timestamp,
+    } });
+}
+
+pub fn resumeSessionRuntime(allocator: std.mem.Allocator, options: ResumeOptions) !AgentSessionRuntimeHost {
+    return openSessionRuntime(allocator, commonOptionsFromResume(options), .{ .resume_existing = .{
+        .session_file_name = options.session_file_name,
+    } });
+}
+
+fn openSessionRuntime(
+    allocator: std.mem.Allocator,
+    options: CommonOptions,
+    open: OpenSession,
+) !AgentSessionRuntimeHost {
     var init_result = try initSessionRuntimeBase(allocator, options);
     errdefer init_result.services.deinit();
 
-    const sessions_dir = try (paths_mod.PersistencePaths{ .global_dir = init_result.services.agent_dir, .cwd = init_result.services.cwd }).sessionsDirForCwd(allocator);
+    var session = switch (open) {
+        .create => |create| try createSession(allocator, options, &init_result, create),
+        .resume_existing => |resume_open| try resumeSession(allocator, options, &init_result, resume_open),
+    };
+    errdefer shutdownAndDeinitSession(&session);
+
+    return initWithSession(
+        allocator,
+        init_result.services,
+        session,
+        options.command_capacity,
+        options.event_capacity,
+    );
+}
+
+fn createSession(
+    allocator: std.mem.Allocator,
+    options: CommonOptions,
+    init_result: *SessionRuntimeInit,
+    create: OpenSessionCreate,
+) !AgentSession {
+    const sessions_dir = try (paths_mod.PersistencePaths{
+        .global_dir = init_result.services.agent_dir,
+        .cwd = init_result.services.cwd,
+    }).sessionsDirForCwd(allocator);
     defer allocator.free(sessions_dir);
+
     var store = try session_store.SessionStore.createInPath(
         allocator,
         init_result.services.io,
         options.dir,
         sessions_dir,
         init_result.services.cwd,
-        options.session_id,
-        options.timestamp,
+        create.session_id,
+        create.timestamp,
     );
     errdefer store.deinit(allocator);
 
     var session_options = init_result.options;
-    session_options.session_id = options.session_id;
-    session_options.timestamp = options.timestamp;
+    session_options.session_id = create.session_id;
+    session_options.timestamp = create.timestamp;
     session_options.session_store = store;
-    var session = try AgentSession.init(allocator, init_result.services.io, session_options);
-    errdefer shutdownAndDeinitSession(&session);
-
-    return initWithSession(allocator, init_result.services, session, options.command_capacity, options.event_capacity);
+    return AgentSession.init(allocator, init_result.services.io, session_options);
 }
 
-pub fn resumeSessionRuntime(allocator: std.mem.Allocator, options: ResumeOptions) !SessionRuntime {
-    if (!std.mem.eql(u8, std.fs.path.basename(options.session_file_name), options.session_file_name)) {
+fn resumeSession(
+    allocator: std.mem.Allocator,
+    options: CommonOptions,
+    init_result: *SessionRuntimeInit,
+    resume_open: OpenSessionResume,
+) !AgentSession {
+    if (!std.mem.eql(u8, std.fs.path.basename(resume_open.session_file_name), resume_open.session_file_name)) {
         return error.InvalidSessionFileName;
     }
 
-    var init_result = try initSessionRuntimeBase(allocator, options);
-    errdefer init_result.services.deinit();
-
-    const sessions_dir = try (paths_mod.PersistencePaths{ .global_dir = init_result.services.agent_dir, .cwd = init_result.services.cwd }).sessionsDirForCwd(allocator);
+    const sessions_dir = try (paths_mod.PersistencePaths{
+        .global_dir = init_result.services.agent_dir,
+        .cwd = init_result.services.cwd,
+    }).sessionsDirForCwd(allocator);
     defer allocator.free(sessions_dir);
-    const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, options.session_file_name });
+    const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, resume_open.session_file_name });
     errdefer allocator.free(file_name);
 
     var session_options = init_result.options;
     session_options.resume_session_store = .{ .dir = options.dir, .file_name = file_name };
-    var session = try AgentSession.init(allocator, init_result.services.io, session_options);
-    errdefer shutdownAndDeinitSession(&session);
-
-    return initWithSession(allocator, init_result.services, session, options.command_capacity, options.event_capacity);
+    return AgentSession.init(allocator, init_result.services.io, session_options);
 }
 
 fn initWithSession(
@@ -390,7 +533,7 @@ fn initWithSession(
     session: AgentSession,
     command_capacity: usize,
     event_capacity: usize,
-) !SessionRuntime {
+) !AgentSessionRuntimeHost {
     if (command_capacity == 0) return error.CommandCapacityZero;
     if (event_capacity == 0) return error.EventCapacityZero;
     const command_buffer = try allocator.alloc(client_protocol.CommandEnvelope, command_capacity);
@@ -413,7 +556,43 @@ const SessionRuntimeInit = struct {
     options: AgentSession.Options,
 };
 
-fn initSessionRuntimeBase(allocator: std.mem.Allocator, options: anytype) !SessionRuntimeInit {
+fn commonOptionsFromCreate(options: CreateOptions) CommonOptions {
+    return .{
+        .cwd = options.cwd,
+        .agent_dir_override = options.agent_dir_override,
+        .current_date = options.current_date,
+        .model = options.model,
+        .thinking_level = options.thinking_level,
+        .stream = options.stream,
+        .dir = options.dir,
+        .environ = options.environ,
+        .task_runtime = options.task_runtime,
+        .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
+        .public_event_capacity = options.public_event_capacity,
+        .command_capacity = options.command_capacity,
+        .event_capacity = options.event_capacity,
+    };
+}
+
+fn commonOptionsFromResume(options: ResumeOptions) CommonOptions {
+    return .{
+        .cwd = options.cwd,
+        .agent_dir_override = options.agent_dir_override,
+        .current_date = options.current_date,
+        .model = options.model,
+        .thinking_level = options.thinking_level,
+        .stream = options.stream,
+        .dir = options.dir,
+        .environ = options.environ,
+        .task_runtime = options.task_runtime,
+        .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
+        .public_event_capacity = options.public_event_capacity,
+        .command_capacity = options.command_capacity,
+        .event_capacity = options.event_capacity,
+    };
+}
+
+fn initSessionRuntimeBase(allocator: std.mem.Allocator, options: CommonOptions) !SessionRuntimeInit {
     const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
         agent_dir_override
     else
@@ -425,7 +604,7 @@ fn initSessionRuntimeBase(allocator: std.mem.Allocator, options: anytype) !Sessi
         .agent_dir = resolved_agent_dir,
         .dir = options.dir,
         .environ = options.environ,
-        .zio_runtime = options.zio_runtime,
+        .task_runtime = options.task_runtime,
     });
     errdefer services.deinit();
 
@@ -441,22 +620,22 @@ fn initSessionRuntimeBase(allocator: std.mem.Allocator, options: anytype) !Sessi
 }
 
 fn shutdownAndDeinitSession(session: *AgentSession) void {
-    AgentSession.RuntimeAccess.requestShutdown(session);
-    while (AgentSession.RuntimeAccess.drainPublicEvent(session)) |event| {
+    session.requestShutdown();
+    while (session.drainPublicEvent()) |event| {
         var owned_event = event;
         owned_event.deinit();
     }
     session.deinit();
 }
 
-fn drainQueuedCommands(self: *SessionRuntime) void {
+fn drainQueuedCommands(self: *AgentSessionRuntimeHost) void {
     while (self.commands.pop()) |envelope| {
         var owned_envelope = envelope;
         owned_envelope.deinit(self.allocator);
     }
 }
 
-fn drainQueuedEvents(self: *SessionRuntime) void {
+fn drainQueuedEvents(self: *AgentSessionRuntimeHost) void {
     while (self.events.pop()) |envelope| {
         var owned_envelope = envelope;
         owned_envelope.deinit(self.allocator);
@@ -488,7 +667,7 @@ fn resolveSessionOptions(services: *RuntimeServices, options: SessionOptionsInpu
         .retry_settings = resolveRetrySettings(services.settings_manager.current()),
         .stream = resolveStream(services, options.stream, model),
         .get_api_key = services.auth_manager.hook(),
-        .zio_runtime = services.zio_runtime,
+        .task_runtime = services.task_runtime,
         .dir = options.dir,
         .environ = services.environ,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
@@ -604,8 +783,8 @@ test "session runtime owns services session and bounded mailboxes" {
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
 
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var session_runtime = try createSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
@@ -613,7 +792,7 @@ test "session runtime owns services session and bounded mailboxes" {
         .session_id = "session",
         .timestamp = "2026-06-09T00:00:00Z",
         .dir = tmp.dir,
-        .zio_runtime = zio_runtime,
+        .task_runtime = task_runtime,
         .command_capacity = 2,
         .event_capacity = 2,
     });
@@ -624,7 +803,16 @@ test "session runtime owns services session and bounded mailboxes" {
     try std.testing.expectEqualStrings("session", session_runtime.session.manager.header.id);
 }
 
-fn initTestRuntime(tmp: *std.testing.TmpDir, zio_runtime: *runtime.Runtime) !SessionRuntime {
+fn initTestRuntime(tmp: *std.testing.TmpDir, task_runtime: *runtime.Runtime) !AgentSessionRuntimeHost {
+    return initTestRuntimeWithCaps(tmp, task_runtime, 4, 64);
+}
+
+fn initTestRuntimeWithCaps(
+    tmp: *std.testing.TmpDir,
+    task_runtime: *runtime.Runtime,
+    command_capacity: usize,
+    event_capacity: usize,
+) !AgentSessionRuntimeHost {
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
     return createSessionRuntime(std.testing.allocator, .{
@@ -634,18 +822,18 @@ fn initTestRuntime(tmp: *std.testing.TmpDir, zio_runtime: *runtime.Runtime) !Ses
         .session_id = "session",
         .timestamp = "2026-06-09T00:00:00Z",
         .dir = tmp.dir,
-        .zio_runtime = zio_runtime,
-        .command_capacity = 4,
-        .event_capacity = 64,
+        .task_runtime = task_runtime,
+        .command_capacity = command_capacity,
+        .event_capacity = event_capacity,
     });
 }
 
 test "session runtime drains submitted command into response event" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    var session_runtime = try initTestRuntime(&tmp, zio_runtime);
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
     try session_runtime.submit(.{ .id = 1, .command = .clear_queue });
@@ -656,12 +844,120 @@ test "session runtime drains submitted command into response event" {
     try std.testing.expectEqual(client_protocol.Response.queue_cleared, event.event.response);
 }
 
+test "session runtime request snapshot emits owned bounded snapshot event" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    try session_runtime.submit(.{ .id = 9, .command = .request_snapshot });
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 9), event.request_id);
+    try std.testing.expect(event.event == .snapshot);
+    try std.testing.expectEqualStrings("session", event.event.snapshot.header.id.text);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, null), event.event.snapshot.active_request_id);
+    try std.testing.expectEqual(@as(usize, 0), event.event.snapshot.history.items.len);
+}
+
+test "session runtime preserves required response under event backpressure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntimeWithCaps(&tmp, task_runtime, 4, 1);
+    defer session_runtime.deinit();
+
+    var command = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 7, "/help");
+    var command_owned = true;
+    defer if (command_owned) command.deinit(std.testing.allocator);
+    try session_runtime.submit(command);
+    command_owned = false;
+    try session_runtime.step();
+
+    var prompt_event = session_runtime.drainEvent().?;
+    defer prompt_event.deinit(std.testing.allocator);
+    try std.testing.expect(prompt_event.event == .prompt_command);
+    try std.testing.expect(session_runtime.pending_event != null);
+
+    try session_runtime.step();
+    var response = session_runtime.drainEvent().?;
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(client_protocol.Response.prompt_finished, response.event.response);
+    try std.testing.expect(session_runtime.pending_event == null);
+}
+
+test "session runtime does not consume commands while event queue is full" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntimeWithCaps(&tmp, task_runtime, 4, 1);
+    defer session_runtime.deinit();
+
+    try session_runtime.submit(.{ .id = 1, .command = .clear_queue });
+    try session_runtime.step();
+    try session_runtime.submit(.{ .id = 2, .command = .request_snapshot });
+    try session_runtime.step();
+
+    var first = session_runtime.drainEvent().?;
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 1), first.request_id);
+    try std.testing.expectEqual(client_protocol.Response.queue_cleared, first.event.response);
+
+    try session_runtime.step();
+    var second = session_runtime.drainEvent().?;
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 2), second.request_id);
+    try std.testing.expect(second.event == .snapshot);
+}
+
+test "session runtime shutdown remains observable under event pressure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntimeWithCaps(&tmp, task_runtime, 4, 1);
+    defer session_runtime.deinit();
+
+    try session_runtime.submit(.{ .id = 1, .command = .clear_queue });
+    try session_runtime.step();
+    try session_runtime.submit(.{ .id = 2, .command = .shutdown });
+    try session_runtime.step();
+
+    var first = session_runtime.drainEvent().?;
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(client_protocol.Response.queue_cleared, first.event.response);
+
+    try session_runtime.step();
+    var second = session_runtime.drainEvent().?;
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 2), second.request_id);
+    try std.testing.expectEqual(client_protocol.Response.shutdown_started, second.event.response);
+}
+
+test "session runtime command queue full rejects submit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntimeWithCaps(&tmp, task_runtime, 1, 4);
+    defer session_runtime.deinit();
+
+    try session_runtime.submit(.{ .id = 1, .command = .clear_queue });
+    try std.testing.expectError(error.Full, session_runtime.submit(.{ .id = 2, .command = .clear_queue }));
+}
+
 test "session runtime handles slash commands without starting prompt run" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    var session_runtime = try initTestRuntime(&tmp, zio_runtime);
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
     var command = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 7, "/help");
@@ -686,9 +982,9 @@ test "session runtime handles slash commands without starting prompt run" {
 test "session runtime queues prompt while active" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    var session_runtime = try initTestRuntime(&tmp, zio_runtime);
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
     var first = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first");

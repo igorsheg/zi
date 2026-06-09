@@ -54,8 +54,6 @@ pub const ProviderRegistry = struct {
 };
 
 test "provider registry returns registered provider by api" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var calls: usize = 0;
@@ -64,13 +62,11 @@ test "provider registry returns registered provider by api" {
     try registry.register(provider, null);
 
     const registered = registry.get(protocol.KnownApi.openai_responses).?;
-    _ = registered.stream.call(testRequest(zio_runtime, protocol.KnownApi.openai_responses));
+    _ = registered.stream.call(testRequest(protocol.KnownApi.openai_responses));
     try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
 test "registering same api routes future calls to replacement provider" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var first_calls: usize = 0;
@@ -80,7 +76,7 @@ test "registering same api routes future calls to replacement provider" {
     try registry.register(testProvider(protocol.KnownApi.openai_responses, &second_calls), "second");
 
     const registered = registry.get(protocol.KnownApi.openai_responses).?;
-    _ = registered.stream.call(testRequest(zio_runtime, protocol.KnownApi.openai_responses));
+    _ = registered.stream.call(testRequest(protocol.KnownApi.openai_responses));
     try std.testing.expectEqual(@as(usize, 0), first_calls);
     try std.testing.expectEqual(@as(usize, 1), second_calls);
 }
@@ -137,11 +133,10 @@ fn testStreamFunction(context: ?*anyopaque, request: protocol.StreamRequest) pro
     return protocol.AssistantMessageEventStream.initBuffered();
 }
 
-fn testRequest(zio_runtime: *runtime.Runtime, api: protocol.Api) protocol.StreamRequest {
+fn testRequest(api: protocol.Api) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
-        .zio_runtime = zio_runtime,
         .model = .{
             .id = "test-model",
             .name = "Test Model",

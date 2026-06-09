@@ -337,14 +337,14 @@ test "grep tool searches directory files with literal pattern" {
     try object.put(std.testing.allocator, "path", .{ .string = "src" });
     try object.put(std.testing.allocator, "pattern", .{ .string = "hello" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call",
@@ -376,14 +376,14 @@ test "grep tool defaults path, sorts files, ignores dependency directories, and 
     try object.put(std.testing.allocator, "ignoreCase", .{ .bool = true });
     try object.put(std.testing.allocator, "limit", .{ .integer = 1 });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call-default",
@@ -407,8 +407,8 @@ test "grep tool reports no matches and truncates long matching lines" {
     var tool = try GrepTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
     defer tool.deinit();
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
 
@@ -418,8 +418,8 @@ test "grep tool reports no matches and truncates long matching lines" {
     try object.put(std.testing.allocator, "pattern", .{ .string = "missing" });
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call",
@@ -441,8 +441,8 @@ test "grep tool reports no matches and truncates long matching lines" {
     try long_object.put(std.testing.allocator, "pattern", .{ .string = "needle" });
     var long_result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call-long",

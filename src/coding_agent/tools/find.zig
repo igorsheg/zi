@@ -227,14 +227,14 @@ test "find tool recursively filters paths" {
     try object.put(std.testing.allocator, "path", .{ .string = "." });
     try object.put(std.testing.allocator, "name", .{ .string = ".zig" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call",
@@ -265,14 +265,14 @@ test "find tool defaults path, sorts results, applies limit, and ignores depende
     try object.put(std.testing.allocator, "name", .{ .string = ".zig" });
     try object.put(std.testing.allocator, "limit", .{ .integer = 1 });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call-default",
@@ -301,14 +301,14 @@ test "find tool reports no matches" {
     try object.put(std.testing.allocator, "path", .{ .string = "." });
     try object.put(std.testing.allocator, "name", .{ .string = "missing" });
 
-    var zio_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         &tool,
         cancel_source.token(),
         "call",

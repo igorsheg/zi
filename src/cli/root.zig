@@ -1,11 +1,10 @@
 const std = @import("std");
-const runtime = @import("../../runtime/root.zig");
-const auth_mode = @import("../auth_mode.zig");
+const runtime = @import("../runtime/root.zig");
+const auth_mode = @import("../coding_agent/auth_mode.zig");
 const args_mod = @import("args.zig");
-const interactive = @import("../interactive.zig");
-const print_mode = @import("../print_mode.zig");
-const session_runtime = @import("../session_runtime.zig");
-const session_listing = @import("../session_listing.zig");
+const print_mode = @import("../frontends/print/print_mode.zig");
+const session_runtime = @import("../coding_agent/session_runtime.zig");
+const session_listing = @import("../coding_agent/session_listing.zig");
 
 const CliError = error{
     InvalidCliUsage,
@@ -98,15 +97,19 @@ fn runAuth(
     options: auth_mode.Options,
 ) !void {
     return switch (command.action) {
-        .login => auth_mode.login(
-            process.gpa,
-            process.io,
-            process.zio_runtime,
-            stdout,
-            stderr,
-            command.provider,
-            options,
-        ),
+        .login => {
+            var task_runtime = try runtime.Runtime.init(process.gpa, .{});
+            defer task_runtime.deinit();
+            return auth_mode.login(
+                process.gpa,
+                process.io,
+                task_runtime,
+                stdout,
+                stderr,
+                command.provider,
+                options,
+            );
+        },
         .logout => auth_mode.logout(process.gpa, process.io, stdout, command.provider, options),
         .status => auth_mode.status(process.gpa, process.io, stdout, command.provider, options),
     };
@@ -133,18 +136,7 @@ fn runApp(
             return runPrompt(process, stdout, stderr, app.messages.slice()[0], true, app, options);
         },
         .rpc => unsupported(stderr, "rpc mode is not implemented yet"),
-        .interactive => {
-            if (app.messages.count > 1) return usage(stderr);
-            return interactive.run(process, stdout, stderr, .{
-                .cwd = options.cwd,
-                .agent_dir_override = options.agent_dir_override,
-                .dir = options.dir,
-                .environ = options.environ,
-                .resume_session_file = app.resume_session_file,
-                .resume_latest = app.resume_latest,
-                .initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null,
-            });
-        },
+        .interactive => unsupported(stderr, "interactive frontend is not wired yet"),
     };
 }
 
@@ -170,7 +162,6 @@ fn runPrompt(
             .session_file_name = session_file,
             .dir = options.dir,
             .environ = options.environ,
-            .zio_runtime = process.zio_runtime,
         });
     } else blk: {
         const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
@@ -183,7 +174,6 @@ fn runPrompt(
             .timestamp = timestamp_text,
             .dir = options.dir,
             .environ = options.environ,
-            .zio_runtime = process.zio_runtime,
         });
     };
     defer app.deinit();
@@ -255,9 +245,7 @@ test "cli auth logout dispatches to auth mode" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const process = testProcess(zio_runtime, &environ);
+    const process = testProcess(&environ);
     var output_buffer: [128]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [128]u8 = undefined;
@@ -290,9 +278,7 @@ test "cli auth status dispatches to auth mode" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const process = testProcess(zio_runtime, &environ);
+    const process = testProcess(&environ);
     var output_buffer: [128]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [128]u8 = undefined;
@@ -319,9 +305,7 @@ test "cli selects newest resumable session through runtime policy" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const process = testProcess(zio_runtime, &environ);
+    const process = testProcess(&environ);
 
     try createCliStoredSession(tmp.dir, "first", "2026-05-27T00:00:00Z");
     try createCliStoredSession(tmp.dir, "second", "2026-05-28T00:00:00Z");
@@ -348,9 +332,7 @@ test "cli selects explicit resumable session through runtime policy" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const process = testProcess(zio_runtime, &environ);
+    const process = testProcess(&environ);
 
     try createCliStoredSession(tmp.dir, "session", "2026-05-27T00:00:00Z");
 
@@ -376,9 +358,7 @@ test "cli reports absent resumable session" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const process = testProcess(zio_runtime, &environ);
+    const process = testProcess(&environ);
     var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
     const app = (try args_mod.parse(&.{"--resume-latest"})).app;
@@ -399,9 +379,7 @@ test "cli reports invalid explicit resume session file" {
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const process = testProcess(zio_runtime, &environ);
+    const process = testProcess(&environ);
     var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
     const app = (try args_mod.parse(&.{ "--resume", "../outside.jsonl" })).app;
@@ -418,9 +396,7 @@ test "cli reports invalid explicit resume session file" {
 test "cli usage returns an error instead of exiting" {
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const process = testProcess(zio_runtime, &environ);
+    const process = testProcess(&environ);
     var output_buffer: [128]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var stderr_buffer: [256]u8 = undefined;
@@ -434,12 +410,11 @@ test "cli usage returns an error instead of exiting" {
     try std.testing.expect(std.mem.startsWith(u8, stderr.buffered(), "usage: zi [options] [prompt]"));
 }
 
-fn testProcess(zio_runtime: *runtime.Runtime, environ: *std.process.Environ.Map) runtime.Process {
+fn testProcess(environ: *std.process.Environ.Map) runtime.Process {
     return .{
         .arena = std.testing.allocator,
         .gpa = std.testing.allocator,
         .io = std.testing.io,
-        .zio_runtime = zio_runtime,
         .environ = environ,
     };
 }

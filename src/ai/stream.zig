@@ -49,54 +49,46 @@ const IgnoreEvents = struct {
 };
 
 test "stream dispatches request to provider registered for model api" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var calls: usize = 0;
     try registry.register(testProvider(protocol.KnownApi.openai_responses, &calls), null);
 
-    var assistant_stream = try stream(&registry, testRequest(zio_runtime, protocol.KnownApi.openai_responses));
+    var assistant_stream = try stream(&registry, testRequest(protocol.KnownApi.openai_responses));
 
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expect(assistant_stream.result() != null);
 }
 
 test "stream reports missing api provider" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
     try std.testing.expectError(
         error.NoApiProvider,
-        stream(&registry, testRequest(zio_runtime, protocol.KnownApi.openai_responses)),
+        stream(&registry, testRequest(protocol.KnownApi.openai_responses)),
     );
 }
 
 test "complete drains stream and returns assistant result" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var calls: usize = 0;
     try registry.register(testProvider(protocol.KnownApi.openai_responses, &calls), null);
 
-    const message = try complete(&registry, testRequest(zio_runtime, protocol.KnownApi.openai_responses));
+    const message = try complete(&registry, testRequest(protocol.KnownApi.openai_responses));
 
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(protocol.StopReason.stop, message.stop_reason);
 }
 
 test "stream simple dispatches request to provider simple function" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var registry = provider_registry.ProviderRegistry.init(std.testing.allocator);
     defer registry.deinit();
     var calls: usize = 0;
     try registry.register(testProvider(protocol.KnownApi.openai_responses, &calls), null);
 
-    var assistant_stream = try streamSimple(&registry, testRequest(zio_runtime, protocol.KnownApi.openai_responses));
+    var assistant_stream = try streamSimple(&registry, testRequest(protocol.KnownApi.openai_responses));
 
     try std.testing.expectEqual(@as(usize, 10), calls);
     try std.testing.expect(assistant_stream.result() != null);
@@ -132,11 +124,10 @@ fn streamWithResult(request: protocol.StreamRequest) protocol.AssistantMessageEv
     return assistant_stream;
 }
 
-fn testRequest(zio_runtime: *runtime.Runtime, api: protocol.Api) protocol.StreamRequest {
+fn testRequest(api: protocol.Api) protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
-        .zio_runtime = zio_runtime,
         .model = .{
             .id = "test-model",
             .name = "Test Model",

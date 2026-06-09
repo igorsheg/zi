@@ -316,10 +316,8 @@ test "provider registers openai responses api" {
 }
 
 test "provider stream without auth emits missing api key error" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
     var provider = Provider.init(.{});
-    var stream = provider.apiProvider().stream.call(testRequest(zio_runtime));
+    var stream = provider.apiProvider().stream.call(testRequest());
 
     const err = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, err.reason);
@@ -334,9 +332,7 @@ test "endpoint url appends responses path" {
 }
 
 test "request body includes model stream input and tools" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const request = testRequest(zio_runtime);
+    const request = testRequest();
     const body = try buildRequestBody(std.testing.allocator, request);
     defer std.testing.allocator.free(body);
 
@@ -347,9 +343,7 @@ test "request body includes model stream input and tools" {
 }
 
 test "request body writes OpenAI call id for tool results" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    var request = testRequest(zio_runtime);
+    var request = testRequest();
     request.context.messages = &.{
         .{ .assistant = .{
             .content = &.{.{ .tool_call = .{
@@ -380,11 +374,10 @@ test "request body writes OpenAI call id for tool results" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"call_id\":\"call_123456789|fc_123456789\"") == null);
 }
 
-fn testRequest(zio_runtime: *runtime.Runtime) protocol.StreamRequest {
+fn testRequest() protocol.StreamRequest {
     return .{
         .allocator = std.testing.allocator,
         .io = std.Io.failing,
-        .zio_runtime = zio_runtime,
         .model = .{
             .id = "gpt-test",
             .name = "GPT Test",

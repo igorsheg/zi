@@ -256,14 +256,14 @@ fn decodeBase64Url(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
 fn login(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     _: ?*anyopaque,
     callbacks: oauth.OAuthLoginCallbacks,
 ) !oauth.OAuthCredentials {
     var attempt = try beginLogin(allocator, io, callbacks);
     defer attempt.deinit(allocator, io);
 
-    const code = try waitForLoginCode(allocator, io, zio_runtime, callbacks, &attempt);
+    const code = try waitForLoginCode(allocator, io, task_runtime, callbacks, &attempt);
     defer allocator.free(code);
     return completeLogin(allocator, io, &attempt, code);
 }
@@ -305,13 +305,13 @@ fn beginLogin(
 fn waitForLoginCode(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     callbacks: oauth.OAuthLoginCallbacks,
     attempt: *LoginAttempt,
 ) ![]const u8 {
     if (attempt.callback_server) |*server| {
         if (callbacks.on_manual_code_input_fn != null) {
-            return raceLoginCode(allocator, io, zio_runtime, callbacks, server, attempt.flow.state);
+            return raceLoginCode(allocator, io, task_runtime, callbacks, server, attempt.flow.state);
         }
         return server.waitForCode(allocator, io, attempt.flow.state) catch
             promptForCode(allocator, callbacks, attempt.flow.state);
@@ -329,7 +329,7 @@ const LoginCodeTaskState = enum {
 };
 
 const LoginCodeTask = struct {
-    handle: runtime.JoinHandle(LoginCodeResult),
+    handle: runtime.Task(LoginCodeResult),
     state: LoginCodeTaskState = .active,
 
     fn cancelAndDiscard(self: *LoginCodeTask, allocator: std.mem.Allocator) void {
@@ -352,17 +352,17 @@ const LoginCodeTask = struct {
 fn raceLoginCode(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *runtime.Runtime,
+    task_runtime: *runtime.Runtime,
     callbacks: oauth.OAuthLoginCallbacks,
     server: *CallbackServer,
     expected_state: []const u8,
 ) ![]const u8 {
     var callback: LoginCodeTask = .{
-        .handle = try zio_runtime.spawn(waitForCallbackCode, .{ allocator, io, server, expected_state }),
+        .handle = try task_runtime.spawn(waitForCallbackCode, .{ allocator, io, server, expected_state }),
     };
     errdefer callback.cancelAndDiscard(allocator);
     var manual: LoginCodeTask = .{
-        .handle = try zio_runtime.spawn(waitForManualCode, .{ allocator, callbacks, expected_state }),
+        .handle = try task_runtime.spawn(waitForManualCode, .{ allocator, callbacks, expected_state }),
     };
     errdefer manual.cancelAndDiscard(allocator);
 
@@ -846,16 +846,16 @@ test "openai codex provider exposes access token as api key" {
 }
 
 test "oauth login race returns manual code and shuts callback waiter down" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
 
     var server = try CallbackServer.start(io);
     defer server.deinit(io);
     var state: LoginRaceTestState = .{ .expected_state = "state-a", .manual_input = "manual-code#state-a" };
     const callbacks = loginRaceCallbacks(&state, immediateManualInput);
 
-    const code = try raceLoginCode(std.testing.allocator, io, zio_runtime, callbacks, &server, state.expected_state);
+    const code = try raceLoginCode(std.testing.allocator, io, task_runtime, callbacks, &server, state.expected_state);
     defer std.testing.allocator.free(code);
 
     try std.testing.expectEqualStrings("manual-code", code);
@@ -863,9 +863,9 @@ test "oauth login race returns manual code and shuts callback waiter down" {
 }
 
 test "oauth login race shuts callback waiter down when manual input is unavailable" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
 
     var server = try CallbackServer.start(io);
     defer server.deinit(io);
@@ -874,25 +874,25 @@ test "oauth login race shuts callback waiter down when manual input is unavailab
 
     try std.testing.expectError(
         error.ManualOAuthInputUnavailable,
-        raceLoginCode(std.testing.allocator, io, zio_runtime, callbacks, &server, state.expected_state),
+        raceLoginCode(std.testing.allocator, io, task_runtime, callbacks, &server, state.expected_state),
     );
     try std.testing.expect(server.closed);
     try std.testing.expectEqual(@as(usize, 1), state.manual_count.load(.acquire));
 }
 
 test "oauth login race returns callback code while manual input is blocked" {
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    const io = zio_runtime.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const io = task_runtime.io();
 
     var server = try CallbackServer.start(io);
     defer server.deinit(io);
     var state: LoginRaceTestState = .{ .expected_state = "state-b", .manual_input = "manual-code#state-b" };
     const callbacks = loginRaceCallbacks(&state, delayedManualInput);
-    var callback_client = try zio_runtime.spawn(sendCallbackRequest, .{ io, state.expected_state, "callback-code" });
+    var callback_client = try task_runtime.spawn(sendCallbackRequest, .{ io, state.expected_state, "callback-code" });
     defer callback_client.cancel();
 
-    const code = try raceLoginCode(std.testing.allocator, io, zio_runtime, callbacks, &server, state.expected_state);
+    const code = try raceLoginCode(std.testing.allocator, io, task_runtime, callbacks, &server, state.expected_state);
     defer std.testing.allocator.free(code);
 
     try callback_client.join();

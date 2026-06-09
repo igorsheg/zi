@@ -1,9 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
+const async_runtime = @import("Runtime.zig");
 const cancel = @import("cancel.zig");
 const ByteBuilder = @import("byte_builder.zig").ByteBuilder;
-const Runtime = zio.Runtime;
+const Runtime = async_runtime.Runtime;
 
 pub const RunOptions = struct {
     argv: []const []const u8,
@@ -72,7 +73,7 @@ const ProcessWaitState = enum {
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
-    zio_runtime: *Runtime,
+    task_runtime: *Runtime,
     options: RunOptions,
 ) !std.process.RunResult {
     std.debug.assert(options.argv.len > 0);
@@ -114,14 +115,14 @@ pub fn run(
     };
     defer stderr_buffer.deinit();
 
-    var stdout_reader = try zio_runtime.spawn(readPipeToBuffer, .{
+    var stdout_reader = try task_runtime.spawn(readPipeToBuffer, .{
         zio.Pipe.fromFd(stdout_file.handle),
         &stdout_buffer,
         OutputStream.stdout,
         &output_chunks,
     });
     defer stdout_reader.cancel();
-    var stderr_reader = try zio_runtime.spawn(readPipeToBuffer, .{
+    var stderr_reader = try task_runtime.spawn(readPipeToBuffer, .{
         zio.Pipe.fromFd(stderr_file.handle),
         &stderr_buffer,
         OutputStream.stderr,
@@ -129,12 +130,12 @@ pub fn run(
     });
     defer stderr_reader.cancel();
 
-    var process_wait = try zio_runtime.spawn(waitForProcess, .{ io, &child });
+    var process_wait = try task_runtime.spawn(waitForProcess, .{ io, &child });
     process_wait_state = .active;
     defer if (process_wait_state == .active) process_wait.cancel();
     errdefer if (process_wait_state == .active) {
         terminateAndDrainProcess(
-            zio_runtime,
+            task_runtime,
             &child,
             &process_wait,
             options.termination_grace_ms,
@@ -148,11 +149,11 @@ pub fn run(
             process_wait_state = .drained;
         };
     };
-    var timeout_wait = try zio_runtime.spawn(waitForTimeout, .{options.timeout_ms});
+    var timeout_wait = try task_runtime.spawn(waitForTimeout, .{options.timeout_ms});
     defer timeout_wait.cancel();
 
     const term = if (options.cancel_token) |cancel_token| blk: {
-        var cancel_wait = try zio_runtime.spawn(waitForCancel, .{cancel_token});
+        var cancel_wait = try task_runtime.spawn(waitForCancel, .{cancel_token});
         defer cancel_wait.cancel();
         while (true) {
             const output_receive = output_chunks.asyncReceive();
@@ -166,7 +167,7 @@ pub fn run(
                 .process => |result| break :blk try completeProcessWait(result, &process_wait_state),
                 .timeout => {
                     try terminateAndDrainProcess(
-                        zio_runtime,
+                        task_runtime,
                         &child,
                         &process_wait,
                         options.termination_grace_ms,
@@ -180,7 +181,7 @@ pub fn run(
                     result catch |err| switch (err) {
                         error.OperationCancelled => {
                             try terminateAndDrainProcess(
-                                zio_runtime,
+                                task_runtime,
                                 &child,
                                 &process_wait,
                                 options.termination_grace_ms,
@@ -197,7 +198,7 @@ pub fn run(
                 },
                 .output_fault => {
                     try terminateAndDrainProcess(
-                        zio_runtime,
+                        task_runtime,
                         &child,
                         &process_wait,
                         options.termination_grace_ms,
@@ -229,7 +230,7 @@ pub fn run(
                 .process => |result| break :blk try completeProcessWait(result, &process_wait_state),
                 .timeout => {
                     try terminateAndDrainProcess(
-                        zio_runtime,
+                        task_runtime,
                         &child,
                         &process_wait,
                         options.termination_grace_ms,
@@ -241,7 +242,7 @@ pub fn run(
                 },
                 .output_fault => {
                     try terminateAndDrainProcess(
-                        zio_runtime,
+                        task_runtime,
                         &child,
                         &process_wait,
                         options.termination_grace_ms,
@@ -302,18 +303,18 @@ fn completeProcessWait(
 }
 
 fn terminateAndDrainProcess(
-    zio_runtime: *Runtime,
+    task_runtime: *Runtime,
     child: *std.process.Child,
-    process_wait: *zio.JoinHandle(ProcessWaitResult),
+    process_wait: *async_runtime.Task(ProcessWaitResult),
     termination_grace_ms: u64,
     process_wait_state: *ProcessWaitState,
-    stdout_reader: *zio.JoinHandle(void),
-    stderr_reader: *zio.JoinHandle(void),
+    stdout_reader: *async_runtime.Task(void),
+    stderr_reader: *async_runtime.Task(void),
 ) !void {
     std.debug.assert(process_wait_state.* == .active);
     const process_id = child.id;
     requestChildTermination(process_id, .graceful);
-    var kill_after_grace = try zio_runtime.spawn(killAfterGrace, .{ process_id, termination_grace_ms });
+    var kill_after_grace = try task_runtime.spawn(killAfterGrace, .{ process_id, termination_grace_ms });
     defer kill_after_grace.cancel();
     _ = try process_wait.join();
     process_wait_state.* = .drained;
@@ -378,18 +379,18 @@ fn readPipeToBuffer(
     }
 }
 
-test "zio process runner drains interleaved stdout and stderr" {
+test "process runner drains interleaved stdout and stderr" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{
         "/bin/sh",
         "-c",
         "printf out-1; printf err-1 >&2; printf out-2; printf err-2 >&2",
     };
 
-    const result = try run(std.testing.allocator, zio_runtime.io(), zio_runtime, .{
+    const result = try run(std.testing.allocator, task_runtime.io(), task_runtime, .{
         .argv = &argv,
         .timeout_ms = 1_000,
         .max_stdout_bytes = 1024,
@@ -403,17 +404,17 @@ test "zio process runner drains interleaved stdout and stderr" {
     try std.testing.expectEqual(expected_term, result.term);
 }
 
-test "zio process runner applies stderr byte bound" {
+test "process runner applies stderr byte bound" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{ "/bin/sh", "-c", "printf 0123456789 >&2" };
 
     try std.testing.expectError(error.StreamTooLong, run(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         .{
             .argv = &argv,
             .timeout_ms = 1_000,
@@ -423,14 +424,14 @@ test "zio process runner applies stderr byte bound" {
     ));
 }
 
-test "zio process runner accepts output exactly at byte bound" {
+test "process runner accepts output exactly at byte bound" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{ "/bin/sh", "-c", "printf 0123456789; printf abcdef >&2" };
 
-    const result = try run(std.testing.allocator, zio_runtime.io(), zio_runtime, .{
+    const result = try run(std.testing.allocator, task_runtime.io(), task_runtime, .{
         .argv = &argv,
         .timeout_ms = 1_000,
         .max_stdout_bytes = 10,
@@ -444,14 +445,14 @@ test "zio process runner accepts output exactly at byte bound" {
     try std.testing.expectEqual(expected_term, result.term);
 }
 
-test "zio process runner drains eof from quiet stream after child exit" {
+test "process runner drains eof from quiet stream after child exit" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{ "/bin/sh", "-c", "printf only-stdout" };
 
-    const result = try run(std.testing.allocator, zio_runtime.io(), zio_runtime, .{
+    const result = try run(std.testing.allocator, task_runtime.io(), task_runtime, .{
         .argv = &argv,
         .timeout_ms = 1_000,
         .max_stdout_bytes = 1024,
@@ -465,14 +466,14 @@ test "zio process runner drains eof from quiet stream after child exit" {
     try std.testing.expectEqual(expected_term, result.term);
 }
 
-test "zio process runner drains stderr when stdout is quiet" {
+test "process runner drains stderr when stdout is quiet" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{ "/bin/sh", "-c", "printf only-stderr >&2" };
 
-    const result = try run(std.testing.allocator, zio_runtime.io(), zio_runtime, .{
+    const result = try run(std.testing.allocator, task_runtime.io(), task_runtime, .{
         .argv = &argv,
         .timeout_ms = 1_000,
         .max_stdout_bytes = 1024,
@@ -486,18 +487,18 @@ test "zio process runner drains stderr when stdout is quiet" {
     try std.testing.expectEqual(expected_term, result.term);
 }
 
-test "zio process runner drains larger stdout and stderr without truncation" {
+test "process runner drains larger stdout and stderr without truncation" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{
         "/bin/sh",
         "-c",
         "i=0; while [ $i -lt 2048 ]; do printf 0123456789abcdef; printf fedcba9876543210 >&2; i=$((i + 1)); done",
     };
 
-    const result = try run(std.testing.allocator, zio_runtime.io(), zio_runtime, .{
+    const result = try run(std.testing.allocator, task_runtime.io(), task_runtime, .{
         .argv = &argv,
         .timeout_ms = 1_000,
         .max_stdout_bytes = 64 * 1024,
@@ -513,11 +514,11 @@ test "zio process runner drains larger stdout and stderr without truncation" {
     try std.testing.expectEqual(expected_term, result.term);
 }
 
-test "zio process runner kills child when stdout bound is exceeded" {
+test "process runner kills child when stdout bound is exceeded" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{
         "/bin/sh",
         "-c",
@@ -526,8 +527,8 @@ test "zio process runner kills child when stdout bound is exceeded" {
 
     try std.testing.expectError(error.StreamTooLong, run(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         .{
             .argv = &argv,
             .timeout_ms = 5_000,
@@ -537,17 +538,17 @@ test "zio process runner kills child when stdout bound is exceeded" {
     ));
 }
 
-test "zio process runner reports output bound after child exits" {
+test "process runner reports output bound after child exits" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{ "/bin/sh", "-c", "printf 0123456789" };
 
     try std.testing.expectError(error.StreamTooLong, run(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         .{
             .argv = &argv,
             .timeout_ms = 1_000,
@@ -557,11 +558,11 @@ test "zio process runner reports output bound after child exits" {
     ));
 }
 
-test "zio process runner kills child when output allocation fails" {
+test "process runner kills child when output allocation fails" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .fail_index = 0,
         .resize_fail_index = std.math.maxInt(usize),
@@ -574,8 +575,8 @@ test "zio process runner kills child when output allocation fails" {
 
     try std.testing.expectError(error.OutOfMemory, run(
         failing_allocator.allocator(),
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         .{
             .argv = &argv,
             .timeout_ms = 5_000,
@@ -585,18 +586,18 @@ test "zio process runner kills child when output allocation fails" {
     ));
 }
 
-test "zio process runner times out while stdout is flowing" {
+test "process runner times out while stdout is flowing" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{
         "/bin/sh",
         "-c",
         "while :; do printf x; sleep 1; done",
     };
 
-    try std.testing.expectError(error.Timeout, run(std.testing.allocator, zio_runtime.io(), zio_runtime, .{
+    try std.testing.expectError(error.Timeout, run(std.testing.allocator, task_runtime.io(), task_runtime, .{
         .argv = &argv,
         .timeout_ms = 10,
         .max_stdout_bytes = 1024,
@@ -604,11 +605,11 @@ test "zio process runner times out while stdout is flowing" {
     }));
 }
 
-test "zio process runner escalates timeout to process group kill" {
+test "process runner escalates timeout to process group kill" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.fmt.allocPrint(
@@ -623,7 +624,7 @@ test "zio process runner escalates timeout to process group kill" {
         "trap '' TERM; (trap '' TERM; sleep 0.2; printf leaked > leaked)& wait",
     };
 
-    try std.testing.expectError(error.Timeout, run(std.testing.allocator, zio_runtime.io(), zio_runtime, .{
+    try std.testing.expectError(error.Timeout, run(std.testing.allocator, task_runtime.io(), task_runtime, .{
         .argv = &argv,
         .cwd = cwd,
         .timeout_ms = 10,
@@ -631,16 +632,16 @@ test "zio process runner escalates timeout to process group kill" {
         .max_stdout_bytes = 1024,
         .max_stderr_bytes = 1024,
     }));
-    try zio_runtime.sleep(.fromMilliseconds(500));
+    try task_runtime.sleep(.fromMilliseconds(500));
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(zio_runtime.io(), "leaked", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(task_runtime.io(), "leaked", .{}));
 }
 
-test "zio process runner cancellation terminates child through single wait owner" {
+test "process runner cancellation terminates child through single wait owner" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     var cancel_source = try cancel.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
     const argv = [_][]const u8{ "/bin/sh", "-c", "while :; do printf x; sleep 1; done" };
@@ -649,8 +650,8 @@ test "zio process runner cancellation terminates child through single wait owner
 
     try std.testing.expectError(error.OperationCancelled, run(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         .{
             .argv = &argv,
             .timeout_ms = 5_000,
@@ -661,17 +662,17 @@ test "zio process runner cancellation terminates child through single wait owner
     ));
 }
 
-test "zio process runner returns spawn errors before creating result ownership" {
+test "process runner returns spawn errors before creating result ownership" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var zio_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
     const argv = [_][]const u8{"/definitely/not/a/zi/test/program"};
 
     try std.testing.expectError(error.FileNotFound, run(
         std.testing.allocator,
-        zio_runtime.io(),
-        zio_runtime,
+        task_runtime.io(),
+        task_runtime,
         .{
             .argv = &argv,
             .timeout_ms = 1_000,

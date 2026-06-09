@@ -1,15 +1,22 @@
 # adr 0015: tui product integration contract
 
-status: accepted
+status: partially superseded by the frontend decoupling refactor
 
 date: 2026-06-05
+
+## supersession note
+
+The `ProductApp.apply(Command) -> ?Effect` contract remains accepted. The adapter
+location is superseded: `coding_agent` no longer imports `tui`; concrete frontend
+adapters live outside both modules and translate `ClientEvent` to TUI `Command`
+and TUI `Effect` to `ClientCommand`.
 
 ## context
 
 ADR 0013 made Zi own the terminal substrate and kept `src/tui` independent of
 agent/session policy. The shipped TUI now has a concrete product boundary:
-`ProductApp.apply(Command) -> ?Effect`, with `coding_agent/interactive.zig` as
-the single adapter between coding-agent events and TUI commands.
+`ProductApp.apply(Command) -> ?Effect`. A concrete frontend adapter, when wired,
+translates between coding-agent client events and TUI commands.
 
 This boundary is intentionally smaller than older plans that suggested an
 agent-event API inside the TUI. The smaller boundary better preserves the import
@@ -32,10 +39,10 @@ Effect:
   request_shutdown
 ```
 
-`src/coding_agent/interactive.zig` is the only shipped bridge. It owns:
+A concrete frontend adapter owns:
 
-- translating `AgentSessionEvent` into `Command` values;
-- turning `Effect.submit_text` into `startPromptRun`;
+- translating `ClientEvent` into `Command` values;
+- turning `Effect.submit_text` into `ClientCommand.submit_prompt`;
 - turning shutdown effects/input into host cancellation or loop stop;
 - bounded drains for terminal input, prompt progress, public events, and render;
 - operational degradation for invalid/oversized streamed transcript payloads.
@@ -48,8 +55,7 @@ not name sessions, providers, models, or agent events.
 - TUI mutation goes through `ProductApp.apply(Command) -> ?Effect`.
 - Effects are returned data, not authority to mutate TUI state through another
   path.
-- The integration adapter lives in `src/coding_agent/interactive.zig` unless a
-  second concrete frontend proves a new seam.
+- The integration adapter lives outside `src/coding_agent` and outside `src/tui`.
 - Agent/session events are coding-agent vocabulary; TUI receives only product
   commands.
 - Streamed model/tool bytes are operational input. Invalid UTF-8 fragments or
@@ -62,7 +68,7 @@ not name sessions, providers, models, or agent events.
 
 The TUI stays reusable as a terminal product without becoming an agent frontend
 framework. The adapter is allowed to know both sides, but all mutation authority
-still belongs to the owners it calls: `AgentSessionRuntimeHost` for sessions and
+still belongs to the owners it calls: `SessionRuntime` for sessions and
 `ProductApp`/`TerminalLoop` for TUI state.
 
 Future richer UI concepts (multi-line composer, slots, extension surfaces, rich
