@@ -60,6 +60,8 @@ pub const SessionRuntime = struct {
     wake_event: runtime.ResetEvent = .init,
     active_run: ?*AgentSession.RuntimeAccess.PromptRun = null,
     active_request_id: ?client_protocol.RequestId = null,
+    active_prompt_text: ?[]u8 = null,
+    active_overflow_count_before: usize = 0,
 
     pub fn submit(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
         try self.commands.push(envelope);
@@ -166,6 +168,7 @@ pub const SessionRuntime = struct {
             AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
             self.active_run = null;
         }
+        self.clearActivePromptText();
         drainQueuedCommands(self);
         drainQueuedEvents(self);
         shutdownAndDeinitSession(&self.session);
@@ -178,15 +181,22 @@ pub const SessionRuntime = struct {
     fn applyCommand(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
         switch (envelope.command) {
             .submit_prompt => |prompt| {
+                if (try self.handlePromptCommand(envelope.id, prompt.text)) return;
                 if (self.active_run != null) {
-                    AgentSession.RuntimeAccess.promptWithOptions(&self.session, prompt.text, &.{}, .{ .streaming_behavior = .steer }) catch |err| {
+                    AgentSession.RuntimeAccess.queuePrompt(&self.session, prompt.text, &.{}, .steer) catch |err| {
                         try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                         return;
                     };
                     try self.drainSessionEvents(envelope.id);
                     return;
                 }
-                self.active_run = AgentSession.RuntimeAccess.startPromptRun(&self.session, prompt.text, &.{}, .{}) catch |err| {
+                self.active_prompt_text = self.allocator.dupe(u8, prompt.text) catch |err| {
+                    try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
+                    return;
+                };
+                self.active_overflow_count_before = AgentSession.RuntimeAccess.contextOverflowCount(&self.session);
+                self.active_run = AgentSession.RuntimeAccess.startPromptRun(&self.session, prompt.text, &.{}) catch |err| {
+                    self.clearActivePromptText();
                     try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                     return;
                 };
@@ -199,6 +209,7 @@ pub const SessionRuntime = struct {
                     AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
                     self.active_run = null;
                     self.active_request_id = null;
+                    self.clearActivePromptText();
                 } else AgentSession.RuntimeAccess.cancel(&self.session);
                 try self.drainSessionEvents(envelope.id);
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .response = .canceled } });
@@ -223,9 +234,82 @@ pub const SessionRuntime = struct {
         if (!more) {
             AgentSession.RuntimeAccess.destroyPromptRun(&self.session, run);
             self.active_run = null;
+            const prompt_text = self.active_prompt_text orelse "";
+            AgentSession.RuntimeAccess.afterPromptRunFinished(
+                &self.session,
+                self.active_overflow_count_before,
+                prompt_text,
+                &.{},
+            ) catch |err| {
+                self.clearActivePromptText();
+                self.active_request_id = null;
+                try self.enqueueRejected(request_id, .invalid_command, @errorName(err));
+                return;
+            };
+            self.clearActivePromptText();
             self.active_request_id = null;
+            try self.drainSessionEvents(request_id);
             try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .response = .prompt_finished } });
         }
+    }
+
+    fn clearActivePromptText(self: *SessionRuntime) void {
+        if (self.active_prompt_text) |text| self.allocator.free(text);
+        self.active_prompt_text = null;
+    }
+
+    fn handlePromptCommand(self: *SessionRuntime, request_id: ?client_protocol.RequestId, text: []const u8) !bool {
+        const parsed = parsePromptCommand(text) orelse return false;
+        const command_text, const command = parsed;
+        if (command) |known| switch (known) {
+            .help => try self.enqueuePromptCommand(request_id, command_text, .handled, "available commands: /help, /session"),
+            .session => {
+                var buffer: [128]u8 = undefined;
+                const message = std.fmt.bufPrint(
+                    &buffer,
+                    "session: active={}; queued events={}",
+                    .{ self.active_run != null, self.events.count() },
+                ) catch "session status unavailable";
+                try self.enqueuePromptCommand(request_id, command_text, .handled, message);
+            },
+        } else {
+            var buffer: [128]u8 = undefined;
+            const message = std.fmt.bufPrint(&buffer, "unknown command: /{s}", .{command_text}) catch "unknown command";
+            try self.enqueuePromptCommand(request_id, command_text, .unknown, message);
+        }
+        try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .response = .prompt_finished } });
+        return true;
+    }
+
+    fn enqueuePromptCommand(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        command: []const u8,
+        result: client_protocol.PromptCommandResult,
+        message: []const u8,
+    ) !void {
+        var owned_command = try client_protocol.EventText.init(self.allocator, command);
+        errdefer owned_command.deinit();
+        var owned_message = try client_protocol.EventText.init(self.allocator, message);
+        errdefer owned_message.deinit();
+        try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .prompt_command = .{
+            .command = owned_command,
+            .result = result,
+            .message = owned_message,
+        } } });
+    }
+
+    const PromptCommand = enum { help, session };
+
+    fn parsePromptCommand(text: []const u8) ?struct { []const u8, ?PromptCommand } {
+        if (text.len < 2 or text[0] != '/') return null;
+        var end: usize = 1;
+        while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
+        if (end == 1) return null;
+        const command = text[1..end];
+        if (std.mem.eql(u8, command, "help")) return .{ command, .help };
+        if (std.mem.eql(u8, command, "session")) return .{ command, .session };
+        return .{ command, null };
     }
 
     fn drainSessionEvents(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
@@ -540,15 +624,10 @@ test "session runtime owns services session and bounded mailboxes" {
     try std.testing.expectEqualStrings("session", session_runtime.session.manager.header.id);
 }
 
-test "session runtime drains submitted command into response event" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+fn initTestRuntime(tmp: *std.testing.TmpDir, zio_runtime: *runtime.Runtime) !SessionRuntime {
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-    var session_runtime = try createSessionRuntime(std.testing.allocator, .{
+    return createSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-06-09",
@@ -556,9 +635,17 @@ test "session runtime drains submitted command into response event" {
         .timestamp = "2026-06-09T00:00:00Z",
         .dir = tmp.dir,
         .zio_runtime = zio_runtime,
-        .command_capacity = 2,
-        .event_capacity = 2,
+        .command_capacity = 4,
+        .event_capacity = 64,
     });
+}
+
+test "session runtime drains submitted command into response event" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, zio_runtime);
     defer session_runtime.deinit();
 
     try session_runtime.submit(.{ .id = 1, .command = .clear_queue });
@@ -567,4 +654,63 @@ test "session runtime drains submitted command into response event" {
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 1), event.request_id);
     try std.testing.expectEqual(client_protocol.Response.queue_cleared, event.event.response);
+}
+
+test "session runtime handles slash commands without starting prompt run" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, zio_runtime);
+    defer session_runtime.deinit();
+
+    var command = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 7, "/help");
+    var command_owned = true;
+    defer if (command_owned) command.deinit(std.testing.allocator);
+    try session_runtime.submit(command);
+    command_owned = false;
+    try session_runtime.step();
+
+    var prompt_event = session_runtime.drainEvent().?;
+    defer prompt_event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 7), prompt_event.request_id);
+    try std.testing.expect(prompt_event.event == .prompt_command);
+    try std.testing.expectEqual(client_protocol.PromptCommandResult.handled, prompt_event.event.prompt_command.result);
+    try std.testing.expect(session_runtime.active_run == null);
+
+    var response = session_runtime.drainEvent().?;
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(client_protocol.Response.prompt_finished, response.event.response);
+}
+
+test "session runtime queues prompt while active" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer zio_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, zio_runtime);
+    defer session_runtime.deinit();
+
+    var first = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first");
+    var first_owned = true;
+    defer if (first_owned) first.deinit(std.testing.allocator);
+    try session_runtime.submit(first);
+    first_owned = false;
+    try session_runtime.step();
+    try std.testing.expect(session_runtime.active_run != null);
+
+    var second = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "second");
+    var second_owned = true;
+    defer if (second_owned) second.deinit(std.testing.allocator);
+    try session_runtime.submit(second);
+    second_owned = false;
+    try session_runtime.step();
+
+    var found_queue = false;
+    while (session_runtime.drainEvent()) |event| {
+        var owned = event;
+        defer owned.deinit(std.testing.allocator);
+        if (owned.event == .queue_update and owned.event.queue_update.steering.items.len == 1) found_queue = true;
+    }
+    try std.testing.expect(found_queue);
 }

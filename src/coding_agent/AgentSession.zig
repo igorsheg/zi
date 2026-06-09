@@ -5,7 +5,6 @@ const runtime = @import("../runtime/root.zig");
 const event_drain_mod = @import("event_drain.zig");
 const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
-const queue_mirror_mod = @import("queue_mirror.zig");
 const client_protocol = @import("client_protocol.zig");
 const session_manager = @import("session_manager.zig");
 const session_store = @import("session_store.zig");
@@ -56,9 +55,6 @@ tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 store: ?*session_store.SessionStore = null,
 agent: *agent_mod.Agent,
-public_event_buffer: []client_protocol.ClientEvent,
-public_events: *event_drain_mod.PublicEventQueue,
-queue_mirror: *queue_mirror_mod.QueueMirror,
 event_drain: *event_drain_mod.EventDrain,
 lifecycle: Lifecycle = .accepting,
 compaction_settings: session_manager.CompactionSettings = .{},
@@ -86,14 +82,7 @@ pub const Options = struct {
     zio_runtime: *runtime.Runtime,
 };
 
-const StreamingBehavior = enum {
-    steer,
-    follow_up,
-};
-
-const PromptOptions = struct {
-    streaming_behavior: ?StreamingBehavior = null,
-};
+const QueuePromptKind = enum { steer, follow_up };
 
 pub const RetrySettings = struct {
     enabled: bool = false,
@@ -272,29 +261,17 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     core_agent.* = try agent_mod.Agent.init(allocator, io, agent_options);
     errdefer core_agent.deinit();
 
-    if (options.public_event_capacity == 0) return error.PublicEventCapacityZero;
-    const public_event_buffer = try allocator.alloc(client_protocol.ClientEvent, options.public_event_capacity);
-    errdefer allocator.free(public_event_buffer);
-    const public_events = try allocator.create(event_drain_mod.PublicEventQueue);
-    errdefer allocator.destroy(public_events);
-    public_events.* = event_drain_mod.PublicEventQueue.init(public_event_buffer);
-
-    const queue_mirror = try allocator.create(queue_mirror_mod.QueueMirror);
-    errdefer allocator.destroy(queue_mirror);
-    queue_mirror.* = .{};
-    errdefer queue_mirror.deinit(allocator);
-
     const event_drain = try allocator.create(event_drain_mod.EventDrain);
     errdefer allocator.destroy(event_drain);
-    event_drain.* = .{
-        .allocator = allocator,
-        .io = io,
-        .manager = manager,
-        .store = store,
-        .queue_mirror = queue_mirror,
-        .public_events = public_events,
-        .timestamp = timestamp,
-    };
+    event_drain.* = try event_drain_mod.EventDrain.init(
+        allocator,
+        io,
+        manager,
+        store,
+        timestamp,
+        options.public_event_capacity,
+    );
+    errdefer event_drain.deinit();
 
     _ = try core_agent.subscribe(.{ .context = event_drain, .call_fn = drainAgentEvent });
 
@@ -312,9 +289,6 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .manager = manager,
         .store = store,
         .agent = core_agent,
-        .public_event_buffer = public_event_buffer,
-        .public_events = public_events,
-        .queue_mirror = queue_mirror,
         .event_drain = event_drain,
         .lifecycle = .accepting,
         .compaction_settings = options.compaction_settings,
@@ -328,11 +302,8 @@ pub fn deinit(self: *AgentSession) void {
     std.debug.assert(self.shutdownComplete());
     self.agent.deinit();
     self.allocator.destroy(self.agent);
+    self.event_drain.deinit();
     self.allocator.destroy(self.event_drain);
-    self.queue_mirror.deinit(self.allocator);
-    self.allocator.destroy(self.queue_mirror);
-    self.allocator.destroy(self.public_events);
-    self.allocator.free(self.public_event_buffer);
     if (self.store) |store| {
         store.deinit(self.allocator);
         self.allocator.destroy(store);
@@ -348,53 +319,10 @@ pub fn deinit(self: *AgentSession) void {
     self.* = undefined;
 }
 
-fn prompt(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
-    try self.promptWithOptions(text, images, .{});
-}
-
-fn promptWithOptions(
-    self: *AgentSession,
-    text: []const u8,
-    images: []const ai.ImageContent,
-    options: PromptOptions,
-) !void {
-    try self.promptWithOptionsInternal(text, images, options, true, true);
-}
-
-fn promptWithOptionsInternal(
-    self: *AgentSession,
-    text: []const u8,
-    images: []const ai.ImageContent,
-    options: PromptOptions,
-    retry_overflow: bool,
-    retry_transient: bool,
-) anyerror!void {
-    if (self.retry_settings.max_attempts > max_auto_retry_attempts_limit) return error.RetrySettingsOutOfBounds;
-    const context_overflow_count_before = self.event_drain.context_overflow_count;
-    const run = self.startPromptRun(text, images, options) catch |err| switch (err) {
-        error.PromptCommandCannotStartLiveRun, error.PromptQueuedCannotStartLiveRun => return,
-        else => |unexpected| return unexpected,
-    };
-    defer self.destroyPromptRun(run);
-    while (try self.stepPromptRun(run)) {}
-    const compacted = if (retry_overflow)
-        try self.checkPostPromptOverflowCompaction(context_overflow_count_before, true)
-    else
-        false;
-    if (compacted and retry_overflow) {
-        try self.retryPromptAfterOverflowCompaction(text, images, options);
-    } else if (retry_transient) {
-        if (self.latestRetryableAssistantError()) |error_message| {
-            try self.retryPromptAfterRetryableError(text, images, options, error_message);
-        }
-    }
-}
-
 fn startPromptRun(
     self: *AgentSession,
     text: []const u8,
     images: []const ai.ImageContent,
-    options: PromptOptions,
 ) !*LivePromptRun {
     self.reconcileLifecycle();
     switch (self.lifecycle) {
@@ -403,18 +331,12 @@ fn startPromptRun(
         .shutdown_requested, .stopped => return error.SessionShuttingDown,
     }
     if (self.active_compaction_cancel_source != null) return error.SessionBusy;
-    const preflight: PromptPreflight = .{
-        .text = text,
-        .images = images,
-        .streaming_behavior = options.streaming_behavior,
-    };
-    if (try self.tryHandlePromptCommand(&preflight)) return error.PromptCommandCannotStartLiveRun;
-    if (try self.queuePromptIfStreaming(&preflight)) return error.PromptQueuedCannotStartLiveRun;
+    if (self.agent.state.isStreaming()) return error.SessionBusy;
     try self.checkPrePromptCompaction();
     const run = try self.allocator.create(LivePromptRun);
     errdefer self.allocator.destroy(run);
     run.* = .{};
-    run.prompts[0] = try self.agent.userMessageFromText(preflight.text, preflight.images);
+    run.prompts[0] = try self.agent.userMessageFromText(text, images);
     const token = try self.agent.beginRun();
     errdefer self.agent.finishRun();
     agent_mod.loop.startPromptStream(
@@ -433,14 +355,6 @@ fn startPromptRun(
     );
     run.markRunning(token);
     return run;
-}
-
-fn stepPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
-    if (!run.isActive()) return false;
-    if (try run.stream.next()) |event| {
-        return self.applyPromptRunEvent(run, event);
-    }
-    return self.finishPromptRun(run);
 }
 
 fn applyPromptRunProgress(
@@ -637,8 +551,8 @@ fn status(self: *AgentSession) AgentSessionStatus {
 fn statusSnapshot(self: *AgentSession) RuntimeStatusSnapshot {
     return .{
         .status = self.status(),
-        .public_event_count = self.public_events.count(),
-        .dropped_public_event_count = self.public_events.dropped(),
+        .public_event_count = self.event_drain.publicEventCount(),
+        .dropped_public_event_count = self.event_drain.droppedPublicEventCount(),
         .context_overflow_count = self.event_drain.context_overflow_count,
     };
 }
@@ -647,34 +561,66 @@ fn shutdownComplete(self: *AgentSession) bool {
     self.reconcileLifecycle();
     return self.lifecycle == .stopped and
         self.agent.waitForIdle() and
-        self.public_events.empty();
+        self.event_drain.publicEventsEmpty();
 }
 
 fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
-    return self.queue_mirror.snapshot(allocator);
+    return self.event_drain.queueSnapshot(allocator);
 }
 
 fn clearQueue(self: *AgentSession) !void {
     self.agent.clearAllQueues();
-    if (self.queue_mirror.clear(self.allocator)) try self.event_drain.emitQueueUpdate();
+    try self.event_drain.clearQueueMirror();
 }
 
 fn drainPublicEvent(self: *AgentSession) ?client_protocol.ClientEvent {
-    const event = self.public_events.pop() orelse return null;
-    self.event_drain.enqueuePendingPublicEventOverflow();
-    return event;
+    return self.event_drain.drainPublicEvent();
 }
 
 fn publicEventWake(self: *AgentSession) *runtime.ResetEvent {
-    return &self.event_drain.public_event_wake;
+    return self.event_drain.publicEventWake();
 }
 
+fn queuePrompt(self: *AgentSession, text: []const u8, images: []const ai.ImageContent, kind: QueuePromptKind) !void {
+    if (!self.agent.state.isStreaming()) return error.SessionNotRunning;
+    switch (kind) {
+        .steer => if (!self.agent.steering_queue.hasCapacity()) return error.QueueFull,
+        .follow_up => if (!self.agent.follow_up_queue.hasCapacity()) return error.QueueFull,
+    }
+    const message = try self.agent.userMessageFromText(text, images);
+    switch (kind) {
+        .steer => {
+            try self.agent.steer(message);
+            try self.event_drain.queue_mirror.appendSteering(self.allocator, text);
+        },
+        .follow_up => {
+            try self.agent.followUp(message);
+            try self.event_drain.queue_mirror.appendFollowUp(self.allocator, text);
+        },
+    }
+    try self.event_drain.emitQueueUpdate();
+}
+
+fn afterPromptRunFinished(self: *AgentSession, previous_overflow_count: usize, text: []const u8, images: []const ai.ImageContent) !void {
+    const compacted = try self.checkPostPromptOverflowCompaction(previous_overflow_count, true);
+    if (compacted) {
+        try self.retryPromptAfterOverflowCompaction(text, images);
+    } else if (self.latestRetryableAssistantError()) |error_message| {
+        try self.retryPromptAfterRetryableError(error_message);
+    }
+}
+
+fn contextOverflowCount(self: *const AgentSession) usize {
+    return self.event_drain.context_overflow_count;
+}
 pub const RuntimeAccess = struct {
     pub const PromptRun = LivePromptRun;
-    pub const promptWithOptions = AgentSession.promptWithOptions;
     pub const cancel = AgentSession.cancel;
     pub const requestShutdown = AgentSession.requestShutdown;
     pub const startPromptRun = AgentSession.startPromptRun;
+    pub const queuePrompt = AgentSession.queuePrompt;
+    pub const afterPromptRunFinished = AgentSession.afterPromptRunFinished;
+    pub const contextOverflowCount = AgentSession.contextOverflowCount;
     pub const applyPromptRunProgress = AgentSession.applyPromptRunProgress;
     pub const cancelPromptRun = AgentSession.cancelPromptRun;
     pub const destroyPromptRun = AgentSession.destroyPromptRun;
@@ -682,6 +628,7 @@ pub const RuntimeAccess = struct {
     pub const drainPublicEvent = AgentSession.drainPublicEvent;
     pub const queueSnapshot = AgentSession.queueSnapshot;
     pub const clearQueue = AgentSession.clearQueue;
+    pub const QueuePromptKind = AgentSession.QueuePromptKind;
 };
 
 test "agent session public event enqueue sets coalesced wake" {
@@ -960,103 +907,6 @@ fn buildSystemPromptText(
     });
 }
 
-const PromptPreflight = struct {
-    text: []const u8,
-    images: []const ai.ImageContent,
-    streaming_behavior: ?StreamingBehavior,
-};
-
-const PromptCommand = enum { help, session };
-
-fn tryHandlePromptCommand(self: *AgentSession, preflight: *const PromptPreflight) !bool {
-    const parsed = parsePromptCommand(preflight.text) orelse return false;
-    const command_text, const command = parsed;
-    if (command) |known| switch (known) {
-        .help => try self.emitPromptCommand(command_text, .handled, "available commands: /help, /session"),
-        .session => {
-            const snapshot = self.statusSnapshot();
-            const message = try std.fmt.allocPrint(
-                self.allocator,
-                "session: {s}; public events: {}; dropped events: {}; active tools: {}",
-                .{ @tagName(snapshot.status), snapshot.public_event_count, snapshot.dropped_public_event_count, self.tools.activeToolNames().len },
-            );
-            errdefer self.allocator.free(message);
-            try self.emitPromptCommandOwned(
-                command_text,
-                .handled,
-                client_protocol.EventText.initOwned(self.allocator, message),
-            );
-        },
-    } else {
-        const unknown_message = try std.fmt.allocPrint(self.allocator, "unknown command: /{s}", .{command_text});
-        errdefer self.allocator.free(unknown_message);
-        try self.emitPromptCommandOwned(
-            command_text,
-            .unknown,
-            client_protocol.EventText.initOwned(self.allocator, unknown_message),
-        );
-    }
-    return true;
-}
-
-fn parsePromptCommand(text: []const u8) ?struct { []const u8, ?PromptCommand } {
-    if (text.len < 2 or text[0] != '/') return null;
-    var end: usize = 1;
-    while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
-    if (end == 1) return null;
-    const command = text[1..end];
-    if (std.mem.eql(u8, command, "help")) return .{ command, .help };
-    if (std.mem.eql(u8, command, "session")) return .{ command, .session };
-    return .{ command, null };
-}
-
-fn emitPromptCommand(
-    self: *AgentSession,
-    command: []const u8,
-    result: client_protocol.PromptCommandResult,
-    message_text: []const u8,
-) !void {
-    var message = try client_protocol.EventText.init(self.allocator, message_text);
-    errdefer message.deinit();
-    try self.emitPromptCommandOwned(command, result, message);
-}
-
-fn emitPromptCommandOwned(
-    self: *AgentSession,
-    command: []const u8,
-    result: client_protocol.PromptCommandResult,
-    message: client_protocol.EventText,
-) !void {
-    var owned_message = message;
-    errdefer owned_message.deinit();
-    self.event_drain.enqueuePublicEvent(.{ .prompt_command = .{
-        .command = try client_protocol.EventText.init(self.allocator, command),
-        .result = result,
-        .message = owned_message,
-    } });
-}
-
-fn queuePromptIfStreaming(self: *AgentSession, preflight: *const PromptPreflight) !bool {
-    if (!self.agent.state.isStreaming()) return false;
-    const behavior = preflight.streaming_behavior orelse return error.StreamingBehaviorRequired;
-    switch (behavior) {
-        .steer => if (!self.agent.steering_queue.hasCapacity()) return error.QueueFull,
-        .follow_up => if (!self.agent.follow_up_queue.hasCapacity()) return error.QueueFull,
-    }
-
-    const message = try self.agent.userMessageFromText(preflight.text, preflight.images);
-    switch (behavior) {
-        .steer => try self.agent.steer(message),
-        .follow_up => try self.agent.followUp(message),
-    }
-    switch (behavior) {
-        .steer => try self.queue_mirror.appendSteering(self.allocator, preflight.text),
-        .follow_up => try self.queue_mirror.appendFollowUp(self.allocator, preflight.text),
-    }
-    try self.event_drain.emitQueueUpdate();
-    return true;
-}
-
 fn checkPrePromptCompaction(self: *AgentSession) !void {
     if (!self.compaction_settings.auto_enabled) return;
     var preparation = self.manager.prepareCompaction(
@@ -1101,7 +951,6 @@ fn retryPromptAfterOverflowCompaction(
     self: *AgentSession,
     text: []const u8,
     images: []const ai.ImageContent,
-    options: PromptOptions,
 ) anyerror!void {
     var error_message = try client_protocol.EventText.init(self.allocator, "context overflow");
     var retry_start_owns_error_message = true;
@@ -1114,7 +963,7 @@ fn retryPromptAfterOverflowCompaction(
     } });
     retry_start_owns_error_message = false;
 
-    self.promptWithOptionsInternal(text, images, options, false, false) catch |err| {
+    self.agent.promptText(text, images) catch |err| {
         const final_error = client_protocol.EventText.init(self.allocator, @errorName(err)) catch return err;
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_end = .{
             .success = false,
@@ -1132,9 +981,6 @@ fn retryPromptAfterOverflowCompaction(
 
 fn retryPromptAfterRetryableError(
     self: *AgentSession,
-    _: []const u8,
-    _: []const ai.ImageContent,
-    _: PromptOptions,
     source_error_message: []const u8,
 ) anyerror!void {
     if (!self.retry_settings.enabled or self.retry_settings.max_attempts == 0) return;
@@ -1356,229 +1202,6 @@ test "agent session shutdown complete requires stopped idle and drained events" 
     try std.testing.expect(session.shutdownComplete());
 }
 
-test "agent session shutdown rejects new prompts" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    session.requestShutdown();
-
-    try std.testing.expectEqual(AgentSessionStatus.stopped, session.status());
-    try std.testing.expectError(error.SessionShuttingDown, session.prompt("blocked", &.{}));
-}
-
-test "agent session shutdown while running stops after terminal event" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    session.requestShutdown();
-
-    try std.testing.expectEqual(AgentSessionStatus.shutdown_requested, session.status());
-    try std.testing.expect(session.agent.signal().?.isRequested());
-    try std.testing.expectError(error.SessionShuttingDown, session.prompt("blocked", &.{}));
-
-    try session.agent.emitEvent(.{ .agent_end = .{ .messages = session.agent.state.messages } });
-    session.agent.finishRun();
-
-    try std.testing.expectEqual(AgentSessionStatus.stopped, session.status());
-    drainAllPublicEvents(&session);
-}
-
-test "agent session prompt uses preflight spine before agent submission" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    try session.prompt("hello", &.{});
-
-    try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
-    try expectNextUserMessageEvent(.message_start, &session, "hello");
-    drainAllPublicEvents(&session);
-}
-
-test "agent session prompt requires streaming behavior while running" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-
-    try std.testing.expectError(error.StreamingBehaviorRequired, session.prompt("queued", &.{}));
-    try std.testing.expect(!session.agent.hasQueuedMessages());
-}
-
-test "agent session slash command while running emits command event without queueing" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try initTestSession(zio_runtime, tmp.dir);
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-
-    try session.promptWithOptions("/help", &.{}, .{});
-
-    try std.testing.expectEqual(@as(usize, 0), session.agent.steering_queue.count());
-    try std.testing.expectEqual(@as(usize, 0), session.agent.follow_up_queue.count());
-    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
-    try expectNextPromptCommand(&session, .handled, "help", "available commands: /help, /session");
-    try std.testing.expectEqual(@as(usize, 0), session.statusSnapshot().public_event_count);
-}
-
-test "agent session slash command public event overflow is bounded" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try initTestSessionWithCapacity(zio_runtime, tmp.dir, 1);
-    defer shutdownAndDeinit(&session);
-
-    try session.promptWithOptions("/help", &.{}, .{});
-    try session.promptWithOptions("/session", &.{}, .{});
-
-    try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().public_event_count);
-    try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().dropped_public_event_count);
-    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
-    try expectNextPromptCommand(&session, .handled, "help", "available commands: /help, /session");
-}
-
-test "agent session prompt queues follow up while running" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-
-    try session.promptWithOptions("queued", &.{}, .{ .streaming_behavior = .follow_up });
-
-    try std.testing.expectEqual(@as(usize, 0), session.agent.steering_queue.count());
-    try std.testing.expectEqual(@as(usize, 1), session.agent.follow_up_queue.count());
-    var event = session.drainPublicEvent().?;
-    defer event.deinit();
-    const queue_update = event.queue_update;
-    try std.testing.expectEqual(@as(usize, 0), queue_update.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 1), queue_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued", queue_update.follow_up.items[0]);
-}
-
-test "agent session prompt queues steering while running" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-
-    try session.promptWithOptions("steer", &.{}, .{ .streaming_behavior = .steer });
-
-    try std.testing.expectEqual(@as(usize, 1), session.agent.steering_queue.count());
-    try std.testing.expectEqual(@as(usize, 0), session.agent.follow_up_queue.count());
-    var event = session.drainPublicEvent().?;
-    defer event.deinit();
-    const queue_update = event.queue_update;
-    try std.testing.expectEqual(@as(usize, 1), queue_update.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), queue_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("steer", queue_update.steering.items[0]);
-}
-
 test "agent session public events are caller drained after message persistence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1618,143 +1241,6 @@ test "agent session public events are caller drained after message persistence" 
     defer end_event.deinit();
     try expectUserMessageEvent(.message_end, end_event.agent_event.event, "hello");
     try std.testing.expect(session.drainPublicEvent() == null);
-}
-
-test "agent session queue update carries revision and snapshot exposes queued text" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-    try session.promptWithOptions("queued", &.{}, .{ .streaming_behavior = .follow_up });
-
-    var event = session.drainPublicEvent().?;
-    defer event.deinit();
-    const queue_update = event.queue_update;
-    try std.testing.expectEqual(@as(u64, 1), queue_update.revision);
-    try std.testing.expectEqual(@as(usize, 0), queue_update.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 1), queue_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued", queue_update.follow_up.items[0]);
-    var json_buffer: [128]u8 = undefined;
-    var json_writer = std.Io.Writer.fixed(&json_buffer);
-    try std.json.Stringify.value(event, .{}, &json_writer);
-    try std.testing.expectEqualStrings(
-        "{\"type\":\"queue_update\",\"steering\":[],\"followUp\":[\"queued\"],\"revision\":1}",
-        json_writer.buffered(),
-    );
-
-    var snapshot = try session.queueSnapshot(std.testing.allocator);
-    defer snapshot.deinit();
-    try std.testing.expectEqual(@as(u64, 1), snapshot.revision);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued", snapshot.follow_up.items[0]);
-}
-
-test "agent session queue update consumes block user message text" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    const image: ai.ImageContent = .{ .data = "abc", .mime_type = "image/png" };
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-    try session.promptWithOptions("queued image", &.{image}, .{ .streaming_behavior = .follow_up });
-
-    var queued_event = session.drainPublicEvent().?;
-    defer queued_event.deinit();
-    const queued_update = queued_event.queue_update;
-    try std.testing.expectEqual(@as(usize, 0), queued_update.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 1), queued_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued image", queued_update.follow_up.items[0]);
-
-    const message = try session.agent.userMessageFromText("queued image", &.{image});
-    try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
-
-    var consumed_event = session.drainPublicEvent().?;
-    defer consumed_event.deinit();
-    const consumed_update = consumed_event.queue_update;
-    try std.testing.expectEqual(@as(usize, 0), consumed_update.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up.items.len);
-    var message_event = session.drainPublicEvent().?;
-    defer message_event.deinit();
-    try expectUserMessageEvent(.message_start, message_event.agent_event.event, "queued image");
-}
-
-test "agent session queue update is emitted before queued user message start" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    defer session.agent.finishRun();
-    try session.promptWithOptions("queued", &.{}, .{ .streaming_behavior = .steer });
-
-    var queued_event = session.drainPublicEvent().?;
-    defer queued_event.deinit();
-    const queued_update = queued_event.queue_update;
-    try std.testing.expectEqual(@as(usize, 1), queued_update.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), queued_update.follow_up.items.len);
-    try std.testing.expectEqualStrings("queued", queued_update.steering.items[0]);
-
-    const message = try session.agent.userMessageFromText("queued", &.{});
-    try session.agent.emitEvent(.{ .message_start = .{ .message = message } });
-
-    var consumed_event = session.drainPublicEvent().?;
-    defer consumed_event.deinit();
-    const consumed_update = consumed_event.queue_update;
-    try std.testing.expectEqual(@as(usize, 0), consumed_update.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), consumed_update.follow_up.items.len);
-    var message_event = session.drainPublicEvent().?;
-    defer message_event.deinit();
-    try expectUserMessageEvent(.message_start, message_event.agent_event.event, "queued");
 }
 
 test "agent session snapshots expose status and active tool read models" {
@@ -1854,75 +1340,6 @@ test "agent session public event drain is caller driven" {
     try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().public_event_count);
     var event = session.drainPublicEvent().?;
     event.deinit();
-    try std.testing.expectEqual(@as(usize, 0), session.statusSnapshot().public_event_count);
-}
-
-test "agent session slash command emits public command event without model run" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try initTestSession(zio_runtime, tmp.dir);
-    defer shutdownAndDeinit(&session);
-
-    try session.promptWithOptions("/missing arg", &.{}, .{});
-
-    try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
-    try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
-    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
-    try expectNextPromptCommand(&session, .unknown, "missing", "unknown command: /missing");
-    try std.testing.expectEqual(@as(usize, 0), session.statusSnapshot().public_event_count);
-}
-
-test "agent session help command emits handled event without model run" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try initTestSession(zio_runtime, tmp.dir);
-    defer shutdownAndDeinit(&session);
-
-    try session.promptWithOptions("/help", &.{}, .{});
-
-    try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
-    try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
-    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
-    try expectNextPromptCommand(&session, .handled, "help", "available commands: /help, /session");
-    try std.testing.expectEqual(@as(usize, 0), session.statusSnapshot().public_event_count);
-}
-
-test "agent session session command emits snapshot without model run" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try initTestSession(zio_runtime, tmp.dir);
-    defer shutdownAndDeinit(&session);
-
-    const expected_tools = session.tools.activeToolNames().len;
-    try session.promptWithOptions("/session", &.{}, .{});
-
-    try std.testing.expectEqual(AgentSessionStatus.idle, session.status());
-    try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
-    try std.testing.expectEqual(@as(usize, 0), session.manager.entries.items.len);
-    var event = session.drainPublicEvent().?;
-    defer event.deinit();
-    try std.testing.expect(event == .prompt_command);
-    try std.testing.expectEqual(
-        client_protocol.PromptCommandResult.handled,
-        event.prompt_command.result,
-    );
-    try std.testing.expectEqualStrings("session", event.prompt_command.command.text);
-    const expected_message = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "session: idle; public events: 0; dropped events: 0; active tools: {}",
-        .{expected_tools},
-    );
-    defer std.testing.allocator.free(expected_message);
-    try std.testing.expectEqualStrings(expected_message, event.prompt_command.message.text);
     try std.testing.expectEqual(@as(usize, 0), session.statusSnapshot().public_event_count);
 }
 
@@ -2312,401 +1729,6 @@ test "agent session generated manual compaction cancellation is observable" {
     try std.testing.expect(end_event.compaction_end.aborted);
     try std.testing.expect(end_event.compaction_end.result == null);
     try std.testing.expectEqualStrings("OperationCancelled", end_event.compaction_end.error_message.?.text);
-}
-
-test "agent session auto compacts before prompt when enabled" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
-    defer provider.deinit();
-    const summary_content = [_]ai.AssistantContent{ai.faux.text("generated summary")};
-    const prompt_content = [_]ai.AssistantContent{ai.faux.text("prompt response")};
-    const responses = [_]ai.AssistantMessage{
-        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
-        ai.faux.assistantMessage(&prompt_content, .{ .stop_reason = .stop }),
-    };
-    try provider.setResponses(&responses);
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-        .model = provider.getModel(),
-        .stream = provider.apiProvider().stream,
-        .compaction_settings = .{ .keep_recent_tokens = 2 },
-    });
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
-        .content = .{ .string = "aaaaaaaa" },
-        .timestamp = 0,
-    } } } });
-    try session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
-        .content = .{ .string = "bbbbbbbb" },
-        .timestamp = 0,
-    } } } });
-    session.agent.finishRun();
-    drainAllPublicEvents(&session);
-    session.compaction_settings.auto_enabled = true;
-
-    try session.prompt("next", &.{});
-
-    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
-    try std.testing.expect(session.manager.entries.items[2] == .compaction);
-    try std.testing.expectEqualStrings("generated summary", session.manager.entries.items[2].compaction.summary);
-
-    var start_event = session.drainPublicEvent().?;
-    defer start_event.deinit();
-    try std.testing.expect(start_event == .compaction_start);
-    try std.testing.expectEqual(
-        client_protocol.CompactionReason.threshold,
-        start_event.compaction_start.reason,
-    );
-    var end_event = session.drainPublicEvent().?;
-    defer end_event.deinit();
-    try std.testing.expect(end_event == .compaction_end);
-    try std.testing.expectEqual(
-        client_protocol.CompactionReason.threshold,
-        end_event.compaction_end.reason,
-    );
-    try std.testing.expect(end_event.compaction_end.result != null);
-
-    var agent_start = session.drainPublicEvent().?;
-    defer agent_start.deinit();
-    try std.testing.expect(agent_start == .agent_event);
-    try std.testing.expect(agent_start.agent_event.event == .agent_start);
-}
-
-test "agent session auto compaction skips already compacted branch before prompt" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
-    defer provider.deinit();
-    const prompt_content = [_]ai.AssistantContent{ai.faux.text("prompt response")};
-    const responses = [_]ai.AssistantMessage{
-        ai.faux.assistantMessage(&prompt_content, .{ .stop_reason = .stop }),
-    };
-    try provider.setResponses(&responses);
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-        .model = provider.getModel(),
-        .stream = provider.apiProvider().stream,
-        .compaction_settings = .{ .keep_recent_tokens = 2, .auto_enabled = true },
-    });
-    defer shutdownAndDeinit(&session);
-
-    const kept = try session.manager.appendMessage(.{ .user = .{
-        .content = .{ .string = "aaaaaaaa" },
-        .timestamp = 0,
-    } }, "t1");
-    _ = try session.manager.appendCompaction("summary", kept, 2, "t2");
-    const context = try session.manager.buildSessionContext(std.testing.allocator);
-    defer session.manager.deinitSessionContext(std.testing.allocator, context);
-    try session.agent.replaceMessages(context.messages);
-
-    try session.prompt("next", &.{});
-
-    try std.testing.expectEqual(@as(usize, 1), provider.call_count);
-    try std.testing.expectEqual(@as(usize, 4), session.manager.entries.items.len);
-    var saw_agent_start = false;
-    while (session.drainPublicEvent()) |event| {
-        var owned_event = event;
-        defer owned_event.deinit();
-        try std.testing.expect(owned_event != .compaction_start);
-        try std.testing.expect(owned_event != .compaction_end);
-        if (owned_event == .agent_event and owned_event.agent_event.event == .agent_start) saw_agent_start = true;
-    }
-    try std.testing.expect(saw_agent_start);
-}
-
-test "agent session auto compacts after context overflow and retries once" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
-    defer provider.deinit();
-    const summary_content = [_]ai.AssistantContent{ai.faux.text("overflow summary")};
-    const responses = [_]ai.AssistantMessage{
-        ai.faux.assistantMessage(&.{}, .{
-            .stop_reason = .error_,
-            .error_message = "maximum context length exceeded",
-        }),
-        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
-        ai.faux.assistantMessage(&.{.{ .text = .{ .text = "retried response" } }}, .{ .stop_reason = .stop }),
-    };
-    try provider.setResponses(&responses);
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-        .model = provider.getModel(),
-        .stream = provider.apiProvider().stream,
-        .compaction_settings = .{ .keep_recent_tokens = 0, .auto_enabled = true },
-    });
-    defer shutdownAndDeinit(&session);
-
-    try session.prompt("overflow request", &.{});
-
-    try std.testing.expectEqual(@as(usize, 3), provider.call_count);
-    try std.testing.expectEqual(@as(usize, 1), session.statusSnapshot().context_overflow_count);
-    try std.testing.expectEqual(@as(usize, 5), session.manager.entries.items.len);
-    try std.testing.expect(session.manager.entries.items[2] == .compaction);
-    try std.testing.expectEqualStrings("overflow summary", session.manager.entries.items[2].compaction.summary);
-
-    var saw_overflow_start = false;
-    var saw_overflow_end = false;
-    var saw_retry_start = false;
-    var saw_retry_end = false;
-    while (session.drainPublicEvent()) |event| {
-        var owned_event = event;
-        defer owned_event.deinit();
-        if (owned_event == .compaction_start) {
-            try std.testing.expectEqual(
-                client_protocol.CompactionReason.overflow,
-                owned_event.compaction_start.reason,
-            );
-            saw_overflow_start = true;
-        }
-        if (owned_event == .compaction_end) {
-            try std.testing.expectEqual(
-                client_protocol.CompactionReason.overflow,
-                owned_event.compaction_end.reason,
-            );
-            try std.testing.expect(owned_event.compaction_end.will_retry);
-            saw_overflow_end = true;
-        }
-        if (owned_event == .auto_retry_start) {
-            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_start.attempt);
-            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_start.max_attempts);
-            saw_retry_start = true;
-        }
-        if (owned_event == .auto_retry_end) {
-            try std.testing.expect(owned_event.auto_retry_end.success);
-            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_end.attempt);
-            saw_retry_end = true;
-        }
-    }
-    try std.testing.expect(saw_overflow_start);
-    try std.testing.expect(saw_overflow_end);
-    try std.testing.expect(saw_retry_start);
-    try std.testing.expect(saw_retry_end);
-}
-
-test "agent session overflow retry does not recurse on second overflow" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
-    defer provider.deinit();
-    const summary_content = [_]ai.AssistantContent{ai.faux.text("overflow summary")};
-    const responses = [_]ai.AssistantMessage{
-        ai.faux.assistantMessage(&.{}, .{
-            .stop_reason = .error_,
-            .error_message = "maximum context length exceeded",
-        }),
-        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
-        ai.faux.assistantMessage(&.{}, .{
-            .stop_reason = .error_,
-            .error_message = "maximum context length exceeded",
-        }),
-    };
-    try provider.setResponses(&responses);
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-        .model = provider.getModel(),
-        .stream = provider.apiProvider().stream,
-        .compaction_settings = .{ .keep_recent_tokens = 0, .auto_enabled = true },
-    });
-    defer shutdownAndDeinit(&session);
-
-    try session.prompt("overflow request", &.{});
-
-    try std.testing.expectEqual(@as(usize, 3), provider.call_count);
-    try std.testing.expectEqual(@as(usize, 2), session.statusSnapshot().context_overflow_count);
-    try std.testing.expectEqual(@as(usize, 5), session.manager.entries.items.len);
-
-    var retry_start_count: usize = 0;
-    var overflow_compaction_count: usize = 0;
-    while (session.drainPublicEvent()) |event| {
-        var owned_event = event;
-        defer owned_event.deinit();
-        if (owned_event == .auto_retry_start) retry_start_count += 1;
-        if (owned_event == .compaction_end and owned_event.compaction_end.reason == .overflow) {
-            overflow_compaction_count += 1;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 1), retry_start_count);
-    try std.testing.expectEqual(@as(usize, 1), overflow_compaction_count);
-}
-
-test "agent session retries transient assistant errors through continue" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
-    defer provider.deinit();
-    const responses = [_]ai.AssistantMessage{
-        ai.faux.assistantMessage(&.{}, .{
-            .stop_reason = .error_,
-            .error_message = "429 rate limit",
-        }),
-        ai.faux.assistantMessage(&.{.{ .text = .{ .text = "retried response" } }}, .{ .stop_reason = .stop }),
-    };
-    try provider.setResponses(&responses);
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-        .model = provider.getModel(),
-        .stream = provider.apiProvider().stream,
-        .retry_settings = .{ .enabled = true, .max_attempts = 1 },
-    });
-    defer shutdownAndDeinit(&session);
-
-    try session.prompt("retry request", &.{});
-
-    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
-    try std.testing.expectEqual(@as(usize, 3), session.manager.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), session.agent.state.messages.len);
-    try std.testing.expect(session.agent.state.messages[1] == .assistant);
-    try std.testing.expectEqual(.stop, session.agent.state.messages[1].assistant.stop_reason);
-
-    var saw_retry_start = false;
-    var saw_retry_end = false;
-    while (session.drainPublicEvent()) |event| {
-        var owned_event = event;
-        defer owned_event.deinit();
-        if (owned_event == .auto_retry_start) {
-            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_start.attempt);
-            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_start.max_attempts);
-            try std.testing.expectEqualStrings("429 rate limit", owned_event.auto_retry_start.error_message.text);
-            saw_retry_start = true;
-        }
-        if (owned_event == .auto_retry_end) {
-            try std.testing.expect(owned_event.auto_retry_end.success);
-            try std.testing.expectEqual(@as(usize, 1), owned_event.auto_retry_end.attempt);
-            saw_retry_end = true;
-        }
-    }
-    try std.testing.expect(saw_retry_start);
-    try std.testing.expect(saw_retry_end);
-}
-
-test "agent session transient retry stops at bounded attempts" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
-    defer provider.deinit();
-    const responses = [_]ai.AssistantMessage{
-        ai.faux.assistantMessage(&.{}, .{
-            .stop_reason = .error_,
-            .error_message = "server_error",
-        }),
-        ai.faux.assistantMessage(&.{}, .{
-            .stop_reason = .error_,
-            .error_message = "Network connection lost.",
-        }),
-    };
-    try provider.setResponses(&responses);
-    var zio_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer zio_runtime.deinit();
-
-    var session = try AgentSession.init(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir = "agent",
-        .current_date = "2026-05-25",
-        .session_id = "session",
-        .timestamp = "2026-05-25T00:00:00Z",
-        .zio_runtime = zio_runtime,
-        .dir = tmp.dir,
-        .model = provider.getModel(),
-        .stream = provider.apiProvider().stream,
-        .retry_settings = .{ .enabled = true, .max_attempts = 1 },
-    });
-    defer shutdownAndDeinit(&session);
-
-    try session.prompt("retry request", &.{});
-
-    try std.testing.expectEqual(@as(usize, 2), provider.call_count);
-    try std.testing.expectEqual(@as(usize, 3), session.manager.entries.items.len);
-
-    var retry_start_count: usize = 0;
-    var saw_failed_retry_end = false;
-    while (session.drainPublicEvent()) |event| {
-        var owned_event = event;
-        defer owned_event.deinit();
-        if (owned_event == .auto_retry_start) retry_start_count += 1;
-        if (owned_event == .auto_retry_end) {
-            try std.testing.expect(!owned_event.auto_retry_end.success);
-            try std.testing.expectEqualStrings(
-                "Network connection lost.",
-                owned_event.auto_retry_end.final_error.?.text,
-            );
-            saw_failed_retry_end = true;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 1), retry_start_count);
-    try std.testing.expect(saw_failed_retry_end);
 }
 
 test "agent session prepared manual compaction emits failure event" {

@@ -15,12 +15,40 @@ pub const EventDrain = struct {
     io: std.Io,
     manager: *session_manager.SessionManager,
     store: ?*session_store.SessionStore,
-    queue_mirror: *queue_mirror_mod.QueueMirror,
-    public_events: *PublicEventQueue,
+    public_event_buffer: []client_protocol.ClientEvent,
+    public_events: PublicEventQueue,
+    queue_mirror: queue_mirror_mod.QueueMirror = .{},
     public_event_wake: runtime.ResetEvent = .init,
     timestamp: []const u8,
     context_overflow_count: usize = 0,
     pending_public_event_overflow_count: usize = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        manager: *session_manager.SessionManager,
+        store: ?*session_store.SessionStore,
+        timestamp: []const u8,
+        public_event_capacity: usize,
+    ) !EventDrain {
+        if (public_event_capacity == 0) return error.PublicEventCapacityZero;
+        const buffer = try allocator.alloc(client_protocol.ClientEvent, public_event_capacity);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .manager = manager,
+            .store = store,
+            .public_event_buffer = buffer,
+            .public_events = PublicEventQueue.init(buffer),
+            .timestamp = timestamp,
+        };
+    }
+
+    pub fn deinit(self: *EventDrain) void {
+        self.queue_mirror.deinit(self.allocator);
+        self.allocator.free(self.public_event_buffer);
+        self.* = undefined;
+    }
 
     pub fn handle(self: *EventDrain, event: agent_mod.AgentEvent) !void {
         try self.updateQueueMirror(event);
@@ -61,6 +89,36 @@ pub const EventDrain = struct {
         if (!self.public_events.pushOrDrop(.{ .event_overflow = .{ .dropped_count = dropped_count } })) return;
         self.pending_public_event_overflow_count = 0;
         self.public_event_wake.set();
+    }
+
+    pub fn queueSnapshot(self: *const EventDrain, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
+        return self.queue_mirror.snapshot(allocator);
+    }
+
+    pub fn clearQueueMirror(self: *EventDrain) !void {
+        if (self.queue_mirror.clear(self.allocator)) try self.emitQueueUpdate();
+    }
+
+    pub fn drainPublicEvent(self: *EventDrain) ?client_protocol.ClientEvent {
+        const event = self.public_events.pop() orelse return null;
+        self.enqueuePendingPublicEventOverflow();
+        return event;
+    }
+
+    pub fn publicEventWake(self: *EventDrain) *runtime.ResetEvent {
+        return &self.public_event_wake;
+    }
+
+    pub fn publicEventCount(self: *const EventDrain) usize {
+        return self.public_events.count();
+    }
+
+    pub fn droppedPublicEventCount(self: *const EventDrain) usize {
+        return self.public_events.dropped();
+    }
+
+    pub fn publicEventsEmpty(self: *const EventDrain) bool {
+        return self.public_events.empty();
     }
 
     fn updateQueueMirror(self: *EventDrain, event: agent_mod.AgentEvent) !void {
