@@ -70,7 +70,23 @@ pub const SessionStore = struct {
     pub fn load(self: SessionStore, allocator: std.mem.Allocator, io: std.Io) !session_manager.SessionManager {
         const data = try self.dir.readFileAlloc(io, self.file_name, allocator, .limited(max_session_file_bytes));
         defer allocator.free(data);
-        return parseSession(allocator, data);
+        var parsed = try parseSession(allocator, data);
+        if (parsed.repair_length) |length| {
+            // The dropped torn line is still on disk. Truncate it away now,
+            // or the next append glues onto the fragment and corrupts both
+            // lines -- turning a recoverable tail into fatal interior damage.
+            self.truncateTo(io, length) catch |err| {
+                parsed.manager.deinit();
+                return err;
+            };
+        }
+        return parsed.manager;
+    }
+
+    fn truncateTo(self: SessionStore, io: std.Io, length: u64) !void {
+        const file = try self.dir.openFile(io, self.file_name, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setLength(io, length);
     }
 };
 
@@ -97,6 +113,9 @@ fn appendLine(io: std.Io, dir: std.Io.Dir, file_name: []const u8, line: []const 
     const file = try dir.openFile(io, file_name, .{ .mode = .read_write });
     defer file.close(io);
     const offset = try file.length(io);
+    // Keep the write bound coherent with the load bound: a session this
+    // store writes must remain loadable by this store.
+    if (offset + line.len > max_session_file_bytes) return error.SessionFileFull;
     try file.writePositionalAll(io, line, offset);
 }
 
@@ -187,7 +206,14 @@ fn writeAgentMessage(writer: *std.Io.Writer, message: agent.AgentMessage) !void 
     }
 }
 
-fn parseSession(allocator: std.mem.Allocator, data: []const u8) !session_manager.SessionManager {
+const ParsedSession = struct {
+    manager: session_manager.SessionManager,
+    /// When a torn trailing line was dropped: byte length of the good
+    /// prefix. The file must be truncated to it before any append.
+    repair_length: ?u64,
+};
+
+fn parseSession(allocator: std.mem.Allocator, data: []const u8) !ParsedSession {
     var lines = std.mem.splitScalar(u8, data, '\n');
     const header_line = lines.next() orelse return error.MissingHeader;
     var parsed_header = try mem.JsonOwned(std.json.Value).parseJson(allocator, header_line, .{});
@@ -209,18 +235,26 @@ fn parseSession(allocator: std.mem.Allocator, data: []const u8) !session_manager
         manager.header.parent_session = try allocator.dupe(u8, try jsonString(parent_session));
     }
 
+    var good_length: usize = @min(header_line.len + 1, data.len);
     while (lines.next()) |line| {
-        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        const line_end = (@intFromPtr(line.ptr) - @intFromPtr(data.ptr)) + line.len;
+        if (std.mem.trim(u8, line, " \t\r").len == 0) {
+            good_length = @min(line_end + 1, data.len);
+            continue;
+        }
         if (line.len > max_session_line_bytes) return error.LineTooLong;
         parseEntryLine(allocator, &manager, line) catch |err| {
             if (err == error.OutOfMemory) return err;
             // A failing final line is a torn append from a crash: drop it
             // and keep what loaded. Interior corruption stays fatal.
-            if (std.mem.trim(u8, lines.rest(), " \t\r\n").len == 0) break;
+            if (std.mem.trim(u8, lines.rest(), " \t\r\n").len == 0) {
+                return .{ .manager = manager, .repair_length = good_length };
+            }
             return err;
         };
+        good_length = @min(line_end + 1, data.len);
     }
-    return manager;
+    return .{ .manager = manager, .repair_length = null };
 }
 
 fn parseEntryLine(allocator: std.mem.Allocator, manager: *session_manager.SessionManager, line: []const u8) !void {
@@ -509,21 +543,84 @@ fn jsonString(value: std.json.Value) ![]const u8 {
     };
 }
 
-test "session parser drops torn trailing line and keeps loaded entries" {
-    var loaded = try parseSession(
-        std.testing.allocator,
+test "session parser drops torn trailing line and reports the repair length" {
+    const good_prefix =
         "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n" ++
-            "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t\",\"message\":" ++
-            "{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":0}}\n" ++
-            "{\"type\":\"message\",\"id\":\"0000",
+        "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t\",\"message\":" ++
+        "{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":0}}\n";
+    var parsed = try parseSession(
+        std.testing.allocator,
+        good_prefix ++ "{\"type\":\"message\",\"id\":\"0000",
     );
-    defer loaded.deinit();
-    try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
+    defer parsed.manager.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.manager.entries.items.len);
+    try std.testing.expectEqual(@as(u64, good_prefix.len), parsed.repair_length.?);
+
+    var clean = try parseSession(std.testing.allocator, good_prefix);
+    defer clean.manager.deinit();
+    try std.testing.expectEqual(@as(?u64, null), clean.repair_length);
 }
 
 const valid_user_line =
     "{\"type\":\"message\",\"id\":\"00000002\",\"parentId\":\"00000001\",\"timestamp\":\"t\"," ++
     "\"message\":{\"role\":\"user\",\"content\":\"next\",\"timestamp\":0}}\n";
+
+test "session store load repairs torn trailing line before future appends" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, "/repo", "session-1", "t0");
+    defer store.deinit(std.testing.allocator);
+    var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+    _ = try manager.appendMessage(.{ .user = .{ .content = .{ .string = "one" }, .timestamp = 0 } }, "t1");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0]);
+
+    // Simulate a crash mid-append: a torn fragment without trailing newline.
+    {
+        const file = try tmp.dir.openFile(std.testing.io, store.file_name, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        const offset = try file.length(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "{\"type\":\"message\",\"id\":\"00", offset);
+    }
+
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
+
+    // Without the on-load repair this append glues onto the fragment and
+    // the file becomes unloadable (fatal interior corruption).
+    _ = try loaded.appendMessage(.{ .user = .{ .content = .{ .string = "two" }, .timestamp = 0 } }, "t2");
+    try store.appendEntry(std.testing.allocator, std.testing.io, loaded.entries.items[1]);
+
+    var reloaded = try store.load(std.testing.allocator, std.testing.io);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reloaded.entries.items.len);
+}
+
+test "session store append rejects writes past the session file cap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, "/repo", "session-1", "t0");
+    defer store.deinit(std.testing.allocator);
+    var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+    _ = try manager.appendMessage(.{ .user = .{ .content = .{ .string = "one" }, .timestamp = 0 } }, "t1");
+
+    // Grow the file sparsely to the cap; any further append must be refused
+    // so the session this store writes stays loadable by this store.
+    {
+        const file = try tmp.dir.openFile(std.testing.io, store.file_name, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "x", max_session_file_bytes - 1);
+    }
+
+    try std.testing.expectError(
+        error.SessionFileFull,
+        store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0]),
+    );
+}
 
 test "session parser rejects malformed interior json shapes" {
     try std.testing.expectError(error.InvalidHeader, parseSession(std.testing.allocator, "[]\n"));
