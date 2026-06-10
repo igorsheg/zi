@@ -258,7 +258,8 @@ pub const SessionRuntime = struct {
     pending_event: ?client_protocol.EventEnvelope = null,
 
     /// All facts about the one in-flight prompt operation live together.
-    /// The phase makes "a run and a retry timer at once" unrepresentable.
+    /// The phase makes "a run, a summary run, and a retry timer at once"
+    /// unrepresentable.
     const ActiveOperation = struct {
         phase: Phase,
         request_id: ?client_protocol.RequestId,
@@ -269,6 +270,7 @@ pub const SessionRuntime = struct {
 
         const Phase = union(enum) {
             running: *AgentSession.PromptRun,
+            compacting: *AgentSession.CompactionRun,
             retry_wait: RetryWait,
         };
 
@@ -282,6 +284,7 @@ pub const SessionRuntime = struct {
         if (self.active) |active| {
             switch (active.phase) {
                 .running => |run| self.session.destroyPromptRun(run),
+                .compacting => |run| self.session.destroyCompactionRun(run),
                 .retry_wait => {},
             }
             self.allocator.free(active.prompt_text);
@@ -342,8 +345,12 @@ pub const SessionRuntime = struct {
         const public_event_wake = self.session.publicEventWake();
         const command_wake = &self.wake_event;
         if (self.active) |*active| switch (active.phase) {
-            .running => |run| {
-                var progress = run.stream.asyncNext();
+            .running, .compacting => {
+                var progress = switch (active.phase) {
+                    .running => |run| run.stream.asyncNext(),
+                    .compacting => |run| run.stream.asyncNext(),
+                    .retry_wait => unreachable,
+                };
                 switch (try runtime.select(.{
                     .input = &input,
                     .prompt = &progress,
@@ -356,7 +363,7 @@ pub const SessionRuntime = struct {
                         return .input;
                     },
                     .prompt => |result| {
-                        self.applyPromptProgress(result) catch |err| switch (err) {
+                        self.applyActiveProgress(result) catch |err| switch (err) {
                             error.EventQueueFull => {},
                             else => self.failActiveOperation(err),
                         };
@@ -459,14 +466,14 @@ pub const SessionRuntime = struct {
         var count: usize = 0;
         while (count < limit) : (count += 1) {
             const active = if (self.active) |*operation| operation else return;
-            const run = switch (active.phase) {
-                .running => |run| run,
+            var progress = switch (active.phase) {
+                .running => |run| run.stream.asyncNext(),
+                .compacting => |run| run.stream.asyncNext(),
                 .retry_wait => return,
             };
-            var progress = run.stream.asyncNext();
             var ready = runtime.Timeout.fromMilliseconds(0);
             switch (try runtime.select(.{ .prompt = &progress, .ready = &ready })) {
-                .prompt => |result| try self.applyPromptProgress(result),
+                .prompt => |result| try self.applyActiveProgress(result),
                 .ready => return,
             }
         }
@@ -478,7 +485,7 @@ pub const SessionRuntime = struct {
         const active = if (self.active) |*operation| operation else return;
         const wait = switch (active.phase) {
             .retry_wait => |wait| wait,
-            .running => return,
+            .running, .compacting => return,
         };
         if (self.nowNanoseconds() < wait.resume_at_ns) return;
         const run = switch (wait.kind) {
@@ -527,13 +534,22 @@ pub const SessionRuntime = struct {
                     return;
                 };
                 const overflow_count_before = self.session.contextOverflowCount();
-                const run = self.session.startPromptRun(prompt.text, &.{}) catch |err| {
-                    self.allocator.free(prompt_text);
-                    try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
-                    return;
+                // Threshold compaction is the operation's opening phase when
+                // due; its settle verdict starts the prompt run. A failure to
+                // even start it degrades: the prompt runs uncompacted.
+                const phase: ActiveOperation.Phase = blk: {
+                    if (self.session.startCompactionRun(.threshold, false) catch null) |compaction_run| {
+                        break :blk .{ .compacting = compaction_run };
+                    }
+                    const run = self.session.startPromptRun(prompt.text, &.{}) catch |err| {
+                        self.allocator.free(prompt_text);
+                        try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
+                        return;
+                    };
+                    break :blk .{ .running = run };
                 };
                 self.active = .{
-                    .phase = .{ .running = run },
+                    .phase = phase,
                     .request_id = envelope.id,
                     .operation_id = self.nextOperationId(),
                     .prompt_text = prompt_text,
@@ -561,6 +577,10 @@ pub const SessionRuntime = struct {
                     .running => |run| {
                         self.session.cancelPromptRun(run) catch self.session.cancel();
                         self.session.destroyPromptRun(run);
+                    },
+                    .compacting => |run| {
+                        self.session.cancelCompactionRun(run);
+                        self.session.destroyCompactionRun(run);
                     },
                     .retry_wait => self.session.cancelRetryWait(),
                 }
@@ -592,10 +612,19 @@ pub const SessionRuntime = struct {
                 try self.enqueueEvent(replay);
             },
             .shutdown => {
-                // A pending retry never outlives shutdown: settle it as canceled.
-                if (self.active != null and self.active.?.phase == .retry_wait) {
+                // A pending retry or summary run never outlives shutdown:
+                // settle it as canceled. (A running prompt is aborted by the
+                // session's own shutdown path below.)
+                if (self.active != null and self.active.?.phase != .running) {
                     const active = self.takeActive().?;
-                    self.session.cancelRetryWait();
+                    switch (active.phase) {
+                        .retry_wait => self.session.cancelRetryWait(),
+                        .compacting => |run| {
+                            self.session.cancelCompactionRun(run);
+                            self.session.destroyCompactionRun(run);
+                        },
+                        .running => unreachable,
+                    }
                     self.allocator.free(active.prompt_text);
                     try self.drainSessionEvents(active.request_id);
                     try self.enqueueEvent(.{
@@ -610,37 +639,53 @@ pub const SessionRuntime = struct {
         }
     }
 
-    fn applyPromptProgress(self: *SessionRuntime, result: anytype) !void {
+    fn applyActiveProgress(self: *SessionRuntime, result: anytype) !void {
         const active = if (self.active) |*operation| operation else return;
-        const run = switch (active.phase) {
-            .running => |running| running,
+        switch (active.phase) {
+            .running => |run| {
+                const more = try self.session.applyPromptRunProgress(run, result);
+                try self.drainSessionEvents(active.request_id);
+                if (more) return;
+                // The run settled. Destroy it, then act on the session's
+                // verdict. State transitions happen before any fallible emit
+                // so a full event queue can never leave the phase pointing
+                // at a destroyed run.
+                self.session.destroyPromptRun(run);
+                const verdict = self.session.settlePromptRun(.{
+                    .overflow_count_before = active.overflow_count_before,
+                    .overflow_retry_used = active.overflow_retry_used,
+                }) catch |err| return self.finishOperationRejected(err);
+                try self.applyVerdict(active, verdict);
+            },
+            .compacting => |run| {
+                const more = try self.session.applyCompactionRunProgress(run, result);
+                try self.drainSessionEvents(active.request_id);
+                if (more) return;
+                const verdict = self.session.settleCompactionRun(run) catch |err| {
+                    self.session.destroyCompactionRun(run);
+                    return self.finishOperationRejected(err);
+                };
+                self.session.destroyCompactionRun(run);
+                try self.applyVerdict(active, verdict);
+            },
             .retry_wait => return,
-        };
-        const more = try self.session.applyPromptRunProgress(run, result);
-        try self.drainSessionEvents(active.request_id);
-        if (more) return;
+        }
+    }
 
-        // The run settled. Destroy it, then act on the session's verdict.
-        // State transitions happen before any fallible emit so a full event
-        // queue can never leave the phase pointing at a destroyed run.
-        self.session.destroyPromptRun(run);
-        const verdict = self.session.settlePromptRun(.{
-            .overflow_count_before = active.overflow_count_before,
-            .overflow_retry_used = active.overflow_retry_used,
-        }) catch |err| {
-            const finished = self.takeActive().?;
-            defer self.allocator.free(finished.prompt_text);
-            try self.enqueueRejected(finished.request_id, .invalid_command, @errorName(err));
-            try self.enqueueEvent(.{
-                .request_id = finished.request_id,
-                .operation_id = finished.operation_id,
-                .event = .{ .operation_finished = .{ .reason = .failed } },
-            });
-            return;
-        };
+    /// Act on a settle verdict. Every arm reassigns the phase or takes the
+    /// operation before its first fallible call.
+    fn applyVerdict(
+        self: *SessionRuntime,
+        active: *ActiveOperation,
+        verdict: AgentSession.SettleVerdict,
+    ) !void {
         switch (verdict) {
+            .compact => |compaction_run| {
+                active.overflow_retry_used = true;
+                active.phase = .{ .compacting = compaction_run };
+                try self.drainSessionEvents(active.request_id);
+            },
             .retry => |retry| {
-                if (retry.kind == .resubmit_prompt) active.overflow_retry_used = true;
                 active.phase = .{ .retry_wait = .{
                     .kind = retry.kind,
                     .resume_at_ns = self.nowNanoseconds() +
@@ -654,7 +699,7 @@ pub const SessionRuntime = struct {
                 const reason: client_protocol.OperationFinished.Reason = switch (verdict) {
                     .completed => .completed,
                     .failed => .failed,
-                    .retry => unreachable,
+                    .retry, .compact => unreachable,
                 };
                 try self.drainSessionEvents(finished.request_id);
                 try self.enqueueEvent(.{
@@ -666,6 +711,17 @@ pub const SessionRuntime = struct {
         }
     }
 
+    fn finishOperationRejected(self: *SessionRuntime, err: anyerror) !void {
+        const finished = self.takeActive().?;
+        defer self.allocator.free(finished.prompt_text);
+        try self.enqueueRejected(finished.request_id, .invalid_command, @errorName(err));
+        try self.enqueueEvent(.{
+            .request_id = finished.request_id,
+            .operation_id = finished.operation_id,
+            .event = .{ .operation_finished = .{ .reason = .failed } },
+        });
+    }
+
     /// Contain an operational failure (persistence, stream apply) to the
     /// active operation: the operation fails loudly, the owner loop lives.
     fn failActiveOperation(self: *SessionRuntime, err: anyerror) void {
@@ -674,6 +730,10 @@ pub const SessionRuntime = struct {
             .running => |run| {
                 self.session.cancelPromptRun(run) catch {};
                 self.session.destroyPromptRun(run);
+            },
+            .compacting => |run| {
+                self.session.cancelCompactionRun(run);
+                self.session.destroyCompactionRun(run);
             },
             .retry_wait => self.session.cancelRetryWait(),
         }
@@ -1289,6 +1349,78 @@ test "session runtime retries transient failure through the live owner loop" {
     try std.testing.expect(found_retry_start);
     try std.testing.expect(found_retry_success);
     try std.testing.expectEqual(@as(usize, 2), FlakyStream.call_count);
+    try std.testing.expect(session_runtime.active == null);
+}
+
+const DriveOutcome = struct {
+    reason: client_protocol.OperationFinished.Reason,
+    saw_compaction_start: bool = false,
+    saw_compaction_end_result: bool = false,
+};
+
+fn driveUntilOperationFinished(session_runtime: *SessionRuntime) !DriveOutcome {
+    var outcome: DriveOutcome = .{ .reason = .failed };
+    var iterations: usize = 0;
+    while (iterations < 2000) : (iterations += 1) {
+        try session_runtime.step();
+        while (session_runtime.drainEvent()) |event| {
+            var owned = event;
+            defer owned.deinit(std.testing.allocator);
+            switch (owned.event) {
+                .compaction_start => outcome.saw_compaction_start = true,
+                .compaction_end => |payload| {
+                    if (payload.result != null) outcome.saw_compaction_end_result = true;
+                },
+                .operation_finished => |payload| {
+                    outcome.reason = payload.reason;
+                    return outcome;
+                },
+                else => {},
+            }
+        }
+        try runtime.sleep(.fromMilliseconds(1));
+    }
+    return error.OperationDidNotFinish;
+}
+
+test "session runtime runs threshold compaction as the operation's opening phase" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    FlakyStream.reset(0);
+    var session_runtime = try initRetryTestRuntime(
+        &tmp,
+        task_runtime,
+        "{\"compaction\":{\"enabled\":true,\"keepRecentTokens\":1}}",
+    );
+    defer session_runtime.deinit();
+
+    // First operation seeds history; nothing to compact yet.
+    var first_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello");
+    var first_owned = true;
+    defer if (first_owned) first_prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(first_prompt);
+    first_owned = false;
+    const first = try driveUntilOperationFinished(&session_runtime);
+    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.completed, first.reason);
+    try std.testing.expect(!first.saw_compaction_start);
+
+    // Second operation opens with the summary run, then runs the prompt.
+    var second_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "again");
+    var second_owned = true;
+    defer if (second_owned) second_prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(second_prompt);
+    second_owned = false;
+    const second = try driveUntilOperationFinished(&session_runtime);
+    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.completed, second.reason);
+    try std.testing.expect(second.saw_compaction_start);
+    try std.testing.expect(second.saw_compaction_end_result);
+
+    // One summary call between the two prompt calls; history holds the
+    // compaction entry before the second turn.
+    try std.testing.expectEqual(@as(usize, 3), FlakyStream.call_count);
+    try std.testing.expect(session_runtime.session.manager.entries.items[2] == .compaction);
     try std.testing.expect(session_runtime.active == null);
 }
 

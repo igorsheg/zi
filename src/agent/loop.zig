@@ -729,7 +729,8 @@ fn streamAssistantResponse(
         .io = io,
         .model = config.model,
         .context = .{
-            .system_prompt = current.system_prompt,
+            // An empty agent system prompt means none on the wire.
+            .system_prompt = if (current.system_prompt.len == 0) null else current.system_prompt,
             .messages = llm_messages,
             .tools = tools.items,
         },

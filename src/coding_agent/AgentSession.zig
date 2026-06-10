@@ -2,9 +2,8 @@
 //! tools, durable history, the long-lived agent, the bounded public event
 //! queue, lifecycle, and the compaction/retry terminal policies.
 //!
-//! Known limit, by design until an operation-backed shape is needed:
-//! auto-compaction and auto-retry run synchronously inside the owner loop.
-//! Both are settings-gated and default off.
+//! Compaction and retry are operation-backed: the session computes verdicts
+//! and starts producer-backed runs; the owner loop does all waiting.
 
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
@@ -82,13 +81,15 @@ pub const RetrySettings = struct {
 /// Hard ceiling on one retry backoff wait, whatever the settings say.
 pub const retry_delay_max_ms = 60_000;
 
-/// What the owner should do after a prompt run settles. `retry` means the
-/// owner waits `delay_ms`, then starts the retry run; the session never
-/// blocks here.
+/// What the owner should do after a prompt or compaction run settles.
+/// `retry` means the owner waits `delay_ms`, then starts the retry run;
+/// `compact` hands the owner a live summary run to drive. The session
+/// never blocks here.
 pub const SettleVerdict = union(enum) {
     completed,
     failed,
     retry: Retry,
+    compact: *CompactionRun,
 
     pub const Retry = struct {
         kind: Kind,
@@ -106,6 +107,28 @@ pub const SettleVerdict = union(enum) {
 pub const SettleContext = struct {
     overflow_count_before: usize,
     overflow_retry_used: bool,
+};
+
+/// One in-flight compaction summary generation: a bare one-shot agent-loop
+/// run (no tools, no queue hooks, empty context) under its own cancel
+/// source. The producer streams; the owner polls; settle applies the result.
+pub const CompactionRun = struct {
+    state: enum { producing, settled } = .producing,
+    stream: agent_mod.loop.AgentEventStream = undefined,
+    buffer: [live_prompt_event_capacity_count]agent_mod.AgentEvent = undefined,
+    prompts: [1]agent_mod.AgentMessage = undefined,
+    cancel: runtime.CancelSource,
+    reason: client_protocol.CompactionReason,
+    will_retry: bool,
+    input: session_manager.CompactionSummaryInput,
+    summary_prompt: []const u8,
+    outcome: Outcome = .pending,
+
+    const Outcome = union(enum) {
+        pending,
+        summary: []const u8,
+        failure: anyerror,
+    };
 };
 
 pub const PromptRun = struct {
@@ -312,7 +335,6 @@ pub fn startPromptRun(
         .shutdown_requested, .stopped => return error.SessionShuttingDown,
     }
     if (self.agent.state.isStreaming()) return error.SessionBusy;
-    if (self.compaction_settings.auto_enabled) _ = try self.runAutoCompaction(.threshold, false);
     const run = try self.allocator.create(PromptRun);
     errdefer self.allocator.destroy(run);
     run.* = .{};
@@ -519,21 +541,13 @@ pub fn queuePrompt(
 /// provider-error retry with exponential backoff. Emits the retry protocol
 /// events and repairs the runtime transcript; the owner does the waiting.
 pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdict {
-    // Context overflow: compact once per operation, then resubmit.
+    // Context overflow: start one summary run per operation; the owner
+    // drives it as the compacting phase and resubmits on success.
     if (!context.overflow_retry_used and
-        self.compaction_settings.auto_enabled and
         self.event_drain.context_overflow_count > context.overflow_count_before)
     {
-        if (try self.runAutoCompaction(.overflow, true)) {
-            const attempt = self.event_drain.beginRetryAttempt();
-            const error_message = try client_protocol.EventText.init(self.allocator, "context overflow");
-            self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
-                .attempt = attempt,
-                .max_attempts = attempt,
-                .delay_ms = 0,
-                .error_message = error_message,
-            } });
-            return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
+        if (try self.startCompactionRun(.overflow, true)) |compaction_run| {
+            return .{ .compact = compaction_run };
         }
     }
 
@@ -616,52 +630,142 @@ fn buildSystemPromptText(
     });
 }
 
-/// Run one settings-gated auto-compaction. Returns false (quietly) when
-/// there is nothing to compact; emits compaction_start/_end otherwise.
-fn runAutoCompaction(
+/// Start one settings-gated compaction summary run. Returns null (quietly)
+/// when compaction is disabled or there is nothing to compact. Emits
+/// compaction_start and spawns the summary producer; the caller owns the
+/// run and must drive it to settle, then destroy it.
+pub fn startCompactionRun(
     self: *AgentSession,
     reason: client_protocol.CompactionReason,
     will_retry: bool,
-) !bool {
+) !?*CompactionRun {
+    if (!self.compaction_settings.auto_enabled) return null;
     var input = self.manager.buildCompactionSummaryInput(
         self.allocator,
         self.compaction_settings,
     ) catch |err| switch (err) {
-        error.NothingToCompact, error.AlreadyCompacted => return false,
+        error.NothingToCompact, error.AlreadyCompacted => return null,
         else => return err,
     };
-    defer input.deinit();
-    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = reason } });
-    self.generateAndApplyCompaction(&input, reason, will_retry) catch |err| {
-        const error_message = client_protocol.EventText.init(self.allocator, @errorName(err)) catch return err;
-        self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
-            .reason = reason,
-            .aborted = err == error.OperationCancelled,
-            .will_retry = false,
-            .error_message = error_message,
-        } });
-        return err;
+    errdefer input.deinit();
+
+    const serialized_input = try input.serialize(self.allocator);
+    defer self.allocator.free(serialized_input);
+    const prefix =
+        "Summarize the conversation for future continuation. Preserve user intent, decisions, files, " ++
+        "tool outcomes, and unresolved work. Return only the summary.\n\n";
+    if (serialized_input.len > max_compaction_summary_prompt_bytes - prefix.len - 1) {
+        return error.CompactionSummaryPromptTooLarge;
+    }
+    const summary_prompt = try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ prefix, serialized_input });
+    errdefer self.allocator.free(summary_prompt);
+
+    const run = try self.allocator.create(CompactionRun);
+    errdefer self.allocator.destroy(run);
+    run.* = .{
+        .cancel = try runtime.CancelSource.init(self.allocator),
+        .reason = reason,
+        .will_retry = will_retry,
+        .input = input,
+        .summary_prompt = summary_prompt,
     };
+    run.prompts[0] = .{ .user = .{
+        .content = .{ .string = run.summary_prompt },
+        .timestamp = 0,
+    } };
+
+    // The summary call is a bare one-shot loop run: empty context, no tools,
+    // no queue or tool hooks. The loop owns provider auth and streaming.
+    var config = self.agent.loop_config;
+    config.transform_context = null;
+    config.get_steering_messages = null;
+    config.get_follow_up_messages = null;
+    config.before_tool_call = null;
+    config.after_tool_call = null;
+
+    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = reason } });
+    agent_mod.loop.startPromptStream(
+        &run.stream,
+        self.allocator,
+        self.task_runtime,
+        &run.prompts,
+        .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
+        config,
+        run.cancel.token(),
+        &run.buffer,
+    );
+    return run;
+}
+
+/// Apply one summary-stream progress result. Returns true while the run is
+/// live. The summary (or its failure) is captured on the run for settle.
+pub fn applyCompactionRunProgress(
+    self: *AgentSession,
+    run: *CompactionRun,
+    progress: @TypeOf(run.stream.asyncNext()).Result,
+) !bool {
+    if (run.state == .settled) return false;
+    const event = progress orelse {
+        run.stream.awaitProducer() catch |err| {
+            if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
+            run.outcome = .{ .failure = err };
+        };
+        run.state = .settled;
+        return false;
+    };
+    defer agent_mod.loop.deinitStreamEvent(self.allocator, event);
+    switch (event) {
+        .message_end => |payload| switch (payload.message) {
+            .assistant => |assistant| {
+                const summary = extractCompactionSummary(self.allocator, assistant) catch |err| {
+                    run.outcome = .{ .failure = err };
+                    return true;
+                };
+                if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
+                run.outcome = .{ .summary = summary };
+            },
+            else => {},
+        },
+        else => {},
+    }
     return true;
 }
 
-fn generateAndApplyCompaction(
-    self: *AgentSession,
-    input: *session_manager.CompactionSummaryInput,
-    reason: client_protocol.CompactionReason,
-    will_retry: bool,
-) !void {
-    const serialized_input = try input.serialize(self.allocator);
-    defer self.allocator.free(serialized_input);
-    const summary = try self.generateCompactionSummary(serialized_input);
-    defer self.allocator.free(summary);
+/// Terminal compaction policy. On success: persist the compaction entry,
+/// replace the runtime context, emit compaction_end, and (overflow) arm the
+/// resubmit retry. On failure: an overflow compaction fails the operation
+/// (the context still does not fit); a threshold compaction degrades and
+/// the prompt proceeds.
+pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerdict {
+    std.debug.assert(run.state == .settled);
+    const summary = switch (run.outcome) {
+        .summary => |summary| summary,
+        .pending, .failure => {
+            const err = switch (run.outcome) {
+                .failure => |failure| failure,
+                else => error.MissingCompactionSummary,
+            };
+            const error_message = try client_protocol.EventText.init(self.allocator, @errorName(err));
+            self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
+                .reason = run.reason,
+                .aborted = err == error.OperationCancelled,
+                .will_retry = false,
+                .error_message = error_message,
+            } });
+            if (run.will_retry) {
+                self.event_drain.failRetry(@errorName(err));
+                return .failed;
+            }
+            return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
+        },
+    };
 
     // Persist the compaction entry durably before committing it in memory.
     try self.manager.ensureAppendCapacity(1);
     const entry = try self.manager.prepareCompactionEntry(
         summary,
-        input.first_kept_entry_id,
-        input.tokens_before,
+        run.input.first_kept_entry_id,
+        run.input.tokens_before,
         self.timestamp,
     );
     var entry_committed = false;
@@ -677,65 +781,55 @@ fn generateAndApplyCompaction(
     try self.agent.replaceMessages(messages);
 
     self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
-        .reason = reason,
+        .reason = run.reason,
         .result = result,
         .aborted = false,
-        .will_retry = will_retry,
+        .will_retry = run.will_retry,
+    } });
+
+    if (run.will_retry) {
+        const attempt = self.event_drain.beginRetryAttempt();
+        const error_message = try client_protocol.EventText.init(self.allocator, "context overflow");
+        self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
+            .attempt = attempt,
+            .max_attempts = attempt,
+            .delay_ms = 0,
+            .error_message = error_message,
+        } });
+    }
+    return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
+}
+
+/// Cancel an in-flight compaction: request, join the producer, emit the
+/// aborted compaction_end. The caller still destroys the run.
+pub fn cancelCompactionRun(self: *AgentSession, run: *CompactionRun) void {
+    run.cancel.request();
+    run.stream.cancelProducer() catch |err| {
+        const ignored_cancel_error = @errorName(err);
+        _ = ignored_cancel_error;
+    };
+    run.state = .settled;
+    const error_message = client_protocol.EventText.init(self.allocator, "OperationCancelled") catch null;
+    self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
+        .reason = run.reason,
+        .aborted = true,
+        .will_retry = false,
+        .error_message = error_message,
     } });
 }
 
-fn generateCompactionSummary(self: *AgentSession, serialized_input: []const u8) ![]const u8 {
-    const prefix =
-        "Summarize the conversation for future continuation. Preserve user intent, decisions, files, " ++
-        "tool outcomes, and unresolved work. Return only the summary.\n\n";
-    if (serialized_input.len > max_compaction_summary_prompt_bytes - prefix.len - 1) {
-        return error.CompactionSummaryPromptTooLarge;
-    }
-    const summary_prompt = try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ prefix, serialized_input });
-    defer self.allocator.free(summary_prompt);
-    var messages = [_]ai.Message{.{ .user = .{
-        .content = .{ .string = summary_prompt },
-        .timestamp = 0,
-    } }};
-
-    var stream_options = self.agent.loop_config.options.stream;
-    var owned_api_key: ?[]const u8 = null;
-    defer if (owned_api_key) |api_key| self.allocator.free(api_key);
-    if (self.agent.loop_config.get_api_key) |get_api_key| {
-        const credential = try agent_mod.GetApiKeyHook.call(
-            self.allocator,
-            get_api_key,
-            self.agent.state.model.provider,
-        );
-        if (credential) |value| {
-            owned_api_key = value.api_key;
-            stream_options.api_key = value.api_key;
-            stream_options.auth_extra = value.auth_extra;
-        }
-    }
-
-    var response_arena = std.heap.ArenaAllocator.init(self.allocator);
-    defer response_arena.deinit();
-    var stream = self.agent.loop_config.stream.call(.{
-        .allocator = response_arena.allocator(),
-        .io = self.io,
-        .model = self.agent.state.model,
-        .context = .{
-            .system_prompt = null,
-            .messages = &messages,
-            .tools = &.{},
-        },
-        .options = stream_options,
-        .cancel_token = null,
-    });
-    defer stream.deinit();
-
-    while (try stream.next(self.io)) |event| switch (event) {
-        .@"error" => |payload| return extractCompactionSummary(self.allocator, payload.@"error"),
-        else => {},
+pub fn destroyCompactionRun(self: *AgentSession, run: *CompactionRun) void {
+    run.cancel.request();
+    run.stream.cancelProducer() catch |err| {
+        const ignored_cleanup_error = @errorName(err);
+        _ = ignored_cleanup_error;
     };
-    const result = stream.result() orelse return error.MissingCompactionSummary;
-    return extractCompactionSummary(self.allocator, result);
+    run.stream.deinit();
+    run.cancel.deinit();
+    if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
+    self.allocator.free(run.summary_prompt);
+    run.input.deinit();
+    self.allocator.destroy(run);
 }
 
 fn extractCompactionSummary(
@@ -1152,6 +1246,23 @@ fn initCompactionTestSession(
     });
 }
 
+/// Poll a compaction run to settle the way the owner loop does: bounded,
+/// non-blocking, yielding to the producer between polls.
+fn driveCompactionRun(session: *AgentSession, run: *AgentSession.CompactionRun) !void {
+    var iterations: usize = 0;
+    while (iterations < 10_000) : (iterations += 1) {
+        var progress = run.stream.asyncNext();
+        var idle = runtime.Timeout.fromMilliseconds(1);
+        switch (try runtime.select(.{ .progress = &progress, .idle = &idle })) {
+            .progress => |result| {
+                if (!try session.applyCompactionRunProgress(run, result)) return;
+            },
+            .idle => {},
+        }
+    }
+    return error.CompactionRunDidNotSettle;
+}
+
 fn appendTwoCompactableMessages(session: *AgentSession) !void {
     _ = try session.manager.appendMessage(.{ .user = .{
         .content = .{ .string = "aaaaaaaa" },
@@ -1197,7 +1308,14 @@ test "agent session auto compaction summarizes persists and replaces context" {
     drainAllPublicEvents(&session);
     const kept = session.manager.entries.items[1].id();
 
-    try std.testing.expect(try session.runAutoCompaction(.threshold, false));
+    const run = (try session.startCompactionRun(.threshold, false)).?;
+    try driveCompactionRun(&session, run);
+    const verdict = try session.settleCompactionRun(run);
+    session.destroyCompactionRun(run);
+    try std.testing.expectEqual(
+        SettleVerdict{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } },
+        verdict,
+    );
 
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
     try std.testing.expectEqualStrings("generated summary", session.manager.entries.items[2].compaction.summary);
@@ -1237,9 +1355,14 @@ test "agent session auto compaction failure does not mutate history" {
 
     try appendTwoCompactableMessages(&session);
 
-    try std.testing.expectError(
-        error.CompactionSummaryGenerationFailed,
-        session.runAutoCompaction(.threshold, false),
+    const run = (try session.startCompactionRun(.threshold, false)).?;
+    try driveCompactionRun(&session, run);
+    const verdict = try session.settleCompactionRun(run);
+    session.destroyCompactionRun(run);
+    // A failed threshold compaction degrades: the prompt still proceeds.
+    try std.testing.expectEqual(
+        SettleVerdict{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } },
+        verdict,
     );
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
@@ -1282,9 +1405,125 @@ test "agent session auto compaction oversized summary does not mutate history" {
 
     try appendTwoCompactableMessages(&session);
 
-    try std.testing.expectError(error.CompactionSummaryTooLarge, session.runAutoCompaction(.threshold, false));
+    const run = (try session.startCompactionRun(.threshold, false)).?;
+    try driveCompactionRun(&session, run);
+    try std.testing.expect(run.outcome == .failure);
+    try std.testing.expectEqual(error.CompactionSummaryTooLarge, run.outcome.failure);
+    const verdict = try session.settleCompactionRun(run);
+    session.destroyCompactionRun(run);
+    try std.testing.expect(verdict == .retry);
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
     drainAllPublicEvents(&session);
+}
+
+test "overflow settle starts compaction and arms the resubmit retry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const summary_content = [_]ai.AssistantContent{ai.faux.text("overflow summary")};
+    const summaries = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&summary_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&summaries);
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+
+    var session = try initCompactionTestSession(task_runtime, tmp.dir, &provider, null);
+    defer shutdownAndDeinit(&session);
+
+    _ = try session.agent.beginRun();
+    try emitUserMessageEnd(&session, "aaaaaaaa");
+    try emitUserMessageEnd(&session, "bbbbbbbb");
+    try emitAssistantError(&session, "maximum context length exceeded");
+    session.agent.finishRun();
+    drainAllPublicEvents(&session);
+    try std.testing.expectEqual(@as(usize, 1), session.contextOverflowCount());
+
+    const verdict = try session.settlePromptRun(.{ .overflow_count_before = 0, .overflow_retry_used = false });
+    try std.testing.expect(verdict == .compact);
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit(std.testing.allocator);
+    try std.testing.expect(start_event == .compaction_start);
+    try std.testing.expect(start_event.compaction_start.reason == .overflow);
+
+    const run = verdict.compact;
+    try driveCompactionRun(&session, run);
+    const resubmit = try session.settleCompactionRun(run);
+    session.destroyCompactionRun(run);
+    try std.testing.expectEqual(
+        SettleVerdict{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } },
+        resubmit,
+    );
+    try std.testing.expect(session.manager.entries.items[3] == .compaction);
+
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit(std.testing.allocator);
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expect(end_event.compaction_end.will_retry);
+    var retry_event = session.drainPublicEvent().?;
+    defer retry_event.deinit(std.testing.allocator);
+    try std.testing.expect(retry_event == .auto_retry_start);
+    try std.testing.expectEqual(@as(usize, 1), retry_event.auto_retry_start.attempt);
+    try std.testing.expectEqual(@as(u64, 0), retry_event.auto_retry_start.delay_ms);
+    try std.testing.expectEqual(@as(u8, 1), session.event_drain.retry_attempt);
+
+    // The overflow budget is one compaction per operation.
+    const second = try session.settlePromptRun(.{ .overflow_count_before = 0, .overflow_retry_used = true });
+    try std.testing.expect(second == .failed);
+    drainAllPublicEvents(&session);
+}
+
+test "start compaction run returns null when disabled or nothing to compact" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+
+    var disabled_session = try initTestSession(task_runtime, tmp.dir, .{});
+    defer shutdownAndDeinit(&disabled_session);
+    try std.testing.expectEqual(
+        @as(?*AgentSession.CompactionRun, null),
+        try disabled_session.startCompactionRun(.threshold, false),
+    );
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    var empty_session = try initCompactionTestSession(task_runtime, tmp.dir, &provider, null);
+    defer shutdownAndDeinit(&empty_session);
+    try std.testing.expectEqual(
+        @as(?*AgentSession.CompactionRun, null),
+        try empty_session.startCompactionRun(.threshold, false),
+    );
+}
+
+test "cancel compaction run emits the aborted compaction end" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+
+    var session = try initCompactionTestSession(task_runtime, tmp.dir, &provider, null);
+    defer shutdownAndDeinit(&session);
+    try appendTwoCompactableMessages(&session);
+
+    const run = (try session.startCompactionRun(.threshold, false)).?;
+    session.cancelCompactionRun(run);
+    session.destroyCompactionRun(run);
+    try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
+
+    var start_event = session.drainPublicEvent().?;
+    defer start_event.deinit(std.testing.allocator);
+    try std.testing.expect(start_event == .compaction_start);
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit(std.testing.allocator);
+    try std.testing.expect(end_event == .compaction_end);
+    try std.testing.expect(end_event.compaction_end.aborted);
+    try std.testing.expect(!end_event.compaction_end.will_retry);
 }
 
 test "agent session terminal policy classifies context overflow after persistence" {
