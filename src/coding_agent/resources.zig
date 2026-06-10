@@ -154,40 +154,38 @@ fn loadProjectContextFiles(
     options: LoadProjectContextOptions,
 ) !LoadedContextFiles {
     var files = std.ArrayList(ContextFile).empty;
-    errdefer files.deinit(allocator);
-    errdefer deinitContextFileItems(allocator, files.items);
+    errdefer {
+        deinitContextFileItems(allocator, files.items);
+        files.deinit(allocator);
+    }
 
     if (try loadContextFileFromDir(allocator, io, options.dir, options.agent_dir)) |global| {
         try appendContextFile(allocator, &files, global);
     }
 
-    var ancestor_files = std.ArrayList(ContextFile).empty;
-    errdefer ancestor_files.deinit(allocator);
-    errdefer deinitContextFileItems(allocator, ancestor_files.items);
-
-    var current_dir = options.cwd;
+    // Collect ancestor dirs cwd -> root (bounded slices of cwd, no copies),
+    // then load root -> cwd so context closer to the cwd appears later.
+    var ancestors: [max_ancestor_depth][]const u8 = undefined;
     var depth: usize = 0;
+    var current_dir = options.cwd;
     while (true) {
         if (depth == max_ancestor_depth) return error.AncestorLimitExceeded;
-        if (try loadContextFileFromDir(allocator, io, options.dir, current_dir)) |context_file| {
-            const already_loaded = containsPath(files.items, context_file.path) or
-                containsPath(ancestor_files.items, context_file.path);
-            if (!already_loaded) {
-                try appendContextFile(allocator, &ancestor_files, context_file);
-            } else {
-                deinitContextFile(allocator, context_file);
-            }
-        }
+        ancestors[depth] = current_dir;
+        depth += 1;
         const parent = std.fs.path.dirname(current_dir) orelse break;
         if (std.mem.eql(u8, parent, current_dir)) break;
         current_dir = parent;
-        depth += 1;
     }
-
-    std.mem.reverse(ContextFile, ancestor_files.items);
-    for (ancestor_files.items) |file| try appendContextFile(allocator, &files, file);
-    ancestor_files.clearRetainingCapacity();
-    ancestor_files.deinit(allocator);
+    while (depth > 0) {
+        depth -= 1;
+        const context_file = (try loadContextFileFromDir(allocator, io, options.dir, ancestors[depth])) orelse
+            continue;
+        if (containsPath(files.items, context_file.path)) {
+            deinitContextFile(allocator, context_file);
+            continue;
+        }
+        try appendContextFile(allocator, &files, context_file);
+    }
 
     return .{ .allocator = allocator, .files = try files.toOwnedSlice(allocator) };
 }

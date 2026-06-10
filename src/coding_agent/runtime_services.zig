@@ -18,8 +18,6 @@ pub const RuntimeServices = struct {
     environ: ?*const std.process.Environ.Map,
     openai_provider: *ai.OpenAiResponsesProvider,
     openai_codex_provider: *ai.OpenAiCodexResponsesProvider,
-    diagnostics: [diagnostic_capacity]Diagnostic = undefined,
-    diagnostic_count: usize = 0,
 
     pub const Options = struct {
         cwd: []const u8,
@@ -87,22 +85,6 @@ pub const RuntimeServices = struct {
             .openai_codex_provider = openai_codex_provider,
         };
     }
-
-    const diagnostic_capacity = 8;
-
-    const Diagnostic = union(enum) {
-        unresolved_model_setting: ModelSetting,
-        unresolved_stream: StreamSetting,
-
-        const ModelSetting = struct {
-            provider: ?[]const u8,
-            model: ?[]const u8,
-        };
-
-        const StreamSetting = struct {
-            api: []const u8,
-        };
-    };
 
     pub fn deinit(self: *RuntimeServices) void {
         self.provider_registry.deinit();

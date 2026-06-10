@@ -3,6 +3,7 @@ const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const path_utils = @import("path_utils.zig");
+const test_support = @import("test_support.zig");
 const tool_output_policy = @import("../tool_output_policy.zig");
 
 pub const max_read_bytes = 1024 * 1024;
@@ -38,15 +39,11 @@ pub const ReadTool = struct {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        var owned_config = config;
+        owned_config.cwd = cwd;
         return .{
             .allocator = allocator,
-            .config = .{
-                .cwd = cwd,
-                .allow_paths_outside_cwd = config.allow_paths_outside_cwd,
-                .max_read_bytes = config.max_read_bytes,
-                .max_output_bytes = config.max_output_bytes,
-                .max_output_lines = config.max_output_lines,
-            },
+            .config = owned_config,
             .parsed_parameters = parsed_parameters,
         };
     }
@@ -104,19 +101,13 @@ fn execute(
         return imageReadResult(allocator, content, mime_type);
     }
     if (!std.unicode.utf8ValidateSlice(content)) {
-        return invalidUtf8ReadResult(allocator);
+        return path_utils.textResult(allocator, "[File omitted: content is not valid UTF-8 text.]", null);
     }
 
     const formatted = try formatReadOutput(allocator, self.config, args, content);
     errdefer formatted.deinit(allocator);
-    const text = formatted.text;
-    const result_content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(result_content);
-    result_content[0] = .{ .text = .{ .text = text } };
-    return .{
-        .allocator = allocator,
-        .result = .{ .content = result_content, .details = try formatted.details(allocator) },
-    };
+    const details = try formatted.details(allocator);
+    return path_utils.ownedTextResult(allocator, formatted.text, details);
 }
 
 const ReadArgs = struct {
@@ -124,18 +115,6 @@ const ReadArgs = struct {
     offset: ?usize,
     limit: ?usize,
 };
-
-fn invalidUtf8ReadResult(allocator: std.mem.Allocator) !agent.ToolExecutionResult {
-    const text = try allocator.dupe(u8, "[File omitted: content is not valid UTF-8 text.]");
-    errdefer allocator.free(text);
-    const result_content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(result_content);
-    result_content[0] = .{ .text = .{ .text = text } };
-    return .{
-        .allocator = allocator,
-        .result = .{ .content = result_content, .details = null },
-    };
-}
 
 fn imageReadResult(
     allocator: std.mem.Allocator,
@@ -259,69 +238,25 @@ const FormattedReadOutput = struct {
 
     fn details(self: FormattedReadOutput, allocator: std.mem.Allocator) !?std.json.Value {
         if (!self.truncated and !self.user_limit and self.next_offset == null) return null;
-        var object: std.json.ObjectMap = .empty;
-        errdefer object.deinit(allocator);
-        var truncation: std.json.ObjectMap = .empty;
-        errdefer truncation.deinit(allocator);
-        try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = self.truncated });
-        try path_utils.putJsonField(allocator, &truncation, "userLimit", .{ .bool = self.user_limit });
-        try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", switch (self.truncated_by) {
-            .lines => "lines",
-            .bytes => "bytes",
+        return try path_utils.jsonDetails(allocator, .{
+            .nextOffset = self.next_offset,
+            .truncation = try path_utils.jsonDetails(allocator, .{
+                .truncated = self.truncated,
+                .userLimit = self.user_limit,
+                .truncatedBy = @as([]const u8, switch (self.truncated_by) {
+                    .lines => "lines",
+                    .bytes => "bytes",
+                }),
+                .firstLineExceedsLimit = self.first_line_exceeds_limit,
+                .outputLines = self.output_lines,
+                .remainingLines = self.remaining_lines,
+                .totalLines = self.total_lines,
+                .totalBytes = self.total_bytes,
+                .outputBytes = self.output_bytes,
+                .maxBytes = self.max_bytes,
+                .maxLines = self.max_lines,
+            }),
         });
-        try path_utils.putJsonField(
-            allocator,
-            &truncation,
-            "firstLineExceedsLimit",
-            .{ .bool = self.first_line_exceeds_limit },
-        );
-        try path_utils.putJsonField(
-            allocator,
-            &truncation,
-            "outputLines",
-            .{ .integer = @intCast(self.output_lines) },
-        );
-        try path_utils.putJsonField(
-            allocator,
-            &truncation,
-            "remainingLines",
-            .{ .integer = @intCast(self.remaining_lines) },
-        );
-        try path_utils.putJsonField(
-            allocator,
-            &truncation,
-            "totalLines",
-            .{ .integer = @intCast(self.total_lines) },
-        );
-        try path_utils.putJsonField(
-            allocator,
-            &truncation,
-            "totalBytes",
-            .{ .integer = @intCast(self.total_bytes) },
-        );
-        try path_utils.putJsonField(
-            allocator,
-            &truncation,
-            "outputBytes",
-            .{ .integer = @intCast(self.output_bytes) },
-        );
-        try path_utils.putJsonField(
-            allocator,
-            &truncation,
-            "maxBytes",
-            .{ .integer = @intCast(self.max_bytes) },
-        );
-        try path_utils.putJsonField(
-            allocator,
-            &truncation,
-            "maxLines",
-            .{ .integer = @intCast(self.max_lines) },
-        );
-        if (self.next_offset) |next_offset| {
-            try path_utils.putJsonField(allocator, &object, "nextOffset", .{ .integer = @intCast(next_offset) });
-        }
-        try path_utils.putJsonField(allocator, &object, "truncation", .{ .object = truncation });
-        return .{ .object = object };
     }
 };
 
@@ -453,37 +388,14 @@ fn formatSize(buffer: []u8, bytes: usize) []const u8 {
 }
 
 test "read tool reads bounded text with offset and limit" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "one\ntwo\nthree\nfour");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "one\ntwo\nthree\nfour" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer read_tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
-    try object.put(std.testing.allocator, "offset", .{ .integer = 2 });
-    try object.put(std.testing.allocator, "limit", .{ .integer = 2 });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &read_tool,
-        cancel_source.token(),
-        "call-1",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\",\"offset\":2,\"limit\":2}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -501,35 +413,14 @@ test "read tool reads bounded text with offset and limit" {
 }
 
 test "read tool omits invalid utf8 text operationally" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/binary.dat", "ok\xffbad");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/binary.dat", .data = "ok\xffbad" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer read_tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "binary.dat" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &read_tool,
-        cancel_source.token(),
-        "call-invalid-utf8",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"binary.dat\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -539,36 +430,15 @@ test "read tool omits invalid utf8 text operationally" {
 }
 
 test "read tool returns image attachment for supported image file" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
     const png_header = "\x89PNG\r\n\x1a\n" ++ "\x00\x00\x00\x0d" ++ "IHDR";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/image.png", .data = png_header });
+    try fixture.write("repo/image.png", png_header);
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer read_tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "image.png" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &read_tool,
-        cancel_source.token(),
-        "call-image",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"image.png\"}");
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), result.result.content.len);
@@ -582,9 +452,6 @@ test "read tool does not classify animated png as supported image" {
         "\x00\x00\x00\x0d" ++ "IHDR" ++ "1234567890123" ++ "\x00\x00\x00\x00" ++
         "\x00\x00\x00\x08" ++ "acTL" ++ "12345678" ++ "\x00\x00\x00\x00";
     try std.testing.expectEqual(@as(?[]const u8, null), detectImageMimeType("animated.png", animated_png));
-}
-
-test "read tool does not classify image extension without image signature" {
     try std.testing.expectEqual(@as(?[]const u8, null), detectImageMimeType("fake.png", "not an image"));
 }
 
@@ -619,35 +486,14 @@ test "read tool reports pi-style byte truncation ranges" {
 }
 
 test "read full untruncated file has no details" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "one\ntwo");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "one\ntwo" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer read_tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &read_tool,
-        cancel_source.token(),
-        "call-full",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("one\ntwo", result.result.content[0].text.text);
@@ -655,20 +501,15 @@ test "read full untruncated file has no details" {
 }
 
 test "read tool can reject paths outside cwd by config" {
-    try std.testing.expect(path_utils.isPathInside("/repo/", "/repo/file.txt"));
+    var fixture = try test_support.Fixture.init("repo/app");
+    defer fixture.deinit();
+    try fixture.dir("repo/other");
+    try fixture.write("repo/other/file.txt", "x");
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo/app");
-    try tmp.dir.createDirPath(std.testing.io, "repo/other");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/other/file.txt", .data = "x" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo/app", &cwd_buffer);
     try std.testing.expectError(error.PathOutsideCwd, path_utils.resolveExistingPath(
         std.testing.allocator,
         std.testing.io,
-        .{ .cwd = cwd_buffer[0..cwd], .allow_paths_outside_cwd = false },
+        .{ .cwd = fixture.cwd(), .allow_paths_outside_cwd = false },
         "../other/file.txt",
     ));
 }
@@ -711,36 +552,14 @@ test "read tool reports first line exceeding output limit" {
 }
 
 test "read tool reports offset beyond end operationally" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "one");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "one" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer read_tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
-    try object.put(std.testing.allocator, "offset", .{ .integer = 3 });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &read_tool,
-        cancel_source.token(),
-        "call-1",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\",\"offset\":3}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(

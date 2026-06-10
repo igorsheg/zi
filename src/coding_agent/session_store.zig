@@ -212,7 +212,13 @@ fn parseSession(allocator: std.mem.Allocator, data: []const u8) !session_manager
     while (lines.next()) |line| {
         if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
         if (line.len > max_session_line_bytes) return error.LineTooLong;
-        try parseEntryLine(allocator, &manager, line);
+        parseEntryLine(allocator, &manager, line) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            // A failing final line is a torn append from a crash: drop it
+            // and keep what loaded. Interior corruption stays fatal.
+            if (std.mem.trim(u8, lines.rest(), " \t\r\n").len == 0) break;
+            return err;
+        };
     }
     return manager;
 }
@@ -503,13 +509,31 @@ fn jsonString(value: std.json.Value) ![]const u8 {
     };
 }
 
-test "session parser rejects malformed json shapes" {
+test "session parser drops torn trailing line and keeps loaded entries" {
+    var loaded = try parseSession(
+        std.testing.allocator,
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n" ++
+            "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t\",\"message\":" ++
+            "{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":0}}\n" ++
+            "{\"type\":\"message\",\"id\":\"0000",
+    );
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
+}
+
+const valid_user_line =
+    "{\"type\":\"message\",\"id\":\"00000002\",\"parentId\":\"00000001\",\"timestamp\":\"t\"," ++
+    "\"message\":{\"role\":\"user\",\"content\":\"next\",\"timestamp\":0}}\n";
+
+test "session parser rejects malformed interior json shapes" {
     try std.testing.expectError(error.InvalidHeader, parseSession(std.testing.allocator, "[]\n"));
+    // A malformed line followed by more content is interior corruption.
     try std.testing.expectError(
         error.InvalidEntry,
         parseSession(
             std.testing.allocator,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n[]\n",
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n[]\n" ++
+                valid_user_line,
         ),
     );
     try std.testing.expectError(
@@ -518,12 +542,12 @@ test "session parser rejects malformed json shapes" {
             std.testing.allocator,
             "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n" ++
                 "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t\",\"message\":" ++
-                "{\"role\":\"assistant\",\"content\":123}}\n",
+                "{\"role\":\"assistant\",\"content\":123}}\n" ++ valid_user_line,
         ),
     );
 }
 
-test "session parser rejects negative usage" {
+test "session parser rejects interior negative usage" {
     try std.testing.expectError(
         error.InvalidEntry,
         parseSession(
@@ -533,7 +557,7 @@ test "session parser rejects negative usage" {
                 "{\"role\":\"assistant\",\"content\":[],\"api\":\"openai-responses\",\"provider\":\"openai\"," ++
                 "\"model\":\"gpt\",\"usage\":{\"input\":-1,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0," ++
                 "\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0," ++
-                "\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":0}}\n",
+                "\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":0}}\n" ++ valid_user_line,
         ),
     );
 }
@@ -568,12 +592,12 @@ test "session store appends entries and round trips context" {
 
     var loaded = try store.load(std.testing.allocator, std.testing.io);
     defer loaded.deinit();
-    const context = try loaded.buildSessionContext(std.testing.allocator);
-    defer loaded.deinitSessionContext(std.testing.allocator, context);
+    const messages = try loaded.contextMessages(std.testing.allocator);
+    defer session_manager.SessionManager.deinitContextMessages(std.testing.allocator, messages);
 
-    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
-    try std.testing.expectEqualStrings("hello", context.messages[0].user.content.string);
-    try std.testing.expectEqualStrings("openai", context.model.?.provider);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("hello", messages[0].user.content.string);
+    try std.testing.expectEqualStrings("openai", loaded.entries.items[0].model_change.provider);
 }
 
 test "session store round trips agent message variants" {
@@ -622,15 +646,15 @@ test "session store round trips agent message variants" {
 
     var loaded = try store.load(std.testing.allocator, std.testing.io);
     defer loaded.deinit();
-    const context = try loaded.buildSessionContext(std.testing.allocator);
-    defer loaded.deinitSessionContext(std.testing.allocator, context);
+    const messages = try loaded.contextMessages(std.testing.allocator);
+    defer session_manager.SessionManager.deinitContextMessages(std.testing.allocator, messages);
 
-    try std.testing.expectEqual(@as(usize, 4), context.messages.len);
-    try std.testing.expectEqualStrings("hello", context.messages[0].user.content.blocks[0].text.text);
-    try std.testing.expectEqualStrings("hi", context.messages[1].assistant.content[0].text.text);
-    try std.testing.expectEqualStrings("call-1", context.messages[1].assistant.content[2].tool_call.id);
-    try std.testing.expectEqualStrings("ok", context.messages[2].tool_result.content[0].text.text);
-    try std.testing.expectEqualStrings("extension", context.messages[3].custom.kind);
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("hello", messages[0].user.content.blocks[0].text.text);
+    try std.testing.expectEqualStrings("hi", messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("call-1", messages[1].assistant.content[2].tool_call.id);
+    try std.testing.expectEqualStrings("ok", messages[2].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("extension", messages[3].custom.kind);
 }
 
 test "session store load preserves entry ids and parent links" {

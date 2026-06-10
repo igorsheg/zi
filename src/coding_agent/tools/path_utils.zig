@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const agent = @import("../../agent/root.zig");
+const ai = @import("../../ai/root.zig");
 
 pub const max_path_bytes: usize = 16 * 1024;
 
@@ -7,18 +9,6 @@ pub const PathConfig = struct {
     cwd: []const u8,
     allow_paths_outside_cwd: bool = false,
 };
-
-pub fn copyConfig(allocator: std.mem.Allocator, config: PathConfig) !PathConfig {
-    return .{
-        .cwd = try allocator.dupe(u8, config.cwd),
-        .allow_paths_outside_cwd = config.allow_paths_outside_cwd,
-    };
-}
-
-pub fn deinitConfig(allocator: std.mem.Allocator, config: *PathConfig) void {
-    allocator.free(config.cwd);
-    config.* = undefined;
-}
 
 pub fn resolveExistingPath(
     allocator: std.mem.Allocator,
@@ -141,6 +131,56 @@ pub fn isPathInside(raw_cwd: []const u8, path: []const u8) bool {
     return std.fs.path.isSep(path[cwd.len]);
 }
 
+/// Wrap owned text (ownership transfers) into a single-content tool result.
+pub fn ownedTextResult(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    details: ?std.json.Value,
+) !agent.ToolExecutionResult {
+    errdefer allocator.free(text);
+    const content = try allocator.alloc(ai.ToolResultContent, 1);
+    content[0] = .{ .text = .{ .text = text } };
+    return .{ .allocator = allocator, .result = .{ .content = content, .details = details } };
+}
+
+pub fn textResult(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    details: ?std.json.Value,
+) !agent.ToolExecutionResult {
+    return ownedTextResult(allocator, try allocator.dupe(u8, text), details);
+}
+
+/// Build an owned `std.json.Value` object from an anonymous struct literal.
+/// Field types: bool, integers, string slices/literals (duped), an already
+/// owned `std.json.Value` (adopted), and optionals of those (null omitted).
+pub fn jsonDetails(allocator: std.mem.Allocator, fields: anytype) error{OutOfMemory}!std.json.Value {
+    var object: std.json.ObjectMap = .empty;
+    errdefer object.deinit(allocator);
+    inline for (@typeInfo(@TypeOf(fields)).@"struct".fields) |field| {
+        try putJsonValue(allocator, &object, field.name, @field(fields, field.name));
+    }
+    return .{ .object = object };
+}
+
+fn putJsonValue(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: anytype,
+) error{OutOfMemory}!void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .optional => if (value) |resolved| try putJsonValue(allocator, object, key, resolved),
+        .bool => try putJsonField(allocator, object, key, .{ .bool = value }),
+        .int, .comptime_int => try putJsonField(allocator, object, key, .{ .integer = @intCast(value) }),
+        else => if (T == std.json.Value)
+            try putJsonField(allocator, object, key, value)
+        else
+            try putJsonStringField(allocator, object, key, value),
+    }
+}
+
 pub fn putJsonField(
     allocator: std.mem.Allocator,
     object: *std.json.ObjectMap,
@@ -161,6 +201,26 @@ pub fn putJsonStringField(
     const owned_value = try allocator.dupe(u8, value);
     errdefer allocator.free(owned_value);
     try putJsonField(allocator, object, key, .{ .string = owned_value });
+}
+
+test "json details builds typed object and omits null optionals" {
+    const nested = try jsonDetails(std.testing.allocator, .{ .truncated = true });
+    const details = try jsonDetails(std.testing.allocator, .{
+        .count = @as(usize, 3),
+        .kind = "bytes",
+        .skipped = @as(?usize, null),
+        .present = @as(?usize, 7),
+        .truncation = nested,
+    });
+    var owned: agent.ToolExecutionResult = try textResult(std.testing.allocator, "x", details);
+    defer owned.deinit();
+
+    const object = owned.result.details.?.object;
+    try std.testing.expectEqual(@as(i64, 3), object.get("count").?.integer);
+    try std.testing.expectEqualStrings("bytes", object.get("kind").?.string);
+    try std.testing.expect(object.get("skipped") == null);
+    try std.testing.expectEqual(@as(i64, 7), object.get("present").?.integer);
+    try std.testing.expect(object.get("truncation").?.object.get("truncated").?.bool);
 }
 
 pub fn ignoredSearchPath(path: []const u8) bool {

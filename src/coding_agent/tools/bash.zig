@@ -6,6 +6,7 @@ const runtime = @import("../../runtime/root.zig");
 const path_utils = @import("path_utils.zig");
 const output_accumulator = @import("output_accumulator.zig");
 const output_tail = @import("output_tail.zig");
+const test_support = @import("test_support.zig");
 
 pub const default_timeout_ms = 30_000;
 pub const max_timeout_ms = 120_000;
@@ -29,6 +30,28 @@ const parameters_schema =
     \\  "required": ["command"]
     \\}
 ;
+
+/// Classify a finished bash tool result as success or error from its details
+/// payload. This is the one owner of the details schema written by
+/// `resultDetails` below; the session layer calls it after every bash call.
+pub fn classifyResult(details: ?std.json.Value, fallback_is_error: bool) bool {
+    const value = details orelse return fallback_is_error;
+    if (value != .object) return fallback_is_error;
+    const object = value.object;
+    if (jsonBool(object.get("timedOut"))) |timed_out| if (timed_out) return true;
+    if (jsonBool(object.get("outputLimitExceeded"))) |limited| if (limited) return true;
+    if (jsonBool(object.get("cancelled"))) |cancelled| if (cancelled) return true;
+    if (object.get("signal") != null or object.get("stopped") != null or object.get("unknown") != null) {
+        return true;
+    }
+    if (object.get("exitCode")) |code| if (code == .integer) return code.integer != 0;
+    return fallback_is_error;
+}
+
+fn jsonBool(value: ?std.json.Value) ?bool {
+    const resolved = value orelse return null;
+    return if (resolved == .bool) resolved.bool else null;
+}
 
 pub const BashTool = struct {
     allocator: std.mem.Allocator,
@@ -321,21 +344,12 @@ fn resultFromOutput(
         try appendTruncationFooter(&text_writer.writer, full_output, preview);
     }
     if (exit_status.len > 0) {
-        try appendStatus(&text_writer.writer, exit_status);
+        try text_writer.writer.writeAll("\n\n");
+        try text_writer.writer.writeAll(exit_status);
     }
 
-    const text = try text_writer.toOwnedSlice();
-    errdefer allocator.free(text);
-    const result_content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(result_content);
-    result_content[0] = .{ .text = .{ .text = text } };
-    return .{
-        .allocator = allocator,
-        .result = .{
-            .content = result_content,
-            .details = try resultDetails(allocator, term, failure, full_output, preview),
-        },
-    };
+    const details = try resultDetails(allocator, term, failure, full_output, preview);
+    return path_utils.ownedTextResult(allocator, try text_writer.toOwnedSlice(), details);
 }
 
 fn timeoutStatus(allocator: std.mem.Allocator, timeout_ms: u64) ![]u8 {
@@ -361,11 +375,6 @@ fn commandExitStatus(allocator: std.mem.Allocator, term: std.process.Child.Term)
         ),
         .unknown => |code| try std.fmt.allocPrint(allocator, "Command exited with unknown status {d}", .{code}),
     };
-}
-
-fn appendStatus(writer: *std.Io.Writer, status: []const u8) !void {
-    try writer.writeAll("\n\n");
-    try writer.writeAll(status);
 }
 
 fn appendTruncationFooter(
@@ -399,23 +408,6 @@ fn countOutputLines(bytes: []const u8) usize {
     return count;
 }
 
-fn failureDetails(allocator: std.mem.Allocator, kind: FailureKind) !std.json.Value {
-    var object: std.json.ObjectMap = .empty;
-    errdefer object.deinit(allocator);
-    try appendFailureDetails(allocator, &object, kind);
-    return .{ .object = object };
-}
-
-fn appendFailureDetails(
-    allocator: std.mem.Allocator,
-    object: *std.json.ObjectMap,
-    kind: FailureKind,
-) !void {
-    try path_utils.putJsonField(allocator, object, "timedOut", .{ .bool = kind == .timeout });
-    try path_utils.putJsonField(allocator, object, "outputLimitExceeded", .{ .bool = kind == .output_limit });
-    try path_utils.putJsonField(allocator, object, "cancelled", .{ .bool = kind == .canceled });
-}
-
 fn resultDetails(
     allocator: std.mem.Allocator,
     term: ?std.process.Child.Term,
@@ -423,88 +415,60 @@ fn resultDetails(
     full_output: []const u8,
     preview: output_tail.TailAppendResult,
 ) !std.json.Value {
-    var object: std.json.ObjectMap = .empty;
-    errdefer object.deinit(allocator);
-    if (term) |resolved| try appendTermDetails(allocator, &object, resolved) else try appendFailureDetails(
-        allocator,
-        &object,
-        failure orelse .output_limit,
-    );
-    if (preview.dropped_bytes > 0 or preview.dropped_lines > 0) {
-        try path_utils.putJsonField(allocator, &object, "truncation", try truncationDetails(
-            allocator,
-            full_output,
-            preview,
-        ));
+    var exit_code: ?i64 = null;
+    var signal: ?i64 = null;
+    var stopped: ?i64 = null;
+    var unknown: ?i64 = null;
+    var cancelled: ?bool = null;
+    var timed_out = false;
+    var output_limited = false;
+    if (term) |resolved| switch (resolved) {
+        .exited => |code| exit_code = code,
+        .signal => |value| signal = @intFromEnum(value),
+        .stopped => |value| stopped = @intFromEnum(value),
+        .unknown => |code| unknown = code,
+    } else {
+        const kind = failure orelse .output_limit;
+        timed_out = kind == .timeout;
+        output_limited = kind == .output_limit;
+        cancelled = kind == .canceled;
     }
-    return .{ .object = object };
-}
-
-fn appendTermDetails(
-    allocator: std.mem.Allocator,
-    object: *std.json.ObjectMap,
-    term: std.process.Child.Term,
-) !void {
-    try path_utils.putJsonField(allocator, object, "timedOut", .{ .bool = false });
-    try path_utils.putJsonField(allocator, object, "outputLimitExceeded", .{ .bool = false });
-    switch (term) {
-        .exited => |code| try path_utils.putJsonField(allocator, object, "exitCode", .{ .integer = code }),
-        .signal => |signal| {
-            try path_utils.putJsonField(allocator, object, "signal", .{ .integer = @intFromEnum(signal) });
-        },
-        .stopped => |signal| {
-            try path_utils.putJsonField(allocator, object, "stopped", .{ .integer = @intFromEnum(signal) });
-        },
-        .unknown => |code| try path_utils.putJsonField(allocator, object, "unknown", .{ .integer = code }),
-    }
-}
-
-fn truncationDetails(
-    allocator: std.mem.Allocator,
-    full_output: []const u8,
-    preview: output_tail.TailAppendResult,
-) !std.json.Value {
-    var truncation: std.json.ObjectMap = .empty;
-    errdefer truncation.deinit(allocator);
-    const total_lines = countOutputLines(full_output);
-    const output_lines = countOutputLines(preview.bytes);
-    try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = true });
-    try path_utils.putJsonStringField(
-        allocator,
-        &truncation,
-        "truncatedBy",
-        if (full_output.len > max_output_preview_bytes) "bytes" else "lines",
-    );
-    try path_utils.putJsonField(allocator, &truncation, "totalLines", .{ .integer = @intCast(total_lines) });
-    try path_utils.putJsonField(allocator, &truncation, "totalBytes", .{ .integer = @intCast(full_output.len) });
-    try path_utils.putJsonField(allocator, &truncation, "outputLines", .{ .integer = @intCast(output_lines) });
-    try path_utils.putJsonField(allocator, &truncation, "outputBytes", .{ .integer = @intCast(preview.bytes.len) });
-    try path_utils.putJsonField(
-        allocator,
-        &truncation,
-        "lastLinePartial",
-        .{ .bool = preview.last_line_partial },
-    );
-    try path_utils.putJsonField(allocator, &truncation, "firstLineExceedsLimit", .{ .bool = false });
-    try path_utils.putJsonField(allocator, &truncation, "maxLines", .{ .integer = max_output_preview_lines });
-    try path_utils.putJsonField(allocator, &truncation, "maxBytes", .{ .integer = max_output_preview_bytes });
-    return .{ .object = truncation };
+    const truncation: ?std.json.Value = if (preview.dropped_bytes > 0 or preview.dropped_lines > 0)
+        try path_utils.jsonDetails(allocator, .{
+            .truncated = true,
+            .truncatedBy = @as([]const u8, if (full_output.len > max_output_preview_bytes) "bytes" else "lines"),
+            .totalLines = countOutputLines(full_output),
+            .totalBytes = full_output.len,
+            .outputLines = countOutputLines(preview.bytes),
+            .outputBytes = preview.bytes.len,
+            .lastLinePartial = preview.last_line_partial,
+            .firstLineExceedsLimit = false,
+            .maxLines = max_output_preview_lines,
+            .maxBytes = max_output_preview_bytes,
+        })
+    else
+        null;
+    return path_utils.jsonDetails(allocator, .{
+        .timedOut = timed_out,
+        .outputLimitExceeded = output_limited,
+        .cancelled = cancelled,
+        .exitCode = exit_code,
+        .signal = signal,
+        .stopped = stopped,
+        .unknown = unknown,
+        .truncation = truncation,
+    });
 }
 
 test "bash tool runs one cwd-bound command" {
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "ok");
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "ok" });
-
-    var tool = try initTestTool(tmp.dir, "repo", .{});
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var result = try executeTestCommand(task_runtime, &tool, "pwd; cat file.txt");
+    var result = try test_support.execute(tool.tool(), "{\"command\":\"pwd; cat file.txt\"}");
     defer result.deinit();
 
     try std.testing.expect(std.mem.endsWith(u8, result.result.content[0].text.text, "repo\nok"));
@@ -512,41 +476,29 @@ test "bash tool runs one cwd-bound command" {
 }
 
 test "bash tool passes explicit environment to child process" {
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();
     try environ.put("ZI_BASH_ENV_TEST", "present");
     try environ.put("PATH", "/usr/bin:/bin");
-    var tool = try BashTool.init(std.testing.allocator, .{
-        .cwd = cwd_buffer[0..cwd_len],
-        .environ = &environ,
-    });
+
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .environ = &environ });
     defer tool.deinit();
 
-    var result = try executeTestCommand(task_runtime, &tool, "printf %s \"$ZI_BASH_ENV_TEST\"");
+    var result = try test_support.execute(tool.tool(), "{\"command\":\"printf %s \\\"$ZI_BASH_ENV_TEST\\\"\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("present", result.result.content[0].text.text);
 }
 
 test "bash tool treats nonzero exit as result data" {
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var tool = try initTestTool(tmp.dir, ".", .{});
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var result = try executeTestCommand(task_runtime, &tool, "printf nope; exit 7");
+    var result = try test_support.execute(tool.tool(), "{\"command\":\"printf nope; exit 7\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -557,16 +509,12 @@ test "bash tool treats nonzero exit as result data" {
 }
 
 test "bash tool treats timeout as bounded result data" {
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var tool = try initTestTool(tmp.dir, ".", .{ .timeout_ms = 1 });
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .timeout_ms = 1 });
     defer tool.deinit();
 
-    var result = try executeTestCommand(task_runtime, &tool, "sleep 60");
+    var result = try test_support.execute(tool.tool(), "{\"command\":\"sleep 60\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -578,16 +526,12 @@ test "bash tool treats timeout as bounded result data" {
 }
 
 test "bash tool treats output limit as bounded result data" {
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var tool = try initTestTool(tmp.dir, ".", .{ .max_stdout_bytes = 4 });
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .max_stdout_bytes = 4 });
     defer tool.deinit();
 
-    var result = try executeTestCommand(task_runtime, &tool, "printf abcdef");
+    var result = try test_support.execute(tool.tool(), "{\"command\":\"printf abcdef\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -598,44 +542,28 @@ test "bash tool treats output limit as bounded result data" {
     try std.testing.expect(result.result.details.?.object.get("outputLimitExceeded").?.bool);
 }
 
-test "bash tool applies command prefix" {
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
+test "bash tool applies command prefix and shell path" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var tool = try initTestTool(tmp.dir, ".", .{ .command_prefix = "ZI_PREFIX_VALUE=ok" });
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    var tool = try BashTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .command_prefix = "ZI_PREFIX_VALUE=ok",
+        .shell_path = "/bin/sh",
+    });
     defer tool.deinit();
 
-    var result = try executeTestCommand(task_runtime, &tool, "printf %s \"$ZI_PREFIX_VALUE\"");
+    var result = try test_support.execute(tool.tool(), "{\"command\":\"printf %s \\\"$ZI_PREFIX_VALUE\\\"\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("ok", result.result.content[0].text.text);
 }
 
-test "bash tool applies configured shell path" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var tool = try initTestTool(tmp.dir, ".", .{ .shell_path = "/bin/sh" });
-    defer tool.deinit();
-
-    var result = try executeTestCommand(task_runtime, &tool, "printf shell-ok");
-    defer result.deinit();
-
-    try std.testing.expectEqualStrings("shell-ok", result.result.content[0].text.text);
-}
-
 test "bash tool accepts timeout seconds" {
     var object: std.json.ObjectMap = .empty;
     defer object.deinit(std.testing.allocator);
-    try putCommand(&object, "echo ok");
+    try object.put(std.testing.allocator, "command", .{ .string = "echo ok" });
     try object.put(std.testing.allocator, "timeout", .{ .integer = 2 });
 
     const args = try parseArgs(.{ .cwd = ".", .timeout_ms = default_timeout_ms }, .{ .object = object });
@@ -643,36 +571,34 @@ test "bash tool accepts timeout seconds" {
 }
 
 test "bash tool rejects oversized commands before process start" {
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var tool = try initTestTool(tmp.dir, ".", .{});
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    const oversized = try std.testing.allocator.alloc(u8, max_command_bytes + 1);
-    defer std.testing.allocator.free(oversized);
-    @memset(oversized, 'x');
+    var args = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer args.deinit();
+    try args.writer.writeAll("{\"command\":\"");
+    try args.writer.splatByteAll('x', max_command_bytes + 1);
+    try args.writer.writeAll("\"}");
 
-    try std.testing.expectError(error.InvalidToolArguments, executeTestCommand(task_runtime, &tool, oversized));
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        test_support.execute(tool.tool(), args.written()),
+    );
 }
 
 test "bash tool rejects invalid config bounds" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
 
     try std.testing.expectError(error.InvalidToolConfig, BashTool.init(std.testing.allocator, .{
-        .cwd = cwd_buffer[0..cwd_len],
+        .cwd = fixture.cwd(),
         .timeout_ms = max_timeout_ms + 1,
         .max_timeout_ms = max_timeout_ms,
     }));
     try std.testing.expectError(error.InvalidToolConfig, BashTool.init(std.testing.allocator, .{
-        .cwd = cwd_buffer[0..cwd_len],
+        .cwd = fixture.cwd(),
         .max_stdout_bytes = 0,
     }));
 }
@@ -682,15 +608,14 @@ test "bash tool cancels running process through owner race" {
     defer task_runtime.deinit();
     const io = task_runtime.io();
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var tool = try initTestTool(tmp.dir, ".", .{});
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
     var object: std.json.ObjectMap = .empty;
     defer object.deinit(std.testing.allocator);
-    try putCommand(&object, "sleep 60");
+    try object.put(std.testing.allocator, "command", .{ .string = "sleep 60" });
 
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
@@ -707,41 +632,4 @@ test "bash tool cancels running process through owner race" {
     cancel_source.request();
 
     try std.testing.expectError(error.OperationCancelled, future.join());
-}
-
-fn initTestTool(dir: std.Io.Dir, sub_path: []const u8, config: struct {
-    timeout_ms: ?u64 = null,
-    max_stdout_bytes: ?usize = null,
-    shell_path: ?[]const u8 = null,
-    command_prefix: ?[]const u8 = null,
-}) !BashTool {
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = try dir.realPathFile(std.testing.io, sub_path, &cwd_buffer);
-    return BashTool.init(std.testing.allocator, .{
-        .cwd = cwd_buffer[0..cwd_len],
-        .timeout_ms = config.timeout_ms orelse default_timeout_ms,
-        .max_stdout_bytes = config.max_stdout_bytes orelse max_stdout_bytes,
-        .shell_path = config.shell_path,
-        .command_prefix = config.command_prefix,
-    });
-}
-
-fn putCommand(object: *std.json.ObjectMap, command: []const u8) !void {
-    try object.put(std.testing.allocator, "command", .{ .string = command });
-}
-
-fn executeTestCommand(
-    task_runtime: *agent.ToolRuntime,
-    tool: *BashTool,
-    command: []const u8,
-) !agent.ToolExecutionResult {
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try putCommand(&object, command);
-
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    return execute(std.testing.allocator, task_runtime.io(), task_runtime, tool, cancel_source.token(), "call", .{
-        .object = object,
-    }, null);
 }

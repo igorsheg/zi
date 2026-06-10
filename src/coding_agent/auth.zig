@@ -23,6 +23,8 @@ pub const AuthStore = struct {
     auth_path: ?[]const u8 = null,
     credentials: []OAuthCredential,
 
+    /// The auth file is operational input: missing, unreadable, or malformed
+    /// content degrades to an empty store. Only allocation failure propagates.
     pub fn load(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -31,22 +33,27 @@ pub const AuthStore = struct {
     ) !AuthStore {
         const auth_path = try paths.authPath(allocator);
         errdefer allocator.free(auth_path);
+        const empty: AuthStore = .{
+            .allocator = allocator,
+            .dir = dir,
+            .auth_path = auth_path,
+            .credentials = try allocator.alloc(OAuthCredential, 0),
+        };
         const bytes = dir.readFileAlloc(
             io,
             auth_path,
             allocator,
             .limited(max_auth_file_bytes),
         ) catch |err| switch (err) {
-            error.FileNotFound => return .{
-                .allocator = allocator,
-                .dir = dir,
-                .auth_path = auth_path,
-                .credentials = try allocator.alloc(OAuthCredential, 0),
-            },
-            else => return err,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return empty,
         };
         defer allocator.free(bytes);
-        var store = try parse(allocator, bytes);
+        var store = parse(allocator, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return empty,
+        };
+        allocator.free(empty.credentials);
         store.dir = dir;
         store.auth_path = auth_path;
         return store;

@@ -1,8 +1,8 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
-const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const path_utils = @import("path_utils.zig");
+const test_support = @import("test_support.zig");
 const tool_output_policy = @import("../tool_output_policy.zig");
 
 pub const max_entries = 200;
@@ -32,20 +32,14 @@ pub const LsTool = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !LsTool {
-        var path_config = try path_utils.copyConfig(allocator, .{
-            .cwd = config.cwd,
-            .allow_paths_outside_cwd = config.allow_paths_outside_cwd,
-        });
-        errdefer path_utils.deinitConfig(allocator, &path_config);
+        const cwd = try allocator.dupe(u8, config.cwd);
+        errdefer allocator.free(cwd);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        var owned_config = config;
+        owned_config.cwd = cwd;
         return .{
             .allocator = allocator,
-            .config = .{
-                .cwd = path_config.cwd,
-                .allow_paths_outside_cwd = path_config.allow_paths_outside_cwd,
-                .max_entries = config.max_entries,
-                .max_output_bytes = config.max_output_bytes,
-            },
+            .config = owned_config,
             .parsed_parameters = parsed_parameters,
         };
     }
@@ -140,37 +134,17 @@ fn execute(
         try writer.writer.writeAll("\n[listing truncated]");
     }
 
-    const text = try writer.toOwnedSlice();
-    errdefer allocator.free(text);
-    const result_content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(result_content);
-    result_content[0] = .{ .text = .{ .text = text } };
-    return .{ .allocator = allocator, .result = .{
-        .content = result_content,
-        .details = try listingDetails(allocator, emitted, truncated, truncated_by, max_entries_value),
-    } };
+    return path_utils.ownedTextResult(allocator, try writer.toOwnedSlice(), try path_utils.jsonDetails(allocator, .{
+        .entries = emitted,
+        .truncation = try path_utils.jsonDetails(allocator, .{
+            .truncated = truncated,
+            .truncatedBy = truncated_by,
+            .maxEntries = max_entries_value,
+        }),
+    }));
 }
 
 const empty_directory_text = "[directory is empty]";
-
-fn listingDetails(
-    allocator: std.mem.Allocator,
-    entries: usize,
-    truncated: bool,
-    truncated_by: []const u8,
-    max_entries_value: usize,
-) !std.json.Value {
-    var object: std.json.ObjectMap = .empty;
-    errdefer object.deinit(allocator);
-    try path_utils.putJsonField(allocator, &object, "entries", .{ .integer = @intCast(entries) });
-    var truncation: std.json.ObjectMap = .empty;
-    errdefer truncation.deinit(allocator);
-    try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = truncated });
-    try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", truncated_by);
-    try path_utils.putJsonField(allocator, &truncation, "maxEntries", .{ .integer = @intCast(max_entries_value) });
-    try path_utils.putJsonField(allocator, &object, "truncation", .{ .object = truncation });
-    return .{ .object = object };
-}
 
 fn parsePath(params: std.json.Value) ![]const u8 {
     if (params != .object) return error.InvalidToolArguments;
@@ -200,36 +174,15 @@ fn kindSuffix(kind: std.Io.File.Kind) []const u8 {
 }
 
 test "ls tool lists one directory with bounds" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("repo/dir/nested");
+    try fixture.write("repo/dir/a.txt", "a");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo/dir");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/dir/a.txt", .data = "a" });
-    try tmp.dir.createDirPath(std.testing.io, "repo/dir/nested");
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try LsTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var tool = try LsTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "dir" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(tool.tool(), "{\"path\":\"dir\"}");
     defer result.deinit();
 
     const text = result.result.content[0].text.text;
@@ -238,52 +191,20 @@ test "ls tool lists one directory with bounds" {
 }
 
 test "ls tool defaults to cwd, sorts entries, and reports empty directories" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("repo/empty");
+    try fixture.write("repo/B.txt", "");
+    try fixture.write("repo/a.txt", "");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo/empty");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/B.txt", .data = "" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/a.txt", .data = "" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try LsTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var tool = try LsTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(tool.tool(), "{}");
     defer result.deinit();
-
     try std.testing.expect(std.mem.indexOf(u8, result.result.content[0].text.text, "a.txt\nB.txt") != null);
 
-    var empty_object: std.json.ObjectMap = .empty;
-    defer empty_object.deinit(std.testing.allocator);
-    try empty_object.put(std.testing.allocator, "path", .{ .string = "empty" });
-    var empty_result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call-empty",
-        .{ .object = empty_object },
-        null,
-    );
+    var empty_result = try test_support.execute(tool.tool(), "{\"path\":\"empty\"}");
     defer empty_result.deinit();
     try std.testing.expectEqualStrings("[directory is empty]", empty_result.result.content[0].text.text);
 }

@@ -2,18 +2,16 @@ const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
-const mutation = @import("file_mutation_queue.zig");
+const file_writer = @import("file_writer.zig");
 const path_utils = @import("path_utils.zig");
+const test_support = @import("test_support.zig");
 
 pub const max_edit_read_bytes = 4 * 1024 * 1024;
 pub const max_edit_output_bytes = 4 * 1024 * 1024;
 pub const max_edits_per_call = 64;
-pub const edit_update_chunk_bytes = 16 * 1024;
 pub const max_diff_bytes = 16 * 1024;
 
 const utf8_bom = "\xef\xbb\xbf";
-
-var temp_file_counter: std.atomic.Value(u64) = .init(0);
 
 const parameters_schema =
     \\{
@@ -40,29 +38,23 @@ pub const EditTool = struct {
     allocator: std.mem.Allocator,
     config: Config,
     parsed_parameters: runtime.JsonOwned(std.json.Value),
-    owned_queue: mutation.FileMutationQueue = .{},
 
     pub const Config = struct {
         cwd: []const u8,
         allow_paths_outside_cwd: bool = false,
         max_read_bytes: usize = max_edit_read_bytes,
         max_output_bytes: usize = max_edit_output_bytes,
-        mutation_queue: ?*mutation.FileMutationQueue = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !EditTool {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        var owned_config = config;
+        owned_config.cwd = cwd;
         return .{
             .allocator = allocator,
-            .config = .{
-                .cwd = cwd,
-                .allow_paths_outside_cwd = config.allow_paths_outside_cwd,
-                .max_read_bytes = config.max_read_bytes,
-                .max_output_bytes = config.max_output_bytes,
-                .mutation_queue = config.mutation_queue,
-            },
+            .config = owned_config,
             .parsed_parameters = parsed_parameters,
         };
     }
@@ -82,12 +74,10 @@ pub const EditTool = struct {
             .parameters = self.parsed_parameters.value,
             .label = "edit",
             .execute = .{ .context = self, .call_fn = execute },
+            // Sequential execution is the file-mutation serialization guarantee:
+            // edit and write never run concurrently with another tool call.
             .execution_mode = .sequential,
         };
-    }
-
-    fn queue(self: *EditTool) *mutation.FileMutationQueue {
-        return self.config.mutation_queue orelse &self.owned_queue;
     }
 };
 
@@ -148,9 +138,6 @@ fn execute(
     }, args.path);
     defer allocator.free(resolved_path);
 
-    var guard = self.queue().lock();
-    defer guard.unlock();
-
     try token.throwIfRequested();
     const original = try std.Io.Dir.readFileAlloc(
         .cwd(),
@@ -166,15 +153,16 @@ fn execute(
         args.edits,
         self.config.max_output_bytes,
     ) catch |err| switch (err) {
-        error.NoChanges => return editOperationalErrorResult(
+        error.NoChanges => return path_utils.textResult(
             allocator,
             "No changes: replacement output is identical.",
+            null,
         ),
         else => return err,
     };
     defer edited.deinit(allocator);
     try token.throwIfRequested();
-    try atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, on_update);
+    try file_writer.atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, on_update);
 
     return editResult(
         allocator,
@@ -357,60 +345,6 @@ fn lessThanMatch(_: void, a: Match, b: Match) bool {
     return a.start < b.start;
 }
 
-fn atomicWriteFileStreamingUpdates(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    content: []const u8,
-    on_update: ?agent.AgentToolUpdateCallback,
-) !void {
-    const stamp = std.Io.Clock.awake.now(io).nanoseconds;
-    const counter = temp_file_counter.fetchAdd(1, .monotonic);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.zi-tmp-{d}-{d}", .{ path, stamp, counter });
-    defer allocator.free(temp_path);
-    errdefer std.Io.Dir.deleteFile(.cwd(), io, temp_path) catch {};
-
-    const file = try std.Io.Dir.createFile(.cwd(), io, temp_path, .{});
-    defer file.close(io);
-
-    var buffer: [4096]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    var offset: usize = 0;
-    while (offset < content.len) {
-        const end = utf8ChunkEnd(content, offset, @min(content.len, offset + edit_update_chunk_bytes));
-        const chunk = content[offset..end];
-        try writer.interface.writeAll(chunk);
-        try emitEditUpdate(allocator, on_update, chunk);
-        offset = end;
-    }
-    try writer.flush();
-    try std.Io.Dir.rename(.cwd(), temp_path, .cwd(), path, io);
-}
-
-fn emitEditUpdate(
-    allocator: std.mem.Allocator,
-    on_update: ?agent.AgentToolUpdateCallback,
-    chunk: []const u8,
-) !void {
-    const callback = on_update orelse return;
-    const text = try allocator.dupe(u8, chunk);
-    defer allocator.free(text);
-    const content = try allocator.alloc(ai.ToolResultContent, 1);
-    defer allocator.free(content);
-    content[0] = .{ .text = .{ .text = text } };
-    try callback.call(.{ .content = content });
-}
-
-fn utf8ChunkEnd(content: []const u8, start: usize, proposed_end: usize) usize {
-    std.debug.assert(start < proposed_end);
-    std.debug.assert(proposed_end <= content.len);
-    if (proposed_end == content.len) return proposed_end;
-    var end = proposed_end;
-    while (end > start and (content[end] & 0xc0) == 0x80) : (end -= 1) {}
-    if (end == start) return proposed_end;
-    return end;
-}
-
 fn lineAt(text: []const u8, wanted_line: usize) []const u8 {
     var line: usize = 1;
     var start: usize = 0;
@@ -425,15 +359,6 @@ fn lineAt(text: []const u8, wanted_line: usize) []const u8 {
     return "";
 }
 
-fn editOperationalErrorResult(allocator: std.mem.Allocator, message: []const u8) !agent.ToolExecutionResult {
-    const text = try allocator.dupe(u8, message);
-    errdefer allocator.free(text);
-    const content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(content);
-    content[0] = .{ .text = .{ .text = text } };
-    return .{ .allocator = allocator, .result = .{ .content = content, .details = null } };
-}
-
 fn editResult(
     allocator: std.mem.Allocator,
     replacements: usize,
@@ -442,25 +367,6 @@ fn editResult(
     before: []const u8,
     after: []const u8,
 ) !agent.ToolExecutionResult {
-    const message = try std.fmt.allocPrint(
-        allocator,
-        "Successfully replaced {d} block(s) in {s}.",
-        .{ replacements, path },
-    );
-    errdefer allocator.free(message);
-    const content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(content);
-    content[0] = .{ .text = .{ .text = message } };
-    var details: std.json.ObjectMap = .empty;
-    errdefer details.deinit(allocator);
-    try path_utils.putJsonStringField(allocator, &details, "path", path);
-    try path_utils.putJsonField(allocator, &details, "replacements", .{ .integer = @intCast(replacements) });
-    try path_utils.putJsonField(
-        allocator,
-        &details,
-        "firstChangedLine",
-        .{ .integer = @intCast(first_changed_line) },
-    );
     const before_line = lineAt(before, first_changed_line);
     const after_line = lineAt(after, first_changed_line);
     const diff = try std.fmt.allocPrint(
@@ -470,7 +376,6 @@ fn editResult(
     );
     errdefer allocator.free(diff);
     if (diff.len > max_diff_bytes) return error.EditTooLarge;
-    try path_utils.putJsonField(allocator, &details, "diff", .{ .string = diff });
     const patch = try std.fmt.allocPrint(
         allocator,
         "--- {s}\n+++ {s}\n@@ line {d} @@\n- {s}\n+ {s}",
@@ -478,55 +383,39 @@ fn editResult(
     );
     errdefer allocator.free(patch);
     if (patch.len > max_diff_bytes) return error.EditTooLarge;
-    try path_utils.putJsonField(allocator, &details, "patch", .{ .string = patch });
-    return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = details } } };
+    const details = try path_utils.jsonDetails(allocator, .{
+        .path = path,
+        .replacements = replacements,
+        .firstChangedLine = first_changed_line,
+        .diff = std.json.Value{ .string = diff },
+        .patch = std.json.Value{ .string = patch },
+    });
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Successfully replaced {d} block(s) in {s}.",
+        .{ replacements, path },
+    );
+    return path_utils.ownedTextResult(allocator, message, details);
 }
 
 test "edit tool applies multiple exact replacements against original content" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "one two three" });
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "one two three");
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer edit_tool.deinit();
 
-    var first: std.json.ObjectMap = .empty;
-    defer first.deinit(std.testing.allocator);
-    try first.put(std.testing.allocator, "oldText", .{ .string = "one" });
-    try first.put(std.testing.allocator, "newText", .{ .string = "1" });
-    var second: std.json.ObjectMap = .empty;
-    defer second.deinit(std.testing.allocator);
-    try second.put(std.testing.allocator, "oldText", .{ .string = "three" });
-    try second.put(std.testing.allocator, "newText", .{ .string = "3" });
-    var edits: std.json.Array = .init(std.testing.allocator);
-    defer edits.deinit();
-    try edits.append(.{ .object = first });
-    try edits.append(.{ .object = second });
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
-    try object.put(std.testing.allocator, "edits", .{ .array = edits });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &edit_tool,
-        cancel_source.token(),
-        "call-1",
-        .{ .object = object },
-        null,
+    var result = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.txt","edits":[
+        \\  {"oldText":"one","newText":"1"},
+        \\  {"oldText":"three","newText":"3"}]}
+        ,
     );
     defer result.deinit();
 
-    const written = try tmp.dir.readFileAlloc(std.testing.io, "repo/file.txt", std.testing.allocator, .unlimited);
+    const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("1 two 3", written);
     try std.testing.expectEqualStrings(
@@ -573,51 +462,18 @@ test "edit tool preserves BOM and CRLF while matching normalized text and tracks
     try std.testing.expectEqual(@as(usize, 1), edited.first_changed_line);
 }
 
-test "edit tool rejects no-op replacement" {
-    try std.testing.expectError(error.NoChanges, applyEdits(
-        std.testing.allocator,
-        "same",
-        &.{.{ .old_text = "same", .new_text = "same" }},
-        max_edit_output_bytes,
-    ));
-}
-
 test "edit tool reports no-op replacement without writing" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = "same" });
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "same");
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer edit_tool.deinit();
 
-    var edit: std.json.ObjectMap = .empty;
-    defer edit.deinit(std.testing.allocator);
-    try edit.put(std.testing.allocator, "oldText", .{ .string = "same" });
-    try edit.put(std.testing.allocator, "newText", .{ .string = "same" });
-    var edits: std.json.Array = .init(std.testing.allocator);
-    defer edits.deinit();
-    try edits.append(.{ .object = edit });
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
-    try object.put(std.testing.allocator, "edits", .{ .array = edits });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &edit_tool,
-        cancel_source.token(),
-        "call-no-op",
-        .{ .object = object },
-        null,
+    var result = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.txt","edits":[{"oldText":"same","newText":"same"}]}
+        ,
     );
     defer result.deinit();
 
@@ -625,31 +481,28 @@ test "edit tool reports no-op replacement without writing" {
         "No changes: replacement output is identical.",
         result.result.content[0].text.text,
     );
-    const written = try tmp.dir.readFileAlloc(std.testing.io, "repo/file.txt", std.testing.allocator, .unlimited);
+    const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("same", written);
 }
 
 test "edit tool streams utf8 safe edited content chunks" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    const original = "old\n" ++ ("中" ** 6000);
-    const replacement = "new\n" ++ ("中" ** 6000);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/file.txt", .data = original });
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    const original = "old\n" ++ ("\xe4\xb8\xad" ** 6000);
+    const replacement = "new\n" ++ ("\xe4\xb8\xad" ** 6000);
+    try fixture.write("repo/file.txt", original);
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer edit_tool.deinit();
 
-    var edit: std.json.ObjectMap = .empty;
-    defer edit.deinit(std.testing.allocator);
-    try edit.put(std.testing.allocator, "oldText", .{ .string = original });
-    try edit.put(std.testing.allocator, "newText", .{ .string = replacement });
+    var edit_object: std.json.ObjectMap = .empty;
+    defer edit_object.deinit(std.testing.allocator);
+    try edit_object.put(std.testing.allocator, "oldText", .{ .string = original });
+    try edit_object.put(std.testing.allocator, "newText", .{ .string = replacement });
     var edits: std.json.Array = .init(std.testing.allocator);
     defer edits.deinit();
-    try edits.append(.{ .object = edit });
+    try edits.append(.{ .object = edit_object });
     var object: std.json.ObjectMap = .empty;
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
@@ -675,26 +528,26 @@ test "edit tool streams utf8 safe edited content chunks" {
 
     try std.testing.expect(capture.count > 1);
     try std.testing.expectEqualStrings(replacement, capture.writer.written());
-    const written = try tmp.dir.readFileAlloc(std.testing.io, "repo/file.txt", std.testing.allocator, .unlimited);
+    const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings(replacement, written);
 }
 
-test "edit tool rejects duplicate old text" {
+test "edit tool rejects bad replacements before mutation" {
+    try std.testing.expectError(error.NoChanges, applyEdits(
+        std.testing.allocator,
+        "same",
+        &.{.{ .old_text = "same", .new_text = "same" }},
+        max_edit_output_bytes,
+    ));
     try std.testing.expectError(
         error.EditTextNotFoundOrNotUnique,
         applyEdits(std.testing.allocator, "x x", &.{.{ .old_text = "x", .new_text = "y" }}, max_edit_output_bytes),
     );
-}
-
-test "edit tool rejects output exceeding bound" {
     try std.testing.expectError(
         error.EditTooLarge,
         applyEdits(std.testing.allocator, "x", &.{.{ .old_text = "x", .new_text = "hello" }}, 3),
     );
-}
-
-test "edit tool rejects overlapping replacements" {
     try std.testing.expectError(
         error.OverlappingEdits,
         applyEdits(

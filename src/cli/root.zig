@@ -1,12 +1,13 @@
 const std = @import("std");
 const runtime = @import("../runtime/root.zig");
-const auth_mode = @import("../coding_agent/auth_mode.zig");
+const coding_agent = @import("../coding_agent/root.zig");
+const auth_mode = coding_agent.auth_mode;
+const session_runtime = coding_agent.session_runtime;
+const session_listing = coding_agent.session_listing;
 const args_mod = @import("args.zig");
 const print_mode = @import("../frontends/print/print_mode.zig");
 const rpc_mode = @import("../frontends/rpc/stdio.zig");
 const interactive = @import("../frontends/tui/interactive.zig");
-const session_runtime = @import("../coding_agent/session_runtime.zig");
-const session_listing = @import("../coding_agent/session_listing.zig");
 
 const CliError = error{
     InvalidCliUsage,
@@ -165,33 +166,7 @@ fn runPrompt(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
-    const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
-    defer process.gpa.free(timestamp_text);
-
-    var app = if (try selectResumeSession(process, stderr, app_args, options)) |session_file| blk: {
-        defer process.gpa.free(session_file);
-        break :blk try session_runtime.resumeSessionRuntime(process.gpa, .{
-            .cwd = options.cwd,
-            .agent_dir_override = options.agent_dir_override,
-            .current_date = timestamp_text,
-            .session_file_name = session_file,
-            .dir = options.dir,
-            .environ = options.environ,
-        });
-    } else blk: {
-        const session_id = try std.fmt.allocPrint(process.gpa, "cli-{d}", .{timestamp});
-        defer process.gpa.free(session_id);
-        break :blk try session_runtime.createSessionRuntime(process.gpa, .{
-            .cwd = options.cwd,
-            .agent_dir_override = options.agent_dir_override,
-            .current_date = timestamp_text,
-            .session_id = session_id,
-            .timestamp = timestamp_text,
-            .dir = options.dir,
-            .environ = options.environ,
-        });
-    };
+    var app = try openCliRuntime(process, stderr, app_args, options, "cli");
     defer app.deinit();
 
     try print_mode.run(&app, stdout, stderr, .{
@@ -207,33 +182,7 @@ fn runRpc(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
-    const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
-    defer process.gpa.free(timestamp_text);
-
-    var app = if (try selectResumeSession(process, stderr, app_args, options)) |session_file| blk: {
-        defer process.gpa.free(session_file);
-        break :blk try session_runtime.resumeSessionRuntime(process.gpa, .{
-            .cwd = options.cwd,
-            .agent_dir_override = options.agent_dir_override,
-            .current_date = timestamp_text,
-            .session_file_name = session_file,
-            .dir = options.dir,
-            .environ = options.environ,
-        });
-    } else blk: {
-        const session_id = try std.fmt.allocPrint(process.gpa, "rpc-{d}", .{timestamp});
-        defer process.gpa.free(session_id);
-        break :blk try session_runtime.createSessionRuntime(process.gpa, .{
-            .cwd = options.cwd,
-            .agent_dir_override = options.agent_dir_override,
-            .current_date = timestamp_text,
-            .session_id = session_id,
-            .timestamp = timestamp_text,
-            .dir = options.dir,
-            .environ = options.environ,
-        });
-    };
+    var app = try openCliRuntime(process, stderr, app_args, options, "rpc");
     defer app.deinit();
 
     if (app_args.messages.count == 1) {
@@ -241,6 +190,38 @@ fn runRpc(
         return;
     }
     try rpc_mode.runFd(&app, std.posix.STDIN_FILENO, stdout, stderr);
+}
+
+fn openCliRuntime(
+    process: runtime.Process,
+    stderr: *std.Io.Writer,
+    app_args: anytype,
+    options: auth_mode.Options,
+    comptime id_prefix: []const u8,
+) !session_runtime.SessionRuntime {
+    const stamp = session_runtime.SessionStamp.now(process.io);
+    if (try selectResumeSession(process, stderr, app_args, options)) |session_file| {
+        defer process.gpa.free(session_file);
+        return session_runtime.openSessionRuntime(process.gpa, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = stamp.date(),
+            .open = .{ .resume_existing = .{ .session_file_name = session_file } },
+            .dir = options.dir,
+            .environ = options.environ,
+        });
+    }
+    var session_id_buffer: [48]u8 = undefined;
+    const session_id = std.fmt.bufPrint(&session_id_buffer, id_prefix ++ "-{d}", .{stamp.nanoseconds}) catch
+        unreachable;
+    return session_runtime.openSessionRuntime(process.gpa, .{
+        .cwd = options.cwd,
+        .agent_dir_override = options.agent_dir_override,
+        .current_date = stamp.date(),
+        .open = .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } },
+        .dir = options.dir,
+        .environ = options.environ,
+    });
 }
 
 fn selectResumeSession(
@@ -484,12 +465,11 @@ fn createCliTestDirs(dir: std.Io.Dir) !void {
 }
 
 fn createCliStoredSession(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {
-    var app_runtime = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+    var app_runtime = try session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",
-        .session_id = session_id,
-        .timestamp = timestamp,
+        .open = .{ .create = .{ .session_id = session_id, .timestamp = timestamp } },
         .dir = dir,
     });
     defer app_runtime.deinit();

@@ -1,8 +1,9 @@
 const std = @import("std");
 
-const client_protocol = @import("../../coding_agent/client_protocol.zig");
-const session_runtime = @import("../../coding_agent/session_runtime.zig");
-const wire_protocol = @import("../../coding_agent/wire_protocol.zig");
+const coding_agent = @import("../../coding_agent/root.zig");
+const client_protocol = coding_agent.client_protocol;
+const session_runtime = coding_agent.session_runtime;
+const wire_protocol = coding_agent.wire_protocol;
 const runtime = @import("../../runtime/root.zig");
 
 pub const Error = anyerror;
@@ -282,7 +283,7 @@ fn writeRejected(
     message: []const u8,
 ) Error!void {
     var owned_message = try client_protocol.EventText.init(allocator, message);
-    defer owned_message.deinit();
+    defer owned_message.deinit(allocator);
     const envelope: client_protocol.EventEnvelope = .{
         .request_id = request_id,
         .event = .{ .rejected = .{ .code = code, .message = owned_message } },
@@ -297,12 +298,11 @@ test "rpc stdio decodes commands and emits snapshot and shutdown" {
     try tmp.dir.createDirPath(std.testing.io, "repo");
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-06-09",
-        .session_id = "rpc-session",
-        .timestamp = "2026-06-09T00:00:00Z",
+        .open = .{ .create = .{ .session_id = "rpc-session", .timestamp = "2026-06-09T00:00:00Z" } },
         .dir = tmp.dir,
         .task_runtime = task_runtime,
     });
@@ -335,12 +335,11 @@ test "rpc input accepts targeted cancel while prompt is active" {
     try tmp.dir.createDirPath(std.testing.io, "repo");
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-06-09",
-        .session_id = "rpc-session",
-        .timestamp = "2026-06-09T00:00:00Z",
+        .open = .{ .create = .{ .session_id = "rpc-session", .timestamp = "2026-06-09T00:00:00Z" } },
         .dir = tmp.dir,
         .task_runtime = task_runtime,
     });
@@ -391,12 +390,11 @@ test "rpc stdio reports malformed json and continues" {
     try tmp.dir.createDirPath(std.testing.io, "repo");
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-06-09",
-        .session_id = "rpc-session",
-        .timestamp = "2026-06-09T00:00:00Z",
+        .open = .{ .create = .{ .session_id = "rpc-session", .timestamp = "2026-06-09T00:00:00Z" } },
         .dir = tmp.dir,
         .task_runtime = task_runtime,
     });
@@ -427,12 +425,11 @@ fn initRpcTestRuntime(
 ) !session_runtime.SessionRuntime {
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
-    return session_runtime.createSessionRuntime(std.testing.allocator, .{
+    return session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-06-09",
-        .session_id = "rpc-session",
-        .timestamp = "2026-06-09T00:00:00Z",
+        .open = .{ .create = .{ .session_id = "rpc-session", .timestamp = "2026-06-09T00:00:00Z" } },
         .dir = tmp.dir,
         .task_runtime = task_runtime,
         .command_capacity = command_capacity,
@@ -641,12 +638,11 @@ test "rpc submit command runs to completed operation" {
     try tmp.dir.createDirPath(std.testing.io, "repo");
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-06-09",
-        .session_id = "rpc-session",
-        .timestamp = "2026-06-09T00:00:00Z",
+        .open = .{ .create = .{ .session_id = "rpc-session", .timestamp = "2026-06-09T00:00:00Z" } },
         .dir = tmp.dir,
         .task_runtime = task_runtime,
         .model = Test.model(),

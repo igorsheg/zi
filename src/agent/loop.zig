@@ -125,6 +125,45 @@ fn runPromptStreamProducer(
     };
 }
 
+/// Continuation sibling of startPromptStream: stream a run that resumes from
+/// the existing context without appending a new user message. The last
+/// context message must not be an assistant message.
+pub fn startContinueStream(
+    stream: *AgentEventStream,
+    allocator: std.mem.Allocator,
+    task_runtime: *runtime.Runtime,
+    context: agent.AgentContext,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    buffer: []agent.AgentEvent,
+) void {
+    const stream_io = task_runtime.io();
+    stream.* = AgentEventStream.init(allocator, buffer);
+    stream.producer = .{ .running = task_runtime.spawn(
+        runContinueStreamProducer,
+        .{ allocator, stream_io, context, config, token, task_runtime, stream },
+    ) catch |err| {
+        stream.pipe.sink().abort();
+        stream.producer = .{ .spawn_failed = err };
+        return;
+    } };
+}
+
+fn runContinueStreamProducer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: agent.AgentContext,
+    config: agent.AgentLoopConfig,
+    token: runtime.CancelToken,
+    task_runtime: *runtime.Runtime,
+    stream: *AgentEventStream,
+) anyerror!void {
+    runContinue(allocator, io, context, config, token, task_runtime, streamSink(stream)) catch |err| {
+        stream.pipe.sink().abort();
+        return err;
+    };
+}
+
 pub const Error = error{
     NoMessages,
     CannotContinueFromAssistant,

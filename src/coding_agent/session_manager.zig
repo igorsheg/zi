@@ -1,10 +1,14 @@
+//! In-memory view of one session's durable history. History is linear:
+//! every entry's parent is the previous entry. The jsonl format still carries
+//! `parentId` per entry (one fact, written by us, validated on load); tree
+//! branching is deliberately not supported until a product feature needs it.
+
 const std = @import("std");
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 
 pub const current_session_version = 3;
 pub const max_session_entries = 16_384;
-pub const max_branch_depth = 16_384;
 pub const max_compaction_summary_bytes = 256 * 1024;
 pub const max_compaction_first_kept_entry_id_bytes = 128;
 pub const max_compaction_keep_recent_tokens = 1_000_000;
@@ -19,161 +23,9 @@ pub const SessionHeader = struct {
     parent_session: ?[]const u8 = null,
 };
 
-pub const ModelRef = struct {
-    provider: []const u8,
-    model_id: []const u8,
-};
-
-pub const SessionContext = struct {
-    messages: []const agent.AgentMessage,
-    thinking_level: []const u8,
-    model: ?ModelRef,
-};
-
 pub const CompactionSettings = struct {
     keep_recent_tokens: u64 = 20_000,
     auto_enabled: bool = false,
-
-    pub fn validate(self: CompactionSettings) error{CompactionSettingsOutOfBounds}!void {
-        if (self.keep_recent_tokens > max_compaction_keep_recent_tokens) return error.CompactionSettingsOutOfBounds;
-    }
-};
-
-pub const CompactionPreparation = struct {
-    allocator: std.mem.Allocator,
-    first_kept_entry_id: []const u8,
-    tokens_before: u64,
-    summarize_start_index: usize,
-    summarize_end_index: usize,
-    previous_summary: ?[]const u8 = null,
-
-    pub fn deinit(self: *CompactionPreparation) void {
-        self.allocator.free(self.first_kept_entry_id);
-        if (self.previous_summary) |summary| self.allocator.free(summary);
-        self.* = undefined;
-    }
-};
-
-pub const CompactionSummaryInput = struct {
-    allocator: std.mem.Allocator,
-    messages: []const agent.AgentMessage,
-    previous_summary: ?[]const u8 = null,
-    first_kept_entry_id: []const u8,
-    tokens_before: u64,
-
-    pub fn deinit(self: *CompactionSummaryInput) void {
-        for (self.messages) |message| agent.deinitAgentMessage(self.allocator, message);
-        self.allocator.free(self.messages);
-        if (self.previous_summary) |summary| self.allocator.free(summary);
-        self.allocator.free(self.first_kept_entry_id);
-        self.* = undefined;
-    }
-
-    pub const SerializeError = error{
-        CompactionSerializedInputTooLarge,
-        WriteFailed,
-    } || std.mem.Allocator.Error;
-
-    pub fn serialize(self: CompactionSummaryInput, allocator: std.mem.Allocator) SerializeError![]const u8 {
-        var writer: std.Io.Writer.Allocating = .init(allocator);
-        errdefer writer.deinit();
-        if (self.previous_summary) |summary| {
-            try appendBounded(&writer, "<previous-summary>\n");
-            try appendBounded(&writer, summary);
-            try appendBounded(&writer, "\n</previous-summary>\n\n");
-        }
-        try appendBounded(&writer, "<conversation>\n");
-        for (self.messages, 0..) |message, index| {
-            if (index > 0) try appendBounded(&writer, "\n\n");
-            try serializeMessage(&writer, message);
-        }
-        try appendBounded(&writer, "\n</conversation>\n");
-        return writer.toOwnedSlice();
-    }
-
-    fn serializeMessage(writer: *std.Io.Writer.Allocating, message: agent.AgentMessage) SerializeError!void {
-        switch (message) {
-            .user => |user| {
-                try appendBounded(writer, "[User]: ");
-                try serializeUserContent(writer, user.content);
-            },
-            .assistant => |assistant| try serializeAssistantContent(writer, assistant.content),
-            .tool_result => |tool_result| try serializeToolResultContent(writer, tool_result.content),
-            .custom => |custom| {
-                try appendBounded(writer, "[Custom ");
-                try appendBounded(writer, custom.kind);
-                try appendBounded(writer, "]");
-            },
-        }
-    }
-
-    fn serializeUserContent(writer: *std.Io.Writer.Allocating, content: ai.UserMessage.Content) SerializeError!void {
-        switch (content) {
-            .string => |text| try appendBounded(writer, text),
-            .blocks => |blocks| {
-                for (blocks) |block| switch (block) {
-                    .text => |text| try appendBounded(writer, text.text),
-                    .image => try appendBounded(writer, "[image]"),
-                };
-            },
-        }
-    }
-
-    fn serializeAssistantContent(
-        writer: *std.Io.Writer.Allocating,
-        content: []const ai.AssistantContent,
-    ) SerializeError!void {
-        var wrote_any = false;
-        for (content) |block| switch (block) {
-            .thinking => |thinking| {
-                if (wrote_any) try appendBounded(writer, "\n");
-                try appendBounded(writer, "[Assistant thinking]: ");
-                try appendBounded(writer, thinking.thinking);
-                wrote_any = true;
-            },
-            .text => |text| {
-                if (wrote_any) try appendBounded(writer, "\n");
-                try appendBounded(writer, "[Assistant]: ");
-                try appendBounded(writer, text.text);
-                wrote_any = true;
-            },
-            .tool_call => |tool_call| {
-                if (wrote_any) try appendBounded(writer, "\n");
-                try appendBounded(writer, "[Assistant tool call]: ");
-                try appendBounded(writer, tool_call.name);
-                wrote_any = true;
-            },
-        };
-    }
-
-    fn serializeToolResultContent(
-        writer: *std.Io.Writer.Allocating,
-        content: []const ai.ToolResultContent,
-    ) SerializeError!void {
-        try appendBounded(writer, "[Tool result]: ");
-        var remaining: usize = max_compaction_tool_result_chars;
-        for (content) |block| switch (block) {
-            .text => |text| {
-                const len = @min(remaining, text.text.len);
-                try appendBounded(writer, text.text[0..len]);
-                remaining -= len;
-                if (remaining == 0) {
-                    try appendBounded(writer, "\n[truncated]");
-                    return;
-                }
-            },
-            .image => try appendBounded(writer, "[image]"),
-        };
-    }
-
-    fn appendBounded(writer: *std.Io.Writer.Allocating, text: []const u8) SerializeError!void {
-        if (text.len > max_compaction_serialized_input_bytes or
-            writer.written().len > max_compaction_serialized_input_bytes - text.len)
-        {
-            return error.CompactionSerializedInputTooLarge;
-        }
-        try writer.writer.writeAll(text);
-    }
 };
 
 pub const SessionEntry = union(enum) {
@@ -224,23 +76,126 @@ pub const SessionEntry = union(enum) {
     }
 };
 
+/// Owned input for one generated compaction summary: the messages to
+/// summarize, the previous summary if any, and the chosen cut point.
+pub const CompactionSummaryInput = struct {
+    allocator: std.mem.Allocator,
+    messages: []const agent.AgentMessage,
+    previous_summary: ?[]const u8 = null,
+    first_kept_entry_id: []const u8,
+    tokens_before: u64,
+
+    pub fn deinit(self: *CompactionSummaryInput) void {
+        for (self.messages) |message| agent.deinitAgentMessage(self.allocator, message);
+        self.allocator.free(self.messages);
+        if (self.previous_summary) |summary| self.allocator.free(summary);
+        self.allocator.free(self.first_kept_entry_id);
+        self.* = undefined;
+    }
+
+    pub const SerializeError = error{
+        CompactionSerializedInputTooLarge,
+        WriteFailed,
+    } || std.mem.Allocator.Error;
+
+    pub fn serialize(self: CompactionSummaryInput, allocator: std.mem.Allocator) SerializeError![]const u8 {
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        if (self.previous_summary) |summary| {
+            try appendBounded(&writer, "<previous-summary>\n");
+            try appendBounded(&writer, summary);
+            try appendBounded(&writer, "\n</previous-summary>\n\n");
+        }
+        try appendBounded(&writer, "<conversation>\n");
+        for (self.messages, 0..) |message, index| {
+            if (index > 0) try appendBounded(&writer, "\n\n");
+            try serializeMessage(&writer, message);
+        }
+        try appendBounded(&writer, "\n</conversation>\n");
+        return writer.toOwnedSlice();
+    }
+
+    fn serializeMessage(writer: *std.Io.Writer.Allocating, message: agent.AgentMessage) SerializeError!void {
+        switch (message) {
+            .user => |user| {
+                try appendBounded(writer, "[User]: ");
+                switch (user.content) {
+                    .string => |text| try appendBounded(writer, text),
+                    .blocks => |blocks| for (blocks) |block| switch (block) {
+                        .text => |text| try appendBounded(writer, text.text),
+                        .image => try appendBounded(writer, "[image]"),
+                    },
+                }
+            },
+            .assistant => |assistant| {
+                var wrote_any = false;
+                for (assistant.content) |block| {
+                    if (wrote_any) try appendBounded(writer, "\n");
+                    switch (block) {
+                        .thinking => |thinking| {
+                            try appendBounded(writer, "[Assistant thinking]: ");
+                            try appendBounded(writer, thinking.thinking);
+                        },
+                        .text => |text| {
+                            try appendBounded(writer, "[Assistant]: ");
+                            try appendBounded(writer, text.text);
+                        },
+                        .tool_call => |tool_call| {
+                            try appendBounded(writer, "[Assistant tool call]: ");
+                            try appendBounded(writer, tool_call.name);
+                        },
+                    }
+                    wrote_any = true;
+                }
+            },
+            .tool_result => |tool_result| {
+                try appendBounded(writer, "[Tool result]: ");
+                var remaining: usize = max_compaction_tool_result_chars;
+                for (tool_result.content) |block| switch (block) {
+                    .text => |text| {
+                        const len = @min(remaining, text.text.len);
+                        try appendBounded(writer, text.text[0..len]);
+                        remaining -= len;
+                        if (remaining == 0) {
+                            try appendBounded(writer, "\n[truncated]");
+                            return;
+                        }
+                    },
+                    .image => try appendBounded(writer, "[image]"),
+                };
+            },
+            .custom => |custom| {
+                try appendBounded(writer, "[Custom ");
+                try appendBounded(writer, custom.kind);
+                try appendBounded(writer, "]");
+            },
+        }
+    }
+
+    fn appendBounded(writer: *std.Io.Writer.Allocating, text: []const u8) SerializeError!void {
+        if (text.len > max_compaction_serialized_input_bytes or
+            writer.written().len > max_compaction_serialized_input_bytes - text.len)
+        {
+            return error.CompactionSerializedInputTooLarge;
+        }
+        try writer.writer.writeAll(text);
+    }
+};
+
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     header: SessionHeader,
     entries: std.ArrayList(SessionEntry) = .empty,
-    leaf_id: ?[]const u8 = null,
     next_id: u64 = 1,
 
     pub const Error = error{
         EntryLimitExceeded,
-        BranchDepthExceeded,
         EntryNotFound,
-        DuplicateEntryId,
         AlreadyCompacted,
         NothingToCompact,
         CompactionSummaryTooLarge,
         CompactionFirstKeptEntryIdTooLarge,
-        CompactionFirstKeptEntryNotInBranch,
+        CompactionFirstKeptEntryNotFound,
         CompactionSettingsOutOfBounds,
     } || std.mem.Allocator.Error;
 
@@ -253,14 +208,12 @@ pub const SessionManager = struct {
         pub const Value = union(enum) {
             message: agent.AgentMessage,
             thinking_level_change: []const u8,
-            model_change: ModelRef,
-            compaction: Compaction,
-
-            pub const Compaction = struct {
+            model_change: struct { provider: []const u8, model_id: []const u8 },
+            compaction: struct {
                 summary: []const u8,
                 first_kept_entry_id: []const u8,
                 tokens_before: u64,
-            };
+            },
         };
     };
 
@@ -302,6 +255,60 @@ pub const SessionManager = struct {
         return self.commitPreparedEntry(entry);
     }
 
+    pub fn appendThinkingLevelChange(
+        self: *SessionManager,
+        thinking_level: []const u8,
+        timestamp: []const u8,
+    ) Error![]const u8 {
+        try self.ensureAppendCapacity(1);
+        const base = try self.nextBase(timestamp);
+        const entry: SessionEntry = blk: {
+            errdefer self.deinitBase(base);
+            break :blk .{ .thinking_level_change = .{
+                .base = base,
+                .thinking_level = try self.allocator.dupe(u8, thinking_level),
+            } };
+        };
+        return self.commitPreparedEntry(entry);
+    }
+
+    pub fn appendModelChange(
+        self: *SessionManager,
+        provider: []const u8,
+        model_id: []const u8,
+        timestamp: []const u8,
+    ) Error![]const u8 {
+        try self.ensureAppendCapacity(1);
+        const base = try self.nextBase(timestamp);
+        const entry: SessionEntry = blk: {
+            errdefer self.deinitBase(base);
+            const provider_copy = try self.allocator.dupe(u8, provider);
+            errdefer self.allocator.free(provider_copy);
+            const model_id_copy = try self.allocator.dupe(u8, model_id);
+            break :blk .{ .model_change = .{
+                .base = base,
+                .provider = provider_copy,
+                .model_id = model_id_copy,
+            } };
+        };
+        return self.commitPreparedEntry(entry);
+    }
+
+    pub fn appendCompaction(
+        self: *SessionManager,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+        timestamp: []const u8,
+    ) Error![]const u8 {
+        try self.ensureAppendCapacity(1);
+        const entry = try self.prepareCompactionEntry(summary, first_kept_entry_id, tokens_before, timestamp);
+        errdefer self.deinitEntry(entry);
+        return self.commitPreparedEntry(entry);
+    }
+
+    /// Prepare/commit split lets the caller persist an entry durably before
+    /// it becomes visible in memory (jsonl reaches disk before commit).
     pub fn ensureAppendCapacity(self: *SessionManager, additional_count: usize) Error!void {
         if (additional_count > max_session_entries - self.entries.items.len) return error.EntryLimitExceeded;
         try self.entries.ensureUnusedCapacity(self.allocator, additional_count);
@@ -320,71 +327,6 @@ pub const SessionManager = struct {
         } };
     }
 
-    pub fn commitPreparedEntry(self: *SessionManager, entry: SessionEntry) []const u8 {
-        std.debug.assert(self.entries.items.len < max_session_entries);
-        const id = entry.id();
-        self.entries.appendAssumeCapacity(entry);
-        self.leaf_id = id;
-        self.next_id += 1;
-        return id;
-    }
-
-    pub fn deinitPreparedEntry(self: *SessionManager, entry: SessionEntry) void {
-        self.deinitEntry(entry);
-    }
-
-    pub fn appendThinkingLevelChange(
-        self: *SessionManager,
-        thinking_level: []const u8,
-        timestamp: []const u8,
-    ) Error![]const u8 {
-        const base = try self.nextBase(timestamp);
-        const entry: SessionEntry = blk: {
-            errdefer self.deinitBase(base);
-            break :blk .{ .thinking_level_change = .{
-                .base = base,
-                .thinking_level = try self.allocator.dupe(u8, thinking_level),
-            } };
-        };
-        errdefer self.deinitEntry(entry);
-        return self.appendEntry(entry);
-    }
-
-    pub fn appendModelChange(
-        self: *SessionManager,
-        provider: []const u8,
-        model_id: []const u8,
-        timestamp: []const u8,
-    ) Error![]const u8 {
-        const base = try self.nextBase(timestamp);
-        const entry: SessionEntry = blk: {
-            errdefer self.deinitBase(base);
-            const provider_copy = try self.allocator.dupe(u8, provider);
-            errdefer self.allocator.free(provider_copy);
-            const model_id_copy = try self.allocator.dupe(u8, model_id);
-            break :blk .{ .model_change = .{
-                .base = base,
-                .provider = provider_copy,
-                .model_id = model_id_copy,
-            } };
-        };
-        errdefer self.deinitEntry(entry);
-        return self.appendEntry(entry);
-    }
-
-    pub fn appendCompaction(
-        self: *SessionManager,
-        summary: []const u8,
-        first_kept_entry_id: []const u8,
-        tokens_before: u64,
-        timestamp: []const u8,
-    ) Error![]const u8 {
-        try self.ensureAppendCapacity(1);
-        const entry = try self.prepareCompactionEntry(summary, first_kept_entry_id, tokens_before, timestamp);
-        errdefer self.deinitEntry(entry);
-        return self.commitPreparedEntry(entry);
-    }
-
     pub fn prepareCompactionEntry(
         self: *SessionManager,
         summary: []const u8,
@@ -392,33 +334,50 @@ pub const SessionManager = struct {
         tokens_before: u64,
         timestamp: []const u8,
     ) Error!SessionEntry {
-        try validateCompactionInput(summary, first_kept_entry_id);
-        if (!(try self.entryIdInBranchFrom(self.leaf_id, first_kept_entry_id))) {
-            return error.CompactionFirstKeptEntryNotInBranch;
+        if (summary.len > max_compaction_summary_bytes) return error.CompactionSummaryTooLarge;
+        if (first_kept_entry_id.len > max_compaction_first_kept_entry_id_bytes) {
+            return error.CompactionFirstKeptEntryIdTooLarge;
         }
+        if (self.findEntryIndex(first_kept_entry_id) == null) return error.CompactionFirstKeptEntryNotFound;
         const base = try self.nextBase(timestamp);
         errdefer self.deinitBase(base);
-        return blk: {
-            const summary_copy = try self.allocator.dupe(u8, summary);
-            errdefer self.allocator.free(summary_copy);
-            const first_kept_entry_id_copy = try self.allocator.dupe(u8, first_kept_entry_id);
-            break :blk .{ .compaction = .{
-                .base = base,
-                .summary = summary_copy,
-                .first_kept_entry_id = first_kept_entry_id_copy,
-                .tokens_before = tokens_before,
-            } };
-        };
+        const summary_copy = try self.allocator.dupe(u8, summary);
+        errdefer self.allocator.free(summary_copy);
+        const first_kept_entry_id_copy = try self.allocator.dupe(u8, first_kept_entry_id);
+        return .{ .compaction = .{
+            .base = base,
+            .summary = summary_copy,
+            .first_kept_entry_id = first_kept_entry_id_copy,
+            .tokens_before = tokens_before,
+        } };
     }
 
+    pub fn commitPreparedEntry(self: *SessionManager, entry: SessionEntry) []const u8 {
+        std.debug.assert(self.entries.items.len < max_session_entries);
+        self.entries.appendAssumeCapacity(entry);
+        self.next_id += 1;
+        return entry.id();
+    }
+
+    pub fn deinitPreparedEntry(self: *SessionManager, entry: SessionEntry) void {
+        self.deinitEntry(entry);
+    }
+
+    /// Append an entry loaded from disk. The parent link must point at the
+    /// previous entry: history is linear, and a duplicated or reordered line
+    /// breaks that chain and is rejected here.
     pub fn appendLoadedEntry(self: *SessionManager, loaded: LoadedEntry) Error![]const u8 {
         if (self.entries.items.len == max_session_entries) return error.EntryLimitExceeded;
-        if (self.findEntry(loaded.id) != null) return error.DuplicateEntryId;
-        if (loaded.parent_id) |parent_id| {
-            if (self.findEntry(parent_id) == null) return error.EntryNotFound;
-        } else if (self.entries.items.len > 0) {
-            return error.EntryNotFound;
-        }
+        const last_id: ?[]const u8 = if (self.entries.items.len == 0)
+            null
+        else
+            self.entries.items[self.entries.items.len - 1].id();
+        const linear = if (loaded.parent_id) |parent_id|
+            last_id != null and std.mem.eql(u8, parent_id, last_id.?)
+        else
+            last_id == null;
+        if (!linear) return error.EntryNotFound;
+
         const base: SessionEntry.Base = blk: {
             const id = try self.allocator.dupe(u8, loaded.id);
             errdefer self.allocator.free(id);
@@ -448,9 +407,12 @@ pub const SessionManager = struct {
                 } };
             },
             .compaction => |compaction| blk: {
-                try validateCompactionInput(compaction.summary, compaction.first_kept_entry_id);
-                if (!(try self.entryIdInBranchFrom(loaded.parent_id, compaction.first_kept_entry_id))) {
-                    return error.CompactionFirstKeptEntryNotInBranch;
+                if (compaction.summary.len > max_compaction_summary_bytes) return error.CompactionSummaryTooLarge;
+                if (compaction.first_kept_entry_id.len > max_compaction_first_kept_entry_id_bytes) {
+                    return error.CompactionFirstKeptEntryIdTooLarge;
+                }
+                if (self.findEntryIndex(compaction.first_kept_entry_id) == null) {
+                    return error.CompactionFirstKeptEntryNotFound;
                 }
                 const summary = try self.allocator.dupe(u8, compaction.summary);
                 errdefer self.allocator.free(summary);
@@ -464,346 +426,150 @@ pub const SessionManager = struct {
             },
         };
         errdefer self.deinitEntry(entry);
-        var next_id = self.next_id;
+        try self.entries.append(self.allocator, entry);
         if (std.fmt.parseInt(u64, loaded.id, 16)) |numeric_id| {
             const after_loaded_id = if (numeric_id == std.math.maxInt(u64)) numeric_id else numeric_id + 1;
-            next_id = @max(next_id, after_loaded_id);
+            self.next_id = @max(self.next_id, after_loaded_id);
         } else |_| {}
-        const appended_id = try self.appendEntry(entry);
-        self.next_id = next_id;
-        return appended_id;
+        return entry.id();
     }
 
-    pub fn branch(self: *SessionManager, id: []const u8) Error!void {
-        self.leaf_id = (try self.getEntry(id)).id();
-    }
-
-    pub fn getEntry(self: *const SessionManager, id: []const u8) Error!*const SessionEntry {
-        return self.findEntry(id) orelse error.EntryNotFound;
-    }
-
-    pub fn getLeafEntry(self: *const SessionManager) Error!?*const SessionEntry {
-        return if (self.leaf_id) |id| try self.getEntry(id) else null;
-    }
-
-    pub fn getTree(self: *const SessionManager) []const SessionEntry {
-        return self.entries.items;
-    }
-
-    pub fn getChildren(
-        self: *const SessionManager,
-        allocator: std.mem.Allocator,
-        parent_id: ?[]const u8,
-    ) Error![]const SessionEntry {
-        var children = std.ArrayList(SessionEntry).empty;
-        errdefer children.deinit(allocator);
-        for (self.entries.items) |entry| {
-            const entry_parent_id = entry.parentId();
-            const matches = if (parent_id) |expected|
-                entry_parent_id != null and std.mem.eql(u8, entry_parent_id.?, expected)
-            else
-                entry_parent_id == null;
-            if (matches) try children.append(allocator, entry);
-        }
-        return children.toOwnedSlice(allocator);
-    }
-
-    pub fn getBranch(self: *const SessionManager, allocator: std.mem.Allocator) Error![]const SessionEntry {
-        return self.getBranchFrom(allocator, self.leaf_id);
-    }
-
-    pub fn getBranchFrom(
-        self: *const SessionManager,
-        allocator: std.mem.Allocator,
-        leaf_id: ?[]const u8,
-    ) Error![]const SessionEntry {
-        var path = std.ArrayList(SessionEntry).empty;
-        errdefer path.deinit(allocator);
-        var current_id = leaf_id;
-        var depth: usize = 0;
-        while (current_id) |id| {
-            if (depth == max_branch_depth) return error.BranchDepthExceeded;
-            const entry = self.findEntry(id) orelse return error.EntryNotFound;
-            try path.append(allocator, entry.*);
-            current_id = entry.parentId();
-            depth += 1;
-        }
-        std.mem.reverse(SessionEntry, path.items);
-        return path.toOwnedSlice(allocator);
-    }
-
-    pub fn buildSessionContext(self: *const SessionManager, allocator: std.mem.Allocator) Error!SessionContext {
-        const branch_entries = try self.getBranch(allocator);
-        defer allocator.free(branch_entries);
-
+    /// Project the entries into the agent's runtime context: the latest
+    /// compaction summary (if any), the kept tail before it, then everything
+    /// after it. The caller owns the returned messages.
+    pub fn contextMessages(self: *const SessionManager, allocator: std.mem.Allocator) Error![]agent.AgentMessage {
         var messages = std.ArrayList(agent.AgentMessage).empty;
-        errdefer {
-            for (messages.items) |message| agent.deinitAgentMessage(allocator, message);
-            messages.deinit(allocator);
-        }
-        var thinking_level: []const u8 = "off";
-        var model: ?ModelRef = null;
+        errdefer freeContextMessages(allocator, &messages);
+
+        const entries = self.entries.items;
         var latest_compaction_index: ?usize = null;
-
-        for (branch_entries, 0..) |entry, index| {
-            switch (entry) {
-                .message => |message_entry| {
-                    if (message_entry.message == .assistant) {
-                        model = .{
-                            .provider = message_entry.message.assistant.provider,
-                            .model_id = message_entry.message.assistant.model,
-                        };
-                    }
-                },
-                .thinking_level_change => |thinking| thinking_level = thinking.thinking_level,
-                .model_change => |model_change| model = .{
-                    .provider = model_change.provider,
-                    .model_id = model_change.model_id,
-                },
-                .compaction => latest_compaction_index = index,
-            }
+        for (entries, 0..) |entry, index| {
+            if (entry == .compaction) latest_compaction_index = index;
         }
 
+        var start: usize = 0;
         if (latest_compaction_index) |compaction_index| {
-            const compaction = branch_entries[compaction_index].compaction;
-            try appendContextMessage(
+            const compaction = entries[compaction_index].compaction;
+            const summary_text = try std.fmt.allocPrint(
                 allocator,
-                &messages,
-                try compactionSummaryMessage(allocator, compaction),
+                "The conversation history before this point was compacted into the following summary:\n\n" ++
+                    "<summary>\n{s}\n</summary>",
+                .{compaction.summary},
             );
-
-            var found_first_kept = false;
-            for (branch_entries[0..compaction_index]) |entry| {
-                if (std.mem.eql(u8, entry.id(), compaction.first_kept_entry_id)) found_first_kept = true;
-                if (found_first_kept) switch (entry) {
-                    .message => |message_entry| try appendContextMessageCopy(
-                        allocator,
-                        &messages,
-                        message_entry.message,
-                    ),
-                    else => {},
-                };
+            {
+                errdefer allocator.free(summary_text);
+                try messages.ensureUnusedCapacity(allocator, 1);
             }
-
-            for (branch_entries[compaction_index + 1 ..]) |entry| {
-                switch (entry) {
-                    .message => |message_entry| try appendContextMessageCopy(
-                        allocator,
-                        &messages,
-                        message_entry.message,
-                    ),
-                    else => {},
-                }
-            }
-        } else {
-            for (branch_entries) |entry| {
-                switch (entry) {
-                    .message => |message_entry| try appendContextMessageCopy(
-                        allocator,
-                        &messages,
-                        message_entry.message,
-                    ),
-                    else => {},
-                }
-            }
+            messages.appendAssumeCapacity(.{ .user = .{
+                .content = .{ .string = summary_text },
+                .timestamp = 0,
+            } });
+            start = self.findEntryIndex(compaction.first_kept_entry_id) orelse compaction_index + 1;
         }
 
-        return .{
-            .messages = try messages.toOwnedSlice(allocator),
-            .thinking_level = thinking_level,
-            .model = model,
-        };
+        for (entries[start..]) |entry| {
+            if (entry != .message) continue;
+            const copy = try agent.copyAgentMessage(allocator, entry.message.message);
+            errdefer agent.deinitAgentMessage(allocator, copy);
+            try messages.append(allocator, copy);
+        }
+        return messages.toOwnedSlice(allocator);
     }
 
-    pub fn prepareCompaction(
-        self: *const SessionManager,
-        allocator: std.mem.Allocator,
-        settings: CompactionSettings,
-    ) Error!CompactionPreparation {
-        try settings.validate();
-        const branch_entries = try self.getBranch(allocator);
-        defer allocator.free(branch_entries);
-        if (branch_entries.len == 0) return error.NothingToCompact;
-        if (branch_entries[branch_entries.len - 1] == .compaction) return error.AlreadyCompacted;
-
-        var previous_compaction_index: ?usize = null;
-        var index = branch_entries.len;
-        while (index > 0) {
-            index -= 1;
-            if (branch_entries[index] == .compaction) {
-                previous_compaction_index = index;
-                break;
-            }
-        }
-
-        var boundary_start: usize = 0;
-        var previous_summary: ?[]const u8 = null;
-        if (previous_compaction_index) |compaction_index| {
-            const compaction = branch_entries[compaction_index].compaction;
-            previous_summary = try allocator.dupe(u8, compaction.summary);
-            errdefer if (previous_summary) |summary| allocator.free(summary);
-            boundary_start = findEntryIndex(branch_entries, compaction.first_kept_entry_id) orelse
-                compaction_index + 1;
-        }
-
-        const first_kept_index = findCompactionCutPoint(
-            branch_entries,
-            boundary_start,
-            branch_entries.len,
-            settings.keep_recent_tokens,
-        );
-        if (first_kept_index <= boundary_start) return error.NothingToCompact;
-
-        const first_kept_entry_id = try allocator.dupe(u8, branch_entries[first_kept_index].id());
-        errdefer allocator.free(first_kept_entry_id);
-
-        return .{
-            .allocator = allocator,
-            .first_kept_entry_id = first_kept_entry_id,
-            .tokens_before = estimateBranchTokens(branch_entries),
-            .summarize_start_index = boundary_start,
-            .summarize_end_index = first_kept_index,
-            .previous_summary = previous_summary,
-        };
+    pub fn deinitContextMessages(allocator: std.mem.Allocator, messages: []const agent.AgentMessage) void {
+        for (messages) |message| agent.deinitAgentMessage(allocator, message);
+        allocator.free(messages);
     }
 
+    /// Choose a compaction cut and gather the messages to summarize.
+    /// Errors with NothingToCompact / AlreadyCompacted when there is no work.
     pub fn buildCompactionSummaryInput(
         self: *const SessionManager,
         allocator: std.mem.Allocator,
         settings: CompactionSettings,
     ) Error!CompactionSummaryInput {
-        var preparation = try self.prepareCompaction(allocator, settings);
-        defer preparation.deinit();
+        if (settings.keep_recent_tokens > max_compaction_keep_recent_tokens) {
+            return error.CompactionSettingsOutOfBounds;
+        }
+        const entries = self.entries.items;
+        if (entries.len == 0) return error.NothingToCompact;
+        if (entries[entries.len - 1] == .compaction) return error.AlreadyCompacted;
 
-        const branch_entries = try self.getBranch(allocator);
-        defer allocator.free(branch_entries);
-
-        var messages = std.ArrayList(agent.AgentMessage).empty;
-        errdefer {
-            for (messages.items) |message| agent.deinitAgentMessage(allocator, message);
-            messages.deinit(allocator);
+        // The summarize window starts at the previous compaction's first kept
+        // entry (its summary is carried forward), or at the beginning.
+        var boundary_start: usize = 0;
+        var previous_summary_text: ?[]const u8 = null;
+        var index = entries.len;
+        while (index > 0) {
+            index -= 1;
+            if (entries[index] == .compaction) {
+                const compaction = entries[index].compaction;
+                previous_summary_text = compaction.summary;
+                boundary_start = self.findEntryIndex(compaction.first_kept_entry_id) orelse index + 1;
+                break;
+            }
         }
 
-        for (branch_entries[preparation.summarize_start_index..preparation.summarize_end_index]) |entry| {
-            switch (entry) {
-                .message => |message_entry| try appendContextMessageCopy(
-                    allocator,
-                    &messages,
-                    message_entry.message,
-                ),
-                else => {},
+        // Cut so the kept suffix holds at least keep_recent_tokens. Only a
+        // non-tool-result message is a valid cut point.
+        var first_valid_cut = boundary_start;
+        while (first_valid_cut < entries.len and !isValidCompactionCut(entries[first_valid_cut])) {
+            first_valid_cut += 1;
+        }
+        var cut_index = first_valid_cut;
+        if (first_valid_cut == entries.len) {
+            cut_index = boundary_start;
+        } else {
+            var accumulated_tokens: u64 = 0;
+            index = entries.len;
+            while (index > boundary_start) {
+                index -= 1;
+                if (entries[index] != .message) continue;
+                accumulated_tokens +|= estimateEntryTokens(entries[index]);
+                if (accumulated_tokens >= settings.keep_recent_tokens) {
+                    cut_index = first_valid_cut;
+                    for (entries[index..], index..) |entry, candidate_index| {
+                        if (isValidCompactionCut(entry)) {
+                            cut_index = candidate_index;
+                            break;
+                        }
+                    }
+                    break;
+                }
             }
+        }
+        if (cut_index <= boundary_start) return error.NothingToCompact;
+
+        var messages = std.ArrayList(agent.AgentMessage).empty;
+        errdefer freeContextMessages(allocator, &messages);
+        for (entries[boundary_start..cut_index]) |entry| {
+            if (entry != .message) continue;
+            const copy = try agent.copyAgentMessage(allocator, entry.message.message);
+            errdefer agent.deinitAgentMessage(allocator, copy);
+            try messages.append(allocator, copy);
         }
         if (messages.items.len == 0) return error.NothingToCompact;
 
-        const first_kept_entry_id = try allocator.dupe(u8, preparation.first_kept_entry_id);
+        const first_kept_entry_id = try allocator.dupe(u8, entries[cut_index].id());
         errdefer allocator.free(first_kept_entry_id);
-        const previous_summary = if (preparation.previous_summary) |summary| try allocator.dupe(u8, summary) else null;
+        const previous_summary = if (previous_summary_text) |text| try allocator.dupe(u8, text) else null;
         errdefer if (previous_summary) |summary| allocator.free(summary);
+
+        var tokens_before: u64 = 0;
+        for (entries) |entry| tokens_before +|= estimateEntryTokens(entry);
 
         return .{
             .allocator = allocator,
             .messages = try messages.toOwnedSlice(allocator),
             .previous_summary = previous_summary,
             .first_kept_entry_id = first_kept_entry_id,
-            .tokens_before = preparation.tokens_before,
+            .tokens_before = tokens_before,
         };
     }
 
-    fn validateCompactionInput(summary: []const u8, first_kept_entry_id: []const u8) Error!void {
-        if (summary.len > max_compaction_summary_bytes) return error.CompactionSummaryTooLarge;
-        if (first_kept_entry_id.len > max_compaction_first_kept_entry_id_bytes) {
-            return error.CompactionFirstKeptEntryIdTooLarge;
-        }
-    }
-
-    fn entryIdInBranchFrom(
-        self: *const SessionManager,
-        leaf_id: ?[]const u8,
-        target_id: []const u8,
-    ) Error!bool {
-        var current_id = leaf_id;
-        var depth: usize = 0;
-        while (current_id) |id| {
-            if (depth == max_branch_depth) return error.BranchDepthExceeded;
-            const entry = self.findEntry(id) orelse return error.EntryNotFound;
-            if (std.mem.eql(u8, entry.id(), target_id)) return true;
-            current_id = entry.parentId();
-            depth += 1;
-        }
-        return false;
-    }
-
-    pub fn deinitSessionContext(_: *const SessionManager, allocator: std.mem.Allocator, context: SessionContext) void {
-        for (context.messages) |message| agent.deinitAgentMessage(allocator, message);
-        allocator.free(context.messages);
-    }
-
-    fn compactionSummaryMessage(
-        allocator: std.mem.Allocator,
-        compaction: SessionEntry.Compaction,
-    ) std.mem.Allocator.Error!agent.AgentMessage {
-        const text = try std.fmt.allocPrint(
-            allocator,
-            "The conversation history before this point was compacted into the following summary:\n\n" ++
-                "<summary>\n{s}\n</summary>",
-            .{compaction.summary},
-        );
-        errdefer allocator.free(text);
-        return .{ .user = .{
-            .content = .{ .string = text },
-            .timestamp = 0,
-        } };
-    }
-
-    fn appendContextMessage(
-        allocator: std.mem.Allocator,
-        messages: *std.ArrayList(agent.AgentMessage),
-        message: agent.AgentMessage,
-    ) std.mem.Allocator.Error!void {
-        errdefer agent.deinitAgentMessage(allocator, message);
-        try messages.append(allocator, message);
-    }
-
-    fn appendContextMessageCopy(
-        allocator: std.mem.Allocator,
-        messages: *std.ArrayList(agent.AgentMessage),
-        message: agent.AgentMessage,
-    ) std.mem.Allocator.Error!void {
-        try appendContextMessage(allocator, messages, try agent.copyAgentMessage(allocator, message));
-    }
-
-    fn findCompactionCutPoint(
-        entries: []const SessionEntry,
-        start_index: usize,
-        end_index: usize,
-        keep_recent_tokens: u64,
-    ) usize {
-        var first_valid_cut = start_index;
-        while (first_valid_cut < end_index and !isValidCompactionCut(entries[first_valid_cut])) {
-            first_valid_cut += 1;
-        }
-        if (first_valid_cut == end_index) return start_index;
-
-        var accumulated_tokens: u64 = 0;
-        var cut_index = first_valid_cut;
-        var index = end_index;
-        while (index > start_index) {
-            index -= 1;
-            if (entries[index] != .message) continue;
-            accumulated_tokens +|= estimateEntryTokens(entries[index]);
-            if (accumulated_tokens >= keep_recent_tokens) {
-                cut_index = first_valid_cut;
-                for (entries[index..end_index], index..) |entry, candidate_index| {
-                    if (isValidCompactionCut(entry)) {
-                        cut_index = candidate_index;
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-        return cut_index;
+    fn freeContextMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(agent.AgentMessage)) void {
+        for (messages.items) |message| agent.deinitAgentMessage(allocator, message);
+        messages.deinit(allocator);
     }
 
     fn isValidCompactionCut(entry: SessionEntry) bool {
@@ -813,58 +579,51 @@ pub const SessionManager = struct {
         };
     }
 
-    fn estimateBranchTokens(entries: []const SessionEntry) u64 {
-        var tokens: u64 = 0;
-        for (entries) |entry| tokens +|= estimateEntryTokens(entry);
-        return tokens;
-    }
-
     fn estimateEntryTokens(entry: SessionEntry) u64 {
-        return switch (entry) {
-            .message => |message_entry| estimateMessageTokens(message_entry.message),
-            .compaction => |compaction| (compaction.summary.len + 3) / 4,
-            else => 0,
-        };
-    }
-
-    fn estimateMessageTokens(message: agent.AgentMessage) u64 {
-        const chars: u64 = switch (message) {
-            .user => |user| switch (user.content) {
-                .string => |text| text.len,
-                .blocks => |blocks| blk: {
+        const chars: u64 = switch (entry) {
+            .compaction => |compaction| compaction.summary.len,
+            .message => |message_entry| switch (message_entry.message) {
+                .user => |user| switch (user.content) {
+                    .string => |text| text.len,
+                    .blocks => |blocks| blk: {
+                        var count: u64 = 0;
+                        for (blocks) |block| switch (block) {
+                            .text => |text| count +|= text.text.len,
+                            .image => count +|= 4800,
+                        };
+                        break :blk count;
+                    },
+                },
+                .assistant => |assistant| blk: {
                     var count: u64 = 0;
-                    for (blocks) |block| switch (block) {
+                    for (assistant.content) |block| switch (block) {
+                        .text => |text| count +|= text.text.len,
+                        .thinking => |thinking| count +|= thinking.thinking.len,
+                        .tool_call => |tool_call| count +|= tool_call.name.len,
+                    };
+                    break :blk count;
+                },
+                .tool_result => |tool_result| blk: {
+                    var count: u64 = tool_result.tool_name.len;
+                    for (tool_result.content) |block| switch (block) {
                         .text => |text| count +|= text.text.len,
                         .image => count +|= 4800,
                     };
                     break :blk count;
                 },
+                .custom => |custom| custom.kind.len,
             },
-            .assistant => |assistant| blk: {
-                var count: u64 = 0;
-                for (assistant.content) |block| switch (block) {
-                    .text => |text| count +|= text.text.len,
-                    .thinking => |thinking| count +|= thinking.thinking.len,
-                    .tool_call => |tool_call| count +|= tool_call.name.len,
-                };
-                break :blk count;
-            },
-            .tool_result => |tool_result| blk: {
-                var count: u64 = tool_result.tool_name.len;
-                for (tool_result.content) |block| switch (block) {
-                    .text => |text| count +|= text.text.len,
-                    .image => count +|= 4800,
-                };
-                break :blk count;
-            },
-            .custom => |custom| custom.kind.len,
+            else => 0,
         };
         return (chars + 3) / 4;
     }
 
-    fn findEntryIndex(entries: []const SessionEntry, entry_id: []const u8) ?usize {
-        for (entries, 0..) |entry, index| {
-            if (std.mem.eql(u8, entry.id(), entry_id)) return index;
+    fn findEntryIndex(self: *const SessionManager, entry_id: []const u8) ?usize {
+        // Search newest-first: lookups overwhelmingly target recent entries.
+        var index = self.entries.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (std.mem.eql(u8, self.entries.items[index].id(), entry_id)) return index;
         }
         return null;
     }
@@ -874,7 +633,10 @@ pub const SessionManager = struct {
         if (self.next_id == std.math.maxInt(u64)) return error.EntryLimitExceeded;
         const id = try std.fmt.allocPrint(self.allocator, "{x:0>8}", .{self.next_id});
         errdefer self.allocator.free(id);
-        const parent_id = if (self.leaf_id) |leaf_id| try self.allocator.dupe(u8, leaf_id) else null;
+        const parent_id = if (self.entries.items.len == 0)
+            null
+        else
+            try self.allocator.dupe(u8, self.entries.items[self.entries.items.len - 1].id());
         errdefer if (parent_id) |value| self.allocator.free(value);
         const timestamp_copy = try self.allocator.dupe(u8, timestamp);
         return .{
@@ -882,21 +644,6 @@ pub const SessionManager = struct {
             .parent_id = parent_id,
             .timestamp = timestamp_copy,
         };
-    }
-
-    fn appendEntry(self: *SessionManager, entry: SessionEntry) Error![]const u8 {
-        const id = entry.id();
-        try self.entries.append(self.allocator, entry);
-        self.leaf_id = id;
-        self.next_id += 1;
-        return id;
-    }
-
-    fn findEntry(self: *const SessionManager, id: []const u8) ?*const SessionEntry {
-        for (self.entries.items) |*entry| {
-            if (std.mem.eql(u8, entry.id(), id)) return entry;
-        }
-        return null;
     }
 
     fn deinitEntry(self: *SessionManager, entry: SessionEntry) void {
@@ -933,18 +680,6 @@ fn userMessage(text: []const u8) agent.AgentMessage {
     return .{ .user = .{ .content = .{ .string = text }, .timestamp = 0 } };
 }
 
-fn assistantMessage(provider: []const u8, model: []const u8) agent.AgentMessage {
-    return .{ .assistant = .{
-        .content = &.{},
-        .api = ai.KnownApi.openai_responses,
-        .provider = provider,
-        .model = model,
-        .usage = ai.protocol.emptyUsage(),
-        .stop_reason = .stop,
-        .timestamp = 0,
-    } };
-}
-
 test "new session stores header metadata" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "2026-01-01T00:00:00Z");
     defer manager.deinit();
@@ -952,77 +687,47 @@ test "new session stores header metadata" {
     try std.testing.expectEqual(@as(u32, current_session_version), manager.header.version);
     try std.testing.expectEqualStrings("session-1", manager.header.id);
     try std.testing.expectEqualStrings("/repo", manager.header.cwd);
-    try std.testing.expect(manager.leaf_id == null);
 }
 
-test "append entries create parent linked branch" {
+test "append entries link linearly to the previous entry" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
     const first = try manager.appendMessage(userMessage("one"), "t1");
-    const second = try manager.appendThinkingLevelChange("high", "t2");
+    _ = try manager.appendThinkingLevelChange("high", "t2");
+    _ = try manager.appendModelChange("openai", "gpt", "t3");
 
+    try std.testing.expect(manager.entries.items[0].parentId() == null);
     try std.testing.expectEqualStrings(first, manager.entries.items[1].parentId().?);
-    try std.testing.expectEqualStrings(second, manager.leaf_id.?);
+    try std.testing.expectEqualStrings("00000002", manager.entries.items[2].parentId().?);
 }
 
-test "append compaction stores durable summary entry" {
+test "append compaction stores durable summary entry with bounds" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
     const root = try manager.appendMessage(userMessage("before"), "t1");
-    const compacted = try manager.appendCompaction("summary", root, 1200, "t2");
+    _ = try manager.appendCompaction("summary", root, 1200, "t2");
 
-    try std.testing.expectEqualStrings(root, manager.entries.items[1].parentId().?);
-    try std.testing.expectEqualStrings(compacted, manager.leaf_id.?);
     try std.testing.expectEqualStrings("summary", manager.entries.items[1].compaction.summary);
     try std.testing.expectEqualStrings(root, manager.entries.items[1].compaction.first_kept_entry_id);
     try std.testing.expectEqual(@as(u64, 1200), manager.entries.items[1].compaction.tokens_before);
-}
 
-test "append compaction enforces bounded owned fields before mutation" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    const root = try manager.appendMessage(userMessage("before"), "t1");
     const oversized_summary = try std.testing.allocator.alloc(u8, max_compaction_summary_bytes + 1);
     defer std.testing.allocator.free(oversized_summary);
     @memset(oversized_summary, 'a');
-
     try std.testing.expectError(
         error.CompactionSummaryTooLarge,
-        manager.appendCompaction(oversized_summary, root, 1, "t2"),
+        manager.appendCompaction(oversized_summary, root, 1, "t3"),
     );
-    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
-
-    const oversized_id = try std.testing.allocator.alloc(u8, max_compaction_first_kept_entry_id_bytes + 1);
-    defer std.testing.allocator.free(oversized_id);
-    @memset(oversized_id, 'b');
-
     try std.testing.expectError(
-        error.CompactionFirstKeptEntryIdTooLarge,
-        manager.appendCompaction("summary", oversized_id, 1, "t2"),
+        error.CompactionFirstKeptEntryNotFound,
+        manager.appendCompaction("summary", "missing", 1, "t3"),
     );
-    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), manager.entries.items.len);
 }
 
-test "append compaction rejects first kept entry outside active branch" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    const root = try manager.appendMessage(userMessage("root"), "t1");
-    const left = try manager.appendMessage(userMessage("left"), "t2");
-    try manager.branch(root);
-    _ = try manager.appendMessage(userMessage("right"), "t3");
-
-    try std.testing.expectError(
-        error.CompactionFirstKeptEntryNotInBranch,
-        manager.appendCompaction("summary", left, 1, "t4"),
-    );
-    try std.testing.expectEqual(@as(usize, 3), manager.entries.items.len);
-}
-
-test "prepared message entry does not mutate active leaf before commit" {
+test "prepared message entry does not mutate entries before commit" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
@@ -1031,52 +736,30 @@ test "prepared message entry does not mutate active leaf before commit" {
     var committed = false;
     errdefer if (!committed) manager.deinitPreparedEntry(entry);
 
-    try std.testing.expect(manager.leaf_id == null);
     try std.testing.expectEqual(@as(usize, 0), manager.entries.items.len);
 
     const id = manager.commitPreparedEntry(entry);
     committed = true;
     try std.testing.expectEqualStrings("00000001", id);
-    try std.testing.expectEqualStrings(id, manager.leaf_id.?);
+    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
 }
 
-test "build context follows active leaf" {
+test "context messages project message entries only" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
     _ = try manager.appendModelChange("openai", "gpt", "t1");
     _ = try manager.appendThinkingLevelChange("medium", "t2");
     _ = try manager.appendMessage(userMessage("hello"), "t3");
-    _ = try manager.appendMessage(assistantMessage("anthropic", "claude"), "t4");
 
-    const context = try manager.buildSessionContext(std.testing.allocator);
-    defer manager.deinitSessionContext(std.testing.allocator, context);
+    const messages = try manager.contextMessages(std.testing.allocator);
+    defer SessionManager.deinitContextMessages(std.testing.allocator, messages);
 
-    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
-    try std.testing.expectEqualStrings("medium", context.thinking_level);
-    try std.testing.expectEqualStrings("anthropic", context.model.?.provider);
-    try std.testing.expectEqualStrings("claude", context.model.?.model_id);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("hello", messages[0].user.content.string);
 }
 
-test "branching preserves old entries and appends from selected leaf" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    const root = try manager.appendMessage(userMessage("root"), "t1");
-    _ = try manager.appendMessage(userMessage("main"), "t2");
-    try manager.branch(root);
-    _ = try manager.appendMessage(userMessage("branch"), "t3");
-
-    const context = try manager.buildSessionContext(std.testing.allocator);
-    defer manager.deinitSessionContext(std.testing.allocator, context);
-
-    try std.testing.expectEqual(@as(usize, 2), context.messages.len);
-    try std.testing.expectEqualStrings("root", context.messages[0].user.content.string);
-    try std.testing.expectEqualStrings("branch", context.messages[1].user.content.string);
-    try std.testing.expectEqual(@as(usize, 3), manager.entries.items.len);
-}
-
-test "build context projects latest compaction summary then kept messages" {
+test "context messages project latest compaction summary then kept messages" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
@@ -1085,71 +768,46 @@ test "build context projects latest compaction summary then kept messages" {
     _ = try manager.appendCompaction("older summary", kept, 3000, "t3");
     _ = try manager.appendMessage(userMessage("after"), "t4");
 
-    const context = try manager.buildSessionContext(std.testing.allocator);
-    defer manager.deinitSessionContext(std.testing.allocator, context);
+    const messages = try manager.contextMessages(std.testing.allocator);
+    defer SessionManager.deinitContextMessages(std.testing.allocator, messages);
 
-    try std.testing.expectEqual(@as(usize, 3), context.messages.len);
-    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].user.content.string, "older summary") != null);
-    try std.testing.expectEqualStrings("kept", context.messages[1].user.content.string);
-    try std.testing.expectEqualStrings("after", context.messages[2].user.content.string);
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].user.content.string, "older summary") != null);
+    try std.testing.expectEqualStrings("kept", messages[1].user.content.string);
+    try std.testing.expectEqualStrings("after", messages[2].user.content.string);
 }
 
-test "prepare compaction rejects empty small and already compacted branches" {
+test "compaction summary input rejects empty small and already compacted histories" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
     try std.testing.expectError(
         error.NothingToCompact,
-        manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 1 }),
+        manager.buildCompactionSummaryInput(std.testing.allocator, .{ .keep_recent_tokens = 1 }),
     );
 
     const root = try manager.appendMessage(userMessage("abcd"), "t1");
     try std.testing.expectError(
         error.NothingToCompact,
-        manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 100 }),
+        manager.buildCompactionSummaryInput(std.testing.allocator, .{ .keep_recent_tokens = 100 }),
     );
 
     _ = try manager.appendCompaction("summary", root, 1, "t2");
     try std.testing.expectError(
         error.AlreadyCompacted,
-        manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 1 }),
+        manager.buildCompactionSummaryInput(std.testing.allocator, .{ .keep_recent_tokens = 1 }),
     );
-}
 
-test "prepare compaction rejects out of bounds settings" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    _ = try manager.appendMessage(userMessage("aaaaaaaa"), "t1");
-    _ = try manager.appendMessage(userMessage("bbbbbbbb"), "t2");
-
+    _ = try manager.appendMessage(userMessage("after"), "t3");
     try std.testing.expectError(
         error.CompactionSettingsOutOfBounds,
-        manager.prepareCompaction(std.testing.allocator, .{
+        manager.buildCompactionSummaryInput(std.testing.allocator, .{
             .keep_recent_tokens = max_compaction_keep_recent_tokens + 1,
         }),
     );
 }
 
-test "prepare compaction keeps bounded recent suffix" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    _ = try manager.appendMessage(userMessage("aaaaaaaa"), "t1");
-    _ = try manager.appendMessage(userMessage("bbbbbbbb"), "t2");
-    const kept = try manager.appendMessage(userMessage("cccccccc"), "t3");
-
-    var preparation = try manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 2 });
-    defer preparation.deinit();
-
-    try std.testing.expectEqualStrings(kept, preparation.first_kept_entry_id);
-    try std.testing.expectEqual(@as(usize, 0), preparation.summarize_start_index);
-    try std.testing.expectEqual(@as(usize, 2), preparation.summarize_end_index);
-    try std.testing.expectEqual(@as(u64, 6), preparation.tokens_before);
-    try std.testing.expect(preparation.previous_summary == null);
-}
-
-test "build compaction summary input owns messages to summarize" {
+test "compaction summary input keeps bounded recent suffix" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
@@ -1168,25 +826,7 @@ test "build compaction summary input owns messages to summarize" {
     try std.testing.expect(input.previous_summary == null);
 }
 
-test "prepare compaction reuses previous first kept boundary" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    const root = try manager.appendMessage(userMessage("aaaaaaaa"), "t1");
-    _ = try manager.appendCompaction("prior", root, 2, "t2");
-    _ = try manager.appendMessage(userMessage("bbbbbbbb"), "t3");
-    const kept = try manager.appendMessage(userMessage("cccccccc"), "t4");
-
-    var preparation = try manager.prepareCompaction(std.testing.allocator, .{ .keep_recent_tokens = 2 });
-    defer preparation.deinit();
-
-    try std.testing.expectEqualStrings(kept, preparation.first_kept_entry_id);
-    try std.testing.expectEqual(@as(usize, 0), preparation.summarize_start_index);
-    try std.testing.expectEqual(@as(usize, 3), preparation.summarize_end_index);
-    try std.testing.expectEqualStrings("prior", preparation.previous_summary.?);
-}
-
-test "build compaction summary input carries previous summary" {
+test "compaction summary input reuses previous first kept boundary and summary" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
@@ -1232,35 +872,13 @@ test "serialize compaction summary input writes deterministic bounded text" {
         } },
     };
 
-    const messages = try std.testing.allocator.alloc(agent.AgentMessage, source_messages.len);
-    var initialized: usize = 0;
-    var input_owns_messages = false;
-    errdefer if (!input_owns_messages) {
-        for (messages[0..initialized]) |message| agent.deinitAgentMessage(std.testing.allocator, message);
-        std.testing.allocator.free(messages);
-    };
-    for (source_messages, 0..) |message, index| {
-        messages[index] = try agent.copyAgentMessage(std.testing.allocator, message);
-        initialized += 1;
-    }
-    const previous_summary = try std.testing.allocator.dupe(u8, "prior summary");
-    var input_owns_previous_summary = false;
-    errdefer if (!input_owns_previous_summary) std.testing.allocator.free(previous_summary);
-    const first_kept_entry_id = try std.testing.allocator.dupe(u8, "00000004");
-    var input_owns_first_kept_entry_id = false;
-    errdefer if (!input_owns_first_kept_entry_id) std.testing.allocator.free(first_kept_entry_id);
-    var input: CompactionSummaryInput = .{
+    const input: CompactionSummaryInput = .{
         .allocator = std.testing.allocator,
-        .messages = messages,
-        .previous_summary = previous_summary,
-        .first_kept_entry_id = first_kept_entry_id,
+        .messages = &source_messages,
+        .previous_summary = "prior summary",
+        .first_kept_entry_id = "00000004",
         .tokens_before = 42,
     };
-    input_owns_messages = true;
-    input_owns_previous_summary = true;
-    input_owns_first_kept_entry_id = true;
-    defer input.deinit();
-
     const serialized = try input.serialize(std.testing.allocator);
     defer std.testing.allocator.free(serialized);
 
@@ -1283,7 +901,6 @@ test "serialize compaction summary input truncates tool results and bounds outpu
     const tool_text = try std.testing.allocator.alloc(u8, max_compaction_tool_result_chars + 1);
     defer std.testing.allocator.free(tool_text);
     @memset(tool_text, 't');
-
     const tool_blocks = [_]ai.ToolResultContent{.{ .text = .{ .text = tool_text } }};
     const source_messages = [_]agent.AgentMessage{.{ .tool_result = .{
         .tool_call_id = "call-1",
@@ -1293,28 +910,12 @@ test "serialize compaction summary input truncates tool results and bounds outpu
         .timestamp = 0,
     } }};
 
-    const messages = try std.testing.allocator.alloc(agent.AgentMessage, source_messages.len);
-    var input_owns_messages = false;
-    errdefer if (!input_owns_messages) std.testing.allocator.free(messages);
-    messages[0] = try agent.copyAgentMessage(std.testing.allocator, source_messages[0]);
-    const initialized: usize = 1;
-    errdefer if (!input_owns_messages) {
-        for (messages[0..initialized]) |message| agent.deinitAgentMessage(std.testing.allocator, message);
-    };
-
-    const first_kept_entry_id = try std.testing.allocator.dupe(u8, "00000002");
-    var input_owns_first_kept_entry_id = false;
-    errdefer if (!input_owns_first_kept_entry_id) std.testing.allocator.free(first_kept_entry_id);
-    var input: CompactionSummaryInput = .{
+    const input: CompactionSummaryInput = .{
         .allocator = std.testing.allocator,
-        .messages = messages,
-        .first_kept_entry_id = first_kept_entry_id,
+        .messages = &source_messages,
+        .first_kept_entry_id = "00000002",
         .tokens_before = 42,
     };
-    input_owns_messages = true;
-    input_owns_first_kept_entry_id = true;
-    defer input.deinit();
-
     const serialized = try input.serialize(std.testing.allocator);
     defer std.testing.allocator.free(serialized);
     try std.testing.expect(std.mem.indexOf(u8, serialized, "\n[truncated]") != null);
@@ -1322,8 +923,7 @@ test "serialize compaction summary input truncates tool results and bounds outpu
     const oversized = try std.testing.allocator.alloc(u8, max_compaction_serialized_input_bytes + 1);
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'x');
-
-    var oversized_input: CompactionSummaryInput = .{
+    const oversized_input: CompactionSummaryInput = .{
         .allocator = std.testing.allocator,
         .messages = &.{},
         .previous_summary = oversized,
@@ -1334,30 +934,9 @@ test "serialize compaction summary input truncates tool results and bounds outpu
         error.CompactionSerializedInputTooLarge,
         oversized_input.serialize(std.testing.allocator),
     );
-    oversized_input.previous_summary = null;
 }
 
-test "tree navigation returns entries leaf and children" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    const root = try manager.appendMessage(userMessage("root"), "t1");
-    const left = try manager.appendMessage(userMessage("left"), "t2");
-    try manager.branch(root);
-    const right = try manager.appendMessage(userMessage("right"), "t3");
-
-    try std.testing.expectEqual(@as(usize, 3), manager.getTree().len);
-    try std.testing.expectEqualStrings(right, (try manager.getLeafEntry()).?.id());
-    try std.testing.expectEqualStrings(left, (try manager.getEntry(left)).id());
-
-    const children = try manager.getChildren(std.testing.allocator, root);
-    defer std.testing.allocator.free(children);
-    try std.testing.expectEqual(@as(usize, 2), children.len);
-    try std.testing.expectEqualStrings(left, children[0].id());
-    try std.testing.expectEqualStrings(right, children[1].id());
-}
-
-test "loaded entries preserve ids parent links and next generated id" {
+test "loaded entries preserve ids and continue id generation" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
@@ -1381,6 +960,32 @@ test "loaded entries preserve ids parent links and next generated id" {
 
     try std.testing.expectEqualStrings("0000000c", manager.entries.items[2].id());
     try std.testing.expectEqualStrings("0000000b", manager.entries.items[2].parentId().?);
+}
+
+test "loaded entries reject non linear parent links" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendLoadedEntry(.{
+        .id = "00000001",
+        .parent_id = null,
+        .timestamp = "t1",
+        .value = .{ .message = userMessage("root") },
+    });
+    // Duplicate line: parent points at its own id's predecessor, not the tail.
+    try std.testing.expectError(error.EntryNotFound, manager.appendLoadedEntry(.{
+        .id = "00000001",
+        .parent_id = null,
+        .timestamp = "t1",
+        .value = .{ .message = userMessage("root") },
+    }));
+    try std.testing.expectError(error.EntryNotFound, manager.appendLoadedEntry(.{
+        .id = "00000003",
+        .parent_id = "missing",
+        .timestamp = "t2",
+        .value = .{ .message = userMessage("orphan") },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
 }
 
 test "loaded compaction entries enforce durable bounds" {
@@ -1407,73 +1012,15 @@ test "loaded compaction entries enforce durable bounds" {
             .tokens_before = 1,
         } },
     }));
-    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
-}
-
-test "loaded compaction entries reject first kept entry outside parent branch" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    _ = try manager.appendLoadedEntry(.{
-        .id = "00000001",
-        .parent_id = null,
-        .timestamp = "t1",
-        .value = .{ .message = userMessage("root") },
-    });
-    _ = try manager.appendLoadedEntry(.{
+    try std.testing.expectError(error.CompactionFirstKeptEntryNotFound, manager.appendLoadedEntry(.{
         .id = "00000002",
         .parent_id = "00000001",
         .timestamp = "t2",
-        .value = .{ .message = userMessage("left") },
-    });
-    try manager.branch("00000001");
-    _ = try manager.appendLoadedEntry(.{
-        .id = "00000003",
-        .parent_id = "00000001",
-        .timestamp = "t3",
-        .value = .{ .message = userMessage("right") },
-    });
-
-    try std.testing.expectError(error.CompactionFirstKeptEntryNotInBranch, manager.appendLoadedEntry(.{
-        .id = "00000004",
-        .parent_id = "00000003",
-        .timestamp = "t4",
         .value = .{ .compaction = .{
             .summary = "summary",
-            .first_kept_entry_id = "00000002",
+            .first_kept_entry_id = "missing",
             .tokens_before = 1,
         } },
     }));
-    try std.testing.expectEqual(@as(usize, 3), manager.entries.items.len);
-}
-
-test "loaded entries reject duplicate ids and missing parents" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    _ = try manager.appendLoadedEntry(.{
-        .id = "00000001",
-        .parent_id = null,
-        .timestamp = "t1",
-        .value = .{ .message = userMessage("root") },
-    });
-    try std.testing.expectError(error.DuplicateEntryId, manager.appendLoadedEntry(.{
-        .id = "00000001",
-        .parent_id = null,
-        .timestamp = "t2",
-        .value = .{ .message = userMessage("duplicate") },
-    }));
-    try std.testing.expectError(error.EntryNotFound, manager.appendLoadedEntry(.{
-        .id = "00000002",
-        .parent_id = "missing",
-        .timestamp = "t2",
-        .value = .{ .message = userMessage("orphan") },
-    }));
-}
-
-test "branch rejects unknown entry" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    try std.testing.expectError(error.EntryNotFound, manager.branch("missing"));
+    try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
 }

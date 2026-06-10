@@ -14,11 +14,11 @@ pub fn userText(message: ai.UserMessage) ?[]const u8 {
 pub fn isContextOverflowAssistant(message: ai.AssistantMessage) bool {
     if (message.stop_reason != .error_) return false;
     const text = message.error_message orelse return false;
-    if (!asciiContainsIgnoreCase(text, "context")) return false;
-    return asciiContainsIgnoreCase(text, "overflow") or
-        asciiContainsIgnoreCase(text, "too large") or
-        asciiContainsIgnoreCase(text, "maximum") or
-        asciiContainsIgnoreCase(text, "length");
+    if (!contains(text, "context")) return false;
+    return contains(text, "overflow") or
+        contains(text, "too large") or
+        contains(text, "maximum") or
+        contains(text, "length");
 }
 
 pub fn isRetryableAssistant(message: ai.AssistantMessage) bool {
@@ -29,34 +29,25 @@ pub fn isRetryableAssistant(message: ai.AssistantMessage) bool {
 }
 
 pub fn isRetryableAssistantErrorText(text: []const u8) bool {
-    return asciiContainsIgnoreCase(text, "overloaded") or
-        asciiContainsIgnoreCase(text, "rate limit") or
-        asciiContainsIgnoreCase(text, "too many requests") or
-        asciiContainsIgnoreCase(text, "429") or
-        asciiContainsIgnoreCase(text, "500") or
-        asciiContainsIgnoreCase(text, "502") or
-        asciiContainsIgnoreCase(text, "503") or
-        asciiContainsIgnoreCase(text, "504") or
-        asciiContainsIgnoreCase(text, "service unavailable") or
-        asciiContainsIgnoreCase(text, "server error") or
-        asciiContainsIgnoreCase(text, "server_error") or
-        asciiContainsIgnoreCase(text, "internal error") or
-        asciiContainsIgnoreCase(text, "internal_error") or
-        asciiContainsIgnoreCase(text, "network") or
-        asciiContainsIgnoreCase(text, "connection") or
-        asciiContainsIgnoreCase(text, "timeout") or
-        asciiContainsIgnoreCase(text, "timed out") or
-        asciiContainsIgnoreCase(text, "terminated");
-}
-
-fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    for (0..haystack.len - needle.len + 1) |start| {
-        var index: usize = 0;
-        while (index < needle.len) : (index += 1) {
-            if (std.ascii.toLower(haystack[start + index]) != std.ascii.toLower(needle[index])) break;
-        } else return true;
+    const needles = [_][]const u8{
+        "overloaded",          "rate limit",   "too many requests", "429",
+        "500",                 "502",          "503",               "504",
+        "service unavailable", "server error", "server_error",      "internal error",
+        "internal_error",      "network",      "connection",        "timeout",
+        "timed out",           "terminated",
+    };
+    for (needles) |needle| {
+        if (contains(text, needle)) return true;
     }
     return false;
+}
+
+fn contains(haystack: []const u8, needle: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+}
+
+test "retryable and overflow classification" {
+    try std.testing.expect(isRetryableAssistantErrorText("Rate Limit exceeded"));
+    try std.testing.expect(isRetryableAssistantErrorText("connection reset"));
+    try std.testing.expect(!isRetryableAssistantErrorText("invalid api key"));
 }

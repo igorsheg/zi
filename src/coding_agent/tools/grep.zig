@@ -1,8 +1,8 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
-const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const path_utils = @import("path_utils.zig");
+const test_support = @import("test_support.zig");
 const tool_output_policy = @import("../tool_output_policy.zig");
 
 pub const max_files = 500;
@@ -41,16 +41,11 @@ pub const GrepTool = struct {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        var owned_config = config;
+        owned_config.cwd = cwd;
         return .{
             .allocator = allocator,
-            .config = .{
-                .cwd = cwd,
-                .allow_paths_outside_cwd = config.allow_paths_outside_cwd,
-                .max_files = config.max_files,
-                .max_file_bytes = config.max_file_bytes,
-                .max_matches = config.max_matches,
-                .max_output_bytes = config.max_output_bytes,
-            },
+            .config = owned_config,
             .parsed_parameters = parsed_parameters,
         };
     }
@@ -120,51 +115,20 @@ fn execute(
         try state.writer.writer.writeAll("\n[grep truncated]");
     }
 
-    const text = try state.writer.toOwnedSlice();
-    errdefer allocator.free(text);
-    const result_content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(result_content);
-    result_content[0] = .{ .text = .{ .text = text } };
-    return .{ .allocator = allocator, .result = .{
-        .content = result_content,
-        .details = try grepDetails(
-            allocator,
-            state.files_seen,
-            state.matches,
-            state.truncated,
-            state.truncated_by,
-            state.long_lines_truncated,
-            args.max_matches,
-        ),
-    } };
-}
-
-fn grepDetails(
-    allocator: std.mem.Allocator,
-    files_seen: usize,
-    matches: usize,
-    truncated: bool,
-    truncated_by: []const u8,
-    long_lines_truncated: usize,
-    max_matches_value: usize,
-) !std.json.Value {
-    var object: std.json.ObjectMap = .empty;
-    errdefer object.deinit(allocator);
-    try path_utils.putJsonField(allocator, &object, "filesSearched", .{ .integer = @intCast(files_seen) });
-    try path_utils.putJsonField(allocator, &object, "matches", .{ .integer = @intCast(matches) });
-    try path_utils.putJsonField(
+    return path_utils.ownedTextResult(
         allocator,
-        &object,
-        "longLinesTruncated",
-        .{ .integer = @intCast(long_lines_truncated) },
+        try state.writer.toOwnedSlice(),
+        try path_utils.jsonDetails(allocator, .{
+            .filesSearched = state.files_seen,
+            .matches = state.matches,
+            .longLinesTruncated = state.long_lines_truncated,
+            .truncation = try path_utils.jsonDetails(allocator, .{
+                .truncated = state.truncated,
+                .truncatedBy = state.truncated_by,
+                .maxMatches = args.max_matches,
+            }),
+        }),
     );
-    var truncation: std.json.ObjectMap = .empty;
-    errdefer truncation.deinit(allocator);
-    try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = truncated });
-    try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", truncated_by);
-    try path_utils.putJsonField(allocator, &truncation, "maxMatches", .{ .integer = @intCast(max_matches_value) });
-    try path_utils.putJsonField(allocator, &object, "truncation", .{ .object = truncation });
-    return .{ .object = object };
 }
 
 fn searchPath(
@@ -320,75 +284,35 @@ fn parseArgs(params: std.json.Value) !Args {
 }
 
 test "grep tool searches directory files with literal pattern" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("repo/src");
+    try fixture.write("repo/src/a.txt", "hello\nworld");
+    try fixture.write("repo/src/b.txt", "nope");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo/src");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/a.txt", .data = "hello\nworld" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/b.txt", .data = "nope" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try GrepTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var tool = try GrepTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "src" });
-    try object.put(std.testing.allocator, "pattern", .{ .string = "hello" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(tool.tool(), "{\"path\":\"src\",\"pattern\":\"hello\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("a.txt:1: hello", result.result.content[0].text.text);
 }
 
 test "grep tool defaults path, sorts files, ignores dependency directories, and supports ignoreCase" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("repo/node_modules/pkg");
+    try fixture.write("repo/b.txt", "Needle");
+    try fixture.write("repo/a.txt", "needle");
+    try fixture.write("repo/node_modules/pkg/c.txt", "needle");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo/node_modules/pkg");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/b.txt", .data = "Needle" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/a.txt", .data = "needle" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/node_modules/pkg/c.txt", .data = "needle" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try GrepTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var tool = try GrepTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "pattern", .{ .string = "needle" });
-    try object.put(std.testing.allocator, "ignoreCase", .{ .bool = true });
-    try object.put(std.testing.allocator, "limit", .{ .integer = 1 });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call-default",
-        .{ .object = object },
-        null,
+    var result = try test_support.execute(
+        tool.tool(),
+        "{\"pattern\":\"needle\",\"ignoreCase\":true,\"limit\":1}",
     );
     defer result.deinit();
 
@@ -396,36 +320,14 @@ test "grep tool defaults path, sorts files, ignores dependency directories, and 
 }
 
 test "grep tool reports no matches and truncates long matching lines" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/a.txt", "nope");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/a.txt", .data = "nope" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try GrepTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var tool = try GrepTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "." });
-    try object.put(std.testing.allocator, "pattern", .{ .string = "missing" });
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(tool.tool(), "{\"path\":\".\",\"pattern\":\"missing\"}");
     defer result.deinit();
     try std.testing.expectEqualStrings("[no matches]", result.result.content[0].text.text);
 
@@ -433,22 +335,9 @@ test "grep tool reports no matches and truncates long matching lines" {
     defer long.deinit();
     try long.writer.writeAll("needle ");
     try long.writer.splatByteAll('x', tool_output_policy.grep_max_line_bytes + 20);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/long.txt", .data = long.written() });
+    try fixture.write("repo/long.txt", long.written());
 
-    var long_object: std.json.ObjectMap = .empty;
-    defer long_object.deinit(std.testing.allocator);
-    try long_object.put(std.testing.allocator, "path", .{ .string = "long.txt" });
-    try long_object.put(std.testing.allocator, "pattern", .{ .string = "needle" });
-    var long_result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call-long",
-        .{ .object = long_object },
-        null,
-    );
+    var long_result = try test_support.execute(tool.tool(), "{\"path\":\"long.txt\",\"pattern\":\"needle\"}");
     defer long_result.deinit();
     try std.testing.expect(std.mem.indexOf(u8, long_result.result.content[0].text.text, "[line truncated]") != null);
 }

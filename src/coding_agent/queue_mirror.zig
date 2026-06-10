@@ -37,13 +37,11 @@ pub const QueueMirror = struct {
 
     pub fn snapshot(self: *const QueueMirror, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
         var steering = try client_protocol.EventTextList.init(allocator, self.steering.items);
-        errdefer steering.deinit();
-        var follow_up = try client_protocol.EventTextList.init(allocator, self.follow_up.items);
-        errdefer follow_up.deinit();
+        errdefer steering.deinit(allocator);
         return .{
             .revision = self.revision,
             .steering = steering,
-            .follow_up = follow_up,
+            .follow_up = try client_protocol.EventTextList.init(allocator, self.follow_up.items),
         };
     }
 

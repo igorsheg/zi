@@ -20,9 +20,6 @@ pub const BuildOptions = struct {
     skills: []const skills_mod.Skill = &.{},
     custom_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
-    readme_path: []const u8 = "README.md",
-    docs_path: []const u8 = "docs",
-    examples_path: []const u8 = "examples",
 };
 
 pub fn build(allocator: std.mem.Allocator, options: BuildOptions) ![]u8 {
@@ -54,7 +51,6 @@ pub fn build(allocator: std.mem.Allocator, options: BuildOptions) ![]u8 {
     );
     try appendBounded(&writer, "Guidelines:\n");
     try appendGuidelines(&writer, options.selected_tools);
-    try appendPiDocumentation(&writer, options);
     try appendAppendSystemPrompt(&writer, options.append_system_prompt);
     try appendProjectContext(&writer, options.context_files);
     if (containsString(options.selected_tools, "read")) try appendSkills(&writer, options.skills);
@@ -119,39 +115,6 @@ fn appendGuideline(guidelines: *[max_guidelines][]const u8, len: *usize, guideli
     if (len.* == max_guidelines) return error.GuidelineLimitExceeded;
     guidelines[len.*] = guideline;
     len.* += 1;
-}
-
-fn appendPiDocumentation(writer: *std.Io.Writer.Allocating, options: BuildOptions) !void {
-    try appendBounded(
-        writer,
-        "\nZi documentation (read only when the user asks about zi itself, " ++
-            "its SDK, extensions, themes, skills, or TUI):\n",
-    );
-    try appendBounded(writer, "- Main documentation: ");
-    try appendBounded(writer, options.readme_path);
-    try appendBounded(writer, "\n- Additional docs: ");
-    try appendBounded(writer, options.docs_path);
-    try appendBounded(writer, "\n- Examples: ");
-    try appendBounded(writer, options.examples_path);
-    try appendBounded(writer, " (extensions, custom tools, SDK)\n");
-    try appendBounded(
-        writer,
-        "- When asked about: extensions (docs/extensions.md, examples/extensions/), " ++
-            "themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), " ++
-            "TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), " ++
-            "custom providers (docs/custom-provider.md), adding models (docs/models.md), " ++
-            "zi packages (docs/packages.md)\n",
-    );
-    try appendBounded(
-        writer,
-        "- When working on zi topics, read the docs and examples, " ++
-            "and follow .md cross-references before implementing\n",
-    );
-    try appendBounded(
-        writer,
-        "- Always read zi .md files completely and follow links to related docs " ++
-            "(e.g., tui.md for TUI API details)\n",
-    );
 }
 
 fn appendAppendSystemPrompt(writer: *std.Io.Writer.Allocating, append_system_prompt: ?[]const u8) !void {
@@ -265,22 +228,6 @@ test "tool snippets are shown only for selected tools with snippets" {
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- dynamic: Run dynamic behavior") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- read:") == null);
-}
-
-test "default prompt includes pi documentation paths" {
-    const prompt = try build(std.testing.allocator, .{
-        .cwd = "/repo",
-        .current_date = "2026-05-25",
-        .selected_tools = &.{},
-        .readme_path = "/zi/README.md",
-        .docs_path = "/zi/docs",
-        .examples_path = "/zi/examples",
-    });
-    defer std.testing.allocator.free(prompt);
-
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Main documentation: /zi/README.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Additional docs: /zi/docs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Examples: /zi/examples") != null);
 }
 
 test "empty custom and append prompts are ignored" {

@@ -1,3 +1,8 @@
+//! The single writer for session state derived from agent events. Order per
+//! event is fixed: queue mirror -> public event -> persistence -> terminal
+//! policy. A persistence failure is reported to the caller after the terminal
+//! policy has still run; the host converts it into a failed operation.
+
 const std = @import("std");
 
 const agent_mod = @import("../agent/root.zig");
@@ -22,6 +27,10 @@ pub const EventDrain = struct {
     timestamp: []const u8,
     context_overflow_count: usize = 0,
     pending_public_event_overflow_count: usize = 0,
+    /// Auto-retry attempt counter. The drain owns it so the success path is
+    /// observed at the one place every event passes: the first non-error
+    /// assistant message settles an in-flight retry mid-turn.
+    retry_attempt: u8 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -51,14 +60,65 @@ pub const EventDrain = struct {
     }
 
     pub fn handle(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        try self.updateQueueMirror(event);
-        try self.emitPublicEvent(event);
+        // Queue mirror: a delivered user message leaves the mirrored queue.
+        if (event == .message_start and event.message_start.message == .user) {
+            if (message_policy.userText(event.message_start.message.user)) |text| {
+                if (self.queue_mirror.removeUserText(self.allocator, text)) try self.emitQueueUpdate();
+            }
+        }
+
+        self.enqueuePublicEvent(.{ .agent_event = try client_protocol.OwnedAgentEvent.init(self.allocator, event) });
+
+        // Persist message_end durably before it can be dropped from any
+        // window; terminal policy still runs when persistence fails.
         var persist_error: ?anyerror = null;
-        self.persistEvent(event) catch |err| {
-            persist_error = err;
-        };
-        self.handleTerminalPolicy(event);
+        if (event == .message_end) {
+            self.persistMessage(event.message_end.message) catch |err| {
+                persist_error = err;
+            };
+        }
+
+        if (event == .message_end and event.message_end.message == .assistant) {
+            const assistant = event.message_end.message.assistant;
+            if (message_policy.isContextOverflowAssistant(assistant)) {
+                self.context_overflow_count += 1;
+            }
+            if (assistant.stop_reason != .error_ and self.retry_attempt > 0) {
+                const attempt = self.retry_attempt;
+                self.retry_attempt = 0;
+                self.enqueuePublicEvent(.{ .auto_retry_end = .{ .success = true, .attempt = attempt } });
+            }
+        }
         if (persist_error) |err| return err;
+    }
+
+    /// Begin one auto-retry attempt; returns the 1-based attempt number.
+    pub fn beginRetryAttempt(self: *EventDrain) u8 {
+        std.debug.assert(self.retry_attempt < std.math.maxInt(u8));
+        self.retry_attempt += 1;
+        return self.retry_attempt;
+    }
+
+    /// Settle an in-flight retry as failed and report the terminal error.
+    /// No-op when no retry is in flight.
+    pub fn failRetry(self: *EventDrain, error_text: []const u8) void {
+        if (self.retry_attempt == 0) return;
+        const attempt = self.retry_attempt;
+        self.retry_attempt = 0;
+        const final_error = client_protocol.EventText.init(self.allocator, error_text) catch return;
+        self.enqueuePublicEvent(.{ .auto_retry_end = .{
+            .success = false,
+            .attempt = attempt,
+            .final_error = final_error,
+        } });
+    }
+
+    fn persistMessage(self: *EventDrain, message: agent_mod.AgentMessage) !void {
+        try self.manager.ensureAppendCapacity(1);
+        const entry = try self.manager.prepareMessageEntry(message, self.timestamp);
+        errdefer self.manager.deinitPreparedEntry(entry);
+        if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
+        _ = self.manager.commitPreparedEntry(entry);
     }
 
     pub fn emitQueueUpdate(self: *EventDrain) !void {
@@ -72,18 +132,10 @@ pub const EventDrain = struct {
     pub fn enqueuePublicEvent(self: *EventDrain, event: client_protocol.ClientEvent) void {
         var owned_event = event;
         if (!self.public_events.pushOrDrop(owned_event)) {
-            owned_event.deinit();
+            owned_event.deinit(self.allocator);
             std.debug.assert(self.pending_public_event_overflow_count < std.math.maxInt(usize));
             self.pending_public_event_overflow_count += 1;
         }
-        self.public_event_wake.set();
-    }
-
-    pub fn enqueuePendingPublicEventOverflow(self: *EventDrain) void {
-        if (self.pending_public_event_overflow_count == 0) return;
-        const dropped_count = self.pending_public_event_overflow_count;
-        if (!self.public_events.pushOrDrop(.{ .event_overflow = .{ .dropped_count = dropped_count } })) return;
-        self.pending_public_event_overflow_count = 0;
         self.public_event_wake.set();
     }
 
@@ -97,7 +149,14 @@ pub const EventDrain = struct {
 
     pub fn drainPublicEvent(self: *EventDrain) ?client_protocol.ClientEvent {
         const event = self.public_events.pop() orelse return null;
-        self.enqueuePendingPublicEventOverflow();
+        // A drained slot makes room for the deferred overflow report.
+        if (self.pending_public_event_overflow_count > 0) {
+            const dropped_count = self.pending_public_event_overflow_count;
+            if (self.public_events.pushOrDrop(.{ .event_overflow = .{ .dropped_count = dropped_count } })) {
+                self.pending_public_event_overflow_count = 0;
+                self.public_event_wake.set();
+            }
+        }
         return event;
     }
 
@@ -115,39 +174,5 @@ pub const EventDrain = struct {
 
     pub fn publicEventsEmpty(self: *const EventDrain) bool {
         return self.public_events.empty();
-    }
-
-    fn updateQueueMirror(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        if (event != .message_start) return;
-        if (event.message_start.message != .user) return;
-        const text = message_policy.userText(event.message_start.message.user) orelse return;
-        if (!self.queue_mirror.removeUserText(self.allocator, text)) return;
-        try self.emitQueueUpdate();
-    }
-
-    fn emitPublicEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        self.enqueuePublicEvent(.{ .agent_event = try client_protocol.OwnedAgentEvent.init(self.allocator, event) });
-    }
-
-    fn persistEvent(self: *EventDrain, event: agent_mod.AgentEvent) !void {
-        if (event != .message_end) return;
-        try self.manager.ensureAppendCapacity(1);
-        const entry = try self.manager.prepareMessageEntry(event.message_end.message, self.timestamp);
-        errdefer self.manager.deinitPreparedEntry(entry);
-        if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
-        _ = self.manager.commitPreparedEntry(entry);
-    }
-
-    fn handleTerminalPolicy(self: *EventDrain, event: agent_mod.AgentEvent) void {
-        switch (event) {
-            .message_end => |payload| {
-                if (payload.message == .assistant and
-                    message_policy.isContextOverflowAssistant(payload.message.assistant))
-                {
-                    self.context_overflow_count += 1;
-                }
-            },
-            else => {},
-        }
     }
 };

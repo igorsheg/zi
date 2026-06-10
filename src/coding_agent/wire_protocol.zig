@@ -5,7 +5,6 @@ const client_protocol = @import("client_protocol.zig");
 pub const version: u32 = 1;
 pub const max_input_line_bytes: usize = 64 * 1024;
 pub const max_output_event_bytes: usize = 256 * 1024;
-pub const max_pending_request_ids: usize = 64;
 pub const max_malformed_lines: usize = 16;
 pub const max_prompt_text_bytes: usize = 32 * 1024;
 
@@ -27,14 +26,7 @@ pub const EventEncodeError = error{
 pub fn decodeCommandLine(
     allocator: std.mem.Allocator,
     raw_line: []const u8,
-) (error{
-    InputLineTooLarge,
-    InvalidJson,
-    InvalidMessage,
-    InvalidRequestId,
-    UnknownCommand,
-    PromptTooLarge,
-} || std.mem.Allocator.Error)!?client_protocol.CommandEnvelope {
+) CommandDecodeError!?client_protocol.CommandEnvelope {
     if (raw_line.len > max_input_line_bytes) return error.InputLineTooLarge;
     const line = trimLine(raw_line);
     if (line.len == 0) return null;
@@ -73,11 +65,7 @@ pub fn decodeCommandLine(
 pub fn encodeEventEnvelope(
     allocator: std.mem.Allocator,
     envelope: client_protocol.EventEnvelope,
-) (error{
-    OutputEventTooLarge,
-    EventJsonNotObject,
-    WriteFailed,
-} || std.mem.Allocator.Error)![]u8 {
+) EventEncodeError![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try std.json.Stringify.value(envelope, .{}, &output.writer);
@@ -181,7 +169,7 @@ test "wire protocol rejects malformed and oversized commands" {
 
 test "wire protocol encodes event envelope object directly" {
     var message = try client_protocol.EventText.init(std.testing.allocator, "nope");
-    defer message.deinit();
+    defer message.deinit(std.testing.allocator);
     const event: client_protocol.EventEnvelope = .{
         .seq = 3,
         .request_id = 7,

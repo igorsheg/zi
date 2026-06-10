@@ -2,13 +2,11 @@ const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
-const mutation = @import("file_mutation_queue.zig");
+const file_writer = @import("file_writer.zig");
 const path_utils = @import("path_utils.zig");
+const test_support = @import("test_support.zig");
 
 pub const max_write_bytes = 4 * 1024 * 1024;
-pub const write_update_chunk_bytes = 16 * 1024;
-
-var temp_file_counter: std.atomic.Value(u64) = .init(0);
 
 const parameters_schema =
     \\{
@@ -25,27 +23,22 @@ pub const WriteTool = struct {
     allocator: std.mem.Allocator,
     config: Config,
     parsed_parameters: runtime.JsonOwned(std.json.Value),
-    owned_queue: mutation.FileMutationQueue = .{},
 
     pub const Config = struct {
         cwd: []const u8,
         allow_paths_outside_cwd: bool = false,
         max_write_bytes: usize = max_write_bytes,
-        mutation_queue: ?*mutation.FileMutationQueue = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !WriteTool {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        var owned_config = config;
+        owned_config.cwd = cwd;
         return .{
             .allocator = allocator,
-            .config = .{
-                .cwd = cwd,
-                .allow_paths_outside_cwd = config.allow_paths_outside_cwd,
-                .max_write_bytes = config.max_write_bytes,
-                .mutation_queue = config.mutation_queue,
-            },
+            .config = owned_config,
             .parsed_parameters = parsed_parameters,
         };
     }
@@ -64,12 +57,9 @@ pub const WriteTool = struct {
             .parameters = self.parsed_parameters.value,
             .label = "write",
             .execute = .{ .context = self, .call_fn = execute },
+            // Sequential execution is the file-mutation serialization guarantee.
             .execution_mode = .sequential,
         };
-    }
-
-    fn queue(self: *WriteTool) *mutation.FileMutationQueue {
-        return self.config.mutation_queue orelse &self.owned_queue;
     }
 };
 
@@ -92,7 +82,15 @@ fn execute(
     const self: *WriteTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = try parseArgs(params);
     if (args.content.len > self.config.max_write_bytes) {
-        return writeTooLargeResult(allocator, args.content.len, self.config.max_write_bytes);
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "[Write omitted: content is {d} bytes, exceeding the {d} byte limit.]",
+            .{ args.content.len, self.config.max_write_bytes },
+        );
+        return path_utils.ownedTextResult(allocator, message, try path_utils.jsonDetails(allocator, .{
+            .contentBytes = args.content.len,
+            .maxBytes = self.config.max_write_bytes,
+        }));
     }
     const resolved_path = try path_utils.resolveCreatablePath(allocator, io, .{
         .cwd = self.config.cwd,
@@ -100,15 +98,20 @@ fn execute(
     }, args.path);
     defer allocator.free(resolved_path);
 
-    var guard = self.queue().lock();
-    defer guard.unlock();
-
     try token.throwIfRequested();
     if (std.fs.path.dirname(resolved_path)) |dir| try std.Io.Dir.createDirPath(.cwd(), io, dir);
-    try atomicWriteFileStreamingUpdates(allocator, io, resolved_path, args.content, on_update);
+    try file_writer.atomicWriteFileStreamingUpdates(allocator, io, resolved_path, args.content, on_update);
     try token.throwIfRequested();
 
-    return writeResult(allocator, args.content.len, args.path);
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Successfully wrote {d} bytes to {s}",
+        .{ args.content.len, args.path },
+    );
+    return path_utils.ownedTextResult(allocator, message, try path_utils.jsonDetails(allocator, .{
+        .bytesWritten = args.content.len,
+        .path = args.path,
+    }));
 }
 
 fn parseArgs(params: std.json.Value) !WriteArgs {
@@ -120,126 +123,20 @@ fn parseArgs(params: std.json.Value) !WriteArgs {
     return .{ .path = path_value.string, .content = content_value.string };
 }
 
-fn atomicWriteFileStreamingUpdates(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    content: []const u8,
-    on_update: ?agent.AgentToolUpdateCallback,
-) !void {
-    const stamp = std.Io.Clock.awake.now(io).nanoseconds;
-    const counter = temp_file_counter.fetchAdd(1, .monotonic);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.zi-tmp-{d}-{d}", .{ path, stamp, counter });
-    defer allocator.free(temp_path);
-    errdefer std.Io.Dir.deleteFile(.cwd(), io, temp_path) catch {};
-
-    const file = try std.Io.Dir.createFile(.cwd(), io, temp_path, .{});
-    defer file.close(io);
-
-    var buffer: [4096]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    var offset: usize = 0;
-    while (offset < content.len) {
-        const end = utf8ChunkEnd(content, offset, @min(content.len, offset + write_update_chunk_bytes));
-        const chunk = content[offset..end];
-        try writer.interface.writeAll(chunk);
-        try emitWriteUpdate(allocator, on_update, chunk);
-        offset = end;
-    }
-    try writer.flush();
-    try std.Io.Dir.rename(.cwd(), temp_path, .cwd(), path, io);
-}
-
-fn emitWriteUpdate(
-    allocator: std.mem.Allocator,
-    on_update: ?agent.AgentToolUpdateCallback,
-    chunk: []const u8,
-) !void {
-    const callback = on_update orelse return;
-    const text = try allocator.dupe(u8, chunk);
-    defer allocator.free(text);
-    const content = try allocator.alloc(ai.ToolResultContent, 1);
-    defer allocator.free(content);
-    content[0] = .{ .text = .{ .text = text } };
-    try callback.call(.{ .content = content });
-}
-
-fn utf8ChunkEnd(content: []const u8, start: usize, proposed_end: usize) usize {
-    std.debug.assert(start < proposed_end);
-    std.debug.assert(proposed_end <= content.len);
-    if (proposed_end == content.len) return proposed_end;
-    var end = proposed_end;
-    while (end > start and (content[end] & 0xc0) == 0x80) : (end -= 1) {}
-    if (end == start) return proposed_end;
-    return end;
-}
-
-fn writeTooLargeResult(
-    allocator: std.mem.Allocator,
-    content_bytes: usize,
-    max_bytes: usize,
-) !agent.ToolExecutionResult {
-    const message = try std.fmt.allocPrint(
-        allocator,
-        "[Write omitted: content is {d} bytes, exceeding the {d} byte limit.]",
-        .{ content_bytes, max_bytes },
-    );
-    errdefer allocator.free(message);
-    const content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(content);
-    content[0] = .{ .text = .{ .text = message } };
-    var details: std.json.ObjectMap = .empty;
-    errdefer details.deinit(allocator);
-    try path_utils.putJsonField(allocator, &details, "contentBytes", .{ .integer = @intCast(content_bytes) });
-    try path_utils.putJsonField(allocator, &details, "maxBytes", .{ .integer = @intCast(max_bytes) });
-    return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = details } } };
-}
-
-fn writeResult(allocator: std.mem.Allocator, bytes_written: usize, path: []const u8) !agent.ToolExecutionResult {
-    const message = try std.fmt.allocPrint(allocator, "Successfully wrote {d} bytes to {s}", .{ bytes_written, path });
-    errdefer allocator.free(message);
-    const content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(content);
-    content[0] = .{ .text = .{ .text = message } };
-    var details: std.json.ObjectMap = .empty;
-    errdefer details.deinit(allocator);
-    try path_utils.putJsonField(allocator, &details, "bytesWritten", .{ .integer = @intCast(bytes_written) });
-    try path_utils.putJsonStringField(allocator, &details, "path", path);
-    return .{ .allocator = allocator, .result = .{ .content = content, .details = .{ .object = details } } };
-}
-
 test "write tool creates parent directories and writes content" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var write_tool = try WriteTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var write_tool = try WriteTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer write_tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "dir/file.txt" });
-    try object.put(std.testing.allocator, "content", .{ .string = "hello" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &write_tool,
-        cancel_source.token(),
-        "call-1",
-        .{ .object = object },
-        null,
+    var result = try test_support.execute(
+        write_tool.tool(),
+        "{\"path\":\"dir/file.txt\",\"content\":\"hello\"}",
     );
     defer result.deinit();
 
-    const written = try tmp.dir.readFileAlloc(std.testing.io, "repo/dir/file.txt", std.testing.allocator, .unlimited);
+    const written = try fixture.read("repo/dir/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello", written);
     try std.testing.expectEqualStrings(
@@ -271,75 +168,44 @@ fn captureWriteUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResul
 }
 
 test "write tool streams utf8 safe content chunks" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var write_tool = try WriteTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var write_tool = try WriteTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer write_tool.deinit();
 
     const content = "中" ** 6000;
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "streamed.txt" });
-    try object.put(std.testing.allocator, "content", .{ .string = content });
+    const args = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"path\":\"streamed.txt\",\"content\":\"{s}\"}}",
+        .{content},
+    );
+    defer std.testing.allocator.free(args);
 
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
     var capture: WriteUpdateCapture = .{ .writer = .init(std.testing.allocator) };
     defer capture.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &write_tool,
-        cancel_source.token(),
-        "call-1",
-        .{ .object = object },
+    var result = try test_support.executeWithUpdate(
+        write_tool.tool(),
+        args,
         .{ .context = &capture, .call_fn = captureWriteUpdate },
     );
     defer result.deinit();
 
     try std.testing.expect(capture.count > 1);
     try std.testing.expectEqualStrings(content, capture.writer.written());
-    const written = try tmp.dir.readFileAlloc(std.testing.io, "repo/streamed.txt", std.testing.allocator, .unlimited);
+    const written = try fixture.read("repo/streamed.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings(content, written);
 }
 
 test "write tool rejects oversized content" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var write_tool = try WriteTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd], .max_write_bytes = 3 });
+    var write_tool = try WriteTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .max_write_bytes = 3 });
     defer write_tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
-    try object.put(std.testing.allocator, "content", .{ .string = "hello" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &write_tool,
-        cancel_source.token(),
-        "call-1",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(write_tool.tool(), "{\"path\":\"file.txt\",\"content\":\"hello\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
@@ -352,17 +218,14 @@ test "write tool rejects oversized content" {
 }
 
 test "write tool rejects paths outside cwd" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "repo/app");
-    try tmp.dir.createDirPath(std.testing.io, "repo/other");
+    var fixture = try test_support.Fixture.init("repo/app");
+    defer fixture.deinit();
+    try fixture.dir("repo/other");
 
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo/app", &cwd_buffer);
     try std.testing.expectError(error.PathOutsideCwd, path_utils.resolveCreatablePath(
         std.testing.allocator,
         std.testing.io,
-        .{ .cwd = cwd_buffer[0..cwd] },
+        .{ .cwd = fixture.cwd() },
         "../other/file.txt",
     ));
 }

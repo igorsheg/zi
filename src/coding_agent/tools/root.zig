@@ -1,6 +1,6 @@
 const bash = @import("bash.zig");
 const edit = @import("edit.zig");
-const file_mutation_queue = @import("file_mutation_queue.zig");
+const file_writer = @import("file_writer.zig");
 const find = @import("find.zig");
 const grep = @import("grep.zig");
 const ls = @import("ls.zig");
@@ -13,7 +13,7 @@ const write = @import("write.zig");
 test {
     _ = bash;
     _ = edit;
-    _ = file_mutation_queue;
+    _ = file_writer;
     _ = find;
     _ = grep;
     _ = ls;

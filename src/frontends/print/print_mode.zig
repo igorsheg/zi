@@ -1,8 +1,9 @@
 const std = @import("std");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
-const client_protocol = @import("../../coding_agent/client_protocol.zig");
-const session_runtime = @import("../../coding_agent/session_runtime.zig");
+const coding_agent = @import("../../coding_agent/root.zig");
+const client_protocol = coding_agent.client_protocol;
+const session_runtime = coding_agent.session_runtime;
 
 pub const OutputMode = enum {
     text,
@@ -69,7 +70,6 @@ fn drainEvents(
             .queue_changed,
             .snapshot,
             .compaction_start,
-            .session_info_changed,
             .compaction_end,
             .auto_retry_start,
             .auto_retry_end,
@@ -165,12 +165,11 @@ test "print mode emits assistant text from injected stream" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
 
-    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",
-        .session_id = "session",
-        .timestamp = "2026-05-27T00:00:00Z",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-05-27T00:00:00Z" } },
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
     });
@@ -201,12 +200,11 @@ test "json print mode streams client protocol events" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
 
-    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",
-        .session_id = "session",
-        .timestamp = "2026-05-27T00:00:00Z",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-05-27T00:00:00Z" } },
         .dir = tmp.dir,
         .stream = provider.apiProvider().stream,
     });

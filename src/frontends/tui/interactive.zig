@@ -2,9 +2,10 @@ const std = @import("std");
 
 const agent_mod = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
-const client_protocol = @import("../../coding_agent/client_protocol.zig");
-const session_listing = @import("../../coding_agent/session_listing.zig");
-const session_runtime = @import("../../coding_agent/session_runtime.zig");
+const coding_agent = @import("../../coding_agent/root.zig");
+const client_protocol = coding_agent.client_protocol;
+const session_listing = coding_agent.session_listing;
+const session_runtime = coding_agent.session_runtime;
 const runtime = @import("../../runtime/root.zig");
 const tui = @import("../../tui/root.zig");
 
@@ -48,29 +49,26 @@ pub fn run(
     stderr: *std.Io.Writer,
     options: Options,
 ) !void {
-    const timestamp = std.Io.Timestamp.now(process.io, .real).nanoseconds;
-    const timestamp_text = try std.fmt.allocPrint(process.gpa, "{d}", .{timestamp});
-    defer process.gpa.free(timestamp_text);
-
+    const stamp = session_runtime.SessionStamp.now(process.io);
     var app = if (try selectResumeSession(process, stderr, options)) |session_file| blk: {
         defer process.gpa.free(session_file);
-        break :blk try session_runtime.resumeSessionRuntime(process.gpa, .{
+        break :blk try session_runtime.openSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
-            .current_date = timestamp_text,
-            .session_file_name = session_file,
+            .current_date = stamp.date(),
+            .open = .{ .resume_existing = .{ .session_file_name = session_file } },
             .dir = options.dir,
             .environ = options.environ,
         });
     } else blk: {
-        const session_id = try std.fmt.allocPrint(process.gpa, "tui-{d}", .{timestamp});
-        defer process.gpa.free(session_id);
-        break :blk try session_runtime.createSessionRuntime(process.gpa, .{
+        var session_id_buffer: [48]u8 = undefined;
+        const session_id = std.fmt.bufPrint(&session_id_buffer, "tui-{d}", .{stamp.nanoseconds}) catch
+            unreachable;
+        break :blk try session_runtime.openSessionRuntime(process.gpa, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
-            .current_date = timestamp_text,
-            .session_id = session_id,
-            .timestamp = timestamp_text,
+            .current_date = stamp.date(),
+            .open = .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } },
             .dir = options.dir,
             .environ = options.environ,
         });
@@ -314,7 +312,6 @@ const InteractiveController = struct {
                 try self.setWorkingStatus(text);
             },
             .auto_retry_end => try self.clearStatus(status_id_working),
-            .session_info_changed => {},
             .event_overflow => |overflow| {
                 var buffer: [96]u8 = undefined;
                 const text = std.fmt.bufPrint(
@@ -830,12 +827,11 @@ test "tui adapter requests replay and recovers from snapshot after mailbox event
 
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-06-09",
-        .session_id = "session",
-        .timestamp = "2026-06-09T00:00:00Z",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
         .dir = tmp.dir,
         .task_runtime = task_runtime,
         .command_capacity = 2,

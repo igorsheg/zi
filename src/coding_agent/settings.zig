@@ -19,6 +19,7 @@ pub const Settings = struct {
     pub const Retry = struct {
         enabled: ?bool = null,
         max_retries: ?u64 = null,
+        base_delay_ms: ?u64 = null,
     };
 };
 
@@ -106,6 +107,8 @@ pub const SettingsManager = struct {
     }
 };
 
+/// A settings file is operational input: a missing, unreadable, or malformed
+/// file degrades to defaults. Only allocation failure propagates.
 fn loadFile(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !SettingsFile {
     const bytes = std.Io.Dir.readFileAlloc(
         dir,
@@ -114,12 +117,15 @@ fn loadFile(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []c
         allocator,
         .limited(max_settings_file_bytes),
     ) catch |err| switch (err) {
-        error.FileNotFound => return .missing,
-        else => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .missing,
     };
     defer allocator.free(bytes);
 
-    return .{ .loaded = try parseSettings(allocator, bytes) };
+    return .{ .loaded = parseSettings(allocator, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .missing,
+    } };
 }
 
 fn parseSettings(allocator: std.mem.Allocator, bytes: []const u8) !LoadedSettings {
@@ -127,16 +133,18 @@ fn parseSettings(allocator: std.mem.Allocator, bytes: []const u8) !LoadedSetting
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSettings;
 
-    return .{
-        .allocator = allocator,
-        .value = .{
-            .default_provider = try optionalString(allocator, parsed.value.object.get("defaultProvider")),
-            .default_model = try optionalString(allocator, parsed.value.object.get("defaultModel")),
-            .default_thinking_level = try optionalString(allocator, parsed.value.object.get("defaultThinkingLevel")),
-            .compaction = try optionalCompaction(parsed.value.object.get("compaction")),
-            .retry = try optionalRetry(parsed.value.object.get("retry")),
-        },
-    };
+    var value: Settings = .{};
+    errdefer {
+        if (value.default_provider) |text| allocator.free(text);
+        if (value.default_model) |text| allocator.free(text);
+        if (value.default_thinking_level) |text| allocator.free(text);
+    }
+    value.default_provider = try optionalString(allocator, parsed.value.object.get("defaultProvider"));
+    value.default_model = try optionalString(allocator, parsed.value.object.get("defaultModel"));
+    value.default_thinking_level = try optionalString(allocator, parsed.value.object.get("defaultThinkingLevel"));
+    value.compaction = try optionalCompaction(parsed.value.object.get("compaction"));
+    value.retry = try optionalRetry(parsed.value.object.get("retry"));
+    return .{ .allocator = allocator, .value = value };
 }
 
 fn optionalCompaction(value: ?std.json.Value) !?Settings.Compaction {
@@ -156,6 +164,7 @@ fn optionalRetry(value: ?std.json.Value) !?Settings.Retry {
     return .{
         .enabled = try optionalBool(resolved.object.get("enabled")),
         .max_retries = try optionalNonNegativeInteger(resolved.object.get("maxRetries")),
+        .base_delay_ms = try optionalNonNegativeInteger(resolved.object.get("baseDelayMs")),
     };
 }
 
@@ -183,6 +192,28 @@ fn optionalBool(value: ?std.json.Value) !?bool {
     if (resolved == .null) return null;
     if (resolved != .bool) return error.InvalidSettings;
     return resolved.bool;
+}
+
+test "settings manager degrades malformed settings to defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/settings.json", .data = "{not json" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.zi/settings.json",
+        .data = "{\"defaultProvider\":123}",
+    });
+
+    var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer manager.deinit();
+
+    try std.testing.expectEqual(SettingsFile.missing, manager.current().global);
+    try std.testing.expectEqual(SettingsFile.missing, manager.current().project);
 }
 
 test "settings manager treats missing global and project settings as defaults" {
@@ -239,7 +270,7 @@ test "settings manager loads compaction and retry settings" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "repo/.zi/settings.json",
         .data = "{\"compaction\":{\"keepRecentTokens\":1234,\"enabled\":true}," ++
-            "\"retry\":{\"enabled\":true,\"maxRetries\":2}}",
+            "\"retry\":{\"enabled\":true,\"maxRetries\":2,\"baseDelayMs\":50}}",
     });
 
     var manager = try SettingsManager.init(std.testing.allocator, std.testing.io, .{
@@ -257,5 +288,9 @@ test "settings manager loads compaction and retry settings" {
     try std.testing.expectEqual(
         @as(u64, 2),
         manager.current().project.loaded.value.retry.?.max_retries.?,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 50),
+        manager.current().project.loaded.value.retry.?.base_delay_ms.?,
     );
 }

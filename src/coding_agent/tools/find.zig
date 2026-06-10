@@ -1,8 +1,8 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
-const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const path_utils = @import("path_utils.zig");
+const test_support = @import("test_support.zig");
 const tool_output_policy = @import("../tool_output_policy.zig");
 
 pub const max_entries = 500;
@@ -36,14 +36,11 @@ pub const FindTool = struct {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        var owned_config = config;
+        owned_config.cwd = cwd;
         return .{
             .allocator = allocator,
-            .config = .{
-                .cwd = cwd,
-                .allow_paths_outside_cwd = config.allow_paths_outside_cwd,
-                .max_entries = config.max_entries,
-                .max_output_bytes = config.max_output_bytes,
-            },
+            .config = owned_config,
             .parsed_parameters = parsed_parameters,
         };
     }
@@ -151,37 +148,17 @@ fn execute(
         try writer.writer.writeAll("\n[find truncated]");
     }
 
-    const text = try writer.toOwnedSlice();
-    errdefer allocator.free(text);
-    const result_content = try allocator.alloc(ai.ToolResultContent, 1);
-    errdefer allocator.free(result_content);
-    result_content[0] = .{ .text = .{ .text = text } };
-    return .{ .allocator = allocator, .result = .{
-        .content = result_content,
-        .details = try findDetails(allocator, emitted, truncated, truncated_by, max_entries_value),
-    } };
+    return path_utils.ownedTextResult(allocator, try writer.toOwnedSlice(), try path_utils.jsonDetails(allocator, .{
+        .entries = emitted,
+        .truncation = try path_utils.jsonDetails(allocator, .{
+            .truncated = truncated,
+            .truncatedBy = truncated_by,
+            .maxEntries = max_entries_value,
+        }),
+    }));
 }
 
 const no_matches_text = "[no matches]";
-
-fn findDetails(
-    allocator: std.mem.Allocator,
-    entries: usize,
-    truncated: bool,
-    truncated_by: []const u8,
-    max_entries_value: usize,
-) !std.json.Value {
-    var object: std.json.ObjectMap = .empty;
-    errdefer object.deinit(allocator);
-    try path_utils.putJsonField(allocator, &object, "entries", .{ .integer = @intCast(entries) });
-    var truncation: std.json.ObjectMap = .empty;
-    errdefer truncation.deinit(allocator);
-    try path_utils.putJsonField(allocator, &truncation, "truncated", .{ .bool = truncated });
-    try path_utils.putJsonStringField(allocator, &truncation, "truncatedBy", truncated_by);
-    try path_utils.putJsonField(allocator, &truncation, "maxEntries", .{ .integer = @intCast(max_entries_value) });
-    try path_utils.putJsonField(allocator, &object, "truncation", .{ .object = truncation });
-    return .{ .object = object };
-}
 
 fn parseArgs(params: std.json.Value) !Args {
     if (params != .object) return error.InvalidToolArguments;
@@ -210,111 +187,48 @@ fn kindSuffix(kind: std.Io.File.Kind) []const u8 {
 }
 
 test "find tool recursively filters paths" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("repo/src");
+    try fixture.write("repo/src/main.zig", "");
+    try fixture.write("repo/README.md", "");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo/src");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/main.zig", .data = "" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/README.md", .data = "" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try FindTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var tool = try FindTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "." });
-    try object.put(std.testing.allocator, "name", .{ .string = ".zig" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(tool.tool(), "{\"path\":\".\",\"name\":\".zig\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("src/main.zig", result.result.content[0].text.text);
 }
 
 test "find tool defaults path, sorts results, applies limit, and ignores dependency directories" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("repo/node_modules/pkg");
+    try fixture.write("repo/b.zig", "");
+    try fixture.write("repo/a.zig", "");
+    try fixture.write("repo/node_modules/pkg/c.zig", "");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo/node_modules/pkg");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/b.zig", .data = "" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/a.zig", .data = "" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/node_modules/pkg/c.zig", .data = "" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try FindTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var tool = try FindTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "name", .{ .string = ".zig" });
-    try object.put(std.testing.allocator, "limit", .{ .integer = 1 });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call-default",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(tool.tool(), "{\"name\":\".zig\",\"limit\":1}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("a.zig\n[find truncated]", result.result.content[0].text.text);
 }
 
 test "find tool reports no matches" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("repo/src");
+    try fixture.write("repo/src/main.zig", "");
 
-    try tmp.dir.createDirPath(std.testing.io, "repo/src");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/main.zig", .data = "" });
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
-    var tool = try FindTool.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd] });
+    var tool = try FindTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
 
-    var object: std.json.ObjectMap = .empty;
-    defer object.deinit(std.testing.allocator);
-    try object.put(std.testing.allocator, "path", .{ .string = "." });
-    try object.put(std.testing.allocator, "name", .{ .string = "missing" });
-
-    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
-    defer cancel_source.deinit();
-    var result = try execute(
-        std.testing.allocator,
-        task_runtime.io(),
-        task_runtime,
-        &tool,
-        cancel_source.token(),
-        "call",
-        .{ .object = object },
-        null,
-    );
+    var result = try test_support.execute(tool.tool(), "{\"path\":\".\",\"name\":\"missing\"}");
     defer result.deinit();
 
     try std.testing.expectEqualStrings("[no matches]", result.result.content[0].text.text);
