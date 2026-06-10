@@ -249,6 +249,15 @@ pub const AgentSessionRuntimeHost = struct {
         return self.commands.count() > 0;
     }
 
+    pub fn rejectClientCommand(
+        self: *AgentSessionRuntimeHost,
+        request_id: ?client_protocol.RequestId,
+        code: client_protocol.Rejection.Code,
+        message: []const u8,
+    ) !void {
+        try self.enqueueRejected(request_id, code, message);
+    }
+
     pub fn waitForWake(self: *AgentSessionRuntimeHost, input_fd: std.posix.fd_t, frame_ms: u64) !WakeResult {
         const readable = runtime.ReadableFd.initBorrowed(input_fd);
         var input = readable.asyncReadable();

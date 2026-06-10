@@ -17,7 +17,7 @@ pub fn run(
     while (true) {
         const raw_line = stdin.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
-                try writeRejected(app.allocator, stdout, null, .invalid_command, "input line too large");
+                try emitRejected(app, stdout, null, .invalid_command, "input line too large");
                 stderr.writeAll("rpc input line too large\n") catch return error.OutputClosed;
                 return error.InputLineTooLarge;
             },
@@ -80,7 +80,7 @@ fn handleLine(
 ) Error!DriveResult {
     var envelope = wire_protocol.decodeCommandLine(app.allocator, raw_line) catch |err| {
         malformed_lines.* += 1;
-        try writeRejected(app.allocator, stdout, null, .invalid_command, @errorName(err));
+        try emitRejected(app, stdout, null, .invalid_command, @errorName(err));
         if (malformed_lines.* >= wire_protocol.max_malformed_lines) {
             stderr.writeAll("too many malformed rpc lines\n") catch return error.OutputClosed;
             return .shutdown;
@@ -91,12 +91,12 @@ fn handleLine(
 
     const request_id = envelope.id;
     const terminal_request_id = if (wait_for_terminal and request_id != null) request_id else null;
-    const command = envelope.command;
+    const is_shutdown = envelope.command == .shutdown;
     var envelope_owned = true;
     defer if (envelope_owned) envelope.deinit(app.allocator);
     app.submit(envelope) catch |err| switch (err) {
         error.Full => {
-            try writeRejected(app.allocator, stdout, request_id, .queue_full, "command queue full");
+            try emitRejected(app, stdout, request_id, .queue_full, "command queue full");
             return .idle;
         },
     };
@@ -104,10 +104,10 @@ fn handleLine(
 
     if (wait_for_terminal) {
         const result = try drive(app, stdout, terminal_request_id);
-        if (command == .shutdown) return .shutdown;
+        if (is_shutdown) return .shutdown;
         return result;
     }
-    return if (command == .shutdown) .shutdown else .idle;
+    return .idle;
 }
 
 const InputState = struct {
@@ -151,7 +151,7 @@ const InputState = struct {
                 continue;
             }
             if (self.line_len == self.line.len) {
-                try writeRejected(app.allocator, stdout, null, .invalid_command, "input line too large");
+                try emitRejected(app, stdout, null, .invalid_command, "input line too large");
                 stderr.writeAll("rpc input line too large\n") catch return error.OutputClosed;
                 self.line_len = 0;
                 self.dropping_oversized = true;
@@ -207,13 +207,33 @@ fn drainEvents(
 
 fn isTerminalEvent(event: client_protocol.ClientEvent) bool {
     return switch (event) {
-        .rejected, .operation_finished, .snapshot, .shutdown_started => true,
+        .rejected, .operation_finished, .snapshot, .replay, .replay_gap, .shutdown_started => true,
         else => false,
     };
 }
 
 fn isShutdownEvent(event: client_protocol.ClientEvent) bool {
     return event == .shutdown_started;
+}
+
+fn emitRejected(
+    app: *session_runtime.SessionRuntime,
+    stdout: *std.Io.Writer,
+    request_id: ?client_protocol.RequestId,
+    code: client_protocol.Rejection.Code,
+    message: []const u8,
+) Error!void {
+    if (try drive(app, stdout, null) == .shutdown) return;
+    app.rejectClientCommand(request_id, code, message) catch |err| switch (err) {
+        error.EventQueueFull => {
+            _ = try drainEvents(app, stdout, null);
+            try app.step();
+            _ = try drainEvents(app, stdout, null);
+            try app.rejectClientCommand(request_id, code, message);
+        },
+        else => return err,
+    };
+    _ = try drainEvents(app, stdout, null);
 }
 
 fn writeEvent(
@@ -371,4 +391,285 @@ test "rpc stdio reports malformed json and continues" {
     const output = stdout.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "InvalidJson") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"id\":2") != null);
+}
+
+fn initRpcTestRuntime(
+    tmp: *std.testing.TmpDir,
+    task_runtime: *runtime.Runtime,
+    command_capacity: usize,
+    event_capacity: usize,
+) !session_runtime.SessionRuntime {
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    return session_runtime.createSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .session_id = "rpc-session",
+        .timestamp = "2026-06-09T00:00:00Z",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+        .command_capacity = command_capacity,
+        .event_capacity = event_capacity,
+    });
+}
+
+fn expectSequencedJsonLineTypes(output: []const u8, expected_types: []const []const u8) !void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var expected_seq: u64 = 1;
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        const object = parsed.value.object;
+        const seq = object.get("seq") orelse return error.MissingSeq;
+        try std.testing.expect(seq == .integer);
+        try std.testing.expectEqual(expected_seq, @as(u64, @intCast(seq.integer)));
+        const event = object.get("event") orelse return error.MissingEvent;
+        try std.testing.expect(event == .object);
+        const event_type = event.object.get("type") orelse return error.MissingEventType;
+        try std.testing.expect(event_type == .string);
+        try std.testing.expect(count < expected_types.len);
+        try std.testing.expectEqualStrings(expected_types[count], event_type.string);
+        expected_seq += 1;
+        count += 1;
+    }
+    try std.testing.expectEqual(expected_types.len, count);
+}
+
+test "rpc stdout is sequenced jsonl for malformed and valid commands" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try initRpcTestRuntime(&tmp, task_runtime, 4, 8);
+    defer app.deinit();
+
+    var input = std.Io.Reader.fixed(
+        \\{
+        \\{"id":2,"type":"snapshot"}
+        \\{"id":3,"type":"shutdown"}
+        \\
+    );
+    var stdout_buffer: [16384]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+
+    try run(&app, &input, &stdout, &stderr);
+
+    try expectSequencedJsonLineTypes(stdout.buffered(), &.{ "rejected", "snapshot", "shutdown_started" });
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "InvalidJson") != null);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "rpc fd shutdown is emitted before returning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try initRpcTestRuntime(&tmp, task_runtime, 4, 8);
+    defer app.deinit();
+
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var state: InputState = .{};
+
+    try std.testing.expectEqual(
+        InputResult.active,
+        try state.feed("{\"id\":9,\"type\":\"shutdown\"}\n", &app, &stdout, &stderr),
+    );
+    try std.testing.expect(app.hasQueuedCommands());
+    try std.testing.expectEqual(DriveResult.shutdown, try drive(&app, &stdout, null));
+
+    try expectSequencedJsonLineTypes(stdout.buffered(), &.{"shutdown_started"});
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"id\":9") != null);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "rpc oversized fd input reports rejection then accepts next line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try initRpcTestRuntime(&tmp, task_runtime, 4, 8);
+    defer app.deinit();
+
+    var stdout_buffer: [16384]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var state: InputState = .{};
+
+    const followup = "\n{\"id\":4,\"type\":\"snapshot\"}\n";
+    const input_len = wire_protocol.max_input_line_bytes + 1 + followup.len;
+    const input = try std.testing.allocator.alloc(u8, input_len);
+    defer std.testing.allocator.free(input);
+    @memset(input[0 .. wire_protocol.max_input_line_bytes + 1], 'x');
+    @memcpy(input[wire_protocol.max_input_line_bytes + 1 ..], followup);
+
+    try std.testing.expectEqual(InputResult.active, try state.feed(input, &app, &stdout, &stderr));
+    try std.testing.expectEqual(DriveResult.idle, try drive(&app, &stdout, null));
+
+    try expectSequencedJsonLineTypes(stdout.buffered(), &.{ "rejected", "snapshot" });
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "input line too large") != null);
+    try std.testing.expectEqualStrings("rpc input line too large\n", stderr.buffered());
+}
+
+test "rpc command queue full rejection is sequenced after accepted work" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try initRpcTestRuntime(&tmp, task_runtime, 1, 8);
+    defer app.deinit();
+
+    var stdout_buffer: [16384]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    var state: InputState = .{};
+
+    try std.testing.expectEqual(
+        InputResult.active,
+        try state.feed(
+            "{\"id\":1,\"type\":\"queue.clear\"}\n{\"id\":2,\"type\":\"snapshot\"}\n",
+            &app,
+            &stdout,
+            &stderr,
+        ),
+    );
+    try std.testing.expectEqual(DriveResult.idle, try drive(&app, &stdout, null));
+
+    try expectSequencedJsonLineTypes(stdout.buffered(), &.{ "operation_finished", "rejected" });
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "queue_full") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"id\":2") != null);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+fn expectSequencedJsonLines(output: []const u8) !usize {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var expected_seq: u64 = 1;
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        const object = parsed.value.object;
+        const seq = object.get("seq") orelse return error.MissingSeq;
+        try std.testing.expect(seq == .integer);
+        try std.testing.expectEqual(expected_seq, @as(u64, @intCast(seq.integer)));
+        const event = object.get("event") orelse return error.MissingEvent;
+        try std.testing.expect(event == .object);
+        const event_type = event.object.get("type") orelse return error.MissingEventType;
+        try std.testing.expect(event_type == .string);
+        expected_seq += 1;
+        count += 1;
+    }
+    return count;
+}
+
+test "rpc submit command runs to completed operation" {
+    const Test = struct {
+        const ai = @import("../../ai/root.zig");
+
+        fn model() ai.Model {
+            return .{
+                .id = "test-model",
+                .name = "test model",
+                .api = ai.KnownApi.openai_responses,
+                .provider = ai.KnownProvider.openai,
+                .base_url = "",
+                .reasoning = false,
+                .input = &.{},
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+                .context_window = 128000,
+                .max_tokens = 4096,
+            };
+        }
+
+        fn stream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
+            var assistant_stream = ai.AssistantMessageEventStream.initBuffered();
+            const sink = assistant_stream.sink();
+            sink.endDone(request.io, .stop, .{
+                .content = &.{.{ .text = .{ .text = "done" } }},
+                .api = request.model.api,
+                .provider = request.model.provider,
+                .model = request.model.id,
+                .usage = ai.protocol.emptyUsage(),
+                .stop_reason = .stop,
+                .timestamp = 0,
+            }) catch std.debug.assert(false);
+            return assistant_stream;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try session_runtime.createSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .session_id = "rpc-session",
+        .timestamp = "2026-06-09T00:00:00Z",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+        .model = Test.model(),
+        .stream = .{ .call_fn = Test.stream },
+    });
+    defer app.deinit();
+
+    var input = std.Io.Reader.fixed(
+        \\{"id":1,"type":"submit","text":"hello"}
+        \\{"id":2,"type":"shutdown"}
+        \\
+    );
+    var stdout_buffer: [32768]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+
+    try run(&app, &input, &stdout, &stderr);
+
+    try std.testing.expect(try expectSequencedJsonLines(stdout.buffered()) >= 3);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "operation_started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "operation_finished") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "completed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "shutdown_started") != null);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "rpc replay command is terminal and returns retained facts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try initRpcTestRuntime(&tmp, task_runtime, 4, 8);
+    defer app.deinit();
+
+    var input = std.Io.Reader.fixed(
+        \\{"id":1,"type":"queue.clear"}
+        \\{"id":2,"type":"replay","after":0}
+        \\{"id":3,"type":"shutdown"}
+        \\
+    );
+    var stdout_buffer: [32768]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+
+    try run(&app, &input, &stdout, &stderr);
+
+    try expectSequencedJsonLineTypes(stdout.buffered(), &.{ "operation_finished", "replay", "shutdown_started" });
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "queue_cleared") != null);
+    try std.testing.expectEqualStrings("", stderr.buffered());
 }
