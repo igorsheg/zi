@@ -554,7 +554,7 @@ pub const SessionRuntime = struct {
                 try self.enqueueEvent(.{
                     .request_id = envelope.id,
                     .operation_id = self.active.?.operation_id,
-                    .event = .{ .operation_started = .{} },
+                    .event = .operation_started,
                 });
                 try self.drainSessionEvents(envelope.id);
             },
@@ -590,12 +590,10 @@ pub const SessionRuntime = struct {
             },
             .queue => |queue_command| switch (queue_command) {
                 .clear => {
+                    // The reply is the state fact itself: a request-correlated
+                    // queue_changed (emitted unconditionally by the drain).
                     try self.session.clearQueue();
-                    try self.drainSessionEvents(null);
-                    try self.enqueueEvent(.{
-                        .request_id = envelope.id,
-                        .event = .{ .operation_finished = .{ .reason = .queue_cleared } },
-                    });
+                    try self.drainSessionEvents(envelope.id);
                 },
             },
             .snapshot => {
@@ -897,8 +895,10 @@ const RetainedEventLedger = struct {
                 .last_retained_seq = last,
             } } };
         }
-        const max_events = @min(request.max_events, client_protocol.replay_event_count_max);
-        var scratch = try allocator.alloc(client_protocol.RetainedEvent.Source, max_events);
+        var scratch = try allocator.alloc(
+            client_protocol.RetainedEvent.Source,
+            client_protocol.replay_event_count_max,
+        );
         defer allocator.free(scratch);
         var out_count: usize = 0;
         var index: usize = 0;
@@ -991,7 +991,7 @@ test "session runtime owns services session and bounded mailboxes" {
     try std.testing.expectEqualStrings("session", session_runtime.session.manager.header.id);
 }
 
-test "session runtime drains submitted command into operation event" {
+test "session runtime acknowledges queue clear with a correlated queue fact" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
@@ -1004,10 +1004,8 @@ test "session runtime drains submitted command into operation event" {
     var event = session_runtime.drainEvent().?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 1), event.request_id);
-    try std.testing.expectEqual(
-        client_protocol.OperationFinished.Reason.queue_cleared,
-        event.event.operation_finished.reason,
-    );
+    try std.testing.expect(event.event == .queue_changed);
+    try std.testing.expectEqual(@as(usize, 0), event.event.queue_changed.steering_count);
 }
 
 test "session runtime replays retained event envelopes" {
@@ -1033,7 +1031,7 @@ test "session runtime replays retained event envelopes" {
     try std.testing.expectEqual(@as(usize, 1), replay.event.replay.events.len);
     try std.testing.expectEqual(original_seq, replay.event.replay.events[0].seq);
     try std.testing.expect(
-        std.mem.indexOf(u8, replay.event.replay.events[0].json.text, "\"queue_cleared\"") != null,
+        std.mem.indexOf(u8, replay.event.replay.events[0].json.text, "\"queue_changed\"") != null,
     );
 }
 
@@ -1080,7 +1078,7 @@ test "session runtime request snapshot emits owned bounded snapshot event" {
     var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
-    try session_runtime.submit(.{ .id = 9, .command = .{ .snapshot = .{} } });
+    try session_runtime.submit(.{ .id = 9, .command = .snapshot });
     try session_runtime.step();
 
     var event = session_runtime.drainEvent().?;
@@ -1105,16 +1103,13 @@ test "session runtime does not consume commands while event queue is full" {
 
     try session_runtime.submit(.{ .id = 1, .command = .{ .queue = .clear } });
     try session_runtime.step();
-    try session_runtime.submit(.{ .id = 2, .command = .{ .snapshot = .{} } });
+    try session_runtime.submit(.{ .id = 2, .command = .snapshot });
     try session_runtime.step();
 
     var first = session_runtime.drainEvent().?;
     defer first.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 1), first.request_id);
-    try std.testing.expectEqual(
-        client_protocol.OperationFinished.Reason.queue_cleared,
-        first.event.operation_finished.reason,
-    );
+    try std.testing.expect(first.event == .queue_changed);
 
     try session_runtime.step();
     var second = session_runtime.drainEvent().?;
@@ -1138,10 +1133,7 @@ test "session runtime shutdown remains observable under event pressure" {
 
     var first = session_runtime.drainEvent().?;
     defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        client_protocol.OperationFinished.Reason.queue_cleared,
-        first.event.operation_finished.reason,
-    );
+    try std.testing.expect(first.event == .queue_changed);
 
     try session_runtime.step();
     var second = session_runtime.drainEvent().?;
@@ -1504,7 +1496,7 @@ test "retained ledger oversized encode evicts through seq and accepts later even
 
     try ledger.append(.{
         .seq = 1,
-        .event = .{ .operation_finished = .{ .reason = .queue_cleared } },
+        .event = .{ .operation_finished = .{ .reason = .completed } },
     });
 
     var message = try client_protocol.EventText.init(std.testing.allocator, "x" ** 512);

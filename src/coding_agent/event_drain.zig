@@ -144,8 +144,12 @@ pub const EventDrain = struct {
         return self.queue_mirror.snapshot(allocator);
     }
 
+    /// Always emits queue_changed, even when the queue was already empty:
+    /// the clear command's only reply is this state fact, so it must be
+    /// unconditional for request correlation.
     pub fn clearQueueMirror(self: *EventDrain) !void {
-        if (self.queue_mirror.clear(self.allocator)) try self.emitQueueUpdate();
+        _ = self.queue_mirror.clear(self.allocator);
+        try self.emitQueueUpdate();
     }
 
     pub fn drainPublicEvent(self: *EventDrain) ?client_protocol.ClientEvent {

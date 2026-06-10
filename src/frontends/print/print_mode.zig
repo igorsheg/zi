@@ -79,12 +79,9 @@ fn drainEvents(
             .operation_started,
             .shutdown_started,
             => try drain.onEvent(owned_event.event),
-            .operation_finished => |operation| {
+            .operation_finished => {
                 try drain.onEvent(owned_event.event);
-                switch (operation.reason) {
-                    .completed, .canceled, .failed => done = true,
-                    .queue_cleared => {},
-                }
+                done = true;
             },
             .rejected => |rejection| {
                 try printAssistantError(stderr, rejection.message.text);

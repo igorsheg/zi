@@ -210,7 +210,7 @@ const InteractiveController = struct {
     }
 
     fn requestSnapshot(self: *InteractiveController) !void {
-        _ = try self.submitCommand(.{ .command = .{ .snapshot = .{} } });
+        _ = try self.submitCommand(.{ .command = .snapshot });
     }
 
     fn requestReplay(self: *InteractiveController, after: client_protocol.EventSeq) !void {
@@ -470,7 +470,6 @@ const InteractiveController = struct {
             .completed => {},
             .canceled => try self.appendStatus(.warning, "canceled"),
             .failed => try self.appendStatus(.err, "operation failed"),
-            .queue_cleared => try self.appendStatus(.info, "queue cleared"),
         }
     }
 
@@ -854,7 +853,7 @@ test "tui adapter requests replay and recovers from snapshot after mailbox event
     };
     defer controller.terminal_loop.deinit();
 
-    try controller.acceptEnvelope(.{ .seq = 2, .event = .{ .operation_started = .{} } });
+    try controller.acceptEnvelope(.{ .seq = 2, .event = .operation_started });
     try std.testing.expectEqual(EventCursor.Recovery.replay_requested, controller.event_cursor.recovery);
     try std.testing.expect(app.hasQueuedCommands());
     try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.slots.count(.status_area));

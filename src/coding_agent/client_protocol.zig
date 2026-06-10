@@ -45,7 +45,7 @@ pub const ClientCommand = union(enum) {
     submit: Submit,
     cancel: Cancel,
     queue: QueueCommand,
-    snapshot: SnapshotRequest,
+    snapshot,
     replay: ReplayRequest,
     shutdown,
 
@@ -79,13 +79,8 @@ pub const QueueCommand = union(enum) {
     clear,
 };
 
-pub const SnapshotRequest = struct {
-    max_bytes: usize = snapshot_history_total_text_bytes_max,
-};
-
 pub const ReplayRequest = struct {
     after: EventSeq,
-    max_events: usize = replay_event_count_max,
 };
 
 pub const EventEnvelope = struct {
@@ -111,7 +106,7 @@ pub const EventEnvelope = struct {
 
 pub const ClientEvent = union(enum) {
     rejected: Rejection,
-    operation_started: OperationStarted,
+    operation_started,
     operation_finished: OperationFinished,
     shutdown_started,
     agent_event: OwnedAgentEvent,
@@ -151,7 +146,7 @@ pub const ClientEvent = union(enum) {
             .agent_event => |event| try stringify.write(event),
             .snapshot => |payload| try stringify.write(payload),
             .replay => |payload| try stringify.write(payload),
-            .shutdown_started => try writeObject(stringify, "shutdown_started", .{}),
+            inline .shutdown_started, .operation_started => |_, tag| try writeObject(stringify, @tagName(tag), .{}),
             inline else => |payload, tag| try writeObject(stringify, @tagName(tag), payload),
         }
     }
@@ -165,14 +160,9 @@ pub const Rejection = struct {
         busy,
         queue_full,
         invalid_command,
+        /// A reply could not be delivered in-band (e.g. too large to encode).
         overflow,
     };
-};
-
-pub const OperationStarted = struct {
-    kind: Kind = .prompt,
-
-    pub const Kind = enum { prompt };
 };
 
 pub const OperationFinished = struct {
@@ -182,7 +172,6 @@ pub const OperationFinished = struct {
         completed,
         canceled,
         failed,
-        queue_cleared,
     };
 };
 

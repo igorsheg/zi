@@ -2,7 +2,6 @@ const std = @import("std");
 
 const client_protocol = @import("client_protocol.zig");
 
-pub const version: u32 = 1;
 pub const max_input_line_bytes: usize = 64 * 1024;
 pub const max_output_event_bytes: usize = 256 * 1024;
 pub const max_malformed_lines: usize = 16;
@@ -19,7 +18,6 @@ pub const CommandDecodeError = error{
 
 pub const EventEncodeError = error{
     OutputEventTooLarge,
-    EventJsonNotObject,
     WriteFailed,
 } || std.mem.Allocator.Error;
 
@@ -54,7 +52,7 @@ pub fn decodeCommandLine(
         return .{ .id = id, .command = .{ .cancel = try decodeCancel(object.get("target")) } };
     }
     if (std.mem.eql(u8, command_type, "queue.clear")) return .{ .id = id, .command = .{ .queue = .clear } };
-    if (std.mem.eql(u8, command_type, "snapshot")) return .{ .id = id, .command = .{ .snapshot = .{} } };
+    if (std.mem.eql(u8, command_type, "snapshot")) return .{ .id = id, .command = .snapshot };
     if (std.mem.eql(u8, command_type, "replay")) {
         return .{ .id = id, .command = .{ .replay = try decodeReplay(object) } };
     }

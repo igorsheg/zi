@@ -216,9 +216,20 @@ fn drainEvents(
     return .idle;
 }
 
+/// A correlated reply that settles one request: drive() stops waiting when
+/// one of these arrives carrying the awaited request id. queue_changed is
+/// terminal because it is the reply to queue.clear and steer/enqueue
+/// submits; uncorrelated queue_changed events never carry a request id.
 fn isTerminalEvent(event: client_protocol.ClientEvent) bool {
     return switch (event) {
-        .rejected, .operation_finished, .snapshot, .replay, .replay_gap, .shutdown_started => true,
+        .rejected,
+        .operation_finished,
+        .snapshot,
+        .replay,
+        .replay_gap,
+        .shutdown_started,
+        .queue_changed,
+        => true,
         else => false,
     };
 }
@@ -259,13 +270,6 @@ fn writeEvent(
             event.request_id,
             .overflow,
             "output event too large",
-        ),
-        error.EventJsonNotObject => return writeRejected(
-            allocator,
-            stdout,
-            event.request_id,
-            .invalid_command,
-            "event json invalid",
         ),
         error.WriteFailed => return error.OutputClosed,
         error.OutOfMemory => return error.OutOfMemory,
@@ -568,7 +572,7 @@ test "rpc command queue full rejection is sequenced after accepted work" {
     );
     try std.testing.expectEqual(DriveResult.idle, try drive(&app, &stdout, null));
 
-    try expectSequencedJsonLineTypes(stdout.buffered(), &.{ "operation_finished", "rejected" });
+    try expectSequencedJsonLineTypes(stdout.buffered(), &.{ "queue_changed", "rejected" });
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "queue_full") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"id\":2") != null);
     try std.testing.expectEqualStrings("", stderr.buffered());
@@ -691,7 +695,7 @@ test "rpc replay command is terminal and returns retained facts" {
 
     try run(&app, &input, &stdout, &stderr);
 
-    try expectSequencedJsonLineTypes(stdout.buffered(), &.{ "operation_finished", "replay", "shutdown_started" });
-    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "queue_cleared") != null);
+    try expectSequencedJsonLineTypes(stdout.buffered(), &.{ "queue_changed", "replay", "shutdown_started" });
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"queue_changed\"") != null);
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
