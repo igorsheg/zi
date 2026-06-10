@@ -121,13 +121,11 @@ const RetainedEventLedger = struct {
 
     fn append(self: *RetainedEventLedger, envelope: client_protocol.EventEnvelope) !void {
         if (envelope.event == .replay or envelope.event == .replay_gap) return;
-        const json = try encodeEnvelopeJson(self.allocator, envelope);
-        errdefer self.allocator.free(json);
-        if (json.len > self.max_bytes) {
+        const json = try encodeEnvelopeJsonBounded(self.allocator, envelope, self.max_bytes) orelse {
             self.evictAllThrough(envelope.seq);
-            self.allocator.free(json);
             return;
-        }
+        };
+        errdefer self.allocator.free(json);
         while (self.count == self.entries.len or self.total_bytes + json.len > self.max_bytes) self.evictOldest();
         const index = (self.start + self.count) % self.entries.len;
         self.entries[index] = .{ .seq = envelope.seq, .json = json };
@@ -201,11 +199,18 @@ const RetainedEventLedger = struct {
     }
 };
 
-fn encodeEnvelopeJson(allocator: std.mem.Allocator, envelope: client_protocol.EventEnvelope) ![]u8 {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    try std.json.Stringify.value(envelope, .{}, &writer.writer);
-    return writer.toOwnedSlice();
+fn encodeEnvelopeJsonBounded(
+    allocator: std.mem.Allocator,
+    envelope: client_protocol.EventEnvelope,
+    max_bytes: usize,
+) !?[]u8 {
+    var storage = try allocator.alloc(u8, max_bytes);
+    defer allocator.free(storage);
+    var writer = std.Io.Writer.fixed(storage);
+    std.json.Stringify.value(envelope, .{}, &writer) catch |err| switch (err) {
+        error.WriteFailed => return null,
+    };
+    return try allocator.dupe(u8, storage[0..writer.end]);
 }
 
 pub const AgentSessionRuntimeHost = struct {
@@ -236,14 +241,23 @@ pub const AgentSessionRuntimeHost = struct {
         return self.events.pop();
     }
 
+    pub fn hasPendingClientEvents(self: *const AgentSessionRuntimeHost) bool {
+        return self.pending_event != null or self.events.count() > 0;
+    }
+
+    pub fn hasQueuedCommands(self: *const AgentSessionRuntimeHost) bool {
+        return self.commands.count() > 0;
+    }
+
     pub fn waitForWake(self: *AgentSessionRuntimeHost, input_fd: std.posix.fd_t, frame_ms: u64) !WakeResult {
         const readable = runtime.ReadableFd.initBorrowed(input_fd);
         var input = readable.asyncReadable();
         var frame = runtime.Timeout.fromMilliseconds(frame_ms);
         var public_event_wake = self.session.publicEventWake();
+        const command_wake = &self.wake_event;
         if (self.active_run) |run| {
             var progress = run.stream.asyncNext();
-            switch (try runtime.select(.{ .input = &input, .prompt = &progress, .public_event = public_event_wake, .frame = &frame })) {
+            switch (try runtime.select(.{ .input = &input, .prompt = &progress, .public_event = public_event_wake, .command = command_wake, .frame = &frame })) {
                 .input => |result| {
                     result catch return .session;
                     return .input;
@@ -260,10 +274,14 @@ pub const AgentSessionRuntimeHost = struct {
                     self.drainSessionEvents(null) catch return .session;
                     return .session;
                 },
+                .command => {
+                    self.wake_event.reset();
+                    return .session;
+                },
                 .frame => return .frame,
             }
         }
-        switch (try runtime.select(.{ .input = &input, .public_event = public_event_wake, .frame = &frame })) {
+        switch (try runtime.select(.{ .input = &input, .public_event = public_event_wake, .command = command_wake, .frame = &frame })) {
             .input => |result| {
                 result catch return .session;
                 return .input;
@@ -271,6 +289,10 @@ pub const AgentSessionRuntimeHost = struct {
             .public_event => {
                 public_event_wake.reset();
                 self.drainSessionEvents(null) catch return .session;
+                return .session;
+            },
+            .command => {
+                self.wake_event.reset();
                 return .session;
             },
             .frame => return .frame,
@@ -415,6 +437,7 @@ pub const AgentSessionRuntimeHost = struct {
             self.session.destroyPromptRun(run);
             self.active_run = null;
             const prompt_text = self.active_prompt_text orelse "";
+            const operation_id = self.active_operation_id;
             self.session.afterPromptRunFinished(
                 self.active_overflow_count_before,
                 prompt_text,
@@ -422,15 +445,17 @@ pub const AgentSessionRuntimeHost = struct {
             ) catch |err| {
                 self.clearActivePromptText();
                 self.active_request_id = null;
+                self.active_operation_id = null;
                 try self.enqueueRejected(request_id, .invalid_command, @errorName(err));
+                try self.enqueueEvent(.{ .request_id = request_id, .operation_id = operation_id, .event = .{ .operation_finished = .{ .reason = .failed } } });
                 return;
             };
             self.clearActivePromptText();
-            const operation_id = self.active_operation_id;
+            const reason: client_protocol.OperationFinished.Reason = if (self.session.agent.state.status == .failed) .failed else .completed;
             self.active_request_id = null;
             self.active_operation_id = null;
             try self.drainSessionEvents(request_id);
-            try self.enqueueEvent(.{ .request_id = request_id, .operation_id = operation_id, .event = .{ .operation_finished = .{ .reason = .completed } } });
+            try self.enqueueEvent(.{ .request_id = request_id, .operation_id = operation_id, .event = .{ .operation_finished = .{ .reason = reason } } });
         }
     }
 
@@ -1157,4 +1182,74 @@ test "session runtime queues prompt while active" {
         if (owned.event == .queue_changed and owned.event.queue_changed.steering_count == 1) found_queue = true;
     }
     try std.testing.expect(found_queue);
+}
+
+test "retained ledger skips envelope that exceeds byte cap without allocating encoded size" {
+    var message = try client_protocol.EventText.init(std.testing.allocator, "0123456789abcdef");
+    defer message.deinit();
+    const envelope: client_protocol.EventEnvelope = .{
+        .seq = 1,
+        .event = .{ .rejected = .{ .code = .invalid_command, .message = message } },
+    };
+
+    const encoded = try encodeEnvelopeJsonBounded(std.testing.allocator, envelope, 8);
+    try std.testing.expect(encoded == null);
+}
+
+test "retained ledger terminal agent events do not carry message payloads" {
+    var ledger = try RetainedEventLedger.init(std.testing.allocator, 4, 256);
+    defer ledger.deinit();
+
+    var agent_end = try client_protocol.OwnedAgentEvent.init(std.testing.allocator, .agent_end);
+    defer agent_end.deinit();
+    try ledger.append(.{ .seq = 1, .event = .{ .agent_event = agent_end } });
+
+    var turn_end = try client_protocol.OwnedAgentEvent.init(std.testing.allocator, .turn_end);
+    defer turn_end.deinit();
+    try ledger.append(.{ .seq = 2, .event = .{ .agent_event = turn_end } });
+
+    try std.testing.expectEqual(@as(usize, 2), ledger.count);
+    for (0..ledger.count) |index| {
+        const entry = ledger.entryAt(index);
+        try std.testing.expect(entry.json.len < 128);
+        try std.testing.expect(std.mem.indexOf(u8, entry.json, "\"message\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.json, "assistantMessageEvent") == null);
+    }
+}
+
+test "retained ledger oversized encode evicts through seq and accepts later events" {
+    var ledger = try RetainedEventLedger.init(std.testing.allocator, 2, 128);
+    defer ledger.deinit();
+
+    try ledger.append(.{
+        .seq = 1,
+        .event = .{ .operation_finished = .{ .reason = .queue_cleared } },
+    });
+
+    var message = try client_protocol.EventText.init(std.testing.allocator, "x" ** 512);
+    defer message.deinit();
+    try ledger.append(.{
+        .seq = 2,
+        .event = .{ .rejected = .{ .code = .invalid_command, .message = message } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), ledger.count);
+    try std.testing.expectEqual(@as(client_protocol.EventSeq, 2), ledger.evicted_through_seq);
+    try std.testing.expectEqual(@as(usize, 0), ledger.total_bytes);
+
+    try ledger.append(.{
+        .seq = 3,
+        .event = .{ .operation_finished = .{ .reason = .completed } },
+    });
+
+    var gap = try ledger.buildReplay(std.testing.allocator, .{ .after = 1 });
+    defer gap.deinit(std.testing.allocator);
+    try std.testing.expect(gap.event == .replay_gap);
+    try std.testing.expectEqual(@as(client_protocol.EventSeq, 1), gap.event.replay_gap.requested_after);
+
+    var replay = try ledger.buildReplay(std.testing.allocator, .{ .after = 2 });
+    defer replay.deinit(std.testing.allocator);
+    try std.testing.expect(replay.event == .replay);
+    try std.testing.expectEqual(@as(usize, 1), replay.event.replay.events.len);
+    try std.testing.expectEqual(@as(client_protocol.EventSeq, 3), replay.event.replay.events[0].seq);
 }

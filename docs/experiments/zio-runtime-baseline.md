@@ -157,7 +157,7 @@ The OAuth callback/manual input race now has local zio coverage:
 Agent stream producers now have direct zio ownership coverage:
 
 - live prompt runs use an explicit 64-event bounded stream buffer.
-- producer success returns terminal messages through `runtime.EventPipe`.
+- producer success closes `runtime.EventPipe` with a bounded `agent_end` marker.
 - producer failure aborts the pipe and leaves no terminal result.
 - canceling a producer blocked on bounded event-pipe backpressure drains the
   zio task before stream deinit.

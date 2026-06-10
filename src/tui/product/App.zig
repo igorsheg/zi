@@ -54,6 +54,17 @@ pub const ProductApp = struct {
                 _ = try self.applyComposer(allocator, .clear);
                 return null;
             },
+            .clear_transcript => {
+                self.transcript.deinit(allocator);
+                self.transcript = .{};
+                self.transcript_scroll_rows = 0;
+                self.transcript_scroll_max_cache = 0;
+                self.transcript_scroll_max_revision = std.math.maxInt(u64);
+                self.transcript_scroll_max_width = 0;
+                self.transcript_scroll_max_visible_rows = std.math.maxInt(usize);
+                self.dirty = true;
+                return null;
+            },
             .insert_composer_text => |text| {
                 _ = try self.applyComposer(allocator, .{ .insert_utf8 = text });
                 return null;
@@ -219,6 +230,7 @@ pub const Command = union(enum) {
     resize: Size,
     input: substrate.input.InputEvent,
     clear_composer,
+    clear_transcript,
     insert_composer_text: []const u8,
     append_transcript: transcript.TranscriptAppend,
     tool_output_delta: ToolOutputDelta,
@@ -499,4 +511,17 @@ test "product app applies slot contributions atomically" {
         .id = 1,
     } }) == null);
     try std.testing.expectEqual(@as(usize, 0), app.slots.count(.composer_top_right));
+}
+
+test "product app clears transcript through command" {
+    var app = try ProductApp.init(20, 4);
+    defer app.deinit(std.testing.allocator);
+
+    try appendTestMessage(&app, .assistant, "hello");
+    try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
+
+    try std.testing.expect(try app.apply(std.testing.allocator, .clear_transcript) == null);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
+    try std.testing.expect(app.dirty);
 }

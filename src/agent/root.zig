@@ -608,11 +608,8 @@ pub fn copyAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) !AgentEve
             ),
         } },
         .message_end => |payload| .{ .message_end = .{ .message = try copyAgentMessage(allocator, payload.message) } },
-        .turn_end => |payload| .{ .turn_end = .{
-            .message = try copyAgentMessage(allocator, payload.message),
-            .tool_results = try copyToolResultMessages(allocator, payload.tool_results),
-        } },
-        .agent_end => |payload| .{ .agent_end = .{ .messages = try copyAgentMessages(allocator, payload.messages) } },
+        .turn_end => .turn_end,
+        .agent_end => .agent_end,
         .tool_execution_start => |payload| .{ .tool_execution_start = .{
             .tool_call_id = try allocator.dupe(u8, payload.tool_call_id),
             .tool_name = try allocator.dupe(u8, payload.tool_name),
@@ -641,15 +638,8 @@ pub fn deinitAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) void {
             ai.owned.deinitAssistantMessageEvent(allocator, payload.assistant_message_event);
         },
         .message_end => |payload| deinitAgentMessage(allocator, payload.message),
-        .turn_end => |payload| {
-            deinitAgentMessage(allocator, payload.message);
-            for (payload.tool_results) |message| deinitToolResultMessage(allocator, message);
-            allocator.free(payload.tool_results);
-        },
-        .agent_end => |payload| {
-            for (payload.messages) |message| deinitAgentMessage(allocator, message);
-            allocator.free(payload.messages);
-        },
+        .turn_end => {},
+        .agent_end => {},
         .tool_execution_start => |payload| {
             allocator.free(payload.tool_call_id);
             allocator.free(payload.tool_name);
@@ -672,24 +662,15 @@ pub fn deinitAgentEvent(allocator: std.mem.Allocator, event: AgentEvent) void {
 
 pub const AgentEvent = union(enum) {
     agent_start,
-    agent_end: AgentEnd,
+    agent_end,
     turn_start,
-    turn_end: TurnEnd,
+    turn_end,
     message_start: MessageEvent,
     message_update: MessageUpdate,
     message_end: MessageEvent,
     tool_execution_start: ToolExecutionStart,
     tool_execution_update: ToolExecutionUpdate,
     tool_execution_end: ToolExecutionEnd,
-
-    pub const AgentEnd = struct {
-        messages: []const AgentMessage,
-    };
-
-    pub const TurnEnd = struct {
-        message: AgentMessage,
-        tool_results: []const ai.ToolResultMessage,
-    };
 
     pub const MessageEvent = struct {
         message: AgentMessage,
@@ -723,16 +704,9 @@ pub const AgentEvent = union(enum) {
         try stringify.beginObject();
         switch (self) {
             .agent_start => try writeJsonField("type", stringify, "agent_start"),
-            .agent_end => |payload| {
-                try writeJsonField("type", stringify, "agent_end");
-                try writeJsonField("messages", stringify, payload.messages);
-            },
+            .agent_end => try writeJsonField("type", stringify, "agent_end"),
             .turn_start => try writeJsonField("type", stringify, "turn_start"),
-            .turn_end => |payload| {
-                try writeJsonField("type", stringify, "turn_end");
-                try writeJsonField("message", stringify, payload.message);
-                try writeJsonField("toolResults", stringify, payload.tool_results);
-            },
+            .turn_end => try writeJsonField("type", stringify, "turn_end"),
             .message_start => |payload| {
                 try writeJsonField("type", stringify, "message_start");
                 try writeJsonField("message", stringify, payload.message);
@@ -863,4 +837,13 @@ fn emptyModel() ai.Model {
         .context_window = 1,
         .max_tokens = 1,
     };
+}
+
+test "agent end is lifecycle marker without transcript payload" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    const event: AgentEvent = .agent_end;
+    try std.json.Stringify.value(event, .{}, &output.writer);
+    try std.testing.expectEqualStrings("{\"type\":\"agent_end\"}", output.written());
 }

@@ -381,7 +381,7 @@ fn finishPromptRun(self: *AgentSession, run: *LivePromptRun) !bool {
     const token = run.terminalToken().?;
     run.stream.awaitProducer() catch |err| {
         try self.settlePromptRunFailure(run, token, @errorName(err));
-        return err;
+        return false;
     };
     self.agent.finishRun();
     run.markSettled();
@@ -1155,7 +1155,7 @@ test "agent session cancel while running is observable until terminal event" {
     try std.testing.expectEqual(AgentSessionStatus.cancel_requested, session.status());
     try std.testing.expect(session.agent.signal().?.isRequested());
 
-    try session.agent.emitEvent(.{ .agent_end = .{ .messages = session.agent.state.messages } });
+    try session.agent.emitEvent(.agent_end);
     session.agent.finishRun();
 
     try std.testing.expectEqual(AgentSessionStatus.idle, session.status());

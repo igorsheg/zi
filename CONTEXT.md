@@ -37,7 +37,7 @@ src/
   cli/           process CLI parsing and concrete mode dispatch
   runtime/       zio-backed mechanism: process, select, bounded queues, cancel, process runner
   tui/           Zi-owned terminal UI (substrate/infra/primitive/product)
-  frontends/     concrete client adapters; print and RPC today
+  frontends/     concrete client adapters; print, RPC, and TUI today
   main.zig       process init -> runtime.Runtime -> cli.main
   root.zig       public package surface (ai, agent, coding_agent, runtime, tui)
 ```
@@ -56,9 +56,8 @@ coding_agent  depends on std, ai, agent, and runtime. no tui or concrete fronten
 two facts follow from this and are load-bearing:
 
 - `src/tui` is agent-agnostic. it never names a session, provider, tool, or
-  agent event. there is intentionally no TUI frontend adapter today; the next
-  one must be rebuilt from the client protocol, not revived as a compatibility
-  shim.
+  agent event. the concrete TUI adapter lives in `src/frontends/tui` and talks
+  to `coding_agent` only through the mailbox protocol.
 - `src/agent` is product-agnostic. it runs any tool set against any provider;
   Zi-specific policy lives in `coding_agent`.
 
@@ -76,7 +75,8 @@ main.zig
 
 cli/
   parses args, resolves a mode, dispatches concrete clients:
-    text         -> frontends/print        (--print, tty, or non-tty stdin)
+    interactive  -> frontends/tui          (default on a tty)
+    text         -> frontends/print        (--print or non-tty stdin)
     json         -> frontends/print (json) (--mode json)
     rpc          -> frontends/rpc          (--mode rpc)
     auth         -> coding_agent auth_mode login/logout/status
@@ -123,6 +123,10 @@ unbounded total conversation. `session_manager` is the in-memory view;
 `session_history_snapshot` produces a bounded snapshot (≈512 items) used to seed
 a frontend transcript on resume. the agent's in-memory transcript is runtime
 context, not the source of truth.
+
+The public boundary contracts are `docs/agent-event-contract.md` and
+`docs/mailbox-contract.md`. In short: events are facts, snapshots are state,
+owners hold state, and pipes do not smuggle unbounded state.
 
 ## agent runtime
 

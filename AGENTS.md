@@ -16,6 +16,10 @@ map is `CONTEXT.md`; this file is how to build inside it.
 - comments explain why. types, bounds, assertions, and tests enforce what.
 - one source of truth per fact. do not reimplement an encoding, equality, or
   policy that a lower layer already owns.
+- Events are facts.
+- Snapshots are state.
+- Owners hold state.
+- Pipes do not smuggle unbounded state.
 
 ## before adding a boundary
 

@@ -355,6 +355,9 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
         .message_end => |message_event| {
             self.clearStreamingMessage();
             try self.appendMessage(message_event.message);
+            if (message_event.message == .assistant and message_event.message.assistant.stop_reason == .error_) {
+                if (message_event.message.assistant.error_message) |message| self.state.status = .{ .failed = message };
+            }
         },
         .tool_execution_start => |tool_event| try self.addPendingToolCall(tool_event.tool_call_id),
         .tool_execution_update => {},
@@ -362,13 +365,7 @@ pub fn applyEvent(self: *Agent, event: agent.AgentEvent) !void {
             .running => |*running| running.pending_tool_calls.remove(tool_event.tool_call_id),
             else => {},
         },
-        .turn_end => |turn_end| {
-            if (turn_end.message == .assistant) {
-                if (turn_end.message.assistant.error_message) |message| {
-                    self.state.status = .{ .failed = message };
-                }
-            }
-        },
+        .turn_end => {},
         .agent_end => self.clearStreamingMessage(),
     }
 }
@@ -380,12 +377,11 @@ pub fn failRun(self: *Agent, token: runtime.CancelToken, message: []const u8) !v
 fn recordRunFailure(self: *Agent, token: runtime.CancelToken, message: []const u8) !void {
     const stop_reason: ai.StopReason = if (token.isRequested()) .aborted else .error_;
     const assistant = terminalAssistantMessage(self.state.model, stop_reason, message);
-    try self.appendMessage(.{ .assistant = assistant });
-    self.state.status = .{ .failed = message };
-    try self.emitEvent(try agent.copyAgentEvent(
-        self.message_arena.allocator(),
-        .{ .agent_end = .{ .messages = self.state.messages } },
-    ));
+    const terminal_message: agent.AgentMessage = .{ .assistant = assistant };
+    try self.emitEvent(.{ .message_start = .{ .message = terminal_message } });
+    try self.emitEvent(.{ .message_end = .{ .message = terminal_message } });
+    try self.emitEvent(.turn_end);
+    try self.emitEvent(.agent_end);
 }
 
 fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_message: ?[]const u8) ai.AssistantMessage {
@@ -533,6 +529,9 @@ pub const PendingMessageQueue = struct {
     }
 };
 
+const llm_tool_result_text_bytes_max: usize = 8 * 1024;
+const llm_tool_result_truncated_note = "\n[tool result truncated for model context]";
+
 fn defaultConvertToLlm(
     allocator: std.mem.Allocator,
     _: ?*anyopaque,
@@ -543,11 +542,79 @@ fn defaultConvertToLlm(
         switch (message) {
             .user => |user| try out.append(allocator, .{ .user = user }),
             .assistant => |assistant| try out.append(allocator, .{ .assistant = assistant }),
-            .tool_result => |tool_result| try out.append(allocator, .{ .tool_result = tool_result }),
+            .tool_result => |tool_result| try out.append(allocator, .{ .tool_result = try compactToolResultForLlm(allocator, tool_result) }),
             .custom => {},
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn compactToolResultForLlm(
+    allocator: std.mem.Allocator,
+    source: ai.ToolResultMessage,
+) std.mem.Allocator.Error!ai.ToolResultMessage {
+    const tool_call_id = try allocator.dupe(u8, source.tool_call_id);
+    errdefer allocator.free(tool_call_id);
+    const tool_name = try allocator.dupe(u8, source.tool_name);
+    errdefer allocator.free(tool_name);
+    const content = try allocator.alloc(ai.ToolResultContent, source.content.len);
+    errdefer allocator.free(content);
+    var initialized: usize = 0;
+    errdefer for (content[0..initialized]) |item| agent.deinitToolResultContent(allocator, item);
+    for (source.content, content) |item, *out| {
+        out.* = switch (item) {
+            .text => |text| .{ .text = .{ .text = try compactToolResultTextForLlm(allocator, text.text) } },
+            .image => .{ .text = .{ .text = try allocator.dupe(u8, "[tool image omitted from model context]") } },
+        };
+        initialized += 1;
+    }
+    return .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .content = content,
+        .details = null,
+        .is_error = source.is_error,
+        .timestamp = source.timestamp,
+    };
+}
+
+fn compactToolResultTextForLlm(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (text.len <= llm_tool_result_text_bytes_max) return allocator.dupe(u8, text);
+    const prefix_len = utf8PrefixLen(text, llm_tool_result_text_bytes_max - llm_tool_result_truncated_note.len);
+    const out = try allocator.alloc(u8, prefix_len + llm_tool_result_truncated_note.len);
+    @memcpy(out[0..prefix_len], text[0..prefix_len]);
+    @memcpy(out[prefix_len..], llm_tool_result_truncated_note);
+    return out;
+}
+
+fn utf8PrefixLen(value: []const u8, max_bytes: usize) usize {
+    if (value.len <= max_bytes) return value.len;
+    var end = max_bytes;
+    while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return end;
+}
+
+test "default llm conversion bounds tool result text" {
+    const large = "x" ** (llm_tool_result_text_bytes_max + 100);
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = large } }};
+    const source = [_]agent.AgentMessage{.{ .tool_result = .{
+        .tool_call_id = "call-1",
+        .tool_name = "find",
+        .content = &content,
+        .is_error = false,
+        .timestamp = 0,
+    } }};
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const converted = try defaultConvertToLlm(arena.allocator(), null, &source);
+
+    try std.testing.expectEqual(@as(usize, 1), converted.len);
+    try std.testing.expect(converted[0] == .tool_result);
+    const text = converted[0].tool_result.content[0].text.text;
+    try std.testing.expect(text.len <= llm_tool_result_text_bytes_max);
+    try std.testing.expect(std.mem.endsWith(u8, text, llm_tool_result_truncated_note));
+    try std.testing.expect(converted[0].tool_result.details == null);
 }
 
 fn defaultStream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
@@ -773,13 +840,30 @@ test "emit event reduces state before notifying listeners" {
     try std.testing.expect(self.state.streamingMessage() == null);
 }
 
+test "fail run emits terminal assistant error before agent end" {
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
+    var probe: ListenerProbe = .{};
+    _ = try self.subscribe(.{ .context = &probe, .call_fn = countListener });
+
+    const token = try self.beginRun();
+    try self.failRun(token, "OutOfMemory");
+    self.finishRun();
+
+    try std.testing.expectEqual(@as(usize, 4), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), self.state.messages.len);
+    try std.testing.expectEqualStrings("OutOfMemory", self.state.messages[0].assistant.error_message.?);
+    try std.testing.expectEqualStrings("OutOfMemory", self.state.errorMessage().?);
+}
+
 test "agent end enters settling until finish run" {
     var fixture = try TestAgent.init(.{});
     defer fixture.deinit();
     const self = &fixture.agent;
     _ = try self.beginRun();
 
-    try self.emitEvent(.{ .agent_end = .{ .messages = &.{} } });
+    try self.emitEvent(.agent_end);
 
     try std.testing.expect(self.state.isStreaming());
     try std.testing.expect(!self.waitForIdle());
@@ -810,7 +894,7 @@ test "tool execution events track pending tool calls" {
     try std.testing.expectEqual(@as(usize, 0), self.state.pendingToolCalls().len);
 }
 
-test "turn end records assistant error message" {
+test "message end records assistant error message" {
     var fixture = try TestAgent.init(.{});
     defer fixture.deinit();
     const self = &fixture.agent;
@@ -820,7 +904,7 @@ test "turn end records assistant error message" {
     message.assistant.error_message = "failed";
     message.assistant.stop_reason = .error_;
 
-    try self.emitEvent(.{ .turn_end = .{ .message = message, .tool_results = &.{} } });
+    try self.emitEvent(.{ .message_end = .{ .message = message } });
 
     try std.testing.expectEqualStrings("failed", self.state.errorMessage().?);
 }
@@ -888,4 +972,106 @@ test "continue from assistant drains follow up when steering empty" {
     try std.testing.expectEqual(@as(usize, 3), self.state.messages.len);
     try std.testing.expectEqualStrings("next", self.state.messages[1].user.content.string);
     try std.testing.expect(self.state.messages[2] == .assistant);
+}
+
+const large_tool_output_text = "x" ** (llm_tool_result_text_bytes_max + 4096);
+
+const LargeToolOutputProbe = struct {
+    calls: usize = 0,
+    saw_bounded_tool_result: bool = false,
+    saw_raw_large_tool_result: bool = false,
+};
+
+fn compactedToolResultProbeStream(context: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
+    const probe: *LargeToolOutputProbe = @ptrCast(@alignCast(context.?));
+    const call_index = probe.calls;
+    probe.calls += 1;
+
+    var stream = ai.AssistantMessageEventStream.initBuffered();
+    const sink = stream.sink();
+    if (call_index == 0) {
+        sink.endDone(request.io, .tool_use, largeToolCallAssistantMessage(request.model)) catch std.debug.assert(false);
+        return stream;
+    }
+
+    for (request.context.messages) |message| {
+        if (message != .tool_result) continue;
+        const text = message.tool_result.content[0].text.text;
+        if (text.len > llm_tool_result_text_bytes_max) probe.saw_raw_large_tool_result = true;
+        if (text.len <= llm_tool_result_text_bytes_max and
+            std.mem.endsWith(u8, text, llm_tool_result_truncated_note))
+        {
+            probe.saw_bounded_tool_result = true;
+        }
+    }
+
+    sink.endDone(request.io, .stop, emptyAssistantResponse(request.model)) catch std.debug.assert(false);
+    return stream;
+}
+
+fn largeToolCallAssistantMessage(model: ai.Model) ai.AssistantMessage {
+    return .{
+        .content = &.{.{ .tool_call = .{
+            .id = "large-1",
+            .name = "large_output",
+            .arguments = .{ .object = .empty },
+        } }},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+}
+
+fn emptyAssistantResponse(model: ai.Model) ai.AssistantMessage {
+    return .{
+        .content = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+}
+
+fn largeOutputTool(
+    allocator: std.mem.Allocator,
+    _: std.Io,
+    _: *runtime.Runtime,
+    _: ?*anyopaque,
+    _: runtime.CancelToken,
+    _: []const u8,
+    _: std.json.Value,
+    _: ?agent.AgentToolUpdateCallback,
+) anyerror!agent.ToolExecutionResult {
+    const content = try allocator.alloc(ai.ToolResultContent, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, large_tool_output_text) } };
+    return .{ .allocator = allocator, .result = .{ .content = content } };
+}
+
+test "agent compacts large tool results before next model request" {
+    var probe: LargeToolOutputProbe = .{};
+    const tool: agent.AgentTool = .{
+        .name = "large_output",
+        .description = "Emit large output",
+        .parameters = .{ .object = .empty },
+        .label = "Large output",
+        .execute = .{ .call_fn = largeOutputTool },
+        .execution_mode = .sequential,
+    };
+    var fixture = try TestAgent.init(.{
+        .tools = &.{tool},
+        .stream = ai.StreamFunction{ .context = &probe, .call_fn = compactedToolResultProbeStream },
+    });
+    defer fixture.deinit();
+
+    try fixture.agent.promptText("hello", &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expect(probe.saw_bounded_tool_result);
+    try std.testing.expect(!probe.saw_raw_large_tool_result);
 }

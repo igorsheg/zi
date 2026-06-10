@@ -629,7 +629,6 @@ fn emitFinalizedToolCall(
 
     const message = try createToolResultMessage(allocator, tool_call, finalized.result.view(), finalized.is_error);
     errdefer agent.deinitToolResultMessage(allocator, message);
-    try emit.emit(.{ .message_start = .{ .message = .{ .tool_result = message } } });
     try emit.emit(.{ .message_end = .{ .message = .{ .tool_result = message } } });
     try messages.append(allocator, message);
 }
