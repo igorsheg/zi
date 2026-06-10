@@ -15,7 +15,6 @@ const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
 const client_protocol = @import("client_protocol.zig");
 const session_manager = @import("session_manager.zig");
-const session_store = @import("session_store.zig");
 const system_prompt = @import("system_prompt.zig");
 const tool_registry = @import("tool_registry.zig");
 
@@ -36,7 +35,7 @@ system_prompt_text: []const u8,
 builtin_tools: *tool_registry.BuiltinTools,
 tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
-store: ?*session_store.SessionStore = null,
+store: ?*session_manager.SessionStore = null,
 agent: *agent_mod.Agent,
 event_drain: *event_drain_mod.EventDrain,
 lifecycle: Lifecycle = .accepting,
@@ -66,8 +65,8 @@ pub const Options = struct {
 /// A store either persists a fresh session or restores an existing one;
 /// the two cases cannot be combined, so they are one union field.
 pub const StoreOptions = union(enum) {
-    create: session_store.SessionStore,
-    restore: session_store.SessionStore,
+    create: session_manager.SessionStore,
+    restore: session_manager.SessionStore,
 };
 
 pub const QueuePromptKind = enum { steer, follow_up };
@@ -234,7 +233,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     errdefer manager.deinit();
 
     const store = if (options.store) |store_options| blk: {
-        const store_ptr = try allocator.create(session_store.SessionStore);
+        const store_ptr = try allocator.create(session_manager.SessionStore);
         store_ptr.* = switch (store_options) {
             .create, .restore => |provided| provided,
         };
@@ -770,7 +769,9 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
     );
     var entry_committed = false;
     errdefer if (!entry_committed) self.manager.deinitPreparedEntry(entry);
-    if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
+    if (self.store) |store| {
+        try store.appendEntry(self.allocator, self.io, entry, self.manager.lastEntryId());
+    }
     var result = try client_protocol.CompactionResult.init(self.allocator, entry.compaction);
     errdefer result.deinit(self.allocator);
     _ = self.manager.commitPreparedEntry(entry);
@@ -1290,14 +1291,11 @@ test "agent session auto compaction summarizes persists and replaces context" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
 
-    const store = try session_store.SessionStore.create(
-        std.testing.allocator,
-        std.testing.io,
-        tmp.dir,
-        "repo",
-        "session",
-        "2026-05-25T00:00:00Z",
-    );
+    const store = try session_manager.SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .cwd = "repo",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+    });
     var session = try initCompactionTestSession(task_runtime, tmp.dir, &provider, .{ .create = store });
     defer shutdownAndDeinit(&session);
 
@@ -1550,7 +1548,7 @@ test "agent session terminal policy runs when persistence fails" {
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo");
 
-    var store: session_store.SessionStore = .{
+    var store: session_manager.SessionStore = .{
         .dir = tmp.dir,
         .file_name = try std.testing.allocator.dupe(u8, "missing/session.jsonl"),
     };

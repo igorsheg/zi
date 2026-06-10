@@ -70,7 +70,7 @@ fn listRuntimeSessions(
         }
         directory_entries_seen += 1;
         if (entry.kind != .file) continue;
-        if (!isSessionLeafName(entry.name)) continue;
+        if (!paths_mod.isSessionFileLeafName(entry.name)) continue;
         const copy = try allocator.dupe(u8, entry.name);
         file_names.append(allocator, copy) catch |err| {
             allocator.free(copy);
@@ -95,7 +95,7 @@ pub fn selectRuntimeSession(
     options: SessionSelectionOptions,
 ) !?[]const u8 {
     if (options.explicit_file_name) |file_name| {
-        if (!isSessionLeafName(file_name)) return error.InvalidSessionFileName;
+        if (!paths_mod.isSessionFileLeafName(file_name)) return error.InvalidSessionFileName;
         const sessions_dir = try runtimeSessionsDir(allocator, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
@@ -156,12 +156,6 @@ fn runtimeSessionsDir(
         .cwd = options.cwd,
     };
     return paths.sessionsDirForCwd(allocator);
-}
-
-fn isSessionLeafName(file_name: []const u8) bool {
-    if (!std.mem.eql(u8, std.fs.path.basename(file_name), file_name)) return false;
-    if (!std.mem.endsWith(u8, file_name, ".jsonl")) return false;
-    return std.mem.indexOfScalar(u8, file_name, '_') != null;
 }
 
 fn newerSessionFile(_: void, left: []const u8, right: []const u8) bool {

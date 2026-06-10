@@ -78,6 +78,23 @@ pub const PersistencePaths = struct {
     }
 };
 
+/// One source of truth for the session file naming scheme:
+/// `<timestamp>_<session-id>.jsonl`. The store formats it; listing and
+/// resume validate it.
+pub fn sessionFileLeafName(
+    allocator: std.mem.Allocator,
+    timestamp: []const u8,
+    session_id: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}_{s}.jsonl", .{ timestamp, session_id });
+}
+
+pub fn isSessionFileLeafName(file_name: []const u8) bool {
+    if (!std.mem.eql(u8, std.fs.path.basename(file_name), file_name)) return false;
+    if (!std.mem.endsWith(u8, file_name, ".jsonl")) return false;
+    return std.mem.indexOfScalar(u8, file_name, '_') != null;
+}
+
 pub fn encodeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
     const capacity_max = std.math.add(usize, cwd.len, 4) catch return error.OutOfMemory;
     var out = mem.ByteBuilder.initBounded(allocator, capacity_max);

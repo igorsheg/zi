@@ -19,7 +19,6 @@ const queue_mirror = @import("queue_mirror.zig");
 const resources = @import("resources.zig");
 const runtime_services = @import("runtime_services.zig");
 const session_manager = @import("session_manager.zig");
-const session_store = @import("session_store.zig");
 const settings = @import("settings.zig");
 const skills = @import("skills.zig");
 const system_prompt = @import("system_prompt.zig");
@@ -35,7 +34,6 @@ test {
     _ = resources;
     _ = runtime_services;
     _ = session_manager;
-    _ = session_store;
     _ = settings;
     _ = skills;
     _ = system_prompt;

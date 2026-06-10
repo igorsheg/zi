@@ -1,13 +1,19 @@
-//! In-memory view of one session's durable history. History is linear:
-//! every entry's parent is the previous entry. The jsonl format still carries
-//! `parentId` per entry (one fact, written by us, validated on load); tree
-//! branching is deliberately not supported until a product feature needs it.
+//! Durable session history: entry shapes and bounds, the in-memory state,
+//! the jsonl encoding, and the file store. History is linear: every entry's
+//! parent is the previous entry, so `parentId` is an encoding detail of the
+//! jsonl line (written at append, validated on load), not stored state.
+//! Tree branching is deliberately not supported until a product feature
+//! needs it.
 
 const std = @import("std");
 const agent = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
+const paths_mod = @import("paths.zig");
+const runtime = @import("../runtime/root.zig");
 
 pub const current_session_version = 3;
+pub const max_session_file_bytes = 64 * 1024 * 1024;
+pub const max_session_line_bytes = 1024 * 1024;
 pub const max_session_entries = 16_384;
 pub const max_compaction_summary_bytes = 256 * 1024;
 pub const max_compaction_first_kept_entry_id_bytes = 128;
@@ -30,30 +36,16 @@ pub const CompactionSettings = struct {
 
 pub const SessionEntry = union(enum) {
     message: Message,
-    thinking_level_change: ThinkingLevelChange,
-    model_change: ModelChange,
     compaction: Compaction,
 
     pub const Base = struct {
         id: []const u8,
-        parent_id: ?[]const u8,
         timestamp: []const u8,
     };
 
     pub const Message = struct {
         base: Base,
         message: agent.AgentMessage,
-    };
-
-    pub const ThinkingLevelChange = struct {
-        base: Base,
-        thinking_level: []const u8,
-    };
-
-    pub const ModelChange = struct {
-        base: Base,
-        provider: []const u8,
-        model_id: []const u8,
     };
 
     pub const Compaction = struct {
@@ -66,12 +58,6 @@ pub const SessionEntry = union(enum) {
     pub fn id(self: SessionEntry) []const u8 {
         return switch (self) {
             inline else => |entry| entry.base.id,
-        };
-    }
-
-    pub fn parentId(self: SessionEntry) ?[]const u8 {
-        return switch (self) {
-            inline else => |entry| entry.base.parent_id,
         };
     }
 };
@@ -191,6 +177,7 @@ pub const SessionManager = struct {
     pub const Error = error{
         EntryLimitExceeded,
         EntryNotFound,
+        InvalidEntryId,
         AlreadyCompacted,
         NothingToCompact,
         CompactionSummaryTooLarge,
@@ -199,22 +186,13 @@ pub const SessionManager = struct {
         CompactionSettingsOutOfBounds,
     } || std.mem.Allocator.Error;
 
-    pub const LoadedEntry = struct {
-        id: []const u8,
-        parent_id: ?[]const u8,
-        timestamp: []const u8,
-        value: Value,
-
-        pub const Value = union(enum) {
-            message: agent.AgentMessage,
-            thinking_level_change: []const u8,
-            model_change: struct { provider: []const u8, model_id: []const u8 },
-            compaction: struct {
-                summary: []const u8,
-                first_kept_entry_id: []const u8,
-                tokens_before: u64,
-            },
-        };
+    const LoadedValue = union(enum) {
+        message: agent.AgentMessage,
+        compaction: struct {
+            summary: []const u8,
+            first_kept_entry_id: []const u8,
+            tokens_before: u64,
+        },
     };
 
     pub fn init(
@@ -252,45 +230,6 @@ pub const SessionManager = struct {
         try self.ensureAppendCapacity(1);
         const entry = try self.prepareMessageEntry(message, timestamp);
         errdefer self.deinitEntry(entry);
-        return self.commitPreparedEntry(entry);
-    }
-
-    pub fn appendThinkingLevelChange(
-        self: *SessionManager,
-        thinking_level: []const u8,
-        timestamp: []const u8,
-    ) Error![]const u8 {
-        try self.ensureAppendCapacity(1);
-        const base = try self.nextBase(timestamp);
-        const entry: SessionEntry = blk: {
-            errdefer self.deinitBase(base);
-            break :blk .{ .thinking_level_change = .{
-                .base = base,
-                .thinking_level = try self.allocator.dupe(u8, thinking_level),
-            } };
-        };
-        return self.commitPreparedEntry(entry);
-    }
-
-    pub fn appendModelChange(
-        self: *SessionManager,
-        provider: []const u8,
-        model_id: []const u8,
-        timestamp: []const u8,
-    ) Error![]const u8 {
-        try self.ensureAppendCapacity(1);
-        const base = try self.nextBase(timestamp);
-        const entry: SessionEntry = blk: {
-            errdefer self.deinitBase(base);
-            const provider_copy = try self.allocator.dupe(u8, provider);
-            errdefer self.allocator.free(provider_copy);
-            const model_id_copy = try self.allocator.dupe(u8, model_id);
-            break :blk .{ .model_change = .{
-                .base = base,
-                .provider = provider_copy,
-                .model_id = model_id_copy,
-            } };
-        };
         return self.commitPreparedEntry(entry);
     }
 
@@ -334,13 +273,26 @@ pub const SessionManager = struct {
         tokens_before: u64,
         timestamp: []const u8,
     ) Error!SessionEntry {
+        const base = try self.nextBase(timestamp);
+        errdefer self.deinitBase(base);
+        return self.compactionEntryFromParts(base, summary, first_kept_entry_id, tokens_before);
+    }
+
+    /// Single validation and construction site for compaction entries,
+    /// shared by the live prepare path and the load path. Takes ownership
+    /// of `base` only on success.
+    fn compactionEntryFromParts(
+        self: *SessionManager,
+        base: SessionEntry.Base,
+        summary: []const u8,
+        first_kept_entry_id: []const u8,
+        tokens_before: u64,
+    ) Error!SessionEntry {
         if (summary.len > max_compaction_summary_bytes) return error.CompactionSummaryTooLarge;
         if (first_kept_entry_id.len > max_compaction_first_kept_entry_id_bytes) {
             return error.CompactionFirstKeptEntryIdTooLarge;
         }
         if (self.findEntryIndex(first_kept_entry_id) == null) return error.CompactionFirstKeptEntryNotFound;
-        const base = try self.nextBase(timestamp);
-        errdefer self.deinitBase(base);
         const summary_copy = try self.allocator.dupe(u8, summary);
         errdefer self.allocator.free(summary_copy);
         const first_kept_entry_id_copy = try self.allocator.dupe(u8, first_kept_entry_id);
@@ -350,6 +302,11 @@ pub const SessionManager = struct {
             .first_kept_entry_id = first_kept_entry_id_copy,
             .tokens_before = tokens_before,
         } };
+    }
+
+    pub fn lastEntryId(self: *const SessionManager) ?[]const u8 {
+        if (self.entries.items.len == 0) return null;
+        return self.entries.items[self.entries.items.len - 1].id();
     }
 
     pub fn commitPreparedEntry(self: *SessionManager, entry: SessionEntry) []const u8 {
@@ -363,75 +320,51 @@ pub const SessionManager = struct {
         self.deinitEntry(entry);
     }
 
-    /// Append an entry loaded from disk. The parent link must point at the
-    /// previous entry: history is linear, and a duplicated or reordered line
-    /// breaks that chain and is rejected here.
-    pub fn appendLoadedEntry(self: *SessionManager, loaded: LoadedEntry) Error![]const u8 {
-        if (self.entries.items.len == max_session_entries) return error.EntryLimitExceeded;
-        const last_id: ?[]const u8 = if (self.entries.items.len == 0)
-            null
-        else
-            self.entries.items[self.entries.items.len - 1].id();
-        const linear = if (loaded.parent_id) |parent_id|
-            last_id != null and std.mem.eql(u8, parent_id, last_id.?)
+    /// Append one entry loaded from disk. The line's parent link must point
+    /// at the previous entry: history is linear, and a duplicated or
+    /// reordered line breaks that chain and is rejected. Ids are zi-written
+    /// `{x:0>8}` hex; anything else is interior corruption and is rejected
+    /// (a foreign id could collide with a generated one).
+    fn appendLoadedEntry(
+        self: *SessionManager,
+        id: []const u8,
+        parent_id: ?[]const u8,
+        timestamp: []const u8,
+        value: LoadedValue,
+    ) Error!void {
+        try self.ensureAppendCapacity(1);
+        const numeric_id = std.fmt.parseInt(u64, id, 16) catch return error.InvalidEntryId;
+        const last_id = self.lastEntryId();
+        const linear = if (parent_id) |parent|
+            last_id != null and std.mem.eql(u8, parent, last_id.?)
         else
             last_id == null;
         if (!linear) return error.EntryNotFound;
 
         const base: SessionEntry.Base = blk: {
-            const id = try self.allocator.dupe(u8, loaded.id);
-            errdefer self.allocator.free(id);
-            const parent_id = if (loaded.parent_id) |parent_id| try self.allocator.dupe(u8, parent_id) else null;
-            errdefer if (parent_id) |value| self.allocator.free(value);
-            const timestamp = try self.allocator.dupe(u8, loaded.timestamp);
-            break :blk .{ .id = id, .parent_id = parent_id, .timestamp = timestamp };
+            const id_copy = try self.allocator.dupe(u8, id);
+            errdefer self.allocator.free(id_copy);
+            break :blk .{ .id = id_copy, .timestamp = try self.allocator.dupe(u8, timestamp) };
         };
-        errdefer self.deinitBase(base);
-        const entry: SessionEntry = switch (loaded.value) {
+        var base_owned = true;
+        errdefer if (base_owned) self.deinitBase(base);
+        const entry: SessionEntry = switch (value) {
             .message => |message| .{ .message = .{
                 .base = base,
                 .message = try agent.copyAgentMessage(self.allocator, message),
             } },
-            .thinking_level_change => |thinking_level| .{ .thinking_level_change = .{
-                .base = base,
-                .thinking_level = try self.allocator.dupe(u8, thinking_level),
-            } },
-            .model_change => |model| blk: {
-                const provider = try self.allocator.dupe(u8, model.provider);
-                errdefer self.allocator.free(provider);
-                const model_id = try self.allocator.dupe(u8, model.model_id);
-                break :blk .{ .model_change = .{
-                    .base = base,
-                    .provider = provider,
-                    .model_id = model_id,
-                } };
-            },
-            .compaction => |compaction| blk: {
-                if (compaction.summary.len > max_compaction_summary_bytes) return error.CompactionSummaryTooLarge;
-                if (compaction.first_kept_entry_id.len > max_compaction_first_kept_entry_id_bytes) {
-                    return error.CompactionFirstKeptEntryIdTooLarge;
-                }
-                if (self.findEntryIndex(compaction.first_kept_entry_id) == null) {
-                    return error.CompactionFirstKeptEntryNotFound;
-                }
-                const summary = try self.allocator.dupe(u8, compaction.summary);
-                errdefer self.allocator.free(summary);
-                const first_kept_entry_id = try self.allocator.dupe(u8, compaction.first_kept_entry_id);
-                break :blk .{ .compaction = .{
-                    .base = base,
-                    .summary = summary,
-                    .first_kept_entry_id = first_kept_entry_id,
-                    .tokens_before = compaction.tokens_before,
-                } };
-            },
+            .compaction => |compaction| try self.compactionEntryFromParts(
+                base,
+                compaction.summary,
+                compaction.first_kept_entry_id,
+                compaction.tokens_before,
+            ),
         };
-        errdefer self.deinitEntry(entry);
-        try self.entries.append(self.allocator, entry);
-        if (std.fmt.parseInt(u64, loaded.id, 16)) |numeric_id| {
-            const after_loaded_id = if (numeric_id == std.math.maxInt(u64)) numeric_id else numeric_id + 1;
-            self.next_id = @max(self.next_id, after_loaded_id);
-        } else |_| {}
-        return entry.id();
+        base_owned = false;
+        // Capacity was reserved above, so this append cannot fail and the
+        // entry has exactly one owner from here.
+        self.entries.appendAssumeCapacity(entry);
+        self.next_id = @max(self.next_id, numeric_id +| 1);
     }
 
     /// Project the entries into the agent's runtime context: the latest
@@ -613,7 +546,6 @@ pub const SessionManager = struct {
                 },
                 .custom => |custom| custom.kind.len,
             },
-            else => 0,
         };
         return (chars + 3) / 4;
     }
@@ -633,17 +565,8 @@ pub const SessionManager = struct {
         if (self.next_id == std.math.maxInt(u64)) return error.EntryLimitExceeded;
         const id = try std.fmt.allocPrint(self.allocator, "{x:0>8}", .{self.next_id});
         errdefer self.allocator.free(id);
-        const parent_id = if (self.entries.items.len == 0)
-            null
-        else
-            try self.allocator.dupe(u8, self.entries.items[self.entries.items.len - 1].id());
-        errdefer if (parent_id) |value| self.allocator.free(value);
         const timestamp_copy = try self.allocator.dupe(u8, timestamp);
-        return .{
-            .id = id,
-            .parent_id = parent_id,
-            .timestamp = timestamp_copy,
-        };
+        return .{ .id = id, .timestamp = timestamp_copy };
     }
 
     fn deinitEntry(self: *SessionManager, entry: SessionEntry) void {
@@ -651,15 +574,6 @@ pub const SessionManager = struct {
             .message => |message| {
                 self.deinitBase(message.base);
                 agent.deinitAgentMessage(self.allocator, message.message);
-            },
-            .thinking_level_change => |thinking| {
-                self.deinitBase(thinking.base);
-                self.allocator.free(thinking.thinking_level);
-            },
-            .model_change => |model| {
-                self.deinitBase(model.base);
-                self.allocator.free(model.provider);
-                self.allocator.free(model.model_id);
             },
             .compaction => |compaction| {
                 self.deinitBase(compaction.base);
@@ -671,10 +585,514 @@ pub const SessionManager = struct {
 
     fn deinitBase(self: *SessionManager, base: SessionEntry.Base) void {
         self.allocator.free(base.id);
-        if (base.parent_id) |parent_id| self.allocator.free(parent_id);
         self.allocator.free(base.timestamp);
     }
 };
+
+/// The jsonl file behind one session: header line, then one entry per line.
+/// Append-only after creation; load truncates a torn trailing line so the
+/// next append cannot glue onto it.
+pub const SessionStore = struct {
+    dir: std.Io.Dir,
+    file_name: []const u8,
+
+    pub const CreateOptions = struct {
+        /// Directory for the session file, created if missing; null writes
+        /// the file directly into `dir`.
+        sessions_dir: ?[]const u8 = null,
+        cwd: []const u8,
+        session_id: []const u8,
+        timestamp: []const u8,
+    };
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        options: CreateOptions,
+    ) !SessionStore {
+        const file_name = blk: {
+            const leaf_name = try paths_mod.sessionFileLeafName(allocator, options.timestamp, options.session_id);
+            const sessions_dir = options.sessions_dir orelse break :blk leaf_name;
+            defer allocator.free(leaf_name);
+            try dir.createDirPath(io, sessions_dir);
+            break :blk try std.fs.path.join(allocator, &.{ sessions_dir, leaf_name });
+        };
+        errdefer allocator.free(file_name);
+        const line = try formatHeaderLine(allocator, .{
+            .id = options.session_id,
+            .timestamp = options.timestamp,
+            .cwd = options.cwd,
+        });
+        defer allocator.free(line);
+        try writeFileAtomic(allocator, io, dir, file_name, line);
+        return .{ .dir = dir, .file_name = file_name };
+    }
+
+    pub fn deinit(self: *SessionStore, allocator: std.mem.Allocator) void {
+        allocator.free(self.file_name);
+        self.* = undefined;
+    }
+
+    /// Append one entry line. `parent_id` is the id of the previous entry
+    /// (null for the first): the parent link is derived at the encoding
+    /// boundary, not stored in the entry.
+    pub fn appendEntry(
+        self: SessionStore,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        entry: SessionEntry,
+        parent_id: ?[]const u8,
+    ) !void {
+        const line = try formatEntryLine(allocator, entry, parent_id);
+        defer allocator.free(line);
+        try appendLine(io, self.dir, self.file_name, line);
+    }
+
+    pub fn load(self: SessionStore, allocator: std.mem.Allocator, io: std.Io) !SessionManager {
+        const data = try self.dir.readFileAlloc(io, self.file_name, allocator, .limited(max_session_file_bytes));
+        defer allocator.free(data);
+        var parsed = try parseSession(allocator, data);
+        if (parsed.repair_length) |length| {
+            // The dropped torn line is still on disk. Truncate it away now,
+            // or the next append glues onto the fragment and corrupts both
+            // lines -- turning a recoverable tail into fatal interior damage.
+            self.truncateTo(io, length) catch |err| {
+                parsed.manager.deinit();
+                return err;
+            };
+        }
+        return parsed.manager;
+    }
+
+    fn truncateTo(self: SessionStore, io: std.Io, length: u64) !void {
+        const file = try self.dir.openFile(io, self.file_name, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setLength(io, length);
+    }
+};
+
+fn writeFileAtomic(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    file_name: []const u8,
+    data: []const u8,
+) !void {
+    const tmp_leaf = try std.fmt.allocPrint(allocator, ".{s}.tmp", .{std.fs.path.basename(file_name)});
+    defer allocator.free(tmp_leaf);
+    const tmp_name = if (std.fs.path.dirname(file_name)) |parent|
+        try std.fs.path.join(allocator, &.{ parent, tmp_leaf })
+    else
+        try allocator.dupe(u8, tmp_leaf);
+    defer allocator.free(tmp_name);
+    try dir.writeFile(io, .{ .sub_path = tmp_name, .data = data });
+    try std.Io.Dir.rename(dir, tmp_name, dir, file_name, io);
+}
+
+fn appendLine(io: std.Io, dir: std.Io.Dir, file_name: []const u8, line: []const u8) !void {
+    if (line.len > max_session_line_bytes) return error.LineTooLong;
+    const file = try dir.openFile(io, file_name, .{ .mode = .read_write });
+    defer file.close(io);
+    const offset = try file.length(io);
+    // Keep the write bound coherent with the load bound: a session this
+    // store writes must remain loadable by this store.
+    if (offset + line.len > max_session_file_bytes) return error.SessionFileFull;
+    try file.writePositionalAll(io, line, offset);
+}
+
+fn formatHeaderLine(allocator: std.mem.Allocator, header: SessionHeader) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("{\"type\":\"session\",\"version\":");
+    try writer.writer.print("{}", .{header.version});
+    try writer.writer.writeAll(",\"id\":");
+    try std.json.Stringify.value(header.id, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"timestamp\":");
+    try std.json.Stringify.value(header.timestamp, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"cwd\":");
+    try std.json.Stringify.value(header.cwd, .{}, &writer.writer);
+    if (header.parent_session) |parent_session| {
+        try writer.writer.writeAll(",\"parentSession\":");
+        try std.json.Stringify.value(parent_session, .{}, &writer.writer);
+    }
+    try writer.writer.writeAll("}\n");
+    return writer.toOwnedSlice();
+}
+
+fn formatEntryLine(allocator: std.mem.Allocator, entry: SessionEntry, parent_id: ?[]const u8) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    switch (entry) {
+        .message => |message| {
+            try writeEntryBase("message", &writer.writer, message.base, parent_id);
+            try writer.writer.writeAll(",\"message\":");
+            try writeAgentMessage(&writer.writer, message.message);
+        },
+        .compaction => |compaction| {
+            try writeEntryBase("compaction", &writer.writer, compaction.base, parent_id);
+            try writer.writer.writeAll(",\"summary\":");
+            try std.json.Stringify.value(compaction.summary, .{}, &writer.writer);
+            try writer.writer.writeAll(",\"firstKeptEntryId\":");
+            try std.json.Stringify.value(compaction.first_kept_entry_id, .{}, &writer.writer);
+            try writer.writer.writeAll(",\"tokensBefore\":");
+            try writer.writer.print("{}", .{compaction.tokens_before});
+        },
+    }
+    try writer.writer.writeAll("}\n");
+    return writer.toOwnedSlice();
+}
+
+fn writeEntryBase(
+    comptime entry_type: []const u8,
+    writer: *std.Io.Writer,
+    base: SessionEntry.Base,
+    parent_id: ?[]const u8,
+) !void {
+    try writer.writeAll("{\"type\":\"");
+    try writer.writeAll(entry_type);
+    try writer.writeAll("\",\"id\":");
+    try std.json.Stringify.value(base.id, .{}, writer);
+    try writer.writeAll(",\"parentId\":");
+    if (parent_id) |parent| {
+        try std.json.Stringify.value(parent, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"timestamp\":");
+    try std.json.Stringify.value(base.timestamp, .{}, writer);
+}
+
+fn writeAgentMessage(writer: *std.Io.Writer, message: agent.AgentMessage) !void {
+    switch (message) {
+        .custom => |custom| {
+            try writer.writeAll("{\"role\":\"custom\",\"customType\":");
+            try std.json.Stringify.value(custom.kind, .{}, writer);
+            try writer.writeAll(",\"payload\":");
+            try std.json.Stringify.value(custom.payload, .{}, writer);
+            try writer.print(",\"timestamp\":{}", .{custom.timestamp});
+            try writer.writeAll("}");
+        },
+        else => try std.json.Stringify.value(message, .{}, writer),
+    }
+}
+
+const ParsedSession = struct {
+    manager: SessionManager,
+    /// When a torn trailing line was dropped: byte length of the good
+    /// prefix. The file must be truncated to it before any append.
+    repair_length: ?u64,
+};
+
+fn parseSession(allocator: std.mem.Allocator, data: []const u8) !ParsedSession {
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    const header_line = lines.next() orelse return error.MissingHeader;
+    var parsed_header = try runtime.JsonOwned(std.json.Value).parseJson(allocator, header_line, .{});
+    defer parsed_header.deinit();
+    const header = try jsonObject(parsed_header.value, error.InvalidHeader);
+    if (!std.mem.eql(u8, try jsonString(header.get("type") orelse return error.InvalidHeader), "session")) {
+        return error.InvalidHeader;
+    }
+    const version = try jsonInteger(header.get("version") orelse return error.InvalidHeader);
+    if (version != current_session_version) return error.UnsupportedVersion;
+    var manager = try SessionManager.init(
+        allocator,
+        try jsonString(header.get("cwd") orelse return error.InvalidHeader),
+        try jsonString(header.get("id") orelse return error.InvalidHeader),
+        try jsonString(header.get("timestamp") orelse return error.InvalidHeader),
+    );
+    errdefer manager.deinit();
+    if (header.get("parentSession")) |parent_session| {
+        manager.header.parent_session = try allocator.dupe(u8, try jsonString(parent_session));
+    }
+
+    var good_length: usize = @min(header_line.len + 1, data.len);
+    while (lines.next()) |line| {
+        const line_end = (@intFromPtr(line.ptr) - @intFromPtr(data.ptr)) + line.len;
+        if (std.mem.trim(u8, line, " \t\r").len == 0) {
+            good_length = @min(line_end + 1, data.len);
+            continue;
+        }
+        if (line.len > max_session_line_bytes) return error.LineTooLong;
+        parseEntryLine(allocator, &manager, line) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            // A failing final line is a torn append from a crash: drop it
+            // and keep what loaded. Interior corruption stays fatal.
+            if (std.mem.trim(u8, lines.rest(), " \t\r\n").len == 0) {
+                return .{ .manager = manager, .repair_length = good_length };
+            }
+            return err;
+        };
+        good_length = @min(line_end + 1, data.len);
+    }
+    return .{ .manager = manager, .repair_length = null };
+}
+
+fn parseEntryLine(allocator: std.mem.Allocator, manager: *SessionManager, line: []const u8) !void {
+    var parsed = try runtime.JsonOwned(std.json.Value).parseJson(allocator, line, .{});
+    defer parsed.deinit();
+    const object = try jsonObject(parsed.value, error.InvalidEntry);
+    const entry_type = try jsonString(object.get("type") orelse return error.InvalidEntry);
+    const id = try jsonString(object.get("id") orelse return error.InvalidEntry);
+    const parent_id = try jsonOptionalString(object.get("parentId") orelse return error.InvalidEntry);
+    const timestamp = try jsonString(object.get("timestamp") orelse return error.InvalidEntry);
+    if (std.mem.eql(u8, entry_type, "message")) {
+        const message = try parseMessage(allocator, object.get("message") orelse return error.InvalidEntry);
+        defer deinitParsedMessageContainers(allocator, message);
+        try manager.appendLoadedEntry(id, parent_id, timestamp, .{ .message = message });
+    } else if (std.mem.eql(u8, entry_type, "compaction")) {
+        try manager.appendLoadedEntry(id, parent_id, timestamp, .{ .compaction = .{
+            .summary = try jsonString(object.get("summary") orelse return error.InvalidEntry),
+            .first_kept_entry_id = try jsonString(object.get("firstKeptEntryId") orelse return error.InvalidEntry),
+            .tokens_before = try jsonNonNegativeInteger(object.get("tokensBefore") orelse return error.InvalidEntry),
+        } });
+    } else {
+        return error.InvalidEntry;
+    }
+}
+
+fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !agent.AgentMessage {
+    const object = try jsonObject(value, error.InvalidEntry);
+    const role = try jsonString(object.get("role") orelse return error.InvalidEntry);
+    if (std.mem.eql(u8, role, "user")) {
+        const raw_content = object.get("content") orelse return error.InvalidEntry;
+        const content: ai.UserMessage.Content = switch (raw_content) {
+            .string => |text| .{ .string = text },
+            .array => |array| .{ .blocks = try parseUserContent(allocator, array.items) },
+            else => return error.InvalidEntry,
+        };
+        errdefer switch (content) {
+            .string => {},
+            .blocks => |blocks| allocator.free(blocks),
+        };
+        return .{ .user = .{
+            .content = content,
+            .timestamp = try jsonInteger(object.get("timestamp") orelse return error.InvalidEntry),
+        } };
+    }
+    if (std.mem.eql(u8, role, "assistant")) {
+        const content = try parseAssistantContent(
+            allocator,
+            try jsonArray(object.get("content") orelse return error.InvalidEntry),
+        );
+        errdefer allocator.free(content);
+        return .{ .assistant = .{
+            .content = content,
+            .api = try jsonString(object.get("api") orelse return error.InvalidEntry),
+            .provider = try jsonString(object.get("provider") orelse return error.InvalidEntry),
+            .model = try jsonString(object.get("model") orelse return error.InvalidEntry),
+            .response_id = try jsonOptionalFieldString(object.get("responseId")),
+            .usage = try parseUsage(object.get("usage") orelse return error.InvalidEntry),
+            .stop_reason = try parseStopReason(
+                try jsonString(object.get("stopReason") orelse return error.InvalidEntry),
+            ),
+            .error_message = try jsonOptionalFieldString(object.get("errorMessage")),
+            .timestamp = try jsonInteger(object.get("timestamp") orelse return error.InvalidEntry),
+        } };
+    }
+    if (std.mem.eql(u8, role, "toolResult")) {
+        const content = try parseToolResultContent(
+            allocator,
+            try jsonArray(object.get("content") orelse return error.InvalidEntry),
+        );
+        errdefer allocator.free(content);
+        return .{ .tool_result = .{
+            .tool_call_id = try jsonString(object.get("toolCallId") orelse return error.InvalidEntry),
+            .tool_name = try jsonString(object.get("toolName") orelse return error.InvalidEntry),
+            .content = content,
+            .details = object.get("details"),
+            .is_error = try jsonBool(object.get("isError") orelse return error.InvalidEntry),
+            .timestamp = try jsonInteger(object.get("timestamp") orelse return error.InvalidEntry),
+        } };
+    }
+    if (std.mem.eql(u8, role, "custom")) {
+        return .{ .custom = .{
+            .kind = try jsonString(object.get("customType") orelse return error.InvalidEntry),
+            .payload = object.get("payload") orelse return error.InvalidEntry,
+            .timestamp = try jsonInteger(object.get("timestamp") orelse return error.InvalidEntry),
+        } };
+    }
+    return error.InvalidEntry;
+}
+
+fn parseUserContent(allocator: std.mem.Allocator, values: []const std.json.Value) ![]const ai.UserContent {
+    const out = try allocator.alloc(ai.UserContent, values.len);
+    errdefer allocator.free(out);
+    for (values, out) |value, *content| {
+        const object = try jsonObject(value, error.InvalidEntry);
+        const block_type = try jsonString(object.get("type") orelse return error.InvalidEntry);
+        if (std.mem.eql(u8, block_type, "text")) {
+            content.* = .{ .text = .{
+                .text = try jsonString(object.get("text") orelse return error.InvalidEntry),
+                .text_signature = try jsonOptionalFieldString(object.get("textSignature")),
+            } };
+        } else if (std.mem.eql(u8, block_type, "image")) {
+            content.* = .{ .image = try parseImageContent(object) };
+        } else {
+            return error.InvalidEntry;
+        }
+    }
+    return out;
+}
+
+fn parseAssistantContent(allocator: std.mem.Allocator, values: []const std.json.Value) ![]const ai.AssistantContent {
+    const out = try allocator.alloc(ai.AssistantContent, values.len);
+    errdefer allocator.free(out);
+    for (values, out) |value, *content| {
+        const object = try jsonObject(value, error.InvalidEntry);
+        const block_type = try jsonString(object.get("type") orelse return error.InvalidEntry);
+        if (std.mem.eql(u8, block_type, "text")) {
+            content.* = .{ .text = .{
+                .text = try jsonString(object.get("text") orelse return error.InvalidEntry),
+                .text_signature = try jsonOptionalFieldString(object.get("textSignature")),
+            } };
+        } else if (std.mem.eql(u8, block_type, "thinking")) {
+            content.* = .{ .thinking = .{
+                .thinking = try jsonString(object.get("thinking") orelse return error.InvalidEntry),
+                .thinking_signature = try jsonOptionalFieldString(object.get("thinkingSignature")),
+                .redacted = if (object.get("redacted")) |redacted| try jsonBool(redacted) else false,
+            } };
+        } else if (std.mem.eql(u8, block_type, "toolCall")) {
+            content.* = .{ .tool_call = .{
+                .id = try jsonString(object.get("id") orelse return error.InvalidEntry),
+                .name = try jsonString(object.get("name") orelse return error.InvalidEntry),
+                .arguments = object.get("arguments") orelse return error.InvalidEntry,
+                .thought_signature = try jsonOptionalFieldString(object.get("thoughtSignature")),
+            } };
+        } else {
+            return error.InvalidEntry;
+        }
+    }
+    return out;
+}
+
+fn parseToolResultContent(allocator: std.mem.Allocator, values: []const std.json.Value) ![]const ai.ToolResultContent {
+    const out = try allocator.alloc(ai.ToolResultContent, values.len);
+    errdefer allocator.free(out);
+    for (values, out) |value, *content| {
+        const object = try jsonObject(value, error.InvalidEntry);
+        const block_type = try jsonString(object.get("type") orelse return error.InvalidEntry);
+        if (std.mem.eql(u8, block_type, "text")) {
+            content.* = .{ .text = .{
+                .text = try jsonString(object.get("text") orelse return error.InvalidEntry),
+                .text_signature = try jsonOptionalFieldString(object.get("textSignature")),
+            } };
+        } else if (std.mem.eql(u8, block_type, "image")) {
+            content.* = .{ .image = try parseImageContent(object) };
+        } else {
+            return error.InvalidEntry;
+        }
+    }
+    return out;
+}
+
+fn parseImageContent(object: std.json.ObjectMap) !ai.ImageContent {
+    return .{
+        .data = try jsonString(object.get("data") orelse return error.InvalidEntry),
+        .mime_type = try jsonString(object.get("mimeType") orelse return error.InvalidEntry),
+    };
+}
+
+fn parseUsage(value: std.json.Value) !ai.Usage {
+    const object = try jsonObject(value, error.InvalidEntry);
+    const cost = try jsonObject(object.get("cost") orelse return error.InvalidEntry, error.InvalidEntry);
+    return .{
+        .input = try jsonNonNegativeInteger(object.get("input") orelse return error.InvalidEntry),
+        .output = try jsonNonNegativeInteger(object.get("output") orelse return error.InvalidEntry),
+        .cache_read = try jsonNonNegativeInteger(object.get("cacheRead") orelse return error.InvalidEntry),
+        .cache_write = try jsonNonNegativeInteger(object.get("cacheWrite") orelse return error.InvalidEntry),
+        .total_tokens = try jsonNonNegativeInteger(object.get("totalTokens") orelse return error.InvalidEntry),
+        .cost = .{
+            .input = try jsonFloat(cost.get("input") orelse return error.InvalidEntry),
+            .output = try jsonFloat(cost.get("output") orelse return error.InvalidEntry),
+            .cache_read = try jsonFloat(cost.get("cacheRead") orelse return error.InvalidEntry),
+            .cache_write = try jsonFloat(cost.get("cacheWrite") orelse return error.InvalidEntry),
+            .total = try jsonFloat(cost.get("total") orelse return error.InvalidEntry),
+        },
+    };
+}
+
+fn parseStopReason(value: []const u8) !ai.StopReason {
+    if (std.mem.eql(u8, value, "stop")) return .stop;
+    if (std.mem.eql(u8, value, "length")) return .length;
+    if (std.mem.eql(u8, value, "toolUse")) return .tool_use;
+    if (std.mem.eql(u8, value, "error")) return .error_;
+    if (std.mem.eql(u8, value, "aborted")) return .aborted;
+    return error.InvalidEntry;
+}
+
+fn deinitParsedMessageContainers(allocator: std.mem.Allocator, message: agent.AgentMessage) void {
+    switch (message) {
+        .user => |user| switch (user.content) {
+            .string => {},
+            .blocks => |blocks| allocator.free(blocks),
+        },
+        .assistant => |assistant| allocator.free(assistant.content),
+        .tool_result => |tool_result| allocator.free(tool_result.content),
+        .custom => {},
+    }
+}
+
+fn jsonObject(value: std.json.Value, err: anyerror) !std.json.ObjectMap {
+    return switch (value) {
+        .object => |object| object,
+        else => err,
+    };
+}
+
+fn jsonArray(value: std.json.Value) ![]const std.json.Value {
+    return switch (value) {
+        .array => |array| array.items,
+        else => error.InvalidEntry,
+    };
+}
+
+fn jsonOptionalFieldString(value: ?std.json.Value) !?[]const u8 {
+    return if (value) |actual| try jsonOptionalString(actual) else null;
+}
+
+fn jsonInteger(value: std.json.Value) !i64 {
+    return switch (value) {
+        .integer => |actual| actual,
+        else => error.InvalidEntry,
+    };
+}
+
+fn jsonNonNegativeInteger(value: std.json.Value) !u64 {
+    const integer = try jsonInteger(value);
+    if (integer < 0) return error.InvalidEntry;
+    return @intCast(integer);
+}
+
+fn jsonBool(value: std.json.Value) !bool {
+    return switch (value) {
+        .bool => |actual| actual,
+        else => error.InvalidEntry,
+    };
+}
+
+fn jsonFloat(value: std.json.Value) !f64 {
+    return switch (value) {
+        .float => |actual| actual,
+        .integer => |actual| @floatFromInt(actual),
+        else => error.InvalidEntry,
+    };
+}
+
+fn jsonOptionalString(value: std.json.Value) !?[]const u8 {
+    return switch (value) {
+        .null => null,
+        .string => |text| text,
+        else => error.InvalidEntry,
+    };
+}
+
+fn jsonString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        else => error.InvalidEntry,
+    };
+}
 
 fn userMessage(text: []const u8) agent.AgentMessage {
     return .{ .user = .{ .content = .{ .string = text }, .timestamp = 0 } };
@@ -689,17 +1107,17 @@ test "new session stores header metadata" {
     try std.testing.expectEqualStrings("/repo", manager.header.cwd);
 }
 
-test "append entries link linearly to the previous entry" {
+test "append entries assign sequential ids" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
+    try std.testing.expectEqual(@as(?[]const u8, null), manager.lastEntryId());
     const first = try manager.appendMessage(userMessage("one"), "t1");
-    _ = try manager.appendThinkingLevelChange("high", "t2");
-    _ = try manager.appendModelChange("openai", "gpt", "t3");
+    _ = try manager.appendMessage(userMessage("two"), "t2");
 
-    try std.testing.expect(manager.entries.items[0].parentId() == null);
-    try std.testing.expectEqualStrings(first, manager.entries.items[1].parentId().?);
-    try std.testing.expectEqualStrings("00000002", manager.entries.items[2].parentId().?);
+    try std.testing.expectEqualStrings("00000001", first);
+    try std.testing.expectEqualStrings("00000002", manager.entries.items[1].id());
+    try std.testing.expectEqualStrings("00000002", manager.lastEntryId().?);
 }
 
 test "append compaction stores durable summary entry with bounds" {
@@ -742,21 +1160,6 @@ test "prepared message entry does not mutate entries before commit" {
     committed = true;
     try std.testing.expectEqualStrings("00000001", id);
     try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
-}
-
-test "context messages project message entries only" {
-    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
-    defer manager.deinit();
-
-    _ = try manager.appendModelChange("openai", "gpt", "t1");
-    _ = try manager.appendThinkingLevelChange("medium", "t2");
-    _ = try manager.appendMessage(userMessage("hello"), "t3");
-
-    const messages = try manager.contextMessages(std.testing.allocator);
-    defer SessionManager.deinitContextMessages(std.testing.allocator, messages);
-
-    try std.testing.expectEqual(@as(usize, 1), messages.len);
-    try std.testing.expectEqualStrings("hello", messages[0].user.content.string);
 }
 
 test "context messages project latest compaction summary then kept messages" {
@@ -940,51 +1343,36 @@ test "loaded entries preserve ids and continue id generation" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
-    _ = try manager.appendLoadedEntry(.{
-        .id = "0000000a",
-        .parent_id = null,
-        .timestamp = "t1",
-        .value = .{ .message = userMessage("root") },
-    });
-    _ = try manager.appendLoadedEntry(.{
-        .id = "0000000b",
-        .parent_id = "0000000a",
-        .timestamp = "t2",
-        .value = .{ .compaction = .{
-            .summary = "summary",
-            .first_kept_entry_id = "0000000a",
-            .tokens_before = 100,
-        } },
-    });
+    try manager.appendLoadedEntry("0000000a", null, "t1", .{ .message = userMessage("root") });
+    try manager.appendLoadedEntry("0000000b", "0000000a", "t2", .{ .compaction = .{
+        .summary = "summary",
+        .first_kept_entry_id = "0000000a",
+        .tokens_before = 100,
+    } });
     _ = try manager.appendMessage(userMessage("next"), "t3");
 
     try std.testing.expectEqualStrings("0000000c", manager.entries.items[2].id());
-    try std.testing.expectEqualStrings("0000000b", manager.entries.items[2].parentId().?);
 }
 
-test "loaded entries reject non linear parent links" {
+test "loaded entries reject non linear parent links and foreign ids" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
-    _ = try manager.appendLoadedEntry(.{
-        .id = "00000001",
-        .parent_id = null,
-        .timestamp = "t1",
-        .value = .{ .message = userMessage("root") },
-    });
+    try manager.appendLoadedEntry("00000001", null, "t1", .{ .message = userMessage("root") });
     // Duplicate line: parent points at its own id's predecessor, not the tail.
-    try std.testing.expectError(error.EntryNotFound, manager.appendLoadedEntry(.{
-        .id = "00000001",
-        .parent_id = null,
-        .timestamp = "t1",
-        .value = .{ .message = userMessage("root") },
-    }));
-    try std.testing.expectError(error.EntryNotFound, manager.appendLoadedEntry(.{
-        .id = "00000003",
-        .parent_id = "missing",
-        .timestamp = "t2",
-        .value = .{ .message = userMessage("orphan") },
-    }));
+    try std.testing.expectError(
+        error.EntryNotFound,
+        manager.appendLoadedEntry("00000001", null, "t1", .{ .message = userMessage("root") }),
+    );
+    try std.testing.expectError(
+        error.EntryNotFound,
+        manager.appendLoadedEntry("00000003", "missing", "t2", .{ .message = userMessage("orphan") }),
+    );
+    // A non-hex id could collide with a generated one later: reject it.
+    try std.testing.expectError(
+        error.InvalidEntryId,
+        manager.appendLoadedEntry("not-hex", "00000001", "t2", .{ .message = userMessage("alien") }),
+    );
     try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
 }
 
@@ -992,35 +1380,362 @@ test "loaded compaction entries enforce durable bounds" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
-    _ = try manager.appendLoadedEntry(.{
-        .id = "00000001",
-        .parent_id = null,
-        .timestamp = "t1",
-        .value = .{ .message = userMessage("root") },
-    });
+    try manager.appendLoadedEntry("00000001", null, "t1", .{ .message = userMessage("root") });
     const oversized_summary = try std.testing.allocator.alloc(u8, max_compaction_summary_bytes + 1);
     defer std.testing.allocator.free(oversized_summary);
     @memset(oversized_summary, 'a');
 
-    try std.testing.expectError(error.CompactionSummaryTooLarge, manager.appendLoadedEntry(.{
-        .id = "00000002",
-        .parent_id = "00000001",
-        .timestamp = "t2",
-        .value = .{ .compaction = .{
+    try std.testing.expectError(error.CompactionSummaryTooLarge, manager.appendLoadedEntry(
+        "00000002",
+        "00000001",
+        "t2",
+        .{ .compaction = .{
             .summary = oversized_summary,
             .first_kept_entry_id = "00000001",
             .tokens_before = 1,
         } },
-    }));
-    try std.testing.expectError(error.CompactionFirstKeptEntryNotFound, manager.appendLoadedEntry(.{
-        .id = "00000002",
-        .parent_id = "00000001",
-        .timestamp = "t2",
-        .value = .{ .compaction = .{
+    ));
+    try std.testing.expectError(error.CompactionFirstKeptEntryNotFound, manager.appendLoadedEntry(
+        "00000002",
+        "00000001",
+        "t2",
+        .{ .compaction = .{
             .summary = "summary",
             .first_kept_entry_id = "missing",
             .tokens_before = 1,
         } },
-    }));
+    ));
     try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
+}
+
+test "session parser drops torn trailing line and reports the repair length" {
+    const good_prefix =
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n" ++
+        "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t\",\"message\":" ++
+        "{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":0}}\n";
+    var parsed = try parseSession(
+        std.testing.allocator,
+        good_prefix ++ "{\"type\":\"message\",\"id\":\"0000",
+    );
+    defer parsed.manager.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.manager.entries.items.len);
+    try std.testing.expectEqual(@as(u64, good_prefix.len), parsed.repair_length.?);
+
+    var clean = try parseSession(std.testing.allocator, good_prefix);
+    defer clean.manager.deinit();
+    try std.testing.expectEqual(@as(?u64, null), clean.repair_length);
+}
+
+test "session store load repairs torn trailing line before future appends" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .cwd = "/repo",
+        .session_id = "session-1",
+        .timestamp = "t0",
+    });
+    defer store.deinit(std.testing.allocator);
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+    _ = try manager.appendMessage(userMessage("one"), "t1");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null);
+
+    // Simulate a crash mid-append: a torn fragment without trailing newline.
+    {
+        const file = try tmp.dir.openFile(std.testing.io, store.file_name, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        const offset = try file.length(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "{\"type\":\"message\",\"id\":\"00", offset);
+    }
+
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
+
+    // Without the on-load repair this append glues onto the fragment and
+    // the file becomes unloadable (fatal interior corruption).
+    _ = try loaded.appendMessage(userMessage("two"), "t2");
+    try store.appendEntry(
+        std.testing.allocator,
+        std.testing.io,
+        loaded.entries.items[1],
+        loaded.entries.items[0].id(),
+    );
+
+    var reloaded = try store.load(std.testing.allocator, std.testing.io);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reloaded.entries.items.len);
+}
+
+test "session store append rejects writes past the session file cap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .cwd = "/repo",
+        .session_id = "session-1",
+        .timestamp = "t0",
+    });
+    defer store.deinit(std.testing.allocator);
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+    _ = try manager.appendMessage(userMessage("one"), "t1");
+
+    // Grow the file sparsely to the cap; any further append must be refused
+    // so the session this store writes stays loadable by this store.
+    {
+        const file = try tmp.dir.openFile(std.testing.io, store.file_name, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "x", max_session_file_bytes - 1);
+    }
+
+    try std.testing.expectError(
+        error.SessionFileFull,
+        store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null),
+    );
+}
+
+const valid_user_line =
+    "{\"type\":\"message\",\"id\":\"00000002\",\"parentId\":\"00000001\",\"timestamp\":\"t\"," ++
+    "\"message\":{\"role\":\"user\",\"content\":\"next\",\"timestamp\":0}}\n";
+
+test "session parser rejects malformed interior json shapes" {
+    try std.testing.expectError(error.InvalidHeader, parseSession(std.testing.allocator, "[]\n"));
+    // A malformed line followed by more content is interior corruption.
+    try std.testing.expectError(
+        error.InvalidEntry,
+        parseSession(
+            std.testing.allocator,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n[]\n" ++
+                valid_user_line,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidEntry,
+        parseSession(
+            std.testing.allocator,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n" ++
+                "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t\",\"message\":" ++
+                "{\"role\":\"assistant\",\"content\":123}}\n" ++ valid_user_line,
+        ),
+    );
+}
+
+test "session parser rejects interior parent chain breaks" {
+    // The second line claims a parent that is not the tail; a valid line
+    // follows, so this is interior corruption, not a torn tail.
+    try std.testing.expectError(
+        error.EntryNotFound,
+        parseSession(
+            std.testing.allocator,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n" ++
+                "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t\",\"message\":" ++
+                "{\"role\":\"user\",\"content\":\"root\",\"timestamp\":0}}\n" ++
+                "{\"type\":\"message\",\"id\":\"00000002\",\"parentId\":\"wrong\",\"timestamp\":\"t\"," ++
+                "\"message\":{\"role\":\"user\",\"content\":\"broken\",\"timestamp\":0}}\n" ++
+                "{\"type\":\"message\",\"id\":\"00000003\",\"parentId\":\"00000002\",\"timestamp\":\"t\"," ++
+                "\"message\":{\"role\":\"user\",\"content\":\"after\",\"timestamp\":0}}\n",
+        ),
+    );
+}
+
+test "session parser rejects interior negative usage" {
+    try std.testing.expectError(
+        error.InvalidEntry,
+        parseSession(
+            std.testing.allocator,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"t\",\"cwd\":\"/repo\"}\n" ++
+                "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t\",\"message\":" ++
+                "{\"role\":\"assistant\",\"content\":[],\"api\":\"openai-responses\",\"provider\":\"openai\"," ++
+                "\"model\":\"gpt\",\"usage\":{\"input\":-1,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0," ++
+                "\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0," ++
+                "\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":0}}\n" ++ valid_user_line,
+        ),
+    );
+}
+
+test "session store creates header file and loads empty manager" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .cwd = "/repo",
+        .session_id = "session-1",
+        .timestamp = "t0",
+    });
+    defer store.deinit(std.testing.allocator);
+
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+
+    try std.testing.expectEqualStrings("session-1", loaded.header.id);
+    try std.testing.expectEqual(@as(usize, 0), loaded.entries.items.len);
+}
+
+test "session store creates the sessions directory when asked" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .sessions_dir = "agent/sessions/--repo--",
+        .cwd = "/repo",
+        .session_id = "session-1",
+        .timestamp = "t0",
+    });
+    defer store.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("agent/sessions/--repo--/t0_session-1.jsonl", store.file_name);
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("session-1", loaded.header.id);
+}
+
+test "session store appends entries and round trips context" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .cwd = "/repo",
+        .session_id = "session-1",
+        .timestamp = "t0",
+    });
+    defer store.deinit(std.testing.allocator);
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendMessage(userMessage("hello"), "t1");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null);
+    _ = try manager.appendMessage(userMessage("again"), "t2");
+    try store.appendEntry(
+        std.testing.allocator,
+        std.testing.io,
+        manager.entries.items[1],
+        manager.entries.items[0].id(),
+    );
+
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+    const messages = try loaded.contextMessages(std.testing.allocator);
+    defer SessionManager.deinitContextMessages(std.testing.allocator, messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("hello", messages[0].user.content.string);
+    try std.testing.expectEqualStrings("again", messages[1].user.content.string);
+}
+
+test "session store round trips agent message variants" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .cwd = "/repo",
+        .session_id = "session-1",
+        .timestamp = "t0",
+    });
+    defer store.deinit(std.testing.allocator);
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    _ = try manager.appendMessage(.{ .user = .{
+        .content = .{ .blocks = &.{.{ .text = .{ .text = "hello" } }} },
+        .timestamp = 11,
+    } }, "t1");
+    _ = try manager.appendMessage(.{ .assistant = .{
+        .content = &.{
+            .{ .text = .{ .text = "hi" } },
+            .{ .thinking = .{ .thinking = "hmm", .redacted = true } },
+            .{ .tool_call = .{ .id = "call-1", .name = "bash", .arguments = .{ .object = .empty } } },
+        },
+        .api = ai.KnownApi.anthropic_messages,
+        .provider = "anthropic",
+        .model = "claude",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 12,
+    } }, "t2");
+    _ = try manager.appendMessage(.{ .tool_result = .{
+        .tool_call_id = "call-1",
+        .tool_name = "bash",
+        .content = &.{.{ .text = .{ .text = "ok" } }},
+        .details = .{ .string = "detail" },
+        .is_error = false,
+        .timestamp = 13,
+    } }, "t3");
+    _ = try manager.appendMessage(.{ .custom = .{
+        .kind = "extension",
+        .payload = .{ .string = "payload" },
+        .timestamp = 14,
+    } }, "t4");
+    for (manager.entries.items, 0..) |entry, index| {
+        const parent = if (index == 0) null else manager.entries.items[index - 1].id();
+        try store.appendEntry(std.testing.allocator, std.testing.io, entry, parent);
+    }
+
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+    const messages = try loaded.contextMessages(std.testing.allocator);
+    defer SessionManager.deinitContextMessages(std.testing.allocator, messages);
+
+    try std.testing.expectEqual(@as(usize, 4), messages.len);
+    try std.testing.expectEqualStrings("hello", messages[0].user.content.blocks[0].text.text);
+    try std.testing.expectEqualStrings("hi", messages[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("call-1", messages[1].assistant.content[2].tool_call.id);
+    try std.testing.expectEqualStrings("ok", messages[2].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("extension", messages[3].custom.kind);
+}
+
+test "session store load preserves entry ids and continues id generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .cwd = "/repo",
+        .session_id = "session-1",
+        .timestamp = "t0",
+    });
+    defer store.deinit(std.testing.allocator);
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const root = try manager.appendMessage(userMessage("root"), "t1");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null);
+    const child = try manager.appendMessage(userMessage("child"), "t2");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[1], root);
+
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+
+    try std.testing.expectEqualStrings(root, loaded.entries.items[0].id());
+    try std.testing.expectEqualStrings(child, loaded.entries.items[1].id());
+
+    _ = try loaded.appendMessage(userMessage("next"), "t3");
+    try std.testing.expectEqualStrings("00000003", loaded.entries.items[2].id());
+}
+
+test "session store round trips compaction entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .cwd = "/repo",
+        .session_id = "session-1",
+        .timestamp = "t0",
+    });
+    defer store.deinit(std.testing.allocator);
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const root = try manager.appendMessage(userMessage("before"), "t1");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null);
+    _ = try manager.appendCompaction("summary", root, 2048, "t2");
+    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[1], root);
+
+    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.entries.items.len);
+    try std.testing.expectEqualStrings("summary", loaded.entries.items[1].compaction.summary);
+    try std.testing.expectEqualStrings(root, loaded.entries.items[1].compaction.first_kept_entry_id);
+    try std.testing.expectEqual(@as(u64, 2048), loaded.entries.items[1].compaction.tokens_before);
 }

@@ -12,7 +12,6 @@ const client_protocol = @import("client_protocol.zig");
 const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_manager = @import("session_manager.zig");
-const session_store = @import("session_store.zig");
 const settings_mod = @import("settings.zig");
 
 pub const WakeResult = enum { input, session, frame };
@@ -136,15 +135,12 @@ fn openSession(allocator: std.mem.Allocator, services: *RuntimeServices, options
 
     switch (options.open) {
         .create => |create| {
-            var store = try session_store.SessionStore.createInPath(
-                allocator,
-                services.io,
-                options.dir,
-                sessions_dir,
-                services.cwd,
-                create.session_id,
-                create.timestamp,
-            );
+            var store = try session_manager.SessionStore.create(allocator, services.io, options.dir, .{
+                .sessions_dir = sessions_dir,
+                .cwd = services.cwd,
+                .session_id = create.session_id,
+                .timestamp = create.timestamp,
+            });
             errdefer store.deinit(allocator);
             session_options.session_id = create.session_id;
             session_options.timestamp = create.timestamp;

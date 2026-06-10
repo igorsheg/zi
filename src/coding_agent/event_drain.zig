@@ -11,7 +11,6 @@ const message_policy = @import("message_policy.zig");
 const queue_mirror_mod = @import("queue_mirror.zig");
 const client_protocol = @import("client_protocol.zig");
 const session_manager = @import("session_manager.zig");
-const session_store = @import("session_store.zig");
 
 pub const PublicEventQueue = runtime.BoundedQueue(client_protocol.ClientEvent);
 
@@ -19,7 +18,7 @@ pub const EventDrain = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     manager: *session_manager.SessionManager,
-    store: ?*session_store.SessionStore,
+    store: ?*session_manager.SessionStore,
     public_event_buffer: []client_protocol.ClientEvent,
     public_events: PublicEventQueue,
     queue_mirror: queue_mirror_mod.QueueMirror = .{},
@@ -36,7 +35,7 @@ pub const EventDrain = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         manager: *session_manager.SessionManager,
-        store: ?*session_store.SessionStore,
+        store: ?*session_manager.SessionStore,
         timestamp: []const u8,
         public_event_capacity: usize,
     ) !EventDrain {
@@ -117,7 +116,9 @@ pub const EventDrain = struct {
         try self.manager.ensureAppendCapacity(1);
         const entry = try self.manager.prepareMessageEntry(message, self.timestamp);
         errdefer self.manager.deinitPreparedEntry(entry);
-        if (self.store) |store| try store.appendEntry(self.allocator, self.io, entry);
+        if (self.store) |store| {
+            try store.appendEntry(self.allocator, self.io, entry, self.manager.lastEntryId());
+        }
         _ = self.manager.commitPreparedEntry(entry);
     }
 
