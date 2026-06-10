@@ -583,7 +583,12 @@ pub fn publicEventWake(self: *AgentSession) *runtime.ResetEvent {
     return self.event_drain.publicEventWake();
 }
 
-pub fn queuePrompt(self: *AgentSession, text: []const u8, images: []const ai.ImageContent, kind: QueuePromptKind) !void {
+pub fn queuePrompt(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+    kind: QueuePromptKind,
+) !void {
     if (!self.agent.state.isStreaming()) return error.SessionNotRunning;
     switch (kind) {
         .steer => if (!self.agent.steering_queue.hasCapacity()) return error.QueueFull,
@@ -603,7 +608,12 @@ pub fn queuePrompt(self: *AgentSession, text: []const u8, images: []const ai.Ima
     try self.event_drain.emitQueueUpdate();
 }
 
-pub fn afterPromptRunFinished(self: *AgentSession, previous_overflow_count: usize, text: []const u8, images: []const ai.ImageContent) !void {
+pub fn afterPromptRunFinished(
+    self: *AgentSession,
+    previous_overflow_count: usize,
+    text: []const u8,
+    images: []const ai.ImageContent,
+) !void {
     const compacted = try self.checkPostPromptOverflowCompaction(previous_overflow_count, true);
     if (compacted) {
         try self.retryPromptAfterOverflowCompaction(text, images);

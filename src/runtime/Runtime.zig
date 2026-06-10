@@ -226,6 +226,7 @@ pub const Runtime = struct {
         return self;
     }
 
+    // ziglint-ignore: Z030 heap owner is poisoned before allocator.destroy(self).
     pub fn deinit(self: *Runtime) void {
         self.inner.deinit();
         const allocator = self.allocator;

@@ -145,7 +145,14 @@ const InputState = struct {
                 continue;
             }
             if (byte == '\n') {
-                const result = try handleLine(app, stdout, stderr, self.line[0..self.line_len], &self.malformed_lines, false);
+                const result = try handleLine(
+                    app,
+                    stdout,
+                    stderr,
+                    self.line[0..self.line_len],
+                    &self.malformed_lines,
+                    false,
+                );
                 self.line_len = 0;
                 if (result == .shutdown) return .shutdown;
                 continue;
@@ -195,7 +202,10 @@ fn drainEvents(
         defer owned_event.deinit(app.allocator);
         const event_request_id = owned_event.request_id;
         if (isShutdownEvent(owned_event.event)) saw_shutdown = true;
-        if (terminal_request_id != null and event_request_id == terminal_request_id and isTerminalEvent(owned_event.event)) {
+        if (terminal_request_id != null and
+            event_request_id == terminal_request_id and
+            isTerminalEvent(owned_event.event))
+        {
             saw_terminal = true;
         }
         try writeEvent(app.allocator, stdout, owned_event);
@@ -242,8 +252,20 @@ fn writeEvent(
     event: client_protocol.EventEnvelope,
 ) Error!void {
     const encoded = wire_protocol.encodeEventEnvelope(allocator, event) catch |err| switch (err) {
-        error.OutputEventTooLarge => return writeRejected(allocator, stdout, event.request_id, .overflow, "output event too large"),
-        error.EventJsonNotObject => return writeRejected(allocator, stdout, event.request_id, .invalid_command, "event json invalid"),
+        error.OutputEventTooLarge => return writeRejected(
+            allocator,
+            stdout,
+            event.request_id,
+            .overflow,
+            "output event too large",
+        ),
+        error.EventJsonNotObject => return writeRejected(
+            allocator,
+            stdout,
+            event.request_id,
+            .invalid_command,
+            "event json invalid",
+        ),
         error.WriteFailed => return error.OutputClosed,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -341,7 +363,11 @@ test "rpc input accepts targeted cancel while prompt is active" {
     var stderr_buffer: [256]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
     var state: InputState = .{};
-    const line = try std.fmt.allocPrint(std.testing.allocator, "{{\"id\":2,\"type\":\"cancel\",\"target\":{{\"operationId\":{}}}}}\n", .{operation_id});
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"id\":2,\"type\":\"cancel\",\"target\":{{\"operationId\":{}}}}}\n",
+        .{operation_id},
+    );
     defer std.testing.allocator.free(line);
 
     try std.testing.expectEqual(InputResult.active, try state.feed(line, &app, &stdout, &stderr));

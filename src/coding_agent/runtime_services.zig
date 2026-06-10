@@ -21,7 +21,7 @@ pub const RuntimeServices = struct {
     diagnostics: [diagnostic_capacity]Diagnostic = undefined,
     diagnostic_count: usize = 0,
 
-    const Options = struct {
+    pub const Options = struct {
         cwd: []const u8,
         agent_dir: []const u8,
         dir: std.Io.Dir = .cwd(),

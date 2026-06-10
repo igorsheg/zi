@@ -542,7 +542,9 @@ fn defaultConvertToLlm(
         switch (message) {
             .user => |user| try out.append(allocator, .{ .user = user }),
             .assistant => |assistant| try out.append(allocator, .{ .assistant = assistant }),
-            .tool_result => |tool_result| try out.append(allocator, .{ .tool_result = try compactToolResultForLlm(allocator, tool_result) }),
+            .tool_result => |tool_result| try out.append(allocator, .{
+                .tool_result = try compactToolResultForLlm(allocator, tool_result),
+            }),
             .custom => {},
         }
     }

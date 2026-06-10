@@ -4,7 +4,7 @@ const argument_count_max = 16;
 const message_count_max = 4;
 const unknown_flag_count_max = 8;
 
-const ParseError = error{
+pub const ParseError = error{
     TooManyArguments,
     TooManyMessages,
     TooManyUnknownFlags,
@@ -13,7 +13,7 @@ const ParseError = error{
     InvalidOptionValue,
 };
 
-const AppMode = enum {
+pub const AppMode = enum {
     interactive,
     text,
     json,
@@ -26,7 +26,7 @@ const OutputMode = enum {
     rpc,
 };
 
-const AppArgs = struct {
+pub const AppArgs = struct {
     help: bool = false,
     print: bool = false,
     mode: ?OutputMode = null,
@@ -47,7 +47,7 @@ const AuthCommand = struct {
     };
 };
 
-const Command = union(enum) {
+pub const Command = union(enum) {
     app: AppArgs,
     auth: AuthCommand,
 };

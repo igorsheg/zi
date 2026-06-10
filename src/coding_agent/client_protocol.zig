@@ -132,7 +132,14 @@ pub const ClientEvent = union(enum) {
             .compaction_end => |*payload| payload.deinit(),
             .auto_retry_start => |*payload| payload.error_message.deinit(),
             .auto_retry_end => |*payload| if (payload.final_error) |*err| err.deinit(),
-            .operation_started, .operation_finished, .shutdown_started, .queue_changed, .replay_gap, .compaction_start, .event_overflow => {},
+            .operation_started,
+            .operation_finished,
+            .shutdown_started,
+            .queue_changed,
+            .replay_gap,
+            .compaction_start,
+            .event_overflow,
+            => {},
         }
         self.* = undefined;
     }
@@ -196,7 +203,11 @@ pub const ClientEvent = union(enum) {
                 try writeJsonField("droppedCount", stringify, payload.dropped_count);
                 try stringify.endObject();
             },
-            .rejected => |payload| try stringify.write(.{ .type = "rejected", .code = payload.code, .message = payload.message.text }),
+            .rejected => |payload| try stringify.write(.{
+                .type = "rejected",
+                .code = payload.code,
+                .message = payload.message.text,
+            }),
             .operation_started => |payload| try stringify.write(payload),
             .operation_finished => |payload| try stringify.write(payload),
             .shutdown_started => try stringify.write(.{ .type = "shutdown_started" }),

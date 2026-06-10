@@ -29,6 +29,10 @@ const output_size_bytes = tui.product.loop.output_size_bytes_default;
 const transcript_append_max = tui.product.transcript.append_size_bytes_max;
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
 
+fn ignoreBestEffortError(err: anyerror) void {
+    std.debug.assert(@errorName(err).len > 0);
+}
+
 const SubmitResult = enum { queued, queue_full };
 
 const EventCursor = struct {
@@ -105,10 +109,10 @@ const InteractiveController = struct {
             output_size_bytes,
         );
         errdefer terminal_loop.deinit();
-        terminal_loop.resizeFromTerminal() catch {};
+        terminal_loop.resizeFromTerminal() catch |err| ignoreBestEffortError(err);
         try terminal_loop.setup(stdout);
         try stdout.flush();
-        errdefer terminal_loop.shutdown(stdout) catch {};
+        errdefer terminal_loop.shutdown(stdout) catch |err| ignoreBestEffortError(err);
 
         var self: InteractiveController = .{
             .allocator = process.gpa,
@@ -125,8 +129,8 @@ const InteractiveController = struct {
     }
 
     fn deinit(self: *InteractiveController) void {
-        self.terminal_loop.shutdown(self.stdout) catch {};
-        self.stdout.flush() catch {};
+        self.terminal_loop.shutdown(self.stdout) catch |err| ignoreBestEffortError(err);
+        self.stdout.flush() catch |err| ignoreBestEffortError(err);
         self.terminal_loop.deinit();
         self.* = undefined;
     }
@@ -313,7 +317,11 @@ const InteractiveController = struct {
             .session_info_changed => {},
             .event_overflow => |overflow| {
                 var buffer: [96]u8 = undefined;
-                const text = std.fmt.bufPrint(&buffer, "event overflow: dropped {d}", .{overflow.dropped_count}) catch "event overflow";
+                const text = std.fmt.bufPrint(
+                    &buffer,
+                    "event overflow: dropped {d}",
+                    .{overflow.dropped_count},
+                ) catch "event overflow";
                 try self.appendStatus(.warning, text);
                 self.event_cursor.recovery = .replay_requested;
                 try self.requestReplay(self.event_cursor.last_seq -| 1);
@@ -540,19 +548,35 @@ const InteractiveController = struct {
         }
     }
 
-    fn appendStatus(self: *InteractiveController, level: tui.product.transcript.TranscriptStatusLevel, text: []const u8) !void {
+    fn appendStatus(
+        self: *InteractiveController,
+        level: tui.product.transcript.TranscriptStatusLevel,
+        text: []const u8,
+    ) !void {
         if (text.len == 0) return;
-        if (!std.unicode.utf8ValidateSlice(text)) return self.appendStaticStatus(.warning, "invalid status text dropped");
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            return self.appendStaticStatus(.warning, "invalid status text dropped");
+        }
         const safe = utf8Prefix(text, transcript_append_max);
         try self.appendStaticStatus(level, safe);
     }
 
-    fn appendStaticStatus(self: *InteractiveController, level: tui.product.transcript.TranscriptStatusLevel, text: []const u8) !void {
+    fn appendStaticStatus(
+        self: *InteractiveController,
+        level: tui.product.transcript.TranscriptStatusLevel,
+        text: []const u8,
+    ) !void {
         if (text.len == 0) return;
-        _ = try self.terminal_loop.applyCommand(.{ .append_transcript = .{ .status = .{ .level = level, .text = text } } });
+        _ = try self.terminal_loop.applyCommand(.{
+            .append_transcript = .{ .status = .{ .level = level, .text = text } },
+        });
     }
 
-    fn applyStatus(self: *InteractiveController, level: tui.product.transcript.TranscriptStatusLevel, text: []const u8) !void {
+    fn applyStatus(
+        self: *InteractiveController,
+        level: tui.product.transcript.TranscriptStatusLevel,
+        text: []const u8,
+    ) !void {
         try self.appendStatus(level, text);
     }
 
@@ -698,7 +722,13 @@ test "tui adapter maps raw text delta into assistant transcript append" {
         .app = undefined,
         .stdout = undefined,
         .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(std.testing.allocator, std.testing.io, 40, 8, output_size_bytes),
+        .terminal_loop = try tui.product.TerminalLoop.init(
+            std.testing.allocator,
+            std.testing.io,
+            40,
+            8,
+            output_size_bytes,
+        ),
     };
 
     const content = [_]ai.AssistantContent{ai.faux.text("hi")};
@@ -709,7 +739,10 @@ test "tui adapter maps raw text delta into assistant transcript append" {
         .partial = partial,
     } } });
     try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.transcript.items.items.len);
-    try std.testing.expectEqualStrings("hi", controller.terminal_loop.product.app.transcript.items.items[0].message.text);
+    try std.testing.expectEqualStrings(
+        "hi",
+        controller.terminal_loop.product.app.transcript.items.items[0].message.text,
+    );
     controller.terminal_loop.deinit();
 }
 
@@ -719,7 +752,13 @@ test "tui adapter renders non-streaming assistant message end" {
         .app = undefined,
         .stdout = undefined,
         .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(std.testing.allocator, std.testing.io, 40, 8, output_size_bytes),
+        .terminal_loop = try tui.product.TerminalLoop.init(
+            std.testing.allocator,
+            std.testing.io,
+            40,
+            8,
+            output_size_bytes,
+        ),
     };
     defer controller.terminal_loop.deinit();
 
@@ -728,7 +767,10 @@ test "tui adapter renders non-streaming assistant message end" {
     try controller.applyMessageEnd(.{ .assistant = message });
 
     try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.transcript.items.items.len);
-    try std.testing.expectEqualStrings("final", controller.terminal_loop.product.app.transcript.items.items[0].message.text);
+    try std.testing.expectEqualStrings(
+        "final",
+        controller.terminal_loop.product.app.transcript.items.items[0].message.text,
+    );
 }
 
 test "tui adapter splits oversized operational message text" {
@@ -737,7 +779,13 @@ test "tui adapter splits oversized operational message text" {
         .app = undefined,
         .stdout = undefined,
         .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(std.testing.allocator, std.testing.io, 40, 8, output_size_bytes),
+        .terminal_loop = try tui.product.TerminalLoop.init(
+            std.testing.allocator,
+            std.testing.io,
+            40,
+            8,
+            output_size_bytes,
+        ),
     };
     defer controller.terminal_loop.deinit();
 
@@ -745,7 +793,10 @@ test "tui adapter splits oversized operational message text" {
     try controller.appendMessage(.assistant, text, .new_item);
 
     try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.transcript.items.items.len);
-    try std.testing.expectEqual(@as(usize, text.len), controller.terminal_loop.product.app.transcript.items.items[0].message.text.len);
+    try std.testing.expectEqual(
+        @as(usize, text.len),
+        controller.terminal_loop.product.app.transcript.items.items[0].message.text.len,
+    );
 }
 
 test "tui adapter drops invalid operational message text without failing" {
@@ -754,7 +805,13 @@ test "tui adapter drops invalid operational message text without failing" {
         .app = undefined,
         .stdout = undefined,
         .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(std.testing.allocator, std.testing.io, 40, 8, output_size_bytes),
+        .terminal_loop = try tui.product.TerminalLoop.init(
+            std.testing.allocator,
+            std.testing.io,
+            40,
+            8,
+            output_size_bytes,
+        ),
     };
     defer controller.terminal_loop.deinit();
 
@@ -791,7 +848,13 @@ test "tui adapter requests replay and recovers from snapshot after mailbox event
         .app = &app,
         .stdout = undefined,
         .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(std.testing.allocator, std.testing.io, 40, 8, output_size_bytes),
+        .terminal_loop = try tui.product.TerminalLoop.init(
+            std.testing.allocator,
+            std.testing.io,
+            40,
+            8,
+            output_size_bytes,
+        ),
     };
     defer controller.terminal_loop.deinit();
 

@@ -4,7 +4,7 @@ const runtime = @import("../../runtime/root.zig");
 const client_protocol = @import("../../coding_agent/client_protocol.zig");
 const session_runtime = @import("../../coding_agent/session_runtime.zig");
 
-const OutputMode = enum {
+pub const OutputMode = enum {
     text,
     json,
 };
@@ -13,7 +13,7 @@ const Error = error{
     OutputClosed,
 };
 
-const Options = struct {
+pub const Options = struct {
     prompt: []const u8,
     output: OutputMode = .text,
 };

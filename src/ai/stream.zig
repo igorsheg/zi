@@ -1,7 +1,6 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const provider_registry = @import("provider_registry.zig");
-const runtime = @import("../runtime/root.zig");
 
 pub const StreamError = error{
     NoApiProvider,

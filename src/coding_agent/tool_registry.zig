@@ -39,7 +39,7 @@ const ToolDisplay = struct {
     body_mode: ToolDisplayBodyMode = .visible,
 };
 
-const ToolMetadata = struct {
+pub const ToolMetadata = struct {
     name: []const u8,
     label: []const u8,
     description: []const u8,
@@ -48,7 +48,7 @@ const ToolMetadata = struct {
     display: ToolDisplay = .{},
 };
 
-const ToolImplementation = struct {
+pub const ToolImplementation = struct {
     context: *anyopaque,
     as_agent_tool_fn: *const fn (*anyopaque) agent.AgentTool,
 
@@ -206,6 +206,7 @@ pub const BuiltinTools = struct {
         return self;
     }
 
+    // ziglint-ignore: Z030 heap owner is poisoned before allocator.destroy(self).
     pub fn deinit(self: *BuiltinTools) void {
         const allocator = self.allocator;
         self.write.deinit();

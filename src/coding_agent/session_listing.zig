@@ -11,7 +11,7 @@ const SessionListOptions = struct {
     max_directory_entries: usize = 512,
 };
 
-const SessionSelectionOptions = struct {
+pub const SessionSelectionOptions = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     dir: std.Io.Dir = .cwd(),

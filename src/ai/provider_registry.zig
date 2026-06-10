@@ -1,6 +1,5 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const runtime = @import("../runtime/root.zig");
 
 pub const ApiProvider = struct {
     api: protocol.Api,

@@ -43,7 +43,7 @@ const OpenSession = union(enum) {
     resume_existing: OpenSessionResume,
 };
 
-const CreateOptions = struct {
+pub const CreateOptions = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     current_date: []const u8,
@@ -63,7 +63,7 @@ const CreateOptions = struct {
     retained_event_bytes: usize = client_protocol.retained_event_bytes_default,
 };
 
-const ResumeOptions = struct {
+pub const ResumeOptions = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     current_date: []const u8,
@@ -210,7 +210,8 @@ fn encodeEnvelopeJsonBounded(
     std.json.Stringify.value(envelope, .{}, &writer) catch |err| switch (err) {
         error.WriteFailed => return null,
     };
-    return try allocator.dupe(u8, storage[0..writer.end]);
+    const encoded = try allocator.dupe(u8, storage[0..writer.end]);
+    return encoded;
 }
 
 pub const AgentSessionRuntimeHost = struct {
@@ -258,7 +259,11 @@ pub const AgentSessionRuntimeHost = struct {
         try self.enqueueRejected(request_id, code, message);
     }
 
-    pub fn waitForWake(self: *AgentSessionRuntimeHost, input_fd: std.posix.fd_t, frame_ms: u64) !WakeResult {
+    pub fn waitForWake(
+        self: *AgentSessionRuntimeHost,
+        input_fd: std.posix.fd_t,
+        frame_ms: u64,
+    ) !WakeResult {
         const readable = runtime.ReadableFd.initBorrowed(input_fd);
         var input = readable.asyncReadable();
         var frame = runtime.Timeout.fromMilliseconds(frame_ms);
@@ -266,7 +271,13 @@ pub const AgentSessionRuntimeHost = struct {
         const command_wake = &self.wake_event;
         if (self.active_run) |run| {
             var progress = run.stream.asyncNext();
-            switch (try runtime.select(.{ .input = &input, .prompt = &progress, .public_event = public_event_wake, .command = command_wake, .frame = &frame })) {
+            switch (try runtime.select(.{
+                .input = &input,
+                .prompt = &progress,
+                .public_event = public_event_wake,
+                .command = command_wake,
+                .frame = &frame,
+            })) {
                 .input => |result| {
                     result catch return .session;
                     return .input;
@@ -290,7 +301,12 @@ pub const AgentSessionRuntimeHost = struct {
                 .frame => return .frame,
             }
         }
-        switch (try runtime.select(.{ .input = &input, .public_event = public_event_wake, .command = command_wake, .frame = &frame })) {
+        switch (try runtime.select(.{
+            .input = &input,
+            .public_event = public_event_wake,
+            .command = command_wake,
+            .frame = &frame,
+        })) {
             .input => |result| {
                 result catch return .session;
                 return .input;
@@ -394,7 +410,11 @@ pub const AgentSessionRuntimeHost = struct {
                 };
                 self.active_request_id = envelope.id;
                 self.active_operation_id = operation_id;
-                try self.enqueueEvent(.{ .request_id = envelope.id, .operation_id = operation_id, .event = .{ .operation_started = .{} } });
+                try self.enqueueEvent(.{
+                    .request_id = envelope.id,
+                    .operation_id = operation_id,
+                    .event = .{ .operation_started = .{} },
+                });
                 try self.drainSessionEvents(envelope.id);
             },
             .cancel => |cancel| {
@@ -412,13 +432,20 @@ pub const AgentSessionRuntimeHost = struct {
                     self.clearActivePromptText();
                 } else self.session.cancel();
                 try self.drainSessionEvents(envelope.id);
-                try self.enqueueEvent(.{ .request_id = envelope.id, .operation_id = operation_id, .event = .{ .operation_finished = .{ .reason = .canceled } } });
+                try self.enqueueEvent(.{
+                    .request_id = envelope.id,
+                    .operation_id = operation_id,
+                    .event = .{ .operation_finished = .{ .reason = .canceled } },
+                });
             },
             .queue => |queue_command| switch (queue_command) {
                 .clear => {
                     try self.session.clearQueue();
                     try self.drainSessionEvents(null);
-                    try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .operation_finished = .{ .reason = .queue_cleared } } });
+                    try self.enqueueEvent(.{
+                        .request_id = envelope.id,
+                        .event = .{ .operation_finished = .{ .reason = .queue_cleared } },
+                    });
                 },
             },
             .snapshot => {
@@ -437,7 +464,11 @@ pub const AgentSessionRuntimeHost = struct {
         }
     }
 
-    fn applyPromptProgressResult(self: *AgentSessionRuntimeHost, run: *AgentSession.PromptRun, result: anytype) !void {
+    fn applyPromptProgressResult(
+        self: *AgentSessionRuntimeHost,
+        run: *AgentSession.PromptRun,
+        result: anytype,
+    ) !void {
         if (self.active_run != run) return;
         const request_id = self.active_request_id;
         const more = try self.session.applyPromptRunProgress(run, result);
@@ -456,15 +487,26 @@ pub const AgentSessionRuntimeHost = struct {
                 self.active_request_id = null;
                 self.active_operation_id = null;
                 try self.enqueueRejected(request_id, .invalid_command, @errorName(err));
-                try self.enqueueEvent(.{ .request_id = request_id, .operation_id = operation_id, .event = .{ .operation_finished = .{ .reason = .failed } } });
+                try self.enqueueEvent(.{
+                    .request_id = request_id,
+                    .operation_id = operation_id,
+                    .event = .{ .operation_finished = .{ .reason = .failed } },
+                });
                 return;
             };
             self.clearActivePromptText();
-            const reason: client_protocol.OperationFinished.Reason = if (self.session.agent.state.status == .failed) .failed else .completed;
+            const reason: client_protocol.OperationFinished.Reason = if (self.session.agent.state.status == .failed)
+                .failed
+            else
+                .completed;
             self.active_request_id = null;
             self.active_operation_id = null;
             try self.drainSessionEvents(request_id);
-            try self.enqueueEvent(.{ .request_id = request_id, .operation_id = operation_id, .event = .{ .operation_finished = .{ .reason = reason } } });
+            try self.enqueueEvent(.{
+                .request_id = request_id,
+                .operation_id = operation_id,
+                .event = .{ .operation_finished = .{ .reason = reason } },
+            });
         }
     }
 
@@ -514,7 +556,10 @@ pub const AgentSessionRuntimeHost = struct {
         message: []const u8,
     ) !void {
         const owned_message = try client_protocol.EventText.init(self.allocator, message);
-        try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .rejected = .{ .code = code, .message = owned_message } } });
+        try self.enqueueEvent(.{
+            .request_id = request_id,
+            .event = .{ .rejected = .{ .code = code, .message = owned_message } },
+        });
     }
 
     fn enqueueEvent(self: *AgentSessionRuntimeHost, envelope: client_protocol.EventEnvelope) !void {
@@ -841,7 +886,9 @@ fn resolveModel(services: *RuntimeServices, explicit: ?ai.Model) ai.Model {
             if (findAvailableModel(services, provider_name, id)) |model| return model;
         };
         if (services.diagnostic_count < services.diagnostics.len) {
-            services.diagnostics[services.diagnostic_count] = .{ .unresolved_model_setting = .{ .provider = provider, .model = model_id } };
+            services.diagnostics[services.diagnostic_count] = .{
+                .unresolved_model_setting = .{ .provider = provider, .model = model_id },
+            };
             services.diagnostic_count += 1;
         }
     }
@@ -862,7 +909,10 @@ fn firstAvailableModel(services: *const RuntimeServices) ?ai.Model {
     return null;
 }
 
-fn resolveThinkingLevel(snapshot: *const settings_mod.SettingsSnapshot, explicit: ?agent_mod.ThinkingLevel) agent_mod.ThinkingLevel {
+fn resolveThinkingLevel(
+    snapshot: *const settings_mod.SettingsSnapshot,
+    explicit: ?agent_mod.ThinkingLevel,
+) agent_mod.ThinkingLevel {
     if (explicit) |level| return level;
     const global = fileSettings(snapshot.global);
     const project = fileSettings(snapshot.project);
@@ -893,13 +943,22 @@ fn resolveRetrySettings(snapshot: *const settings_mod.SettingsSnapshot) AgentSes
     var settings: AgentSession.RetrySettings = .{};
     if (global.retry) |retry| {
         if (retry.enabled) |enabled| settings.enabled = enabled;
-        if (retry.max_retries) |attempts| settings.max_attempts = if (attempts > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(attempts);
+        if (retry.max_retries) |attempts| {
+            settings.max_attempts = boundedRetryAttempts(attempts);
+        }
     }
     if (project.retry) |retry| {
         if (retry.enabled) |enabled| settings.enabled = enabled;
-        if (retry.max_retries) |attempts| settings.max_attempts = if (attempts > std.math.maxInt(u8)) std.math.maxInt(u8) else @intCast(attempts);
+        if (retry.max_retries) |attempts| {
+            settings.max_attempts = boundedRetryAttempts(attempts);
+        }
     }
     return settings;
+}
+
+fn boundedRetryAttempts(attempts: u64) u8 {
+    if (attempts > std.math.maxInt(u8)) return std.math.maxInt(u8);
+    return @intCast(attempts);
 }
 
 fn fileSettings(file: settings_mod.SettingsFile) settings_mod.Settings {
@@ -983,7 +1042,10 @@ test "session runtime drains submitted command into operation event" {
     var event = session_runtime.drainEvent().?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 1), event.request_id);
-    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.queue_cleared, event.event.operation_finished.reason);
+    try std.testing.expectEqual(
+        client_protocol.OperationFinished.Reason.queue_cleared,
+        event.event.operation_finished.reason,
+    );
 }
 
 test "session runtime replays retained event envelopes" {
@@ -1008,7 +1070,9 @@ test "session runtime replays retained event envelopes" {
     try std.testing.expect(replay.event == .replay);
     try std.testing.expectEqual(@as(usize, 1), replay.event.replay.events.len);
     try std.testing.expectEqual(original_seq, replay.event.replay.events[0].seq);
-    try std.testing.expect(std.mem.indexOf(u8, replay.event.replay.events[0].json.text, "\"queue_cleared\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, replay.event.replay.events[0].json.text, "\"queue_cleared\"") != null,
+    );
 }
 
 test "session runtime reports replay gap after retained ledger eviction" {
@@ -1063,7 +1127,10 @@ test "session runtime request snapshot emits owned bounded snapshot event" {
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 9), event.request_id);
     try std.testing.expect(event.event == .snapshot);
     try std.testing.expectEqualStrings("session", event.event.snapshot.header.id.text);
-    try std.testing.expectEqual(@as(?client_protocol.RequestId, null), event.event.snapshot.active_request_id);
+    try std.testing.expectEqual(
+        @as(?client_protocol.RequestId, null),
+        event.event.snapshot.active_request_id,
+    );
     try std.testing.expectEqual(@as(usize, 0), event.event.snapshot.history.items.len);
 }
 
@@ -1083,7 +1150,10 @@ test "session runtime does not consume commands while event queue is full" {
     var first = session_runtime.drainEvent().?;
     defer first.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 1), first.request_id);
-    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.queue_cleared, first.event.operation_finished.reason);
+    try std.testing.expectEqual(
+        client_protocol.OperationFinished.Reason.queue_cleared,
+        first.event.operation_finished.reason,
+    );
 
     try session_runtime.step();
     var second = session_runtime.drainEvent().?;
@@ -1107,7 +1177,10 @@ test "session runtime shutdown remains observable under event pressure" {
 
     var first = session_runtime.drainEvent().?;
     defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.queue_cleared, first.event.operation_finished.reason);
+    try std.testing.expectEqual(
+        client_protocol.OperationFinished.Reason.queue_cleared,
+        first.event.operation_finished.reason,
+    );
 
     try session_runtime.step();
     var second = session_runtime.drainEvent().?;
@@ -1144,7 +1217,10 @@ test "session runtime cancels targeted active operation" {
     try session_runtime.step();
 
     const operation_id = session_runtime.active_operation_id.?;
-    try session_runtime.submit(.{ .id = 2, .command = .{ .cancel = .{ .target = .{ .operation_id = operation_id } } } });
+    try session_runtime.submit(.{
+        .id = 2,
+        .command = .{ .cancel = .{ .target = .{ .operation_id = operation_id } } },
+    });
     try session_runtime.step();
 
     var found_canceled = false;

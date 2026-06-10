@@ -3,7 +3,6 @@ const env_api_keys = @import("../utils/env_api_keys.zig");
 const http_utils = @import("../utils/http.zig");
 const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
-const runtime = @import("../../runtime/root.zig");
 const shared = @import("openai_responses_shared.zig");
 const simple_options = @import("simple_options.zig");
 const transform_messages = @import("transform_messages.zig");
