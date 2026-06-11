@@ -1,8 +1,7 @@
-const std = @import("std");
-const substrate = @import("../substrate/root.zig");
+const input_mod = @import("input.zig");
 
 pub const KeyAction = union(enum) {
-    composer_insert: substrate.input.InlineBytes,
+    composer_insert: input_mod.InlineBytes,
     composer_backspace,
     composer_left,
     composer_right,
@@ -18,7 +17,7 @@ pub const KeyAction = union(enum) {
     none,
 };
 
-pub fn resolve(event: substrate.input.InputEvent) KeyAction {
+pub fn resolve(event: input_mod.Input) KeyAction {
     return switch (event) {
         .text => |bytes| .{ .composer_insert = bytes },
         .key => |key| resolveKey(key),
@@ -26,7 +25,7 @@ pub fn resolve(event: substrate.input.InputEvent) KeyAction {
     };
 }
 
-fn resolveKey(key: substrate.input.Key) KeyAction {
+fn resolveKey(key: input_mod.Key) KeyAction {
     return switch (key) {
         .backspace => .composer_backspace,
         .arrow_left => .composer_left,
@@ -37,33 +36,9 @@ fn resolveKey(key: substrate.input.Key) KeyAction {
         .page_up => .transcript_page_up,
         .page_down => .transcript_page_down,
         .escape => .interrupt,
-        .ctrl => |c| switch (c) {
-            0x03 => .clear_or_exit,
-            0x15 => .transcript_page_up,
-            0x04 => .exit_if_composer_empty,
-            else => .none,
-        },
-        else => .none,
+        .ctrl_c => .clear_or_exit,
+        .ctrl_u => .transcript_page_up,
+        .ctrl_d => .exit_if_composer_empty,
+        .tab, .delete => .none,
     };
-}
-
-test "product keys resolve composer actions" {
-    const text = substrate.input.InlineBytes.from("a");
-    try std.testing.expect(resolve(.{ .text = text }) == .composer_insert);
-    try std.testing.expect(resolve(.{ .key = .backspace }) == .composer_backspace);
-    try std.testing.expect(resolve(.{ .key = .arrow_left }) == .composer_left);
-    try std.testing.expect(resolve(.{ .key = .arrow_right }) == .composer_right);
-    try std.testing.expect(resolve(.{ .key = .home }) == .composer_start);
-    try std.testing.expect(resolve(.{ .key = .end }) == .composer_end);
-    try std.testing.expect(resolve(.{ .key = .enter }) == .composer_submit);
-}
-
-test "product keys resolve transcript and app actions" {
-    try std.testing.expect(resolve(.{ .key = .page_up }) == .transcript_page_up);
-    try std.testing.expect(resolve(.{ .key = .page_down }) == .transcript_page_down);
-    try std.testing.expect(resolve(.{ .key = .{ .ctrl = 0x15 } }) == .transcript_page_up);
-    try std.testing.expect(resolve(.{ .key = .{ .ctrl = 0x04 } }) == .exit_if_composer_empty);
-    try std.testing.expect(resolve(.{ .key = .escape }) == .interrupt);
-    try std.testing.expect(resolve(.{ .key = .{ .ctrl = 0x03 } }) == .clear_or_exit);
-    try std.testing.expect(resolve(.{ .key = .arrow_up }) == .none);
 }

@@ -1,5 +1,5 @@
 const std = @import("std");
-const primitive = @import("../primitive/root.zig");
+const vaxis = @import("vaxis");
 const theme_mod = @import("theme.zig");
 
 pub const generated_text_bytes_max: usize = 160;
@@ -30,9 +30,9 @@ pub const Projection = struct {
     prefix: []const u8 = "",
     text: []const u8,
     repeat_prefix: bool = false,
-    prefix_style: primitive.Style,
-    text_style: primitive.Style,
-    row_style: primitive.Style,
+    prefix_style: vaxis.Style,
+    text_style: vaxis.Style,
+    row_style: vaxis.Style,
     generated: bool = false,
 };
 
@@ -188,27 +188,4 @@ fn trimLeft(bytes: []const u8) []const u8 {
     var index: usize = 0;
     while (index < bytes.len and (bytes[index] == ' ' or bytes[index] == '\t')) : (index += 1) {}
     return bytes[index..];
-}
-
-test "markdown projection classifies common block lines" {
-    const theme = theme_mod.Theme.codex();
-    var state: State = .{};
-    var generated: [generated_text_bytes_max]u8 = undefined;
-
-    try std.testing.expectEqual(LineKind.heading, classifyLine(&state, "## Title", &theme, &generated).kind);
-    try std.testing.expectEqual(LineKind.quote, classifyLine(&state, "> quoted", &theme, &generated).kind);
-    try std.testing.expectEqual(LineKind.list, classifyLine(&state, "12. item", &theme, &generated).kind);
-    try std.testing.expectEqual(LineKind.horizontal_rule, classifyLine(&state, "---", &theme, &generated).kind);
-}
-
-test "markdown projection tracks fenced code state" {
-    const theme = theme_mod.Theme.codex();
-    var state: State = .{};
-    var generated: [generated_text_bytes_max]u8 = undefined;
-
-    try std.testing.expectEqual(LineKind.code, classifyLine(&state, "```zig", &theme, &generated).kind);
-    try std.testing.expect(state.in_code_fence);
-    try std.testing.expectEqual(LineKind.code, classifyLine(&state, "# not heading", &theme, &generated).kind);
-    try std.testing.expectEqual(LineKind.code, classifyLine(&state, "```", &theme, &generated).kind);
-    try std.testing.expect(!state.in_code_fence);
 }

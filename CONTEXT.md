@@ -5,8 +5,8 @@ but the implementation is Zi-shaped: bounded, explicit, owned, and small.
 
 The goal is not to port a TypeScript architecture. The goal is to preserve what
 users feel — session continuity, reliable tools, prompt/resources, model
-selection, print/interactive modes, and observable cancellation — on top of a
-substrate Zi fully owns and can reason about.
+selection, print/interactive modes, and observable cancellation — on top of
+substrates Zi can reason about explicitly.
 
 "Bounded" in Zi means bounded resident working set, bounded in-flight work, and
 an explicit policy at every accumulation point. It does not mean every external
@@ -36,7 +36,7 @@ src/
   coding_agent/  Zi core product/session policy and typed client protocol
   cli/           process CLI parsing and concrete mode dispatch
   runtime/       zio-backed mechanism: process, select, bounded queues, cancel, process runner
-  tui/           Zi-owned terminal UI (substrate/infra/primitive/product)
+  tui/           agent-agnostic terminal UI product on vendored libvaxis
   frontends/     concrete client adapters; print, RPC, and TUI today
   main.zig       process init -> runtime.Runtime -> cli.main
   root.zig       public package surface (ai, agent, coding_agent, runtime, tui)
@@ -49,7 +49,7 @@ the reverse:
 ai        depends on std (+ runtime mechanism for I/O). knows nothing above it.
 agent     depends on std, ai, runtime. must not import coding_agent or tui.
 runtime   depends on std + vendored zio. pure mechanism, no product policy.
-tui       depends on std + vendored uucode only. no runtime, agent, ai, or coding_agent.
+tui       depends on std + vendored vaxis only. no runtime, agent, ai, or coding_agent.
 coding_agent  depends on std, ai, agent, and runtime. no tui or concrete frontend adapters.
 ```
 
@@ -63,8 +63,9 @@ two facts follow from this and are load-bearing:
 
 vendored dependencies are deliberate and minimal: `zio` (lalinsky/zio, the Zig
 0.16 `std.Io` runtime — task spawning, channels, select, cancellation) and
-`uucode` (grapheme segmentation and display width). The model catalog is
-generated into `src/ai/models.generated.zig` via `zig build generate-models`.
+`libvaxis` (terminal raw mode, parsing, screen/window primitives, diff/render,
+Unicode width). The model catalog is generated into
+`src/ai/models.generated.zig` via `zig build generate-models`.
 
 ## coding-agent spine
 
@@ -242,41 +243,62 @@ zio-native by the same token. the seam is the `runtime` vocabulary, not `std.Io`
 
 ## tui layer
 
-Zi owns its terminal substrate end to end. there is no libvaxis (removed in
-ADR 0013). the layering is rings, dependencies pointing inward:
+Zi no longer owns a terminal substrate/infra/primitive stack. vendored libvaxis
+owns terminal mechanism: raw tty setup, parsing, capability detection, screen
+cells, windows, borders, diff/render, style/color encodings, and Unicode width.
+Zi owns product policy and the frontend owner loop:
 
 ```text
-tui/substrate   terminal lifecycle, raw mode, size query, ANSI, semantic-free input decoding
-tui/infra       bounded cell buffers, output staging, the double-buffer diff renderer
-tui/primitive   color, style, rect, grapheme/width text policy, border chrome
-tui/product     ProductApp, composer, transcript, frame, keys, theme, the owner loops
+tui/product     ProductApp, composer, transcript, frame, input, theme, slots
+frontends/tui   concrete coding-agent adapter and wake/render loop
+libvaxis        terminal substrate/infra/primitives
 ```
 
-`substrate`, `infra`, and `primitive` never mention a product concept
-(transcript, composer, tool, assistant, session). they could render any app.
+Do not reintroduce `tui/substrate`, `tui/infra`, or `tui/primitive` layers. Small
+product drawing helpers may exist only as policy adapters over Vaxis primitives
+(for example transcript wrapping or tool chrome); they must not grow into a
+second terminal substrate.
 
-`ProductApp` is the single owner of TUI state (composer, transcript, scroll,
-theme, dirty flag). all mutation goes through one path:
+`ProductApp` is the single owner of TUI product state (composer, transcript,
+scroll, theme, dirty flag). all mutation goes through one path:
 
 ```text
 ProductApp.apply(Command) -> ?Effect
   Command : resize | input | clear_composer | append_transcript | tool_output_delta
-  Effect  : submit_text | request_shutdown
+  Effect  : submit_text | request_shutdown | interrupt | confirm_result
 ```
 
 `Command` carries a domain-neutral `TranscriptAppend` (message / status / tool),
 not agent types. `Effect` is returned data, never a second mutation path.
 
-rendering is a transaction. `frame.build` paints `ProductApp` state into the
-renderer's next cell buffer; `Renderer.stage` diffs next against current into a
-bounded `FrameOutput`; the bytes are written; only then does `commit` swap
-buffers. a write failure `discard`s and leaves state dirty, so the next frame
-re-paints. terminal output is single-owner and synchronous at the render site.
+rendering is a transaction through Vaxis. `frame.build` paints `ProductApp` state
+into a Vaxis screen/window; `vaxis.render` writes terminal output synchronously at
+the render site; product state stays dirty until the write succeeds. terminal
+output is single-owner and synchronous at the render site.
 
-no TUI bridge is part of `coding_agent`. A future concrete frontend adapter will
-own the wake loop, translate `ClientEvent` into TUI `Command`s, and turn TUI
-`Effect`s into `ClientCommand`s. Until that adapter is wired, interactive mode is
-explicitly unsupported.
+The concrete TUI frontend owns the wake loop and must block in
+`SessionRuntime.waitAndApplyWake(input_fd, frame_ms)`. That select observes
+terminal input readiness, session/agent progress, public-event wake, command
+wake, retry deadlines, and the frame timer. `step()` and event draining happen
+from this owner after wakes. Do not replace this with sleep polling, callback
+mutation, or a foreign input thread: typing must not be required for shimmer,
+transcript streaming, retry countdowns, or any other UI progress.
+
+Input has one non-obvious platform split: Vaxis opens `/dev/tty` for raw mode,
+size, and writes, while the frontend selects/reads `stdin` for readiness. This is
+intentional on macOS because kqueue cannot poll `/dev/tty` reliably in this
+setup. Bytes read from stdin are fed through a persistent `vaxis.Parser` on the
+owner loop.
+
+Do not use `vaxis.Loop` for Zi's product loop by default. It is a thread + queue
+runtime and creates another lifecycle/overflow boundary. If it is introduced,
+document the queue bound, overflow policy, shutdown order, and why the extra
+owner boundary pays rent.
+
+Any owner storing Vaxis/Tty state must be pinned once initialized. Vaxis/Tty may
+store pointers into owner fields (for example tty buffers and env maps). Do not
+return or copy such an owner by value after initialization; use heap allocation or
+another explicit pinning strategy and document it on the type.
 
 transcript is bounded resident state (item and byte caps, oldest-first eviction).
 wrapping and scrolling are measured in display rows, not newline counts. visible

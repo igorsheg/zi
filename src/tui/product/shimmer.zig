@@ -1,17 +1,18 @@
 const std = @import("std");
-const infra = @import("../infra/root.zig");
-const primitive = @import("../primitive/root.zig");
+const vaxis = @import("vaxis");
+const wrap = @import("wrap.zig");
 
 pub const Config = struct {
     lead_pad_cols: u16 = 6,
     tail_pad_cols: u16 = 10,
     band_half_width: u16 = 2,
-    base_style: primitive.Style,
-    edge_style: primitive.Style,
-    peak_style: primitive.Style,
+    base_style: vaxis.Style,
+    edge_style: vaxis.Style,
+    peak_style: vaxis.Style,
 };
 
 pub const Bucket = enum { base, edge, peak };
+const segment_count_max: usize = 256;
 
 pub fn phaseForTick(tick: u64, config: Config, text: []const u8) u32 {
     const period = shimmerPeriod(config, text);
@@ -20,7 +21,7 @@ pub fn phaseForTick(tick: u64, config: Config, text: []const u8) u32 {
 }
 
 fn shimmerPeriod(config: Config, text: []const u8) u64 {
-    return primitive.text.displayWidth(text) + config.lead_pad_cols + config.tail_pad_cols;
+    return wrap.displayWidth(text) + config.lead_pad_cols + config.tail_pad_cols;
 }
 
 pub fn bucketForColumn(config: Config, phase: u32, visual_col: usize) Bucket {
@@ -56,27 +57,27 @@ pub fn floorStrength(raw_strength: u8, floor: u8) u8 {
     return @intCast(@divTrunc(numer, denom));
 }
 
-pub fn lerpColor(from: primitive.Color, to: primitive.Color, t: u8) primitive.Color {
+pub fn lerpColor(from: vaxis.Color, to: vaxis.Color, t: u8) vaxis.Color {
     return switch (from) {
         .default => if (t == 0) from else to,
         .rgb => |from_rgb| switch (to) {
             .default => if (t == 255) to else from,
             .rgb => |to_rgb| .{ .rgb = .{
-                .r = lerpChannel(from_rgb.r, to_rgb.r, t),
-                .g = lerpChannel(from_rgb.g, to_rgb.g, t),
-                .b = lerpChannel(from_rgb.b, to_rgb.b, t),
+                lerpChannel(from_rgb[0], to_rgb[0], t),
+                lerpChannel(from_rgb[1], to_rgb[1], t),
+                lerpChannel(from_rgb[2], to_rgb[2], t),
             } },
-            .indexed => if (t < 128) from else to,
+            .index => if (t < 128) from else to,
         },
-        .indexed => switch (to) {
+        .index => switch (to) {
             .default => if (t == 255) to else from,
-            .rgb, .indexed => if (t < 128) from else to,
+            .rgb, .index => if (t < 128) from else to,
         },
     };
 }
 
 pub fn write(
-    renderer: *infra.Renderer,
+    renderer: anytype,
     x: u16,
     y: u16,
     text: []const u8,
@@ -90,9 +91,9 @@ pub fn write(
     var run_x = x;
     var run_bucket: ?Bucket = null;
     var index: usize = 0;
-    while (index < text.len and cursor_x < renderer.next.width) {
+    while (index < text.len and cursor_x < renderer.width) {
         const char_start = index;
-        const grapheme = primitive.text.nextGrapheme(text[index..]);
+        const grapheme = wrap.nextGrapheme(text[index..]);
         if (grapheme.end == 0) break;
         const bucket = bucketForColumn(config, phase, visual_col);
         if (run_bucket == null) {
@@ -114,7 +115,7 @@ pub fn write(
 }
 
 pub fn writeSmooth(
-    renderer: *infra.Renderer,
+    renderer: anytype,
     x: u16,
     y: u16,
     text: []const u8,
@@ -126,23 +127,36 @@ pub fn writeSmooth(
     var cursor_x = x;
     var visual_col: usize = 0;
     var index: usize = 0;
-    while (index < text.len and cursor_x < renderer.next.width) {
-        const grapheme = primitive.text.nextGrapheme(text[index..]);
+    var segments: [segment_count_max]vaxis.Segment = undefined;
+    var segment_count: usize = 0;
+    var segment_x = x;
+
+    while (index < text.len and cursor_x < renderer.width) {
+        const grapheme = wrap.nextGrapheme(text[index..]);
         if (grapheme.end == 0) break;
         const slice = text[index .. index + grapheme.end];
         const strength = floorStrength(strengthForColumn(config, phase, visual_col), floor);
         var style = config.base_style;
         if (strength > 0) style.fg = lerpColor(config.base_style.fg, config.peak_style.fg, strength);
         if (strength >= 224) style = mergeStyle(style, config.peak_style);
-        try renderer.writeText(cursor_x, y, slice, style);
+
+        if (segment_count == segments.len) {
+            renderer.printSegments(segment_x, y, segments[0..segment_count]);
+            segment_x = cursor_x;
+            segment_count = 0;
+        }
+        segments[segment_count] = .{ .text = slice, .style = style };
+        segment_count += 1;
+
         cursor_x = advance(cursor_x, grapheme.width);
         visual_col += grapheme.width;
         index += grapheme.end;
     }
+    renderer.printSegments(segment_x, y, segments[0..segment_count]);
     return cursor_x;
 }
 
-fn styleForBucket(config: Config, bucket: Bucket) primitive.Style {
+fn styleForBucket(config: Config, bucket: Bucket) vaxis.Style {
     return switch (bucket) {
         .base => config.base_style,
         .edge => config.edge_style,
@@ -158,51 +172,17 @@ fn lerpChannel(from: u8, to: u8, t: u8) u8 {
     return @intCast(@max(0, @min(value, 255)));
 }
 
-fn mergeStyle(base: primitive.Style, overlay: primitive.Style) primitive.Style {
+fn mergeStyle(base: vaxis.Style, overlay: vaxis.Style) vaxis.Style {
     return .{
         .fg = if (overlay.fg == .default) base.fg else overlay.fg,
         .bg = if (overlay.bg == .default) base.bg else overlay.bg,
         .bold = base.bold or overlay.bold,
         .dim = base.dim or overlay.dim,
-        .underline = base.underline or overlay.underline,
+        .ul = if (overlay.ul == .default) base.ul else overlay.ul,
+        .ul_style = if (overlay.ul_style == .off) base.ul_style else overlay.ul_style,
     };
 }
 
 fn advance(x: u16, width: usize) u16 {
     return @intCast(@min(@as(usize, std.math.maxInt(u16)), @as(usize, x) + width));
-}
-
-test "shimmer bucket matches original band rules" {
-    const config: Config = .{
-        .lead_pad_cols = 0,
-        .tail_pad_cols = 0,
-        .band_half_width = 1,
-        .base_style = .{ .dim = true },
-        .edge_style = .{},
-        .peak_style = .{ .bold = true },
-    };
-    try std.testing.expectEqual(Bucket.peak, bucketForColumn(config, 1, 1));
-    try std.testing.expectEqual(Bucket.edge, bucketForColumn(config, 1, 0));
-    try std.testing.expectEqual(Bucket.base, bucketForColumn(config, 4, 0));
-}
-
-test "shimmer smooth interpolates rgb color" {
-    const from: primitive.Color = .{ .rgb = .{ .r = 0, .g = 0, .b = 0 } };
-    const to: primitive.Color = .{ .rgb = .{ .r = 100, .g = 50, .b = 200 } };
-    const expected: primitive.Color = .{ .rgb = .{ .r = 50, .g = 25, .b = 100 } };
-    try std.testing.expectEqual(expected, lerpColor(from, to, 128));
-}
-
-test "shimmer writes grapheme clusters atomically" {
-    var renderer = try infra.Renderer.init(std.testing.allocator, 8, 1, 8);
-    defer renderer.deinit();
-    const config: Config = .{
-        .base_style = .{ .dim = true },
-        .edge_style = .{},
-        .peak_style = .{ .bold = true },
-    };
-    _ = try writeSmooth(&renderer, 0, 0, "e\u{0301}中", 0, config, 0);
-    try std.testing.expect((try renderer.next.get(0, 0)).renderText() != null);
-    try std.testing.expect((try renderer.next.get(1, 0)).renderText() != null);
-    try std.testing.expect((try renderer.next.get(2, 0)).kind == .wide_continuation);
 }

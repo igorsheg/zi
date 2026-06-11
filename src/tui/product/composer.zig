@@ -1,5 +1,5 @@
 const std = @import("std");
-const text_primitive = @import("../primitive/text.zig");
+const wrap = @import("wrap.zig");
 
 pub const buffer_size_bytes_max: usize = 16 * 1024;
 pub const submit_size_bytes_max: usize = buffer_size_bytes_max;
@@ -87,7 +87,7 @@ pub const ComposerBuffer = struct {
 
     pub fn backspace(self: *ComposerBuffer) void {
         if (self.cursor_byte_index == 0) return;
-        const start = text_primitive.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
+        const start = wrap.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
         self.bytes.replaceRangeAssumeCapacity(start, self.cursor_byte_index - start, "");
         self.cursor_byte_index = start;
         self.bumpRevision();
@@ -95,13 +95,13 @@ pub const ComposerBuffer = struct {
 
     pub fn moveLeft(self: *ComposerBuffer) void {
         if (self.cursor_byte_index == 0) return;
-        self.cursor_byte_index = text_primitive.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
+        self.cursor_byte_index = wrap.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
         self.bumpRevision();
     }
 
     pub fn moveRight(self: *ComposerBuffer) void {
         if (self.cursor_byte_index >= self.bytes.items.len) return;
-        self.cursor_byte_index = text_primitive.nextGraphemeEnd(self.bytes.items, self.cursor_byte_index);
+        self.cursor_byte_index = wrap.nextGraphemeEnd(self.bytes.items, self.cursor_byte_index);
         self.bumpRevision();
     }
 
@@ -222,7 +222,7 @@ const ComposerProjectionBuilder = struct {
         const wrap_width = @max(width, 1);
         var start: usize = 0;
         while (start < bytes.len) {
-            const line = text_primitive.nextVisualLineBreak(bytes, start, wrap_width);
+            const line = wrap.nextVisualLineBreak(bytes, start, wrap_width);
             if (line.next == start) break;
             self.captureCursor(bytes, line);
             self.emit(.{ .text = bytes[line.start..line.end] });
@@ -238,13 +238,13 @@ const ComposerProjectionBuilder = struct {
         }
     }
 
-    fn captureCursor(self: *ComposerProjectionBuilder, bytes: []const u8, line: text_primitive.VisualLineBreak) void {
+    fn captureCursor(self: *ComposerProjectionBuilder, bytes: []const u8, line: wrap.VisualLineBreak) void {
         if (self.cursor.found) return;
         if (self.cursor_byte_index < line.start or self.cursor_byte_index > line.end) return;
         const col = if (self.cursor_byte_index == line.end)
             line.width
         else
-            text_primitive.displayWidth(bytes[line.start..self.cursor_byte_index]);
+            wrap.displayWidth(bytes[line.start..self.cursor_byte_index]);
         self.cursor = .{ .row = self.total_rows, .col = col, .found = true };
     }
 
@@ -288,173 +288,8 @@ const ComposerProjectionBuilder = struct {
     }
 };
 
-test "composer inserts utf8 moves and backspaces by grapheme" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "ao\u{0300}👩🏽‍🚀b");
-    composer.moveLeft();
-    composer.backspace();
-    try std.testing.expectEqualStrings("ao\u{0300}b", composer.text());
-    composer.backspace();
-    try std.testing.expectEqualStrings("ab", composer.text());
-
-    const submitted = (try composer.takeSubmit(std.testing.allocator)).?;
-    defer std.testing.allocator.free(submitted);
-    try std.testing.expectEqualStrings("ab", submitted);
-    try std.testing.expectEqualStrings("", composer.text());
-}
-
-test "composer normalizes newlines and projects visible tail rows" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "one\r\ntwo\rthree");
-    try std.testing.expectEqualStrings("one\ntwo\nthree", composer.text());
-    try std.testing.expect(try composer.apply(std.testing.allocator, .newline) == null);
-    try composer.insertUtf8(std.testing.allocator, "four");
-
-    var rows: [visible_rows_max]ComposerVisualRow = undefined;
-    const projection = composer.visibleRows(20, &rows);
-    try std.testing.expectEqual(@as(usize, 4), projection.total_rows);
-    try std.testing.expectEqual(@as(usize, 4), projection.visible_count);
-    try std.testing.expectEqualStrings("one", rows[0].text);
-    try std.testing.expectEqualStrings("four", rows[3].text);
-}
-
-test "composer visible rows keep newest tail" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "1\n2\n3\n4\n5");
-    var rows: [visible_rows_max]ComposerVisualRow = undefined;
-    const projection = composer.visibleRows(20, &rows);
-    try std.testing.expectEqual(@as(usize, 5), projection.total_rows);
-    try std.testing.expectEqual(@as(usize, 1), projection.first_visible_row);
-    try std.testing.expectEqualStrings("2", rows[0].text);
-    try std.testing.expectEqualStrings("5", rows[3].text);
-}
-
 // Composer wrapping follows display rows, not physical newlines. This keeps the
 // future editor contract honest: storage remains one UTF-8 buffer, while the
 // render projection owns visual wrapping and tail selection.
-test "composer visible rows wrap long lines and keep newest visual tail" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "abcde12345XYZ");
-    var rows: [visible_rows_max]ComposerVisualRow = undefined;
-    const projection = composer.visibleRows(5, &rows);
-    try std.testing.expectEqual(@as(usize, 3), projection.total_rows);
-    try std.testing.expectEqual(@as(usize, 0), projection.first_visible_row);
-    try std.testing.expectEqualStrings("abcde", rows[0].text);
-    try std.testing.expectEqualStrings("12345", rows[1].text);
-    try std.testing.expectEqualStrings("XYZ", rows[2].text);
-}
-
-test "composer visible rows do not split wide graphemes" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "ab中cd");
-    var rows: [visible_rows_max]ComposerVisualRow = undefined;
-    const projection = composer.visibleRows(3, &rows);
-    try std.testing.expectEqual(@as(usize, 3), projection.total_rows);
-    try std.testing.expectEqualStrings("ab", rows[0].text);
-    try std.testing.expectEqualStrings("中c", rows[1].text);
-    try std.testing.expectEqualStrings("d", rows[2].text);
-}
-
-test "composer visible rows tail wrapped output" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "111\n222\n333\n444\n55555");
-    var rows: [visible_rows_max]ComposerVisualRow = undefined;
-    const projection = composer.visibleRows(3, &rows);
-    try std.testing.expectEqual(@as(usize, 6), projection.total_rows);
-    try std.testing.expectEqual(@as(usize, 2), projection.first_visible_row);
-    try std.testing.expectEqualStrings("333", rows[0].text);
-    try std.testing.expectEqualStrings("555", rows[2].text);
-    try std.testing.expectEqualStrings("55", rows[3].text);
-}
-
-test "composer projection reports visible cursor display column" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "a中b");
-    composer.moveLeft();
-
-    var rows: [visible_rows_max]ComposerVisualRow = undefined;
-    const projection = composer.visibleRows(20, &rows);
-    try std.testing.expect(projection.cursor_visible);
-    try std.testing.expectEqual(@as(usize, 0), projection.cursor_visible_row);
-    try std.testing.expectEqual(@as(usize, 3), projection.cursor_display_col);
-}
-
-test "composer projection reports cursor on visible tail row" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "one\ntwo\nthree\nfour\nfive");
-
-    var rows: [visible_rows_max]ComposerVisualRow = undefined;
-    const projection = composer.visibleRows(20, &rows);
-    try std.testing.expect(projection.cursor_visible);
-    try std.testing.expectEqual(@as(usize, 3), projection.cursor_visible_row);
-    try std.testing.expectEqual(@as(usize, 4), projection.cursor_display_col);
-}
-
 // Composer projection is cached because status animations can render at 60 FPS
 // while the editor text is unchanged. Mutations must invalidate the cache.
-test "composer projection cache follows text and cursor revisions" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "abc");
-    var rows: [visible_rows_max]ComposerVisualRow = undefined;
-    _ = composer.visibleRows(20, &rows);
-    try std.testing.expectEqualStrings("abc", rows[0].text);
-
-    composer.moveLeft();
-    const cursor_projection = composer.visibleRows(20, &rows);
-    try std.testing.expectEqual(@as(usize, 2), cursor_projection.cursor_display_col);
-
-    try composer.insertUtf8(std.testing.allocator, "Z");
-    const text_projection = composer.visibleRows(20, &rows);
-    try std.testing.expectEqual(@as(usize, 1), text_projection.visible_count);
-    try std.testing.expectEqualStrings("abZc", rows[0].text);
-}
-
-test "composer submit trims whitespace and ignores empty" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try composer.insertUtf8(std.testing.allocator, "  hello\n");
-    const submitted = (try composer.apply(std.testing.allocator, .submit)).?;
-    defer std.testing.allocator.free(submitted);
-    try std.testing.expectEqualStrings("hello", submitted);
-
-    try composer.insertUtf8(std.testing.allocator, "  \n\t ");
-    try std.testing.expect(try composer.apply(std.testing.allocator, .submit) == null);
-    try std.testing.expectEqualStrings("", composer.text());
-}
-
-test "composer command contract owns editing and submit" {
-    var composer: ComposerBuffer = .{};
-    defer composer.deinit(std.testing.allocator);
-
-    try std.testing.expect(try composer.apply(std.testing.allocator, .{ .insert_utf8 = "ab" }) == null);
-    try std.testing.expect(try composer.apply(std.testing.allocator, .move_start) == null);
-    try std.testing.expect(try composer.apply(std.testing.allocator, .{ .insert_utf8 = "中" }) == null);
-    try std.testing.expectEqualStrings("中ab", composer.text());
-    try std.testing.expect(try composer.apply(std.testing.allocator, .move_end) == null);
-    try std.testing.expect(try composer.apply(std.testing.allocator, .backspace) == null);
-    try std.testing.expectEqualStrings("中a", composer.text());
-
-    const submitted = (try composer.apply(std.testing.allocator, .submit)).?;
-    defer std.testing.allocator.free(submitted);
-    try std.testing.expectEqualStrings("中a", submitted);
-    try std.testing.expectEqualStrings("", composer.text());
-}

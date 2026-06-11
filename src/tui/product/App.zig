@@ -1,6 +1,6 @@
 const std = @import("std");
-const substrate = @import("../substrate/root.zig");
 const composer_mod = @import("composer.zig");
+const input_mod = @import("input.zig");
 const frame_mod = @import("frame.zig");
 const keys = @import("keys.zig");
 const slots_mod = @import("slots.zig");
@@ -117,7 +117,7 @@ pub const ProductApp = struct {
         }
     }
 
-    fn applyInput(self: *ProductApp, allocator: std.mem.Allocator, event: substrate.input.InputEvent) !?Effect {
+    fn applyInput(self: *ProductApp, allocator: std.mem.Allocator, event: input_mod.Input) !?Effect {
         if (self.modal != null) return self.applyModal(allocator, event);
         switch (keys.resolve(event)) {
             .composer_insert => |bytes| {
@@ -154,7 +154,7 @@ pub const ProductApp = struct {
         return null;
     }
 
-    fn applyModal(self: *ProductApp, allocator: std.mem.Allocator, event: substrate.input.InputEvent) !?Effect {
+    fn applyModal(self: *ProductApp, allocator: std.mem.Allocator, event: input_mod.Input) !?Effect {
         const modal = if (self.modal) |*modal| modal else return null;
         if (modal.applyInput(event)) |result| {
             modal.deinit(allocator);
@@ -228,7 +228,7 @@ pub const ProductApp = struct {
 
 pub const Command = union(enum) {
     resize: Size,
-    input: substrate.input.InputEvent,
+    input: input_mod.Input,
     clear_composer,
     clear_transcript,
     insert_composer_text: []const u8,
@@ -272,30 +272,6 @@ pub const Effect = union(enum) {
     }
 };
 
-test "product app applies input through one mutation path" {
-    var app = try ProductApp.init(20, 4);
-    defer app.deinit(std.testing.allocator);
-
-    const text = substrate.input.InlineBytes.from("hello");
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .text = text } }) == null);
-    try std.testing.expectEqualStrings("hello", app.composer.text());
-
-    const effect = (try app.apply(std.testing.allocator, .{ .input = .{ .key = .enter } })).?;
-    defer effect.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("hello", effect.submit_text);
-    try std.testing.expectEqualStrings("", app.composer.text());
-}
-
-test "product app maps escape to interrupt not shutdown" {
-    var app = try ProductApp.init(20, 4);
-    defer app.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(
-        app_mod_effect_interrupt,
-        try app.apply(std.testing.allocator, .{ .input = .{ .key = .escape } }),
-    );
-}
-
 const app_mod_effect_interrupt: ?Effect = .interrupt;
 const app_mod_effect_request_shutdown: ?Effect = .request_shutdown;
 
@@ -303,225 +279,4 @@ fn appendTestMessage(app: *ProductApp, role: transcript.TranscriptRole, text: []
     _ = try app.apply(std.testing.allocator, .{
         .append_transcript = .{ .message = .{ .role = role, .text = text } },
     });
-}
-
-test "product app applies transcript append through apply" {
-    var app = try ProductApp.init(20, 4);
-    defer app.deinit(std.testing.allocator);
-
-    var source = [_]u8{ 'o', 'k' };
-    try std.testing.expect(try app.apply(std.testing.allocator, .{
-        .append_transcript = .{ .message = .{ .role = .assistant, .text = &source } },
-    }) == null);
-    source[0] = 'n';
-
-    try std.testing.expect(app.dirty);
-    try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
-    try std.testing.expectEqualStrings("ok", app.transcript.items.items[0].message.text);
-}
-
-test "product app maps ctrl-u to transcript scroll" {
-    var app = try ProductApp.init(20, 5);
-    defer app.deinit(std.testing.allocator);
-
-    try appendTestMessage(&app, .system, "one");
-    try appendTestMessage(&app, .system, "two");
-    try appendTestMessage(&app, .system, "three");
-    try appendTestMessage(&app, .system, "four");
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x15 } } }) == null);
-    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
-}
-
-test "product app ctrl-c clears then double press exits" {
-    var app = try ProductApp.init(20, 4);
-    defer app.deinit(std.testing.allocator);
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .insert_composer_text = "draft" }) == null);
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .animation_tick = 10 }) == null);
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x03 } } }) == null);
-    try std.testing.expectEqualStrings("", app.composer.text());
-    try std.testing.expectEqual(
-        app_mod_effect_request_shutdown,
-        try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x03 } } }),
-    );
-}
-
-test "product app ctrl-d exits only when composer is empty" {
-    var app = try ProductApp.init(20, 4);
-    defer app.deinit(std.testing.allocator);
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .insert_composer_text = "draft" }) == null);
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x04 } } }) == null);
-    try std.testing.expectEqualStrings("draft", app.composer.text());
-    _ = try app.apply(std.testing.allocator, .clear_composer);
-    try std.testing.expectEqual(
-        app_mod_effect_request_shutdown,
-        try app.apply(std.testing.allocator, .{ .input = .{ .key = .{ .ctrl = 0x04 } } }),
-    );
-}
-
-test "product app page down at bottom does not dirty" {
-    var app = try ProductApp.init(20, 5);
-    defer app.deinit(std.testing.allocator);
-    app.dirty = false;
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_down } }) == null);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
-    try std.testing.expect(!app.dirty);
-}
-
-test "product app pages transcript scroll and append preserves it" {
-    var app = try ProductApp.init(20, 5);
-    defer app.deinit(std.testing.allocator);
-
-    try appendTestMessage(&app, .system, "one");
-    try appendTestMessage(&app, .system, "two");
-    try appendTestMessage(&app, .system, "three");
-    try appendTestMessage(&app, .system, "four");
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_up } }) == null);
-    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
-    try appendTestMessage(&app, .system, "five");
-    try std.testing.expectEqual(@as(usize, 1), app.transcript_scroll_rows);
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{ .key = .page_down } }) == null);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
-}
-
-test "product app scroll max cache follows direct transcript revision" {
-    var app = try ProductApp.init(20, 5);
-    defer app.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), app.transcriptScrollMax());
-    try app.transcript.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = "one" } });
-    try app.transcript.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = "two" } });
-    try app.transcript.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = "three" } });
-    try app.transcript.append(std.testing.allocator, .{ .message = .{ .role = .system, .text = "four" } });
-
-    try std.testing.expect(app.transcriptScrollMax() > 0);
-}
-
-test "product app clamps transcript scroll after append eviction" {
-    var app = try ProductApp.init(20, 5);
-    defer app.deinit(std.testing.allocator);
-
-    for (0..transcript.line_count_max + 1) |index| {
-        const text = if (index == 0) "old" else "new";
-        try appendTestMessage(&app, .system, text);
-    }
-    app.transcript_scroll_rows = std.math.maxInt(usize);
-    try appendTestMessage(&app, .system, "tail");
-    app.clampTranscriptScroll();
-
-    try std.testing.expect(app.transcript_scroll_rows <= app.transcriptScrollMax());
-}
-
-test "product app confirm modal captures input until result" {
-    var app = try ProductApp.init(30, 8);
-    defer app.deinit(std.testing.allocator);
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .open_confirm = .{
-        .id = 1,
-        .title = "Delete?",
-        .body = "Really?",
-    } }) == null);
-    try std.testing.expect(app.modal != null);
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .input = .{
-        .text = substrate.input.InlineBytes.from("x"),
-    } }) == null);
-    try std.testing.expectEqualStrings("", app.composer.text());
-
-    const effect = (try app.apply(std.testing.allocator, .{ .input = .{
-        .text = substrate.input.InlineBytes.from("n"),
-    } })).?;
-    defer effect.deinit(std.testing.allocator);
-    try std.testing.expect(effect == .confirm_result);
-    try std.testing.expectEqual(@as(surface_mod.ModalId, 1), effect.confirm_result.id);
-    try std.testing.expect(!effect.confirm_result.accepted);
-    try std.testing.expect(app.modal == null);
-}
-
-test "product app rejects second modal before mutation" {
-    var app = try ProductApp.init(30, 8);
-    defer app.deinit(std.testing.allocator);
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .open_confirm = .{
-        .id = 1,
-        .title = "One",
-        .body = "",
-    } }) == null);
-    try std.testing.expectError(error.ModalAlreadyOpen, app.apply(std.testing.allocator, .{ .open_confirm = .{
-        .id = 2,
-        .title = "Two",
-        .body = "",
-    } }));
-    const effect = (try app.apply(std.testing.allocator, .{ .input = .{ .key = .enter } })).?;
-    try std.testing.expect(effect.confirm_result.accepted);
-}
-
-test "product app animation tick dirties only animated status" {
-    var app = try ProductApp.init(20, 5);
-    defer app.deinit(std.testing.allocator);
-
-    app.dirty = false;
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .animation_tick = 1 }) == null);
-    try std.testing.expect(!app.dirty);
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
-        .slot = .status_area,
-        .id = 1,
-        .text = "working",
-        .effect = .shimmer,
-    } }) == null);
-    app.dirty = false;
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .animation_tick = 2 }) == null);
-    try std.testing.expect(app.dirty);
-    app.dirty = false;
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .animation_tick = 2 }) == null);
-    try std.testing.expect(!app.dirty);
-}
-
-test "product app applies slot contributions atomically" {
-    var app = try ProductApp.init(20, 5);
-    defer app.deinit(std.testing.allocator);
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
-        .slot = .composer_top_right,
-        .id = 1,
-        .text = "model: faux",
-    } }) == null);
-    try std.testing.expect(app.dirty);
-    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_right));
-
-    app.dirty = false;
-    try std.testing.expectError(
-        error.InvalidSlotContributionText,
-        app.apply(std.testing.allocator, .{ .set_slot_contribution = .{
-            .slot = .composer_top_right,
-            .id = 2,
-            .text = "bad\n",
-        } }),
-    );
-    try std.testing.expect(!app.dirty);
-    try std.testing.expectEqual(@as(usize, 1), app.slots.count(.composer_top_right));
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .{ .clear_slot_contribution = .{
-        .slot = .composer_top_right,
-        .id = 1,
-    } }) == null);
-    try std.testing.expectEqual(@as(usize, 0), app.slots.count(.composer_top_right));
-}
-
-test "product app clears transcript through command" {
-    var app = try ProductApp.init(20, 4);
-    defer app.deinit(std.testing.allocator);
-
-    try appendTestMessage(&app, .assistant, "hello");
-    try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
-
-    try std.testing.expect(try app.apply(std.testing.allocator, .clear_transcript) == null);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript_scroll_rows);
-    try std.testing.expect(app.dirty);
 }

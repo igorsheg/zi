@@ -62,7 +62,7 @@ import rules (enforced by review; they are real today):
 - `ai` imports std (+ runtime for I/O). nothing above it.
 - `agent` imports std, ai, runtime. never coding_agent or tui.
 - `runtime` imports std + vendored zio. never product modules.
-- `tui` imports std + vendored uucode only. never runtime, ai, agent, coding_agent.
+- `tui` imports std + vendored vaxis only. never runtime, ai, agent, coding_agent.
 - `coding_agent` imports ai, agent, runtime, and std. never tui or frontend adapters.
 - concrete frontends live outside `src/coding_agent`; a TUI adapter may import both
   coding_agent and tui, but it is not part of the core.
@@ -136,24 +136,43 @@ agent event
 - the TUI is agent-agnostic. commands carry the domain-neutral `TranscriptAppend`
   (message / status / tool). any `ClientEvent -> Command` translation lives in a
   frontend adapter outside `src/tui` and outside `src/coding_agent`.
-- rendering is a transaction: `frame.build` paints into the next cell buffer,
-  `Renderer.stage` diffs into a bounded `FrameOutput`, bytes are written, then
-  `commit` swaps. on write failure, `discard` and stay dirty. terminal output is
+- Vaxis owns terminal mechanism: raw tty setup, parsing, capability detection,
+  screen cells, windows, borders, diff/render, and terminal primitive encodings.
+  Zi owns product policy: transcript, composer, commands/effects, session adapter
+  mapping, bounded resident state, and the frontend owner loop.
+- rendering is a transaction through Vaxis: `frame.build` paints into a Vaxis
+  screen/window, `vaxis.render` writes terminal output synchronously at the render
+  site, and product state stays dirty until the write succeeds. terminal output is
   single-owner and synchronous at the render site.
-- full-frame stage + diff first. do not add dirty rectangles or retained surfaces
-  until full-frame is measured too slow.
+- do not reintroduce Zi-owned terminal substrate/infra/primitive layers. no local
+  ANSI encoders, raw-mode managers, cell buffers, diff renderers, style/color
+  encodings, or grapheme/width engines unless a concrete Vaxis gap is proven and
+  bounded. use Vaxis styles/colors/windows/borders/unicode/gwidth.
 - transcript is bounded resident domain state with explicit item/byte caps and
   oldest-first eviction. wrapping and scrolling use display rows, not newline
   counts. layout/scroll work must be O(viewport + visible items), not O(history),
   with caches keyed by transcript revision and viewport shape rather than hidden
   caller discipline.
-- `substrate`, `infra`, and `primitive` must not name a product concept
-  (transcript, composer, tool, assistant, user, system, session, model). color
-  and style encoding/equality live in `primitive`; do not reimplement them in the
-  renderer.
+- product drawing helpers may exist only as Zi policy adapters over Vaxis
+  primitives (for example transcript wrapping or tool chrome). they must not grow
+  into a second terminal substrate.
 - streamed agent/tool text is operational input. a fragment, an invalid-UTF-8
   split, or an oversized payload is sanitized or dropped — it must never
   propagate as a fatal error out of the owner loop.
+- the concrete TUI frontend must keep Zi's event-driven owner loop: zio `select`
+  over terminal input readiness, session/agent progress, public-event wake,
+  command wake, and a ~16ms frame timer. typing must not be required for shimmer
+  or transcript progress; frame ticks and session wakes must render without input.
+- do not use `vaxis.Loop` for Zi's product loop by default. it is a thread + queue
+  runtime and creates another lifecycle/overflow boundary. If it is introduced,
+  document the queue bound, overflow policy, shutdown order, and why the extra
+  owner boundary pays rent. Zi may use `vaxis.Parser`/rendering while Zi owns
+  scheduling and mutation.
+- any TUI owner that stores Vaxis/Tty state must be pinned once initialized. Do
+  not return or copy it by value after fields can point into its own storage
+  (for example tty buffers, env maps, parser/terminal state, or spawned worker
+  context). Prefer heap allocation or another explicit pinning strategy, and
+  document the invariant on the type.
 - defer multi-line composer, surfaces, slots, extra themes, and extension UI until
   a second concrete owner proves the seam. extensions will request through the
   same commands/slots built-ins use; they never get mutable stores or raw cells.

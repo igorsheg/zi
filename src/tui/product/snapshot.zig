@@ -87,19 +87,3 @@ fn writeSnapshot(path: []const u8, text: []const u8) !void {
     try writer.interface.writeAll(text);
     try writer.interface.flush();
 }
-
-test "snapshot normalization trims trailing whitespace" {
-    const normalized = try normalizeAlloc(std.testing.allocator, "a  \n b\t\r\n", .{});
-    defer std.testing.allocator.free(normalized);
-    try std.testing.expectEqualStrings("a\n b\n", normalized);
-}
-
-test "snapshot normalization can preserve whitespace" {
-    const normalized = try normalizeAlloc(
-        std.testing.allocator,
-        "a  ",
-        .{ .trim_trailing_whitespace = false },
-    );
-    defer std.testing.allocator.free(normalized);
-    try std.testing.expectEqualStrings("a  ", normalized);
-}

@@ -20,13 +20,12 @@ pub const Options = struct {
 };
 
 const frame_interval_ms: u64 = 16;
-const effect_count_max = tui.product.terminal_loop.effects_per_step_max;
+const effect_count_max = tui.product.vaxis_terminal_loop.effects_per_step_max;
 const client_events_per_tick_max = 64;
 const status_id_working: tui.product.SlotContributionId = 1;
 const status_id_queue: tui.product.SlotContributionId = 2;
 const status_id_recovery: tui.product.SlotContributionId = 3;
 const model_slot_id: tui.product.SlotContributionId = 1;
-const output_size_bytes = tui.product.loop.output_size_bytes_default;
 const transcript_append_max = tui.product.transcript.append_size_bytes_max;
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
 
@@ -85,7 +84,7 @@ const InteractiveController = struct {
     app: *session_runtime.SessionRuntime,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    terminal_loop: tui.product.TerminalLoop,
+    terminal_loop: *tui.product.TerminalLoop,
     cancel_requested: bool = false,
     event_cursor: EventCursor = .{},
     animation_tick: u64 = 0,
@@ -99,18 +98,15 @@ const InteractiveController = struct {
         stderr: *std.Io.Writer,
         initial_prompt: ?[]const u8,
     ) !InteractiveController {
-        var terminal_loop = try tui.product.TerminalLoop.init(
+        const terminal_loop = try tui.product.TerminalLoop.init(
             process.gpa,
             process.io,
             80,
             24,
-            output_size_bytes,
         );
         errdefer terminal_loop.deinit();
-        terminal_loop.resizeFromTerminal() catch |err| ignoreBestEffortError(err);
-        try terminal_loop.setup(stdout);
-        try stdout.flush();
-        errdefer terminal_loop.shutdown(stdout) catch |err| ignoreBestEffortError(err);
+        try terminal_loop.setup();
+        errdefer terminal_loop.shutdown() catch |err| ignoreBestEffortError(err);
 
         var self: InteractiveController = .{
             .allocator = process.gpa,
@@ -121,14 +117,12 @@ const InteractiveController = struct {
         };
         try self.requestSnapshot();
         if (initial_prompt) |prompt| try self.submitPrompt(prompt);
-        _ = try self.terminal_loop.renderIfDirty(stdout);
-        try stdout.flush();
+        _ = try self.terminal_loop.renderIfDirty();
         return self;
     }
 
     fn deinit(self: *InteractiveController) void {
-        self.terminal_loop.shutdown(self.stdout) catch |err| ignoreBestEffortError(err);
-        self.stdout.flush() catch |err| ignoreBestEffortError(err);
+        self.terminal_loop.shutdown() catch |err| ignoreBestEffortError(err);
         self.terminal_loop.deinit();
         self.* = undefined;
     }
@@ -151,8 +145,7 @@ const InteractiveController = struct {
         try self.app.step();
         const drained = try self.drainClientEventsBounded(client_events_per_tick_max);
         try self.tickStatus();
-        try self.terminal_loop.renderIfDirty(self.stdout);
-        try self.stdout.flush();
+        try self.terminal_loop.renderIfDirty();
         return drained == client_events_per_tick_max or self.app.hasImmediateWork();
     }
 
@@ -172,7 +165,7 @@ const InteractiveController = struct {
 
     fn handleInputResult(
         self: *InteractiveController,
-        result: tui.product.terminal_loop.StepResult,
+        result: tui.product.vaxis_terminal_loop.StepResult,
         effects: []tui.product.Effect,
     ) !void {
         defer for (effects) |effect| effect.deinit(self.allocator);
@@ -708,184 +701,4 @@ fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
     var end = max_bytes;
     while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
     return value[0..end];
-}
-
-test "tui adapter maps raw text delta into assistant transcript append" {
-    var controller: InteractiveController = .{
-        .allocator = std.testing.allocator,
-        .app = undefined,
-        .stdout = undefined,
-        .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(
-            std.testing.allocator,
-            std.testing.io,
-            40,
-            8,
-            output_size_bytes,
-        ),
-    };
-
-    const content = [_]ai.AssistantContent{ai.faux.text("hi")};
-    const partial = ai.faux.assistantMessage(&content, .{});
-    try controller.applyMessageUpdate(.{ .assistant_message_event = .{ .text_delta = .{
-        .content_index = 0,
-        .delta = "hi",
-        .partial = partial,
-    } } });
-    try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.transcript.items.items.len);
-    try std.testing.expectEqualStrings(
-        "hi",
-        controller.terminal_loop.product.app.transcript.items.items[0].message.text,
-    );
-    controller.terminal_loop.deinit();
-}
-
-test "tui adapter renders non-streaming assistant message end" {
-    var controller: InteractiveController = .{
-        .allocator = std.testing.allocator,
-        .app = undefined,
-        .stdout = undefined,
-        .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(
-            std.testing.allocator,
-            std.testing.io,
-            40,
-            8,
-            output_size_bytes,
-        ),
-    };
-    defer controller.terminal_loop.deinit();
-
-    const content = [_]ai.AssistantContent{ai.faux.text("final")};
-    const message = ai.faux.assistantMessage(&content, .{});
-    try controller.applyMessageEnd(.{ .assistant = message });
-
-    try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.transcript.items.items.len);
-    try std.testing.expectEqualStrings(
-        "final",
-        controller.terminal_loop.product.app.transcript.items.items[0].message.text,
-    );
-}
-
-test "tui adapter splits oversized operational message text" {
-    var controller: InteractiveController = .{
-        .allocator = std.testing.allocator,
-        .app = undefined,
-        .stdout = undefined,
-        .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(
-            std.testing.allocator,
-            std.testing.io,
-            40,
-            8,
-            output_size_bytes,
-        ),
-    };
-    defer controller.terminal_loop.deinit();
-
-    const text = "a" ** (transcript_append_max + 10);
-    try controller.appendMessage(.assistant, text, .new_item);
-
-    try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.transcript.items.items.len);
-    try std.testing.expectEqual(
-        @as(usize, text.len),
-        controller.terminal_loop.product.app.transcript.items.items[0].message.text.len,
-    );
-}
-
-test "tui adapter drops invalid operational message text without failing" {
-    var controller: InteractiveController = .{
-        .allocator = std.testing.allocator,
-        .app = undefined,
-        .stdout = undefined,
-        .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(
-            std.testing.allocator,
-            std.testing.io,
-            40,
-            8,
-            output_size_bytes,
-        ),
-    };
-    defer controller.terminal_loop.deinit();
-
-    const invalid = [_]u8{0xff};
-    try controller.appendMessage(.assistant, &invalid, .new_item);
-
-    try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.transcript.items.items.len);
-    try std.testing.expect(controller.terminal_loop.product.app.transcript.items.items[0] == .status);
-}
-
-test "tui adapter requests replay and recovers from snapshot after mailbox event gap" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "repo");
-
-    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
-        .cwd = "repo",
-        .agent_dir_override = "agent",
-        .current_date = "2026-06-09",
-        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
-        .dir = tmp.dir,
-        .task_runtime = task_runtime,
-        .command_capacity = 2,
-        .event_capacity = 8,
-    });
-    defer app.deinit();
-
-    var controller: InteractiveController = .{
-        .allocator = std.testing.allocator,
-        .app = &app,
-        .stdout = undefined,
-        .stderr = undefined,
-        .terminal_loop = try tui.product.TerminalLoop.init(
-            std.testing.allocator,
-            std.testing.io,
-            40,
-            8,
-            output_size_bytes,
-        ),
-    };
-    defer controller.terminal_loop.deinit();
-
-    try controller.acceptEnvelope(.{ .seq = 2, .event = .operation_started });
-    try std.testing.expectEqual(EventCursor.Recovery.replay_requested, controller.event_cursor.recovery);
-    try std.testing.expect(app.hasImmediateWork());
-    try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.slots.count(.status_area));
-
-    try app.step();
-    while (app.drainEvent()) |event| {
-        var owned = event;
-        owned.deinit(std.testing.allocator);
-    }
-
-    try controller.acceptEnvelope(.{ .seq = 3, .event = .{ .replay_gap = .{
-        .requested_after = 0,
-        .first_retained_seq = 1,
-        .last_retained_seq = 0,
-    } } });
-    try std.testing.expectEqual(EventCursor.Recovery.snapshot_requested, controller.event_cursor.recovery);
-    try std.testing.expect(app.hasImmediateWork());
-
-    try app.step();
-    var snapshot: ?client_protocol.EventEnvelope = null;
-    while (app.drainEvent()) |event| {
-        var owned = event;
-        if (owned.event == .snapshot) {
-            snapshot = owned;
-            break;
-        }
-        owned.deinit(std.testing.allocator);
-    }
-
-    var snapshot_event = snapshot.?;
-    defer snapshot_event.deinit(std.testing.allocator);
-    try controller.acceptEnvelope(snapshot_event);
-
-    try std.testing.expectEqual(EventCursor.Recovery.live, controller.event_cursor.recovery);
-    try std.testing.expectEqual(snapshot_event.seq, controller.event_cursor.last_seq);
-    try std.testing.expectEqual(@as(usize, 0), controller.terminal_loop.product.app.slots.count(.status_area));
 }

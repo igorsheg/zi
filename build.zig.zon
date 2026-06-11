@@ -7,8 +7,8 @@
         .zio = .{
             .path = "vendor/zio",
         },
-        .uucode = .{
-            .path = "vendor/uucode",
+        .vaxis = .{
+            .path = "vendor/libvaxis",
         },
     },
     .paths = .{
@@ -19,7 +19,7 @@
         "docs",
         "src",
         "vendor/zio",
-        "vendor/uucode",
+        "vendor/libvaxis",
         "LICENSE",
         "README.md",
     },

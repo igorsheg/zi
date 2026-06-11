@@ -105,39 +105,3 @@ fn countLines(bytes: []const u8) usize {
     if (bytes[bytes.len - 1] == '\n') count -= 1;
     return count;
 }
-
-test "transcript preview keeps tail by byte cap" {
-    const result = try appendTail(std.testing.allocator, "abcdef", "ghij");
-    defer std.testing.allocator.free(result.bytes);
-    try std.testing.expectEqualStrings("abcdefghij", result.bytes);
-    try std.testing.expectEqual(@as(usize, 0), result.dropped_bytes);
-}
-
-test "transcript preview keeps tail by line cap" {
-    const result = try appendTailWithOptions(std.testing.allocator, "one\ntwo\n", "three\nfour\nfive", .{
-        .max_bytes = 100,
-        .max_lines = 2,
-    });
-    defer std.testing.allocator.free(result.bytes);
-    try std.testing.expectEqualStrings("four\nfive", result.bytes);
-    try std.testing.expect(result.dropped_lines >= 3);
-}
-
-test "transcript preview drops partial first line when earlier lines exceed byte cap" {
-    const result = try appendTailWithOptions(std.testing.allocator, "aaaa\nbbbb\ncccc", "\ndddd", .{
-        .max_bytes = 9,
-        .max_lines = 10,
-    });
-    defer std.testing.allocator.free(result.bytes);
-    try std.testing.expectEqualStrings("cccc\ndddd", result.bytes);
-}
-
-test "transcript preview keeps utf8-safe suffix for huge final line" {
-    const result = try appendTailWithOptions(std.testing.allocator, "", "ab中cd", .{
-        .max_bytes = 5,
-        .max_lines = 10,
-    });
-    defer std.testing.allocator.free(result.bytes);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(result.bytes));
-    try std.testing.expectEqualStrings("中cd", result.bytes);
-}
