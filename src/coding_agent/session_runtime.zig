@@ -1,6 +1,6 @@
 //! The session mailbox host: owns one AgentSession, the bounded command and
 //! event queues, the retained-event replay ledger, and the single owner loop
-//! seam (`waitForWake` + `step`). Frontends talk to it only through
+//! seam (`waitAndApplyWake` + `step`). Frontends talk to it only through
 //! `submit`/`drainEvent`; no callback path mutates session state.
 
 const std = @import("std");
@@ -141,7 +141,7 @@ fn openSession(allocator: std.mem.Allocator, services: *RuntimeServices, options
                 .session_id = create.session_id,
                 .timestamp = create.timestamp,
             });
-            errdefer store.deinit(allocator);
+            errdefer store.deinit();
             session_options.session_id = create.session_id;
             session_options.timestamp = create.timestamp;
             session_options.store = .{ .create = store };
@@ -149,10 +149,10 @@ fn openSession(allocator: std.mem.Allocator, services: *RuntimeServices, options
         },
         .resume_existing => |resume_open| {
             const leaf = resume_open.session_file_name;
-            if (!std.mem.eql(u8, std.fs.path.basename(leaf), leaf)) return error.InvalidSessionFileName;
+            if (!paths_mod.isSessionFileLeafName(leaf)) return error.InvalidSessionFileName;
             const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, leaf });
             errdefer allocator.free(file_name);
-            session_options.store = .{ .restore = .{ .dir = options.dir, .file_name = file_name } };
+            session_options.store = .{ .restore = .{ .allocator = allocator, .dir = options.dir, .file_name = file_name } };
             return AgentSession.init(allocator, services.io, session_options);
         },
     }
@@ -278,11 +278,7 @@ pub const SessionRuntime = struct {
 
     pub fn deinit(self: *SessionRuntime) void {
         if (self.active) |active| {
-            switch (active.phase) {
-                .running => |run| self.session.destroyPromptRun(run),
-                .compacting => |run| self.session.destroyCompactionRun(run),
-                .retry_wait => {},
-            }
+            self.destroyActivePhase(active);
             self.allocator.free(active.prompt_text);
             self.active = null;
         }
@@ -313,12 +309,8 @@ pub const SessionRuntime = struct {
         return self.events.pop();
     }
 
-    pub fn hasPendingClientEvents(self: *const SessionRuntime) bool {
-        return self.pending_event != null or self.events.count() > 0;
-    }
-
-    pub fn hasQueuedCommands(self: *const SessionRuntime) bool {
-        return self.commands.count() > 0;
+    pub fn hasImmediateWork(self: *const SessionRuntime) bool {
+        return self.pending_event != null or self.events.count() > 0 or self.commands.count() > 0;
     }
 
     pub fn rejectClientCommand(
@@ -330,7 +322,7 @@ pub const SessionRuntime = struct {
         try self.enqueueRejected(request_id, code, message);
     }
 
-    pub fn waitForWake(
+    pub fn waitAndApplyWake(
         self: *SessionRuntime,
         input_fd: std.posix.fd_t,
         frame_ms: u64,
@@ -505,6 +497,28 @@ pub const SessionRuntime = struct {
         return active;
     }
 
+    fn destroyActivePhase(self: *SessionRuntime, active: ActiveOperation) void {
+        switch (active.phase) {
+            .running => |run| self.session.destroyPromptRun(run),
+            .compacting => |run| self.session.destroyCompactionRun(run),
+            .retry_wait => {},
+        }
+    }
+
+    fn cancelAndDestroyActivePhase(self: *SessionRuntime, active: ActiveOperation) void {
+        switch (active.phase) {
+            .running => |run| {
+                self.session.cancelPromptRun(run) catch {};
+                self.session.destroyPromptRun(run);
+            },
+            .compacting => |run| {
+                self.session.cancelCompactionRun(run);
+                self.session.destroyCompactionRun(run);
+            },
+            .retry_wait => self.session.cancelRetryWait(),
+        }
+    }
+
     fn applyCommand(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
         switch (envelope.command) {
             .submit => |prompt| {
@@ -569,17 +583,7 @@ pub const SessionRuntime = struct {
                     return;
                 }
                 const active = self.takeActive().?;
-                switch (active.phase) {
-                    .running => |run| {
-                        self.session.cancelPromptRun(run) catch self.session.cancel();
-                        self.session.destroyPromptRun(run);
-                    },
-                    .compacting => |run| {
-                        self.session.cancelCompactionRun(run);
-                        self.session.destroyCompactionRun(run);
-                    },
-                    .retry_wait => self.session.cancelRetryWait(),
-                }
+                self.cancelAndDestroyActivePhase(active);
                 self.allocator.free(active.prompt_text);
                 try self.drainSessionEvents(envelope.id);
                 try self.enqueueEvent(.{
@@ -592,7 +596,7 @@ pub const SessionRuntime = struct {
                 .clear => {
                     // The reply is the state fact itself: a request-correlated
                     // queue_changed (emitted unconditionally by the drain).
-                    try self.session.clearQueue();
+                    self.session.clearQueue();
                     try self.drainSessionEvents(envelope.id);
                 },
             },
@@ -611,14 +615,7 @@ pub const SessionRuntime = struct {
                 // session's own shutdown path below.)
                 if (self.active != null and self.active.?.phase != .running) {
                     const active = self.takeActive().?;
-                    switch (active.phase) {
-                        .retry_wait => self.session.cancelRetryWait(),
-                        .compacting => |run| {
-                            self.session.cancelCompactionRun(run);
-                            self.session.destroyCompactionRun(run);
-                        },
-                        .running => unreachable,
-                    }
+                    self.cancelAndDestroyActivePhase(active);
                     self.allocator.free(active.prompt_text);
                     try self.drainSessionEvents(active.request_id);
                     try self.enqueueEvent(.{
@@ -720,17 +717,7 @@ pub const SessionRuntime = struct {
     /// active operation: the operation fails loudly, the owner loop lives.
     fn failActiveOperation(self: *SessionRuntime, err: anyerror) void {
         const active = self.takeActive() orelse return;
-        switch (active.phase) {
-            .running => |run| {
-                self.session.cancelPromptRun(run) catch {};
-                self.session.destroyPromptRun(run);
-            },
-            .compacting => |run| {
-                self.session.cancelCompactionRun(run);
-                self.session.destroyCompactionRun(run);
-            },
-            .retry_wait => self.session.cancelRetryWait(),
-        }
+        self.cancelAndDestroyActivePhase(active);
         self.allocator.free(active.prompt_text);
         self.enqueueRejected(active.request_id, .invalid_command, @errorName(err)) catch {};
         self.enqueueEvent(.{
@@ -741,23 +728,10 @@ pub const SessionRuntime = struct {
     }
 
     fn buildClientSnapshot(self: *SessionRuntime) !client_protocol.Snapshot {
-        var queue = try self.session.queueSnapshot(self.allocator);
-        errdefer queue.deinit(self.allocator);
-        var header = try client_protocol.SessionHeaderSnapshot.init(self.allocator, self.session.manager.header);
-        errdefer header.deinit(self.allocator);
-        var model = try client_protocol.ModelSnapshot.init(self.allocator, self.session.agent.state.model);
-        errdefer model.deinit(self.allocator);
-        const history = try client_protocol.HistorySnapshot.fromEntries(
+        return self.session.clientSnapshot(
             self.allocator,
-            self.session.manager.entries.items,
+            if (self.active) |active| active.request_id else null,
         );
-        return .{
-            .header = header,
-            .model = model,
-            .queue = queue,
-            .active_request_id = if (self.active) |active| active.request_id else null,
-            .history = history,
-        };
     }
 
     fn drainSessionEvents(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
@@ -1162,7 +1136,7 @@ test "session runtime cancels targeted active operation" {
     var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
-    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first");
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first", .auto);
     var prompt_owned = true;
     defer if (prompt_owned) prompt.deinit(std.testing.allocator);
     try session_runtime.submit(prompt);
@@ -1198,7 +1172,7 @@ test "session runtime queues prompt while active" {
     var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
-    var first = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first");
+    var first = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first", .auto);
     var first_owned = true;
     defer if (first_owned) first.deinit(std.testing.allocator);
     try session_runtime.submit(first);
@@ -1206,7 +1180,7 @@ test "session runtime queues prompt while active" {
     try session_runtime.step();
     try std.testing.expect(session_runtime.active != null);
 
-    var second = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "second");
+    var second = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "second", .auto);
     var second_owned = true;
     defer if (second_owned) second.deinit(std.testing.allocator);
     try session_runtime.submit(second);
@@ -1306,7 +1280,7 @@ test "session runtime retries transient failure through the live owner loop" {
     );
     defer session_runtime.deinit();
 
-    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello");
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
     var prompt_owned = true;
     defer if (prompt_owned) prompt.deinit(std.testing.allocator);
     try session_runtime.submit(prompt);
@@ -1385,7 +1359,7 @@ test "session runtime runs threshold compaction as the operation's opening phase
     defer session_runtime.deinit();
 
     // First operation seeds history; nothing to compact yet.
-    var first_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello");
+    var first_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
     var first_owned = true;
     defer if (first_owned) first_prompt.deinit(std.testing.allocator);
     try session_runtime.submit(first_prompt);
@@ -1395,7 +1369,7 @@ test "session runtime runs threshold compaction as the operation's opening phase
     try std.testing.expect(!first.saw_compaction_start);
 
     // Second operation opens with the summary run, then runs the prompt.
-    var second_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "again");
+    var second_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "again", .auto);
     var second_owned = true;
     defer if (second_owned) second_prompt.deinit(std.testing.allocator);
     try session_runtime.submit(second_prompt);
@@ -1425,7 +1399,7 @@ test "session runtime cancel during retry backoff settles operation as canceled"
     );
     defer session_runtime.deinit();
 
-    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello");
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
     var prompt_owned = true;
     defer if (prompt_owned) prompt.deinit(std.testing.allocator);
     try session_runtime.submit(prompt);

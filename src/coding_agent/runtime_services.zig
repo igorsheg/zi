@@ -59,7 +59,7 @@ pub const RuntimeServices = struct {
 
         const openai_provider = try allocator.create(ai.OpenAiResponsesProvider);
         errdefer allocator.destroy(openai_provider);
-        openai_provider.* = ai.OpenAiResponsesProvider.init(.{});
+        openai_provider.* = ai.OpenAiResponsesProvider.init(.{ .environ = options.environ });
 
         const openai_codex_provider = try allocator.create(ai.OpenAiCodexResponsesProvider);
         errdefer allocator.destroy(openai_codex_provider);
@@ -117,8 +117,6 @@ test "runtime services owns stable cwd, agent dir, settings manager" {
     });
     defer services.deinit();
 
-    try std.testing.expectEqualStrings("repo", services.cwd);
-    try std.testing.expectEqualStrings("agent", services.agent_dir);
     try std.testing.expectEqualStrings("repo", services.cwd);
     try std.testing.expectEqualStrings("agent", services.agent_dir);
     try std.testing.expect(services.provider_registry.get(ai.KnownApi.openai_responses) != null);

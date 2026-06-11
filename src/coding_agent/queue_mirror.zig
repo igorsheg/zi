@@ -35,6 +35,14 @@ pub const QueueMirror = struct {
         return true;
     }
 
+    pub fn changed(self: *const QueueMirror) client_protocol.QueueChanged {
+        return .{
+            .steering_count = self.steering.items.len,
+            .follow_up_count = self.follow_up.items.len,
+            .revision = self.revision,
+        };
+    }
+
     pub fn snapshot(self: *const QueueMirror, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
         var steering = try client_protocol.EventTextList.init(allocator, self.steering.items);
         errdefer steering.deinit(allocator);

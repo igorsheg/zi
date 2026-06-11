@@ -136,10 +136,6 @@ pub const AuthStore = struct {
         }
     }
 
-    pub fn save(self: *const AuthStore, io: std.Io) !void {
-        try self.saveCredentials(io, self.credentials);
-    }
-
     fn saveCredentials(self: *const AuthStore, io: std.Io, credentials: []const OAuthCredential) !void {
         const dir = self.dir orelse return error.AuthStoreReadOnly;
         const auth_path = self.auth_path orelse return error.AuthStoreReadOnly;
@@ -184,12 +180,12 @@ pub const AuthManager = struct {
         return .{ .context = @constCast(self), .call_fn = getApiKey };
     }
 
-    pub fn findEnvApiKey(self: *const AuthManager, provider: ai.Provider) ?ai.EnvApiKey {
+    fn findEnvApiKey(self: *const AuthManager, provider: ai.Provider) ?ai.EnvApiKey {
         const environ = self.environ orelse return null;
         return ai.getEnvApiKey(environ, provider);
     }
 
-    pub fn findOAuthCredentials(self: *const AuthManager, provider: ai.Provider) ?ai.OAuthCredentials {
+    fn findOAuthCredentials(self: *const AuthManager, provider: ai.Provider) ?ai.OAuthCredentials {
         return self.store.findOAuth(provider);
     }
 
@@ -421,18 +417,9 @@ test "auth store loads oauth credentials from global auth file" {
     defer auth.deinit();
     const key = try agent_mod.GetApiKeyHook.call(std.testing.allocator, auth.hook(), ai.KnownProvider.openai_codex);
     defer std.testing.allocator.free(key.?.api_key);
-    try auth.store.save(std.testing.io);
-    const saved = try tmp.dir.readFileAlloc(std.testing.io, "agent/auth.json", std.testing.allocator, .unlimited);
-    defer std.testing.allocator.free(saved);
-
     try std.testing.expect(auth.hasAuth(ai.KnownProvider.openai_codex));
     try std.testing.expectEqualStrings("access-token", key.?.api_key);
     try std.testing.expect(key.?.auth_extra.? == .object);
-    try std.testing.expectEqualStrings(
-        "{\"openai-codex\":{\"type\":\"oauth\",\"refresh\":\"refresh-token\"," ++
-            "\"access\":\"access-token\",\"expires\":123,\"extra\":{\"account\":\"a1\"}}}\n",
-        saved,
-    );
 }
 
 test "auth manager persists oauth credentials through one mutation path" {

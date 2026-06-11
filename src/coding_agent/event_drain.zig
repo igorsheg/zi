@@ -62,7 +62,7 @@ pub const EventDrain = struct {
         // Queue mirror: a delivered user message leaves the mirrored queue.
         if (event == .message_start and event.message_start.message == .user) {
             if (message_policy.userText(event.message_start.message.user)) |text| {
-                if (self.queue_mirror.removeUserText(self.allocator, text)) try self.emitQueueUpdate();
+                if (self.queue_mirror.removeUserText(self.allocator, text)) self.emitQueueUpdate();
             }
         }
 
@@ -113,21 +113,16 @@ pub const EventDrain = struct {
     }
 
     fn persistMessage(self: *EventDrain, message: agent_mod.AgentMessage) !void {
-        try self.manager.ensureAppendCapacity(1);
         const entry = try self.manager.prepareMessageEntry(message, self.timestamp);
         errdefer self.manager.deinitPreparedEntry(entry);
         if (self.store) |store| {
-            try store.appendEntry(self.allocator, self.io, entry, self.manager.lastEntryId());
+            try store.appendEntry(self.io, entry, self.manager.lastEntryId());
         }
         _ = self.manager.commitPreparedEntry(entry);
     }
 
-    pub fn emitQueueUpdate(self: *EventDrain) !void {
-        self.enqueuePublicEvent(.{ .queue_changed = .{
-            .steering_count = self.queue_mirror.steering.items.len,
-            .follow_up_count = self.queue_mirror.follow_up.items.len,
-            .revision = self.queue_mirror.revision,
-        } });
+    pub fn emitQueueUpdate(self: *EventDrain) void {
+        self.enqueuePublicEvent(.{ .queue_changed = self.queue_mirror.changed() });
     }
 
     pub fn enqueuePublicEvent(self: *EventDrain, event: client_protocol.ClientEvent) void {
@@ -144,12 +139,22 @@ pub const EventDrain = struct {
         return self.queue_mirror.snapshot(allocator);
     }
 
+    pub fn appendSteering(self: *EventDrain, text: []const u8) !void {
+        try self.queue_mirror.appendSteering(self.allocator, text);
+        self.emitQueueUpdate();
+    }
+
+    pub fn appendFollowUp(self: *EventDrain, text: []const u8) !void {
+        try self.queue_mirror.appendFollowUp(self.allocator, text);
+        self.emitQueueUpdate();
+    }
+
     /// Always emits queue_changed, even when the queue was already empty:
     /// the clear command's only reply is this state fact, so it must be
     /// unconditional for request correlation.
-    pub fn clearQueueMirror(self: *EventDrain) !void {
+    pub fn clearQueueMirror(self: *EventDrain) void {
         _ = self.queue_mirror.clear(self.allocator);
-        try self.emitQueueUpdate();
+        self.emitQueueUpdate();
     }
 
     pub fn drainPublicEvent(self: *EventDrain) ?client_protocol.ClientEvent {

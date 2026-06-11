@@ -27,13 +27,9 @@ const live_prompt_event_capacity_count = 64;
 allocator: std.mem.Allocator,
 io: std.Io,
 task_runtime: *runtime.Runtime,
-cwd: []const u8,
-current_date: []const u8,
 timestamp: []const u8,
-prompt_resources: resources.PromptResources,
 system_prompt_text: []const u8,
 builtin_tools: *tool_registry.BuiltinTools,
-tools: tool_registry.ToolRegistry,
 manager: *session_manager.SessionManager,
 store: ?*session_manager.SessionStore = null,
 agent: *agent_mod.Agent,
@@ -170,12 +166,6 @@ pub const PromptRun = struct {
     }
 };
 
-const Error = error{
-    SessionBusy,
-    SessionCancelling,
-    SessionShuttingDown,
-};
-
 const Lifecycle = enum {
     accepting,
     cancel_requested,
@@ -186,10 +176,6 @@ const Lifecycle = enum {
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSession {
     const task_runtime = options.task_runtime;
 
-    const cwd = try allocator.dupe(u8, options.cwd);
-    errdefer allocator.free(cwd);
-    const current_date = try allocator.dupe(u8, options.current_date);
-    errdefer allocator.free(current_date);
     const timestamp = try allocator.dupe(u8, options.timestamp);
     errdefer allocator.free(timestamp);
 
@@ -198,7 +184,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .agent_dir = options.agent_dir,
         .cwd = options.cwd,
     });
-    errdefer prompt_resources.deinit();
+    defer prompt_resources.deinit();
 
     const builtin_tools = try tool_registry.BuiltinTools.init(allocator, .{
         .cwd = options.cwd,
@@ -207,8 +193,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     });
     errdefer builtin_tools.deinit();
 
-    var tools: tool_registry.ToolRegistry = .{};
-    try builtin_tools.appendDefinitions(&tools);
+    const tools = try builtin_tools.registry();
 
     const system_prompt_text = try buildSystemPromptText(
         allocator,
@@ -222,7 +207,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     const manager = try allocator.create(session_manager.SessionManager);
     errdefer allocator.destroy(manager);
     manager.* = if (options.store != null and options.store.? == .restore)
-        try options.store.?.restore.load(allocator, io)
+        try options.store.?.restore.load(io)
     else
         try session_manager.SessionManager.init(
             allocator,
@@ -240,7 +225,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         break :blk store_ptr;
     } else null;
     errdefer if (store) |store_ptr| {
-        store_ptr.deinit(allocator);
+        store_ptr.deinit();
         allocator.destroy(store_ptr);
     };
 
@@ -282,13 +267,9 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .allocator = allocator,
         .io = io,
         .task_runtime = task_runtime,
-        .cwd = cwd,
-        .current_date = current_date,
         .timestamp = timestamp,
-        .prompt_resources = prompt_resources,
         .system_prompt_text = system_prompt_text,
         .builtin_tools = builtin_tools,
-        .tools = tools,
         .manager = manager,
         .store = store,
         .agent = core_agent,
@@ -308,17 +289,14 @@ pub fn deinit(self: *AgentSession) void {
     self.event_drain.deinit();
     self.allocator.destroy(self.event_drain);
     if (self.store) |store| {
-        store.deinit(self.allocator);
+        store.deinit();
         self.allocator.destroy(store);
     }
     self.manager.deinit();
     self.allocator.destroy(self.manager);
     self.builtin_tools.deinit();
     self.allocator.free(self.system_prompt_text);
-    self.prompt_resources.deinit();
     self.allocator.free(self.timestamp);
-    self.allocator.free(self.current_date);
-    self.allocator.free(self.cwd);
     self.* = undefined;
 }
 
@@ -327,35 +305,20 @@ pub fn startPromptRun(
     text: []const u8,
     images: []const ai.ImageContent,
 ) !*PromptRun {
-    self.reconcileLifecycle();
-    switch (self.lifecycle) {
-        .accepting => {},
-        .cancel_requested => return error.SessionCancelling,
-        .shutdown_requested, .stopped => return error.SessionShuttingDown,
-    }
-    if (self.agent.state.isStreaming()) return error.SessionBusy;
-    const run = try self.allocator.create(PromptRun);
-    errdefer self.allocator.destroy(run);
-    run.* = .{};
+    const run = try self.createPromptRun();
+    errdefer if (run.isActive()) self.destroyPromptRun(run) else self.allocator.destroy(run);
     run.prompts[0] = try self.agent.userMessageFromText(text, images);
-    const token = try self.agent.beginRun();
-    errdefer self.agent.finishRun();
+    const token = try self.beginPromptRun(run);
     agent_mod.loop.startPromptStream(
         &run.stream,
         self.allocator,
         self.task_runtime,
         &run.prompts,
-        .{
-            .system_prompt = self.agent.state.system_prompt,
-            .messages = self.agent.state.messages,
-            .tools = self.agent.state.tools,
-        },
+        self.agentContext(),
         self.agent.loop_config,
         token,
         &run.buffer,
     );
-    std.debug.assert(run.state == .settled);
-    run.state = .{ .running = token };
     return run;
 }
 
@@ -363,37 +326,22 @@ pub fn startPromptRun(
 /// user message: the retry path after the failed assistant message has been
 /// removed. Fails if the transcript still ends with an assistant message.
 pub fn startContinueRun(self: *AgentSession) !*PromptRun {
-    self.reconcileLifecycle();
-    switch (self.lifecycle) {
-        .accepting => {},
-        .cancel_requested => return error.SessionCancelling,
-        .shutdown_requested, .stopped => return error.SessionShuttingDown,
-    }
-    if (self.agent.state.isStreaming()) return error.SessionBusy;
     if (self.agent.state.messages.len == 0) return error.NoMessages;
     if (self.agent.state.messages[self.agent.state.messages.len - 1] == .assistant) {
         return error.CannotContinueFromAssistant;
     }
-    const run = try self.allocator.create(PromptRun);
-    errdefer self.allocator.destroy(run);
-    run.* = .{};
-    const token = try self.agent.beginRun();
-    errdefer self.agent.finishRun();
+    const run = try self.createPromptRun();
+    errdefer if (run.isActive()) self.destroyPromptRun(run) else self.allocator.destroy(run);
+    const token = try self.beginPromptRun(run);
     agent_mod.loop.startContinueStream(
         &run.stream,
         self.allocator,
         self.task_runtime,
-        .{
-            .system_prompt = self.agent.state.system_prompt,
-            .messages = self.agent.state.messages,
-            .tools = self.agent.state.tools,
-        },
+        self.agentContext(),
         self.agent.loop_config,
         token,
         &run.buffer,
     );
-    std.debug.assert(run.state == .settled);
-    run.state = .{ .running = token };
     return run;
 }
 
@@ -459,15 +407,6 @@ pub fn destroyPromptRun(self: *AgentSession, run: *PromptRun) void {
     self.allocator.destroy(run);
 }
 
-pub fn cancel(self: *AgentSession) void {
-    self.reconcileLifecycle();
-    if (self.lifecycle != .accepting) return;
-    if (self.agent.state.status == .settling) return;
-    if (!self.agent.state.isStreaming()) return;
-    self.lifecycle = .cancel_requested;
-    self.agent.abort();
-}
-
 pub fn requestShutdown(self: *AgentSession) void {
     self.reconcileLifecycle();
     switch (self.lifecycle) {
@@ -493,13 +432,30 @@ pub fn shutdownComplete(self: *AgentSession) bool {
         self.event_drain.publicEventsEmpty();
 }
 
-pub fn queueSnapshot(self: *const AgentSession, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
-    return self.event_drain.queueSnapshot(allocator);
+pub fn clientSnapshot(
+    self: *const AgentSession,
+    allocator: std.mem.Allocator,
+    active_request_id: ?client_protocol.RequestId,
+) !client_protocol.Snapshot {
+    var queue = try self.event_drain.queueSnapshot(allocator);
+    errdefer queue.deinit(allocator);
+    var header = try client_protocol.SessionHeaderSnapshot.init(allocator, self.manager.header);
+    errdefer header.deinit(allocator);
+    var model = try client_protocol.ModelSnapshot.init(allocator, self.agent.state.model);
+    errdefer model.deinit(allocator);
+    const history = try client_protocol.HistorySnapshot.fromEntries(allocator, self.manager.entries.items);
+    return .{
+        .header = header,
+        .model = model,
+        .queue = queue,
+        .active_request_id = active_request_id,
+        .history = history,
+    };
 }
 
-pub fn clearQueue(self: *AgentSession) !void {
+pub fn clearQueue(self: *AgentSession) void {
     self.agent.clearAllQueues();
-    try self.event_drain.clearQueueMirror();
+    self.event_drain.clearQueueMirror();
 }
 
 pub fn drainPublicEvent(self: *AgentSession) ?client_protocol.ClientEvent {
@@ -525,14 +481,13 @@ pub fn queuePrompt(
     switch (kind) {
         .steer => {
             try self.agent.steer(message);
-            try self.event_drain.queue_mirror.appendSteering(self.allocator, text);
+            try self.event_drain.appendSteering(text);
         },
         .follow_up => {
             try self.agent.followUp(message);
-            try self.event_drain.queue_mirror.appendFollowUp(self.allocator, text);
+            try self.event_drain.appendFollowUp(text);
         },
     }
-    try self.event_drain.emitQueueUpdate();
 }
 
 /// Terminal session policy after a prompt run settles. Decides between
@@ -589,6 +544,38 @@ fn retryBackoffMs(settings: RetrySettings, attempt: u8) u64 {
 
 pub fn contextOverflowCount(self: *const AgentSession) usize {
     return self.event_drain.context_overflow_count;
+}
+
+fn createPromptRun(self: *AgentSession) !*PromptRun {
+    try self.ensureCanStartRun();
+    const run = try self.allocator.create(PromptRun);
+    run.* = .{};
+    return run;
+}
+
+fn beginPromptRun(self: *AgentSession, run: *PromptRun) !runtime.CancelToken {
+    const token = try self.agent.beginRun();
+    std.debug.assert(run.state == .settled);
+    run.state = .{ .running = token };
+    return token;
+}
+
+fn agentContext(self: *AgentSession) agent_mod.AgentContext {
+    return .{
+        .system_prompt = self.agent.state.system_prompt,
+        .messages = self.agent.state.messages,
+        .tools = self.agent.state.tools,
+    };
+}
+
+fn ensureCanStartRun(self: *AgentSession) !void {
+    self.reconcileLifecycle();
+    switch (self.lifecycle) {
+        .accepting => {},
+        .cancel_requested => return error.SessionCancelling,
+        .shutdown_requested, .stopped => return error.SessionShuttingDown,
+    }
+    if (self.agent.state.isStreaming()) return error.SessionBusy;
 }
 
 /// Idle transitions are observed lazily: a wake never carries data, so
@@ -760,7 +747,6 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
     };
 
     // Persist the compaction entry durably before committing it in memory.
-    try self.manager.ensureAppendCapacity(1);
     const entry = try self.manager.prepareCompactionEntry(
         summary,
         run.input.first_kept_entry_id,
@@ -770,7 +756,7 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
     var entry_committed = false;
     errdefer if (!entry_committed) self.manager.deinitPreparedEntry(entry);
     if (self.store) |store| {
-        try store.appendEntry(self.allocator, self.io, entry, self.manager.lastEntryId());
+        try store.appendEntry(self.io, entry, self.manager.lastEntryId());
     }
     var result = try client_protocol.CompactionResult.init(self.allocator, entry.compaction);
     errdefer result.deinit(self.allocator);
@@ -1111,9 +1097,8 @@ test "agent session initializes policy spine with definition-first builtin tools
     var session = try initTestSession(task_runtime, tmp.dir, .{});
     defer shutdownAndDeinit(&session);
 
-    try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.tools.len);
     try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.agent.state.tools.len);
-    try std.testing.expectEqualStrings("read", session.tools.activeToolNames()[0]);
+    try std.testing.expectEqualStrings("read", session.agent.state.tools[0].name);
     try std.testing.expectEqualStrings("bash", session.agent.state.tools[4].name);
     try std.testing.expectEqual(agent_mod.ToolExecutionMode.sequential, session.agent.state.tools[4].execution_mode.?);
     try std.testing.expect(std.mem.indexOf(u8, session.system_prompt_text, "global") != null);
@@ -1172,28 +1157,6 @@ test "agent session persists message_end and exposes caller-drained events" {
     try std.testing.expect(event == .agent_event);
     try std.testing.expect(event.agent_event.event == .message_end);
     try std.testing.expect(session.drainPublicEvent() == null);
-}
-
-test "agent session cancel while running is observable until terminal event" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
-    var session = try initTestSession(task_runtime, tmp.dir, .{});
-    defer shutdownAndDeinit(&session);
-
-    _ = try session.agent.beginRun();
-    session.cancel();
-
-    try std.testing.expectEqual(Lifecycle.cancel_requested, session.lifecycle);
-    try std.testing.expect(session.agent.signal().?.isRequested());
-
-    try session.agent.emitEvent(.agent_end);
-    session.agent.finishRun();
-
-    session.reconcileLifecycle();
-    try std.testing.expectEqual(Lifecycle.accepting, session.lifecycle);
-    drainAllPublicEvents(&session);
 }
 
 test "agent session shutdown complete requires stopped idle and drained events" {
@@ -1264,12 +1227,18 @@ fn driveCompactionRun(session: *AgentSession, run: *AgentSession.CompactionRun) 
     return error.CompactionRunDidNotSettle;
 }
 
+fn appendTestMessage(session: *AgentSession, message: agent_mod.AgentMessage, timestamp: []const u8) ![]const u8 {
+    const entry = try session.manager.prepareMessageEntry(message, timestamp);
+    errdefer session.manager.deinitPreparedEntry(entry);
+    return session.manager.commitPreparedEntry(entry);
+}
+
 fn appendTwoCompactableMessages(session: *AgentSession) !void {
-    _ = try session.manager.appendMessage(.{ .user = .{
+    _ = try appendTestMessage(session, .{ .user = .{
         .content = .{ .string = "aaaaaaaa" },
         .timestamp = 0,
     } }, "t1");
-    _ = try session.manager.appendMessage(.{ .user = .{
+    _ = try appendTestMessage(session, .{ .user = .{
         .content = .{ .string = "bbbbbbbb" },
         .timestamp = 0,
     } }, "t2");
@@ -1333,7 +1302,7 @@ test "agent session auto compaction summarizes persists and replaces context" {
     try std.testing.expectEqualStrings("generated summary", end_event.compaction_end.result.?.summary.text);
 
     // Durable truth round-trips.
-    var loaded = try session.store.?.load(std.testing.allocator, std.testing.io);
+    var loaded = try session.store.?.load(std.testing.io);
     defer loaded.deinit();
     try std.testing.expect(loaded.entries.items[2] == .compaction);
     try std.testing.expectEqualStrings("generated summary", loaded.entries.items[2].compaction.summary);
@@ -1549,11 +1518,12 @@ test "agent session terminal policy runs when persistence fails" {
     try tmp.dir.createDirPath(std.testing.io, "repo");
 
     var store: session_manager.SessionStore = .{
+        .allocator = std.testing.allocator,
         .dir = tmp.dir,
         .file_name = try std.testing.allocator.dupe(u8, "missing/session.jsonl"),
     };
     var store_needs_deinit = true;
-    errdefer if (store_needs_deinit) store.deinit(std.testing.allocator);
+    errdefer if (store_needs_deinit) store.deinit();
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
 

@@ -226,21 +226,19 @@ pub const SessionManager = struct {
         self.* = undefined;
     }
 
-    pub fn appendMessage(self: *SessionManager, message: agent.AgentMessage, timestamp: []const u8) Error![]const u8 {
-        try self.ensureAppendCapacity(1);
+    fn appendMessage(self: *SessionManager, message: agent.AgentMessage, timestamp: []const u8) Error![]const u8 {
         const entry = try self.prepareMessageEntry(message, timestamp);
         errdefer self.deinitEntry(entry);
         return self.commitPreparedEntry(entry);
     }
 
-    pub fn appendCompaction(
+    fn appendCompaction(
         self: *SessionManager,
         summary: []const u8,
         first_kept_entry_id: []const u8,
         tokens_before: u64,
         timestamp: []const u8,
     ) Error![]const u8 {
-        try self.ensureAppendCapacity(1);
         const entry = try self.prepareCompactionEntry(summary, first_kept_entry_id, tokens_before, timestamp);
         errdefer self.deinitEntry(entry);
         return self.commitPreparedEntry(entry);
@@ -248,7 +246,7 @@ pub const SessionManager = struct {
 
     /// Prepare/commit split lets the caller persist an entry durably before
     /// it becomes visible in memory (jsonl reaches disk before commit).
-    pub fn ensureAppendCapacity(self: *SessionManager, additional_count: usize) Error!void {
+    fn ensureAppendCapacity(self: *SessionManager, additional_count: usize) Error!void {
         if (additional_count > max_session_entries - self.entries.items.len) return error.EntryLimitExceeded;
         try self.entries.ensureUnusedCapacity(self.allocator, additional_count);
     }
@@ -258,6 +256,7 @@ pub const SessionManager = struct {
         message: agent.AgentMessage,
         timestamp: []const u8,
     ) Error!SessionEntry {
+        try self.ensureAppendCapacity(1);
         const base = try self.nextBase(timestamp);
         errdefer self.deinitBase(base);
         return .{ .message = .{
@@ -273,6 +272,7 @@ pub const SessionManager = struct {
         tokens_before: u64,
         timestamp: []const u8,
     ) Error!SessionEntry {
+        try self.ensureAppendCapacity(1);
         const base = try self.nextBase(timestamp);
         errdefer self.deinitBase(base);
         return self.compactionEntryFromParts(base, summary, first_kept_entry_id, tokens_before);
@@ -593,6 +593,7 @@ pub const SessionManager = struct {
 /// Append-only after creation; load truncates a torn trailing line so the
 /// next append cannot glue onto it.
 pub const SessionStore = struct {
+    allocator: std.mem.Allocator,
     dir: std.Io.Dir,
     file_name: []const u8,
 
@@ -626,11 +627,11 @@ pub const SessionStore = struct {
         });
         defer allocator.free(line);
         try writeFileAtomic(allocator, io, dir, file_name, line);
-        return .{ .dir = dir, .file_name = file_name };
+        return .{ .allocator = allocator, .dir = dir, .file_name = file_name };
     }
 
-    pub fn deinit(self: *SessionStore, allocator: std.mem.Allocator) void {
-        allocator.free(self.file_name);
+    pub fn deinit(self: *SessionStore) void {
+        self.allocator.free(self.file_name);
         self.* = undefined;
     }
 
@@ -639,20 +640,19 @@ pub const SessionStore = struct {
     /// boundary, not stored in the entry.
     pub fn appendEntry(
         self: SessionStore,
-        allocator: std.mem.Allocator,
         io: std.Io,
         entry: SessionEntry,
         parent_id: ?[]const u8,
     ) !void {
-        const line = try formatEntryLine(allocator, entry, parent_id);
-        defer allocator.free(line);
+        const line = try formatEntryLine(self.allocator, entry, parent_id);
+        defer self.allocator.free(line);
         try appendLine(io, self.dir, self.file_name, line);
     }
 
-    pub fn load(self: SessionStore, allocator: std.mem.Allocator, io: std.Io) !SessionManager {
-        const data = try self.dir.readFileAlloc(io, self.file_name, allocator, .limited(max_session_file_bytes));
-        defer allocator.free(data);
-        var parsed = try parseSession(allocator, data);
+    pub fn load(self: SessionStore, io: std.Io) !SessionManager {
+        const data = try self.dir.readFileAlloc(io, self.file_name, self.allocator, .limited(max_session_file_bytes));
+        defer self.allocator.free(data);
+        var parsed = try parseSession(self.allocator, data);
         if (parsed.repair_length) |length| {
             // The dropped torn line is still on disk. Truncate it away now,
             // or the next append glues onto the fragment and corrupts both
@@ -1149,7 +1149,6 @@ test "prepared message entry does not mutate entries before commit" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
-    try manager.ensureAppendCapacity(1);
     const entry = try manager.prepareMessageEntry(userMessage("one"), "t1");
     var committed = false;
     errdefer if (!committed) manager.deinitPreparedEntry(entry);
@@ -1435,11 +1434,11 @@ test "session store load repairs torn trailing line before future appends" {
         .session_id = "session-1",
         .timestamp = "t0",
     });
-    defer store.deinit(std.testing.allocator);
+    defer store.deinit();
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
     _ = try manager.appendMessage(userMessage("one"), "t1");
-    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null);
+    try store.appendEntry(std.testing.io, manager.entries.items[0], null);
 
     // Simulate a crash mid-append: a torn fragment without trailing newline.
     {
@@ -1449,7 +1448,7 @@ test "session store load repairs torn trailing line before future appends" {
         try file.writePositionalAll(std.testing.io, "{\"type\":\"message\",\"id\":\"00", offset);
     }
 
-    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    var loaded = try store.load(std.testing.io);
     defer loaded.deinit();
     try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
 
@@ -1457,13 +1456,12 @@ test "session store load repairs torn trailing line before future appends" {
     // the file becomes unloadable (fatal interior corruption).
     _ = try loaded.appendMessage(userMessage("two"), "t2");
     try store.appendEntry(
-        std.testing.allocator,
         std.testing.io,
         loaded.entries.items[1],
         loaded.entries.items[0].id(),
     );
 
-    var reloaded = try store.load(std.testing.allocator, std.testing.io);
+    var reloaded = try store.load(std.testing.io);
     defer reloaded.deinit();
     try std.testing.expectEqual(@as(usize, 2), reloaded.entries.items.len);
 }
@@ -1477,7 +1475,7 @@ test "session store append rejects writes past the session file cap" {
         .session_id = "session-1",
         .timestamp = "t0",
     });
-    defer store.deinit(std.testing.allocator);
+    defer store.deinit();
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
     _ = try manager.appendMessage(userMessage("one"), "t1");
@@ -1492,7 +1490,7 @@ test "session store append rejects writes past the session file cap" {
 
     try std.testing.expectError(
         error.SessionFileFull,
-        store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null),
+        store.appendEntry(std.testing.io, manager.entries.items[0], null),
     );
 }
 
@@ -1564,9 +1562,9 @@ test "session store creates header file and loads empty manager" {
         .session_id = "session-1",
         .timestamp = "t0",
     });
-    defer store.deinit(std.testing.allocator);
+    defer store.deinit();
 
-    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    var loaded = try store.load(std.testing.io);
     defer loaded.deinit();
 
     try std.testing.expectEqualStrings("session-1", loaded.header.id);
@@ -1583,10 +1581,10 @@ test "session store creates the sessions directory when asked" {
         .session_id = "session-1",
         .timestamp = "t0",
     });
-    defer store.deinit(std.testing.allocator);
+    defer store.deinit();
 
     try std.testing.expectEqualStrings("agent/sessions/--repo--/t0_session-1.jsonl", store.file_name);
-    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    var loaded = try store.load(std.testing.io);
     defer loaded.deinit();
     try std.testing.expectEqualStrings("session-1", loaded.header.id);
 }
@@ -1600,21 +1598,20 @@ test "session store appends entries and round trips context" {
         .session_id = "session-1",
         .timestamp = "t0",
     });
-    defer store.deinit(std.testing.allocator);
+    defer store.deinit();
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
     _ = try manager.appendMessage(userMessage("hello"), "t1");
-    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null);
+    try store.appendEntry(std.testing.io, manager.entries.items[0], null);
     _ = try manager.appendMessage(userMessage("again"), "t2");
     try store.appendEntry(
-        std.testing.allocator,
         std.testing.io,
         manager.entries.items[1],
         manager.entries.items[0].id(),
     );
 
-    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    var loaded = try store.load(std.testing.io);
     defer loaded.deinit();
     const messages = try loaded.contextMessages(std.testing.allocator);
     defer SessionManager.deinitContextMessages(std.testing.allocator, messages);
@@ -1633,7 +1630,7 @@ test "session store round trips agent message variants" {
         .session_id = "session-1",
         .timestamp = "t0",
     });
-    defer store.deinit(std.testing.allocator);
+    defer store.deinit();
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
@@ -1669,10 +1666,10 @@ test "session store round trips agent message variants" {
     } }, "t4");
     for (manager.entries.items, 0..) |entry, index| {
         const parent = if (index == 0) null else manager.entries.items[index - 1].id();
-        try store.appendEntry(std.testing.allocator, std.testing.io, entry, parent);
+        try store.appendEntry(std.testing.io, entry, parent);
     }
 
-    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    var loaded = try store.load(std.testing.io);
     defer loaded.deinit();
     const messages = try loaded.contextMessages(std.testing.allocator);
     defer SessionManager.deinitContextMessages(std.testing.allocator, messages);
@@ -1694,16 +1691,16 @@ test "session store load preserves entry ids and continues id generation" {
         .session_id = "session-1",
         .timestamp = "t0",
     });
-    defer store.deinit(std.testing.allocator);
+    defer store.deinit();
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
     const root = try manager.appendMessage(userMessage("root"), "t1");
-    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null);
+    try store.appendEntry(std.testing.io, manager.entries.items[0], null);
     const child = try manager.appendMessage(userMessage("child"), "t2");
-    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[1], root);
+    try store.appendEntry(std.testing.io, manager.entries.items[1], root);
 
-    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    var loaded = try store.load(std.testing.io);
     defer loaded.deinit();
 
     try std.testing.expectEqualStrings(root, loaded.entries.items[0].id());
@@ -1722,16 +1719,16 @@ test "session store round trips compaction entries" {
         .session_id = "session-1",
         .timestamp = "t0",
     });
-    defer store.deinit(std.testing.allocator);
+    defer store.deinit();
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
     const root = try manager.appendMessage(userMessage("before"), "t1");
-    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[0], null);
+    try store.appendEntry(std.testing.io, manager.entries.items[0], null);
     _ = try manager.appendCompaction("summary", root, 2048, "t2");
-    try store.appendEntry(std.testing.allocator, std.testing.io, manager.entries.items[1], root);
+    try store.appendEntry(std.testing.io, manager.entries.items[1], root);
 
-    var loaded = try store.load(std.testing.allocator, std.testing.io);
+    var loaded = try store.load(std.testing.io);
     defer loaded.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), loaded.entries.items.len);

@@ -7,7 +7,9 @@ pub const env_agent_dir_name = "ZI_CODING_AGENT_DIR";
 pub const project_config_dir_name = ".zi";
 pub const settings_file_name = "settings.json";
 pub const auth_file_name = "auth.json";
+pub const sessions_dir_name = "sessions";
 pub const skills_dir_name = "skills";
+pub const skill_file_name = "SKILL.md";
 pub const system_prompt_file_name = "SYSTEM.md";
 pub const append_system_prompt_file_name = "APPEND_SYSTEM.md";
 
@@ -50,7 +52,7 @@ pub const PersistencePaths = struct {
     pub fn sessionsDirForCwd(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {
         const encoded = try encodeCwd(allocator, self.cwd);
         defer allocator.free(encoded);
-        return std.fs.path.join(allocator, &.{ self.global_dir, "sessions", encoded });
+        return std.fs.path.join(allocator, &.{ self.global_dir, sessions_dir_name, encoded });
     }
 
     pub fn globalSettingsPath(self: PersistencePaths, allocator: std.mem.Allocator) ![]const u8 {

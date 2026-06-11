@@ -3,18 +3,18 @@
 
 const std = @import("std");
 
-pub const AgentSession = @import("AgentSession.zig");
-pub const auth = @import("auth.zig");
 pub const auth_mode = @import("auth_mode.zig");
 pub const client_protocol = @import("client_protocol.zig");
-pub const paths = @import("paths.zig");
 pub const session_listing = @import("session_listing.zig");
 pub const session_runtime = @import("session_runtime.zig");
 pub const wire_protocol = @import("wire_protocol.zig");
 
 // Internal modules, referenced here so `zig build test` reaches their tests.
+const AgentSession = @import("AgentSession.zig");
+const auth = @import("auth.zig");
 const event_drain = @import("event_drain.zig");
 const message_policy = @import("message_policy.zig");
+const paths = @import("paths.zig");
 const queue_mirror = @import("queue_mirror.zig");
 const resources = @import("resources.zig");
 const runtime_services = @import("runtime_services.zig");
@@ -28,8 +28,11 @@ const tools = @import("tools/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = AgentSession;
+    _ = auth;
     _ = event_drain;
     _ = message_policy;
+    _ = paths;
     _ = queue_mirror;
     _ = resources;
     _ = runtime_services;

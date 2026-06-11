@@ -7,12 +7,13 @@ const path_utils = @import("path_utils.zig");
 const output_accumulator = @import("output_accumulator.zig");
 const output_tail = @import("output_tail.zig");
 const test_support = @import("test_support.zig");
+const tool_output_policy = @import("../tool_output_policy.zig");
 
 pub const default_timeout_ms = 30_000;
 pub const max_timeout_ms = 120_000;
 pub const max_command_bytes = 16 * 1024;
-pub const max_output_preview_bytes = 50 * 1024;
-pub const max_output_preview_lines = 2000;
+pub const max_output_preview_bytes = tool_output_policy.default_max_bytes;
+pub const max_output_preview_lines = tool_output_policy.default_max_lines;
 pub const max_stdout_bytes = max_output_preview_bytes * 2;
 pub const max_stderr_bytes = max_output_preview_bytes * 2;
 

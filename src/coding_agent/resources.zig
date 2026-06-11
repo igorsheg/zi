@@ -44,18 +44,6 @@ pub const LoadedContextFiles = struct {
     }
 };
 
-const LoadProjectContextOptions = struct {
-    dir: std.Io.Dir = .cwd(),
-    agent_dir: []const u8,
-    cwd: []const u8,
-};
-
-const DiscoverPromptFileOptions = struct {
-    dir: std.Io.Dir = .cwd(),
-    agent_dir: []const u8,
-    cwd: []const u8,
-};
-
 pub const PromptResources = struct {
     context_files: LoadedContextFiles,
     system_prompt: LoadedPromptFile,
@@ -117,7 +105,7 @@ pub const PromptResources = struct {
 fn discoverSystemPromptFile(
     allocator: std.mem.Allocator,
     io: std.Io,
-    options: DiscoverPromptFileOptions,
+    options: PromptResources.LoadOptions,
 ) !LoadedPromptFile {
     return discoverPromptFile(allocator, io, options, paths_mod.system_prompt_file_name);
 }
@@ -125,7 +113,7 @@ fn discoverSystemPromptFile(
 fn discoverAppendSystemPromptFile(
     allocator: std.mem.Allocator,
     io: std.Io,
-    options: DiscoverPromptFileOptions,
+    options: PromptResources.LoadOptions,
 ) !LoadedPromptFile {
     return discoverPromptFile(allocator, io, options, paths_mod.append_system_prompt_file_name);
 }
@@ -133,7 +121,7 @@ fn discoverAppendSystemPromptFile(
 fn discoverPromptFile(
     allocator: std.mem.Allocator,
     io: std.Io,
-    options: DiscoverPromptFileOptions,
+    options: PromptResources.LoadOptions,
     file_name: []const u8,
 ) !LoadedPromptFile {
     const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = options.agent_dir, .cwd = options.cwd };
@@ -151,7 +139,7 @@ fn discoverPromptFile(
 fn loadProjectContextFiles(
     allocator: std.mem.Allocator,
     io: std.Io,
-    options: LoadProjectContextOptions,
+    options: PromptResources.LoadOptions,
 ) !LoadedContextFiles {
     var files = std.ArrayList(ContextFile).empty;
     errdefer {

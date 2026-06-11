@@ -137,7 +137,7 @@ const InteractiveController = struct {
         while (self.terminal_loop.isRunning()) {
             if (try self.serviceImmediateWork()) continue;
 
-            const wake = try self.app.waitForWake(self.terminal_loop.inputFd(), frame_interval_ms);
+            const wake = try self.app.waitAndApplyWake(self.terminal_loop.inputFd(), frame_interval_ms);
             switch (wake) {
                 .input => try self.drainInput(),
                 .session => if (self.pending_input_flush) try self.flushPendingInput(),
@@ -153,9 +153,7 @@ const InteractiveController = struct {
         try self.tickStatus();
         try self.terminal_loop.renderIfDirty(self.stdout);
         try self.stdout.flush();
-        return drained == client_events_per_tick_max or
-            self.app.hasPendingClientEvents() or
-            self.app.hasQueuedCommands();
+        return drained == client_events_per_tick_max or self.app.hasImmediateWork();
     }
 
     fn drainInput(self: *InteractiveController) !void {
@@ -197,7 +195,7 @@ const InteractiveController = struct {
     }
 
     fn submitPrompt(self: *InteractiveController, prompt: []const u8) !void {
-        const envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(self.allocator, null, prompt);
+        const envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(self.allocator, null, prompt, .auto);
         if (try self.submitCommand(envelope) == .queued) self.cancel_requested = false;
     }
 
@@ -855,7 +853,7 @@ test "tui adapter requests replay and recovers from snapshot after mailbox event
 
     try controller.acceptEnvelope(.{ .seq = 2, .event = .operation_started });
     try std.testing.expectEqual(EventCursor.Recovery.replay_requested, controller.event_cursor.recovery);
-    try std.testing.expect(app.hasQueuedCommands());
+    try std.testing.expect(app.hasImmediateWork());
     try std.testing.expectEqual(@as(usize, 1), controller.terminal_loop.product.app.slots.count(.status_area));
 
     try app.step();
@@ -870,7 +868,7 @@ test "tui adapter requests replay and recovers from snapshot after mailbox event
         .last_retained_seq = 0,
     } } });
     try std.testing.expectEqual(EventCursor.Recovery.snapshot_requested, controller.event_cursor.recovery);
-    try std.testing.expect(app.hasQueuedCommands());
+    try std.testing.expect(app.hasImmediateWork());
 
     try app.step();
     var snapshot: ?client_protocol.EventEnvelope = null;

@@ -61,10 +61,6 @@ pub const SettingsSnapshot = struct {
 
 pub const SettingsManager = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
-    dir: std.Io.Dir,
-    global_path: []const u8,
-    project_path: []const u8,
     snapshot: SettingsSnapshot,
 
     pub const Options = struct {
@@ -74,9 +70,9 @@ pub const SettingsManager = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !SettingsManager {
         const global_path = try options.paths.globalSettingsPath(allocator);
-        errdefer allocator.free(global_path);
+        defer allocator.free(global_path);
         const project_path = try options.paths.projectSettingsPath(allocator);
-        errdefer allocator.free(project_path);
+        defer allocator.free(project_path);
 
         var snapshot: SettingsSnapshot = .{
             .global = try loadFile(allocator, io, options.dir, global_path),
@@ -87,18 +83,12 @@ pub const SettingsManager = struct {
 
         return .{
             .allocator = allocator,
-            .io = io,
-            .dir = options.dir,
-            .global_path = global_path,
-            .project_path = project_path,
             .snapshot = snapshot,
         };
     }
 
     pub fn deinit(self: *SettingsManager) void {
         self.snapshot.deinit();
-        self.allocator.free(self.project_path);
-        self.allocator.free(self.global_path);
         self.* = undefined;
     }
 
@@ -231,8 +221,6 @@ test "settings manager treats missing global and project settings as defaults" {
 
     try std.testing.expectEqual(SettingsFile.missing, manager.current().global);
     try std.testing.expectEqual(SettingsFile.missing, manager.current().project);
-    try std.testing.expectEqualStrings("agent/settings.json", manager.global_path);
-    try std.testing.expectEqualStrings("repo/.zi/settings.json", manager.project_path);
 }
 
 test "settings manager loads global and project default model settings" {

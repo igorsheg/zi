@@ -35,7 +35,7 @@ pub fn runPrompt(
     stdout: *std.Io.Writer,
     prompt: []const u8,
 ) Error!void {
-    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(app.allocator, 1, prompt);
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(app.allocator, 1, prompt, .auto);
     var envelope_owned = true;
     defer if (envelope_owned) envelope.deinit(app.allocator);
     try app.submit(envelope);
@@ -51,7 +51,7 @@ pub fn runFd(
 ) Error!void {
     var state: InputState = .{};
     while (true) {
-        const wake = try app.waitForWake(input_fd, rpc_idle_tick_ms);
+        const wake = try app.waitAndApplyWake(input_fd, rpc_idle_tick_ms);
         if (wake == .input) {
             const input_result = try state.readAvailable(input_fd, app, stdout, stderr);
             if (input_result == .shutdown) return;
@@ -349,7 +349,7 @@ test "rpc input accepts targeted cancel while prompt is active" {
     });
     defer app.deinit();
 
-    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first");
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "first", .auto);
     var prompt_owned = true;
     defer if (prompt_owned) prompt.deinit(std.testing.allocator);
     try app.submit(prompt);
@@ -510,7 +510,7 @@ test "rpc fd shutdown is emitted before returning" {
         InputResult.active,
         try state.feed("{\"id\":9,\"type\":\"shutdown\"}\n", &app, &stdout, &stderr),
     );
-    try std.testing.expect(app.hasQueuedCommands());
+    try std.testing.expect(app.hasImmediateWork());
     try std.testing.expectEqual(DriveResult.shutdown, try drive(&app, &stdout, null));
 
     try expectSequencedJsonLineTypes(stdout.buffered(), &.{"shutdown_started"});

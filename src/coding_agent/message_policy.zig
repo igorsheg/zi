@@ -28,7 +28,7 @@ pub fn isRetryableAssistant(message: ai.AssistantMessage) bool {
     return isRetryableAssistantErrorText(text);
 }
 
-pub fn isRetryableAssistantErrorText(text: []const u8) bool {
+fn isRetryableAssistantErrorText(text: []const u8) bool {
     const needles = [_][]const u8{
         "overloaded",          "rate limit",   "too many requests", "429",
         "500",                 "502",          "503",               "504",

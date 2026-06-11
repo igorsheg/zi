@@ -44,9 +44,12 @@ pub fn decodeCommandLine(
         const text_value = object.get("text") orelse return error.InvalidMessage;
         if (text_value != .string) return error.InvalidMessage;
         if (text_value.string.len > max_prompt_text_bytes) return error.PromptTooLarge;
-        var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(allocator, id, text_value.string);
-        envelope.command.submit.mode = try decodeSubmitMode(object.get("mode"));
-        return envelope;
+        return try client_protocol.CommandEnvelope.initSubmitPrompt(
+            allocator,
+            id,
+            text_value.string,
+            try decodeSubmitMode(object.get("mode")),
+        );
     }
     if (std.mem.eql(u8, command_type, "cancel")) {
         return .{ .id = id, .command = .{ .cancel = try decodeCancel(object.get("target")) } };
@@ -72,16 +75,13 @@ pub fn encodeEventEnvelope(
     return output.toOwnedSlice();
 }
 
-pub fn trimLine(raw_line: []const u8) []const u8 {
+fn trimLine(raw_line: []const u8) []const u8 {
     if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r') return raw_line[0 .. raw_line.len - 1];
     return raw_line;
 }
 
 fn decodeRequestId(value: ?std.json.Value) CommandDecodeError!?client_protocol.RequestId {
-    const raw = value orelse return null;
-    if (raw != .integer) return error.InvalidRequestId;
-    if (raw.integer < 0) return error.InvalidRequestId;
-    return @intCast(raw.integer);
+    return try decodeOptionalId(value, error.InvalidRequestId);
 }
 
 fn decodeSubmitMode(value: ?std.json.Value) CommandDecodeError!client_protocol.Submit.Mode {
@@ -111,15 +111,20 @@ fn decodeCancel(value: ?std.json.Value) CommandDecodeError!client_protocol.Cance
 }
 
 fn decodeRequiredId(raw: std.json.Value) CommandDecodeError!client_protocol.RequestId {
-    if (raw != .integer) return error.InvalidRequestId;
-    if (raw.integer < 0) return error.InvalidRequestId;
+    return try decodeOptionalId(raw, error.InvalidRequestId) orelse error.InvalidRequestId;
+}
+
+fn decodeOptionalId(
+    value: ?std.json.Value,
+    err: CommandDecodeError,
+) CommandDecodeError!?client_protocol.RequestId {
+    const raw = value orelse return null;
+    if (raw != .integer or raw.integer < 0) return err;
     return @intCast(raw.integer);
 }
 
 fn decodeReplay(object: std.json.ObjectMap) CommandDecodeError!client_protocol.ReplayRequest {
-    const after_value = object.get("after") orelse return error.InvalidMessage;
-    if (after_value != .integer or after_value.integer < 0) return error.InvalidMessage;
-    return .{ .after = @intCast(after_value.integer) };
+    return .{ .after = (try decodeOptionalId(object.get("after"), error.InvalidMessage)) orelse return error.InvalidMessage };
 }
 
 test "wire protocol decodes submit prompt command" {

@@ -4,7 +4,6 @@ const skills_mod = @import("skills.zig");
 
 pub const max_prompt_bytes = 512 * 1024;
 pub const max_tool_snippets = 128;
-const max_guidelines = 128;
 
 pub const ToolSnippet = struct {
     name: []const u8,
@@ -81,40 +80,27 @@ fn appendGuidelines(
     writer: *std.Io.Writer.Allocating,
     selected_tools: []const []const u8,
 ) !void {
-    var guidelines: [max_guidelines][]const u8 = undefined;
-    var len: usize = 0;
-
     const has_bash = containsString(selected_tools, "bash");
     const has_grep = containsString(selected_tools, "grep");
     const has_find = containsString(selected_tools, "find");
     const has_ls = containsString(selected_tools, "ls");
     if (has_bash and !has_grep and !has_find and !has_ls) {
-        try appendGuideline(&guidelines, &len, "Use bash for file operations like ls, rg, find");
+        try appendGuideline(writer, "Use bash for file operations like ls, rg, find");
     } else if (has_bash and (has_grep or has_find or has_ls)) {
         try appendGuideline(
-            &guidelines,
-            &len,
+            writer,
             "Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)",
         );
     }
 
-    try appendGuideline(&guidelines, &len, "Be concise in your responses");
-    try appendGuideline(&guidelines, &len, "Show file paths clearly when working with files");
-
-    for (guidelines[0..len]) |guideline| {
-        try appendBounded(writer, "- ");
-        try appendBounded(writer, guideline);
-        try appendBounded(writer, "\n");
-    }
+    try appendGuideline(writer, "Be concise in your responses");
+    try appendGuideline(writer, "Show file paths clearly when working with files");
 }
 
-fn appendGuideline(guidelines: *[max_guidelines][]const u8, len: *usize, guideline: []const u8) !void {
-    for (guidelines[0..len.*]) |existing| {
-        if (std.mem.eql(u8, existing, guideline)) return;
-    }
-    if (len.* == max_guidelines) return error.GuidelineLimitExceeded;
-    guidelines[len.*] = guideline;
-    len.* += 1;
+fn appendGuideline(writer: *std.Io.Writer.Allocating, guideline: []const u8) !void {
+    try appendBounded(writer, "- ");
+    try appendBounded(writer, guideline);
+    try appendBounded(writer, "\n");
 }
 
 fn appendAppendSystemPrompt(writer: *std.Io.Writer.Allocating, append_system_prompt: ?[]const u8) !void {

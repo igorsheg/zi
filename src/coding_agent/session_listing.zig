@@ -39,7 +39,6 @@ fn listRuntimeSessions(
 ) !SessionList {
     const sessions_dir = try runtimeSessionsDir(allocator, .{
         .cwd = options.cwd,
-        .dir = options.dir,
         .agent_dir_override = options.agent_dir_override,
         .environ = options.environ,
     });
@@ -99,7 +98,6 @@ pub fn selectRuntimeSession(
         const sessions_dir = try runtimeSessionsDir(allocator, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
-            .dir = options.dir,
             .environ = options.environ,
         });
         defer allocator.free(sessions_dir);
@@ -137,7 +135,6 @@ pub fn selectRuntimeSession(
 const RuntimeSessionDirOptions = struct {
     cwd: []const u8,
     agent_dir_override: ?[]const u8,
-    dir: std.Io.Dir,
     environ: ?*const std.process.Environ.Map,
 };
 

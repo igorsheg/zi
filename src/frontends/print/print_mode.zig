@@ -37,7 +37,7 @@ fn runInner(
     stderr: *std.Io.Writer,
     options: Options,
 ) !void {
-    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(app.allocator, 1, options.prompt);
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(app.allocator, 1, options.prompt, .auto);
     var envelope_owned = true;
     defer if (envelope_owned) envelope.deinit(app.allocator);
     try app.submit(envelope);

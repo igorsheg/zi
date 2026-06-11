@@ -32,8 +32,10 @@ pub const LoadSkillsOptions = struct {
 
 pub fn loadSkills(allocator: std.mem.Allocator, io: std.Io, options: LoadSkillsOptions) !SkillSet {
     var skills = std.ArrayList(Skill).empty;
-    errdefer skills.deinit(allocator);
-    errdefer deinitSkillItems(allocator, skills.items);
+    errdefer {
+        for (skills.items) |skill| deinitSkill(allocator, skill);
+        skills.deinit(allocator);
+    }
 
     const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = options.agent_dir, .cwd = options.cwd };
     const global_dir = try resource_paths.globalSkillsDir(allocator);
@@ -57,7 +59,7 @@ fn loadSkillsFromDir(
 ) !void {
     if (depth == max_skill_depth) return error.SkillDepthExceeded;
 
-    const skill_path = try std.fs.path.join(allocator, &.{ path, "SKILL.md" });
+    const skill_path = try std.fs.path.join(allocator, &.{ path, paths_mod.skill_file_name });
     defer allocator.free(skill_path);
     if (try loadSkillFile(allocator, io, root_dir, skill_path, std.fs.path.basename(path))) |skill| {
         try insertSkill(allocator, skills, skill);
@@ -278,11 +280,6 @@ fn insertSkill(allocator: std.mem.Allocator, skills: *std.ArrayList(Skill), skil
 
 fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
-}
-
-fn deinitSkillItems(allocator: std.mem.Allocator, skills: []const Skill) void {
-    if (skills.len == 0) return;
-    for (skills) |skill| deinitSkill(allocator, skill);
 }
 
 fn deinitSkill(allocator: std.mem.Allocator, skill: Skill) void {

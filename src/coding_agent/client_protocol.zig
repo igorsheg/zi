@@ -31,8 +31,13 @@ pub const CommandEnvelope = struct {
     id: ?RequestId = null,
     command: ClientCommand,
 
-    pub fn initSubmitPrompt(allocator: std.mem.Allocator, id: ?RequestId, text: []const u8) !CommandEnvelope {
-        return .{ .id = id, .command = .{ .submit = .{ .text = try allocator.dupe(u8, text), .mode = .auto } } };
+    pub fn initSubmitPrompt(
+        allocator: std.mem.Allocator,
+        id: ?RequestId,
+        text: []const u8,
+        mode: Submit.Mode,
+    ) !CommandEnvelope {
+        return .{ .id = id, .command = .{ .submit = .{ .text = try allocator.dupe(u8, text), .mode = mode } } };
     }
 
     pub fn deinit(self: *CommandEnvelope, allocator: std.mem.Allocator) void {
@@ -645,8 +650,30 @@ fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, val
     try stringify.write(value);
 }
 
+fn appendTestMessage(
+    manager: *session_manager.SessionManager,
+    message: agent_mod.AgentMessage,
+    timestamp: []const u8,
+) ![]const u8 {
+    const entry = try manager.prepareMessageEntry(message, timestamp);
+    errdefer manager.deinitPreparedEntry(entry);
+    return manager.commitPreparedEntry(entry);
+}
+
+fn appendTestCompaction(
+    manager: *session_manager.SessionManager,
+    summary: []const u8,
+    first_kept_entry_id: []const u8,
+    tokens_before: u64,
+    timestamp: []const u8,
+) ![]const u8 {
+    const entry = try manager.prepareCompactionEntry(summary, first_kept_entry_id, tokens_before, timestamp);
+    errdefer manager.deinitPreparedEntry(entry);
+    return manager.commitPreparedEntry(entry);
+}
+
 test "command envelope owns prompt text" {
-    var envelope = try CommandEnvelope.initSubmitPrompt(std.testing.allocator, 7, "hello");
+    var envelope = try CommandEnvelope.initSubmitPrompt(std.testing.allocator, 7, "hello", .auto);
     defer envelope.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(?RequestId, 7), envelope.id);
@@ -665,8 +692,8 @@ test "history snapshot from entries maps roles and keeps newest under caps" {
     var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "s", "t0");
     defer manager.deinit();
 
-    _ = try manager.appendMessage(.{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }, "t1");
-    _ = try manager.appendMessage(.{ .assistant = .{
+    _ = try appendTestMessage(&manager, .{ .user = .{ .content = .{ .string = "hello" }, .timestamp = 0 } }, "t1");
+    _ = try appendTestMessage(&manager, .{ .assistant = .{
         .content = &.{.{ .text = .{ .text = "hi" } }},
         .api = ai.KnownApi.openai_responses,
         .provider = "openai",
@@ -693,7 +720,7 @@ test "history snapshot truncates oversized items and drops oldest under byte bud
     const oversized = try std.testing.allocator.alloc(u8, snapshot_history_item_text_bytes_max + 4);
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'a');
-    _ = try manager.appendMessage(.{ .user = .{ .content = .{ .string = oversized }, .timestamp = 0 } }, "t1");
+    _ = try appendTestMessage(&manager, .{ .user = .{ .content = .{ .string = oversized }, .timestamp = 0 } }, "t1");
 
     var snapshot = try HistorySnapshot.fromEntries(std.testing.allocator, manager.entries.items);
     defer snapshot.deinit(std.testing.allocator);
@@ -708,7 +735,7 @@ test "history snapshot truncates oversized items and drops oldest under byte bud
     @memset(big, 'b');
     const needed = snapshot_history_total_text_bytes_max / snapshot_history_item_text_bytes_max + 1;
     for (0..needed) |_| {
-        _ = try manager.appendMessage(.{ .user = .{ .content = .{ .string = big }, .timestamp = 0 } }, "t2");
+        _ = try appendTestMessage(&manager, .{ .user = .{ .content = .{ .string = big }, .timestamp = 0 } }, "t2");
     }
     var full = try HistorySnapshot.fromEntries(std.testing.allocator, manager.entries.items);
     defer full.deinit(std.testing.allocator);
@@ -741,11 +768,11 @@ test "compaction end event serializes owned result" {
     var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
-    const first_kept = try manager.appendMessage(.{ .user = .{
+    const first_kept = try appendTestMessage(&manager, .{ .user = .{
         .content = .{ .string = "kept" },
         .timestamp = 0,
     } }, "t1");
-    _ = try manager.appendCompaction("summary", first_kept, 42, "t2");
+    _ = try appendTestCompaction(&manager, "summary", first_kept, 42, "t2");
 
     var event: ClientEvent = .{ .compaction_end = .{
         .reason = .threshold,

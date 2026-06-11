@@ -8,8 +8,8 @@ const ls_tool = @import("tools/ls.zig");
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
 
-const max_tools = 64;
 pub const default_active_tool_names: []const []const u8 = &.{ "read", "ls", "grep", "find", "bash", "edit", "write" };
+const max_tools = default_active_tool_names.len;
 
 /// Bounded set of executable tools plus the per-tool system prompt snippet.
 /// The agent core receives the borrowed `agent.AgentTool` views; the snippet
@@ -20,7 +20,7 @@ pub const ToolRegistry = struct {
     prompt_snippets: [max_tools]?[]const u8 = undefined,
     len: usize = 0,
 
-    pub fn append(self: *ToolRegistry, tool: agent.AgentTool, prompt_snippet: ?[]const u8) !void {
+    fn append(self: *ToolRegistry, tool: agent.AgentTool, prompt_snippet: ?[]const u8) !void {
         if (self.len == max_tools) return error.ToolLimitExceeded;
         for (self.names[0..self.len]) |name| {
             if (std.mem.eql(u8, name, tool.name)) return error.DuplicateToolName;
@@ -121,35 +121,37 @@ pub const BuiltinTools = struct {
         allocator.destroy(self);
     }
 
-    pub fn appendDefinitions(self: *BuiltinTools, registry: *ToolRegistry) !void {
-        try registry.append(
+    pub fn registry(self: *BuiltinTools) !ToolRegistry {
+        var out: ToolRegistry = .{};
+        try out.append(
             self.read.tool(),
             "Read file contents. Use offset/limit for large files; continue with offset when needed.",
         );
-        try registry.append(
+        try out.append(
             self.ls.tool(),
             "List one directory. Prefer this over bash ls for directory inspection.",
         );
-        try registry.append(
+        try out.append(
             self.grep.tool(),
             "Search files for literal text. Prefer this over bash grep for simple searches.",
         );
-        try registry.append(
+        try out.append(
             self.find.tool(),
             "Find paths under a directory. Prefer this over bash find for simple path discovery.",
         );
-        try registry.append(
+        try out.append(
             self.bash.tool(),
             "Run one shell command in the session cwd. Prefer read/ls/grep/find/edit/write for file work.",
         );
-        try registry.append(
+        try out.append(
             self.edit.tool(),
             "Edit a file using exact unique text replacements. Use one call for multiple disjoint edits.",
         );
-        try registry.append(
+        try out.append(
             self.write.tool(),
             "Create or overwrite a text file, creating parent directories as needed.",
         );
+        return out;
     }
 };
 
@@ -162,8 +164,7 @@ test "tool registry exposes builtin tools names and snippets in order" {
 
     var builtins = try BuiltinTools.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
     defer builtins.deinit();
-    var registry: ToolRegistry = .{};
-    try builtins.appendDefinitions(&registry);
+    const registry = try builtins.registry();
 
     try std.testing.expectEqual(default_active_tool_names.len, registry.len);
     for (default_active_tool_names, registry.activeToolNames()) |expected, actual| {
@@ -172,18 +173,4 @@ test "tool registry exposes builtin tools names and snippets in order" {
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[4].execution_mode.?);
     try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[5].execution_mode.?);
     try std.testing.expect(registry.activePromptSnippets()[0] != null);
-}
-
-test "tool registry rejects duplicate tool names" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd_len = try tmp.dir.realPathFile(std.testing.io, ".", &cwd_buffer);
-
-    var builtins = try BuiltinTools.init(std.testing.allocator, .{ .cwd = cwd_buffer[0..cwd_len] });
-    defer builtins.deinit();
-    var registry: ToolRegistry = .{};
-    try builtins.appendDefinitions(&registry);
-    try std.testing.expectError(error.DuplicateToolName, registry.append(builtins.read.tool(), null));
 }
