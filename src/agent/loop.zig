@@ -6,7 +6,19 @@ const tool_runner = @import("tool_runner.zig");
 
 pub const EventSink = agent.EventSink;
 
-const AgentEventPipe = runtime.EventPipe(agent.AgentEvent, void);
+/// One mirrored event plus the arena that owns every allocation inside it.
+/// The consumer drops the arena in one call instead of a deep per-field free.
+pub const StreamEvent = struct {
+    arena: std.heap.ArenaAllocator,
+    event: agent.AgentEvent,
+
+    pub fn deinit(self: *StreamEvent) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+const AgentEventPipe = runtime.EventPipe(StreamEvent, void);
 pub const AgentEventStreamNextError = AgentEventPipe.NextError;
 pub const AgentEventStreamEmitError = AgentEventPipe.EmitError;
 pub const AgentEventStreamPoll = AgentEventPipe.Stream.Poll;
@@ -22,7 +34,7 @@ pub const AgentEventStream = struct {
         settled,
     };
 
-    pub fn init(allocator: std.mem.Allocator, buffer: []agent.AgentEvent) AgentEventStream {
+    pub fn init(allocator: std.mem.Allocator, buffer: []StreamEvent) AgentEventStream {
         return .{
             .allocator = allocator,
             .pipe = AgentEventPipe.init(buffer),
@@ -36,7 +48,7 @@ pub const AgentEventStream = struct {
         self.* = undefined;
     }
 
-    pub fn next(self: *AgentEventStream) AgentEventStreamNextError!?agent.AgentEvent {
+    pub fn next(self: *AgentEventStream) AgentEventStreamNextError!?StreamEvent {
         return self.pipe.stream().next();
     }
 
@@ -80,7 +92,10 @@ pub const AgentEventStream = struct {
     fn discardPendingEvents(self: *AgentEventStream) void {
         while (true) {
             switch (self.pipe.stream().poll()) {
-                .event => |event| deinitStreamEvent(self.allocator, event),
+                .event => |event| {
+                    var owned = event;
+                    owned.deinit();
+                },
                 .empty, .terminal => return,
             }
         }
@@ -95,7 +110,7 @@ pub fn startPromptStream(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    buffer: []agent.AgentEvent,
+    buffer: []StreamEvent,
 ) void {
     const stream_io = task_runtime.io();
     stream.* = AgentEventStream.init(allocator, buffer);
@@ -135,7 +150,7 @@ pub fn startContinueStream(
     context: agent.AgentContext,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    buffer: []agent.AgentEvent,
+    buffer: []StreamEvent,
 ) void {
     const stream_io = task_runtime.io();
     stream.* = AgentEventStream.init(allocator, buffer);
@@ -170,35 +185,6 @@ pub const Error = error{
     TooManyTools,
     MissingAssistantResult,
 };
-
-pub fn deinitStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) void {
-    switch (event) {
-        .message_start => |payload| agent.deinitAgentMessage(allocator, payload.message),
-        .message_update => |payload| {
-            ai.owned.deinitAssistantMessageEvent(allocator, payload.assistant_message_event);
-        },
-        .message_end => |payload| agent.deinitAgentMessage(allocator, payload.message),
-        .turn_end => {},
-        .agent_end => {},
-        .tool_execution_start => |payload| {
-            allocator.free(payload.tool_call_id);
-            allocator.free(payload.tool_name);
-            runtime.freeJsonValue(allocator, payload.args);
-        },
-        .tool_execution_update => |payload| {
-            allocator.free(payload.tool_call_id);
-            allocator.free(payload.tool_name);
-            runtime.freeJsonValue(allocator, payload.args);
-            deinitCopiedAgentToolResult(allocator, payload.partial_result);
-        },
-        .tool_execution_end => |payload| {
-            allocator.free(payload.tool_call_id);
-            allocator.free(payload.tool_name);
-            deinitCopiedAgentToolResult(allocator, payload.result);
-        },
-        .agent_start, .turn_start => {},
-    }
-}
 
 fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
     return switch (event) {
@@ -336,13 +322,23 @@ fn copyDeltaPartial(
     content_index: usize,
     kind: DeltaPartialKind,
 ) !ai.AssistantMessage {
+    // Text/thinking delta partials only ever carried empty placeholder blocks
+    // (live text reaches clients through the event's `delta` field, not the
+    // partial), so an empty content slice is information-equivalent and skips
+    // the per-delta O(content_index) placeholder rebuild. Tool-call partials
+    // still carry the argument preview below.
+    if (kind == .text or kind == .thinking) {
+        return copyAssistantMetadataWithContent(allocator, source, &.{});
+    }
+    // Only tool-call deltas reach here (text/thinking returned above). The
+    // partial keeps a tool_call preview at the active index and empty
+    // placeholders for the blocks before it.
     if (content_index >= source.content.len) return ai.owned.copyAssistantMessage(allocator, source);
     const content = try copyDeltaContent(
         allocator,
         source.content[content_index],
         content_index + 1,
         content_index,
-        kind,
     );
     errdefer ai.owned.deinitAssistantContentSlice(allocator, content);
     return copyAssistantMetadataWithContent(allocator, source, content);
@@ -353,7 +349,6 @@ fn copyDeltaContent(
     target: ai.AssistantContent,
     content_len: usize,
     target_index: usize,
-    kind: DeltaPartialKind,
 ) ![]const ai.AssistantContent {
     const content = try allocator.alloc(ai.AssistantContent, content_len);
     var initialized: usize = 0;
@@ -362,28 +357,13 @@ fn copyDeltaContent(
         allocator.free(content);
     }
     for (content, 0..) |*item, index| {
-        item.* = if (index == target_index)
-            try copyDeltaContentTarget(allocator, target, kind)
+        item.* = if (index == target_index and target == .tool_call)
+            .{ .tool_call = try copyToolCallPreview(allocator, target.tool_call) }
         else
             .{ .text = .{ .text = try allocator.dupe(u8, "") } };
         initialized += 1;
     }
     return content;
-}
-
-fn copyDeltaContentTarget(
-    allocator: std.mem.Allocator,
-    target: ai.AssistantContent,
-    kind: DeltaPartialKind,
-) !ai.AssistantContent {
-    return switch (kind) {
-        .text => .{ .text = .{ .text = try allocator.dupe(u8, "") } },
-        .thinking => .{ .thinking = .{ .thinking = try allocator.dupe(u8, "") } },
-        .tool_call => if (target == .tool_call)
-            .{ .tool_call = try copyToolCallPreview(allocator, target.tool_call) }
-        else
-            .{ .text = .{ .text = try allocator.dupe(u8, "") } },
-    };
 }
 
 fn copyToolCallPreview(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
@@ -511,11 +491,21 @@ fn streamSink(stream: *AgentEventStream) EventSink {
 fn streamSinkEmit(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const stream: *AgentEventStream = @ptrCast(@alignCast(context.?));
     switch (event) {
-        .agent_end => try stream.pipe.sink().end(.agent_end, {}),
+        .agent_end => try stream.pipe.sink().end(.{
+            // agent_end carries no payload; an empty arena allocates nothing,
+            // so dropping it on an end() error is harmless.
+            .arena = std.heap.ArenaAllocator.init(stream.allocator),
+            .event = .agent_end,
+        }, {}),
         else => {
-            const stream_event = try copyStreamEvent(stream.allocator, event);
-            errdefer deinitStreamEvent(stream.allocator, stream_event);
-            try stream.pipe.sink().emit(stream_event);
+            // Each mirrored event owns its allocations in a private arena.
+            // On a successful emit the ring slot takes the arena by value; on
+            // failure we drop it here. (Safe: the copied event holds pointers
+            // into heap pages, not into the moved arena struct.)
+            var arena = std.heap.ArenaAllocator.init(stream.allocator);
+            errdefer arena.deinit();
+            const copied = try copyStreamEvent(arena.allocator(), event);
+            try stream.pipe.sink().emit(.{ .arena = arena, .event = copied });
         },
     }
 }
@@ -541,7 +531,6 @@ pub fn runPrompt(
         try current.messages.append(allocator, prompt);
     }
 
-    current.owned_tool_results_start = current.messages.items.len;
     try runLoop(allocator, io, &current, config, token, task_runtime, emit);
 }
 
@@ -583,7 +572,7 @@ fn runLoop(
         while (has_more_tool_calls or pending_messages.len > 0) {
             if (token.isRequested()) {
                 const aborted = try ai.owned.copyAssistantMessage(
-                    allocator,
+                    current.ownedAllocator(),
                     terminalAssistantMessage(config.model, .aborted, "aborted"),
                 );
                 try current.messages.append(allocator, .{ .assistant = aborted });
@@ -605,7 +594,10 @@ fn runLoop(
                 pending_messages = &.{};
             }
 
-            var owned_assistant: ?ai.AssistantMessage = try streamAssistantResponse(
+            // streamAssistantResponse returns into current.owned_arena, so an
+            // append failure leaves the message owned by the arena (no leak,
+            // no per-field free) and Context.deinit drops it.
+            const assistant = try streamAssistantResponse(
                 allocator,
                 io,
                 current,
@@ -614,10 +606,7 @@ fn runLoop(
                 task_runtime,
                 emit,
             );
-            errdefer if (owned_assistant) |assistant| ai.owned.deinitAssistantMessage(allocator, assistant);
-            const assistant = owned_assistant.?;
             try current.messages.append(allocator, .{ .assistant = assistant });
-            owned_assistant = null;
 
             if (assistant.stop_reason == .error_ or assistant.stop_reason == .aborted) {
                 try emit.emit(.turn_end);
@@ -627,6 +616,7 @@ fn runLoop(
 
             const tool_results = try tool_runner.Runner.init(
                 allocator,
+                current.ownedAllocator(),
                 io,
                 task_runtime,
                 .{
@@ -639,16 +629,12 @@ fn runLoop(
                 token,
                 emit,
             ).run();
+            // Message contents live in current.owned_arena; only the slice
+            // container is scratch. An append failure leaves the remaining
+            // messages owned by the arena, which Context.deinit drops.
             defer allocator.free(tool_results.messages);
-            var moved_tool_results: usize = 0;
-            errdefer {
-                for (tool_results.messages[moved_tool_results..]) |message| {
-                    agent.deinitToolResultMessage(allocator, message);
-                }
-            }
             for (tool_results.messages) |message| {
                 try current.messages.append(allocator, .{ .tool_result = message });
-                moved_tool_results += 1;
             }
 
             try emit.emit(.turn_end);
@@ -680,10 +666,20 @@ fn emitPendingMessages(
     messages: []const agent.AgentMessage,
     emit: EventSink,
 ) !void {
+    // Re-home pending messages into the owned arena so Context owns every
+    // in-loop message uniformly. Free only the originals the previous code
+    // owned (assistant/tool_result); other variants carry borrowed content.
+    // The slice container itself is freed by the caller.
+    defer for (messages) |message| switch (message) {
+        .assistant => |assistant| ai.owned.deinitAssistantMessage(allocator, assistant),
+        .tool_result => |tool_result| agent.deinitToolResultMessage(allocator, tool_result),
+        else => {},
+    };
     for (messages) |message| {
         try emit.emit(.{ .message_start = .{ .message = message } });
         try emit.emit(.{ .message_end = .{ .message = message } });
-        try current.messages.append(allocator, message);
+        const owned = try agent.copyAgentMessage(current.ownedAllocator(), message);
+        try current.messages.append(allocator, owned);
     }
 }
 
@@ -763,14 +759,14 @@ fn streamAssistantResponse(
                     try emit.emit(.{ .message_start = .{ .message = .{ .assistant = done.message } } });
                 }
                 try emit.emit(.{ .message_end = .{ .message = .{ .assistant = done.message } } });
-                return ai.owned.copyAssistantMessage(allocator, done.message);
+                return ai.owned.copyAssistantMessage(current.ownedAllocator(), done.message);
             },
             .@"error" => |err| {
                 if (!added_partial) {
                     try emit.emit(.{ .message_start = .{ .message = .{ .assistant = err.@"error" } } });
                 }
                 try emit.emit(.{ .message_end = .{ .message = .{ .assistant = err.@"error" } } });
-                return ai.owned.copyAssistantMessage(allocator, err.@"error");
+                return ai.owned.copyAssistantMessage(current.ownedAllocator(), err.@"error");
             },
         }
     }
@@ -778,7 +774,7 @@ fn streamAssistantResponse(
     const result = stream.result() orelse return error.MissingAssistantResult;
     if (!added_partial) try emit.emit(.{ .message_start = .{ .message = .{ .assistant = result } } });
     try emit.emit(.{ .message_end = .{ .message = .{ .assistant = result } } });
-    return ai.owned.copyAssistantMessage(allocator, result);
+    return ai.owned.copyAssistantMessage(current.ownedAllocator(), result);
 }
 
 fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_message: ?[]const u8) ai.AssistantMessage {
@@ -796,10 +792,13 @@ fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_messag
 
 const Context = struct {
     allocator: std.mem.Allocator,
+    // Owns every message produced inside the loop (assistant + tool results).
+    // Dropped as a unit in deinit, so no per-message free walk is needed and
+    // clones into it need no errdefer unwinding.
+    owned_arena: std.heap.ArenaAllocator,
     system_prompt: []const u8,
     messages: std.ArrayList(agent.AgentMessage),
     tools: []const agent.AgentTool,
-    owned_tool_results_start: usize,
 
     fn init(allocator: std.mem.Allocator, source: agent.AgentContext) !Context {
         var messages = std.ArrayList(agent.AgentMessage).empty;
@@ -807,21 +806,20 @@ const Context = struct {
         try messages.appendSlice(allocator, source.messages);
         return .{
             .allocator = allocator,
+            .owned_arena = std.heap.ArenaAllocator.init(allocator),
             .system_prompt = source.system_prompt,
             .messages = messages,
             .tools = source.tools,
-            .owned_tool_results_start = source.messages.len,
         };
     }
 
+    fn ownedAllocator(self: *Context) std.mem.Allocator {
+        return self.owned_arena.allocator();
+    }
+
     fn deinit(self: *Context) void {
-        for (self.messages.items[self.owned_tool_results_start..]) |message| {
-            switch (message) {
-                .assistant => |assistant| ai.owned.deinitAssistantMessage(self.allocator, assistant),
-                .tool_result => |tool_result| agent.deinitToolResultMessage(self.allocator, tool_result),
-                else => {},
-            }
-        }
+        // All in-loop messages (assistant + tool results) live in owned_arena.
+        self.owned_arena.deinit();
         self.messages.deinit(self.allocator);
         self.* = undefined;
     }
@@ -1034,6 +1032,22 @@ test "stream event copy bounds delta partial to changed content" {
     try std.testing.expectEqual(@as(usize, stream_tool_argument_preview_bytes_max), preview.string.len);
 }
 
+test "compact text delta partial with real content drops to empty content" {
+    const content = [_]ai.AssistantContent{.{ .text = .{ .text = "hello world" } }};
+    var partial = assistantMessage("x");
+    partial.content = &content;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const copied = try copyCompactAssistantMessageEvent(arena.allocator(), .{ .text_delta = .{
+        .content_index = 0,
+        .delta = "h",
+        .partial = partial,
+    } });
+    try std.testing.expectEqual(@as(usize, 0), copied.text_delta.partial.content.len);
+}
+
 fn userMessage(text: []const u8) agent.AgentMessage {
     return .{ .user = .{ .content = .{ .string = text }, .timestamp = 0 } };
 }
@@ -1148,7 +1162,7 @@ test "prompt stream exposes events through event pipe" {
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
-    var buffer: [8]agent.AgentEvent = undefined;
+    var buffer: [8]StreamEvent = undefined;
     var stream: AgentEventStream = undefined;
 
     startPromptStream(
@@ -1167,10 +1181,13 @@ test "prompt stream exposes events through event pipe" {
     );
     defer stream.deinit();
 
-    const start_event = (try stream.next()).?;
-    defer deinitStreamEvent(std.testing.allocator, start_event);
-    try std.testing.expectEqual(agent.AgentEvent.agent_start, start_event);
-    while (try stream.next()) |event| deinitStreamEvent(std.testing.allocator, event);
+    var start_event = (try stream.next()).?;
+    defer start_event.deinit();
+    try std.testing.expectEqual(agent.AgentEvent.agent_start, start_event.event);
+    while (try stream.next()) |captured| {
+        var event = captured;
+        event.deinit();
+    }
     try stream.awaitProducer();
 }
 
@@ -1180,7 +1197,7 @@ test "prompt stream drains many fast deltas through bounded pipe" {
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
-    var buffer: [8]agent.AgentEvent = undefined;
+    var buffer: [8]StreamEvent = undefined;
     var stream: AgentEventStream = undefined;
 
     startPromptStream(
@@ -1200,9 +1217,10 @@ test "prompt stream drains many fast deltas through bounded pipe" {
     defer stream.deinit();
 
     var update_count: usize = 0;
-    while (try stream.next()) |event| {
-        defer deinitStreamEvent(std.testing.allocator, event);
-        if (event == .message_update) update_count += 1;
+    while (try stream.next()) |captured| {
+        var event = captured;
+        defer event.deinit();
+        if (event.event == .message_update) update_count += 1;
     }
     try stream.awaitProducer();
     try std.testing.expectEqual(@as(usize, fast_delta_stream_count), update_count);
@@ -1214,7 +1232,7 @@ test "prompt stream closes event pipe when producer fails before terminal event"
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
-    var buffer: [8]agent.AgentEvent = undefined;
+    var buffer: [8]StreamEvent = undefined;
     var stream: AgentEventStream = undefined;
 
     startPromptStream(
@@ -1233,7 +1251,10 @@ test "prompt stream closes event pipe when producer fails before terminal event"
     );
     defer stream.deinit();
 
-    while (try stream.next()) |event| deinitStreamEvent(std.testing.allocator, event);
+    while (try stream.next()) |captured| {
+        var event = captured;
+        event.deinit();
+    }
     try std.testing.expectError(error.MissingAssistantResult, stream.awaitProducer());
 }
 
@@ -1243,7 +1264,7 @@ test "prompt stream cancellation drains producer blocked on bounded event pipe" 
     var cancel = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel.deinit();
     const prompt = userMessage("hello");
-    var buffer: [1]agent.AgentEvent = undefined;
+    var buffer: [1]StreamEvent = undefined;
     var stream: AgentEventStream = undefined;
 
     startPromptStream(
@@ -1262,9 +1283,9 @@ test "prompt stream cancellation drains producer blocked on bounded event pipe" 
     );
     defer stream.deinit();
 
-    const start_event = (try stream.next()).?;
-    defer deinitStreamEvent(std.testing.allocator, start_event);
-    try std.testing.expectEqual(agent.AgentEvent.agent_start, start_event);
+    var start_event = (try stream.next()).?;
+    defer start_event.deinit();
+    try std.testing.expectEqual(agent.AgentEvent.agent_start, start_event.event);
     try std.testing.expectError(error.Canceled, stream.cancelProducer());
 }
 
@@ -1283,7 +1304,7 @@ test "prompt stream cancellation while tool is running drains as canceled" {
         .label = "Echo",
         .execute = .{ .context = &entered, .call_fn = sleepingTool },
     };
-    var buffer: [16]agent.AgentEvent = undefined;
+    var buffer: [16]StreamEvent = undefined;
     var stream: AgentEventStream = undefined;
 
     startPromptStream(

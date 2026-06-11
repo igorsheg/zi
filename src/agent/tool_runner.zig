@@ -10,6 +10,10 @@ pub const Batch = struct {
 
 pub const Runner = struct {
     allocator: std.mem.Allocator,
+    // Owns the durable result-message contents returned in Batch. Scratch and
+    // the message-list container use `allocator`; only the kept messages land
+    // here, so the caller's arena can own them without a per-message free.
+    result_allocator: std.mem.Allocator,
     io: std.Io,
     task_runtime: *runtime.Runtime,
     context: agent.AgentContext,
@@ -20,6 +24,7 @@ pub const Runner = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        result_allocator: std.mem.Allocator,
         io: std.Io,
         task_runtime: *runtime.Runtime,
         context: agent.AgentContext,
@@ -30,6 +35,7 @@ pub const Runner = struct {
     ) Runner {
         return .{
             .allocator = allocator,
+            .result_allocator = result_allocator,
             .io = io,
             .task_runtime = task_runtime,
             .context = context,
@@ -48,6 +54,7 @@ pub const Runner = struct {
         )) {
             return executeToolCallsSequential(
                 self.allocator,
+                self.result_allocator,
                 self.io,
                 self.task_runtime,
                 self.context,
@@ -59,6 +66,7 @@ pub const Runner = struct {
         }
         return executeToolCallsParallel(
             self.allocator,
+            self.result_allocator,
             self.io,
             self.context,
             self.assistant,
@@ -89,6 +97,7 @@ fn shouldExecuteToolsSequential(
 
 fn executeToolCallsSequential(
     allocator: std.mem.Allocator,
+    result_allocator: std.mem.Allocator,
     io: std.Io,
     task_runtime: *runtime.Runtime,
     context: agent.AgentContext,
@@ -98,7 +107,7 @@ fn executeToolCallsSequential(
     emit: agent.EventSink,
 ) !Batch {
     var messages = std.ArrayList(ai.ToolResultMessage).empty;
-    errdefer deinitToolResultMessages(allocator, messages.items, &messages);
+    errdefer deinitToolResultMessages(result_allocator, allocator, messages.items, &messages);
     var finalized_count: usize = 0;
     var terminate_count: usize = 0;
 
@@ -126,7 +135,7 @@ fn executeToolCallsSequential(
         finalized_count += 1;
         if (finalized.result.result.terminate) terminate_count += 1;
 
-        emitFinalizedToolCall(allocator, emit, tool_call, finalized, &messages) catch |err| {
+        emitFinalizedToolCall(allocator, result_allocator, emit, tool_call, finalized, &messages) catch |err| {
             finalized.result.deinit();
             return err;
         };
@@ -277,6 +286,7 @@ const ParallelToolUpdateContext = struct {
 
 fn executeToolCallsParallel(
     allocator: std.mem.Allocator,
+    result_allocator: std.mem.Allocator,
     io: std.Io,
     context: agent.AgentContext,
     assistant: ai.AssistantMessage,
@@ -342,14 +352,14 @@ fn executeToolCallsParallel(
     try group.await();
 
     var messages = std.ArrayList(ai.ToolResultMessage).empty;
-    errdefer deinitToolResultMessages(allocator, messages.items, &messages);
+    errdefer deinitToolResultMessages(result_allocator, allocator, messages.items, &messages);
     var terminate_count: usize = 0;
 
     for (executed[0..prepared_count]) |item| {
         executed_owned[item.prepared.index()] = false;
         var finalized = try finalizeExecutedToolCall(allocator, context, assistant, config, token, item);
         if (finalized.result.result.terminate) terminate_count += 1;
-        emitFinalizedToolCall(allocator, emit, item.prepared.toolCall(), finalized, &messages) catch |err| {
+        emitFinalizedToolCall(allocator, result_allocator, emit, item.prepared.toolCall(), finalized, &messages) catch |err| {
             finalized.result.deinit();
             return err;
         };
@@ -615,6 +625,7 @@ fn finalizeExecutedToolCall(
 
 fn emitFinalizedToolCall(
     allocator: std.mem.Allocator,
+    result_allocator: std.mem.Allocator,
     emit: agent.EventSink,
     tool_call: ai.ToolCall,
     finalized: FinalizedToolCall,
@@ -627,8 +638,10 @@ fn emitFinalizedToolCall(
         .is_error = finalized.is_error,
     } });
 
-    const message = try createToolResultMessage(allocator, tool_call, finalized.result.view(), finalized.is_error);
-    errdefer agent.deinitToolResultMessage(allocator, message);
+    // Durable message content lives in result_allocator; the list container
+    // and the append below use the scratch allocator.
+    const message = try createToolResultMessage(result_allocator, tool_call, finalized.result.view(), finalized.is_error);
+    errdefer agent.deinitToolResultMessage(result_allocator, message);
     try emit.emit(.{ .message_end = .{ .message = .{ .tool_result = message } } });
     try messages.append(allocator, message);
 }
@@ -822,10 +835,11 @@ fn createErrorToolResultFmt(
 }
 
 fn deinitToolResultMessages(
-    allocator: std.mem.Allocator,
+    result_allocator: std.mem.Allocator,
+    list_allocator: std.mem.Allocator,
     messages: []const ai.ToolResultMessage,
     list: *std.ArrayList(ai.ToolResultMessage),
 ) void {
-    for (messages) |message| agent.deinitToolResultMessage(allocator, message);
-    list.deinit(allocator);
+    for (messages) |message| agent.deinitToolResultMessage(result_allocator, message);
+    list.deinit(list_allocator);
 }

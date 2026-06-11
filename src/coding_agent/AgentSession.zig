@@ -110,7 +110,7 @@ pub const SettleContext = struct {
 pub const CompactionRun = struct {
     state: enum { producing, settled } = .producing,
     stream: agent_mod.loop.AgentEventStream = undefined,
-    buffer: [live_prompt_event_capacity_count]agent_mod.AgentEvent = undefined,
+    buffer: [live_prompt_event_capacity_count]agent_mod.loop.StreamEvent = undefined,
     prompts: [1]agent_mod.AgentMessage = undefined,
     cancel: runtime.CancelSource,
     reason: client_protocol.CompactionReason,
@@ -129,7 +129,7 @@ pub const CompactionRun = struct {
 pub const PromptRun = struct {
     state: State = .settled,
     stream: agent_mod.loop.AgentEventStream = undefined,
-    buffer: [live_prompt_event_capacity_count]agent_mod.AgentEvent = undefined,
+    buffer: [live_prompt_event_capacity_count]agent_mod.loop.StreamEvent = undefined,
     prompts: [1]agent_mod.AgentMessage = undefined,
 
     const State = union(enum) {
@@ -352,7 +352,7 @@ pub fn applyPromptRunProgress(
     progress: @TypeOf(run.stream.asyncNext()).Result,
 ) !bool {
     if (!run.isActive()) return false;
-    const event = progress orelse {
+    var event = progress orelse {
         // Stream is done: settle the run as completed or failed.
         const token = run.terminalToken().?;
         run.stream.awaitProducer() catch |err| {
@@ -363,8 +363,8 @@ pub fn applyPromptRunProgress(
         run.markSettled();
         return false;
     };
-    defer agent_mod.loop.deinitStreamEvent(self.allocator, event);
-    try self.agent.emitEvent(event);
+    defer event.deinit();
+    try self.agent.emitEvent(event.event);
     return true;
 }
 
@@ -691,7 +691,7 @@ pub fn applyCompactionRunProgress(
     progress: @TypeOf(run.stream.asyncNext()).Result,
 ) !bool {
     if (run.state == .settled) return false;
-    const event = progress orelse {
+    var event = progress orelse {
         run.stream.awaitProducer() catch |err| {
             if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
             run.outcome = .{ .failure = err };
@@ -699,8 +699,8 @@ pub fn applyCompactionRunProgress(
         run.state = .settled;
         return false;
     };
-    defer agent_mod.loop.deinitStreamEvent(self.allocator, event);
-    switch (event) {
+    defer event.deinit();
+    switch (event.event) {
         .message_end => |payload| switch (payload.message) {
             .assistant => |assistant| {
                 const summary = extractCompactionSummary(self.allocator, assistant) catch |err| {

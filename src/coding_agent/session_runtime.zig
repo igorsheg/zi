@@ -1247,6 +1247,48 @@ const FlakyStream = struct {
     }
 };
 
+test "session runtime streams multi-block deltas through the live owner loop" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const reply_content = [_]ai.AssistantContent{
+        .{ .thinking = .{ .thinking = "let me think about this" } },
+        .{ .text = .{ .text = "here is the answer" } },
+    };
+    const replies = [_]ai.AssistantMessage{
+        ai.faux.assistantMessage(&reply_content, .{ .stop_reason = .stop }),
+    };
+    try provider.setResponses(&replies);
+
+    var session_runtime = try openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+    });
+    defer session_runtime.deinit();
+
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
+    var prompt_owned = true;
+    defer if (prompt_owned) prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(prompt);
+    prompt_owned = false;
+
+    const outcome = try driveUntilOperationFinished(&session_runtime);
+    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.completed, outcome.reason);
+    try std.testing.expect(session_runtime.active == null);
+}
+
 fn initRetryTestRuntime(
     tmp: *std.testing.TmpDir,
     task_runtime: *runtime.Runtime,
