@@ -132,13 +132,18 @@ fn drawComposer(app: *app_mod.ProductApp, renderer: anytype, composer_rows: usiz
     }
 }
 
-pub fn transcriptScrollMax(transcript: transcript_mod.TranscriptBuffer, width: u16, visible_rows: usize) usize {
+pub fn transcriptScrollMax(
+    transcript: transcript_mod.TranscriptBuffer,
+    width: u16,
+    visible_rows: usize,
+    tools_expanded: bool,
+) usize {
     if (width == 0 or visible_rows == 0) return 0;
     var sink = TranscriptRowSink.countOnly();
     var item_index = transcript.items.items.len;
     while (item_index > 0) {
         item_index -= 1;
-        emitItemRowsNewestFirst(&sink, transcript.items.items[item_index], width, null);
+        emitItemRowsNewestFirst(&sink, transcript.items.items[item_index], width, null, tools_expanded);
     }
     return if (sink.total_emitted > visible_rows) sink.total_emitted - visible_rows else 0;
 }
@@ -189,7 +194,13 @@ fn drawTranscript(
     var item_index = app.transcript.items.items.len;
     while (item_index > 0 and sink.row_count < row_limit) {
         item_index -= 1;
-        emitItemRowsNewestFirst(&sink, app.transcript.items.items[item_index], app.width, &app.theme);
+        emitItemRowsNewestFirst(
+            &sink,
+            app.transcript.items.items[item_index],
+            app.width,
+            &app.theme,
+            app.tools_expanded,
+        );
     }
 
     var draw_index = sink.row_count;
@@ -306,6 +317,7 @@ fn emitItemRowsNewestFirst(
     item: transcript_mod.TranscriptItem,
     frame_width: u16,
     theme: ?*const theme_mod.Theme,
+    tools_expanded: bool,
 ) void {
     const style = transcriptItemStyle(item, theme);
     // Transcript spacing has two concepts: padding is inside an item and uses
@@ -316,7 +328,7 @@ fn emitItemRowsNewestFirst(
     emitMarginBottomRows(sink);
     emitVerticalPaddingRows(sink, transcriptItemPaddingY(item), style);
     if (item == .tool) {
-        emitToolRowsNewestFirst(sink, item.tool, frame_width, theme);
+        emitToolRowsNewestFirst(sink, item.tool, frame_width, theme, tools_expanded);
     } else if (item == .message and item.message.role == .assistant) {
         emitMarkdownRowsNewestFirst(sink, item.message.text, frame_width, theme);
     } else {
@@ -418,25 +430,41 @@ fn emitToolRowsNewestFirst(
     tool: transcript_mod.TranscriptTool,
     frame_width: u16,
     theme: ?*const theme_mod.Theme,
+    tools_expanded: bool,
 ) void {
     const fallback = theme_mod.Theme.codex();
     const resolved = theme orelse &fallback;
+    // Error rail is red, matching pi-mono's error tint on failed tools.
+    const rail_style = if (tool.status == .err) resolved.status_error else resolved.tool_chrome;
 
     const block: chrome.OpenBlock = .{};
     var bottom_buffer: [tool_chrome_line_bytes_max]u8 = undefined;
     const bottom = block.bottomLine(&bottom_buffer) catch "╰────";
-    sink.emitGenerated("", bottom, false, resolved.tool_chrome);
+    sink.emitGenerated("", bottom, false, rail_style);
     if (sink.full()) return;
 
-    const projected = transcript_projection.itemPrimary(.{ .tool = tool });
-    if (transcript_projection.toolBodyVisible(tool)) {
+    if (tool.footer.len > 0) {
         emitWrappedRowsNewestFirst(
+            sink,
+            .{ .prefix = block.bodyPrefix(), .text = tool.footer },
+            frame_width,
+            true,
+            rail_style,
+            resolved.transcript_secondary,
+        );
+        if (sink.full()) return;
+    }
+
+    const projected = transcript_projection.itemPrimary(.{ .tool = tool });
+    if (transcript_projection.toolBodyVisible(tool, tools_expanded)) {
+        emitToolBodyRowsNewestFirst(
             sink,
             .{ .prefix = block.bodyPrefix(), .text = projected.text },
             frame_width,
-            true,
-            resolved.tool_chrome,
-            resolved.tool_output,
+            tool.collapse,
+            tools_expanded,
+            rail_style,
+            resolved,
         );
         if (sink.full()) return;
     }
@@ -446,7 +474,7 @@ fn emitToolRowsNewestFirst(
             .{ .prefix = block.bodyPrefix(), .text = tool.call_preview },
             frame_width,
             true,
-            resolved.tool_chrome,
+            rail_style,
             resolved.tool_output,
         );
         if (sink.full()) return;
@@ -459,8 +487,8 @@ fn emitToolRowsNewestFirst(
             .{ .prefix = block.bodyPrefix(), .text = notice },
             frame_width,
             true,
-            resolved.tool_chrome,
-            resolved.tool_chrome,
+            rail_style,
+            rail_style,
         );
         if (sink.full()) return;
     }
@@ -472,10 +500,10 @@ fn emitToolRowsNewestFirst(
         .text = title_text,
         .suffix = "]",
         .show_prefix = true,
-        .prefix_style = resolved.tool_chrome,
+        .prefix_style = rail_style,
         .text_style = resolved.tool_title,
-        .suffix_style = resolved.tool_chrome,
-        .row_style = resolved.tool_chrome,
+        .suffix_style = rail_style,
+        .row_style = rail_style,
     });
 }
 
@@ -506,6 +534,83 @@ fn emitWrappedRowsNewestFirst(
         sink.emitBorrowed(line_rows[remaining]);
         if (sink.full()) return;
     }
+}
+
+// Collapsed tools show a bounded visual-row window over the body (pi-mono's
+// sliding preview): tail tools keep the newest rows with a "... (N earlier
+// lines, ctrl+o to expand)" hint above, head tools keep the first rows with a
+// "... (N more lines, ...)" hint below. Expanded shows the full retained
+// preview. Rows are counted after wrapping so the window is stable across
+// widths, the same way scroll accounting works.
+fn emitToolBodyRowsNewestFirst(
+    sink: *TranscriptRowSink,
+    item: transcript_projection.RenderItem,
+    frame_width: u16,
+    collapse: transcript_mod.TranscriptToolCollapse,
+    expanded: bool,
+    rail_style: vaxis.Style,
+    theme: *const theme_mod.Theme,
+) void {
+    const inner_width = transcriptItemInnerWidth(frame_width);
+    const prefix_width: u16 = @intCast(@min(wrap.displayWidth(item.prefix), inner_width));
+    var line_rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
+    const line_row_count = collectWrappedTranscriptLine(
+        &line_rows,
+        item,
+        inner_width,
+        prefix_width,
+        true,
+        rail_style,
+        theme.tool_output,
+        theme.tool_output,
+    );
+
+    const rows_max: usize = collapse.rows_max;
+    if (expanded or line_row_count <= rows_max) {
+        var remaining = line_row_count;
+        while (remaining > 0) {
+            remaining -= 1;
+            sink.emitBorrowed(line_rows[remaining]);
+            if (sink.full()) return;
+        }
+        return;
+    }
+
+    const hidden_rows = line_row_count - rows_max;
+    var hint_buffer: [96]u8 = undefined;
+    const hint = transcript_projection.collapseHint(&hint_buffer, collapse.mode, hidden_rows);
+    const window_start: usize = if (collapse.mode == .tail) hidden_rows else 0;
+    const window_end = window_start + rows_max;
+
+    if (collapse.mode == .head) {
+        emitToolHintRow(sink, item.prefix, hint, rail_style, theme);
+        if (sink.full()) return;
+    }
+    var remaining = window_end;
+    while (remaining > window_start) {
+        remaining -= 1;
+        sink.emitBorrowed(line_rows[remaining]);
+        if (sink.full()) return;
+    }
+    if (collapse.mode == .tail) emitToolHintRow(sink, item.prefix, hint, rail_style, theme);
+}
+
+fn emitToolHintRow(
+    sink: *TranscriptRowSink,
+    prefix: []const u8,
+    hint: []const u8,
+    rail_style: vaxis.Style,
+    theme: *const theme_mod.Theme,
+) void {
+    sink.emitGeneratedParts(.{
+        .prefix = prefix,
+        .text = hint,
+        .show_prefix = true,
+        .prefix_style = rail_style,
+        .text_style = theme.transcript_secondary,
+        .suffix_style = theme.transcript_secondary,
+        .row_style = theme.transcript_secondary,
+    });
 }
 
 fn transcriptItemInnerWidth(frame_width: u16) u16 {
@@ -650,4 +755,67 @@ fn cellTextEquals(buffer: anytype, x: u16, y: u16, text: []const u8) bool {
         if (cell.renderScalar() != byte) return false;
     }
     return true;
+}
+
+test "collapsed tool body shows a bounded window with a hint row" {
+    const allocator = std.testing.allocator;
+    var transcript_buffer: transcript_mod.TranscriptBuffer = .{};
+    defer transcript_buffer.deinit(allocator);
+
+    try transcript_buffer.append(allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .collapse = .{ .mode = .tail, .rows_max = 5 },
+        .title = "$ seq 8",
+    } });
+    try transcript_buffer.appendToolOutput(allocator, "call-1", "1\n2\n3\n4\n5\n6\n7\n8", 0, 0);
+    const item = transcript_buffer.items.items[0];
+
+    // Collapsed: margin + bottom + 5 window rows + hint + header.
+    var collapsed = TranscriptRowSink.countOnly();
+    emitItemRowsNewestFirst(&collapsed, item, 80, null, false);
+    try std.testing.expectEqual(@as(usize, 9), collapsed.total_emitted);
+
+    // Expanded: margin + bottom + all 8 body rows + header, no hint.
+    var expanded = TranscriptRowSink.countOnly();
+    emitItemRowsNewestFirst(&expanded, item, 80, null, true);
+    try std.testing.expectEqual(@as(usize, 11), expanded.total_emitted);
+}
+
+test "head-collapsed tool body keeps the first rows" {
+    const allocator = std.testing.allocator;
+    var transcript_buffer: transcript_mod.TranscriptBuffer = .{};
+    defer transcript_buffer.deinit(allocator);
+
+    try transcript_buffer.append(allocator, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "grep",
+        .collapse = .{ .mode = .head, .rows_max = 2 },
+    } });
+    try transcript_buffer.appendToolOutput(allocator, "call-1", "a\nb\nc\nd", 0, 0);
+    const item = transcript_buffer.items.items[0];
+
+    var rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
+    var sink = TranscriptRowSink.store(&rows, transcript_visual_rows_max, 0);
+    emitItemRowsNewestFirst(&sink, item, 80, null, false);
+
+    // Rows arrive newest-first: margin, bottom border, hint, window rows b then a, header.
+    try std.testing.expect(std.mem.indexOf(u8, rows[2].text, "more lines") != null);
+    try std.testing.expectEqualStrings("b", rows[3].text);
+    try std.testing.expectEqualStrings("a", rows[4].text);
+}
+
+test "tool footer emits a body row" {
+    const allocator = std.testing.allocator;
+    var transcript_buffer: transcript_mod.TranscriptBuffer = .{};
+    defer transcript_buffer.deinit(allocator);
+
+    try transcript_buffer.append(allocator, .{ .tool = .{ .tool_call_id = "call-1", .name = "bash" } });
+    try transcript_buffer.replaceToolFooter(allocator, "call-1", "Took 1.2s");
+    const item = transcript_buffer.items.items[0];
+
+    var rows: [transcript_visual_rows_max]TranscriptVisualRow = undefined;
+    var sink = TranscriptRowSink.store(&rows, transcript_visual_rows_max, 0);
+    emitItemRowsNewestFirst(&sink, item, 80, null, false);
+    try std.testing.expectEqualStrings("Took 1.2s", rows[2].text);
 }

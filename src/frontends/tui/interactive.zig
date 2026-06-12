@@ -28,6 +28,16 @@ const status_id_recovery: tui.product.SlotContributionId = 3;
 const model_slot_id: tui.product.SlotContributionId = 1;
 const transcript_append_max = tui.product.transcript.append_size_bytes_max;
 const TranscriptAppend = tui.product.transcript.TranscriptAppend;
+const tool_title_bytes_max = 160;
+const tool_timer_count_max = 8;
+const tool_timer_id_bytes_max = 96;
+
+const ToolTimer = struct {
+    id: [tool_timer_id_bytes_max]u8 = undefined,
+    id_len: u8,
+    started_ms: i64,
+    footer_elapsed_s: u64 = 0,
+};
 
 fn ignoreBestEffortError(err: anyerror) void {
     std.debug.assert(@errorName(err).len > 0);
@@ -81,6 +91,7 @@ pub fn run(
 
 const InteractiveController = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     app: *session_runtime.SessionRuntime,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
@@ -90,6 +101,7 @@ const InteractiveController = struct {
     animation_tick: u64 = 0,
     pending_input_flush: bool = false,
     assistant_text_delta_seen: bool = false,
+    tool_timers: [tool_timer_count_max]?ToolTimer = @splat(null),
 
     fn init(
         process: runtime.Process,
@@ -110,6 +122,7 @@ const InteractiveController = struct {
 
         var self: InteractiveController = .{
             .allocator = process.gpa,
+            .io = process.io,
             .app = app,
             .stdout = stdout,
             .stderr = stderr,
@@ -367,25 +380,29 @@ const InteractiveController = struct {
     }
 
     fn applyToolCall(self: *InteractiveController, tool_call: ai.ToolCall) !void {
-        const title = toolTitle(tool_call.name, tool_call.arguments);
+        var title_buffer: [tool_title_bytes_max]u8 = undefined;
+        const title = formatCallTitle(&title_buffer, tool_call.name, tool_call.arguments);
         try self.appendTool(.{
             .tool_call_id = tool_call.id,
             .name = tool_call.name,
             .presentation = toolPresentation(tool_call.name),
             .status = .pending,
             .body_mode = toolBodyMode(tool_call.name),
+            .collapse = toolCollapse(tool_call.name),
             .title = title,
         });
     }
 
     fn applyToolStart(self: *InteractiveController, payload: agent_mod.AgentEvent.ToolExecutionStart) !void {
+        var title_buffer: [tool_title_bytes_max]u8 = undefined;
         try self.appendTool(toolAppend(
             payload.tool_call_id,
             payload.tool_name,
             .pending,
-            toolTitle(payload.tool_name, payload.args),
+            formatCallTitle(&title_buffer, payload.tool_name, payload.args),
             false,
         ).tool);
+        self.startToolTimer(payload.tool_call_id);
     }
 
     fn applyToolUpdate(self: *InteractiveController, payload: agent_mod.AgentEvent.ToolExecutionUpdate) !void {
@@ -401,8 +418,9 @@ const InteractiveController = struct {
             "",
             payload.is_error,
         ).tool);
+        try self.finishToolTimer(payload.tool_call_id);
         const text = firstToolResultText(payload.result.content) orelse return;
-        try self.appendToolOutput(payload.tool_call_id, text);
+        try self.replaceToolOutput(payload.tool_call_id, text);
     }
 
     fn applySnapshot(self: *InteractiveController, snapshot: client_protocol.Snapshot) !void {
@@ -456,6 +474,7 @@ const InteractiveController = struct {
 
     fn applyOperationFinished(self: *InteractiveController, finished: client_protocol.OperationFinished) !void {
         self.cancel_requested = false;
+        self.clearToolTimers();
         try self.clearStatus(status_id_working);
         switch (finished.reason) {
             .completed => {},
@@ -512,6 +531,95 @@ const InteractiveController = struct {
         var safe_tool = tool;
         safe_tool.title = utf8Prefix(tool.title, transcript_append_max / 2);
         _ = try self.terminal_loop.applyCommand(.{ .append_transcript = .{ .tool = safe_tool } });
+    }
+
+    /// Final tool result replaces the streamed preview (pi-mono semantics):
+    /// the first chunk overwrites, remaining chunks append.
+    fn replaceToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(tool_call_id) or !std.unicode.utf8ValidateSlice(text)) {
+            try self.appendStaticStatus(.warning, "invalid tool output dropped");
+            return;
+        }
+        const first = utf8Prefix(text, transcript_append_max);
+        _ = try self.terminal_loop.applyCommand(.{ .replace_tool_output = .{
+            .tool_call_id = tool_call_id,
+            .text = first,
+        } });
+        try self.appendToolOutput(tool_call_id, text[first.len..]);
+    }
+
+    fn nowMs(self: *InteractiveController) i64 {
+        return @intCast(@divTrunc(std.Io.Clock.awake.now(self.io).nanoseconds, std.time.ns_per_ms));
+    }
+
+    fn startToolTimer(self: *InteractiveController, tool_call_id: []const u8) void {
+        if (tool_call_id.len == 0 or tool_call_id.len > tool_timer_id_bytes_max) return;
+        if (self.findToolTimer(tool_call_id) != null) return;
+        for (&self.tool_timers) |*slot| {
+            if (slot.* != null) continue;
+            var timer: ToolTimer = .{ .id_len = @intCast(tool_call_id.len), .started_ms = self.nowMs() };
+            @memcpy(timer.id[0..tool_call_id.len], tool_call_id);
+            slot.* = timer;
+            return;
+        }
+        // Table full: the tool simply runs without a duration footer.
+    }
+
+    fn findToolTimer(self: *InteractiveController, tool_call_id: []const u8) ?*ToolTimer {
+        for (&self.tool_timers) |*slot| {
+            if (slot.*) |*timer| {
+                if (std.mem.eql(u8, timer.id[0..timer.id_len], tool_call_id)) return timer;
+            }
+        }
+        return null;
+    }
+
+    fn finishToolTimer(self: *InteractiveController, tool_call_id: []const u8) !void {
+        const timer = self.findToolTimer(tool_call_id) orelse return;
+        try self.setToolDurationFooter(tool_call_id, "Took", timer.started_ms);
+        self.removeToolTimer(tool_call_id);
+    }
+
+    fn removeToolTimer(self: *InteractiveController, tool_call_id: []const u8) void {
+        for (&self.tool_timers) |*slot| {
+            if (slot.*) |*timer| {
+                if (std.mem.eql(u8, timer.id[0..timer.id_len], tool_call_id)) slot.* = null;
+            }
+        }
+    }
+
+    fn clearToolTimers(self: *InteractiveController) void {
+        self.tool_timers = @splat(null);
+    }
+
+    fn tickToolTimers(self: *InteractiveController) !void {
+        for (&self.tool_timers) |*slot| {
+            const timer = if (slot.*) |*value| value else continue;
+            const elapsed_ms = self.nowMs() - timer.started_ms;
+            const elapsed_s: u64 = if (elapsed_ms > 0) @intCast(@divTrunc(elapsed_ms, std.time.ms_per_s)) else 0;
+            if (elapsed_s == timer.footer_elapsed_s) continue;
+            timer.footer_elapsed_s = elapsed_s;
+            try self.setToolDurationFooter(timer.id[0..timer.id_len], "Elapsed", timer.started_ms);
+        }
+    }
+
+    fn setToolDurationFooter(
+        self: *InteractiveController,
+        tool_call_id: []const u8,
+        label: []const u8,
+        started_ms: i64,
+    ) !void {
+        const elapsed_ms: u64 = @intCast(@max(0, self.nowMs() - started_ms));
+        var buffer: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "{s} {d}.{d}s", .{
+            label,
+            elapsed_ms / std.time.ms_per_s,
+            (elapsed_ms % std.time.ms_per_s) / 100,
+        }) catch return;
+        _ = try self.terminal_loop.applyCommand(.{ .replace_tool_footer = .{
+            .tool_call_id = tool_call_id,
+            .text = text,
+        } });
     }
 
     fn appendToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
@@ -596,6 +704,7 @@ const InteractiveController = struct {
     fn tickStatus(self: *InteractiveController) !void {
         self.animation_tick +%= 1;
         _ = try self.terminal_loop.applyCommand(.{ .animation_tick = self.animation_tick });
+        try self.tickToolTimers();
     }
 };
 
@@ -638,6 +747,7 @@ fn toolAppend(
         .presentation = toolPresentation(name),
         .status = if (is_error) .err else status,
         .body_mode = toolBodyMode(name),
+        .collapse = toolCollapse(name),
         .title = title,
     } };
 }
@@ -658,28 +768,143 @@ fn toolBodyMode(name: []const u8) tui.product.transcript.TranscriptToolBodyMode 
     return .visible;
 }
 
-fn toolTitle(tool_name: []const u8, args_value: std.json.Value) []const u8 {
-    if (std.mem.eql(u8, tool_name, "bash")) return argString(args_value, "command");
-    if (std.mem.eql(u8, tool_name, "read") or
-        std.mem.eql(u8, tool_name, "edit") or
+// Collapsed-window policy per tool, mirroring pi-mono's previews: bash shows
+// the last 5 visual lines (errors live at the end), search/listing tools show
+// the first lines of an already head-truncated result.
+fn toolCollapse(name: []const u8) tui.product.transcript.TranscriptToolCollapse {
+    if (std.mem.eql(u8, name, "bash")) return .{ .mode = .tail, .rows_max = 5 };
+    if (std.mem.eql(u8, name, "grep")) return .{ .mode = .head, .rows_max = 15 };
+    if (std.mem.eql(u8, name, "find") or std.mem.eql(u8, name, "ls")) return .{ .mode = .head, .rows_max = 20 };
+    if (std.mem.eql(u8, name, "read") or
+        std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "edit")) return .{ .mode = .head, .rows_max = 10 };
+    return .{ .mode = .tail, .rows_max = 5 };
+}
+
+// Header titles mirror pi-mono's renderCall text:
+//   bash  ->  $ <command> (timeout Ns)
+//   read  ->  read <path>:<start>-<end>
+//   edit/write/ls -> <name> <path>
+//   grep  ->  grep /<pattern>/ in <path> (<glob>) limit N
+//   find  ->  find <pattern> in <path> (limit N)
+// Missing string args render as "..." while arguments are still streaming.
+fn formatCallTitle(buffer: []u8, tool_name: []const u8, args_value: std.json.Value) []const u8 {
+    var title: TitleBuilder = .{ .buffer = buffer };
+    if (std.mem.eql(u8, tool_name, "bash")) {
+        title.add("$ ");
+        title.add(argStringOrEllipsis(args_value, "command"));
+        if (argInt(args_value, "timeout")) |timeout| {
+            title.add(" (timeout ");
+            title.addInt(timeout);
+            title.add("s)");
+        }
+    } else if (std.mem.eql(u8, tool_name, "read")) {
+        title.add("read ");
+        title.add(argStringOrEllipsis(args_value, "path"));
+        const offset = argInt(args_value, "offset");
+        const limit = argInt(args_value, "limit");
+        if (offset != null or limit != null) {
+            const start = offset orelse 1;
+            title.add(":");
+            title.addInt(start);
+            if (limit) |count| {
+                // Model-supplied integers are operational input; saturate
+                // instead of trusting them to stay in range.
+                title.add("-");
+                title.addInt(start +| count -| 1);
+            }
+        }
+    } else if (std.mem.eql(u8, tool_name, "edit") or
         std.mem.eql(u8, tool_name, "write") or
-        std.mem.eql(u8, tool_name, "ls")) return argString(args_value, "path");
-    if (std.mem.eql(u8, tool_name, "grep")) return preferredArg(args_value, "pattern", "path");
-    if (std.mem.eql(u8, tool_name, "find")) return preferredArg(args_value, "path", "name");
-    return "";
+        std.mem.eql(u8, tool_name, "ls"))
+    {
+        title.add(tool_name);
+        title.add(" ");
+        title.add(argStringOrEllipsis(args_value, "path"));
+        if (std.mem.eql(u8, tool_name, "ls")) {
+            if (argInt(args_value, "limit")) |limit| {
+                title.add(" (limit ");
+                title.addInt(limit);
+                title.add(")");
+            }
+        }
+    } else if (std.mem.eql(u8, tool_name, "grep")) {
+        title.add("grep /");
+        title.add(argStringOrEllipsis(args_value, "pattern"));
+        title.add("/ in ");
+        title.add(argStringOrDefault(args_value, "path", "."));
+        if (argString(args_value, "glob")) |glob| {
+            title.add(" (");
+            title.add(glob);
+            title.add(")");
+        }
+        if (argInt(args_value, "limit")) |limit| {
+            title.add(" limit ");
+            title.addInt(limit);
+        }
+    } else if (std.mem.eql(u8, tool_name, "find")) {
+        title.add("find ");
+        title.add(argStringOrEllipsis(args_value, "pattern"));
+        title.add(" in ");
+        title.add(argStringOrDefault(args_value, "path", "."));
+        if (argInt(args_value, "limit")) |limit| {
+            title.add(" (limit ");
+            title.addInt(limit);
+            title.add(")");
+        }
+    } else {
+        // Unknown tool: name-only header; the projection falls back to the
+        // tool name when the title is empty, so emit nothing here.
+        return "";
+    }
+    return title.slice();
 }
 
-fn preferredArg(args_value: std.json.Value, first_key: []const u8, second_key: []const u8) []const u8 {
-    const first = argString(args_value, first_key);
-    if (first.len != 0) return first;
-    return argString(args_value, second_key);
+/// Bounded single-line title assembly: control characters become spaces,
+/// overflow truncates, and the final slice is trimmed to a UTF-8 boundary.
+const TitleBuilder = struct {
+    buffer: []u8,
+    len: usize = 0,
+
+    fn add(self: *TitleBuilder, text: []const u8) void {
+        for (text) |byte| {
+            if (self.len >= self.buffer.len) return;
+            self.buffer[self.len] = if (byte == '\n' or byte == '\r' or byte == '\t') ' ' else byte;
+            self.len += 1;
+        }
+    }
+
+    fn addInt(self: *TitleBuilder, value: i64) void {
+        var digits: [24]u8 = undefined;
+        self.add(std.fmt.bufPrint(&digits, "{d}", .{value}) catch return);
+    }
+
+    fn slice(self: *const TitleBuilder) []const u8 {
+        var end = self.len;
+        while (end > 0 and !std.unicode.utf8ValidateSlice(self.buffer[0..end])) end -= 1;
+        return self.buffer[0..end];
+    }
+};
+
+fn argString(args_value: std.json.Value, key: []const u8) ?[]const u8 {
+    if (args_value != .object) return null;
+    const value = args_value.object.get(key) orelse return null;
+    if (value != .string or value.string.len == 0) return null;
+    return value.string;
 }
 
-fn argString(args_value: std.json.Value, key: []const u8) []const u8 {
-    if (args_value != .object) return "";
-    const value = args_value.object.get(key) orelse return "";
-    if (value != .string) return "";
-    return utf8Prefix(value.string, 512);
+fn argStringOrEllipsis(args_value: std.json.Value, key: []const u8) []const u8 {
+    return argString(args_value, key) orelse "...";
+}
+
+fn argStringOrDefault(args_value: std.json.Value, key: []const u8, default: []const u8) []const u8 {
+    return argString(args_value, key) orelse default;
+}
+
+fn argInt(args_value: std.json.Value, key: []const u8) ?i64 {
+    if (args_value != .object) return null;
+    const value = args_value.object.get(key) orelse return null;
+    return if (value == .integer) value.integer else null;
 }
 
 fn firstToolResultText(content: []const ai.ToolResultContent) ?[]const u8 {
@@ -701,4 +926,51 @@ fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
     var end = max_bytes;
     while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
     return value[0..end];
+}
+
+fn testArgs(allocator: std.mem.Allocator, json: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+}
+
+test "formatCallTitle mirrors pi-mono call headers" {
+    const allocator = std.testing.allocator;
+    var buffer: [tool_title_bytes_max]u8 = undefined;
+
+    var bash_args = try testArgs(allocator, "{\"command\":\"ls -la\",\"timeout\":5}");
+    defer bash_args.deinit();
+    try std.testing.expectEqualStrings(
+        "$ ls -la (timeout 5s)",
+        formatCallTitle(&buffer, "bash", bash_args.value),
+    );
+
+    var read_args = try testArgs(allocator, "{\"path\":\"src/main.zig\",\"offset\":10,\"limit\":20}");
+    defer read_args.deinit();
+    try std.testing.expectEqualStrings(
+        "read src/main.zig:10-29",
+        formatCallTitle(&buffer, "read", read_args.value),
+    );
+
+    var grep_args = try testArgs(allocator, "{\"pattern\":\"foo\",\"glob\":\"*.zig\",\"limit\":50}");
+    defer grep_args.deinit();
+    try std.testing.expectEqualStrings(
+        "grep /foo/ in . (*.zig) limit 50",
+        formatCallTitle(&buffer, "grep", grep_args.value),
+    );
+}
+
+test "formatCallTitle shows ellipsis while args stream and sanitizes newlines" {
+    const allocator = std.testing.allocator;
+    var buffer: [tool_title_bytes_max]u8 = undefined;
+
+    var empty_args = try testArgs(allocator, "{}");
+    defer empty_args.deinit();
+    try std.testing.expectEqualStrings("$ ...", formatCallTitle(&buffer, "bash", empty_args.value));
+    try std.testing.expectEqualStrings("", formatCallTitle(&buffer, "mystery", empty_args.value));
+
+    var multiline_args = try testArgs(allocator, "{\"command\":\"echo a\\necho b\"}");
+    defer multiline_args.deinit();
+    try std.testing.expectEqualStrings(
+        "$ echo a echo b",
+        formatCallTitle(&buffer, "bash", multiline_args.value),
+    );
 }

@@ -11,6 +11,16 @@ pub const TranscriptStatusLevel = enum { info, warning, err };
 pub const TranscriptToolPresentation = enum { generic, command, file, patch, search, directory };
 pub const TranscriptToolStatus = enum { pending, success, err };
 pub const TranscriptToolBodyMode = enum { visible, hidden_on_success };
+pub const TranscriptToolCollapseMode = enum { head, tail };
+
+/// Collapsed-view window over a tool's output body, measured in visual rows.
+/// Mirrors pi-mono per-tool previews: bash keeps the tail (errors live at the
+/// end), listing/search tools keep the head. Expansion shows the full retained
+/// preview; the transcript byte caps still bound what is resident.
+pub const TranscriptToolCollapse = struct {
+    mode: TranscriptToolCollapseMode = .tail,
+    rows_max: u8 = 5,
+};
 
 pub const TranscriptAppendMode = enum { new_item, extend_previous_assistant_message, extend_previous_same_role };
 
@@ -34,6 +44,7 @@ pub const TranscriptAppend = union(enum) {
         presentation: TranscriptToolPresentation = .generic,
         status: TranscriptToolStatus = .pending,
         body_mode: TranscriptToolBodyMode = .visible,
+        collapse: TranscriptToolCollapse = .{},
         title: []const u8 = "",
         call_preview: []const u8 = "",
     };
@@ -47,9 +58,11 @@ pub const TranscriptTool = struct {
     presentation: TranscriptToolPresentation,
     status: TranscriptToolStatus,
     body_mode: TranscriptToolBodyMode,
+    collapse: TranscriptToolCollapse,
     title: []u8,
     call_preview: []u8,
     output_preview: []u8,
+    footer: []u8,
     output_truncated_head_bytes: usize = 0,
     output_truncated_head_lines: usize = 0,
 
@@ -58,7 +71,8 @@ pub const TranscriptTool = struct {
             self.name.len +
             self.title.len +
             self.call_preview.len +
-            self.output_preview.len;
+            self.output_preview.len +
+            self.footer.len;
     }
 };
 
@@ -77,6 +91,7 @@ pub const TranscriptItem = union(enum) {
                 allocator.free(item.title);
                 allocator.free(item.call_preview);
                 allocator.free(item.output_preview);
+                allocator.free(item.footer);
             },
         }
         self.* = undefined;
@@ -132,6 +147,56 @@ pub const TranscriptBuffer = struct {
         tool.output_preview = next.bytes;
         tool.output_truncated_head_bytes += dropped_head_bytes + next.dropped_bytes;
         tool.output_truncated_head_lines += dropped_head_lines + next.dropped_lines;
+        const next_size = tool.sizeBytes();
+        self.total_size_bytes = self.total_size_bytes - old_size + next_size;
+        self.evictUntilBounded(allocator);
+        self.noteMutation();
+    }
+
+    /// Replace the whole output preview. Used when a tool finishes: the final
+    /// result supersedes the streamed deltas instead of duplicating them.
+    pub fn replaceToolOutput(
+        self: *TranscriptBuffer,
+        allocator: std.mem.Allocator,
+        tool_call_id: []const u8,
+        output: []const u8,
+    ) !void {
+        if (output.len > append_size_bytes_max) return error.TranscriptAppendTooLarge;
+        if (!std.unicode.utf8ValidateSlice(tool_call_id) or !std.unicode.utf8ValidateSlice(output)) {
+            return error.InvalidUtf8;
+        }
+        const index = self.findTool(tool_call_id) orelse return;
+        const tool = &self.items.items[index].tool;
+        const old_size = tool.sizeBytes();
+        const copy = try allocator.dupe(u8, output);
+        errdefer allocator.free(copy);
+        allocator.free(tool.output_preview);
+        tool.output_preview = copy;
+        tool.output_truncated_head_bytes = 0;
+        tool.output_truncated_head_lines = 0;
+        const next_size = tool.sizeBytes();
+        self.total_size_bytes = self.total_size_bytes - old_size + next_size;
+        self.evictUntilBounded(allocator);
+        self.noteMutation();
+    }
+
+    pub fn replaceToolFooter(
+        self: *TranscriptBuffer,
+        allocator: std.mem.Allocator,
+        tool_call_id: []const u8,
+        footer: []const u8,
+    ) !void {
+        if (footer.len > append_size_bytes_max) return error.TranscriptAppendTooLarge;
+        if (!std.unicode.utf8ValidateSlice(tool_call_id) or !std.unicode.utf8ValidateSlice(footer)) {
+            return error.InvalidUtf8;
+        }
+        const index = self.findTool(tool_call_id) orelse return;
+        const tool = &self.items.items[index].tool;
+        const old_size = tool.sizeBytes();
+        const copy = try allocator.dupe(u8, footer);
+        errdefer allocator.free(copy);
+        allocator.free(tool.footer);
+        tool.footer = copy;
         const next_size = tool.sizeBytes();
         self.total_size_bytes = self.total_size_bytes - old_size + next_size;
         self.evictUntilBounded(allocator);
@@ -246,7 +311,8 @@ pub const TranscriptBuffer = struct {
                 name.len +
                 next_title.len +
                 old.call_preview.len +
-                old.output_preview.len;
+                old.output_preview.len +
+                old.footer.len;
             allocator.free(old.tool_call_id);
             allocator.free(old.name);
             allocator.free(old.title);
@@ -256,9 +322,11 @@ pub const TranscriptBuffer = struct {
                 .presentation = tool.presentation,
                 .status = mergeToolStatus(old.status, tool.status),
                 .body_mode = tool.body_mode,
+                .collapse = tool.collapse,
                 .title = next_title,
                 .call_preview = old.call_preview,
                 .output_preview = old.output_preview,
+                .footer = old.footer,
                 .output_truncated_head_bytes = old.output_truncated_head_bytes,
                 .output_truncated_head_lines = old.output_truncated_head_lines,
             };
@@ -271,6 +339,8 @@ pub const TranscriptBuffer = struct {
         errdefer allocator.free(call_preview);
         const output_preview = try allocator.dupe(u8, "");
         errdefer allocator.free(output_preview);
+        const footer = try allocator.dupe(u8, "");
+        errdefer allocator.free(footer);
         try self.items.append(allocator, .{
             .tool = .{
                 .tool_call_id = tool_call_id,
@@ -278,9 +348,11 @@ pub const TranscriptBuffer = struct {
                 .presentation = tool.presentation,
                 .status = tool.status,
                 .body_mode = tool.body_mode,
+                .collapse = tool.collapse,
                 .title = title,
                 .call_preview = call_preview,
                 .output_preview = output_preview,
+                .footer = footer,
             },
         });
         self.total_size_bytes += append_size;
@@ -313,3 +385,33 @@ pub const TranscriptBuffer = struct {
         }
     }
 };
+
+test "replaceToolOutput supersedes streamed preview and clears omission counters" {
+    const allocator = std.testing.allocator;
+    var buffer: TranscriptBuffer = .{};
+    defer buffer.deinit(allocator);
+
+    try buffer.append(allocator, .{ .tool = .{ .tool_call_id = "call-1", .name = "bash" } });
+    try buffer.appendToolOutput(allocator, "call-1", "streamed delta\n", 3, 2);
+    try buffer.replaceToolOutput(allocator, "call-1", "final output");
+
+    const tool = buffer.items.items[0].tool;
+    try std.testing.expectEqualStrings("final output", tool.output_preview);
+    try std.testing.expectEqual(@as(usize, 0), tool.output_truncated_head_bytes);
+    try std.testing.expectEqual(@as(usize, 0), tool.output_truncated_head_lines);
+    try std.testing.expectEqual(tool.sizeBytes(), buffer.total_size_bytes);
+}
+
+test "replaceToolFooter stores footer and keeps byte accounting" {
+    const allocator = std.testing.allocator;
+    var buffer: TranscriptBuffer = .{};
+    defer buffer.deinit(allocator);
+
+    try buffer.append(allocator, .{ .tool = .{ .tool_call_id = "call-1", .name = "bash" } });
+    try buffer.replaceToolFooter(allocator, "call-1", "Took 1.2s");
+    try buffer.replaceToolFooter(allocator, "call-1", "Took 2.4s");
+
+    const tool = buffer.items.items[0].tool;
+    try std.testing.expectEqualStrings("Took 2.4s", tool.footer);
+    try std.testing.expectEqual(tool.sizeBytes(), buffer.total_size_bytes);
+}

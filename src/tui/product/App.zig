@@ -21,6 +21,7 @@ pub const ProductApp = struct {
     transcript_scroll_max_width: u16 = 0,
     transcript_scroll_max_visible_rows: usize = std.math.maxInt(usize),
     theme: theme_mod.Theme = theme_mod.Theme.codex(),
+    tools_expanded: bool = false,
     animation_tick: u64 = 0,
     last_clear_tick: ?u64 = null,
     dirty: bool = true,
@@ -90,6 +91,16 @@ pub const ProductApp = struct {
                 self.dirty = true;
                 return null;
             },
+            .replace_tool_output => |replace| {
+                try self.transcript.replaceToolOutput(allocator, replace.tool_call_id, replace.text);
+                self.dirty = true;
+                return null;
+            },
+            .replace_tool_footer => |footer| {
+                try self.transcript.replaceToolFooter(allocator, footer.tool_call_id, footer.text);
+                self.dirty = true;
+                return null;
+            },
             .set_slot_contribution => |contribution| {
                 try self.slots.set(allocator, contribution);
                 self.dirty = true;
@@ -131,6 +142,7 @@ pub const ProductApp = struct {
             .composer_submit => if (try self.applyComposer(allocator, .submit)) |effect| return effect,
             .transcript_page_up => self.scrollTranscript(self.transcriptVisibleRows()),
             .transcript_page_down => self.scrollTranscriptDown(self.transcriptVisibleRows()),
+            .toggle_tool_expansion => self.toggleToolExpansion(),
             .interrupt => return .interrupt,
             .clear_or_exit => if (try self.clearOrExit(allocator)) |effect| return effect,
             .exit_if_composer_empty => if (self.composer.text().len == 0) return .request_shutdown,
@@ -138,6 +150,13 @@ pub const ProductApp = struct {
             .none => {},
         }
         return null;
+    }
+
+    fn toggleToolExpansion(self: *ProductApp) void {
+        self.tools_expanded = !self.tools_expanded;
+        // Expansion changes the projected row count; drop the scroll-max cache.
+        self.transcript_scroll_max_revision = std.math.maxInt(u64);
+        self.dirty = true;
     }
 
     fn clearOrExit(self: *ProductApp, allocator: std.mem.Allocator) !?Effect {
@@ -210,6 +229,7 @@ pub const ProductApp = struct {
                 self.transcript,
                 self.width,
                 visible_rows,
+                self.tools_expanded,
             );
             self.transcript_scroll_max_revision = self.transcript.revision;
             self.transcript_scroll_max_width = self.width;
@@ -235,6 +255,8 @@ pub const Command = union(enum) {
     append_transcript: transcript.TranscriptAppend,
     tool_output_delta: ToolOutputDelta,
     replace_tool_call_preview: ToolCallPreview,
+    replace_tool_output: ToolText,
+    replace_tool_footer: ToolText,
     set_slot_contribution: slots_mod.SetContribution,
     animation_tick: u64,
     open_confirm: surface_mod.OpenConfirm,
@@ -249,6 +271,11 @@ pub const ToolOutputDelta = struct {
 };
 
 pub const ToolCallPreview = struct {
+    tool_call_id: []const u8,
+    text: []const u8,
+};
+
+pub const ToolText = struct {
     tool_call_id: []const u8,
     text: []const u8,
 };

@@ -32,6 +32,7 @@ pub const Key = enum {
     page_down,
     ctrl_c,
     ctrl_d,
+    ctrl_o,
     ctrl_u,
 };
 
@@ -71,6 +72,7 @@ fn fromVaxisKey(key: vaxis.Key) Input {
     if (key.matches(vaxis.Key.page_down, .{})) return .{ .key = .page_down };
     if (key.matches('c', .{ .ctrl = true })) return .{ .key = .ctrl_c };
     if (key.matches('d', .{ .ctrl = true })) return .{ .key = .ctrl_d };
+    if (key.matches('o', .{ .ctrl = true })) return .{ .key = .ctrl_o };
     if (key.matches('u', .{ .ctrl = true })) return .{ .key = .ctrl_u };
     if (key.text) |text| {
         if (text.len > 0 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {

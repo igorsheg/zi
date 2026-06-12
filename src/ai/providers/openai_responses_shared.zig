@@ -14,6 +14,7 @@ pub const ProcessError = error{
 const max_stream_text_block_bytes = 4 * 1024 * 1024;
 const max_stream_thinking_block_bytes = 4 * 1024 * 1024;
 const max_stream_tool_arguments_bytes = 1024 * 1024;
+const max_stream_content_blocks = 256;
 
 pub fn errorStream(request: protocol.StreamRequest, err: anyerror) protocol.AssistantMessageEventStream {
     var stream = protocol.AssistantMessageEventStream.initBuffered();
@@ -295,6 +296,18 @@ pub const ResponseStreamReducer = struct {
         return snapshot;
     }
 
+    /// All content-block appends go through here. `partial()` snapshots borrow
+    /// `content.items`, and one SSE chunk can queue several events before the
+    /// consumer drains them — so the array must never relocate while a stream
+    /// is live. Capacity is reserved once and growth past the cap is rejected.
+    fn appendContentBlock(self: *ResponseStreamReducer, block: protocol.AssistantContent) !void {
+        if (self.content.capacity == 0) {
+            try self.content.ensureTotalCapacityPrecise(self.arena.allocator(), max_stream_content_blocks);
+        }
+        if (self.content.items.len >= max_stream_content_blocks) return error.TooManyContentBlocks;
+        self.content.appendAssumeCapacity(block);
+    }
+
     pub fn applySseData(
         self: *ResponseStreamReducer,
         io: std.Io,
@@ -376,7 +389,7 @@ pub const ResponseStreamReducer = struct {
         try self.finishCurrentBlock(io, sink);
         const item_type = jsonString(item.get("type")) orelse return;
         if (std.mem.eql(u8, item_type, "reasoning")) {
-            try self.content.append(self.arena.allocator(), .{ .thinking = .{ .thinking = "" } });
+            try self.appendContentBlock(.{ .thinking = .{ .thinking = "" } });
             const index = self.content.items.len - 1;
             self.current = .{ .thinking = .{
                 .content_index = index,
@@ -387,7 +400,7 @@ pub const ResponseStreamReducer = struct {
             } };
             try sink.emit(io, .{ .thinking_start = .{ .content_index = index, .partial = try self.partial() } });
         } else if (std.mem.eql(u8, item_type, "message")) {
-            try self.content.append(self.arena.allocator(), .{ .text = .{ .text = "" } });
+            try self.appendContentBlock(.{ .text = .{ .text = "" } });
             const index = self.content.items.len - 1;
             self.current = .{ .text = .{
                 .content_index = index,
@@ -402,7 +415,7 @@ pub const ResponseStreamReducer = struct {
             const item_id = jsonString(item.get("id")) orelse "";
             const name = jsonString(item.get("name")) orelse "";
             const id = try std.fmt.allocPrint(self.arena.allocator(), "{s}|{s}", .{ call_id, item_id });
-            try self.content.append(self.arena.allocator(), .{ .tool_call = .{
+            try self.appendContentBlock(.{ .tool_call = .{
                 .id = id,
                 .name = try dupe(self, name),
                 .arguments = emptyObject(),
@@ -817,4 +830,24 @@ fn testModel() protocol.Model {
         .context_window = 128_000,
         .max_tokens = 32_000,
     };
+}
+
+test "responses reducer content storage never relocates while a stream is live" {
+    // Pending events queued between consumer pulls borrow `content.items`
+    // (see `partial()`); a relocation would leave earlier snapshots dangling.
+    const model = testModel();
+    var reducer = ResponseStreamReducer.init(std.testing.allocator, model, 123);
+    defer reducer.deinit();
+
+    try reducer.appendContentBlock(.{ .text = .{ .text = "" } });
+    const first_ptr = reducer.content.items.ptr;
+    var index: usize = 1;
+    while (index < max_stream_content_blocks) : (index += 1) {
+        try reducer.appendContentBlock(.{ .text = .{ .text = "" } });
+    }
+    try std.testing.expectEqual(first_ptr, reducer.content.items.ptr);
+    try std.testing.expectError(
+        error.TooManyContentBlocks,
+        reducer.appendContentBlock(.{ .text = .{ .text = "" } }),
+    );
 }
