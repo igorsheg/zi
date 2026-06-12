@@ -102,17 +102,18 @@ rules:
 
 ## coding-agent rules
 
-- `AgentSessionRuntimeHost` is the only owner of session replacement; it builds
-  the next session before invalidating the old one. frontends never replace.
+- `SessionRuntime` is the mailbox host and owns exactly one session for its
+  lifetime. session replacement is unsupported by design: a new session is a
+  new runtime, opened by the CLI. frontends never replace.
 - `AgentSession` contains one long-lived `agent.Agent` and owns that session's
-  preflight, events, persistence, resources, and tools.
+  policy spine, events, persistence, resources, and tools.
 - the event drain is the only writer of queue mirrors, session history,
   retry/compaction state, and the public event queue. order is fixed:
 
 ```text
 agent event
   -> queue/status mirror
-  -> public AgentSessionEvent queue (bounded; overflow emits public_event_overflow)
+  -> public ClientEvent queue (bounded; overflow emits event_overflow)
   -> persistence (append-only jsonl on message_end)
   -> terminal policy (retry/compaction accounting)
 ```
@@ -127,32 +128,40 @@ agent event
 
 ## tui rules
 
-- `ProductApp` is the only owner of TUI product state. all mutation goes through
-  `ProductApp.apply(Command) -> ?Effect`. `Effect` is returned data, not a
-  second mutation path.
-- a command validates and bounds before it mutates. it fails before the state
-  transition or commits completely; it never mutates and then fails on a derived
-  event, projection, or render.
-- the TUI is agent-agnostic. commands carry the domain-neutral `TranscriptAppend`
-  (message / status / tool). any `ClientEvent -> Command` translation lives in a
-  frontend adapter outside `src/tui` and outside `src/coding_agent`.
+- `tui.App` is the only owner of TUI product state. all mutation goes through
+  `App.apply(Command) -> ?Effect`. `Effect` is returned data, not a second
+  mutation path.
+- `apply` is total over operational input: oversize, invalid-UTF-8, unknown-id,
+  and slot-full inputs degrade into notices or no-ops before mutation; only
+  OutOfMemory propagates. it never mutates and then fails on a derived event,
+  projection, or render. time enters only through `Command.tick`; App never
+  reads a clock.
+- the TUI is agent-agnostic. commands carry the domain-neutral
+  `Transcript.Append` (message / status / tool). any `ClientEvent -> Command`
+  translation lives in a frontend adapter outside `src/tui` and outside
+  `src/coding_agent`.
 - Vaxis owns terminal mechanism: raw tty setup, parsing, capability detection,
   screen cells, windows, borders, diff/render, and terminal primitive encodings.
   Zi owns product policy: transcript, composer, commands/effects, session adapter
   mapping, bounded resident state, and the frontend owner loop.
-- rendering is a transaction through Vaxis: `frame.build` paints into a Vaxis
-  screen/window, `vaxis.render` writes terminal output synchronously at the render
-  site, and product state stays dirty until the write succeeds. terminal output is
-  single-owner and synchronous at the render site.
+- rendering is a transaction through Vaxis: `render.draw` paints into a Vaxis
+  screen/window (infallibly), `vaxis.render` writes terminal output synchronously
+  at the render site, and product state stays dirty until the write succeeds.
+  terminal output is single-owner (`tui.Terminal`) and synchronous at the render
+  site.
 - do not reintroduce Zi-owned terminal substrate/infra/primitive layers. no local
   ANSI encoders, raw-mode managers, cell buffers, diff renderers, style/color
   encodings, or grapheme/width engines unless a concrete Vaxis gap is proven and
-  bounded. use Vaxis styles/colors/windows/borders/unicode/gwidth.
+  bounded. use Vaxis styles/colors/windows/borders/unicode/gwidth. policy modules
+  take `Style`/`Color` from `theme.zig`; only Terminal/render/input/text import
+  vaxis directly.
 - transcript is bounded resident domain state with explicit item/byte caps and
-  oldest-first eviction. wrapping and scrolling use display rows, not newline
-  counts. layout/scroll work must be O(viewport + visible items), not O(history),
-  with caches keyed by transcript revision and viewport shape rather than hidden
-  caller discipline.
+  oldest-first eviction (a single tool preview is capped at a fraction of the
+  total). wrapping and scrolling use display rows, not newline counts.
+  layout/scroll work must be O(viewport + items), not O(resident bytes): count
+  and draw share one row producer (`render.buildItemRows`), and per-item row
+  counts memoize in `Transcript.Item.layout` keyed by (item version, width,
+  expanded) rather than hidden caller discipline.
 - product drawing helpers may exist only as Zi policy adapters over Vaxis
   primitives (for example transcript wrapping or tool chrome). they must not grow
   into a second terminal substrate.
@@ -161,8 +170,10 @@ agent event
   propagate as a fatal error out of the owner loop.
 - the concrete TUI frontend must keep Zi's event-driven owner loop: zio `select`
   over terminal input readiness, session/agent progress, public-event wake,
-  command wake, and a ~16ms frame timer. typing must not be required for shimmer
-  or transcript progress; frame ticks and session wakes must render without input.
+  command wake, and an animation-gated frame timer (~16ms while a shimmer is
+  live, slow idle heartbeat otherwise — an idle zi must not spin). typing must
+  not be required for shimmer or transcript progress; frame ticks and session
+  wakes must render without input.
 - do not use `vaxis.Loop` for Zi's product loop by default. it is a thread + queue
   runtime and creates another lifecycle/overflow boundary. If it is introduced,
   document the queue bound, overflow policy, shutdown order, and why the extra
@@ -173,9 +184,10 @@ agent event
   (for example tty buffers, env maps, parser/terminal state, or spawned worker
   context). Prefer heap allocation or another explicit pinning strategy, and
   document the invariant on the type.
-- defer multi-line composer, surfaces, slots, extra themes, and extension UI until
-  a second concrete owner proves the seam. extensions will request through the
-  same commands/slots built-ins use; they never get mutable stores or raw cells.
+- defer modal surfaces, extra themes, composer history/completion, and extension
+  UI until a second concrete owner proves the seam. extensions will request
+  through the same commands/status contributions built-ins use; they never get
+  mutable stores or raw cells.
 
 ## tools
 

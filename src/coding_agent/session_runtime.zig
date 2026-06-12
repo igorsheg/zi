@@ -522,6 +522,10 @@ pub const SessionRuntime = struct {
     fn applyCommand(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
         switch (envelope.command) {
             .submit => |prompt| {
+                // Slash commands are mailbox facts, not prompts: they reply
+                // with a request-correlated prompt_command event and never
+                // reach the model or the queues, active operation or not.
+                if (try self.handleSlashCommand(envelope.id, prompt.text)) return;
                 if (self.active != null and prompt.mode != .start) {
                     const delivery: AgentSession.QueuePromptKind = switch (prompt.mode) {
                         .auto, .steer => .steer,
@@ -700,6 +704,60 @@ pub const SessionRuntime = struct {
                 });
             },
         }
+    }
+
+    /// Handle one slash command. Returns false when the text is not a
+    /// command (no leading '/', or '/' without a name) so it flows on as a
+    /// normal prompt. Replies are bounded; an over-long echo degrades to a
+    /// generic message instead of failing.
+    fn handleSlashCommand(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        text: []const u8,
+    ) !bool {
+        const command = parseSlashCommand(text) orelse return false;
+        var reply_buffer: [256]u8 = undefined;
+        if (std.mem.eql(u8, command, "help")) {
+            try self.enqueuePromptCommand(request_id, command, .handled, "available commands: /help, /session");
+        } else if (std.mem.eql(u8, command, "session")) {
+            const reply = std.fmt.bufPrint(&reply_buffer, "session: {s}; entries: {d}; model: {s}/{s}", .{
+                self.session.manager.header.id,
+                self.session.manager.entries.items.len,
+                self.session.agent.state.model.provider,
+                self.session.agent.state.model.id,
+            }) catch "session status unavailable";
+            try self.enqueuePromptCommand(request_id, command, .handled, reply);
+        } else {
+            const reply = std.fmt.bufPrint(&reply_buffer, "unknown command: /{s}", .{command}) catch
+                "unknown command";
+            try self.enqueuePromptCommand(request_id, command, .unknown, reply);
+        }
+        return true;
+    }
+
+    fn parseSlashCommand(text: []const u8) ?[]const u8 {
+        if (text.len < 2 or text[0] != '/') return null;
+        var end: usize = 1;
+        while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
+        if (end == 1) return null;
+        return text[1..end];
+    }
+
+    fn enqueuePromptCommand(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        command: []const u8,
+        result: client_protocol.PromptCommand.Result,
+        message: []const u8,
+    ) !void {
+        var command_text = try client_protocol.EventText.init(self.allocator, command);
+        errdefer command_text.deinit(self.allocator);
+        const message_text = try client_protocol.EventText.init(self.allocator, message);
+        try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .prompt_command = .{
+            .command = command_text,
+            .result = result,
+            .message = message_text,
+        } } });
     }
 
     fn finishOperationRejected(self: *SessionRuntime, err: anyerror) !void {
@@ -1050,6 +1108,115 @@ test "session runtime reports replay gap after retained ledger eviction" {
     defer gap.deinit(std.testing.allocator);
     try std.testing.expect(gap.event == .replay_gap);
     try std.testing.expectEqual(@as(client_protocol.EventSeq, 0), gap.event.replay_gap.requested_after);
+}
+
+test "session runtime handles slash command without starting an operation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 7, "/help", .auto);
+    errdefer envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 7), event.request_id);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expect(event.event.prompt_command.result == .handled);
+    try std.testing.expectEqualStrings("help", event.event.prompt_command.command.text);
+    try std.testing.expectEqualStrings(
+        "available commands: /help, /session",
+        event.event.prompt_command.message.text,
+    );
+    // No operation started, nothing queued, nothing persisted.
+    try std.testing.expect(session_runtime.active == null);
+    try std.testing.expect(session_runtime.drainEvent() == null);
+    try std.testing.expectEqual(@as(usize, 0), session_runtime.session.manager.entries.items.len);
+}
+
+test "session runtime session command reports session facts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 8, "/session", .auto);
+    errdefer envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expect(event.event.prompt_command.result == .handled);
+    try std.testing.expect(std.mem.indexOf(u8, event.event.prompt_command.message.text, "session: session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event.event.prompt_command.message.text, "entries: 0") != null);
+}
+
+test "session runtime replies unknown for unrecognized slash command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 9, "/mystery now", .auto);
+    errdefer envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expect(event.event.prompt_command.result == .unknown);
+    try std.testing.expectEqualStrings("mystery", event.event.prompt_command.command.text);
+    try std.testing.expectEqualStrings("unknown command: /mystery", event.event.prompt_command.message.text);
+    try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime slash command never queues while an operation is active" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    // Simulate an in-flight operation with a parked retry phase; a slash
+    // command must reply as a fact, not steer or enqueue.
+    session_runtime.active = .{
+        .phase = .{ .retry_wait = .{ .kind = .resubmit_prompt, .resume_at_ns = std.math.maxInt(i96) } },
+        .request_id = 1,
+        .operation_id = 1,
+        .prompt_text = try std.testing.allocator.dupe(u8, "original"),
+        .overflow_count_before = 0,
+    };
+
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "/help", .auto);
+    errdefer envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expectEqual(@as(usize, 0), session_runtime.session.agent.steering_queue.count());
+    try std.testing.expectEqual(@as(usize, 0), session_runtime.session.agent.follow_up_queue.count());
+}
+
+test "slash command requires a name; bare or spaced slash is a prompt" {
+    try std.testing.expectEqual(@as(?[]const u8, null), SessionRuntime.parseSlashCommand("/"));
+    try std.testing.expectEqual(@as(?[]const u8, null), SessionRuntime.parseSlashCommand("/ help"));
+    try std.testing.expectEqual(@as(?[]const u8, null), SessionRuntime.parseSlashCommand("help"));
+    try std.testing.expectEqualStrings("help", SessionRuntime.parseSlashCommand("/help extra").?);
 }
 
 test "session runtime request snapshot emits owned bounded snapshot event" {

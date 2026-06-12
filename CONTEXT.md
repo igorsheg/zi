@@ -81,37 +81,37 @@ cli/
     json         -> frontends/print (json) (--mode json)
     rpc          -> frontends/rpc          (--mode rpc)
     auth         -> coding_agent auth_mode login/logout/status
-  resume/list selection runs through coding_agent session listing before a host is created.
+  resume/list selection runs through coding_agent session listing before a
+  runtime is opened.
 
-coding_agent.sdk
-  the public host API: createRuntimeHost, resumeRuntimeHost, selectRuntimeSession,
-  listRuntimeSessions. returns RuntimeHostHandle { services, host }.
-  deinit order is fixed: host first (shutdown/drain/deinit), then services.
+session_runtime.openSessionRuntime
+  the public entry: builds RuntimeServices, resolves session options
+  (explicit -> project settings -> global settings -> default; provider and
+  model are scope-atomic and never mix across scopes), creates or resumes the
+  session store, and constructs the one AgentSession inside a SessionRuntime.
+  one runtime is one session: replacement is deliberately unsupported — a new
+  session is a new runtime, opened by the CLI.
 
 RuntimeServices
   cwd-scoped, long-lived services: duped cwd + agent_dir, SettingsManager,
-  AuthManager, ModelRegistry, ProviderRegistry and its provider instances,
-  and resolution diagnostics. owns or borrows the zio runtime explicitly.
-  exposes paths() as a borrowed view; it stores no self-referential path fields.
+  AuthManager, ProviderRegistry and its provider instances. owns or borrows
+  the zio runtime explicitly.
 
-session_config.resolve
-  explicit options + services -> AgentSessionRuntimeHost.BaseOptions.
-  precedence: explicit option -> project settings -> global settings -> default.
-  provider and model are scope-atomic: a project model paired with a global
-  provider is rejected and recorded as a diagnostic, not silently mixed.
-
-AgentSessionRuntimeHost
-  owns the current AgentSession and the only session-replacement path.
-  replacement builds the next session before invalidating the old one, drains
-  the old session's events, then swaps and rebinds. frontends never replace.
+SessionRuntime
+  the client mailbox host (docs/mailbox-contract.md): bounded command and
+  event queues, monotonically sequenced EventEnvelopes, the retained-event
+  replay ledger, slash commands (/help, /session — handled at the mailbox,
+  never reaching the model or queues), and the active-operation state machine
+  whose phase (running | compacting | retry_wait) makes "a run, a summary
+  run, and a retry timer at once" unrepresentable. frontends talk to it only
+  through submit/drainEvent/step/waitAndApplyWake.
 
 AgentSession
-  owns one session's policy: prompt resources, system prompt, builtin tools and
-  tool registry, session manager, optional session store, the long-lived agent,
-  a bounded public AgentSessionEvent queue, the queue mirror, the event drain,
-  lifecycle state, and compaction/retry settings.
-  a prompt run is a LivePromptRun { cancel token, event stream, bounded event
-  buffer, prompt }. prompt() is session preflight, not a raw Agent.prompt call.
+  owns one session's policy: prompt resources, system prompt, builtin tools,
+  durable history (session_manager + jsonl store), the long-lived agent, the
+  bounded public event queue and its drain, lifecycle, and the
+  compaction/retry terminal policies. runs settle as verdicts (completed |
+  failed | retry | compact); the owner loop does all waiting.
 
 agent.Agent
   owns the transcript loop, provider stream, tool execution, and the
@@ -249,7 +249,7 @@ cells, windows, borders, diff/render, style/color encodings, and Unicode width.
 Zi owns product policy and the frontend owner loop:
 
 ```text
-tui/product     ProductApp, composer, transcript, frame, input, theme, slots
+tui/            App, Composer, Transcript, Terminal, render, input, status, theme
 frontends/tui   concrete coding-agent adapter and wake/render loop
 libvaxis        terminal substrate/infra/primitives
 ```
@@ -257,24 +257,39 @@ libvaxis        terminal substrate/infra/primitives
 Do not reintroduce `tui/substrate`, `tui/infra`, or `tui/primitive` layers. Small
 product drawing helpers may exist only as policy adapters over Vaxis primitives
 (for example transcript wrapping or tool chrome); they must not grow into a
-second terminal substrate.
+second terminal substrate. The vaxis import surface is deliberately small:
+`Terminal.zig` (tty/render), `render.zig` (window writes), `input.zig` (events),
+`text.zig` (unicode/gwidth), and `theme.zig` (the `Style`/`Color` aliases every
+other policy module uses instead of importing vaxis).
 
-`ProductApp` is the single owner of TUI product state (composer, transcript,
-scroll, theme, dirty flag). all mutation goes through one path:
+`tui.App` is the single owner of TUI product state (composer, transcript,
+status contributions, scroll, theme, dirty flag). all mutation goes through one
+path:
 
 ```text
-ProductApp.apply(Command) -> ?Effect
-  Command : resize | input | clear_composer | append_transcript | tool_output_delta
-  Effect  : submit_text | request_shutdown | interrupt | confirm_result
+App.apply(Command) -> ?Effect
+  Command : resize | input | tick | clear_transcript | append_transcript
+          | tool_output_delta | replace_tool_output | replace_tool_footer
+          | set_status | clear_status
+  Effect  : submit_text | interrupt | request_shutdown
 ```
 
-`Command` carries a domain-neutral `TranscriptAppend` (message / status / tool),
-not agent types. `Effect` is returned data, never a second mutation path.
+`Command` carries the domain-neutral `Transcript.Append` (message / status /
+tool), not agent types. `Effect` is returned data, never a second mutation path.
 
-rendering is a transaction through Vaxis. `frame.build` paints `ProductApp` state
-into a Vaxis screen/window; `vaxis.render` writes terminal output synchronously at
-the render site; product state stays dirty until the write succeeds. terminal
-output is single-owner and synchronous at the render site.
+`apply` is total over operational input: oversize pastes, invalid UTF-8, unknown
+tool ids, and full status slots degrade into transcript notices or no-ops; only
+OutOfMemory propagates. Streamed text is sanitized on ingest (a codepoint split
+across two deltas is carried in a per-item pending tail), so stored transcript
+text is valid UTF-8 by construction. Time enters only through `Command.tick`
+(wall-clock ms from the frontend); App never reads a clock — the ctrl+c
+double-press window and status shimmer both derive from ticked time.
+
+rendering is a transaction through Vaxis. `render.draw` paints `App` state into
+a Vaxis screen/window (infallibly); `vaxis.render` writes terminal output
+synchronously at the render site; product state stays dirty until the write
+succeeds. terminal output is single-owner and synchronous at the render site
+(`tui.Terminal`, the heap-pinned owner of tty state and the draw scratch).
 
 The concrete TUI frontend owns the wake loop and must block in
 `SessionRuntime.waitAndApplyWake(input_fd, frame_ms)`. That select observes
@@ -282,7 +297,9 @@ terminal input readiness, session/agent progress, public-event wake, command
 wake, retry deadlines, and the frame timer. `step()` and event draining happen
 from this owner after wakes. Do not replace this with sleep polling, callback
 mutation, or a foreign input thread: typing must not be required for shimmer,
-transcript streaming, retry countdowns, or any other UI progress.
+transcript streaming, retry countdowns, or any other UI progress. The frame
+timer is animation-gated: 16ms while a shimmer is live, a slow idle heartbeat
+otherwise — an idle zi must not wake 60 times a second.
 
 Input has one non-obvious platform split: Vaxis opens `/dev/tty` for raw mode,
 size, and writes, while the frontend selects/reads `stdin` for readiness. This is
@@ -300,12 +317,15 @@ store pointers into owner fields (for example tty buffers and env maps). Do not
 return or copy such an owner by value after initialization; use heap allocation or
 another explicit pinning strategy and document it on the type.
 
-transcript is bounded resident state (item and byte caps, oldest-first eviction).
-wrapping and scrolling are measured in display rows, not newline counts. visible
-rows are projected fresh each frame through one newest-first row stream shared by
-both scroll-counting and drawing, so the two cannot drift. Scroll/layout caches
-key off transcript revision and viewport shape, not caller discipline, so direct
-transcript mutation cannot silently leave stale layout facts.
+transcript is bounded resident state (item and byte caps, oldest-first eviction;
+one tool's retained preview is capped at 1/8 of the total budget so a chatty
+tool cannot evict the whole conversation). wrapping and scrolling are measured
+in display rows, not newline counts. both scroll-counting and drawing consume
+`render.buildItemRows`, the single producer of an item's visual rows, so the
+two cannot drift. per-item row counts are memoized in `Transcript.Item.layout`,
+keyed by (item version, width, tools_expanded) — never caller discipline — so
+scroll math is O(items) and drawing is O(viewport): items above the scroll
+window are skipped by cached count without re-wrapping their text.
 
 ## public boundaries and semantic contracts
 
@@ -321,32 +341,43 @@ preserve these behaviors (the pi-mono lessons), not any TypeScript shape:
 - session history is append-only durable truth; the agent transcript is context.
 - retry and compaction are terminal session policies, not provider policies.
 - a frontend observes session state through public events, snapshots, and
-  commands. it never reaches into `host.currentSession().agent`, the session
-  manager, providers, tools, settings, auth, or model owners.
+  commands. it never reaches into the session, its agent, the session manager,
+  providers, tools, settings, auth, or model owners.
 
-the public boundary type is `AgentSessionEvent`:
+the public boundary is `client_protocol`: frontends submit `CommandEnvelope`s
+(`submit | cancel | queue.clear | snapshot | replay | shutdown`) and drain
+sequenced `EventEnvelope`s carrying `ClientEvent`:
 
 ```zig
-pub const AgentSessionEvent = union(enum) {
-    agent_event: agent.AgentEvent,
-    queue_update: QueueUpdate,
+pub const ClientEvent = union(enum) {
+    rejected: Rejection,
+    operation_started,
+    operation_finished: OperationFinished,
+    shutdown_started,
+    agent_event: OwnedAgentEvent,
+    queue_changed: QueueChanged,
+    snapshot: Snapshot,
+    replay: ReplayBatch,
+    replay_gap: ReplayGap,
     prompt_command: PromptCommand,
     compaction_start: CompactionStart,
-    session_info_changed: SessionInfoChanged,
     compaction_end: CompactionEnd,
     auto_retry_start: AutoRetryStart,
     auto_retry_end: AutoRetryEnd,
-    public_event_overflow: PublicEventOverflow,
+    event_overflow: EventOverflow,
 };
 ```
 
 notes:
 
-- the queue is bounded. on overflow, events are dropped and a single
-  `public_event_overflow { dropped_count }` is emitted so clients learn of loss.
-- stored string payloads are owned; the drained event's `deinit` frees them.
-- compaction/retry events are protocol vocabulary; the recovery behavior behind
-  some of them is still on the north star.
+- every envelope carries a monotonically increasing `seq`; clients recover
+  from gaps via `replay`, and from replay gaps via `snapshot`
+  (docs/mailbox-contract.md).
+- queues are bounded. on overflow, events are dropped and a single
+  `event_overflow { dropped_count }` is emitted so clients learn of loss.
+- stored string payloads are owned; the drained envelope's `deinit` frees them.
+- retry/compaction recovery behaviors behind these events are implemented
+  session policies (settle verdicts), not just vocabulary.
 
 ## cancellation and shutdown
 
@@ -369,19 +400,19 @@ succeed.
 current code is honest about being a slice. the direction it is reaching for —
 not yet built, and not to be built speculatively:
 
-- pull-based / operation-backed provider streaming, so backend production and
-  owner drain run concurrently with bounded memory, backpressure, and clean
-  cancellation (today the provider fills a bounded buffer synchronously).
-- retry and compaction wired as real terminal session policies (the events and
-  settings exist; automatic recovery and overflow-triggered compaction do not).
+- operation-backed provider streaming, so backend production and owner drain
+  run concurrently with bounded memory, backpressure, and clean cancellation
+  (product providers pull today; concurrent production is the open half).
+- manual compaction as a mailbox command (auto threshold/overflow compaction
+  and bounded backoff retry shipped as settle-verdict session policies).
 - a hard, enforced bash timeout/interrupt (today cancel is cooperative polling).
 - an owned `ModelRegistry` that runtime providers can register into (today the
   catalog is generated and static).
-- an RPC mode (today rejected at dispatch).
-- richer TUI product: multi-line composer, surfaces/slots, themes beyond
-  `codex`, and a virtualized transcript layout whose work is O(viewport), not
-  O(history). each enters only when a second concrete owner or real pressure
-  proves the seam — one adapter is a hypothetical seam, two make a real one.
+- richer TUI product: modal surfaces (confirm dialogs), themes beyond `codex`,
+  composer history/completion. each enters only when a second concrete owner or
+  real pressure proves the seam — one adapter is a hypothetical seam, two make
+  a real one. (multi-line composer input and the O(viewport) transcript layout
+  shipped with the libvaxis TUI.)
 - future Lua extensions that request through the same commands/events/slots the
   built-in product uses; they never receive mutable stores or terminal cells.
 

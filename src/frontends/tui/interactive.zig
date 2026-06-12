@@ -1,3 +1,6 @@
+//! Concrete coding-agent TUI frontend: owns the wake loop, translates
+//! ClientEvents into agent-agnostic tui Commands, and feeds tui Effects back
+//! as session commands. This is the only module that knows both vocabularies.
 const std = @import("std");
 
 const agent_mod = @import("../../agent/root.zig");
@@ -19,15 +22,19 @@ pub const Options = struct {
     initial_prompt: ?[]const u8 = null,
 };
 
+/// Frame pacing: 16ms while something animates (shimmer, tool timers run
+/// under an active operation's shimmer), otherwise a slow heartbeat. Session
+/// and input wakes interrupt either; an idle zi must not spin.
 const frame_interval_ms: u64 = 16;
-const effect_count_max = tui.product.vaxis_terminal_loop.effects_per_step_max;
+const idle_frame_interval_ms: u64 = 30_000;
+
+const effect_count_max = tui.Terminal.effects_per_read_max;
 const client_events_per_tick_max = 64;
-const status_id_working: tui.product.SlotContributionId = 1;
-const status_id_queue: tui.product.SlotContributionId = 2;
-const status_id_recovery: tui.product.SlotContributionId = 3;
-const model_slot_id: tui.product.SlotContributionId = 1;
-const transcript_append_max = tui.product.transcript.append_size_bytes_max;
-const TranscriptAppend = tui.product.transcript.TranscriptAppend;
+const status_id_working: tui.status.ContributionId = 1;
+const status_id_queue: tui.status.ContributionId = 2;
+const status_id_recovery: tui.status.ContributionId = 3;
+const model_slot_id: tui.status.ContributionId = 1;
+const transcript_append_max = tui.Transcript.append_size_bytes_max;
 const tool_title_bytes_max = 160;
 const tool_timer_count_max = 8;
 const tool_timer_id_bytes_max = 96;
@@ -95,11 +102,9 @@ const InteractiveController = struct {
     app: *session_runtime.SessionRuntime,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    terminal_loop: *tui.product.TerminalLoop,
+    terminal: *tui.Terminal,
     cancel_requested: bool = false,
     event_cursor: EventCursor = .{},
-    animation_tick: u64 = 0,
-    pending_input_flush: bool = false,
     assistant_text_delta_seen: bool = false,
     tool_timers: [tool_timer_count_max]?ToolTimer = @splat(null),
 
@@ -110,15 +115,10 @@ const InteractiveController = struct {
         stderr: *std.Io.Writer,
         initial_prompt: ?[]const u8,
     ) !InteractiveController {
-        const terminal_loop = try tui.product.TerminalLoop.init(
-            process.gpa,
-            process.io,
-            80,
-            24,
-        );
-        errdefer terminal_loop.deinit();
-        try terminal_loop.setup();
-        errdefer terminal_loop.shutdown() catch |err| ignoreBestEffortError(err);
+        const terminal = try tui.Terminal.init(process.gpa, process.io, 80, 24);
+        errdefer terminal.deinit();
+        try terminal.setup();
+        errdefer terminal.shutdown() catch |err| ignoreBestEffortError(err);
 
         var self: InteractiveController = .{
             .allocator = process.gpa,
@@ -126,29 +126,36 @@ const InteractiveController = struct {
             .app = app,
             .stdout = stdout,
             .stderr = stderr,
-            .terminal_loop = terminal_loop,
+            .terminal = terminal,
         };
         try self.requestSnapshot();
         if (initial_prompt) |prompt| try self.submitPrompt(prompt);
-        _ = try self.terminal_loop.renderIfDirty();
+        try self.terminal.renderIfDirty();
         return self;
     }
 
     fn deinit(self: *InteractiveController) void {
-        self.terminal_loop.shutdown() catch |err| ignoreBestEffortError(err);
-        self.terminal_loop.deinit();
+        self.terminal.shutdown() catch |err| ignoreBestEffortError(err);
+        self.terminal.deinit();
         self.* = undefined;
     }
 
     fn run(self: *InteractiveController) !void {
-        while (self.terminal_loop.isRunning()) {
+        while (self.terminal.isRunning()) {
             if (try self.serviceImmediateWork()) continue;
 
-            const wake = try self.app.waitAndApplyWake(self.terminal_loop.inputFd(), frame_interval_ms);
+            const frame_ms: u64 = if (self.terminal.hasAnimation())
+                frame_interval_ms
+            else
+                idle_frame_interval_ms;
+            const wake = try self.app.waitAndApplyWake(self.terminal.inputFd(), frame_ms);
+            // Time enters the product through ticks; refresh before handling
+            // the wake so wall-clock policies (ctrl+c double press, shimmer)
+            // never see stale time after a long idle wait.
+            try self.tickTime();
             switch (wake) {
                 .input => try self.drainInput(),
-                .session => if (self.pending_input_flush) try self.flushPendingInput(),
-                .frame => if (self.pending_input_flush) try self.flushPendingInput(),
+                .session, .frame => {},
             }
             _ = try self.serviceImmediateWork();
         }
@@ -157,46 +164,29 @@ const InteractiveController = struct {
     fn serviceImmediateWork(self: *InteractiveController) !bool {
         try self.app.step();
         const drained = try self.drainClientEventsBounded(client_events_per_tick_max);
-        try self.tickStatus();
-        try self.terminal_loop.renderIfDirty();
+        try self.tickTime();
+        try self.terminal.renderIfDirty();
         return drained == client_events_per_tick_max or self.app.hasImmediateWork();
     }
 
     fn drainInput(self: *InteractiveController) !void {
-        var effects: [effect_count_max]tui.product.Effect = undefined;
-        const result = try self.terminal_loop.readAvailableInput(&effects);
-        self.pending_input_flush = true;
-        try self.handleInputResult(result, effects[0..result.effect_count]);
+        var effects: [effect_count_max]tui.Effect = undefined;
+        const result = try self.terminal.readAvailableInput(&effects);
+        defer for (effects[0..result.effect_count]) |effect| effect.deinit(self.allocator);
+        for (effects[0..result.effect_count]) |effect| try self.handleEffect(effect);
+        if (result.truncated) try self.appendStatus(.warning, "input truncated");
+        if (result.effect_overflow) try self.appendStatus(.warning, "input effects dropped");
     }
 
-    fn flushPendingInput(self: *InteractiveController) !void {
-        self.pending_input_flush = false;
-        var effects: [effect_count_max]tui.product.Effect = undefined;
-        const result = try self.terminal_loop.flushPendingInput(&effects);
-        try self.handleInputResult(result, effects[0..result.effect_count]);
-    }
-
-    fn handleInputResult(
-        self: *InteractiveController,
-        result: tui.product.vaxis_terminal_loop.StepResult,
-        effects: []tui.product.Effect,
-    ) !void {
-        defer for (effects) |effect| effect.deinit(self.allocator);
-        for (effects) |effect| try self.handleEffect(effect);
-        if (result.input_overflow or result.truncated) try self.applyStatus(.warning, "input truncated");
-        if (result.effect_overflow) try self.applyStatus(.warning, "input effects dropped");
-    }
-
-    fn handleEffect(self: *InteractiveController, effect: tui.product.Effect) !void {
+    fn handleEffect(self: *InteractiveController, effect: tui.Effect) !void {
         switch (effect) {
             .submit_text => |text| try self.submitPrompt(text),
             .interrupt => try self.cancelActive(),
             .request_shutdown => {
                 if (try self.submitCommand(.{ .command = .shutdown }) == .queued) {
-                    self.terminal_loop.requestStop();
+                    self.terminal.requestStop();
                 }
             },
-            .confirm_result => {},
         }
     }
 
@@ -209,7 +199,7 @@ const InteractiveController = struct {
         if (self.cancel_requested) return;
         if (try self.submitCommand(.{ .command = .{ .cancel = .{} } }) == .queued) {
             self.cancel_requested = true;
-            try self.applyStatus(.warning, "cancel requested");
+            try self.appendStatus(.warning, "cancel requested");
         }
     }
 
@@ -226,7 +216,7 @@ const InteractiveController = struct {
         self.app.submit(owned) catch |err| switch (err) {
             error.Full => {
                 owned.deinit(self.allocator);
-                try self.applyStatus(.err, "command queue full");
+                try self.appendStatus(.err, "command queue full");
                 return .queue_full;
             },
         };
@@ -288,6 +278,10 @@ const InteractiveController = struct {
             .operation_started => try self.setWorkingStatus("working"),
             .operation_finished => |finished| try self.applyOperationFinished(finished),
             .rejected => |rejection| try self.appendStatus(.err, rejection.message.text),
+            .prompt_command => |command| try self.appendStatus(
+                if (command.result == .handled) .info else .warning,
+                command.message.text,
+            ),
             .queue_changed => |queue| try self.applyQueueChanged(queue),
             .snapshot => |snapshot| try self.applySnapshot(snapshot),
             .replay => {
@@ -300,7 +294,7 @@ const InteractiveController = struct {
                 try self.appendStatus(.warning, "replay gap; requesting snapshot");
                 try self.requestSnapshot();
             },
-            .shutdown_started => self.terminal_loop.requestStop(),
+            .shutdown_started => self.terminal.requestStop(),
             .compaction_start => try self.setWorkingStatus("compacting"),
             .compaction_end => |payload| if (payload.error_message) |message|
                 try self.appendStatus(.warning, message.text)
@@ -381,7 +375,6 @@ const InteractiveController = struct {
 
     fn applyToolCall(self: *InteractiveController, tool_call: ai.ToolCall) !void {
         var title_buffer: [tool_title_bytes_max]u8 = undefined;
-        const title = formatCallTitle(&title_buffer, tool_call.name, tool_call.arguments);
         try self.appendTool(.{
             .tool_call_id = tool_call.id,
             .name = tool_call.name,
@@ -389,7 +382,7 @@ const InteractiveController = struct {
             .status = .pending,
             .body_mode = toolBodyMode(tool_call.name),
             .collapse = toolCollapse(tool_call.name),
-            .title = title,
+            .title = formatCallTitle(&title_buffer, tool_call.name, tool_call.arguments),
         });
     }
 
@@ -401,7 +394,7 @@ const InteractiveController = struct {
             .pending,
             formatCallTitle(&title_buffer, payload.tool_name, payload.args),
             false,
-        ).tool);
+        ));
         self.startToolTimer(payload.tool_call_id);
     }
 
@@ -417,39 +410,35 @@ const InteractiveController = struct {
             if (payload.is_error) .err else .success,
             "",
             payload.is_error,
-        ).tool);
+        ));
         try self.finishToolTimer(payload.tool_call_id);
         const text = toolEndDisplayText(payload) orelse return;
         try self.replaceToolOutput(payload.tool_call_id, text);
     }
 
     fn applySnapshot(self: *InteractiveController, snapshot: client_protocol.Snapshot) !void {
-        _ = try self.terminal_loop.applyCommand(.clear_transcript);
+        _ = try self.terminal.applyCommand(.clear_transcript);
         var model_buffer: [160]u8 = undefined;
         const model_text = std.fmt.bufPrint(
             &model_buffer,
             "{s}/{s}",
             .{ snapshot.model.provider.text, snapshot.model.id.text },
         ) catch snapshot.model.id.text;
-        _ = try self.terminal_loop.applyCommand(.{ .set_slot_contribution = .{
-            .slot = .composer_top_right,
+        _ = try self.terminal.applyCommand(.{ .set_status = .{
+            .slot = .composer_corner,
             .id = model_slot_id,
             .priority = 1,
             .text = model_text,
         } });
         for (snapshot.history.items) |item| {
-            const role: tui.product.transcript.TranscriptRole = switch (item.role) {
+            const role: tui.Transcript.Role = switch (item.role) {
                 .user => .user,
                 .assistant => .assistant,
                 .system => .system,
             };
             try self.appendMessage(role, item.text.text, .new_item);
         }
-        try self.applyQueueSnapshot(snapshot.queue);
-    }
-
-    fn applyQueueSnapshot(self: *InteractiveController, queue: client_protocol.QueueSnapshot) !void {
-        try self.applyQueueCounts(queue.steering.items.len, queue.follow_up.items.len);
+        try self.applyQueueCounts(snapshot.queue.steering.items.len, snapshot.queue.follow_up.items.len);
     }
 
     fn applyQueueChanged(self: *InteractiveController, queue: client_protocol.QueueChanged) !void {
@@ -464,8 +453,8 @@ const InteractiveController = struct {
             "queued steer={d} followup={d}",
             .{ steering_count, follow_up_count },
         ) catch "queued prompts";
-        _ = try self.terminal_loop.applyCommand(.{ .set_slot_contribution = .{
-            .slot = .status_area,
+        _ = try self.terminal.applyCommand(.{ .set_status = .{
+            .slot = .status_line,
             .id = status_id_queue,
             .priority = 1,
             .text = text,
@@ -483,26 +472,21 @@ const InteractiveController = struct {
         }
     }
 
+    /// Append in transcript-cap-sized chunks. Sanitization (invalid UTF-8,
+    /// split codepoints) is the transcript's job; chunk boundaries fall back
+    /// to raw bytes when no UTF-8 boundary exists in range.
     fn appendMessage(
         self: *InteractiveController,
-        role: tui.product.transcript.TranscriptRole,
+        role: tui.Transcript.Role,
         text: []const u8,
-        mode: tui.product.transcript.TranscriptAppendMode,
+        mode: tui.Transcript.AppendMode,
     ) !void {
         if (text.len == 0) return;
-        if (!std.unicode.utf8ValidateSlice(text)) {
-            try self.appendStaticStatus(.warning, "invalid message text dropped");
-            return;
-        }
         var remaining = text;
         var chunk_mode = mode;
         while (remaining.len > 0) {
-            const chunk = utf8Prefix(remaining, transcript_append_max);
-            if (chunk.len == 0) {
-                try self.appendStaticStatus(.warning, "message text truncated");
-                return;
-            }
-            _ = try self.terminal_loop.applyCommand(.{ .append_transcript = .{ .message = .{
+            const chunk = boundedChunk(remaining);
+            _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .message = .{
                 .role = role,
                 .text = chunk,
                 .mode = chunk_mode,
@@ -520,32 +504,71 @@ const InteractiveController = struct {
         };
     }
 
-    fn appendTool(self: *InteractiveController, tool: tui.product.transcript.TranscriptAppend.ToolAppend) !void {
-        if (!std.unicode.utf8ValidateSlice(tool.tool_call_id) or
-            !std.unicode.utf8ValidateSlice(tool.name) or
-            !std.unicode.utf8ValidateSlice(tool.title))
-        {
-            try self.appendStaticStatus(.warning, "invalid tool metadata dropped");
-            return;
-        }
-        var safe_tool = tool;
-        safe_tool.title = utf8Prefix(tool.title, transcript_append_max / 2);
-        _ = try self.terminal_loop.applyCommand(.{ .append_transcript = .{ .tool = safe_tool } });
+    fn appendTool(self: *InteractiveController, tool: tui.Transcript.Append.ToolAppend) !void {
+        _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .tool = tool } });
     }
 
     /// Final tool result replaces the streamed preview (pi-mono semantics):
     /// the first chunk overwrites, remaining chunks append.
     fn replaceToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
-        if (!std.unicode.utf8ValidateSlice(tool_call_id) or !std.unicode.utf8ValidateSlice(text)) {
-            try self.appendStaticStatus(.warning, "invalid tool output dropped");
-            return;
-        }
-        const first = utf8Prefix(text, transcript_append_max);
-        _ = try self.terminal_loop.applyCommand(.{ .replace_tool_output = .{
+        const first = boundedChunk(text);
+        _ = try self.terminal.applyCommand(.{ .replace_tool_output = .{
             .tool_call_id = tool_call_id,
             .text = first,
         } });
         try self.appendToolOutput(tool_call_id, text[first.len..]);
+    }
+
+    fn appendToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
+        var remaining = text;
+        while (remaining.len > 0) {
+            const chunk = boundedChunk(remaining);
+            _ = try self.terminal.applyCommand(.{ .tool_output_delta = .{
+                .tool_call_id = tool_call_id,
+                .text = chunk,
+            } });
+            remaining = remaining[chunk.len..];
+        }
+    }
+
+    fn appendStatus(
+        self: *InteractiveController,
+        level: tui.Transcript.StatusLevel,
+        text: []const u8,
+    ) !void {
+        if (text.len == 0) return;
+        _ = try self.terminal.applyCommand(.{
+            .append_transcript = .{ .status = .{ .level = level, .text = boundedChunk(text) } },
+        });
+    }
+
+    fn setWorkingStatus(self: *InteractiveController, text: []const u8) !void {
+        _ = try self.terminal.applyCommand(.{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_working,
+            .priority = 10,
+            .text = text,
+            .effect = .shimmer,
+        } });
+    }
+
+    fn setRecoveryStatus(self: *InteractiveController, text: []const u8) !void {
+        _ = try self.terminal.applyCommand(.{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_recovery,
+            .priority = 9,
+            .text = text,
+            .effect = .shimmer,
+        } });
+    }
+
+    fn clearStatus(self: *InteractiveController, id: tui.status.ContributionId) !void {
+        _ = try self.terminal.applyCommand(.{ .clear_status = .{ .slot = .status_line, .id = id } });
+    }
+
+    fn tickTime(self: *InteractiveController) !void {
+        _ = try self.terminal.applyCommand(.{ .tick = .{ .now_ms = self.nowMs() } });
+        try self.tickToolTimers();
     }
 
     fn nowMs(self: *InteractiveController) i64 {
@@ -616,97 +639,21 @@ const InteractiveController = struct {
             elapsed_ms / std.time.ms_per_s,
             (elapsed_ms % std.time.ms_per_s) / 100,
         }) catch return;
-        _ = try self.terminal_loop.applyCommand(.{ .replace_tool_footer = .{
+        _ = try self.terminal.applyCommand(.{ .replace_tool_footer = .{
             .tool_call_id = tool_call_id,
             .text = text,
         } });
     }
-
-    fn appendToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
-        if (text.len == 0) return;
-        if (!std.unicode.utf8ValidateSlice(tool_call_id) or !std.unicode.utf8ValidateSlice(text)) {
-            try self.appendStaticStatus(.warning, "invalid tool output dropped");
-            return;
-        }
-        var remaining = text;
-        while (remaining.len > 0) {
-            const chunk = utf8Prefix(remaining, transcript_append_max);
-            if (chunk.len == 0) {
-                try self.appendStaticStatus(.warning, "tool output truncated");
-                return;
-            }
-            _ = try self.terminal_loop.applyCommand(.{ .tool_output_delta = .{
-                .tool_call_id = tool_call_id,
-                .text = chunk,
-            } });
-            remaining = remaining[chunk.len..];
-        }
-    }
-
-    fn appendStatus(
-        self: *InteractiveController,
-        level: tui.product.transcript.TranscriptStatusLevel,
-        text: []const u8,
-    ) !void {
-        if (text.len == 0) return;
-        if (!std.unicode.utf8ValidateSlice(text)) {
-            return self.appendStaticStatus(.warning, "invalid status text dropped");
-        }
-        const safe = utf8Prefix(text, transcript_append_max);
-        try self.appendStaticStatus(level, safe);
-    }
-
-    fn appendStaticStatus(
-        self: *InteractiveController,
-        level: tui.product.transcript.TranscriptStatusLevel,
-        text: []const u8,
-    ) !void {
-        if (text.len == 0) return;
-        _ = try self.terminal_loop.applyCommand(.{
-            .append_transcript = .{ .status = .{ .level = level, .text = text } },
-        });
-    }
-
-    fn applyStatus(
-        self: *InteractiveController,
-        level: tui.product.transcript.TranscriptStatusLevel,
-        text: []const u8,
-    ) !void {
-        try self.appendStatus(level, text);
-    }
-
-    fn setWorkingStatus(self: *InteractiveController, text: []const u8) !void {
-        const safe = if (std.unicode.utf8ValidateSlice(text)) utf8Prefix(text, 512) else "working";
-        _ = try self.terminal_loop.applyCommand(.{ .set_slot_contribution = .{
-            .slot = .status_area,
-            .id = status_id_working,
-            .priority = 10,
-            .text = safe,
-            .effect = .shimmer,
-        } });
-    }
-
-    fn setRecoveryStatus(self: *InteractiveController, text: []const u8) !void {
-        const safe = if (std.unicode.utf8ValidateSlice(text)) utf8Prefix(text, 512) else "recovering";
-        _ = try self.terminal_loop.applyCommand(.{ .set_slot_contribution = .{
-            .slot = .status_area,
-            .id = status_id_recovery,
-            .priority = 9,
-            .text = safe,
-            .effect = .shimmer,
-        } });
-    }
-
-    fn clearStatus(self: *InteractiveController, id: tui.product.SlotContributionId) !void {
-        _ = try self.terminal_loop.applyCommand(.{ .clear_slot_contribution = .{ .slot = .status_area, .id = id } });
-    }
-
-    fn tickStatus(self: *InteractiveController) !void {
-        self.animation_tick +%= 1;
-        _ = try self.terminal_loop.applyCommand(.{ .animation_tick = self.animation_tick });
-        try self.tickToolTimers();
-    }
 };
+
+/// Largest prefix that fits one transcript append, preferring a UTF-8
+/// boundary; falls back to a raw cut when the head has no boundary (the
+/// transcript sanitizes whatever arrives).
+fn boundedChunk(text: []const u8) []const u8 {
+    const prefix = utf8Prefix(text, transcript_append_max);
+    if (prefix.len > 0) return prefix;
+    return text[0..@min(text.len, transcript_append_max)];
+}
 
 fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options: Options) !?[]const u8 {
     if (options.resume_session_file == null and !options.resume_latest) return null;
@@ -737,11 +684,11 @@ fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options
 fn toolAppend(
     tool_call_id: []const u8,
     name: []const u8,
-    status: tui.product.transcript.TranscriptToolStatus,
+    status: tui.Transcript.ToolStatus,
     title: []const u8,
     is_error: bool,
-) TranscriptAppend {
-    return .{ .tool = .{
+) tui.Transcript.Append.ToolAppend {
+    return .{
         .tool_call_id = tool_call_id,
         .name = name,
         .presentation = toolPresentation(name),
@@ -749,10 +696,10 @@ fn toolAppend(
         .body_mode = toolBodyMode(name),
         .collapse = toolCollapse(name),
         .title = title,
-    } };
+    };
 }
 
-fn toolPresentation(name: []const u8) tui.product.transcript.TranscriptToolPresentation {
+fn toolPresentation(name: []const u8) tui.Transcript.ToolPresentation {
     if (std.mem.eql(u8, name, "bash")) return .command;
     if (std.mem.eql(u8, name, "read")) return .file;
     if (std.mem.eql(u8, name, "edit")) return .patch;
@@ -763,7 +710,7 @@ fn toolPresentation(name: []const u8) tui.product.transcript.TranscriptToolPrese
     return .generic;
 }
 
-fn toolBodyMode(name: []const u8) tui.product.transcript.TranscriptToolBodyMode {
+fn toolBodyMode(name: []const u8) tui.Transcript.ToolBodyMode {
     if (std.mem.eql(u8, name, "read")) return .hidden_on_success;
     return .visible;
 }
@@ -784,7 +731,7 @@ fn toolEndDisplayText(payload: agent_mod.AgentEvent.ToolExecutionEnd) ?[]const u
 // Collapsed-window policy per tool, mirroring pi-mono's previews: bash shows
 // the last 5 visual lines (errors live at the end), search/listing tools show
 // the first lines of an already head-truncated result.
-fn toolCollapse(name: []const u8) tui.product.transcript.TranscriptToolCollapse {
+fn toolCollapse(name: []const u8) tui.Transcript.ToolCollapse {
     if (std.mem.eql(u8, name, "bash")) return .{ .mode = .tail, .rows_max = 5 };
     if (std.mem.eql(u8, name, "grep")) return .{ .mode = .head, .rows_max = 15 };
     if (std.mem.eql(u8, name, "find") or std.mem.eql(u8, name, "ls")) return .{ .mode = .head, .rows_max = 20 };

@@ -1,59 +1,43 @@
+//! Line classifier for assistant text: headings, quotes, lists, code fences,
+//! and horizontal rules get distinct prefixes and styles. This is per-line
+//! presentation policy, not a markdown AST; inline emphasis is out of scope.
 const std = @import("std");
-const vaxis = @import("vaxis");
 const theme_mod = @import("theme.zig");
 
-pub const generated_text_bytes_max: usize = 160;
-const horizontal_rule_line =
+pub const horizontal_rule_line =
     "────────────────────────────────" ++
     "────────────────────────────────";
-pub const fence_lang_bytes_max: usize = 32;
 
 pub const State = struct {
-    in_code_fence: bool = false,
     fence: Fence = .none,
-    lang: []const u8 = "",
+
+    pub const Fence = enum { none, backtick, tilde };
 };
 
-pub const Fence = enum { none, backtick, tilde };
-
-pub const LineKind = enum {
-    plain,
-    heading,
-    quote,
-    list,
-    code,
-    horizontal_rule,
-};
+pub const LineKind = enum { plain, heading, quote, list, code, horizontal_rule };
 
 pub const Projection = struct {
     kind: LineKind,
     prefix: []const u8 = "",
     text: []const u8,
+    /// Whether wrapped continuation rows repeat the prefix (quotes/code do;
+    /// list markers indent instead).
     repeat_prefix: bool = false,
-    prefix_style: vaxis.Style,
-    text_style: vaxis.Style,
-    row_style: vaxis.Style,
-    generated: bool = false,
+    prefix_style: theme_mod.Style,
+    text_style: theme_mod.Style,
+    row_style: theme_mod.Style,
 };
 
-pub fn classifyLine(
-    state: *State,
-    line: []const u8,
-    theme: *const theme_mod.Theme,
-    generated_buffer: []u8,
-) Projection {
-    if (state.in_code_fence) {
+pub fn classifyLine(state: *State, line: []const u8, theme: *const theme_mod.Theme) Projection {
+    if (state.fence != .none) {
         if (fenceMarker(line)) |marker| {
             if (marker == state.fence) state.* = .{};
-            return codeProjection(line, theme);
         }
         return codeProjection(line, theme);
     }
 
     if (fenceMarker(line)) |marker| {
-        state.in_code_fence = true;
         state.fence = marker;
-        state.lang = fenceLanguage(line);
         return codeProjection(line, theme);
     }
 
@@ -61,19 +45,18 @@ pub fn classifyLine(
     if (horizontalRule(trimmed)) {
         return .{
             .kind = .horizontal_rule,
-            .text = horizontalRuleText(generated_buffer),
-            .text_style = theme.transcript_secondary,
+            .text = horizontal_rule_line,
             .prefix_style = theme.transcript_secondary,
+            .text_style = theme.transcript_secondary,
             .row_style = theme.transcript_secondary,
-            .generated = true,
         };
     }
     if (heading(trimmed)) |content| {
         return .{
             .kind = .heading,
             .text = content,
-            .text_style = theme.status_accent,
             .prefix_style = theme.status_accent,
+            .text_style = theme.status_accent,
             .row_style = theme.transcript_text,
         };
     }
@@ -102,8 +85,8 @@ pub fn classifyLine(
     return .{
         .kind = .plain,
         .text = line,
-        .text_style = theme.transcript_text,
         .prefix_style = theme.transcript_text,
+        .text_style = theme.transcript_text,
         .row_style = theme.transcript_text,
     };
 }
@@ -120,18 +103,11 @@ fn codeProjection(line: []const u8, theme: *const theme_mod.Theme) Projection {
     };
 }
 
-fn fenceMarker(line: []const u8) ?Fence {
+fn fenceMarker(line: []const u8) ?State.Fence {
     const trimmed = trimLeft(line);
     if (std.mem.startsWith(u8, trimmed, "```")) return .backtick;
     if (std.mem.startsWith(u8, trimmed, "~~~")) return .tilde;
     return null;
-}
-
-fn fenceLanguage(line: []const u8) []const u8 {
-    const trimmed = trimLeft(line);
-    if (trimmed.len <= 3) return "";
-    const lang = trimLeft(trimmed[3..]);
-    return lang[0..@min(lang.len, fence_lang_bytes_max)];
 }
 
 fn heading(line: []const u8) ?[]const u8 {
@@ -179,13 +155,33 @@ fn horizontalRule(line: []const u8) bool {
     return true;
 }
 
-fn horizontalRuleText(buffer: []u8) []const u8 {
-    _ = buffer;
-    return horizontal_rule_line;
-}
-
 fn trimLeft(bytes: []const u8) []const u8 {
     var index: usize = 0;
     while (index < bytes.len and (bytes[index] == ' ' or bytes[index] == '\t')) : (index += 1) {}
     return bytes[index..];
+}
+
+test "classifyLine tracks fences and recognizes structures" {
+    const theme = theme_mod.Theme.codex();
+    var state: State = .{};
+
+    try std.testing.expectEqual(LineKind.heading, classifyLine(&state, "# Title", &theme).kind);
+    try std.testing.expectEqual(LineKind.quote, classifyLine(&state, "> quoted", &theme).kind);
+    try std.testing.expectEqual(LineKind.list, classifyLine(&state, "12. item", &theme).kind);
+    try std.testing.expectEqual(LineKind.horizontal_rule, classifyLine(&state, "---", &theme).kind);
+
+    try std.testing.expectEqual(LineKind.code, classifyLine(&state, "```zig", &theme).kind);
+    // Inside a fence everything is code, including would-be headings.
+    try std.testing.expectEqual(LineKind.code, classifyLine(&state, "# not a heading", &theme).kind);
+    try std.testing.expectEqual(LineKind.code, classifyLine(&state, "```", &theme).kind);
+    try std.testing.expectEqual(LineKind.plain, classifyLine(&state, "after", &theme).kind);
+}
+
+test "list marker requires a space and ordered lists keep their numbers" {
+    const theme = theme_mod.Theme.codex();
+    var state: State = .{};
+    try std.testing.expectEqual(LineKind.plain, classifyLine(&state, "-no space", &theme).kind);
+    const ordered = classifyLine(&state, "3. third", &theme);
+    try std.testing.expectEqualStrings("3. ", ordered.prefix);
+    try std.testing.expectEqualStrings("third", ordered.text);
 }

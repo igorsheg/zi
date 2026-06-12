@@ -119,6 +119,7 @@ pub const ClientEvent = union(enum) {
     snapshot: Snapshot,
     replay: ReplayBatch,
     replay_gap: ReplayGap,
+    prompt_command: PromptCommand,
     compaction_start: CompactionStart,
     compaction_end: CompactionEnd,
     auto_retry_start: AutoRetryStart,
@@ -131,6 +132,7 @@ pub const ClientEvent = union(enum) {
             .agent_event => |*payload| payload.deinit(allocator),
             .snapshot => |*payload| payload.deinit(allocator),
             .replay => |*payload| payload.deinit(allocator),
+            .prompt_command => |*payload| payload.deinit(allocator),
             .compaction_end => |*payload| payload.deinit(allocator),
             .auto_retry_start => |*payload| payload.error_message.deinit(allocator),
             .auto_retry_end => |*payload| if (payload.final_error) |*err| err.deinit(allocator),
@@ -181,6 +183,23 @@ pub const OperationFinished = struct {
         canceled,
         failed,
     };
+};
+
+/// Reply to a slash command intercepted at the mailbox boundary. The text
+/// is a session fact for display; it never reaches the model or the prompt
+/// queues.
+pub const PromptCommand = struct {
+    command: EventText,
+    result: Result,
+    message: EventText,
+
+    pub const Result = enum { handled, unknown };
+
+    pub fn deinit(self: *PromptCommand, allocator: std.mem.Allocator) void {
+        self.command.deinit(allocator);
+        self.message.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 pub const EventText = struct {
@@ -744,6 +763,25 @@ test "history snapshot truncates oversized items and drops oldest under byte bud
     defer full.deinit(std.testing.allocator);
     try std.testing.expect(full.dropped_items > 0);
     try std.testing.expectEqualStrings(big, full.items[full.items.len - 1].text.text);
+}
+
+test "prompt command event serializes public shape" {
+    var event: ClientEvent = .{ .prompt_command = .{
+        .command = try EventText.init(std.testing.allocator, "help"),
+        .result = .handled,
+        .message = try EventText.init(std.testing.allocator, "available commands: /help, /session"),
+    } };
+    defer event.deinit(std.testing.allocator);
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try std.json.Stringify.value(event, .{}, &writer.writer);
+
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"prompt_command\",\"command\":\"help\",\"result\":\"handled\"," ++
+            "\"message\":\"available commands: /help, /session\"}",
+        writer.written(),
+    );
 }
 
 test "failed compaction end event omits result" {

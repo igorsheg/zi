@@ -83,6 +83,17 @@ fn drainEvents(
                 try drain.onEvent(owned_event.event);
                 done = true;
             },
+            // A slash command's reply is the whole interaction in print mode.
+            .prompt_command => |command| {
+                switch (output) {
+                    .text => {
+                        try stdout.writeAll(command.message.text);
+                        try stdout.writeByte('\n');
+                    },
+                    .json => try drain.onEvent(owned_event.event),
+                }
+                done = true;
+            },
             .rejected => |rejection| {
                 try printAssistantError(stderr, rejection.message.text);
                 done = true;
