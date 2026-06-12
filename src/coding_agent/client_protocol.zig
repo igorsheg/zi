@@ -165,6 +165,9 @@ pub const Rejection = struct {
         busy,
         queue_full,
         invalid_command,
+        /// The host ran out of a resource (e.g. memory); the command itself
+        /// was well-formed and may succeed if retried later.
+        exhausted,
         /// A reply could not be delivered in-band (e.g. too large to encode).
         overflow,
     };

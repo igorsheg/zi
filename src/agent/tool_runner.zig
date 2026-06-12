@@ -110,32 +110,40 @@ fn executeToolCallsSequential(
     errdefer deinitToolResultMessages(result_allocator, allocator, messages.items, &messages);
     var finalized_count: usize = 0;
     var terminate_count: usize = 0;
+    var index: usize = 0;
 
     for (assistant.content) |content| {
         if (content != .tool_call) continue;
         if (token.isRequested()) break;
-        const tool_call = content.tool_call;
+        const prepared = prepareToolCall(context, assistant, content.tool_call, config, token, index);
+        index += 1;
         try emit.emit(.{ .tool_execution_start = .{
-            .tool_call_id = tool_call.id,
-            .tool_name = tool_call.name,
-            .args = tool_call.arguments,
+            .tool_call_id = prepared.toolCall().id,
+            .tool_name = prepared.toolCall().name,
+            .args = prepared.args(),
         } });
 
-        var finalized = try executeOneToolCall(
-            allocator,
-            io,
-            task_runtime,
-            context,
-            assistant,
-            tool_call,
-            config,
-            token,
-            emit,
-        );
+        var update_context: ToolUpdateContext = .{
+            .emit = emit,
+            .tool_call = prepared.toolCall(),
+            .args = prepared.args(),
+        };
+        const executed = try executePreparedToolCall(allocator, io, task_runtime, prepared, token, .{
+            .context = &update_context,
+            .call_fn = emitToolUpdate,
+        });
+        var finalized = try finalizeExecutedToolCall(allocator, context, assistant, config, token, executed);
         finalized_count += 1;
         if (finalized.result.result.terminate) terminate_count += 1;
 
-        emitFinalizedToolCall(allocator, result_allocator, emit, tool_call, finalized, &messages) catch |err| {
+        emitFinalizedToolCall(
+            allocator,
+            result_allocator,
+            emit,
+            prepared.toolCall(),
+            finalized,
+            &messages,
+        ) catch |err| {
             finalized.result.deinit();
             return err;
         };
@@ -164,20 +172,19 @@ const FailedPreparedToolCall = struct {
 const PreparedToolCall = union(enum) {
     executable: ExecutablePreparedToolCall,
     missing: FailedPreparedToolCall,
-    prepare_error: FailedPreparedToolCall,
     blocked: FailedPreparedToolCall,
 
     fn index(self: PreparedToolCall) usize {
         return switch (self) {
             .executable => |item| item.index,
-            .missing, .prepare_error, .blocked => |item| item.index,
+            .missing, .blocked => |item| item.index,
         };
     }
 
     fn toolCall(self: PreparedToolCall) ai.ToolCall {
         return switch (self) {
             .executable => |item| item.tool_call,
-            .missing, .prepare_error, .blocked => |item| item.tool_call,
+            .missing, .blocked => |item| item.tool_call,
         };
     }
 
@@ -185,7 +192,7 @@ const PreparedToolCall = union(enum) {
         return switch (self) {
             .executable => |item| item.args,
             .missing => |item| item.tool_call.arguments,
-            .prepare_error, .blocked => |item| .{ .string = item.reason },
+            .blocked => |item| .{ .string = item.reason },
         };
     }
 };
@@ -206,6 +213,11 @@ const ToolWorkerEvent = union(enum) {
     complete: ExecutedToolCall,
     failed: ToolFailure,
 
+    // The channel is buffered, so the worker resumes as soon as send returns
+    // while the event may still sit in the buffer. Identity fields borrow
+    // from the prepared array (alive for the whole batch); `partial_result`
+    // is copied at send time because the tool may reuse its buffers the
+    // moment the update callback returns. The receiver owns the copy.
     const ToolUpdate = struct {
         tool_call_id: []const u8,
         tool_name: []const u8,
@@ -278,6 +290,7 @@ const ToolWorkerGroup = struct {
 };
 
 const ParallelToolUpdateContext = struct {
+    allocator: std.mem.Allocator,
     channel: *ToolWorkerChannel,
     tool_call: ai.ToolCall,
     args: std.json.Value,
@@ -296,7 +309,7 @@ fn executeToolCallsParallel(
     emit: agent.EventSink,
 ) !Batch {
     var prepared: [agent.max_tool_calls_per_turn]PreparedToolCall = undefined;
-    const prepared_count = try prepareParallelToolCalls(allocator, context, assistant, config, token, emit, &prepared);
+    const prepared_count = try prepareParallelToolCalls(context, assistant, config, token, emit, &prepared);
     if (prepared_count == 0) return .{ .messages = &.{}, .terminate = false };
 
     std.debug.assert(prepared_count <= agent.max_tool_calls_per_turn);
@@ -305,7 +318,7 @@ fn executeToolCallsParallel(
     var update_count: std.atomic.Value(usize) = .init(0);
     var group = ToolWorkerGroup.init(task_runtime);
     defer group.deinit();
-    errdefer cancelParallelToolWorkers(&group, &channel);
+    errdefer cancelParallelToolWorkers(allocator, &group, &channel);
 
     for (prepared[0..prepared_count]) |item| {
         try group.spawn(
@@ -322,12 +335,15 @@ fn executeToolCallsParallel(
     while (completed_count < prepared_count) {
         const event = try channel.receive();
         switch (event) {
-            .update => |update| try emit.emit(.{ .tool_execution_update = .{
-                .tool_call_id = update.tool_call_id,
-                .tool_name = update.tool_name,
-                .args = update.args,
-                .partial_result = update.partial_result,
-            } }),
+            .update => |update| {
+                defer agent.deinitAgentToolResult(allocator, update.partial_result);
+                try emit.emit(.{ .tool_execution_update = .{
+                    .tool_call_id = update.tool_call_id,
+                    .tool_name = update.tool_name,
+                    .args = update.args,
+                    .partial_result = update.partial_result,
+                } });
+            },
             .complete => |complete| {
                 executed[complete.prepared.index()] = complete;
                 executed_owned[complete.prepared.index()] = true;
@@ -373,24 +389,26 @@ fn executeToolCallsParallel(
 }
 
 fn cancelParallelToolWorkers(
+    allocator: std.mem.Allocator,
     group: *ToolWorkerGroup,
     channel: *ToolWorkerChannel,
 ) void {
     group.cancel();
     channel.close(.graceful);
-    drainPendingToolWorkerEvents(channel);
+    drainPendingToolWorkerEvents(allocator, channel);
 }
 
-fn drainPendingToolWorkerEvents(channel: *ToolWorkerChannel) void {
+fn drainPendingToolWorkerEvents(allocator: std.mem.Allocator, channel: *ToolWorkerChannel) void {
     while (true) {
         var event = channel.tryReceive() catch break;
-        deinitToolWorkerEvent(&event);
+        deinitToolWorkerEvent(allocator, &event);
     }
 }
 
-fn deinitToolWorkerEvent(event: *ToolWorkerEvent) void {
+fn deinitToolWorkerEvent(allocator: std.mem.Allocator, event: *ToolWorkerEvent) void {
     switch (event.*) {
-        .update, .failed => {},
+        .update => |update| agent.deinitAgentToolResult(allocator, update.partial_result),
+        .failed => {},
         .complete => |*complete| complete.result.deinit(),
     }
 }
@@ -405,7 +423,6 @@ fn deinitOwnedExecutedToolCalls(
 }
 
 fn prepareParallelToolCalls(
-    allocator: std.mem.Allocator,
     context: agent.AgentContext,
     assistant: ai.AssistantMessage,
     config: agent.AgentLoopConfig,
@@ -422,7 +439,7 @@ fn prepareParallelToolCalls(
         if (token.isRequested()) break;
         if (prepared_count == out.len) return error.TooManyTools;
 
-        out[prepared_count] = prepareToolCall(allocator, context, assistant, tool_call, config, token, prepared_count);
+        out[prepared_count] = prepareToolCall(context, assistant, tool_call, config, token, prepared_count);
         const item = out[prepared_count];
         const started_tool_call = item.toolCall();
         try emit.emit(.{ .tool_execution_start = .{
@@ -444,14 +461,20 @@ fn executePreparedToolCallWorker(
     channel: *ToolWorkerChannel,
     update_count: *std.atomic.Value(usize),
 ) anyerror!void {
+    var update_context: ParallelToolUpdateContext = .{
+        .allocator = allocator,
+        .channel = channel,
+        .tool_call = prepared.toolCall(),
+        .args = prepared.args(),
+        .update_count = update_count,
+    };
     var executed = executePreparedToolCall(
         allocator,
         io,
         task_runtime,
         prepared,
         token,
-        channel,
-        update_count,
+        .{ .context = &update_context, .call_fn = enqueueToolUpdate },
     ) catch |err| {
         channel.send(.{ .failed = .{ .prepared = prepared, .error_name = @errorName(err) } }) catch |channel_err| {
             if (channel_err == error.Canceled) return error.Canceled;
@@ -466,7 +489,6 @@ fn executePreparedToolCallWorker(
 }
 
 fn prepareToolCall(
-    allocator: std.mem.Allocator,
     context: agent.AgentContext,
     assistant: ai.AssistantMessage,
     tool_call: ai.ToolCall,
@@ -480,23 +502,11 @@ fn prepareToolCall(
         .reason = tool_call.name,
     } };
 
-    const args = if (tool.prepare_arguments) |prepare|
-        agent.PrepareArgumentsHook.call(allocator, prepare, tool_call.arguments) catch |err| return .{
-            .prepare_error = .{
-                .index = index,
-                .tool_call = tool_call,
-                .reason = @errorName(err),
-            },
-        }
-    else
-        tool_call.arguments;
+    const args = tool_call.arguments;
 
-    // Debt owner: agent. Reason: JSON-schema validation needs one shared
-    // validator for sequential and parallel tool paths. Scope: before-tool
-    // policy may block or rewrite arguments, but schema validation is not yet
-    // executable here. Remove when `agent.AgentTool.parameters` has an
-    // executable validator. Current behavior is covered by prepare/block tests
-    // on sequential and parallel tool paths.
+    // Debt owner: agent. Reason: JSON-schema validation of `args` against
+    // `agent.AgentTool.parameters` is not yet executable here; the before-tool
+    // policy may only block. Remove when an executable validator exists.
     if (config.before_tool_call) |before| {
         const before_result = before.call(token, .{
             .assistant_message = assistant,
@@ -524,18 +534,12 @@ fn executePreparedToolCall(
     task_runtime: *runtime.Runtime,
     prepared: PreparedToolCall,
     token: runtime.CancelToken,
-    channel: *ToolWorkerChannel,
-    update_count: *std.atomic.Value(usize),
+    on_update: agent.AgentToolUpdateCallback,
 ) anyerror!ExecutedToolCall {
     switch (prepared) {
         .missing => |item| return .{
             .prepared = prepared,
             .result = try createErrorToolResultFmt(allocator, "Tool {s} not found", .{item.reason}),
-            .is_error = true,
-        },
-        .prepare_error => |item| return .{
-            .prepared = prepared,
-            .result = try createErrorToolResultFmt(allocator, "prepare arguments failed: {s}", .{item.reason}),
             .is_error = true,
         },
         .blocked => |item| return .{
@@ -544,16 +548,6 @@ fn executePreparedToolCall(
             .is_error = true,
         },
         .executable => |item| {
-            var update_context: ParallelToolUpdateContext = .{
-                .channel = channel,
-                .tool_call = item.tool_call,
-                .args = item.args,
-                .update_count = update_count,
-            };
-            const update_callback: agent.AgentToolUpdateCallback = .{
-                .context = &update_context,
-                .call_fn = enqueueToolUpdate,
-            };
             const result = agent.ExecuteToolHook.call(
                 allocator,
                 io,
@@ -562,7 +556,7 @@ fn executePreparedToolCall(
                 token,
                 item.tool_call.id,
                 item.args,
-                update_callback,
+                on_update,
             ) catch |err| return .{
                 .prepared = prepared,
                 .result = try createErrorToolResultFmt(allocator, "tool execution failed: {s}", .{@errorName(err)}),
@@ -646,104 +640,6 @@ fn emitFinalizedToolCall(
     try messages.append(allocator, message);
 }
 
-fn executeOneToolCall(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    task_runtime: *runtime.Runtime,
-    context: agent.AgentContext,
-    assistant: ai.AssistantMessage,
-    tool_call: ai.ToolCall,
-    config: agent.AgentLoopConfig,
-    token: runtime.CancelToken,
-    emit: agent.EventSink,
-) !FinalizedToolCall {
-    const tool = findTool(context.tools, tool_call.name) orelse return .{
-        .result = try createErrorToolResultFmt(allocator, "Tool {s} not found", .{tool_call.name}),
-        .is_error = true,
-    };
-
-    const args = if (tool.prepare_arguments) |prepare|
-        agent.PrepareArgumentsHook.call(allocator, prepare, tool_call.arguments) catch |err| return .{
-            .result = try createErrorToolResultFmt(allocator, "prepare arguments failed: {s}", .{@errorName(err)}),
-            .is_error = true,
-        }
-    else
-        tool_call.arguments;
-
-    if (config.before_tool_call) |before| {
-        const before_result = before.call(token, .{
-            .assistant_message = assistant,
-            .tool_call = tool_call,
-            .args = args,
-            .agent = .{
-                .system_prompt = context.system_prompt,
-                .messages = context.messages,
-                .tools = context.tools,
-            },
-        });
-        switch (before_result) {
-            .allow => {},
-            .block => |reason| return .{
-                .result = try createErrorToolResult(allocator, reason),
-                .is_error = true,
-            },
-        }
-    }
-
-    var update_context: ToolUpdateContext = .{
-        .emit = emit,
-        .tool_call = tool_call,
-        .args = args,
-    };
-    const update_callback: agent.AgentToolUpdateCallback = .{
-        .context = &update_context,
-        .call_fn = emitToolUpdate,
-    };
-    var result = agent.ExecuteToolHook.call(
-        allocator,
-        io,
-        task_runtime,
-        tool.execute,
-        token,
-        tool_call.id,
-        args,
-        update_callback,
-    ) catch |err| return .{
-        .result = try createErrorToolResultFmt(allocator, "tool execution failed: {s}", .{@errorName(err)}),
-        .is_error = true,
-    };
-    var is_error = false;
-
-    if (config.after_tool_call) |after| {
-        const override = after.call(token, .{
-            .assistant_message = assistant,
-            .tool_call = tool_call,
-            .args = args,
-            .result = result.view(),
-            .is_error = is_error,
-            .agent = .{
-                .system_prompt = context.system_prompt,
-                .messages = context.messages,
-                .tools = context.tools,
-            },
-        }) catch |err| {
-            result.deinit();
-            return .{
-                .result = try createErrorToolResultFmt(allocator, "after tool call failed: {s}", .{@errorName(err)}),
-                .is_error = true,
-            };
-        };
-        if (override) |value| {
-            if (value.content) |content| try replaceToolResultContent(&result, content);
-            if (value.details) |details| try replaceToolResultDetails(&result, details);
-            if (value.terminate) |terminate| result.result.terminate = terminate;
-            if (value.is_error) |override_is_error| is_error = override_is_error;
-        }
-    }
-
-    return .{ .result = result, .is_error = is_error };
-}
-
 const ToolUpdateContext = struct {
     emit: agent.EventSink,
     tool_call: ai.ToolCall,
@@ -753,12 +649,14 @@ const ToolUpdateContext = struct {
 fn enqueueToolUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult) anyerror!void {
     const update: *ParallelToolUpdateContext = @ptrCast(@alignCast(context.?));
     const previous_count = update.update_count.fetchAdd(1, .monotonic);
-    if (previous_count >= agent.max_tool_updates_per_batch) return error.TooManyTools;
+    if (previous_count >= agent.max_tool_updates_per_batch) return error.TooManyToolUpdates;
+    const owned_partial = try agent.copyAgentToolResult(update.allocator, partial_result);
+    errdefer agent.deinitAgentToolResult(update.allocator, owned_partial);
     try update.channel.send(.{ .update = .{
         .tool_call_id = update.tool_call.id,
         .tool_name = update.tool_call.name,
         .args = update.args,
-        .partial_result = partial_result,
+        .partial_result = owned_partial,
     } });
 }
 

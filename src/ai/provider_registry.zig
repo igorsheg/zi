@@ -37,13 +37,18 @@ pub const ProviderRegistry = struct {
     }
 
     pub fn unregisterSource(self: *ProviderRegistry, source_id: []const u8) void {
-        var iterator = self.providers.iterator();
-        while (iterator.next()) |entry| {
-            if (entry.value_ptr.source_id) |registered_source_id| {
+        // Removing while iterating invalidates std hashmap iterators, so
+        // restart the scan after each removal. Provider counts are tiny.
+        restart: while (true) {
+            var iterator = self.providers.iterator();
+            while (iterator.next()) |entry| {
+                const registered_source_id = entry.value_ptr.source_id orelse continue;
                 if (std.mem.eql(u8, registered_source_id, source_id)) {
                     _ = self.providers.remove(entry.key_ptr.*);
+                    continue :restart;
                 }
             }
+            return;
         }
     }
 
@@ -100,6 +105,22 @@ test "provider registry unregisters providers by source id" {
 
     try std.testing.expectEqual(@as(?ApiProvider, null), registry.get(protocol.KnownApi.openai_responses));
     try std.testing.expect(registry.get(protocol.KnownApi.anthropic_messages) != null);
+}
+
+test "provider registry unregisters multiple providers from one source" {
+    var registry = ProviderRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var calls: usize = 0;
+    try registry.register(testProvider(protocol.KnownApi.openai_responses, &calls), "extension-a");
+    try registry.register(testProvider(protocol.KnownApi.anthropic_messages, &calls), "extension-a");
+    try registry.register(testProvider(protocol.KnownApi.openai_completions, &calls), "extension-b");
+
+    registry.unregisterSource("extension-a");
+
+    try std.testing.expectEqual(@as(?ApiProvider, null), registry.get(protocol.KnownApi.openai_responses));
+    try std.testing.expectEqual(@as(?ApiProvider, null), registry.get(protocol.KnownApi.anthropic_messages));
+    try std.testing.expect(registry.get(protocol.KnownApi.openai_completions) != null);
 }
 
 test "provider registry clear removes all providers" {

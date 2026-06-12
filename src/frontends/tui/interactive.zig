@@ -419,7 +419,7 @@ const InteractiveController = struct {
             payload.is_error,
         ).tool);
         try self.finishToolTimer(payload.tool_call_id);
-        const text = firstToolResultText(payload.result.content) orelse return;
+        const text = toolEndDisplayText(payload) orelse return;
         try self.replaceToolOutput(payload.tool_call_id, text);
     }
 
@@ -764,8 +764,21 @@ fn toolPresentation(name: []const u8) tui.product.transcript.TranscriptToolPrese
 }
 
 fn toolBodyMode(name: []const u8) tui.product.transcript.TranscriptToolBodyMode {
-    if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "edit")) return .hidden_on_success;
+    if (std.mem.eql(u8, name, "read")) return .hidden_on_success;
     return .visible;
+}
+
+fn toolEndDisplayText(payload: agent_mod.AgentEvent.ToolExecutionEnd) ?[]const u8 {
+    if (std.mem.eql(u8, payload.tool_name, "edit") and !payload.is_error) {
+        if (payload.result.details) |details| {
+            if (details == .object) {
+                if (details.object.get("diff")) |diff| {
+                    if (diff == .string) return diff.string;
+                }
+            }
+        }
+    }
+    return firstToolResultText(payload.result.content);
 }
 
 // Collapsed-window policy per tool, mirroring pi-mono's previews: bash shows

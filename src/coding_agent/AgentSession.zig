@@ -315,7 +315,7 @@ pub fn startPromptRun(
         self.task_runtime,
         &run.prompts,
         self.agentContext(),
-        self.agent.loop_config,
+        self.agent.loopConfig(),
         token,
         &run.buffer,
     );
@@ -338,7 +338,7 @@ pub fn startContinueRun(self: *AgentSession) !*PromptRun {
         self.allocator,
         self.task_runtime,
         self.agentContext(),
-        self.agent.loop_config,
+        self.agent.loopConfig(),
         token,
         &run.buffer,
     );
@@ -662,8 +662,7 @@ pub fn startCompactionRun(
 
     // The summary call is a bare one-shot loop run: empty context, no tools,
     // no queue or tool hooks. The loop owns provider auth and streaming.
-    var config = self.agent.loop_config;
-    config.transform_context = null;
+    var config = self.agent.loopConfig();
     config.get_steering_messages = null;
     config.get_follow_up_messages = null;
     config.before_tool_call = null;

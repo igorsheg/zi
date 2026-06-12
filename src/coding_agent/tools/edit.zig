@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
+const edit_diff = @import("edit_diff.zig");
 const file_writer = @import("file_writer.zig");
 const path_utils = @import("path_utils.zig");
 const test_support = @import("test_support.zig");
@@ -9,7 +10,7 @@ const test_support = @import("test_support.zig");
 pub const max_edit_read_bytes = 4 * 1024 * 1024;
 pub const max_edit_output_bytes = 4 * 1024 * 1024;
 pub const max_edits_per_call = 64;
-pub const max_diff_bytes = 16 * 1024;
+pub const max_diff_bytes = edit_diff.diff_bytes_max;
 
 const utf8_bom = "\xef\xbb\xbf";
 
@@ -104,16 +105,18 @@ const TextShape = struct {
     line_ending: LineEnding,
 };
 
-const AppliedEdit = struct {
+const EditOutput = struct {
     original_normalized: []u8,
     normalized: []u8,
     restored: []u8,
+    diff: []u8,
     first_changed_line: usize,
 
-    fn deinit(self: *AppliedEdit, allocator: std.mem.Allocator) void {
+    fn deinit(self: *EditOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.original_normalized);
         allocator.free(self.normalized);
         allocator.free(self.restored);
+        allocator.free(self.diff);
         self.* = undefined;
     }
 };
@@ -169,8 +172,7 @@ fn execute(
         args.edits.len,
         args.path,
         edited.first_changed_line,
-        edited.original_normalized,
-        edited.normalized,
+        edited.diff,
     );
 }
 
@@ -202,7 +204,7 @@ fn applyEditsPreservingTextShape(
     original: []const u8,
     edits: []const Replacement,
     max_output_bytes: usize,
-) !AppliedEdit {
+) !EditOutput {
     const shape = detectTextShape(original);
     const body = if (shape.has_bom) original[utf8_bom.len..] else original;
     const normalized_original = try normalizeLineEndings(allocator, body);
@@ -221,14 +223,18 @@ fn applyEditsPreservingTextShape(
         allocator.free(normalized.new_text);
     };
 
-    const normalized = try applyEdits(allocator, normalized_original, normalized_edits, max_output_bytes);
+    var applied: [max_edits_per_call]edit_diff.AppliedEdit = undefined;
+    const normalized = try applyEdits(allocator, normalized_original, normalized_edits, max_output_bytes, applied[0..edits.len]);
     errdefer allocator.free(normalized);
+    const diff = try edit_diff.render(allocator, normalized_original, applied[0..edits.len]);
+    errdefer allocator.free(diff);
     const restored = try restoreTextShape(allocator, normalized, shape, max_output_bytes);
     errdefer allocator.free(restored);
     return .{
         .original_normalized = normalized_original,
         .normalized = normalized,
         .restored = restored,
+        .diff = diff,
         .first_changed_line = firstChangedLine(normalized_original, normalized),
     };
 }
@@ -238,7 +244,9 @@ fn applyEdits(
     original: []const u8,
     edits: []const Replacement,
     max_output_bytes: usize,
+    applied_edits: []edit_diff.AppliedEdit,
 ) ![]u8 {
+    std.debug.assert(applied_edits.len == edits.len);
     var matches = try allocator.alloc(Match, edits.len);
     defer allocator.free(matches);
 
@@ -264,7 +272,12 @@ fn applyEdits(
 
     var source_pos: usize = 0;
     var out_pos: usize = 0;
-    for (matches) |match| {
+    for (matches, 0..) |match, applied_index| {
+        applied_edits[applied_index] = .{
+            .base_offset = match.start,
+            .old_text = edits[match.edit_index].old_text,
+            .new_text = edits[match.edit_index].new_text,
+        };
         const prefix = original[source_pos..match.start];
         @memcpy(out[out_pos .. out_pos + prefix.len], prefix);
         out_pos += prefix.len;
@@ -364,32 +377,23 @@ fn editResult(
     replacements: usize,
     path: []const u8,
     first_changed_line: usize,
-    before: []const u8,
-    after: []const u8,
+    diff: []const u8,
 ) !agent.ToolExecutionResult {
-    const before_line = lineAt(before, first_changed_line);
-    const after_line = lineAt(after, first_changed_line);
-    const diff = try std.fmt.allocPrint(
-        allocator,
-        "@@ line {d} @@\n- {s}\n+ {s}",
-        .{ first_changed_line, before_line, after_line },
-    );
-    errdefer allocator.free(diff);
-    if (diff.len > max_diff_bytes) return error.EditTooLarge;
     const patch = try std.fmt.allocPrint(
         allocator,
-        "--- {s}\n+++ {s}\n@@ line {d} @@\n- {s}\n+ {s}",
-        .{ path, path, first_changed_line, before_line, after_line },
+        "--- {s}\n+++ {s}\n{s}",
+        .{ path, path, diff },
     );
-    errdefer allocator.free(patch);
+    defer allocator.free(patch);
     if (patch.len > max_diff_bytes) return error.EditTooLarge;
     const details = try path_utils.jsonDetails(allocator, .{
         .path = path,
         .replacements = replacements,
         .firstChangedLine = first_changed_line,
-        .diff = std.json.Value{ .string = diff },
-        .patch = std.json.Value{ .string = patch },
+        .diff = diff,
+        .patch = patch,
     });
+    errdefer runtime.freeJsonValue(allocator, details);
     const message = try std.fmt.allocPrint(
         allocator,
         "Successfully replaced {d} block(s) in {s}.",
@@ -534,20 +538,23 @@ test "edit tool streams utf8 safe edited content chunks" {
 }
 
 test "edit tool rejects bad replacements before mutation" {
+    var applied_one: [1]edit_diff.AppliedEdit = undefined;
     try std.testing.expectError(error.NoChanges, applyEdits(
         std.testing.allocator,
         "same",
         &.{.{ .old_text = "same", .new_text = "same" }},
         max_edit_output_bytes,
+        &applied_one,
     ));
     try std.testing.expectError(
         error.EditTextNotFoundOrNotUnique,
-        applyEdits(std.testing.allocator, "x x", &.{.{ .old_text = "x", .new_text = "y" }}, max_edit_output_bytes),
+        applyEdits(std.testing.allocator, "x x", &.{.{ .old_text = "x", .new_text = "y" }}, max_edit_output_bytes, &applied_one),
     );
     try std.testing.expectError(
         error.EditTooLarge,
-        applyEdits(std.testing.allocator, "x", &.{.{ .old_text = "x", .new_text = "hello" }}, 3),
+        applyEdits(std.testing.allocator, "x", &.{.{ .old_text = "x", .new_text = "hello" }}, 3, &applied_one),
     );
+    var applied_two: [2]edit_diff.AppliedEdit = undefined;
     try std.testing.expectError(
         error.OverlappingEdits,
         applyEdits(
@@ -558,6 +565,7 @@ test "edit tool rejects bad replacements before mutation" {
                 .{ .old_text = "bcd", .new_text = "y" },
             },
             max_edit_output_bytes,
+            &applied_two,
         ),
     );
 }

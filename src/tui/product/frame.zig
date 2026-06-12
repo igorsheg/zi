@@ -381,6 +381,8 @@ fn emitMarkdownRowsNewestFirst(
             projected.prefix_style,
             projected.text_style,
             projected.row_style,
+            null,
+            null,
         );
         if (item_row_count >= item_rows.len) break;
     }
@@ -461,6 +463,7 @@ fn emitToolRowsNewestFirst(
             sink,
             .{ .prefix = block.bodyPrefix(), .text = projected.text },
             frame_width,
+            tool.presentation,
             tool.collapse,
             tools_expanded,
             rail_style,
@@ -527,6 +530,8 @@ fn emitWrappedRowsNewestFirst(
         prefix_style,
         text_style,
         text_style,
+        null,
+        null,
     );
     var remaining = line_row_count;
     while (remaining > 0) {
@@ -546,6 +551,7 @@ fn emitToolBodyRowsNewestFirst(
     sink: *TranscriptRowSink,
     item: transcript_projection.RenderItem,
     frame_width: u16,
+    presentation: transcript_mod.TranscriptToolPresentation,
     collapse: transcript_mod.TranscriptToolCollapse,
     expanded: bool,
     rail_style: vaxis.Style,
@@ -563,6 +569,8 @@ fn emitToolBodyRowsNewestFirst(
         rail_style,
         theme.tool_output,
         theme.tool_output,
+        presentation,
+        theme,
     );
 
     const rows_max: usize = collapse.rows_max;
@@ -650,6 +658,8 @@ fn collectWrappedTranscriptLine(
     prefix_style: vaxis.Style,
     text_style: vaxis.Style,
     row_style: vaxis.Style,
+    presentation: ?transcript_mod.TranscriptToolPresentation,
+    theme: ?*const theme_mod.Theme,
 ) usize {
     var line_row_count: usize = 0;
     var start: usize = 0;
@@ -671,14 +681,16 @@ fn collectWrappedTranscriptLine(
         }
         const visual = wrap.nextVisualLineBreak(item.text, start, width);
         if (visual.next == start) break;
+        const resolved_text_style = toolBodyLineStyle(presentation, theme, item.text, visual.start, text_style);
+        const resolved_row_style = if ((presentation orelse .generic) == .patch) resolved_text_style else row_style;
         line_rows[line_row_count] = .{
             .prefix = item.prefix,
             .text = item.text[visual.start..visual.end],
             .show_prefix = repeat_prefix or visual_index == 0,
             .prefix_style = prefix_style,
-            .text_style = text_style,
-            .suffix_style = text_style,
-            .row_style = row_style,
+            .text_style = resolved_text_style,
+            .suffix_style = resolved_text_style,
+            .row_style = resolved_row_style,
         };
         line_row_count += 1;
         start = visual.next;
@@ -696,6 +708,31 @@ fn collectWrappedTranscriptLine(
         line_row_count += 1;
     }
     return line_row_count;
+}
+
+fn toolBodyLineStyle(
+    presentation: ?transcript_mod.TranscriptToolPresentation,
+    theme: ?*const theme_mod.Theme,
+    text: []const u8,
+    offset: usize,
+    fallback: vaxis.Style,
+) vaxis.Style {
+    if ((presentation orelse return fallback) != .patch) return fallback;
+    const resolved = theme orelse return fallback;
+    const line_start = physicalLineStart(text, offset);
+    if (line_start >= text.len) return fallback;
+    if (std.mem.startsWith(u8, text[line_start..], "@@")) return resolved.transcript_secondary;
+    return switch (text[line_start]) {
+        '+' => resolved.diff_add,
+        '-' => resolved.diff_del,
+        else => fallback,
+    };
+}
+
+fn physicalLineStart(text: []const u8, offset: usize) usize {
+    var pos = @min(offset, text.len);
+    while (pos > 0 and text[pos - 1] != '\n') pos -= 1;
+    return pos;
 }
 
 pub fn checkSize(width: u16, height: u16) !void {

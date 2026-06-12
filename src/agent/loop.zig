@@ -208,8 +208,8 @@ fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
             errdefer allocator.free(tool_name);
             const args = try runtime.cloneJsonValue(allocator, payload.args);
             errdefer runtime.freeJsonValue(allocator, args);
-            const partial_result = try copyAgentToolResult(allocator, payload.partial_result);
-            errdefer deinitCopiedAgentToolResult(allocator, partial_result);
+            const partial_result = try agent.copyAgentToolResult(allocator, payload.partial_result);
+            errdefer agent.deinitAgentToolResult(allocator, partial_result);
             break :blk .{ .tool_execution_update = .{
                 .tool_call_id = tool_call_id,
                 .tool_name = tool_name,
@@ -222,8 +222,8 @@ fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
             errdefer allocator.free(tool_call_id);
             const tool_name = try allocator.dupe(u8, payload.tool_name);
             errdefer allocator.free(tool_name);
-            const result = try copyAgentToolResult(allocator, payload.result);
-            errdefer deinitCopiedAgentToolResult(allocator, result);
+            const result = try agent.copyAgentToolResult(allocator, payload.result);
+            errdefer agent.deinitAgentToolResult(allocator, result);
             break :blk .{ .tool_execution_end = .{
                 .tool_call_id = tool_call_id,
                 .tool_name = tool_name,
@@ -391,18 +391,11 @@ fn copyToolArgumentPreview(allocator: std.mem.Allocator, arguments: std.json.Val
         if (value != .string) continue;
         const key_copy = try allocator.dupe(u8, key);
         errdefer allocator.free(key_copy);
-        const value_copy = try allocator.dupe(u8, utf8Prefix(value.string, stream_tool_argument_preview_bytes_max));
+        const value_copy = try allocator.dupe(u8, agent.utf8Prefix(value.string, stream_tool_argument_preview_bytes_max));
         errdefer allocator.free(value_copy);
         try object.put(allocator, key_copy, .{ .string = value_copy });
     }
     return .{ .object = object };
-}
-
-fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
-    if (value.len <= max_bytes) return value;
-    var end = max_bytes;
-    while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
-    return value[0..end];
 }
 
 fn copyAssistantMetadataWithContent(
@@ -465,23 +458,6 @@ fn copyStreamToolResultMessages(
         initialized += 1;
     }
     return cloned;
-}
-
-fn copyAgentToolResult(allocator: std.mem.Allocator, result: agent.AgentToolResult) !agent.AgentToolResult {
-    const content = try agent.copyToolResultContentSlice(allocator, result.content);
-    errdefer agent.deinitToolResultContentSlice(allocator, content);
-    const details = if (result.details) |value| try runtime.cloneJsonValue(allocator, value) else null;
-    errdefer if (details) |value| runtime.freeJsonValue(allocator, value);
-    return .{
-        .content = content,
-        .details = details,
-        .terminate = result.terminate,
-    };
-}
-
-fn deinitCopiedAgentToolResult(allocator: std.mem.Allocator, result: agent.AgentToolResult) void {
-    agent.deinitToolResultContentSlice(allocator, result.content);
-    if (result.details) |details| runtime.freeJsonValue(allocator, details);
 }
 
 fn streamSink(stream: *AgentEventStream) EventSink {
@@ -565,7 +541,9 @@ fn runLoop(
 ) !void {
     var first_turn = true;
     var pending_messages = try drainMessages(allocator, config.get_steering_messages);
-    defer allocator.free(pending_messages);
+    // Contents are deinited by emitPendingMessages once consumed; this defer
+    // covers early returns (cancellation) that leave a batch unconsumed.
+    defer freePendingMessages(allocator, pending_messages);
 
     while (true) {
         var has_more_tool_calls = true;
@@ -603,7 +581,6 @@ fn runLoop(
                 current,
                 config,
                 token,
-                task_runtime,
                 emit,
             );
             try current.messages.append(allocator, .{ .assistant = assistant });
@@ -660,6 +637,11 @@ fn drainMessages(
     return allocator.alloc(agent.AgentMessage, 0);
 }
 
+fn freePendingMessages(allocator: std.mem.Allocator, messages: []const agent.AgentMessage) void {
+    for (messages) |message| agent.deinitAgentMessage(allocator, message);
+    allocator.free(messages);
+}
+
 fn emitPendingMessages(
     allocator: std.mem.Allocator,
     current: *Context,
@@ -667,14 +649,10 @@ fn emitPendingMessages(
     emit: EventSink,
 ) !void {
     // Re-home pending messages into the owned arena so Context owns every
-    // in-loop message uniformly. Free only the originals the previous code
-    // owned (assistant/tool_result); other variants carry borrowed content.
-    // The slice container itself is freed by the caller.
-    defer for (messages) |message| switch (message) {
-        .assistant => |assistant| ai.owned.deinitAssistantMessage(allocator, assistant),
-        .tool_result => |tool_result| agent.deinitToolResultMessage(allocator, tool_result),
-        else => {},
-    };
+    // in-loop message uniformly. The queue/hook contract hands us ownership
+    // of every message's contents; the slice container itself is freed by
+    // the caller.
+    defer for (messages) |message| agent.deinitAgentMessage(allocator, message);
     for (messages) |message| {
         try emit.emit(.{ .message_start = .{ .message = message } });
         try emit.emit(.{ .message_end = .{ .message = message } });
@@ -689,19 +667,17 @@ fn streamAssistantResponse(
     current: *Context,
     config: agent.AgentLoopConfig,
     token: runtime.CancelToken,
-    _: *runtime.Runtime,
     emit: EventSink,
 ) !ai.AssistantMessage {
     var request_arena = std.heap.ArenaAllocator.init(allocator);
     defer request_arena.deinit();
     const request_allocator = request_arena.allocator();
 
-    const agent_messages = if (config.transform_context) |hook|
-        try agent.TransformContextHook.call(request_allocator, hook, token, current.messages.items)
-    else
-        current.messages.items;
-
-    const llm_messages = try agent.ConvertToLlmHook.call(request_allocator, config.convert_to_llm, agent_messages);
+    const llm_messages = try agent.ConvertToLlmHook.call(
+        request_allocator,
+        config.convert_to_llm,
+        current.messages.items,
+    );
     var tools = std.ArrayList(ai.Tool).empty;
     defer tools.deinit(allocator);
     for (current.tools) |tool| try tools.append(allocator, tool.asTool());
@@ -825,7 +801,7 @@ const Context = struct {
     }
 };
 
-fn defaultConvertToLlm(
+fn testConvertToLlm(
     allocator: std.mem.Allocator,
     _: ?*anyopaque,
     messages: []const agent.AgentMessage,
@@ -1145,7 +1121,7 @@ test "run prompt emits prompt assistant and agent end events" {
         .{
             .model = testModel(),
             .stream = .{ .call_fn = testStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
         },
         cancel.token(),
         task_runtime,
@@ -1174,7 +1150,7 @@ test "prompt stream exposes events through event pipe" {
         .{
             .model = testModel(),
             .stream = .{ .call_fn = testStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
         },
         cancel.token(),
         &buffer,
@@ -1209,7 +1185,7 @@ test "prompt stream drains many fast deltas through bounded pipe" {
         .{
             .model = testModel(),
             .stream = .{ .call_fn = fastDeltaBufferedStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
         },
         cancel.token(),
         &buffer,
@@ -1244,7 +1220,7 @@ test "prompt stream closes event pipe when producer fails before terminal event"
         .{
             .model = testModel(),
             .stream = .{ .call_fn = emptyStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
         },
         cancel.token(),
         &buffer,
@@ -1276,7 +1252,7 @@ test "prompt stream cancellation drains producer blocked on bounded event pipe" 
         .{
             .model = testModel(),
             .stream = .{ .call_fn = testStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
         },
         cancel.token(),
         &buffer,
@@ -1316,7 +1292,7 @@ test "prompt stream cancellation while tool is running drains as canceled" {
         .{
             .model = testModel(),
             .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
         },
         cancel.token(),
         &buffer,
@@ -1356,7 +1332,7 @@ test "run prompt executes tool result then continues assistant turn" {
         .{
             .model = testModel(),
             .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
         },
         cancel.token(),
         task_runtime,
@@ -1396,7 +1372,7 @@ test "parallel tool calls emit bounded live updates through owner" {
         .{
             .model = testModel(),
             .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
             .tool_execution = .parallel,
         },
         cancel.token(),
@@ -1441,7 +1417,7 @@ test "parallel tool calls cancel and drain workers when owner update drain fails
         .{
             .model = testModel(),
             .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
             .tool_execution = .parallel,
         },
         cancel.token(),
@@ -1480,7 +1456,7 @@ test "parallel tool calls bound live updates before completing worker result" {
         .{
             .model = testModel(),
             .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
             .tool_execution = .parallel,
         },
         cancel.token(),
@@ -1534,7 +1510,7 @@ test "parallel tool calls finalize results in assistant source order" {
         .{
             .model = testModel(),
             .stream = .{ .context = &stream_calls, .call_fn = testTwoToolStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
             .tool_execution = .parallel,
         },
         cancel.token(),
@@ -1573,7 +1549,7 @@ test "run continue rejects assistant tail" {
         .{
             .model = testModel(),
             .stream = .{ .call_fn = testStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
         },
         cancel.token(),
         task_runtime,
@@ -1626,7 +1602,7 @@ test "run prompt emits one tool result message_end per executed tool" {
         .{
             .model = testModel(),
             .stream = .{ .context = &stream_calls, .call_fn = testToolStream },
-            .convert_to_llm = .{ .call_fn = defaultConvertToLlm },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
             .tool_execution = .sequential,
         },
         cancel.token(),

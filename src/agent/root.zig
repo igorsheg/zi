@@ -10,6 +10,9 @@ pub const max_tool_updates_per_batch = 256;
 
 pub const EventSink = struct {
     context: ?*anyopaque = null,
+    // anyerror is deliberate: sinks fan out to client listeners (TUI render,
+    // persistence), which are open-ended user code. The loop treats any sink
+    // failure the same way — abort the run — so a narrower set buys nothing.
     call_fn: *const fn (?*anyopaque, AgentEvent) anyerror!void,
 
     pub fn emit(self: EventSink, event: AgentEvent) anyerror!void {
@@ -337,6 +340,9 @@ pub const PendingToolCalls = struct {
         self.len = 0;
     }
 
+    /// Removing an id that is not pending is a no-op by contract: a
+    /// tool_execution_end can arrive after the status was reset or after a
+    /// duplicated end event, and neither should fault the reducer.
     pub fn remove(self: *PendingToolCalls, id: []const u8) void {
         for (self.ids[0..self.len], 0..) |pending_id, index| {
             if (std.mem.eql(u8, pending_id, id)) {
@@ -415,19 +421,6 @@ pub const AgentToolUpdateCallback = struct {
     }
 };
 
-pub const PrepareArgumentsHook = struct {
-    context: ?*anyopaque = null,
-    call_fn: *const fn (std.mem.Allocator, ?*anyopaque, std.json.Value) std.mem.Allocator.Error!std.json.Value,
-
-    pub fn call(
-        allocator: std.mem.Allocator,
-        self: PrepareArgumentsHook,
-        args: std.json.Value,
-    ) std.mem.Allocator.Error!std.json.Value {
-        return self.call_fn(allocator, self.context, args);
-    }
-};
-
 pub const ExecuteToolHook = struct {
     context: ?*anyopaque = null,
     call_fn: *const fn (
@@ -460,7 +453,6 @@ pub const AgentTool = struct {
     description: []const u8,
     parameters: std.json.Value,
     label: []const u8,
-    prepare_arguments: ?PrepareArgumentsHook = null,
     execute: ExecuteToolHook,
     execution_mode: ?ToolExecutionMode = null,
 
@@ -509,25 +501,6 @@ pub const ConvertToLlmHook = struct {
         messages: []const AgentMessage,
     ) std.mem.Allocator.Error![]const ai.Message {
         return self.call_fn(allocator, self.context, messages);
-    }
-};
-
-pub const TransformContextHook = struct {
-    context: ?*anyopaque = null,
-    call_fn: *const fn (
-        std.mem.Allocator,
-        ?*anyopaque,
-        runtime.CancelToken,
-        []const AgentMessage,
-    ) std.mem.Allocator.Error![]const AgentMessage,
-
-    pub fn call(
-        allocator: std.mem.Allocator,
-        self: TransformContextHook,
-        token: runtime.CancelToken,
-        messages: []const AgentMessage,
-    ) std.mem.Allocator.Error![]const AgentMessage {
-        return self.call_fn(allocator, self.context, token, messages);
     }
 };
 
@@ -587,7 +560,6 @@ pub const AgentLoopConfig = struct {
     options: ai.SimpleStreamOptions = .{},
     stream: ai.StreamFunction,
     convert_to_llm: ConvertToLlmHook,
-    transform_context: ?TransformContextHook = null,
     get_api_key: ?GetApiKeyHook = null,
     get_steering_messages: ?GetMessagesHook = null,
     get_follow_up_messages: ?GetMessagesHook = null,
@@ -747,6 +719,15 @@ pub const AgentEvent = union(enum) {
 fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, value: anytype) !void {
     try stringify.objectField(name);
     try stringify.write(value);
+}
+
+/// Longest prefix of `value` that is at most `max_bytes` long and does not
+/// split a UTF-8 sequence.
+pub fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
+    if (value.len <= max_bytes) return value;
+    var end = max_bytes;
+    while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
+    return value[0..end];
 }
 
 pub fn toAiThinkingLevel(level: ThinkingLevel) ?ai.ThinkingLevel {

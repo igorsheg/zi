@@ -536,12 +536,22 @@ fn jsonErrorReason(reason: ErrorReason) []const u8 {
     };
 }
 
+// anyerror is deliberate: next() bottoms out in provider transport code
+// (HTTP, SSE, process), whose failure sets are open-ended. Callers do not
+// branch on these errors — the loop converts any stream failure into a
+// terminal assistant message, and retry classification happens on that
+// message, not on the error value.
 pub const AssistantMessageEventStreamNextError = anyerror;
 pub const AssistantMessageEventSinkEmitError = error{StreamEventBufferFull};
 
 pub const AssistantMessageEventStream = struct {
     kind: Kind,
 
+    /// The buffered variant is for tests and short synthetic streams only:
+    /// it holds at most `buffered_event_capacity` pre-recorded events and
+    /// fails emit with StreamEventBufferFull beyond that. Real providers
+    /// stream thousands of delta events and must use `initCustom`, which
+    /// pulls events on demand.
     pub const buffered_event_capacity = 256;
 
     const Kind = union(enum) {
@@ -714,6 +724,77 @@ pub fn emptyUsage() Usage {
             .total = 0,
         },
     };
+}
+
+// Golden wire shapes. The jsonStringify implementations hand-write their
+// camelCase keys, so a renamed struct field cannot drift silently: this test
+// pins the full encoding of every message role with all optionals set.
+test "message wire shapes are pinned" {
+    const assistant: Message = .{ .assistant = .{
+        .content = &.{
+            .{ .text = .{ .text = "hi", .text_signature = "sig-t" } },
+            .{ .thinking = .{ .thinking = "hm", .thinking_signature = "sig-k", .redacted = true } },
+            .{ .tool_call = .{
+                .id = "call-1",
+                .name = "bash",
+                .arguments = .{ .object = .empty },
+                .thought_signature = "sig-c",
+            } },
+        },
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .response_id = "resp-1",
+        .usage = .{
+            .input = 1,
+            .output = 2,
+            .cache_read = 3,
+            .cache_write = 4,
+            .total_tokens = 10,
+            .cost = .{ .input = 0.5, .output = 1.5, .cache_read = 0.25, .cache_write = 0.75, .total = 3 },
+        },
+        .stop_reason = .tool_use,
+        .error_message = "boom",
+        .timestamp = 7,
+    } };
+    const user: Message = .{ .user = .{
+        .content = .{ .blocks = &.{
+            .{ .text = .{ .text = "look" } },
+            .{ .image = .{ .data = "QUJD", .mime_type = "image/png" } },
+        } },
+        .timestamp = 8,
+    } };
+    const tool_result: Message = .{ .tool_result = .{
+        .tool_call_id = "call-1",
+        .tool_name = "bash",
+        .content = &.{.{ .text = .{ .text = "ok" } }},
+        .is_error = false,
+        .timestamp = 9,
+    } };
+
+    try expectWireShape(assistant, "{\"role\":\"assistant\",\"content\":[" ++
+        "{\"type\":\"text\",\"text\":\"hi\",\"textSignature\":\"sig-t\"}," ++
+        "{\"type\":\"thinking\",\"thinking\":\"hm\",\"thinkingSignature\":\"sig-k\",\"redacted\":true}," ++
+        "{\"type\":\"toolCall\",\"id\":\"call-1\",\"name\":\"bash\",\"arguments\":{}," ++
+        "\"thoughtSignature\":\"sig-c\"}]," ++
+        "\"api\":\"test-api\",\"provider\":\"test-provider\",\"model\":\"test-model\"," ++
+        "\"responseId\":\"resp-1\"," ++
+        "\"usage\":{\"input\":1,\"output\":2,\"cacheRead\":3,\"cacheWrite\":4,\"totalTokens\":10," ++
+        "\"cost\":{\"input\":0.5,\"output\":1.5,\"cacheRead\":0.25,\"cacheWrite\":0.75,\"total\":3}}," ++
+        "\"stopReason\":\"toolUse\",\"errorMessage\":\"boom\",\"timestamp\":7}");
+    try expectWireShape(user, "{\"role\":\"user\",\"content\":[" ++
+        "{\"type\":\"text\",\"text\":\"look\"}," ++
+        "{\"type\":\"image\",\"data\":\"QUJD\",\"mimeType\":\"image/png\"}],\"timestamp\":8}");
+    try expectWireShape(tool_result, "{\"role\":\"toolResult\",\"toolCallId\":\"call-1\"," ++
+        "\"toolName\":\"bash\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]," ++
+        "\"isError\":false,\"timestamp\":9}");
+}
+
+fn expectWireShape(value: anytype, expected: []const u8) !void {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.json.Stringify.value(value, .{}, &output.writer);
+    try std.testing.expectEqualStrings(expected, output.written());
 }
 
 test "stream function calls provider implementation with request" {

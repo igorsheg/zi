@@ -529,7 +529,7 @@ pub const SessionRuntime = struct {
                         .start => unreachable,
                     };
                     self.session.queuePrompt(prompt.text, &.{}, delivery) catch |err| {
-                        try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
+                        try self.enqueueRejected(envelope.id, rejectionCode(err), @errorName(err));
                         return;
                     };
                     try self.drainSessionEvents(envelope.id);
@@ -540,7 +540,7 @@ pub const SessionRuntime = struct {
                     return;
                 }
                 const prompt_text = self.allocator.dupe(u8, prompt.text) catch |err| {
-                    try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
+                    try self.enqueueRejected(envelope.id, .exhausted, @errorName(err));
                     return;
                 };
                 const overflow_count_before = self.session.contextOverflowCount();
@@ -705,7 +705,7 @@ pub const SessionRuntime = struct {
     fn finishOperationRejected(self: *SessionRuntime, err: anyerror) !void {
         const finished = self.takeActive().?;
         defer self.allocator.free(finished.prompt_text);
-        try self.enqueueRejected(finished.request_id, .invalid_command, @errorName(err));
+        try self.enqueueRejected(finished.request_id, rejectionCode(err), @errorName(err));
         try self.enqueueEvent(.{
             .request_id = finished.request_id,
             .operation_id = finished.operation_id,
@@ -719,7 +719,7 @@ pub const SessionRuntime = struct {
         const active = self.takeActive() orelse return;
         self.cancelAndDestroyActivePhase(active);
         self.allocator.free(active.prompt_text);
-        self.enqueueRejected(active.request_id, .invalid_command, @errorName(err)) catch {};
+        self.enqueueRejected(active.request_id, rejectionCode(err), @errorName(err)) catch {};
         self.enqueueEvent(.{
             .request_id = active.request_id,
             .operation_id = active.operation_id,
@@ -739,6 +739,14 @@ pub const SessionRuntime = struct {
             const event = self.session.drainPublicEvent() orelse return;
             try self.enqueueEvent(.{ .request_id = request_id, .event = event });
         }
+    }
+
+    fn rejectionCode(err: anyerror) client_protocol.Rejection.Code {
+        return switch (err) {
+            error.QueueFull => .queue_full,
+            error.OutOfMemory => .exhausted,
+            else => .invalid_command,
+        };
     }
 
     fn enqueueRejected(

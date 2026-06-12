@@ -79,6 +79,8 @@ pub const Timeout = struct {
     }
 };
 
+pub const Mutex = zio.Mutex;
+
 pub const ResetEvent = struct {
     inner: zio.ResetEvent = .init,
 

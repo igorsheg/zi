@@ -1,5 +1,6 @@
 const bash = @import("bash.zig");
 const edit = @import("edit.zig");
+const edit_diff = @import("edit_diff.zig");
 const file_writer = @import("file_writer.zig");
 const find = @import("find.zig");
 const grep = @import("grep.zig");
@@ -13,6 +14,7 @@ const write = @import("write.zig");
 test {
     _ = bash;
     _ = edit;
+    _ = edit_diff;
     _ = file_writer;
     _ = find;
     _ = grep;

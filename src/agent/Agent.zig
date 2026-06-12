@@ -11,7 +11,15 @@ pub const max_listeners = 32;
 allocator: std.mem.Allocator,
 io: std.Io,
 task_runtime: *runtime.Runtime,
+/// Owns transcript-scale data: appended messages, prompt images, pending
+/// tool-call ids. Reset by reset()/replaceMessages() — which is also the
+/// compaction path, so memory returns when the transcript is rebuilt.
 message_arena: std.heap.ArenaAllocator,
+/// Owns only the latest streaming partial; reset on every update so memory
+/// stays bounded by one partial regardless of stream length.
+streaming_arena: std.heap.ArenaAllocator,
+/// Owns one mirrored loop event at a time (emitFromLoop); reset per event.
+event_scratch_arena: std.heap.ArenaAllocator,
 state: agent.AgentState,
 messages: std.ArrayList(agent.AgentMessage) = .empty,
 tools: std.ArrayList(agent.AgentTool) = .empty,
@@ -38,22 +46,12 @@ pub const Options = struct {
     follow_up_mode: QueueMode = .one_at_a_time,
     stream: ai.StreamFunction = .{ .call_fn = defaultStream },
     convert_to_llm: agent.ConvertToLlmHook = .{ .call_fn = defaultConvertToLlm },
-    transform_context: ?agent.TransformContextHook = null,
     get_api_key: ?agent.GetApiKeyHook = null,
     before_tool_call: ?agent.BeforeToolCallHook = null,
     after_tool_call: ?agent.AfterToolCallHook = null,
     task_runtime: *runtime.Runtime,
 };
 
-pub const Error = error{
-    AlreadyRunning,
-    QueueFull,
-    TooManyListeners,
-    TooManyToolCalls,
-    NoActiveRun,
-    NoMessages,
-    CannotContinueFromAssistant,
-};
 
 pub const Listener = struct {
     context: ?*anyopaque = null,
@@ -76,6 +74,8 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !Agent {
         .task_runtime = options.task_runtime,
         .cancel_source = try runtime.CancelSource.init(allocator),
         .message_arena = std.heap.ArenaAllocator.init(allocator),
+        .streaming_arena = std.heap.ArenaAllocator.init(allocator),
+        .event_scratch_arena = std.heap.ArenaAllocator.init(allocator),
         .state = .{
             .system_prompt = options.system_prompt,
             .model = options.model,
@@ -90,7 +90,6 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !Agent {
             .options = .{ .reasoning = agent.toAiThinkingLevel(options.thinking_level) },
             .stream = options.stream,
             .convert_to_llm = options.convert_to_llm,
-            .transform_context = options.transform_context,
             .get_api_key = options.get_api_key,
             .before_tool_call = options.before_tool_call,
             .after_tool_call = options.after_tool_call,
@@ -116,6 +115,8 @@ pub fn deinit(self: *Agent) void {
     self.listeners.deinit(self.allocator);
     self.cancel_source.deinit();
     self.message_arena.deinit();
+    self.streaming_arena.deinit();
+    self.event_scratch_arena.deinit();
     self.* = undefined;
 }
 
@@ -158,22 +159,28 @@ pub fn appendMessage(self: *Agent, message: agent.AgentMessage) !void {
     self.state.messages = self.messages.items;
 }
 
-pub fn steer(self: *Agent, message: agent.AgentMessage) Error!void {
-    const owned = agent.copyAgentMessage(self.message_arena.allocator(), message) catch return error.QueueFull;
-    self.steering_queue.enqueue(self.allocator, owned) catch return error.QueueFull;
+pub fn steer(self: *Agent, message: agent.AgentMessage) error{ QueueFull, OutOfMemory }!void {
+    const owned = try agent.copyAgentMessage(self.allocator, message);
+    self.steering_queue.enqueue(self.allocator, owned) catch |err| {
+        agent.deinitAgentMessage(self.allocator, owned);
+        return err;
+    };
 }
 
-pub fn followUp(self: *Agent, message: agent.AgentMessage) Error!void {
-    const owned = agent.copyAgentMessage(self.message_arena.allocator(), message) catch return error.QueueFull;
-    self.follow_up_queue.enqueue(self.allocator, owned) catch return error.QueueFull;
+pub fn followUp(self: *Agent, message: agent.AgentMessage) error{ QueueFull, OutOfMemory }!void {
+    const owned = try agent.copyAgentMessage(self.allocator, message);
+    self.follow_up_queue.enqueue(self.allocator, owned) catch |err| {
+        agent.deinitAgentMessage(self.allocator, owned);
+        return err;
+    };
 }
 
 pub fn clearSteeringQueue(self: *Agent) void {
-    self.steering_queue.clear();
+    self.steering_queue.clear(self.allocator);
 }
 
 pub fn clearFollowUpQueue(self: *Agent) void {
-    self.follow_up_queue.clear();
+    self.follow_up_queue.clear(self.allocator);
 }
 
 pub fn clearAllQueues(self: *Agent) void {
@@ -181,7 +188,7 @@ pub fn clearAllQueues(self: *Agent) void {
     self.clearFollowUpQueue();
 }
 
-pub fn hasQueuedMessages(self: *const Agent) bool {
+pub fn hasQueuedMessages(self: *Agent) bool {
     return self.steering_queue.hasItems() or self.follow_up_queue.hasItems();
 }
 
@@ -204,7 +211,7 @@ pub fn reset(self: *Agent) void {
     self.active_run = null;
 }
 
-pub fn subscribe(self: *Agent, listener: Listener) Error!usize {
+pub fn subscribe(self: *Agent, listener: Listener) error{ TooManyListeners, OutOfMemory }!usize {
     for (self.listeners.items, 0..) |slot, index| {
         if (slot == null) {
             self.listeners.items[index] = listener;
@@ -212,7 +219,7 @@ pub fn subscribe(self: *Agent, listener: Listener) Error!usize {
         }
     }
     if (self.listeners.items.len == max_listeners) return error.TooManyListeners;
-    self.listeners.append(self.allocator, listener) catch return error.QueueFull;
+    try self.listeners.append(self.allocator, listener);
     return self.listeners.items.len - 1;
 }
 
@@ -221,7 +228,7 @@ pub fn unsubscribe(self: *Agent, handle: usize) void {
     self.listeners.items[handle] = null;
 }
 
-pub fn beginRun(self: *Agent) Error!runtime.CancelToken {
+pub fn beginRun(self: *Agent) error{AlreadyRunning}!runtime.CancelToken {
     if (self.active_run != null) return error.AlreadyRunning;
     self.cancel_source.resetAfterDrain();
     self.active_run = self.operations.reserve();
@@ -255,7 +262,7 @@ pub fn promptMessages(self: *Agent, messages: []const agent.AgentMessage) !void 
 fn runPromptMessages(self: *Agent, messages: []const agent.AgentMessage, skip_initial_steering: bool) !void {
     const token = try self.beginRun();
     errdefer self.finishRun();
-    var config = self.loop_config;
+    var config = self.loopConfig();
     var steering_once: SkipInitialSteeringHook = .{ .agent = self, .skip = skip_initial_steering };
     if (skip_initial_steering) {
         config.get_steering_messages = .{ .context = &steering_once, .call_fn = skipInitialSteeringMessages };
@@ -288,13 +295,13 @@ pub fn continueRun(self: *Agent) !void {
     if (last == .assistant) {
         if (self.steering_queue.hasItems()) {
             const drained = try self.steering_queue.drain(self.allocator);
-            defer self.allocator.free(drained);
+            defer self.deinitDrainedMessages(drained);
             try self.runPromptMessages(drained, true);
             return;
         }
         if (self.follow_up_queue.hasItems()) {
             const drained = try self.follow_up_queue.drain(self.allocator);
-            defer self.allocator.free(drained);
+            defer self.deinitDrainedMessages(drained);
             try self.promptMessages(drained);
             return;
         }
@@ -307,7 +314,7 @@ pub fn continueRun(self: *Agent) !void {
         self.allocator,
         self.io,
         self.contextSnapshot(),
-        self.loop_config,
+        self.loopConfig(),
         token,
         self.task_runtime,
         .{ .context = self, .call_fn = emitFromLoop },
@@ -397,6 +404,39 @@ fn terminalAssistantMessage(model: ai.Model, reason: ai.StopReason, error_messag
     };
 }
 
+/// The run config with the steering and follow-up queues bound to this
+/// agent. `loop_config` itself never holds the binding: Agent.init returns
+/// by value, so a self pointer captured there would dangle. Anyone starting
+/// a loop run for this agent (its own prompt methods, the coding-agent
+/// session) must take the config from here.
+pub fn loopConfig(self: *Agent) agent.AgentLoopConfig {
+    var config = self.loop_config;
+    config.get_steering_messages = .{ .context = self, .call_fn = drainSteeringMessages };
+    config.get_follow_up_messages = .{ .context = self, .call_fn = drainFollowUpMessages };
+    return config;
+}
+
+fn deinitDrainedMessages(self: *Agent, drained: []const agent.AgentMessage) void {
+    for (drained) |message| agent.deinitAgentMessage(self.allocator, message);
+    self.allocator.free(drained);
+}
+
+fn drainSteeringMessages(
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+) std.mem.Allocator.Error![]const agent.AgentMessage {
+    const self: *Agent = @ptrCast(@alignCast(context.?));
+    return self.steering_queue.drain(allocator);
+}
+
+fn drainFollowUpMessages(
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+) std.mem.Allocator.Error![]const agent.AgentMessage {
+    const self: *Agent = @ptrCast(@alignCast(context.?));
+    return self.follow_up_queue.drain(allocator);
+}
+
 const SkipInitialSteeringHook = struct {
     agent: *Agent,
     skip: bool,
@@ -424,7 +464,11 @@ fn contextSnapshot(self: *const Agent) agent.AgentContext {
 
 fn emitFromLoop(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     const self: *Agent = @ptrCast(@alignCast(context.?));
-    try self.emitEvent(try agent.copyAgentEvent(self.message_arena.allocator(), event));
+    // The copy lives only for this call: listeners and applyEvent must not
+    // retain it (applyEvent re-copies what it keeps into the durable or
+    // streaming arena). Resetting here drops the previous event's copy.
+    _ = self.event_scratch_arena.reset(.retain_capacity);
+    try self.emitEvent(try agent.copyAgentEvent(self.event_scratch_arena.allocator(), event));
 }
 
 pub fn userMessageFromText(self: *Agent, text: []const u8, images: []const ai.ImageContent) !agent.AgentMessage {
@@ -447,7 +491,10 @@ pub fn userMessageFromText(self: *Agent, text: []const u8, images: []const ai.Im
 }
 
 fn setStreamingMessage(self: *Agent, message: agent.AgentMessage) !void {
-    const owned = try agent.copyAgentMessage(self.message_arena.allocator(), message);
+    // Only the latest partial is retained; the arena reset drops the
+    // previous one so a long stream holds at most one partial's memory.
+    _ = self.streaming_arena.reset(.retain_capacity);
+    const owned = try agent.copyAgentMessage(self.streaming_arena.allocator(), message);
     switch (self.state.status) {
         .running => |*running| running.streaming_message = owned,
         .idle => self.state.status = .{ .running = .{ .streaming_message = owned } },
@@ -462,14 +509,14 @@ fn clearStreamingMessage(self: *Agent) void {
     }
 }
 
-fn addPendingToolCall(self: *Agent, id: []const u8) Error!void {
+fn addPendingToolCall(self: *Agent, id: []const u8) error{ TooManyToolCalls, OutOfMemory }!void {
     switch (self.state.status) {
         .running => |*running| {
-            const owned_id = self.message_arena.allocator().dupe(u8, id) catch return error.QueueFull;
+            const owned_id = try self.message_arena.allocator().dupe(u8, id);
             running.pending_tool_calls.append(owned_id) catch return error.TooManyToolCalls;
         },
         .idle => {
-            const owned_id = self.message_arena.allocator().dupe(u8, id) catch return error.QueueFull;
+            const owned_id = try self.message_arena.allocator().dupe(u8, id);
             self.state.status = .{ .running = .{} };
             self.state.status.running.pending_tool_calls.append(owned_id) catch return error.TooManyToolCalls;
         },
@@ -477,44 +524,67 @@ fn addPendingToolCall(self: *Agent, id: []const u8) Error!void {
     }
 }
 
+/// Queue of messages waiting to enter a run. Enqueue happens on the owner
+/// task while the loop producer task drains between turns, so every access
+/// holds the mutex. Message contents are owned by the queue's allocator
+/// (not an arena): drain transfers that ownership to the caller, who must
+/// deinit each message and free the slice.
 pub const PendingMessageQueue = struct {
     mode: QueueMode = .one_at_a_time,
+    mutex: runtime.Mutex = .init,
     messages: std.ArrayList(agent.AgentMessage) = .empty,
 
     pub fn deinit(self: *PendingMessageQueue, allocator: std.mem.Allocator) void {
+        for (self.messages.items) |message| agent.deinitAgentMessage(allocator, message);
         self.messages.deinit(allocator);
         self.* = undefined;
     }
 
+    /// Takes ownership of `message` (contents allocated from `allocator`)
+    /// on success; the caller keeps ownership on failure.
     pub fn enqueue(
         self: *PendingMessageQueue,
         allocator: std.mem.Allocator,
         message: agent.AgentMessage,
     ) error{ QueueFull, OutOfMemory }!void {
+        self.mutex.lockUncancelable();
+        defer self.mutex.unlock();
         if (self.messages.items.len == max_queued_messages) return error.QueueFull;
         try self.messages.append(allocator, message);
     }
 
-    pub fn hasItems(self: *const PendingMessageQueue) bool {
+    pub fn hasItems(self: *PendingMessageQueue) bool {
+        self.mutex.lockUncancelable();
+        defer self.mutex.unlock();
         return self.messages.items.len > 0;
     }
 
-    pub fn count(self: *const PendingMessageQueue) usize {
+    pub fn count(self: *PendingMessageQueue) usize {
+        self.mutex.lockUncancelable();
+        defer self.mutex.unlock();
         return self.messages.items.len;
     }
 
-    pub fn hasCapacity(self: *const PendingMessageQueue) bool {
+    pub fn hasCapacity(self: *PendingMessageQueue) bool {
+        self.mutex.lockUncancelable();
+        defer self.mutex.unlock();
         return self.messages.items.len < max_queued_messages;
     }
 
-    pub fn clear(self: *PendingMessageQueue) void {
+    pub fn clear(self: *PendingMessageQueue, allocator: std.mem.Allocator) void {
+        self.mutex.lockUncancelable();
+        defer self.mutex.unlock();
+        for (self.messages.items) |message| agent.deinitAgentMessage(allocator, message);
         self.messages.clearRetainingCapacity();
     }
 
+    /// The caller owns the returned messages and the slice.
     pub fn drain(
         self: *PendingMessageQueue,
         allocator: std.mem.Allocator,
     ) std.mem.Allocator.Error![]const agent.AgentMessage {
+        self.mutex.lockUncancelable();
+        defer self.mutex.unlock();
         if (self.messages.items.len == 0) return &.{};
 
         const drain_count: usize = switch (self.mode) {
@@ -582,18 +652,11 @@ fn compactToolResultForLlm(
 
 fn compactToolResultTextForLlm(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
     if (text.len <= llm_tool_result_text_bytes_max) return allocator.dupe(u8, text);
-    const prefix_len = utf8PrefixLen(text, llm_tool_result_text_bytes_max - llm_tool_result_truncated_note.len);
-    const out = try allocator.alloc(u8, prefix_len + llm_tool_result_truncated_note.len);
-    @memcpy(out[0..prefix_len], text[0..prefix_len]);
-    @memcpy(out[prefix_len..], llm_tool_result_truncated_note);
+    const prefix = agent.utf8Prefix(text, llm_tool_result_text_bytes_max - llm_tool_result_truncated_note.len);
+    const out = try allocator.alloc(u8, prefix.len + llm_tool_result_truncated_note.len);
+    @memcpy(out[0..prefix.len], prefix);
+    @memcpy(out[prefix.len..], llm_tool_result_truncated_note);
     return out;
-}
-
-fn utf8PrefixLen(value: []const u8, max_bytes: usize) usize {
-    if (value.len <= max_bytes) return value.len;
-    var end = max_bytes;
-    while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
-    return end;
 }
 
 test "default llm conversion bounds tool result text" {
@@ -758,11 +821,14 @@ test "pending message queue drains one at a time by default" {
     var queue: PendingMessageQueue = .{};
     defer queue.deinit(std.testing.allocator);
 
-    try queue.enqueue(std.testing.allocator, userMessage("one"));
-    try queue.enqueue(std.testing.allocator, userMessage("two"));
+    try queue.enqueue(std.testing.allocator, try agent.copyAgentMessage(std.testing.allocator, userMessage("one")));
+    try queue.enqueue(std.testing.allocator, try agent.copyAgentMessage(std.testing.allocator, userMessage("two")));
 
     const drained = try queue.drain(std.testing.allocator);
-    defer std.testing.allocator.free(drained);
+    defer {
+        for (drained) |message| agent.deinitAgentMessage(std.testing.allocator, message);
+        std.testing.allocator.free(drained);
+    }
 
     try std.testing.expectEqual(@as(usize, 1), drained.len);
     try std.testing.expectEqualStrings("one", drained[0].user.content.string);
@@ -774,10 +840,15 @@ test "pending message queue has explicit maximum" {
     defer queue.deinit(std.testing.allocator);
 
     for (0..max_queued_messages) |_| {
-        try queue.enqueue(std.testing.allocator, userMessage("message"));
+        try queue.enqueue(
+            std.testing.allocator,
+            try agent.copyAgentMessage(std.testing.allocator, userMessage("message")),
+        );
     }
 
-    try std.testing.expectError(error.QueueFull, queue.enqueue(std.testing.allocator, userMessage("overflow")));
+    const overflow = try agent.copyAgentMessage(std.testing.allocator, userMessage("overflow"));
+    defer agent.deinitAgentMessage(std.testing.allocator, overflow);
+    try std.testing.expectError(error.QueueFull, queue.enqueue(std.testing.allocator, overflow));
 }
 
 test "abort without active run is a no-op" {
@@ -943,6 +1014,23 @@ test "continue rejects empty transcript" {
     const self = &fixture.agent;
 
     try std.testing.expectError(error.NoMessages, self.continueRun());
+}
+
+test "queued steering message is drained into a live run" {
+    var fixture = try TestAgent.init(.{});
+    defer fixture.deinit();
+    const self = &fixture.agent;
+
+    // Queued before the run starts: the loop's initial steering drain must
+    // pick it up mid-run, without waiting for the run to settle.
+    try self.steer(userMessage("mid-run steer"));
+    try self.promptText("hello", &.{});
+
+    try std.testing.expect(!self.hasQueuedMessages());
+    try std.testing.expectEqual(@as(usize, 3), self.state.messages.len);
+    try std.testing.expectEqualStrings("hello", self.state.messages[0].user.content.string);
+    try std.testing.expectEqualStrings("mid-run steer", self.state.messages[1].user.content.string);
+    try std.testing.expect(self.state.messages[2] == .assistant);
 }
 
 test "continue from assistant drains one steering batch" {
