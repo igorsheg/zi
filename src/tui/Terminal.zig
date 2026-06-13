@@ -83,6 +83,7 @@ pub fn setup(self: *Terminal) !void {
     self.tty = try vaxis.Tty.init(self.io, &self.tty_buffer);
     try self.vx.enterAltScreen(self.tty.?.writer());
     try self.vx.setBracketedPaste(self.tty.?.writer(), true);
+    try self.vx.setMouseMode(self.tty.?.writer(), true);
     const ws = self.tty.?.getWinsize() catch vaxis.Winsize{
         .cols = self.app.width,
         .rows = self.app.height,

@@ -51,6 +51,8 @@ pub const Input = union(enum) {
     text: InlineBytes,
     paste_begin,
     paste_end,
+    wheel_up,
+    wheel_down,
     focus_in,
     focus_out,
     ignored,
@@ -61,8 +63,18 @@ pub fn fromVaxis(event: vaxis.Event) Input {
         .key_press => |key| fromVaxisKey(key),
         .paste_start => .paste_begin,
         .paste_end => .paste_end,
+        .mouse => |mouse| fromVaxisMouse(mouse),
         .focus_in => .focus_in,
         .focus_out => .focus_out,
+        else => .ignored,
+    };
+}
+
+fn fromVaxisMouse(mouse: vaxis.Mouse) Input {
+    if (mouse.type != .press) return .ignored;
+    return switch (mouse.button) {
+        .wheel_up => .wheel_up,
+        .wheel_down => .wheel_down,
         else => .ignored,
     };
 }
@@ -111,6 +123,8 @@ pub const KeyAction = union(enum) {
     composer_submit,
     transcript_page_up,
     transcript_page_down,
+    transcript_scroll_up,
+    transcript_scroll_down,
     toggle_tool_expansion,
     interrupt,
     clear_or_exit,
@@ -122,6 +136,8 @@ pub fn resolve(event: Input) KeyAction {
     return switch (event) {
         .text => |bytes| .{ .composer_insert = bytes },
         .key => |key| resolveKey(key),
+        .wheel_up => .transcript_scroll_up,
+        .wheel_down => .transcript_scroll_down,
         else => .none,
     };
 }
@@ -151,10 +167,36 @@ fn resolveKey(key: Key) KeyAction {
     };
 }
 
+test "fromVaxis maps only mouse wheel presses" {
+    try std.testing.expectEqual(Input.wheel_up, fromVaxis(.{ .mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .wheel_up,
+        .mods = .{},
+        .type = .press,
+    } }));
+    try std.testing.expectEqual(Input.wheel_down, fromVaxis(.{ .mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .wheel_down,
+        .mods = .{},
+        .type = .press,
+    } }));
+    try std.testing.expectEqual(Input.ignored, fromVaxis(.{ .mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } }));
+}
+
 test "resolve maps editing keys" {
     try std.testing.expectEqual(KeyAction.composer_delete_forward, resolve(.{ .key = .delete }));
     try std.testing.expectEqual(KeyAction.composer_up, resolve(.{ .key = .arrow_up }));
     try std.testing.expectEqual(KeyAction.composer_down, resolve(.{ .key = .arrow_down }));
+    try std.testing.expectEqual(KeyAction.transcript_scroll_up, resolve(.wheel_up));
+    try std.testing.expectEqual(KeyAction.transcript_scroll_down, resolve(.wheel_down));
     try std.testing.expectEqual(KeyAction.composer_newline, resolve(.{ .key = .newline }));
     try std.testing.expectEqual(KeyAction.composer_submit, resolve(.{ .key = .enter }));
 }

@@ -21,6 +21,7 @@ const App = @This();
 
 /// Second ctrl+c within this window exits; the first clears the composer.
 pub const double_press_window_ms: i64 = 500;
+pub const mouse_wheel_scroll_rows: usize = 3;
 
 width: u16,
 height: u16,
@@ -209,6 +210,8 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
         },
         .transcript_page_up => self.scrollUp(render.transcriptVisibleRows(self)),
         .transcript_page_down => self.scrollDown(render.transcriptVisibleRows(self)),
+        .transcript_scroll_up => self.scrollUp(mouse_wheel_scroll_rows),
+        .transcript_scroll_down => self.scrollDown(mouse_wheel_scroll_rows),
         .toggle_tool_expansion => {
             self.tools_expanded = !self.tools_expanded;
             self.dirty = true;
@@ -442,6 +445,28 @@ test "arrow up moves within wrapped composer before recalling history" {
 
     _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_up } });
     try std.testing.expectEqualStrings("previous", app.composer.text());
+}
+
+test "mouse wheel scrolls the resident transcript and clamps" {
+    const gpa = std.testing.allocator;
+    var app = App.init(20, 6);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "one\ntwo\nthree\nfour\nfive\nsix",
+    } } });
+    const max_scroll = render.transcriptScrollMax(&app);
+    try std.testing.expect(max_scroll > 0);
+
+    _ = try app.apply(gpa, .{ .input = .wheel_up });
+    try std.testing.expectEqual(@min(max_scroll, mouse_wheel_scroll_rows), app.scroll_rows);
+
+    _ = try app.apply(gpa, .{ .input = .wheel_down });
+    try std.testing.expectEqual(@as(usize, 0), app.scroll_rows);
+
+    _ = try app.apply(gpa, .{ .input = .wheel_down });
+    try std.testing.expectEqual(@as(usize, 0), app.scroll_rows);
 }
 
 test "paste mode turns enter into a newline and never submits" {
