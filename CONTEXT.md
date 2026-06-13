@@ -409,10 +409,10 @@ not yet built, and not to be built speculatively:
 - an owned `ModelRegistry` that runtime providers can register into (today the
   catalog is generated and static).
 - richer TUI product: modal surfaces (confirm dialogs), themes beyond `codex`,
-  composer history/completion. each enters only when a second concrete owner or
-  real pressure proves the seam — one adapter is a hypothetical seam, two make
-  a real one. (multi-line composer input and the O(viewport) transcript layout
-  shipped with the libvaxis TUI.)
+  and composer completion. each enters only when a second concrete owner or real
+  pressure proves the seam — one adapter is a hypothetical seam, two make a real
+  one. (multi-line composer input, bounded prompt history, and the O(viewport)
+  transcript layout shipped with the libvaxis TUI.)
 - future Lua extensions that request through the same commands/events/slots the
   built-in product uses; they never receive mutable stores or terminal cells.
 

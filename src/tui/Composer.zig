@@ -16,6 +16,7 @@ pub const visible_rows_max: usize = 4;
 
 bytes: std.ArrayListUnmanaged(u8) = .empty,
 cursor_byte_index: usize = 0,
+vertical_target_col: ?usize = null,
 revision: u64 = 0,
 projection_cache: ?ProjectionCache = null,
 
@@ -29,6 +30,8 @@ pub fn text(self: *const Composer) []const u8 {
 }
 
 pub const InsertResult = enum { ok, rejected_full };
+pub const VerticalDirection = enum { up, down };
+pub const MoveVerticalResult = enum { moved, boundary };
 
 /// Insert at the cursor. CR and CRLF normalize to LF so terminal enter/paste
 /// variants produce one newline encoding.
@@ -57,15 +60,42 @@ fn insertNormalized(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) 
     if (self.bytes.items.len + bytes.len > buffer_size_bytes_max) return .rejected_full;
     try self.bytes.insertSlice(gpa, self.cursor_byte_index, bytes);
     self.cursor_byte_index += bytes.len;
-    self.bumpRevision();
+    self.noteEdit();
     return .ok;
 }
 
 pub fn clear(self: *Composer) void {
-    if (self.bytes.items.len == 0 and self.cursor_byte_index == 0) return;
+    if (self.bytes.items.len == 0 and self.cursor_byte_index == 0 and self.vertical_target_col == null) return;
     self.bytes.clearRetainingCapacity();
     self.cursor_byte_index = 0;
-    self.bumpRevision();
+    self.noteEdit();
+}
+
+pub fn replaceText(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!void {
+    try self.replaceTextAtCursor(gpa, bytes, bytes.len);
+}
+
+pub fn replaceTextAtCursor(
+    self: *Composer,
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    cursor_byte_index: usize,
+) error{OutOfMemory}!void {
+    std.debug.assert(std.unicode.utf8ValidateSlice(bytes));
+    std.debug.assert(bytes.len <= buffer_size_bytes_max);
+    std.debug.assert(cursor_byte_index <= bytes.len);
+
+    try self.bytes.ensureTotalCapacity(gpa, bytes.len);
+    self.bytes.clearRetainingCapacity();
+    self.bytes.appendSliceAssumeCapacity(bytes);
+    self.cursor_byte_index = cursor_byte_index;
+    self.noteEdit();
+}
+
+pub fn submitSlice(self: *const Composer) ?[]const u8 {
+    if (self.bytes.items.len == 0) return null;
+    const trimmed = std.mem.trim(u8, self.bytes.items, " \t\n\r");
+    return if (trimmed.len == 0) null else trimmed;
 }
 
 pub fn backspace(self: *Composer) void {
@@ -73,49 +103,62 @@ pub fn backspace(self: *Composer) void {
     const start = text_mod.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
     self.bytes.replaceRangeAssumeCapacity(start, self.cursor_byte_index - start, "");
     self.cursor_byte_index = start;
-    self.bumpRevision();
+    self.noteEdit();
 }
 
 pub fn deleteForward(self: *Composer) void {
     if (self.cursor_byte_index >= self.bytes.items.len) return;
     const end = text_mod.nextGraphemeEnd(self.bytes.items, self.cursor_byte_index);
     self.bytes.replaceRangeAssumeCapacity(self.cursor_byte_index, end - self.cursor_byte_index, "");
-    self.bumpRevision();
+    self.noteEdit();
 }
 
 pub fn moveLeft(self: *Composer) void {
     if (self.cursor_byte_index == 0) return;
     self.cursor_byte_index = text_mod.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
-    self.bumpRevision();
+    self.noteEdit();
 }
 
 pub fn moveRight(self: *Composer) void {
     if (self.cursor_byte_index >= self.bytes.items.len) return;
     self.cursor_byte_index = text_mod.nextGraphemeEnd(self.bytes.items, self.cursor_byte_index);
-    self.bumpRevision();
+    self.noteEdit();
 }
 
 pub fn moveStart(self: *Composer) void {
     if (self.cursor_byte_index == 0) return;
     self.cursor_byte_index = 0;
-    self.bumpRevision();
+    self.noteEdit();
 }
 
 pub fn moveEnd(self: *Composer) void {
     if (self.cursor_byte_index == self.bytes.items.len) return;
     self.cursor_byte_index = self.bytes.items.len;
+    self.noteEdit();
+}
+
+pub fn moveVertical(self: *Composer, width: u16, direction: VerticalDirection) MoveVerticalResult {
+    const current = self.cursorPosition(width);
+    const target_row = switch (direction) {
+        .up => if (current.row == 0) return .boundary else current.row - 1,
+        .down => if (current.row + 1 >= current.total_rows) return .boundary else current.row + 1,
+    };
+    const target_col = self.vertical_target_col orelse current.col;
+    const target_index = self.byteIndexAtRowCol(width, target_row, target_col);
+    if (target_index == self.cursor_byte_index) return .boundary;
+    self.vertical_target_col = target_col;
+    self.cursor_byte_index = target_index;
     self.bumpRevision();
+    return .moved;
 }
 
 /// Take the trimmed buffer for submission, clearing the composer. Returns
 /// null (and clears) when the content is empty or whitespace-only.
 pub fn takeSubmit(self: *Composer, gpa: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
-    if (self.bytes.items.len == 0) return null;
-    const trimmed = std.mem.trim(u8, self.bytes.items, " \t\n\r");
-    if (trimmed.len == 0) {
-        self.clear();
+    const trimmed = self.submitSlice() orelse {
+        if (self.bytes.items.len != 0) self.clear();
         return null;
-    }
+    };
     const owned = try gpa.dupe(u8, trimmed);
     self.clear();
     return owned;
@@ -131,6 +174,84 @@ pub fn visibleRows(self: *Composer, width: u16, out: *[visible_rows_max]VisualRo
     return cached.projection;
 }
 
+const CursorLocation = struct {
+    row: usize,
+    col: usize,
+    total_rows: usize,
+};
+
+fn cursorPosition(self: *const Composer, width: u16) CursorLocation {
+    std.debug.assert(self.cursor_byte_index <= self.bytes.items.len);
+    const bytes = self.bytes.items;
+    if (bytes.len == 0) return .{ .row = 0, .col = 0, .total_rows = 1 };
+
+    const wrap_width = @max(width, 1);
+    var found_row: usize = 0;
+    var found_col: usize = 0;
+    var found = false;
+    var total_rows: usize = 0;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const line = text_mod.nextVisualLineBreak(bytes, start, wrap_width);
+        if (line.next == start) break;
+        if (!found and self.cursor_byte_index >= line.start and self.cursor_byte_index <= line.end) {
+            found_row = total_rows;
+            found_col = if (self.cursor_byte_index == line.end)
+                line.width
+            else
+                text_mod.displayWidth(bytes[line.start..self.cursor_byte_index]);
+            found = true;
+        }
+        total_rows += 1;
+        start = line.next;
+    }
+    if (bytes[bytes.len - 1] == '\n') {
+        if (!found and self.cursor_byte_index == bytes.len) {
+            found_row = total_rows;
+            found_col = 0;
+            found = true;
+        }
+        total_rows += 1;
+    }
+    if (!found) {
+        found_row = if (total_rows == 0) 0 else total_rows - 1;
+        found_col = 0;
+    }
+    return .{ .row = found_row, .col = found_col, .total_rows = @max(total_rows, 1) };
+}
+
+fn byteIndexAtRowCol(self: *const Composer, width: u16, target_row: usize, target_col: usize) usize {
+    const bytes = self.bytes.items;
+    if (bytes.len == 0) return 0;
+
+    const wrap_width = @max(width, 1);
+    var row: usize = 0;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const line = text_mod.nextVisualLineBreak(bytes, start, wrap_width);
+        if (line.next == start) break;
+        if (row == target_row) return byteIndexForDisplayCol(bytes, line.start, line.end, target_col);
+        row += 1;
+        start = line.next;
+    }
+    if (bytes[bytes.len - 1] == '\n' and row == target_row) return bytes.len;
+    return bytes.len;
+}
+
+fn byteIndexForDisplayCol(bytes: []const u8, start: usize, end: usize, target_col: usize) usize {
+    var index = start;
+    var col: usize = 0;
+    while (index < end) {
+        const grapheme = text_mod.nextGrapheme(bytes[index..end]);
+        if (grapheme.end == 0) break;
+        const next_col = col + grapheme.width;
+        if (next_col > target_col) return index;
+        index += grapheme.end;
+        col = next_col;
+    }
+    return end;
+}
+
 fn cachedProjection(self: *Composer, width: u16) ProjectionCache {
     if (self.projection_cache) |cache| {
         if (cache.revision == self.revision and cache.width == width) return cache;
@@ -144,6 +265,11 @@ fn cachedProjection(self: *Composer, width: u16) ProjectionCache {
     cache.projection = projectVisualRows(self, width, &cache.rows);
     self.projection_cache = cache;
     return cache;
+}
+
+fn noteEdit(self: *Composer) void {
+    self.vertical_target_col = null;
+    self.bumpRevision();
 }
 
 fn bumpRevision(self: *Composer) void {
@@ -296,6 +422,30 @@ test "deleteForward removes the grapheme under the cursor" {
     composer.moveStart();
     composer.deleteForward();
     try std.testing.expectEqualStrings("b", composer.text());
+}
+
+test "vertical movement follows wrapped rows" {
+    const gpa = std.testing.allocator;
+    var composer: Composer = .{};
+    defer composer.deinit(gpa);
+
+    _ = try composer.insert(gpa, "abcdef");
+    try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(3, .up));
+    try std.testing.expectEqual(@as(usize, 3), composer.cursor_byte_index);
+    try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(3, .down));
+    try std.testing.expectEqual(@as(usize, 6), composer.cursor_byte_index);
+}
+
+test "vertical movement preserves the desired display column across short rows" {
+    const gpa = std.testing.allocator;
+    var composer: Composer = .{};
+    defer composer.deinit(gpa);
+
+    _ = try composer.insert(gpa, "abcdef\ngh\nijklmn");
+    try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(6, .up));
+    try std.testing.expectEqual(@as(usize, 9), composer.cursor_byte_index);
+    try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(6, .up));
+    try std.testing.expectEqual(@as(usize, 6), composer.cursor_byte_index);
 }
 
 test "takeSubmit trims, clears, and returns null for whitespace" {

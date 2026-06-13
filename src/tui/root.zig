@@ -4,6 +4,7 @@
 //! through App.Command / App.Effect.
 pub const App = @import("App.zig");
 pub const Composer = @import("Composer.zig");
+pub const PromptHistory = @import("PromptHistory.zig");
 pub const Terminal = @import("Terminal.zig");
 pub const Transcript = @import("Transcript.zig");
 pub const input = @import("input.zig");
@@ -20,6 +21,7 @@ pub const Effect = App.Effect;
 test {
     _ = App;
     _ = Composer;
+    _ = PromptHistory;
     _ = Terminal;
     _ = Transcript;
     _ = input;

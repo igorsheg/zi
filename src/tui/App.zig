@@ -9,6 +9,7 @@
 //! `Command.tick` (wall-clock ms) — App never reads a clock.
 const std = @import("std");
 const Composer = @import("Composer.zig");
+const PromptHistory = @import("PromptHistory.zig");
 const Transcript = @import("Transcript.zig");
 const input_mod = @import("input.zig");
 const render = @import("render.zig");
@@ -24,6 +25,10 @@ pub const double_press_window_ms: i64 = 500;
 width: u16,
 height: u16,
 composer: Composer = .{},
+prompt_history: PromptHistory = .{},
+history_cursor_from_newest: ?usize = null,
+history_draft: std.ArrayListUnmanaged(u8) = .empty,
+history_draft_cursor_byte_index: usize = 0,
 transcript: Transcript = .{},
 status: status_mod.Store = .{},
 scroll_rows: usize = 0,
@@ -42,6 +47,8 @@ pub fn init(width: u16, height: u16) App {
 }
 
 pub fn deinit(self: *App, gpa: std.mem.Allocator) void {
+    self.history_draft.deinit(gpa);
+    self.prompt_history.deinit(gpa);
     self.transcript.deinit(gpa);
     self.composer.deinit(gpa);
     self.* = undefined;
@@ -189,19 +196,16 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
     switch (input_mod.resolve(event)) {
         .composer_insert => |bytes| return self.composerInsert(gpa, bytes.slice()),
         .composer_newline => return self.composerInsert(gpa, "\n"),
-        .composer_backspace => self.composerEdit(Composer.backspace),
-        .composer_delete_forward => self.composerEdit(Composer.deleteForward),
-        .composer_left => self.composerEdit(Composer.moveLeft),
-        .composer_right => self.composerEdit(Composer.moveRight),
-        .composer_start => self.composerEdit(Composer.moveStart),
-        .composer_end => self.composerEdit(Composer.moveEnd),
+        .composer_backspace => self.composerTextEdit(Composer.backspace),
+        .composer_delete_forward => self.composerTextEdit(Composer.deleteForward),
+        .composer_left => self.composerCursorEdit(Composer.moveLeft),
+        .composer_right => self.composerCursorEdit(Composer.moveRight),
+        .composer_up => try self.composerUpOrHistory(gpa),
+        .composer_down => try self.composerDownOrHistory(gpa),
+        .composer_start => self.composerCursorEdit(Composer.moveStart),
+        .composer_end => self.composerCursorEdit(Composer.moveEnd),
         .composer_submit => {
-            if (try self.composer.takeSubmit(gpa)) |text| {
-                self.dirty = true;
-                self.composer_full_noticed = false;
-                return .{ .submit_text = text };
-            }
-            self.dirty = true;
+            if (try self.composerSubmit(gpa)) |effect| return effect;
         },
         .transcript_page_up => self.scrollUp(render.transcriptVisibleRows(self)),
         .transcript_page_down => self.scrollDown(render.transcriptVisibleRows(self)),
@@ -228,6 +232,7 @@ fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{O
         text_mod.sanitizeInto(&clean_buffer, bytes);
     switch (try self.composer.insert(gpa, clean)) {
         .ok => {
+            self.resetHistoryNavigation();
             self.composer_full_noticed = false;
             self.dirty = true;
         },
@@ -241,9 +246,104 @@ fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{O
     return null;
 }
 
-fn composerEdit(self: *App, comptime edit: fn (*Composer) void) void {
+fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
+    const text = self.composer.submitSlice() orelse {
+        if (self.composer.text().len != 0) self.composer.clear();
+        self.resetHistoryNavigation();
+        self.dirty = true;
+        return null;
+    };
+
+    const submitted = try gpa.dupe(u8, text);
+    errdefer gpa.free(submitted);
+    try self.prompt_history.record(gpa, text);
+
+    self.composer.clear();
+    self.resetHistoryNavigation();
+    self.composer_full_noticed = false;
+    self.dirty = true;
+    return .{ .submit_text = submitted };
+}
+
+fn composerTextEdit(self: *App, comptime edit: fn (*Composer) void) void {
+    edit(&self.composer);
+    self.resetHistoryNavigation();
+    self.dirty = true;
+}
+
+fn composerCursorEdit(self: *App, comptime edit: fn (*Composer) void) void {
     edit(&self.composer);
     self.dirty = true;
+}
+
+fn composerUpOrHistory(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    if (self.composer.text().len != 0 and
+        self.composer.moveVertical(render.composerTextWidth(self.width), .up) == .moved)
+    {
+        self.dirty = true;
+        return;
+    }
+    try self.historyPrevious(gpa);
+}
+
+fn composerDownOrHistory(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    if (self.composer.text().len != 0 and
+        self.composer.moveVertical(render.composerTextWidth(self.width), .down) == .moved)
+    {
+        self.dirty = true;
+        return;
+    }
+    try self.historyNext(gpa);
+}
+
+fn historyPrevious(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    if (self.prompt_history.len() == 0) return;
+
+    const next_offset = if (self.history_cursor_from_newest) |offset| blk: {
+        if (offset + 1 >= self.prompt_history.len()) return;
+        break :blk offset + 1;
+    } else blk: {
+        try self.saveHistoryDraft(gpa);
+        break :blk 0;
+    };
+
+    const text = self.prompt_history.getFromNewest(next_offset).?;
+    try self.composer.replaceText(gpa, text);
+    self.history_cursor_from_newest = next_offset;
+    self.composer_full_noticed = false;
+    self.dirty = true;
+}
+
+fn historyNext(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    const offset = self.history_cursor_from_newest orelse return;
+    if (offset == 0) {
+        try self.composer.replaceTextAtCursor(
+            gpa,
+            self.history_draft.items,
+            self.history_draft_cursor_byte_index,
+        );
+        self.resetHistoryNavigation();
+    } else {
+        const next_offset = offset - 1;
+        const text = self.prompt_history.getFromNewest(next_offset).?;
+        try self.composer.replaceText(gpa, text);
+        self.history_cursor_from_newest = next_offset;
+    }
+    self.composer_full_noticed = false;
+    self.dirty = true;
+}
+
+fn saveHistoryDraft(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    try self.history_draft.ensureTotalCapacity(gpa, self.composer.text().len);
+    self.history_draft.clearRetainingCapacity();
+    self.history_draft.appendSliceAssumeCapacity(self.composer.text());
+    self.history_draft_cursor_byte_index = self.composer.cursor_byte_index;
+}
+
+fn resetHistoryNavigation(self: *App) void {
+    self.history_cursor_from_newest = null;
+    self.history_draft.clearRetainingCapacity();
+    self.history_draft_cursor_byte_index = 0;
 }
 
 fn clearOrExit(self: *App) ?Effect {
@@ -253,6 +353,7 @@ fn clearOrExit(self: *App) ?Effect {
         }
     }
     self.composer.clear();
+    self.resetHistoryNavigation();
     self.composer_full_noticed = false;
     self.last_clear_ms = self.now_ms;
     self.dirty = true;
@@ -301,6 +402,46 @@ test "submit returns owned text and clears the composer" {
     defer effect.deinit(gpa);
     try std.testing.expectEqualStrings("hello", effect.submit_text);
     try std.testing.expectEqual(@as(usize, 0), app.composer.text().len);
+}
+
+test "arrow history recall preserves the current draft" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("first") } });
+    const submitted = (try app.apply(gpa, .{ .input = .{ .key = .enter } })).?;
+    submitted.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("draft") } });
+    _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_left } });
+    _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_left } });
+    const draft_cursor = app.composer.cursor_byte_index;
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_up } });
+    try std.testing.expectEqualStrings("first", app.composer.text());
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_down } });
+    try std.testing.expectEqualStrings("draft", app.composer.text());
+    try std.testing.expectEqual(draft_cursor, app.composer.cursor_byte_index);
+}
+
+test "arrow up moves within wrapped composer before recalling history" {
+    const gpa = std.testing.allocator;
+    var app = App.init(7, 24); // composer text width is 3.
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("previous") } });
+    const submitted = (try app.apply(gpa, .{ .input = .{ .key = .enter } })).?;
+    submitted.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("abcdef") } });
+    _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_up } });
+    try std.testing.expectEqualStrings("abcdef", app.composer.text());
+    try std.testing.expectEqual(@as(usize, 3), app.composer.cursor_byte_index);
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_up } });
+    try std.testing.expectEqualStrings("previous", app.composer.text());
 }
 
 test "paste mode turns enter into a newline and never submits" {

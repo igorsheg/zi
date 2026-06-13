@@ -40,6 +40,13 @@ empties.
   snapshot test helper are deleted; status contributions are allocation-free
   inline storage.
 
+## Resolved after the rewrite
+
+- **Composer up/down movement and prompt history** — arrow up/down first move
+  through wrapped visual rows, then recall bounded App-owned prompt history at
+  the composer boundary. Draft text is restored when walking back down past the
+  newest history entry.
+
 ## Still open
 
 - [ ] **Verify bracketed paste end-to-end in a real terminal.** The mechanism
@@ -47,6 +54,3 @@ empties.
   of it has been exercised against a real terminal emulator. Pasting a file
   path or code block into the prompt is day-one dogfooding; test it first,
   fix what falls out.
-- [ ] **No up/down cursor movement within wrapped composer rows** (arrow
-  up/down map to `.none`, explicitly). Product work, scheduled with composer
-  history/completion in the north star.

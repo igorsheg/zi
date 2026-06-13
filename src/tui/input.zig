@@ -104,6 +104,8 @@ pub const KeyAction = union(enum) {
     composer_delete_forward,
     composer_left,
     composer_right,
+    composer_up,
+    composer_down,
     composer_start,
     composer_end,
     composer_submit,
@@ -130,6 +132,8 @@ fn resolveKey(key: Key) KeyAction {
         .delete => .composer_delete_forward,
         .arrow_left => .composer_left,
         .arrow_right => .composer_right,
+        .arrow_up => .composer_up,
+        .arrow_down => .composer_down,
         .home => .composer_start,
         .end => .composer_end,
         .enter => .composer_submit,
@@ -141,14 +145,16 @@ fn resolveKey(key: Key) KeyAction {
         .ctrl_o => .toggle_tool_expansion,
         .ctrl_u => .transcript_page_up,
         .ctrl_d => .exit_if_composer_empty,
-        // No completion or history UI yet; mapped explicitly so the gaps are
-        // a decision, not an accident.
-        .tab, .arrow_up, .arrow_down => .none,
+        // No completion UI yet; mapped explicitly so the gap is a decision,
+        // not an accident.
+        .tab => .none,
     };
 }
 
 test "resolve maps editing keys" {
     try std.testing.expectEqual(KeyAction.composer_delete_forward, resolve(.{ .key = .delete }));
+    try std.testing.expectEqual(KeyAction.composer_up, resolve(.{ .key = .arrow_up }));
+    try std.testing.expectEqual(KeyAction.composer_down, resolve(.{ .key = .arrow_down }));
     try std.testing.expectEqual(KeyAction.composer_newline, resolve(.{ .key = .newline }));
     try std.testing.expectEqual(KeyAction.composer_submit, resolve(.{ .key = .enter }));
 }

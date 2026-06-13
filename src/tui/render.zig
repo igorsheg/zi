@@ -143,7 +143,7 @@ pub fn composerRows(app: *App) usize {
     return @min(app.composer.visualRows(text_width), Composer.visible_rows_max) + 2;
 }
 
-fn composerTextWidth(width: u16) u16 {
+pub fn composerTextWidth(width: u16) u16 {
     return if (width > 4) width - 4 else 1;
 }
 
