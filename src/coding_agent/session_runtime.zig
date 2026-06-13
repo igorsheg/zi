@@ -613,6 +613,14 @@ pub const SessionRuntime = struct {
                 replay.request_id = envelope.id;
                 try self.enqueueEvent(replay);
             },
+            .history_page => |request| {
+                var page = self.session.clientHistoryPage(self.allocator, request.before_entry_id) catch |err| {
+                    try self.enqueueRejected(envelope.id, rejectionCode(err), @errorName(err));
+                    return;
+                };
+                errdefer page.deinit(self.allocator);
+                try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .history_page = page } });
+            },
             .shutdown => {
                 // A pending retry or summary run never outlives shutdown:
                 // settle it as canceled. (A running prompt is aborted by the
@@ -1240,6 +1248,38 @@ test "session runtime request snapshot emits owned bounded snapshot event" {
         event.event.snapshot.active_request_id,
     );
     try std.testing.expectEqual(@as(usize, 0), event.event.snapshot.history.items.len);
+}
+
+test "session runtime history page command emits entries before cursor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    const first = try session_runtime.session.manager.prepareMessageEntry(.{
+        .user = .{ .content = .{ .string = "one" }, .timestamp = 0 },
+    }, "t1");
+    _ = session_runtime.session.manager.commitPreparedEntry(first);
+    const second = try session_runtime.session.manager.prepareMessageEntry(.{
+        .user = .{ .content = .{ .string = "two" }, .timestamp = 0 },
+    }, "t2");
+    const before = session_runtime.session.manager.commitPreparedEntry(second);
+
+    var request = try client_protocol.CommandEnvelope.initHistoryPage(std.testing.allocator, 10, before);
+    var request_owned = true;
+    defer if (request_owned) request.deinit(std.testing.allocator);
+    try session_runtime.submit(request);
+    request_owned = false;
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 10), event.request_id);
+    try std.testing.expect(event.event == .history_page);
+    try std.testing.expectEqual(@as(usize, 1), event.event.history_page.items.len);
+    try std.testing.expectEqualStrings("one", event.event.history_page.items[0].text.text);
 }
 
 test "session runtime does not consume commands while event queue is full" {

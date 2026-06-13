@@ -85,6 +85,7 @@ pub const Command = union(enum) {
     tool_output_delta: ToolOutputDelta,
     replace_tool_output: ToolText,
     replace_tool_footer: ToolText,
+    prepend_transcript: Transcript.Append.MessageAppend,
     set_status: status_mod.Set,
     clear_status: status_mod.Clear,
 };
@@ -93,11 +94,12 @@ pub const Effect = union(enum) {
     submit_text: []u8,
     interrupt,
     request_shutdown,
+    request_transcript_history,
 
     pub fn deinit(self: Effect, gpa: std.mem.Allocator) void {
         switch (self) {
             .submit_text => |text| gpa.free(text),
-            .interrupt, .request_shutdown => {},
+            .interrupt, .request_shutdown, .request_transcript_history => {},
         }
     }
 };
@@ -156,6 +158,13 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.dirty = true;
             return null;
         },
+        .prepend_transcript => |message| {
+            const outcome = try self.transcript.prependMessage(gpa, message);
+            try self.noteOutcome(gpa, outcome);
+            self.scroll_rows = render.transcriptScrollMax(self);
+            self.dirty = true;
+            return null;
+        },
         .set_status => |update| {
             if (self.status.set(update) == .dropped_full) try self.notice(gpa, .warning, "status line full");
             self.dirty = true;
@@ -208,9 +217,13 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
         .composer_submit => {
             if (try self.composerSubmit(gpa)) |effect| return effect;
         },
-        .transcript_page_up => self.scrollUp(render.transcriptVisibleRows(self)),
+        .transcript_page_up => if (self.scrollUp(render.transcriptVisibleRows(self)) == .boundary) {
+            return .request_transcript_history;
+        },
         .transcript_page_down => self.scrollDown(render.transcriptVisibleRows(self)),
-        .transcript_scroll_up => self.scrollUp(mouse_wheel_scroll_rows),
+        .transcript_scroll_up => if (self.scrollUp(mouse_wheel_scroll_rows) == .boundary) {
+            return .request_transcript_history;
+        },
         .transcript_scroll_down => self.scrollDown(mouse_wheel_scroll_rows),
         .toggle_tool_expansion => {
             self.tools_expanded = !self.tools_expanded;
@@ -363,13 +376,16 @@ fn clearOrExit(self: *App) ?Effect {
     return null;
 }
 
-fn scrollUp(self: *App, rows: usize) void {
-    if (rows == 0) return;
+const ScrollResult = enum { moved, boundary };
+
+fn scrollUp(self: *App, rows: usize) ScrollResult {
     const max = render.transcriptScrollMax(self);
+    if (rows == 0 or self.scroll_rows == max) return .boundary;
     const next = @min(max, self.scroll_rows + rows);
-    if (next == self.scroll_rows) return;
+    if (next == self.scroll_rows) return .boundary;
     self.scroll_rows = next;
     self.dirty = true;
+    return .moved;
 }
 
 fn scrollDown(self: *App, rows: usize) void {
@@ -462,11 +478,35 @@ test "mouse wheel scrolls the resident transcript and clamps" {
     _ = try app.apply(gpa, .{ .input = .wheel_up });
     try std.testing.expectEqual(@min(max_scroll, mouse_wheel_scroll_rows), app.scroll_rows);
 
-    _ = try app.apply(gpa, .{ .input = .wheel_down });
-    try std.testing.expectEqual(@as(usize, 0), app.scroll_rows);
+    app.scroll_rows = max_scroll;
+    const boundary = try app.apply(gpa, .{ .input = .wheel_up });
+    try std.testing.expect(boundary.? == .request_transcript_history);
 
     _ = try app.apply(gpa, .{ .input = .wheel_down });
+    try std.testing.expectEqual(max_scroll -| mouse_wheel_scroll_rows, app.scroll_rows);
+
+    app.scroll_rows = 0;
+    _ = try app.apply(gpa, .{ .input = .wheel_down });
     try std.testing.expectEqual(@as(usize, 0), app.scroll_rows);
+}
+
+test "prepending transcript history keeps the viewport on older content" {
+    const gpa = std.testing.allocator;
+    var app = App.init(20, 6);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "newer\nrows\nhere",
+    } } });
+    _ = try app.apply(gpa, .{ .prepend_transcript = .{
+        .role = .user,
+        .text = "older",
+        .mode = .new_item,
+    } });
+
+    try std.testing.expect(app.scroll_rows == render.transcriptScrollMax(&app));
+    try std.testing.expectEqual(Transcript.Role.user, app.transcript.items.items[0].body.message.role);
 }
 
 test "paste mode turns enter into a newline and never submits" {

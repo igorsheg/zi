@@ -69,6 +69,7 @@ fn drainEvents(
             .agent_event,
             .queue_changed,
             .snapshot,
+            .history_page,
             .compaction_start,
             .compaction_end,
             .auto_retry_start,

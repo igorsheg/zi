@@ -104,6 +104,10 @@ const InteractiveController = struct {
     stderr: *std.Io.Writer,
     terminal: *tui.Terminal,
     cancel_requested: bool = false,
+    operation_active: bool = false,
+    history_oldest_entry_id: ?[]u8 = null,
+    history_has_more_before: bool = false,
+    history_request_in_flight: bool = false,
     event_cursor: EventCursor = .{},
     assistant_text_delta_seen: bool = false,
     tool_timers: [tool_timer_count_max]?ToolTimer = @splat(null),
@@ -135,6 +139,7 @@ const InteractiveController = struct {
     }
 
     fn deinit(self: *InteractiveController) void {
+        if (self.history_oldest_entry_id) |id| self.allocator.free(id);
         self.terminal.shutdown() catch |err| ignoreBestEffortError(err);
         self.terminal.deinit();
         self.* = undefined;
@@ -182,6 +187,7 @@ const InteractiveController = struct {
         switch (effect) {
             .submit_text => |text| try self.submitPrompt(text),
             .interrupt => try self.cancelActive(),
+            .request_transcript_history => try self.requestHistoryPage(),
             .request_shutdown => {
                 if (try self.submitCommand(.{ .command = .shutdown }) == .queued) {
                     self.terminal.requestStop();
@@ -209,6 +215,13 @@ const InteractiveController = struct {
 
     fn requestReplay(self: *InteractiveController, after: client_protocol.EventSeq) !void {
         _ = try self.submitCommand(.{ .command = .{ .replay = .{ .after = after } } });
+    }
+
+    fn requestHistoryPage(self: *InteractiveController) !void {
+        if (self.operation_active or self.history_request_in_flight or !self.history_has_more_before) return;
+        const before_entry_id = self.history_oldest_entry_id orelse return self.requestSnapshot();
+        const envelope = try client_protocol.CommandEnvelope.initHistoryPage(self.allocator, null, before_entry_id);
+        if (try self.submitCommand(envelope) == .queued) self.history_request_in_flight = true;
     }
 
     fn submitCommand(self: *InteractiveController, envelope: client_protocol.CommandEnvelope) !SubmitResult {
@@ -275,15 +288,25 @@ const InteractiveController = struct {
     fn applyClientEvent(self: *InteractiveController, event: client_protocol.ClientEvent) !void {
         switch (event) {
             .agent_event => |payload| try self.applyAgentEvent(payload.event),
-            .operation_started => try self.setWorkingStatus("working"),
-            .operation_finished => |finished| try self.applyOperationFinished(finished),
-            .rejected => |rejection| try self.appendStatus(.err, rejection.message.text),
+            .operation_started => {
+                self.operation_active = true;
+                try self.setWorkingStatus("working");
+            },
+            .operation_finished => |finished| {
+                self.operation_active = false;
+                try self.applyOperationFinished(finished);
+            },
+            .rejected => |rejection| {
+                self.history_request_in_flight = false;
+                try self.appendStatus(.err, rejection.message.text);
+            },
             .prompt_command => |command| try self.appendStatus(
                 if (command.result == .handled) .info else .warning,
                 command.message.text,
             ),
             .queue_changed => |queue| try self.applyQueueChanged(queue),
             .snapshot => |snapshot| try self.applySnapshot(snapshot),
+            .history_page => |page| try self.applyHistoryPage(page),
             .replay => {
                 self.event_cursor.recovery = .snapshot_requested;
                 try self.appendStatus(.warning, "replay requires snapshot in TUI adapter");
@@ -418,6 +441,18 @@ const InteractiveController = struct {
 
     fn applySnapshot(self: *InteractiveController, snapshot: client_protocol.Snapshot) !void {
         _ = try self.terminal.applyCommand(.clear_transcript);
+        self.operation_active = snapshot.active_request_id != null;
+        self.history_request_in_flight = false;
+        // Snapshot history can be wider than the TUI resident item cap. Track
+        // the oldest item the TUI will actually retain after append eviction,
+        // otherwise the next page would skip the evicted snapshot prefix.
+        const retained_start = snapshot.history.items.len -| tui.Transcript.item_count_max;
+        self.history_has_more_before = snapshot.history.dropped_items > 0 or retained_start > 0;
+        if (snapshot.history.items.len > 0) {
+            try self.setOldestHistoryEntryId(snapshot.history.items[retained_start].entry_id.text);
+        } else {
+            self.clearOldestHistoryEntryId();
+        }
         var model_buffer: [160]u8 = undefined;
         const model_text = std.fmt.bufPrint(
             &model_buffer,
@@ -439,6 +474,40 @@ const InteractiveController = struct {
             try self.appendMessage(role, item.text.text, .new_item);
         }
         try self.applyQueueCounts(snapshot.queue.steering.items.len, snapshot.queue.follow_up.items.len);
+    }
+
+    fn applyHistoryPage(self: *InteractiveController, page: client_protocol.HistoryPage) !void {
+        self.history_request_in_flight = false;
+        self.history_has_more_before = page.has_more_before;
+        if (page.items.len == 0) return;
+
+        try self.setOldestHistoryEntryId(page.items[0].entry_id.text);
+        var index = page.items.len;
+        while (index > 0) {
+            index -= 1;
+            const item = page.items[index];
+            const role: tui.Transcript.Role = switch (item.role) {
+                .user => .user,
+                .assistant => .assistant,
+                .system => .system,
+            };
+            _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{
+                .role = role,
+                .text = item.text.text,
+                .mode = .new_item,
+            } });
+        }
+    }
+
+    fn setOldestHistoryEntryId(self: *InteractiveController, entry_id: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, entry_id);
+        if (self.history_oldest_entry_id) |old| self.allocator.free(old);
+        self.history_oldest_entry_id = owned;
+    }
+
+    fn clearOldestHistoryEntryId(self: *InteractiveController) void {
+        if (self.history_oldest_entry_id) |old| self.allocator.free(old);
+        self.history_oldest_entry_id = null;
     }
 
     fn applyQueueChanged(self: *InteractiveController, queue: client_protocol.QueueChanged) !void {

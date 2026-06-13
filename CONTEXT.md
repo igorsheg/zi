@@ -317,15 +317,17 @@ store pointers into owner fields (for example tty buffers and env maps). Do not
 return or copy such an owner by value after initialization; use heap allocation or
 another explicit pinning strategy and document it on the type.
 
-transcript is bounded resident state (item and byte caps, oldest-first eviction;
-one tool's retained preview is capped at 1/8 of the total budget so a chatty
-tool cannot evict the whole conversation). wrapping and scrolling are measured
-in display rows, not newline counts. both scroll-counting and drawing consume
-`render.buildItemRows`, the single producer of an item's visual rows, so the
-two cannot drift. per-item row counts are memoized in `Transcript.Item.layout`,
-keyed by (item version, width, tools_expanded) — never caller discipline — so
-scroll math is O(items) and drawing is O(viewport): items above the scroll
-window are skipped by cached count without re-wrapping their text.
+transcript is bounded resident state (item and byte caps; live-tail appends
+evict oldest, while history-page prepends evict newest so the resident window
+can slide backward). one tool's retained preview is capped at 1/8 of the total
+budget so a chatty tool cannot evict the whole conversation. wrapping and
+scrolling are measured in display rows, not newline counts. both
+scroll-counting and drawing consume `render.buildItemRows`, the single producer
+of an item's visual rows, so the two cannot drift. per-item row counts are
+memoized in `Transcript.Item.layout`, keyed by (item version, width,
+tools_expanded) — never caller discipline — so scroll math is O(items) and
+drawing is O(viewport): items above the scroll window are skipped by cached
+count without re-wrapping their text.
 
 ## public boundaries and semantic contracts
 

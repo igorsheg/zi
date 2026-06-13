@@ -225,6 +225,7 @@ fn isTerminalEvent(event: client_protocol.ClientEvent) bool {
         .rejected,
         .operation_finished,
         .snapshot,
+        .history_page,
         .replay,
         .replay_gap,
         .shutdown_started,

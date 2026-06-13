@@ -1,8 +1,8 @@
 //! Bounded resident transcript. This is a *view window*, not history:
-//! durable truth lives in the session store; when the caps below are hit the
-//! oldest items are evicted and scrollback simply ends.
+//! durable truth lives in the session store. Live-tail appends evict oldest;
+//! history-page prepends evict newest so the resident window can slide back.
 //!
-//! Bounds (policy: evict oldest):
+//! Bounds:
 //!   - item_count_max items, total_size_bytes_max resident text bytes
 //!   - one append is capped at append_size_bytes_max (callers chunk)
 //!   - one tool's retained output preview is capped at tool_preview_bytes_max,
@@ -170,6 +170,30 @@ pub fn append(self: *Transcript, gpa: std.mem.Allocator, entry: Append) error{Ou
         .status => |status| self.appendStatus(gpa, status),
         .tool => |tool| self.appendTool(gpa, tool),
     };
+}
+
+pub fn prependMessage(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    message: Append.MessageAppend,
+) error{OutOfMemory}!Outcome {
+    defer self.revision +%= 1;
+    const bounded = text_mod.utf8Prefix(message.text, append_size_bytes_max);
+    const truncated = bounded.len < message.text.len;
+
+    var body: Message = .{ .role = message.role };
+    errdefer body.text.deinit(gpa);
+    try appendStreamBytes(&body.text, &body.pending, gpa, bounded);
+
+    try self.items.append(gpa, undefined);
+    const last_index = self.items.items.len - 1;
+    if (last_index > 0) {
+        @memmove(self.items.items[1 .. last_index + 1], self.items.items[0..last_index]);
+    }
+    self.items.items[0] = .{ .body = .{ .message = body } };
+    self.total_size_bytes += body.text.items.len;
+    self.evictNewestUntilBounded(gpa);
+    return .{ .truncated = truncated };
 }
 
 /// Stream more output into a tool's tail-windowed preview. Unknown ids are
@@ -366,6 +390,14 @@ fn noteItemMutation(self: *Transcript, item: *Item, old_size: usize, new_size: u
 fn evictUntilBounded(self: *Transcript, gpa: std.mem.Allocator) void {
     while (self.items.items.len > item_count_max or self.total_size_bytes > total_size_bytes_max) {
         var item = self.items.orderedRemove(0);
+        self.total_size_bytes -= item.sizeBytes();
+        item.deinitBody(gpa);
+    }
+}
+
+fn evictNewestUntilBounded(self: *Transcript, gpa: std.mem.Allocator) void {
+    while (self.items.items.len > item_count_max or self.total_size_bytes > total_size_bytes_max) {
+        var item = self.items.orderedRemove(self.items.items.len - 1);
         self.total_size_bytes -= item.sizeBytes();
         item.deinitBody(gpa);
     }

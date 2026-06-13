@@ -453,6 +453,14 @@ pub fn clientSnapshot(
     };
 }
 
+pub fn clientHistoryPage(
+    self: *const AgentSession,
+    allocator: std.mem.Allocator,
+    before_entry_id: []const u8,
+) !client_protocol.HistoryPage {
+    return client_protocol.HistoryPage.beforeEntry(allocator, self.manager.entries.items, before_entry_id);
+}
+
 pub fn clearQueue(self: *AgentSession) void {
     self.agent.clearAllQueues();
     self.event_drain.clearQueueMirror();

@@ -31,6 +31,7 @@ submit { text, mode }
 cancel { target }
 queue.clear
 snapshot
+history_page { before_entry_id }
 replay { after, max_events }
 shutdown
 ```
@@ -64,6 +65,7 @@ Named caps:
 - retained events: `retained_event_count_default` and `retained_event_bytes_default`
 - replay batch: `replay_event_count_max`
 - snapshot history: item count/per-item/total text caps
+- history pages: item count/per-item/total text caps
 
 Policy:
 

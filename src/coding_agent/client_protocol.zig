@@ -22,6 +22,9 @@ pub const replay_event_count_max = 64;
 pub const snapshot_history_items_max = 512;
 pub const snapshot_history_item_text_bytes_max = 16 * 1024;
 pub const snapshot_history_total_text_bytes_max = 128 * 1024;
+pub const history_page_items_max = 64;
+pub const history_page_item_text_bytes_max = snapshot_history_item_text_bytes_max;
+pub const history_page_total_text_bytes_max = 64 * 1024;
 pub const snapshot_model_text_bytes_max = 256;
 
 pub const CommandQueue = runtime.BoundedQueue(CommandEnvelope);
@@ -40,6 +43,16 @@ pub const CommandEnvelope = struct {
         return .{ .id = id, .command = .{ .submit = .{ .text = try allocator.dupe(u8, text), .mode = mode } } };
     }
 
+    pub fn initHistoryPage(
+        allocator: std.mem.Allocator,
+        id: ?RequestId,
+        before_entry_id: []const u8,
+    ) !CommandEnvelope {
+        return .{ .id = id, .command = .{ .history_page = .{
+            .before_entry_id = try allocator.dupe(u8, before_entry_id),
+        } } };
+    }
+
     pub fn deinit(self: *CommandEnvelope, allocator: std.mem.Allocator) void {
         self.command.deinit(allocator);
         self.* = undefined;
@@ -52,11 +65,13 @@ pub const ClientCommand = union(enum) {
     queue: QueueCommand,
     snapshot,
     replay: ReplayRequest,
+    history_page: HistoryPageRequest,
     shutdown,
 
     pub fn deinit(self: *ClientCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .submit => |prompt| allocator.free(prompt.text),
+            .history_page => |request| allocator.free(request.before_entry_id),
             .cancel, .queue, .snapshot, .replay, .shutdown => {},
         }
         self.* = undefined;
@@ -86,6 +101,10 @@ pub const QueueCommand = union(enum) {
 
 pub const ReplayRequest = struct {
     after: EventSeq,
+};
+
+pub const HistoryPageRequest = struct {
+    before_entry_id: []u8,
 };
 
 pub const EventEnvelope = struct {
@@ -119,6 +138,7 @@ pub const ClientEvent = union(enum) {
     snapshot: Snapshot,
     replay: ReplayBatch,
     replay_gap: ReplayGap,
+    history_page: HistoryPage,
     prompt_command: PromptCommand,
     compaction_start: CompactionStart,
     compaction_end: CompactionEnd,
@@ -132,6 +152,7 @@ pub const ClientEvent = union(enum) {
             .agent_event => |*payload| payload.deinit(allocator),
             .snapshot => |*payload| payload.deinit(allocator),
             .replay => |*payload| payload.deinit(allocator),
+            .history_page => |*payload| payload.deinit(allocator),
             .prompt_command => |*payload| payload.deinit(allocator),
             .compaction_end => |*payload| payload.deinit(allocator),
             .auto_retry_start => |*payload| payload.error_message.deinit(allocator),
@@ -152,6 +173,7 @@ pub const ClientEvent = union(enum) {
         switch (self) {
             .agent_event => |event| try stringify.write(event),
             .snapshot => |payload| try stringify.write(payload),
+            .history_page => |payload| try stringify.write(payload),
             .replay => |payload| try stringify.write(payload),
             inline .shutdown_started, .operation_started => |_, tag| try writeObject(stringify, @tagName(tag), .{}),
             inline else => |payload, tag| try writeObject(stringify, @tagName(tag), payload),
@@ -508,81 +530,20 @@ pub const HistorySnapshot = struct {
         allocator: std.mem.Allocator,
         entries: []const session_manager.SessionEntry,
     ) !HistorySnapshot {
-        var items = std.ArrayList(HistorySnapshotItem).empty;
-        errdefer {
-            for (items.items) |*item| item.deinit(allocator);
-            items.deinit(allocator);
-        }
-        var total_text_bytes: usize = 0;
-        var dropped_items: usize = 0;
-        var dropped_text_bytes: usize = 0;
-
-        // Walk newest-first so budget pressure drops the oldest history.
-        var index = entries.len;
-        while (index > 0) {
-            index -= 1;
-            if (entries[index] != .message) continue;
-            var item = (try itemFromMessage(allocator, entries[index].message.message)) orelse continue;
-            const text = utf8Prefix(item.text.text, snapshot_history_item_text_bytes_max);
-            if (items.items.len == snapshot_history_items_max or
-                total_text_bytes + text.len > snapshot_history_total_text_bytes_max)
-            {
-                dropped_items += 1;
-                dropped_text_bytes += item.text.text.len;
-                item.deinit(allocator);
-                continue;
-            }
-            dropped_text_bytes += item.text.text.len - text.len;
-            if (text.len < item.text.text.len) {
-                const role = item.role;
-                const truncated = allocator.dupe(u8, text) catch |err| {
-                    item.deinit(allocator);
-                    return err;
-                };
-                item.deinit(allocator);
-                item = .{ .role = role, .text = .{ .text = truncated } };
-            }
-            {
-                errdefer item.deinit(allocator);
-                try items.append(allocator, item);
-            }
-            total_text_bytes += text.len;
-        }
-        std.mem.reverse(HistorySnapshotItem, items.items);
+        const collected = try collectHistoryBefore(allocator, entries, entries.len, .{
+            .items_max = snapshot_history_items_max,
+            .item_text_bytes_max = snapshot_history_item_text_bytes_max,
+            .total_text_bytes_max = snapshot_history_total_text_bytes_max,
+        });
         return .{
-            .items = try items.toOwnedSlice(allocator),
-            .dropped_items = dropped_items,
-            .dropped_text_bytes = dropped_text_bytes,
+            .items = collected.items,
+            .dropped_items = collected.dropped_items,
+            .dropped_text_bytes = collected.dropped_text_bytes,
         };
     }
 
-    fn itemFromMessage(allocator: std.mem.Allocator, message: agent_mod.AgentMessage) !?HistorySnapshotItem {
-        switch (message) {
-            .user => |user| {
-                const text = message_policy.userText(user) orelse return null;
-                return .{ .role = .user, .text = try EventText.init(allocator, text) };
-            },
-            .assistant => |assistant| {
-                var writer: std.Io.Writer.Allocating = .init(allocator);
-                defer writer.deinit();
-                for (assistant.content) |content| {
-                    if (content != .text) continue;
-                    if (writer.written().len > 0) try writer.writer.writeByte('\n');
-                    try writer.writer.writeAll(content.text.text);
-                }
-                if (writer.written().len == 0) {
-                    const error_message = assistant.error_message orelse return null;
-                    return .{ .role = .system, .text = try EventText.init(allocator, error_message) };
-                }
-                return .{ .role = .assistant, .text = .{ .text = try writer.toOwnedSlice() } };
-            },
-            .tool_result, .custom => return null,
-        }
-    }
-
     pub fn deinit(self: *HistorySnapshot, allocator: std.mem.Allocator) void {
-        for (self.items) |*item| item.deinit(allocator);
-        allocator.free(self.items);
+        deinitHistoryItems(allocator, self.items);
         self.* = undefined;
     }
 
@@ -591,17 +552,172 @@ pub const HistorySnapshot = struct {
     }
 };
 
+pub const HistoryPage = struct {
+    before_entry_id: EventText,
+    items: []HistorySnapshotItem,
+    has_more_before: bool = false,
+    dropped_items: usize = 0,
+    dropped_text_bytes: usize = 0,
+
+    pub fn beforeEntry(
+        allocator: std.mem.Allocator,
+        entries: []const session_manager.SessionEntry,
+        before_entry_id: []const u8,
+    ) !HistoryPage {
+        const before_index = findEntryIndex(entries, before_entry_id) orelse return error.HistoryEntryNotFound;
+        var before = try EventText.init(allocator, before_entry_id);
+        errdefer before.deinit(allocator);
+        const collected = try collectHistoryBefore(allocator, entries, before_index, .{
+            .items_max = history_page_items_max,
+            .item_text_bytes_max = history_page_item_text_bytes_max,
+            .total_text_bytes_max = history_page_total_text_bytes_max,
+        });
+        return .{
+            .before_entry_id = before,
+            .items = collected.items,
+            .has_more_before = collected.dropped_items > 0,
+            .dropped_items = collected.dropped_items,
+            .dropped_text_bytes = collected.dropped_text_bytes,
+        };
+    }
+
+    pub fn deinit(self: *HistoryPage, allocator: std.mem.Allocator) void {
+        self.before_entry_id.deinit(allocator);
+        deinitHistoryItems(allocator, self.items);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: HistoryPage, stringify: *std.json.Stringify) !void {
+        try writeObject(stringify, "history_page", self);
+    }
+};
+
 pub const HistorySnapshotItem = struct {
+    entry_id: EventText,
     role: Role,
     text: EventText,
 
     pub const Role = enum { user, assistant, system };
 
     pub fn deinit(self: *HistorySnapshotItem, allocator: std.mem.Allocator) void {
+        self.entry_id.deinit(allocator);
         self.text.deinit(allocator);
         self.* = undefined;
     }
 };
+
+const HistoryLimits = struct {
+    items_max: usize,
+    item_text_bytes_max: usize,
+    total_text_bytes_max: usize,
+};
+
+const HistoryCollectResult = struct {
+    items: []HistorySnapshotItem,
+    dropped_items: usize = 0,
+    dropped_text_bytes: usize = 0,
+};
+
+fn collectHistoryBefore(
+    allocator: std.mem.Allocator,
+    entries: []const session_manager.SessionEntry,
+    end_index: usize,
+    limits: HistoryLimits,
+) !HistoryCollectResult {
+    var items = std.ArrayList(HistorySnapshotItem).empty;
+    errdefer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit(allocator);
+    }
+    var total_text_bytes: usize = 0;
+    var dropped_items: usize = 0;
+    var dropped_text_bytes: usize = 0;
+
+    // Walk newest-first so budget pressure drops the oldest history.
+    var index = @min(end_index, entries.len);
+    while (index > 0) {
+        index -= 1;
+        var item = (try itemFromEntry(allocator, entries[index])) orelse continue;
+        const text = utf8Prefix(item.text.text, limits.item_text_bytes_max);
+        if (items.items.len == limits.items_max or total_text_bytes + text.len > limits.total_text_bytes_max) {
+            dropped_items += 1;
+            dropped_text_bytes += item.text.text.len;
+            item.deinit(allocator);
+            continue;
+        }
+        dropped_text_bytes += item.text.text.len - text.len;
+        if (text.len < item.text.text.len) {
+            const truncated = EventText.init(allocator, text) catch |err| {
+                item.deinit(allocator);
+                return err;
+            };
+            item.text.deinit(allocator);
+            item.text = truncated;
+        }
+        {
+            errdefer item.deinit(allocator);
+            try items.append(allocator, item);
+        }
+        total_text_bytes += text.len;
+    }
+    std.mem.reverse(HistorySnapshotItem, items.items);
+    return .{
+        .items = try items.toOwnedSlice(allocator),
+        .dropped_items = dropped_items,
+        .dropped_text_bytes = dropped_text_bytes,
+    };
+}
+
+fn itemFromEntry(allocator: std.mem.Allocator, entry: session_manager.SessionEntry) !?HistorySnapshotItem {
+    if (entry != .message) return null;
+    switch (entry.message.message) {
+        .user => |user| {
+            const text = message_policy.userText(user) orelse return null;
+            var entry_id = try EventText.init(allocator, entry.id());
+            errdefer entry_id.deinit(allocator);
+            return .{ .entry_id = entry_id, .role = .user, .text = try EventText.init(allocator, text) };
+        },
+        .assistant => |assistant| {
+            var writer: std.Io.Writer.Allocating = .init(allocator);
+            defer writer.deinit();
+            for (assistant.content) |content| {
+                if (content != .text) continue;
+                if (writer.written().len > 0) try writer.writer.writeByte('\n');
+                try writer.writer.writeAll(content.text.text);
+            }
+            if (writer.written().len == 0) {
+                const error_message = assistant.error_message orelse return null;
+                var entry_id = try EventText.init(allocator, entry.id());
+                errdefer entry_id.deinit(allocator);
+                return .{
+                    .entry_id = entry_id,
+                    .role = .system,
+                    .text = try EventText.init(allocator, error_message),
+                };
+            }
+            var entry_id = try EventText.init(allocator, entry.id());
+            errdefer entry_id.deinit(allocator);
+            return .{
+                .entry_id = entry_id,
+                .role = .assistant,
+                .text = .{ .text = try writer.toOwnedSlice() },
+            };
+        },
+        .tool_result, .custom => return null,
+    }
+}
+
+fn deinitHistoryItems(allocator: std.mem.Allocator, items: []HistorySnapshotItem) void {
+    for (items) |*item| item.deinit(allocator);
+    allocator.free(items);
+}
+
+fn findEntryIndex(entries: []const session_manager.SessionEntry, entry_id: []const u8) ?usize {
+    for (entries, 0..) |entry, index| {
+        if (std.mem.eql(u8, entry.id(), entry_id)) return index;
+    }
+    return null;
+}
 
 pub const QueueSnapshot = struct {
     revision: u64,
@@ -729,10 +845,34 @@ test "history snapshot from entries maps roles and keeps newest under caps" {
     defer snapshot.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), snapshot.items.len);
+    try std.testing.expectEqualStrings("00000001", snapshot.items[0].entry_id.text);
     try std.testing.expectEqual(HistorySnapshotItem.Role.user, snapshot.items[0].role);
     try std.testing.expectEqualStrings("hello", snapshot.items[0].text.text);
+    try std.testing.expectEqualStrings("00000002", snapshot.items[1].entry_id.text);
     try std.testing.expectEqual(HistorySnapshotItem.Role.assistant, snapshot.items[1].role);
     try std.testing.expectEqualStrings("hi", snapshot.items[1].text.text);
+}
+
+test "history page returns bounded items before an entry id" {
+    var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "s", "t0");
+    defer manager.deinit();
+
+    _ = try appendTestMessage(&manager, .{ .user = .{ .content = .{ .string = "one" }, .timestamp = 0 } }, "t1");
+    _ = try appendTestMessage(&manager, .{ .user = .{ .content = .{ .string = "two" }, .timestamp = 0 } }, "t2");
+    const before = try appendTestMessage(&manager, .{ .user = .{
+        .content = .{ .string = "three" },
+        .timestamp = 0,
+    } }, "t3");
+
+    var page = try HistoryPage.beforeEntry(std.testing.allocator, manager.entries.items, before);
+    defer page.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), page.items.len);
+    try std.testing.expectEqualStrings("00000001", page.items[0].entry_id.text);
+    try std.testing.expectEqualStrings("one", page.items[0].text.text);
+    try std.testing.expectEqualStrings("00000002", page.items[1].entry_id.text);
+    try std.testing.expectEqualStrings("two", page.items[1].text.text);
+    try std.testing.expect(!page.has_more_before);
 }
 
 test "history snapshot truncates oversized items and drops oldest under byte budget" {
