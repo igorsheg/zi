@@ -140,6 +140,7 @@ pub const ClientEvent = union(enum) {
     replay_gap: ReplayGap,
     history_page: HistoryPage,
     prompt_command: PromptCommand,
+    session_chrome: SessionChromeSnapshot,
     compaction_start: CompactionStart,
     compaction_end: CompactionEnd,
     auto_retry_start: AutoRetryStart,
@@ -154,6 +155,7 @@ pub const ClientEvent = union(enum) {
             .replay => |*payload| payload.deinit(allocator),
             .history_page => |*payload| payload.deinit(allocator),
             .prompt_command => |*payload| payload.deinit(allocator),
+            .session_chrome => |*payload| payload.deinit(allocator),
             .compaction_end => |*payload| payload.deinit(allocator),
             .auto_retry_start => |*payload| payload.error_message.deinit(allocator),
             .auto_retry_end => |*payload| if (payload.final_error) |*err| err.deinit(allocator),
@@ -175,8 +177,8 @@ pub const ClientEvent = union(enum) {
             .snapshot => |payload| try stringify.write(payload),
             .history_page => |payload| try stringify.write(payload),
             .replay => |payload| try stringify.write(payload),
-            inline .shutdown_started, .operation_started => |_, tag| try writeObject(stringify, @tagName(tag), .{}),
-            inline else => |payload, tag| try writeObject(stringify, @tagName(tag), payload),
+            inline .shutdown_started, .operation_started => |_, tag| try writeObject(@tagName(tag), stringify, .{}),
+            inline else => |payload, tag| try writeObject(@tagName(tag), stringify, payload),
         }
     }
 };
@@ -362,7 +364,7 @@ pub const CompactionResult = struct {
     }
 
     pub fn jsonStringify(self: CompactionResult, stringify: *std.json.Stringify) !void {
-        try writeObject(stringify, null, self);
+        try writeObject(null, stringify, self);
     }
 };
 
@@ -503,6 +505,8 @@ pub const ReplayGap = struct {
 pub const Snapshot = struct {
     header: SessionHeaderSnapshot,
     model: ModelSnapshot,
+    thinking_level: agent_mod.ThinkingLevel,
+    context: ContextUsageSnapshot,
     queue: QueueSnapshot,
     active_request_id: ?RequestId,
     history: HistorySnapshot,
@@ -516,7 +520,7 @@ pub const Snapshot = struct {
     }
 
     pub fn jsonStringify(self: Snapshot, stringify: *std.json.Stringify) !void {
-        try writeObject(stringify, "snapshot", self);
+        try writeObject("snapshot", stringify, self);
     }
 };
 
@@ -556,7 +560,7 @@ pub const SessionHeaderSnapshot = struct {
     }
 
     pub fn jsonStringify(self: SessionHeaderSnapshot, stringify: *std.json.Stringify) !void {
-        try writeObject(stringify, null, self);
+        try writeObject(null, stringify, self);
     }
 };
 
@@ -580,7 +584,53 @@ pub const ModelSnapshot = struct {
     }
 
     pub fn jsonStringify(self: ModelSnapshot, stringify: *std.json.Stringify) !void {
-        try writeObject(stringify, null, self);
+        try writeObject(null, stringify, self);
+    }
+};
+
+pub const ContextUsageSnapshot = struct {
+    tokens: ?u64 = null,
+    window: u64 = 0,
+    percent_tenths: ?u32 = null,
+
+    pub fn jsonStringify(self: ContextUsageSnapshot, stringify: *std.json.Stringify) !void {
+        try writeObject(null, stringify, self);
+    }
+};
+
+pub const SessionChromeSnapshot = struct {
+    cwd: EventText,
+    model: ModelSnapshot,
+    thinking_level: agent_mod.ThinkingLevel,
+    context: ContextUsageSnapshot,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        cwd: []const u8,
+        model: ai.Model,
+        thinking_level: agent_mod.ThinkingLevel,
+        context: ContextUsageSnapshot,
+    ) !SessionChromeSnapshot {
+        var cwd_text = try EventText.init(allocator, cwd);
+        errdefer cwd_text.deinit(allocator);
+        var model_snapshot = try ModelSnapshot.init(allocator, model);
+        errdefer model_snapshot.deinit(allocator);
+        return .{
+            .cwd = cwd_text,
+            .model = model_snapshot,
+            .thinking_level = thinking_level,
+            .context = context,
+        };
+    }
+
+    pub fn deinit(self: *SessionChromeSnapshot, allocator: std.mem.Allocator) void {
+        self.cwd.deinit(allocator);
+        self.model.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: SessionChromeSnapshot, stringify: *std.json.Stringify) !void {
+        try writeObject("session_chrome", stringify, self);
     }
 };
 
@@ -616,7 +666,7 @@ pub const HistorySnapshot = struct {
     }
 
     pub fn jsonStringify(self: HistorySnapshot, stringify: *std.json.Stringify) !void {
-        try writeObject(stringify, null, self);
+        try writeObject(null, stringify, self);
     }
 };
 
@@ -656,7 +706,7 @@ pub const HistoryPage = struct {
     }
 
     pub fn jsonStringify(self: HistoryPage, stringify: *std.json.Stringify) !void {
-        try writeObject(stringify, "history_page", self);
+        try writeObject("history_page", stringify, self);
     }
 };
 
@@ -799,7 +849,7 @@ pub const QueueSnapshot = struct {
     }
 
     pub fn jsonStringify(self: QueueSnapshot, stringify: *std.json.Stringify) !void {
-        try writeObject(stringify, null, self);
+        try writeObject(null, stringify, self);
     }
 };
 
@@ -807,8 +857,8 @@ pub const QueueSnapshot = struct {
 /// then every field under its camelCase name; null optionals are omitted.
 /// This is the one owner of the wire field-naming policy.
 fn writeObject(
-    stringify: *std.json.Stringify,
     comptime type_tag: ?[]const u8,
+    stringify: *std.json.Stringify,
     payload: anytype,
 ) !void {
     try stringify.beginObject();

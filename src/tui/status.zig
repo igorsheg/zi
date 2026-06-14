@@ -1,15 +1,15 @@
 //! Allocation-free status contributions. Frontend adapters publish small
 //! prioritized text segments into named slots (the status line above the
-//! composer and the composer's top-right corner label); render orders them
-//! by priority. Text is stored inline, so the store never allocates and
-//! `deinit` is unnecessary.
+//! composer and the composer's top border labels); render orders them by
+//! priority. Text is stored inline, so the store never allocates and `deinit`
+//! is unnecessary.
 const std = @import("std");
 const text_mod = @import("text.zig");
 
 pub const entry_count_max: usize = 16;
 pub const text_bytes_max: usize = 160;
 
-pub const Slot = enum { composer_corner, status_line };
+pub const Slot = enum { composer_left, composer_right, status_line };
 pub const Effect = enum { none, shimmer };
 pub const ContributionId = u32;
 
@@ -135,9 +135,24 @@ pub const Store = struct {
 
 test "set replaces by id and ordered sorts by priority" {
     var store: Store = .{};
-    try std.testing.expectEqual(SetResult.ok, store.set(.{ .slot = .status_line, .id = 1, .priority = 1, .text = "low" }));
-    try std.testing.expectEqual(SetResult.ok, store.set(.{ .slot = .status_line, .id = 2, .priority = 9, .text = "high" }));
-    try std.testing.expectEqual(SetResult.ok, store.set(.{ .slot = .status_line, .id = 1, .priority = 1, .text = "low2" }));
+    try std.testing.expectEqual(SetResult.ok, store.set(.{
+        .slot = .status_line,
+        .id = 1,
+        .priority = 1,
+        .text = "low",
+    }));
+    try std.testing.expectEqual(SetResult.ok, store.set(.{
+        .slot = .status_line,
+        .id = 2,
+        .priority = 9,
+        .text = "high",
+    }));
+    try std.testing.expectEqual(SetResult.ok, store.set(.{
+        .slot = .status_line,
+        .id = 1,
+        .priority = 1,
+        .text = "low2",
+    }));
 
     var views: [4]View = undefined;
     const n = store.ordered(.status_line, &views);

@@ -36,9 +36,14 @@ Accepted when:
 
 Known defer is acceptable only if documented:
 
-- full-output spill file path
-- exact 100ms bash-local wall-clock throttle
-- generic spawn hook
+- full-output spill file path — deferred because current output is already
+  bounded and tail-preserved in memory; durable spill adds filesystem lifetime
+  policy without a current retrieval flow.
+- exact 100ms bash-local wall-clock throttle — deferred because the owner loop
+  already bounds update chunks and frame pacing; no measured local spinner
+  regression requires another timer policy.
+- generic spawn hook — deferred until an actual extension/remote execution
+  owner needs it; builtin bash currently has one explicit spawn path.
 
 ## Read
 
@@ -55,8 +60,12 @@ Accepted when:
 
 Optional/deferred:
 
-- image resizing
-- model-vision-specific tool-time policy
+- image resizing — deferred because Zi currently returns bounded image
+  attachments plus a fallback display note; resizing would add image-processing
+  policy and dependency surface without a proven model/provider need.
+- model-vision-specific tool-time policy — deferred until model capability
+  routing needs to omit or transform images at tool time; today the tool emits
+  facts and frontend/model policy remains separate.
 
 ## Write
 
@@ -87,8 +96,12 @@ Accepted when:
 
 Deferred unless proven needed:
 
-- fuzzy quote/dash/whitespace matching
-- remote edit operations
+- fuzzy quote/dash/whitespace matching — deferred because exact matching is
+  auditable, deterministic, and rejects ambiguity before mutation; compatibility
+  aliases already cover the common schema drift.
+- remote edit operations — deferred until Zi has a concrete remote filesystem
+  owner; local atomic mutation through `FileMutationQueue` is the only shipped
+  mutation path.
 
 ## LS
 
@@ -118,9 +131,13 @@ Accepted when:
 
 Deferred unless needed:
 
-- full `.gitignore` parsing
-- external `fd` dependency
-- full glob semantics
+- full `.gitignore` parsing — deferred because Zi has explicit bounded ignore
+  policy for high-noise directories (`.git`, `node_modules`) and no dependency
+  on project-specific ignore parsing yet.
+- external `fd` dependency — deferred to keep the builtin deterministic and
+  dependency-light; current traversal has explicit visited/result caps.
+- full glob semantics — deferred because simple bounded `*`/`?` compatibility
+  covers current pi-style calls without importing a glob engine.
 
 ## Grep
 
@@ -139,9 +156,12 @@ Accepted when:
 
 Deferred unless needed:
 
-- regex mode
-- context lines
-- ripgrep/.gitignore parity
+- regex mode — deferred intentionally: Zi grep is literal-only and now reports
+  `literal=false` as an unsupported mode instead of silently changing semantics.
+  Adding regex needs a concrete regex engine/dependency decision.
+- ripgrep/.gitignore parity — deferred because current search is in-process,
+  bounded, deterministic, and ignores known high-noise directories without
+  introducing an external process/dependency seam.
 
 ## TUI/tool UX
 

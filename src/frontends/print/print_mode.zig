@@ -69,6 +69,7 @@ fn drainEvents(
             .agent_event,
             .queue_changed,
             .snapshot,
+            .session_chrome,
             .history_page,
             .compaction_start,
             .compaction_end,

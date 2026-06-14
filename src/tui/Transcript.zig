@@ -24,7 +24,7 @@ pub const append_size_bytes_max: usize = 8 * 1024;
 pub const tool_preview_bytes_max: usize = total_size_bytes_max / 8;
 pub const tool_preview_lines_max: usize = 1024;
 
-items: std.ArrayListUnmanaged(Item) = .empty,
+items: std.ArrayList(Item) = .empty,
 total_size_bytes: usize = 0,
 revision: u64 = 0,
 
@@ -75,6 +75,7 @@ pub const Append = union(enum) {
         body_mode: ToolBodyMode = .visible,
         collapse: ToolCollapse = .{},
         title: []const u8 = "",
+        compact_title: []const u8 = "",
     };
 };
 
@@ -117,6 +118,7 @@ pub const Item = struct {
                 gpa.free(tool.id);
                 gpa.free(tool.name);
                 gpa.free(tool.title);
+                gpa.free(tool.compact_title);
                 tool.output.deinit(gpa);
                 gpa.free(tool.footer);
             },
@@ -136,7 +138,7 @@ pub const Item = struct {
 
 pub const Message = struct {
     role: Role,
-    text: std.ArrayListUnmanaged(u8) = .empty,
+    text: std.ArrayList(u8) = .empty,
     pending: PendingUtf8 = .{},
 };
 
@@ -159,14 +161,20 @@ pub const Tool = struct {
     body_mode: ToolBodyMode,
     collapse: ToolCollapse,
     title: []u8,
-    output: std.ArrayListUnmanaged(u8) = .empty,
+    compact_title: []u8,
+    output: std.ArrayList(u8) = .empty,
     footer: []u8,
     pending: PendingUtf8 = .{},
     dropped_head_bytes: usize = 0,
     dropped_head_lines: usize = 0,
 
     pub fn sizeBytes(self: *const Tool) usize {
-        return self.id.len + self.name.len + self.title.len + self.output.items.len + self.footer.len;
+        return self.id.len +
+            self.name.len +
+            self.title.len +
+            self.compact_title.len +
+            self.output.items.len +
+            self.footer.len;
     }
 };
 
@@ -204,7 +212,7 @@ pub fn prependMessage(
 
     var body: Message = .{ .role = message.role };
     errdefer body.text.deinit(gpa);
-    try appendStreamBytes(&body.text, &body.pending, gpa, bounded);
+    try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
 
     try self.items.append(gpa, undefined);
     const last_index = self.items.items.len - 1;
@@ -233,7 +241,7 @@ pub fn appendToolOutput(
     const old_size = tool.sizeBytes();
 
     const bounded = text_mod.utf8Prefix(delta, append_size_bytes_max);
-    try appendStreamBytes(&tool.output, &tool.pending, gpa, bounded);
+    try appendStreamBytes(gpa, &tool.output, &tool.pending, bounded);
     const trim = trimToTailWindow(&tool.output, tool_preview_bytes_max, tool_preview_lines_max);
     tool.dropped_head_bytes += dropped_head_bytes + trim.dropped_bytes;
     tool.dropped_head_lines += dropped_head_lines + trim.dropped_lines;
@@ -259,7 +267,7 @@ pub fn replaceToolOutput(
     const bounded = text_mod.utf8Prefix(output, append_size_bytes_max);
     tool.output.clearRetainingCapacity();
     tool.pending = .{};
-    try text_mod.appendSanitized(&tool.output, gpa, bounded);
+    try text_mod.appendSanitized(gpa, &tool.output, bounded);
     tool.dropped_head_bytes = 0;
     tool.dropped_head_lines = 0;
 
@@ -306,7 +314,7 @@ fn appendMessage(
         };
         if (matches) {
             const old_size = last.sizeBytes();
-            try appendStreamBytes(&last.body.message.text, &last.body.message.pending, gpa, bounded);
+            try appendStreamBytes(gpa, &last.body.message.text, &last.body.message.pending, bounded);
             self.noteItemMutation(last, old_size, last.sizeBytes());
             self.evictUntilBounded(gpa);
             return .{ .truncated = truncated };
@@ -315,7 +323,7 @@ fn appendMessage(
 
     var body: Message = .{ .role = message.role };
     errdefer body.text.deinit(gpa);
-    try appendStreamBytes(&body.text, &body.pending, gpa, bounded);
+    try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
     try self.items.append(gpa, .{ .body = .{ .message = body } });
     self.total_size_bytes += body.text.items.len;
     self.evictUntilBounded(gpa);
@@ -364,26 +372,41 @@ fn appendTool(self: *Transcript, gpa: std.mem.Allocator, tool: Append.ToolAppend
     const id_bounded = text_mod.utf8Prefix(tool.tool_call_id, append_size_bytes_max);
     const name_bounded = text_mod.utf8Prefix(tool.name, append_size_bytes_max);
     const title_bounded = text_mod.utf8Prefix(tool.title, append_size_bytes_max);
+    const compact_title_bounded = text_mod.utf8Prefix(tool.compact_title, append_size_bytes_max);
     const truncated = id_bounded.len < tool.tool_call_id.len or
         name_bounded.len < tool.name.len or
-        title_bounded.len < tool.title.len;
+        title_bounded.len < tool.title.len or
+        compact_title_bounded.len < tool.compact_title.len;
 
     if (self.findTool(id_bounded)) |index| {
         const item = &self.items.items[index];
         const existing = &item.body.tool;
-        const old_size = existing.sizeBytes();
-        if (title_bounded.len > 0) {
-            const title = try sanitizedCopy(gpa, title_bounded);
-            gpa.free(existing.title);
-            existing.title = title;
+        // Provider/tool ids are only reliable for the live call. Some providers
+        // reuse short ids across turns; a titled pending start after a terminal
+        // item is a new transcript fact, not a mutation of old output.
+        const starts_new_reused_id = tool.status == .pending and
+            existing.status != .pending and
+            (title_bounded.len > 0 or compact_title_bounded.len > 0);
+        if (!starts_new_reused_id) {
+            const old_size = existing.sizeBytes();
+            if (title_bounded.len > 0) {
+                const title = try sanitizedCopy(gpa, title_bounded);
+                gpa.free(existing.title);
+                existing.title = title;
+            }
+            if (compact_title_bounded.len > 0) {
+                const compact_title = try sanitizedCopy(gpa, compact_title_bounded);
+                gpa.free(existing.compact_title);
+                existing.compact_title = compact_title;
+            }
+            existing.presentation = tool.presentation;
+            existing.status = mergeToolStatus(existing.status, tool.status);
+            existing.body_mode = tool.body_mode;
+            existing.collapse = tool.collapse;
+            self.noteItemMutation(item, old_size, existing.sizeBytes());
+            self.evictUntilBounded(gpa);
+            return .{ .truncated = truncated };
         }
-        existing.presentation = tool.presentation;
-        existing.status = mergeToolStatus(existing.status, tool.status);
-        existing.body_mode = tool.body_mode;
-        existing.collapse = tool.collapse;
-        self.noteItemMutation(item, old_size, existing.sizeBytes());
-        self.evictUntilBounded(gpa);
-        return .{ .truncated = truncated };
     }
 
     const id = try sanitizedCopy(gpa, id_bounded);
@@ -392,6 +415,8 @@ fn appendTool(self: *Transcript, gpa: std.mem.Allocator, tool: Append.ToolAppend
     errdefer gpa.free(name);
     const title = try sanitizedCopy(gpa, title_bounded);
     errdefer gpa.free(title);
+    const compact_title = try sanitizedCopy(gpa, compact_title_bounded);
+    errdefer gpa.free(compact_title);
     const footer = try gpa.dupe(u8, "");
     errdefer gpa.free(footer);
     try self.items.append(gpa, .{ .body = .{ .tool = .{
@@ -402,6 +427,7 @@ fn appendTool(self: *Transcript, gpa: std.mem.Allocator, tool: Append.ToolAppend
         .body_mode = tool.body_mode,
         .collapse = tool.collapse,
         .title = title,
+        .compact_title = compact_title,
         .footer = footer,
     } } });
     self.total_size_bytes += self.items.items[self.items.items.len - 1].sizeBytes();
@@ -417,7 +443,10 @@ fn mergeToolStatus(old: ToolStatus, new: ToolStatus) ToolStatus {
 }
 
 pub fn findTool(self: *const Transcript, tool_call_id: []const u8) ?usize {
-    for (self.items.items, 0..) |*item, index| {
+    var index = self.items.items.len;
+    while (index > 0) {
+        index -= 1;
+        const item = &self.items.items[index];
         if (item.body == .tool and std.mem.eql(u8, item.body.tool.id, tool_call_id)) return index;
     }
     return null;
@@ -455,9 +484,9 @@ pub const PendingUtf8 = struct {
 };
 
 fn appendStreamBytes(
-    list: *std.ArrayListUnmanaged(u8),
-    pending: *PendingUtf8,
     gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    pending: *PendingUtf8,
     delta: []const u8,
 ) error{OutOfMemory}!void {
     var rest = delta;
@@ -491,16 +520,16 @@ fn appendStreamBytes(
         }
     }
     const split = text_mod.splitIncompleteTail(rest);
-    try text_mod.appendSanitized(list, gpa, split.complete);
+    try text_mod.appendSanitized(gpa, list, split.complete);
     @memcpy(pending.bytes[0..split.tail.len], split.tail);
     pending.len = @intCast(split.tail.len);
 }
 
 fn sanitizedCopy(gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}![]u8 {
     if (std.unicode.utf8ValidateSlice(bytes)) return gpa.dupe(u8, bytes);
-    var list: std.ArrayListUnmanaged(u8) = .empty;
+    var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
-    try text_mod.appendSanitized(&list, gpa, bytes);
+    try text_mod.appendSanitized(gpa, &list, bytes);
     return list.toOwnedSlice(gpa);
 }
 
@@ -512,13 +541,13 @@ const TailTrim = struct {
 /// In-place tail window over a preview buffer: keep complete trailing lines
 /// under both caps. The only partial-line case is one huge final line, where
 /// a UTF-8-safe suffix beats an empty preview.
-fn trimToTailWindow(list: *std.ArrayListUnmanaged(u8), max_bytes: usize, max_lines: usize) TailTrim {
+fn trimToTailWindow(list: *std.ArrayList(u8), max_bytes: usize, max_lines: usize) TailTrim {
     const window = tailWindow(list.items, max_bytes, max_lines);
     if (window.start == 0 and window.end == list.items.len) return .{};
     const dropped_bytes = window.start;
     const dropped_lines = countLines(list.items[0..window.start]);
     const kept = window.end - window.start;
-    std.mem.copyForwards(u8, list.items[0..kept], list.items[window.start..window.end]);
+    @memmove(list.items[0..kept], list.items[window.start..window.end]);
     list.shrinkRetainingCapacity(kept);
     return .{ .dropped_bytes = dropped_bytes, .dropped_lines = dropped_lines };
 }
@@ -704,6 +733,38 @@ test "tool end reuses the start item and never downgrades a terminal status" {
     const tool = transcript.items.items[0].body.tool;
     try std.testing.expectEqual(ToolStatus.success, tool.status);
     try std.testing.expectEqualStrings("$ ls", tool.title); // empty update keeps the old title
+}
+
+test "reused terminal tool id starts a new item and updates newest" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .{ .tool = .{
+        .tool_call_id = "tool-1",
+        .name = "ls",
+        .title = "ls src/agent (limit 100)",
+    } });
+    _ = try transcript.replaceToolOutput(gpa, "tool-1", "Agent.zig\nroot.zig");
+    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "tool-1", .name = "ls", .status = .success } });
+
+    _ = try transcript.append(gpa, .{ .tool = .{
+        .tool_call_id = "tool-1",
+        .name = "ls",
+        .title = "ls src/frontends (limit 100)",
+    } });
+    _ = try transcript.replaceToolOutput(gpa, "tool-1", "print/\nrpc/\ntui/");
+    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "tool-1", .name = "ls", .status = .success } });
+
+    try std.testing.expectEqual(@as(usize, 2), transcript.items.items.len);
+    const first = transcript.items.items[0].body.tool;
+    const second = transcript.items.items[1].body.tool;
+    try std.testing.expectEqualStrings("ls src/agent (limit 100)", first.title);
+    try std.testing.expectEqualStrings("Agent.zig\nroot.zig", first.output.items);
+    try std.testing.expectEqual(ToolStatus.success, first.status);
+    try std.testing.expectEqualStrings("ls src/frontends (limit 100)", second.title);
+    try std.testing.expectEqualStrings("print/\nrpc/\ntui/", second.output.items);
+    try std.testing.expectEqual(ToolStatus.success, second.status);
 }
 
 test "unknown tool ids are a no-op, not an error" {

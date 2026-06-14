@@ -27,6 +27,8 @@ pub const item_rows_max: usize = 512;
 const transcript_top: u16 = 1; // row 0 is the shell header
 const padding_x: u16 = 1;
 const item_margin_bottom: usize = 1;
+const tool_title_prefix = "╭─[";
+const tool_title_suffix = "]";
 const tool_body_prefix = "│ ";
 const tool_bottom_line = "╰───";
 const hint_bytes_max: usize = 96;
@@ -38,10 +40,16 @@ const title_bytes_max: usize = 160;
 /// transcript text are borrowed and need no copy.
 pub const generated_text_bytes_max: usize = 512;
 
+pub const RowSegment = struct {
+    text: []const u8,
+    style: theme_mod.Style,
+};
+
 pub const Row = struct {
     prefix: []const u8 = "",
     text: []const u8 = "",
     suffix: []const u8 = "",
+    segments: []const RowSegment = &.{},
     show_prefix: bool = false,
     prefix_style: theme_mod.Style = .{},
     text_style: theme_mod.Style = .{},
@@ -56,6 +64,8 @@ pub const RowScratch = struct {
     rows: [item_rows_max]Row = undefined,
     text: [generated_text_bytes_max]u8 = undefined,
     text_len: usize = 0,
+    segments: [32]RowSegment = undefined,
+    segment_len: usize = 0,
 };
 
 /// Copy formatted text into the scratch arena so the returned slice lives
@@ -71,11 +81,20 @@ fn internText(out: ?*RowScratch, bytes: []const u8) []const u8 {
     return dest;
 }
 
+fn internSegments(out: ?*RowScratch, segments: []const RowSegment) []const RowSegment {
+    const scratch = out orelse return &.{};
+    const available = scratch.segments.len - scratch.segment_len;
+    const keep = @min(segments.len, available);
+    const dest = scratch.segments[scratch.segment_len..][0..keep];
+    @memcpy(dest, segments[0..keep]);
+    scratch.segment_len += keep;
+    return dest;
+}
+
 /// Paint the whole frame into vaxis' screen. Infallible by design: the
 /// fallible half of the render transaction is the terminal write that
 /// follows in Terminal.renderIfDirty.
 pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
-    clampScroll(app);
     var painter = Painter.init(vx);
     painter.clear();
     if (app.width == 0 or app.height == 0) return;
@@ -95,8 +114,8 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
     }
 }
 
-pub fn clampScroll(app: *App) void {
-    app.scroll_rows = @min(app.scroll_rows, transcriptScrollMax(app));
+fn clampedScrollRows(app: *App) usize {
+    return @min(app.viewport.scroll_rows, transcriptScrollMax(app));
 }
 
 pub fn transcriptScrollMax(app: *App) usize {
@@ -170,7 +189,7 @@ pub fn composerTextWidth(width: u16) u16 {
 fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_rows: usize) void {
     if (visible_rows == 0 or app.width == 0) return;
     const total = transcriptTotalRows(app);
-    var skip_remaining = app.scroll_rows; // clamped by draw()
+    var skip_remaining = clampedScrollRows(app);
     const drawn = @min(total - skip_remaining, visible_rows);
     if (drawn == 0) return;
 
@@ -233,7 +252,10 @@ fn buildItemRows(
     theme: *const theme_mod.Theme,
     expanded: bool,
 ) void {
-    if (out) |scratch| scratch.text_len = 0;
+    if (out) |scratch| {
+        scratch.text_len = 0;
+        scratch.segment_len = 0;
+    }
     const style = itemStyle(item, theme);
     const padding = itemPaddingY(item);
     var index: usize = 0;
@@ -414,10 +436,15 @@ fn buildToolRows(
     const inner = innerWidth(width);
 
     var title_buffer: [title_bytes_max]u8 = undefined;
+    const title_available = width -| (padding_x +
+        text_mod.displayWidth(tool_title_prefix) +
+        text_mod.displayWidth(tool_title_suffix));
+    const title = internText(out, fitToWidth(toolTitle(tool, expanded, &title_buffer), title_available));
     putRow(out, count, .{
-        .prefix = "╭─[",
-        .text = internText(out, toolTitle(tool, &title_buffer)),
-        .suffix = "]",
+        .prefix = tool_title_prefix,
+        .text = title,
+        .suffix = tool_title_suffix,
+        .segments = toolTitleSegments(out, tool, title, theme),
         .show_prefix = true,
         .prefix_style = rail,
         .text_style = theme.tool_title,
@@ -611,18 +638,28 @@ fn countWrappedRows(text: []const u8, inner: u16, prefix_width: u16) usize {
     return rows;
 }
 
-/// Patch bodies tint added/removed/hunk lines by their physical line start.
+/// Tool notices and patch bodies tint by their physical line start.
 fn bodyLineStyle(options: WrapOptions, offset: usize) theme_mod.Style {
-    if ((options.presentation orelse return options.text_style) != .patch) return options.text_style;
     const theme = options.theme orelse return options.text_style;
     const line_start = physicalLineStart(options.text, offset);
     if (line_start >= options.text.len) return options.text_style;
+    if (isToolWarningLine(options.text[line_start..])) return theme.status_warning;
+    if ((options.presentation orelse .generic) != .patch) return options.text_style;
     if (std.mem.startsWith(u8, options.text[line_start..], "@@")) return theme.transcript_secondary;
     return switch (options.text[line_start]) {
         '+' => theme.diff_add,
         '-' => theme.diff_del,
         else => options.text_style,
     };
+}
+
+fn isToolWarningLine(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "[Truncated:") or
+        std.mem.startsWith(u8, line, "[First line") or
+        std.mem.startsWith(u8, line, "[Line ") or
+        std.mem.startsWith(u8, line, "[Showing ") or
+        std.mem.startsWith(u8, line, "[Write omitted") or
+        std.mem.startsWith(u8, line, "[File omitted");
 }
 
 fn physicalLineStart(text: []const u8, offset: usize) usize {
@@ -633,10 +670,102 @@ fn physicalLineStart(text: []const u8, offset: usize) usize {
 
 // The adapter formats the full pi-mono-style header into `title`
 // ("$ cmd", "read path:1-20", ...); the tool name is only a fallback.
-fn toolTitle(tool: *const Transcript.Tool, buffer: *[title_bytes_max]u8) []const u8 {
-    if (tool.title.len == 0) return tool.name;
-    if (tool.title.len <= buffer.len) return tool.title;
-    return text_mod.utf8Prefix(tool.title, buffer.len);
+fn toolTitle(tool: *const Transcript.Tool, expanded: bool, buffer: *[title_bytes_max]u8) []const u8 {
+    const title = if (!expanded and tool.compact_title.len > 0) tool.compact_title else tool.title;
+    if (title.len == 0) return tool.name;
+    if (title.len <= buffer.len) return title;
+    return text_mod.utf8Prefix(title, buffer.len);
+}
+
+fn toolTitleSegments(
+    out: ?*RowScratch,
+    tool: *const Transcript.Tool,
+    title: []const u8,
+    theme: *const theme_mod.Theme,
+) []const RowSegment {
+    if (title.len == 0) return &.{};
+    var parts: [8]RowSegment = undefined;
+    var count: usize = 0;
+    const first_space = std.mem.findScalar(u8, title, ' ') orelse {
+        parts[count] = .{ .text = title, .style = theme.tool_title };
+        count += 1;
+        return internSegments(out, parts[0..count]);
+    };
+    addTitleSegment(&parts, &count, title[0..first_space], theme.tool_title);
+    addTitleSegment(&parts, &count, title[first_space .. first_space + 1], theme.transcript_secondary);
+    const rest = title[first_space + 1 ..];
+
+    if (std.mem.endsWith(u8, title, " (ctrl+o to expand)")) {
+        addHintedTitleRest(&parts, &count, rest, theme);
+    } else switch (tool.presentation) {
+        .file, .patch => addFileTitleRest(&parts, &count, rest, theme),
+        .search => addSearchTitleRest(&parts, &count, rest, theme),
+        .directory => addDirectoryTitleRest(&parts, &count, rest, theme),
+        .command => addCommandTitleRest(&parts, &count, rest, theme),
+        .generic => addTitleSegment(&parts, &count, rest, theme.tool_title),
+    }
+    return internSegments(out, parts[0..count]);
+}
+
+fn addTitleSegment(
+    parts: *[8]RowSegment,
+    count: *usize,
+    text: []const u8,
+    style: theme_mod.Style,
+) void {
+    if (text.len == 0 or count.* == parts.len) return;
+    parts[count.*] = .{ .text = text, .style = style };
+    count.* += 1;
+}
+
+fn addHintedTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, theme: *const theme_mod.Theme) void {
+    const hint = " (ctrl+o to expand)";
+    const body = rest[0 .. rest.len - hint.len];
+    addFileTitleRest(parts, count, body, theme);
+    addTitleSegment(parts, count, hint, theme.transcript_secondary);
+}
+
+fn addFileTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, theme: *const theme_mod.Theme) void {
+    if (lineRangeStart(rest)) |range_start| {
+        addTitleSegment(parts, count, rest[0..range_start], theme.status_accent);
+        addTitleSegment(parts, count, rest[range_start..], theme.status_warning);
+    } else {
+        addTitleSegment(parts, count, rest, theme.status_accent);
+    }
+}
+
+fn addSearchTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, theme: *const theme_mod.Theme) void {
+    if (rest.len > 0 and rest[0] == '/') {
+        if (std.mem.findScalarPos(u8, rest, 1, '/')) |end| {
+            addTitleSegment(parts, count, rest[0 .. end + 1], theme.status_accent);
+            addTitleSegment(parts, count, rest[end + 1 ..], theme.transcript_secondary);
+            return;
+        }
+    }
+    addTitleSegment(parts, count, rest, theme.status_accent);
+}
+
+fn addDirectoryTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, theme: *const theme_mod.Theme) void {
+    addTitleSegment(parts, count, rest, theme.status_accent);
+}
+
+fn addCommandTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, theme: *const theme_mod.Theme) void {
+    const timeout = " (timeout ";
+    if (std.mem.findLast(u8, rest, timeout)) |index| {
+        addTitleSegment(parts, count, rest[0..index], theme.tool_title);
+        addTitleSegment(parts, count, rest[index..], theme.transcript_secondary);
+    } else {
+        addTitleSegment(parts, count, rest, theme.tool_title);
+    }
+}
+
+fn lineRangeStart(text: []const u8) ?usize {
+    const colon = std.mem.findScalarLast(u8, text, ':') orelse return null;
+    if (colon + 1 >= text.len or !std.ascii.isDigit(text[colon + 1])) return null;
+    for (text[colon + 1 ..]) |byte| {
+        if (!std.ascii.isDigit(byte) and byte != '-') return null;
+    }
+    return colon;
 }
 
 fn toolBodyVisible(tool: *const Transcript.Tool, expanded: bool) bool {
@@ -782,12 +911,24 @@ fn drawComposer(app: *App, painter: *Painter, composer_rows: usize, bottom_reser
         painter.roundedBorder(0, box_y, app.width, box_height, app.theme.composer_chrome);
         if (app.width >= 4) {
             const inner = app.width - 2;
-            if (app.status.highestPriority(.composer_corner)) |view| {
+            const left_x: usize = 2;
+            var right_start: usize = @as(usize, app.width) - 2;
+            var right_visible = false;
+            if (app.status.highestPriority(.composer_right)) |view| {
                 const label_width = text_mod.displayWidth(view.text);
                 if (inner >= 2 + label_width) {
-                    const x = @as(usize, app.width) - 2 - label_width;
-                    painter.writeText(@intCast(x), box_y, view.text, app.theme.composer_slot);
+                    right_start = @as(usize, app.width) - 2 - label_width;
+                    painter.writeText(@intCast(right_start), box_y, view.text, app.theme.composer_slot);
+                    right_visible = true;
                 }
+            }
+            if (app.status.highestPriority(.composer_left)) |view| {
+                const available = if (right_visible)
+                    right_start -| (left_x + 1)
+                else
+                    @as(usize, app.width) -| (left_x + 2);
+                const label = fitToWidth(view.text, available);
+                if (label.len > 0) painter.writeText(@intCast(left_x), box_y, label, app.theme.composer_slot);
             }
         }
     }
@@ -841,7 +982,12 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
     }
 
     if (match_count == 0) {
-        painter.writeText(x + 2, @intCast(@as(usize, y) + item_start_row), "no matches", app.theme.transcript_secondary);
+        painter.writeText(
+            x + 2,
+            @intCast(@as(usize, y) + item_start_row),
+            "no matches",
+            app.theme.transcript_secondary,
+        );
         return;
     }
 
@@ -855,16 +1001,31 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
         const is_selected = item_index == selected;
         const row_y: u16 = @intCast(@as(usize, y) + item_start_row + row);
         const marker = if (is_selected) "> " else "  ";
-        painter.writeText(x + 2, row_y, marker, if (is_selected) app.theme.status_accent else app.theme.transcript_secondary);
+        painter.writeText(
+            x + 2,
+            row_y,
+            marker,
+            if (is_selected) app.theme.status_accent else app.theme.transcript_secondary,
+        );
         const label_x = x + 4;
         const label_width = inner_width -| 2;
         const label = fitToWidth(item.labelSlice(), label_width);
-        painter.writeText(label_x, row_y, label, if (is_selected) app.theme.composer_text else app.theme.transcript_text);
+        painter.writeText(
+            label_x,
+            row_y,
+            label,
+            if (is_selected) app.theme.composer_text else app.theme.transcript_text,
+        );
         const used = text_mod.displayWidth(label) + 2;
         const detail = item.detailSlice();
         if (detail.len > 0 and used + 2 < inner_width) {
             const detail_x = advance(x + 2, used + 2);
-            painter.writeText(detail_x, row_y, fitToWidth(detail, inner_width - used - 2), app.theme.transcript_secondary);
+            painter.writeText(
+                detail_x,
+                row_y,
+                fitToWidth(detail, inner_width - used - 2),
+                app.theme.transcript_secondary,
+            );
         }
     }
 }
@@ -889,7 +1050,7 @@ const Painter = struct {
 
     fn writeText(self: *Painter, x: u16, y: u16, bytes: []const u8, style: theme_mod.Style) void {
         if (x >= self.width or y >= self.height or bytes.len == 0) return;
-        const segment = vaxis.Segment{ .text = bytes, .style = style };
+        const segment: vaxis.Segment = .{ .text = bytes, .style = style };
         _ = self.vx.window().print(&.{segment}, .{ .col_offset = x, .row_offset = y, .wrap = .none });
     }
 
@@ -936,7 +1097,13 @@ const Painter = struct {
             self.writeText(x, y, row.prefix, row.prefix_style);
             x = advance(x, text_mod.displayWidth(row.prefix));
         }
-        if (x < self.width and row.text.len > 0) {
+        if (row.segments.len > 0) {
+            for (row.segments) |segment| {
+                if (x >= self.width) break;
+                self.writeText(x, y, segment.text, segment.style);
+                x = advance(x, text_mod.displayWidth(segment.text));
+            }
+        } else if (x < self.width and row.text.len > 0) {
             self.writeText(x, y, row.text, row.text_style);
             x = advance(x, text_mod.displayWidth(row.text));
         }
@@ -996,6 +1163,138 @@ test "head-collapsed tool keeps the first rows with the hint below" {
     try std.testing.expectEqualStrings("b", scratch.rows[2].text);
     try std.testing.expect(std.mem.indexOf(u8, scratch.rows[3].text, "more lines") != null);
     try std.testing.expectEqual(@as(usize, 6), count);
+}
+
+test "tool warning body lines use warning style" {
+    var app = App.init(80, 24);
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "grep",
+        .presentation = .search,
+        .title = "grep /foo/ in .",
+    } });
+    _ = try app.transcript.appendToolOutput(
+        testing_gpa,
+        "call-1",
+        "src/main.zig:1: foo\n[Truncated: 2 matches limit]",
+        0,
+        0,
+    );
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    var count: usize = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+
+    try std.testing.expectEqualStrings("src/main.zig:1: foo", scratch.rows[1].text);
+    try std.testing.expectEqual(app.theme.tool_output, scratch.rows[1].text_style);
+    try std.testing.expectEqualStrings("[Truncated: 2 matches limit]", scratch.rows[2].text);
+    try std.testing.expectEqual(app.theme.status_warning, scratch.rows[2].text_style);
+}
+
+test "successful read hides body until expanded" {
+    var app = App.init(80, 24);
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "read",
+        .presentation = .file,
+        .status = .success,
+        .body_mode = .hidden_on_success,
+        .collapse = .{ .mode = .head, .rows_max = 10 },
+        .title = "read src/main.zig:1-2",
+    } });
+    _ = try app.transcript.appendToolOutput(testing_gpa, "call-1", "one\ntwo", 0, 0);
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    var count: usize = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualStrings("read src/main.zig:1-2", scratch.rows[0].text);
+    try std.testing.expectEqualStrings(tool_bottom_line, scratch.rows[1].text);
+
+    count = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, true);
+    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqualStrings("one", scratch.rows[1].text);
+    try std.testing.expectEqualStrings("two", scratch.rows[2].text);
+}
+
+test "tool header uses compact title only while collapsed" {
+    var app = App.init(80, 24);
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "read",
+        .title = "read skills/review/SKILL.md:1-10",
+        .compact_title = "[skill] review:1-10 (ctrl+o to expand)",
+    } });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    var count: usize = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+    try std.testing.expectEqualStrings("[skill] review:1-10 (ctrl+o to expand)", scratch.rows[0].text);
+
+    count = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, true);
+    try std.testing.expectEqualStrings("read skills/review/SKILL.md:1-10", scratch.rows[0].text);
+}
+
+test "file tool header styles name path range and hint as segments" {
+    var app = App.init(80, 24);
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "read",
+        .presentation = .file,
+        .title = "read src/main.zig:1-20",
+    } });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    var count: usize = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+
+    const header = scratch.rows[0];
+    try std.testing.expectEqual(@as(usize, 4), header.segments.len);
+    try std.testing.expectEqualStrings("read", header.segments[0].text);
+    try std.testing.expectEqualStrings(" ", header.segments[1].text);
+    try std.testing.expectEqualStrings("src/main.zig", header.segments[2].text);
+    try std.testing.expectEqualStrings(":1-20", header.segments[3].text);
+    try std.testing.expectEqual(app.theme.status_accent, header.segments[2].style);
+    try std.testing.expectEqual(app.theme.status_warning, header.segments[3].style);
+}
+
+test "tool header reserves room for closing bracket" {
+    var app = App.init(24, 8);
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "read",
+        .title = "read src/agent/Agent.zig:1-260 plus more text",
+    } });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    var count: usize = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+
+    const header = scratch.rows[0];
+    const used = padding_x +
+        text_mod.displayWidth(header.prefix) +
+        text_mod.displayWidth(header.text) +
+        text_mod.displayWidth(header.suffix);
+    try std.testing.expectEqualStrings(tool_title_suffix, header.suffix);
+    try std.testing.expect(used <= app.width);
 }
 
 test "memoized item rows match a fresh build and invalidate on mutation" {
@@ -1059,6 +1358,31 @@ test "scroll max accounts for composer and status reservations" {
     // A status contribution reserves one more row.
     _ = app.status.set(.{ .slot = .status_line, .id = 1, .text = "working" });
     try std.testing.expectEqual(visible - 1, transcriptVisibleRows(&app));
+}
+
+test "composer top border draws cwd and session chrome without overlap" {
+    var env = std.process.Environ.Map.init(testing_gpa);
+    defer env.deinit();
+
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var output_storage: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_storage);
+    defer vx.deinit(testing_gpa, &writer);
+
+    try vx.resize(testing_gpa, &writer, .{ .cols = 60, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(60, 8);
+    defer app.deinit(testing_gpa);
+    _ = app.status.set(.{ .slot = .composer_left, .id = 1, .text = "/repo" });
+    _ = app.status.set(.{ .slot = .composer_right, .id = 2, .text = "67.5%/272k • openai/gpt (high)" });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try std.testing.expect(screenContainsText(vx.window(), "/repo"));
+    try std.testing.expect(screenContainsText(vx.window(), "67.5%/272k"));
+    try std.testing.expect(screenContainsText(vx.window(), "openai/gpt (high)"));
 }
 
 test "vaxis screen receives the frame" {
@@ -1167,9 +1491,10 @@ test "scrolled frame draws older rows and clamps to max" {
     const scratch = try testing_gpa.create(RowScratch);
     defer testing_gpa.destroy(scratch);
 
-    app.scroll_rows = 10_000; // clamps to max instead of blanking
+    app.viewport.scroll_rows = 10_000; // render clamps locally instead of blanking
     draw(&app, &vx, scratch);
     try expectScreenText(vx.window(), 1, 1, "line-0");
+    try std.testing.expectEqual(@as(usize, 10_000), app.viewport.scroll_rows);
 }
 
 fn screenContainsText(window: vaxis.Window, needle: []const u8) bool {

@@ -23,18 +23,75 @@ const App = @This();
 /// Second ctrl+c within this window exits; the first clears the composer.
 pub const double_press_window_ms: i64 = 500;
 pub const mouse_wheel_scroll_rows: usize = 3;
+pub const tail_autoscroll_detach_rows: usize = mouse_wheel_scroll_rows * 2;
+
+const ScrollResult = enum { moved, boundary };
+const ScrollAttachment = enum { auto, detached };
+
+const TranscriptViewport = struct {
+    scroll_rows: usize = 0,
+    attachment: ScrollAttachment = .auto,
+
+    fn clear(self: *TranscriptViewport) void {
+        self.* = .{};
+    }
+
+    fn historyPrepended(self: *TranscriptViewport, max_scroll: usize) void {
+        self.scroll_rows = max_scroll;
+        self.attachment = .detached;
+    }
+
+    fn scrollUp(self: *TranscriptViewport, rows: usize, max_scroll: usize) ScrollResult {
+        if (rows == 0 or self.scroll_rows == max_scroll) return .boundary;
+        const next = @min(max_scroll, self.scroll_rows + rows);
+        if (next == self.scroll_rows) return .boundary;
+        self.scroll_rows = next;
+        self.updateAttachmentFromDistance();
+        return .moved;
+    }
+
+    fn scrollDown(self: *TranscriptViewport, rows: usize) bool {
+        if (rows == 0) return false;
+        const next = self.scroll_rows -| rows;
+        if (next == self.scroll_rows) return false;
+        self.scroll_rows = next;
+        self.updateAttachmentFromDistance();
+        return true;
+    }
+
+    fn tailMutated(self: *TranscriptViewport, before_max: usize, after_max: usize) void {
+        if (self.attachment == .auto or self.scroll_rows <= tail_autoscroll_detach_rows) {
+            self.attachment = .auto;
+            self.scroll_rows = 0;
+            return;
+        }
+        self.scroll_rows = @min(after_max, self.scroll_rows + (after_max -| before_max));
+    }
+
+    fn clampOrFollow(self: *TranscriptViewport, max_scroll: usize) void {
+        if (self.attachment == .auto) {
+            self.scroll_rows = 0;
+        } else {
+            self.scroll_rows = @min(self.scroll_rows, max_scroll);
+        }
+    }
+
+    fn updateAttachmentFromDistance(self: *TranscriptViewport) void {
+        self.attachment = if (self.scroll_rows > tail_autoscroll_detach_rows) .detached else .auto;
+    }
+};
 
 width: u16,
 height: u16,
 composer: Composer = .{},
 prompt_history: PromptHistory = .{},
 history_cursor_from_newest: ?usize = null,
-history_draft: std.ArrayListUnmanaged(u8) = .empty,
+history_draft: std.ArrayList(u8) = .empty,
 history_draft_cursor_byte_index: usize = 0,
 transcript: Transcript = .{},
 completion: Completion = .{},
 status: status_mod.Store = .{},
-scroll_rows: usize = 0,
+viewport: TranscriptViewport = .{},
 theme: theme_mod.Theme = theme_mod.Theme.codex(),
 tools_expanded: bool = false,
 now_ms: i64 = 0,
@@ -263,6 +320,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             if (self.width != size.width or self.height != size.height) {
                 self.width = size.width;
                 self.height = size.height;
+                self.clampOrFollowViewport();
                 self.dirty = true;
             }
             return null;
@@ -277,17 +335,20 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         },
         .clear_transcript => {
             self.transcript.clear(gpa);
-            self.scroll_rows = 0;
+            self.viewport.clear();
             self.dirty = true;
             return null;
         },
         .append_transcript => |entry| {
+            const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.append(gpa, entry);
             try self.noteOutcome(gpa, outcome);
+            self.applyTailMutationScroll(before_max);
             self.dirty = true;
             return null;
         },
         .tool_output_delta => |delta| {
+            const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.appendToolOutput(
                 gpa,
                 delta.tool_call_id,
@@ -296,25 +357,30 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
                 delta.dropped_head_lines,
             );
             try self.noteOutcome(gpa, outcome);
+            self.applyTailMutationScroll(before_max);
             self.dirty = true;
             return null;
         },
         .replace_tool_output => |replace| {
+            const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.replaceToolOutput(gpa, replace.tool_call_id, replace.text);
             try self.noteOutcome(gpa, outcome);
+            self.applyTailMutationScroll(before_max);
             self.dirty = true;
             return null;
         },
         .replace_tool_footer => |footer| {
+            const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.replaceToolFooter(gpa, footer.tool_call_id, footer.text);
             try self.noteOutcome(gpa, outcome);
+            self.applyTailMutationScroll(before_max);
             self.dirty = true;
             return null;
         },
         .prepend_transcript => |message| {
             const outcome = try self.transcript.prependMessage(gpa, message);
             try self.noteOutcome(gpa, outcome);
-            self.scroll_rows = render.transcriptScrollMax(self);
+            self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.dirty = true;
             return null;
         },
@@ -423,6 +489,7 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
         .transcript_scroll_down => self.scrollDown(mouse_wheel_scroll_rows),
         .toggle_tool_expansion => {
             self.tools_expanded = !self.tools_expanded;
+            self.clampOrFollowViewport();
             self.dirty = true;
         },
         .interrupt => return .interrupt,
@@ -754,7 +821,7 @@ fn acceptComposerArgCompletion(
     const query = self.composerArgQuery(completion.commandName()) orelse return;
     const index = completion.picker.selectedIndex() orelse return;
     const item = completion.picker.itemAt(index);
-    var next: std.ArrayListUnmanaged(u8) = .empty;
+    var next: std.ArrayList(u8) = .empty;
     defer next.deinit(gpa);
     const text = self.composer.text();
     try next.ensureTotalCapacity(gpa, text.len - (query.end - query.start) + item.idSlice().len);
@@ -785,34 +852,48 @@ fn clearOrExit(self: *App) ?Effect {
     return null;
 }
 
-const ScrollResult = enum { moved, boundary };
-
 fn scrollUp(self: *App, rows: usize) ScrollResult {
-    const max = render.transcriptScrollMax(self);
-    if (rows == 0 or self.scroll_rows == max) return .boundary;
-    const next = @min(max, self.scroll_rows + rows);
-    if (next == self.scroll_rows) return .boundary;
-    self.scroll_rows = next;
-    self.dirty = true;
-    return .moved;
+    const result = self.viewport.scrollUp(rows, render.transcriptScrollMax(self));
+    if (result == .moved) self.dirty = true;
+    return result;
 }
 
 fn scrollDown(self: *App, rows: usize) void {
-    if (rows == 0) return;
-    const next = self.scroll_rows -| rows;
-    if (next == self.scroll_rows) return;
-    self.scroll_rows = next;
-    self.dirty = true;
+    if (self.viewport.scrollDown(rows)) self.dirty = true;
+}
+
+/// Tail mutations are append/replace operations at the live end of the
+/// transcript. When auto-attached, they pin to the tail. When detached, they
+/// add any new bottom distance to `scroll_rows` so the user's viewport does
+/// not drift while an agent streams below it.
+fn applyTailMutationScroll(self: *App, before_max: usize) void {
+    self.viewport.tailMutated(before_max, render.transcriptScrollMax(self));
+}
+
+fn clampOrFollowViewport(self: *App) void {
+    self.viewport.clampOrFollow(render.transcriptScrollMax(self));
 }
 
 fn noteOutcome(self: *App, gpa: std.mem.Allocator, outcome: Transcript.Outcome) error{OutOfMemory}!void {
-    if (outcome.truncated) try self.notice(gpa, .warning, "transcript append truncated");
+    if (outcome.truncated) try self.appendNotice(gpa, .warning, "transcript append truncated");
+}
+
+fn appendNotice(
+    self: *App,
+    gpa: std.mem.Allocator,
+    level: Transcript.StatusLevel,
+    text: []const u8,
+) error{OutOfMemory}!void {
+    _ = try self.transcript.append(gpa, .{ .status = .{ .level = level, .text = text } });
+    self.dirty = true;
 }
 
 /// Internal degradation notices share the transcript status vocabulary so
 /// policy failures are visible to the user instead of silently dropped.
 fn notice(self: *App, gpa: std.mem.Allocator, level: Transcript.StatusLevel, text: []const u8) error{OutOfMemory}!void {
-    _ = try self.transcript.append(gpa, .{ .status = .{ .level = level, .text = text } });
+    const before_max = render.transcriptScrollMax(self);
+    try self.appendNotice(gpa, level, text);
+    self.applyTailMutationScroll(before_max);
     self.dirty = true;
 }
 
@@ -885,18 +966,85 @@ test "mouse wheel scrolls the resident transcript and clamps" {
     try std.testing.expect(max_scroll > 0);
 
     _ = try app.apply(gpa, .{ .input = .wheel_up });
-    try std.testing.expectEqual(@min(max_scroll, mouse_wheel_scroll_rows), app.scroll_rows);
+    try std.testing.expectEqual(@min(max_scroll, mouse_wheel_scroll_rows), app.viewport.scroll_rows);
 
-    app.scroll_rows = max_scroll;
+    app.viewport.scroll_rows = max_scroll;
     const boundary = try app.apply(gpa, .{ .input = .wheel_up });
     try std.testing.expect(boundary.? == .request_transcript_history);
 
     _ = try app.apply(gpa, .{ .input = .wheel_down });
-    try std.testing.expectEqual(max_scroll -| mouse_wheel_scroll_rows, app.scroll_rows);
+    try std.testing.expectEqual(max_scroll -| mouse_wheel_scroll_rows, app.viewport.scroll_rows);
 
-    app.scroll_rows = 0;
+    app.viewport.scroll_rows = 0;
     _ = try app.apply(gpa, .{ .input = .wheel_down });
-    try std.testing.expectEqual(@as(usize, 0), app.scroll_rows);
+    try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
+}
+
+test "tail appends stick to bottom while near tail" {
+    const gpa = std.testing.allocator;
+    var app = App.init(20, 6);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "one\ntwo\nthree\nfour\nfive\nsix",
+    } } });
+    _ = try app.apply(gpa, .{ .input = .wheel_up });
+    try std.testing.expect(app.viewport.scroll_rows > 0);
+    try std.testing.expect(app.viewport.scroll_rows <= tail_autoscroll_detach_rows);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "tail",
+    } } });
+    try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
+}
+
+test "detached scrolling preserves viewport distance while tail grows" {
+    const gpa = std.testing.allocator;
+    var app = App.init(20, 6);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten",
+    } } });
+    while (app.viewport.scroll_rows <= tail_autoscroll_detach_rows) {
+        _ = try app.apply(gpa, .{ .input = .wheel_up });
+    }
+    const before_scroll = app.viewport.scroll_rows;
+    const before_max = render.transcriptScrollMax(&app);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "tail",
+    } } });
+    const after_max = render.transcriptScrollMax(&app);
+    try std.testing.expect(after_max > before_max);
+    try std.testing.expectEqual(@min(after_max, before_scroll + (after_max - before_max)), app.viewport.scroll_rows);
+}
+
+test "scrolling back near the tail reattaches on next tail append" {
+    const gpa = std.testing.allocator;
+    var app = App.init(20, 6);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten",
+    } } });
+    while (app.viewport.scroll_rows <= tail_autoscroll_detach_rows) {
+        _ = try app.apply(gpa, .{ .input = .wheel_up });
+    }
+    while (app.viewport.scroll_rows > tail_autoscroll_detach_rows) {
+        _ = try app.apply(gpa, .{ .input = .wheel_down });
+    }
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "tail",
+    } } });
+    try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
 }
 
 test "prepending transcript history keeps the viewport on older content" {
@@ -914,7 +1062,7 @@ test "prepending transcript history keeps the viewport on older content" {
         .mode = .new_item,
     } });
 
-    try std.testing.expect(app.scroll_rows == render.transcriptScrollMax(&app));
+    try std.testing.expect(app.viewport.scroll_rows == render.transcriptScrollMax(&app));
     try std.testing.expectEqual(Transcript.Role.user, app.transcript.items.items[0].body.message.role);
 }
 

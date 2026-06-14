@@ -120,8 +120,8 @@ pub fn splitIncompleteTail(bytes: []const u8) SplitTail {
 /// Append `bytes` with every invalid UTF-8 sequence replaced by U+FFFD.
 /// Valid input is copied verbatim.
 pub fn appendSanitized(
-    list: *std.ArrayListUnmanaged(u8),
     gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
     bytes: []const u8,
 ) error{OutOfMemory}!void {
     if (std.unicode.utf8ValidateSlice(bytes)) {
@@ -239,9 +239,9 @@ test "splitIncompleteTail carries a split codepoint" {
 }
 
 test "appendSanitized replaces invalid bytes and keeps valid text" {
-    var list: std.ArrayListUnmanaged(u8) = .empty;
+    var list: std.ArrayList(u8) = .empty;
     defer list.deinit(std.testing.allocator);
-    try appendSanitized(&list, std.testing.allocator, "ok\xffgo");
+    try appendSanitized(std.testing.allocator, &list, "ok\xffgo");
     try std.testing.expectEqualStrings("ok\u{fffd}go", list.items);
 }
 

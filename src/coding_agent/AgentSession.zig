@@ -447,10 +447,85 @@ pub fn clientSnapshot(
     return .{
         .header = header,
         .model = model,
+        .thinking_level = self.agent.state.thinking_level,
+        .context = self.clientContextUsage(),
         .queue = queue,
         .active_request_id = active_request_id,
         .history = history,
     };
+}
+
+pub fn clientChromeSnapshot(
+    self: *const AgentSession,
+    allocator: std.mem.Allocator,
+) !client_protocol.SessionChromeSnapshot {
+    return client_protocol.SessionChromeSnapshot.init(
+        allocator,
+        self.manager.header.cwd,
+        self.agent.state.model,
+        self.agent.state.thinking_level,
+        self.clientContextUsage(),
+    );
+}
+
+fn clientContextUsage(self: *const AgentSession) client_protocol.ContextUsageSnapshot {
+    const window = self.agent.state.model.context_window;
+    if (window == 0) return .{};
+
+    const entries = self.manager.entries.items;
+    const latest_compaction_index = latestCompactionIndex(entries);
+    const search_start = if (latest_compaction_index) |index| index + 1 else 0;
+    if (latest_compaction_index != null and !hasKnownAssistantUsage(entries[search_start..])) {
+        return .{ .window = window };
+    }
+
+    var usage_index: ?usize = null;
+    var usage_tokens: u64 = 0;
+    var index = entries.len;
+    while (index > search_start) {
+        index -= 1;
+        const tokens = assistantContextTokens(entries[index]) orelse continue;
+        usage_index = index;
+        usage_tokens = tokens;
+        break;
+    }
+
+    var tokens: u64 = usage_tokens;
+    const estimate_start = if (usage_index) |resolved| resolved + 1 else search_start;
+    for (entries[estimate_start..]) |entry| tokens +|= session_manager.SessionManager.estimateEntryTokens(entry);
+    const percent_tenths = if (window == 0) null else percent: {
+        const scaled = (@as(u128, tokens) * 1000) / window;
+        break :percent @as(u32, @intCast(@min(scaled, std.math.maxInt(u32))));
+    };
+    return .{ .tokens = tokens, .window = window, .percent_tenths = percent_tenths };
+}
+
+fn latestCompactionIndex(entries: []const session_manager.SessionEntry) ?usize {
+    var index = entries.len;
+    while (index > 0) {
+        index -= 1;
+        if (entries[index] == .compaction) return index;
+    }
+    return null;
+}
+
+fn hasKnownAssistantUsage(entries: []const session_manager.SessionEntry) bool {
+    for (entries) |entry| {
+        const tokens = assistantContextTokens(entry) orelse continue;
+        if (tokens > 0) return true;
+    }
+    return false;
+}
+
+fn assistantContextTokens(entry: session_manager.SessionEntry) ?u64 {
+    if (entry != .message or entry.message.message != .assistant) return null;
+    const assistant = entry.message.message.assistant;
+    if (assistant.stop_reason == .aborted or assistant.stop_reason == .error_) return null;
+    if (assistant.usage.total_tokens != 0) return assistant.usage.total_tokens;
+    return assistant.usage.input +|
+        assistant.usage.output +|
+        assistant.usage.cache_read +|
+        assistant.usage.cache_write;
 }
 
 pub fn clientHistoryPage(
@@ -874,8 +949,18 @@ fn classifyToolResultAfterCall(
     _: runtime.CancelToken,
     context: agent_mod.AfterToolCallContext,
 ) anyerror!?agent_mod.AfterToolCallResult {
-    if (!std.mem.eql(u8, context.tool_call.name, "bash")) return null;
-    return .{ .is_error = bash_tool.classifyResult(context.result.details, context.is_error) };
+    if (std.mem.eql(u8, context.tool_call.name, "bash")) {
+        return .{ .is_error = bash_tool.classifyResult(context.result.details, context.is_error) };
+    }
+    if (toolResultRequestsError(context.result.details)) return .{ .is_error = true };
+    return null;
+}
+
+fn toolResultRequestsError(details: ?std.json.Value) bool {
+    const value = details orelse return false;
+    if (value != .object) return false;
+    const is_error = value.object.get("isError") orelse return false;
+    return is_error == .bool and is_error.bool;
 }
 
 fn drainAgentEvent(
@@ -886,6 +971,14 @@ fn drainAgentEvent(
 ) anyerror!void {
     const drain: *event_drain_mod.EventDrain = @ptrCast(@alignCast(context.?));
     try drain.handle(event);
+}
+
+test "tool result details can request error classification" {
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try object.put(std.testing.allocator, "isError", .{ .bool = true });
+    try std.testing.expect(toolResultRequestsError(.{ .object = object }));
+    try std.testing.expect(!toolResultRequestsError(null));
 }
 
 // -- tests --------------------------------------------------------------
@@ -900,8 +993,8 @@ const TestSessionOptions = struct {
 };
 
 fn initTestSession(task_runtime: *runtime.Runtime, dir: std.Io.Dir, overrides: TestSessionOptions) !AgentSession {
-    dir.createDirPath(std.testing.io, "agent") catch {};
-    dir.createDirPath(std.testing.io, "repo") catch {};
+    try dir.createDirPath(std.testing.io, "agent");
+    try dir.createDirPath(std.testing.io, "repo");
     var options: Options = .{
         .cwd = "repo",
         .agent_dir = "agent",
@@ -984,10 +1077,8 @@ test "settle verdict arms backoff retry and repairs the runtime transcript" {
     drainAllPublicEvents(&session);
 
     const verdict = try session.settlePromptRun(.{ .overflow_count_before = 0, .overflow_retry_used = false });
-    try std.testing.expectEqual(
-        SettleVerdict{ .retry = .{ .kind = .continue_run, .delay_ms = 100 } },
-        verdict,
-    );
+    const expected: SettleVerdict = .{ .retry = .{ .kind = .continue_run, .delay_ms = 100 } };
+    try std.testing.expectEqual(expected, verdict);
     // The failed assistant message is gone from the runtime context; the
     // durable history still has it.
     try std.testing.expectEqual(@as(usize, 1), session.agent.state.messages.len);
@@ -1286,10 +1377,8 @@ test "agent session auto compaction summarizes persists and replaces context" {
     try driveCompactionRun(&session, run);
     const verdict = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
-    try std.testing.expectEqual(
-        SettleVerdict{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } },
-        verdict,
-    );
+    const expected: SettleVerdict = .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
+    try std.testing.expectEqual(expected, verdict);
 
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
     try std.testing.expectEqualStrings("generated summary", session.manager.entries.items[2].compaction.summary);
@@ -1334,10 +1423,8 @@ test "agent session auto compaction failure does not mutate history" {
     const verdict = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
     // A failed threshold compaction degrades: the prompt still proceeds.
-    try std.testing.expectEqual(
-        SettleVerdict{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } },
-        verdict,
-    );
+    const expected: SettleVerdict = .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
+    try std.testing.expectEqual(expected, verdict);
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), session.agent.state.messages.len);
 
@@ -1426,10 +1513,8 @@ test "overflow settle starts compaction and arms the resubmit retry" {
     try driveCompactionRun(&session, run);
     const resubmit = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
-    try std.testing.expectEqual(
-        SettleVerdict{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } },
-        resubmit,
-    );
+    const expected: SettleVerdict = .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
+    try std.testing.expectEqual(expected, resubmit);
     try std.testing.expect(session.manager.entries.items[3] == .compaction);
 
     var end_event = session.drainPublicEvent().?;

@@ -8,6 +8,7 @@ pub const client_protocol = @import("client_protocol.zig");
 pub const session_listing = @import("session_listing.zig");
 pub const session_runtime = @import("session_runtime.zig");
 pub const slash_commands = @import("slash_commands.zig");
+pub const tool_metadata = @import("tool_metadata.zig");
 pub const wire_protocol = @import("wire_protocol.zig");
 
 // Internal modules, referenced here so `zig build test` reaches their tests.
@@ -41,6 +42,7 @@ test {
     _ = settings;
     _ = skills;
     _ = system_prompt;
+    _ = tool_metadata;
     _ = tool_registry;
     _ = tool_output_policy;
     _ = tools;

@@ -29,6 +29,7 @@ pub const ReadTool = struct {
 
     pub const Config = struct {
         cwd: []const u8,
+        home_dir: ?[]const u8 = null,
         allow_paths_outside_cwd: bool = false,
         max_read_bytes: usize = max_read_bytes,
         max_output_bytes: usize = max_output_bytes,
@@ -38,9 +39,12 @@ pub const ReadTool = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !ReadTool {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
+        const home_dir = if (config.home_dir) |path| try allocator.dupe(u8, path) else null;
+        errdefer if (home_dir) |path| allocator.free(path);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
         var owned_config = config;
         owned_config.cwd = cwd;
+        owned_config.home_dir = home_dir;
         return .{
             .allocator = allocator,
             .config = owned_config,
@@ -50,6 +54,7 @@ pub const ReadTool = struct {
 
     pub fn deinit(self: *ReadTool) void {
         self.allocator.free(self.config.cwd);
+        if (self.config.home_dir) |path| self.allocator.free(path);
         self.parsed_parameters.deinit();
         self.* = undefined;
     }
@@ -80,20 +85,30 @@ fn execute(
 ) anyerror!agent.ToolExecutionResult {
     try token.throwIfRequested();
     const self: *ReadTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
-    const args = try parseArgs(params);
+    const args = parseArgs(params) catch |err| switch (err) {
+        error.InvalidToolArguments => return readErrorResult(
+            allocator,
+            "invalid_arguments",
+            "Invalid read arguments: provide path/file_path and positive offset/limit integers.",
+        ),
+    };
     const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
+        .home_dir = self.config.home_dir,
     }, args.path);
     defer allocator.free(resolved_path);
 
-    const content = try std.Io.Dir.readFileAlloc(
+    const content = std.Io.Dir.readFileAlloc(
         .cwd(),
         io,
         resolved_path,
         allocator,
         .limited(self.config.max_read_bytes),
-    );
+    ) catch |err| switch (err) {
+        error.FileTooBig, error.StreamTooLong => return readTooLargeResult(allocator, self.config.max_read_bytes),
+        else => return err,
+    };
     defer allocator.free(content);
     try token.throwIfRequested();
 
@@ -115,6 +130,35 @@ const ReadArgs = struct {
     offset: ?usize,
     limit: ?usize,
 };
+
+fn readErrorResult(
+    allocator: std.mem.Allocator,
+    reason: []const u8,
+    message: []const u8,
+) !agent.ToolExecutionResult {
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.textResult(allocator, message, details);
+}
+
+fn readTooLargeResult(allocator: std.mem.Allocator, max_bytes: usize) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Read failed: file exceeds the {d} byte read limit.",
+        .{max_bytes},
+    );
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = @as([]const u8, "file_too_large"),
+        .maxBytes = max_bytes,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
+}
 
 fn imageReadResult(
     allocator: std.mem.Allocator,
@@ -200,7 +244,8 @@ fn isWebp(content: []const u8) bool {
 
 fn parseArgs(params: std.json.Value) !ReadArgs {
     if (params != .object) return error.InvalidToolArguments;
-    const path_value = params.object.get("path") orelse return error.InvalidToolArguments;
+    const path_value = params.object.get("path") orelse params.object.get("file_path") orelse
+        return error.InvalidToolArguments;
     if (path_value != .string or path_value.string.len == 0) return error.InvalidToolArguments;
     return .{
         .path = path_value.string,
@@ -222,7 +267,10 @@ const FormattedReadOutput = struct {
     truncated: bool,
     user_limit: bool,
     truncated_by: ReadTruncatedBy,
+    offset_beyond_eof: bool,
+    requested_offset: usize,
     first_line_exceeds_limit: bool,
+    first_line_bytes: usize,
     output_lines: usize,
     remaining_lines: usize,
     total_lines: usize,
@@ -237,8 +285,17 @@ const FormattedReadOutput = struct {
     }
 
     fn details(self: FormattedReadOutput, allocator: std.mem.Allocator) !?std.json.Value {
+        if (self.offset_beyond_eof) {
+            const value = try path_utils.jsonDetails(allocator, .{
+                .isError = true,
+                .reason = @as([]const u8, "offset_beyond_eof"),
+                .offset = self.requested_offset,
+                .totalLines = self.total_lines,
+            });
+            return value;
+        }
         if (!self.truncated and !self.user_limit and self.next_offset == null) return null;
-        return try path_utils.jsonDetails(allocator, .{
+        const value = try path_utils.jsonDetails(allocator, .{
             .nextOffset = self.next_offset,
             .truncation = try path_utils.jsonDetails(allocator, .{
                 .truncated = self.truncated,
@@ -248,6 +305,7 @@ const FormattedReadOutput = struct {
                     .bytes => "bytes",
                 }),
                 .firstLineExceedsLimit = self.first_line_exceeds_limit,
+                .firstLineBytes = if (self.first_line_bytes > 0) self.first_line_bytes else null,
                 .outputLines = self.output_lines,
                 .remainingLines = self.remaining_lines,
                 .totalLines = self.total_lines,
@@ -257,6 +315,7 @@ const FormattedReadOutput = struct {
                 .maxLines = self.max_lines,
             }),
         });
+        return value;
     }
 };
 
@@ -277,7 +336,9 @@ fn formatReadOutput(
     var remaining_lines: usize = 0;
     var total_lines: usize = 0;
     var skipped_to_start = false;
+    var offset_beyond_eof = false;
     var first_line_exceeds_limit = false;
+    var first_line_bytes: usize = 0;
     var user_limit = false;
     var output_truncated = false;
     var truncated_by: ReadTruncatedBy = .lines;
@@ -302,7 +363,10 @@ fn formatReadOutput(
         if (bytes_written + separator_bytes + line.len > config.max_output_bytes) {
             output_truncated = true;
             truncated_by = .bytes;
-            if (emitted_lines == 0) first_line_exceeds_limit = true;
+            if (emitted_lines == 0) {
+                first_line_exceeds_limit = true;
+                first_line_bytes = line.len;
+            }
             remaining_lines += 1;
             continue;
         }
@@ -317,6 +381,7 @@ fn formatReadOutput(
     }
 
     if (!skipped_to_start) {
+        offset_beyond_eof = true;
         try writer.writer.print(
             "[Offset {d} is beyond end of file ({d} lines total).]",
             .{ start_line, total_lines },
@@ -324,12 +389,14 @@ fn formatReadOutput(
     }
     const next_offset = if (remaining_lines > 0 and last_emitted_line != null) last_emitted_line.? + 1 else null;
     if (first_line_exceeds_limit) {
-        var size_buffer: [32]u8 = undefined;
+        var line_size_buffer: [32]u8 = undefined;
+        var limit_size_buffer: [32]u8 = undefined;
         try writer.writer.print(
-            "[Line {d} exceeds {s} limit. Use bash: sed -n '{d}p' {s} | head -c {d}]",
+            "[Line {d} is {s}, exceeds {s} limit. Use bash: sed -n '{d}p' {s} | head -c {d}]",
             .{
                 start_line,
-                formatSize(&size_buffer, config.max_output_bytes),
+                formatSize(&line_size_buffer, first_line_bytes),
+                formatSize(&limit_size_buffer, config.max_output_bytes),
                 start_line,
                 args.path,
                 config.max_output_bytes,
@@ -368,7 +435,10 @@ fn formatReadOutput(
         .truncated = output_truncated,
         .user_limit = user_limit,
         .truncated_by = truncated_by,
+        .offset_beyond_eof = offset_beyond_eof,
+        .requested_offset = start_line,
         .first_line_exceeds_limit = first_line_exceeds_limit,
+        .first_line_bytes = first_line_bytes,
         .output_lines = emitted_lines,
         .remaining_lines = remaining_lines,
         .total_lines = total_lines,
@@ -410,6 +480,77 @@ test "read tool reads bounded text with offset and limit" {
     try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
     try std.testing.expectEqual(@as(i64, 9), truncation.get("outputBytes").?.integer);
     try std.testing.expectEqual(@as(i64, max_output_bytes), truncation.get("maxBytes").?.integer);
+}
+
+test "read tool expands configured home directory" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("home/project");
+    try fixture.write("home/project/file.txt", "home ok");
+
+    var home_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const home_len = try fixture.tmp.dir.realPathFile(std.testing.io, "home", &home_buffer);
+    var read_tool = try ReadTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .home_dir = home_buffer[0..home_len],
+        .allow_paths_outside_cwd = true,
+    });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"~/project/file.txt\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("home ok", result.result.content[0].text.text);
+}
+
+test "read tool reports invalid arguments operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\",\"offset\":0}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Invalid read arguments: provide path/file_path and positive offset/limit integers.",
+        result.result.content[0].text.text,
+    );
+    try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
+}
+
+test "read tool reports oversized file operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "hello");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .max_read_bytes = 3 });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Read failed: file exceeds the 3 byte read limit.",
+        result.result.content[0].text.text,
+    );
+    try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
+    try std.testing.expectEqualStrings("file_too_large", result.result.details.?.object.get("reason").?.string);
+}
+
+test "read tool accepts file_path compatibility argument" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "ok");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"file_path\":\"file.txt\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("ok", result.result.content[0].text.text);
 }
 
 test "read tool omits invalid utf8 text operationally" {
@@ -542,13 +683,14 @@ test "read tool reports first line exceeding output limit" {
     try std.testing.expect(formatted.first_line_exceeds_limit);
     try std.testing.expectEqual(@as(?usize, null), formatted.next_offset);
     try std.testing.expectEqualStrings(
-        "[Line 1 exceeds 3B limit. Use bash: sed -n '1p' file.txt | head -c 3]",
+        "[Line 1 is 6B, exceeds 3B limit. Use bash: sed -n '1p' file.txt | head -c 3]",
         formatted.text,
     );
     const details = (try formatted.details(std.testing.allocator)).?;
     defer runtime.freeJsonValue(std.testing.allocator, details);
     const truncation = details.object.get("truncation").?.object;
     try std.testing.expectEqualStrings("bytes", truncation.get("truncatedBy").?.string);
+    try std.testing.expectEqual(@as(i64, 6), truncation.get("firstLineBytes").?.integer);
 }
 
 test "read tool reports offset beyond end operationally" {
@@ -566,4 +708,9 @@ test "read tool reports offset beyond end operationally" {
         "[Offset 3 is beyond end of file (1 lines total).]",
         result.result.content[0].text.text,
     );
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("offset_beyond_eof", details.get("reason").?.string);
+    try std.testing.expectEqual(@as(i64, 3), details.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), details.get("totalLines").?.integer);
 }

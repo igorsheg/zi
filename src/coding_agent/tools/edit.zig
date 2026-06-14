@@ -1,9 +1,8 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
-const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const edit_diff = @import("edit_diff.zig");
-const file_writer = @import("file_writer.zig");
+const file_mutation_queue = @import("file_mutation_queue.zig");
 const path_utils = @import("path_utils.zig");
 const test_support = @import("test_support.zig");
 
@@ -39,20 +38,26 @@ pub const EditTool = struct {
     allocator: std.mem.Allocator,
     config: Config,
     parsed_parameters: runtime.JsonOwned(std.json.Value),
+    default_mutation_queue: file_mutation_queue.FileMutationQueue = .{},
 
     pub const Config = struct {
         cwd: []const u8,
+        home_dir: ?[]const u8 = null,
         allow_paths_outside_cwd: bool = false,
         max_read_bytes: usize = max_edit_read_bytes,
         max_output_bytes: usize = max_edit_output_bytes,
+        mutation_queue: ?*file_mutation_queue.FileMutationQueue = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !EditTool {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
+        const home_dir = if (config.home_dir) |path| try allocator.dupe(u8, path) else null;
+        errdefer if (home_dir) |path| allocator.free(path);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
         var owned_config = config;
         owned_config.cwd = cwd;
+        owned_config.home_dir = home_dir;
         return .{
             .allocator = allocator,
             .config = owned_config,
@@ -62,6 +67,7 @@ pub const EditTool = struct {
 
     pub fn deinit(self: *EditTool) void {
         self.allocator.free(self.config.cwd);
+        if (self.config.home_dir) |path| self.allocator.free(path);
         self.parsed_parameters.deinit();
         self.* = undefined;
     }
@@ -90,6 +96,15 @@ const Replacement = struct {
 const EditArgs = struct {
     path: []const u8,
     edits: []const Replacement,
+
+    fn deinit(self: *EditArgs, allocator: std.mem.Allocator) void {
+        for (self.edits) |edit| {
+            allocator.free(edit.old_text);
+            allocator.free(edit.new_text);
+        }
+        allocator.free(self.edits);
+        self.* = undefined;
+    }
 };
 
 const Match = struct {
@@ -133,11 +148,24 @@ fn execute(
 ) anyerror!agent.ToolExecutionResult {
     try token.throwIfRequested();
     const self: *EditTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
-    const args = try parseArgs(allocator, params);
-    defer allocator.free(args.edits);
+    var args = parseArgs(allocator, params) catch |err| switch (err) {
+        error.InvalidToolArguments => return editErrorResult(
+            allocator,
+            "invalid_arguments",
+            "Invalid edit arguments: provide path and one or more edits with non-empty oldText and string newText.",
+        ),
+        error.TooManyEdits => return editErrorResult(
+            allocator,
+            "too_many_edits",
+            "Edit failed: too many replacements in one call; split the edit into smaller batches.",
+        ),
+        else => return err,
+    };
+    defer args.deinit(allocator);
     const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
+        .home_dir = self.config.home_dir,
     }, args.path);
     defer allocator.free(resolved_path);
 
@@ -156,16 +184,29 @@ fn execute(
         args.edits,
         self.config.max_output_bytes,
     ) catch |err| switch (err) {
-        error.NoChanges => return path_utils.textResult(
+        error.NoChanges => return editErrorResult(
             allocator,
-            "No changes: replacement output is identical.",
-            null,
+            "no_changes",
+            "Edit failed: replacement output is identical.",
         ),
+        error.EditTextNotFoundOrNotUnique => return editErrorResult(
+            allocator,
+            "old_text_not_unique",
+            "Edit failed: every oldText must match exactly once in the file.",
+        ),
+        error.OverlappingEdits => return editErrorResult(
+            allocator,
+            "overlapping_edits",
+            "Edit failed: replacements overlap; merge nearby or overlapping changes into one edit.",
+        ),
+        error.EditTooLarge => return editTooLargeResult(allocator, self.config.max_output_bytes),
         else => return err,
     };
     defer edited.deinit(allocator);
     try token.throwIfRequested();
-    try file_writer.atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, on_update);
+    _ = on_update;
+    const mutation_queue = self.config.mutation_queue orelse &self.default_mutation_queue;
+    try mutation_queue.atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, null, .{});
 
     return editResult(
         allocator,
@@ -178,25 +219,91 @@ fn execute(
 
 fn parseArgs(allocator: std.mem.Allocator, params: std.json.Value) !EditArgs {
     if (params != .object) return error.InvalidToolArguments;
-    const path_value = params.object.get("path") orelse return error.InvalidToolArguments;
+    const path_value = params.object.get("path") orelse params.object.get("file_path") orelse
+        return error.InvalidToolArguments;
     if (path_value != .string or path_value.string.len == 0) return error.InvalidToolArguments;
 
-    const edits_value = params.object.get("edits") orelse return error.InvalidToolArguments;
-    if (edits_value != .array or edits_value.array.items.len == 0) return error.InvalidToolArguments;
-    if (edits_value.array.items.len > max_edits_per_call) return error.TooManyEdits;
-    const edits = try allocator.alloc(Replacement, edits_value.array.items.len);
-    errdefer allocator.free(edits);
-    for (edits_value.array.items, edits) |item, *edit| edit.* = try parseReplacement(item);
+    var parsed_edits: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_edits) |*parsed| parsed.deinit();
+    const edits_value = try normalizedEditsValue(allocator, params.object.get("edits"), &parsed_edits);
+    const legacy = legacyReplacement(params.object);
+    const edit_count = replacementCount(edits_value) + if (legacy != null) @as(usize, 1) else 0;
+    if (edit_count == 0) return error.InvalidToolArguments;
+    if (edit_count > max_edits_per_call) return error.TooManyEdits;
+
+    const edits = try allocator.alloc(Replacement, edit_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (edits[0..initialized]) |edit| {
+            allocator.free(edit.old_text);
+            allocator.free(edit.new_text);
+        }
+        allocator.free(edits);
+    }
+    if (edits_value) |value| {
+        if (value != .array) return error.InvalidToolArguments;
+        for (value.array.items) |item| {
+            edits[initialized] = try parseReplacement(allocator, item);
+            initialized += 1;
+        }
+    }
+    if (legacy) |replacement| {
+        edits[initialized] = try parseReplacementFields(allocator, replacement.old_value, replacement.new_value);
+        initialized += 1;
+    }
+    std.debug.assert(initialized == edits.len);
     return .{ .path = path_value.string, .edits = edits };
 }
 
-fn parseReplacement(value: std.json.Value) !Replacement {
+fn normalizedEditsValue(
+    allocator: std.mem.Allocator,
+    raw_value: ?std.json.Value,
+    parsed_edits: *?std.json.Parsed(std.json.Value),
+) !?std.json.Value {
+    const value = raw_value orelse return null;
+    if (value == .string) {
+        parsed_edits.* = std.json.parseFromSlice(std.json.Value, allocator, value.string, .{}) catch
+            return error.InvalidToolArguments;
+        return parsed_edits.*.?.value;
+    }
+    return value;
+}
+
+const LegacyReplacement = struct {
+    old_value: std.json.Value,
+    new_value: std.json.Value,
+};
+
+fn legacyReplacement(object: std.json.ObjectMap) ?LegacyReplacement {
+    const old_value = object.get("oldText") orelse return null;
+    const new_value = object.get("newText") orelse return null;
+    return .{ .old_value = old_value, .new_value = new_value };
+}
+
+fn replacementCount(edits_value: ?std.json.Value) usize {
+    const value = edits_value orelse return 0;
+    if (value != .array) return 0;
+    return value.array.items.len;
+}
+
+fn parseReplacement(allocator: std.mem.Allocator, value: std.json.Value) !Replacement {
     if (value != .object) return error.InvalidToolArguments;
     const old_value = value.object.get("oldText") orelse return error.InvalidToolArguments;
     const new_value = value.object.get("newText") orelse return error.InvalidToolArguments;
+    return parseReplacementFields(allocator, old_value, new_value);
+}
+
+fn parseReplacementFields(
+    allocator: std.mem.Allocator,
+    old_value: std.json.Value,
+    new_value: std.json.Value,
+) !Replacement {
     if (old_value != .string or new_value != .string) return error.InvalidToolArguments;
     if (old_value.string.len == 0) return error.InvalidToolArguments;
-    return .{ .old_text = old_value.string, .new_text = new_value.string };
+    const old_text = try allocator.dupe(u8, old_value.string);
+    errdefer allocator.free(old_text);
+    const new_text = try allocator.dupe(u8, new_value.string);
+    return .{ .old_text = old_text, .new_text = new_text };
 }
 
 fn applyEditsPreservingTextShape(
@@ -224,7 +331,13 @@ fn applyEditsPreservingTextShape(
     };
 
     var applied: [max_edits_per_call]edit_diff.AppliedEdit = undefined;
-    const normalized = try applyEdits(allocator, normalized_original, normalized_edits, max_output_bytes, applied[0..edits.len]);
+    const normalized = try applyEdits(
+        allocator,
+        normalized_original,
+        normalized_edits,
+        max_output_bytes,
+        applied[0..edits.len],
+    );
     errdefer allocator.free(normalized);
     const diff = try edit_diff.render(allocator, normalized_original, applied[0..edits.len]);
     errdefer allocator.free(diff);
@@ -372,6 +485,35 @@ fn lineAt(text: []const u8, wanted_line: usize) []const u8 {
     return "";
 }
 
+fn editErrorResult(
+    allocator: std.mem.Allocator,
+    reason: []const u8,
+    message: []const u8,
+) !agent.ToolExecutionResult {
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.textResult(allocator, message, details);
+}
+
+fn editTooLargeResult(allocator: std.mem.Allocator, max_output_bytes: usize) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Edit failed: output would exceed the {d} byte limit.",
+        .{max_output_bytes},
+    );
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = @as([]const u8, "output_too_large"),
+        .maxBytes = max_output_bytes,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
+}
+
 fn editResult(
     allocator: std.mem.Allocator,
     replacements: usize,
@@ -453,6 +595,45 @@ fn captureEditUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult
     };
 }
 
+test "edit tool accepts legacy top-level replacement and file_path" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "old");
+
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer edit_tool.deinit();
+
+    var result = try test_support.execute(
+        edit_tool.tool(),
+        "{\"file_path\":\"file.txt\",\"oldText\":\"old\",\"newText\":\"new\"}",
+    );
+    defer result.deinit();
+
+    const written = try fixture.read("repo/file.txt");
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("new", written);
+    try std.testing.expectEqual(@as(i64, 1), result.result.details.?.object.get("replacements").?.integer);
+}
+
+test "edit tool accepts edits encoded as json string" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "old");
+
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer edit_tool.deinit();
+
+    var result = try test_support.execute(
+        edit_tool.tool(),
+        "{\"path\":\"file.txt\",\"edits\":\"[{\\\"oldText\\\":\\\"old\\\",\\\"newText\\\":\\\"new\\\"}]\"}",
+    );
+    defer result.deinit();
+
+    const written = try fixture.read("repo/file.txt");
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("new", written);
+}
+
 test "edit tool preserves BOM and CRLF while matching normalized text and tracks firstChangedLine" {
     var edited = try applyEditsPreservingTextShape(
         std.testing.allocator,
@@ -482,15 +663,73 @@ test "edit tool reports no-op replacement without writing" {
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
-        "No changes: replacement output is identical.",
+        "Edit failed: replacement output is identical.",
         result.result.content[0].text.text,
     );
+    try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
     const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("same", written);
 }
 
-test "edit tool streams utf8 safe edited content chunks" {
+test "edit tool returns actionable operational errors" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "abc abc");
+
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .max_output_bytes = 5 });
+    defer edit_tool.deinit();
+
+    var invalid = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.txt","edits":[{"oldText":"","newText":"x"}]}
+        ,
+    );
+    defer invalid.deinit();
+    try std.testing.expectEqualStrings(
+        "Invalid edit arguments: provide path and one or more edits with non-empty oldText and string newText.",
+        invalid.result.content[0].text.text,
+    );
+
+    var duplicate = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.txt","edits":[{"oldText":"abc","newText":"x"}]}
+        ,
+    );
+    defer duplicate.deinit();
+    try std.testing.expectEqualStrings(
+        "Edit failed: every oldText must match exactly once in the file.",
+        duplicate.result.content[0].text.text,
+    );
+
+    var overlap = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.txt","edits":[{"oldText":"abc ","newText":"x"},{"oldText":"bc a","newText":"y"}]}
+        ,
+    );
+    defer overlap.deinit();
+    try std.testing.expectEqualStrings(
+        "Edit failed: replacements overlap; merge nearby or overlapping changes into one edit.",
+        overlap.result.content[0].text.text,
+    );
+
+    var too_large = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.txt","edits":[{"oldText":"abc abc","newText":"abcdef"}]}
+        ,
+    );
+    defer too_large.deinit();
+    try std.testing.expectEqualStrings(
+        "Edit failed: output would exceed the 5 byte limit.",
+        too_large.result.content[0].text.text,
+    );
+
+    const written = try fixture.read("repo/file.txt");
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("abc abc", written);
+}
+
+test "edit tool does not stream full edited file on success" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
     const original = "old\n" ++ ("\xe4\xb8\xad" ** 6000);
@@ -530,8 +769,8 @@ test "edit tool streams utf8 safe edited content chunks" {
     );
     defer result.deinit();
 
-    try std.testing.expect(capture.count > 1);
-    try std.testing.expectEqualStrings(replacement, capture.writer.written());
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expectEqualStrings("", capture.writer.written());
     const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings(replacement, written);
@@ -548,11 +787,23 @@ test "edit tool rejects bad replacements before mutation" {
     ));
     try std.testing.expectError(
         error.EditTextNotFoundOrNotUnique,
-        applyEdits(std.testing.allocator, "x x", &.{.{ .old_text = "x", .new_text = "y" }}, max_edit_output_bytes, &applied_one),
+        applyEdits(
+            std.testing.allocator,
+            "x x",
+            &.{.{ .old_text = "x", .new_text = "y" }},
+            max_edit_output_bytes,
+            &applied_one,
+        ),
     );
     try std.testing.expectError(
         error.EditTooLarge,
-        applyEdits(std.testing.allocator, "x", &.{.{ .old_text = "x", .new_text = "hello" }}, 3, &applied_one),
+        applyEdits(
+            std.testing.allocator,
+            "x",
+            &.{.{ .old_text = "x", .new_text = "hello" }},
+            3,
+            &applied_one,
+        ),
     );
     var applied_two: [2]edit_diff.AppliedEdit = undefined;
     try std.testing.expectError(

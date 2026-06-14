@@ -26,6 +26,7 @@ pub const LsTool = struct {
 
     pub const Config = struct {
         cwd: []const u8,
+        home_dir: ?[]const u8 = null,
         allow_paths_outside_cwd: bool = false,
         max_entries: usize = max_entries,
         max_output_bytes: usize = max_output_bytes,
@@ -34,9 +35,12 @@ pub const LsTool = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !LsTool {
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
+        const home_dir = if (config.home_dir) |path| try allocator.dupe(u8, path) else null;
+        errdefer if (home_dir) |path| allocator.free(path);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
         var owned_config = config;
         owned_config.cwd = cwd;
+        owned_config.home_dir = home_dir;
         return .{
             .allocator = allocator,
             .config = owned_config,
@@ -46,6 +50,7 @@ pub const LsTool = struct {
 
     pub fn deinit(self: *LsTool) void {
         self.allocator.free(self.config.cwd);
+        if (self.config.home_dir) |path| self.allocator.free(path);
         self.parsed_parameters.deinit();
         self.* = undefined;
     }
@@ -73,11 +78,24 @@ fn execute(
 ) anyerror!agent.ToolExecutionResult {
     try token.throwIfRequested();
     const self: *LsTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
-    const path = try parsePath(params);
-    const max_entries_value = try path_utils.parseOptionalLimit(params, self.config.max_entries);
+    const path = parsePath(params) catch |err| switch (err) {
+        error.InvalidToolArguments => return path_utils.errorTextResult(
+            allocator,
+            "invalid_arguments",
+            "Invalid ls arguments: path must be a string and limit must be a positive integer.",
+        ),
+    };
+    const max_entries_value = path_utils.parseOptionalLimit(params, self.config.max_entries) catch |err| switch (err) {
+        error.InvalidToolArguments => return path_utils.errorTextResult(
+            allocator,
+            "invalid_limit",
+            "Invalid ls limit: provide a positive integer.",
+        ),
+    };
     const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
+        .home_dir = self.config.home_dir,
     }, path);
     defer allocator.free(resolved_path);
 
@@ -130,9 +148,7 @@ fn execute(
     {
         try writer.writer.writeAll(empty_directory_text);
     }
-    if (truncated and writer.written().len + 28 <= self.config.max_output_bytes) {
-        try writer.writer.writeAll("\n[listing truncated]");
-    }
+    if (truncated) try appendTruncationSentinel(&writer, self.config.max_output_bytes);
 
     return path_utils.ownedTextResult(allocator, try writer.toOwnedSlice(), try path_utils.jsonDetails(allocator, .{
         .entries = emitted,
@@ -140,11 +156,21 @@ fn execute(
             .truncated = truncated,
             .truncatedBy = truncated_by,
             .maxEntries = max_entries_value,
+            .maxScannedEntries = max_scan_entries,
+            .maxOutputBytes = self.config.max_output_bytes,
         }),
     }));
 }
 
-const empty_directory_text = "[directory is empty]";
+const listing_truncated_sentinel = "[listing truncated]";
+const empty_directory_text = "(empty directory)";
+
+fn appendTruncationSentinel(writer: *std.Io.Writer.Allocating, max_bytes: usize) !void {
+    const separator: usize = if (writer.written().len == 0) 0 else 1;
+    if (writer.written().len + separator + listing_truncated_sentinel.len > max_bytes) return;
+    if (separator > 0) try writer.writer.writeByte('\n');
+    try writer.writer.writeAll(listing_truncated_sentinel);
+}
 
 fn parsePath(params: std.json.Value) ![]const u8 {
     if (params != .object) return error.InvalidToolArguments;
@@ -190,6 +216,47 @@ test "ls tool lists one directory with bounds" {
     try std.testing.expect(std.mem.indexOf(u8, text, "nested/") != null);
 }
 
+test "ls tool reports invalid arguments operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+
+    var tool = try LsTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer tool.deinit();
+
+    var result = try test_support.execute(tool.tool(), "{\"path\":42}");
+    defer result.deinit();
+    try std.testing.expectEqualStrings(
+        "Invalid ls arguments: path must be a string and limit must be a positive integer.",
+        result.result.content[0].text.text,
+    );
+    try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
+
+    var limit_result = try test_support.execute(tool.tool(), "{\"limit\":0}");
+    defer limit_result.deinit();
+    try std.testing.expectEqualStrings(
+        "Invalid ls limit: provide a positive integer.",
+        limit_result.result.content[0].text.text,
+    );
+    try std.testing.expectEqualStrings("invalid_limit", limit_result.result.details.?.object.get("reason").?.string);
+}
+
+test "ls tool reports byte truncation details and bounds sentinel" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/long-name.txt", "");
+
+    var tool = try LsTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .max_output_bytes = 4 });
+    defer tool.deinit();
+
+    var result = try test_support.execute(tool.tool(), "{}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("", result.result.content[0].text.text);
+    const truncation = result.result.details.?.object.get("truncation").?.object;
+    try std.testing.expectEqualStrings("bytes", truncation.get("truncatedBy").?.string);
+    try std.testing.expectEqual(@as(i64, 4), truncation.get("maxOutputBytes").?.integer);
+}
+
 test "ls tool defaults to cwd, sorts entries, and reports empty directories" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
@@ -206,5 +273,5 @@ test "ls tool defaults to cwd, sorts entries, and reports empty directories" {
 
     var empty_result = try test_support.execute(tool.tool(), "{\"path\":\"empty\"}");
     defer empty_result.deinit();
-    try std.testing.expectEqualStrings("[directory is empty]", empty_result.result.content[0].text.text);
+    try std.testing.expectEqualStrings("(empty directory)", empty_result.result.content[0].text.text);
 }

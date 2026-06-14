@@ -375,7 +375,14 @@ fn executeToolCallsParallel(
         executed_owned[item.prepared.index()] = false;
         var finalized = try finalizeExecutedToolCall(allocator, context, assistant, config, token, item);
         if (finalized.result.result.terminate) terminate_count += 1;
-        emitFinalizedToolCall(allocator, result_allocator, emit, item.prepared.toolCall(), finalized, &messages) catch |err| {
+        emitFinalizedToolCall(
+            allocator,
+            result_allocator,
+            emit,
+            item.prepared.toolCall(),
+            finalized,
+            &messages,
+        ) catch |err| {
             finalized.result.deinit();
             return err;
         };
@@ -634,7 +641,12 @@ fn emitFinalizedToolCall(
 
     // Durable message content lives in result_allocator; the list container
     // and the append below use the scratch allocator.
-    const message = try createToolResultMessage(result_allocator, tool_call, finalized.result.view(), finalized.is_error);
+    const message = try createToolResultMessage(
+        result_allocator,
+        tool_call,
+        finalized.result.view(),
+        finalized.is_error,
+    );
     errdefer agent.deinitToolResultMessage(result_allocator, message);
     try emit.emit(.{ .message_end = .{ .message = .{ .tool_result = message } } });
     try messages.append(allocator, message);

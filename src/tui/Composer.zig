@@ -14,7 +14,7 @@ const Composer = @This();
 pub const buffer_size_bytes_max: usize = 16 * 1024;
 pub const visible_rows_max: usize = 4;
 
-bytes: std.ArrayListUnmanaged(u8) = .empty,
+bytes: std.ArrayList(u8) = .empty,
 cursor_byte_index: usize = 0,
 vertical_target_col: ?usize = null,
 revision: u64 = 0,
@@ -39,7 +39,7 @@ pub fn insert(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) error{
     std.debug.assert(std.unicode.utf8ValidateSlice(bytes));
     if (std.mem.indexOfScalar(u8, bytes, '\r') == null) return self.insertNormalized(gpa, bytes);
 
-    var normalized: std.ArrayListUnmanaged(u8) = .empty;
+    var normalized: std.ArrayList(u8) = .empty;
     defer normalized.deinit(gpa);
     try normalized.ensureTotalCapacity(gpa, bytes.len);
     var index: usize = 0;

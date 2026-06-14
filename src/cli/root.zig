@@ -166,7 +166,7 @@ fn runPrompt(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    var app = try openCliRuntime(process, stderr, app_args, options, "cli");
+    var app = try openCliRuntime("cli", process, stderr, app_args, options);
     defer app.deinit();
 
     try print_mode.run(&app, stdout, stderr, .{
@@ -182,7 +182,7 @@ fn runRpc(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    var app = try openCliRuntime(process, stderr, app_args, options, "rpc");
+    var app = try openCliRuntime("rpc", process, stderr, app_args, options);
     defer app.deinit();
 
     if (app_args.messages.count == 1) {
@@ -193,11 +193,11 @@ fn runRpc(
 }
 
 fn openCliRuntime(
+    comptime id_prefix: []const u8,
     process: runtime.Process,
     stderr: *std.Io.Writer,
     app_args: anytype,
     options: auth_mode.Options,
-    comptime id_prefix: []const u8,
 ) !session_runtime.SessionRuntime {
     const stamp = session_runtime.SessionStamp.now(process.io);
     if (try selectResumeSession(process, stderr, app_args, options)) |session_file| {

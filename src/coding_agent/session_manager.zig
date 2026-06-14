@@ -512,7 +512,7 @@ pub const SessionManager = struct {
         };
     }
 
-    fn estimateEntryTokens(entry: SessionEntry) u64 {
+    pub fn estimateEntryTokens(entry: SessionEntry) u64 {
         const chars: u64 = switch (entry) {
             .compaction => |compaction| compaction.summary.len,
             .message => |message_entry| switch (message_entry.message) {

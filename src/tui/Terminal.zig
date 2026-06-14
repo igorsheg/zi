@@ -64,6 +64,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, width: u16, height: u16) !*Termi
 }
 
 // The heap owner poisons itself before destroy; gpa is copied out first.
+// ziglint-ignore: Z030 linter wants poison as last statement, but heap destroy must follow it.
 pub fn deinit(self: *Terminal) void {
     const gpa = self.gpa;
     self.app.deinit(gpa);

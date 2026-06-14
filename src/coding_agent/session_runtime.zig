@@ -20,6 +20,10 @@ pub const WakeResult = enum { input, session, frame };
 const session_command_message_bytes_max: usize = 160;
 const SessionStats = client_protocol.PromptCommandSessionStats;
 
+fn ignoreBestEffortError(err: anyerror) void {
+    std.debug.assert(@errorName(err).len > 0);
+}
+
 /// Wall-clock facts for opening one session: the prompt-visible date, the
 /// ISO header/file timestamp, and a uniqueness source for session ids.
 pub const SessionStamp = struct {
@@ -156,7 +160,11 @@ fn openSession(allocator: std.mem.Allocator, services: *RuntimeServices, options
             if (!paths_mod.isSessionFileLeafName(leaf)) return error.InvalidSessionFileName;
             const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, leaf });
             errdefer allocator.free(file_name);
-            session_options.store = .{ .restore = .{ .allocator = allocator, .dir = options.dir, .file_name = file_name } };
+            session_options.store = .{ .restore = .{
+                .allocator = allocator,
+                .dir = options.dir,
+                .file_name = file_name,
+            } };
             return AgentSession.init(allocator, services.io, session_options);
         },
     }
@@ -490,7 +498,7 @@ pub const SessionRuntime = struct {
             return;
         };
         active.phase = .{ .running = run };
-        self.drainSessionEvents(active.request_id) catch {};
+        self.drainSessionEvents(active.request_id) catch |err| ignoreBestEffortError(err);
     }
 
     fn nowNanoseconds(self: *const SessionRuntime) i96 {
@@ -514,7 +522,7 @@ pub const SessionRuntime = struct {
     fn cancelAndDestroyActivePhase(self: *SessionRuntime, active: ActiveOperation) void {
         switch (active.phase) {
             .running => |run| {
-                self.session.cancelPromptRun(run) catch {};
+                self.session.cancelPromptRun(run) catch |err| ignoreBestEffortError(err);
                 self.session.destroyPromptRun(run);
             },
             .compacting => |run| {
@@ -716,6 +724,7 @@ pub const SessionRuntime = struct {
                     .operation_id = finished.operation_id,
                     .event = .{ .operation_finished = .{ .reason = reason } },
                 });
+                try self.enqueueSessionChrome(finished.request_id);
             },
         }
     }
@@ -824,8 +833,11 @@ pub const SessionRuntime = struct {
         }
         if (self.services.provider_registry.get(model.api) == null) {
             var reply_buffer: [160]u8 = undefined;
-            const reply = std.fmt.bufPrint(&reply_buffer, "provider unavailable for model: {s}", .{model.provider}) catch
-                "provider unavailable for model";
+            const reply = std.fmt.bufPrint(
+                &reply_buffer,
+                "provider unavailable for model: {s}",
+                .{model.provider},
+            ) catch "provider unavailable for model";
             try self.enqueuePromptCommand(request_id, command, .failed, reply);
             return;
         }
@@ -835,13 +847,14 @@ pub const SessionRuntime = struct {
         const reply = std.fmt.bufPrint(&reply_buffer, "model: {s}/{s}", .{ model.provider, model.id }) catch
             "model changed";
         try self.enqueuePromptCommand(request_id, command, .handled, reply);
+        try self.enqueueSessionChrome(request_id);
     }
 
     const ModelResolveError = error{ UnknownModel, AmbiguousModel, InvalidModelSelector };
 
     fn resolveModelSelector(self: *const SessionRuntime, selector: []const u8) ModelResolveError!ai.Model {
         if (selector.len == 0) return error.InvalidModelSelector;
-        if (std.mem.indexOfScalar(u8, selector, '/')) |slash| {
+        if (std.mem.findScalar(u8, selector, '/')) |slash| {
             if (slash == 0 or slash + 1 >= selector.len) return error.InvalidModelSelector;
             const provider = selector[0..slash];
             const model_id = selector[slash + 1 ..];
@@ -932,12 +945,13 @@ pub const SessionRuntime = struct {
         const active = self.takeActive() orelse return;
         self.cancelAndDestroyActivePhase(active);
         self.allocator.free(active.prompt_text);
-        self.enqueueRejected(active.request_id, rejectionCode(err), @errorName(err)) catch {};
+        self.enqueueRejected(active.request_id, rejectionCode(err), @errorName(err)) catch |enqueue_err|
+            ignoreBestEffortError(enqueue_err);
         self.enqueueEvent(.{
             .request_id = active.request_id,
             .operation_id = active.operation_id,
             .event = .{ .operation_finished = .{ .reason = .failed } },
-        }) catch {};
+        }) catch |enqueue_err| ignoreBestEffortError(enqueue_err);
     }
 
     fn buildClientSnapshot(self: *SessionRuntime) !client_protocol.Snapshot {
@@ -945,6 +959,13 @@ pub const SessionRuntime = struct {
             self.allocator,
             if (self.active) |active| active.request_id else null,
         );
+    }
+
+    fn enqueueSessionChrome(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
+        if (!self.hasEventCapacity()) return;
+        var chrome = try self.session.clientChromeSnapshot(self.allocator);
+        errdefer chrome.deinit(self.allocator);
+        try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .session_chrome = chrome } });
     }
 
     fn drainSessionEvents(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
@@ -1311,7 +1332,10 @@ test "session runtime session command reports session facts" {
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event.event == .prompt_command);
     try std.testing.expect(event.event.prompt_command.result == .handled);
-    try std.testing.expectEqual(client_protocol.PromptCommand.Presentation.transcript, event.event.prompt_command.presentation);
+    try std.testing.expectEqual(
+        client_protocol.PromptCommand.Presentation.transcript,
+        event.event.prompt_command.presentation,
+    );
     const info = event.event.prompt_command.session_info.?;
     try std.testing.expect(info.file != null);
     try std.testing.expect(std.mem.indexOf(u8, info.file.?.text, "agent/sessions/--repo--/") != null);
@@ -1342,7 +1366,12 @@ test "session runtime model command selects an authenticated model" {
     });
     defer session_runtime.deinit();
 
-    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 10, "/model openai/gpt-5.1", .auto);
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(
+        std.testing.allocator,
+        10,
+        "/model openai/gpt-5.1",
+        .auto,
+    );
     errdefer envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
     try session_runtime.step();
@@ -1365,7 +1394,12 @@ test "session runtime model command rejects missing auth" {
     var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
-    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 11, "/model openai/gpt-5.1", .auto);
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(
+        std.testing.allocator,
+        11,
+        "/model openai/gpt-5.1",
+        .auto,
+    );
     errdefer envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
     try session_runtime.step();
@@ -1386,7 +1420,12 @@ test "session runtime replies unknown for unrecognized slash command" {
     var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
-    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 9, "/mystery now", .auto);
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(
+        std.testing.allocator,
+        9,
+        "/mystery now",
+        .auto,
+    );
     errdefer envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
     try session_runtime.step();
@@ -1453,6 +1492,9 @@ test "session runtime request snapshot emits owned bounded snapshot event" {
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 9), event.request_id);
     try std.testing.expect(event.event == .snapshot);
     try std.testing.expectEqualStrings("session", event.event.snapshot.header.id.text);
+    try std.testing.expectEqual(agent_mod.ThinkingLevel.off, event.event.snapshot.thinking_level);
+    try std.testing.expectEqual(@as(u64, 0), event.event.snapshot.context.window);
+    try std.testing.expectEqual(@as(?u64, null), event.event.snapshot.context.tokens);
     try std.testing.expectEqual(
         @as(?client_protocol.RequestId, null),
         event.event.snapshot.active_request_id,

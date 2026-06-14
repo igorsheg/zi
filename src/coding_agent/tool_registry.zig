@@ -2,6 +2,7 @@ const std = @import("std");
 const agent = @import("../agent/root.zig");
 const bash_tool = @import("tools/bash.zig");
 const edit_tool = @import("tools/edit.zig");
+const file_mutation_queue = @import("tools/file_mutation_queue.zig");
 const find_tool = @import("tools/find.zig");
 const grep_tool = @import("tools/grep.zig");
 const ls_tool = @import("tools/ls.zig");
@@ -55,6 +56,7 @@ pub const BuiltinTools = struct {
     bash: BashTool,
     edit: EditTool,
     write: WriteTool,
+    mutation_queue: file_mutation_queue.FileMutationQueue = .{},
 
     const ReadTool = read_tool.ReadTool;
     const LsTool = ls_tool.LsTool;
@@ -73,6 +75,7 @@ pub const BuiltinTools = struct {
     pub fn init(allocator: std.mem.Allocator, options: Options) !*BuiltinTools {
         const self = try allocator.create(BuiltinTools);
         self.allocator = allocator;
+        self.mutation_queue = .{};
         var read_init = false;
         var ls_init = false;
         var grep_init = false;
@@ -91,19 +94,46 @@ pub const BuiltinTools = struct {
 
         const cwd = options.cwd;
         const outside = options.allow_paths_outside_cwd;
-        self.read = try ReadTool.init(allocator, .{ .cwd = cwd, .allow_paths_outside_cwd = outside });
+        const home_dir = if (options.environ) |environ| environ.get("HOME") orelse environ.get("USERPROFILE") else null;
+        self.read = try ReadTool.init(allocator, .{
+            .cwd = cwd,
+            .home_dir = home_dir,
+            .allow_paths_outside_cwd = outside,
+        });
         read_init = true;
-        self.ls = try LsTool.init(allocator, .{ .cwd = cwd, .allow_paths_outside_cwd = outside });
+        self.ls = try LsTool.init(allocator, .{
+            .cwd = cwd,
+            .home_dir = home_dir,
+            .allow_paths_outside_cwd = outside,
+        });
         ls_init = true;
-        self.grep = try GrepTool.init(allocator, .{ .cwd = cwd, .allow_paths_outside_cwd = outside });
+        self.grep = try GrepTool.init(allocator, .{
+            .cwd = cwd,
+            .home_dir = home_dir,
+            .allow_paths_outside_cwd = outside,
+        });
         grep_init = true;
-        self.find = try FindTool.init(allocator, .{ .cwd = cwd, .allow_paths_outside_cwd = outside });
+        self.find = try FindTool.init(allocator, .{
+            .cwd = cwd,
+            .home_dir = home_dir,
+            .allow_paths_outside_cwd = outside,
+        });
         find_init = true;
         self.bash = try BashTool.init(allocator, .{ .cwd = cwd, .environ = options.environ });
         bash_init = true;
-        self.edit = try EditTool.init(allocator, .{ .cwd = cwd, .allow_paths_outside_cwd = outside });
+        self.edit = try EditTool.init(allocator, .{
+            .cwd = cwd,
+            .home_dir = home_dir,
+            .allow_paths_outside_cwd = outside,
+            .mutation_queue = &self.mutation_queue,
+        });
         edit_init = true;
-        self.write = try WriteTool.init(allocator, .{ .cwd = cwd, .allow_paths_outside_cwd = outside });
+        self.write = try WriteTool.init(allocator, .{
+            .cwd = cwd,
+            .home_dir = home_dir,
+            .allow_paths_outside_cwd = outside,
+            .mutation_queue = &self.mutation_queue,
+        });
         return self;
     }
 

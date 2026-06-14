@@ -21,6 +21,7 @@ pub const EventEncodeError = error{
     WriteFailed,
 } || std.mem.Allocator.Error;
 
+// ziglint-ignore: Z015 exported protocol API intentionally exposes its named decode error set.
 pub fn decodeCommandLine(
     allocator: std.mem.Allocator,
     raw_line: []const u8,
@@ -44,12 +45,13 @@ pub fn decodeCommandLine(
         const text_value = object.get("text") orelse return error.InvalidMessage;
         if (text_value != .string) return error.InvalidMessage;
         if (text_value.string.len > max_prompt_text_bytes) return error.PromptTooLarge;
-        return try client_protocol.CommandEnvelope.initSubmitPrompt(
+        const envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(
             allocator,
             id,
             text_value.string,
             try decodeSubmitMode(object.get("mode")),
         );
+        return envelope;
     }
     if (std.mem.eql(u8, command_type, "cancel")) {
         return .{ .id = id, .command = .{ .cancel = try decodeCancel(object.get("target")) } };
@@ -63,6 +65,7 @@ pub fn decodeCommandLine(
     return error.UnknownCommand;
 }
 
+// ziglint-ignore: Z015 exported protocol API intentionally exposes its named encode error set.
 pub fn encodeEventEnvelope(
     allocator: std.mem.Allocator,
     envelope: client_protocol.EventEnvelope,
@@ -81,7 +84,7 @@ fn trimLine(raw_line: []const u8) []const u8 {
 }
 
 fn decodeRequestId(value: ?std.json.Value) CommandDecodeError!?client_protocol.RequestId {
-    return try decodeOptionalId(value, error.InvalidRequestId);
+    return decodeOptionalId(value, error.InvalidRequestId);
 }
 
 fn decodeSubmitMode(value: ?std.json.Value) CommandDecodeError!client_protocol.Submit.Mode {
@@ -111,7 +114,7 @@ fn decodeCancel(value: ?std.json.Value) CommandDecodeError!client_protocol.Cance
 }
 
 fn decodeRequiredId(raw: std.json.Value) CommandDecodeError!client_protocol.RequestId {
-    return try decodeOptionalId(raw, error.InvalidRequestId) orelse error.InvalidRequestId;
+    return (try decodeOptionalId(raw, error.InvalidRequestId)) orelse error.InvalidRequestId;
 }
 
 fn decodeOptionalId(
@@ -124,7 +127,9 @@ fn decodeOptionalId(
 }
 
 fn decodeReplay(object: std.json.ObjectMap) CommandDecodeError!client_protocol.ReplayRequest {
-    return .{ .after = (try decodeOptionalId(object.get("after"), error.InvalidMessage)) orelse return error.InvalidMessage };
+    const after = (try decodeOptionalId(object.get("after"), error.InvalidMessage)) orelse
+        return error.InvalidMessage;
+    return .{ .after = after };
 }
 
 test "wire protocol decodes submit prompt command" {

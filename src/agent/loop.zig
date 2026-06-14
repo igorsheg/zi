@@ -385,15 +385,32 @@ fn copyToolArgumentPreview(allocator: std.mem.Allocator, arguments: std.json.Val
     if (arguments != .object) return .null;
     var object: std.json.ObjectMap = .empty;
     errdefer runtime.freeJsonValue(allocator, .{ .object = object });
-    const keys = [_][]const u8{ "command", "path", "pattern", "name", "content" };
-    for (keys) |key| {
+    const string_keys = [_][]const u8{
+        "command",
+        "path",
+        "file_path",
+        "pattern",
+        "name",
+        "content",
+        "glob",
+    };
+    for (string_keys) |key| {
         const value = arguments.object.get(key) orelse continue;
         if (value != .string) continue;
         const key_copy = try allocator.dupe(u8, key);
         errdefer allocator.free(key_copy);
-        const value_copy = try allocator.dupe(u8, agent.utf8Prefix(value.string, stream_tool_argument_preview_bytes_max));
+        const bounded = agent.utf8Prefix(value.string, stream_tool_argument_preview_bytes_max);
+        const value_copy = try allocator.dupe(u8, bounded);
         errdefer allocator.free(value_copy);
         try object.put(allocator, key_copy, .{ .string = value_copy });
+    }
+    const integer_keys = [_][]const u8{ "offset", "limit", "timeout" };
+    for (integer_keys) |key| {
+        const value = arguments.object.get(key) orelse continue;
+        if (value != .integer) continue;
+        const key_copy = try allocator.dupe(u8, key);
+        errdefer allocator.free(key_copy);
+        try object.put(allocator, key_copy, .{ .integer = value.integer });
     }
     return .{ .object = object };
 }
@@ -970,6 +987,8 @@ test "stream event copy bounds delta partial to changed content" {
     try args.put(std.testing.allocator, "content", .{
         .string = "large write content must not be copied on each delta" ** 512,
     });
+    try args.put(std.testing.allocator, "offset", .{ .integer = 10 });
+    try args.put(std.testing.allocator, "limit", .{ .integer = 20 });
 
     const content = [_]ai.AssistantContent{
         .{ .text = .{ .text = "large prior text that should not be copied into delta partial" } },
@@ -1006,6 +1025,14 @@ test "stream event copy bounds delta partial to changed content" {
     const preview = copied_partial.content[1].tool_call.arguments.object.get("content").?;
     try std.testing.expect(preview == .string);
     try std.testing.expectEqual(@as(usize, stream_tool_argument_preview_bytes_max), preview.string.len);
+    try std.testing.expectEqual(
+        @as(i64, 10),
+        copied_partial.content[1].tool_call.arguments.object.get("offset").?.integer,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 20),
+        copied_partial.content[1].tool_call.arguments.object.get("limit").?.integer,
+    );
 }
 
 test "compact text delta partial with real content drops to empty content" {

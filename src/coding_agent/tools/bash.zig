@@ -249,7 +249,7 @@ fn emitBashOutputUpdate(
     const self: *BashUpdateContext = @ptrCast(@alignCast(context orelse return));
     try self.append(bytes);
     const on_update = self.on_update orelse return;
-    const text = try self.allocator.dupe(u8, bytes);
+    const text = try path_utils.dupSanitizedUtf8(self.allocator, bytes);
     defer self.allocator.free(text);
     const content = try self.allocator.alloc(ai.ToolResultContent, 1);
     defer self.allocator.free(content);
@@ -493,6 +493,21 @@ test "bash tool passes explicit environment to child process" {
     try std.testing.expectEqualStrings("present", result.result.content[0].text.text);
 }
 
+test "bash tool sanitizes invalid utf8 output" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer tool.deinit();
+
+    var result = try test_support.execute(tool.tool(), "{\"command\":\"printf '\\\\377'\"}");
+    defer result.deinit();
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.result.content[0].text.text));
+    try std.testing.expectEqualStrings("�", result.result.content[0].text.text);
+}
+
 test "bash tool treats nonzero exit as result data" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
@@ -541,6 +556,69 @@ test "bash tool treats output limit as bounded result data" {
     );
     try std.testing.expect(!result.result.details.?.object.get("timedOut").?.bool);
     try std.testing.expect(result.result.details.?.object.get("outputLimitExceeded").?.bool);
+}
+
+test "bash result classification marks operational failures as errors" {
+    const allocator = std.testing.allocator;
+
+    const success = try path_utils.jsonDetails(allocator, .{ .exitCode = 0 });
+    defer runtime.freeJsonValue(allocator, success);
+    try std.testing.expect(!classifyResult(success, false));
+
+    const nonzero = try path_utils.jsonDetails(allocator, .{ .exitCode = 7 });
+    defer runtime.freeJsonValue(allocator, nonzero);
+    try std.testing.expect(classifyResult(nonzero, false));
+
+    const timed_out = try path_utils.jsonDetails(allocator, .{ .timedOut = true });
+    defer runtime.freeJsonValue(allocator, timed_out);
+    try std.testing.expect(classifyResult(timed_out, false));
+
+    const output_limited = try path_utils.jsonDetails(allocator, .{ .outputLimitExceeded = true });
+    defer runtime.freeJsonValue(allocator, output_limited);
+    try std.testing.expect(classifyResult(output_limited, false));
+
+    const cancelled = try path_utils.jsonDetails(allocator, .{ .cancelled = true });
+    defer runtime.freeJsonValue(allocator, cancelled);
+    try std.testing.expect(classifyResult(cancelled, false));
+
+    const signal = try path_utils.jsonDetails(allocator, .{ .signal = 9 });
+    defer runtime.freeJsonValue(allocator, signal);
+    try std.testing.expect(classifyResult(signal, false));
+
+    const stopped = try path_utils.jsonDetails(allocator, .{ .stopped = 19 });
+    defer runtime.freeJsonValue(allocator, stopped);
+    try std.testing.expect(classifyResult(stopped, false));
+
+    const unknown = try path_utils.jsonDetails(allocator, .{ .unknown = 1 });
+    defer runtime.freeJsonValue(allocator, unknown);
+    try std.testing.expect(classifyResult(unknown, false));
+}
+
+test "bash tail truncation details include line byte and limit facts" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    for (0..max_output_preview_lines + 2) |index| {
+        try output.writer.print("line {d}\n", .{index + 1});
+    }
+
+    var result = try resultFromOutput(
+        std.testing.allocator,
+        output.written(),
+        null,
+        .{ .exited = 0 },
+        null,
+    );
+    defer result.deinit();
+
+    const truncation = result.result.details.?.object.get("truncation").?.object;
+    try std.testing.expectEqualStrings("lines", truncation.get("truncatedBy").?.string);
+    try std.testing.expectEqual(@as(i64, max_output_preview_lines + 2), truncation.get("totalLines").?.integer);
+    try std.testing.expectEqual(@as(i64, max_output_preview_lines), truncation.get("outputLines").?.integer);
+    try std.testing.expect(truncation.get("totalBytes").?.integer > truncation.get("outputBytes").?.integer);
+    try std.testing.expectEqual(@as(i64, max_output_preview_lines), truncation.get("maxLines").?.integer);
+    try std.testing.expectEqual(@as(i64, max_output_preview_bytes), truncation.get("maxBytes").?.integer);
+    try std.testing.expect(!truncation.get("lastLinePartial").?.bool);
+    try std.testing.expect(!truncation.get("firstLineExceedsLimit").?.bool);
 }
 
 test "bash tool applies command prefix and shell path" {
