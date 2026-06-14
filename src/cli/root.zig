@@ -1,4 +1,5 @@
 const std = @import("std");
+const app_info = @import("../app_info.zig");
 const runtime = @import("../runtime/root.zig");
 const coding_agent = @import("../coding_agent/root.zig");
 const auth_mode = coding_agent.auth_mode;
@@ -125,6 +126,7 @@ fn runApp(
     app: anytype,
     options: auth_mode.Options,
 ) !void {
+    if (app.version) return stdout.print("zi {s}\n", .{app_info.version});
     if (app.help) return args_mod.writeHelp(stdout);
     if (app.unknown_flags.count > 0) return unknownFlag(stderr, app.unknown_flags.slice()[0].name);
 
@@ -152,6 +154,7 @@ fn runApp(
                 .resume_session_file = app.resume_session_file,
                 .resume_latest = app.resume_latest,
                 .initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null,
+                .version = app_info.version,
             });
         },
     };

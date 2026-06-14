@@ -9,6 +9,7 @@
 //! `Command.tick` (wall-clock ms) — App never reads a clock.
 const std = @import("std");
 const Composer = @import("Composer.zig");
+const Greeter = @import("Greeter.zig");
 const Picker = @import("Picker.zig");
 const PromptHistory = @import("PromptHistory.zig");
 const Transcript = @import("Transcript.zig");
@@ -59,6 +60,13 @@ const TranscriptViewport = struct {
         return true;
     }
 
+    fn followTail(self: *TranscriptViewport) bool {
+        if (self.scroll_rows == 0 and self.attachment == .auto) return false;
+        self.scroll_rows = 0;
+        self.attachment = .auto;
+        return true;
+    }
+
     fn tailMutated(self: *TranscriptViewport, before_max: usize, after_max: usize) void {
         if (self.attachment == .auto or self.scroll_rows <= tail_autoscroll_detach_rows) {
             self.attachment = .auto;
@@ -89,6 +97,7 @@ history_cursor_from_newest: ?usize = null,
 history_draft: std.ArrayList(u8) = .empty,
 history_draft_cursor_byte_index: usize = 0,
 transcript: Transcript = .{},
+greeter: ?Greeter = null,
 completion: Completion = .{},
 status: status_mod.Store = .{},
 viewport: TranscriptViewport = .{},
@@ -287,6 +296,8 @@ pub const Command = union(enum) {
     replace_tool_output: ToolText,
     replace_tool_footer: ToolText,
     prepend_transcript: Transcript.Append.MessageAppend,
+    set_greeter: Greeter.Set,
+    clear_greeter,
     open_picker: Picker.Open,
     close_picker,
     set_composer_completions: Picker.Open,
@@ -381,6 +392,18 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             const outcome = try self.transcript.prependMessage(gpa, message);
             try self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
+            self.dirty = true;
+            return null;
+        },
+        .set_greeter => |greeter| {
+            self.greeter = Greeter.from(greeter);
+            self.clampOrFollowViewport();
+            self.dirty = true;
+            return null;
+        },
+        .clear_greeter => {
+            self.greeter = null;
+            self.clampOrFollowViewport();
             self.dirty = true;
             return null;
         },
@@ -487,6 +510,7 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
             return .request_transcript_history;
         },
         .transcript_scroll_down => self.scrollDown(mouse_wheel_scroll_rows),
+        .transcript_follow_tail => self.followTail(),
         .toggle_tool_expansion => {
             self.tools_expanded = !self.tools_expanded;
             self.clampOrFollowViewport();
@@ -598,6 +622,7 @@ fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{O
         text_mod.sanitizeInto(&clean_buffer, bytes);
     switch (try self.composer.insert(gpa, clean)) {
         .ok => {
+            if (clean.len > 0) self.noteGreeterCharacterInput();
             self.resetHistoryNavigation();
             self.completion.noteEdit();
             self.syncComposerCompletion();
@@ -612,6 +637,15 @@ fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{O
         },
     }
     return null;
+}
+
+fn noteGreeterCharacterInput(self: *App) void {
+    if (self.greeter) |greeter| {
+        if (greeter.auto_hide_on_first_input) {
+            self.greeter = null;
+            self.clampOrFollowViewport();
+        }
+    }
 }
 
 fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
@@ -862,6 +896,10 @@ fn scrollDown(self: *App, rows: usize) void {
     if (self.viewport.scrollDown(rows)) self.dirty = true;
 }
 
+fn followTail(self: *App) void {
+    if (self.viewport.followTail()) self.dirty = true;
+}
+
 /// Tail mutations are append/replace operations at the live end of the
 /// transcript. When auto-attached, they pin to the tail. When detached, they
 /// add any new bottom distance to `scroll_rows` so the user's viewport does
@@ -980,6 +1018,34 @@ test "mouse wheel scrolls the resident transcript and clamps" {
     try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
 }
 
+test "greeter hides on first typed character by default" {
+    const gpa = std.testing.allocator;
+    var app = App.init(20, 6);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .set_greeter = .{ .title = "zi" } });
+    try std.testing.expect(app.greeter != null);
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("h") } });
+    try std.testing.expect(app.greeter == null);
+    try std.testing.expectEqualStrings("h", app.composer.text());
+}
+
+test "greeter can opt out of first character auto hide" {
+    const gpa = std.testing.allocator;
+    var app = App.init(20, 6);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .set_greeter = .{
+        .title = "zi",
+        .auto_hide_on_first_input = false,
+    } });
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("h") } });
+
+    try std.testing.expect(app.greeter != null);
+    try std.testing.expectEqualStrings("h", app.composer.text());
+}
+
 test "tail appends stick to bottom while near tail" {
     const gpa = std.testing.allocator;
     var app = App.init(20, 6);
@@ -1045,6 +1111,24 @@ test "scrolling back near the tail reattaches on next tail append" {
         .text = "tail",
     } } });
     try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
+}
+
+test "ctrl end follows the transcript tail immediately" {
+    const gpa = std.testing.allocator;
+    var app = App.init(20, 6);
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten",
+    } } });
+    while (app.viewport.scroll_rows <= tail_autoscroll_detach_rows) {
+        _ = try app.apply(gpa, .{ .input = .wheel_up });
+    }
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .ctrl_end } });
+    try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
+    try std.testing.expectEqual(ScrollAttachment.auto, app.viewport.attachment);
 }
 
 test "prepending transcript history keeps the viewport on older content" {

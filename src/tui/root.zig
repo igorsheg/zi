@@ -4,6 +4,7 @@
 //! through App.Command / App.Effect.
 pub const App = @import("App.zig");
 pub const Composer = @import("Composer.zig");
+pub const Greeter = @import("Greeter.zig");
 pub const Picker = @import("Picker.zig");
 pub const PromptHistory = @import("PromptHistory.zig");
 pub const Terminal = @import("Terminal.zig");
@@ -23,6 +24,7 @@ pub const Effect = App.Effect;
 test {
     _ = App;
     _ = Composer;
+    _ = Greeter;
     _ = Picker;
     _ = PromptHistory;
     _ = Terminal;

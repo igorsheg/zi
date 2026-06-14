@@ -3,12 +3,17 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = b.option([]const u8, "version", "Zi version string") orelse "0.0.0-local";
+
+    const app_options = b.addOptions();
+    app_options.addOption([]const u8, "version", version);
 
     const zi = b.addModule("zi", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    zi.addOptions("build_options", app_options);
     const zio_dep = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
@@ -28,17 +33,19 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vaxis", .module = vaxis_dep.module("vaxis") }},
     });
 
+    const exe_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zio", .module = zio_dep.module("zio") },
+            .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+        },
+    });
+    exe_module.addOptions("build_options", app_options);
     const exe = b.addExecutable(.{
         .name = "zi",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zio", .module = zio_dep.module("zio") },
-                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
-            },
-        }),
+        .root_module = exe_module,
     });
     b.installArtifact(exe);
 
@@ -72,6 +79,23 @@ pub fn build(b: *std.Build) void {
     const tui_fixture_cmd = b.addRunArtifact(tui_fixture);
     if (b.args) |args| tui_fixture_cmd.addArgs(args);
     b.step("tui-fixture", "Run deterministic TUI fixture").dependOn(&tui_fixture_cmd.step);
+
+    const tui_render_bench = b.addExecutable(.{
+        .name = "tui-render-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/tui-render-bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "tui", .module = tui_module },
+                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+            },
+        }),
+    });
+    b.step("tui-render-bench-bin", "Build deterministic TUI render benchmark").dependOn(&tui_render_bench.step);
+    const tui_render_bench_cmd = b.addRunArtifact(tui_render_bench);
+    if (b.args) |args| tui_render_bench_cmd.addArgs(args);
+    b.step("tui-render-bench", "Run deterministic TUI render benchmark").dependOn(&tui_render_bench_cmd.step);
 
     const lib_tests = b.addTest(.{ .root_module = zi });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });

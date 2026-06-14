@@ -11,6 +11,7 @@ const vaxis = @import("vaxis");
 const App = @import("App.zig");
 const Transcript = @import("Transcript.zig");
 const Composer = @import("Composer.zig");
+const Greeter = @import("Greeter.zig");
 const Picker = @import("Picker.zig");
 const input_mod = @import("input.zig");
 const markdown = @import("markdown.zig");
@@ -24,11 +25,10 @@ const theme_mod = @import("theme.zig");
 /// its first `item_rows_max` rows.
 pub const item_rows_max: usize = 512;
 
-const transcript_top: u16 = 1; // row 0 is the shell header
+const transcript_top: u16 = 0;
 const padding_x: u16 = 1;
 const item_margin_bottom: usize = 1;
-const tool_title_prefix = "╭─[";
-const tool_title_suffix = "]";
+const tool_top_line = "╭───";
 const tool_body_prefix = "│ ";
 const tool_bottom_line = "╰───";
 const hint_bytes_max: usize = 96;
@@ -99,11 +99,15 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
     painter.clear();
     if (app.width == 0 or app.height == 0) return;
 
-    painter.writeText(0, 0, "zi", app.theme.shell_label);
     const composer_rows = composerRows(app);
     const picker_rows = pickerRows(app);
     const status_rows = statusRows(app);
+    const greeter_rows = greeterRows(app);
     drawTranscript(app, &painter, scratch, transcriptVisibleRows(app));
+    if (greeter_rows > 0) {
+        const y: u16 = @intCast(@as(usize, app.height) - picker_rows - composer_rows - status_rows - greeter_rows);
+        drawGreeter(app, &painter, y);
+    }
     if (status_rows > 0 and @as(usize, app.height) > composer_rows + picker_rows) {
         const y: u16 = @intCast(@as(usize, app.height) - picker_rows - composer_rows - 1);
         drawStatusLine(app, &painter, y);
@@ -125,7 +129,7 @@ pub fn transcriptScrollMax(app: *App) usize {
 pub fn transcriptVisibleRows(app: *App) usize {
     if (app.height == 0) return 0;
     const body_rows = @as(usize, app.height) - transcript_top;
-    const reserved = @min(composerRows(app) + statusRows(app) + pickerRows(app), body_rows);
+    const reserved = @min(composerRows(app) + statusRows(app) + pickerRows(app) + greeterRows(app), body_rows);
     return body_rows - reserved;
 }
 
@@ -161,6 +165,15 @@ pub fn statusRows(app: *App) usize {
     if (app.height == 0) return 0;
     if (@as(usize, app.height) <= composerRows(app) + pickerRows(app)) return 0;
     return 1;
+}
+
+pub fn greeterRows(app: *App) usize {
+    if (app.greeter == null or app.transcript.items.items.len != 0) return 0;
+    if (app.height == 0) return 0;
+    const rows = Greeter.row_count;
+    const occupied = composerRows(app) + pickerRows(app) + statusRows(app);
+    if (@as(usize, app.height) < occupied + rows) return 0;
+    return rows;
 }
 
 pub fn composerRows(app: *App) usize {
@@ -431,32 +444,28 @@ fn buildToolRows(
     theme: *const theme_mod.Theme,
     expanded: bool,
 ) void {
-    // Error rail tints the whole chrome red, matching pi-mono's failed tools.
+    // Error rail tints only the result/body chrome; the title stays plain.
     const rail = if (tool.status == .err) theme.status_error else theme.tool_chrome;
     const inner = innerWidth(width);
 
     var title_buffer: [title_bytes_max]u8 = undefined;
-    const title_available = width -| (padding_x +
-        text_mod.displayWidth(tool_title_prefix) +
-        text_mod.displayWidth(tool_title_suffix));
+    const title_available = width -| padding_x;
     const title = internText(out, fitToWidth(toolTitle(tool, expanded, &title_buffer), title_available));
     putRow(out, count, .{
-        .prefix = tool_title_prefix,
         .text = title,
-        .suffix = tool_title_suffix,
         .segments = toolTitleSegments(out, tool, title, theme),
-        .show_prefix = true,
-        .prefix_style = rail,
         .text_style = theme.tool_title,
-        .suffix_style = rail,
-        .row_style = rail,
     });
 
     var notice_buffer: [notice_bytes_max]u8 = undefined;
-    if (omissionNotice(tool, &notice_buffer)) |notice| {
+    const notice = omissionNotice(tool, &notice_buffer);
+    const has_body_chrome = notice != null or toolBodyVisible(tool, expanded) or tool.footer.len > 0;
+    if (has_body_chrome) putRow(out, count, .{ .text = tool_top_line, .text_style = rail, .row_style = rail });
+
+    if (notice) |text| {
         emitWrappedText(out, count, .{
             .prefix = tool_body_prefix,
-            .text = internText(out, notice),
+            .text = internText(out, text),
             .repeat_prefix = true,
             .prefix_style = rail,
             .text_style = rail,
@@ -481,7 +490,9 @@ fn buildToolRows(
         });
     }
 
-    putRow(out, count, .{ .text = tool_bottom_line, .text_style = rail, .row_style = rail });
+    if (has_body_chrome) {
+        putRow(out, count, .{ .text = tool_bottom_line, .text_style = rail, .row_style = rail });
+    }
 }
 
 /// Collapsed tools show a bounded window over the wrapped body rows: tail
@@ -668,7 +679,7 @@ fn physicalLineStart(text: []const u8, offset: usize) usize {
     return pos;
 }
 
-// The adapter formats the full pi-mono-style header into `title`
+// The adapter formats the full pi-mono-style title into `title`
 // ("$ cmd", "read path:1-20", ...); the tool name is only a fallback.
 fn toolTitle(tool: *const Transcript.Tool, expanded: bool, buffer: *[title_bytes_max]u8) []const u8 {
     const title = if (!expanded and tool.compact_title.len > 0) tool.compact_title else tool.title;
@@ -796,6 +807,34 @@ fn omissionNotice(tool: *const Transcript.Tool, buffer: *[notice_bytes_max]u8) ?
             "· ··· output omitted";
     }
     return null;
+}
+
+// --- greeter ---
+
+const greeter_logo = [_][]const u8{
+    "  ░▀▀█░▀█▀",
+    "  ░▄▀░░░█░",
+    "  ░▀▀▀░▀▀▀",
+};
+
+fn drawGreeter(app: *App, painter: *Painter, y: u16) void {
+    const greeter = if (app.greeter) |*value| value else return;
+    var row: usize = 0;
+    while (row < Greeter.row_count) : (row += 1) {
+        const row_y: u16 = @intCast(@as(usize, y) + row);
+        if (row_y >= app.height) return;
+        painter.writeText(0, row_y, greeter_logo[row], app.theme.transcript_secondary);
+        const text = switch (row) {
+            0 => greeter.titleSlice(),
+            1 => greeter.subtitleSlice(),
+            else => "",
+        };
+        if (text.len == 0) continue;
+        const text_x = advance(0, text_mod.displayWidth(greeter_logo[row]) + 3);
+        if (text_x >= app.width) continue;
+        const available = @as(usize, app.width) - text_x;
+        painter.writeText(text_x, row_y, fitToWidth(text, available), app.theme.transcript_secondary);
+    }
 }
 
 // --- status line ---
@@ -1134,12 +1173,12 @@ test "collapsed tool body shows a bounded window with a hint row" {
     } });
     _ = try app.transcript.appendToolOutput(testing_gpa, "call-1", "1\n2\n3\n4\n5\n6\n7\n8", 0, 0);
 
-    // Collapsed: header + hint + 5 window rows + bottom + margin.
-    try std.testing.expectEqual(@as(usize, 9), countItem(&app, 0));
+    // Collapsed: title + top + hint + 5 window rows + bottom + margin.
+    try std.testing.expectEqual(@as(usize, 10), countItem(&app, 0));
 
-    // Expanded: header + all 8 body rows + bottom + margin, no hint.
+    // Expanded: title + top + all 8 body rows + bottom + margin, no hint.
     app.tools_expanded = true;
-    try std.testing.expectEqual(@as(usize, 11), countItem(&app, 0));
+    try std.testing.expectEqual(@as(usize, 12), countItem(&app, 0));
 }
 
 test "head-collapsed tool keeps the first rows with the hint below" {
@@ -1158,11 +1197,12 @@ test "head-collapsed tool keeps the first rows with the hint below" {
     var count: usize = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
 
-    // Top-down: header, window rows a/b, hint, bottom, margin.
-    try std.testing.expectEqualStrings("a", scratch.rows[1].text);
-    try std.testing.expectEqualStrings("b", scratch.rows[2].text);
-    try std.testing.expect(std.mem.indexOf(u8, scratch.rows[3].text, "more lines") != null);
-    try std.testing.expectEqual(@as(usize, 6), count);
+    // Top-down: title, top border, window rows a/b, hint, bottom, margin.
+    try std.testing.expectEqualStrings(tool_top_line, scratch.rows[1].text);
+    try std.testing.expectEqualStrings("a", scratch.rows[2].text);
+    try std.testing.expectEqualStrings("b", scratch.rows[3].text);
+    try std.testing.expect(std.mem.indexOf(u8, scratch.rows[4].text, "more lines") != null);
+    try std.testing.expectEqual(@as(usize, 7), count);
 }
 
 test "tool warning body lines use warning style" {
@@ -1188,10 +1228,11 @@ test "tool warning body lines use warning style" {
     var count: usize = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
 
-    try std.testing.expectEqualStrings("src/main.zig:1: foo", scratch.rows[1].text);
-    try std.testing.expectEqual(app.theme.tool_output, scratch.rows[1].text_style);
-    try std.testing.expectEqualStrings("[Truncated: 2 matches limit]", scratch.rows[2].text);
-    try std.testing.expectEqual(app.theme.status_warning, scratch.rows[2].text_style);
+    try std.testing.expectEqualStrings(tool_top_line, scratch.rows[1].text);
+    try std.testing.expectEqualStrings("src/main.zig:1: foo", scratch.rows[2].text);
+    try std.testing.expectEqual(app.theme.tool_output, scratch.rows[2].text_style);
+    try std.testing.expectEqualStrings("[Truncated: 2 matches limit]", scratch.rows[3].text);
+    try std.testing.expectEqual(app.theme.status_warning, scratch.rows[3].text_style);
 }
 
 test "successful read hides body until expanded" {
@@ -1214,18 +1255,19 @@ test "successful read hides body until expanded" {
     var count: usize = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
 
-    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expectEqualStrings("read src/main.zig:1-2", scratch.rows[0].text);
-    try std.testing.expectEqualStrings(tool_bottom_line, scratch.rows[1].text);
+    try std.testing.expectEqualStrings("", scratch.rows[1].text);
 
     count = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, true);
-    try std.testing.expectEqual(@as(usize, 5), count);
-    try std.testing.expectEqualStrings("one", scratch.rows[1].text);
-    try std.testing.expectEqualStrings("two", scratch.rows[2].text);
+    try std.testing.expectEqual(@as(usize, 6), count);
+    try std.testing.expectEqualStrings(tool_top_line, scratch.rows[1].text);
+    try std.testing.expectEqualStrings("one", scratch.rows[2].text);
+    try std.testing.expectEqualStrings("two", scratch.rows[3].text);
 }
 
-test "tool header uses compact title only while collapsed" {
+test "tool title uses compact text only while collapsed" {
     var app = App.init(80, 24);
     defer app.deinit(testing_gpa);
 
@@ -1247,7 +1289,7 @@ test "tool header uses compact title only while collapsed" {
     try std.testing.expectEqualStrings("read skills/review/SKILL.md:1-10", scratch.rows[0].text);
 }
 
-test "file tool header styles name path range and hint as segments" {
+test "file tool title styles name path range and hint as segments" {
     var app = App.init(80, 24);
     defer app.deinit(testing_gpa);
 
@@ -1263,17 +1305,17 @@ test "file tool header styles name path range and hint as segments" {
     var count: usize = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
 
-    const header = scratch.rows[0];
-    try std.testing.expectEqual(@as(usize, 4), header.segments.len);
-    try std.testing.expectEqualStrings("read", header.segments[0].text);
-    try std.testing.expectEqualStrings(" ", header.segments[1].text);
-    try std.testing.expectEqualStrings("src/main.zig", header.segments[2].text);
-    try std.testing.expectEqualStrings(":1-20", header.segments[3].text);
-    try std.testing.expectEqual(app.theme.status_accent, header.segments[2].style);
-    try std.testing.expectEqual(app.theme.status_warning, header.segments[3].style);
+    const title = scratch.rows[0];
+    try std.testing.expectEqual(@as(usize, 4), title.segments.len);
+    try std.testing.expectEqualStrings("read", title.segments[0].text);
+    try std.testing.expectEqualStrings(" ", title.segments[1].text);
+    try std.testing.expectEqualStrings("src/main.zig", title.segments[2].text);
+    try std.testing.expectEqualStrings(":1-20", title.segments[3].text);
+    try std.testing.expectEqual(app.theme.status_accent, title.segments[2].style);
+    try std.testing.expectEqual(app.theme.status_warning, title.segments[3].style);
 }
 
-test "tool header reserves room for closing bracket" {
+test "tool title is plain text outside the body rail and fits width" {
     var app = App.init(24, 8);
     defer app.deinit(testing_gpa);
 
@@ -1288,12 +1330,11 @@ test "tool header reserves room for closing bracket" {
     var count: usize = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
 
-    const header = scratch.rows[0];
-    const used = padding_x +
-        text_mod.displayWidth(header.prefix) +
-        text_mod.displayWidth(header.text) +
-        text_mod.displayWidth(header.suffix);
-    try std.testing.expectEqualStrings(tool_title_suffix, header.suffix);
+    const title = scratch.rows[0];
+    const used = padding_x + text_mod.displayWidth(title.text);
+    try std.testing.expectEqualStrings("", title.prefix);
+    try std.testing.expectEqualStrings("", title.suffix);
+    try std.testing.expect(!title.show_prefix);
     try std.testing.expect(used <= app.width);
 }
 
@@ -1407,8 +1448,7 @@ test "vaxis screen receives the frame" {
     defer testing_gpa.destroy(scratch);
     draw(&app, &vx, scratch);
 
-    try expectScreenText(vx.window(), 0, 0, "zi");
-    try expectScreenText(vx.window(), 1, 1, "hello vaxis");
+    try expectScreenText(vx.window(), 1, 0, "hello vaxis");
 }
 
 test "single command completion row remains visible below composer" {
@@ -1493,8 +1533,62 @@ test "scrolled frame draws older rows and clamps to max" {
 
     app.viewport.scroll_rows = 10_000; // render clamps locally instead of blanking
     draw(&app, &vx, scratch);
-    try expectScreenText(vx.window(), 1, 1, "line-0");
+    try expectScreenText(vx.window(), 1, 0, "line-0");
     try std.testing.expectEqual(@as(usize, 10_000), app.viewport.scroll_rows);
+}
+
+test "empty frame renders greeter above status and composer" {
+    var env = std.process.Environ.Map.init(testing_gpa);
+    defer env.deinit();
+
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var output_storage: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_storage);
+    defer vx.deinit(testing_gpa, &writer);
+    try vx.resize(testing_gpa, &writer, .{ .cols = 60, .rows = 9, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(60, 9);
+    defer app.deinit(testing_gpa);
+    _ = try app.apply(testing_gpa, .{ .set_greeter = .{
+        .title = "zi 1.2.3",
+        .subtitle = "Type / for commands. Ask zi about zi if you get lost.",
+    } });
+    _ = app.status.set(.{ .slot = .status_line, .id = 1, .text = "ready" });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try std.testing.expect(screenContainsText(vx.window(), "░▀▀█░▀█▀"));
+    try std.testing.expect(screenContainsText(vx.window(), "zi 1.2.3"));
+    try std.testing.expect(screenContainsText(vx.window(), "Type / for commands"));
+    try std.testing.expect(screenContainsText(vx.window(), "ready"));
+}
+
+test "greeter is empty-state chrome and hides once transcript exists" {
+    var env = std.process.Environ.Map.init(testing_gpa);
+    defer env.deinit();
+
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var output_storage: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_storage);
+    defer vx.deinit(testing_gpa, &writer);
+    try vx.resize(testing_gpa, &writer, .{ .cols = 60, .rows = 9, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(60, 9);
+    defer app.deinit(testing_gpa);
+    _ = try app.apply(testing_gpa, .{ .set_greeter = .{ .title = "zi 1.2.3" } });
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "hello",
+    } } });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try std.testing.expect(!screenContainsText(vx.window(), "░▀▀█░▀█▀"));
+    try std.testing.expect(screenContainsText(vx.window(), "hello"));
 }
 
 fn screenContainsText(window: vaxis.Window, needle: []const u8) bool {

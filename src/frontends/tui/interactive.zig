@@ -22,6 +22,7 @@ pub const Options = struct {
     resume_session_file: ?[]const u8 = null,
     resume_latest: bool = false,
     initial_prompt: ?[]const u8 = null,
+    version: []const u8 = "0.0.0-local",
 };
 
 /// Frame pacing: 16ms while something animates (shimmer, tool timers run
@@ -43,6 +44,11 @@ const transcript_append_max = tui.Transcript.append_size_bytes_max;
 const tool_title_bytes_max = 160;
 const tool_timer_count_max = 8;
 const tool_timer_id_bytes_max = 96;
+
+fn nextWakeDelayMs(immediate_work_pending: bool, animation_active: bool) u64 {
+    if (immediate_work_pending) return 0;
+    return if (animation_active) frame_interval_ms else idle_frame_interval_ms;
+}
 
 const ToolTimer = struct {
     id: [tool_timer_id_bytes_max]u8 = undefined,
@@ -96,7 +102,14 @@ pub fn run(
     };
     defer app.deinit();
 
-    var controller = try InteractiveController.init(process, &app, stdout, stderr, options.initial_prompt);
+    var controller = try InteractiveController.init(
+        process,
+        &app,
+        stdout,
+        stderr,
+        options.initial_prompt,
+        options.version,
+    );
     defer controller.deinit();
     try controller.run();
 }
@@ -124,6 +137,7 @@ const InteractiveController = struct {
         stdout: *std.Io.Writer,
         stderr: *std.Io.Writer,
         initial_prompt: ?[]const u8,
+        version: []const u8,
     ) !InteractiveController {
         const terminal = try tui.Terminal.init(process.gpa, process.io, 80, 24);
         errdefer terminal.deinit();
@@ -139,6 +153,7 @@ const InteractiveController = struct {
             .terminal = terminal,
             .home_dir = process.env("HOME") orelse process.env("USERPROFILE"),
         };
+        try self.installGreeter(version);
         try self.installSlashCompletions();
         try self.installModelCompletions();
         try self.requestSnapshot();
@@ -156,13 +171,13 @@ const InteractiveController = struct {
 
     fn run(self: *InteractiveController) !void {
         while (self.terminal.isRunning()) {
-            if (try self.serviceImmediateWork()) continue;
+            const immediate = try self.serviceImmediateWork();
+            if (!self.terminal.isRunning()) break;
 
-            const frame_ms: u64 = if (self.terminal.hasAnimation())
-                frame_interval_ms
-            else
-                idle_frame_interval_ms;
-            const wake = try self.app.waitAndApplyWake(self.terminal.inputFd(), frame_ms);
+            const wake = try self.app.waitAndApplyWake(
+                self.terminal.inputFd(),
+                nextWakeDelayMs(immediate, self.terminal.hasAnimation()),
+            );
             // Time enters the product through ticks; refresh before handling
             // the wake so wall-clock policies (ctrl+c double press, shimmer)
             // never see stale time after a long idle wait.
@@ -171,7 +186,6 @@ const InteractiveController = struct {
                 .input => try self.drainInput(),
                 .session, .frame => {},
             }
-            _ = try self.serviceImmediateWork();
         }
     }
 
@@ -233,6 +247,15 @@ const InteractiveController = struct {
         else
             std.fmt.bufPrint(&buffer, "/model {s}", .{query}) catch "/model ";
         _ = try self.terminal.applyCommand(.{ .replace_composer_text = text });
+    }
+
+    fn installGreeter(self: *InteractiveController, version: []const u8) !void {
+        var title: [tui.Greeter.text_bytes_max]u8 = undefined;
+        const title_text = std.fmt.bufPrint(&title, "zi {s}", .{version}) catch "zi";
+        _ = try self.terminal.applyCommand(.{ .set_greeter = .{
+            .title = title_text,
+            .subtitle = "Type / for commands. Ask zi about zi if you get lost.",
+        } });
     }
 
     fn installModelCompletions(self: *InteractiveController) !void {
@@ -1061,6 +1084,12 @@ test "model slash parser distinguishes exact selection from picker search" {
     try std.testing.expect(parseModelCommand("/modelx") == null);
     try std.testing.expect(isExactModelSelector("openai/gpt-5.1"));
     try std.testing.expect(!isExactModelSelector("openai/nope"));
+}
+
+test "immediate TUI work polls instead of starving input" {
+    try std.testing.expectEqual(@as(u64, 0), nextWakeDelayMs(true, false));
+    try std.testing.expectEqual(@as(u64, frame_interval_ms), nextWakeDelayMs(false, true));
+    try std.testing.expectEqual(@as(u64, idle_frame_interval_ms), nextWakeDelayMs(false, false));
 }
 
 fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options: Options) !?[]const u8 {

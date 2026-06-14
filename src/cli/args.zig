@@ -28,6 +28,7 @@ const OutputMode = enum {
 
 pub const AppArgs = struct {
     help: bool = false,
+    version: bool = false,
     print: bool = false,
     mode: ?OutputMode = null,
     resume_session_file: ?[]const u8 = null,
@@ -91,6 +92,7 @@ const FlagValueMode = enum {
 
 const AppFlagTarget = enum {
     help,
+    version,
     print,
     mode,
     resume_session,
@@ -131,6 +133,11 @@ const app_flags = [_]AppFlagSpec{
         .long = "resume-latest",
         .target = .resume_latest,
         .help = "Resume the newest session for this cwd",
+    },
+    .{
+        .long = "version",
+        .target = .version,
+        .help = "Show zi version",
     },
     .{
         .long = "help",
@@ -271,6 +278,7 @@ fn readFlagValue(
 fn applyAppFlag(result: *AppArgs, spec: AppFlagSpec, value: ?[]const u8) ParseError!void {
     switch (spec.target) {
         .help => result.help = true,
+        .version => result.version = true,
         .print => result.print = true,
         .mode => result.mode = std.meta.stringToEnum(OutputMode, value orelse return error.MissingOptionValue) orelse
             return error.InvalidOptionValue,
@@ -411,6 +419,11 @@ test "usage includes resume forms" {
 test "parses help" {
     const app = (try parse(&.{"--help"})).app;
     try std.testing.expect(app.help);
+}
+
+test "parses version" {
+    const app = (try parse(&.{"--version"})).app;
+    try std.testing.expect(app.version);
 }
 
 test "unknown option fails" {

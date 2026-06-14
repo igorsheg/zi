@@ -44,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
                         } } });
                     }
                 },
+                .picker_selected => {},
                 .interrupt, .request_shutdown => terminal.requestStop(),
                 .request_transcript_history => if (history_pages_loaded < history_pages_max) {
                     try prependHistoryPage(terminal, history_pages_loaded);

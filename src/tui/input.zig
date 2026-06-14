@@ -38,6 +38,7 @@ pub const Key = enum {
     arrow_down,
     home,
     end,
+    ctrl_end,
     page_up,
     page_down,
     ctrl_c,
@@ -94,6 +95,7 @@ fn fromVaxisKey(key: vaxis.Key) Input {
     if (key.matches(vaxis.Key.up, .{})) return .{ .key = .arrow_up };
     if (key.matches(vaxis.Key.down, .{})) return .{ .key = .arrow_down };
     if (key.matches(vaxis.Key.home, .{})) return .{ .key = .home };
+    if (key.matches(vaxis.Key.end, .{ .ctrl = true })) return .{ .key = .ctrl_end };
     if (key.matches(vaxis.Key.end, .{})) return .{ .key = .end };
     if (key.matches(vaxis.Key.page_up, .{})) return .{ .key = .page_up };
     if (key.matches(vaxis.Key.page_down, .{})) return .{ .key = .page_down };
@@ -125,6 +127,7 @@ pub const KeyAction = union(enum) {
     transcript_page_down,
     transcript_scroll_up,
     transcript_scroll_down,
+    transcript_follow_tail,
     toggle_tool_expansion,
     interrupt,
     clear_or_exit,
@@ -156,6 +159,7 @@ fn resolveKey(key: Key) KeyAction {
         .newline => .composer_newline,
         .page_up => .transcript_page_up,
         .page_down => .transcript_page_down,
+        .ctrl_end => .transcript_follow_tail,
         .escape => .interrupt,
         .ctrl_c => .clear_or_exit,
         .ctrl_o => .toggle_tool_expansion,
@@ -211,6 +215,7 @@ test "resolve maps editing keys" {
     try std.testing.expectEqual(KeyAction.composer_down, resolve(.{ .key = .arrow_down }));
     try std.testing.expectEqual(KeyAction.transcript_scroll_up, resolve(.wheel_up));
     try std.testing.expectEqual(KeyAction.transcript_scroll_down, resolve(.wheel_down));
+    try std.testing.expectEqual(KeyAction.transcript_follow_tail, resolve(.{ .key = .ctrl_end }));
     try std.testing.expectEqual(KeyAction.composer_newline, resolve(.{ .key = .newline }));
     try std.testing.expectEqual(KeyAction.composer_submit, resolve(.{ .key = .enter }));
 }
