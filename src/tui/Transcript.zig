@@ -45,10 +45,13 @@ pub const ToolCollapse = struct {
 
 pub const AppendMode = enum { new_item, extend_previous_assistant_message, extend_previous_same_role };
 
+pub const CustomFormat = enum { plain, markdown };
+
 pub const Append = union(enum) {
     message: MessageAppend,
     status: StatusAppend,
     tool: ToolAppend,
+    custom: CustomAppend,
 
     pub const MessageAppend = struct {
         role: Role,
@@ -58,6 +61,11 @@ pub const Append = union(enum) {
     pub const StatusAppend = struct {
         level: StatusLevel,
         text: []const u8,
+    };
+    pub const CustomAppend = struct {
+        title: []const u8 = "",
+        text: []const u8,
+        format: CustomFormat = .plain,
     };
     pub const ToolAppend = struct {
         tool_call_id: []const u8,
@@ -94,12 +102,17 @@ pub const Item = struct {
         message: Message,
         status: Status,
         tool: Tool,
+        custom: Custom,
     };
 
     fn deinitBody(self: *Item, gpa: std.mem.Allocator) void {
         switch (self.body) {
             .message => |*message| message.text.deinit(gpa),
             .status => |status| gpa.free(status.text),
+            .custom => |*custom| {
+                gpa.free(custom.title);
+                gpa.free(custom.text);
+            },
             .tool => |*tool| {
                 gpa.free(tool.id);
                 gpa.free(tool.name);
@@ -115,6 +128,7 @@ pub const Item = struct {
         return switch (self.body) {
             .message => |message| message.text.items.len,
             .status => |status| status.text.len,
+            .custom => |custom| custom.title.len + custom.text.len,
             .tool => |tool| tool.sizeBytes(),
         };
     }
@@ -129,6 +143,12 @@ pub const Message = struct {
 pub const Status = struct {
     level: StatusLevel,
     text: []u8,
+};
+
+pub const Custom = struct {
+    title: []u8,
+    text: []u8,
+    format: CustomFormat,
 };
 
 pub const Tool = struct {
@@ -169,6 +189,7 @@ pub fn append(self: *Transcript, gpa: std.mem.Allocator, entry: Append) error{Ou
         .message => |message| self.appendMessage(gpa, message),
         .status => |status| self.appendStatus(gpa, status),
         .tool => |tool| self.appendTool(gpa, tool),
+        .custom => |custom| self.appendCustom(gpa, custom),
     };
 }
 
@@ -313,6 +334,27 @@ fn appendStatus(
     self.total_size_bytes += copy.len;
     self.evictUntilBounded(gpa);
     return .{ .truncated = bounded.len < status.text.len };
+}
+
+fn appendCustom(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    custom: Append.CustomAppend,
+) error{OutOfMemory}!Outcome {
+    const title_bounded = text_mod.utf8Prefix(custom.title, append_size_bytes_max);
+    const text_bounded = text_mod.utf8Prefix(custom.text, append_size_bytes_max);
+    const title = try sanitizedCopy(gpa, title_bounded);
+    errdefer gpa.free(title);
+    const text = try sanitizedCopy(gpa, text_bounded);
+    errdefer gpa.free(text);
+    try self.items.append(gpa, .{ .body = .{ .custom = .{
+        .title = title,
+        .text = text,
+        .format = custom.format,
+    } } });
+    self.total_size_bytes += title.len + text.len;
+    self.evictUntilBounded(gpa);
+    return .{ .truncated = title_bounded.len < custom.title.len or text_bounded.len < custom.text.len };
 }
 
 /// Append a tool item, or update it in place when the id already exists
@@ -575,6 +617,23 @@ test "oversize append truncates and reports" {
     const outcome = try transcript.append(gpa, .{ .message = .{ .role = .user, .text = big } });
     try std.testing.expect(outcome.truncated);
     try std.testing.expectEqual(append_size_bytes_max, transcript.items.items[0].sizeBytes());
+}
+
+test "custom entries are distinct transcript items" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .{ .custom = .{
+        .title = "Session Info",
+        .text = "**Messages**\nTotal: 0",
+        .format = .markdown,
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), transcript.items.items.len);
+    try std.testing.expect(transcript.items.items[0].body == .custom);
+    try std.testing.expectEqualStrings("Session Info", transcript.items.items[0].body.custom.title);
+    try std.testing.expectEqualStrings("**Messages**\nTotal: 0", transcript.items.items[0].body.custom.text);
 }
 
 test "eviction keeps item and byte caps with exact accounting" {

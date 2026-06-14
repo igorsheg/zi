@@ -167,6 +167,20 @@ fn resolveKey(key: Key) KeyAction {
     };
 }
 
+fn parseInput(bytes: []const u8) !Input {
+    var parser: vaxis.Parser = .{};
+    const parsed = try parser.parse(bytes, null);
+    try std.testing.expectEqual(bytes.len, parsed.n);
+    return fromVaxis(parsed.event.?);
+}
+
+test "raw parser bytes map paste markers and mouse wheel" {
+    try std.testing.expectEqual(Input.paste_begin, try parseInput("\x1b[200~"));
+    try std.testing.expectEqual(Input.paste_end, try parseInput("\x1b[201~"));
+    try std.testing.expectEqual(Input.wheel_up, try parseInput("\x1b[<64;10;5M"));
+    try std.testing.expectEqual(Input.wheel_down, try parseInput("\x1b[<65;10;5M"));
+}
+
 test "fromVaxis maps only mouse wheel presses" {
     try std.testing.expectEqual(Input.wheel_up, fromVaxis(.{ .mouse = .{
         .col = 0,

@@ -7,6 +7,7 @@ const agent_mod = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../../coding_agent/root.zig");
 const client_protocol = coding_agent.client_protocol;
+const slash_commands = coding_agent.slash_commands;
 const session_listing = coding_agent.session_listing;
 const session_runtime = coding_agent.session_runtime;
 const runtime = @import("../../runtime/root.zig");
@@ -34,6 +35,8 @@ const status_id_working: tui.status.ContributionId = 1;
 const status_id_queue: tui.status.ContributionId = 2;
 const status_id_recovery: tui.status.ContributionId = 3;
 const model_slot_id: tui.status.ContributionId = 1;
+const model_picker_id: tui.Picker.Id = 1;
+const command_completion_picker_id: tui.Picker.Id = 2;
 const transcript_append_max = tui.Transcript.append_size_bytes_max;
 const tool_title_bytes_max = 160;
 const tool_timer_count_max = 8;
@@ -132,6 +135,8 @@ const InteractiveController = struct {
             .stderr = stderr,
             .terminal = terminal,
         };
+        try self.installSlashCompletions();
+        try self.installModelCompletions();
         try self.requestSnapshot();
         if (initial_prompt) |prompt| try self.submitPrompt(prompt);
         try self.terminal.renderIfDirty();
@@ -185,7 +190,8 @@ const InteractiveController = struct {
 
     fn handleEffect(self: *InteractiveController, effect: tui.Effect) !void {
         switch (effect) {
-            .submit_text => |text| try self.submitPrompt(text),
+            .submit_text => |text| if (!try self.handleSubmittedCommand(text)) try self.submitPrompt(text),
+            .picker_selected => |selection| try self.handlePickerSelection(selection),
             .interrupt => try self.cancelActive(),
             .request_transcript_history => try self.requestHistoryPage(),
             .request_shutdown => {
@@ -194,6 +200,87 @@ const InteractiveController = struct {
                 }
             },
         }
+    }
+
+    fn handleSubmittedCommand(self: *InteractiveController, text: []const u8) !bool {
+        const model_query = parseModelCommand(text) orelse return false;
+        if (model_query.len > 0 and isExactModelSelector(model_query)) return false;
+        try self.editModelCommand(model_query);
+        return true;
+    }
+
+    fn handlePickerSelection(self: *InteractiveController, selection: tui.Picker.Selection) !void {
+        switch (selection.picker_id) {
+            model_picker_id => try self.submitSelectedModel(selection.item_id),
+            else => {},
+        }
+    }
+
+    fn submitSelectedModel(self: *InteractiveController, item_id: []const u8) !void {
+        var buffer: [tui.Picker.id_bytes_max + 8]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&buffer, "/model {s}", .{item_id}) catch return;
+        try self.submitPrompt(prompt);
+    }
+
+    fn editModelCommand(self: *InteractiveController, query: []const u8) !void {
+        var buffer: [tui.Picker.query_bytes_max + 8]u8 = undefined;
+        const text = if (query.len == 0)
+            "/model "
+        else
+            std.fmt.bufPrint(&buffer, "/model {s}", .{query}) catch "/model ";
+        _ = try self.terminal.applyCommand(.{ .replace_composer_text = text });
+    }
+
+    fn installModelCompletions(self: *InteractiveController) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+        var items = std.ArrayList(tui.Picker.Item).empty;
+        defer items.deinit(self.allocator);
+
+        outer: for (ai.getProviders()) |provider| {
+            const authed = self.app.services.auth_manager.hasAuth(provider);
+            for (ai.getModels(provider)) |model| {
+                if (items.items.len == tui.Picker.item_count_max) break :outer;
+                const id = try std.fmt.allocPrint(arena_allocator, "{s}/{s}", .{ model.provider, model.id });
+                const available = self.app.services.provider_registry.get(model.api) != null;
+                const detail = if (!available)
+                    try std.fmt.allocPrint(arena_allocator, "{s} - unavailable", .{model.name})
+                else if (authed)
+                    try std.fmt.allocPrint(arena_allocator, "{s} - ready", .{model.name})
+                else
+                    try std.fmt.allocPrint(arena_allocator, "{s} - missing auth", .{model.name});
+                try items.append(self.allocator, .{ .id = id, .label = id, .detail = detail });
+            }
+        }
+
+        _ = try self.terminal.applyCommand(.{ .set_composer_arg_completions = .{
+            .command_name = "model",
+            .picker = .{
+                .id = model_picker_id,
+                .title = "Models",
+                .items = items.items,
+            },
+        } });
+    }
+
+    fn installSlashCompletions(self: *InteractiveController) !void {
+        var items: [slash_commands.command_count_max]tui.Picker.Item = undefined;
+        var labels: [slash_commands.command_count_max][1 + slash_commands.name_bytes_max]u8 = undefined;
+        for (slash_commands.builtins, 0..) |command, index| {
+            labels[index][0] = '/';
+            @memcpy(labels[index][1..][0..command.name.len], command.name);
+            items[index] = .{
+                .id = command.name,
+                .label = labels[index][0 .. 1 + command.name.len],
+                .detail = command.summary,
+            };
+        }
+        _ = try self.terminal.applyCommand(.{ .set_composer_completions = .{
+            .id = command_completion_picker_id,
+            .title = "Commands",
+            .items = items[0..slash_commands.builtins.len],
+        } });
     }
 
     fn submitPrompt(self: *InteractiveController, prompt: []const u8) !void {
@@ -300,10 +387,21 @@ const InteractiveController = struct {
                 self.history_request_in_flight = false;
                 try self.appendStatus(.err, rejection.message.text);
             },
-            .prompt_command => |command| try self.appendStatus(
-                if (command.result == .handled) .info else .warning,
-                command.message.text,
-            ),
+            .prompt_command => |command| {
+                switch (command.presentation) {
+                    .transcript => if (command.session_info) |info|
+                        try self.appendSessionInfo(info)
+                    else
+                        try self.appendCustom("Command", command.message.text, .markdown),
+                    .status => try self.appendStatus(
+                        if (command.result == .handled) .info else .warning,
+                        command.message.text,
+                    ),
+                }
+                if (command.result == .handled and std.mem.eql(u8, command.command.text, "model")) {
+                    try self.requestSnapshot();
+                }
+            },
             .queue_changed => |queue| try self.applyQueueChanged(queue),
             .snapshot => |snapshot| try self.applySnapshot(snapshot),
             .history_page => |page| try self.applyHistoryPage(page),
@@ -611,6 +709,28 @@ const InteractiveController = struct {
         });
     }
 
+    fn appendSessionInfo(
+        self: *InteractiveController,
+        info: client_protocol.PromptCommandSessionInfo,
+    ) !void {
+        var buffer: [2048]u8 = undefined;
+        try self.appendCustom("Session Info", formatSessionInfo(&buffer, info), .markdown);
+    }
+
+    fn appendCustom(
+        self: *InteractiveController,
+        title: []const u8,
+        text: []const u8,
+        format: tui.Transcript.CustomFormat,
+    ) !void {
+        if (title.len == 0 and text.len == 0) return;
+        _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .custom = .{
+            .title = title,
+            .text = boundedChunk(text),
+            .format = format,
+        } } });
+    }
+
     fn setWorkingStatus(self: *InteractiveController, text: []const u8) !void {
         _ = try self.terminal.applyCommand(.{ .set_status = .{
             .slot = .status_line,
@@ -722,6 +842,68 @@ fn boundedChunk(text: []const u8) []const u8 {
     const prefix = utf8Prefix(text, transcript_append_max);
     if (prefix.len > 0) return prefix;
     return text[0..@min(text.len, transcript_append_max)];
+}
+
+fn formatSessionInfo(buffer: []u8, info: client_protocol.PromptCommandSessionInfo) []const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    if (info.file) |file| {
+        writer.print("File: {s}\n", .{file.text}) catch return "session status unavailable";
+    } else {
+        writer.writeAll("File: In-memory\n") catch return "session status unavailable";
+    }
+    writer.print("ID: {s}\n\n", .{info.id.text}) catch return "session status unavailable";
+    writer.writeAll("**Messages**\n") catch return "session status unavailable";
+    writer.print("User: {d}\n", .{info.user_messages}) catch return "session status unavailable";
+    writer.print("Assistant: {d}\n", .{info.assistant_messages}) catch return "session status unavailable";
+    writer.print("Tool Calls: {d}\n", .{info.tool_calls}) catch return "session status unavailable";
+    writer.print("Tool Results: {d}\n", .{info.tool_results}) catch return "session status unavailable";
+    writer.print("Total: {d}\n\n", .{info.total_messages}) catch return "session status unavailable";
+    writer.writeAll("**Tokens**\n") catch return "session status unavailable";
+    writer.print("Input: {d}\n", .{info.input_tokens}) catch return "session status unavailable";
+    writer.print("Output: {d}\n", .{info.output_tokens}) catch return "session status unavailable";
+    if (info.cache_read_tokens > 0) {
+        writer.print("Cache Read: {d}\n", .{info.cache_read_tokens}) catch return "session status unavailable";
+    }
+    if (info.cache_write_tokens > 0) {
+        writer.print("Cache Write: {d}\n", .{info.cache_write_tokens}) catch return "session status unavailable";
+    }
+    writer.print("Total: {d}", .{info.total_tokens}) catch return "session status unavailable";
+    if (info.cost > 0) {
+        writer.print("\n\n**Cost**\nTotal: {d:.4}", .{info.cost}) catch return "session status unavailable";
+    }
+    return writer.buffered();
+}
+
+fn parseModelCommand(text: []const u8) ?[]const u8 {
+    const invocation = slash_commands.parseInvocation(text) orelse return null;
+    const spec = slash_commands.lookup(invocation.name) orelse return null;
+    if (spec.id != .model) return null;
+    return invocation.args;
+}
+
+fn isExactModelSelector(selector: []const u8) bool {
+    if (selector.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, selector, '/')) |slash| {
+        if (slash == 0 or slash + 1 >= selector.len) return false;
+        return ai.getModel(selector[0..slash], selector[slash + 1 ..]) != null;
+    }
+    var found = false;
+    for (ai.getProviders()) |provider| {
+        for (ai.getModels(provider)) |model| {
+            if (!std.mem.eql(u8, model.id, selector)) continue;
+            if (found) return false;
+            found = true;
+        }
+    }
+    return found;
+}
+
+test "model slash parser distinguishes exact selection from picker search" {
+    try std.testing.expectEqualStrings("", parseModelCommand("/model").?);
+    try std.testing.expectEqualStrings("gpt", parseModelCommand("/model gpt").?);
+    try std.testing.expect(parseModelCommand("/modelx") == null);
+    try std.testing.expect(isExactModelSelector("openai/gpt-5.1"));
+    try std.testing.expect(!isExactModelSelector("openai/nope"));
 }
 
 fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options: Options) !?[]const u8 {

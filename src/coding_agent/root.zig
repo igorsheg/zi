@@ -7,6 +7,7 @@ pub const auth_mode = @import("auth_mode.zig");
 pub const client_protocol = @import("client_protocol.zig");
 pub const session_listing = @import("session_listing.zig");
 pub const session_runtime = @import("session_runtime.zig");
+pub const slash_commands = @import("slash_commands.zig");
 pub const wire_protocol = @import("wire_protocol.zig");
 
 // Internal modules, referenced here so `zig build test` reaches their tests.

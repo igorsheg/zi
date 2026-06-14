@@ -52,7 +52,6 @@ pub const Options = struct {
     task_runtime: *runtime.Runtime,
 };
 
-
 pub const Listener = struct {
     context: ?*anyopaque = null,
     call_fn: *const fn (std.Io, ?*anyopaque, agent.AgentEvent, runtime.CancelToken) anyerror!void,
@@ -127,6 +126,10 @@ pub fn setSystemPrompt(self: *Agent, system_prompt: []const u8) void {
 pub fn setModel(self: *Agent, model: ai.Model) void {
     self.state.model = model;
     self.loop_config.model = model;
+}
+
+pub fn setStream(self: *Agent, stream: ai.StreamFunction) void {
+    self.loop_config.stream = stream;
 }
 
 pub fn setThinkingLevel(self: *Agent, thinking_level: agent.ThinkingLevel) void {

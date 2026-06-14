@@ -13,8 +13,12 @@ const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_manager = @import("session_manager.zig");
 const settings_mod = @import("settings.zig");
+const slash_commands = @import("slash_commands.zig");
 
 pub const WakeResult = enum { input, session, frame };
+
+const session_command_message_bytes_max: usize = 160;
+const SessionStats = client_protocol.PromptCommandSessionStats;
 
 /// Wall-clock facts for opening one session: the prompt-visible date, the
 /// ISO header/file timestamp, and a uniqueness source for session ids.
@@ -171,13 +175,15 @@ fn resolveSessionOptions(services: *RuntimeServices, options: Options) AgentSess
         if (pair.default_provider) |provider| {
             if (pair.default_model) |model_id| {
                 if (ai.getModel(provider, model_id)) |model| {
-                    if (services.auth_manager.hasAuth(model.provider)) break :model model;
+                    if (services.auth_manager.hasAuth(model.provider) and
+                        services.provider_registry.get(model.api) != null) break :model model;
                 }
             }
         }
         for (ai.getProviders()) |provider| {
             for (ai.getModels(provider)) |model| {
-                if (services.auth_manager.hasAuth(model.provider)) break :model model;
+                if (services.auth_manager.hasAuth(model.provider) and
+                    services.provider_registry.get(model.api) != null) break :model model;
             }
         }
         break :model agent_mod.Agent.defaultModel();
@@ -723,32 +729,172 @@ pub const SessionRuntime = struct {
         request_id: ?client_protocol.RequestId,
         text: []const u8,
     ) !bool {
-        const command = parseSlashCommand(text) orelse return false;
-        var reply_buffer: [256]u8 = undefined;
-        if (std.mem.eql(u8, command, "help")) {
-            try self.enqueuePromptCommand(request_id, command, .handled, "available commands: /help, /session");
-        } else if (std.mem.eql(u8, command, "session")) {
-            const reply = std.fmt.bufPrint(&reply_buffer, "session: {s}; entries: {d}; model: {s}/{s}", .{
-                self.session.manager.header.id,
-                self.session.manager.entries.items.len,
-                self.session.agent.state.model.provider,
-                self.session.agent.state.model.id,
-            }) catch "session status unavailable";
-            try self.enqueuePromptCommand(request_id, command, .handled, reply);
-        } else {
-            const reply = std.fmt.bufPrint(&reply_buffer, "unknown command: /{s}", .{command}) catch
+        const invocation = slash_commands.parseInvocation(text) orelse return false;
+        const spec = slash_commands.lookup(invocation.name) orelse {
+            var reply_buffer: [256]u8 = undefined;
+            const reply = std.fmt.bufPrint(&reply_buffer, "unknown command: /{s}", .{invocation.name}) catch
                 "unknown command";
-            try self.enqueuePromptCommand(request_id, command, .unknown, reply);
+            try self.enqueuePromptCommand(request_id, invocation.name, .unknown, reply);
+            return true;
+        };
+
+        var reply_buffer: [256]u8 = undefined;
+        switch (spec.id) {
+            .help => try self.enqueuePromptCommand(
+                request_id,
+                spec.name,
+                .handled,
+                slash_commands.formatAvailable(&reply_buffer),
+            ),
+            .session => try self.enqueueSessionPromptCommand(request_id, spec.name),
+            .model => try self.handleModelSlashCommand(request_id, spec.name, invocation.args),
         }
         return true;
     }
 
     fn parseSlashCommand(text: []const u8) ?[]const u8 {
-        if (text.len < 2 or text[0] != '/') return null;
-        var end: usize = 1;
-        while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
-        if (end == 1) return null;
-        return text[1..end];
+        return slash_commands.parseName(text);
+    }
+
+    fn formatSessionFallback(self: *const SessionRuntime, buffer: []u8, stats: SessionStats) []const u8 {
+        return std.fmt.bufPrint(buffer, "session: {s}; messages: {d}; tokens: {d}", .{
+            self.session.manager.header.id,
+            stats.total_messages,
+            stats.total_tokens,
+        }) catch "session status unavailable";
+    }
+
+    fn collectSessionStats(manager: *const session_manager.SessionManager) SessionStats {
+        var stats: SessionStats = .{};
+        for (manager.entries.items) |entry| switch (entry) {
+            .compaction => {},
+            .message => |message_entry| {
+                stats.total_messages += 1;
+                switch (message_entry.message) {
+                    .user => stats.user_messages += 1,
+                    .assistant => |assistant| {
+                        stats.assistant_messages += 1;
+                        stats.input_tokens +|= assistant.usage.input;
+                        stats.output_tokens +|= assistant.usage.output;
+                        stats.cache_read_tokens +|= assistant.usage.cache_read;
+                        stats.cache_write_tokens +|= assistant.usage.cache_write;
+                        stats.total_tokens +|= assistant.usage.input +|
+                            assistant.usage.output +|
+                            assistant.usage.cache_read +|
+                            assistant.usage.cache_write;
+                        stats.cost += assistant.usage.cost.total;
+                        for (assistant.content) |content| switch (content) {
+                            .tool_call => stats.tool_calls += 1,
+                            .text, .thinking => {},
+                        };
+                    },
+                    .tool_result => stats.tool_results += 1,
+                    .custom => {},
+                }
+            },
+        };
+        return stats;
+    }
+
+    fn handleModelSlashCommand(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        command: []const u8,
+        args: []const u8,
+    ) !void {
+        if (args.len == 0) {
+            try self.enqueuePromptCommand(request_id, command, .handled, "usage: /model <provider/model>");
+            return;
+        }
+        const model = self.resolveModelSelector(args) catch |err| {
+            const message = switch (err) {
+                error.AmbiguousModel => "ambiguous model; use provider/model",
+                error.InvalidModelSelector => "invalid model selector; use provider/model",
+                error.UnknownModel => "unknown model",
+            };
+            try self.enqueuePromptCommand(request_id, command, .failed, message);
+            return;
+        };
+        if (!self.services.auth_manager.hasAuth(model.provider)) {
+            var reply_buffer: [160]u8 = undefined;
+            const reply = std.fmt.bufPrint(&reply_buffer, "missing auth for provider: {s}", .{model.provider}) catch
+                "missing auth for provider";
+            try self.enqueuePromptCommand(request_id, command, .failed, reply);
+            return;
+        }
+        if (self.services.provider_registry.get(model.api) == null) {
+            var reply_buffer: [160]u8 = undefined;
+            const reply = std.fmt.bufPrint(&reply_buffer, "provider unavailable for model: {s}", .{model.provider}) catch
+                "provider unavailable for model";
+            try self.enqueuePromptCommand(request_id, command, .failed, reply);
+            return;
+        }
+
+        self.setSessionModel(model);
+        var reply_buffer: [256]u8 = undefined;
+        const reply = std.fmt.bufPrint(&reply_buffer, "model: {s}/{s}", .{ model.provider, model.id }) catch
+            "model changed";
+        try self.enqueuePromptCommand(request_id, command, .handled, reply);
+    }
+
+    const ModelResolveError = error{ UnknownModel, AmbiguousModel, InvalidModelSelector };
+
+    fn resolveModelSelector(self: *const SessionRuntime, selector: []const u8) ModelResolveError!ai.Model {
+        if (selector.len == 0) return error.InvalidModelSelector;
+        if (std.mem.indexOfScalar(u8, selector, '/')) |slash| {
+            if (slash == 0 or slash + 1 >= selector.len) return error.InvalidModelSelector;
+            const provider = selector[0..slash];
+            const model_id = selector[slash + 1 ..];
+            return ai.getModel(provider, model_id) orelse error.UnknownModel;
+        }
+
+        if (ai.getModel(self.session.agent.state.model.provider, selector)) |model| return model;
+        var found: ?ai.Model = null;
+        for (ai.getProviders()) |provider| {
+            for (ai.getModels(provider)) |model| {
+                if (!std.mem.eql(u8, model.id, selector)) continue;
+                if (found != null) return error.AmbiguousModel;
+                found = model;
+            }
+        }
+        return found orelse error.UnknownModel;
+    }
+
+    fn setSessionModel(self: *SessionRuntime, model: ai.Model) void {
+        self.session.agent.setModel(model);
+        if (self.services.provider_registry.get(model.api)) |provider| {
+            self.session.agent.setStream(provider.stream_simple);
+        }
+    }
+
+    fn enqueueSessionPromptCommand(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        command: []const u8,
+    ) !void {
+        const stats = collectSessionStats(self.session.manager);
+        var fallback_buffer: [session_command_message_bytes_max]u8 = undefined;
+        var command_text = try client_protocol.EventText.init(self.allocator, command);
+        errdefer command_text.deinit(self.allocator);
+        var message_text = try client_protocol.EventText.init(
+            self.allocator,
+            self.formatSessionFallback(&fallback_buffer, stats),
+        );
+        errdefer message_text.deinit(self.allocator);
+        var session_info = try client_protocol.PromptCommandSessionInfo.init(
+            self.allocator,
+            if (self.session.store) |store| store.file_name else null,
+            self.session.manager.header.id,
+            stats,
+        );
+        errdefer session_info.deinit(self.allocator);
+        try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .prompt_command = .{
+            .command = command_text,
+            .result = .handled,
+            .message = message_text,
+            .presentation = .transcript,
+            .session_info = session_info,
+        } } });
     }
 
     fn enqueuePromptCommand(
@@ -760,7 +906,8 @@ pub const SessionRuntime = struct {
     ) !void {
         var command_text = try client_protocol.EventText.init(self.allocator, command);
         errdefer command_text.deinit(self.allocator);
-        const message_text = try client_protocol.EventText.init(self.allocator, message);
+        var message_text = try client_protocol.EventText.init(self.allocator, message);
+        errdefer message_text.deinit(self.allocator);
         try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .prompt_command = .{
             .command = command_text,
             .result = result,
@@ -1138,7 +1285,7 @@ test "session runtime handles slash command without starting an operation" {
     try std.testing.expect(event.event.prompt_command.result == .handled);
     try std.testing.expectEqualStrings("help", event.event.prompt_command.command.text);
     try std.testing.expectEqualStrings(
-        "available commands: /help, /session",
+        "available commands: /help, /session, /model",
         event.event.prompt_command.message.text,
     );
     // No operation started, nothing queued, nothing persisted.
@@ -1164,8 +1311,71 @@ test "session runtime session command reports session facts" {
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event.event == .prompt_command);
     try std.testing.expect(event.event.prompt_command.result == .handled);
+    try std.testing.expectEqual(client_protocol.PromptCommand.Presentation.transcript, event.event.prompt_command.presentation);
+    const info = event.event.prompt_command.session_info.?;
+    try std.testing.expect(info.file != null);
+    try std.testing.expect(std.mem.indexOf(u8, info.file.?.text, "agent/sessions/--repo--/") != null);
+    try std.testing.expectEqualStrings("session", info.id.text);
+    try std.testing.expectEqual(@as(usize, 0), info.total_messages);
+    try std.testing.expectEqual(@as(u64, 0), info.total_tokens);
     try std.testing.expect(std.mem.indexOf(u8, event.event.prompt_command.message.text, "session: session") != null);
-    try std.testing.expect(std.mem.indexOf(u8, event.event.prompt_command.message.text, "entries: 0") != null);
+}
+
+test "session runtime model command selects an authenticated model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("OPENAI_API_KEY", "test-key");
+    var session_runtime = try openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+        .environ = &environ,
+        .task_runtime = task_runtime,
+    });
+    defer session_runtime.deinit();
+
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 10, "/model openai/gpt-5.1", .auto);
+    errdefer envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expect(event.event.prompt_command.result == .handled);
+    try std.testing.expectEqualStrings("model", event.event.prompt_command.command.text);
+    try std.testing.expectEqualStrings("openai", session_runtime.session.agent.state.model.provider);
+    try std.testing.expectEqualStrings("gpt-5.1", session_runtime.session.agent.state.model.id);
+    try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime model command rejects missing auth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 11, "/model openai/gpt-5.1", .auto);
+    errdefer envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expect(event.event.prompt_command.result == .failed);
+    try std.testing.expect(std.mem.indexOf(u8, event.event.prompt_command.message.text, "missing auth") != null);
+    try std.testing.expect(session_runtime.active == null);
 }
 
 test "session runtime replies unknown for unrecognized slash command" {

@@ -11,6 +11,8 @@ const vaxis = @import("vaxis");
 const App = @import("App.zig");
 const Transcript = @import("Transcript.zig");
 const Composer = @import("Composer.zig");
+const Picker = @import("Picker.zig");
+const input_mod = @import("input.zig");
 const markdown = @import("markdown.zig");
 const shimmer = @import("shimmer.zig");
 const status_mod = @import("status.zig");
@@ -80,13 +82,17 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
 
     painter.writeText(0, 0, "zi", app.theme.shell_label);
     const composer_rows = composerRows(app);
+    const picker_rows = pickerRows(app);
     const status_rows = statusRows(app);
     drawTranscript(app, &painter, scratch, transcriptVisibleRows(app));
-    if (status_rows > 0 and app.height > composer_rows) {
-        const y: u16 = @intCast(@as(usize, app.height) - composer_rows - 1);
+    if (status_rows > 0 and @as(usize, app.height) > composer_rows + picker_rows) {
+        const y: u16 = @intCast(@as(usize, app.height) - picker_rows - composer_rows - 1);
         drawStatusLine(app, &painter, y);
     }
-    drawComposer(app, &painter, composer_rows);
+    drawComposer(app, &painter, composer_rows, picker_rows);
+    if (app.visiblePicker()) |picker| {
+        drawPicker(app, picker, &painter, picker_rows, app.visiblePickerFocusesFilter());
+    }
 }
 
 pub fn clampScroll(app: *App) void {
@@ -100,7 +106,7 @@ pub fn transcriptScrollMax(app: *App) usize {
 pub fn transcriptVisibleRows(app: *App) usize {
     if (app.height == 0) return 0;
     const body_rows = @as(usize, app.height) - transcript_top;
-    const reserved = @min(composerRows(app) + statusRows(app), body_rows);
+    const reserved = @min(composerRows(app) + statusRows(app) + pickerRows(app), body_rows);
     return body_rows - reserved;
 }
 
@@ -134,7 +140,7 @@ fn itemRows(item: *Transcript.Item, width: u16, theme: *const theme_mod.Theme, e
 pub fn statusRows(app: *App) usize {
     if (app.status.count(.status_line) == 0) return 0;
     if (app.height == 0) return 0;
-    if (@as(usize, app.height) <= composerRows(app)) return 0;
+    if (@as(usize, app.height) <= composerRows(app) + pickerRows(app)) return 0;
     return 1;
 }
 
@@ -143,8 +149,20 @@ pub fn composerRows(app: *App) usize {
     return @min(app.composer.visualRows(text_width), Composer.visible_rows_max) + 2;
 }
 
+pub fn pickerRows(app: *App) usize {
+    const picker = app.visiblePicker() orelse return 0;
+    if (app.height < 6) return 0;
+    const match_count = picker.matchCount();
+    const item_rows = @min(@max(match_count, 1), Picker.visible_rows_max);
+    const chrome_rows: usize = if (app.visiblePickerFocusesFilter()) 3 else 2;
+    // Keep at least a one-line composer box and its border budget visible;
+    // the picker is below the composer and yields first on tiny terminals.
+    const rows_max = @as(usize, app.height) -| 3;
+    return @min(item_rows + chrome_rows, rows_max);
+}
+
 pub fn composerTextWidth(width: u16) u16 {
-    return if (width > 4) width - 4 else 1;
+    return if (width > 2) width - 2 else 1;
 }
 
 // --- transcript ---
@@ -242,6 +260,7 @@ fn buildItemRows(
             .row_style = style,
             .inner_width = innerWidth(width),
         }),
+        .custom => |custom| buildCustomRows(out, count, custom, width, theme),
         .tool => |*tool| buildToolRows(out, count, tool, width, theme, expanded),
     }
 
@@ -276,6 +295,7 @@ fn itemStyle(item: *const Transcript.Item, theme: *const theme_mod.Theme) theme_
             .warning => theme.status_warning,
             .err => theme.status_error,
         },
+        .custom => theme.transcript_text,
         .tool => theme.tool_chrome,
     };
 }
@@ -300,6 +320,38 @@ fn innerWidth(frame_width: u16) u16 {
     const total_padding = padding_x * 2;
     if (frame_width <= total_padding) return 0;
     return frame_width - total_padding;
+}
+
+fn buildCustomRows(
+    out: ?*RowScratch,
+    count: *usize,
+    custom: Transcript.Custom,
+    width: u16,
+    theme: *const theme_mod.Theme,
+) void {
+    const inner = innerWidth(width);
+    if (custom.title.len > 0) {
+        emitWrappedText(out, count, .{
+            .prefix = "",
+            .text = custom.title,
+            .prefix_style = theme.status_accent,
+            .text_style = theme.status_accent,
+            .row_style = theme.transcript_text,
+            .inner_width = inner,
+        });
+        putRow(out, count, .{ .row_style = theme.transcript_text });
+    }
+    switch (custom.format) {
+        .plain => emitWrappedText(out, count, .{
+            .prefix = "",
+            .text = custom.text,
+            .prefix_style = theme.transcript_text,
+            .text_style = theme.transcript_text,
+            .row_style = theme.transcript_text,
+            .inner_width = inner,
+        }),
+        .markdown => buildMarkdownRows(out, count, custom.text, width, theme),
+    }
 }
 
 fn buildMarkdownRows(
@@ -719,11 +771,12 @@ fn advance(x: u16, width: usize) u16 {
 
 // --- composer ---
 
-fn drawComposer(app: *App, painter: *Painter, composer_rows: usize) void {
+fn drawComposer(app: *App, painter: *Painter, composer_rows: usize, bottom_reserved: usize) void {
     if (composer_rows < 3 or app.height == 0 or app.width == 0) return;
-    const height = @min(composer_rows, @as(usize, app.height));
+    const available_bottom = @as(usize, app.height) -| bottom_reserved;
+    const height = @min(composer_rows, available_bottom);
     if (height < 3) return;
-    const box_y: u16 = @intCast(@as(usize, app.height) - height);
+    const box_y: u16 = @intCast(available_bottom - height);
     const box_height: u16 = @intCast(height);
     if (app.width >= 2 and box_height >= 2) {
         painter.roundedBorder(0, box_y, app.width, box_height, app.theme.composer_chrome);
@@ -745,14 +798,73 @@ fn drawComposer(app: *App, painter: *Painter, composer_rows: usize) void {
     var index: usize = 0;
     while (index < visible_count) : (index += 1) {
         const y: u16 = @intCast(@as(usize, box_y) + 1 + index);
-        painter.writeText(1, y, "> ", app.theme.composer_prompt);
-        if (app.width > 3) painter.writeText(3, y, rows[index].text, app.theme.composer_text);
+        if (app.width > 2) painter.writeText(1, y, rows[index].text, app.theme.composer_text);
     }
     if (projection.cursor_visible) {
         const cursor_y = @as(usize, box_y) + 1 + projection.cursor_visible_row;
-        const cursor_x = 3 + projection.cursor_display_col;
+        const cursor_x = 1 + projection.cursor_display_col;
         if (cursor_x < app.width and cursor_y < app.height) {
             painter.setCursor(@intCast(cursor_x), @intCast(cursor_y));
+        }
+    }
+}
+
+// --- picker ---
+
+fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved: usize, focus_filter: bool) void {
+    if (app.width < 8 or app.height < 6) return;
+
+    const match_count = picker.matchCount();
+    const chrome_rows: usize = if (focus_filter) 3 else 2;
+    if (rows_reserved < chrome_rows + 1) return;
+    const item_rows = @min(@max(match_count, 1), rows_reserved - chrome_rows);
+    const box_width: u16 = app.width;
+    const x: u16 = 0;
+    const y: u16 = @intCast(@as(usize, app.height) - rows_reserved);
+
+    painter.fillRect(x, y, box_width, @intCast(rows_reserved), .{});
+    painter.roundedBorder(x, y, box_width, @intCast(rows_reserved), app.theme.composer_chrome);
+
+    const inner_width = if (box_width > 4) @as(usize, box_width) - 4 else 1;
+    const title = fitToWidth(picker.titleSlice(), inner_width);
+    painter.writeText(x + 2, y, title, app.theme.status_accent);
+
+    const item_start_row: usize = if (focus_filter) 2 else 1;
+    if (focus_filter) {
+        const filter_prefix = "filter: ";
+        painter.writeText(x + 2, y + 1, filter_prefix, app.theme.transcript_secondary);
+        const prefix_width = text_mod.displayWidth(filter_prefix);
+        const query = fitToWidth(picker.querySlice(), inner_width -| prefix_width);
+        const query_x = advance(x + 2, prefix_width);
+        painter.writeText(query_x, y + 1, query, app.theme.composer_text);
+        painter.setCursor(advance(query_x, text_mod.displayWidth(query)), y + 1);
+    }
+
+    if (match_count == 0) {
+        painter.writeText(x + 2, @intCast(@as(usize, y) + item_start_row), "no matches", app.theme.transcript_secondary);
+        return;
+    }
+
+    const selected_ordinal = picker.selectedOrdinal() orelse 0;
+    const first_ordinal = if (selected_ordinal >= item_rows) selected_ordinal - item_rows + 1 else 0;
+    var row: usize = 0;
+    while (row < item_rows) : (row += 1) {
+        const item_index = picker.nthMatchIndex(first_ordinal + row) orelse break;
+        const item = picker.itemAt(item_index);
+        const selected = picker.selectedIndex() orelse std.math.maxInt(usize);
+        const is_selected = item_index == selected;
+        const row_y: u16 = @intCast(@as(usize, y) + item_start_row + row);
+        const marker = if (is_selected) "> " else "  ";
+        painter.writeText(x + 2, row_y, marker, if (is_selected) app.theme.status_accent else app.theme.transcript_secondary);
+        const label_x = x + 4;
+        const label_width = inner_width -| 2;
+        const label = fitToWidth(item.labelSlice(), label_width);
+        painter.writeText(label_x, row_y, label, if (is_selected) app.theme.composer_text else app.theme.transcript_text);
+        const used = text_mod.displayWidth(label) + 2;
+        const detail = item.detailSlice();
+        if (detail.len > 0 and used + 2 < inner_width) {
+            const detail_x = advance(x + 2, used + 2);
+            painter.writeText(detail_x, row_y, fitToWidth(detail, inner_width - used - 2), app.theme.transcript_secondary);
         }
     }
 }
@@ -915,6 +1027,22 @@ test "memoized item rows match a fresh build and invalidate on mutation" {
     try std.testing.expectEqual(narrow_fresh, countItem(&app, 0));
 }
 
+test "picker reserves bottom rows and pushes composer/status upward" {
+    var app = App.init(40, 16);
+    defer app.deinit(testing_gpa);
+
+    const before = transcriptVisibleRows(&app);
+    const items = [_]Picker.Item{
+        .{ .id = "one", .label = "one" },
+        .{ .id = "two", .label = "two" },
+    };
+    _ = try app.apply(testing_gpa, .{ .open_picker = .{ .id = 1, .title = "Pick", .items = &items } });
+
+    const reserved = pickerRows(&app);
+    try std.testing.expect(reserved > 0);
+    try std.testing.expectEqual(before - reserved, transcriptVisibleRows(&app));
+}
+
 test "scroll max accounts for composer and status reservations" {
     var app = App.init(40, 10);
     defer app.deinit(testing_gpa);
@@ -959,6 +1087,64 @@ test "vaxis screen receives the frame" {
     try expectScreenText(vx.window(), 1, 1, "hello vaxis");
 }
 
+test "single command completion row remains visible below composer" {
+    var env = std.process.Environ.Map.init(testing_gpa);
+    defer env.deinit();
+
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var output_storage: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_storage);
+    defer vx.deinit(testing_gpa, &writer);
+
+    try vx.resize(testing_gpa, &writer, .{ .cols = 40, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(40, 8);
+    defer app.deinit(testing_gpa);
+    const items = [_]Picker.Item{
+        .{ .id = "help", .label = "/help", .detail = "Show commands" },
+        .{ .id = "model", .label = "/model", .detail = "Select model" },
+    };
+    _ = try app.apply(testing_gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+    _ = try app.apply(testing_gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
+
+    try std.testing.expectEqual(@as(usize, 3), pickerRows(&app));
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try std.testing.expect(screenContainsText(vx.window(), "/model"));
+}
+
+test "history prepend is visible at the scrollback boundary" {
+    var env = std.process.Environ.Map.init(testing_gpa);
+    defer env.deinit();
+
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var output_storage: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_storage);
+    defer vx.deinit(testing_gpa, &writer);
+
+    try vx.resize(testing_gpa, &writer, .{ .cols = 30, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(30, 8);
+    defer app.deinit(testing_gpa);
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "newer one\nnewer two\nnewer three\nnewer four",
+    } } });
+    _ = try app.apply(testing_gpa, .{ .prepend_transcript = .{
+        .role = .user,
+        .text = "fixture older row",
+        .mode = .new_item,
+    } });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try std.testing.expect(screenContainsText(vx.window(), "fixture older row"));
+}
+
 test "scrolled frame draws older rows and clamps to max" {
     var env = std.process.Environ.Map.init(testing_gpa);
     defer env.deinit();
@@ -984,6 +1170,24 @@ test "scrolled frame draws older rows and clamps to max" {
     app.scroll_rows = 10_000; // clamps to max instead of blanking
     draw(&app, &vx, scratch);
     try expectScreenText(vx.window(), 1, 1, "line-0");
+}
+
+fn screenContainsText(window: vaxis.Window, needle: []const u8) bool {
+    var row: u16 = 0;
+    while (row < window.height) : (row += 1) {
+        var buffer: [512]u8 = undefined;
+        var len: usize = 0;
+        var col: u16 = 0;
+        while (col < window.width) : (col += 1) {
+            const cell = window.readCell(col, row) orelse continue;
+            const grapheme = cell.char.grapheme;
+            if (len + grapheme.len > buffer.len) break;
+            @memcpy(buffer[len..][0..grapheme.len], grapheme);
+            len += grapheme.len;
+        }
+        if (std.mem.indexOf(u8, buffer[0..len], needle) != null) return true;
+    }
+    return false;
 }
 
 fn expectScreenText(window: vaxis.Window, x: u16, y: u16, expected: []const u8) !void {

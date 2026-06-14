@@ -210,16 +210,84 @@ pub const OperationFinished = struct {
 /// Reply to a slash command intercepted at the mailbox boundary. The text
 /// is a session fact for display; it never reaches the model or the prompt
 /// queues.
+pub const PromptCommandSessionStats = struct {
+    user_messages: usize = 0,
+    assistant_messages: usize = 0,
+    tool_calls: usize = 0,
+    tool_results: usize = 0,
+    total_messages: usize = 0,
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+    cost: f64 = 0,
+};
+
+pub const PromptCommandSessionInfo = struct {
+    file: ?EventText,
+    id: EventText,
+    user_messages: usize,
+    assistant_messages: usize,
+    tool_calls: usize,
+    tool_results: usize,
+    total_messages: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    total_tokens: u64,
+    cost: f64,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        file: ?[]const u8,
+        id: []const u8,
+        stats: PromptCommandSessionStats,
+    ) !PromptCommandSessionInfo {
+        var file_text: ?EventText = if (file) |text| try EventText.init(allocator, text) else null;
+        errdefer if (file_text) |*text| text.deinit(allocator);
+        const id_text = try EventText.init(allocator, id);
+        return .{
+            .file = file_text,
+            .id = id_text,
+            .user_messages = stats.user_messages,
+            .assistant_messages = stats.assistant_messages,
+            .tool_calls = stats.tool_calls,
+            .tool_results = stats.tool_results,
+            .total_messages = stats.total_messages,
+            .input_tokens = stats.input_tokens,
+            .output_tokens = stats.output_tokens,
+            .cache_read_tokens = stats.cache_read_tokens,
+            .cache_write_tokens = stats.cache_write_tokens,
+            .total_tokens = stats.total_tokens,
+            .cost = stats.cost,
+        };
+    }
+
+    pub fn deinit(self: *PromptCommandSessionInfo, allocator: std.mem.Allocator) void {
+        if (self.file) |*file| file.deinit(allocator);
+        self.id.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const PromptCommand = struct {
     command: EventText,
     result: Result,
+    /// Bounded fallback text for simple clients. Rich clients should prefer
+    /// typed payload fields when present.
     message: EventText,
+    presentation: Presentation = .status,
+    session_info: ?PromptCommandSessionInfo = null,
 
-    pub const Result = enum { handled, unknown };
+    pub const Result = enum { handled, unknown, failed };
+    pub const Presentation = enum { status, transcript };
 
     pub fn deinit(self: *PromptCommand, allocator: std.mem.Allocator) void {
         self.command.deinit(allocator);
         self.message.deinit(allocator);
+        if (self.session_info) |*info| info.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -919,7 +987,7 @@ test "prompt command event serializes public shape" {
 
     try std.testing.expectEqualStrings(
         "{\"type\":\"prompt_command\",\"command\":\"help\",\"result\":\"handled\"," ++
-            "\"message\":\"available commands: /help, /session\"}",
+            "\"message\":\"available commands: /help, /session\",\"presentation\":\"status\"}",
         writer.written(),
     );
 }

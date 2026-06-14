@@ -9,6 +9,7 @@
 //! `Command.tick` (wall-clock ms) — App never reads a clock.
 const std = @import("std");
 const Composer = @import("Composer.zig");
+const Picker = @import("Picker.zig");
 const PromptHistory = @import("PromptHistory.zig");
 const Transcript = @import("Transcript.zig");
 const input_mod = @import("input.zig");
@@ -31,6 +32,7 @@ history_cursor_from_newest: ?usize = null,
 history_draft: std.ArrayListUnmanaged(u8) = .empty,
 history_draft_cursor_byte_index: usize = 0,
 transcript: Transcript = .{},
+completion: Completion = .{},
 status: status_mod.Store = .{},
 scroll_rows: usize = 0,
 theme: theme_mod.Theme = theme_mod.Theme.codex(),
@@ -50,6 +52,7 @@ pub fn init(width: u16, height: u16) App {
 pub fn deinit(self: *App, gpa: std.mem.Allocator) void {
     self.history_draft.deinit(gpa);
     self.prompt_history.deinit(gpa);
+    self.completion.deinit(gpa);
     self.transcript.deinit(gpa);
     self.composer.deinit(gpa);
     self.* = undefined;
@@ -76,6 +79,147 @@ pub const ToolText = struct {
     text: []const u8,
 };
 
+pub const SlashArgCompletionOpen = struct {
+    command_name: []const u8,
+    picker: Picker.Open,
+};
+
+const slash_arg_command_name_bytes_max: usize = 32;
+
+const SlashArgCompletion = struct {
+    command_name: [slash_arg_command_name_bytes_max]u8 = undefined,
+    command_name_len: u8 = 0,
+    picker: Picker,
+
+    fn init(gpa: std.mem.Allocator, open: SlashArgCompletionOpen) error{OutOfMemory}!SlashArgCompletion {
+        var self: SlashArgCompletion = .{ .picker = undefined };
+        const command_name = text_mod.utf8Prefix(open.command_name, slash_arg_command_name_bytes_max);
+        @memcpy(self.command_name[0..command_name.len], command_name);
+        self.command_name_len = @intCast(command_name.len);
+        self.picker = try Picker.init(gpa, open.picker);
+        return self;
+    }
+
+    fn deinit(self: *SlashArgCompletion, gpa: std.mem.Allocator) void {
+        self.picker.deinit(gpa);
+        self.* = undefined;
+    }
+
+    fn commandName(self: *const SlashArgCompletion) []const u8 {
+        return self.command_name[0..self.command_name_len];
+    }
+};
+
+/// Single owner for popup/listbox state. It stores candidate lists installed
+/// by the frontend, but exposes at most one visible picker at a time:
+/// modal > slash-arg completion > command completion. The composer remains
+/// text focus for non-modal completions.
+const Completion = struct {
+    modal: ?Picker = null,
+    command: ?Picker = null,
+    slash_arg: ?SlashArgCompletion = null,
+    hidden_until_edit: bool = false,
+
+    fn deinit(self: *Completion, gpa: std.mem.Allocator) void {
+        if (self.modal) |*picker| picker.deinit(gpa);
+        if (self.command) |*picker| picker.deinit(gpa);
+        if (self.slash_arg) |*completion| completion.deinit(gpa);
+        self.* = undefined;
+    }
+
+    fn setModal(self: *Completion, gpa: std.mem.Allocator, open: Picker.Open) error{OutOfMemory}!void {
+        var next = try Picker.init(gpa, open);
+        errdefer next.deinit(gpa);
+        if (self.modal) |*picker| picker.deinit(gpa);
+        self.modal = next;
+    }
+
+    fn closeModal(self: *Completion, gpa: std.mem.Allocator) bool {
+        if (self.modal) |*picker| {
+            picker.deinit(gpa);
+            self.modal = null;
+            return true;
+        }
+        return false;
+    }
+
+    fn setCommand(self: *Completion, gpa: std.mem.Allocator, open: Picker.Open) error{OutOfMemory}!void {
+        var next = try Picker.init(gpa, open);
+        errdefer next.deinit(gpa);
+        if (self.command) |*picker| picker.deinit(gpa);
+        self.command = next;
+    }
+
+    fn clearCommand(self: *Completion, gpa: std.mem.Allocator) bool {
+        if (self.command) |*picker| {
+            picker.deinit(gpa);
+            self.command = null;
+            return true;
+        }
+        return false;
+    }
+
+    fn setSlashArg(
+        self: *Completion,
+        gpa: std.mem.Allocator,
+        open: SlashArgCompletionOpen,
+    ) error{OutOfMemory}!void {
+        var next = try SlashArgCompletion.init(gpa, open);
+        errdefer next.deinit(gpa);
+        if (self.slash_arg) |*completion| completion.deinit(gpa);
+        self.slash_arg = next;
+    }
+
+    fn clearSlashArg(self: *Completion, gpa: std.mem.Allocator) bool {
+        if (self.slash_arg) |*completion| {
+            completion.deinit(gpa);
+            self.slash_arg = null;
+            return true;
+        }
+        return false;
+    }
+
+    fn hideUntilEdit(self: *Completion) void {
+        self.hidden_until_edit = true;
+    }
+
+    fn noteEdit(self: *Completion) void {
+        self.hidden_until_edit = false;
+    }
+
+    fn sync(self: *Completion, app: *const App) void {
+        if (self.command) |*picker| {
+            if (app.composerCompletionQuery()) |query| picker.replaceQuery(query);
+        }
+        if (self.slash_arg) |*completion| {
+            if (app.composerArgQuery(completion.commandName())) |query| {
+                completion.picker.replaceQuery(query.text);
+            }
+        }
+    }
+
+    fn visiblePicker(self: *Completion, app: *const App) ?*Picker {
+        if (self.modal) |*picker| return picker;
+        if (self.activeSlashArg(app)) |completion| return &completion.picker;
+        if (self.activeCommand(app)) |picker| return picker;
+        return null;
+    }
+
+    fn activeCommand(self: *Completion, app: *const App) ?*Picker {
+        if (self.hidden_until_edit) return null;
+        if (self.modal != null or self.activeSlashArg(app) != null) return null;
+        if (self.command == null or app.composerCompletionQuery() == null) return null;
+        return &self.command.?;
+    }
+
+    fn activeSlashArg(self: *Completion, app: *const App) ?*SlashArgCompletion {
+        if (self.hidden_until_edit or self.modal != null) return null;
+        const completion = if (self.slash_arg) |*value| value else return null;
+        if (app.composerArgQuery(completion.commandName()) == null) return null;
+        return completion;
+    }
+};
+
 pub const Command = union(enum) {
     resize: Size,
     input: input_mod.Input,
@@ -86,12 +230,20 @@ pub const Command = union(enum) {
     replace_tool_output: ToolText,
     replace_tool_footer: ToolText,
     prepend_transcript: Transcript.Append.MessageAppend,
+    open_picker: Picker.Open,
+    close_picker,
+    set_composer_completions: Picker.Open,
+    clear_composer_completions,
+    set_composer_arg_completions: SlashArgCompletionOpen,
+    clear_composer_arg_completions,
+    replace_composer_text: []const u8,
     set_status: status_mod.Set,
     clear_status: status_mod.Clear,
 };
 
 pub const Effect = union(enum) {
     submit_text: []u8,
+    picker_selected: Picker.Selection,
     interrupt,
     request_shutdown,
     request_transcript_history,
@@ -99,6 +251,7 @@ pub const Effect = union(enum) {
     pub fn deinit(self: Effect, gpa: std.mem.Allocator) void {
         switch (self) {
             .submit_text => |text| gpa.free(text),
+            .picker_selected => |selection| gpa.free(selection.item_id),
             .interrupt, .request_shutdown, .request_transcript_history => {},
         }
     }
@@ -165,6 +318,45 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.dirty = true;
             return null;
         },
+        .open_picker => |open| {
+            try self.completion.setModal(gpa, open);
+            self.dirty = true;
+            return null;
+        },
+        .close_picker => {
+            if (self.completion.closeModal(gpa)) self.dirty = true;
+            return null;
+        },
+        .set_composer_completions => |open| {
+            try self.completion.setCommand(gpa, open);
+            self.syncComposerCompletion();
+            self.dirty = true;
+            return null;
+        },
+        .clear_composer_completions => {
+            if (self.completion.clearCommand(gpa)) self.dirty = true;
+            return null;
+        },
+        .set_composer_arg_completions => |open| {
+            try self.completion.setSlashArg(gpa, open);
+            self.syncComposerCompletion();
+            self.dirty = true;
+            return null;
+        },
+        .clear_composer_arg_completions => {
+            if (self.completion.clearSlashArg(gpa)) self.dirty = true;
+            return null;
+        },
+        .replace_composer_text => |text| {
+            const clean = if (std.unicode.utf8ValidateSlice(text)) text else "";
+            const bounded = text_mod.utf8Prefix(clean, Composer.buffer_size_bytes_max);
+            try self.composer.replaceText(gpa, bounded);
+            self.resetHistoryNavigation();
+            self.completion.noteEdit();
+            self.syncComposerCompletion();
+            self.dirty = true;
+            return null;
+        },
         .set_status => |update| {
             if (self.status.set(update) == .dropped_full) try self.notice(gpa, .warning, "status line full");
             self.dirty = true;
@@ -189,6 +381,10 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
         },
         else => {},
     }
+    if (self.completion.modal != null) return self.applyPickerInput(gpa, event);
+    const completion_result = try self.applyCompletionInput(gpa, event);
+    if (completion_result.consumed) return completion_result.effect;
+
     // Bracketed-paste content arrives as ordinary key events between the
     // markers. Enter inside a paste is data, not a submit.
     if (self.in_paste) {
@@ -237,6 +433,93 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
     return null;
 }
 
+const CompletionInputResult = struct {
+    consumed: bool = false,
+    effect: ?Effect = null,
+};
+
+/// Composer completions follow combobox semantics: the composer keeps text
+/// focus, printable input edits the composer, and only navigation/acceptance
+/// keys act on the popup listbox.
+fn applyCompletionInput(
+    self: *App,
+    gpa: std.mem.Allocator,
+    event: input_mod.Input,
+) error{OutOfMemory}!CompletionInputResult {
+    const completion_picker = self.visiblePicker() orelse return .{};
+    switch (event) {
+        .key => |key| switch (key) {
+            .enter => {
+                if (self.composerCompletionQueryMatchesSelected()) return .{};
+                try self.acceptComposerCompletion(gpa);
+                return .{ .consumed = true };
+            },
+            .escape => {
+                self.completion.hideUntilEdit();
+                self.dirty = true;
+                return .{ .consumed = true };
+            },
+            .tab => {
+                try self.acceptComposerCompletion(gpa);
+                return .{ .consumed = true };
+            },
+            .arrow_up => {
+                _ = try completion_picker.applyInput(gpa, .{ .key = .arrow_up });
+                self.dirty = true;
+                return .{ .consumed = true };
+            },
+            .arrow_down => {
+                _ = try completion_picker.applyInput(gpa, .{ .key = .arrow_down });
+                self.dirty = true;
+                return .{ .consumed = true };
+            },
+            else => return .{},
+        },
+        .wheel_up => {
+            _ = try completion_picker.applyInput(gpa, .wheel_up);
+            self.dirty = true;
+            return .{ .consumed = true };
+        },
+        .wheel_down => {
+            _ = try completion_picker.applyInput(gpa, .wheel_down);
+            self.dirty = true;
+            return .{ .consumed = true };
+        },
+        else => return .{},
+    }
+}
+
+fn applyPickerInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{OutOfMemory}!?Effect {
+    if (self.in_paste) {
+        switch (event) {
+            .text => {},
+            .key => |key| switch (key) {
+                .enter, .newline, .tab => {
+                    const as_text = input_mod.InlineBytes.from(" ");
+                    return self.applyPickerInput(gpa, .{ .text = as_text });
+                },
+                else => return null,
+            },
+            else => return null,
+        }
+    }
+
+    const modal = if (self.completion.modal) |*picker| picker else return null;
+    const result = try modal.applyInput(gpa, event);
+    self.dirty = true;
+    switch (result) {
+        .none => return null,
+        .closed => {
+            _ = self.completion.closeModal(gpa);
+            return null;
+        },
+        .selected => |selection| {
+            _ = self.completion.closeModal(gpa);
+            return .{ .picker_selected = selection };
+        },
+    }
+}
+
 fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!?Effect {
     // Key text is operational input; sanitize so Composer's valid-UTF-8
     // contract holds even against a terminal that emits garbage. Worst case
@@ -249,6 +532,8 @@ fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{O
     switch (try self.composer.insert(gpa, clean)) {
         .ok => {
             self.resetHistoryNavigation();
+            self.completion.noteEdit();
+            self.syncComposerCompletion();
             self.composer_full_noticed = false;
             self.dirty = true;
         },
@@ -266,6 +551,7 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
     const text = self.composer.submitSlice() orelse {
         if (self.composer.text().len != 0) self.composer.clear();
         self.resetHistoryNavigation();
+        self.completion.noteEdit();
         self.dirty = true;
         return null;
     };
@@ -276,6 +562,8 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
 
     self.composer.clear();
     self.resetHistoryNavigation();
+    self.completion.noteEdit();
+    self.syncComposerCompletion();
     self.composer_full_noticed = false;
     self.dirty = true;
     return .{ .submit_text = submitted };
@@ -284,11 +572,14 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
 fn composerTextEdit(self: *App, comptime edit: fn (*Composer) void) void {
     edit(&self.composer);
     self.resetHistoryNavigation();
+    self.completion.noteEdit();
+    self.syncComposerCompletion();
     self.dirty = true;
 }
 
 fn composerCursorEdit(self: *App, comptime edit: fn (*Composer) void) void {
     edit(&self.composer);
+    self.syncComposerCompletion();
     self.dirty = true;
 }
 
@@ -326,6 +617,8 @@ fn historyPrevious(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
     const text = self.prompt_history.getFromNewest(next_offset).?;
     try self.composer.replaceText(gpa, text);
     self.history_cursor_from_newest = next_offset;
+    self.completion.noteEdit();
+    self.syncComposerCompletion();
     self.composer_full_noticed = false;
     self.dirty = true;
 }
@@ -345,6 +638,8 @@ fn historyNext(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
         try self.composer.replaceText(gpa, text);
         self.history_cursor_from_newest = next_offset;
     }
+    self.completion.noteEdit();
+    self.syncComposerCompletion();
     self.composer_full_noticed = false;
     self.dirty = true;
 }
@@ -362,6 +657,118 @@ fn resetHistoryNavigation(self: *App) void {
     self.history_draft_cursor_byte_index = 0;
 }
 
+pub fn visiblePicker(self: *App) ?*Picker {
+    return self.completion.visiblePicker(self);
+}
+
+pub fn visiblePickerFocusesFilter(self: *const App) bool {
+    return self.completion.modal != null;
+}
+
+fn composerCompletionVisible(self: *App) bool {
+    return self.visiblePicker() != null;
+}
+
+fn syncComposerCompletion(self: *App) void {
+    self.completion.sync(self);
+}
+
+fn composerCompletionQueryMatchesSelected(self: *App) bool {
+    if (self.activeComposerArgCompletion()) |completion| {
+        const query = self.composerArgQuery(completion.commandName()) orelse return false;
+        const index = completion.picker.selectedIndex() orelse return false;
+        const item = completion.picker.itemAt(index);
+        return std.ascii.eqlIgnoreCase(item.idSlice(), query.text);
+    }
+    const completion = self.activeCommandCompletion() orelse return false;
+    const query = self.composerCompletionQuery() orelse return false;
+    const index = completion.selectedIndex() orelse return false;
+    const item = completion.itemAt(index);
+    return std.ascii.eqlIgnoreCase(item.idSlice(), query);
+}
+
+fn activeCommandCompletion(self: *App) ?*Picker {
+    return self.completion.activeCommand(self);
+}
+
+fn activeComposerArgCompletion(self: *App) ?*SlashArgCompletion {
+    return self.completion.activeSlashArg(self);
+}
+
+fn composerCompletionQuery(self: *const App) ?[]const u8 {
+    const text = self.composer.text();
+    if (text.len == 0 or text[0] != '/') return null;
+    const cursor = self.composer.cursor_byte_index;
+    if (cursor == 0) return null;
+    var end: usize = 1;
+    while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
+    if (cursor > end) return null;
+    return text[1..cursor];
+}
+
+const ComposerArgQuery = struct {
+    start: usize,
+    end: usize,
+    text: []const u8,
+};
+
+fn composerArgQuery(self: *const App, command_name: []const u8) ?ComposerArgQuery {
+    const text = self.composer.text();
+    if (text.len < command_name.len + 2 or text[0] != '/') return null;
+    var command_end: usize = 1;
+    while (command_end < text.len and !std.ascii.isWhitespace(text[command_end])) command_end += 1;
+    if (!std.ascii.eqlIgnoreCase(text[1..command_end], command_name)) return null;
+    var arg_start = command_end;
+    while (arg_start < text.len and std.ascii.isWhitespace(text[arg_start])) arg_start += 1;
+    const cursor = self.composer.cursor_byte_index;
+    if (cursor < arg_start) return null;
+    return .{ .start = arg_start, .end = cursor, .text = text[arg_start..cursor] };
+}
+
+fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    if (self.activeComposerArgCompletion()) |completion| {
+        try self.acceptComposerArgCompletion(gpa, completion);
+        return;
+    }
+    const completion = self.activeCommandCompletion() orelse return;
+    const index = completion.selectedIndex() orelse return;
+    const item = completion.itemAt(index);
+    var replacement: [1 + Picker.id_bytes_max + 1]u8 = undefined;
+    replacement[0] = '/';
+    const id = item.idSlice();
+    @memcpy(replacement[1..][0..id.len], id);
+    replacement[1 + id.len] = ' ';
+    try self.composer.replaceText(gpa, replacement[0 .. 1 + id.len + 1]);
+    self.resetHistoryNavigation();
+    self.completion.noteEdit();
+    self.syncComposerCompletion();
+    self.composer_full_noticed = false;
+    self.dirty = true;
+}
+
+fn acceptComposerArgCompletion(
+    self: *App,
+    gpa: std.mem.Allocator,
+    completion: *SlashArgCompletion,
+) error{OutOfMemory}!void {
+    const query = self.composerArgQuery(completion.commandName()) orelse return;
+    const index = completion.picker.selectedIndex() orelse return;
+    const item = completion.picker.itemAt(index);
+    var next: std.ArrayListUnmanaged(u8) = .empty;
+    defer next.deinit(gpa);
+    const text = self.composer.text();
+    try next.ensureTotalCapacity(gpa, text.len - (query.end - query.start) + item.idSlice().len);
+    next.appendSliceAssumeCapacity(text[0..query.start]);
+    next.appendSliceAssumeCapacity(item.idSlice());
+    next.appendSliceAssumeCapacity(text[query.end..]);
+    try self.composer.replaceTextAtCursor(gpa, next.items, query.start + item.idSlice().len);
+    self.resetHistoryNavigation();
+    self.completion.noteEdit();
+    self.syncComposerCompletion();
+    self.composer_full_noticed = false;
+    self.dirty = true;
+}
+
 fn clearOrExit(self: *App) ?Effect {
     if (self.last_clear_ms) |last_ms| {
         if (self.now_ms >= last_ms and self.now_ms - last_ms <= double_press_window_ms) {
@@ -370,6 +777,8 @@ fn clearOrExit(self: *App) ?Effect {
     }
     self.composer.clear();
     self.resetHistoryNavigation();
+    self.completion.noteEdit();
+    self.syncComposerCompletion();
     self.composer_full_noticed = false;
     self.last_clear_ms = self.now_ms;
     self.dirty = true;
@@ -447,7 +856,7 @@ test "arrow history recall preserves the current draft" {
 
 test "arrow up moves within wrapped composer before recalling history" {
     const gpa = std.testing.allocator;
-    var app = App.init(7, 24); // composer text width is 3.
+    var app = App.init(5, 24); // composer text width is 3.
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("previous") } });
@@ -507,6 +916,126 @@ test "prepending transcript history keeps the viewport on older content" {
 
     try std.testing.expect(app.scroll_rows == render.transcriptScrollMax(&app));
     try std.testing.expectEqual(Transcript.Role.user, app.transcript.items.items[0].body.message.role);
+}
+
+test "picker selection returns opaque item id and closes modal" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24);
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{
+        .{ .id = "openai/gpt", .label = "openai/gpt" },
+        .{ .id = "anthropic/claude", .label = "anthropic/claude" },
+    };
+    _ = try app.apply(gpa, .{ .open_picker = .{ .id = 1, .title = "Model", .items = &items } });
+    _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_down } });
+    const effect = (try app.apply(gpa, .{ .input = .{ .key = .enter } })).?;
+    defer effect.deinit(gpa);
+
+    try std.testing.expect(effect == .picker_selected);
+    try std.testing.expectEqual(@as(Picker.Id, 1), effect.picker_selected.picker_id);
+    try std.testing.expectEqualStrings("anthropic/claude", effect.picker_selected.item_id);
+    try std.testing.expect(app.completion.modal == null);
+}
+
+test "composer slash completion is combobox-style: arrows move list, typing filters input" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24);
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{
+        .{ .id = "model", .label = "/model", .detail = "Select model" },
+        .{ .id = "monitor", .label = "/monitor", .detail = "Show monitor" },
+    };
+    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
+    try std.testing.expectEqualStrings("/m", app.composer.text());
+    try std.testing.expectEqual(@as(usize, 2), app.completion.command.?.matchCount());
+    try std.testing.expectEqual(@as(usize, 0), app.completion.command.?.selectedIndex().?);
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_down } });
+    try std.testing.expectEqualStrings("/m", app.composer.text());
+    try std.testing.expectEqual(@as(usize, 1), app.completion.command.?.selectedIndex().?);
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("o") } });
+    try std.testing.expectEqualStrings("/mo", app.composer.text());
+    try std.testing.expectEqualStrings("mo", app.completion.command.?.querySlice());
+    try std.testing.expectEqual(@as(usize, 2), app.completion.command.?.matchCount());
+}
+
+test "composer slash completion filters while typing and tab accepts" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24);
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{
+        .{ .id = "help", .label = "help", .detail = "Show commands" },
+        .{ .id = "model", .label = "model", .detail = "Select model" },
+    };
+    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
+    try std.testing.expect(app.visiblePicker() != null);
+    try std.testing.expectEqualStrings("m", app.completion.command.?.querySlice());
+    try std.testing.expectEqual(@as(usize, 1), app.completion.command.?.matchCount());
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .backspace } });
+    try std.testing.expectEqualStrings("", app.completion.command.?.querySlice());
+    try std.testing.expectEqual(@as(usize, 2), app.completion.command.?.matchCount());
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("m") } });
+    _ = try app.apply(gpa, .{ .input = .{ .key = .tab } });
+    try std.testing.expectEqualStrings("/model ", app.composer.text());
+    try std.testing.expect(app.visiblePicker() == null);
+}
+
+test "composer slash completion escape hides until the next edit" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24);
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{.{ .id = "model", .label = "/model", .detail = "Select model" }};
+    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
+    try std.testing.expect(app.visiblePicker() != null);
+    try std.testing.expect((try app.apply(gpa, .{ .input = .{ .key = .escape } })) == null);
+    try std.testing.expect(app.visiblePicker() == null);
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .backspace } });
+    try std.testing.expect(app.visiblePicker() != null);
+}
+
+test "composer slash completion enter accepts only incomplete command" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24);
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{.{ .id = "model", .label = "/model", .detail = "Select model" }};
+    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
+    try std.testing.expect((try app.apply(gpa, .{ .input = .{ .key = .enter } })) == null);
+    try std.testing.expectEqualStrings("/model ", app.composer.text());
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .backspace } });
+    const effect = (try app.apply(gpa, .{ .input = .{ .key = .enter } })).?;
+    defer effect.deinit(gpa);
+    try std.testing.expectEqualStrings("/model", effect.submit_text);
+}
+
+test "picker escape closes without interrupting the session" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24);
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{.{ .id = "one", .label = "one" }};
+    _ = try app.apply(gpa, .{ .open_picker = .{ .id = 1, .title = "Pick", .items = &items } });
+    const effect = try app.apply(gpa, .{ .input = .{ .key = .escape } });
+
+    try std.testing.expect(effect == null);
+    try std.testing.expect(app.completion.modal == null);
 }
 
 test "paste mode turns enter into a newline and never submits" {
