@@ -13,6 +13,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const App = @import("App.zig");
 const input_mod = @import("input.zig");
+const theme_mod = @import("theme.zig");
 const render = @import("render.zig");
 
 const Terminal = @This();
@@ -48,7 +49,7 @@ pub const ReadResult = struct {
     eof: bool = false,
 };
 
-pub fn init(gpa: std.mem.Allocator, io: std.Io, width: u16, height: u16) !*Terminal {
+pub fn init(gpa: std.mem.Allocator, io: std.Io, width: u16, height: u16, terminal_info: theme_mod.TerminalInfo) !*Terminal {
     const self = try gpa.create(Terminal);
     errdefer gpa.destroy(self);
     self.* = .{
@@ -56,7 +57,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, width: u16, height: u16) !*Termi
         .io = io,
         .env = std.process.Environ.Map.init(gpa),
         .vx = undefined,
-        .app = App.init(width, height),
+        .app = App.init(width, height, terminal_info),
     };
     errdefer self.env.deinit();
     self.vx = try vaxis.init(io, gpa, &self.env, .{});

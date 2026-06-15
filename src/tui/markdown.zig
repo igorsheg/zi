@@ -2,11 +2,8 @@
 //! and horizontal rules get distinct prefixes and styles. This is per-line
 //! presentation policy, not a markdown AST; inline emphasis is out of scope.
 const std = @import("std");
+const glyphs = @import("glyphs.zig");
 const theme_mod = @import("theme.zig");
-
-pub const horizontal_rule_line =
-    "────────────────────────────────" ++
-    "────────────────────────────────";
 
 pub const State = struct {
     fence: Fence = .none,
@@ -45,7 +42,7 @@ pub fn classifyLine(state: *State, line: []const u8, theme: *const theme_mod.The
     if (horizontalRule(trimmed)) {
         return .{
             .kind = .horizontal_rule,
-            .text = horizontal_rule_line,
+            .text = glyphs.horizontal_rule,
             .prefix_style = theme.transcript_secondary,
             .text_style = theme.transcript_secondary,
             .row_style = theme.transcript_secondary,
@@ -63,7 +60,7 @@ pub fn classifyLine(state: *State, line: []const u8, theme: *const theme_mod.The
     if (quote(trimmed)) |content| {
         return .{
             .kind = .quote,
-            .prefix = "│ ",
+            .prefix = glyphs.quote_prefix,
             .text = content,
             .repeat_prefix = true,
             .prefix_style = theme.transcript_secondary,
@@ -162,7 +159,7 @@ fn trimLeft(bytes: []const u8) []const u8 {
 }
 
 test "classifyLine tracks fences and recognizes structures" {
-    const theme = theme_mod.Theme.codex();
+    const theme = theme_mod.Theme.codex(.{});
     var state: State = .{};
 
     try std.testing.expectEqual(LineKind.heading, classifyLine(&state, "# Title", &theme).kind);
@@ -178,7 +175,7 @@ test "classifyLine tracks fences and recognizes structures" {
 }
 
 test "list marker requires a space and ordered lists keep their numbers" {
-    const theme = theme_mod.Theme.codex();
+    const theme = theme_mod.Theme.codex(.{});
     var state: State = .{};
     try std.testing.expectEqual(LineKind.plain, classifyLine(&state, "-no space", &theme).kind);
     const ordered = classifyLine(&state, "3. third", &theme);

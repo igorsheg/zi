@@ -2,8 +2,10 @@
 //! a session, provider, tool, or agent event; the concrete coding-agent
 //! adapter lives in src/frontends/tui and talks to this package only
 //! through App.Command / App.Effect.
+pub const ansi = @import("ansi.zig");
 pub const App = @import("App.zig");
 pub const Composer = @import("Composer.zig");
+pub const glyphs = @import("glyphs.zig");
 pub const Greeter = @import("Greeter.zig");
 pub const Picker = @import("Picker.zig");
 pub const PromptHistory = @import("PromptHistory.zig");
@@ -22,8 +24,10 @@ pub const Command = App.Command;
 pub const Effect = App.Effect;
 
 test {
+    _ = ansi;
     _ = App;
     _ = Composer;
+    _ = glyphs;
     _ = Greeter;
     _ = Picker;
     _ = PromptHistory;

@@ -1,5 +1,5 @@
 //! Bounded, domain-neutral single-select picker. The TUI core owns only
-//! modal product state: title, filter query, rows, and highlighted index.
+//! modal product state: filter query, rows, and highlighted index.
 //! Item ids are opaque bytes that the concrete frontend interprets.
 const std = @import("std");
 
@@ -13,7 +13,6 @@ pub const Id = u32;
 pub const item_count_max: usize = 384;
 pub const visible_rows_max: usize = 8;
 pub const id_bytes_max: usize = 128;
-pub const title_bytes_max: usize = 96;
 pub const label_bytes_max: usize = 160;
 pub const detail_bytes_max: usize = 160;
 pub const query_bytes_max: usize = 128;
@@ -26,7 +25,6 @@ pub const Item = struct {
 
 pub const Open = struct {
     id: Id,
-    title: []const u8,
     query: []const u8 = "",
     items: []const Item,
 };
@@ -72,8 +70,6 @@ pub const OwnedItem = struct {
 };
 
 id: Id,
-title: [title_bytes_max]u8 = undefined,
-title_len: u16 = 0,
 query: [query_bytes_max]u8 = undefined,
 query_len: u16 = 0,
 items: std.ArrayList(OwnedItem) = .empty,
@@ -86,7 +82,6 @@ pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
     var self: Picker = .{ .id = open.id };
     errdefer self.deinit(gpa);
 
-    self.title_len = copyBounded(title_bytes_max, &self.title, open.title);
     self.query_len = copyBounded(query_bytes_max, &self.query, open.query);
 
     const keep = @min(open.items.len, item_count_max);
@@ -100,10 +95,6 @@ pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
 pub fn deinit(self: *Picker, gpa: std.mem.Allocator) void {
     self.items.deinit(gpa);
     self.* = undefined;
-}
-
-pub fn titleSlice(self: *const Picker) []const u8 {
-    return self.title[0..self.title_len];
 }
 
 pub fn querySlice(self: *const Picker) []const u8 {
@@ -326,7 +317,7 @@ test "picker filters, moves, and returns an opaque selected id" {
         .{ .id = "openai/gpt", .label = "openai/gpt", .detail = "OpenAI" },
         .{ .id = "anthropic/claude", .label = "anthropic/claude", .detail = "Anthropic" },
     };
-    var picker = try Picker.init(gpa, .{ .id = 7, .title = "Model", .query = "", .items = &source });
+    var picker = try Picker.init(gpa, .{ .id = 7, .query = "", .items = &source });
     defer picker.deinit(gpa);
 
     _ = try picker.applyInput(gpa, .{ .text = input_mod.InlineBytes.from("cla") });
@@ -349,7 +340,7 @@ test "picker falls back to fuzzy search and wraps navigation" {
         .{ .id = "openai/gpt-4.1", .label = "openai/gpt-4.1" },
         .{ .id = "openai/gpt-5.1", .label = "openai/gpt-5.1" },
     };
-    var picker = try Picker.init(gpa, .{ .id = 7, .title = "Model", .items = &source });
+    var picker = try Picker.init(gpa, .{ .id = 7, .items = &source });
     defer picker.deinit(gpa);
 
     _ = try picker.applyInput(gpa, .{ .text = input_mod.InlineBytes.from("g51") });

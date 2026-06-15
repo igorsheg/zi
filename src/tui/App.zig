@@ -101,7 +101,7 @@ greeter: ?Greeter = null,
 completion: Completion = .{},
 status: status_mod.Store = .{},
 viewport: TranscriptViewport = .{},
-theme: theme_mod.Theme = theme_mod.Theme.codex(),
+theme: theme_mod.Theme,
 tools_expanded: bool = false,
 now_ms: i64 = 0,
 last_clear_ms: ?i64 = null,
@@ -111,8 +111,12 @@ in_paste: bool = false,
 composer_full_noticed: bool = false,
 dirty: bool = true,
 
-pub fn init(width: u16, height: u16) App {
-    return .{ .width = width, .height = height };
+pub fn init(width: u16, height: u16, terminal_info: theme_mod.TerminalInfo) App {
+    return .{
+        .width = width,
+        .height = height,
+        .theme = theme_mod.resolve(.codex, terminal_info),
+    };
 }
 
 pub fn deinit(self: *App, gpa: std.mem.Allocator) void {
@@ -941,7 +945,7 @@ pub fn hasAnimation(self: *const App) bool {
 
 test "submit returns owned text and clears the composer" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("hello") } });
@@ -953,7 +957,7 @@ test "submit returns owned text and clears the composer" {
 
 test "arrow history recall preserves the current draft" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("first") } });
@@ -975,7 +979,7 @@ test "arrow history recall preserves the current draft" {
 
 test "arrow up moves within wrapped composer before recalling history" {
     const gpa = std.testing.allocator;
-    var app = App.init(5, 24); // composer text width is 3.
+    var app = App.init(5, 24, .{}); // composer text width is 3.
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("previous") } });
@@ -993,7 +997,7 @@ test "arrow up moves within wrapped composer before recalling history" {
 
 test "mouse wheel scrolls the resident transcript and clamps" {
     const gpa = std.testing.allocator;
-    var app = App.init(20, 6);
+    var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
@@ -1020,7 +1024,7 @@ test "mouse wheel scrolls the resident transcript and clamps" {
 
 test "greeter hides on first typed character by default" {
     const gpa = std.testing.allocator;
-    var app = App.init(20, 6);
+    var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .set_greeter = .{ .title = "zi" } });
@@ -1033,7 +1037,7 @@ test "greeter hides on first typed character by default" {
 
 test "greeter can opt out of first character auto hide" {
     const gpa = std.testing.allocator;
-    var app = App.init(20, 6);
+    var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .set_greeter = .{
@@ -1048,7 +1052,7 @@ test "greeter can opt out of first character auto hide" {
 
 test "tail appends stick to bottom while near tail" {
     const gpa = std.testing.allocator;
-    var app = App.init(20, 6);
+    var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
@@ -1068,7 +1072,7 @@ test "tail appends stick to bottom while near tail" {
 
 test "detached scrolling preserves viewport distance while tail grows" {
     const gpa = std.testing.allocator;
-    var app = App.init(20, 6);
+    var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
@@ -1092,7 +1096,7 @@ test "detached scrolling preserves viewport distance while tail grows" {
 
 test "scrolling back near the tail reattaches on next tail append" {
     const gpa = std.testing.allocator;
-    var app = App.init(20, 6);
+    var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
@@ -1115,7 +1119,7 @@ test "scrolling back near the tail reattaches on next tail append" {
 
 test "ctrl end follows the transcript tail immediately" {
     const gpa = std.testing.allocator;
-    var app = App.init(20, 6);
+    var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
@@ -1133,7 +1137,7 @@ test "ctrl end follows the transcript tail immediately" {
 
 test "prepending transcript history keeps the viewport on older content" {
     const gpa = std.testing.allocator;
-    var app = App.init(20, 6);
+    var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
@@ -1152,14 +1156,14 @@ test "prepending transcript history keeps the viewport on older content" {
 
 test "picker selection returns opaque item id and closes modal" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     const items = [_]Picker.Item{
         .{ .id = "openai/gpt", .label = "openai/gpt" },
         .{ .id = "anthropic/claude", .label = "anthropic/claude" },
     };
-    _ = try app.apply(gpa, .{ .open_picker = .{ .id = 1, .title = "Model", .items = &items } });
+    _ = try app.apply(gpa, .{ .open_picker = .{ .id = 1, .items = &items } });
     _ = try app.apply(gpa, .{ .input = .{ .key = .arrow_down } });
     const effect = (try app.apply(gpa, .{ .input = .{ .key = .enter } })).?;
     defer effect.deinit(gpa);
@@ -1172,14 +1176,14 @@ test "picker selection returns opaque item id and closes modal" {
 
 test "composer slash completion is combobox-style: arrows move list, typing filters input" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     const items = [_]Picker.Item{
         .{ .id = "model", .label = "/model", .detail = "Select model" },
         .{ .id = "monitor", .label = "/monitor", .detail = "Show monitor" },
     };
-    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .items = &items } });
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
     try std.testing.expectEqualStrings("/m", app.composer.text());
@@ -1198,14 +1202,14 @@ test "composer slash completion is combobox-style: arrows move list, typing filt
 
 test "composer slash completion filters while typing and tab accepts" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     const items = [_]Picker.Item{
         .{ .id = "help", .label = "help", .detail = "Show commands" },
         .{ .id = "model", .label = "model", .detail = "Select model" },
     };
-    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .items = &items } });
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
     try std.testing.expect(app.visiblePicker() != null);
@@ -1224,11 +1228,11 @@ test "composer slash completion filters while typing and tab accepts" {
 
 test "composer slash completion escape hides until the next edit" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     const items = [_]Picker.Item{.{ .id = "model", .label = "/model", .detail = "Select model" }};
-    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .items = &items } });
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
     try std.testing.expect(app.visiblePicker() != null);
@@ -1241,11 +1245,11 @@ test "composer slash completion escape hides until the next edit" {
 
 test "composer slash completion enter accepts only incomplete command" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     const items = [_]Picker.Item{.{ .id = "model", .label = "/model", .detail = "Select model" }};
-    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+    _ = try app.apply(gpa, .{ .set_composer_completions = .{ .id = 2, .items = &items } });
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
     try std.testing.expect((try app.apply(gpa, .{ .input = .{ .key = .enter } })) == null);
@@ -1259,11 +1263,11 @@ test "composer slash completion enter accepts only incomplete command" {
 
 test "picker escape closes without interrupting the session" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     const items = [_]Picker.Item{.{ .id = "one", .label = "one" }};
-    _ = try app.apply(gpa, .{ .open_picker = .{ .id = 1, .title = "Pick", .items = &items } });
+    _ = try app.apply(gpa, .{ .open_picker = .{ .id = 1, .items = &items } });
     const effect = try app.apply(gpa, .{ .input = .{ .key = .escape } });
 
     try std.testing.expect(effect == null);
@@ -1272,7 +1276,7 @@ test "picker escape closes without interrupting the session" {
 
 test "paste mode turns enter into a newline and never submits" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .input = .paste_begin });
@@ -1287,7 +1291,7 @@ test "paste mode turns enter into a newline and never submits" {
 
 test "composer overflow degrades to one notice instead of an error" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     var fill: [64]u8 = undefined;
@@ -1309,7 +1313,7 @@ test "composer overflow degrades to one notice instead of an error" {
 
 test "ctrl+c clears first, exits on wall-clock double press" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("draft") } });
@@ -1329,7 +1333,7 @@ test "ctrl+c clears first, exits on wall-clock double press" {
 
 test "escape interrupts and ctrl+d exits only when empty" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     try std.testing.expect((try app.apply(gpa, .{ .input = .{ .key = .escape } })).? == .interrupt);
@@ -1342,7 +1346,7 @@ test "escape interrupts and ctrl+d exits only when empty" {
 
 test "tick marks dirty only while something animates" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
     app.dirty = false;
 
@@ -1362,7 +1366,7 @@ test "tick marks dirty only while something animates" {
 
 test "invalid streamed text degrades instead of erroring" {
     const gpa = std.testing.allocator;
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(gpa);
 
     const effect = try app.apply(gpa, .{ .append_transcript = .{ .message = .{

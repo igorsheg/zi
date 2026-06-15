@@ -50,6 +50,24 @@ fn nextWakeDelayMs(immediate_work_pending: bool, animation_active: bool) u64 {
     return if (animation_active) frame_interval_ms else idle_frame_interval_ms;
 }
 
+fn resolveTerminalInfo(process: runtime.Process) tui.theme.TerminalInfo {
+    return .{
+        .scheme = if (process.env("ZI_THEME_LIGHT") != null) .light else null,
+        .color_level = resolveColorLevel(process),
+    };
+}
+
+fn resolveColorLevel(process: runtime.Process) tui.theme.ColorLevel {
+    if (process.env("COLORTERM")) |value| {
+        if (std.mem.indexOf(u8, value, "truecolor") != null) return .truecolor;
+        if (std.mem.indexOf(u8, value, "24bit") != null) return .truecolor;
+    }
+    if (process.env("TERM")) |value| {
+        if (std.mem.indexOf(u8, value, "256color") != null) return .ansi256;
+    }
+    return .unknown;
+}
+
 const ToolTimer = struct {
     id: [tool_timer_id_bytes_max]u8 = undefined,
     id_len: u8,
@@ -139,7 +157,8 @@ const InteractiveController = struct {
         initial_prompt: ?[]const u8,
         version: []const u8,
     ) !InteractiveController {
-        const terminal = try tui.Terminal.init(process.gpa, process.io, 80, 24);
+        const terminal_info = resolveTerminalInfo(process);
+        const terminal = try tui.Terminal.init(process.gpa, process.io, 80, 24, terminal_info);
         errdefer terminal.deinit();
         try terminal.setup();
         errdefer terminal.shutdown() catch |err| ignoreBestEffortError(err);
@@ -285,7 +304,6 @@ const InteractiveController = struct {
             .command_name = "model",
             .picker = .{
                 .id = model_picker_id,
-                .title = "Models",
                 .items = items.items,
             },
         } });
@@ -305,7 +323,6 @@ const InteractiveController = struct {
         }
         _ = try self.terminal.applyCommand(.{ .set_composer_completions = .{
             .id = command_completion_picker_id,
-            .title = "Commands",
             .items = items[0..slash_commands.builtins.len],
         } });
     }

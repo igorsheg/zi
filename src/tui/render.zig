@@ -13,6 +13,7 @@ const Transcript = @import("Transcript.zig");
 const Composer = @import("Composer.zig");
 const Greeter = @import("Greeter.zig");
 const Picker = @import("Picker.zig");
+const glyphs = @import("glyphs.zig");
 const input_mod = @import("input.zig");
 const markdown = @import("markdown.zig");
 const shimmer = @import("shimmer.zig");
@@ -28,9 +29,6 @@ pub const item_rows_max: usize = 512;
 const transcript_top: u16 = 0;
 const padding_x: u16 = 1;
 const item_margin_bottom: usize = 1;
-const tool_top_line = "╭───";
-const tool_body_prefix = "│ ";
-const tool_bottom_line = "╰───";
 const hint_bytes_max: usize = 96;
 const notice_bytes_max: usize = 96;
 const title_bytes_max: usize = 160;
@@ -183,10 +181,12 @@ pub fn composerRows(app: *App) usize {
 
 pub fn pickerRows(app: *App) usize {
     const picker = app.visiblePicker() orelse return 0;
-    if (app.height < 6) return 0;
+    if (app.height < 4) return 0;
     const match_count = picker.matchCount();
     const item_rows = @min(@max(match_count, 1), Picker.visible_rows_max);
-    const chrome_rows: usize = if (app.visiblePickerFocusesFilter()) 3 else 2;
+    // Picker is chromeless: no border, no title. Modal pickers still need a
+    // filter input row; inline completions borrow the composer as their filter.
+    const chrome_rows: usize = if (app.visiblePickerFocusesFilter()) 1 else 0;
     // Keep at least a one-line composer box and its border budget visible;
     // the picker is below the composer and yields first on tiny terminals.
     const rows_max = @as(usize, app.height) -| 3;
@@ -460,11 +460,11 @@ fn buildToolRows(
     var notice_buffer: [notice_bytes_max]u8 = undefined;
     const notice = omissionNotice(tool, &notice_buffer);
     const has_body_chrome = notice != null or toolBodyVisible(tool, expanded) or tool.footer.len > 0;
-    if (has_body_chrome) putRow(out, count, .{ .text = tool_top_line, .text_style = rail, .row_style = rail });
+    if (has_body_chrome) putRow(out, count, .{ .text = glyphs.tool_top_line, .text_style = rail, .row_style = rail });
 
     if (notice) |text| {
         emitWrappedText(out, count, .{
-            .prefix = tool_body_prefix,
+            .prefix = glyphs.tool_body_prefix,
             .text = internText(out, text),
             .repeat_prefix = true,
             .prefix_style = rail,
@@ -480,7 +480,7 @@ fn buildToolRows(
 
     if (tool.footer.len > 0) {
         emitWrappedText(out, count, .{
-            .prefix = tool_body_prefix,
+            .prefix = glyphs.tool_body_prefix,
             .text = tool.footer,
             .repeat_prefix = true,
             .prefix_style = rail,
@@ -491,7 +491,7 @@ fn buildToolRows(
     }
 
     if (has_body_chrome) {
-        putRow(out, count, .{ .text = tool_bottom_line, .text_style = rail, .row_style = rail });
+        putRow(out, count, .{ .text = glyphs.tool_bottom_line, .text_style = rail, .row_style = rail });
     }
 }
 
@@ -510,12 +510,12 @@ fn buildToolBodyRows(
     expanded: bool,
 ) void {
     const body = tool.output.items;
-    const prefix_width: u16 = @intCast(@min(text_mod.displayWidth(tool_body_prefix), inner));
+    const prefix_width: u16 = @intCast(@min(text_mod.displayWidth(glyphs.tool_body_prefix), inner));
     const body_rows_total = countWrappedRows(body, inner, prefix_width);
     const rows_max: usize = tool.collapse.rows_max;
 
     var options: WrapOptions = .{
-        .prefix = tool_body_prefix,
+        .prefix = glyphs.tool_body_prefix,
         .text = body,
         .repeat_prefix = true,
         .prefix_style = rail,
@@ -534,7 +534,7 @@ fn buildToolBodyRows(
     const hidden = body_rows_total - rows_max;
     var hint_buffer: [hint_bytes_max]u8 = undefined;
     const hint_row: Row = .{
-        .prefix = tool_body_prefix,
+        .prefix = glyphs.tool_body_prefix,
         .text = internText(out, collapseHint(&hint_buffer, tool.collapse.mode, hidden)),
         .show_prefix = true,
         .prefix_style = rail,
@@ -839,8 +839,6 @@ fn drawGreeter(app: *App, painter: *Painter, y: u16) void {
 
 // --- status line ---
 
-const status_separator = " · ";
-
 fn statusShimmerConfig(theme: *const theme_mod.Theme) shimmer.Config {
     _ = theme;
     return .{
@@ -861,14 +859,14 @@ fn drawStatusLine(app: *App, painter: *Painter, y: u16) void {
         if (view.text.len == 0) continue;
         const remaining: usize = if (x < app.width) app.width - x else 0;
         if (remaining == 0) return;
-        const separator_width: usize = if (rendered_any) text_mod.displayWidth(status_separator) else 0;
+        const separator_width: usize = if (rendered_any) text_mod.displayWidth(glyphs.status_separator) else 0;
         if (separator_width >= remaining) return;
         const available = remaining - separator_width;
         const fitted = fitToWidth(view.text, available);
         if (fitted.len == 0) continue;
 
         if (rendered_any) {
-            painter.writeText(x, y, status_separator, app.theme.transcript_secondary);
+            painter.writeText(x, y, glyphs.status_separator, app.theme.transcript_secondary);
             x = advance(x, separator_width);
         }
         switch (view.effect) {
@@ -992,40 +990,35 @@ fn drawComposer(app: *App, painter: *Painter, composer_rows: usize, bottom_reser
 // --- picker ---
 
 fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved: usize, focus_filter: bool) void {
-    if (app.width < 8 or app.height < 6) return;
+    if (app.width < 4 or app.height < 4) return;
 
     const match_count = picker.matchCount();
-    const chrome_rows: usize = if (focus_filter) 3 else 2;
+    const chrome_rows: usize = if (focus_filter) 1 else 0;
     if (rows_reserved < chrome_rows + 1) return;
     const item_rows = @min(@max(match_count, 1), rows_reserved - chrome_rows);
     const box_width: u16 = app.width;
     const x: u16 = 0;
     const y: u16 = @intCast(@as(usize, app.height) - rows_reserved);
 
+    // Clear the area behind the picker so it does not composite over the
+    // transcript; the chromeless style relies on content and position, not
+    // a border, so we keep the default background.
     painter.fillRect(x, y, box_width, @intCast(rows_reserved), .{});
-    painter.roundedBorder(x, y, box_width, @intCast(rows_reserved), app.theme.composer_chrome);
 
-    const inner_width = if (box_width > 4) @as(usize, box_width) - 4 else 1;
-    const title = fitToWidth(picker.titleSlice(), inner_width);
-    painter.writeText(x + 2, y, title, app.theme.status_accent);
-
-    const item_start_row: usize = if (focus_filter) 2 else 1;
+    const inner_width = if (box_width > 2) @as(usize, box_width) - 2 else 1;
+    const item_start_row: usize = if (focus_filter) 1 else 0;
     if (focus_filter) {
-        const filter_prefix = "filter: ";
-        painter.writeText(x + 2, y + 1, filter_prefix, app.theme.transcript_secondary);
-        const prefix_width = text_mod.displayWidth(filter_prefix);
-        const query = fitToWidth(picker.querySlice(), inner_width -| prefix_width);
-        const query_x = advance(x + 2, prefix_width);
-        painter.writeText(query_x, y + 1, query, app.theme.composer_text);
-        painter.setCursor(advance(query_x, text_mod.displayWidth(query)), y + 1);
+        const query = fitToWidth(picker.querySlice(), inner_width);
+        painter.writeText(x + 1, y, query, app.theme.picker_filter);
+        painter.setCursor(advance(x + 1, text_mod.displayWidth(query)), y);
     }
 
     if (match_count == 0) {
         painter.writeText(
-            x + 2,
+            x + 1,
             @intCast(@as(usize, y) + item_start_row),
             "no matches",
-            app.theme.transcript_secondary,
+            app.theme.picker_empty,
         );
         return;
     }
@@ -1039,31 +1032,22 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
         const selected = picker.selectedIndex() orelse std.math.maxInt(usize);
         const is_selected = item_index == selected;
         const row_y: u16 = @intCast(@as(usize, y) + item_start_row + row);
-        const marker = if (is_selected) "> " else "  ";
-        painter.writeText(
-            x + 2,
-            row_y,
-            marker,
-            if (is_selected) app.theme.status_accent else app.theme.transcript_secondary,
-        );
-        const label_x = x + 4;
+        const marker = if (is_selected) glyphs.picker_selected else glyphs.picker_unselected;
+        const item_style = if (is_selected) app.theme.picker_selected else app.theme.picker_unselected;
+        painter.writeText(x + 1, row_y, marker, item_style);
+        const label_x = x + 3;
         const label_width = inner_width -| 2;
         const label = fitToWidth(item.labelSlice(), label_width);
-        painter.writeText(
-            label_x,
-            row_y,
-            label,
-            if (is_selected) app.theme.composer_text else app.theme.transcript_text,
-        );
+        painter.writeText(label_x, row_y, label, item_style);
         const used = text_mod.displayWidth(label) + 2;
         const detail = item.detailSlice();
         if (detail.len > 0 and used + 2 < inner_width) {
-            const detail_x = advance(x + 2, used + 2);
+            const detail_x = advance(x + 1, used + 2);
             painter.writeText(
                 detail_x,
                 row_y,
                 fitToWidth(detail, inner_width - used - 2),
-                app.theme.transcript_secondary,
+                app.theme.picker_detail,
             );
         }
     }
@@ -1162,7 +1146,7 @@ fn countItem(app: *App, index: usize) usize {
 }
 
 test "collapsed tool body shows a bounded window with a hint row" {
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
@@ -1182,7 +1166,7 @@ test "collapsed tool body shows a bounded window with a hint row" {
 }
 
 test "head-collapsed tool keeps the first rows with the hint below" {
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
@@ -1198,7 +1182,7 @@ test "head-collapsed tool keeps the first rows with the hint below" {
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
 
     // Top-down: title, top border, window rows a/b, hint, bottom, margin.
-    try std.testing.expectEqualStrings(tool_top_line, scratch.rows[1].text);
+    try std.testing.expectEqualStrings(glyphs.tool_top_line, scratch.rows[1].text);
     try std.testing.expectEqualStrings("a", scratch.rows[2].text);
     try std.testing.expectEqualStrings("b", scratch.rows[3].text);
     try std.testing.expect(std.mem.indexOf(u8, scratch.rows[4].text, "more lines") != null);
@@ -1206,7 +1190,7 @@ test "head-collapsed tool keeps the first rows with the hint below" {
 }
 
 test "tool warning body lines use warning style" {
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
@@ -1228,7 +1212,7 @@ test "tool warning body lines use warning style" {
     var count: usize = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
 
-    try std.testing.expectEqualStrings(tool_top_line, scratch.rows[1].text);
+    try std.testing.expectEqualStrings(glyphs.tool_top_line, scratch.rows[1].text);
     try std.testing.expectEqualStrings("src/main.zig:1: foo", scratch.rows[2].text);
     try std.testing.expectEqual(app.theme.tool_output, scratch.rows[2].text_style);
     try std.testing.expectEqualStrings("[Truncated: 2 matches limit]", scratch.rows[3].text);
@@ -1236,7 +1220,7 @@ test "tool warning body lines use warning style" {
 }
 
 test "successful read hides body until expanded" {
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
@@ -1262,13 +1246,13 @@ test "successful read hides body until expanded" {
     count = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, true);
     try std.testing.expectEqual(@as(usize, 6), count);
-    try std.testing.expectEqualStrings(tool_top_line, scratch.rows[1].text);
+    try std.testing.expectEqualStrings(glyphs.tool_top_line, scratch.rows[1].text);
     try std.testing.expectEqualStrings("one", scratch.rows[2].text);
     try std.testing.expectEqualStrings("two", scratch.rows[3].text);
 }
 
 test "tool title uses compact text only while collapsed" {
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
@@ -1290,7 +1274,7 @@ test "tool title uses compact text only while collapsed" {
 }
 
 test "file tool title styles name path range and hint as segments" {
-    var app = App.init(80, 24);
+    var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
@@ -1316,7 +1300,7 @@ test "file tool title styles name path range and hint as segments" {
 }
 
 test "tool title is plain text outside the body rail and fits width" {
-    var app = App.init(24, 8);
+    var app = App.init(24, 8, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
@@ -1339,7 +1323,7 @@ test "tool title is plain text outside the body rail and fits width" {
 }
 
 test "memoized item rows match a fresh build and invalidate on mutation" {
-    var app = App.init(60, 24);
+    var app = App.init(60, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .message = .{
@@ -1368,7 +1352,7 @@ test "memoized item rows match a fresh build and invalidate on mutation" {
 }
 
 test "picker reserves bottom rows and pushes composer/status upward" {
-    var app = App.init(40, 16);
+    var app = App.init(40, 16, .{});
     defer app.deinit(testing_gpa);
 
     const before = transcriptVisibleRows(&app);
@@ -1376,7 +1360,7 @@ test "picker reserves bottom rows and pushes composer/status upward" {
         .{ .id = "one", .label = "one" },
         .{ .id = "two", .label = "two" },
     };
-    _ = try app.apply(testing_gpa, .{ .open_picker = .{ .id = 1, .title = "Pick", .items = &items } });
+    _ = try app.apply(testing_gpa, .{ .open_picker = .{ .id = 1, .items = &items } });
 
     const reserved = pickerRows(&app);
     try std.testing.expect(reserved > 0);
@@ -1384,7 +1368,7 @@ test "picker reserves bottom rows and pushes composer/status upward" {
 }
 
 test "scroll max accounts for composer and status reservations" {
-    var app = App.init(40, 10);
+    var app = App.init(40, 10, .{});
     defer app.deinit(testing_gpa);
 
     var index: usize = 0;
@@ -1412,7 +1396,7 @@ test "composer top border draws cwd and session chrome without overlap" {
 
     try vx.resize(testing_gpa, &writer, .{ .cols = 60, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
 
-    var app = App.init(60, 8);
+    var app = App.init(60, 8, .{});
     defer app.deinit(testing_gpa);
     _ = app.status.set(.{ .slot = .composer_left, .id = 1, .text = "/repo" });
     _ = app.status.set(.{ .slot = .composer_right, .id = 2, .text = "67.5%/272k • openai/gpt (high)" });
@@ -1437,7 +1421,7 @@ test "vaxis screen receives the frame" {
 
     try vx.resize(testing_gpa, &writer, .{ .cols = 30, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
 
-    var app = App.init(30, 8);
+    var app = App.init(30, 8, .{});
     defer app.deinit(testing_gpa);
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
         .role = .assistant,
@@ -1462,16 +1446,16 @@ test "single command completion row remains visible below composer" {
 
     try vx.resize(testing_gpa, &writer, .{ .cols = 40, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
 
-    var app = App.init(40, 8);
+    var app = App.init(40, 8, .{});
     defer app.deinit(testing_gpa);
     const items = [_]Picker.Item{
         .{ .id = "help", .label = "/help", .detail = "Show commands" },
         .{ .id = "model", .label = "/model", .detail = "Select model" },
     };
-    _ = try app.apply(testing_gpa, .{ .set_composer_completions = .{ .id = 2, .title = "Commands", .items = &items } });
+    _ = try app.apply(testing_gpa, .{ .set_composer_completions = .{ .id = 2, .items = &items } });
     _ = try app.apply(testing_gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/m") } });
 
-    try std.testing.expectEqual(@as(usize, 3), pickerRows(&app));
+    try std.testing.expectEqual(@as(usize, 1), pickerRows(&app));
     const scratch = try testing_gpa.create(RowScratch);
     defer testing_gpa.destroy(scratch);
     draw(&app, &vx, scratch);
@@ -1490,7 +1474,7 @@ test "history prepend is visible at the scrollback boundary" {
 
     try vx.resize(testing_gpa, &writer, .{ .cols = 30, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
 
-    var app = App.init(30, 8);
+    var app = App.init(30, 8, .{});
     defer app.deinit(testing_gpa);
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
         .role = .assistant,
@@ -1519,7 +1503,7 @@ test "scrolled frame draws older rows and clamps to max" {
     defer vx.deinit(testing_gpa, &writer);
     try vx.resize(testing_gpa, &writer, .{ .cols = 30, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
 
-    var app = App.init(30, 8);
+    var app = App.init(30, 8, .{});
     defer app.deinit(testing_gpa);
     var index: usize = 0;
     var label: [16]u8 = undefined;
@@ -1547,7 +1531,7 @@ test "empty frame renders greeter above status and composer" {
     defer vx.deinit(testing_gpa, &writer);
     try vx.resize(testing_gpa, &writer, .{ .cols = 60, .rows = 9, .x_pixel = 0, .y_pixel = 0 });
 
-    var app = App.init(60, 9);
+    var app = App.init(60, 9, .{});
     defer app.deinit(testing_gpa);
     _ = try app.apply(testing_gpa, .{ .set_greeter = .{
         .title = "zi 1.2.3",
@@ -1575,7 +1559,7 @@ test "greeter is empty-state chrome and hides once transcript exists" {
     defer vx.deinit(testing_gpa, &writer);
     try vx.resize(testing_gpa, &writer, .{ .cols = 60, .rows = 9, .x_pixel = 0, .y_pixel = 0 });
 
-    var app = App.init(60, 9);
+    var app = App.init(60, 9, .{});
     defer app.deinit(testing_gpa);
     _ = try app.apply(testing_gpa, .{ .set_greeter = .{ .title = "zi 1.2.3" } });
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
