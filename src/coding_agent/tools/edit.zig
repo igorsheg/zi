@@ -43,7 +43,7 @@ pub const EditTool = struct {
     pub const Config = struct {
         cwd: []const u8,
         home_dir: ?[]const u8 = null,
-        allow_paths_outside_cwd: bool = false,
+        allow_paths_outside_cwd: bool = true,
         max_read_bytes: usize = max_edit_read_bytes,
         max_output_bytes: usize = max_edit_output_bytes,
         mutation_queue: ?*file_mutation_queue.FileMutationQueue = null,
@@ -113,6 +113,28 @@ const Match = struct {
     edit_index: usize,
 };
 
+const EditFailureKind = enum {
+    none,
+    empty_old_text,
+    old_text_not_found,
+    old_text_not_unique,
+    overlapping_edits,
+    no_changes,
+};
+
+const EditFailure = struct {
+    kind: EditFailureKind = .none,
+    edit_index: usize = 0,
+    other_edit_index: usize = 0,
+    occurrences: usize = 0,
+    total_edits: usize = 0,
+};
+
+const MatchCount = struct {
+    first: ?usize = null,
+    occurrences: usize = 0,
+};
+
 const LineEnding = enum { lf, crlf };
 
 const TextShape = struct {
@@ -152,7 +174,7 @@ fn execute(
         error.InvalidToolArguments => return editErrorResult(
             allocator,
             "invalid_arguments",
-            "Invalid edit arguments: provide path and one or more edits with non-empty oldText and string newText.",
+            "Invalid edit arguments: provide path and one or more edits with string oldText and string newText.",
         ),
         error.TooManyEdits => return editErrorResult(
             allocator,
@@ -178,27 +200,20 @@ fn execute(
         .limited(self.config.max_read_bytes),
     );
     defer allocator.free(original);
+    var failure: EditFailure = .{};
     var edited = applyEditsPreservingTextShape(
         allocator,
         original,
         args.edits,
         self.config.max_output_bytes,
+        &failure,
     ) catch |err| switch (err) {
-        error.NoChanges => return editErrorResult(
-            allocator,
-            "no_changes",
-            "Edit failed: replacement output is identical.",
-        ),
-        error.EditTextNotFoundOrNotUnique => return editErrorResult(
-            allocator,
-            "old_text_not_unique",
-            "Edit failed: every oldText must match exactly once in the file.",
-        ),
-        error.OverlappingEdits => return editErrorResult(
-            allocator,
-            "overlapping_edits",
-            "Edit failed: replacements overlap; merge nearby or overlapping changes into one edit.",
-        ),
+        error.EmptyOldText,
+        error.EditTextNotFound,
+        error.EditTextNotUnique,
+        error.OverlappingEdits,
+        error.NoChanges,
+        => return editFailureResult(allocator, args.path, failure),
         error.EditTooLarge => return editTooLargeResult(allocator, self.config.max_output_bytes),
         else => return err,
     };
@@ -299,7 +314,6 @@ fn parseReplacementFields(
     new_value: std.json.Value,
 ) !Replacement {
     if (old_value != .string or new_value != .string) return error.InvalidToolArguments;
-    if (old_value.string.len == 0) return error.InvalidToolArguments;
     const old_text = try allocator.dupe(u8, old_value.string);
     errdefer allocator.free(old_text);
     const new_text = try allocator.dupe(u8, new_value.string);
@@ -311,6 +325,7 @@ fn applyEditsPreservingTextShape(
     original: []const u8,
     edits: []const Replacement,
     max_output_bytes: usize,
+    failure: ?*EditFailure,
 ) !EditOutput {
     const shape = detectTextShape(original);
     const body = if (shape.has_bom) original[utf8_bom.len..] else original;
@@ -337,6 +352,7 @@ fn applyEditsPreservingTextShape(
         normalized_edits,
         max_output_bytes,
         applied[0..edits.len],
+        failure,
     );
     errdefer allocator.free(normalized);
     const diff = try edit_diff.render(allocator, normalized_original, applied[0..edits.len]);
@@ -358,20 +374,55 @@ fn applyEdits(
     edits: []const Replacement,
     max_output_bytes: usize,
     applied_edits: []edit_diff.AppliedEdit,
+    failure: ?*EditFailure,
 ) ![]u8 {
     std.debug.assert(applied_edits.len == edits.len);
     var matches = try allocator.alloc(Match, edits.len);
     defer allocator.free(matches);
 
     for (edits, matches, 0..) |edit, *match, index| {
-        const start = findUnique(original, edit.old_text) orelse return error.EditTextNotFoundOrNotUnique;
+        if (edit.old_text.len == 0) {
+            setEditFailure(failure, .{
+                .kind = .empty_old_text,
+                .edit_index = index,
+                .total_edits = edits.len,
+            });
+            return error.EmptyOldText;
+        }
+        const count = countMatches(original, edit.old_text);
+        if (count.occurrences == 0) {
+            setEditFailure(failure, .{
+                .kind = .old_text_not_found,
+                .edit_index = index,
+                .total_edits = edits.len,
+            });
+            return error.EditTextNotFound;
+        }
+        if (count.occurrences > 1) {
+            setEditFailure(failure, .{
+                .kind = .old_text_not_unique,
+                .edit_index = index,
+                .occurrences = count.occurrences,
+                .total_edits = edits.len,
+            });
+            return error.EditTextNotUnique;
+        }
+        const start = count.first.?;
         match.* = .{ .start = start, .end = start + edit.old_text.len, .edit_index = index };
     }
 
     std.mem.sort(Match, matches, {}, lessThanMatch);
     for (matches[1..], 1..) |current, index| {
         const previous = matches[index - 1];
-        if (current.start < previous.end) return error.OverlappingEdits;
+        if (current.start < previous.end) {
+            setEditFailure(failure, .{
+                .kind = .overlapping_edits,
+                .edit_index = previous.edit_index,
+                .other_edit_index = current.edit_index,
+                .total_edits = edits.len,
+            });
+            return error.OverlappingEdits;
+        }
     }
 
     var total_len = original.len;
@@ -401,7 +452,10 @@ fn applyEdits(
     }
     const suffix = original[source_pos..];
     @memcpy(out[out_pos .. out_pos + suffix.len], suffix);
-    if (std.mem.eql(u8, out, original)) return error.NoChanges;
+    if (std.mem.eql(u8, out, original)) {
+        setEditFailure(failure, .{ .kind = .no_changes, .total_edits = edits.len });
+        return error.NoChanges;
+    }
     return out;
 }
 
@@ -460,11 +514,22 @@ fn firstChangedLine(before: []const u8, after: []const u8) usize {
     return line;
 }
 
-fn findUnique(haystack: []const u8, needle: []const u8) ?usize {
-    const first = std.mem.indexOf(u8, haystack, needle) orelse return null;
-    const rest_start = first + needle.len;
-    if (std.mem.indexOf(u8, haystack[rest_start..], needle) != null) return null;
-    return first;
+fn countMatches(haystack: []const u8, needle: []const u8) MatchCount {
+    std.debug.assert(needle.len > 0);
+    var result: MatchCount = .{};
+    var offset: usize = 0;
+    while (offset <= haystack.len) {
+        const found = std.mem.find(u8, haystack[offset..], needle) orelse break;
+        const absolute = offset + found;
+        if (result.first == null) result.first = absolute;
+        result.occurrences += 1;
+        offset = absolute + needle.len;
+    }
+    return result;
+}
+
+fn setEditFailure(failure: ?*EditFailure, value: EditFailure) void {
+    if (failure) |out| out.* = value;
 }
 
 fn lessThanMatch(_: void, a: Match, b: Match) bool {
@@ -496,6 +561,115 @@ fn editErrorResult(
     });
     errdefer runtime.freeJsonValue(allocator, details);
     return path_utils.textResult(allocator, message, details);
+}
+
+fn editFailureResult(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    failure: EditFailure,
+) !agent.ToolExecutionResult {
+    switch (failure.kind) {
+        .empty_old_text => {
+            if (failure.total_edits == 1) return editFailureResultFmt(
+                allocator,
+                "oldText must not be empty in {s}.",
+                editFailureReason(failure.kind),
+                .{path},
+            );
+            return editFailureResultFmt(
+                allocator,
+                "edits[{d}].oldText must not be empty in {s}.",
+                editFailureReason(failure.kind),
+                .{ failure.edit_index, path },
+            );
+        },
+        .old_text_not_found => {
+            if (failure.total_edits == 1) return editFailureResultFmt(
+                allocator,
+                "Could not find the exact text in {s}. " ++
+                    "The old text must match exactly including all whitespace and newlines.",
+                editFailureReason(failure.kind),
+                .{path},
+            );
+            return editFailureResultFmt(
+                allocator,
+                "Could not find edits[{d}] in {s}. " ++
+                    "The oldText must match exactly including all whitespace and newlines.",
+                editFailureReason(failure.kind),
+                .{ failure.edit_index, path },
+            );
+        },
+        .old_text_not_unique => {
+            if (failure.total_edits == 1) return editFailureResultFmt(
+                allocator,
+                "Found {d} occurrences of the text in {s}. " ++
+                    "The text must be unique. Please provide more context to make it unique.",
+                editFailureReason(failure.kind),
+                .{ failure.occurrences, path },
+            );
+            return editFailureResultFmt(
+                allocator,
+                "Found {d} occurrences of edits[{d}] in {s}. " ++
+                    "Each oldText must be unique. Please provide more context to make it unique.",
+                editFailureReason(failure.kind),
+                .{ failure.occurrences, failure.edit_index, path },
+            );
+        },
+        .overlapping_edits => return editFailureResultFmt(
+            allocator,
+            "edits[{d}] and edits[{d}] overlap in {s}. " ++
+                "Merge them into one edit or target disjoint regions.",
+            editFailureReason(failure.kind),
+            .{ failure.edit_index, failure.other_edit_index, path },
+        ),
+        .no_changes => {
+            if (failure.total_edits == 1) return editFailureResultFmt(
+                allocator,
+                "No changes made to {s}. The replacement produced identical content. " ++
+                    "This might indicate an issue with special characters or the text not existing as expected.",
+                editFailureReason(failure.kind),
+                .{path},
+            );
+            return editFailureResultFmt(
+                allocator,
+                "No changes made to {s}. The replacements produced identical content.",
+                editFailureReason(failure.kind),
+                .{path},
+            );
+        },
+        .none => return editErrorResult(
+            allocator,
+            "edit_failed",
+            "Edit failed.",
+        ),
+    }
+}
+
+fn editFailureReason(kind: EditFailureKind) []const u8 {
+    return switch (kind) {
+        .none => "edit_failed",
+        .empty_old_text => "empty_old_text",
+        .old_text_not_found => "old_text_not_found",
+        .old_text_not_unique => "old_text_not_unique",
+        .overlapping_edits => "overlapping_edits",
+        .no_changes => "no_changes",
+    };
+}
+
+fn editFailureResultFmt(
+    allocator: std.mem.Allocator,
+    comptime fmt: []const u8,
+    reason: []const u8,
+    args: anytype,
+) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
 }
 
 fn editTooLargeResult(allocator: std.mem.Allocator, max_output_bytes: usize) !agent.ToolExecutionResult {
@@ -640,6 +814,7 @@ test "edit tool preserves BOM and CRLF while matching normalized text and tracks
         utf8_bom ++ "one\r\ntwo\r\n",
         &.{.{ .old_text = "one\ntwo", .new_text = "1\n2" }},
         max_edit_output_bytes,
+        null,
     );
     defer edited.deinit(std.testing.allocator);
 
@@ -663,13 +838,36 @@ test "edit tool reports no-op replacement without writing" {
     defer result.deinit();
 
     try std.testing.expectEqualStrings(
-        "Edit failed: replacement output is identical.",
+        "No changes made to file.txt. The replacement produced identical content. " ++
+            "This might indicate an issue with special characters or the text not existing as expected.",
         result.result.content[0].text.text,
     );
     try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
     const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("same", written);
+}
+
+test "edit tool reports duplicate oldText with occurrence count" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "1: line 1\n2: line 2\n10: line 10\n11: line 11\n");
+
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer edit_tool.deinit();
+
+    var duplicate = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.txt","edits":[{"oldText":"line 1","newText":"changed"},{"oldText":"line 2","newText":"ok"}]}
+        ,
+    );
+    defer duplicate.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Found 3 occurrences of edits[0] in file.txt. " ++
+            "Each oldText must be unique. Please provide more context to make it unique.",
+        duplicate.result.content[0].text.text,
+    );
 }
 
 test "edit tool returns actionable operational errors" {
@@ -680,15 +878,15 @@ test "edit tool returns actionable operational errors" {
     var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .max_output_bytes = 5 });
     defer edit_tool.deinit();
 
-    var invalid = try test_support.execute(
+    var empty = try test_support.execute(
         edit_tool.tool(),
         \\{"path":"file.txt","edits":[{"oldText":"","newText":"x"}]}
         ,
     );
-    defer invalid.deinit();
+    defer empty.deinit();
     try std.testing.expectEqualStrings(
-        "Invalid edit arguments: provide path and one or more edits with non-empty oldText and string newText.",
-        invalid.result.content[0].text.text,
+        "oldText must not be empty in file.txt.",
+        empty.result.content[0].text.text,
     );
 
     var duplicate = try test_support.execute(
@@ -698,7 +896,8 @@ test "edit tool returns actionable operational errors" {
     );
     defer duplicate.deinit();
     try std.testing.expectEqualStrings(
-        "Edit failed: every oldText must match exactly once in the file.",
+        "Found 2 occurrences of the text in file.txt. " ++
+            "The text must be unique. Please provide more context to make it unique.",
         duplicate.result.content[0].text.text,
     );
 
@@ -709,7 +908,8 @@ test "edit tool returns actionable operational errors" {
     );
     defer overlap.deinit();
     try std.testing.expectEqualStrings(
-        "Edit failed: replacements overlap; merge nearby or overlapping changes into one edit.",
+        "edits[0] and edits[1] overlap in file.txt. " ++
+            "Merge them into one edit or target disjoint regions.",
         overlap.result.content[0].text.text,
     );
 
@@ -784,39 +984,34 @@ test "edit tool rejects bad replacements before mutation" {
         &.{.{ .old_text = "same", .new_text = "same" }},
         max_edit_output_bytes,
         &applied_one,
+        null,
     ));
-    try std.testing.expectError(
-        error.EditTextNotFoundOrNotUnique,
-        applyEdits(
-            std.testing.allocator,
-            "x x",
-            &.{.{ .old_text = "x", .new_text = "y" }},
-            max_edit_output_bytes,
-            &applied_one,
-        ),
-    );
-    try std.testing.expectError(
-        error.EditTooLarge,
-        applyEdits(
-            std.testing.allocator,
-            "x",
-            &.{.{ .old_text = "x", .new_text = "hello" }},
-            3,
-            &applied_one,
-        ),
-    );
+    try std.testing.expectError(error.EditTextNotUnique, applyEdits(
+        std.testing.allocator,
+        "x x",
+        &.{.{ .old_text = "x", .new_text = "y" }},
+        max_edit_output_bytes,
+        &applied_one,
+        null,
+    ));
+    try std.testing.expectError(error.EditTooLarge, applyEdits(
+        std.testing.allocator,
+        "x",
+        &.{.{ .old_text = "x", .new_text = "hello" }},
+        3,
+        &applied_one,
+        null,
+    ));
     var applied_two: [2]edit_diff.AppliedEdit = undefined;
-    try std.testing.expectError(
-        error.OverlappingEdits,
-        applyEdits(
-            std.testing.allocator,
-            "abcdef",
-            &.{
-                .{ .old_text = "abc", .new_text = "x" },
-                .{ .old_text = "bcd", .new_text = "y" },
-            },
-            max_edit_output_bytes,
-            &applied_two,
-        ),
-    );
+    try std.testing.expectError(error.OverlappingEdits, applyEdits(
+        std.testing.allocator,
+        "abcdef",
+        &.{
+            .{ .old_text = "abc", .new_text = "x" },
+            .{ .old_text = "bcd", .new_text = "y" },
+        },
+        max_edit_output_bytes,
+        &applied_two,
+        null,
+    ));
 }

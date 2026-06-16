@@ -23,20 +23,22 @@ pub fn atomicWriteFileStreamingUpdates(
     defer allocator.free(temp_path);
     errdefer std.Io.Dir.deleteFile(.cwd(), io, temp_path) catch {};
 
-    const file = try std.Io.Dir.createFile(.cwd(), io, temp_path, .{});
-    defer file.close(io);
+    {
+        const file = try std.Io.Dir.createFile(.cwd(), io, temp_path, .{});
+        defer file.close(io);
 
-    var buffer: [4096]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    var offset: usize = 0;
-    while (offset < content.len) {
-        const end = utf8ChunkEnd(content, offset, @min(content.len, offset + update_chunk_bytes));
-        const chunk = content[offset..end];
-        try writer.interface.writeAll(chunk);
-        try emitUpdate(allocator, on_update, chunk);
-        offset = end;
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        var offset: usize = 0;
+        while (offset < content.len) {
+            const end = utf8ChunkEnd(content, offset, @min(content.len, offset + update_chunk_bytes));
+            const chunk = content[offset..end];
+            try writer.interface.writeAll(chunk);
+            try emitUpdate(allocator, on_update, chunk);
+            offset = end;
+        }
+        try writer.flush();
     }
-    try writer.flush();
     try std.Io.Dir.rename(.cwd(), temp_path, .cwd(), path, io);
 }
 

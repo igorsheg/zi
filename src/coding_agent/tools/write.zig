@@ -27,7 +27,7 @@ pub const WriteTool = struct {
     pub const Config = struct {
         cwd: []const u8,
         home_dir: ?[]const u8 = null,
-        allow_paths_outside_cwd: bool = false,
+        allow_paths_outside_cwd: bool = true,
         max_write_bytes: usize = max_write_bytes,
         mutation_queue: ?*file_mutation_queue.FileMutationQueue = null,
     };
@@ -109,18 +109,39 @@ fn execute(
         errdefer runtime.freeJsonValue(allocator, details);
         return path_utils.ownedTextResult(allocator, message, details);
     }
-    const resolved_path = try path_utils.resolveCreatablePath(allocator, io, .{
+    const resolved_path = path_utils.resolveCreatablePath(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
         .home_dir = self.config.home_dir,
-    }, args.path);
+    }, args.path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.InvalidToolArguments => return writeErrorResult(
+            allocator,
+            "invalid_path",
+            "Invalid write path: provide a non-empty path.",
+        ),
+        else => return writeErrorResultFmt(
+            allocator,
+            "Write path resolution failed for {s}: {s}",
+            "path_error",
+            .{ args.path, @errorName(err) },
+        ),
+    };
     defer allocator.free(resolved_path);
 
     try token.throwIfRequested();
     const mutation_queue = self.config.mutation_queue orelse &self.default_mutation_queue;
-    try mutation_queue.atomicWriteFileStreamingUpdates(allocator, io, resolved_path, args.content, on_update, .{
+    mutation_queue.atomicWriteFileStreamingUpdates(allocator, io, resolved_path, args.content, on_update, .{
         .create_parent_dirs = true,
-    });
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return writeErrorResultFmt(
+            allocator,
+            "Write failed for {s}: {s}",
+            "write_failed",
+            .{ args.path, @errorName(err) },
+        ),
+    };
     try token.throwIfRequested();
 
     const message = try std.fmt.allocPrint(
@@ -145,6 +166,22 @@ fn writeErrorResult(
     });
     errdefer runtime.freeJsonValue(allocator, details);
     return path_utils.textResult(allocator, message, details);
+}
+
+fn writeErrorResultFmt(
+    allocator: std.mem.Allocator,
+    comptime fmt: []const u8,
+    reason: []const u8,
+    args: anytype,
+) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
 }
 
 fn parseArgs(params: std.json.Value) !WriteArgs {
@@ -268,6 +305,22 @@ test "write tool reports invalid arguments operationally" {
     try std.testing.expectEqualStrings("invalid_arguments", result.result.details.?.object.get("reason").?.string);
 }
 
+test "write tool reports path failures operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/blocker", "x");
+
+    var write_tool = try WriteTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer write_tool.deinit();
+
+    var result = try test_support.execute(write_tool.tool(), "{\"path\":\"blocker/file.txt\",\"content\":\"x\"}");
+    defer result.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, result.result.content[0].text.text, "Write failed") != null);
+    try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
+    try std.testing.expectEqualStrings("write_failed", result.result.details.?.object.get("reason").?.string);
+}
+
 test "write tool rejects oversized content" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
@@ -289,15 +342,17 @@ test "write tool rejects oversized content" {
     try std.testing.expectEqual(@as(i64, 3), details.get("maxBytes").?.integer);
 }
 
-test "write tool rejects paths outside cwd" {
+test "write tool follows pi-mono outside-cwd behavior by default" {
     var fixture = try test_support.Fixture.init("repo/app");
     defer fixture.deinit();
     try fixture.dir("repo/other");
 
-    try std.testing.expectError(error.PathOutsideCwd, path_utils.resolveCreatablePath(
-        std.testing.allocator,
-        std.testing.io,
-        .{ .cwd = fixture.cwd() },
-        "../other/file.txt",
-    ));
+    var write_tool = try WriteTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer write_tool.deinit();
+    var result = try test_support.execute(write_tool.tool(), "{\"path\":\"../other/file.txt\",\"content\":\"x\"}");
+    defer result.deinit();
+
+    const written = try fixture.read("repo/other/file.txt");
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("x", written);
 }
