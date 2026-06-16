@@ -521,17 +521,30 @@ fn grepMetadata(buffer: []u8, object: std.json.ObjectMap) ?[]const u8 {
     if (!truncated and long_lines == 0) return null;
 
     var writer = std.Io.Writer.fixed(buffer);
-    writer.writeAll("Truncated: ") catch return null;
     var wrote_any = false;
     if (truncated) {
-        writeTruncationReason(&writer, truncation.?, "matches", "matches") catch return null;
+        const by = jsonString(truncation.?, "truncatedBy") orelse "";
+        if (std.mem.eql(u8, by, "matches")) {
+            const limit = jsonInt(truncation.?, "maxMatches") orelse 0;
+            writer.print("Limited: {d} matches", .{limit}) catch return null;
+        } else {
+            writer.writeAll("Truncated: ") catch return null;
+            writeTruncationReason(&writer, truncation.?, "matches", "matches") catch return null;
+        }
         wrote_any = true;
     }
     if (long_lines > 0) {
-        if (wrote_any) writer.writeAll(", ") catch return null;
-        writer.writeAll("some lines truncated") catch return null;
+        if (wrote_any) writer.writeAll(" • ") catch return null;
+        writer.writeAll("Truncated: some lines") catch return null;
     }
     return writer.buffered();
+}
+
+fn limitedEntriesMetadata(buffer: []u8, truncation: std.json.ObjectMap, noun: []const u8) ?[]const u8 {
+    const by = jsonString(truncation, "truncatedBy") orelse "";
+    if (!std.mem.eql(u8, by, "entries")) return null;
+    const limit = jsonInt(truncation, "maxEntries") orelse return null;
+    return std.fmt.bufPrint(buffer, "Limited: {d} {s}", .{ limit, noun }) catch null;
 }
 
 fn entriesMetadata(
@@ -541,6 +554,7 @@ fn entriesMetadata(
 ) ?[]const u8 {
     const truncation = jsonObject(object, "truncation") orelse return null;
     if (!(jsonBool(truncation, "truncated") orelse false)) return null;
+    if (limitedEntriesMetadata(buffer, truncation, noun)) |text| return text;
     var writer = std.Io.Writer.fixed(buffer);
     writer.writeAll("Truncated: ") catch return null;
     writeTruncationReason(&writer, truncation, "entries", noun) catch return null;
@@ -885,7 +899,7 @@ test "tool display moves truncation sentinels into metadata" {
 
     var metadata_buffer: [metadata_bytes_max]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "Truncated: 2 matches limit, some lines truncated",
+        "Limited: 2 matches • Truncated: some lines",
         metadataForDetails(&metadata_buffer, "grep", grep_details.value),
     );
 
@@ -893,6 +907,36 @@ test "tool display moves truncation sentinels into metadata" {
     const text = try normalizeResultOutput(allocator, "grep", grep_details.value, raw);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("a.zig:1: foo", text);
+}
+
+test "ls metadata moves listing limits out of the body" {
+    const allocator = std.testing.allocator;
+    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
+
+    var entries_details = try testArgs(
+        allocator,
+        "{\"truncation\":{\"truncated\":true,\"truncatedBy\":\"entries\",\"maxEntries\":20}}",
+    );
+    defer entries_details.deinit();
+    try std.testing.expectEqualStrings(
+        "Limited: 20 entries",
+        metadataForDetails(&metadata_buffer, "ls", entries_details.value),
+    );
+
+    const raw = try allocator.dupe(u8, "a.txt\nb.txt\n[listing truncated]");
+    const text = try normalizeResultOutput(allocator, "ls", entries_details.value, raw);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("a.txt\nb.txt", text);
+
+    var bytes_details = try testArgs(
+        allocator,
+        "{\"truncation\":{\"truncated\":true,\"truncatedBy\":\"bytes\",\"maxOutputBytes\":51200}}",
+    );
+    defer bytes_details.deinit();
+    try std.testing.expectEqualStrings(
+        "Truncated: 50KB output limit",
+        metadataForDetails(&metadata_buffer, "ls", bytes_details.value),
+    );
 }
 
 test "tool metadata formats grep byte and file-size truncation warnings" {

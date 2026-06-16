@@ -92,14 +92,19 @@ fn execute(
             "Invalid ls limit: provide a positive integer.",
         ),
     };
-    const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
+    const resolved_path = path_utils.resolveExistingPath(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
         .home_dir = self.config.home_dir,
-    }, path);
+    }, path) catch |err| return pathErrorResult(allocator, path, err);
     defer allocator.free(resolved_path);
 
-    var dir = try std.Io.Dir.openDir(.cwd(), io, resolved_path, .{ .iterate = true });
+    var dir = std.Io.Dir.openDir(.cwd(), io, resolved_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return pathErrorResult(allocator, path, err),
+        error.NotDir => return pathErrorResult(allocator, path, err),
+        error.AccessDenied => return pathErrorResult(allocator, path, err),
+        else => return err,
+    };
     defer dir.close(io);
     var iter = dir.iterate();
     var entries = std.ArrayList([]u8).empty;
@@ -165,6 +170,36 @@ fn execute(
 const listing_truncated_sentinel = "[listing truncated]";
 const empty_directory_text = "(empty directory)";
 
+fn pathErrorResult(allocator: std.mem.Allocator, path: []const u8, err: anyerror) !agent.ToolExecutionResult {
+    const reason: []const u8 = switch (err) {
+        error.FileNotFound => "path_not_found",
+        error.NotDir => "not_directory",
+        error.AccessDenied => "access_denied",
+        error.PathOutsideCwd => "path_outside_cwd",
+        error.InvalidToolArguments => "invalid_path",
+        else => return err,
+    };
+    const message = switch (err) {
+        error.FileNotFound => try std.fmt.allocPrint(allocator, "Path not found: {s}", .{path}),
+        error.NotDir => try std.fmt.allocPrint(allocator, "Not a directory: {s}", .{path}),
+        error.AccessDenied => try std.fmt.allocPrint(allocator, "Cannot read directory: access denied: {s}", .{path}),
+        error.PathOutsideCwd => try std.fmt.allocPrint(
+            allocator,
+            "Path outside current working directory: {s}",
+            .{path},
+        ),
+        error.InvalidToolArguments => try std.fmt.allocPrint(allocator, "Invalid ls path: {s}", .{path}),
+        else => unreachable,
+    };
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
+}
+
 fn appendTruncationSentinel(writer: *std.Io.Writer.Allocating, max_bytes: usize) !void {
     const separator: usize = if (writer.written().len == 0) 0 else 1;
     if (writer.written().len + separator + listing_truncated_sentinel.len > max_bytes) return;
@@ -219,6 +254,7 @@ test "ls tool lists one directory with bounds" {
 test "ls tool reports invalid arguments operationally" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
+    try fixture.write("repo/file.txt", "not a dir");
 
     var tool = try LsTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
@@ -238,6 +274,16 @@ test "ls tool reports invalid arguments operationally" {
         limit_result.result.content[0].text.text,
     );
     try std.testing.expectEqualStrings("invalid_limit", limit_result.result.details.?.object.get("reason").?.string);
+
+    var missing_result = try test_support.execute(tool.tool(), "{\"path\":\"missing\"}");
+    defer missing_result.deinit();
+    try std.testing.expectEqualStrings("Path not found: missing", missing_result.result.content[0].text.text);
+    try std.testing.expectEqualStrings("path_not_found", missing_result.result.details.?.object.get("reason").?.string);
+
+    var file_result = try test_support.execute(tool.tool(), "{\"path\":\"file.txt\"}");
+    defer file_result.deinit();
+    try std.testing.expectEqualStrings("Not a directory: file.txt", file_result.result.content[0].text.text);
+    try std.testing.expectEqualStrings("not_directory", file_result.result.details.?.object.get("reason").?.string);
 }
 
 test "ls tool reports byte truncation details and bounds sentinel" {
