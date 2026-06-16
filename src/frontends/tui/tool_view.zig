@@ -148,7 +148,7 @@ pub fn callPreviewFooter(buffer: []u8, name: []const u8, args_value: std.json.Va
     const total_lines = countLines(preview);
     const visible_lines: usize = @min(total_lines, tool_metadata.displayForTool("write").collapse.rows_max);
     if (visible_lines == total_lines) return "";
-    return std.fmt.bufPrint(buffer, "Showing {d} of {d} lines", .{ visible_lines, total_lines }) catch "";
+    return std.fmt.bufPrint(buffer, "Showing lines 1-{d} of {d}", .{ visible_lines, total_lines }) catch "";
 }
 
 pub fn clearsCallPreviewOnStart(name: []const u8) bool {
@@ -751,7 +751,7 @@ test "write call previews content until execution stream starts" {
     );
     defer long_args.deinit();
     try std.testing.expectEqualStrings(
-        "Showing 10 of 12 lines",
+        "Showing lines 1-10 of 12",
         callPreviewFooter(&footer_buffer, "write", long_args.value),
     );
 }
