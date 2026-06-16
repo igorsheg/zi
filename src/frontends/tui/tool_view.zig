@@ -434,7 +434,7 @@ fn readMetadata(buffer: []u8, object: std.json.ObjectMap) ?[]const u8 {
     var writer = std.Io.Writer.fixed(buffer);
     if (first_line_exceeds) {
         const max_bytes = jsonInt(truncation, "maxBytes") orelse 0;
-        writer.writeAll("First line exceeds ") catch return null;
+        writer.writeAll("Truncated: first line exceeds ") catch return null;
         writeByteSize(&writer, max_bytes) catch return null;
         writer.writeAll(" limit") catch return null;
     } else if (jsonBool(truncation, "truncated") orelse false) {
@@ -453,7 +453,7 @@ fn readMetadata(buffer: []u8, object: std.json.ObjectMap) ?[]const u8 {
     } else {
         const remaining = jsonInt(truncation, "remainingLines") orelse return null;
         if (remaining <= 0) return null;
-        writer.print("{d} more lines in file", .{remaining}) catch return null;
+        writer.print("Limited: {d} more lines in file", .{remaining}) catch return null;
     }
     if (next_offset) |offset| writer.print("; use offset={d} to continue", .{offset}) catch return null;
     return writer.buffered();
@@ -755,6 +755,46 @@ test "read display trims trailing empty lines" {
     try std.testing.expectEqualStrings("one", trimTrailingEmptyLines("one\n"));
     try std.testing.expectEqualStrings("one", trimTrailingEmptyLines("one\n\n"));
     try std.testing.expectEqualStrings("one\ntwo", trimTrailingEmptyLines("one\ntwo"));
+}
+
+test "read display moves continuation notices into metadata" {
+    const allocator = std.testing.allocator;
+    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
+    var user_limit = try testArgs(
+        allocator,
+        "{\"nextOffset\":4,\"truncation\":{\"truncated\":false,\"userLimit\":true,\"remainingLines\":1}}",
+    );
+    defer user_limit.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Limited: 1 more lines in file; use offset=4 to continue",
+        metadataForDetails(&metadata_buffer, "read", user_limit.value),
+    );
+
+    const raw = try allocator.dupe(u8, "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]");
+    const text = try normalizeResultOutput(allocator, "read", user_limit.value, raw);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("two\nthree", text);
+}
+
+test "read display labels safety clipping as truncation" {
+    const allocator = std.testing.allocator;
+    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
+    var details = try testArgs(
+        allocator,
+        "{\"truncation\":{\"truncated\":true,\"firstLineExceedsLimit\":true,\"maxBytes\":51200}}",
+    );
+    defer details.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Truncated: first line exceeds 50KB limit",
+        metadataForDetails(&metadata_buffer, "read", details.value),
+    );
+
+    const raw = try allocator.dupe(u8, "[Line 1 is 60KB, exceeds 50KB limit. Use bash: sed -n '1p' big.txt]");
+    const text = try normalizeResultOutput(allocator, "read", details.value, raw);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
 }
 
 test "formatCompactCallTitle mirrors pi-mono read resource headers" {
