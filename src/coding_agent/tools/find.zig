@@ -100,14 +100,19 @@ fn execute(
             "Invalid find limit: provide a positive integer.",
         ),
     };
-    const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
+    const resolved_path = path_utils.resolveExistingPath(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
         .home_dir = self.config.home_dir,
-    }, args.path);
+    }, args.path) catch |err| return path_utils.pathErrorResult(allocator, "find", args.path, err);
     defer allocator.free(resolved_path);
 
-    var dir = try std.Io.Dir.openDir(.cwd(), io, resolved_path, .{ .iterate = true });
+    var dir = std.Io.Dir.openDir(.cwd(), io, resolved_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return path_utils.pathErrorResult(allocator, "find", args.path, err),
+        error.NotDir => return path_utils.pathErrorResult(allocator, "find", args.path, err),
+        error.AccessDenied => return path_utils.pathErrorResult(allocator, "find", args.path, err),
+        else => return err,
+    };
     defer dir.close(io);
     var walker = try dir.walk(allocator);
     defer walker.deinit();
@@ -297,6 +302,7 @@ test "find tool reports byte and visited truncation details" {
 test "find tool reports invalid arguments operationally" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
+    try fixture.write("repo/file.txt", "not a dir");
 
     var tool = try FindTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
     defer tool.deinit();
@@ -316,6 +322,16 @@ test "find tool reports invalid arguments operationally" {
         limit_result.result.content[0].text.text,
     );
     try std.testing.expectEqualStrings("invalid_limit", limit_result.result.details.?.object.get("reason").?.string);
+
+    var missing_result = try test_support.execute(tool.tool(), "{\"path\":\"missing\"}");
+    defer missing_result.deinit();
+    try std.testing.expectEqualStrings("Path not found: missing", missing_result.result.content[0].text.text);
+    try std.testing.expectEqualStrings("path_not_found", missing_result.result.details.?.object.get("reason").?.string);
+
+    var file_result = try test_support.execute(tool.tool(), "{\"path\":\"file.txt\"}");
+    defer file_result.deinit();
+    try std.testing.expectEqualStrings("Not a directory: file.txt", file_result.result.content[0].text.text);
+    try std.testing.expectEqualStrings("not_directory", file_result.result.details.?.object.get("reason").?.string);
 }
 
 test "find tool reports no matches" {

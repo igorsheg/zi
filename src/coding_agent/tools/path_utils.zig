@@ -424,6 +424,41 @@ pub fn errorTextResult(
     return textResult(allocator, message, details);
 }
 
+pub fn pathErrorResult(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    path: []const u8,
+    err: anyerror,
+) !agent.ToolExecutionResult {
+    const reason: []const u8 = switch (err) {
+        error.FileNotFound => "path_not_found",
+        error.NotDir => "not_directory",
+        error.AccessDenied => "access_denied",
+        error.PathOutsideCwd => "path_outside_cwd",
+        error.InvalidToolArguments => "invalid_path",
+        else => return err,
+    };
+    const message = switch (err) {
+        error.FileNotFound => try std.fmt.allocPrint(allocator, "Path not found: {s}", .{path}),
+        error.NotDir => try std.fmt.allocPrint(allocator, "Not a directory: {s}", .{path}),
+        error.AccessDenied => try std.fmt.allocPrint(allocator, "Cannot read path: access denied: {s}", .{path}),
+        error.PathOutsideCwd => try std.fmt.allocPrint(
+            allocator,
+            "Path outside current working directory: {s}",
+            .{path},
+        ),
+        error.InvalidToolArguments => try std.fmt.allocPrint(allocator, "Invalid {s} path: {s}", .{ tool_name, path }),
+        else => unreachable,
+    };
+    errdefer allocator.free(message);
+    const details = try jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return ownedTextResult(allocator, message, details);
+}
+
 /// Build an owned `std.json.Value` object from an anonymous struct literal.
 /// Field types: bool, integers, string slices/literals (duped), an already
 /// owned `std.json.Value` (adopted), and optionals of those (null omitted).

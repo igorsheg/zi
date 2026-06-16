@@ -909,7 +909,7 @@ test "tool display moves truncation sentinels into metadata" {
     try std.testing.expectEqualStrings("a.zig:1: foo", text);
 }
 
-test "ls metadata moves listing limits out of the body" {
+test "listing metadata moves limits out of the body" {
     const allocator = std.testing.allocator;
     var metadata_buffer: [metadata_bytes_max]u8 = undefined;
 
@@ -922,11 +922,20 @@ test "ls metadata moves listing limits out of the body" {
         "Limited: 20 entries",
         metadataForDetails(&metadata_buffer, "ls", entries_details.value),
     );
+    try std.testing.expectEqualStrings(
+        "Limited: 20 results",
+        metadataForDetails(&metadata_buffer, "find", entries_details.value),
+    );
 
-    const raw = try allocator.dupe(u8, "a.txt\nb.txt\n[listing truncated]");
-    const text = try normalizeResultOutput(allocator, "ls", entries_details.value, raw);
-    defer allocator.free(text);
-    try std.testing.expectEqualStrings("a.txt\nb.txt", text);
+    const raw_ls = try allocator.dupe(u8, "a.txt\nb.txt\n[listing truncated]");
+    const ls_text = try normalizeResultOutput(allocator, "ls", entries_details.value, raw_ls);
+    defer allocator.free(ls_text);
+    try std.testing.expectEqualStrings("a.txt\nb.txt", ls_text);
+
+    const raw_find = try allocator.dupe(u8, "a.txt\nb.txt\n[find truncated]");
+    const find_text = try normalizeResultOutput(allocator, "find", entries_details.value, raw_find);
+    defer allocator.free(find_text);
+    try std.testing.expectEqualStrings("a.txt\nb.txt", find_text);
 
     var bytes_details = try testArgs(
         allocator,
@@ -935,7 +944,7 @@ test "ls metadata moves listing limits out of the body" {
     defer bytes_details.deinit();
     try std.testing.expectEqualStrings(
         "Truncated: 50KB output limit",
-        metadataForDetails(&metadata_buffer, "ls", bytes_details.value),
+        metadataForDetails(&metadata_buffer, "find", bytes_details.value),
     );
 }
 
