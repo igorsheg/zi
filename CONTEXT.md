@@ -437,7 +437,7 @@ public-boundary test.
 - env-gated fake providers in the product CLI (faux is test-only).
 - callback listeners that mutate session state; only the event drain mutates it.
 - json mode that emits event tags instead of real content.
-- a broad tool framework before bash/grep/find/ls/edit/write prove the shape.
+- a broad tool framework before read/bash/edit/write prove the shape.
 - `tui` reaching into `coding_agent`/session/provider/tool internals.
 - terminal cells as an extension API, or write-only TUI event queues.
 - treating streamed agent/tool data as a programmer error: operational input is

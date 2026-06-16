@@ -256,7 +256,7 @@ Deletion gate:
 ! rg 'EventQueueFull.*return err' src/coding_agent/session_runtime.zig
 ```
 
-The exact grep may change after implementation; the property is: ordinary event queue pressure does not tear down `step()`.
+The exact check may change after implementation; the property is: ordinary event queue pressure does not tear down `step()`.
 
 Tests:
 

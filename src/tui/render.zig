@@ -862,8 +862,6 @@ fn toolTitleSegments(
         addHintedTitleRest(&parts, &count, rest, theme);
     } else switch (tool.presentation) {
         .file, .patch => addFileTitleRest(&parts, &count, rest, theme),
-        .search => addSearchTitleRest(&parts, &count, rest, theme),
-        .directory => addDirectoryTitleRest(&parts, &count, rest, theme),
         .command => addCommandTitleRest(&parts, &count, rest, theme),
         .generic => addTitleSegment(&parts, &count, rest, theme.tool_title),
     }
@@ -895,21 +893,6 @@ fn addFileTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, them
     } else {
         addTitleSegment(parts, count, rest, theme.status_accent);
     }
-}
-
-fn addSearchTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, theme: *const theme_mod.Theme) void {
-    if (rest.len > 0 and rest[0] == '/') {
-        if (std.mem.findScalarPos(u8, rest, 1, '/')) |end| {
-            addTitleSegment(parts, count, rest[0 .. end + 1], theme.status_accent);
-            addTitleSegment(parts, count, rest[end + 1 ..], theme.transcript_secondary);
-            return;
-        }
-    }
-    addTitleSegment(parts, count, rest, theme.status_accent);
-}
-
-fn addDirectoryTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, theme: *const theme_mod.Theme) void {
-    addTitleSegment(parts, count, rest, theme.status_accent);
 }
 
 fn addCommandTitleRest(parts: *[8]RowSegment, count: *usize, rest: []const u8, theme: *const theme_mod.Theme) void {
@@ -1375,7 +1358,7 @@ test "head-collapsed tool keeps the first rows with the hint below" {
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
         .tool_call_id = "call-1",
-        .name = "grep",
+        .name = "custom",
         .collapse = .{ .mode = .head, .rows_max = 2 },
     } });
     _ = try app.transcript.appendToolOutput(testing_gpa, "call-1", "a\nb\nc\nd", 0, 0);
@@ -1399,14 +1382,13 @@ test "tool warning body lines use warning style" {
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
         .tool_call_id = "call-1",
-        .name = "grep",
-        .presentation = .search,
-        .title = "grep /foo/ in .",
+        .name = "custom",
+        .title = "custom output",
     } });
     _ = try app.transcript.appendToolOutput(
         testing_gpa,
         "call-1",
-        "src/main.zig:1: foo\n[Truncated: 2 matches limit]",
+        "src/main.zig:1: foo\n[Truncated: output clipped]",
         0,
         0,
     );
@@ -1419,7 +1401,7 @@ test "tool warning body lines use warning style" {
     try std.testing.expectEqualStrings(glyphs.tool_top_line, scratch.rows[1].text);
     try std.testing.expectEqualStrings("src/main.zig:1: foo", scratch.rows[2].text);
     try std.testing.expectEqual(app.theme.tool_output, scratch.rows[2].text_style);
-    try std.testing.expectEqualStrings("[Truncated: 2 matches limit]", scratch.rows[3].text);
+    try std.testing.expectEqualStrings("[Truncated: output clipped]", scratch.rows[3].text);
     try std.testing.expectEqual(app.theme.status_warning, scratch.rows[3].text_style);
 }
 
@@ -1904,27 +1886,25 @@ test "frame scratch keeps generated tool titles stable" {
     defer app.deinit(testing_gpa);
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
         .role = .user,
-        .text = "Run a single ls tool call",
+        .text = "Run a single custom tool call",
     } } });
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .tool = .{
-        .tool_call_id = "call-ls",
-        .name = "ls",
-        .presentation = .directory,
+        .tool_call_id = "call-custom",
+        .name = "custom",
         .status = .pending,
         .collapse = .{ .mode = .head, .rows_max = 20 },
-        .title = "ls (limit 50)",
+        .title = "custom list",
     } } });
     _ = try app.apply(testing_gpa, .{ .replace_tool_output = .{
-        .tool_call_id = "call-ls",
+        .tool_call_id = "call-custom",
         .text = ".claude/\n.forks/\n.git/\n.github/\n.gitignore\n.pi/\n.references/\n.tmp/\n" ++
             ".zi/\n.zig-cache/\n.ziglint.zon\nAGENTS.md\nautoresearch.checks.sh\n" ++
             "autoresearch.ideas.md\nautoresearch.md\nautoresearch.sh\nbuild.zig\n" ++
             "build.zig.zon\nCONTEXT.md\ndocs/\n",
     } });
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .tool = .{
-        .tool_call_id = "call-ls",
-        .name = "ls",
-        .presentation = .directory,
+        .tool_call_id = "call-custom",
+        .name = "custom",
         .status = .success,
         .collapse = .{ .mode = .head, .rows_max = 20 },
     } } });

@@ -667,7 +667,7 @@ test "default llm conversion bounds tool result text" {
     const content = [_]ai.ToolResultContent{.{ .text = .{ .text = large } }};
     const source = [_]agent.AgentMessage{.{ .tool_result = .{
         .tool_call_id = "call-1",
-        .tool_name = "find",
+        .tool_name = "custom",
         .content = &content,
         .is_error = false,
         .timestamp = 0,

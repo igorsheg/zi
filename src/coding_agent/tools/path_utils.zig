@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
-const runtime = @import("../../runtime/root.zig");
 
 pub const max_path_bytes: usize = 16 * 1024;
 
@@ -411,54 +410,6 @@ pub fn textResult(
     return ownedTextResult(allocator, try allocator.dupe(u8, text), details);
 }
 
-pub fn errorTextResult(
-    allocator: std.mem.Allocator,
-    reason: []const u8,
-    message: []const u8,
-) !agent.ToolExecutionResult {
-    const details = try jsonDetails(allocator, .{
-        .isError = true,
-        .reason = reason,
-    });
-    errdefer runtime.freeJsonValue(allocator, details);
-    return textResult(allocator, message, details);
-}
-
-pub fn pathErrorResult(
-    allocator: std.mem.Allocator,
-    tool_name: []const u8,
-    path: []const u8,
-    err: anyerror,
-) !agent.ToolExecutionResult {
-    const reason: []const u8 = switch (err) {
-        error.FileNotFound => "path_not_found",
-        error.NotDir => "not_directory",
-        error.AccessDenied => "access_denied",
-        error.PathOutsideCwd => "path_outside_cwd",
-        error.InvalidToolArguments => "invalid_path",
-        else => return err,
-    };
-    const message = switch (err) {
-        error.FileNotFound => try std.fmt.allocPrint(allocator, "Path not found: {s}", .{path}),
-        error.NotDir => try std.fmt.allocPrint(allocator, "Not a directory: {s}", .{path}),
-        error.AccessDenied => try std.fmt.allocPrint(allocator, "Cannot read path: access denied: {s}", .{path}),
-        error.PathOutsideCwd => try std.fmt.allocPrint(
-            allocator,
-            "Path outside current working directory: {s}",
-            .{path},
-        ),
-        error.InvalidToolArguments => try std.fmt.allocPrint(allocator, "Invalid {s} path: {s}", .{ tool_name, path }),
-        else => unreachable,
-    };
-    errdefer allocator.free(message);
-    const details = try jsonDetails(allocator, .{
-        .isError = true,
-        .reason = reason,
-    });
-    errdefer runtime.freeJsonValue(allocator, details);
-    return ownedTextResult(allocator, message, details);
-}
-
 /// Build an owned `std.json.Value` object from an anonymous struct literal.
 /// Field types: bool, integers, string slices/literals (duped), an already
 /// owned `std.json.Value` (adopted), and optionals of those (null omitted).
@@ -540,49 +491,6 @@ test "json details builds typed object and omits null optionals" {
     try std.testing.expect(object.get("truncation").?.object.get("truncated").?.bool);
 }
 
-pub fn ignoredSearchPath(path: []const u8) bool {
-    var parts = std.mem.splitAny(u8, path, "/\\");
-    while (parts.next()) |part| {
-        if (std.mem.eql(u8, part, ".git") or std.mem.eql(u8, part, "node_modules")) return true;
-    }
-    return false;
-}
-
-pub fn parseOptionalLimit(params: std.json.Value, config_max: usize) !usize {
-    if (params != .object) return error.InvalidToolArguments;
-    const value = params.object.get("limit") orelse return config_max;
-    if (value != .integer or value.integer < 1) return error.InvalidToolArguments;
-    const requested = std.math.cast(usize, value.integer) orelse return config_max;
-    return @min(requested, config_max);
-}
-
-pub fn simpleGlobMatch(pattern: []const u8, text: []const u8) bool {
-    var pattern_index: usize = 0;
-    var text_index: usize = 0;
-    var star_index: ?usize = null;
-    var retry_text_index: usize = 0;
-    while (text_index < text.len) {
-        if (pattern_index < pattern.len and
-            (pattern[pattern_index] == '?' or pattern[pattern_index] == text[text_index]))
-        {
-            pattern_index += 1;
-            text_index += 1;
-        } else if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
-            star_index = pattern_index;
-            pattern_index += 1;
-            retry_text_index = text_index;
-        } else if (star_index) |star| {
-            pattern_index = star + 1;
-            retry_text_index += 1;
-            text_index = retry_text_index;
-        } else {
-            return false;
-        }
-    }
-    while (pattern_index < pattern.len and pattern[pattern_index] == '*') pattern_index += 1;
-    return pattern_index == pattern.len;
-}
-
 test "existing path resolution tries common macOS filename variants" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -637,12 +545,6 @@ test "path containment requires separator boundary" {
     try std.testing.expect(!isPathInside("/repo", "/repo2/file"));
 }
 
-test "simple glob match supports star and question" {
-    try std.testing.expect(simpleGlobMatch("*.zig", "src/main.zig"));
-    try std.testing.expect(simpleGlobMatch("src/?.zig", "src/a.zig"));
-    try std.testing.expect(!simpleGlobMatch("src/?.zig", "src/main.zig"));
-}
-
 test "home expansion is explicit and bounded" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -683,12 +585,6 @@ test "path normalization strips one at sign and maps unicode spaces" {
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'x');
     try std.testing.expectError(error.InvalidToolArguments, normalizeInputPath(std.testing.allocator, oversized));
-}
-
-test "search ignore policy skips common dependency metadata paths" {
-    try std.testing.expect(ignoredSearchPath(".git/config"));
-    try std.testing.expect(ignoredSearchPath("src/node_modules/pkg/index.js"));
-    try std.testing.expect(!ignoredSearchPath("src/git/config"));
 }
 
 test "path containment rejects symlink escapes" {

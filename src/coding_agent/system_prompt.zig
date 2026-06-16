@@ -80,17 +80,8 @@ fn appendGuidelines(
     writer: *std.Io.Writer.Allocating,
     selected_tools: []const []const u8,
 ) !void {
-    const has_bash = containsString(selected_tools, "bash");
-    const has_grep = containsString(selected_tools, "grep");
-    const has_find = containsString(selected_tools, "find");
-    const has_ls = containsString(selected_tools, "ls");
-    if (has_bash and !has_grep and !has_find and !has_ls) {
-        try appendGuideline(writer, "Use bash for file operations like ls, rg, find");
-    } else if (has_bash and (has_grep or has_find or has_ls)) {
-        try appendGuideline(
-            writer,
-            "Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)",
-        );
+    if (containsString(selected_tools, "bash")) {
+        try appendGuideline(writer, "Use bash for shell-based file exploration");
     }
 
     try appendGuideline(writer, "Be concise in your responses");

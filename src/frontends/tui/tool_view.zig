@@ -16,16 +16,13 @@ pub const title_bytes_max = 160;
 pub const metadata_bytes_max = 192;
 pub const footer_bytes_max = 256;
 
-const ToolKind = enum { bash, read, edit, write, grep, find, ls, custom };
+const ToolKind = enum { bash, read, edit, write, custom };
 
 fn kind(name: []const u8) ToolKind {
     if (std.mem.eql(u8, name, "bash")) return .bash;
     if (std.mem.eql(u8, name, "read")) return .read;
     if (std.mem.eql(u8, name, "edit")) return .edit;
     if (std.mem.eql(u8, name, "write")) return .write;
-    if (std.mem.eql(u8, name, "grep")) return .grep;
-    if (std.mem.eql(u8, name, "find")) return .find;
-    if (std.mem.eql(u8, name, "ls")) return .ls;
     return .custom;
 }
 
@@ -122,8 +119,6 @@ pub fn presentation(name: []const u8) tui.Transcript.ToolPresentation {
         .command => .command,
         .file => .file,
         .patch => .patch,
-        .search => .search,
-        .directory => .directory,
     };
 }
 
@@ -226,9 +221,6 @@ pub fn metadataForDetails(
     return switch (kind(tool_name)) {
         .bash => bashMetadata(buffer, value.object) orelse "",
         .read => readMetadata(buffer, value.object) orelse "",
-        .grep => grepMetadata(buffer, value.object) orelse "",
-        .find => entriesMetadata(buffer, value.object, "results") orelse "",
-        .ls => entriesMetadata(buffer, value.object, "entries") orelse "",
         .edit, .write, .custom => "",
     };
 }
@@ -263,42 +255,6 @@ pub fn formatCallTitleWithHome(
             title.add(tool_name);
             title.add(" ");
             title.addPath(argString(args_value, "file_path") orelse argStringOrEllipsis(args_value, "path"));
-        },
-        .ls => {
-            title.add(tool_name);
-            title.add(" ");
-            title.addPath(argStringOrDefault(args_value, "path", "."));
-            if (argPositiveInt(args_value, "limit")) |limit| {
-                title.add(" (limit ");
-                title.addInt(limit);
-                title.add(")");
-            }
-        },
-        .grep => {
-            title.add("grep /");
-            title.add(argStringOrEllipsis(args_value, "pattern"));
-            title.add("/ in ");
-            title.addPath(argStringOrDefault(args_value, "path", "."));
-            if (argString(args_value, "glob")) |glob| {
-                title.add(" (");
-                title.add(glob);
-                title.add(")");
-            }
-            if (argPositiveInt(args_value, "limit")) |limit| {
-                title.add(" limit ");
-                title.addInt(limit);
-            }
-        },
-        .find => {
-            title.add("find ");
-            title.add(argString(args_value, "pattern") orelse argStringOrEllipsis(args_value, "name"));
-            title.add(" in ");
-            title.addPath(argStringOrDefault(args_value, "path", "."));
-            if (argPositiveInt(args_value, "limit")) |limit| {
-                title.add(" (limit ");
-                title.addInt(limit);
-                title.add(")");
-            }
         },
         .custom => return "",
     }
@@ -423,17 +379,6 @@ fn stripToolSentinel(tool_name: []const u8, details: ?std.json.Value, text: []co
     if (tool_kind == .read and has_metadata) {
         if (stripReadFooter(text)) |body| return body;
     }
-    const sentinel = switch (tool_kind) {
-        .grep => "[grep truncated]",
-        .find => "[find truncated]",
-        .ls => "[listing truncated]",
-        .bash, .read, .edit, .write, .custom => return .{ .first = text },
-    };
-    if (std.mem.endsWith(u8, text, sentinel) and has_metadata) {
-        var end = text.len - sentinel.len;
-        if (end > 0 and text[end - 1] == '\n') end -= 1;
-        return .{ .first = trimTrailingEmptyLines(text[0..end]), .changed = true };
-    }
     return .{ .first = text };
 }
 
@@ -514,91 +459,6 @@ fn readMetadata(buffer: []u8, object: std.json.ObjectMap) ?[]const u8 {
     return writer.buffered();
 }
 
-fn grepMetadata(buffer: []u8, object: std.json.ObjectMap) ?[]const u8 {
-    const long_lines = jsonInt(object, "longLinesTruncated") orelse 0;
-    const truncation = jsonObject(object, "truncation");
-    const truncated = if (truncation) |trunc| jsonBool(trunc, "truncated") orelse false else false;
-    if (!truncated and long_lines == 0) return null;
-
-    var writer = std.Io.Writer.fixed(buffer);
-    var wrote_any = false;
-    if (truncated) {
-        const by = jsonString(truncation.?, "truncatedBy") orelse "";
-        if (std.mem.eql(u8, by, "matches")) {
-            const limit = jsonInt(truncation.?, "maxMatches") orelse 0;
-            writer.print("Limited: {d} matches", .{limit}) catch return null;
-        } else {
-            writer.writeAll("Truncated: ") catch return null;
-            writeTruncationReason(&writer, truncation.?, "matches", "matches") catch return null;
-        }
-        wrote_any = true;
-    }
-    if (long_lines > 0) {
-        if (wrote_any) writer.writeAll(" • ") catch return null;
-        writer.writeAll("Truncated: some lines") catch return null;
-    }
-    return writer.buffered();
-}
-
-fn limitedEntriesMetadata(buffer: []u8, truncation: std.json.ObjectMap, noun: []const u8) ?[]const u8 {
-    const by = jsonString(truncation, "truncatedBy") orelse "";
-    if (!std.mem.eql(u8, by, "entries")) return null;
-    const limit = jsonInt(truncation, "maxEntries") orelse return null;
-    return std.fmt.bufPrint(buffer, "Limited: {d} {s}", .{ limit, noun }) catch null;
-}
-
-fn entriesMetadata(
-    buffer: []u8,
-    object: std.json.ObjectMap,
-    noun: []const u8,
-) ?[]const u8 {
-    const truncation = jsonObject(object, "truncation") orelse return null;
-    if (!(jsonBool(truncation, "truncated") orelse false)) return null;
-    if (limitedEntriesMetadata(buffer, truncation, noun)) |text| return text;
-    var writer = std.Io.Writer.fixed(buffer);
-    writer.writeAll("Truncated: ") catch return null;
-    writeTruncationReason(&writer, truncation, "entries", noun) catch return null;
-    return writer.buffered();
-}
-
-fn writeTruncationReason(
-    writer: *std.Io.Writer,
-    truncation: std.json.ObjectMap,
-    limit_key: []const u8,
-    noun: []const u8,
-) !void {
-    const by = jsonString(truncation, "truncatedBy") orelse "";
-    if (std.mem.eql(u8, by, limit_key)) {
-        if (jsonInt(truncation, "maxEntries")) |limit| {
-            try writer.print("{d} {s} limit", .{ limit, noun });
-            return;
-        }
-        if (jsonInt(truncation, "maxMatches")) |limit| {
-            try writer.print("{d} {s} limit", .{ limit, noun });
-            return;
-        }
-    }
-    if (std.mem.eql(u8, by, "bytes")) {
-        if (jsonInt(truncation, "maxOutputBytes")) |max_bytes| {
-            try writeByteSize(writer, max_bytes);
-            try writer.writeAll(" output limit");
-        } else {
-            try writer.writeAll("output size limit");
-        }
-    } else if (std.mem.eql(u8, by, "file_size")) {
-        if (jsonInt(truncation, "maxFileBytes")) |max_bytes| {
-            try writeByteSize(writer, max_bytes);
-            try writer.writeAll(" file size limit");
-        } else {
-            try writer.writeAll("file size limit");
-        }
-    } else if (std.mem.eql(u8, by, "files")) {
-        try writer.writeAll("file scan limit");
-    } else {
-        try writer.writeAll("output limit");
-    }
-}
-
 fn writeByteSize(writer: *std.Io.Writer, bytes: i64) !void {
     if (bytes > 0 and @mod(bytes, 1024) == 0) {
         try writer.print("{d}KB", .{@divTrunc(bytes, 1024)});
@@ -610,7 +470,7 @@ fn writeByteSize(writer: *std.Io.Writer, bytes: i64) !void {
 fn shouldTrimResult(name: []const u8, is_error: bool) bool {
     if (is_error) return false;
     return switch (kind(name)) {
-        .bash, .read, .grep, .find, .ls, .write => true,
+        .bash, .read, .write => true,
         .edit, .custom => false,
     };
 }
@@ -725,10 +585,6 @@ fn argStringOrEllipsis(args_value: std.json.Value, key: []const u8) []const u8 {
     return argString(args_value, key) orelse "...";
 }
 
-fn argStringOrDefault(args_value: std.json.Value, key: []const u8, default: []const u8) []const u8 {
-    return argString(args_value, key) orelse default;
-}
-
 fn argPositiveInt(args_value: std.json.Value, key: []const u8) ?i64 {
     const value = argInt(args_value, key) orelse return null;
     return if (value > 0) value else null;
@@ -799,9 +655,9 @@ test "formatCallTitle mirrors pi-mono call headers" {
     const allocator = std.testing.allocator;
     var buffer: [title_bytes_max]u8 = undefined;
 
-    var bash_args = try testArgs(allocator, "{\"command\":\"ls -la\",\"timeout\":5}");
+    var bash_args = try testArgs(allocator, "{\"command\":\"pwd\",\"timeout\":5}");
     defer bash_args.deinit();
-    try std.testing.expectEqualStrings("$ ls -la (timeout 5s)", formatCallTitle(&buffer, "bash", bash_args.value));
+    try std.testing.expectEqualStrings("$ pwd (timeout 5s)", formatCallTitle(&buffer, "bash", bash_args.value));
 
     var read_args = try testArgs(allocator, "{\"path\":\"src/main.zig\",\"offset\":10,\"limit\":20}");
     defer read_args.deinit();
@@ -823,24 +679,6 @@ test "formatCallTitle mirrors pi-mono call headers" {
         "read ~/repo/src/main.zig",
         formatCallTitleWithHome(&buffer, "read", home_path_args.value, "/Users/me"),
     );
-
-    var grep_args = try testArgs(allocator, "{\"pattern\":\"foo\",\"glob\":\"*.zig\",\"limit\":50}");
-    defer grep_args.deinit();
-    try std.testing.expectEqualStrings(
-        "grep /foo/ in . (*.zig) limit 50",
-        formatCallTitle(&buffer, "grep", grep_args.value),
-    );
-
-    var find_args = try testArgs(allocator, "{\"name\":\".zig\",\"path\":\"src\",\"limit\":25}");
-    defer find_args.deinit();
-    try std.testing.expectEqualStrings(
-        "find .zig in src (limit 25)",
-        formatCallTitle(&buffer, "find", find_args.value),
-    );
-
-    var ls_args = try testArgs(allocator, "{}");
-    defer ls_args.deinit();
-    try std.testing.expectEqualStrings("ls .", formatCallTitle(&buffer, "ls", ls_args.value));
 
     var write_args = try testArgs(allocator, "{\"file_path\":\"src/file.zig\",\"path\":\"ignored.zig\"}");
     defer write_args.deinit();
@@ -887,90 +725,6 @@ test "tool result display joins text and image fallback" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expectEqualStrings("Read image file [image/png]\n[Image: image/png]", text);
-}
-
-test "tool display moves truncation sentinels into metadata" {
-    const allocator = std.testing.allocator;
-    var grep_details = try testArgs(
-        allocator,
-        "{\"longLinesTruncated\":1,\"truncation\":{\"truncated\":true,\"truncatedBy\":\"matches\",\"maxMatches\":2}}",
-    );
-    defer grep_details.deinit();
-
-    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "Limited: 2 matches • Truncated: some lines",
-        metadataForDetails(&metadata_buffer, "grep", grep_details.value),
-    );
-
-    const raw = try allocator.dupe(u8, "a.zig:1: foo\n[grep truncated]");
-    const text = try normalizeResultOutput(allocator, "grep", grep_details.value, raw);
-    defer allocator.free(text);
-    try std.testing.expectEqualStrings("a.zig:1: foo", text);
-}
-
-test "listing metadata moves limits out of the body" {
-    const allocator = std.testing.allocator;
-    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
-
-    var entries_details = try testArgs(
-        allocator,
-        "{\"truncation\":{\"truncated\":true,\"truncatedBy\":\"entries\",\"maxEntries\":20}}",
-    );
-    defer entries_details.deinit();
-    try std.testing.expectEqualStrings(
-        "Limited: 20 entries",
-        metadataForDetails(&metadata_buffer, "ls", entries_details.value),
-    );
-    try std.testing.expectEqualStrings(
-        "Limited: 20 results",
-        metadataForDetails(&metadata_buffer, "find", entries_details.value),
-    );
-
-    const raw_ls = try allocator.dupe(u8, "a.txt\nb.txt\n[listing truncated]");
-    const ls_text = try normalizeResultOutput(allocator, "ls", entries_details.value, raw_ls);
-    defer allocator.free(ls_text);
-    try std.testing.expectEqualStrings("a.txt\nb.txt", ls_text);
-
-    const raw_find = try allocator.dupe(u8, "a.txt\nb.txt\n[find truncated]");
-    const find_text = try normalizeResultOutput(allocator, "find", entries_details.value, raw_find);
-    defer allocator.free(find_text);
-    try std.testing.expectEqualStrings("a.txt\nb.txt", find_text);
-
-    var bytes_details = try testArgs(
-        allocator,
-        "{\"truncation\":{\"truncated\":true,\"truncatedBy\":\"bytes\",\"maxOutputBytes\":51200}}",
-    );
-    defer bytes_details.deinit();
-    try std.testing.expectEqualStrings(
-        "Truncated: 50KB output limit",
-        metadataForDetails(&metadata_buffer, "find", bytes_details.value),
-    );
-}
-
-test "tool metadata formats grep byte and file-size truncation warnings" {
-    const allocator = std.testing.allocator;
-    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
-
-    var bytes_details = try testArgs(
-        allocator,
-        "{\"truncation\":{\"truncated\":true,\"truncatedBy\":\"bytes\",\"maxOutputBytes\":51200}}",
-    );
-    defer bytes_details.deinit();
-    try std.testing.expectEqualStrings(
-        "Truncated: 50KB output limit",
-        metadataForDetails(&metadata_buffer, "grep", bytes_details.value),
-    );
-
-    var file_details = try testArgs(
-        allocator,
-        "{\"truncation\":{\"truncated\":true,\"truncatedBy\":\"file_size\",\"maxFileBytes\":262144}}",
-    );
-    defer file_details.deinit();
-    try std.testing.expectEqualStrings(
-        "Truncated: 256KB file size limit",
-        metadataForDetails(&metadata_buffer, "grep", file_details.value),
-    );
 }
 
 test "bash display strips core truncation footer and reports metadata" {
@@ -1029,7 +783,6 @@ test "formatCompactCallTitle mirrors pi-mono read resource headers" {
 test "only process tools show duration footer" {
     try std.testing.expect(showsDuration("bash"));
     try std.testing.expect(!showsDuration("read"));
-    try std.testing.expect(!showsDuration("grep"));
 }
 
 test "formatCallTitle shows ellipsis while args stream and sanitizes newlines" {

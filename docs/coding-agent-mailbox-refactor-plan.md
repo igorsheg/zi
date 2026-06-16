@@ -179,7 +179,7 @@ After migration, these should be private or used only by `SessionRuntime`/tests 
 
 - [ ] Record current `zig build test`, `zig build`, `zig fmt --check src`.
 - [ ] Record current `./autoresearch.sh` metrics.
-- [ ] Add grep gates to the plan or checks for forbidden direct frontend paths.
+- [ ] Add text-search gates to the plan or checks for forbidden direct frontend paths.
 - [ ] Confirm no unrelated TUI cleanup is bundled.
 
 Done when: baseline is known and no code behavior changes were made.

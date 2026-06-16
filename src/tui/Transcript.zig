@@ -30,14 +30,14 @@ revision: u64 = 0,
 
 pub const Role = enum { user, assistant, system, thinking };
 pub const StatusLevel = enum { info, warning, err };
-pub const ToolPresentation = enum { generic, command, file, patch, search, directory };
+pub const ToolPresentation = enum { generic, command, file, patch };
 pub const ToolStatus = enum { pending, success, err };
 pub const ToolBodyMode = enum { visible, hidden_on_success };
 pub const ToolCollapseMode = enum { head, tail };
 
 /// Collapsed-view window over a tool's output, measured in visual rows.
-/// Bash keeps the tail (errors live at the end); listing/search tools keep
-/// the head. Expansion (ctrl+o) shows the full retained preview.
+/// Bash keeps the tail (errors live at the end); file/patch tools keep the
+/// head. Expansion (ctrl+o) shows the full retained preview.
 pub const ToolCollapse = struct {
     mode: ToolCollapseMode = .tail,
     rows_max: u8 = 5,
@@ -731,14 +731,14 @@ test "tool end reuses the start item and never downgrades a terminal status" {
     var transcript: Transcript = .{};
     defer transcript.deinit(gpa);
 
-    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "call-1", .name = "bash", .title = "$ ls" } });
+    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "call-1", .name = "bash", .title = "$ pwd" } });
     _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "call-1", .name = "bash", .status = .success } });
     _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "call-1", .name = "bash", .status = .pending } });
 
     try std.testing.expectEqual(@as(usize, 1), transcript.items.items.len);
     const tool = transcript.items.items[0].body.tool;
     try std.testing.expectEqual(ToolStatus.success, tool.status);
-    try std.testing.expectEqualStrings("$ ls", tool.title); // empty update keeps the old title
+    try std.testing.expectEqualStrings("$ pwd", tool.title); // empty update keeps the old title
 }
 
 test "reused terminal tool id starts a new item and updates newest" {
@@ -748,27 +748,27 @@ test "reused terminal tool id starts a new item and updates newest" {
 
     _ = try transcript.append(gpa, .{ .tool = .{
         .tool_call_id = "tool-1",
-        .name = "ls",
-        .title = "ls src/agent (limit 100)",
+        .name = "custom",
+        .title = "custom src/agent",
     } });
     _ = try transcript.replaceToolOutput(gpa, "tool-1", "Agent.zig\nroot.zig");
-    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "tool-1", .name = "ls", .status = .success } });
+    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "tool-1", .name = "custom", .status = .success } });
 
     _ = try transcript.append(gpa, .{ .tool = .{
         .tool_call_id = "tool-1",
-        .name = "ls",
-        .title = "ls src/frontends (limit 100)",
+        .name = "custom",
+        .title = "custom src/frontends",
     } });
     _ = try transcript.replaceToolOutput(gpa, "tool-1", "print/\nrpc/\ntui/");
-    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "tool-1", .name = "ls", .status = .success } });
+    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "tool-1", .name = "custom", .status = .success } });
 
     try std.testing.expectEqual(@as(usize, 2), transcript.items.items.len);
     const first = transcript.items.items[0].body.tool;
     const second = transcript.items.items[1].body.tool;
-    try std.testing.expectEqualStrings("ls src/agent (limit 100)", first.title);
+    try std.testing.expectEqualStrings("custom src/agent", first.title);
     try std.testing.expectEqualStrings("Agent.zig\nroot.zig", first.output.items);
     try std.testing.expectEqual(ToolStatus.success, first.status);
-    try std.testing.expectEqualStrings("ls src/frontends (limit 100)", second.title);
+    try std.testing.expectEqualStrings("custom src/frontends", second.title);
     try std.testing.expectEqualStrings("print/\nrpc/\ntui/", second.output.items);
     try std.testing.expectEqual(ToolStatus.success, second.status);
 }

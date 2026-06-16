@@ -1197,8 +1197,8 @@ test "agent session initializes policy spine with definition-first builtin tools
 
     try std.testing.expectEqual(tool_registry.default_active_tool_names.len, session.agent.state.tools.len);
     try std.testing.expectEqualStrings("read", session.agent.state.tools[0].name);
-    try std.testing.expectEqualStrings("bash", session.agent.state.tools[4].name);
-    try std.testing.expectEqual(agent_mod.ToolExecutionMode.sequential, session.agent.state.tools[4].execution_mode.?);
+    try std.testing.expectEqualStrings("bash", session.agent.state.tools[1].name);
+    try std.testing.expectEqual(agent_mod.ToolExecutionMode.sequential, session.agent.state.tools[1].execution_mode.?);
     try std.testing.expect(std.mem.indexOf(u8, session.system_prompt_text, "global") != null);
 }
 

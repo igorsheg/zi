@@ -193,7 +193,7 @@ agent event
 
 - tools are definition-first: metadata + JSON schema + prompt text + impl. the
   core agent receives borrowed `agent.AgentTool` views only.
-- builtin set: read, ls, grep, find, bash, edit, write. heterogeneous adapters
+- builtin set: read, bash, edit, write. heterogeneous adapters
   belong at the registry boundary; the active set is bounded.
 - file mutation has one path (`FileMutationQueue`). tool output is bounded by
   `tool_output_policy`. process tools need timeout and cancel before shipping new

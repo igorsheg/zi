@@ -103,66 +103,6 @@ Deferred unless proven needed:
   owner; local atomic mutation through `FileMutationQueue` is the only shipped
   mutation path.
 
-## LS
-
-Accepted when:
-
-- Path is optional and defaults to `.`.
-- Limit is optional and capped by config.
-- Output is sorted deterministically.
-- Empty directory emits a clear message.
-- Directory/symlink suffixes are stable and tested.
-- Entry vs byte truncation reasons are accurate.
-- Sentinel notices never exceed configured output caps.
-- Paths use shared existing-path resolution.
-
-## Find
-
-Accepted when:
-
-- Path is optional and defaults to `.`.
-- Limit is optional and capped by config.
-- Traversal has explicit visited/result caps.
-- Output is deterministic for non-truncated result sets.
-- `.git` and `node_modules` are ignored/pruned by explicit coding-agent policy.
-- No-match output is explicit.
-- Entry/files/bytes truncation reasons are accurate.
-- Existing substring/name semantics are documented unless glob parity is implemented.
-
-Deferred unless needed:
-
-- full `.gitignore` parsing — deferred because Zi has explicit bounded ignore
-  policy for high-noise directories (`.git`, `node_modules`) and no dependency
-  on project-specific ignore parsing yet.
-- external `fd` dependency — deferred to keep the builtin deterministic and
-  dependency-light; current traversal has explicit visited/result caps.
-- full glob semantics — deferred because simple bounded `*`/`?` compatibility
-  covers current pi-style calls without importing a glob engine.
-
-## Grep
-
-Accepted when:
-
-- Path is optional and defaults to `.`.
-- Limit is optional and capped by config.
-- Traversal/file collection is explicitly bounded.
-- Search order is deterministic for non-truncated result sets.
-- `.git` and `node_modules` are ignored/pruned.
-- Literal search works; ASCII `ignoreCase` works if exposed.
-- No-match output is explicit.
-- Long matching lines are UTF-8-safe truncated and counted.
-- Invalid UTF-8 file content cannot produce invalid tool result text.
-- Files/matches/bytes/file-size truncation reasons are accurate.
-
-Deferred unless needed:
-
-- regex mode — deferred intentionally: Zi grep is literal-only and now reports
-  `literal=false` as an unsupported mode instead of silently changing semantics.
-  Adding regex needs a concrete regex engine/dependency decision.
-- ripgrep/.gitignore parity — deferred because current search is in-process,
-  bounded, deterministic, and ignores known high-noise directories without
-  introducing an external process/dependency seam.
-
 ## TUI/tool UX
 
 Accepted when:

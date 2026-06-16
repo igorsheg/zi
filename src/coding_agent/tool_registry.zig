@@ -3,13 +3,10 @@ const agent = @import("../agent/root.zig");
 const bash_tool = @import("tools/bash.zig");
 const edit_tool = @import("tools/edit.zig");
 const file_mutation_queue = @import("tools/file_mutation_queue.zig");
-const find_tool = @import("tools/find.zig");
-const grep_tool = @import("tools/grep.zig");
-const ls_tool = @import("tools/ls.zig");
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
 
-pub const default_active_tool_names: []const []const u8 = &.{ "read", "ls", "grep", "find", "bash", "edit", "write" };
+pub const default_active_tool_names: []const []const u8 = &.{ "read", "bash", "edit", "write" };
 const max_tools = default_active_tool_names.len;
 
 /// Bounded set of executable tools plus the per-tool system prompt snippet.
@@ -50,18 +47,12 @@ pub const ToolRegistry = struct {
 pub const BuiltinTools = struct {
     allocator: std.mem.Allocator,
     read: ReadTool,
-    ls: LsTool,
-    grep: GrepTool,
-    find: FindTool,
     bash: BashTool,
     edit: EditTool,
     write: WriteTool,
     mutation_queue: file_mutation_queue.FileMutationQueue = .{},
 
     const ReadTool = read_tool.ReadTool;
-    const LsTool = ls_tool.LsTool;
-    const GrepTool = grep_tool.GrepTool;
-    const FindTool = find_tool.FindTool;
     const BashTool = bash_tool.BashTool;
     const EditTool = edit_tool.EditTool;
     const WriteTool = write_tool.WriteTool;
@@ -77,17 +68,11 @@ pub const BuiltinTools = struct {
         self.allocator = allocator;
         self.mutation_queue = .{};
         var read_init = false;
-        var ls_init = false;
-        var grep_init = false;
-        var find_init = false;
         var bash_init = false;
         var edit_init = false;
         errdefer {
             if (edit_init) self.edit.deinit();
             if (bash_init) self.bash.deinit();
-            if (find_init) self.find.deinit();
-            if (grep_init) self.grep.deinit();
-            if (ls_init) self.ls.deinit();
             if (read_init) self.read.deinit();
             allocator.destroy(self);
         }
@@ -101,24 +86,6 @@ pub const BuiltinTools = struct {
             .allow_paths_outside_cwd = outside,
         });
         read_init = true;
-        self.ls = try LsTool.init(allocator, .{
-            .cwd = cwd,
-            .home_dir = home_dir,
-            .allow_paths_outside_cwd = outside,
-        });
-        ls_init = true;
-        self.grep = try GrepTool.init(allocator, .{
-            .cwd = cwd,
-            .home_dir = home_dir,
-            .allow_paths_outside_cwd = outside,
-        });
-        grep_init = true;
-        self.find = try FindTool.init(allocator, .{
-            .cwd = cwd,
-            .home_dir = home_dir,
-            .allow_paths_outside_cwd = outside,
-        });
-        find_init = true;
         self.bash = try BashTool.init(allocator, .{ .cwd = cwd, .environ = options.environ });
         bash_init = true;
         self.edit = try EditTool.init(allocator, .{
@@ -143,9 +110,6 @@ pub const BuiltinTools = struct {
         self.write.deinit();
         self.edit.deinit();
         self.bash.deinit();
-        self.find.deinit();
-        self.grep.deinit();
-        self.ls.deinit();
         self.read.deinit();
         self.* = undefined;
         allocator.destroy(self);
@@ -158,20 +122,8 @@ pub const BuiltinTools = struct {
             "Read file contents. Use offset/limit for large files; continue with offset when needed.",
         );
         try out.append(
-            self.ls.tool(),
-            "List one directory. Prefer this over bash ls for directory inspection.",
-        );
-        try out.append(
-            self.grep.tool(),
-            "Search files for literal text. Prefer this over bash grep for simple searches.",
-        );
-        try out.append(
-            self.find.tool(),
-            "Find paths under a directory. Prefer this over bash find for simple path discovery.",
-        );
-        try out.append(
             self.bash.tool(),
-            "Run one shell command in the session cwd. Prefer read/ls/grep/find/edit/write for file work.",
+            "Run one shell command in the session cwd. Prefer read/edit/write for direct file work.",
         );
         try out.append(
             self.edit.tool(),
@@ -200,7 +152,7 @@ test "tool registry exposes builtin tools names and snippets in order" {
     for (default_active_tool_names, registry.activeToolNames()) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
     }
-    try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[4].execution_mode.?);
-    try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[5].execution_mode.?);
+    try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[1].execution_mode.?);
+    try std.testing.expectEqual(agent.ToolExecutionMode.sequential, registry.activeAgentTools()[2].execution_mode.?);
     try std.testing.expect(registry.activePromptSnippets()[0] != null);
 }
