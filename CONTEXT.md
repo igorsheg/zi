@@ -227,6 +227,8 @@ operation -> backend runs concurrently under an owner
           -> cancel wakes the backend; shutdown drains, joins, then deinits
 ```
 
+I/O primitive completions belong to the owner that created or armed the primitive; handoff means the receiving owner creates or arms its own primitive, not that a handle transfer moves completions.
+
 note what is deliberately *not* built: there is no central `Operation` table,
 `Completion` struct, `CompletionQueue`, or global `ShutdownState`. zio's typed
 `select` plus per-owner bounded queues already provide the property; a registry

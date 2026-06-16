@@ -92,7 +92,13 @@ pub const Layout = struct {
     width: u16 = 0,
     expanded: bool = false,
     version: u32 = 0, // 0 never matches a live item version
+    markdown_width: u16 = 0,
+    markdown_stable_end: usize = 0,
+    markdown_stable_rows: u32 = 0,
+    markdown_fence: MarkdownFence = .none,
 };
+
+pub const MarkdownFence = enum { none, backtick, tilde };
 
 pub const Item = struct {
     version: u32 = 1,

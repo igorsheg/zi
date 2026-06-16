@@ -33,6 +33,7 @@ const item_margin_bottom: usize = 1;
 const hint_bytes_max: usize = 96;
 const notice_bytes_max: usize = 96;
 const title_bytes_max: usize = 160;
+const footer_bytes_max: usize = 256;
 
 /// Bytes of formatted (non-borrowed) text one frame can pin for vaxis cells:
 /// tool titles, collapse hints, and omission notices. Static literals and
@@ -154,15 +155,121 @@ fn itemRows(item: *Transcript.Item, width: u16, theme: *const theme_mod.Theme, e
     {
         return item.layout.rows;
     }
-    var count: usize = 0;
-    buildItemRows(null, &count, item, width, theme, expanded);
-    item.layout = .{
-        .rows = @intCast(count),
-        .width = width,
-        .expanded = expanded,
-        .version = item.version,
+    const count = if (item.body == .message and item.body.message.role == .assistant)
+        cachedAssistantMarkdownRows(item, width, theme)
+    else blk: {
+        var rows: usize = 0;
+        buildItemRows(null, &rows, item, width, theme, expanded);
+        break :blk rows;
     };
+    item.layout.rows = @intCast(count);
+    item.layout.width = width;
+    item.layout.expanded = expanded;
+    item.layout.version = item.version;
     return count;
+}
+
+fn cachedAssistantMarkdownRows(item: *Transcript.Item, width: u16, theme: *const theme_mod.Theme) usize {
+    std.debug.assert(item.body == .message);
+    std.debug.assert(item.body.message.role == .assistant);
+    const text = item.body.message.text.items;
+    const stable_end = markdownStableEnd(text);
+    if (item.layout.markdown_width != width or item.layout.markdown_stable_end > stable_end) {
+        item.layout.markdown_width = width;
+        item.layout.markdown_stable_end = 0;
+        item.layout.markdown_stable_rows = 0;
+        item.layout.markdown_fence = .none;
+    }
+
+    const inner = innerWidth(width);
+    var rows: usize = item.layout.markdown_stable_rows;
+    var state = markdownStateFromCache(item.layout.markdown_fence);
+    var start = item.layout.markdown_stable_end;
+    while (start < stable_end and rows < item_rows_max) {
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse stable_end;
+        addMarkdownLineRows(null, &rows, &state, text[start..end], inner, theme);
+        start = if (end < stable_end) end + 1 else end;
+    }
+    item.layout.markdown_stable_end = stable_end;
+    item.layout.markdown_stable_rows = @intCast(@min(rows, item_rows_max));
+    item.layout.markdown_fence = cacheFenceFromState(state);
+
+    if (rows >= item_rows_max) return item_rows_max;
+    var tail_count: usize = 0;
+    buildAssistantMarkdownTailRows(null, &tail_count, item, width, theme);
+    return @min(rows + tail_count, item_rows_max);
+}
+
+fn buildAssistantMarkdownTailRows(
+    out: ?*RowScratch,
+    count: *usize,
+    item: *const Transcript.Item,
+    width: u16,
+    theme: *const theme_mod.Theme,
+) void {
+    std.debug.assert(item.body == .message);
+    std.debug.assert(item.body.message.role == .assistant);
+    if (out) |scratch| scratch.reset();
+    const text = item.body.message.text.items;
+    const stable_end = @min(item.layout.markdown_stable_end, text.len);
+    var state = markdownStateFromCache(item.layout.markdown_fence);
+    const inner = innerWidth(width);
+    if (stable_end < text.len) {
+        var tail_lines: PhysicalLineIterator = .{ .text = text[stable_end..] };
+        while (tail_lines.next()) |line| {
+            addMarkdownLineRows(out, count, &state, line, inner, theme);
+            if (count.* >= item_rows_max) return;
+        }
+    } else if (text.len == 0 or text[text.len - 1] == '\n') {
+        addMarkdownLineRows(out, count, &state, "", inner, theme);
+    }
+    var margin: usize = 0;
+    while (margin < item_margin_bottom and count.* < item_rows_max) : (margin += 1) putRow(out, count, .{});
+}
+
+fn addMarkdownLineRows(
+    out: ?*RowScratch,
+    rows: *usize,
+    state: *markdown.State,
+    line: []const u8,
+    inner: u16,
+    theme: *const theme_mod.Theme,
+) void {
+    const projected = markdown.classifyLine(state, line, theme);
+    emitWrappedText(out, rows, .{
+        .prefix = projected.prefix,
+        .text = projected.text,
+        .repeat_prefix = projected.repeat_prefix,
+        .prefix_style = projected.prefix_style,
+        .text_style = projected.text_style,
+        .row_style = projected.row_style,
+        .inner_width = inner,
+    });
+}
+
+fn markdownStableEnd(text: []const u8) usize {
+    var index = text.len;
+    while (index > 0) {
+        index -= 1;
+        if (text[index] == '\n') return index + 1;
+    }
+    return 0;
+}
+
+fn markdownStateFromCache(fence: Transcript.MarkdownFence) markdown.State {
+    return .{ .fence = switch (fence) {
+        .none => .none,
+        .backtick => .backtick,
+        .tilde => .tilde,
+    } };
+}
+
+fn cacheFenceFromState(state: markdown.State) Transcript.MarkdownFence {
+    return switch (state.fence) {
+        .none => .none,
+        .backtick => .backtick,
+        .tilde => .tilde,
+    };
 }
 
 pub fn statusRows(app: *App) usize {
@@ -227,9 +334,13 @@ fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_ro
             skip_remaining -= rows;
             continue;
         }
-        sink.skip_remaining = skip_remaining;
+        const skip_from_bottom = skip_remaining;
         skip_remaining = 0;
+        const draw_end = rows - skip_from_bottom;
+        const draw_start = draw_end - @min(draw_end, sink.draw_remaining);
+        if (tryDrawAssistantTailWindow(app, scratch, item, draw_start, draw_end, &sink)) continue;
 
+        sink.skip_remaining = skip_from_bottom;
         var count: usize = 0;
         buildItemRowsFrame(scratch, &count, item, app.width, &app.theme, app.tools_expanded);
         std.debug.assert(count == rows); // memo and fresh build must agree
@@ -240,6 +351,31 @@ fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_ro
             sink.emit(scratch.rows[k]);
         }
     }
+}
+
+fn tryDrawAssistantTailWindow(
+    app: *App,
+    scratch: *RowScratch,
+    item: *const Transcript.Item,
+    draw_start: usize,
+    draw_end: usize,
+    sink: *RowSink,
+) bool {
+    if (item.body != .message or item.body.message.role != .assistant) return false;
+    const stable_rows: usize = item.layout.markdown_stable_rows;
+    if (stable_rows == 0 or draw_start < stable_rows) return false;
+
+    var tail_count: usize = 0;
+    buildAssistantMarkdownTailRows(scratch, &tail_count, item, app.width, &app.theme);
+    if (draw_end - stable_rows > tail_count) return false;
+
+    const tail_start = draw_start - stable_rows;
+    var tail_index = draw_end - stable_rows;
+    while (tail_index > tail_start and sink.draw_remaining > 0) {
+        tail_index -= 1;
+        sink.emit(scratch.rows[tail_index]);
+    }
+    return true;
 }
 
 const RowSink = struct {
@@ -416,6 +552,7 @@ fn buildMarkdownRows(
     var emitted_any = false;
     var lines: PhysicalLineIterator = .{ .text = text };
     while (lines.next()) |line| {
+        if (count.* >= item_rows_max) return;
         const projected = markdown.classifyLine(&state, line, theme);
         emitWrappedText(out, count, .{
             .prefix = projected.prefix,
@@ -474,7 +611,7 @@ fn buildToolRows(
 
     var notice_buffer: [notice_bytes_max]u8 = undefined;
     const notice = omissionNotice(tool, &notice_buffer);
-    const has_body_chrome = notice != null or toolBodyVisible(tool, expanded) or tool.footer.len > 0;
+    const has_body_chrome = notice != null or toolBodyVisible(tool, expanded);
     if (has_body_chrome) putRow(out, count, .{ .text = glyphs.tool_top_line, .text_style = rail, .row_style = rail });
 
     if (notice) |text| {
@@ -493,20 +630,19 @@ fn buildToolRows(
         buildToolBodyRows(out, count, tool, inner, rail, theme, expanded);
     }
 
-    if (tool.footer.len > 0) {
-        emitWrappedText(out, count, .{
-            .prefix = glyphs.tool_body_prefix,
-            .text = tool.footer,
-            .repeat_prefix = true,
-            .prefix_style = rail,
-            .text_style = theme.transcript_secondary,
-            .row_style = theme.transcript_secondary,
-            .inner_width = inner,
-        });
-    }
-
     if (has_body_chrome) {
         putRow(out, count, .{ .text = glyphs.tool_bottom_line, .text_style = rail, .row_style = rail });
+    }
+
+    if (tool.footer.len > 0) {
+        var footer_buffer: [footer_bytes_max]u8 = undefined;
+        const footer_available = width -| padding_x;
+        const footer = internText(out, fitToWidth(toolFooter(tool, &footer_buffer), footer_available));
+        putRow(out, count, .{
+            .text = footer,
+            .text_style = theme.transcript_secondary,
+            .row_style = theme.transcript_secondary,
+        });
     }
 }
 
@@ -600,6 +736,7 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
     var visual_index: usize = 0;
     var window_index: usize = 0;
     while (start < options.text.len) : (visual_index += 1) {
+        if (count.* >= item_rows_max) return;
         const width = if (visual_index == 0) options.inner_width - prefix_width else options.inner_width;
         var row: Row = .{
             .prefix = options.prefix,
@@ -623,7 +760,7 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
         emitWindowed(out, count, &window_index, options.window, row);
         start = visual.next;
     }
-    if (options.text.len == 0) {
+    if (options.text.len == 0 and count.* < item_rows_max) {
         emitWindowed(out, count, &window_index, options.window, .{
             .prefix = options.prefix,
             .show_prefix = true,
@@ -810,6 +947,15 @@ fn collapseHint(buffer: []u8, mode: Transcript.ToolCollapseMode, hidden_rows: us
         .head => std.fmt.bufPrint(buffer, "... ({d} more lines, ctrl+o to expand)", .{hidden_rows}),
     };
     return result catch "... (ctrl+o to expand)";
+}
+
+fn toolFooter(tool: *const Transcript.Tool, buffer: *[footer_bytes_max]u8) []const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    writer.writeByte('[') catch return "";
+    const max_body = buffer.len -| 2;
+    writer.writeAll(text_mod.utf8Prefix(tool.footer, max_body)) catch return "";
+    writer.writeByte(']') catch return "";
+    return writer.buffered();
 }
 
 fn omissionNotice(tool: *const Transcript.Tool, buffer: *[notice_bytes_max]u8) ?[]const u8 {
@@ -1277,6 +1423,51 @@ test "tool warning body lines use warning style" {
     try std.testing.expectEqual(app.theme.status_warning, scratch.rows[3].text_style);
 }
 
+test "tool metadata footer renders outside the body rail" {
+    var app = App.init(80, 24, .{});
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .title = "$ sleep 1",
+    } });
+    _ = try app.transcript.replaceToolFooter(testing_gpa, "call-1", "Elapsed 1.0s");
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    var count: usize = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualStrings("$ sleep 1", scratch.rows[0].text);
+    try std.testing.expectEqualStrings("[Elapsed 1.0s]", scratch.rows[1].text);
+    try std.testing.expectEqualStrings("", scratch.rows[2].text);
+}
+
+test "tool metadata footer follows the body rail" {
+    var app = App.init(80, 24, .{});
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .title = "$ echo hi",
+    } });
+    _ = try app.transcript.replaceToolOutput(testing_gpa, "call-1", "hi");
+    _ = try app.transcript.replaceToolFooter(testing_gpa, "call-1", "Took 0.1s");
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    var count: usize = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+
+    try std.testing.expectEqualStrings(glyphs.tool_top_line, scratch.rows[1].text);
+    try std.testing.expectEqualStrings("hi", scratch.rows[2].text);
+    try std.testing.expectEqualStrings(glyphs.tool_bottom_line, scratch.rows[3].text);
+    try std.testing.expectEqualStrings("[Took 0.1s]", scratch.rows[4].text);
+}
+
 test "successful read hides body until expanded" {
     var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
@@ -1661,6 +1852,45 @@ fn expectScreenText(window: vaxis.Window, x: u16, y: u16, expected: []const u8) 
     }
 }
 
+test "assistant markdown row cache advances only at newline boundaries" {
+    var app = App.init(40, 12, .{});
+    defer app.deinit(testing_gpa);
+
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "one\n",
+    } } });
+    const item = &app.transcript.items.items[0];
+    try std.testing.expectEqual(@as(usize, 3), itemRows(item, app.width, &app.theme, app.tools_expanded));
+    try std.testing.expectEqual(@as(usize, 4), item.layout.markdown_stable_end);
+    try std.testing.expectEqual(@as(u32, 1), item.layout.markdown_stable_rows);
+
+    var tail_count: usize = 0;
+    buildAssistantMarkdownTailRows(null, &tail_count, item, app.width, &app.theme);
+    try std.testing.expectEqual(@as(usize, 2), tail_count);
+
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "two",
+        .mode = .extend_previous_assistant_message,
+    } } });
+    try std.testing.expectEqual(@as(usize, 3), itemRows(item, app.width, &app.theme, app.tools_expanded));
+    try std.testing.expectEqual(@as(usize, 4), item.layout.markdown_stable_end);
+    try std.testing.expectEqual(@as(u32, 1), item.layout.markdown_stable_rows);
+
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "\n",
+        .mode = .extend_previous_assistant_message,
+    } } });
+    try std.testing.expectEqual(@as(usize, 4), itemRows(item, app.width, &app.theme, app.tools_expanded));
+    try std.testing.expectEqual(@as(usize, 8), item.layout.markdown_stable_end);
+    try std.testing.expectEqual(@as(u32, 2), item.layout.markdown_stable_rows);
+    tail_count = 0;
+    buildAssistantMarkdownTailRows(null, &tail_count, item, app.width, &app.theme);
+    try std.testing.expectEqual(@as(usize, 2), tail_count);
+}
+
 test "frame scratch keeps generated tool titles stable" {
     var env = try std.testing.environ.createMap(testing_gpa);
     defer env.deinit();
@@ -1686,7 +1916,10 @@ test "frame scratch keeps generated tool titles stable" {
     } } });
     _ = try app.apply(testing_gpa, .{ .replace_tool_output = .{
         .tool_call_id = "call-ls",
-        .text = ".claude/\n.forks/\n.git/\n.github/\n.gitignore\n.pi/\n.references/\n.tmp/\n.zi/\n.zig-cache/\n.ziglint.zon\nAGENTS.md\nautoresearch.checks.sh\nautoresearch.ideas.md\nautoresearch.md\nautoresearch.sh\nbuild.zig\nbuild.zig.zon\nCONTEXT.md\ndocs/\n",
+        .text = ".claude/\n.forks/\n.git/\n.github/\n.gitignore\n.pi/\n.references/\n.tmp/\n" ++
+            ".zi/\n.zig-cache/\n.ziglint.zon\nAGENTS.md\nautoresearch.checks.sh\n" ++
+            "autoresearch.ideas.md\nautoresearch.md\nautoresearch.sh\nbuild.zig\n" ++
+            "build.zig.zon\nCONTEXT.md\ndocs/\n",
     } });
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .tool = .{
         .tool_call_id = "call-ls",
