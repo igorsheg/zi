@@ -431,32 +431,51 @@ fn readMetadata(buffer: []u8, object: std.json.ObjectMap) ?[]const u8 {
     const truncation = jsonObject(object, "truncation") orelse return null;
     const next_offset = jsonInt(object, "nextOffset");
     const first_line_exceeds = jsonBool(truncation, "firstLineExceedsLimit") orelse false;
+    const truncated = jsonBool(truncation, "truncated") orelse false;
+    const remaining = jsonInt(truncation, "remainingLines") orelse 0;
     var writer = std.Io.Writer.fixed(buffer);
-    if (first_line_exceeds) {
-        const max_bytes = jsonInt(truncation, "maxBytes") orelse 0;
-        writer.writeAll("Truncated: first line exceeds ") catch return null;
-        writeByteSize(&writer, max_bytes) catch return null;
-        writer.writeAll(" limit") catch return null;
-    } else if (jsonBool(truncation, "truncated") orelse false) {
-        const by = jsonString(truncation, "truncatedBy") orelse "";
-        const output_lines = jsonInt(truncation, "outputLines") orelse 0;
-        writer.writeAll("Truncated: ") catch return null;
-        if (std.mem.eql(u8, by, "lines")) {
-            const total_lines = jsonInt(truncation, "totalLines") orelse 0;
-            writer.print("showing {d} of {d} lines", .{ output_lines, total_lines }) catch return null;
-        } else {
-            const max_bytes = jsonInt(truncation, "maxBytes") orelse 0;
-            writer.print("{d} lines shown (", .{output_lines}) catch return null;
-            writeByteSize(&writer, max_bytes) catch return null;
-            writer.writeAll(" limit)") catch return null;
-        }
-    } else {
-        const remaining = jsonInt(truncation, "remainingLines") orelse return null;
-        if (remaining <= 0) return null;
+    var wrote_chip = false;
+
+    if ((jsonBool(truncation, "userLimit") orelse false) and remaining > 0) {
         writer.print("Limited: {d} more lines in file", .{remaining}) catch return null;
+        if (next_offset) |offset| writer.print("; use offset={d} to continue", .{offset}) catch return null;
+        wrote_chip = true;
     }
-    if (next_offset) |offset| writer.print("; use offset={d} to continue", .{offset}) catch return null;
-    return writer.buffered();
+
+    if (first_line_exceeds or truncated) {
+        if (wrote_chip) writer.writeAll(" • ") catch return null;
+        if (first_line_exceeds) {
+            const max_bytes = jsonInt(truncation, "maxBytes") orelse 0;
+            writer.writeAll("Truncated: first line exceeds ") catch return null;
+            writeByteSize(&writer, max_bytes) catch return null;
+            writer.writeAll(" limit") catch return null;
+        } else {
+            const by = jsonString(truncation, "truncatedBy") orelse "";
+            const output_lines = jsonInt(truncation, "outputLines") orelse 0;
+            writer.writeAll("Truncated: ") catch return null;
+            if (std.mem.eql(u8, by, "lines")) {
+                const total_lines = jsonInt(truncation, "totalLines") orelse 0;
+                writer.print("showing {d} of {d} lines", .{ output_lines, total_lines }) catch return null;
+            } else {
+                const max_bytes = jsonInt(truncation, "maxBytes") orelse 0;
+                writer.print("{d} lines shown (", .{output_lines}) catch return null;
+                writeByteSize(&writer, max_bytes) catch return null;
+                writer.writeAll(" limit)") catch return null;
+            }
+            if (!wrote_chip) {
+                if (next_offset) |offset| writer.print("; use offset={d} to continue", .{offset}) catch return null;
+            }
+        }
+        wrote_chip = true;
+    }
+
+    if (!wrote_chip and remaining > 0) {
+        writer.print("Limited: {d} more lines in file", .{remaining}) catch return null;
+        if (next_offset) |offset| writer.print("; use offset={d} to continue", .{offset}) catch return null;
+        wrote_chip = true;
+    }
+
+    return if (wrote_chip) writer.buffered() else null;
 }
 
 fn writeByteSize(writer: *std.Io.Writer, bytes: i64) !void {
@@ -795,6 +814,22 @@ test "read display labels safety clipping as truncation" {
     const text = try normalizeResultOutput(allocator, "read", details.value, raw);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("", text);
+}
+
+test "read metadata uses footer chip separators" {
+    const allocator = std.testing.allocator;
+    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
+    var details = try testArgs(
+        allocator,
+        "{\"nextOffset\":21,\"truncation\":{\"truncated\":true,\"userLimit\":true," ++
+            "\"remainingLines\":20,\"firstLineExceedsLimit\":true,\"maxBytes\":51200}}",
+    );
+    defer details.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Limited: 20 more lines in file; use offset=21 to continue • Truncated: first line exceeds 50KB limit",
+        metadataForDetails(&metadata_buffer, "read", details.value),
+    );
 }
 
 test "formatCompactCallTitle mirrors pi-mono read resource headers" {
