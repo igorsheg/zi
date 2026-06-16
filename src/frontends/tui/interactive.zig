@@ -336,7 +336,7 @@ const InteractiveController = struct {
         if (self.cancel_requested) return;
         if (try self.submitCommand(.{ .command = .{ .cancel = .{} } }) == .queued) {
             self.cancel_requested = true;
-            try self.appendStatus(.warning, "cancel requested");
+            try self.appendStatusWithTone(.info, "cancel requested", .canceled);
         }
     }
 
@@ -520,7 +520,9 @@ const InteractiveController = struct {
         switch (message) {
             .user => |user| if (userText(user)) |text| try self.appendMessage(.user, text, .new_item),
             .assistant => |assistant| {
-                if (assistant.error_message) |message_text| try self.appendStatus(.err, message_text);
+                if (assistant.error_message) |message_text| {
+                    if (!self.cancel_requested) try self.appendStatus(.err, message_text);
+                }
                 if (!self.assistant_text_delta_seen) try self.appendAssistantFinalText(assistant);
                 self.assistant_text_delta_seen = false;
             },
@@ -724,7 +726,7 @@ const InteractiveController = struct {
         try self.clearStatus(status_id_working);
         switch (finished.reason) {
             .completed => {},
-            .canceled => try self.appendStatus(.warning, "canceled"),
+            .canceled => try self.appendStatusWithTone(.info, "canceled", .canceled),
             .failed => try self.appendStatus(.err, "operation failed"),
         }
     }
@@ -798,10 +800,34 @@ const InteractiveController = struct {
         level: tui.Transcript.StatusLevel,
         text: []const u8,
     ) !void {
-        if (text.len == 0) return;
-        _ = try self.terminal.applyCommand(.{
-            .append_transcript = .{ .status = .{ .level = level, .text = boundedChunk(text) } },
+        try self.appendStatusWithTone(level, text, switch (level) {
+            .info => .accent,
+            .warning => .warning,
+            .err => .err,
         });
+    }
+
+    fn appendStatusWithTone(
+        self: *InteractiveController,
+        level: tui.Transcript.StatusLevel,
+        text: []const u8,
+        tone: tui.status.Tone,
+    ) !void {
+        if (text.len == 0) return;
+        var buffer: [tui.status.text_bytes_max]u8 = undefined;
+        const display = switch (level) {
+            .info => text,
+            .warning => std.fmt.bufPrint(&buffer, "warning: {s}", .{text}) catch text,
+            .err => std.fmt.bufPrint(&buffer, "error: {s}", .{text}) catch text,
+        };
+        _ = try self.terminal.applyCommand(.{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_working,
+            .priority = 10,
+            .text = boundedChunk(display),
+            .effect = .shuffle,
+            .tone = tone,
+        } });
     }
 
     fn appendSessionInfo(

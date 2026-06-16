@@ -344,7 +344,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         .tick => |tick| {
             if (tick.now_ms != self.now_ms) {
                 self.now_ms = tick.now_ms;
-                if (self.status.hasAnimated(.status_line)) self.dirty = true;
+                if (self.status.hasAnimated(.status_line, self.now_ms)) self.dirty = true;
             }
             return null;
         },
@@ -451,7 +451,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             return null;
         },
         .set_status => |update| {
-            if (self.status.set(update) == .dropped_full) try self.notice(gpa, .warning, "status line full");
+            if (self.status.set(update, self.now_ms) == .dropped_full) try self.notice(gpa, .warning, "status line full");
             self.dirty = true;
             return null;
         },
@@ -940,7 +940,7 @@ fn notice(self: *App, gpa: std.mem.Allocator, level: Transcript.StatusLevel, tex
 }
 
 pub fn hasAnimation(self: *const App) bool {
-    return self.status.hasAnimated(.status_line);
+    return self.status.hasAnimated(.status_line, self.now_ms);
 }
 
 test "submit returns owned text and clears the composer" {
@@ -1362,6 +1362,20 @@ test "tick marks dirty only while something animates" {
     app.dirty = false;
     _ = try app.apply(gpa, .{ .tick = .{ .now_ms = 200 } });
     try std.testing.expect(app.dirty);
+
+    _ = try app.apply(gpa, .{ .clear_status = .{ .slot = .status_line, .id = 1 } });
+    _ = try app.apply(gpa, .{ .set_status = .{
+        .slot = .status_line,
+        .id = 1,
+        .text = "canceled",
+        .effect = .shuffle,
+    } });
+    app.dirty = false;
+    _ = try app.apply(gpa, .{ .tick = .{ .now_ms = 700 } });
+    try std.testing.expect(app.dirty);
+    app.dirty = false;
+    _ = try app.apply(gpa, .{ .tick = .{ .now_ms = 900 } });
+    try std.testing.expect(!app.dirty);
 }
 
 test "invalid streamed text degrades instead of erroring" {

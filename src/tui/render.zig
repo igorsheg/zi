@@ -17,6 +17,7 @@ const glyphs = @import("glyphs.zig");
 const input_mod = @import("input.zig");
 const markdown = @import("markdown.zig");
 const shimmer = @import("shimmer.zig");
+const shuffle_text = @import("shuffle_text.zig");
 const status_mod = @import("status.zig");
 const text_mod = @import("text.zig");
 const theme_mod = @import("theme.zig");
@@ -33,10 +34,10 @@ const hint_bytes_max: usize = 96;
 const notice_bytes_max: usize = 96;
 const title_bytes_max: usize = 160;
 
-/// Bytes of formatted (non-borrowed) text one item can pin for its rows:
-/// tool title, collapse hint, and omission notice. Static literals and
+/// Bytes of formatted (non-borrowed) text one frame can pin for vaxis cells:
+/// tool titles, collapse hints, and omission notices. Static literals and
 /// transcript text are borrowed and need no copy.
-pub const generated_text_bytes_max: usize = 512;
+pub const generated_text_bytes_max: usize = 16 * 1024;
 
 pub const RowSegment = struct {
     text: []const u8,
@@ -62,8 +63,13 @@ pub const RowScratch = struct {
     rows: [item_rows_max]Row = undefined,
     text: [generated_text_bytes_max]u8 = undefined,
     text_len: usize = 0,
-    segments: [32]RowSegment = undefined,
+    segments: [item_rows_max * 2]RowSegment = undefined,
     segment_len: usize = 0,
+
+    fn reset(self: *RowScratch) void {
+        self.text_len = 0;
+        self.segment_len = 0;
+    }
 };
 
 /// Copy formatted text into the scratch arena so the returned slice lives
@@ -93,6 +99,7 @@ fn internSegments(out: ?*RowScratch, segments: []const RowSegment) []const RowSe
 /// fallible half of the render transaction is the terminal write that
 /// follows in Terminal.renderIfDirty.
 pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
+    scratch.reset();
     var painter = Painter.init(vx);
     painter.clear();
     if (app.width == 0 or app.height == 0) return;
@@ -224,7 +231,7 @@ fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_ro
         skip_remaining = 0;
 
         var count: usize = 0;
-        buildItemRows(scratch, &count, item, app.width, &app.theme, app.tools_expanded);
+        buildItemRowsFrame(scratch, &count, item, app.width, &app.theme, app.tools_expanded);
         std.debug.assert(count == rows); // memo and fresh build must agree
         // Rows are built top-down; the sink consumes newest-first.
         var k = count;
@@ -265,10 +272,18 @@ fn buildItemRows(
     theme: *const theme_mod.Theme,
     expanded: bool,
 ) void {
-    if (out) |scratch| {
-        scratch.text_len = 0;
-        scratch.segment_len = 0;
-    }
+    if (out) |scratch| scratch.reset();
+    buildItemRowsFrame(out, count, item, width, theme, expanded);
+}
+
+fn buildItemRowsFrame(
+    out: ?*RowScratch,
+    count: *usize,
+    item: *const Transcript.Item,
+    width: u16,
+    theme: *const theme_mod.Theme,
+    expanded: bool,
+) void {
     const style = itemStyle(item, theme);
     const padding = itemPaddingY(item);
     var index: usize = 0;
@@ -840,10 +855,9 @@ fn drawGreeter(app: *App, painter: *Painter, y: u16) void {
 // --- status line ---
 
 fn statusShimmerConfig(theme: *const theme_mod.Theme) shimmer.Config {
-    _ = theme;
     return .{
-        .base_style = .{ .dim = true },
-        .peak_style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bold = true },
+        .base_style = theme.shimmer_base,
+        .peak_style = theme.shimmer_peak,
     };
 }
 
@@ -871,10 +885,19 @@ fn drawStatusLine(app: *App, painter: *Painter, y: u16) void {
         }
         switch (view.effect) {
             .none => {
-                painter.writeText(x, y, fitted, app.theme.transcript_secondary);
+                painter.writeText(x, y, fitted, statusToneStyle(view.tone, &app.theme));
                 x = advance(x, text_mod.displayWidth(fitted));
             },
             .shimmer => x = drawShimmerText(painter, x, y, fitted, app.now_ms, statusShimmerConfig(&app.theme)),
+            .shuffle => x = drawShuffleText(
+                painter,
+                x,
+                y,
+                fitted,
+                app.now_ms,
+                view.started_ms,
+                statusToneStyle(view.tone, &app.theme),
+            ),
         }
         rendered_any = true;
     }
@@ -928,6 +951,41 @@ fn drawShimmerText(
         index += grapheme.end;
     }
     painter.printSegments(segment_x, y, segments[0..segment_count]);
+    return cursor_x;
+}
+
+fn statusToneStyle(tone: status_mod.Tone, theme: *const theme_mod.Theme) theme_mod.Style {
+    return switch (tone) {
+        .secondary => theme.transcript_secondary,
+        .accent => theme.status_accent,
+        .canceled => theme.status_canceled,
+        .warning => theme.status_warning,
+        .err => theme.status_error,
+    };
+}
+
+fn drawShuffleText(
+    painter: *Painter,
+    x: u16,
+    y: u16,
+    text: []const u8,
+    now_ms: i64,
+    start_ms: i64,
+    style: theme_mod.Style,
+) u16 {
+    const config: shuffle_text.Config = .{};
+    const span_count = shuffle_text.countSpans(text);
+    var cursor_x = x;
+    var index: usize = 0;
+    var span_index: usize = 0;
+    while (shuffle_text.nextSpan(text, index)) |span| {
+        if (cursor_x >= painter.width) break;
+        const rendered = shuffle_text.renderedSpan(config, text, span, span_index, span_count, now_ms, start_ms);
+        painter.writeText(cursor_x, y, rendered, style);
+        cursor_x = advance(cursor_x, text_mod.displayWidth(rendered));
+        index = span.start + span.len;
+        span_index += 1;
+    }
     return cursor_x;
 }
 
@@ -1381,7 +1439,7 @@ test "scroll max accounts for composer and status reservations" {
     try std.testing.expectEqual(total - visible, transcriptScrollMax(&app));
 
     // A status contribution reserves one more row.
-    _ = app.status.set(.{ .slot = .status_line, .id = 1, .text = "working" });
+    _ = app.status.set(.{ .slot = .status_line, .id = 1, .text = "working" }, 0);
     try std.testing.expectEqual(visible - 1, transcriptVisibleRows(&app));
 }
 
@@ -1398,8 +1456,8 @@ test "composer top border draws cwd and session chrome without overlap" {
 
     var app = App.init(60, 8, .{});
     defer app.deinit(testing_gpa);
-    _ = app.status.set(.{ .slot = .composer_left, .id = 1, .text = "/repo" });
-    _ = app.status.set(.{ .slot = .composer_right, .id = 2, .text = "67.5%/272k • openai/gpt (high)" });
+    _ = app.status.set(.{ .slot = .composer_left, .id = 1, .text = "/repo" }, 0);
+    _ = app.status.set(.{ .slot = .composer_right, .id = 2, .text = "67.5%/272k • openai/gpt (high)" }, 0);
 
     const scratch = try testing_gpa.create(RowScratch);
     defer testing_gpa.destroy(scratch);
@@ -1537,7 +1595,7 @@ test "empty frame renders greeter above status and composer" {
         .title = "zi 1.2.3",
         .subtitle = "Type / for commands. Ask zi about zi if you get lost.",
     } });
-    _ = app.status.set(.{ .slot = .status_line, .id = 1, .text = "ready" });
+    _ = app.status.set(.{ .slot = .status_line, .id = 1, .text = "ready" }, 0);
 
     const scratch = try testing_gpa.create(RowScratch);
     defer testing_gpa.destroy(scratch);
@@ -1601,4 +1659,81 @@ fn expectScreenText(window: vaxis.Window, x: u16, y: u16, expected: []const u8) 
         try std.testing.expectEqualStrings(expected[index .. index + 1], cell.char.grapheme);
         col += 1;
     }
+}
+
+test "frame scratch keeps generated tool titles stable" {
+    var env = try std.testing.environ.createMap(testing_gpa);
+    defer env.deinit();
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var deinit_writer = std.Io.Writer.Discarding.init(&.{});
+    defer vx.deinit(testing_gpa, &deinit_writer.writer);
+    var writer = std.Io.Writer.Discarding.init(&.{});
+    try vx.resize(testing_gpa, &writer.writer, .{ .cols = 100, .rows = 60, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(100, 60, .{});
+    defer app.deinit(testing_gpa);
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .user,
+        .text = "Run a single ls tool call",
+    } } });
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .tool = .{
+        .tool_call_id = "call-ls",
+        .name = "ls",
+        .presentation = .directory,
+        .status = .pending,
+        .collapse = .{ .mode = .head, .rows_max = 20 },
+        .title = "ls (limit 50)",
+    } } });
+    _ = try app.apply(testing_gpa, .{ .replace_tool_output = .{
+        .tool_call_id = "call-ls",
+        .text = ".claude/\n.forks/\n.git/\n.github/\n.gitignore\n.pi/\n.references/\n.tmp/\n.zi/\n.zig-cache/\n.ziglint.zon\nAGENTS.md\nautoresearch.checks.sh\nautoresearch.ideas.md\nautoresearch.md\nautoresearch.sh\nbuild.zig\nbuild.zig.zon\nCONTEXT.md\ndocs/\n",
+    } });
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .tool = .{
+        .tool_call_id = "call-ls",
+        .name = "ls",
+        .presentation = .directory,
+        .status = .success,
+        .collapse = .{ .mode = .head, .rows_max = 20 },
+    } } });
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "Done.",
+    } } });
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .user,
+        .text = "run a single bash tool call",
+    } } });
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .tool = .{
+        .tool_call_id = "call-bash",
+        .name = "bash",
+        .presentation = .command,
+        .status = .pending,
+        .collapse = .{ .mode = .tail, .rows_max = 5 },
+        .title = "$ pwd (timeout 10s)",
+    } } });
+    _ = try app.apply(testing_gpa, .{ .replace_tool_output = .{
+        .tool_call_id = "call-bash",
+        .text = "/Users/igors/workspace/dev/personal/zi",
+    } });
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .tool = .{
+        .tool_call_id = "call-bash",
+        .name = "bash",
+        .presentation = .command,
+        .status = .success,
+        .collapse = .{ .mode = .tail, .rows_max = 5 },
+    } } });
+    _ = try app.apply(testing_gpa, .{ .replace_tool_footer = .{
+        .tool_call_id = "call-bash",
+        .text = "Took 0.0s",
+    } });
+    _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "Done.",
+    } } });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try std.testing.expect(screenContainsText(vx.window(), "$ pwd (timeout 10s)"));
 }

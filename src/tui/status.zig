@@ -4,13 +4,15 @@
 //! priority. Text is stored inline, so the store never allocates and `deinit`
 //! is unnecessary.
 const std = @import("std");
+const shuffle_text = @import("shuffle_text.zig");
 const text_mod = @import("text.zig");
 
 pub const entry_count_max: usize = 16;
 pub const text_bytes_max: usize = 160;
 
 pub const Slot = enum { composer_left, composer_right, status_line };
-pub const Effect = enum { none, shimmer };
+pub const Effect = enum { none, shimmer, shuffle };
+pub const Tone = enum { secondary, accent, canceled, warning, err };
 pub const ContributionId = u32;
 
 pub const Set = struct {
@@ -19,6 +21,7 @@ pub const Set = struct {
     priority: i16 = 0,
     text: []const u8,
     effect: Effect = .none,
+    tone: Tone = .secondary,
 };
 
 pub const Clear = struct {
@@ -30,6 +33,8 @@ pub const View = struct {
     priority: i16,
     text: []const u8,
     effect: Effect,
+    tone: Tone,
+    started_ms: i64,
 };
 
 pub const SetResult = enum { ok, dropped_full };
@@ -39,6 +44,8 @@ const Entry = struct {
     id: ContributionId,
     priority: i16,
     effect: Effect,
+    tone: Tone,
+    started_ms: i64,
     text_len: u8,
     text: [text_bytes_max]u8,
 };
@@ -49,25 +56,35 @@ pub const Store = struct {
 
     /// Set or replace a contribution. Text is sanitized (invalid UTF-8 and
     /// line breaks never reach render) and truncated to the inline capacity.
-    pub fn set(self: *Store, update: Set) SetResult {
+    pub fn set(self: *Store, update: Set, now_ms: i64) SetResult {
         std.debug.assert(update.id != 0); // 0 is reserved as "no id"; adapter owns ids
-        const index = self.find(update.slot, update.id) orelse blk: {
+        const found = self.find(update.slot, update.id);
+        const index = found orelse blk: {
             if (self.len == self.entries.len) return .dropped_full;
             self.len += 1;
             break :blk self.len - 1;
         };
         const entry = &self.entries[index];
+        var sanitized: [text_bytes_max]u8 = undefined;
+        const clean = text_mod.sanitizeInto(&sanitized, update.text);
+        var text: [text_bytes_max]u8 = undefined;
+        var len: usize = 0;
+        for (clean) |byte| {
+            text[len] = if (byte == '\n' or byte == '\r' or byte == '\t') ' ' else byte;
+            len += 1;
+        }
+        if (found == null or
+            entry.effect != update.effect or
+            !std.mem.eql(u8, entry.text[0..entry.text_len], text[0..len]))
+        {
+            entry.started_ms = now_ms;
+        }
         entry.slot = update.slot;
         entry.id = update.id;
         entry.priority = update.priority;
         entry.effect = update.effect;
-        var sanitized: [text_bytes_max]u8 = undefined;
-        const clean = text_mod.sanitizeInto(&sanitized, update.text);
-        var len: usize = 0;
-        for (clean) |byte| {
-            entry.text[len] = if (byte == '\n' or byte == '\r' or byte == '\t') ' ' else byte;
-            len += 1;
-        }
+        entry.tone = update.tone;
+        @memcpy(entry.text[0..len], text[0..len]);
         entry.text_len = @intCast(len);
         return .ok;
     }
@@ -99,6 +116,8 @@ pub const Store = struct {
                 .priority = entry.priority,
                 .text = entry.text[0..entry.text_len],
                 .effect = entry.effect,
+                .tone = entry.tone,
+                .started_ms = entry.started_ms,
             };
             n += 1;
         }
@@ -118,9 +137,14 @@ pub const Store = struct {
         return views[0];
     }
 
-    pub fn hasAnimated(self: *const Store, slot: Slot) bool {
+    pub fn hasAnimated(self: *const Store, slot: Slot, now_ms: i64) bool {
         for (self.entries[0..self.len]) |entry| {
-            if (entry.slot == slot and entry.effect == .shimmer) return true;
+            if (entry.slot != slot) continue;
+            switch (entry.effect) {
+                .none => {},
+                .shimmer => return true,
+                .shuffle => if (shuffle_text.isRunning(now_ms, entry.started_ms, .{})) return true,
+            }
         }
         return false;
     }
@@ -140,19 +164,19 @@ test "set replaces by id and ordered sorts by priority" {
         .id = 1,
         .priority = 1,
         .text = "low",
-    }));
+    }, 0));
     try std.testing.expectEqual(SetResult.ok, store.set(.{
         .slot = .status_line,
         .id = 2,
         .priority = 9,
         .text = "high",
-    }));
+    }, 0));
     try std.testing.expectEqual(SetResult.ok, store.set(.{
         .slot = .status_line,
         .id = 1,
         .priority = 1,
         .text = "low2",
-    }));
+    }, 0));
 
     var views: [4]View = undefined;
     const n = store.ordered(.status_line, &views);
@@ -163,7 +187,7 @@ test "set replaces by id and ordered sorts by priority" {
 
 test "set sanitizes line breaks and bounds text" {
     var store: Store = .{};
-    _ = store.set(.{ .slot = .status_line, .id = 1, .text = "a\nb\xffc" });
+    _ = store.set(.{ .slot = .status_line, .id = 1, .text = "a\nb\xffc" }, 0);
     const view = store.highestPriority(.status_line).?;
     try std.testing.expectEqualStrings("a b\u{fffd}c", view.text);
 }
@@ -172,9 +196,9 @@ test "store rejects past capacity and clear frees a slot" {
     var store: Store = .{};
     var id: ContributionId = 1;
     while (id <= entry_count_max) : (id += 1) {
-        try std.testing.expectEqual(SetResult.ok, store.set(.{ .slot = .status_line, .id = id, .text = "x" }));
+        try std.testing.expectEqual(SetResult.ok, store.set(.{ .slot = .status_line, .id = id, .text = "x" }, 0));
     }
-    try std.testing.expectEqual(SetResult.dropped_full, store.set(.{ .slot = .status_line, .id = 99, .text = "x" }));
+    try std.testing.expectEqual(SetResult.dropped_full, store.set(.{ .slot = .status_line, .id = 99, .text = "x" }, 0));
     try std.testing.expect(store.clear(.{ .slot = .status_line, .id = 1 }));
-    try std.testing.expectEqual(SetResult.ok, store.set(.{ .slot = .status_line, .id = 99, .text = "x" }));
+    try std.testing.expectEqual(SetResult.ok, store.set(.{ .slot = .status_line, .id = 99, .text = "x" }, 0));
 }

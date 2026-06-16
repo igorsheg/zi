@@ -16,6 +16,7 @@ pub const markdown = @import("markdown.zig");
 pub const match = @import("match.zig");
 pub const render = @import("render.zig");
 pub const shimmer = @import("shimmer.zig");
+pub const shuffle_text = @import("shuffle_text.zig");
 pub const status = @import("status.zig");
 pub const text = @import("text.zig");
 pub const theme = @import("theme.zig");
@@ -38,6 +39,7 @@ test {
     _ = match;
     _ = render;
     _ = shimmer;
+    _ = shuffle_text;
     _ = status;
     _ = text;
     _ = theme;
