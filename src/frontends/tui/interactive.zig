@@ -567,6 +567,11 @@ const InteractiveController = struct {
         try self.appendTool(tool_view.callAppend(&buffers, tool_call, self.home_dir));
         if (tool_view.callPreviewText(tool_call.name, tool_call.arguments)) |preview| {
             try self.replaceToolOutput(tool_call.id, preview);
+            var footer_buffer: [tool_view.footer_bytes_max]u8 = undefined;
+            try self.replaceToolFooter(
+                tool_call.id,
+                tool_view.callPreviewFooter(&footer_buffer, tool_call.name, tool_call.arguments),
+            );
         }
     }
 
@@ -595,7 +600,11 @@ const InteractiveController = struct {
         const duration = self.finishToolTimer(payload.tool_call_id, &duration_buffer) orelse "";
         var footer_buffer: [tool_view.footer_bytes_max]u8 = undefined;
         const footer = tool_view.joinMetadata(&footer_buffer, view.metadata, duration);
-        if (footer.len > 0) try self.replaceToolFooter(payload.tool_call_id, footer);
+        if (footer.len > 0) {
+            try self.replaceToolFooter(payload.tool_call_id, footer);
+        } else if (payload.is_error) {
+            try self.replaceToolFooter(payload.tool_call_id, "");
+        }
 
         const text = view.output orelse return;
         try self.replaceToolOutput(payload.tool_call_id, text);

@@ -140,6 +140,17 @@ pub fn callPreviewText(name: []const u8, args_value: std.json.Value) ?[]const u8
     return if (preview.len > 0) preview else null;
 }
 
+pub fn callPreviewFooter(buffer: []u8, name: []const u8, args_value: std.json.Value) []const u8 {
+    if (kind(name) != .write) return "";
+    const content = argString(args_value, "content") orelse return "";
+    const preview = trimTrailingEmptyLines(content);
+    if (preview.len == 0) return "";
+    const total_lines = countLines(preview);
+    const visible_lines: usize = @min(total_lines, tool_metadata.displayForTool("write").collapse.rows_max);
+    if (visible_lines == total_lines) return "";
+    return std.fmt.bufPrint(buffer, "Showing {d} of {d} lines", .{ visible_lines, total_lines }) catch "";
+}
+
 pub fn clearsCallPreviewOnStart(name: []const u8) bool {
     return kind(name) == .write;
 }
@@ -503,6 +514,15 @@ pub fn trimTrailingEmptyLines(text: []const u8) []const u8 {
     return text[0..end];
 }
 
+fn countLines(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var lines: usize = 1;
+    for (text) |byte| {
+        if (byte == '\n') lines += 1;
+    }
+    return lines;
+}
+
 fn collapse(name: []const u8) tui.Transcript.ToolCollapse {
     const metadata = tool_metadata.displayForTool(name).collapse;
     return .{
@@ -716,12 +736,24 @@ test "formatCallTitle mirrors pi-mono call headers" {
 
 test "write call previews content until execution stream starts" {
     const allocator = std.testing.allocator;
+    var footer_buffer: [footer_bytes_max]u8 = undefined;
 
     var write_args = try testArgs(allocator, "{\"path\":\"file.txt\",\"content\":\"one\\ntwo\\n\"}");
     defer write_args.deinit();
     try std.testing.expectEqualStrings("one\ntwo", callPreviewText("write", write_args.value).?);
+    try std.testing.expectEqualStrings("", callPreviewFooter(&footer_buffer, "write", write_args.value));
     try std.testing.expect(clearsCallPreviewOnStart("write"));
     try std.testing.expect(callPreviewText("read", write_args.value) == null);
+
+    var long_args = try testArgs(
+        allocator,
+        "{\"path\":\"file.txt\",\"content\":\"1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n11\\n12\"}",
+    );
+    defer long_args.deinit();
+    try std.testing.expectEqualStrings(
+        "Showing 10 of 12 lines",
+        callPreviewFooter(&footer_buffer, "write", long_args.value),
+    );
 }
 
 test "successful write result is hidden so streamed content remains visible" {
