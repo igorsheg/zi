@@ -235,16 +235,182 @@ fn addMarkdownLineRows(
     inner: u16,
     theme: *const theme_mod.Theme,
 ) void {
-    const projected = markdown.classifyLine(state, line, theme);
-    emitWrappedText(out, rows, .{
+    emitMarkdownProjection(out, rows, markdown.classifyLine(state, line, theme), inner, theme);
+}
+
+fn emitMarkdownProjection(
+    out: ?*RowScratch,
+    rows: *usize,
+    projected: markdown.Projection,
+    inner: u16,
+    theme: *const theme_mod.Theme,
+) void {
+    if (!projected.parse_inline) {
+        emitWrappedText(out, rows, .{
+            .prefix = projected.prefix,
+            .continuation_prefix = projected.continuation_prefix,
+            .text = projected.text,
+            .repeat_prefix = projected.repeat_prefix,
+            .prefix_style = projected.prefix_style,
+            .text_style = projected.text_style,
+            .row_style = projected.row_style,
+            .inner_width = inner,
+        });
+        return;
+    }
+    emitWrappedInlineMarkdown(out, rows, .{
         .prefix = projected.prefix,
+        .continuation_prefix = projected.continuation_prefix,
         .text = projected.text,
         .repeat_prefix = projected.repeat_prefix,
         .prefix_style = projected.prefix_style,
         .text_style = projected.text_style,
         .row_style = projected.row_style,
         .inner_width = inner,
+        .theme = theme,
     });
+}
+
+const InlineMarkdownOptions = struct {
+    prefix: []const u8,
+    continuation_prefix: []const u8 = "",
+    text: []const u8,
+    repeat_prefix: bool = false,
+    prefix_style: theme_mod.Style,
+    text_style: theme_mod.Style,
+    row_style: theme_mod.Style,
+    inner_width: u16,
+    theme: *const theme_mod.Theme,
+};
+
+const InlineRowBuilder = struct {
+    out: ?*RowScratch,
+    count: *usize,
+    options: InlineMarkdownOptions,
+    visual_index: usize = 0,
+    row_width: u16 = 0,
+    row_limit: u16 = 0,
+    row_segment_start: usize = 0,
+    row_segment_len: usize = 0,
+    row_raw_start: usize = 0,
+    row_raw_end: usize = 0,
+    row_has_text: bool = false,
+    row_dropped_segments: bool = false,
+    row_started: bool = false,
+
+    fn emitSpan(self: *InlineRowBuilder, span: markdown.InlineSpan) void {
+        var start: usize = 0;
+        while (start < span.text.len and self.count.* < item_rows_max) {
+            self.ensureRow(span.raw_start);
+            if (self.row_limit == 0) {
+                self.flush();
+                return;
+            }
+            if (self.row_width >= self.row_limit) {
+                self.flush();
+                continue;
+            }
+            const remaining: u16 = self.row_limit - self.row_width;
+            const visual = text_mod.nextVisualLineBreak(span.text, start, remaining);
+            if (visual.next == start) break;
+            const piece = span.text[visual.start..visual.end];
+            if (piece.len > 0) self.appendSegment(piece, span.style);
+            self.row_width += @intCast(@min(visual.width, remaining));
+            self.markRaw(span.raw_start, span.raw_end);
+            start = visual.next;
+            if (start < span.text.len) self.flush();
+        }
+    }
+
+    fn finish(self: *InlineRowBuilder) void {
+        if (!self.row_started) {
+            self.ensureRow(0);
+            self.flush();
+            return;
+        }
+        self.flush();
+    }
+
+    fn ensureRow(self: *InlineRowBuilder, raw_start: usize) void {
+        if (self.row_started) return;
+        self.row_started = true;
+        self.row_width = 0;
+        const prefix = self.currentPrefix();
+        self.row_limit = self.options.inner_width - @as(u16, @intCast(@min(
+            text_mod.displayWidth(prefix),
+            self.options.inner_width,
+        )));
+        self.row_raw_start = raw_start;
+        self.row_raw_end = raw_start;
+        self.row_has_text = false;
+        self.row_dropped_segments = false;
+        if (self.out) |scratch| self.row_segment_start = scratch.segment_len;
+        self.row_segment_len = 0;
+    }
+
+    fn appendSegment(self: *InlineRowBuilder, bytes: []const u8, style: theme_mod.Style) void {
+        self.row_has_text = true;
+        const scratch = self.out orelse return;
+        if (self.row_segment_len > 0) {
+            const last = &scratch.segments[scratch.segment_len - 1];
+            const last_end = @intFromPtr(last.text.ptr) + last.text.len;
+            if (last_end == @intFromPtr(bytes.ptr) and theme_mod.Style.eql(last.style, style)) {
+                last.text = last.text.ptr[0 .. last.text.len + bytes.len];
+                return;
+            }
+        }
+        if (scratch.segment_len >= scratch.segments.len) {
+            self.row_dropped_segments = true;
+            return;
+        }
+        scratch.segments[scratch.segment_len] = .{ .text = bytes, .style = style };
+        scratch.segment_len += 1;
+        self.row_segment_len += 1;
+    }
+
+    fn markRaw(self: *InlineRowBuilder, start: usize, end: usize) void {
+        if (!self.row_has_text) self.row_raw_start = start;
+        self.row_raw_end = @max(self.row_raw_end, end);
+    }
+
+    fn flush(self: *InlineRowBuilder) void {
+        if (!self.row_started or self.count.* >= item_rows_max) return;
+        const prefix = self.currentPrefix();
+        var row: Row = .{
+            .prefix = prefix,
+            .show_prefix = prefix.len > 0,
+            .prefix_style = self.options.prefix_style,
+            .text_style = self.options.text_style,
+            .suffix_style = self.options.text_style,
+            .row_style = self.options.row_style,
+        };
+        if (self.out) |scratch| {
+            if (self.row_dropped_segments) {
+                scratch.segment_len = self.row_segment_start;
+                row.text = self.options.text[self.row_raw_start..@min(self.row_raw_end, self.options.text.len)];
+            } else {
+                row.segments = scratch.segments[self.row_segment_start..scratch.segment_len];
+            }
+        }
+        putRow(self.out, self.count, row);
+        self.visual_index += 1;
+        self.row_started = false;
+    }
+
+    fn currentPrefix(self: *const InlineRowBuilder) []const u8 {
+        if (self.visual_index == 0 or self.options.repeat_prefix) return self.options.prefix;
+        return self.options.continuation_prefix;
+    }
+};
+
+fn emitWrappedInlineMarkdown(out: ?*RowScratch, count: *usize, options: InlineMarkdownOptions) void {
+    var builder: InlineRowBuilder = .{ .out = out, .count = count, .options = options };
+    var index: usize = 0;
+    while (markdown.nextInlineSpan(options.text, &index, options.text_style, options.theme)) |span| {
+        builder.emitSpan(span);
+        if (count.* >= item_rows_max) return;
+    }
+    builder.finish();
 }
 
 fn markdownStableEnd(text: []const u8) usize {
@@ -553,16 +719,7 @@ fn buildMarkdownRows(
     var lines: PhysicalLineIterator = .{ .text = text };
     while (lines.next()) |line| {
         if (count.* >= item_rows_max) return;
-        const projected = markdown.classifyLine(&state, line, theme);
-        emitWrappedText(out, count, .{
-            .prefix = projected.prefix,
-            .text = projected.text,
-            .repeat_prefix = projected.repeat_prefix,
-            .prefix_style = projected.prefix_style,
-            .text_style = projected.text_style,
-            .row_style = projected.row_style,
-            .inner_width = inner,
-        });
+        emitMarkdownProjection(out, count, markdown.classifyLine(&state, line, theme), inner, theme);
         emitted_any = true;
     }
     if (!emitted_any) putRow(out, count, .{ .row_style = theme.transcript_text });
@@ -715,6 +872,7 @@ const WrapWindow = struct {
 
 const WrapOptions = struct {
     prefix: []const u8,
+    continuation_prefix: []const u8 = "",
     text: []const u8,
     repeat_prefix: bool = false,
     prefix_style: theme_mod.Style,
@@ -731,16 +889,17 @@ const WrapOptions = struct {
 /// only when `repeat_prefix` is set. The first row wraps at
 /// `inner - prefix_width`, continuations at full inner width.
 fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void {
-    const prefix_width: u16 = @intCast(@min(text_mod.displayWidth(options.prefix), options.inner_width));
     var start: usize = 0;
     var visual_index: usize = 0;
     var window_index: usize = 0;
     while (start < options.text.len) : (visual_index += 1) {
         if (count.* >= item_rows_max) return;
-        const width = if (visual_index == 0) options.inner_width - prefix_width else options.inner_width;
+        const prefix = wrapPrefix(options, visual_index);
+        const prefix_width: u16 = @intCast(@min(text_mod.displayWidth(prefix), options.inner_width));
+        const width = options.inner_width - prefix_width;
         var row: Row = .{
-            .prefix = options.prefix,
-            .show_prefix = options.repeat_prefix or visual_index == 0,
+            .prefix = prefix,
+            .show_prefix = prefix.len > 0,
             .prefix_style = options.prefix_style,
             .text_style = options.text_style,
             .suffix_style = options.text_style,
@@ -748,7 +907,7 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
         };
         if (width == 0) {
             emitWindowed(out, count, &window_index, options.window, row);
-            continue;
+            return;
         }
         const visual = text_mod.nextVisualLineBreak(options.text, start, width);
         if (visual.next == start) break;
@@ -761,15 +920,21 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
         start = visual.next;
     }
     if (options.text.len == 0 and count.* < item_rows_max) {
+        const prefix = wrapPrefix(options, 0);
         emitWindowed(out, count, &window_index, options.window, .{
-            .prefix = options.prefix,
-            .show_prefix = true,
+            .prefix = prefix,
+            .show_prefix = prefix.len > 0,
             .prefix_style = options.prefix_style,
             .text_style = options.text_style,
             .suffix_style = options.text_style,
             .row_style = options.row_style,
         });
     }
+}
+
+fn wrapPrefix(options: WrapOptions, visual_index: usize) []const u8 {
+    if (visual_index == 0 or options.repeat_prefix) return options.prefix;
+    return options.continuation_prefix;
 }
 
 fn emitWindowed(out: ?*RowScratch, count: *usize, window_index: *usize, window: WrapWindow, row: Row) void {
@@ -1832,6 +1997,42 @@ fn expectScreenText(window: vaxis.Window, x: u16, y: u16, expected: []const u8) 
         try std.testing.expectEqualStrings(expected[index .. index + 1], cell.char.grapheme);
         col += 1;
     }
+}
+
+test "markdown inline spans strip markers and keep styles" {
+    const theme = theme_mod.Theme.codex(.{});
+    var scratch: RowScratch = undefined;
+    scratch.reset();
+    var count: usize = 0;
+
+    buildMarkdownRows(&scratch, &count, "use `foo` and **bar**", 80, &theme);
+
+    try std.testing.expectEqual(@as(usize, 1), count);
+    const row = scratch.rows[0];
+    try std.testing.expectEqual(@as(usize, 4), row.segments.len);
+    try std.testing.expectEqualStrings("use ", row.segments[0].text);
+    try std.testing.expectEqualStrings("foo", row.segments[1].text);
+    try std.testing.expect(theme_mod.Style.eql(theme.tool_output, row.segments[1].style));
+    try std.testing.expectEqualStrings(" and ", row.segments[2].text);
+    try std.testing.expectEqualStrings("bar", row.segments[3].text);
+    try std.testing.expect(row.segments[3].style.bold);
+
+    var counted: usize = 0;
+    buildMarkdownRows(null, &counted, "use `foo` and **bar**", 80, &theme);
+    try std.testing.expectEqual(counted, count);
+}
+
+test "markdown list continuations align under marker" {
+    const theme = theme_mod.Theme.codex(.{});
+    var scratch: RowScratch = undefined;
+    scratch.reset();
+    var count: usize = 0;
+
+    buildMarkdownRows(&scratch, &count, "- abcdefgh", 8, &theme);
+
+    try std.testing.expect(count >= 2);
+    try std.testing.expectEqualStrings("- ", scratch.rows[0].prefix);
+    try std.testing.expectEqualStrings("  ", scratch.rows[1].prefix);
 }
 
 test "assistant markdown row cache advances only at newline boundaries" {
