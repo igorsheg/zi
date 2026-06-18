@@ -85,26 +85,29 @@ cli/
   runtime is opened.
 
 session_runtime.openSessionRuntime
-  the public entry: builds RuntimeServices, resolves session options
-  (explicit -> project settings -> global settings -> default; provider and
-  model are scope-atomic and never mix across scopes), creates or resumes the
-  session store, and constructs the one AgentSession inside a SessionRuntime.
-  one runtime is one session: replacement is deliberately unsupported — a new
-  session is a new runtime, opened by the CLI.
+  the public entry: owns or borrows the host task runtime, builds
+  RuntimeServices, resolves session options (explicit -> project settings ->
+  global settings -> default; provider and model are scope-atomic and never mix
+  across scopes), creates or resumes the session store, and constructs the first
+  AgentSession inside a SessionRuntime.
+  `SessionRuntime` is the stable mailbox host: session replacement validates
+  the target, builds the next services/session slot completely, then swaps it
+  through the owner path before emitting `session_changed`.
 
 RuntimeServices
-  cwd-scoped, long-lived services: duped cwd + agent_dir, SettingsManager,
-  AuthManager, ProviderRegistry and its provider instances. owns or borrows
-  the zio runtime explicitly.
+  cwd-scoped, replaceable services: duped cwd + agent_dir, SettingsManager,
+  AuthManager, ProviderRegistry and its provider instances. borrows the stable
+  host task runtime from SessionRuntime.
 
 SessionRuntime
   the client mailbox host (docs/mailbox-contract.md): bounded command and
   event queues, monotonically sequenced EventEnvelopes, the retained-event
-  replay ledger, slash commands (/help, /session — handled at the mailbox,
-  never reaching the model or queues), and the active-operation state machine
-  whose phase (running | compacting | retry_wait) makes "a run, a summary
-  run, and a retry timer at once" unrepresentable. frontends talk to it only
-  through submit/drainEvent/step/waitAndApplyWake.
+  replay ledger, slash commands (/help, /session, /model, /resume — handled at
+  the mailbox, never reaching the model or queues), session switching through
+  a typed command, and the active-operation state machine whose phase (running
+  | compacting | retry_wait) makes "a run, a summary run, and a retry timer at
+  once" unrepresentable. frontends talk to it only through
+  submit/drainEvent/step/waitAndApplyWake.
 
 AgentSession
   owns one session's policy: prompt resources, system prompt, builtin tools,
@@ -119,10 +122,12 @@ agent.Agent
 ```
 
 session history is durable truth: `session_store` writes append-only jsonl (a
-header line, then one line per `message_end`). This is the spill policy for the
-unbounded total conversation. `session_manager` is the in-memory view;
-`session_history_snapshot` produces a bounded snapshot (≈512 items) used to seed
-a frontend transcript on resume. the agent's in-memory transcript is runtime
+header line, one line per `message_end`, and durable session facts such as
+model/thinking changes). This is the spill policy for the unbounded total
+conversation. `session_manager` is the in-memory view;
+`session_history_snapshot` produces a bounded snapshot (≈512 items, including
+assistant tool calls and tool results) used to seed a frontend transcript on
+resume. the agent's in-memory transcript is runtime
 context, not the source of truth.
 
 The public boundary contracts are `docs/agent-event-contract.md` and

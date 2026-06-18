@@ -27,6 +27,7 @@ pub const Open = struct {
     id: Id,
     query: []const u8 = "",
     items: []const Item,
+    search_detail: bool = false,
 };
 
 pub const Selection = struct {
@@ -77,9 +78,10 @@ matches: [item_count_max]u16 = undefined,
 match_len: u16 = 0,
 selected_index: usize = 0,
 dropped_items: usize = 0,
+search_detail: bool = false,
 
 pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
-    var self: Picker = .{ .id = open.id };
+    var self: Picker = .{ .id = open.id, .search_detail = open.search_detail };
     errdefer self.deinit(gpa);
 
     self.query_len = copyBounded(query_bytes_max, &self.query, open.query);
@@ -285,6 +287,7 @@ fn itemScore(self: *const Picker, index: usize) ?match_mod.Score {
     var best: ?match_mod.Score = null;
     best = bestScore(best, fieldScore(item.idSlice(), query_text, 0));
     best = bestScore(best, fieldScore(item.labelSlice(), query_text, 4));
+    if (self.search_detail) best = bestScore(best, fieldScore(item.detailSlice(), query_text, 8));
     return best;
 }
 
@@ -332,6 +335,20 @@ test "picker filters, moves, and returns an opaque selected id" {
     try std.testing.expect(result == .selected);
     try std.testing.expectEqual(@as(Id, 7), result.selected.picker_id);
     try std.testing.expectEqualStrings("anthropic/claude", result.selected.item_id);
+}
+
+test "picker optionally searches detail text" {
+    const gpa = std.testing.allocator;
+    const source = [_]Item{
+        .{ .id = "one", .label = "first", .detail = "repo alpha" },
+        .{ .id = "two", .label = "second", .detail = "repo beta" },
+    };
+    var picker = try Picker.init(gpa, .{ .id = 7, .items = &source, .search_detail = true });
+    defer picker.deinit(gpa);
+
+    _ = try picker.applyInput(gpa, .{ .text = input_mod.InlineBytes.from("beta") });
+    try std.testing.expectEqual(@as(usize, 1), picker.matchCount());
+    try std.testing.expectEqual(@as(usize, 1), picker.selectedIndex().?);
 }
 
 test "picker falls back to fuzzy search and wraps navigation" {

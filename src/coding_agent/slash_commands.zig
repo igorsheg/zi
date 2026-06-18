@@ -11,17 +11,20 @@ pub const Id = enum {
     help,
     session,
     model,
+    resume_session,
 };
 
 pub const ArgKind = enum {
     none,
     optional_text,
     model_selector,
+    session_selector,
 };
 
 pub const PickerKind = enum {
     none,
     model,
+    session,
 };
 
 pub const Command = struct {
@@ -46,6 +49,13 @@ pub const builtins = [_]Command{
         .summary = "Select model",
         .arg_kind = .model_selector,
         .picker = .model,
+    },
+    .{
+        .id = .resume_session,
+        .name = "resume",
+        .summary = "Resume session",
+        .arg_kind = .session_selector,
+        .picker = .session,
     },
 };
 
@@ -110,7 +120,7 @@ test "slash command parser extracts name and trimmed args" {
 test "slash command catalog formats help from builtin source" {
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "available commands: /help, /session, /model",
+        "available commands: /help, /session, /model, /resume",
         formatAvailable(&buffer),
     );
     try std.testing.expectEqual(Id.model, lookup("model").?.id);

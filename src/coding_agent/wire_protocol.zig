@@ -61,6 +61,11 @@ pub fn decodeCommandLine(
     if (std.mem.eql(u8, command_type, "replay")) {
         return .{ .id = id, .command = .{ .replay = try decodeReplay(object) } };
     }
+    if (std.mem.eql(u8, command_type, "switch_session")) {
+        const file_value = object.get("sessionFile") orelse return error.InvalidMessage;
+        if (file_value != .string) return error.InvalidMessage;
+        return try client_protocol.CommandEnvelope.initSwitchSession(allocator, id, file_value.string);
+    }
     if (std.mem.eql(u8, command_type, "shutdown")) return .{ .id = id, .command = .shutdown };
     return error.UnknownCommand;
 }
@@ -148,6 +153,15 @@ test "wire protocol decodes CRLF and ignores empty lines" {
     var envelope = (try decodeCommandLine(std.testing.allocator, "{\"type\":\"cancel\"}\r")) orelse unreachable;
     defer envelope.deinit(std.testing.allocator);
     try std.testing.expect(envelope.command == .cancel);
+}
+
+test "wire protocol decodes switch session command" {
+    const line = "{\"id\":4,\"type\":\"switch_session\",\"sessionFile\":\"t_session.jsonl\"}";
+    var envelope = (try decodeCommandLine(std.testing.allocator, line)) orelse unreachable;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 4), envelope.id);
+    try std.testing.expect(envelope.command == .switch_session);
+    try std.testing.expectEqualStrings("t_session.jsonl", envelope.command.switch_session.session_file_name);
 }
 
 // Cancel targets identify work without giving clients mutation authority.

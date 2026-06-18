@@ -443,7 +443,7 @@ pub fn clientSnapshot(
     errdefer header.deinit(allocator);
     var model = try client_protocol.ModelSnapshot.init(allocator, self.agent.state.model);
     errdefer model.deinit(allocator);
-    const history = try client_protocol.HistorySnapshot.fromEntries(allocator, self.manager.entries.items);
+    const history = try client_protocol.HistorySnapshot.fromSession(allocator, self.manager);
     return .{
         .header = header,
         .model = model,
@@ -533,7 +533,7 @@ pub fn clientHistoryPage(
     allocator: std.mem.Allocator,
     before_entry_id: []const u8,
 ) !client_protocol.HistoryPage {
-    return client_protocol.HistoryPage.beforeEntry(allocator, self.manager.entries.items, before_entry_id);
+    return client_protocol.HistoryPage.beforeEntry(allocator, self.manager, before_entry_id);
 }
 
 pub fn clearQueue(self: *AgentSession) void {

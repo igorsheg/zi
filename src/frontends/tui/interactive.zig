@@ -14,13 +14,19 @@ const runtime = @import("../../runtime/root.zig");
 const tui = @import("../../tui/root.zig");
 const tool_view = @import("tool_view.zig");
 
+pub const StartupAction = enum {
+    none,
+    resume_picker,
+};
+
 pub const Options = struct {
     cwd: []const u8 = ".",
     agent_dir_override: ?[]const u8 = null,
     dir: std.Io.Dir = .cwd(),
     environ: ?*const std.process.Environ.Map = null,
-    resume_session_file: ?[]const u8 = null,
-    resume_latest: bool = false,
+    session_selector: ?[]const u8 = null,
+    continue_latest: bool = false,
+    startup_action: StartupAction = .none,
     initial_prompt: ?[]const u8 = null,
     version: []const u8 = "0.0.0-local",
 };
@@ -40,6 +46,7 @@ const composer_cwd_slot_id: tui.status.ContributionId = 1;
 const composer_session_slot_id: tui.status.ContributionId = 2;
 const model_picker_id: tui.Picker.Id = 1;
 const command_completion_picker_id: tui.Picker.Id = 2;
+const resume_picker_id: tui.Picker.Id = 3;
 const transcript_append_max = tui.Transcript.append_size_bytes_max;
 const tool_timer_count_max = 8;
 const tool_timer_id_bytes_max = 96;
@@ -140,6 +147,7 @@ pub fn run(
         &app,
         stdout,
         stderr,
+        options.startup_action,
         options.initial_prompt,
         options.version,
     );
@@ -170,6 +178,7 @@ const InteractiveController = struct {
         app: *session_runtime.SessionRuntime,
         stdout: *std.Io.Writer,
         stderr: *std.Io.Writer,
+        startup_action: StartupAction,
         initial_prompt: ?[]const u8,
         version: []const u8,
     ) !InteractiveController {
@@ -191,10 +200,19 @@ const InteractiveController = struct {
         try self.installGreeter(version);
         try self.installSlashCompletions();
         try self.installModelCompletions();
+        try self.installResumeCompletions();
         try self.requestSnapshot();
+        try self.applyStartupAction(startup_action);
         if (initial_prompt) |prompt| try self.submitPrompt(prompt);
         try self.terminal.renderIfDirty();
         return self;
+    }
+
+    fn applyStartupAction(self: *InteractiveController, action: StartupAction) !void {
+        switch (action) {
+            .none => {},
+            .resume_picker => try self.editResumeCommand(),
+        }
     }
 
     fn deinit(self: *InteractiveController) void {
@@ -264,6 +282,11 @@ const InteractiveController = struct {
     }
 
     fn handleSubmittedCommand(self: *InteractiveController, text: []const u8) !bool {
+        if (parseResumeCommand(text)) |resume_query| {
+            if (resume_query.len > 0) return false;
+            try self.editResumeCommand();
+            return true;
+        }
         const model_query = parseModelCommand(text) orelse return false;
         if (model_query.len > 0 and isExactModelSelector(model_query)) return false;
         try self.editModelCommand(model_query);
@@ -273,6 +296,7 @@ const InteractiveController = struct {
     fn handlePickerSelection(self: *InteractiveController, selection: tui.Picker.Selection) !void {
         switch (selection.picker_id) {
             model_picker_id => try self.submitSelectedModel(selection.item_id),
+            resume_picker_id => try self.submitSelectedSession(selection.item_id),
             else => {},
         }
     }
@@ -283,6 +307,11 @@ const InteractiveController = struct {
         try self.submitPrompt(prompt);
     }
 
+    fn submitSelectedSession(self: *InteractiveController, item_id: []const u8) !void {
+        const envelope = try client_protocol.CommandEnvelope.initSwitchSession(self.allocator, null, item_id);
+        _ = try self.submitCommand(envelope);
+    }
+
     fn editModelCommand(self: *InteractiveController, query: []const u8) !void {
         var buffer: [tui.Picker.query_bytes_max + 8]u8 = undefined;
         const text = if (query.len == 0)
@@ -290,6 +319,10 @@ const InteractiveController = struct {
         else
             std.fmt.bufPrint(&buffer, "/model {s}", .{query}) catch "/model ";
         _ = try self.terminal.applyCommand(.{ .replace_composer_text = text });
+    }
+
+    fn editResumeCommand(self: *InteractiveController) !void {
+        _ = try self.terminal.applyCommand(.{ .replace_composer_text = "/resume " });
     }
 
     fn installGreeter(self: *InteractiveController, version: []const u8) !void {
@@ -329,6 +362,44 @@ const InteractiveController = struct {
             .picker = .{
                 .id = model_picker_id,
                 .items = items.items,
+            },
+        } });
+    }
+
+    fn installResumeCompletions(self: *InteractiveController) !void {
+        var summaries = session_listing.listRuntimeSessionSummaries(self.allocator, self.io, .{
+            .cwd = self.app.services.cwd,
+            .agent_dir_override = self.app.services.agent_dir,
+            .dir = self.app.sessionListDir(),
+            .environ = self.app.sessionListEnviron(),
+            .max_sessions = tui.Picker.item_count_max,
+        }) catch |err| {
+            ignoreBestEffortError(err);
+            try self.appendStatus(.warning, "resume sessions unavailable");
+            return;
+        };
+        defer summaries.deinit(self.allocator);
+
+        var items: [tui.Picker.item_count_max]tui.Picker.Item = undefined;
+        var item_count: usize = 0;
+        for (summaries.items) |summary| {
+            if (summary.file_name.len > tui.Picker.id_bytes_max) continue;
+            items[item_count] = .{
+                .id = summary.file_name,
+                .label = summary.title,
+                .detail = summary.detail,
+            };
+            item_count += 1;
+        }
+        if (summaries.truncated) try self.appendStatus(.warning, "resume session list truncated");
+
+        _ = try self.terminal.applyCommand(.{ .set_composer_arg_completions = .{
+            .command_name = "resume",
+            .accept = .emit_selection,
+            .picker = .{
+                .id = resume_picker_id,
+                .items = items[0..item_count],
+                .search_detail = true,
             },
         } });
     }
@@ -469,6 +540,7 @@ const InteractiveController = struct {
             },
             .queue_changed => |queue| try self.applyQueueChanged(queue),
             .snapshot => |snapshot| try self.applySnapshot(snapshot),
+            .session_changed => try self.applySessionChanged(),
             .session_chrome => |chrome| try self.applySessionChrome(chrome),
             .history_page => |page| try self.applyHistoryPage(page),
             .replay => {
@@ -610,6 +682,21 @@ const InteractiveController = struct {
         try self.replaceToolOutput(payload.tool_call_id, text);
     }
 
+    fn applySessionChanged(self: *InteractiveController) !void {
+        self.operation_active = false;
+        self.cancel_requested = false;
+        self.history_request_in_flight = false;
+        self.history_has_more_before = false;
+        self.clearOldestHistoryEntryId();
+        self.clearToolTimers();
+        _ = try self.terminal.applyCommand(.clear_transcript);
+        try self.clearStatus(status_id_working);
+        try self.clearStatus(status_id_queue);
+        try self.installResumeCompletions();
+        try self.requestSnapshot();
+        try self.appendStatus(.info, "resumed session");
+    }
+
     fn applySnapshot(self: *InteractiveController, snapshot: client_protocol.Snapshot) !void {
         _ = try self.terminal.applyCommand(.clear_transcript);
         self.operation_active = snapshot.active_request_id != null;
@@ -630,14 +717,7 @@ const InteractiveController = struct {
             snapshot.thinking_level,
             snapshot.context,
         );
-        for (snapshot.history.items) |item| {
-            const role: tui.Transcript.Role = switch (item.role) {
-                .user => .user,
-                .assistant => .assistant,
-                .system => .system,
-            };
-            try self.appendMessage(role, item.text.text, .new_item);
-        }
+        for (snapshot.history.items) |item| try self.applyHistoryItem(item, .append);
         try self.applyQueueCounts(snapshot.queue.steering.items.len, snapshot.queue.follow_up.items.len);
     }
 
@@ -688,18 +768,106 @@ const InteractiveController = struct {
         var index = page.items.len;
         while (index > 0) {
             index -= 1;
-            const item = page.items[index];
-            const role: tui.Transcript.Role = switch (item.role) {
-                .user => .user,
-                .assistant => .assistant,
-                .system => .system,
-            };
-            _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{
-                .role = role,
-                .text = item.text.text,
-                .mode = .new_item,
-            } });
+            try self.applyHistoryItem(page.items[index], .prepend);
         }
+    }
+
+    const HistoryApplyDirection = enum { append, prepend };
+
+    fn applyHistoryItem(
+        self: *InteractiveController,
+        item: client_protocol.HistorySnapshotItem,
+        direction: HistoryApplyDirection,
+    ) !void {
+        switch (direction) {
+            .append => try self.appendHistoryItem(item),
+            .prepend => try self.prependHistoryItem(item),
+        }
+    }
+
+    fn appendHistoryItem(self: *InteractiveController, item: client_protocol.HistorySnapshotItem) !void {
+        switch (item.kind) {
+            .user, .assistant, .system => {
+                if (item.text.text.len > 0) {
+                    try self.appendMessage(historyMessageRole(item.kind).?, item.text.text, .new_item);
+                }
+                if (item.kind == .assistant) {
+                    for (item.tool_calls) |tool_call| {
+                        try self.appendTool(tool_view.append(
+                            tool_call.id.text,
+                            tool_call.name.text,
+                            .pending,
+                            tool_call.title.text,
+                            "",
+                            false,
+                        ));
+                    }
+                }
+            },
+            .tool_result => {
+                const id = if (item.tool_call_id) |id| id.text else return;
+                const name = if (item.tool_name) |name| name.text else return;
+                try self.appendTool(tool_view.append(
+                    id,
+                    name,
+                    if (item.is_error) .err else .success,
+                    "",
+                    "",
+                    item.is_error,
+                ));
+                try self.replaceToolOutput(id, item.text.text);
+            },
+        }
+    }
+
+    fn prependHistoryItem(self: *InteractiveController, item: client_protocol.HistorySnapshotItem) !void {
+        switch (item.kind) {
+            .user, .system => try self.prependMessage(historyMessageRole(item.kind).?, item.text.text),
+            .assistant => {
+                var tools = std.ArrayList(tui.Transcript.Append.ToolAppend).empty;
+                defer tools.deinit(self.allocator);
+                try tools.ensureTotalCapacity(self.allocator, item.tool_calls.len);
+                for (item.tool_calls) |tool_call| tools.appendAssumeCapacity(tool_view.append(
+                    tool_call.id.text,
+                    tool_call.name.text,
+                    .pending,
+                    tool_call.title.text,
+                    "",
+                    false,
+                ));
+                const message: ?tui.Transcript.Append.MessageAppend = if (item.text.text.len > 0) .{
+                    .role = .assistant,
+                    .text = item.text.text,
+                    .mode = .new_item,
+                } else null;
+                _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{
+                    .message = message,
+                    .tools = tools.items,
+                } });
+            },
+            .tool_result => {
+                const id = if (item.tool_call_id) |id| id.text else return;
+                const name = if (item.tool_name) |name| name.text else return;
+                _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{ .tools = &.{tool_view.append(
+                    id,
+                    name,
+                    if (item.is_error) .err else .success,
+                    "",
+                    "",
+                    item.is_error,
+                )} } });
+                try self.replaceFrontToolOutput(id, item.text.text);
+            },
+        }
+    }
+
+    fn historyMessageRole(kind: client_protocol.HistorySnapshotItem.Kind) ?tui.Transcript.Role {
+        return switch (kind) {
+            .user => .user,
+            .assistant => .assistant,
+            .system => .system,
+            .tool_result => null,
+        };
     }
 
     fn setOldestHistoryEntryId(self: *InteractiveController, entry_id: []const u8) !void {
@@ -736,11 +904,15 @@ const InteractiveController = struct {
     fn applyOperationFinished(self: *InteractiveController, finished: client_protocol.OperationFinished) !void {
         self.cancel_requested = false;
         self.clearToolTimers();
-        try self.clearStatus(status_id_working);
         switch (finished.reason) {
-            .completed => {},
-            .canceled => try self.appendStatusWithTone(.info, "canceled", .canceled),
-            .failed => try self.appendStatus(.err, "operation failed"),
+            .completed => try self.clearStatus(status_id_working),
+            .canceled => {
+                try self.clearStatus(status_id_working);
+                try self.appendStatusWithTone(.info, "canceled", .canceled);
+            },
+            // The failure path emits the provider/tool/persistence error first;
+            // do not clear or overwrite it with a generic status.
+            .failed => {},
         }
     }
 
@@ -768,6 +940,19 @@ const InteractiveController = struct {
         }
     }
 
+    fn prependMessage(
+        self: *InteractiveController,
+        role: tui.Transcript.Role,
+        text: []const u8,
+    ) !void {
+        if (text.len == 0) return;
+        _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{ .message = .{
+            .role = role,
+            .text = text,
+            .mode = .new_item,
+        } } });
+    }
+
     fn appendAssistantFinalText(self: *InteractiveController, assistant: ai.AssistantMessage) !void {
         for (assistant.content) |content| switch (content) {
             .text => |text| try self.appendMessage(.assistant, text.text, .extend_previous_assistant_message),
@@ -792,6 +977,16 @@ const InteractiveController = struct {
         try self.appendToolOutput(tool_call_id, text[first.consumed..]);
     }
 
+    fn replaceFrontToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
+        var buffer: [transcript_append_max]u8 = undefined;
+        const first = tool_view.normalizedOutputChunk(&buffer, text);
+        _ = try self.terminal.applyCommand(.{ .replace_front_tool_output = .{
+            .tool_call_id = tool_call_id,
+            .text = first.text,
+        } });
+        try self.appendFrontToolOutput(tool_call_id, text[first.consumed..]);
+    }
+
     fn appendToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
         var remaining = text;
         while (remaining.len > 0) {
@@ -800,6 +995,22 @@ const InteractiveController = struct {
             if (chunk.consumed == 0) return;
             if (chunk.text.len > 0) {
                 _ = try self.terminal.applyCommand(.{ .tool_output_delta = .{
+                    .tool_call_id = tool_call_id,
+                    .text = chunk.text,
+                } });
+            }
+            remaining = remaining[chunk.consumed..];
+        }
+    }
+
+    fn appendFrontToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
+        var remaining = text;
+        while (remaining.len > 0) {
+            var buffer: [transcript_append_max]u8 = undefined;
+            const chunk = tool_view.normalizedOutputChunk(&buffer, remaining);
+            if (chunk.consumed == 0) return;
+            if (chunk.text.len > 0) {
+                _ = try self.terminal.applyCommand(.{ .front_tool_output_delta = .{
                     .tool_call_id = tool_call_id,
                     .text = chunk.text,
                 } });
@@ -1079,6 +1290,13 @@ fn parseModelCommand(text: []const u8) ?[]const u8 {
     return invocation.args;
 }
 
+fn parseResumeCommand(text: []const u8) ?[]const u8 {
+    const invocation = slash_commands.parseInvocation(text) orelse return null;
+    const spec = slash_commands.lookup(invocation.name) orelse return null;
+    if (spec.id != .resume_session) return null;
+    return invocation.args;
+}
+
 fn isExactModelSelector(selector: []const u8) bool {
     if (selector.len == 0) return false;
     if (std.mem.findScalar(u8, selector, '/')) |slash| {
@@ -1123,20 +1341,24 @@ test "render throttle coalesces active streaming but lets input render immediate
 }
 
 fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options: Options) !?[]const u8 {
-    if (options.resume_session_file == null and !options.resume_latest) return null;
+    if (options.session_selector == null and !options.continue_latest) return null;
     const selected = session_listing.selectRuntimeSession(process.gpa, process.io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
         .dir = options.dir,
         .environ = options.environ,
-        .explicit_file_name = options.resume_session_file,
+        .selector = options.session_selector,
     }) catch |err| switch (err) {
         error.InvalidSessionFileName => {
-            try stderr.writeAll("invalid resume session file\n");
+            try stderr.writeAll("invalid session selector\n");
             return error.InvalidSessionFileName;
         },
+        error.AmbiguousSessionSelector => {
+            try stderr.writeAll("ambiguous session selector\n");
+            return error.AmbiguousSessionSelector;
+        },
         error.SessionListTruncated => {
-            try stderr.writeAll("too many sessions to choose latest safely\n");
+            try stderr.writeAll("too many sessions to choose safely\n");
             return error.SessionListTruncated;
         },
         else => return err,

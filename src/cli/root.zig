@@ -133,26 +133,27 @@ fn runApp(
     const stdin_is_tty = try std.Io.File.stdin().isTty(process.io);
     return switch (args_mod.resolveAppMode(app, stdin_is_tty)) {
         .text => {
-            if (app.messages.count != 1) return usage(stderr);
+            if (app.resume_picker or app.messages.count != 1) return usage(stderr);
             return runPrompt(process, stdout, stderr, app.messages.slice()[0], false, app, options);
         },
         .json => {
-            if (app.messages.count != 1) return usage(stderr);
+            if (app.resume_picker or app.messages.count != 1) return usage(stderr);
             return runPrompt(process, stdout, stderr, app.messages.slice()[0], true, app, options);
         },
         .rpc => {
-            if (app.messages.count > 1) return usage(stderr);
+            if (app.resume_picker or app.messages.count > 1) return usage(stderr);
             return runRpc(process, stdout, stderr, app, options);
         },
         .interactive => {
-            if (app.messages.count > 1) return usage(stderr);
+            if (app.messages.count > 1 or (app.resume_picker and app.messages.count > 0)) return usage(stderr);
             return interactive.run(process, stdout, stderr, .{
                 .cwd = options.cwd,
                 .agent_dir_override = options.agent_dir_override,
                 .dir = options.dir,
                 .environ = options.environ,
-                .resume_session_file = app.resume_session_file,
-                .resume_latest = app.resume_latest,
+                .session_selector = app.session_selector,
+                .continue_latest = app.continue_latest,
+                .startup_action = if (app.resume_picker) .resume_picker else .none,
                 .initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null,
                 .version = app_info.version,
             });
@@ -233,20 +234,24 @@ fn selectResumeSession(
     app: anytype,
     options: auth_mode.Options,
 ) !?[]const u8 {
-    if (app.resume_session_file == null and !app.resume_latest) return null;
+    if (app.session_selector == null and !app.continue_latest) return null;
     const selected = session_listing.selectRuntimeSession(process.gpa, process.io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
         .dir = options.dir,
         .environ = options.environ,
-        .explicit_file_name = app.resume_session_file,
+        .selector = app.session_selector,
     }) catch |err| switch (err) {
         error.InvalidSessionFileName => {
-            try stderr.writeAll("invalid resume session file\n");
+            try stderr.writeAll("invalid session selector\n");
+            return error.InvalidCliUsage;
+        },
+        error.AmbiguousSessionSelector => {
+            try stderr.writeAll("ambiguous session selector\n");
             return error.InvalidCliUsage;
         },
         error.SessionListTruncated => {
-            try stderr.writeAll("too many sessions to choose latest safely\n");
+            try stderr.writeAll("too many sessions to choose safely\n");
             return error.InvalidCliUsage;
         },
         else => return err,
@@ -355,7 +360,7 @@ test "cli selects newest resumable session through runtime policy" {
 
     var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
-    const app = (try args_mod.parse(&.{"--resume-latest"})).app;
+    const app = (try args_mod.parse(&.{"--continue"})).app;
     const selected = (try selectResumeSession(process, &stderr, app, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
@@ -381,7 +386,7 @@ test "cli selects explicit resumable session through runtime policy" {
 
     var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
-    const app = (try args_mod.parse(&.{ "--resume", "2026-05-27T00:00:00Z_session.jsonl" })).app;
+    const app = (try args_mod.parse(&.{ "--session", "2026-05-27T00:00:00Z_session.jsonl" })).app;
     const selected = (try selectResumeSession(process, &stderr, app, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
@@ -391,6 +396,32 @@ test "cli selects explicit resumable session through runtime policy" {
     defer std.testing.allocator.free(selected);
 
     try std.testing.expectEqualStrings("2026-05-27T00:00:00Z_session.jsonl", selected);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "cli selects explicit session id through runtime policy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createCliTestDirs(tmp.dir);
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const process = testProcess(&environ);
+
+    try createCliStoredSession(tmp.dir, "tui-1781704148400901000", "2026-05-27T00:00:00Z");
+
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+    const app = (try args_mod.parse(&.{ "--session", "tui-1781704148400901000" })).app;
+    const selected = (try selectResumeSession(process, &stderr, app, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = process.environ,
+    })).?;
+    defer std.testing.allocator.free(selected);
+
+    try std.testing.expectEqualStrings("2026-05-27T00:00:00Z_tui-1781704148400901000.jsonl", selected);
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 
@@ -404,7 +435,7 @@ test "cli reports absent resumable session" {
     const process = testProcess(&environ);
     var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
-    const app = (try args_mod.parse(&.{"--resume-latest"})).app;
+    const app = (try args_mod.parse(&.{"--continue"})).app;
 
     try std.testing.expectError(error.NoResumableSession, selectResumeSession(process, &stderr, app, .{
         .cwd = "repo",
@@ -415,7 +446,7 @@ test "cli reports absent resumable session" {
     try std.testing.expectEqualStrings("no resumable session found\n", stderr.buffered());
 }
 
-test "cli reports invalid explicit resume session file" {
+test "cli reports invalid explicit session selector" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try createCliTestDirs(tmp.dir);
@@ -425,7 +456,7 @@ test "cli reports invalid explicit resume session file" {
     const process = testProcess(&environ);
     var stderr_buffer: [128]u8 = undefined;
     var stderr = std.Io.Writer.fixed(&stderr_buffer);
-    const app = (try args_mod.parse(&.{ "--resume", "../outside.jsonl" })).app;
+    const app = (try args_mod.parse(&.{ "--session", "../outside.jsonl" })).app;
 
     try std.testing.expectError(error.InvalidCliUsage, selectResumeSession(process, &stderr, app, .{
         .cwd = "repo",
@@ -433,7 +464,7 @@ test "cli reports invalid explicit resume session file" {
         .dir = tmp.dir,
         .environ = process.environ,
     }));
-    try std.testing.expectEqualStrings("invalid resume session file\n", stderr.buffered());
+    try std.testing.expectEqualStrings("invalid session selector\n", stderr.buffered());
 }
 
 test "cli usage returns an error instead of exiting" {

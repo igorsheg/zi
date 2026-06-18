@@ -79,6 +79,11 @@ pub const Append = union(enum) {
     };
 };
 
+pub const Prepend = struct {
+    message: ?Append.MessageAppend = null,
+    tools: []const Append.ToolAppend = &.{},
+};
+
 /// Degradations the caller may want to surface; never an error.
 pub const Outcome = struct {
     truncated: bool = false,
@@ -207,28 +212,32 @@ pub fn append(self: *Transcript, gpa: std.mem.Allocator, entry: Append) error{Ou
     };
 }
 
+pub fn prepend(self: *Transcript, gpa: std.mem.Allocator, rows: Prepend) error{OutOfMemory}!Outcome {
+    defer self.revision +%= 1;
+    var outcome: Outcome = .{};
+    var insertion_index: usize = 0;
+
+    if (rows.message) |message| {
+        const message_outcome = try self.insertMessageAt(gpa, insertion_index, message);
+        outcome.truncated = outcome.truncated or message_outcome.truncated;
+        insertion_index += 1;
+    }
+
+    for (rows.tools) |tool| {
+        const tool_outcome = try self.prependToolAt(gpa, &insertion_index, tool);
+        outcome.truncated = outcome.truncated or tool_outcome.truncated;
+    }
+
+    self.evictNewestUntilBounded(gpa);
+    return outcome;
+}
+
 pub fn prependMessage(
     self: *Transcript,
     gpa: std.mem.Allocator,
     message: Append.MessageAppend,
 ) error{OutOfMemory}!Outcome {
-    defer self.revision +%= 1;
-    const bounded = text_mod.utf8Prefix(message.text, append_size_bytes_max);
-    const truncated = bounded.len < message.text.len;
-
-    var body: Message = .{ .role = message.role };
-    errdefer body.text.deinit(gpa);
-    try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
-
-    try self.items.append(gpa, undefined);
-    const last_index = self.items.items.len - 1;
-    if (last_index > 0) {
-        @memmove(self.items.items[1 .. last_index + 1], self.items.items[0..last_index]);
-    }
-    self.items.items[0] = .{ .body = .{ .message = body } };
-    self.total_size_bytes += body.text.items.len;
-    self.evictNewestUntilBounded(gpa);
-    return .{ .truncated = truncated };
+    return self.prepend(gpa, .{ .message = message });
 }
 
 /// Stream more output into a tool's tail-windowed preview. Unknown ids are
@@ -242,19 +251,23 @@ pub fn appendToolOutput(
     dropped_head_lines: usize,
 ) error{OutOfMemory}!Outcome {
     const index = self.findTool(tool_call_id) orelse return .{};
-    const item = &self.items.items[index];
-    const tool = &item.body.tool;
-    const old_size = tool.sizeBytes();
-
-    const bounded = text_mod.utf8Prefix(delta, append_size_bytes_max);
-    try appendStreamBytes(gpa, &tool.output, &tool.pending, bounded);
-    const trim = trimToTailWindow(&tool.output, tool_preview_bytes_max, tool_preview_lines_max);
-    tool.dropped_head_bytes += dropped_head_bytes + trim.dropped_bytes;
-    tool.dropped_head_lines += dropped_head_lines + trim.dropped_lines;
-
-    self.noteItemMutation(item, old_size, tool.sizeBytes());
+    const outcome = try self.appendToolOutputAt(gpa, index, delta, dropped_head_bytes, dropped_head_lines);
     self.evictUntilBounded(gpa);
-    return .{ .truncated = bounded.len < delta.len };
+    return outcome;
+}
+
+pub fn appendFrontToolOutput(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    tool_call_id: []const u8,
+    delta: []const u8,
+    dropped_head_bytes: usize,
+    dropped_head_lines: usize,
+) error{OutOfMemory}!Outcome {
+    const index = self.findToolFromFront(tool_call_id) orelse return .{};
+    const outcome = try self.appendToolOutputAt(gpa, index, delta, dropped_head_bytes, dropped_head_lines);
+    self.evictNewestUntilBounded(gpa);
+    return outcome;
 }
 
 /// Replace the streamed preview with the final result (the final output
@@ -266,20 +279,21 @@ pub fn replaceToolOutput(
     output: []const u8,
 ) error{OutOfMemory}!Outcome {
     const index = self.findTool(tool_call_id) orelse return .{};
-    const item = &self.items.items[index];
-    const tool = &item.body.tool;
-    const old_size = tool.sizeBytes();
-
-    const bounded = text_mod.utf8Prefix(output, append_size_bytes_max);
-    tool.output.clearRetainingCapacity();
-    tool.pending = .{};
-    try text_mod.appendSanitized(gpa, &tool.output, bounded);
-    tool.dropped_head_bytes = 0;
-    tool.dropped_head_lines = 0;
-
-    self.noteItemMutation(item, old_size, tool.sizeBytes());
+    const outcome = try self.replaceToolOutputAt(gpa, index, output);
     self.evictUntilBounded(gpa);
-    return .{ .truncated = bounded.len < output.len };
+    return outcome;
+}
+
+pub fn replaceFrontToolOutput(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    tool_call_id: []const u8,
+    output: []const u8,
+) error{OutOfMemory}!Outcome {
+    const index = self.findToolFromFront(tool_call_id) orelse return .{};
+    const outcome = try self.replaceToolOutputAt(gpa, index, output);
+    self.evictNewestUntilBounded(gpa);
+    return outcome;
 }
 
 pub fn replaceToolFooter(
@@ -301,6 +315,23 @@ pub fn replaceToolFooter(
     self.noteItemMutation(item, old_size, tool.sizeBytes());
     self.evictUntilBounded(gpa);
     return .{ .truncated = bounded.len < footer.len };
+}
+
+fn insertMessageAt(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    index: usize,
+    message: Append.MessageAppend,
+) error{OutOfMemory}!Outcome {
+    const bounded = text_mod.utf8Prefix(message.text, append_size_bytes_max);
+    const truncated = bounded.len < message.text.len;
+
+    var body: Message = .{ .role = message.role };
+    errdefer body.text.deinit(gpa);
+    try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
+
+    try self.insertOwnedItem(gpa, index, .{ .body = .{ .message = body } });
+    return .{ .truncated = truncated };
 }
 
 fn appendMessage(
@@ -376,17 +407,11 @@ fn appendCustom(
 /// success/err is never downgraded back to pending by a late start event.
 fn appendTool(self: *Transcript, gpa: std.mem.Allocator, tool: Append.ToolAppend) error{OutOfMemory}!Outcome {
     const id_bounded = text_mod.utf8Prefix(tool.tool_call_id, append_size_bytes_max);
-    const name_bounded = text_mod.utf8Prefix(tool.name, append_size_bytes_max);
     const title_bounded = text_mod.utf8Prefix(tool.title, append_size_bytes_max);
     const compact_title_bounded = text_mod.utf8Prefix(tool.compact_title, append_size_bytes_max);
-    const truncated = id_bounded.len < tool.tool_call_id.len or
-        name_bounded.len < tool.name.len or
-        title_bounded.len < tool.title.len or
-        compact_title_bounded.len < tool.compact_title.len;
 
     if (self.findTool(id_bounded)) |index| {
-        const item = &self.items.items[index];
-        const existing = &item.body.tool;
+        const existing = &self.items.items[index].body.tool;
         // Provider/tool ids are only reliable for the live call. Some providers
         // reuse short ids across turns; a titled pending start after a terminal
         // item is a new transcript fact, not a mutation of old output.
@@ -394,26 +419,51 @@ fn appendTool(self: *Transcript, gpa: std.mem.Allocator, tool: Append.ToolAppend
             existing.status != .pending and
             (title_bounded.len > 0 or compact_title_bounded.len > 0);
         if (!starts_new_reused_id) {
-            const old_size = existing.sizeBytes();
-            if (title_bounded.len > 0) {
-                const title = try sanitizedCopy(gpa, title_bounded);
-                gpa.free(existing.title);
-                existing.title = title;
-            }
-            if (compact_title_bounded.len > 0) {
-                const compact_title = try sanitizedCopy(gpa, compact_title_bounded);
-                gpa.free(existing.compact_title);
-                existing.compact_title = compact_title;
-            }
-            existing.presentation = tool.presentation;
-            existing.status = mergeToolStatus(existing.status, tool.status);
-            existing.body_mode = tool.body_mode;
-            existing.collapse = tool.collapse;
-            self.noteItemMutation(item, old_size, existing.sizeBytes());
+            const outcome = try self.updateToolAt(gpa, index, tool);
             self.evictUntilBounded(gpa);
-            return .{ .truncated = truncated };
+            return outcome;
         }
     }
+
+    const outcome = try self.insertToolAt(gpa, self.items.items.len, tool);
+    self.evictUntilBounded(gpa);
+    return outcome;
+}
+
+fn prependToolAt(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    insertion_index: *usize,
+    tool: Append.ToolAppend,
+) error{OutOfMemory}!Outcome {
+    const id_bounded = text_mod.utf8Prefix(tool.tool_call_id, append_size_bytes_max);
+    if (tool.status == .pending) {
+        if (self.findToolInFrontRun(id_bounded, insertion_index.*)) |index| {
+            const outcome = try self.updateToolAt(gpa, index, tool);
+            insertion_index.* = index + 1;
+            return outcome;
+        }
+    }
+
+    const outcome = try self.insertToolAt(gpa, insertion_index.*, tool);
+    insertion_index.* += 1;
+    return outcome;
+}
+
+fn insertToolAt(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    index: usize,
+    tool: Append.ToolAppend,
+) error{OutOfMemory}!Outcome {
+    const id_bounded = text_mod.utf8Prefix(tool.tool_call_id, append_size_bytes_max);
+    const name_bounded = text_mod.utf8Prefix(tool.name, append_size_bytes_max);
+    const title_bounded = text_mod.utf8Prefix(tool.title, append_size_bytes_max);
+    const compact_title_bounded = text_mod.utf8Prefix(tool.compact_title, append_size_bytes_max);
+    const truncated = id_bounded.len < tool.tool_call_id.len or
+        name_bounded.len < tool.name.len or
+        title_bounded.len < tool.title.len or
+        compact_title_bounded.len < tool.compact_title.len;
 
     const id = try sanitizedCopy(gpa, id_bounded);
     errdefer gpa.free(id);
@@ -425,7 +475,8 @@ fn appendTool(self: *Transcript, gpa: std.mem.Allocator, tool: Append.ToolAppend
     errdefer gpa.free(compact_title);
     const footer = try gpa.dupe(u8, "");
     errdefer gpa.free(footer);
-    try self.items.append(gpa, .{ .body = .{ .tool = .{
+
+    try self.insertOwnedItem(gpa, index, .{ .body = .{ .tool = .{
         .id = id,
         .name = name,
         .presentation = tool.presentation,
@@ -436,9 +487,103 @@ fn appendTool(self: *Transcript, gpa: std.mem.Allocator, tool: Append.ToolAppend
         .compact_title = compact_title,
         .footer = footer,
     } } });
-    self.total_size_bytes += self.items.items[self.items.items.len - 1].sizeBytes();
-    self.evictUntilBounded(gpa);
     return .{ .truncated = truncated };
+}
+
+fn updateToolAt(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    index: usize,
+    tool: Append.ToolAppend,
+) error{OutOfMemory}!Outcome {
+    const id_bounded = text_mod.utf8Prefix(tool.tool_call_id, append_size_bytes_max);
+    const name_bounded = text_mod.utf8Prefix(tool.name, append_size_bytes_max);
+    const title_bounded = text_mod.utf8Prefix(tool.title, append_size_bytes_max);
+    const compact_title_bounded = text_mod.utf8Prefix(tool.compact_title, append_size_bytes_max);
+    const truncated = id_bounded.len < tool.tool_call_id.len or
+        name_bounded.len < tool.name.len or
+        title_bounded.len < tool.title.len or
+        compact_title_bounded.len < tool.compact_title.len;
+
+    const title = if (title_bounded.len > 0) try sanitizedCopy(gpa, title_bounded) else null;
+    errdefer if (title) |value| gpa.free(value);
+    const compact_title = if (compact_title_bounded.len > 0) try sanitizedCopy(gpa, compact_title_bounded) else null;
+    errdefer if (compact_title) |value| gpa.free(value);
+
+    const item = &self.items.items[index];
+    const existing = &item.body.tool;
+    const old_size = existing.sizeBytes();
+    if (title) |value| {
+        gpa.free(existing.title);
+        existing.title = value;
+    }
+    if (compact_title) |value| {
+        gpa.free(existing.compact_title);
+        existing.compact_title = value;
+    }
+    existing.presentation = tool.presentation;
+    existing.status = mergeToolStatus(existing.status, tool.status);
+    existing.body_mode = tool.body_mode;
+    existing.collapse = tool.collapse;
+    self.noteItemMutation(item, old_size, existing.sizeBytes());
+    return .{ .truncated = truncated };
+}
+
+fn appendToolOutputAt(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    index: usize,
+    delta: []const u8,
+    dropped_head_bytes: usize,
+    dropped_head_lines: usize,
+) error{OutOfMemory}!Outcome {
+    const item = &self.items.items[index];
+    const tool = &item.body.tool;
+    const old_size = tool.sizeBytes();
+
+    const bounded = text_mod.utf8Prefix(delta, append_size_bytes_max);
+    try appendStreamBytes(gpa, &tool.output, &tool.pending, bounded);
+    const trim = trimToTailWindow(&tool.output, tool_preview_bytes_max, tool_preview_lines_max);
+    tool.dropped_head_bytes += dropped_head_bytes + trim.dropped_bytes;
+    tool.dropped_head_lines += dropped_head_lines + trim.dropped_lines;
+
+    self.noteItemMutation(item, old_size, tool.sizeBytes());
+    return .{ .truncated = bounded.len < delta.len };
+}
+
+fn replaceToolOutputAt(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    index: usize,
+    output: []const u8,
+) error{OutOfMemory}!Outcome {
+    const item = &self.items.items[index];
+    const tool = &item.body.tool;
+    const old_size = tool.sizeBytes();
+
+    const bounded = text_mod.utf8Prefix(output, append_size_bytes_max);
+    tool.output.clearRetainingCapacity();
+    tool.pending = .{};
+    try text_mod.appendSanitized(gpa, &tool.output, bounded);
+    tool.dropped_head_bytes = 0;
+    tool.dropped_head_lines = 0;
+
+    self.noteItemMutation(item, old_size, tool.sizeBytes());
+    return .{ .truncated = bounded.len < output.len };
+}
+
+fn insertOwnedItem(self: *Transcript, gpa: std.mem.Allocator, index: usize, item: Item) error{OutOfMemory}!void {
+    std.debug.assert(index <= self.items.items.len);
+    var owned = item;
+    errdefer owned.deinitBody(gpa);
+
+    try self.items.append(gpa, undefined);
+    const last_index = self.items.items.len - 1;
+    if (index < last_index) {
+        @memmove(self.items.items[index + 1 .. last_index + 1], self.items.items[index..last_index]);
+    }
+    self.items.items[index] = owned;
+    self.total_size_bytes += self.items.items[index].sizeBytes();
 }
 
 fn mergeToolStatus(old: ToolStatus, new: ToolStatus) ToolStatus {
@@ -454,6 +599,23 @@ pub fn findTool(self: *const Transcript, tool_call_id: []const u8) ?usize {
         index -= 1;
         const item = &self.items.items[index];
         if (item.body == .tool and std.mem.eql(u8, item.body.tool.id, tool_call_id)) return index;
+    }
+    return null;
+}
+
+pub fn findToolFromFront(self: *const Transcript, tool_call_id: []const u8) ?usize {
+    for (self.items.items, 0..) |*item, index| {
+        if (item.body == .tool and std.mem.eql(u8, item.body.tool.id, tool_call_id)) return index;
+    }
+    return null;
+}
+
+fn findToolInFrontRun(self: *const Transcript, tool_call_id: []const u8, start_index: usize) ?usize {
+    var index = start_index;
+    while (index < self.items.items.len) : (index += 1) {
+        const item = &self.items.items[index];
+        if (item.body != .tool) return null;
+        if (std.mem.eql(u8, item.body.tool.id, tool_call_id)) return index;
     }
     return null;
 }

@@ -42,6 +42,7 @@ cancel { target }
 queue.clear
 snapshot
 replay { after }
+switch_session { sessionFile }
 shutdown
 ```
 
@@ -73,6 +74,7 @@ snapshot
 replay
 replay_gap
 queue_changed
+session_changed
 session_info_changed
 event_overflow
 ```
@@ -87,10 +89,12 @@ auto_retry_start
 auto_retry_end
 ```
 
-The protocol does not distill `agent.AgentEvent` into bespoke transcript/tool
+Live updates do not distill `agent.AgentEvent` into bespoke transcript/tool
 projections. Tool-call granularity comes from `agent_event` variants such as
 `message_update`, `tool_execution_start`, `tool_execution_update`, and
-`tool_execution_end`.
+`tool_execution_end`. Snapshot/history state is the bounded reconstruction path:
+assistant history items carry final tool calls, and tool-result history items
+carry final tool output.
 
 ## Wire JSONL
 

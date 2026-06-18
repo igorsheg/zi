@@ -102,13 +102,17 @@ rules:
 
 ## coding-agent rules
 
-- `SessionRuntime` is the mailbox host and owns exactly one session for its
-  lifetime. session replacement is unsupported by design: a new session is a
-  new runtime, opened by the CLI. frontends never replace.
+- `SessionRuntime` is the stable mailbox host and owns exactly one live session
+  slot at a time. it owns or borrows the task runtime for its whole lifetime;
+  replaceable session services only borrow it. session replacement builds the
+  next slot completely, then swaps it through the mailbox owner path. frontends
+  never mutate sessions directly.
 - `AgentSession` contains one long-lived `agent.Agent` and owns that session's
   policy spine, events, persistence, resources, and tools.
-- the event drain is the only writer of queue mirrors, session history,
-  retry/compaction state, and the public event queue. order is fixed:
+- the event drain is the only writer of queue mirrors, message-derived session
+  history, retry/compaction state, and the public event queue. mailbox-owned
+  session facts such as model changes are persisted by `SessionRuntime` before
+  mutating the live agent. order is fixed:
 
 ```text
 agent event

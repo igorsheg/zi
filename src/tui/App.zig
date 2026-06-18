@@ -149,9 +149,15 @@ pub const ToolText = struct {
     text: []const u8,
 };
 
+pub const SlashArgAccept = enum {
+    insert_argument,
+    emit_selection,
+};
+
 pub const SlashArgCompletionOpen = struct {
     command_name: []const u8,
     picker: Picker.Open,
+    accept: SlashArgAccept = .insert_argument,
 };
 
 const slash_arg_command_name_bytes_max: usize = 32;
@@ -159,6 +165,7 @@ const slash_arg_command_name_bytes_max: usize = 32;
 const SlashArgCompletion = struct {
     command_name: [slash_arg_command_name_bytes_max]u8 = undefined,
     command_name_len: u8 = 0,
+    accept: SlashArgAccept = .insert_argument,
     picker: Picker,
 
     fn init(gpa: std.mem.Allocator, open: SlashArgCompletionOpen) error{OutOfMemory}!SlashArgCompletion {
@@ -166,6 +173,7 @@ const SlashArgCompletion = struct {
         const command_name = text_mod.utf8Prefix(open.command_name, slash_arg_command_name_bytes_max);
         @memcpy(self.command_name[0..command_name.len], command_name);
         self.command_name_len = @intCast(command_name.len);
+        self.accept = open.accept;
         self.picker = try Picker.init(gpa, open.picker);
         return self;
     }
@@ -297,9 +305,11 @@ pub const Command = union(enum) {
     clear_transcript,
     append_transcript: Transcript.Append,
     tool_output_delta: ToolOutputDelta,
+    front_tool_output_delta: ToolOutputDelta,
     replace_tool_output: ToolText,
+    replace_front_tool_output: ToolText,
     replace_tool_footer: ToolText,
-    prepend_transcript: Transcript.Append.MessageAppend,
+    prepend_transcript: Transcript.Prepend,
     set_greeter: Greeter.Set,
     clear_greeter,
     open_picker: Picker.Open,
@@ -376,11 +386,31 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.dirty = true;
             return null;
         },
+        .front_tool_output_delta => |delta| {
+            const outcome = try self.transcript.appendFrontToolOutput(
+                gpa,
+                delta.tool_call_id,
+                delta.text,
+                delta.dropped_head_bytes,
+                delta.dropped_head_lines,
+            );
+            try self.noteOutcome(gpa, outcome);
+            self.viewport.historyPrepended(render.transcriptScrollMax(self));
+            self.dirty = true;
+            return null;
+        },
         .replace_tool_output => |replace| {
             const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.replaceToolOutput(gpa, replace.tool_call_id, replace.text);
             try self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
+            self.dirty = true;
+            return null;
+        },
+        .replace_front_tool_output => |replace| {
+            const outcome = try self.transcript.replaceFrontToolOutput(gpa, replace.tool_call_id, replace.text);
+            try self.noteOutcome(gpa, outcome);
+            self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.dirty = true;
             return null;
         },
@@ -392,8 +422,8 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.dirty = true;
             return null;
         },
-        .prepend_transcript => |message| {
-            const outcome = try self.transcript.prependMessage(gpa, message);
+        .prepend_transcript => |rows| {
+            const outcome = try self.transcript.prepend(gpa, rows);
             try self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.dirty = true;
@@ -546,18 +576,16 @@ fn applyCompletionInput(
         .key => |key| switch (key) {
             .enter => {
                 if (self.composerCompletionQueryMatchesSelected()) return .{};
-                try self.acceptComposerCompletion(gpa);
-                return .{ .consumed = true };
+                const effect = try self.acceptComposerCompletion(gpa);
+                if (effect == null and self.completionHasNoSelection()) return .{};
+                return .{ .consumed = true, .effect = effect };
             },
             .escape => {
                 self.completion.hideUntilEdit();
                 self.dirty = true;
                 return .{ .consumed = true };
             },
-            .tab => {
-                try self.acceptComposerCompletion(gpa);
-                return .{ .consumed = true };
-            },
+            .tab => return .{ .consumed = true, .effect = try self.acceptComposerCompletion(gpa) },
             .arrow_up => {
                 _ = try completion_picker.applyInput(gpa, .{ .key = .arrow_up });
                 self.dirty = true;
@@ -778,8 +806,14 @@ fn syncComposerCompletion(self: *App) void {
     self.completion.sync(self);
 }
 
+fn completionHasNoSelection(self: *App) bool {
+    const completion_picker = self.visiblePicker() orelse return false;
+    return completion_picker.selectedIndex() == null;
+}
+
 fn composerCompletionQueryMatchesSelected(self: *App) bool {
     if (self.activeComposerArgCompletion()) |completion| {
+        if (completion.accept != .insert_argument) return false;
         const query = self.composerArgQuery(completion.commandName()) orelse return false;
         const index = completion.picker.selectedIndex() orelse return false;
         const item = completion.picker.itemAt(index);
@@ -830,13 +864,18 @@ fn composerArgQuery(self: *const App, command_name: []const u8) ?ComposerArgQuer
     return .{ .start = arg_start, .end = cursor, .text = text[arg_start..cursor] };
 }
 
-fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
     if (self.activeComposerArgCompletion()) |completion| {
-        try self.acceptComposerArgCompletion(gpa, completion);
-        return;
+        return switch (completion.accept) {
+            .insert_argument => blk: {
+                try self.acceptComposerArgCompletion(gpa, completion);
+                break :blk null;
+            },
+            .emit_selection => try self.selectComposerArgCompletion(gpa, completion),
+        };
     }
-    const completion = self.activeCommandCompletion() orelse return;
-    const index = completion.selectedIndex() orelse return;
+    const completion = self.activeCommandCompletion() orelse return null;
+    const index = completion.selectedIndex() orelse return null;
     const item = completion.itemAt(index);
     var replacement: [1 + Picker.id_bytes_max + 1]u8 = undefined;
     replacement[0] = '/';
@@ -849,6 +888,7 @@ fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemor
     self.syncComposerCompletion();
     self.composer_full_noticed = false;
     self.dirty = true;
+    return null;
 }
 
 fn acceptComposerArgCompletion(
@@ -872,6 +912,23 @@ fn acceptComposerArgCompletion(
     self.syncComposerCompletion();
     self.composer_full_noticed = false;
     self.dirty = true;
+}
+
+fn selectComposerArgCompletion(
+    self: *App,
+    gpa: std.mem.Allocator,
+    completion: *SlashArgCompletion,
+) error{OutOfMemory}!?Effect {
+    const index = completion.picker.selectedIndex() orelse return null;
+    const item = completion.picker.itemAt(index);
+    const item_id = try gpa.dupe(u8, item.idSlice());
+    self.composer.clear();
+    self.resetHistoryNavigation();
+    self.completion.noteEdit();
+    self.syncComposerCompletion();
+    self.composer_full_noticed = false;
+    self.dirty = true;
+    return .{ .picker_selected = .{ .picker_id = completion.picker.id, .item_id = item_id } };
 }
 
 fn clearOrExit(self: *App) ?Effect {
@@ -1144,14 +1201,50 @@ test "prepending transcript history keeps the viewport on older content" {
         .role = .assistant,
         .text = "newer\nrows\nhere",
     } } });
-    _ = try app.apply(gpa, .{ .prepend_transcript = .{
+    _ = try app.apply(gpa, .{ .prepend_transcript = .{ .message = .{
         .role = .user,
         .text = "older",
         .mode = .new_item,
-    } });
+    } } });
 
     try std.testing.expect(app.viewport.scroll_rows == render.transcriptScrollMax(&app));
     try std.testing.expectEqual(Transcript.Role.user, app.transcript.items.items[0].body.message.role);
+}
+
+test "prepending history tool result merges with its older tool call" {
+    const gpa = std.testing.allocator;
+    var app = App.init(40, 8, .{});
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "newer",
+    } } });
+    _ = try app.apply(gpa, .{ .prepend_transcript = .{ .tools = &.{.{
+        .tool_call_id = "call-1",
+        .name = "read",
+        .status = .success,
+    }} } });
+    _ = try app.apply(gpa, .{ .replace_front_tool_output = .{
+        .tool_call_id = "call-1",
+        .text = "file contents",
+    } });
+    _ = try app.apply(gpa, .{ .prepend_transcript = .{
+        .message = .{ .role = .assistant, .text = "I'll read it." },
+        .tools = &.{.{
+            .tool_call_id = "call-1",
+            .name = "read",
+            .status = .pending,
+            .title = "read {}",
+        }},
+    } });
+
+    try std.testing.expectEqual(@as(usize, 3), app.transcript.items.items.len);
+    try std.testing.expectEqual(Transcript.Role.assistant, app.transcript.items.items[0].body.message.role);
+    try std.testing.expectEqual(Transcript.ToolStatus.success, app.transcript.items.items[1].body.tool.status);
+    try std.testing.expectEqualStrings("read {}", app.transcript.items.items[1].body.tool.title);
+    try std.testing.expectEqualStrings("file contents", app.transcript.items.items[1].body.tool.output.items);
+    try std.testing.expectEqualStrings("newer", app.transcript.items.items[2].body.message.text.items);
 }
 
 test "picker selection returns opaque item id and closes modal" {
@@ -1224,6 +1317,49 @@ test "composer slash completion filters while typing and tab accepts" {
     _ = try app.apply(gpa, .{ .input = .{ .key = .tab } });
     try std.testing.expectEqualStrings("/model ", app.composer.text());
     try std.testing.expect(app.visiblePicker() == null);
+}
+
+test "composer slash arg completion can emit selected item" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{
+        .{ .id = "2026-06-10T00:00:00Z_one.jsonl", .label = "one" },
+        .{ .id = "2026-06-09T00:00:00Z_two.jsonl", .label = "two" },
+    };
+    _ = try app.apply(gpa, .{ .set_composer_arg_completions = .{
+        .command_name = "resume",
+        .accept = .emit_selection,
+        .picker = .{ .id = 3, .items = &items },
+    } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/resume two") } });
+    const effect = (try app.apply(gpa, .{ .input = .{ .key = .enter } })).?;
+    defer effect.deinit(gpa);
+    try std.testing.expect(effect == .picker_selected);
+    try std.testing.expectEqual(@as(Picker.Id, 3), effect.picker_selected.picker_id);
+    try std.testing.expectEqualStrings("2026-06-09T00:00:00Z_two.jsonl", effect.picker_selected.item_id);
+    try std.testing.expectEqualStrings("", app.composer.text());
+}
+
+test "composer slash arg completion with no match submits text" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{.{ .id = "2026-06-10T00:00:00Z_one.jsonl", .label = "one" }};
+    _ = try app.apply(gpa, .{ .set_composer_arg_completions = .{
+        .command_name = "resume",
+        .accept = .emit_selection,
+        .picker = .{ .id = 3, .items = &items },
+    } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("/resume tui-178") } });
+    const effect = (try app.apply(gpa, .{ .input = .{ .key = .enter } })).?;
+    defer effect.deinit(gpa);
+    try std.testing.expect(effect == .submit_text);
+    try std.testing.expectEqualStrings("/resume tui-178", effect.submit_text);
 }
 
 test "composer slash completion escape hides until the next edit" {

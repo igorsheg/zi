@@ -1,6 +1,7 @@
-//! The session mailbox host: owns one AgentSession, the bounded command and
-//! event queues, the retained-event replay ledger, and the single owner loop
-//! seam (`waitAndApplyWake` + `step`). Frontends talk to it only through
+//! The session mailbox host: owns the current AgentSession slot, the bounded
+//! command and event queues, the retained-event replay ledger, and the single
+//! owner loop seam (`waitAndApplyWake` + `step`). Session replacement builds a
+//! complete next slot before publishing it. Frontends talk to it only through
 //! `submit`/`drainEvent`; no callback path mutates session state.
 
 const std = @import("std");
@@ -11,6 +12,7 @@ const AgentSession = @import("AgentSession.zig");
 const client_protocol = @import("client_protocol.zig");
 const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
+const session_listing = @import("session_listing.zig");
 const session_manager = @import("session_manager.zig");
 const settings_mod = @import("settings.zig");
 const slash_commands = @import("slash_commands.zig");
@@ -96,12 +98,15 @@ pub fn openSessionRuntime(allocator: std.mem.Allocator, options: Options) !Sessi
         try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
     defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
 
+    const task_runtime = options.task_runtime orelse try runtime.Runtime.init(allocator, .{});
+    errdefer if (options.task_runtime == null) task_runtime.deinit();
+
     var services = try RuntimeServices.init(allocator, .{
         .cwd = options.cwd,
         .agent_dir = resolved_agent_dir,
         .dir = options.dir,
         .environ = options.environ,
-        .task_runtime = options.task_runtime,
+        .task_runtime = task_runtime,
     });
     errdefer services.deinit();
 
@@ -124,6 +129,17 @@ pub fn openSessionRuntime(allocator: std.mem.Allocator, options: Options) !Sessi
         .allocator = allocator,
         .services = services,
         .session = session,
+        .task_runtime = task_runtime,
+        .task_runtime_owner = if (options.task_runtime == null) .owned else .borrowed,
+        .host_config = .{
+            .dir = options.dir,
+            .environ = options.environ,
+            .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
+            .public_event_capacity = options.public_event_capacity,
+            .model = options.model,
+            .thinking_level = options.thinking_level,
+            .stream = options.stream,
+        },
         .command_buffer = command_buffer,
         .event_buffer = event_buffer,
         .commands = client_protocol.CommandQueue.init(command_buffer),
@@ -165,8 +181,44 @@ fn openSession(allocator: std.mem.Allocator, services: *RuntimeServices, options
                 .dir = options.dir,
                 .file_name = file_name,
             } };
-            return AgentSession.init(allocator, services.io, session_options);
+            var session = try AgentSession.init(allocator, services.io, session_options);
+            errdefer shutdownAndDeinitSession(&session);
+            restoreSessionPreferences(services, &session, .{
+                .model_explicit = options.model != null,
+                .thinking_explicit = options.thinking_level != null,
+            });
+            return session;
         },
+    }
+}
+
+const RestorePreferenceOptions = struct {
+    model_explicit: bool,
+    thinking_explicit: bool,
+};
+
+fn restoreSessionPreferences(
+    services: *RuntimeServices,
+    session: *AgentSession,
+    options: RestorePreferenceOptions,
+) void {
+    const preferences = session.manager.sessionPreferences();
+    if (!options.model_explicit) {
+        if (preferences.model) |saved| {
+            if (ai.getModel(saved.provider, saved.model_id)) |model| {
+                if (services.auth_manager.hasAuth(model.provider) and services.provider_registry.get(model.api) != null) {
+                    session.agent.setModel(model);
+                    if (services.provider_registry.get(model.api)) |provider| {
+                        session.agent.setStream(provider.stream_simple);
+                    }
+                }
+            }
+        }
+    }
+    if (!options.thinking_explicit) {
+        if (preferences.thinking_level) |text| {
+            if (parseThinkingLevel(text)) |level| session.agent.setThinkingLevel(level);
+        }
     }
 }
 
@@ -199,11 +251,7 @@ fn resolveSessionOptions(services: *RuntimeServices, options: Options) AgentSess
 
     const thinking_level = options.thinking_level orelse level: {
         if (project.default_thinking_level orelse global.default_thinking_level) |text| {
-            inline for (@typeInfo(agent_mod.ThinkingLevel).@"enum".fields) |field| {
-                if (std.ascii.eqlIgnoreCase(text, field.name)) {
-                    break :level @field(agent_mod.ThinkingLevel, field.name);
-                }
-            }
+            if (parseThinkingLevel(text)) |parsed| break :level parsed;
         }
         break :level .off;
     };
@@ -252,10 +300,22 @@ fn fileSettings(file: settings_mod.SettingsFile) settings_mod.Settings {
     };
 }
 
+fn parseThinkingLevel(text: []const u8) ?agent_mod.ThinkingLevel {
+    inline for (@typeInfo(agent_mod.ThinkingLevel).@"enum".fields) |field| {
+        if (std.ascii.eqlIgnoreCase(text, field.name)) return @field(agent_mod.ThinkingLevel, field.name);
+    }
+    return null;
+}
+
+const TaskRuntimeOwner = enum { owned, borrowed };
+
 pub const SessionRuntime = struct {
     allocator: std.mem.Allocator,
     services: RuntimeServices,
     session: AgentSession,
+    task_runtime: *runtime.Runtime,
+    task_runtime_owner: TaskRuntimeOwner,
+    host_config: HostConfig,
     command_buffer: []client_protocol.CommandEnvelope,
     event_buffer: []client_protocol.EventEnvelope,
     commands: client_protocol.CommandQueue,
@@ -266,6 +326,16 @@ pub const SessionRuntime = struct {
     next_operation_id: client_protocol.OperationId = 1,
     next_event_seq: client_protocol.EventSeq = 1,
     pending_event: ?client_protocol.EventEnvelope = null,
+
+    const HostConfig = struct {
+        dir: std.Io.Dir,
+        environ: ?*const std.process.Environ.Map,
+        allow_paths_outside_cwd: bool,
+        public_event_capacity: usize,
+        model: ?ai.Model,
+        thinking_level: ?agent_mod.ThinkingLevel,
+        stream: ?ai.StreamFunction,
+    };
 
     /// All facts about the one in-flight prompt operation live together.
     /// The phase makes "a run, a summary run, and a retry timer at once"
@@ -309,6 +379,10 @@ pub const SessionRuntime = struct {
         self.retained_events.deinit();
         shutdownAndDeinitSession(&self.session);
         self.services.deinit();
+        switch (self.task_runtime_owner) {
+            .owned => self.task_runtime.deinit(),
+            .borrowed => {},
+        }
         self.allocator.free(self.event_buffer);
         self.allocator.free(self.command_buffer);
         self.* = undefined;
@@ -334,6 +408,14 @@ pub const SessionRuntime = struct {
         message: []const u8,
     ) !void {
         try self.enqueueRejected(request_id, code, message);
+    }
+
+    pub fn sessionListDir(self: *const SessionRuntime) std.Io.Dir {
+        return self.host_config.dir;
+    }
+
+    pub fn sessionListEnviron(self: *const SessionRuntime) ?*const std.process.Environ.Map {
+        return self.host_config.environ;
     }
 
     pub fn waitAndApplyWake(
@@ -635,6 +717,7 @@ pub const SessionRuntime = struct {
                 errdefer page.deinit(self.allocator);
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .history_page = page } });
             },
+            .switch_session => |request| try self.switchSession(envelope.id, request.session_file_name),
             .shutdown => {
                 // A pending retry or summary run never outlives shutdown:
                 // settle it as canceled. (A running prompt is aborted by the
@@ -654,6 +737,74 @@ pub const SessionRuntime = struct {
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .shutdown_started });
             },
         }
+    }
+
+    fn switchSession(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        session_selector: []const u8,
+    ) !void {
+        if (self.active != null) {
+            try self.enqueueRejected(request_id, .busy, "cancel active operation before resume");
+            return;
+        }
+        const session_file_name = session_listing.selectRuntimeSession(self.allocator, self.services.io, .{
+            .cwd = self.services.cwd,
+            .agent_dir_override = self.services.agent_dir,
+            .dir = self.host_config.dir,
+            .environ = self.host_config.environ,
+            .selector = session_selector,
+        }) catch |err| {
+            try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            return;
+        } orelse {
+            try self.enqueueRejected(request_id, .invalid_command, "session not found");
+            return;
+        };
+        defer self.allocator.free(session_file_name);
+
+        const stamp = SessionStamp.now(self.services.io);
+        var next_services = try RuntimeServices.init(self.allocator, .{
+            .cwd = self.services.cwd,
+            .agent_dir = self.services.agent_dir,
+            .dir = self.host_config.dir,
+            .environ = self.host_config.environ,
+            .task_runtime = self.task_runtime,
+        });
+        var next_services_owned = true;
+        errdefer if (next_services_owned) next_services.deinit();
+
+        var next_session = openSession(self.allocator, &next_services, .{
+            .cwd = self.services.cwd,
+            .agent_dir_override = self.services.agent_dir,
+            .current_date = stamp.date(),
+            .open = .{ .resume_existing = .{ .session_file_name = session_file_name } },
+            .model = self.host_config.model,
+            .thinking_level = self.host_config.thinking_level,
+            .stream = self.host_config.stream,
+            .dir = self.host_config.dir,
+            .environ = self.host_config.environ,
+            .task_runtime = self.task_runtime,
+            .allow_paths_outside_cwd = self.host_config.allow_paths_outside_cwd,
+            .public_event_capacity = self.host_config.public_event_capacity,
+        }) catch |err| {
+            try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            return;
+        };
+        var next_session_owned = true;
+        errdefer if (next_session_owned) shutdownAndDeinitSession(&next_session);
+
+        var old_session = self.session;
+        var old_services = self.services;
+        self.services = next_services;
+        next_services_owned = false;
+        self.session = next_session;
+        next_session_owned = false;
+        shutdownAndDeinitSession(&old_session);
+        old_services.deinit();
+
+        try self.enqueueEvent(.{ .request_id = request_id, .event = .session_changed });
+        try self.enqueueSessionChrome(request_id);
     }
 
     fn applyActiveProgress(self: *SessionRuntime, result: anytype) !void {
@@ -757,6 +908,7 @@ pub const SessionRuntime = struct {
             ),
             .session => try self.enqueueSessionPromptCommand(request_id, spec.name),
             .model => try self.handleModelSlashCommand(request_id, spec.name, invocation.args),
+            .resume_session => try self.handleResumeSlashCommand(request_id, spec.name, invocation.args),
         }
         return true;
     }
@@ -776,7 +928,7 @@ pub const SessionRuntime = struct {
     fn collectSessionStats(manager: *const session_manager.SessionManager) SessionStats {
         var stats: SessionStats = .{};
         for (manager.entries.items) |entry| switch (entry) {
-            .compaction => {},
+            .compaction, .model_change, .thinking_level_change => {},
             .message => |message_entry| {
                 stats.total_messages += 1;
                 switch (message_entry.message) {
@@ -803,6 +955,19 @@ pub const SessionRuntime = struct {
             },
         };
         return stats;
+    }
+
+    fn handleResumeSlashCommand(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        command: []const u8,
+        args: []const u8,
+    ) !void {
+        if (args.len == 0) {
+            try self.enqueuePromptCommand(request_id, command, .handled, "usage: /resume <session-file>");
+            return;
+        }
+        try self.switchSession(request_id, args);
     }
 
     fn handleModelSlashCommand(
@@ -842,7 +1007,10 @@ pub const SessionRuntime = struct {
             return;
         }
 
-        self.setSessionModel(model);
+        self.setSessionModel(model) catch |err| {
+            try self.enqueuePromptCommand(request_id, command, .failed, @errorName(err));
+            return;
+        };
         var reply_buffer: [256]u8 = undefined;
         const reply = std.fmt.bufPrint(&reply_buffer, "model: {s}/{s}", .{ model.provider, model.id }) catch
             "model changed";
@@ -873,7 +1041,19 @@ pub const SessionRuntime = struct {
         return found orelse error.UnknownModel;
     }
 
-    fn setSessionModel(self: *SessionRuntime, model: ai.Model) void {
+    fn setSessionModel(self: *SessionRuntime, model: ai.Model) !void {
+        const entry = try self.session.manager.prepareModelChangeEntry(
+            model.provider,
+            model.id,
+            self.session.timestamp,
+        );
+        var entry_committed = false;
+        errdefer if (!entry_committed) self.session.manager.deinitPreparedEntry(entry);
+        if (self.session.store) |store| {
+            try store.appendEntry(self.session.io, entry, self.session.manager.lastEntryId());
+        }
+        _ = self.session.manager.commitPreparedEntry(entry);
+        entry_committed = true;
         self.session.agent.setModel(model);
         if (self.services.provider_registry.get(model.api)) |provider| {
             self.session.agent.setStream(provider.stream_simple);
@@ -1295,8 +1475,10 @@ test "session runtime handles slash command without starting an operation" {
     defer session_runtime.deinit();
 
     var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 7, "/help", .auto);
-    errdefer envelope.deinit(std.testing.allocator);
+    var envelope_owned = true;
+    errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
+    envelope_owned = false;
     try session_runtime.step();
 
     var event = session_runtime.drainEvent().?;
@@ -1306,13 +1488,91 @@ test "session runtime handles slash command without starting an operation" {
     try std.testing.expect(event.event.prompt_command.result == .handled);
     try std.testing.expectEqualStrings("help", event.event.prompt_command.command.text);
     try std.testing.expectEqualStrings(
-        "available commands: /help, /session, /model",
+        "available commands: /help, /session, /model, /resume",
         event.event.prompt_command.message.text,
     );
     // No operation started, nothing queued, nothing persisted.
     try std.testing.expect(session_runtime.active == null);
     try std.testing.expect(session_runtime.drainEvent() == null);
     try std.testing.expectEqual(@as(usize, 0), session_runtime.session.manager.entries.items.len);
+}
+
+test "session runtime switches to a selected session through the mailbox" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    var store = try session_manager.SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .sessions_dir = "agent/sessions/--repo--",
+        .cwd = "repo",
+        .session_id = "other",
+        .timestamp = "2026-06-10T00:00:00Z",
+    });
+    defer store.deinit();
+
+    var envelope = try client_protocol.CommandEnvelope.initSwitchSession(
+        std.testing.allocator,
+        9,
+        "2026-06-10T00:00:00Z_other.jsonl",
+    );
+    var envelope_owned = true;
+    errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    envelope_owned = false;
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 9), event.request_id);
+    try std.testing.expect(event.event == .session_changed);
+    try std.testing.expectEqualStrings("other", session_runtime.session.manager.header.id);
+    try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime keeps owned task runtime across session switch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var session_runtime = try openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+    });
+    defer session_runtime.deinit();
+    const host_runtime = session_runtime.task_runtime;
+    try std.testing.expectEqual(TaskRuntimeOwner.owned, session_runtime.task_runtime_owner);
+    try std.testing.expect(session_runtime.services.task_runtime == host_runtime);
+
+    var store = try session_manager.SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .sessions_dir = "agent/sessions/--repo--",
+        .cwd = "repo",
+        .session_id = "other",
+        .timestamp = "2026-06-10T00:00:00Z",
+    });
+    defer store.deinit();
+
+    var envelope = try client_protocol.CommandEnvelope.initSwitchSession(
+        std.testing.allocator,
+        10,
+        "2026-06-10T00:00:00Z_other.jsonl",
+    );
+    var envelope_owned = true;
+    errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    envelope_owned = false;
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .session_changed);
+    try std.testing.expect(session_runtime.task_runtime == host_runtime);
+    try std.testing.expect(session_runtime.services.task_runtime == host_runtime);
 }
 
 test "session runtime session command reports session facts" {
@@ -1383,7 +1643,82 @@ test "session runtime model command selects an authenticated model" {
     try std.testing.expectEqualStrings("model", event.event.prompt_command.command.text);
     try std.testing.expectEqualStrings("openai", session_runtime.session.agent.state.model.provider);
     try std.testing.expectEqualStrings("gpt-5.1", session_runtime.session.agent.state.model.id);
+    try std.testing.expect(session_runtime.session.manager.entries.items[0] == .model_change);
+    try std.testing.expectEqualStrings("openai", session_runtime.session.manager.entries.items[0].model_change.provider);
+    try std.testing.expectEqualStrings("gpt-5.1", session_runtime.session.manager.entries.items[0].model_change.model_id);
+    var loaded = try session_runtime.session.store.?.load(std.testing.io);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.entries.items[0] == .model_change);
+    try std.testing.expectEqualStrings("gpt-5.1", loaded.sessionPreferences().model.?.model_id);
     try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime switch restores persisted session model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("OPENAI_API_KEY", "test-key");
+
+    var session_runtime = try openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+        .environ = &environ,
+        .task_runtime = task_runtime,
+    });
+    defer session_runtime.deinit();
+
+    var store = try session_manager.SessionStore.create(std.testing.allocator, std.testing.io, tmp.dir, .{
+        .sessions_dir = "agent/sessions/--repo--",
+        .cwd = "repo",
+        .session_id = "other",
+        .timestamp = "2026-06-10T00:00:00Z",
+    });
+    defer store.deinit();
+    var manager = try session_manager.SessionManager.init(
+        std.testing.allocator,
+        "repo",
+        "other",
+        "2026-06-10T00:00:00Z",
+    );
+    defer manager.deinit();
+    const model_entry = try manager.prepareModelChangeEntry("openai", "gpt-5.1", "t1");
+    var model_entry_committed = false;
+    errdefer if (!model_entry_committed) manager.deinitPreparedEntry(model_entry);
+    try store.appendEntry(std.testing.io, model_entry, null);
+    const model_entry_id = manager.commitPreparedEntry(model_entry);
+    model_entry_committed = true;
+    const thinking_entry = try manager.prepareThinkingLevelChangeEntry("high", "t2");
+    var thinking_entry_committed = false;
+    errdefer if (!thinking_entry_committed) manager.deinitPreparedEntry(thinking_entry);
+    try store.appendEntry(std.testing.io, thinking_entry, model_entry_id);
+    _ = manager.commitPreparedEntry(thinking_entry);
+    thinking_entry_committed = true;
+
+    var envelope = try client_protocol.CommandEnvelope.initSwitchSession(
+        std.testing.allocator,
+        12,
+        "2026-06-10T00:00:00Z_other.jsonl",
+    );
+    var envelope_owned = true;
+    errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    envelope_owned = false;
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .session_changed);
+    try std.testing.expectEqualStrings("openai", session_runtime.session.agent.state.model.provider);
+    try std.testing.expectEqualStrings("gpt-5.1", session_runtime.session.agent.state.model.id);
+    try std.testing.expectEqual(agent_mod.ThinkingLevel.high, session_runtime.session.agent.state.thinking_level);
 }
 
 test "session runtime model command rejects missing auth" {

@@ -17,6 +17,9 @@ pub const max_session_line_bytes = 1024 * 1024;
 pub const max_session_entries = 16_384;
 pub const max_compaction_summary_bytes = 256 * 1024;
 pub const max_compaction_first_kept_entry_id_bytes = 128;
+pub const max_model_provider_bytes = 64;
+pub const max_model_id_bytes = 128;
+pub const max_thinking_level_bytes = 32;
 pub const max_compaction_keep_recent_tokens = 1_000_000;
 pub const max_compaction_serialized_input_bytes = 512 * 1024;
 pub const max_compaction_tool_result_chars = 16 * 1024;
@@ -37,6 +40,8 @@ pub const CompactionSettings = struct {
 pub const SessionEntry = union(enum) {
     message: Message,
     compaction: Compaction,
+    model_change: ModelChange,
+    thinking_level_change: ThinkingLevelChange,
 
     pub const Base = struct {
         id: []const u8,
@@ -55,11 +60,38 @@ pub const SessionEntry = union(enum) {
         tokens_before: u64,
     };
 
+    pub const ModelChange = struct {
+        base: Base,
+        provider: []const u8,
+        model_id: []const u8,
+    };
+
+    pub const ThinkingLevelChange = struct {
+        base: Base,
+        thinking_level: []const u8,
+    };
+
     pub fn id(self: SessionEntry) []const u8 {
         return switch (self) {
             inline else => |entry| entry.base.id,
         };
     }
+};
+
+pub const ReconstructedSessionItem = struct {
+    entry_id: []const u8,
+    timestamp: []const u8,
+    content: Content,
+
+    pub const Content = union(enum) {
+        message: agent.AgentMessage,
+        compaction_summary: CompactionSummary,
+    };
+
+    pub const CompactionSummary = struct {
+        summary: []const u8,
+        tokens_before: u64,
+    };
 };
 
 /// Owned input for one generated compaction summary: the messages to
@@ -186,6 +218,16 @@ pub const SessionManager = struct {
         CompactionSettingsOutOfBounds,
     } || std.mem.Allocator.Error;
 
+    pub const SessionPreferences = struct {
+        model: ?Model = null,
+        thinking_level: ?[]const u8 = null,
+
+        pub const Model = struct {
+            provider: []const u8,
+            model_id: []const u8,
+        };
+    };
+
     const LoadedValue = union(enum) {
         message: agent.AgentMessage,
         compaction: struct {
@@ -193,6 +235,11 @@ pub const SessionManager = struct {
             first_kept_entry_id: []const u8,
             tokens_before: u64,
         },
+        model_change: struct {
+            provider: []const u8,
+            model_id: []const u8,
+        },
+        thinking_level_change: []const u8,
     };
 
     pub fn init(
@@ -278,6 +325,29 @@ pub const SessionManager = struct {
         return self.compactionEntryFromParts(base, summary, first_kept_entry_id, tokens_before);
     }
 
+    pub fn prepareModelChangeEntry(
+        self: *SessionManager,
+        provider: []const u8,
+        model_id: []const u8,
+        timestamp: []const u8,
+    ) Error!SessionEntry {
+        try self.ensureAppendCapacity(1);
+        const base = try self.nextBase(timestamp);
+        errdefer self.deinitBase(base);
+        return self.modelChangeEntryFromParts(base, provider, model_id);
+    }
+
+    pub fn prepareThinkingLevelChangeEntry(
+        self: *SessionManager,
+        thinking_level: []const u8,
+        timestamp: []const u8,
+    ) Error!SessionEntry {
+        try self.ensureAppendCapacity(1);
+        const base = try self.nextBase(timestamp);
+        errdefer self.deinitBase(base);
+        return self.thinkingLevelChangeEntryFromParts(base, thinking_level);
+    }
+
     /// Single validation and construction site for compaction entries,
     /// shared by the live prepare path and the load path. Takes ownership
     /// of `base` only on success.
@@ -301,6 +371,36 @@ pub const SessionManager = struct {
             .summary = summary_copy,
             .first_kept_entry_id = first_kept_entry_id_copy,
             .tokens_before = tokens_before,
+        } };
+    }
+
+    fn modelChangeEntryFromParts(
+        self: *SessionManager,
+        base: SessionEntry.Base,
+        provider: []const u8,
+        model_id: []const u8,
+    ) Error!SessionEntry {
+        if (provider.len == 0 or provider.len > max_model_provider_bytes) return error.InvalidEntryId;
+        if (model_id.len == 0 or model_id.len > max_model_id_bytes) return error.InvalidEntryId;
+        const provider_copy = try self.allocator.dupe(u8, provider);
+        errdefer self.allocator.free(provider_copy);
+        const model_id_copy = try self.allocator.dupe(u8, model_id);
+        return .{ .model_change = .{
+            .base = base,
+            .provider = provider_copy,
+            .model_id = model_id_copy,
+        } };
+    }
+
+    fn thinkingLevelChangeEntryFromParts(
+        self: *SessionManager,
+        base: SessionEntry.Base,
+        thinking_level: []const u8,
+    ) Error!SessionEntry {
+        if (thinking_level.len == 0 or thinking_level.len > max_thinking_level_bytes) return error.InvalidEntryId;
+        return .{ .thinking_level_change = .{
+            .base = base,
+            .thinking_level = try self.allocator.dupe(u8, thinking_level),
         } };
     }
 
@@ -359,6 +459,15 @@ pub const SessionManager = struct {
                 compaction.first_kept_entry_id,
                 compaction.tokens_before,
             ),
+            .model_change => |model_change| try self.modelChangeEntryFromParts(
+                base,
+                model_change.provider,
+                model_change.model_id,
+            ),
+            .thinking_level_change => |thinking_level| try self.thinkingLevelChangeEntryFromParts(
+                base,
+                thinking_level,
+            ),
         };
         base_owned = false;
         // Capacity was reserved above, so this append cannot fail and the
@@ -374,6 +483,40 @@ pub const SessionManager = struct {
         var messages = std.ArrayList(agent.AgentMessage).empty;
         errdefer freeContextMessages(allocator, &messages);
 
+        const items = try self.reconstructSession(allocator);
+        defer allocator.free(items);
+        for (items) |item| switch (item.content) {
+            .compaction_summary => |summary| {
+                const summary_text = try std.fmt.allocPrint(
+                    allocator,
+                    "The conversation history before this point was compacted into the following summary:\n\n" ++
+                        "<summary>\n{s}\n</summary>",
+                    .{summary.summary},
+                );
+                errdefer allocator.free(summary_text);
+                try messages.append(allocator, .{ .user = .{
+                    .content = .{ .string = summary_text },
+                    .timestamp = 0,
+                } });
+            },
+            .message => |message| {
+                const copy = try agent.copyAgentMessage(allocator, message);
+                errdefer agent.deinitAgentMessage(allocator, copy);
+                try messages.append(allocator, copy);
+            },
+        };
+        return messages.toOwnedSlice(allocator);
+    }
+
+    /// Rebuild the durable session transcript view. The returned slice is owned
+    /// by the caller; item payloads borrow from this manager.
+    pub fn reconstructSession(
+        self: *const SessionManager,
+        allocator: std.mem.Allocator,
+    ) Error![]ReconstructedSessionItem {
+        var items = std.ArrayList(ReconstructedSessionItem).empty;
+        errdefer items.deinit(allocator);
+
         const entries = self.entries.items;
         var latest_compaction_index: ?usize = null;
         for (entries, 0..) |entry, index| {
@@ -383,35 +526,51 @@ pub const SessionManager = struct {
         var start: usize = 0;
         if (latest_compaction_index) |compaction_index| {
             const compaction = entries[compaction_index].compaction;
-            const summary_text = try std.fmt.allocPrint(
-                allocator,
-                "The conversation history before this point was compacted into the following summary:\n\n" ++
-                    "<summary>\n{s}\n</summary>",
-                .{compaction.summary},
-            );
-            {
-                errdefer allocator.free(summary_text);
-                try messages.ensureUnusedCapacity(allocator, 1);
-            }
-            messages.appendAssumeCapacity(.{ .user = .{
-                .content = .{ .string = summary_text },
-                .timestamp = 0,
-            } });
+            try items.append(allocator, .{
+                .entry_id = compaction.base.id,
+                .timestamp = compaction.base.timestamp,
+                .content = .{ .compaction_summary = .{
+                    .summary = compaction.summary,
+                    .tokens_before = compaction.tokens_before,
+                } },
+            });
             start = self.findEntryIndex(compaction.first_kept_entry_id) orelse compaction_index + 1;
         }
 
         for (entries[start..]) |entry| {
             if (entry != .message) continue;
-            const copy = try agent.copyAgentMessage(allocator, entry.message.message);
-            errdefer agent.deinitAgentMessage(allocator, copy);
-            try messages.append(allocator, copy);
+            try items.append(allocator, .{
+                .entry_id = entry.message.base.id,
+                .timestamp = entry.message.base.timestamp,
+                .content = .{ .message = entry.message.message },
+            });
         }
-        return messages.toOwnedSlice(allocator);
+        return items.toOwnedSlice(allocator);
     }
 
     pub fn deinitContextMessages(allocator: std.mem.Allocator, messages: []const agent.AgentMessage) void {
         for (messages) |message| agent.deinitAgentMessage(allocator, message);
         allocator.free(messages);
+    }
+
+    pub fn sessionPreferences(self: *const SessionManager) SessionPreferences {
+        var preferences: SessionPreferences = .{};
+        for (self.entries.items) |entry| switch (entry) {
+            .model_change => |model_change| preferences.model = .{
+                .provider = model_change.provider,
+                .model_id = model_change.model_id,
+            },
+            .thinking_level_change => |thinking| preferences.thinking_level = thinking.thinking_level,
+            .message => |message_entry| switch (message_entry.message) {
+                .assistant => |assistant| preferences.model = .{
+                    .provider = assistant.provider,
+                    .model_id = assistant.model,
+                },
+                .user, .tool_result, .custom => {},
+            },
+            .compaction => {},
+        };
+        return preferences;
     }
 
     /// Choose a compaction cut and gather the messages to summarize.
@@ -514,6 +673,7 @@ pub const SessionManager = struct {
 
     pub fn estimateEntryTokens(entry: SessionEntry) u64 {
         const chars: u64 = switch (entry) {
+            .model_change, .thinking_level_change => 0,
             .compaction => |compaction| compaction.summary.len,
             .message => |message_entry| switch (message_entry.message) {
                 .user => |user| switch (user.content) {
@@ -579,6 +739,15 @@ pub const SessionManager = struct {
                 self.deinitBase(compaction.base);
                 self.allocator.free(compaction.summary);
                 self.allocator.free(compaction.first_kept_entry_id);
+            },
+            .model_change => |model_change| {
+                self.deinitBase(model_change.base);
+                self.allocator.free(model_change.provider);
+                self.allocator.free(model_change.model_id);
+            },
+            .thinking_level_change => |thinking| {
+                self.deinitBase(thinking.base);
+                self.allocator.free(thinking.thinking_level);
             },
         }
     }
@@ -738,6 +907,18 @@ fn formatEntryLine(allocator: std.mem.Allocator, entry: SessionEntry, parent_id:
             try writer.writer.writeAll(",\"tokensBefore\":");
             try writer.writer.print("{}", .{compaction.tokens_before});
         },
+        .model_change => |model_change| {
+            try writeEntryBase("model_change", &writer.writer, model_change.base, parent_id);
+            try writer.writer.writeAll(",\"provider\":");
+            try std.json.Stringify.value(model_change.provider, .{}, &writer.writer);
+            try writer.writer.writeAll(",\"modelId\":");
+            try std.json.Stringify.value(model_change.model_id, .{}, &writer.writer);
+        },
+        .thinking_level_change => |thinking| {
+            try writeEntryBase("thinking_level_change", &writer.writer, thinking.base, parent_id);
+            try writer.writer.writeAll(",\"thinkingLevel\":");
+            try std.json.Stringify.value(thinking.thinking_level, .{}, &writer.writer);
+        },
     }
     try writer.writer.writeAll("}\n");
     return writer.toOwnedSlice();
@@ -846,6 +1027,18 @@ fn parseEntryLine(allocator: std.mem.Allocator, manager: *SessionManager, line: 
             .first_kept_entry_id = try jsonString(object.get("firstKeptEntryId") orelse return error.InvalidEntry),
             .tokens_before = try jsonNonNegativeInteger(object.get("tokensBefore") orelse return error.InvalidEntry),
         } });
+    } else if (std.mem.eql(u8, entry_type, "model_change")) {
+        try manager.appendLoadedEntry(id, parent_id, timestamp, .{ .model_change = .{
+            .provider = try jsonString(object.get("provider") orelse return error.InvalidEntry),
+            .model_id = try jsonString(object.get("modelId") orelse return error.InvalidEntry),
+        } });
+    } else if (std.mem.eql(u8, entry_type, "thinking_level_change")) {
+        try manager.appendLoadedEntry(
+            id,
+            parent_id,
+            timestamp,
+            .{ .thinking_level_change = try jsonString(object.get("thinkingLevel") orelse return error.InvalidEntry) },
+        );
     } else {
         return error.InvalidEntry;
     }
@@ -1680,6 +1873,16 @@ test "session store round trips agent message variants" {
     try std.testing.expectEqualStrings("call-1", messages[1].assistant.content[2].tool_call.id);
     try std.testing.expectEqualStrings("ok", messages[2].tool_result.content[0].text.text);
     try std.testing.expectEqualStrings("extension", messages[3].custom.kind);
+
+    const reconstructed = try loaded.reconstructSession(std.testing.allocator);
+    defer std.testing.allocator.free(reconstructed);
+    try std.testing.expectEqual(@as(usize, 4), reconstructed.len);
+    try std.testing.expectEqualStrings("00000002", reconstructed[1].entry_id);
+    try std.testing.expect(reconstructed[1].content == .message);
+    try std.testing.expectEqualStrings("call-1", reconstructed[1].content.message.assistant.content[2].tool_call.id);
+    try std.testing.expect(reconstructed[2].content == .message);
+    try std.testing.expectEqualStrings("call-1", reconstructed[2].content.message.tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("ok", reconstructed[2].content.message.tool_result.content[0].text.text);
 }
 
 test "session store load preserves entry ids and continues id generation" {
@@ -1723,16 +1926,26 @@ test "session store round trips compaction entries" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
 
-    const root = try manager.appendMessage(userMessage("before"), "t1");
+    const old = try manager.appendMessage(userMessage("old"), "t1");
     try store.appendEntry(std.testing.io, manager.entries.items[0], null);
-    _ = try manager.appendCompaction("summary", root, 2048, "t2");
-    try store.appendEntry(std.testing.io, manager.entries.items[1], root);
+    const kept = try manager.appendMessage(userMessage("kept"), "t2");
+    try store.appendEntry(std.testing.io, manager.entries.items[1], old);
+    _ = try manager.appendCompaction("summary", kept, 2048, "t3");
+    try store.appendEntry(std.testing.io, manager.entries.items[2], kept);
 
     var loaded = try store.load(std.testing.io);
     defer loaded.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), loaded.entries.items.len);
-    try std.testing.expectEqualStrings("summary", loaded.entries.items[1].compaction.summary);
-    try std.testing.expectEqualStrings(root, loaded.entries.items[1].compaction.first_kept_entry_id);
-    try std.testing.expectEqual(@as(u64, 2048), loaded.entries.items[1].compaction.tokens_before);
+    try std.testing.expectEqual(@as(usize, 3), loaded.entries.items.len);
+    try std.testing.expectEqualStrings("summary", loaded.entries.items[2].compaction.summary);
+    try std.testing.expectEqualStrings(kept, loaded.entries.items[2].compaction.first_kept_entry_id);
+    try std.testing.expectEqual(@as(u64, 2048), loaded.entries.items[2].compaction.tokens_before);
+
+    const reconstructed = try loaded.reconstructSession(std.testing.allocator);
+    defer std.testing.allocator.free(reconstructed);
+    try std.testing.expectEqual(@as(usize, 2), reconstructed.len);
+    try std.testing.expect(reconstructed[0].content == .compaction_summary);
+    try std.testing.expectEqualStrings("summary", reconstructed[0].content.compaction_summary.summary);
+    try std.testing.expect(reconstructed[1].content == .message);
+    try std.testing.expectEqualStrings("kept", reconstructed[1].content.message.user.content.string);
 }

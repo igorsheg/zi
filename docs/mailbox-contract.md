@@ -8,7 +8,7 @@ submit commands and drain sequenced facts. Session mutation remains single-owner
 ```text
 ClientCommand
   -> bounded command queue
-  -> AgentSessionRuntimeHost owner step
+  -> SessionRuntime owner step
   -> AgentSession / agent owner mutation
   -> bounded public ClientEvent queue
   -> sequenced EventEnvelope
@@ -33,6 +33,7 @@ queue.clear
 snapshot
 history_page { before_entry_id }
 replay { after, max_events }
+switch_session { session_file_name }
 shutdown
 ```
 

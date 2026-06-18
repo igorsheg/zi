@@ -1876,11 +1876,11 @@ test "history prepend is visible at the scrollback boundary" {
         .role = .assistant,
         .text = "newer one\nnewer two\nnewer three\nnewer four",
     } } });
-    _ = try app.apply(testing_gpa, .{ .prepend_transcript = .{
+    _ = try app.apply(testing_gpa, .{ .prepend_transcript = .{ .message = .{
         .role = .user,
         .text = "fixture older row",
         .mode = .new_item,
-    } });
+    } } });
 
     const scratch = try testing_gpa.create(RowScratch);
     defer testing_gpa.destroy(scratch);

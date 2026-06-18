@@ -31,8 +31,9 @@ pub const AppArgs = struct {
     version: bool = false,
     print: bool = false,
     mode: ?OutputMode = null,
-    resume_session_file: ?[]const u8 = null,
-    resume_latest: bool = false,
+    session_selector: ?[]const u8 = null,
+    continue_latest: bool = false,
+    resume_picker: bool = false,
     messages: MessageList = .{},
     unknown_flags: UnknownFlagList = .{},
 };
@@ -95,8 +96,9 @@ const AppFlagTarget = enum {
     version,
     print,
     mode,
-    resume_session,
-    resume_latest,
+    resume_picker,
+    session,
+    continue_latest,
 };
 
 const AppFlagSpec = struct {
@@ -124,15 +126,22 @@ const app_flags = [_]AppFlagSpec{
     },
     .{
         .long = "resume",
-        .value = .required,
-        .target = .resume_session,
-        .value_name = "session",
-        .help = "Resume the named session file",
+        .short = "r",
+        .target = .resume_picker,
+        .help = "Select a session to resume",
     },
     .{
-        .long = "resume-latest",
-        .target = .resume_latest,
-        .help = "Resume the newest session for this cwd",
+        .long = "session",
+        .value = .required,
+        .target = .session,
+        .value_name = "session",
+        .help = "Use specific session file or id prefix",
+    },
+    .{
+        .long = "continue",
+        .short = "c",
+        .target = .continue_latest,
+        .help = "Continue the newest session for this cwd",
     },
     .{
         .long = "version",
@@ -275,6 +284,10 @@ fn readFlagValue(
     };
 }
 
+fn hasResumePolicy(result: AppArgs) bool {
+    return result.session_selector != null or result.continue_latest or result.resume_picker;
+}
+
 fn applyAppFlag(result: *AppArgs, spec: AppFlagSpec, value: ?[]const u8) ParseError!void {
     switch (spec.target) {
         .help => result.help = true,
@@ -282,13 +295,19 @@ fn applyAppFlag(result: *AppArgs, spec: AppFlagSpec, value: ?[]const u8) ParseEr
         .print => result.print = true,
         .mode => result.mode = std.meta.stringToEnum(OutputMode, value orelse return error.MissingOptionValue) orelse
             return error.InvalidOptionValue,
-        .resume_session => {
-            if (result.resume_session_file != null or result.resume_latest) return error.InvalidOptionValue;
-            result.resume_session_file = value orelse return error.MissingOptionValue;
+        .resume_picker => {
+            if (hasResumePolicy(result.*)) return error.InvalidOptionValue;
+            result.resume_picker = true;
         },
-        .resume_latest => {
-            if (result.resume_session_file != null or result.resume_latest) return error.InvalidOptionValue;
-            result.resume_latest = true;
+        .session => {
+            if (hasResumePolicy(result.*)) return error.InvalidOptionValue;
+            const session = value orelse return error.MissingOptionValue;
+            if (session.len == 0) return error.InvalidOptionValue;
+            result.session_selector = session;
+        },
+        .continue_latest => {
+            if (hasResumePolicy(result.*)) return error.InvalidOptionValue;
+            result.continue_latest = true;
         },
     }
 }
@@ -339,7 +358,8 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
         \\  zi "explain this repo"
         \\  zi -p "hello"
         \\  zi --mode json "explain this repo"
-        \\  zi --resume-latest
+        \\  zi --resume
+        \\  zi --continue
         \\  zi auth status openai-codex
         \\
     );
@@ -349,8 +369,9 @@ pub fn writeHelp(writer: *std.Io.Writer) !void {
 pub fn writeUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\usage: zi [options] [prompt]
-        \\       zi --resume <session> [prompt]
-        \\       zi --resume-latest [prompt]
+        \\       zi --resume
+        \\       zi --session <session> [prompt]
+        \\       zi --continue [prompt]
         \\       zi auth login openai-codex
         \\       zi auth logout openai-codex
         \\       zi auth status openai-codex
@@ -367,10 +388,16 @@ fn writeFlagHelp(writer: *std.Io.Writer, flag: AppFlagSpec) !void {
         try writer.writeAll("    ");
     }
     try writer.print("--{s}", .{flag.long});
-    if (flag.value == .required) try writer.print(" <{s}>", .{flag.value_name});
+    switch (flag.value) {
+        .none => {},
+        .required => try writer.print(" <{s}>", .{flag.value_name}),
+    }
     const width = 36;
     const short_len = if (flag.short) |short| short.len + 4 else 4;
-    const value_len = if (flag.value == .required) flag.value_name.len + 3 else 0;
+    const value_len = switch (flag.value) {
+        .none => 0,
+        .required => flag.value_name.len + 3,
+    };
     try writePadding(writer, short_len + flag.long.len + 2 + value_len, width);
     try writer.print("{s}\n", .{flag.help});
 }
@@ -387,33 +414,57 @@ test "parses print prompt" {
     try std.testing.expectEqualStrings("hello", app.messages.slice()[0]);
 }
 
-test "parses resume session file" {
-    const app = (try parse(&.{ "--resume", "t_session.jsonl" })).app;
-    try std.testing.expectEqualStrings("t_session.jsonl", app.resume_session_file.?);
-    try std.testing.expect(!app.resume_latest);
+test "parses resume picker" {
+    const app = (try parse(&.{"--resume"})).app;
+    try std.testing.expect(app.resume_picker);
+    try std.testing.expect(app.session_selector == null);
+    try std.testing.expect(!app.continue_latest);
 }
 
-test "parses resume latest" {
-    const app = (try parse(&.{"--resume-latest"})).app;
-    try std.testing.expect(app.resume_latest);
-    try std.testing.expect(app.resume_session_file == null);
+test "resume flag does not consume a session argument" {
+    const app = (try parse(&.{ "--resume", "hello" })).app;
+    try std.testing.expect(app.resume_picker);
+    try std.testing.expect(app.session_selector == null);
+    try std.testing.expectEqualStrings("hello", app.messages.slice()[0]);
+}
+
+test "parses explicit session selector" {
+    const app = (try parse(&.{ "--session", "t_session.jsonl" })).app;
+    try std.testing.expectEqualStrings("t_session.jsonl", app.session_selector.?);
+    try std.testing.expect(!app.resume_picker);
+    try std.testing.expect(!app.continue_latest);
+}
+
+test "parses continue latest" {
+    const app = (try parse(&.{"--continue"})).app;
+    try std.testing.expect(app.continue_latest);
+    try std.testing.expect(app.session_selector == null);
+    try std.testing.expect(!app.resume_picker);
+}
+
+test "parses resume and continue short flags" {
+    try std.testing.expect((try parse(&.{"-r"})).app.resume_picker);
+    try std.testing.expect((try parse(&.{"-c"})).app.continue_latest);
 }
 
 test "rejects duplicate resume policy" {
-    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "a.jsonl", "--resume-latest" }));
-    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume-latest", "--resume", "a.jsonl" }));
-    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "a.jsonl", "--resume", "b.jsonl" }));
-    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume-latest", "--resume-latest" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--session", "a.jsonl", "--continue" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--continue", "--session", "a.jsonl" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--session", "a.jsonl", "--session", "b.jsonl" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--continue", "--continue" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "--continue" }));
+    try std.testing.expectError(error.InvalidOptionValue, parse(&.{ "--resume", "--session", "a.jsonl" }));
 }
 
-test "usage includes resume forms" {
+test "usage includes session forms" {
     var buffer: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
 
     try writeUsage(&writer);
 
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --resume <session> [prompt]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --resume-latest [prompt]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --session <session> [prompt]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "zi --continue [prompt]") != null);
 }
 
 test "parses help" {

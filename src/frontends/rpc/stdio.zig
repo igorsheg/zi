@@ -230,6 +230,7 @@ fn isTerminalEvent(event: client_protocol.ClientEvent) bool {
         .replay_gap,
         .shutdown_started,
         .queue_changed,
+        .session_changed,
         => true,
         else => false,
     };

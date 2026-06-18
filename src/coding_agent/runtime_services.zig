@@ -9,7 +9,6 @@ pub const RuntimeServices = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     task_runtime: *runtime.Runtime,
-    task_runtime_owner: RuntimeOwner,
     cwd: []const u8,
     agent_dir: []const u8,
     settings_manager: settings_mod.SettingsManager,
@@ -24,12 +23,7 @@ pub const RuntimeServices = struct {
         agent_dir: []const u8,
         dir: std.Io.Dir = .cwd(),
         environ: ?*const std.process.Environ.Map = null,
-        task_runtime: ?*runtime.Runtime = null,
-    };
-
-    const RuntimeOwner = enum {
-        owned,
-        borrowed,
+        task_runtime: *runtime.Runtime,
     };
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !RuntimeServices {
@@ -37,9 +31,7 @@ pub const RuntimeServices = struct {
         errdefer allocator.free(cwd);
         const agent_dir = try allocator.dupe(u8, options.agent_dir);
         errdefer allocator.free(agent_dir);
-        const task_runtime = options.task_runtime orelse try runtime.Runtime.init(allocator, .{});
-        errdefer if (options.task_runtime == null) task_runtime.deinit();
-        const io = task_runtime.io();
+        const io = options.task_runtime.io();
 
         const resource_paths: paths_mod.PersistencePaths = .{ .global_dir = agent_dir, .cwd = cwd };
         var settings_manager = try settings_mod.SettingsManager.init(allocator, io, .{
@@ -73,8 +65,7 @@ pub const RuntimeServices = struct {
         return .{
             .allocator = allocator,
             .io = io,
-            .task_runtime = task_runtime,
-            .task_runtime_owner = if (options.task_runtime == null) .owned else .borrowed,
+            .task_runtime = options.task_runtime,
             .cwd = cwd,
             .agent_dir = agent_dir,
             .settings_manager = settings_manager,
@@ -88,10 +79,6 @@ pub const RuntimeServices = struct {
 
     pub fn deinit(self: *RuntimeServices) void {
         self.provider_registry.deinit();
-        switch (self.task_runtime_owner) {
-            .owned => self.task_runtime.deinit(),
-            .borrowed => {},
-        }
         self.allocator.destroy(self.openai_codex_provider);
         self.allocator.destroy(self.openai_provider);
         self.auth_manager.deinit();
@@ -107,6 +94,9 @@ test "runtime services owns stable cwd, agent dir, settings manager" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+
     try tmp.dir.createDirPath(std.testing.io, "agent");
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
 
@@ -114,6 +104,7 @@ test "runtime services owns stable cwd, agent dir, settings manager" {
         .cwd = "repo",
         .agent_dir = "agent",
         .dir = tmp.dir,
+        .task_runtime = task_runtime,
     });
     defer services.deinit();
 
@@ -141,5 +132,4 @@ test "runtime services can borrow process task runtime" {
     defer services.deinit();
 
     try std.testing.expect(services.task_runtime == task_runtime);
-    try std.testing.expectEqual(RuntimeServices.RuntimeOwner.borrowed, services.task_runtime_owner);
 }

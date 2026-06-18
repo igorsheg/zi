@@ -88,7 +88,7 @@ boundaries:
 
 - Initial prompt behavior: `tui_mode.Options.initial_prompt` submits through
   the same public command/effect path as typed composer submit.
-- Resume behavior: `resume_session_file` is handled by `tui_mode` and
+- Resume behavior: `session_selector` is handled by `tui_mode` and
   `AgentSessionRuntimeHost`, not by `src/tui`.
 - Agent event handling: TUI observes only public session events and owned
   snapshots.
