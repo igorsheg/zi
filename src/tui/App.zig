@@ -1074,6 +1074,28 @@ test "mouse wheel scrolls the resident transcript and clamps" {
     try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
 }
 
+test "scrolling without overflow keeps sticky tail attached" {
+    const gpa = std.testing.allocator;
+    var app = App.init(40, 12, .{});
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "short",
+    } } });
+    const effect = try app.apply(gpa, .{ .input = .wheel_up });
+    try std.testing.expect(effect.? == .request_transcript_history);
+    try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
+    try std.testing.expectEqual(ScrollAttachment.auto, app.viewport.attachment);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
+        .role = .assistant,
+        .text = "tail",
+    } } });
+    try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
+    try std.testing.expectEqual(ScrollAttachment.auto, app.viewport.attachment);
+}
+
 test "greeter hides on first typed character by default" {
     const gpa = std.testing.allocator;
     var app = App.init(20, 6, .{});

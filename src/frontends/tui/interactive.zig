@@ -57,6 +57,10 @@ fn nextWakeDelayMs(immediate_work_pending: bool, animation_active: bool) u64 {
     return if (animation_active) frame_interval_ms else idle_frame_interval_ms;
 }
 
+fn canRequestHistoryPage(history_request_in_flight: bool, history_has_more_before: bool) bool {
+    return !history_request_in_flight and history_has_more_before;
+}
+
 fn resolveTerminalInfo(process: runtime.Process) tui.theme.TerminalInfo {
     return .{
         .scheme = if (process.env("ZI_THEME_LIGHT") != null) .light else null,
@@ -420,7 +424,7 @@ const InteractiveController = struct {
     }
 
     fn requestHistoryPage(self: *InteractiveController) !void {
-        if (self.operation_active or self.history_request_in_flight or !self.history_has_more_before) return;
+        if (!canRequestHistoryPage(self.history_request_in_flight, self.history_has_more_before)) return;
         const before_entry_id = self.history_oldest_entry_id orelse return self.requestSnapshot();
         const envelope = try client_protocol.CommandEnvelope.initHistoryPage(self.allocator, null, before_entry_id);
         if (try self.submitCommand(envelope) == .queued) self.history_request_in_flight = true;
@@ -1353,6 +1357,12 @@ test "immediate TUI work polls instead of starving input" {
     try std.testing.expectEqual(@as(u64, 0), nextWakeDelayMs(true, false));
     try std.testing.expectEqual(@as(u64, frame_interval_ms), nextWakeDelayMs(false, true));
     try std.testing.expectEqual(@as(u64, idle_frame_interval_ms), nextWakeDelayMs(false, false));
+}
+
+test "history paging is gated only by history state" {
+    try std.testing.expect(canRequestHistoryPage(false, true));
+    try std.testing.expect(!canRequestHistoryPage(true, true));
+    try std.testing.expect(!canRequestHistoryPage(false, false));
 }
 
 test "render throttle coalesces active streaming but lets input render immediately" {
