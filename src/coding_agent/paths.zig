@@ -26,7 +26,7 @@ pub const ToolPaths = struct {
         config: Config,
         path: []const u8,
     ) ![]const u8 {
-        return resolveExistingPath(allocator, io, config, path);
+        return resolvePath(allocator, io, config, path, .existing);
     }
 
     pub fn resolveCreatable(
@@ -35,7 +35,7 @@ pub const ToolPaths = struct {
         config: Config,
         path: []const u8,
     ) ![]const u8 {
-        return resolveCreatablePath(allocator, io, config, path);
+        return resolvePath(allocator, io, config, path, .creatable);
     }
 };
 
@@ -46,24 +46,6 @@ pub const ToolPathConfig = struct {
     allow_paths_outside_cwd: bool = false,
     home_dir: ?[]const u8 = null,
 };
-
-fn resolveExistingPath(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: ToolPathConfig,
-    path: []const u8,
-) ![]const u8 {
-    return resolvePath(allocator, io, config, path, .existing);
-}
-
-fn resolveCreatablePath(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: ToolPathConfig,
-    path: []const u8,
-) ![]const u8 {
-    return resolvePath(allocator, io, config, path, .creatable);
-}
 
 const PathKind = enum { existing, creatable };
 
@@ -558,14 +540,14 @@ test "existing path resolution tries common macOS filename variants" {
     const cwd = cwd_buffer[0..cwd_len];
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/shot\xe2\x80\xafAM.png", .data = "x" });
-    const screenshot = try resolveExistingPath(std.testing.allocator, std.testing.io, .{
+    const screenshot = try ToolPaths.resolveExisting(std.testing.allocator, std.testing.io, .{
         .cwd = cwd,
     }, "shot AM.png");
     defer std.testing.allocator.free(screenshot);
     try std.testing.expect(std.mem.endsWith(u8, screenshot, "shot\xe2\x80\xafAM.png"));
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/it\xe2\x80\x99s.txt", .data = "x" });
-    const curly = try resolveExistingPath(std.testing.allocator, std.testing.io, .{
+    const curly = try ToolPaths.resolveExisting(std.testing.allocator, std.testing.io, .{
         .cwd = cwd,
     }, "it's.txt");
     defer std.testing.allocator.free(curly);
@@ -577,7 +559,7 @@ test "existing path resolution tries common macOS filename variants" {
     try std.testing.expect((try nfdLatin1PathVariant(std.testing.allocator, "Cafe.txt")) == null);
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/Cafe\u{301}.txt", .data = "x" });
-    const decomposed = try resolveExistingPath(std.testing.allocator, std.testing.io, .{
+    const decomposed = try ToolPaths.resolveExisting(std.testing.allocator, std.testing.io, .{
         .cwd = cwd,
     }, "Café.txt");
     defer std.testing.allocator.free(decomposed);
@@ -589,7 +571,7 @@ test "existing path resolution tries common macOS filename variants" {
     try std.testing.expectEqualStrings("Cafe\u{301}\xe2\x80\x99s.txt", nfd_curly);
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/Cafe\u{301}\xe2\x80\x99s.txt", .data = "x" });
-    const combined = try resolveExistingPath(std.testing.allocator, std.testing.io, .{
+    const combined = try ToolPaths.resolveExisting(std.testing.allocator, std.testing.io, .{
         .cwd = cwd,
     }, "Café's.txt");
     defer std.testing.allocator.free(combined);
@@ -619,7 +601,7 @@ test "home expansion is explicit and bounded" {
 
     var home_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const home = try std.fmt.bufPrint(&home_buffer, "{s}/home/", .{root});
-    const resolved = try resolveExistingPath(std.testing.allocator, std.testing.io, .{
+    const resolved = try ToolPaths.resolveExisting(std.testing.allocator, std.testing.io, .{
         .cwd = repo,
         .allow_paths_outside_cwd = true,
         .home_dir = home,
@@ -660,13 +642,13 @@ test "path containment rejects symlink escapes" {
     const cwd_len = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
     const cwd = cwd_buffer[0..cwd_len];
 
-    try std.testing.expectError(error.PathOutsideCwd, resolveExistingPath(
+    try std.testing.expectError(error.PathOutsideCwd, ToolPaths.resolveExisting(
         std.testing.allocator,
         std.testing.io,
         .{ .cwd = cwd },
         "link/file.txt",
     ));
-    try std.testing.expectError(error.PathOutsideCwd, resolveCreatablePath(
+    try std.testing.expectError(error.PathOutsideCwd, ToolPaths.resolveCreatable(
         std.testing.allocator,
         std.testing.io,
         .{ .cwd = cwd },
@@ -685,7 +667,7 @@ test "creatable path containment uses nearest existing parent" {
     const cwd_len = try tmp.dir.realPathFile(std.testing.io, "repo", &cwd_buffer);
     const cwd = cwd_buffer[0..cwd_len];
 
-    const resolved = try resolveCreatablePath(
+    const resolved = try ToolPaths.resolveCreatable(
         std.testing.allocator,
         std.testing.io,
         .{ .cwd = cwd },
@@ -694,7 +676,7 @@ test "creatable path containment uses nearest existing parent" {
     defer std.testing.allocator.free(resolved);
     try std.testing.expect(std.mem.endsWith(u8, resolved, "dir/new/file.txt"));
 
-    try std.testing.expectError(error.PathOutsideCwd, resolveCreatablePath(
+    try std.testing.expectError(error.PathOutsideCwd, ToolPaths.resolveCreatable(
         std.testing.allocator,
         std.testing.io,
         .{ .cwd = cwd },

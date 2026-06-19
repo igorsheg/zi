@@ -104,7 +104,7 @@ pub const EventDrain = struct {
         if (self.retry_attempt == 0) return;
         const attempt = self.retry_attempt;
         self.retry_attempt = 0;
-        const final_error = client_protocol.EventText.init(self.allocator, error_text) catch return;
+        const final_error = client_protocol.EventText.init(self.allocator, error_text) catch null;
         self.enqueuePublicEvent(.{ .auto_retry_end = .{
             .success = false,
             .attempt = attempt,
@@ -141,12 +141,14 @@ pub const EventDrain = struct {
 
     pub fn appendSteering(self: *EventDrain, text: []const u8) !void {
         try self.queue_mirror.appendSteering(self.allocator, text);
-        self.emitQueueUpdate();
     }
 
     pub fn appendFollowUp(self: *EventDrain, text: []const u8) !void {
         try self.queue_mirror.appendFollowUp(self.allocator, text);
-        self.emitQueueUpdate();
+    }
+
+    pub fn removeQueuedText(self: *EventDrain, text: []const u8) void {
+        _ = self.queue_mirror.removeUserText(self.allocator, text);
     }
 
     /// Always emits queue_changed, even when the queue was already empty:

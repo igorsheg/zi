@@ -224,7 +224,10 @@ fn selectBySessionIdPrefix(
         if (entry.kind != .file) continue;
         const id = sessionIdFromLeaf(entry.name) orelse continue;
         if (std.mem.eql(u8, id, selector)) {
-            if (match) |file_name| allocator.free(file_name);
+            if (match) |file_name| {
+                allocator.free(file_name);
+                match = null;
+            }
             const selected = try allocator.dupe(u8, entry.name);
             return selected;
         }

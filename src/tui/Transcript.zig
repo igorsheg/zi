@@ -232,14 +232,6 @@ pub fn prepend(self: *Transcript, gpa: std.mem.Allocator, rows: Prepend) error{O
     return outcome;
 }
 
-pub fn prependMessage(
-    self: *Transcript,
-    gpa: std.mem.Allocator,
-    message: Append.MessageAppend,
-) error{OutOfMemory}!Outcome {
-    return self.prepend(gpa, .{ .message = message });
-}
-
 /// Stream more output into a tool's tail-windowed preview. Unknown ids are
 /// a no-op: the tool may have been evicted, which is not an error.
 pub fn appendToolOutput(

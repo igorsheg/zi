@@ -560,17 +560,20 @@ pub fn queuePrompt(
         .steer => if (!self.agent.steering_queue.hasCapacity()) return error.QueueFull,
         .follow_up => if (!self.agent.follow_up_queue.hasCapacity()) return error.QueueFull,
     }
+    switch (kind) {
+        .steer => try self.event_drain.appendSteering(text),
+        .follow_up => try self.event_drain.appendFollowUp(text),
+    }
+    var mirror_committed = false;
+    errdefer if (!mirror_committed) self.event_drain.removeQueuedText(text);
+
     const message = try self.agent.userMessageFromText(text, images);
     switch (kind) {
-        .steer => {
-            try self.agent.steer(message);
-            try self.event_drain.appendSteering(text);
-        },
-        .follow_up => {
-            try self.agent.followUp(message);
-            try self.event_drain.appendFollowUp(text);
-        },
+        .steer => try self.agent.steer(message),
+        .follow_up => try self.agent.followUp(message),
     }
+    mirror_committed = true;
+    self.event_drain.emitQueueUpdate();
 }
 
 /// Terminal session policy after a prompt run settles. Decides between
@@ -1131,6 +1134,45 @@ test "settle verdict fails after exhausted attempts with terminal retry end" {
     try std.testing.expectEqualStrings("rate limit exceeded", end_event.auto_retry_end.final_error.?.text);
 }
 
+test "retry failure still emits end event when final error allocation fails" {
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var session = try AgentSession.init(failing.allocator(), std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        if (!session.agent.waitForIdle()) session.agent.finishRun();
+        session.requestShutdown();
+        drainAllPublicEvents(&session);
+        session.deinit();
+    }
+
+    session.event_drain.retry_attempt = 1;
+    failing.fail_index = failing.alloc_index;
+    session.event_drain.failRetry("rate limit exceeded");
+    failing.fail_index = std.math.maxInt(usize);
+
+    var end_event = session.drainPublicEvent().?;
+    defer end_event.deinit(failing.allocator());
+    try std.testing.expect(end_event == .auto_retry_end);
+    try std.testing.expect(!end_event.auto_retry_end.success);
+    try std.testing.expectEqual(@as(usize, 1), end_event.auto_retry_end.attempt);
+    try std.testing.expect(end_event.auto_retry_end.final_error == null);
+}
+
 test "settle verdict ignores non retryable errors and clean runs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1208,6 +1250,44 @@ test "live prompt run uses explicit bounded event buffer" {
         live_prompt_event_capacity_count,
         @typeInfo(@FieldType(PromptRun, "buffer")).array.len,
     );
+}
+
+test "queue prompt rolls back mirror when agent queue allocation fails" {
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var session = try AgentSession.init(failing.allocator(), std.testing.io, .{
+        .cwd = "repo",
+        .agent_dir = "agent",
+        .current_date = "2026-05-25",
+        .session_id = "session",
+        .timestamp = "2026-05-25T00:00:00Z",
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        if (!session.agent.waitForIdle()) session.agent.finishRun();
+        session.requestShutdown();
+        while (session.drainPublicEvent()) |event| {
+            var owned_event = event;
+            owned_event.deinit(failing.allocator());
+        }
+        session.deinit();
+    }
+
+    _ = try session.agent.beginRun();
+    failing.fail_index = failing.alloc_index + 2;
+
+    try std.testing.expectError(error.OutOfMemory, session.queuePrompt("hello", &.{}, .steer));
+    const changed = session.event_drain.queue_mirror.changed();
+    try std.testing.expectEqual(@as(usize, 0), changed.steering_count);
+    try std.testing.expect(!session.agent.steering_queue.hasItems());
 }
 
 test "agent session public event enqueue sets coalesced wake" {

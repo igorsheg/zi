@@ -3,6 +3,7 @@
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
+const runtime = @import("../../runtime/root.zig");
 
 const utf8_replacement = "\u{fffd}";
 
@@ -66,6 +67,37 @@ pub fn textResult(
     details: ?std.json.Value,
 ) !agent.ToolExecutionResult {
     return ownedTextResult(allocator, try allocator.dupe(u8, text), details);
+}
+
+pub fn errorResult(
+    allocator: std.mem.Allocator,
+    reason: []const u8,
+    message: []const u8,
+) !agent.ToolExecutionResult {
+    const details = try jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return textResult(allocator, message, details);
+}
+
+pub fn errorResultFmt(
+    allocator: std.mem.Allocator,
+    comptime fmt: []const u8,
+    reason: []const u8,
+    args: anytype,
+) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    var message_owned = true;
+    errdefer if (message_owned) allocator.free(message);
+    const details = try jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    message_owned = false;
+    return ownedTextResult(allocator, message, details);
 }
 
 /// Build an owned `std.json.Value` object from an anonymous struct literal.

@@ -64,18 +64,20 @@ pub const PromptResources = struct {
         });
         errdefer context_files.deinit();
 
-        var system_prompt = try discoverSystemPromptFile(allocator, io, .{
-            .dir = options.dir,
-            .agent_dir = options.agent_dir,
-            .cwd = options.cwd,
-        });
+        var system_prompt = try discoverPromptFile(
+            allocator,
+            io,
+            .{ .dir = options.dir, .agent_dir = options.agent_dir, .cwd = options.cwd },
+            paths_mod.system_prompt_file_name,
+        );
         errdefer system_prompt.deinit();
 
-        var append_system_prompt = try discoverAppendSystemPromptFile(allocator, io, .{
-            .dir = options.dir,
-            .agent_dir = options.agent_dir,
-            .cwd = options.cwd,
-        });
+        var append_system_prompt = try discoverPromptFile(
+            allocator,
+            io,
+            .{ .dir = options.dir, .agent_dir = options.agent_dir, .cwd = options.cwd },
+            paths_mod.append_system_prompt_file_name,
+        );
         errdefer append_system_prompt.deinit();
 
         var loaded_skills = try skills_mod.loadSkills(allocator, io, .{
@@ -101,22 +103,6 @@ pub const PromptResources = struct {
         self.* = undefined;
     }
 };
-
-fn discoverSystemPromptFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    options: PromptResources.LoadOptions,
-) !LoadedPromptFile {
-    return discoverPromptFile(allocator, io, options, paths_mod.system_prompt_file_name);
-}
-
-fn discoverAppendSystemPromptFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    options: PromptResources.LoadOptions,
-) !LoadedPromptFile {
-    return discoverPromptFile(allocator, io, options, paths_mod.append_system_prompt_file_name);
-}
 
 fn discoverPromptFile(
     allocator: std.mem.Allocator,
@@ -157,7 +143,7 @@ fn loadProjectContextFiles(
     var depth: usize = 0;
     var current_dir = options.cwd;
     while (true) {
-        if (depth == max_ancestor_depth) return error.AncestorLimitExceeded;
+        if (depth == max_ancestor_depth) break;
         ancestors[depth] = current_dir;
         depth += 1;
         const parent = std.fs.path.dirname(current_dir) orelse break;
@@ -183,8 +169,14 @@ fn appendContextFile(
     files: *std.ArrayList(ContextFile),
     context_file: ContextFile,
 ) !void {
-    if (files.items.len == max_context_files) return error.ContextFileLimitExceeded;
-    try files.append(allocator, context_file);
+    if (files.items.len == max_context_files) {
+        deinitContextFile(allocator, context_file);
+        return;
+    }
+    files.append(allocator, context_file) catch |err| {
+        deinitContextFile(allocator, context_file);
+        return err;
+    };
 }
 
 fn loadPromptFileFromDir(
@@ -196,17 +188,9 @@ fn loadPromptFileFromDir(
 ) !?PromptFile {
     const path = try std.fs.path.join(allocator, &.{ search_dir, file_name });
     errdefer allocator.free(path);
-    const content = dir.readFileAlloc(
-        io,
-        path,
-        allocator,
-        .limited(max_system_prompt_file_bytes),
-    ) catch |err| switch (err) {
-        error.FileNotFound => {
-            allocator.free(path);
-            return null;
-        },
-        else => return err,
+    const content = (try readFileOrNull(allocator, io, dir, path, max_system_prompt_file_bytes)) orelse {
+        allocator.free(path);
+        return null;
     };
     return .{ .path = path, .content = content };
 }
@@ -221,25 +205,32 @@ fn loadContextFileFromDir(
     for (candidates) |candidate| {
         const path = try std.fs.path.join(allocator, &.{ search_dir, candidate });
         errdefer allocator.free(path);
-        const content = dir.readFileAlloc(
-            io,
-            path,
-            allocator,
-            .limited(max_context_file_bytes),
-        ) catch |err| switch (err) {
-            error.FileNotFound => {
-                allocator.free(path);
-                continue;
-            },
-            error.AccessDenied, error.PermissionDenied, error.IsDir => {
-                allocator.free(path);
-                continue;
-            },
-            else => return err,
+        const content = (try readFileOrNull(allocator, io, dir, path, max_context_file_bytes)) orelse {
+            allocator.free(path);
+            continue;
         };
         return .{ .path = path, .content = content };
     }
     return null;
+}
+
+fn readFileOrNull(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    max_bytes: usize,
+) !?[]u8 {
+    return dir.readFileAlloc(io, path, allocator, .limited(max_bytes)) catch |err| switch (err) {
+        error.FileNotFound,
+        error.FileTooBig,
+        error.StreamTooLong,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.IsDir,
+        => null,
+        else => return err,
+    };
 }
 
 fn containsPath(files: []const ContextFile, path: []const u8) bool {
@@ -298,17 +289,21 @@ test "prompt resources returns null prompts when files are missing" {
     try std.testing.expect(prompt_resources.append_system_prompt.file == null);
 }
 
-test "system prompt discovery rejects directory at prompt path" {
+test "system prompt discovery skips directory at prompt path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi/SYSTEM.md");
 
-    try std.testing.expectError(error.IsDir, discoverSystemPromptFile(std.testing.allocator, std.testing.io, .{
-        .dir = tmp.dir,
-        .agent_dir = "missing",
-        .cwd = "repo",
-    }));
+    var file = try discoverPromptFile(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .dir = tmp.dir, .agent_dir = "missing", .cwd = "repo" },
+        paths_mod.system_prompt_file_name,
+    );
+    defer file.deinit();
+
+    try std.testing.expect(file.file == null);
 }
 
 test "discovers project system prompt before global" {
@@ -320,11 +315,12 @@ test "discovers project system prompt before global" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/SYSTEM.md", .data = "global" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.zi/SYSTEM.md", .data = "project" });
 
-    var file = try discoverSystemPromptFile(std.testing.allocator, std.testing.io, .{
-        .dir = tmp.dir,
-        .agent_dir = "agent",
-        .cwd = "repo",
-    });
+    var file = try discoverPromptFile(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .dir = tmp.dir, .agent_dir = "agent", .cwd = "repo" },
+        paths_mod.system_prompt_file_name,
+    );
     defer file.deinit();
 
     try std.testing.expect(file.file != null);
@@ -340,11 +336,12 @@ test "discovers global append system prompt when project prompt is missing" {
     try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/APPEND_SYSTEM.md", .data = "append" });
 
-    var file = try discoverAppendSystemPromptFile(std.testing.allocator, std.testing.io, .{
-        .dir = tmp.dir,
-        .agent_dir = "agent",
-        .cwd = "repo",
-    });
+    var file = try discoverPromptFile(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .dir = tmp.dir, .agent_dir = "agent", .cwd = "repo" },
+        paths_mod.append_system_prompt_file_name,
+    );
     defer file.deinit();
 
     try std.testing.expect(file.file != null);

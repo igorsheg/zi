@@ -8,6 +8,7 @@ const test_support = @import("test_support.zig");
 const tool_output_policy = @import("../tool_output_policy.zig");
 
 pub const max_read_bytes = 1024 * 1024;
+pub const max_image_bytes = 512 * 1024;
 pub const max_output_bytes = tool_output_policy.default_max_bytes;
 pub const max_output_lines = tool_output_policy.default_max_lines;
 
@@ -33,6 +34,7 @@ pub const ReadTool = struct {
         home_dir: ?[]const u8 = null,
         allow_paths_outside_cwd: bool = false,
         max_read_bytes: usize = max_read_bytes,
+        max_image_bytes: usize = max_image_bytes,
         max_output_bytes: usize = max_output_bytes,
         max_output_lines: usize = max_output_lines,
     };
@@ -87,7 +89,7 @@ fn execute(
     try token.throwIfRequested();
     const self: *ReadTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = parseArgs(params) catch |err| switch (err) {
-        error.InvalidToolArguments => return readErrorResult(
+        error.InvalidToolArguments => return path_utils.errorResult(
             allocator,
             "invalid_arguments",
             "Invalid read arguments: provide path/file_path and positive offset/limit integers.",
@@ -114,15 +116,21 @@ fn execute(
     try token.throwIfRequested();
 
     if (detectImageMimeType(resolved_path, content)) |mime_type| {
+        if (content.len > self.config.max_image_bytes) {
+            return imageTooLargeResult(allocator, self.config.max_image_bytes, mime_type);
+        }
         return imageReadResult(allocator, content, mime_type);
     }
     if (!std.unicode.utf8ValidateSlice(content)) {
         return path_utils.textResult(allocator, "[File omitted: content is not valid UTF-8 text.]", null);
     }
 
-    const formatted = try formatReadOutput(allocator, self.config, args, content);
-    errdefer formatted.deinit(allocator);
+    var formatted = try formatReadOutput(allocator, self.config, args, content);
+    var formatted_owned = true;
+    errdefer if (formatted_owned) formatted.deinit(allocator);
     const details = try formatted.details(allocator);
+    errdefer if (details) |value| runtime.freeJsonValue(allocator, value);
+    formatted_owned = false;
     return path_utils.ownedTextResult(allocator, formatted.text, details);
 }
 
@@ -131,19 +139,6 @@ const ReadArgs = struct {
     offset: ?usize,
     limit: ?usize,
 };
-
-fn readErrorResult(
-    allocator: std.mem.Allocator,
-    reason: []const u8,
-    message: []const u8,
-) !agent.ToolExecutionResult {
-    const details = try path_utils.jsonDetails(allocator, .{
-        .isError = true,
-        .reason = reason,
-    });
-    errdefer runtime.freeJsonValue(allocator, details);
-    return path_utils.textResult(allocator, message, details);
-}
 
 fn readTooLargeResult(allocator: std.mem.Allocator, max_bytes: usize) !agent.ToolExecutionResult {
     const message = try std.fmt.allocPrint(
@@ -155,6 +150,26 @@ fn readTooLargeResult(allocator: std.mem.Allocator, max_bytes: usize) !agent.Too
     const details = try path_utils.jsonDetails(allocator, .{
         .isError = true,
         .reason = @as([]const u8, "file_too_large"),
+        .maxBytes = max_bytes,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
+}
+
+fn imageTooLargeResult(
+    allocator: std.mem.Allocator,
+    max_bytes: usize,
+    mime_type: []const u8,
+) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "[Image omitted: {s} exceeds the {d} byte inline image limit.]",
+        .{ mime_type, max_bytes },
+    );
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .reason = @as([]const u8, "image_too_large"),
+        .mimeType = mime_type,
         .maxBytes = max_bytes,
     });
     errdefer runtime.freeJsonValue(allocator, details);
@@ -587,6 +602,29 @@ test "read tool returns image attachment for supported image file" {
     try std.testing.expectEqualStrings("Read image file [image/png]", result.result.content[0].text.text);
     try std.testing.expectEqualStrings("image/png", result.result.content[1].image.mime_type);
     try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUg==", result.result.content[1].image.data);
+}
+
+test "read tool omits images over inline image limit" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    const png_header = "\x89PNG\r\n\x1a\n" ++ "\x00\x00\x00\x0d" ++ "IHDR";
+    try fixture.write("repo/image.png", png_header);
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .max_image_bytes = png_header.len - 1,
+    });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"image.png\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.result.content.len);
+    try std.testing.expectEqualStrings(
+        "[Image omitted: image/png exceeds the 15 byte inline image limit.]",
+        result.result.content[0].text.text,
+    );
+    try std.testing.expectEqualStrings("image_too_large", result.result.details.?.object.get("reason").?.string);
 }
 
 test "read tool does not classify animated png as supported image" {

@@ -62,6 +62,10 @@ pub const AuthStore = struct {
     }
 
     pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !AuthStore {
+        return .{ .allocator = allocator, .credentials = try parseCredentials(allocator, bytes) };
+    }
+
+    fn parseCredentials(allocator: std.mem.Allocator, bytes: []const u8) ![]OAuthCredential {
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidAuthStore;
@@ -83,7 +87,7 @@ pub const AuthStore = struct {
             }
         }
 
-        return .{ .allocator = allocator, .credentials = try credentials.toOwnedSlice(allocator) };
+        return credentials.toOwnedSlice(allocator);
     }
 
     pub fn deinit(self: *AuthStore) void {
@@ -91,6 +95,37 @@ pub const AuthStore = struct {
         self.allocator.free(self.credentials);
         if (self.auth_path) |auth_path| self.allocator.free(auth_path);
         self.* = undefined;
+    }
+
+    fn reload(self: *AuthStore, io: std.Io) !void {
+        const dir = self.dir orelse return error.AuthStoreReadOnly;
+        const auth_path = self.auth_path orelse return error.AuthStoreReadOnly;
+        const bytes = dir.readFileAlloc(io, auth_path, self.allocator, .limited(max_auth_file_bytes)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.replaceCredentials(try self.allocator.alloc(OAuthCredential, 0)),
+        };
+        defer self.allocator.free(bytes);
+        const credentials = parseCredentials(self.allocator, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.replaceCredentials(try self.allocator.alloc(OAuthCredential, 0)),
+        };
+        self.replaceCredentials(credentials);
+    }
+
+    fn replaceCredentials(self: *AuthStore, credentials: []OAuthCredential) void {
+        for (self.credentials) |*credential| credential.deinit(self.allocator);
+        self.allocator.free(self.credentials);
+        self.credentials = credentials;
+    }
+
+    fn lockFile(self: *const AuthStore, io: std.Io) !std.Io.File {
+        const dir = self.dir orelse return error.AuthStoreReadOnly;
+        const auth_path = self.auth_path orelse return error.AuthStoreReadOnly;
+        const lock_path = try std.fmt.allocPrint(self.allocator, "{s}.lock", .{auth_path});
+        defer self.allocator.free(lock_path);
+        const parent = std.fs.path.dirname(lock_path) orelse ".";
+        try dir.createDirPath(io, parent);
+        return dir.createFile(io, lock_path, .{ .read = true, .truncate = false, .lock = .exclusive });
     }
 
     pub fn setOAuth(self: *AuthStore, io: std.Io, provider: ai.Provider, credentials: ai.OAuthCredentials) !void {
@@ -241,29 +276,42 @@ pub const AuthManager = struct {
         if (self.findEnvApiKey(provider)) |key| {
             return .{ .api_key = try allocator.dupe(u8, key.value) };
         }
-        var credentials = self.findOAuthCredentials(provider) orelse return null;
         const oauth_provider = self.oauthProvider(provider) orelse return null;
-        if (try self.refreshIfExpired(oauth_provider, credentials)) |refreshed| credentials = refreshed;
+        const credentials = try self.refreshIfExpired(oauth_provider) orelse return null;
         const api_key = try oauth_provider.getApiKey(credentials);
         return .{ .api_key = try allocator.dupe(u8, api_key), .auth_extra = credentials.extra };
     }
 
-    fn refreshIfExpired(
+    fn refreshIfExpired(self: *AuthManager, provider: ai.OAuthProviderInterface) !?ai.OAuthCredentials {
+        const now_ms: i64 = @intCast(std.Io.Timestamp.now(self.io, .real).toMilliseconds());
+        const credentials = self.findOAuthCredentials(provider.id) orelse return null;
+        if (now_ms < credentials.expires) return credentials;
+
+        var lock_file = self.store.lockFile(self.io) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.refreshExpiredUnlocked(provider, credentials),
+        };
+        defer lock_file.close(self.io);
+
+        try self.store.reload(self.io);
+        const current = self.findOAuthCredentials(provider.id) orelse return null;
+        if (now_ms < current.expires) return current;
+        return self.refreshExpiredUnlocked(provider, current);
+    }
+
+    fn refreshExpiredUnlocked(
         self: *AuthManager,
         provider: ai.OAuthProviderInterface,
         credentials: ai.OAuthCredentials,
     ) !?ai.OAuthCredentials {
-        const now_ms: i64 = @intCast(std.Io.Timestamp.now(self.io, .real).toMilliseconds());
-        if (now_ms < credentials.expires) return null;
-
         var refreshed = provider.refreshToken(self.store.allocator, self.io, credentials) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return null,
+            else => return credentials,
         };
         defer deinitOAuthCredentials(self.store.allocator, &refreshed);
         self.setOAuthCredentials(self.io, provider.id, refreshed) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return null,
+            else => return credentials,
         };
         return self.findOAuthCredentials(provider.id);
     }
@@ -493,6 +541,44 @@ test "auth manager refreshes expired oauth credentials before returning api key"
     const bytes = try tmp.dir.readFileAlloc(std.testing.io, "agent/auth.json", std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "refreshed-access-token") != null);
+}
+
+test "auth manager reloads oauth credentials under refresh lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/auth.json",
+        .data = "{\"test-oauth\":{\"type\":\"oauth\",\"refresh\":\"old-refresh\"," ++
+            "\"access\":\"expired-access-token\",\"expires\":0}}",
+    });
+
+    var calls: OAuthRefreshCalls = .{};
+    const providers = [_]ai.OAuthProviderInterface{.{
+        .id = "test-oauth",
+        .name = "Test OAuth",
+        .context = &calls,
+        .login_fn = testOAuthLogin,
+        .refresh_token_fn = testOAuthRefreshWithCount,
+        .get_api_key_fn = testOAuthApiKey,
+    }};
+    var auth = try AuthManager.init(std.testing.allocator, std.testing.io, .{
+        .oauth_providers = &providers,
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer auth.deinit();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/auth.json",
+        .data = "{\"test-oauth\":{\"type\":\"oauth\",\"refresh\":\"new-refresh\"," ++
+            "\"access\":\"fresh-access-token\",\"expires\":9223372036854775807}}",
+    });
+
+    const key = try agent_mod.GetApiKeyHook.call(std.testing.allocator, auth.hook(), "test-oauth");
+    defer std.testing.allocator.free(key.?.api_key);
+    try std.testing.expectEqualStrings("fresh-access-token", key.?.api_key);
+    try std.testing.expectEqual(@as(usize, 0), calls.refresh_count);
 }
 
 test "auth manager persists oauth credentials through one mutation path" {

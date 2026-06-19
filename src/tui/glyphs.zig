@@ -27,15 +27,3 @@ pub const horizontal_rule = "────────────────" +
     "────────────────" ++
     "────────────────" ++
     "────────────────";
-
-/// Bullet prefix for plain lists.
-pub const bullet = "• ";
-
-/// Success / approval indicator.
-pub const check = "✔ ";
-
-/// Error / failure indicator.
-pub const cross = "✗ ";
-
-/// Composer prompt marker.
-pub const prompt = "› ";

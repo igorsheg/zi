@@ -57,7 +57,7 @@ fn loadSkillsFromDir(
     depth: usize,
     skills: *std.ArrayList(Skill),
 ) !void {
-    if (depth == max_skill_depth) return error.SkillDepthExceeded;
+    if (depth == max_skill_depth) return;
 
     const skill_path = try std.fs.path.join(allocator, &.{ path, paths_mod.skill_file_name });
     defer allocator.free(skill_path);
@@ -137,17 +137,19 @@ fn loadSkillFile(
     fallback_name: []const u8,
 ) !?Skill {
     const content = dir.readFileAlloc(io, path, allocator, .limited(max_skill_bytes)) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound, error.FileTooBig, error.StreamTooLong => return null,
         else => return err,
     };
     defer allocator.free(content);
 
-    const parsed = try parseFrontmatter(content);
-    if (parsed.description.len == 0) return error.InvalidSkillFrontmatter;
+    const parsed = parseFrontmatter(content) catch |err| switch (err) {
+        error.InvalidSkillFrontmatter => return null,
+    };
+    if (parsed.description.len == 0) return null;
     const skill_name = if (parsed.name.len > 0) parsed.name else fallback_name;
-    if (skill_name.len == 0) return error.InvalidSkillFrontmatter;
-    if (skill_name.len > max_skill_name_bytes) return error.SkillNameTooLong;
-    if (parsed.description.len > max_skill_description_bytes) return error.SkillDescriptionTooLong;
+    if (skill_name.len == 0) return null;
+    if (skill_name.len > max_skill_name_bytes) return null;
+    if (parsed.description.len > max_skill_description_bytes) return null;
 
     const path_copy = try canonicalSkillPath(allocator, io, dir, path);
     errdefer allocator.free(path_copy);
@@ -270,7 +272,7 @@ fn insertSkill(allocator: std.mem.Allocator, skills: *std.ArrayList(Skill), skil
     }
     if (skills.items.len == max_skills) {
         deinitSkill(allocator, skill);
-        return error.SkillLimitExceeded;
+        return;
     }
     skills.append(allocator, skill) catch |err| {
         deinitSkill(allocator, skill);
@@ -437,36 +439,33 @@ test "accepts crlf frontmatter delimiters" {
     try std.testing.expectEqualStrings("crlf skill", skills.skills[0].description);
 }
 
-test "rejects non-delimiter frontmatter close prefix" {
+test "skips invalid skill frontmatter" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "agent/skills/bad-close");
+    try tmp.dir.createDirPath(std.testing.io, "agent/skills/bad");
+    try tmp.dir.createDirPath(std.testing.io, "agent/skills/good");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agent/skills/bad-close/SKILL.md",
         .data = "---\nname: bad-close\n---oops\ndescription: invalid\n---\nbody",
     });
-
-    try std.testing.expectError(error.InvalidSkillFrontmatter, loadSkills(std.testing.allocator, std.testing.io, .{
-        .dir = tmp.dir,
-        .agent_dir = "agent",
-        .cwd = "repo",
-    }));
-}
-
-test "rejects invalid skill frontmatter" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "agent/skills/bad");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agent/skills/bad/SKILL.md",
         .data = "---\nname: bad\n---\nbody",
     });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/skills/good/SKILL.md",
+        .data = "---\nname: good\ndescription: good skill\n---\nbody",
+    });
 
-    try std.testing.expectError(error.InvalidSkillFrontmatter, loadSkills(std.testing.allocator, std.testing.io, .{
+    var skills = try loadSkills(std.testing.allocator, std.testing.io, .{
         .dir = tmp.dir,
         .agent_dir = "agent",
         .cwd = "repo",
-    }));
+    });
+    defer skills.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), skills.skills.len);
+    try std.testing.expectEqualStrings("good", skills.skills[0].name);
 }

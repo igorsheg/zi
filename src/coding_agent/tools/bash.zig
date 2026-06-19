@@ -62,8 +62,6 @@ pub const BashTool = struct {
     pub const Config = struct {
         cwd: []const u8,
         environ: ?*const std.process.Environ.Map = null,
-        shell_path: ?[]const u8 = null,
-        command_prefix: ?[]const u8 = null,
         timeout_ms: u64 = default_timeout_ms,
         max_timeout_ms: u64 = max_timeout_ms,
         max_stdout_bytes: usize = max_stdout_bytes,
@@ -74,31 +72,18 @@ pub const BashTool = struct {
         try validateConfig(config);
         const cwd = try allocator.dupe(u8, config.cwd);
         errdefer allocator.free(cwd);
-        const shell_path = if (config.shell_path) |path| try allocator.dupe(u8, path) else null;
-        errdefer if (shell_path) |path| allocator.free(path);
-        const command_prefix = if (config.command_prefix) |prefix| try allocator.dupe(u8, prefix) else null;
-        errdefer if (command_prefix) |prefix| allocator.free(prefix);
         const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        var owned_config = config;
+        owned_config.cwd = cwd;
         return .{
             .allocator = allocator,
-            .config = .{
-                .cwd = cwd,
-                .environ = config.environ,
-                .shell_path = shell_path,
-                .command_prefix = command_prefix,
-                .timeout_ms = config.timeout_ms,
-                .max_timeout_ms = config.max_timeout_ms,
-                .max_stdout_bytes = config.max_stdout_bytes,
-                .max_stderr_bytes = config.max_stderr_bytes,
-            },
+            .config = owned_config,
             .parsed_parameters = parsed_parameters,
         };
     }
 
     pub fn deinit(self: *BashTool) void {
         self.allocator.free(self.config.cwd);
-        if (self.config.shell_path) |path| self.allocator.free(path);
-        if (self.config.command_prefix) |prefix| self.allocator.free(prefix);
         self.parsed_parameters.deinit();
         self.* = undefined;
     }
@@ -123,12 +108,6 @@ fn validateConfig(config: BashTool.Config) !void {
     if (config.timeout_ms > config.max_timeout_ms) return error.InvalidToolConfig;
     if (config.max_stdout_bytes == 0) return error.InvalidToolConfig;
     if (config.max_stderr_bytes == 0) return error.InvalidToolConfig;
-    if (config.shell_path) |path| {
-        if (path.len == 0 or path.len > max_command_bytes) return error.InvalidToolConfig;
-    }
-    if (config.command_prefix) |prefix| {
-        if (prefix.len == 0 or prefix.len > max_command_bytes) return error.InvalidToolConfig;
-    }
 }
 
 const Args = struct {
@@ -203,15 +182,7 @@ fn runProcess(
     token: runtime.CancelToken,
     update_context: *BashUpdateContext,
 ) anyerror!std.process.RunResult {
-    var command_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer command_writer.deinit();
-    if (config.command_prefix) |prefix| {
-        try command_writer.writer.writeAll(prefix);
-        try command_writer.writer.writeByte('\n');
-    }
-    try command_writer.writer.writeAll(args.command);
-    if (command_writer.written().len > max_command_bytes) return error.InvalidToolArguments;
-    const argv = shellArgv(config, command_writer.written());
+    const argv = shellArgv(args.command);
     const run_result = try runtime.runProcess(allocator, io, task_runtime, .{
         .argv = &argv,
         .cwd = config.cwd,
@@ -283,10 +254,10 @@ fn parseArgs(config: BashTool.Config, params: std.json.Value) !Args {
     return .{ .command = command_value.string, .timeout_ms = timeout_ms };
 }
 
-fn shellArgv(config: BashTool.Config, command: []const u8) [3][]const u8 {
+fn shellArgv(command: []const u8) [3][]const u8 {
     return switch (builtin.os.tag) {
-        .windows => .{ config.shell_path orelse "cmd.exe", "/C", command },
-        else => .{ config.shell_path orelse "/bin/sh", "-c", command },
+        .windows => .{ "cmd.exe", "/C", command },
+        else => .{ "/bin/sh", "-c", command },
     };
 }
 
@@ -313,7 +284,7 @@ fn resultFromRun(
         if (writer.written().len > 0) try writer.writer.writeByte('\n');
         try writer.writer.writeAll(run_result.stderr);
     }
-    return resultFromOutput(allocator, writer.written(), null, run_result.term, null);
+    return resultFromOutputWithTotals(allocator, writer.written(), null, run_result.term, null, null);
 }
 
 fn resultFromObservedOutput(
@@ -329,16 +300,6 @@ fn resultFromObservedOutput(
         .truncated = observed_output.truncated,
         .last_line_partial = observed_output.last_line_partial,
     });
-}
-
-fn resultFromOutput(
-    allocator: std.mem.Allocator,
-    full_output: []const u8,
-    status: ?[]const u8,
-    term: ?std.process.Child.Term,
-    failure: ?FailureKind,
-) !agent.ToolExecutionResult {
-    return resultFromOutputWithTotals(allocator, full_output, status, term, failure, null);
 }
 
 const OutputTotals = struct {
@@ -658,11 +619,12 @@ test "bash tail truncation details include line byte and limit facts" {
         try output.writer.print("line {d}\n", .{index + 1});
     }
 
-    var result = try resultFromOutput(
+    var result = try resultFromOutputWithTotals(
         std.testing.allocator,
         output.written(),
         null,
         .{ .exited = 0 },
+        null,
         null,
     );
     defer result.deinit();
@@ -703,24 +665,6 @@ test "bash execute path preserves tail truncation totals" {
     try std.testing.expectEqualStrings("lines", truncation.get("truncatedBy").?.string);
     try std.testing.expectEqual(@as(i64, max_output_preview_lines + 2), truncation.get("totalLines").?.integer);
     try std.testing.expectEqual(@as(i64, max_output_preview_lines), truncation.get("outputLines").?.integer);
-}
-
-test "bash tool applies command prefix and shell path" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    var fixture = try test_support.Fixture.init("repo");
-    defer fixture.deinit();
-    var tool = try BashTool.init(std.testing.allocator, .{
-        .cwd = fixture.cwd(),
-        .command_prefix = "ZI_PREFIX_VALUE=ok",
-        .shell_path = "/bin/sh",
-    });
-    defer tool.deinit();
-
-    var result = try test_support.execute(tool.tool(), "{\"command\":\"printf %s \\\"$ZI_PREFIX_VALUE\\\"\"}");
-    defer result.deinit();
-
-    try std.testing.expectEqualStrings("ok", result.result.content[0].text.text);
 }
 
 test "bash tool accepts timeout seconds" {

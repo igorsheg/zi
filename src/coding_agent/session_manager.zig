@@ -411,6 +411,9 @@ pub const SessionManager = struct {
 
     pub fn commitPreparedEntry(self: *SessionManager, entry: SessionEntry) []const u8 {
         std.debug.assert(self.entries.items.len < max_session_entries);
+        var expected_id_buffer: [16]u8 = undefined;
+        const expected_id = std.fmt.bufPrint(&expected_id_buffer, "{x:0>8}", .{self.next_id}) catch unreachable;
+        std.debug.assert(std.mem.eql(u8, entry.id(), expected_id));
         self.entries.appendAssumeCapacity(entry);
         self.next_id += 1;
         return entry.id();
@@ -721,7 +724,6 @@ pub const SessionManager = struct {
     }
 
     fn nextBase(self: *SessionManager, timestamp: []const u8) Error!SessionEntry.Base {
-        if (self.entries.items.len == max_session_entries) return error.EntryLimitExceeded;
         if (self.next_id == std.math.maxInt(u64)) return error.EntryLimitExceeded;
         const id = try std.fmt.allocPrint(self.allocator, "{x:0>8}", .{self.next_id});
         errdefer self.allocator.free(id);
@@ -1352,6 +1354,14 @@ test "prepared message entry does not mutate entries before commit" {
     committed = true;
     try std.testing.expectEqualStrings("00000001", id);
     try std.testing.expectEqual(@as(usize, 1), manager.entries.items.len);
+}
+
+test "prepare rejects exhausted generated entry id" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+    manager.next_id = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.EntryLimitExceeded, manager.prepareMessageEntry(userMessage("one"), "t1"));
 }
 
 test "context messages project latest compaction summary then kept messages" {

@@ -88,7 +88,7 @@ fn execute(
     try token.throwIfRequested();
     const self: *WriteTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     const args = parseArgs(params) catch |err| switch (err) {
-        error.InvalidToolArguments => return writeErrorResult(
+        error.InvalidToolArguments => return path_utils.errorResult(
             allocator,
             "invalid_arguments",
             "Invalid write arguments: provide path/file_path and string content.",
@@ -116,12 +116,12 @@ fn execute(
         .home_dir = self.config.home_dir,
     }, args.path) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        error.InvalidToolArguments => return writeErrorResult(
+        error.InvalidToolArguments => return path_utils.errorResult(
             allocator,
             "invalid_path",
             "Invalid write path: provide a non-empty path.",
         ),
-        else => return writeErrorResultFmt(
+        else => return path_utils.errorResultFmt(
             allocator,
             "Write path resolution failed for {s}: {s}",
             "path_error",
@@ -136,7 +136,7 @@ fn execute(
         .create_parent_dirs = true,
     }) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => return writeErrorResultFmt(
+        else => return path_utils.errorResultFmt(
             allocator,
             "Write failed for {s}: {s}",
             "write_failed",
@@ -145,43 +145,16 @@ fn execute(
     };
     try token.throwIfRequested();
 
+    const details = try path_utils.jsonDetails(allocator, .{
+        .bytesWritten = args.content.len,
+        .path = args.path,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
     const message = try std.fmt.allocPrint(
         allocator,
         "Successfully wrote {d} bytes to {s}",
         .{ args.content.len, args.path },
     );
-    return path_utils.ownedTextResult(allocator, message, try path_utils.jsonDetails(allocator, .{
-        .bytesWritten = args.content.len,
-        .path = args.path,
-    }));
-}
-
-fn writeErrorResult(
-    allocator: std.mem.Allocator,
-    reason: []const u8,
-    message: []const u8,
-) !agent.ToolExecutionResult {
-    const details = try path_utils.jsonDetails(allocator, .{
-        .isError = true,
-        .reason = reason,
-    });
-    errdefer runtime.freeJsonValue(allocator, details);
-    return path_utils.textResult(allocator, message, details);
-}
-
-fn writeErrorResultFmt(
-    allocator: std.mem.Allocator,
-    comptime fmt: []const u8,
-    reason: []const u8,
-    args: anytype,
-) !agent.ToolExecutionResult {
-    const message = try std.fmt.allocPrint(allocator, fmt, args);
-    errdefer allocator.free(message);
-    const details = try path_utils.jsonDetails(allocator, .{
-        .isError = true,
-        .reason = reason,
-    });
-    errdefer runtime.freeJsonValue(allocator, details);
     return path_utils.ownedTextResult(allocator, message, details);
 }
 
@@ -220,25 +193,6 @@ test "write tool creates parent directories and writes content" {
     try std.testing.expectEqual(@as(i64, 5), details.get("bytesWritten").?.integer);
 }
 
-const WriteUpdateCapture = struct {
-    writer: std.Io.Writer.Allocating,
-    count: usize = 0,
-
-    fn deinit(self: *WriteUpdateCapture) void {
-        self.writer.deinit();
-        self.* = undefined;
-    }
-};
-
-fn captureWriteUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult) anyerror!void {
-    const capture: *WriteUpdateCapture = @ptrCast(@alignCast(context.?));
-    capture.count += 1;
-    for (partial_result.content) |content| switch (content) {
-        .text => |text| try capture.writer.writer.writeAll(text.text),
-        .image => {},
-    };
-}
-
 test "write tool accepts file_path compatibility argument" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
@@ -272,12 +226,12 @@ test "write tool streams utf8 safe content chunks" {
     );
     defer std.testing.allocator.free(args);
 
-    var capture: WriteUpdateCapture = .{ .writer = .init(std.testing.allocator) };
+    var capture: test_support.UpdateCapture = .{ .writer = .init(std.testing.allocator) };
     defer capture.deinit();
     var result = try test_support.executeWithUpdate(
         write_tool.tool(),
         args,
-        .{ .context = &capture, .call_fn = captureWriteUpdate },
+        .{ .context = &capture, .call_fn = test_support.captureUpdate },
     );
     defer result.deinit();
 

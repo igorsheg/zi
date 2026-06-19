@@ -68,3 +68,22 @@ pub fn executeWithUpdate(
         on_update,
     );
 }
+
+pub const UpdateCapture = struct {
+    writer: std.Io.Writer.Allocating,
+    count: usize = 0,
+
+    pub fn deinit(self: *UpdateCapture) void {
+        self.writer.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn captureUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult) anyerror!void {
+    const capture: *UpdateCapture = @ptrCast(@alignCast(context.?));
+    capture.count += 1;
+    for (partial_result.content) |content| switch (content) {
+        .text => |text| try capture.writer.writer.writeAll(text.text),
+        .image => {},
+    };
+}

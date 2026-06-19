@@ -229,15 +229,6 @@ const Completion = struct {
         self.command = next;
     }
 
-    fn clearCommand(self: *Completion, gpa: std.mem.Allocator) bool {
-        if (self.command) |*picker| {
-            picker.deinit(gpa);
-            self.command = null;
-            return true;
-        }
-        return false;
-    }
-
     fn setSlashArg(
         self: *Completion,
         gpa: std.mem.Allocator,
@@ -251,22 +242,11 @@ const Completion = struct {
         slot.* = next;
     }
 
-    fn clearSlashArg(self: *Completion, gpa: std.mem.Allocator) bool {
-        const had_any = self.hasSlashArg();
-        self.clearSlashArgSlots(gpa);
-        return had_any;
-    }
-
     fn clearSlashArgSlots(self: *Completion, gpa: std.mem.Allocator) void {
         for (&self.slash_args) |*slot| {
             if (slot.*) |*completion| completion.deinit(gpa);
             slot.* = null;
         }
-    }
-
-    fn hasSlashArg(self: *const Completion) bool {
-        for (&self.slash_args) |*slot| if (slot.* != null) return true;
-        return false;
     }
 
     fn slashArgSlot(self: *Completion, raw_command_name: []const u8) ?*?SlashArgCompletion {
@@ -340,13 +320,10 @@ pub const Command = union(enum) {
     replace_tool_footer: ToolText,
     prepend_transcript: Transcript.Prepend,
     set_greeter: Greeter.Set,
-    clear_greeter,
     open_picker: Picker.Open,
     close_picker,
     set_composer_completions: Picker.Open,
-    clear_composer_completions,
     set_composer_arg_completions: SlashArgCompletionOpen,
-    clear_composer_arg_completions,
     replace_composer_text: []const u8,
     set_status: status_mod.Set,
     clear_status: status_mod.Clear,
@@ -464,12 +441,6 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.dirty = true;
             return null;
         },
-        .clear_greeter => {
-            self.greeter = null;
-            self.clampOrFollowViewport();
-            self.dirty = true;
-            return null;
-        },
         .open_picker => |open| {
             try self.completion.setModal(gpa, open);
             self.dirty = true;
@@ -485,18 +456,10 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.dirty = true;
             return null;
         },
-        .clear_composer_completions => {
-            if (self.completion.clearCommand(gpa)) self.dirty = true;
-            return null;
-        },
         .set_composer_arg_completions => |open| {
             try self.completion.setSlashArg(gpa, open);
             self.syncComposerCompletion();
             self.dirty = true;
-            return null;
-        },
-        .clear_composer_arg_completions => {
-            if (self.completion.clearSlashArg(gpa)) self.dirty = true;
             return null;
         },
         .replace_composer_text => |text| {

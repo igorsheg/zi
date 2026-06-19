@@ -27,10 +27,18 @@ pub const VisualLineBreak = struct {
 pub fn nextGrapheme(bytes: []const u8) Grapheme {
     if (bytes.len == 0) return .{ .start = 0, .end = 0, .width = 0 };
     if (!std.unicode.utf8ValidateSlice(bytes)) return .{ .start = 0, .end = 1, .width = 1 };
+    return nextValidGrapheme(bytes);
+}
+
+fn nextValidGrapheme(bytes: []const u8) Grapheme {
     var iterator = vaxis.unicode.graphemeIterator(bytes);
     const grapheme = iterator.next() orelse return .{ .start = 0, .end = 0, .width = 0 };
     const end = grapheme.start + grapheme.len;
-    return .{ .start = grapheme.start, .end = end, .width = clampWidth(displayWidth(bytes[grapheme.start..end])) };
+    return .{
+        .start = grapheme.start,
+        .end = end,
+        .width = clampWidth(vaxis.gwidth.gwidth(bytes[grapheme.start..end], .unicode)),
+    };
 }
 
 pub fn previousGraphemeStart(bytes: []const u8, cursor: usize) usize {
@@ -51,7 +59,7 @@ pub fn nextGraphemeEnd(bytes: []const u8, cursor: usize) usize {
     std.debug.assert(cursor <= bytes.len);
     if (cursor >= bytes.len) return bytes.len;
     if (!std.unicode.utf8ValidateSlice(bytes[cursor..])) return nextScalarEnd(bytes, cursor);
-    const grapheme = nextGrapheme(bytes[cursor..]);
+    const grapheme = nextValidGrapheme(bytes[cursor..]);
     if (grapheme.end == 0) return bytes.len;
     return @min(cursor + grapheme.end, bytes.len);
 }
@@ -68,6 +76,7 @@ pub fn nextVisualLineBreak(bytes: []const u8, start: usize, max_width: u16) Visu
     if (start == bytes.len or max_width == 0) return .{ .start = start, .end = start, .next = start, .width = 0 };
     if (bytes[start] == '\n') return .{ .start = start, .end = start, .next = start + 1, .width = 0 };
 
+    const valid_tail = std.unicode.utf8ValidateSlice(bytes[start..]);
     var index = start;
     var width: u16 = 0;
     while (index < bytes.len) {
@@ -75,7 +84,7 @@ pub fn nextVisualLineBreak(bytes: []const u8, start: usize, max_width: u16) Visu
         if (bytes[index] == '\r' and index + 1 < bytes.len and bytes[index + 1] == '\n') {
             return .{ .start = start, .end = index, .next = index + 2, .width = width };
         }
-        const grapheme = nextGrapheme(bytes[index..]);
+        const grapheme = if (valid_tail) nextValidGrapheme(bytes[index..]) else nextGrapheme(bytes[index..]);
         if (grapheme.end == 0) break;
         const next_width = width + grapheme.width;
         if (next_width > max_width) {

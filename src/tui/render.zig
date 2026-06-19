@@ -48,12 +48,10 @@ pub const RowSegment = struct {
 pub const Row = struct {
     prefix: []const u8 = "",
     text: []const u8 = "",
-    suffix: []const u8 = "",
     segments: []const RowSegment = &.{},
     show_prefix: bool = false,
     prefix_style: theme_mod.Style = .{},
     text_style: theme_mod.Style = .{},
-    suffix_style: theme_mod.Style = .{},
     row_style: theme_mod.Style = .{},
 };
 
@@ -381,7 +379,6 @@ const InlineRowBuilder = struct {
             .show_prefix = prefix.len > 0,
             .prefix_style = self.options.prefix_style,
             .text_style = self.options.text_style,
-            .suffix_style = self.options.text_style,
             .row_style = self.options.row_style,
         };
         if (self.out) |scratch| {
@@ -847,7 +844,6 @@ fn buildToolBodyRows(
         .show_prefix = true,
         .prefix_style = rail,
         .text_style = theme.transcript_secondary,
-        .suffix_style = theme.transcript_secondary,
         .row_style = theme.transcript_secondary,
     };
 
@@ -902,7 +898,6 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
             .show_prefix = prefix.len > 0,
             .prefix_style = options.prefix_style,
             .text_style = options.text_style,
-            .suffix_style = options.text_style,
             .row_style = options.row_style,
         };
         if (width == 0) {
@@ -914,7 +909,6 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
         const line_style = bodyLineStyle(options, visual.start);
         row.text = options.text[visual.start..visual.end];
         row.text_style = line_style;
-        row.suffix_style = line_style;
         if ((options.presentation orelse .generic) == .patch) row.row_style = line_style;
         emitWindowed(out, count, &window_index, options.window, row);
         start = visual.next;
@@ -926,7 +920,6 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
             .show_prefix = prefix.len > 0,
             .prefix_style = options.prefix_style,
             .text_style = options.text_style,
-            .suffix_style = options.text_style,
             .row_style = options.row_style,
         });
     }
@@ -1482,9 +1475,6 @@ const Painter = struct {
             self.writeText(x, y, row.text, row.text_style);
             x = advance(x, text_mod.displayWidth(row.text));
         }
-        if (x < self.width and row.suffix.len > 0) {
-            self.writeText(x, y, row.suffix, row.suffix_style);
-        }
     }
 };
 
@@ -1718,7 +1708,6 @@ test "tool title is plain text outside the body rail and fits width" {
     const title = scratch.rows[0];
     const used = padding_x + text_mod.displayWidth(title.text);
     try std.testing.expectEqualStrings("", title.prefix);
-    try std.testing.expectEqualStrings("", title.suffix);
     try std.testing.expect(!title.show_prefix);
     try std.testing.expect(used <= app.width);
 }

@@ -1311,27 +1311,29 @@ pub const SessionRuntime = struct {
         defer self.allocator.free(load.cwd);
         defer self.allocator.free(load.agent_dir);
 
-        var resume_sessions = resume_result catch |err| {
+        const resume_sessions = resume_result catch |err| {
             load.models.deinit(self.allocator);
             try self.enqueueRejected(load.request_id, rejectionCode(err), @errorName(err));
             return;
         };
-        errdefer resume_sessions.deinit(self.allocator);
 
         var snapshot: client_protocol.CompletionSnapshot = .{
             .models = load.models,
             .resume_sessions = resume_sessions,
         };
+        var snapshot_owned = true;
+        errdefer if (snapshot_owned) snapshot.deinit(self.allocator);
         self.enqueueEvent(.{
             .request_id = load.request_id,
             .event = .{ .completion_snapshot = snapshot },
         }) catch |err| switch (err) {
-            error.EventQueueFull => return error.EventQueueFull,
-            else => {
-                snapshot.deinit(self.allocator);
-                return err;
+            error.EventQueueFull => {
+                snapshot_owned = false;
+                return error.EventQueueFull;
             },
+            else => return err,
         };
+        snapshot_owned = false;
     }
 
     fn cancelCompletionLoad(self: *SessionRuntime) void {

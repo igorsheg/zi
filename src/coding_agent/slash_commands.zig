@@ -14,13 +14,6 @@ pub const Id = enum {
     resume_session,
 };
 
-pub const ArgKind = enum {
-    none,
-    optional_text,
-    model_selector,
-    session_selector,
-};
-
 pub const PickerKind = enum {
     none,
     model,
@@ -31,7 +24,6 @@ pub const Command = struct {
     id: Id,
     name: []const u8,
     summary: []const u8,
-    arg_kind: ArgKind = .none,
     picker: PickerKind = .none,
 };
 
@@ -47,14 +39,12 @@ pub const builtins = [_]Command{
         .id = .model,
         .name = "model",
         .summary = "Select model",
-        .arg_kind = .model_selector,
         .picker = .model,
     },
     .{
         .id = .resume_session,
         .name = "resume",
         .summary = "Resume session",
-        .arg_kind = .session_selector,
         .picker = .session,
     },
 };

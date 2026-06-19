@@ -172,12 +172,12 @@ fn execute(
     try token.throwIfRequested();
     const self: *EditTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
     var args = parseArgs(allocator, params) catch |err| switch (err) {
-        error.InvalidToolArguments => return editErrorResult(
+        error.InvalidToolArguments => return path_utils.errorResult(
             allocator,
             "invalid_arguments",
             "Invalid edit arguments: provide path and one or more edits with string oldText and string newText.",
         ),
-        error.TooManyEdits => return editErrorResult(
+        error.TooManyEdits => return path_utils.errorResult(
             allocator,
             "too_many_edits",
             "Edit failed: too many replacements in one call; split the edit into smaller batches.",
@@ -221,13 +221,16 @@ fn execute(
     defer edited.deinit(allocator);
     try token.throwIfRequested();
     _ = on_update;
-    var result = try editResult(
+    var result = editResult(
         allocator,
         args.edits.len,
         args.path,
         edited.first_changed_line,
         edited.diff,
-    );
+    ) catch |err| switch (err) {
+        error.EditTooLarge => return editDiffTooLargeResult(allocator),
+        else => return err,
+    };
     errdefer result.deinit();
     try token.throwIfRequested();
     const mutation_queue = self.config.mutation_queue orelse &self.default_mutation_queue;
@@ -338,16 +341,20 @@ fn applyEditsPreservingTextShape(
 
     const normalized_edits = try allocator.alloc(Replacement, edits.len);
     defer allocator.free(normalized_edits);
-    for (edits, normalized_edits) |edit, *normalized| {
-        normalized.old_text = try normalizeLineEndings(allocator, edit.old_text);
-        errdefer allocator.free(normalized.old_text);
-        normalized.new_text = try normalizeLineEndings(allocator, edit.new_text);
-        errdefer allocator.free(normalized.new_text);
-    }
-    defer for (normalized_edits) |normalized| {
+    var normalized_count: usize = 0;
+    defer for (normalized_edits[0..normalized_count]) |normalized| {
         allocator.free(normalized.old_text);
         allocator.free(normalized.new_text);
     };
+    for (edits, normalized_edits) |edit, *normalized| {
+        const old_text = try normalizeLineEndings(allocator, edit.old_text);
+        const new_text = normalizeLineEndings(allocator, edit.new_text) catch |err| {
+            allocator.free(old_text);
+            return err;
+        };
+        normalized.* = .{ .old_text = old_text, .new_text = new_text };
+        normalized_count += 1;
+    }
 
     var applied: [max_edits_per_call]edit_diff.AppliedEdit = undefined;
     const normalized = try applyEdits(
@@ -540,33 +547,6 @@ fn lessThanMatch(_: void, a: Match, b: Match) bool {
     return a.start < b.start;
 }
 
-fn lineAt(text: []const u8, wanted_line: usize) []const u8 {
-    var line: usize = 1;
-    var start: usize = 0;
-    var index: usize = 0;
-    while (index <= text.len) : (index += 1) {
-        if (index == text.len or text[index] == '\n') {
-            if (line == wanted_line) return text[start..index];
-            line += 1;
-            start = index + 1;
-        }
-    }
-    return "";
-}
-
-fn editErrorResult(
-    allocator: std.mem.Allocator,
-    reason: []const u8,
-    message: []const u8,
-) !agent.ToolExecutionResult {
-    const details = try path_utils.jsonDetails(allocator, .{
-        .isError = true,
-        .reason = reason,
-    });
-    errdefer runtime.freeJsonValue(allocator, details);
-    return path_utils.textResult(allocator, message, details);
-}
-
 fn editFailureResult(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -641,7 +621,7 @@ fn editFailureResult(
                 .{path},
             );
         },
-        .none => return editErrorResult(
+        .none => return path_utils.errorResult(
             allocator,
             "edit_failed",
             "Edit failed.",
@@ -666,14 +646,7 @@ fn editFailureResultFmt(
     reason: []const u8,
     args: anytype,
 ) !agent.ToolExecutionResult {
-    const message = try std.fmt.allocPrint(allocator, fmt, args);
-    errdefer allocator.free(message);
-    const details = try path_utils.jsonDetails(allocator, .{
-        .isError = true,
-        .reason = reason,
-    });
-    errdefer runtime.freeJsonValue(allocator, details);
-    return path_utils.ownedTextResult(allocator, message, details);
+    return path_utils.errorResultFmt(allocator, fmt, reason, args);
 }
 
 fn editTooLargeResult(allocator: std.mem.Allocator, max_output_bytes: usize) !agent.ToolExecutionResult {
@@ -687,6 +660,22 @@ fn editTooLargeResult(allocator: std.mem.Allocator, max_output_bytes: usize) !ag
         .isError = true,
         .reason = @as([]const u8, "output_too_large"),
         .maxBytes = max_output_bytes,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
+}
+
+fn editDiffTooLargeResult(allocator: std.mem.Allocator) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Edit failed: diff would exceed the {d} byte limit.",
+        .{max_diff_bytes},
+    );
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = @as([]const u8, "diff_too_large"),
+        .maxBytes = max_diff_bytes,
     });
     errdefer runtime.freeJsonValue(allocator, details);
     return path_utils.ownedTextResult(allocator, message, details);
@@ -754,25 +743,6 @@ test "edit tool applies multiple exact replacements against original content" {
     try std.testing.expect(details.get("patch").? == .string);
 }
 
-const EditUpdateCapture = struct {
-    writer: std.Io.Writer.Allocating,
-    count: usize = 0,
-
-    fn deinit(self: *EditUpdateCapture) void {
-        self.writer.deinit();
-        self.* = undefined;
-    }
-};
-
-fn captureEditUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult) anyerror!void {
-    const capture: *EditUpdateCapture = @ptrCast(@alignCast(context.?));
-    capture.count += 1;
-    for (partial_result.content) |content| switch (content) {
-        .text => |text| try capture.writer.writer.writeAll(text.text),
-        .image => {},
-    };
-}
-
 test "edit tool accepts legacy top-level replacement and file_path" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
@@ -824,6 +794,35 @@ test "edit tool preserves BOM and CRLF while matching normalized text and tracks
 
     try std.testing.expectEqualStrings(utf8_bom ++ "1\r\n2\r\n", edited.restored);
     try std.testing.expectEqual(@as(usize, 1), edited.first_changed_line);
+}
+
+test "edit normalization frees initialized edits on allocation failure" {
+    const edits = [_]Replacement{
+        .{ .old_text = "one\ntwo", .new_text = "ONE\nTWO" },
+        .{ .old_text = "three", .new_text = "THREE" },
+    };
+
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = std.math.maxInt(usize),
+        });
+        var edited = applyEditsPreservingTextShape(
+            failing.allocator(),
+            "one\r\ntwo\r\nthree\r\nfour",
+            &edits,
+            max_edit_output_bytes,
+            null,
+        ) catch |err| {
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        edited.deinit(failing.allocator());
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) break;
+    }
 }
 
 test "edit tool reports no-op replacement without writing" {
@@ -959,7 +958,7 @@ test "edit tool does not stream full edited file on success" {
     defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    var capture: EditUpdateCapture = .{ .writer = .init(std.testing.allocator) };
+    var capture: test_support.UpdateCapture = .{ .writer = .init(std.testing.allocator) };
     defer capture.deinit();
     var result = try execute(
         std.testing.allocator,
@@ -969,7 +968,7 @@ test "edit tool does not stream full edited file on success" {
         cancel_source.token(),
         "call-1",
         .{ .object = object },
-        .{ .context = &capture, .call_fn = captureEditUpdate },
+        .{ .context = &capture, .call_fn = test_support.captureUpdate },
     );
     defer result.deinit();
 
@@ -990,7 +989,7 @@ fn largeEditBlock(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
     return writer.toOwnedSlice();
 }
 
-test "edit tool does not write when success result is too large" {
+test "edit tool returns operational error when success result is too large" {
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
     const original = try largeEditBlock(std.testing.allocator, "old");
@@ -1018,7 +1017,7 @@ test "edit tool does not write when success result is too large" {
     defer task_runtime.deinit();
     var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
     defer cancel_source.deinit();
-    var result = execute(
+    var result = try execute(
         std.testing.allocator,
         task_runtime.io(),
         task_runtime,
@@ -1027,15 +1026,13 @@ test "edit tool does not write when success result is too large" {
         "call-1",
         .{ .object = object },
         null,
-    ) catch |err| {
-        try std.testing.expectEqual(error.EditTooLarge, err);
-        const written = try fixture.read("repo/file.txt");
-        defer std.testing.allocator.free(written);
-        try std.testing.expectEqualStrings(original, written);
-        return;
-    };
-    result.deinit();
-    try std.testing.expect(false);
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("diff_too_large", result.result.details.?.object.get("reason").?.string);
+    const written = try fixture.read("repo/file.txt");
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings(original, written);
 }
 
 test "edit tool rejects bad replacements before mutation" {

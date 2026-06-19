@@ -152,18 +152,6 @@ pub fn moveVertical(self: *Composer, width: u16, direction: VerticalDirection) M
     return .moved;
 }
 
-/// Take the trimmed buffer for submission, clearing the composer. Returns
-/// null (and clears) when the content is empty or whitespace-only.
-pub fn takeSubmit(self: *Composer, gpa: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
-    const trimmed = self.submitSlice() orelse {
-        if (self.bytes.items.len != 0) self.clear();
-        return null;
-    };
-    const owned = try gpa.dupe(u8, trimmed);
-    self.clear();
-    return owned;
-}
-
 pub fn visualRows(self: *Composer, width: u16) usize {
     return self.cachedProjection(width).projection.total_rows;
 }
@@ -446,22 +434,6 @@ test "vertical movement preserves the desired display column across short rows" 
     try std.testing.expectEqual(@as(usize, 9), composer.cursor_byte_index);
     try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(6, .up));
     try std.testing.expectEqual(@as(usize, 6), composer.cursor_byte_index);
-}
-
-test "takeSubmit trims, clears, and returns null for whitespace" {
-    const gpa = std.testing.allocator;
-    var composer: Composer = .{};
-    defer composer.deinit(gpa);
-
-    _ = try composer.insert(gpa, "  hi there \n");
-    const submitted = (try composer.takeSubmit(gpa)).?;
-    defer gpa.free(submitted);
-    try std.testing.expectEqualStrings("hi there", submitted);
-    try std.testing.expectEqual(@as(usize, 0), composer.text().len);
-
-    _ = try composer.insert(gpa, "   \n");
-    try std.testing.expectEqual(@as(?[]u8, null), try composer.takeSubmit(gpa));
-    try std.testing.expectEqual(@as(usize, 0), composer.text().len);
 }
 
 test "projection cache invalidates on edit and tracks the cursor" {
