@@ -58,13 +58,23 @@ pub fn decodeCommandLine(
     }
     if (std.mem.eql(u8, command_type, "queue.clear")) return .{ .id = id, .command = .{ .queue = .clear } };
     if (std.mem.eql(u8, command_type, "snapshot")) return .{ .id = id, .command = .snapshot };
+    if (std.mem.eql(u8, command_type, "completion_snapshot")) {
+        return .{ .id = id, .command = .completion_snapshot };
+    }
     if (std.mem.eql(u8, command_type, "replay")) {
         return .{ .id = id, .command = .{ .replay = try decodeReplay(object) } };
+    }
+    if (std.mem.eql(u8, command_type, "history_page")) {
+        const before_value = object.get("beforeEntryId") orelse return error.InvalidMessage;
+        if (before_value != .string) return error.InvalidMessage;
+        const envelope = try client_protocol.CommandEnvelope.initHistoryPage(allocator, id, before_value.string);
+        return envelope;
     }
     if (std.mem.eql(u8, command_type, "switch_session")) {
         const file_value = object.get("sessionFile") orelse return error.InvalidMessage;
         if (file_value != .string) return error.InvalidMessage;
-        return try client_protocol.CommandEnvelope.initSwitchSession(allocator, id, file_value.string);
+        const envelope = try client_protocol.CommandEnvelope.initSwitchSession(allocator, id, file_value.string);
+        return envelope;
     }
     if (std.mem.eql(u8, command_type, "shutdown")) return .{ .id = id, .command = .shutdown };
     return error.UnknownCommand;
@@ -162,6 +172,24 @@ test "wire protocol decodes switch session command" {
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 4), envelope.id);
     try std.testing.expect(envelope.command == .switch_session);
     try std.testing.expectEqualStrings("t_session.jsonl", envelope.command.switch_session.session_file_name);
+}
+
+test "wire protocol decodes completion snapshot command" {
+    const line = "{\"id\":5,\"type\":\"completion_snapshot\"}";
+    var envelope = (try decodeCommandLine(std.testing.allocator, line)) orelse unreachable;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 5), envelope.id);
+    try std.testing.expect(envelope.command == .completion_snapshot);
+}
+
+// History pages are anchored by core-owned session entry ids.
+test "wire protocol decodes history page command" {
+    const line = "{\"id\":6,\"type\":\"history_page\",\"beforeEntryId\":\"00000003\"}";
+    var envelope = (try decodeCommandLine(std.testing.allocator, line)) orelse unreachable;
+    defer envelope.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 6), envelope.id);
+    try std.testing.expect(envelope.command == .history_page);
+    try std.testing.expectEqualStrings("00000003", envelope.command.history_page.before_entry_id);
 }
 
 // Cancel targets identify work without giving clients mutation authority.

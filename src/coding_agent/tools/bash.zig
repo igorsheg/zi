@@ -171,18 +171,18 @@ fn execute(
         error.Timeout => {
             const status = try timeoutStatus(allocator, args.timeout_ms);
             defer allocator.free(status);
-            return resultFromOutput(allocator, update_context.output.snapshot().content, status, null, .timeout);
+            return resultFromObservedOutput(allocator, update_context.output.snapshot(), status, null, .timeout);
         },
-        error.OperationCancelled => return resultFromOutput(
+        error.OperationCancelled => return resultFromObservedOutput(
             allocator,
-            update_context.output.snapshot().content,
+            update_context.output.snapshot(),
             "Command aborted",
             null,
             .canceled,
         ),
-        error.StreamTooLong => return resultFromOutput(
+        error.StreamTooLong => return resultFromObservedOutput(
             allocator,
-            update_context.output.snapshot().content,
+            update_context.output.snapshot(),
             "bash output limit exceeded",
             null,
             .output_limit,
@@ -191,7 +191,7 @@ fn execute(
     };
     defer freeRunResult(allocator, run_result);
     try token.throwIfRequested();
-    return resultFromRun(allocator, run_result, update_context.output.snapshot().content);
+    return resultFromRun(allocator, run_result, update_context.output.snapshot());
 }
 
 fn runProcess(
@@ -299,9 +299,13 @@ const FailureKind = enum {
 fn resultFromRun(
     allocator: std.mem.Allocator,
     run_result: std.process.RunResult,
-    observed_output: []const u8,
+    observed_output: output_accumulator.Snapshot,
 ) !agent.ToolExecutionResult {
-    if (observed_output.len > 0) return resultFromOutput(allocator, observed_output, null, run_result.term, null);
+    const run_output_bytes = run_result.stdout.len + run_result.stderr.len;
+    if (observed_output.total_bytes > 0 and observed_output.total_bytes == run_output_bytes) {
+        return resultFromObservedOutput(allocator, observed_output, null, run_result.term, null);
+    }
+
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
     if (run_result.stdout.len > 0) try writer.writer.writeAll(run_result.stdout);
@@ -312,6 +316,21 @@ fn resultFromRun(
     return resultFromOutput(allocator, writer.written(), null, run_result.term, null);
 }
 
+fn resultFromObservedOutput(
+    allocator: std.mem.Allocator,
+    observed_output: output_accumulator.Snapshot,
+    status: ?[]const u8,
+    term: ?std.process.Child.Term,
+    failure: ?FailureKind,
+) !agent.ToolExecutionResult {
+    return resultFromOutputWithTotals(allocator, observed_output.content, status, term, failure, .{
+        .total_lines = observed_output.total_lines,
+        .total_bytes = observed_output.total_bytes,
+        .truncated = observed_output.truncated,
+        .last_line_partial = observed_output.last_line_partial,
+    });
+}
+
 fn resultFromOutput(
     allocator: std.mem.Allocator,
     full_output: []const u8,
@@ -319,13 +338,54 @@ fn resultFromOutput(
     term: ?std.process.Child.Term,
     failure: ?FailureKind,
 ) !agent.ToolExecutionResult {
-    const preview = try output_tail.appendTail(allocator, "", full_output, .{
+    return resultFromOutputWithTotals(allocator, full_output, status, term, failure, null);
+}
+
+const OutputTotals = struct {
+    total_lines: usize,
+    total_bytes: usize,
+    truncated: bool,
+    last_line_partial: bool,
+};
+
+const OutputFacts = struct {
+    truncated: bool,
+    total_lines: usize,
+    total_bytes: usize,
+    output_lines: usize,
+    output_bytes: usize,
+    last_line_partial: bool,
+};
+
+fn resultFromOutputWithTotals(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    status: ?[]const u8,
+    term: ?std.process.Child.Term,
+    failure: ?FailureKind,
+    output_totals: ?OutputTotals,
+) !agent.ToolExecutionResult {
+    const preview = try output_tail.appendTail(allocator, "", output, .{
         .max_bytes = max_output_preview_bytes,
         .max_lines = max_output_preview_lines,
     });
     defer allocator.free(preview.bytes);
 
-    const truncated = preview.dropped_bytes > 0 or preview.dropped_lines > 0;
+    const preview_truncated = preview.dropped_bytes > 0 or preview.dropped_lines > 0;
+    const totals = output_totals orelse OutputTotals{
+        .total_lines = countOutputLines(output),
+        .total_bytes = output.len,
+        .truncated = preview_truncated,
+        .last_line_partial = preview.last_line_partial,
+    };
+    const facts: OutputFacts = .{
+        .truncated = totals.truncated or preview_truncated,
+        .total_lines = totals.total_lines,
+        .total_bytes = totals.total_bytes,
+        .output_lines = countOutputLines(preview.bytes),
+        .output_bytes = preview.bytes.len,
+        .last_line_partial = totals.last_line_partial or preview.last_line_partial,
+    };
     const exit_status = if (status) |text|
         try allocator.dupe(u8, text)
     else if (term) |resolved|
@@ -341,15 +401,16 @@ fn resultFromOutput(
     } else {
         try text_writer.writer.writeAll("(no output)");
     }
-    if (truncated) {
-        try appendTruncationFooter(&text_writer.writer, full_output, preview);
+    if (facts.truncated) {
+        try appendTruncationFooter(&text_writer.writer, facts);
     }
     if (exit_status.len > 0) {
         try text_writer.writer.writeAll("\n\n");
         try text_writer.writer.writeAll(exit_status);
     }
 
-    const details = try resultDetails(allocator, term, failure, full_output, preview);
+    const details = try resultDetails(allocator, term, failure, facts);
+    errdefer runtime.freeJsonValue(allocator, details);
     return path_utils.ownedTextResult(allocator, try text_writer.toOwnedSlice(), details);
 }
 
@@ -378,23 +439,20 @@ fn commandExitStatus(allocator: std.mem.Allocator, term: std.process.Child.Term)
     };
 }
 
-fn appendTruncationFooter(
-    writer: *std.Io.Writer,
-    full_output: []const u8,
-    preview: output_tail.TailAppendResult,
-) !void {
-    const total_lines = countOutputLines(full_output);
-    const output_lines = countOutputLines(preview.bytes);
-    const start_line = if (output_lines == 0 or total_lines < output_lines) 1 else total_lines - output_lines + 1;
-    if (preview.last_line_partial) {
+fn appendTruncationFooter(writer: *std.Io.Writer, facts: OutputFacts) !void {
+    const start_line = if (facts.output_lines == 0 or facts.total_lines < facts.output_lines)
+        1
+    else
+        facts.total_lines - facts.output_lines + 1;
+    if (facts.last_line_partial) {
         try writer.print(
             "\n\n[Showing last {d}KB of line {d} ({d}KB limit)]",
-            .{ preview.bytes.len / 1024, total_lines, max_output_preview_bytes / 1024 },
+            .{ facts.output_bytes / 1024, facts.total_lines, max_output_preview_bytes / 1024 },
         );
     } else {
         try writer.print(
             "\n\n[Showing lines {d}-{d} of {d} ({d}KB limit)]",
-            .{ start_line, total_lines, total_lines, max_output_preview_bytes / 1024 },
+            .{ start_line, facts.total_lines, facts.total_lines, max_output_preview_bytes / 1024 },
         );
     }
 }
@@ -413,8 +471,7 @@ fn resultDetails(
     allocator: std.mem.Allocator,
     term: ?std.process.Child.Term,
     failure: ?FailureKind,
-    full_output: []const u8,
-    preview: output_tail.TailAppendResult,
+    facts: OutputFacts,
 ) !std.json.Value {
     var exit_code: ?i64 = null;
     var signal: ?i64 = null;
@@ -434,15 +491,15 @@ fn resultDetails(
         output_limited = kind == .output_limit;
         cancelled = kind == .canceled;
     }
-    const truncation: ?std.json.Value = if (preview.dropped_bytes > 0 or preview.dropped_lines > 0)
+    const truncation: ?std.json.Value = if (facts.truncated)
         try path_utils.jsonDetails(allocator, .{
             .truncated = true,
-            .truncatedBy = @as([]const u8, if (full_output.len > max_output_preview_bytes) "bytes" else "lines"),
-            .totalLines = countOutputLines(full_output),
-            .totalBytes = full_output.len,
-            .outputLines = countOutputLines(preview.bytes),
-            .outputBytes = preview.bytes.len,
-            .lastLinePartial = preview.last_line_partial,
+            .truncatedBy = @as([]const u8, if (facts.total_bytes > max_output_preview_bytes) "bytes" else "lines"),
+            .totalLines = facts.total_lines,
+            .totalBytes = facts.total_bytes,
+            .outputLines = facts.output_lines,
+            .outputBytes = facts.output_bytes,
+            .lastLinePartial = facts.last_line_partial,
             .firstLineExceedsLimit = false,
             .maxLines = max_output_preview_lines,
             .maxBytes = max_output_preview_bytes,
@@ -619,6 +676,33 @@ test "bash tail truncation details include line byte and limit facts" {
     try std.testing.expectEqual(@as(i64, max_output_preview_bytes), truncation.get("maxBytes").?.integer);
     try std.testing.expect(!truncation.get("lastLinePartial").?.bool);
     try std.testing.expect(!truncation.get("firstLineExceedsLimit").?.bool);
+}
+
+test "bash execute path preserves tail truncation totals" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer tool.deinit();
+
+    const args = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"command\":\"" ++
+            "i=1; while [ $i -le {d} ]; do printf 'line %s\\\\n' $i; " ++
+            "i=$((i+1)); done; sleep 0.05" ++
+            "\"}}",
+        .{max_output_preview_lines + 2},
+    );
+    defer std.testing.allocator.free(args);
+
+    var result = try test_support.execute(tool.tool(), args);
+    defer result.deinit();
+
+    const truncation = result.result.details.?.object.get("truncation").?.object;
+    try std.testing.expectEqualStrings("lines", truncation.get("truncatedBy").?.string);
+    try std.testing.expectEqual(@as(i64, max_output_preview_lines + 2), truncation.get("totalLines").?.integer);
+    try std.testing.expectEqual(@as(i64, max_output_preview_lines), truncation.get("outputLines").?.integer);
 }
 
 test "bash tool applies command prefix and shell path" {

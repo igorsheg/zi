@@ -49,7 +49,13 @@ pub const ReadResult = struct {
     eof: bool = false,
 };
 
-pub fn init(gpa: std.mem.Allocator, io: std.Io, width: u16, height: u16, terminal_info: theme_mod.TerminalInfo) !*Terminal {
+pub fn init(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    width: u16,
+    height: u16,
+    terminal_info: theme_mod.TerminalInfo,
+) !*Terminal {
     const self = try gpa.create(Terminal);
     errdefer gpa.destroy(self);
     self.* = .{
@@ -121,6 +127,10 @@ pub fn isDirty(self: *const Terminal) bool {
 
 pub fn hasAnimation(self: *const Terminal) bool {
     return self.app.hasAnimation();
+}
+
+pub fn composerText(self: *const Terminal) []const u8 {
+    return self.app.composer.text();
 }
 
 pub fn applyCommand(self: *Terminal, command: App.Command) error{OutOfMemory}!?App.Effect {

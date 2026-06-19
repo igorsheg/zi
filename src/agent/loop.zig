@@ -584,9 +584,10 @@ fn runLoop(
             }
 
             if (pending_messages.len > 0) {
-                try emitPendingMessages(allocator, current, pending_messages, emit);
-                allocator.free(pending_messages);
+                const messages = pending_messages;
                 pending_messages = &.{};
+                defer allocator.free(messages);
+                try emitPendingMessages(allocator, current, messages, emit);
             }
 
             // streamAssistantResponse returns into current.owned_arena, so an
@@ -852,6 +853,10 @@ fn failOnToolUpdateSink(context: ?*anyopaque, event: agent.AgentEvent) anyerror!
     try testSink(context, event);
 }
 
+fn failOnQueuedMessageStartSink(_: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
+    if (event == .message_start and event.message_start.message == .user) return error.TestSinkFailed;
+}
+
 fn copyMessageForTest(message: agent.AgentMessage) !agent.AgentMessage {
     return switch (message) {
         .tool_result => |tool_result| .{
@@ -1053,6 +1058,17 @@ test "compact text delta partial with real content drops to empty content" {
 
 fn userMessage(text: []const u8) agent.AgentMessage {
     return .{ .user = .{ .content = .{ .string = text }, .timestamp = 0 } };
+}
+
+fn oneQueuedMessage(
+    allocator: std.mem.Allocator,
+    _: ?*anyopaque,
+) std.mem.Allocator.Error![]const agent.AgentMessage {
+    const messages = try allocator.alloc(agent.AgentMessage, 1);
+    errdefer allocator.free(messages);
+    const content = try allocator.dupe(u8, "queued");
+    messages[0] = .{ .user = .{ .content = .{ .string = content }, .timestamp = 0 } };
+    return messages;
 }
 
 fn echoTool(
@@ -1581,6 +1597,29 @@ test "run continue rejects assistant tail" {
         cancel.token(),
         task_runtime,
         .{ .context = &events, .call_fn = testSink },
+    ));
+}
+
+test "queued message emit failure releases pending batch once" {
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
+    const seed = userMessage("seed");
+
+    try std.testing.expectError(error.TestSinkFailed, runContinue(
+        std.testing.allocator,
+        std.Io.failing,
+        .{ .system_prompt = "", .messages = &.{seed}, .tools = &.{} },
+        .{
+            .model = testModel(),
+            .stream = .{ .call_fn = testStream },
+            .convert_to_llm = .{ .call_fn = testConvertToLlm },
+            .get_steering_messages = .{ .call_fn = oneQueuedMessage },
+        },
+        cancel.token(),
+        task_runtime,
+        .{ .call_fn = failOnQueuedMessageStartSink },
     ));
 }
 

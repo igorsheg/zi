@@ -31,6 +31,7 @@ submit { text, mode }
 cancel { target }
 queue.clear
 snapshot
+completion_snapshot
 history_page { before_entry_id }
 replay { after, max_events }
 switch_session { session_file_name }
@@ -67,6 +68,7 @@ Named caps:
 - replay batch: `replay_event_count_max`
 - snapshot history: item count/per-item/total text caps
 - history pages: item count/per-item/total text caps
+- completion snapshot: item count/id/label/detail byte caps
 
 Policy:
 

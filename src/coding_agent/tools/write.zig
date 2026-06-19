@@ -3,6 +3,7 @@ const agent = @import("../../agent/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const file_mutation_queue = @import("file_mutation_queue.zig");
 const path_utils = @import("path_utils.zig");
+const paths_mod = @import("../paths.zig");
 const test_support = @import("test_support.zig");
 
 pub const max_write_bytes = 4 * 1024 * 1024;
@@ -109,7 +110,7 @@ fn execute(
         errdefer runtime.freeJsonValue(allocator, details);
         return path_utils.ownedTextResult(allocator, message, details);
     }
-    const resolved_path = path_utils.resolveCreatablePath(allocator, io, .{
+    const resolved_path = paths_mod.ToolPaths.resolveCreatable(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
         .home_dir = self.config.home_dir,

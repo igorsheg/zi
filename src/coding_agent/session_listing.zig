@@ -309,7 +309,9 @@ fn loadRuntimeSessionSummary(
 
     var builder: RuntimeSessionSummaryBuilder = .{ .scan_truncated = read_count == buffer.len };
     var lines = std.mem.splitScalar(u8, complete, '\n');
-    while (lines.next()) |line| parseSummaryLine(allocator, std.mem.trim(u8, line, " \t\r"), &builder) catch {};
+    while (lines.next()) |line| {
+        parseSummaryLine(allocator, std.mem.trim(u8, line, " \t\r"), &builder) catch continue;
+    }
     return summaryFromBuilder(allocator, file_name, &builder);
 }
 
@@ -430,7 +432,7 @@ fn jsonString(value: ?std.json.Value) ?[]const u8 {
 
 fn fallbackTitle(file_name: []const u8) []const u8 {
     const stem = if (std.mem.endsWith(u8, file_name, ".jsonl")) file_name[0 .. file_name.len - 6] else file_name;
-    if (std.mem.indexOfScalar(u8, stem, '_')) |underscore| {
+    if (std.mem.findScalar(u8, stem, '_')) |underscore| {
         if (underscore + 1 < stem.len) return stem[underscore + 1 ..];
     }
     return stem;
@@ -529,9 +531,12 @@ test "session summaries use first user message and bounded metadata" {
     try tmp.dir.createDirPath(std.testing.io, "agent/sessions/--repo--");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "agent/sessions/--repo--/2026-05-28T00:00:00Z_second.jsonl",
-        .data = "{\"type\":\"session\",\"version\":3,\"id\":\"second\",\"timestamp\":\"2026-05-28T00:00:00Z\",\"cwd\":\"/tmp/repo\"}\n" ++
-            "{\"type\":\"message\",\"id\":\"00000001\",\"parentId\":null,\"timestamp\":\"t1\",\"message\":{\"role\":\"assistant\",\"content\":[],\"api\":\"openai-responses\",\"provider\":\"openai\",\"model\":\"gpt\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"end_turn\",\"timestamp\":0}}\n" ++
-            "{\"type\":\"message\",\"id\":\"00000002\",\"parentId\":\"00000001\",\"timestamp\":\"t2\",\"message\":{\"role\":\"user\",\"content\":\"Fix\\nresume picker labels\",\"timestamp\":0}}\n",
+        .data = "{\"type\":\"session\",\"timestamp\":\"2026-05-28T00:00:00Z\"," ++
+            "\"cwd\":\"/tmp/repo\"}\n" ++
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\"," ++
+            "\"content\":\"ignored\"}}\n" ++
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\"," ++
+            "\"content\":\"Fix\\nresume picker labels\"}}\n",
     });
 
     var summaries = try listRuntimeSessionSummaries(std.testing.allocator, std.testing.io, .{
@@ -682,12 +687,15 @@ test "session selection rejects ambiguous session id prefix" {
     try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_tui-a.jsonl");
     try writeSessionListingTestFile(tmp.dir, "2026-05-28T00:00:00Z_tui-b.jsonl");
 
-    try std.testing.expectError(error.AmbiguousSessionSelector, selectRuntimeSession(std.testing.allocator, std.testing.io, .{
-        .cwd = "repo",
-        .agent_dir_override = "agent",
-        .dir = tmp.dir,
-        .selector = "tui-",
-    }));
+    try std.testing.expectError(
+        error.AmbiguousSessionSelector,
+        selectRuntimeSession(std.testing.allocator, std.testing.io, .{
+            .cwd = "repo",
+            .agent_dir_override = "agent",
+            .dir = tmp.dir,
+            .selector = "tui-",
+        }),
+    );
 }
 
 test "session selection chooses newest only from complete listing" {

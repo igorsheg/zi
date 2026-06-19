@@ -161,6 +161,7 @@ pub const SlashArgCompletionOpen = struct {
 };
 
 const slash_arg_command_name_bytes_max: usize = 32;
+const slash_arg_completion_count_max: usize = 8;
 
 const SlashArgCompletion = struct {
     command_name: [slash_arg_command_name_bytes_max]u8 = undefined,
@@ -195,13 +196,13 @@ const SlashArgCompletion = struct {
 const Completion = struct {
     modal: ?Picker = null,
     command: ?Picker = null,
-    slash_arg: ?SlashArgCompletion = null,
+    slash_args: [slash_arg_completion_count_max]?SlashArgCompletion = @splat(null),
     hidden_until_edit: bool = false,
 
     fn deinit(self: *Completion, gpa: std.mem.Allocator) void {
         if (self.modal) |*picker| picker.deinit(gpa);
         if (self.command) |*picker| picker.deinit(gpa);
-        if (self.slash_arg) |*completion| completion.deinit(gpa);
+        self.clearSlashArgSlots(gpa);
         self.* = undefined;
     }
 
@@ -244,17 +245,42 @@ const Completion = struct {
     ) error{OutOfMemory}!void {
         var next = try SlashArgCompletion.init(gpa, open);
         errdefer next.deinit(gpa);
-        if (self.slash_arg) |*completion| completion.deinit(gpa);
-        self.slash_arg = next;
+        // Frontend-installed hints are bounded; if full, newest replaces slot 0.
+        const slot = self.slashArgSlot(open.command_name) orelse self.emptySlashArgSlot() orelse &self.slash_args[0];
+        if (slot.*) |*completion| completion.deinit(gpa);
+        slot.* = next;
     }
 
     fn clearSlashArg(self: *Completion, gpa: std.mem.Allocator) bool {
-        if (self.slash_arg) |*completion| {
-            completion.deinit(gpa);
-            self.slash_arg = null;
-            return true;
+        const had_any = self.hasSlashArg();
+        self.clearSlashArgSlots(gpa);
+        return had_any;
+    }
+
+    fn clearSlashArgSlots(self: *Completion, gpa: std.mem.Allocator) void {
+        for (&self.slash_args) |*slot| {
+            if (slot.*) |*completion| completion.deinit(gpa);
+            slot.* = null;
         }
+    }
+
+    fn hasSlashArg(self: *const Completion) bool {
+        for (&self.slash_args) |*slot| if (slot.* != null) return true;
         return false;
+    }
+
+    fn slashArgSlot(self: *Completion, raw_command_name: []const u8) ?*?SlashArgCompletion {
+        const command_name = text_mod.utf8Prefix(raw_command_name, slash_arg_command_name_bytes_max);
+        for (&self.slash_args) |*slot| {
+            const completion = if (slot.*) |*value| value else continue;
+            if (std.ascii.eqlIgnoreCase(completion.commandName(), command_name)) return slot;
+        }
+        return null;
+    }
+
+    fn emptySlashArgSlot(self: *Completion) ?*?SlashArgCompletion {
+        for (&self.slash_args) |*slot| if (slot.* == null) return slot;
+        return null;
     }
 
     fn hideUntilEdit(self: *Completion) void {
@@ -269,7 +295,8 @@ const Completion = struct {
         if (self.command) |*picker| {
             if (app.composerCompletionQuery()) |query| picker.replaceQuery(query);
         }
-        if (self.slash_arg) |*completion| {
+        for (&self.slash_args) |*slot| {
+            const completion = if (slot.*) |*value| value else continue;
             if (app.composerArgQuery(completion.commandName())) |query| {
                 completion.picker.replaceQuery(query.text);
             }
@@ -292,9 +319,11 @@ const Completion = struct {
 
     fn activeSlashArg(self: *Completion, app: *const App) ?*SlashArgCompletion {
         if (self.hidden_until_edit or self.modal != null) return null;
-        const completion = if (self.slash_arg) |*value| value else return null;
-        if (app.composerArgQuery(completion.commandName()) == null) return null;
-        return completion;
+        for (&self.slash_args) |*slot| {
+            const completion = if (slot.*) |*value| value else continue;
+            if (app.composerArgQuery(completion.commandName()) != null) return completion;
+        }
+        return null;
     }
 };
 
@@ -367,7 +396,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         .append_transcript => |entry| {
             const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.append(gpa, entry);
-            try self.noteOutcome(gpa, outcome);
+            self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
             self.dirty = true;
             return null;
@@ -381,7 +410,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
                 delta.dropped_head_bytes,
                 delta.dropped_head_lines,
             );
-            try self.noteOutcome(gpa, outcome);
+            self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
             self.dirty = true;
             return null;
@@ -394,7 +423,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
                 delta.dropped_head_bytes,
                 delta.dropped_head_lines,
             );
-            try self.noteOutcome(gpa, outcome);
+            self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.dirty = true;
             return null;
@@ -402,14 +431,14 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         .replace_tool_output => |replace| {
             const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.replaceToolOutput(gpa, replace.tool_call_id, replace.text);
-            try self.noteOutcome(gpa, outcome);
+            self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
             self.dirty = true;
             return null;
         },
         .replace_front_tool_output => |replace| {
             const outcome = try self.transcript.replaceFrontToolOutput(gpa, replace.tool_call_id, replace.text);
-            try self.noteOutcome(gpa, outcome);
+            self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.dirty = true;
             return null;
@@ -417,14 +446,14 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         .replace_tool_footer => |footer| {
             const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.replaceToolFooter(gpa, footer.tool_call_id, footer.text);
-            try self.noteOutcome(gpa, outcome);
+            self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
             self.dirty = true;
             return null;
         },
         .prepend_transcript => |rows| {
             const outcome = try self.transcript.prepend(gpa, rows);
-            try self.noteOutcome(gpa, outcome);
+            self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.dirty = true;
             return null;
@@ -481,7 +510,9 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             return null;
         },
         .set_status => |update| {
-            if (self.status.set(update, self.now_ms) == .dropped_full) try self.notice(gpa, .warning, "status line full");
+            if (self.status.set(update, self.now_ms) == .dropped_full) {
+                try self.notice(gpa, .warning, "status line full");
+            }
             self.dirty = true;
             return null;
         },
@@ -973,8 +1004,9 @@ fn clampOrFollowViewport(self: *App) void {
     self.viewport.clampOrFollow(render.transcriptScrollMax(self));
 }
 
-fn noteOutcome(self: *App, gpa: std.mem.Allocator, outcome: Transcript.Outcome) error{OutOfMemory}!void {
-    if (outcome.truncated) try self.appendNotice(gpa, .warning, "transcript append truncated");
+fn noteOutcome(self: *App, gpa: std.mem.Allocator, outcome: Transcript.Outcome) void {
+    if (!outcome.truncated) return;
+    self.appendNotice(gpa, .warning, "transcript append truncated") catch return;
 }
 
 fn appendNotice(
@@ -1319,6 +1351,36 @@ test "composer slash completion filters while typing and tab accepts" {
     try std.testing.expect(app.visiblePicker() == null);
 }
 
+test "composer slash arg completions are keyed by command" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    const model_items = [_]Picker.Item{
+        .{ .id = "openai/gpt", .label = "openai/gpt" },
+        .{ .id = "anthropic/claude", .label = "anthropic/claude" },
+    };
+    const resume_items = [_]Picker.Item{.{ .id = "2026-06-10T00:00:00Z_one.jsonl", .label = "one" }};
+    _ = try app.apply(gpa, .{ .set_composer_arg_completions = .{
+        .command_name = "model",
+        .picker = .{ .id = 1, .items = &model_items },
+    } });
+    _ = try app.apply(gpa, .{ .set_composer_arg_completions = .{
+        .command_name = "resume",
+        .accept = .emit_selection,
+        .picker = .{ .id = 3, .items = &resume_items },
+    } });
+
+    _ = try app.apply(gpa, .{ .replace_composer_text = "/model " });
+    try std.testing.expectEqual(@as(Picker.Id, 1), app.visiblePicker().?.id);
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("claude") } });
+    try std.testing.expectEqual(@as(Picker.Id, 1), app.visiblePicker().?.id);
+    try std.testing.expectEqual(@as(usize, 1), app.visiblePicker().?.matchCount());
+
+    _ = try app.apply(gpa, .{ .replace_composer_text = "/resume " });
+    try std.testing.expectEqual(@as(Picker.Id, 3), app.visiblePicker().?.id);
+}
+
 test "composer slash arg completion can emit selected item" {
     const gpa = std.testing.allocator;
     var app = App.init(80, 24, .{});
@@ -1528,4 +1590,37 @@ test "invalid streamed text degrades instead of erroring" {
         "bad\u{fffd}byte",
         app.transcript.items.items[0].body.message.text.items,
     );
+}
+
+// Truncation warnings are UI hints; the transcript mutation is the fact.
+test "truncation notice oom does not fail transcript append" {
+    const oversized = "x" ** (Transcript.append_size_bytes_max + 1);
+    var saw_notice_oom = false;
+
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const gpa = failing.allocator();
+        var app = App.init(80, 24, .{});
+        defer app.deinit(gpa);
+
+        const effect = app.apply(gpa, .{ .append_transcript = .{ .message = .{
+            .role = .assistant,
+            .text = oversized,
+        } } }) catch continue;
+        if (effect) |value| {
+            value.deinit(gpa);
+            return error.UnexpectedEffect;
+        }
+        if (!failing.has_induced_failure) continue;
+
+        saw_notice_oom = true;
+        try std.testing.expectEqual(@as(usize, 1), app.transcript.items.items.len);
+        try std.testing.expectEqual(
+            Transcript.append_size_bytes_max,
+            app.transcript.items.items[0].body.message.text.items.len,
+        );
+        break;
+    }
+
+    try std.testing.expect(saw_notice_oom);
 }

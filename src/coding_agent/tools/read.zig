@@ -3,6 +3,7 @@ const agent = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const runtime = @import("../../runtime/root.zig");
 const path_utils = @import("path_utils.zig");
+const paths_mod = @import("../paths.zig");
 const test_support = @import("test_support.zig");
 const tool_output_policy = @import("../tool_output_policy.zig");
 
@@ -92,7 +93,7 @@ fn execute(
             "Invalid read arguments: provide path/file_path and positive offset/limit integers.",
         ),
     };
-    const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
+    const resolved_path = try paths_mod.ToolPaths.resolveExisting(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
         .home_dir = self.config.home_dir,
@@ -647,7 +648,7 @@ test "read tool can reject paths outside cwd by config" {
     try fixture.dir("repo/other");
     try fixture.write("repo/other/file.txt", "x");
 
-    try std.testing.expectError(error.PathOutsideCwd, path_utils.resolveExistingPath(
+    try std.testing.expectError(error.PathOutsideCwd, paths_mod.ToolPaths.resolveExisting(
         std.testing.allocator,
         std.testing.io,
         .{ .cwd = fixture.cwd(), .allow_paths_outside_cwd = false },

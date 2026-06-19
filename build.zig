@@ -26,13 +26,6 @@ pub fn build(b: *std.Build) void {
     });
     zi.addImport("vaxis", vaxis_dep.module("vaxis"));
 
-    const tui_module = b.createModule(.{
-        .root_source_file = b.path("src/tui/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "vaxis", .module = vaxis_dep.module("vaxis") }},
-    });
-
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -65,37 +58,6 @@ pub fn build(b: *std.Build) void {
     const generate_models_cmd = b.addRunArtifact(generate_models);
     generate_models_cmd.addArg("src/ai/models.generated.zig");
     b.step("generate-models", "Generate AI model table").dependOn(&generate_models_cmd.step);
-
-    const tui_fixture = b.addExecutable(.{
-        .name = "tui-fixture",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("scripts/tui-fixture.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "tui", .module = tui_module }},
-        }),
-    });
-    b.step("tui-fixture-bin", "Build deterministic TUI fixture").dependOn(&tui_fixture.step);
-    const tui_fixture_cmd = b.addRunArtifact(tui_fixture);
-    if (b.args) |args| tui_fixture_cmd.addArgs(args);
-    b.step("tui-fixture", "Run deterministic TUI fixture").dependOn(&tui_fixture_cmd.step);
-
-    const tui_render_bench = b.addExecutable(.{
-        .name = "tui-render-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("scripts/tui-render-bench.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "tui", .module = tui_module },
-                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
-            },
-        }),
-    });
-    b.step("tui-render-bench-bin", "Build deterministic TUI render benchmark").dependOn(&tui_render_bench.step);
-    const tui_render_bench_cmd = b.addRunArtifact(tui_render_bench);
-    if (b.args) |args| tui_render_bench_cmd.addArgs(args);
-    b.step("tui-render-bench", "Run deterministic TUI render benchmark").dependOn(&tui_render_bench_cmd.step);
 
     const lib_tests = b.addTest(.{ .root_module = zi });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });

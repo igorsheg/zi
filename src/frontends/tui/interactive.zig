@@ -42,6 +42,7 @@ const client_events_per_tick_max = 64;
 const status_id_working: tui.status.ContributionId = 1;
 const status_id_queue: tui.status.ContributionId = 2;
 const status_id_recovery: tui.status.ContributionId = 3;
+const status_id_completion: tui.status.ContributionId = 4;
 const composer_cwd_slot_id: tui.status.ContributionId = 1;
 const composer_session_slot_id: tui.status.ContributionId = 2;
 const model_picker_id: tui.Picker.Id = 1;
@@ -167,6 +168,8 @@ const InteractiveController = struct {
     history_oldest_entry_id: ?[]u8 = null,
     history_has_more_before: bool = false,
     history_request_in_flight: bool = false,
+    completion_snapshot_requested: bool = false,
+    completion_snapshot_loaded: bool = false,
     event_cursor: EventCursor = .{},
     assistant_text_delta_seen: bool = false,
     render_throttle: RenderThrottle = .{},
@@ -199,8 +202,6 @@ const InteractiveController = struct {
         };
         try self.installGreeter(version);
         try self.installSlashCompletions();
-        try self.installModelCompletions();
-        try self.installResumeCompletions();
         try self.requestSnapshot();
         try self.applyStartupAction(startup_action);
         if (initial_prompt) |prompt| try self.submitPrompt(prompt);
@@ -262,6 +263,7 @@ const InteractiveController = struct {
         const result = try self.terminal.readAvailableInput(&effects);
         defer for (effects[0..result.effect_count]) |effect| effect.deinit(self.allocator);
         for (effects[0..result.effect_count]) |effect| try self.handleEffect(effect);
+        try self.requestLazyCompletionSnapshot();
         if (result.event_count > 0) self.render_throttle.requestImmediate();
         if (result.truncated) try self.appendStatus(.warning, "input truncated");
         if (result.effect_overflow) try self.appendStatus(.warning, "input effects dropped");
@@ -282,15 +284,15 @@ const InteractiveController = struct {
     }
 
     fn handleSubmittedCommand(self: *InteractiveController, text: []const u8) !bool {
-        if (parseResumeCommand(text)) |resume_query| {
-            if (resume_query.len > 0) return false;
+        if (isBareResumeCommand(text)) {
             try self.editResumeCommand();
             return true;
         }
-        const model_query = parseModelCommand(text) orelse return false;
-        if (model_query.len > 0 and isExactModelSelector(model_query)) return false;
-        try self.editModelCommand(model_query);
-        return true;
+        if (isBareModelCommand(text)) {
+            try self.editModelCommand();
+            return true;
+        }
+        return false;
     }
 
     fn handlePickerSelection(self: *InteractiveController, selection: tui.Picker.Selection) !void {
@@ -312,17 +314,14 @@ const InteractiveController = struct {
         _ = try self.submitCommand(envelope);
     }
 
-    fn editModelCommand(self: *InteractiveController, query: []const u8) !void {
-        var buffer: [tui.Picker.query_bytes_max + 8]u8 = undefined;
-        const text = if (query.len == 0)
-            "/model "
-        else
-            std.fmt.bufPrint(&buffer, "/model {s}", .{query}) catch "/model ";
-        _ = try self.terminal.applyCommand(.{ .replace_composer_text = text });
+    fn editModelCommand(self: *InteractiveController) !void {
+        _ = try self.terminal.applyCommand(.{ .replace_composer_text = "/model " });
+        try self.requestCompletionSnapshot();
     }
 
     fn editResumeCommand(self: *InteractiveController) !void {
         _ = try self.terminal.applyCommand(.{ .replace_composer_text = "/resume " });
+        try self.requestCompletionSnapshot();
     }
 
     fn installGreeter(self: *InteractiveController, version: []const u8) !void {
@@ -334,71 +333,35 @@ const InteractiveController = struct {
         } });
     }
 
-    fn installModelCompletions(self: *InteractiveController) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const arena_allocator = arena.allocator();
-        var items = std.ArrayList(tui.Picker.Item).empty;
-        defer items.deinit(self.allocator);
+    fn applyCompletionSnapshot(self: *InteractiveController, snapshot: client_protocol.CompletionSnapshot) !void {
+        self.completion_snapshot_requested = false;
+        self.completion_snapshot_loaded = true;
+        try self.clearStatus(status_id_completion);
+        try self.installModelCompletions(snapshot.models);
+        try self.installResumeCompletions(snapshot.resume_sessions);
+    }
 
-        outer: for (ai.getProviders()) |provider| {
-            const authed = self.app.services.auth_manager.hasAuth(provider);
-            for (ai.getModels(provider)) |model| {
-                if (items.items.len == tui.Picker.item_count_max) break :outer;
-                const id = try std.fmt.allocPrint(arena_allocator, "{s}/{s}", .{ model.provider, model.id });
-                const available = self.app.services.provider_registry.get(model.api) != null;
-                const detail = if (!available)
-                    try std.fmt.allocPrint(arena_allocator, "{s} - unavailable", .{model.name})
-                else if (authed)
-                    try std.fmt.allocPrint(arena_allocator, "{s} - ready", .{model.name})
-                else
-                    try std.fmt.allocPrint(arena_allocator, "{s} - missing auth", .{model.name});
-                try items.append(self.allocator, .{ .id = id, .label = id, .detail = detail });
-            }
-        }
-
+    fn installModelCompletions(self: *InteractiveController, list: client_protocol.CompletionList) !void {
+        var items: [client_protocol.completion_item_count_max]tui.Picker.Item = undefined;
+        const mapped = completionPickerItems(&items, list);
         _ = try self.terminal.applyCommand(.{ .set_composer_arg_completions = .{
             .command_name = "model",
             .picker = .{
                 .id = model_picker_id,
-                .items = items.items,
+                .items = mapped,
             },
         } });
     }
 
-    fn installResumeCompletions(self: *InteractiveController) !void {
-        var summaries = session_listing.listRuntimeSessionSummaries(self.allocator, self.io, .{
-            .cwd = self.app.services.cwd,
-            .agent_dir_override = self.app.services.agent_dir,
-            .dir = self.app.sessionListDir(),
-            .environ = self.app.sessionListEnviron(),
-            .max_sessions = tui.Picker.item_count_max,
-        }) catch |err| {
-            ignoreBestEffortError(err);
-            try self.appendStatus(.warning, "resume sessions unavailable");
-            return;
-        };
-        defer summaries.deinit(self.allocator);
-
-        var items: [tui.Picker.item_count_max]tui.Picker.Item = undefined;
-        var item_count: usize = 0;
-        for (summaries.items) |summary| {
-            if (summary.file_name.len > tui.Picker.id_bytes_max) continue;
-            items[item_count] = .{
-                .id = summary.file_name,
-                .label = summary.title,
-                .detail = summary.detail,
-            };
-            item_count += 1;
-        }
-        if (summaries.truncated) try self.appendStatus(.warning, "resume session list truncated");
-
+    fn installResumeCompletions(self: *InteractiveController, list: client_protocol.CompletionList) !void {
+        var items: [client_protocol.completion_item_count_max]tui.Picker.Item = undefined;
+        const mapped = completionPickerItems(&items, list);
         _ = try self.terminal.applyCommand(.{ .set_composer_arg_completions = .{
             .command_name = "resume",
             .accept = .emit_selection,
             .picker = .{
                 .id = resume_picker_id,
-                .items = items[0..item_count],
+                .items = mapped,
                 .search_detail = true,
             },
         } });
@@ -437,6 +400,19 @@ const InteractiveController = struct {
 
     fn requestSnapshot(self: *InteractiveController) !void {
         _ = try self.submitCommand(.{ .command = .snapshot });
+    }
+
+    fn requestCompletionSnapshot(self: *InteractiveController) !void {
+        if (self.completion_snapshot_requested or self.completion_snapshot_loaded) return;
+        if (try self.submitCommand(.{ .command = .completion_snapshot }) == .queued) {
+            self.completion_snapshot_requested = true;
+            try self.setCompletionStatus();
+        }
+    }
+
+    fn requestLazyCompletionSnapshot(self: *InteractiveController) !void {
+        if (!needsLazyCompletionSnapshot(self.terminal.composerText())) return;
+        try self.requestCompletionSnapshot();
     }
 
     fn requestReplay(self: *InteractiveController, after: client_protocol.EventSeq) !void {
@@ -524,6 +500,11 @@ const InteractiveController = struct {
             },
             .rejected => |rejection| {
                 self.history_request_in_flight = false;
+                if (self.completion_snapshot_requested) {
+                    self.completion_snapshot_requested = false;
+                    self.completion_snapshot_loaded = false;
+                    try self.clearStatus(status_id_completion);
+                }
                 try self.appendStatus(.err, rejection.message.text);
             },
             .prompt_command => |command| {
@@ -540,6 +521,7 @@ const InteractiveController = struct {
             },
             .queue_changed => |queue| try self.applyQueueChanged(queue),
             .snapshot => |snapshot| try self.applySnapshot(snapshot),
+            .completion_snapshot => |snapshot| try self.applyCompletionSnapshot(snapshot),
             .session_changed => try self.applySessionChanged(),
             .session_chrome => |chrome| try self.applySessionChrome(chrome),
             .history_page => |page| try self.applyHistoryPage(page),
@@ -692,7 +674,9 @@ const InteractiveController = struct {
         _ = try self.terminal.applyCommand(.clear_transcript);
         try self.clearStatus(status_id_working);
         try self.clearStatus(status_id_queue);
-        try self.installResumeCompletions();
+        try self.clearStatus(status_id_completion);
+        self.completion_snapshot_requested = false;
+        self.completion_snapshot_loaded = false;
         try self.requestSnapshot();
         try self.appendStatus(.info, "resumed session");
     }
@@ -1096,6 +1080,16 @@ const InteractiveController = struct {
         } });
     }
 
+    fn setCompletionStatus(self: *InteractiveController) !void {
+        _ = try self.terminal.applyCommand(.{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_completion,
+            .priority = 8,
+            .text = "loading completions",
+            .effect = .shimmer,
+        } });
+    }
+
     fn clearStatus(self: *InteractiveController, id: tui.status.ContributionId) !void {
         _ = try self.terminal.applyCommand(.{ .clear_status = .{ .slot = .status_line, .id = id } });
     }
@@ -1283,43 +1277,76 @@ fn formatSessionInfo(buffer: []u8, info: client_protocol.PromptCommandSessionInf
     return writer.buffered();
 }
 
-fn parseModelCommand(text: []const u8) ?[]const u8 {
-    const invocation = slash_commands.parseInvocation(text) orelse return null;
-    const spec = slash_commands.lookup(invocation.name) orelse return null;
-    if (spec.id != .model) return null;
-    return invocation.args;
+fn isBareModelCommand(text: []const u8) bool {
+    return isBareSlashCommand(text, .model);
 }
 
-fn parseResumeCommand(text: []const u8) ?[]const u8 {
-    const invocation = slash_commands.parseInvocation(text) orelse return null;
-    const spec = slash_commands.lookup(invocation.name) orelse return null;
-    if (spec.id != .resume_session) return null;
-    return invocation.args;
+fn isBareResumeCommand(text: []const u8) bool {
+    return isBareSlashCommand(text, .resume_session);
 }
 
-fn isExactModelSelector(selector: []const u8) bool {
-    if (selector.len == 0) return false;
-    if (std.mem.findScalar(u8, selector, '/')) |slash| {
-        if (slash == 0 or slash + 1 >= selector.len) return false;
-        return ai.getModel(selector[0..slash], selector[slash + 1 ..]) != null;
+fn isBareSlashCommand(text: []const u8, id: slash_commands.Id) bool {
+    const invocation = slash_commands.parseInvocation(text) orelse return false;
+    const spec = slash_commands.lookup(invocation.name) orelse return false;
+    return spec.id == id and invocation.args.len == 0;
+}
+
+fn needsLazyCompletionSnapshot(text: []const u8) bool {
+    const invocation = slash_commands.parseInvocation(text) orelse return false;
+    const spec = slash_commands.lookup(invocation.name) orelse return false;
+    switch (spec.picker) {
+        .model, .session => {},
+        .none => return false,
     }
-    var found = false;
-    for (ai.getProviders()) |provider| {
-        for (ai.getModels(provider)) |model| {
-            if (!std.mem.eql(u8, model.id, selector)) continue;
-            if (found) return false;
-            found = true;
-        }
-    }
-    return found;
+    const command_end = 1 + invocation.name.len;
+    return text.len > command_end and std.ascii.isWhitespace(text[command_end]);
 }
 
-test "model slash parser distinguishes exact selection from picker search" {
-    try std.testing.expectEqualStrings("", parseModelCommand("/model").?);
-    try std.testing.expectEqualStrings("gpt", parseModelCommand("/model gpt").?);
-    try std.testing.expect(parseModelCommand("/modelx") == null);
-    try std.testing.expect(isExactModelSelector("openai/gpt-5.1"));
-    try std.testing.expect(!isExactModelSelector("openai/nope"));
+fn completionPickerItems(
+    buffer: *[client_protocol.completion_item_count_max]tui.Picker.Item,
+    list: client_protocol.CompletionList,
+) []const tui.Picker.Item {
+    const keep = @min(list.items.len, buffer.len);
+    for (list.items[0..keep], 0..) |item, index| {
+        buffer[index] = .{
+            .id = item.id.text,
+            .label = item.label.text,
+            .detail = item.detail.text,
+        };
+    }
+    return buffer[0..keep];
+}
+
+test "model slash parser only claims bare command" {
+    try std.testing.expect(isBareModelCommand("/model"));
+    try std.testing.expect(isBareModelCommand("/model   "));
+    try std.testing.expect(!isBareModelCommand("/model gpt-5.1"));
+    try std.testing.expect(!isBareModelCommand("/modelx"));
+}
+
+test "lazy completion snapshot waits for picker command argument" {
+    try std.testing.expect(!needsLazyCompletionSnapshot("/model"));
+    try std.testing.expect(needsLazyCompletionSnapshot("/model "));
+    try std.testing.expect(needsLazyCompletionSnapshot("/resume session"));
+    try std.testing.expect(!needsLazyCompletionSnapshot("/help "));
+    try std.testing.expect(!needsLazyCompletionSnapshot("/modelx "));
+}
+
+test "completion picker items come only from protocol snapshot data" {
+    const source = [_]client_protocol.CompletionItem.Source{.{
+        .id = "custom/not-in-model-table",
+        .label = "custom label",
+        .detail = "custom detail",
+    }};
+    var list = try client_protocol.CompletionList.init(std.testing.allocator, &source, false);
+    defer list.deinit(std.testing.allocator);
+
+    var items: [client_protocol.completion_item_count_max]tui.Picker.Item = undefined;
+    const mapped = completionPickerItems(&items, list);
+    try std.testing.expectEqual(@as(usize, 1), mapped.len);
+    try std.testing.expectEqualStrings("custom/not-in-model-table", mapped[0].id);
+    try std.testing.expectEqualStrings("custom label", mapped[0].label);
+    try std.testing.expectEqualStrings("custom detail", mapped[0].detail);
 }
 
 test "immediate TUI work polls instead of starving input" {

@@ -41,6 +41,7 @@ cancel { target }
 
 queue.clear
 snapshot
+completion_snapshot
 replay { after }
 switch_session { sessionFile }
 shutdown
@@ -71,6 +72,7 @@ State/sync:
 
 ```text
 snapshot
+completion_snapshot
 replay
 replay_gap
 queue_changed
@@ -106,8 +108,9 @@ Commands:
 {"id":3,"type":"cancel","target":{"operationId":1}}
 {"id":4,"type":"queue.clear"}
 {"id":5,"type":"snapshot"}
-{"id":6,"type":"replay","after":42}
-{"id":7,"type":"shutdown"}
+{"id":6,"type":"completion_snapshot"}
+{"id":7,"type":"replay","after":42}
+{"id":8,"type":"shutdown"}
 ```
 
 Events are direct envelopes, never string-spliced:
@@ -127,6 +130,7 @@ malformed lines before disconnect: 16
 command queue: bounded by SessionRuntime options
 event queue: bounded by SessionRuntime options
 retained event ledger: bounded by event count and encoded byte caps
+completion snapshot: item count/id/label/detail byte caps
 ```
 
 ## Replay

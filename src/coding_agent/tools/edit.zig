@@ -4,6 +4,7 @@ const runtime = @import("../../runtime/root.zig");
 const edit_diff = @import("edit_diff.zig");
 const file_mutation_queue = @import("file_mutation_queue.zig");
 const path_utils = @import("path_utils.zig");
+const paths_mod = @import("../paths.zig");
 const test_support = @import("test_support.zig");
 
 pub const max_edit_read_bytes = 4 * 1024 * 1024;
@@ -184,7 +185,7 @@ fn execute(
         else => return err,
     };
     defer args.deinit(allocator);
-    const resolved_path = try path_utils.resolveExistingPath(allocator, io, .{
+    const resolved_path = try paths_mod.ToolPaths.resolveExisting(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
         .home_dir = self.config.home_dir,
@@ -220,16 +221,19 @@ fn execute(
     defer edited.deinit(allocator);
     try token.throwIfRequested();
     _ = on_update;
-    const mutation_queue = self.config.mutation_queue orelse &self.default_mutation_queue;
-    try mutation_queue.atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, null, .{});
-
-    return editResult(
+    var result = try editResult(
         allocator,
         args.edits.len,
         args.path,
         edited.first_changed_line,
         edited.diff,
     );
+    errdefer result.deinit();
+    try token.throwIfRequested();
+    const mutation_queue = self.config.mutation_queue orelse &self.default_mutation_queue;
+    try mutation_queue.atomicWriteFileStreamingUpdates(allocator, io, resolved_path, edited.restored, null, .{});
+
+    return result;
 }
 
 fn parseArgs(allocator: std.mem.Allocator, params: std.json.Value) !EditArgs {
@@ -974,6 +978,64 @@ test "edit tool does not stream full edited file on success" {
     const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings(replacement, written);
+}
+
+fn largeEditBlock(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var line: usize = 0;
+    while (line < 300) : (line += 1) {
+        try writer.writer.print("{s}-{d}-abcdefghijklmnopqrstuvwx\n", .{ prefix, line });
+    }
+    return writer.toOwnedSlice();
+}
+
+test "edit tool does not write when success result is too large" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    const original = try largeEditBlock(std.testing.allocator, "old");
+    defer std.testing.allocator.free(original);
+    const replacement = try largeEditBlock(std.testing.allocator, "new");
+    defer std.testing.allocator.free(replacement);
+    try fixture.write("repo/file.txt", original);
+
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer edit_tool.deinit();
+
+    var edit_object: std.json.ObjectMap = .empty;
+    defer edit_object.deinit(std.testing.allocator);
+    try edit_object.put(std.testing.allocator, "oldText", .{ .string = original });
+    try edit_object.put(std.testing.allocator, "newText", .{ .string = replacement });
+    var edits: std.json.Array = .init(std.testing.allocator);
+    defer edits.deinit();
+    try edits.append(.{ .object = edit_object });
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(std.testing.allocator);
+    try object.put(std.testing.allocator, "path", .{ .string = "file.txt" });
+    try object.put(std.testing.allocator, "edits", .{ .array = edits });
+
+    var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    defer cancel_source.deinit();
+    var result = execute(
+        std.testing.allocator,
+        task_runtime.io(),
+        task_runtime,
+        &edit_tool,
+        cancel_source.token(),
+        "call-1",
+        .{ .object = object },
+        null,
+    ) catch |err| {
+        try std.testing.expectEqual(error.EditTooLarge, err);
+        const written = try fixture.read("repo/file.txt");
+        defer std.testing.allocator.free(written);
+        try std.testing.expectEqualStrings(original, written);
+        return;
+    };
+    result.deinit();
+    try std.testing.expect(false);
 }
 
 test "edit tool rejects bad replacements before mutation" {

@@ -956,7 +956,7 @@ fn countWrappedRows(text: []const u8, inner: u16, prefix_width: u16) usize {
         const width = if (visual_index == 0) inner - @min(prefix_width, inner) else inner;
         if (width == 0) {
             rows += 1;
-            continue;
+            return rows;
         }
         const visual = text_mod.nextVisualLineBreak(text, start, width);
         if (visual.next == start) break;
@@ -1495,6 +1495,11 @@ const testing_gpa = std.testing.allocator;
 fn countItem(app: *App, index: usize) usize {
     const item = &app.transcript.items.items[index];
     return itemRows(item, app.width, &app.theme, app.tools_expanded);
+}
+
+test "wrapped row counting terminates when width is zero" {
+    try std.testing.expectEqual(@as(usize, 1), countWrappedRows("abc", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countWrappedRows("abc", 1, 1));
 }
 
 test "collapsed tool body shows a bounded window with a hint row" {

@@ -356,67 +356,111 @@ fn normalizeResultOutput(
     owned_text: []u8,
 ) ![]u8 {
     errdefer allocator.free(owned_text);
-    const body = stripToolSentinel(tool_name, details, owned_text);
-    if (!body.changed) return owned_text;
-
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    var wrote_any = false;
-    if (body.first.len > 0) {
-        try writer.writer.writeAll(body.first);
-        wrote_any = true;
-    }
-    if (body.second.len > 0) {
-        if (wrote_any) try writer.writer.writeByte('\n');
-        try writer.writer.writeAll(body.second);
-    }
+    const body = try resultBodyFromDetails(allocator, tool_name, details, owned_text) orelse return owned_text;
     allocator.free(owned_text);
-    return writer.toOwnedSlice();
+    return body;
 }
 
-const ToolBody = struct {
-    first: []const u8,
-    second: []const u8 = "",
-    changed: bool = false,
-};
-
-fn stripToolSentinel(tool_name: []const u8, details: ?std.json.Value, text: []const u8) ToolBody {
-    const tool_kind = kind(tool_name);
-    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
-    const has_metadata = metadataForDetails(&metadata_buffer, tool_name, details).len > 0;
-    if (tool_kind == .bash and has_metadata) {
-        if (stripBashTruncationFooter(text)) |body| return body;
-    }
-    if (tool_kind == .read and has_metadata) {
-        if (stripReadFooter(text)) |body| return body;
-    }
-    return .{ .first = text };
-}
-
-fn stripBashTruncationFooter(text: []const u8) ?ToolBody {
-    const marker = "\n\n[Showing ";
-    const start = std.mem.lastIndexOf(u8, text, marker) orelse return null;
-    const close_rel = std.mem.indexOfScalar(u8, text[start + marker.len ..], ']') orelse return null;
-    const close = start + marker.len + close_rel + 1;
-    var tail_start = close;
-    while (tail_start < text.len and (text[tail_start] == '\n' or text[tail_start] == '\r')) tail_start += 1;
-    return .{
-        .first = trimTrailingEmptyLines(text[0..start]),
-        .second = trimTrailingEmptyLines(text[tail_start..]),
-        .changed = true,
+fn resultBodyFromDetails(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    details: ?std.json.Value,
+    text: []const u8,
+) !?[]u8 {
+    const value = details orelse return null;
+    if (value != .object) return null;
+    return switch (kind(tool_name)) {
+        .bash => bashBodyFromDetails(allocator, value.object, text),
+        .read => readBodyFromDetails(allocator, value.object, text),
+        .edit, .write, .custom => null,
     };
 }
 
-fn stripReadFooter(text: []const u8) ?ToolBody {
-    if (std.mem.startsWith(u8, text, "[Line ")) return .{ .first = "", .changed = true };
-    const marker = "\n\n[";
-    const start = std.mem.lastIndexOf(u8, text, marker) orelse return null;
-    if (std.mem.indexOf(u8, text[start..], "Use offset=") == null and
-        std.mem.indexOf(u8, text[start..], "more lines in file") == null)
-    {
-        return null;
+fn bashBodyFromDetails(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    text: []const u8,
+) !?[]u8 {
+    const output = outputPrefixFromDetails(object, text) orelse return null;
+    const trimmed = trimTrailingEmptyLines(output);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var wrote_any = false;
+    if (trimmed.len > 0) {
+        try writer.writer.writeAll(trimmed);
+        wrote_any = true;
     }
-    return .{ .first = trimTrailingEmptyLines(text[0..start]), .changed = true };
+    try writeBashStatus(&writer.writer, object, &wrote_any);
+    const body = try writer.toOwnedSlice();
+    return body;
+}
+
+fn readBodyFromDetails(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    text: []const u8,
+) !?[]u8 {
+    const output = outputPrefixFromDetails(object, text) orelse return null;
+    const body = try allocator.dupe(u8, trimTrailingEmptyLines(output));
+    return body;
+}
+
+fn outputPrefixFromDetails(object: std.json.ObjectMap, text: []const u8) ?[]const u8 {
+    const truncation = jsonObject(object, "truncation") orelse return null;
+    const output_bytes = jsonInt(truncation, "outputBytes") orelse return null;
+    if (output_bytes < 0) return null;
+    const end = std.math.cast(usize, output_bytes) orelse return null;
+    if (end > text.len) return null;
+    return utf8Prefix(text, end);
+}
+
+fn utf8Prefix(text: []const u8, end: usize) []const u8 {
+    var valid_end = end;
+    while (valid_end > 0 and !std.unicode.utf8ValidateSlice(text[0..valid_end])) valid_end -= 1;
+    return text[0..valid_end];
+}
+
+fn writeBashStatus(writer: *std.Io.Writer, object: std.json.ObjectMap, wrote_any: *bool) !void {
+    if (jsonInt(object, "exitCode")) |code| {
+        if (code == 0) return;
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.print("Command exited with code {d}", .{code});
+        return;
+    }
+    if (jsonBool(object, "timedOut") orelse false) {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.writeAll("Command timed out");
+        return;
+    }
+    if (jsonBool(object, "outputLimitExceeded") orelse false) {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.writeAll("bash output limit exceeded");
+        return;
+    }
+    if (jsonBool(object, "cancelled") orelse false) {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.writeAll("Command aborted");
+        return;
+    }
+    if (jsonInt(object, "signal")) |signal| {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.print("Command killed by signal {d}", .{signal});
+        return;
+    }
+    if (jsonInt(object, "stopped")) |signal| {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.print("Command stopped by signal {d}", .{signal});
+        return;
+    }
+    if (jsonInt(object, "unknown")) |code| {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.print("Command exited with unknown status {d}", .{code});
+    }
+}
+
+fn writeStatusSeparator(writer: *std.Io.Writer, wrote_any: *bool) !void {
+    if (wrote_any.*) try writer.writeByte('\n');
+    wrote_any.* = true;
 }
 
 fn bashMetadata(buffer: []u8, object: std.json.ObjectMap) ?[]const u8 {
@@ -778,13 +822,13 @@ test "tool result display joins text and image fallback" {
     try std.testing.expectEqualStrings("Read image file [image/png]\n[Image: image/png]", text);
 }
 
-test "bash display strips core truncation footer and reports metadata" {
+test "bash display uses truncation details for body and metadata" {
     const allocator = std.testing.allocator;
     var metadata_buffer: [metadata_bytes_max]u8 = undefined;
     var details = try testArgs(
         allocator,
-        "{\"truncation\":{\"truncated\":true,\"truncatedBy\":\"lines\"," ++
-            "\"outputLines\":5,\"totalLines\":100,\"maxBytes\":51200}}",
+        "{\"exitCode\":1,\"truncation\":{\"truncated\":true,\"truncatedBy\":\"lines\"," ++
+            "\"outputLines\":5,\"totalLines\":100,\"outputBytes\":16,\"maxBytes\":51200}}",
     );
     defer details.deinit();
 
@@ -813,7 +857,8 @@ test "read display moves continuation notices into metadata" {
     var metadata_buffer: [metadata_bytes_max]u8 = undefined;
     var user_limit = try testArgs(
         allocator,
-        "{\"nextOffset\":4,\"truncation\":{\"truncated\":false,\"userLimit\":true,\"remainingLines\":1}}",
+        "{\"nextOffset\":4,\"truncation\":{\"truncated\":false,\"userLimit\":true," ++
+            "\"remainingLines\":1,\"outputBytes\":9}}",
     );
     defer user_limit.deinit();
 
@@ -833,7 +878,8 @@ test "read display labels safety clipping as truncation" {
     var metadata_buffer: [metadata_bytes_max]u8 = undefined;
     var details = try testArgs(
         allocator,
-        "{\"truncation\":{\"truncated\":true,\"firstLineExceedsLimit\":true,\"maxBytes\":51200}}",
+        "{\"truncation\":{\"truncated\":true,\"firstLineExceedsLimit\":true," ++
+            "\"outputBytes\":0,\"maxBytes\":51200}}",
     );
     defer details.deinit();
 

@@ -206,7 +206,9 @@ fn restoreSessionPreferences(
     if (!options.model_explicit) {
         if (preferences.model) |saved| {
             if (ai.getModel(saved.provider, saved.model_id)) |model| {
-                if (services.auth_manager.hasAuth(model.provider) and services.provider_registry.get(model.api) != null) {
+                if (services.auth_manager.hasAuth(model.provider) and
+                    services.provider_registry.get(model.api) != null)
+                {
                     session.agent.setModel(model);
                     if (services.provider_registry.get(model.api)) |provider| {
                         session.agent.setStream(provider.stream_simple);
@@ -323,6 +325,7 @@ pub const SessionRuntime = struct {
     retained_events: RetainedEventLedger,
     wake_event: runtime.ResetEvent = .init,
     active: ?ActiveOperation = null,
+    completion_load: ?CompletionLoad = null,
     next_operation_id: client_protocol.OperationId = 1,
     next_event_seq: client_protocol.EventSeq = 1,
     pending_event: ?client_protocol.EventEnvelope = null,
@@ -360,7 +363,16 @@ pub const SessionRuntime = struct {
         };
     };
 
+    const CompletionLoad = struct {
+        request_id: ?client_protocol.RequestId,
+        models: client_protocol.CompletionList,
+        resume_task: runtime.Task(anyerror!client_protocol.CompletionList),
+        cwd: []u8,
+        agent_dir: []u8,
+    };
+
     pub fn deinit(self: *SessionRuntime) void {
+        self.cancelCompletionLoad();
         if (self.active) |active| {
             self.destroyActivePhase(active);
             self.allocator.free(active.prompt_text);
@@ -398,7 +410,10 @@ pub const SessionRuntime = struct {
     }
 
     pub fn hasImmediateWork(self: *const SessionRuntime) bool {
-        return self.pending_event != null or self.events.count() > 0 or self.commands.count() > 0;
+        return self.pending_event != null or
+            self.events.count() > 0 or
+            self.commands.count() > 0 or
+            (self.completion_load != null and self.completion_load.?.resume_task.hasResult());
     }
 
     pub fn rejectClientCommand(
@@ -408,14 +423,6 @@ pub const SessionRuntime = struct {
         message: []const u8,
     ) !void {
         try self.enqueueRejected(request_id, code, message);
-    }
-
-    pub fn sessionListDir(self: *const SessionRuntime) std.Io.Dir {
-        return self.host_config.dir;
-    }
-
-    pub fn sessionListEnviron(self: *const SessionRuntime) ?*const std.process.Environ.Map {
-        return self.host_config.environ;
     }
 
     pub fn waitAndApplyWake(
@@ -435,6 +442,42 @@ pub const SessionRuntime = struct {
                     .compacting => |run| run.stream.asyncNext(),
                     .retry_wait => unreachable,
                 };
+                if (self.completion_load) |*load| {
+                    switch (try runtime.select(.{
+                        .input = &input,
+                        .prompt = &progress,
+                        .completion = &load.resume_task,
+                        .public_event = public_event_wake,
+                        .command = command_wake,
+                        .frame = &frame,
+                    })) {
+                        .input => |result| {
+                            result catch return .session;
+                            return .input;
+                        },
+                        .prompt => |result| {
+                            self.applyActiveProgress(result) catch |err| switch (err) {
+                                error.EventQueueFull => {},
+                                else => self.failActiveOperation(err),
+                            };
+                            return .session;
+                        },
+                        .completion => |result| {
+                            if (self.hasEventCapacity()) try self.applyCompletionLoadResult(result);
+                            return .session;
+                        },
+                        .public_event => {
+                            public_event_wake.reset();
+                            self.drainSessionEvents(null) catch return .session;
+                            return .session;
+                        },
+                        .command => {
+                            self.wake_event.reset();
+                            return .session;
+                        },
+                        .frame => return .frame,
+                    }
+                }
                 switch (try runtime.select(.{
                     .input = &input,
                     .prompt = &progress,
@@ -472,6 +515,39 @@ pub const SessionRuntime = struct {
                     return .session;
                 }
                 var retry = runtime.Timeout.fromNanoseconds(@intCast(remaining_ns));
+                if (self.completion_load) |*load| {
+                    switch (try runtime.select(.{
+                        .input = &input,
+                        .retry = &retry,
+                        .completion = &load.resume_task,
+                        .public_event = public_event_wake,
+                        .command = command_wake,
+                        .frame = &frame,
+                    })) {
+                        .input => |result| {
+                            result catch return .session;
+                            return .input;
+                        },
+                        .retry => {
+                            self.startDueRetry();
+                            return .session;
+                        },
+                        .completion => |result| {
+                            if (self.hasEventCapacity()) try self.applyCompletionLoadResult(result);
+                            return .session;
+                        },
+                        .public_event => {
+                            public_event_wake.reset();
+                            self.drainSessionEvents(null) catch return .session;
+                            return .session;
+                        },
+                        .command => {
+                            self.wake_event.reset();
+                            return .session;
+                        },
+                        .frame => return .frame,
+                    }
+                }
                 switch (try runtime.select(.{
                     .input = &input,
                     .retry = &retry,
@@ -500,6 +576,34 @@ pub const SessionRuntime = struct {
                 }
             },
         };
+        if (self.completion_load) |*load| {
+            switch (try runtime.select(.{
+                .input = &input,
+                .completion = &load.resume_task,
+                .public_event = public_event_wake,
+                .command = command_wake,
+                .frame = &frame,
+            })) {
+                .input => |result| {
+                    result catch return .session;
+                    return .input;
+                },
+                .completion => |result| {
+                    if (self.hasEventCapacity()) try self.applyCompletionLoadResult(result);
+                    return .session;
+                },
+                .public_event => {
+                    public_event_wake.reset();
+                    self.drainSessionEvents(null) catch return .session;
+                    return .session;
+                },
+                .command => {
+                    self.wake_event.reset();
+                    return .session;
+                },
+                .frame => return .frame,
+            }
+        }
         switch (try runtime.select(.{
             .input = &input,
             .public_event = public_event_wake,
@@ -525,6 +629,7 @@ pub const SessionRuntime = struct {
 
     pub fn step(self: *SessionRuntime) !void {
         if (!self.flushPendingEvent()) return;
+        if (self.hasEventCapacity()) try self.finishReadyCompletionLoad();
         while (self.hasEventCapacity()) {
             const envelope = self.commands.pop() orelse break;
             var command = envelope;
@@ -704,6 +809,7 @@ pub const SessionRuntime = struct {
                 const snapshot = try self.buildClientSnapshot();
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .snapshot = snapshot } });
             },
+            .completion_snapshot => try self.startCompletionLoad(envelope.id),
             .replay => |request| {
                 var replay = try self.retained_events.buildReplay(self.allocator, request);
                 replay.request_id = envelope.id;
@@ -980,6 +1086,10 @@ pub const SessionRuntime = struct {
             try self.enqueuePromptCommand(request_id, command, .handled, "usage: /model <provider/model>");
             return;
         }
+        if (self.active != null) {
+            try self.enqueuePromptCommand(request_id, command, .failed, "cancel active operation before model change");
+            return;
+        }
         const model = self.resolveModelSelector(args) catch |err| {
             const message = switch (err) {
                 error.AmbiguousModel => "ambiguous model; use provider/model",
@@ -1141,6 +1251,143 @@ pub const SessionRuntime = struct {
         );
     }
 
+    fn startCompletionLoad(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
+        if (self.completion_load != null) {
+            try self.enqueueRejected(request_id, .busy, "completion snapshot already loading");
+            return;
+        }
+
+        var models = self.buildModelCompletionList() catch |err| {
+            try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            return;
+        };
+        errdefer models.deinit(self.allocator);
+
+        const cwd = try self.allocator.dupe(u8, self.services.cwd);
+        errdefer self.allocator.free(cwd);
+        const agent_dir = try self.allocator.dupe(u8, self.services.agent_dir);
+        errdefer self.allocator.free(agent_dir);
+
+        const resume_task = self.task_runtime.spawn(buildResumeCompletionListWorker, .{
+            self.allocator,
+            self.services.io,
+            self.host_config.dir,
+            self.host_config.environ,
+            cwd,
+            agent_dir,
+        }) catch |err| {
+            try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            return;
+        };
+
+        self.completion_load = .{
+            .request_id = request_id,
+            .models = models,
+            .resume_task = resume_task,
+            .cwd = cwd,
+            .agent_dir = agent_dir,
+        };
+    }
+
+    fn finishReadyCompletionLoad(self: *SessionRuntime) !void {
+        const load = if (self.completion_load) |*completion| completion else return;
+        if (!load.resume_task.hasResult()) return;
+        try self.applyCompletionLoadResult(load.resume_task.getResult());
+    }
+
+    fn applyCompletionLoadResult(
+        self: *SessionRuntime,
+        resume_result: anyerror!client_protocol.CompletionList,
+    ) !void {
+        self.finishCompletionLoad(resume_result) catch |err| switch (err) {
+            error.EventQueueFull => return,
+            else => return err,
+        };
+    }
+
+    fn finishCompletionLoad(self: *SessionRuntime, resume_result: anyerror!client_protocol.CompletionList) !void {
+        var load = self.completion_load orelse return;
+        self.completion_load = null;
+        defer self.allocator.free(load.cwd);
+        defer self.allocator.free(load.agent_dir);
+
+        var resume_sessions = resume_result catch |err| {
+            load.models.deinit(self.allocator);
+            try self.enqueueRejected(load.request_id, rejectionCode(err), @errorName(err));
+            return;
+        };
+        errdefer resume_sessions.deinit(self.allocator);
+
+        var snapshot: client_protocol.CompletionSnapshot = .{
+            .models = load.models,
+            .resume_sessions = resume_sessions,
+        };
+        self.enqueueEvent(.{
+            .request_id = load.request_id,
+            .event = .{ .completion_snapshot = snapshot },
+        }) catch |err| switch (err) {
+            error.EventQueueFull => return error.EventQueueFull,
+            else => {
+                snapshot.deinit(self.allocator);
+                return err;
+            },
+        };
+    }
+
+    fn cancelCompletionLoad(self: *SessionRuntime) void {
+        var load = self.completion_load orelse return;
+        self.completion_load = null;
+        load.resume_task.cancel();
+        if (load.resume_task.getResult()) |resume_sessions| {
+            var owned = resume_sessions;
+            owned.deinit(self.allocator);
+        } else |_| {}
+        load.models.deinit(self.allocator);
+        self.allocator.free(load.cwd);
+        self.allocator.free(load.agent_dir);
+    }
+
+    const CompletionStatus = enum { ready, missing_auth, unavailable };
+
+    fn buildModelCompletionList(self: *SessionRuntime) !client_protocol.CompletionList {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+        var sources = std.ArrayList(client_protocol.CompletionItem.Source).empty;
+        var truncated = false;
+
+        outer: for (ai.getProviders()) |provider| {
+            for (ai.getModels(provider)) |model| {
+                if (sources.items.len == client_protocol.completion_item_count_max) {
+                    truncated = true;
+                    break :outer;
+                }
+                const id = try std.fmt.allocPrint(arena_allocator, "{s}/{s}", .{ model.provider, model.id });
+                const detail = try std.fmt.allocPrint(arena_allocator, "{s} - {s}", .{
+                    model.name,
+                    completionStatusText(self.modelCompletionStatus(model)),
+                });
+                try sources.append(arena_allocator, .{ .id = id, .label = id, .detail = detail });
+            }
+        }
+
+        return client_protocol.CompletionList.init(self.allocator, sources.items, truncated);
+    }
+
+    fn modelCompletionStatus(self: *const SessionRuntime, model: ai.Model) CompletionStatus {
+        if (self.services.provider_registry.get(model.api) == null) return .unavailable;
+        if (!self.services.auth_manager.hasAuth(model.provider)) return .missing_auth;
+        return .ready;
+    }
+
+    fn completionStatusText(status: CompletionStatus) []const u8 {
+        return switch (status) {
+            .ready => "ready",
+            .missing_auth => "missing auth",
+            .unavailable => "unavailable",
+        };
+    }
+
     fn enqueueSessionChrome(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
         if (!self.hasEventCapacity()) return;
         var chrome = try self.session.clientChromeSnapshot(self.allocator);
@@ -1211,6 +1458,47 @@ pub const SessionRuntime = struct {
         return false;
     }
 };
+
+fn buildResumeCompletionListWorker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    environ: ?*const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) anyerror!client_protocol.CompletionList {
+    return buildResumeCompletionListFor(allocator, io, dir, environ, cwd, agent_dir);
+}
+
+fn buildResumeCompletionListFor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    environ: ?*const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) !client_protocol.CompletionList {
+    var summaries = try session_listing.listRuntimeSessionSummaries(allocator, io, .{
+        .cwd = cwd,
+        .agent_dir_override = agent_dir,
+        .dir = dir,
+        .environ = environ,
+        .max_sessions = client_protocol.completion_item_count_max,
+    });
+    defer summaries.deinit(allocator);
+
+    var sources: [client_protocol.completion_item_count_max]client_protocol.CompletionItem.Source = undefined;
+    var count: usize = 0;
+    for (summaries.items) |summary| {
+        sources[count] = .{
+            .id = summary.file_name,
+            .label = summary.title,
+            .detail = summary.detail,
+        };
+        count += 1;
+    }
+    return client_protocol.CompletionList.init(allocator, sources[0..count], summaries.truncated);
+}
 
 fn shutdownAndDeinitSession(session: *AgentSession) void {
     session.requestShutdown();
@@ -1385,6 +1673,43 @@ test "session runtime owns services session and bounded mailboxes" {
     try std.testing.expectEqual(@as(usize, 2), session_runtime.commands.capacity());
     try std.testing.expectEqual(@as(usize, 2), session_runtime.events.capacity());
     try std.testing.expectEqualStrings("session", session_runtime.session.manager.header.id);
+}
+
+test "session runtime completion snapshot reports model status and resume sessions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    try session_runtime.submit(.{ .id = 4, .command = .completion_snapshot });
+
+    var event: client_protocol.EventEnvelope = event: {
+        var iterations: usize = 0;
+        while (iterations < 2000) : (iterations += 1) {
+            try session_runtime.step();
+            if (session_runtime.drainEvent()) |event| break :event event;
+            try runtime.sleep(.fromMilliseconds(1));
+        }
+        return error.TestUnexpectedResult;
+    };
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 4), event.request_id);
+    try std.testing.expect(event.event == .completion_snapshot);
+    const snapshot = event.event.completion_snapshot;
+    try std.testing.expect(snapshot.models.items.len > 0);
+    try std.testing.expect(snapshot.resume_sessions.items.len > 0);
+    try std.testing.expectEqualStrings(
+        "2026-06-09T00:00:00Z_session.jsonl",
+        snapshot.resume_sessions.items[0].id.text,
+    );
+
+    var found_missing_auth = false;
+    for (snapshot.models.items) |item| {
+        if (std.mem.indexOf(u8, item.detail.text, "missing auth") != null) found_missing_auth = true;
+    }
+    try std.testing.expect(found_missing_auth);
 }
 
 test "session runtime acknowledges queue clear with a correlated queue fact" {
@@ -1644,8 +1969,14 @@ test "session runtime model command selects an authenticated model" {
     try std.testing.expectEqualStrings("openai", session_runtime.session.agent.state.model.provider);
     try std.testing.expectEqualStrings("gpt-5.1", session_runtime.session.agent.state.model.id);
     try std.testing.expect(session_runtime.session.manager.entries.items[0] == .model_change);
-    try std.testing.expectEqualStrings("openai", session_runtime.session.manager.entries.items[0].model_change.provider);
-    try std.testing.expectEqualStrings("gpt-5.1", session_runtime.session.manager.entries.items[0].model_change.model_id);
+    try std.testing.expectEqualStrings(
+        "openai",
+        session_runtime.session.manager.entries.items[0].model_change.provider,
+    );
+    try std.testing.expectEqualStrings(
+        "gpt-5.1",
+        session_runtime.session.manager.entries.items[0].model_change.model_id,
+    );
     var loaded = try session_runtime.session.store.?.load(std.testing.io);
     defer loaded.deinit();
     try std.testing.expect(loaded.entries.items[0] == .model_change);
@@ -1745,6 +2076,57 @@ test "session runtime model command rejects missing auth" {
     try std.testing.expect(event.event.prompt_command.result == .failed);
     try std.testing.expect(std.mem.indexOf(u8, event.event.prompt_command.message.text, "missing auth") != null);
     try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime model command does not mutate while active" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("OPENAI_API_KEY", "test-key");
+    var session_runtime = try openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+        .environ = &environ,
+        .task_runtime = task_runtime,
+    });
+    defer session_runtime.deinit();
+    const old_model = session_runtime.session.agent.state.model;
+    session_runtime.active = .{
+        .phase = .{ .retry_wait = .{ .kind = .resubmit_prompt, .resume_at_ns = std.math.maxInt(i96) } },
+        .request_id = 1,
+        .operation_id = 1,
+        .prompt_text = try session_runtime.allocator.dupe(u8, "original"),
+        .overflow_count_before = 0,
+    };
+
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(
+        std.testing.allocator,
+        12,
+        "/model openai/gpt-5.1",
+        .auto,
+    );
+    errdefer envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expect(event.event.prompt_command.result == .failed);
+    try std.testing.expect(std.mem.indexOf(u8, event.event.prompt_command.message.text, "active operation") != null);
+    try std.testing.expectEqualStrings(old_model.provider, session_runtime.session.agent.state.model.provider);
+    try std.testing.expectEqualStrings(old_model.id, session_runtime.session.agent.state.model.id);
+    try std.testing.expectEqual(@as(usize, 0), session_runtime.session.manager.entries.items.len);
+    try std.testing.expect(session_runtime.active != null);
+    try std.testing.expect(session_runtime.drainEvent() == null);
 }
 
 test "session runtime replies unknown for unrecognized slash command" {

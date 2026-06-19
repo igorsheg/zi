@@ -23,8 +23,10 @@ pub const tool_bottom_line = "╰───";
 pub const quote_prefix = "│ ";
 
 /// Horizontal rule rendered for markdown `---` / `***` / `___`.
-pub const horizontal_rule = "────────────────────────────────" ++
-    "────────────────────────────────";
+pub const horizontal_rule = "────────────────" ++
+    "────────────────" ++
+    "────────────────" ++
+    "────────────────";
 
 /// Bullet prefix for plain lists.
 pub const bullet = "• ";

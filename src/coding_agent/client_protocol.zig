@@ -22,10 +22,17 @@ pub const replay_event_count_max = 64;
 pub const snapshot_history_items_max = 512;
 pub const snapshot_history_item_text_bytes_max = 16 * 1024;
 pub const snapshot_history_total_text_bytes_max = 128 * 1024;
+const history_tool_id_bytes_max = 256;
+const history_tool_name_bytes_max = 128;
 pub const history_page_items_max = 64;
 pub const history_page_item_text_bytes_max = snapshot_history_item_text_bytes_max;
 pub const history_page_total_text_bytes_max = 64 * 1024;
 pub const snapshot_model_text_bytes_max = 256;
+/// Mirrors current TUI picker caps without importing TUI into the core protocol.
+pub const completion_item_count_max = 384;
+pub const completion_id_bytes_max = 128;
+pub const completion_label_bytes_max = 160;
+pub const completion_detail_bytes_max = 160;
 
 pub const CommandQueue = runtime.BoundedQueue(CommandEnvelope);
 pub const EventQueue = runtime.BoundedQueue(EventEnvelope);
@@ -74,6 +81,7 @@ pub const ClientCommand = union(enum) {
     cancel: Cancel,
     queue: QueueCommand,
     snapshot,
+    completion_snapshot,
     replay: ReplayRequest,
     history_page: HistoryPageRequest,
     switch_session: SwitchSession,
@@ -84,7 +92,7 @@ pub const ClientCommand = union(enum) {
             .submit => |prompt| allocator.free(prompt.text),
             .history_page => |request| allocator.free(request.before_entry_id),
             .switch_session => |request| allocator.free(request.session_file_name),
-            .cancel, .queue, .snapshot, .replay, .shutdown => {},
+            .cancel, .queue, .snapshot, .completion_snapshot, .replay, .shutdown => {},
         }
         self.* = undefined;
     }
@@ -152,6 +160,7 @@ pub const ClientEvent = union(enum) {
     agent_event: OwnedAgentEvent,
     queue_changed: QueueChanged,
     snapshot: Snapshot,
+    completion_snapshot: CompletionSnapshot,
     replay: ReplayBatch,
     replay_gap: ReplayGap,
     history_page: HistoryPage,
@@ -169,6 +178,7 @@ pub const ClientEvent = union(enum) {
             .rejected => |*rejection| rejection.message.deinit(allocator),
             .agent_event => |*payload| payload.deinit(allocator),
             .snapshot => |*payload| payload.deinit(allocator),
+            .completion_snapshot => |*payload| payload.deinit(allocator),
             .replay => |*payload| payload.deinit(allocator),
             .history_page => |*payload| payload.deinit(allocator),
             .prompt_command => |*payload| payload.deinit(allocator),
@@ -195,7 +205,11 @@ pub const ClientEvent = union(enum) {
             .snapshot => |payload| try stringify.write(payload),
             .history_page => |payload| try stringify.write(payload),
             .replay => |payload| try stringify.write(payload),
-            inline .shutdown_started, .operation_started, .session_changed => |_, tag| try writeObject(@tagName(tag), stringify, .{}),
+            inline .shutdown_started, .operation_started, .session_changed => |_, tag| try writeObject(
+                @tagName(tag),
+                stringify,
+                .{},
+            ),
             inline else => |payload, tag| try writeObject(@tagName(tag), stringify, payload),
         }
     }
@@ -520,6 +534,106 @@ pub const ReplayGap = struct {
     last_retained_seq: EventSeq,
 };
 
+pub const CompletionItem = struct {
+    id: EventText,
+    label: EventText,
+    detail: EventText,
+
+    pub const Source = struct {
+        id: []const u8,
+        label: []const u8,
+        detail: []const u8 = "",
+    };
+
+    pub fn init(allocator: std.mem.Allocator, source: Source) !CompletionItem {
+        var id = try EventText.init(allocator, utf8Prefix(source.id, completion_id_bytes_max));
+        errdefer id.deinit(allocator);
+        var label = try EventText.init(allocator, utf8Prefix(source.label, completion_label_bytes_max));
+        errdefer label.deinit(allocator);
+        return .{
+            .id = id,
+            .label = label,
+            .detail = try EventText.init(allocator, utf8Prefix(source.detail, completion_detail_bytes_max)),
+        };
+    }
+
+    pub fn deinit(self: *CompletionItem, allocator: std.mem.Allocator) void {
+        self.id.deinit(allocator);
+        self.label.deinit(allocator);
+        self.detail.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: CompletionItem, stringify: *std.json.Stringify) !void {
+        try writeObject(null, stringify, self);
+    }
+};
+
+pub const CompletionList = struct {
+    items: []CompletionItem,
+    truncated: bool = false,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        source: []const CompletionItem.Source,
+        source_truncated: bool,
+    ) !CompletionList {
+        const keep = @min(source.len, completion_item_count_max);
+        const items = try allocator.alloc(CompletionItem, keep);
+        errdefer allocator.free(items);
+        var initialized: usize = 0;
+        errdefer for (items[0..initialized]) |*item| item.deinit(allocator);
+        for (source[0..keep]) |item| {
+            items[initialized] = try CompletionItem.init(allocator, item);
+            initialized += 1;
+        }
+        return .{
+            .items = items,
+            .truncated = source_truncated or source.len > keep,
+        };
+    }
+
+    pub fn deinit(self: *CompletionList, allocator: std.mem.Allocator) void {
+        for (self.items) |*item| item.deinit(allocator);
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: CompletionList, stringify: *std.json.Stringify) !void {
+        try writeObject(null, stringify, self);
+    }
+};
+
+pub const CompletionSnapshot = struct {
+    models: CompletionList,
+    resume_sessions: CompletionList,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        model_items: []const CompletionItem.Source,
+        models_truncated: bool,
+        resume_items: []const CompletionItem.Source,
+        resume_truncated: bool,
+    ) !CompletionSnapshot {
+        var models = try CompletionList.init(allocator, model_items, models_truncated);
+        errdefer models.deinit(allocator);
+        return .{
+            .models = models,
+            .resume_sessions = try CompletionList.init(allocator, resume_items, resume_truncated),
+        };
+    }
+
+    pub fn deinit(self: *CompletionSnapshot, allocator: std.mem.Allocator) void {
+        self.models.deinit(allocator);
+        self.resume_sessions.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: CompletionSnapshot, stringify: *std.json.Stringify) !void {
+        try writeObject("completion_snapshot", stringify, self);
+    }
+};
+
 pub const Snapshot = struct {
     header: SessionHeaderSnapshot,
     model: ModelSnapshot,
@@ -704,7 +818,8 @@ pub const HistoryPage = struct {
     ) !HistoryPage {
         const session_items = try manager.reconstructSession(allocator);
         defer allocator.free(session_items);
-        const before_index = findReconstructedIndex(session_items, before_entry_id) orelse return error.HistoryEntryNotFound;
+        const before_index = findReconstructedIndex(session_items, before_entry_id) orelse
+            return error.HistoryEntryNotFound;
         var before = try EventText.init(allocator, before_entry_id);
         errdefer before.deinit(allocator);
         const collected = try collectHistoryBefore(allocator, session_items, before_index, .{
@@ -802,30 +917,24 @@ fn collectHistoryBefore(
     var index = @min(end_index, session_items.len);
     while (index > 0) {
         index -= 1;
-        var item = (try itemFromReconstructed(allocator, session_items[index])) orelse continue;
-        const full_bytes = itemTextBytes(item);
-        const text = utf8Prefix(item.text.text, limits.item_text_bytes_max);
-        const resident_bytes = text.len + toolCallsTextBytes(item.tool_calls);
-        if (items.items.len == limits.items_max or total_text_bytes + resident_bytes > limits.total_text_bytes_max) {
+        const built = (try itemFromReconstructed(allocator, session_items[index], limits.item_text_bytes_max)) orelse
+            continue;
+        var item = built.item;
+        const resident_bytes = itemTextBytes(item);
+        const budget_full = total_text_bytes >= limits.total_text_bytes_max or
+            resident_bytes > limits.total_text_bytes_max - total_text_bytes;
+        if (items.items.len == limits.items_max or budget_full) {
             dropped_items += 1;
-            dropped_text_bytes += full_bytes;
+            dropped_text_bytes +|= built.full_text_bytes;
             item.deinit(allocator);
             continue;
         }
-        dropped_text_bytes += item.text.text.len - text.len;
-        if (text.len < item.text.text.len) {
-            const truncated = EventText.init(allocator, text) catch |err| {
-                item.deinit(allocator);
-                return err;
-            };
-            item.text.deinit(allocator);
-            item.text = truncated;
-        }
+        dropped_text_bytes +|= built.full_text_bytes -| resident_bytes;
         {
             errdefer item.deinit(allocator);
             try items.append(allocator, item);
         }
-        total_text_bytes += text.len;
+        total_text_bytes += resident_bytes;
     }
     std.mem.reverse(HistorySnapshotItem, items.items);
     return .{
@@ -836,27 +945,48 @@ fn collectHistoryBefore(
 }
 
 fn itemTextBytes(item: HistorySnapshotItem) usize {
-    return item.text.text.len + toolCallsTextBytes(item.tool_calls);
+    var total = item.text.text.len + toolCallsTextBytes(item.tool_calls);
+    if (item.tool_call_id) |id| total += id.text.len;
+    if (item.tool_name) |name| total += name.text.len;
+    return total;
 }
 
 fn toolCallsTextBytes(tool_calls: []const HistoryToolCall) usize {
     var total: usize = 0;
-    for (tool_calls) |tool_call| total += tool_call.title.text.len;
+    for (tool_calls) |tool_call| {
+        total += tool_call.id.text.len + tool_call.name.text.len + tool_call.title.text.len;
+    }
     return total;
 }
+
+const BuiltHistoryItem = struct {
+    item: HistorySnapshotItem,
+    full_text_bytes: usize,
+};
+
+const BuiltHistoryToolCall = struct {
+    tool_call: HistoryToolCall,
+    full_text_bytes: usize,
+};
+
+const BoundedHistoryText = struct {
+    text: EventText,
+    full_bytes: usize,
+};
 
 fn itemFromReconstructed(
     allocator: std.mem.Allocator,
     item: session_manager.ReconstructedSessionItem,
-) !?HistorySnapshotItem {
+    item_text_bytes_max: usize,
+) !?BuiltHistoryItem {
     switch (item.content) {
         .compaction_summary => |summary| {
             var entry_id = try EventText.init(allocator, item.entry_id);
             errdefer entry_id.deinit(allocator);
+            const text = try boundedHistoryText(allocator, summary.summary, item_text_bytes_max);
             return .{
-                .entry_id = entry_id,
-                .kind = .system,
-                .text = try EventText.init(allocator, summary.summary),
+                .item = .{ .entry_id = entry_id, .kind = .system, .text = text.text },
+                .full_text_bytes = text.full_bytes,
             };
         },
         .message => |message| switch (message) {
@@ -864,15 +994,19 @@ fn itemFromReconstructed(
                 const text = message_policy.userText(user) orelse return null;
                 var entry_id = try EventText.init(allocator, item.entry_id);
                 errdefer entry_id.deinit(allocator);
-                return .{ .entry_id = entry_id, .kind = .user, .text = try EventText.init(allocator, text) };
+                const bounded = try boundedHistoryText(allocator, text, item_text_bytes_max);
+                return .{
+                    .item = .{ .entry_id = entry_id, .kind = .user, .text = bounded.text },
+                    .full_text_bytes = bounded.full_bytes,
+                };
             },
             .assistant => |assistant| {
                 const entry_id = try EventText.init(allocator, item.entry_id);
-                return assistantHistoryItem(allocator, entry_id, assistant);
+                return assistantHistoryItem(allocator, entry_id, assistant, item_text_bytes_max);
             },
             .tool_result => |tool_result| {
                 const entry_id = try EventText.init(allocator, item.entry_id);
-                return try toolResultHistoryItem(allocator, entry_id, tool_result);
+                return try toolResultHistoryItem(allocator, entry_id, tool_result, item_text_bytes_max);
             },
             .custom => return null,
         },
@@ -883,12 +1017,16 @@ fn assistantHistoryItem(
     allocator: std.mem.Allocator,
     entry_id: EventText,
     assistant: ai.AssistantMessage,
-) !?HistorySnapshotItem {
+    item_text_bytes_max: usize,
+) !?BuiltHistoryItem {
     var owned_entry_id = entry_id;
     errdefer owned_entry_id.deinit(allocator);
 
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
+    var buffer: [snapshot_history_item_text_bytes_max]u8 = undefined;
+    var writer = boundedHistoryWriter(&buffer, item_text_bytes_max);
+    var text_full_bytes: usize = 0;
+    var wrote_text = false;
+    var tool_calls_full_bytes: usize = 0;
     var tool_calls = std.ArrayList(HistoryToolCall).empty;
     errdefer {
         for (tool_calls.items) |*tool_call| tool_call.deinit(allocator);
@@ -897,80 +1035,122 @@ fn assistantHistoryItem(
 
     for (assistant.content) |content| switch (content) {
         .text => |text| {
-            if (writer.written().len > 0) try writer.writer.writeByte('\n');
-            try writer.writer.writeAll(text.text);
+            if (wrote_text) {
+                text_full_bytes += 1;
+                try appendBoundedHistoryText(&writer, "\n");
+            }
+            text_full_bytes += text.text.len;
+            try appendBoundedHistoryText(&writer, text.text);
+            wrote_text = true;
         },
-        .tool_call => |tool_call| try tool_calls.append(allocator, try historyToolCall(allocator, tool_call)),
+        .tool_call => |tool_call| {
+            var built = try historyToolCall(allocator, tool_call, item_text_bytes_max);
+            tool_calls.append(allocator, built.tool_call) catch |err| {
+                built.tool_call.deinit(allocator);
+                return err;
+            };
+            tool_calls_full_bytes += built.full_text_bytes;
+        },
         .thinking => {},
     };
 
-    if (writer.written().len == 0 and tool_calls.items.len == 0) {
+    if (writer.buffered().len == 0 and tool_calls.items.len == 0) {
         const error_message = assistant.error_message orelse {
             owned_entry_id.deinit(allocator);
             return null;
         };
+        const text = try boundedHistoryText(allocator, error_message, item_text_bytes_max);
         return .{
-            .entry_id = owned_entry_id,
-            .kind = .system,
-            .text = try EventText.init(allocator, error_message),
+            .item = .{ .entry_id = owned_entry_id, .kind = .system, .text = text.text },
+            .full_text_bytes = text.full_bytes,
         };
     }
 
-    const text = try writer.toOwnedSlice();
-    errdefer allocator.free(text);
+    var text = try EventText.init(allocator, utf8Prefix(writer.buffered(), writer.buffered().len));
+    errdefer text.deinit(allocator);
     return .{
-        .entry_id = owned_entry_id,
-        .kind = .assistant,
-        .text = .{ .text = text },
-        .tool_calls = try tool_calls.toOwnedSlice(allocator),
+        .item = .{
+            .entry_id = owned_entry_id,
+            .kind = .assistant,
+            .text = text,
+            .tool_calls = try tool_calls.toOwnedSlice(allocator),
+        },
+        .full_text_bytes = text_full_bytes + tool_calls_full_bytes,
     };
 }
 
-fn historyToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !HistoryToolCall {
-    var id = try EventText.init(allocator, tool_call.id);
-    errdefer id.deinit(allocator);
-    var name = try EventText.init(allocator, tool_call.name);
-    errdefer name.deinit(allocator);
+fn historyToolCall(
+    allocator: std.mem.Allocator,
+    tool_call: ai.ToolCall,
+    item_text_bytes_max: usize,
+) !BuiltHistoryToolCall {
+    var id = try boundedHistoryText(allocator, tool_call.id, history_tool_id_bytes_max);
+    errdefer id.text.deinit(allocator);
+    var name = try boundedHistoryText(allocator, tool_call.name, history_tool_name_bytes_max);
+    errdefer name.text.deinit(allocator);
+    const title = try toolCallTitle(allocator, tool_call, item_text_bytes_max);
     return .{
-        .id = id,
-        .name = name,
-        .title = try toolCallTitle(allocator, tool_call),
+        .tool_call = .{ .id = id.text, .name = name.text, .title = title.text },
+        .full_text_bytes = id.full_bytes + name.full_bytes + title.full_bytes,
     };
 }
 
-fn toolCallTitle(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !EventText {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
-    try writer.writer.writeAll(tool_call.name);
-    try writer.writer.writeByte(' ');
-    try std.json.Stringify.value(tool_call.arguments, .{}, &writer.writer);
-    return EventText.init(allocator, utf8Prefix(writer.written(), snapshot_history_item_text_bytes_max));
+fn toolCallTitle(
+    allocator: std.mem.Allocator,
+    tool_call: ai.ToolCall,
+    item_text_bytes_max: usize,
+) !BoundedHistoryText {
+    var buffer: [snapshot_history_item_text_bytes_max]u8 = undefined;
+    var writer = boundedHistoryWriter(&buffer, item_text_bytes_max);
+    try appendBoundedHistoryText(&writer, tool_call.name);
+    try appendBoundedHistoryText(&writer, " ");
+    std.json.Stringify.value(tool_call.arguments, .{}, &writer) catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
+
+    var counter = std.Io.Writer.Discarding.init(&.{});
+    try std.json.Stringify.value(tool_call.arguments, .{}, &counter.writer);
+    const args_bytes = std.math.lossyCast(usize, counter.fullCount());
+    return .{
+        .text = try EventText.init(allocator, utf8Prefix(writer.buffered(), writer.buffered().len)),
+        .full_bytes = tool_call.name.len + 1 + args_bytes,
+    };
 }
 
 fn toolResultHistoryItem(
     allocator: std.mem.Allocator,
     entry_id: EventText,
     tool_result: ai.ToolResultMessage,
-) !HistorySnapshotItem {
+    item_text_bytes_max: usize,
+) !BuiltHistoryItem {
     var owned_entry_id = entry_id;
     errdefer owned_entry_id.deinit(allocator);
-    var tool_call_id = try EventText.init(allocator, tool_result.tool_call_id);
-    errdefer tool_call_id.deinit(allocator);
-    var tool_name = try EventText.init(allocator, tool_result.tool_name);
-    errdefer tool_name.deinit(allocator);
+    var tool_call_id = try boundedHistoryText(allocator, tool_result.tool_call_id, history_tool_id_bytes_max);
+    errdefer tool_call_id.text.deinit(allocator);
+    var tool_name = try boundedHistoryText(allocator, tool_result.tool_name, history_tool_name_bytes_max);
+    errdefer tool_name.text.deinit(allocator);
+    const text = try toolResultText(allocator, tool_result.content, item_text_bytes_max);
     return .{
-        .entry_id = owned_entry_id,
-        .kind = .tool_result,
-        .text = try toolResultText(allocator, tool_result.content),
-        .tool_call_id = tool_call_id,
-        .tool_name = tool_name,
-        .is_error = tool_result.is_error,
+        .item = .{
+            .entry_id = owned_entry_id,
+            .kind = .tool_result,
+            .text = text.text,
+            .tool_call_id = tool_call_id.text,
+            .tool_name = tool_name.text,
+            .is_error = tool_result.is_error,
+        },
+        .full_text_bytes = text.full_bytes + tool_call_id.full_bytes + tool_name.full_bytes,
     };
 }
 
-fn toolResultText(allocator: std.mem.Allocator, content: []const ai.ToolResultContent) !EventText {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
+fn toolResultText(
+    allocator: std.mem.Allocator,
+    content: []const ai.ToolResultContent,
+    item_text_bytes_max: usize,
+) !BoundedHistoryText {
+    var buffer: [snapshot_history_item_text_bytes_max]u8 = undefined;
+    var writer = boundedHistoryWriter(&buffer, item_text_bytes_max);
+    var full_bytes: usize = 0;
     var wrote_any = false;
     for (content) |item| {
         const text = switch (item) {
@@ -978,11 +1158,35 @@ fn toolResultText(allocator: std.mem.Allocator, content: []const ai.ToolResultCo
             .image => |image| imageFallbackText(image.mime_type),
         };
         if (text.len == 0) continue;
-        if (wrote_any) try writer.writer.writeByte('\n');
-        try writer.writer.writeAll(text);
+        if (wrote_any) {
+            full_bytes += 1;
+            try appendBoundedHistoryText(&writer, "\n");
+        }
+        full_bytes += text.len;
+        try appendBoundedHistoryText(&writer, text);
         wrote_any = true;
     }
-    return .{ .text = try writer.toOwnedSlice() };
+    return .{
+        .text = try EventText.init(allocator, utf8Prefix(writer.buffered(), writer.buffered().len)),
+        .full_bytes = full_bytes,
+    };
+}
+
+fn boundedHistoryText(allocator: std.mem.Allocator, text: []const u8, max_bytes: usize) !BoundedHistoryText {
+    return .{
+        .text = try EventText.init(allocator, utf8Prefix(text, max_bytes)),
+        .full_bytes = text.len,
+    };
+}
+
+fn boundedHistoryWriter(buffer: *[snapshot_history_item_text_bytes_max]u8, max_bytes: usize) std.Io.Writer {
+    std.debug.assert(max_bytes <= buffer.len);
+    return std.Io.Writer.fixed(buffer[0..max_bytes]);
+}
+
+fn appendBoundedHistoryText(writer: *std.Io.Writer, text: []const u8) !void {
+    const prefix = utf8Prefix(text, writer.unusedCapacityLen());
+    if (prefix.len > 0) try writer.writeAll(prefix);
 }
 
 fn imageFallbackText(mime_type: []const u8) []const u8 {
@@ -1113,6 +1317,34 @@ test "event envelope deinitializes owned client event" {
     event.deinit(std.testing.allocator);
 }
 
+test "completion snapshot owns and deinitializes strings" {
+    const models = [_]CompletionItem.Source{.{ .id = "provider/model", .label = "provider/model", .detail = "ready" }};
+    const sessions = [_]CompletionItem.Source{.{ .id = "session.jsonl", .label = "session", .detail = "today" }};
+    var snapshot = try CompletionSnapshot.init(std.testing.allocator, &models, false, &sessions, false);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("provider/model", snapshot.models.items[0].id.text);
+    try std.testing.expectEqualStrings("session", snapshot.resume_sessions.items[0].label.text);
+}
+
+test "completion snapshot truncates item count and text fields" {
+    const long_id = "i" ** (completion_id_bytes_max + 4);
+    const long_label = "l" ** (completion_label_bytes_max + 4);
+    const long_detail = "d" ** (completion_detail_bytes_max + 4);
+    const source = try std.testing.allocator.alloc(CompletionItem.Source, completion_item_count_max + 1);
+    defer std.testing.allocator.free(source);
+    for (source) |*item| item.* = .{ .id = long_id, .label = long_label, .detail = long_detail };
+
+    var list = try CompletionList.init(std.testing.allocator, source, false);
+    defer list.deinit(std.testing.allocator);
+
+    try std.testing.expect(list.truncated);
+    try std.testing.expectEqual(completion_item_count_max, list.items.len);
+    try std.testing.expectEqual(completion_id_bytes_max, list.items[0].id.text.len);
+    try std.testing.expectEqual(completion_label_bytes_max, list.items[0].label.text.len);
+    try std.testing.expectEqual(completion_detail_bytes_max, list.items[0].detail.text.len);
+}
+
 test "history snapshot from session maps roles and keeps newest under caps" {
     var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "s", "t0");
     defer manager.deinit();
@@ -1178,6 +1410,54 @@ test "history snapshot projects assistant tool calls and tool results" {
     try std.testing.expectEqualStrings("file contents", snapshot.items[1].text.text);
 }
 
+test "history bounds tool text before storing snapshot items" {
+    var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "s", "t0");
+    defer manager.deinit();
+
+    const huge = try std.testing.allocator.alloc(u8, snapshot_history_item_text_bytes_max * 2);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'x');
+    const huge_id = try std.testing.allocator.alloc(u8, history_tool_id_bytes_max + 8);
+    defer std.testing.allocator.free(huge_id);
+    @memset(huge_id, 'i');
+    const huge_name = try std.testing.allocator.alloc(u8, history_tool_name_bytes_max + 8);
+    defer std.testing.allocator.free(huge_name);
+    @memset(huge_name, 'n');
+
+    var args = std.json.ObjectMap.empty;
+    defer args.deinit(std.testing.allocator);
+    try args.put(std.testing.allocator, "payload", .{ .string = huge });
+    const tool_call: ai.ToolCall = .{ .id = huge_id, .name = huge_name, .arguments = .{ .object = args } };
+    _ = try appendTestMessage(&manager, .{ .assistant = .{
+        .content = &.{.{ .tool_call = tool_call }},
+        .api = ai.KnownApi.openai_responses,
+        .provider = "openai",
+        .model = "gpt",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    } }, "t1");
+    _ = try appendTestMessage(&manager, .{ .tool_result = .{
+        .tool_call_id = huge_id,
+        .tool_name = huge_name,
+        .content = &.{.{ .text = .{ .text = huge } }},
+        .is_error = false,
+        .timestamp = 0,
+    } }, "t2");
+
+    var snapshot = try HistorySnapshot.fromSession(std.testing.allocator, &manager);
+    defer snapshot.deinit(std.testing.allocator);
+
+    const call = snapshot.items[0].tool_calls[0];
+    try std.testing.expectEqual(history_tool_id_bytes_max, call.id.text.len);
+    try std.testing.expectEqual(history_tool_name_bytes_max, call.name.text.len);
+    try std.testing.expect(call.title.text.len <= snapshot_history_item_text_bytes_max);
+    try std.testing.expectEqual(snapshot_history_item_text_bytes_max, snapshot.items[1].text.text.len);
+    try std.testing.expectEqual(history_tool_id_bytes_max, snapshot.items[1].tool_call_id.?.text.len);
+    try std.testing.expectEqual(history_tool_name_bytes_max, snapshot.items[1].tool_name.?.text.len);
+    try std.testing.expect(snapshot.dropped_text_bytes > 0);
+}
+
 test "history page returns bounded items before an entry id" {
     var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "s", "t0");
     defer manager.deinit();
@@ -1198,6 +1478,43 @@ test "history page returns bounded items before an entry id" {
     try std.testing.expectEqualStrings("00000002", page.items[1].entry_id.text);
     try std.testing.expectEqualStrings("two", page.items[1].text.text);
     try std.testing.expect(!page.has_more_before);
+}
+
+test "history budget counts assistant tool call titles" {
+    var manager = try session_manager.SessionManager.init(std.testing.allocator, "/repo", "s", "t0");
+    defer manager.deinit();
+
+    const tool_call: ai.ToolCall = .{ .id = "call-1", .name = "bash", .arguments = .{ .object = .empty } };
+    var title = try toolCallTitle(std.testing.allocator, tool_call, snapshot_history_item_text_bytes_max);
+    defer title.text.deinit(std.testing.allocator);
+
+    _ = try appendTestMessage(&manager, .{ .user = .{ .content = .{ .string = "old" }, .timestamp = 0 } }, "t1");
+    _ = try appendTestMessage(&manager, .{ .assistant = .{
+        .content = &.{.{ .tool_call = tool_call }},
+        .api = ai.KnownApi.openai_responses,
+        .provider = "openai",
+        .model = "gpt",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    } }, "t2");
+    _ = try appendTestMessage(&manager, .{ .user = .{ .content = .{ .string = "new" }, .timestamp = 0 } }, "t3");
+
+    const session_items = try manager.reconstructSession(std.testing.allocator);
+    defer std.testing.allocator.free(session_items);
+    const tool_call_bytes = tool_call.id.len + tool_call.name.len + title.text.text.len;
+    const collected = try collectHistoryBefore(std.testing.allocator, session_items, session_items.len, .{
+        .items_max = 8,
+        .item_text_bytes_max = 128,
+        .total_text_bytes_max = "new".len + tool_call_bytes,
+    });
+    defer deinitHistoryItems(std.testing.allocator, collected.items);
+
+    try std.testing.expectEqual(@as(usize, 2), collected.items.len);
+    try std.testing.expectEqual(@as(usize, 1), collected.dropped_items);
+    try std.testing.expectEqual(@as(usize, "old".len), collected.dropped_text_bytes);
+    try std.testing.expectEqual(HistorySnapshotItem.Kind.assistant, collected.items[0].kind);
+    try std.testing.expectEqualStrings("new", collected.items[1].text.text);
 }
 
 test "history snapshot truncates oversized items and drops oldest under byte budget" {
