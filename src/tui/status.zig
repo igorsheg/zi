@@ -1,6 +1,6 @@
 //! Allocation-free status contributions. Frontend adapters publish small
 //! prioritized text segments into named slots (the status line above the
-//! composer and the composer's top border labels); render orders them by
+//! composer and the composer's border labels); render orders them by
 //! priority. Text is stored inline, so the store never allocates and `deinit`
 //! is unnecessary.
 const std = @import("std");
@@ -10,7 +10,7 @@ const text_mod = @import("text.zig");
 pub const entry_count_max: usize = 16;
 pub const text_bytes_max: usize = 160;
 
-pub const Slot = enum { composer_left, composer_right, status_line };
+pub const Slot = enum { composer_left, composer_right, composer_bottom_left, composer_bottom_right, status_line };
 pub const Effect = enum { none, shimmer, shuffle };
 pub const Tone = enum { secondary, accent, canceled, warning, err };
 pub const ContributionId = u32;

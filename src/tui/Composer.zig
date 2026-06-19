@@ -1,11 +1,11 @@
 //! The prompt editor: one UTF-8 buffer plus a byte cursor. Storage stays a
-//! flat buffer; visual wrapping and the visible-tail window live in a cached
+//! flat buffer; visual wrapping and the cursor-visible window live in a cached
 //! projection keyed by (revision, width), because status animation renders
 //! frames far more often than the text changes.
 //!
 //! Callers pass valid UTF-8 (App sanitizes operational input first); that
-//! contract is asserted, not error-handled. The only operational rejection
-//! is the byte cap, surfaced as `InsertResult.rejected_full`.
+//! contract is asserted, not error-handled. Operational overflow inserts the
+//! largest UTF-8 prefix that fits and reports the dropped suffix.
 const std = @import("std");
 const text_mod = @import("text.zig");
 
@@ -17,6 +17,7 @@ pub const visible_rows_max: usize = 4;
 bytes: std.ArrayList(u8) = .empty,
 cursor_byte_index: usize = 0,
 vertical_target_col: ?usize = null,
+first_visible_row: usize = 0,
 revision: u64 = 0,
 projection_cache: ?ProjectionCache = null,
 
@@ -29,7 +30,7 @@ pub fn text(self: *const Composer) []const u8 {
     return self.bytes.items;
 }
 
-pub const InsertResult = enum { ok, rejected_full };
+pub const InsertResult = enum { ok, inserted_truncated, rejected_full };
 pub const VerticalDirection = enum { up, down };
 pub const MoveVerticalResult = enum { moved, boundary };
 
@@ -57,17 +58,23 @@ pub fn insert(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) error{
 
 fn insertNormalized(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!InsertResult {
     if (bytes.len == 0) return .ok;
-    if (self.bytes.items.len + bytes.len > buffer_size_bytes_max) return .rejected_full;
-    try self.bytes.insertSlice(gpa, self.cursor_byte_index, bytes);
-    self.cursor_byte_index += bytes.len;
+    const remaining = buffer_size_bytes_max - self.bytes.items.len;
+    const inserted = text_mod.utf8Prefix(bytes, remaining);
+    if (inserted.len == 0) return .rejected_full;
+    try self.bytes.insertSlice(gpa, self.cursor_byte_index, inserted);
+    self.cursor_byte_index += inserted.len;
     self.noteEdit();
-    return .ok;
+    return if (inserted.len == bytes.len) .ok else .inserted_truncated;
 }
 
 pub fn clear(self: *Composer) void {
-    if (self.bytes.items.len == 0 and self.cursor_byte_index == 0 and self.vertical_target_col == null) return;
+    if (self.bytes.items.len == 0 and
+        self.cursor_byte_index == 0 and
+        self.vertical_target_col == null and
+        self.first_visible_row == 0) return;
     self.bytes.clearRetainingCapacity();
     self.cursor_byte_index = 0;
+    self.first_visible_row = 0;
     self.noteEdit();
 }
 
@@ -89,6 +96,7 @@ pub fn replaceTextAtCursor(
     self.bytes.clearRetainingCapacity();
     self.bytes.appendSliceAssumeCapacity(bytes);
     self.cursor_byte_index = cursor_byte_index;
+    self.first_visible_row = 0;
     self.noteEdit();
 }
 
@@ -250,7 +258,8 @@ fn cachedProjection(self: *Composer, width: u16) ProjectionCache {
         .rows = undefined,
         .projection = undefined,
     };
-    cache.projection = projectVisualRows(self, width, &cache.rows);
+    cache.projection = projectVisualRows(self, width, self.first_visible_row, &cache.rows);
+    self.first_visible_row = cache.projection.first_visible_row;
     self.projection_cache = cache;
     return cache;
 }
@@ -285,98 +294,66 @@ pub const Projection = struct {
     cursor_display_col: usize,
 };
 
-fn projectVisualRows(composer: *const Composer, width: u16, out: *[visible_rows_max]VisualRow) Projection {
+fn projectVisualRows(
+    composer: *const Composer,
+    width: u16,
+    requested_first_visible_row: usize,
+    out: *[visible_rows_max]VisualRow,
+) Projection {
     std.debug.assert(composer.cursor_byte_index <= composer.text().len);
-    var builder: ProjectionBuilder = .{ .out = out, .cursor_byte_index = composer.cursor_byte_index };
-    builder.project(composer.text(), width);
-    return builder.finish();
+    const cursor = composer.cursorPosition(width);
+    const visible_count = @min(cursor.total_rows, visible_rows_max);
+    var first_visible_row = @min(requested_first_visible_row, cursor.total_rows - visible_count);
+    if (cursor.row < first_visible_row) {
+        first_visible_row = cursor.row;
+    } else if (cursor.row >= first_visible_row + visible_count) {
+        first_visible_row = cursor.row - visible_count + 1;
+    }
+    first_visible_row = @min(first_visible_row, cursor.total_rows - visible_count);
+    fillVisibleRows(composer.text(), width, first_visible_row, visible_count, out);
+    return .{
+        .first_visible_row = first_visible_row,
+        .visible_count = visible_count,
+        .total_rows = cursor.total_rows,
+        .cursor_visible = true,
+        .cursor_visible_row = cursor.row - first_visible_row,
+        .cursor_display_col = cursor.col,
+    };
 }
 
-const CursorPosition = struct {
-    row: usize = 0,
-    col: usize = 0,
-    found: bool = false,
-};
-
-const ProjectionBuilder = struct {
+fn fillVisibleRows(
+    bytes: []const u8,
+    width: u16,
+    first_visible_row: usize,
+    visible_count: usize,
     out: *[visible_rows_max]VisualRow,
-    cursor_byte_index: usize,
-    total_rows: usize = 0,
-    cursor: CursorPosition = .{},
+) void {
+    if (visible_count == 0) return;
+    if (bytes.len == 0) {
+        out[0] = .{ .text = "" };
+        return;
+    }
 
-    fn project(self: *ProjectionBuilder, bytes: []const u8, width: u16) void {
-        if (bytes.len == 0) {
-            self.cursor = .{ .row = 0, .col = 0, .found = true };
-            self.emit(.{ .text = "" });
-            return;
+    const wrap_width = @max(width, 1);
+    var row: usize = 0;
+    var written: usize = 0;
+    var start: usize = 0;
+    while (start < bytes.len and written < visible_count) {
+        const line = text_mod.nextVisualLineBreak(bytes, start, wrap_width);
+        if (line.next == start) break;
+        if (row >= first_visible_row) {
+            out[written] = .{ .text = bytes[line.start..line.end] };
+            written += 1;
         }
-
-        const wrap_width = @max(width, 1);
-        var start: usize = 0;
-        while (start < bytes.len) {
-            const line = text_mod.nextVisualLineBreak(bytes, start, wrap_width);
-            if (line.next == start) break;
-            self.captureCursor(bytes, line);
-            self.emit(.{ .text = bytes[line.start..line.end] });
-            start = line.next;
-        }
-        if (bytes[bytes.len - 1] == '\n') {
-            if (self.cursor_byte_index == bytes.len) self.cursor = .{
-                .row = self.total_rows,
-                .col = 0,
-                .found = true,
-            };
-            self.emit(.{ .text = "" });
-        }
+        row += 1;
+        start = line.next;
     }
-
-    fn captureCursor(self: *ProjectionBuilder, bytes: []const u8, line: text_mod.VisualLineBreak) void {
-        if (self.cursor.found) return;
-        if (self.cursor_byte_index < line.start or self.cursor_byte_index > line.end) return;
-        const col = if (self.cursor_byte_index == line.end)
-            line.width
-        else
-            text_mod.displayWidth(bytes[line.start..self.cursor_byte_index]);
-        self.cursor = .{ .row = self.total_rows, .col = col, .found = true };
+    if (bytes[bytes.len - 1] == '\n' and written < visible_count and row >= first_visible_row) {
+        out[written] = .{ .text = "" };
+        written += 1;
     }
-
-    fn emit(self: *ProjectionBuilder, row: VisualRow) void {
-        self.out[self.total_rows % visible_rows_max] = row;
-        self.total_rows += 1;
-    }
-
-    fn finish(self: *ProjectionBuilder) Projection {
-        if (!self.cursor.found) self.cursor = .{
-            .row = if (self.total_rows == 0) 0 else self.total_rows - 1,
-            .col = 0,
-            .found = true,
-        };
-        const visible_count = @min(self.total_rows, visible_rows_max);
-        const first_visible_row = self.total_rows - visible_count;
-        self.rotateVisibleRows(first_visible_row, visible_count);
-        const cursor_visible = self.cursor.row >= first_visible_row and
-            self.cursor.row < first_visible_row + visible_count;
-        return .{
-            .first_visible_row = first_visible_row,
-            .visible_count = visible_count,
-            .total_rows = self.total_rows,
-            .cursor_visible = cursor_visible,
-            .cursor_visible_row = if (cursor_visible) self.cursor.row - first_visible_row else 0,
-            .cursor_display_col = if (cursor_visible) self.cursor.col else 0,
-        };
-    }
-
-    /// The emit ring stores rows modulo capacity; reorder so out[0..count]
-    /// is the visible window oldest-first.
-    fn rotateVisibleRows(self: *ProjectionBuilder, first_visible_row: usize, visible_count: usize) void {
-        var ordered: [visible_rows_max]VisualRow = undefined;
-        var index: usize = 0;
-        while (index < visible_count) : (index += 1) {
-            ordered[index] = self.out[(first_visible_row + index) % visible_rows_max];
-        }
-        @memcpy(self.out[0..visible_count], ordered[0..visible_count]);
-    }
-};
+    std.debug.assert(written == visible_count);
+}
 
 test "insert normalizes CRLF and moves the cursor" {
     const gpa = std.testing.allocator;
@@ -388,17 +365,19 @@ test "insert normalizes CRLF and moves the cursor" {
     try std.testing.expectEqual(composer.text().len, composer.cursor_byte_index);
 }
 
-test "insert rejects past the byte cap without mutating" {
+test "insert fills the byte cap before rejecting overflow" {
     const gpa = std.testing.allocator;
     var composer: Composer = .{};
     defer composer.deinit(gpa);
 
-    const big = try gpa.alloc(u8, buffer_size_bytes_max);
-    defer gpa.free(big);
-    @memset(big, 'x');
-    try std.testing.expectEqual(InsertResult.ok, try composer.insert(gpa, big));
-    try std.testing.expectEqual(InsertResult.rejected_full, try composer.insert(gpa, "y"));
+    const almost_big = try gpa.alloc(u8, buffer_size_bytes_max - 1);
+    defer gpa.free(almost_big);
+    @memset(almost_big, 'x');
+    try std.testing.expectEqual(InsertResult.ok, try composer.insert(gpa, almost_big));
+    try std.testing.expectEqual(InsertResult.inserted_truncated, try composer.insert(gpa, "yz"));
     try std.testing.expectEqual(buffer_size_bytes_max, composer.text().len);
+    try std.testing.expectEqual('y', composer.text()[composer.text().len - 1]);
+    try std.testing.expectEqual(InsertResult.rejected_full, try composer.insert(gpa, "z"));
 }
 
 test "deleteForward removes the grapheme under the cursor" {
@@ -464,4 +443,35 @@ test "trailing newline emits an empty row with the cursor on it" {
     try std.testing.expectEqual(@as(usize, 2), projection.total_rows);
     try std.testing.expectEqual(@as(usize, 1), projection.cursor_visible_row);
     try std.testing.expectEqual(@as(usize, 0), projection.cursor_display_col);
+}
+
+test "visible rows scroll only when cursor leaves the composer window" {
+    const gpa = std.testing.allocator;
+    var composer: Composer = .{};
+    defer composer.deinit(gpa);
+
+    _ = try composer.insert(gpa, "a\nb\nc\nd\ne\nf");
+    var rows: [visible_rows_max]VisualRow = undefined;
+    var projection = composer.visibleRows(10, &rows);
+    try std.testing.expectEqual(@as(usize, 2), projection.first_visible_row);
+    try std.testing.expectEqualStrings("c", rows[0].text);
+    try std.testing.expectEqualStrings("f", rows[3].text);
+    try std.testing.expectEqual(@as(usize, 3), projection.cursor_visible_row);
+
+    try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(10, .up));
+    projection = composer.visibleRows(10, &rows);
+    try std.testing.expectEqual(@as(usize, 2), projection.first_visible_row);
+    try std.testing.expectEqual(@as(usize, 2), projection.cursor_visible_row);
+
+    try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(10, .up));
+    try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(10, .up));
+    projection = composer.visibleRows(10, &rows);
+    try std.testing.expectEqual(@as(usize, 2), projection.first_visible_row);
+    try std.testing.expectEqual(@as(usize, 0), projection.cursor_visible_row);
+
+    try std.testing.expectEqual(MoveVerticalResult.moved, composer.moveVertical(10, .up));
+    projection = composer.visibleRows(10, &rows);
+    try std.testing.expectEqual(@as(usize, 1), projection.first_visible_row);
+    try std.testing.expectEqualStrings("b", rows[0].text);
+    try std.testing.expectEqual(@as(usize, 0), projection.cursor_visible_row);
 }

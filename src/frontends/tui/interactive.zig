@@ -61,6 +61,11 @@ fn canRequestHistoryPage(history_request_in_flight: bool, history_has_more_befor
     return !history_request_in_flight and history_has_more_before;
 }
 
+fn nonEmptyEnv(value: ?[]const u8) ?[]const u8 {
+    const text = value orelse return null;
+    return if (std.mem.trim(u8, text, " \t\r\n").len == 0) null else text;
+}
+
 fn resolveTerminalInfo(process: runtime.Process) tui.theme.TerminalInfo {
     return .{
         .scheme = if (process.env("ZI_THEME_LIGHT") != null) .light else null,
@@ -179,6 +184,9 @@ const InteractiveController = struct {
     render_throttle: RenderThrottle = .{},
     tool_timers: [tool_timer_count_max]?ToolTimer = @splat(null),
     home_dir: ?[]const u8 = null,
+    editor: ?[]const u8 = null,
+    tmp_dir: []const u8 = "/tmp",
+    external_editor_counter: u64 = 0,
 
     fn init(
         process: runtime.Process,
@@ -203,6 +211,11 @@ const InteractiveController = struct {
             .stderr = stderr,
             .terminal = terminal,
             .home_dir = process.env("HOME") orelse process.env("USERPROFILE"),
+            .editor = nonEmptyEnv(process.env("EDITOR")),
+            .tmp_dir = nonEmptyEnv(process.env("TMPDIR")) orelse
+                nonEmptyEnv(process.env("TEMP")) orelse
+                nonEmptyEnv(process.env("TMP")) orelse
+                "/tmp",
         };
         try self.installGreeter(version);
         try self.installSlashCompletions();
@@ -276,6 +289,7 @@ const InteractiveController = struct {
     fn handleEffect(self: *InteractiveController, effect: tui.Effect) !void {
         switch (effect) {
             .submit_text => |text| if (!try self.handleSubmittedCommand(text)) try self.submitPrompt(text),
+            .edit_composer_external => |text| try self.editComposerExternal(text),
             .picker_selected => |selection| try self.handlePickerSelection(selection),
             .interrupt => try self.cancelActive(),
             .request_transcript_history => try self.requestHistoryPage(),
@@ -285,6 +299,137 @@ const InteractiveController = struct {
                 }
             },
         }
+    }
+
+    const EditorRead = struct {
+        bytes: []u8,
+        len: usize,
+        truncated: bool,
+
+        fn slice(self: *const EditorRead) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+
+    fn editComposerExternal(self: *InteractiveController, text: []const u8) !void {
+        const path = self.createEditorTempFile(text) catch |err| {
+            try self.appendEditorError("could not create editor temp file", err);
+            return;
+        };
+        defer self.allocator.free(path);
+        defer std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+
+        self.terminal.suspendForExternalProgram() catch |err| {
+            try self.appendEditorError("could not suspend terminal", err);
+            return;
+        };
+        const term = self.runEditor(path);
+        try self.terminal.resumeAfterExternalProgram();
+
+        const completed = term catch |err| {
+            try self.appendEditorError("editor failed", err);
+            return;
+        };
+        if (!editorExitedSuccessfully(completed)) {
+            try self.appendStatus(.warning, "editor exited nonzero; composer unchanged");
+            return;
+        }
+
+        const edited = self.readEditorTempFile(path) catch |err| {
+            try self.appendEditorError("could not read editor temp file", err);
+            return;
+        };
+        defer self.allocator.free(edited.bytes);
+        _ = try self.terminal.applyCommand(.{ .replace_composer_text = edited.slice() });
+        if (edited.truncated) try self.appendStatus(.warning, "editor input too large: pasted prefix only");
+    }
+
+    fn createEditorTempFile(self: *InteractiveController, text: []const u8) ![]u8 {
+        var attempts: usize = 0;
+        while (attempts < 16) : (attempts += 1) {
+            self.external_editor_counter +%= 1;
+            const stamp = std.Io.Clock.awake.now(self.io).nanoseconds;
+            var name_buffer: [96]u8 = undefined;
+            const name = std.fmt.bufPrint(
+                &name_buffer,
+                "zi-composer-{d}-{d}.md",
+                .{ stamp, self.external_editor_counter },
+            ) catch unreachable;
+            const path = try std.fs.path.join(self.allocator, &.{ self.tmp_dir, name });
+            errdefer self.allocator.free(path);
+
+            var file = std.Io.Dir.createFileAbsolute(self.io, path, .{
+                .read = true,
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    self.allocator.free(path);
+                    continue;
+                },
+                else => return err,
+            };
+            defer file.close(self.io);
+
+            var write_buffer: [4096]u8 = undefined;
+            var writer = file.writer(self.io, &write_buffer);
+            try writer.interface.writeAll(text);
+            try writer.flush();
+            return path;
+        }
+        return error.PathAlreadyExists;
+    }
+
+    fn readEditorTempFile(self: *InteractiveController, path: []const u8) !EditorRead {
+        var file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
+        defer file.close(self.io);
+        const read_limit = tui.Composer.buffer_size_bytes_max + 3;
+        const file_len = try file.length(self.io);
+        const read_len: usize = @intCast(@min(file_len, @as(u64, read_limit)));
+        const bytes = try self.allocator.alloc(u8, read_len);
+        errdefer self.allocator.free(bytes);
+        const len = try file.readPositionalAll(self.io, bytes, 0);
+        return .{ .bytes = bytes, .len = len, .truncated = file_len > read_limit };
+    }
+
+    fn runEditor(self: *InteractiveController, path: []const u8) !std.process.Child.Term {
+        if (self.editor) |editor| {
+            const argv = [_][]const u8{ "/bin/sh", "-c", "exec $1 \"$2\"", "zi-editor", editor, path };
+            return self.spawnAndWait(&argv);
+        }
+
+        const fallbacks = [_][]const u8{ "nvim", "vim", "nano" };
+        for (fallbacks) |editor| {
+            const argv = [_][]const u8{ editor, path };
+            return self.spawnAndWait(&argv) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+        }
+        return error.FileNotFound;
+    }
+
+    fn spawnAndWait(self: *InteractiveController, argv: []const []const u8) !std.process.Child.Term {
+        var child = try std.process.spawn(self.io, .{
+            .argv = argv,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
+        return child.wait(self.io);
+    }
+
+    fn editorExitedSuccessfully(term: std.process.Child.Term) bool {
+        return switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+    }
+
+    fn appendEditorError(self: *InteractiveController, message: []const u8, err: anyerror) !void {
+        var buffer: [tui.status.text_bytes_max]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "{s}: {s}", .{ message, @errorName(err) }) catch message;
+        try self.appendStatus(.warning, text);
     }
 
     fn handleSubmittedCommand(self: *InteractiveController, text: []const u8) !bool {

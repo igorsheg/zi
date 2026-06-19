@@ -3,6 +3,7 @@
 //! Both are pure: paste-mode and modal decisions belong to App.
 const std = @import("std");
 const vaxis = @import("vaxis");
+const text_mod = @import("text.zig");
 
 pub const inline_text_bytes_max: usize = 64;
 
@@ -14,9 +15,12 @@ pub const InlineBytes = struct {
 
     pub fn from(data: []const u8) InlineBytes {
         var value: InlineBytes = .{};
-        const n = @min(data.len, value.bytes.len);
-        @memcpy(value.bytes[0..n], data[0..n]);
-        value.len = @intCast(n);
+        const prefix = if (std.unicode.utf8ValidateSlice(data))
+            text_mod.utf8Prefix(data, value.bytes.len)
+        else
+            data[0..@min(data.len, value.bytes.len)];
+        @memcpy(value.bytes[0..prefix.len], prefix);
+        value.len = @intCast(prefix.len);
         return value;
     }
 
@@ -43,6 +47,7 @@ pub const Key = enum {
     page_down,
     ctrl_c,
     ctrl_d,
+    ctrl_g,
     ctrl_o,
     ctrl_u,
 };
@@ -101,10 +106,13 @@ fn fromVaxisKey(key: vaxis.Key) Input {
     if (key.matches(vaxis.Key.page_down, .{})) return .{ .key = .page_down };
     if (key.matches('c', .{ .ctrl = true })) return .{ .key = .ctrl_c };
     if (key.matches('d', .{ .ctrl = true })) return .{ .key = .ctrl_d };
+    if (key.matches('g', .{ .ctrl = true })) return .{ .key = .ctrl_g };
     if (key.matches('o', .{ .ctrl = true })) return .{ .key = .ctrl_o };
     if (key.matches('u', .{ .ctrl = true })) return .{ .key = .ctrl_u };
     if (key.text) |text| {
-        if (text.len > 0 and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+        const plain_text = !key.mods.ctrl and !key.mods.alt;
+        const alt_gr_text = key.mods.ctrl and key.mods.alt;
+        if (text.len > 0 and !key.mods.super and (plain_text or alt_gr_text)) {
             return .{ .text = InlineBytes.from(text) };
         }
     }
@@ -132,6 +140,7 @@ pub const KeyAction = union(enum) {
     interrupt,
     clear_or_exit,
     exit_if_composer_empty,
+    open_external_editor,
     none,
 };
 
@@ -162,6 +171,7 @@ fn resolveKey(key: Key) KeyAction {
         .ctrl_end => .transcript_follow_tail,
         .escape => .interrupt,
         .ctrl_c => .clear_or_exit,
+        .ctrl_g => .open_external_editor,
         .ctrl_o => .toggle_tool_expansion,
         .ctrl_u => .transcript_page_up,
         .ctrl_d => .exit_if_composer_empty,
@@ -218,4 +228,21 @@ test "resolve maps editing keys" {
     try std.testing.expectEqual(KeyAction.transcript_follow_tail, resolve(.{ .key = .ctrl_end }));
     try std.testing.expectEqual(KeyAction.composer_newline, resolve(.{ .key = .newline }));
     try std.testing.expectEqual(KeyAction.composer_submit, resolve(.{ .key = .enter }));
+    try std.testing.expectEqual(KeyAction.open_external_editor, resolve(.{ .key = .ctrl_g }));
+}
+
+test "ctrl alt printable text passes through for AltGr" {
+    const input = fromVaxis(.{ .key_press = .{
+        .codepoint = '@',
+        .text = "@",
+        .mods = .{ .ctrl = true, .alt = true },
+    } });
+    try std.testing.expect(input == .text);
+    try std.testing.expectEqualStrings("@", input.text.slice());
+}
+
+test "inline text truncates on utf8 boundaries" {
+    const bytes = InlineBytes.from("x" ** inline_text_bytes_max ++ "é");
+    try std.testing.expectEqual(@as(usize, inline_text_bytes_max), bytes.slice().len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(bytes.slice()));
 }

@@ -107,6 +107,21 @@ pub fn shutdown(self: *Terminal) !void {
     if (self.tty) |*tty| try self.vx.resetState(tty.writer());
 }
 
+pub fn suspendForExternalProgram(self: *Terminal) !void {
+    self.pending_len = 0;
+    self.parser = .{};
+    if (self.tty) |*tty| {
+        try self.vx.resetState(tty.writer());
+        tty.deinit();
+        self.tty = null;
+    }
+}
+
+pub fn resumeAfterExternalProgram(self: *Terminal) !void {
+    if (self.tty == null) try self.setup();
+    self.app.dirty = true;
+}
+
 pub fn requestStop(self: *Terminal) void {
     self.running = false;
 }
@@ -183,6 +198,7 @@ pub fn readAvailableInput(self: *Terminal, effects: []App.Effect) !ReadResult {
             else => try self.applyInput(input_mod.fromVaxis(event), effects, &result),
         }
     }
+    if (result.truncated) _ = try self.app.apply(self.gpa, .{ .input = .paste_end });
     if (containsShutdown(effects[0..result.effect_count])) {
         result.shutdown_requested = true;
         self.requestStop();

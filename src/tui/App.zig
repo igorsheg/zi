@@ -25,6 +25,7 @@ const App = @This();
 pub const double_press_window_ms: i64 = 500;
 pub const mouse_wheel_scroll_rows: usize = 3;
 pub const tail_autoscroll_detach_rows: usize = mouse_wheel_scroll_rows * 2;
+const composer_scroll_status_id: status_mod.ContributionId = std.math.maxInt(status_mod.ContributionId);
 
 const ScrollResult = enum { moved, boundary };
 const ScrollAttachment = enum { auto, detached };
@@ -331,6 +332,7 @@ pub const Command = union(enum) {
 
 pub const Effect = union(enum) {
     submit_text: []u8,
+    edit_composer_external: []u8,
     picker_selected: Picker.Selection,
     interrupt,
     request_shutdown,
@@ -338,7 +340,7 @@ pub const Effect = union(enum) {
 
     pub fn deinit(self: Effect, gpa: std.mem.Allocator) void {
         switch (self) {
-            .submit_text => |text| gpa.free(text),
+            .submit_text, .edit_composer_external => |text| gpa.free(text),
             .picker_selected => |selection| gpa.free(selection.item_id),
             .interrupt, .request_shutdown, .request_transcript_history => {},
         }
@@ -352,6 +354,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
                 self.width = size.width;
                 self.height = size.height;
                 self.clampOrFollowViewport();
+                self.syncComposerScrollHint();
                 self.dirty = true;
             }
             return null;
@@ -360,7 +363,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         .tick => |tick| {
             if (tick.now_ms != self.now_ms) {
                 self.now_ms = tick.now_ms;
-                if (self.status.hasAnimated(.status_line, self.now_ms)) self.dirty = true;
+                if (self.statusHasAnimated()) self.dirty = true;
             }
             return null;
         },
@@ -463,12 +466,16 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             return null;
         },
         .replace_composer_text => |text| {
-            const clean = if (std.unicode.utf8ValidateSlice(text)) text else "";
-            const bounded = text_mod.utf8Prefix(clean, Composer.buffer_size_bytes_max);
+            var clean_buffer: [Composer.buffer_size_bytes_max]u8 = undefined;
+            const bounded = if (std.unicode.utf8ValidateSlice(text))
+                text_mod.utf8Prefix(text, Composer.buffer_size_bytes_max)
+            else
+                text_mod.sanitizeInto(&clean_buffer, text);
             try self.composer.replaceText(gpa, bounded);
             self.resetHistoryNavigation();
             self.completion.noteEdit();
             self.syncComposerCompletion();
+            self.syncComposerScrollHint();
             self.dirty = true;
             return null;
         },
@@ -547,6 +554,7 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
         .interrupt => return .interrupt,
         .clear_or_exit => return self.clearOrExit(),
         .exit_if_composer_empty => if (self.composer.text().len == 0) return .request_shutdown,
+        .open_external_editor => return try self.openExternalEditor(gpa),
         .none => {},
     }
     return null;
@@ -647,22 +655,29 @@ fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{O
     else
         text_mod.sanitizeInto(&clean_buffer, bytes);
     switch (try self.composer.insert(gpa, clean)) {
-        .ok => {
+        .ok, .inserted_truncated => |result| {
             if (clean.len > 0) self.noteGreeterCharacterInput();
             self.resetHistoryNavigation();
             self.completion.noteEdit();
             self.syncComposerCompletion();
+            self.syncComposerScrollHint();
             self.composer_full_noticed = false;
             self.dirty = true;
+            if (result == .inserted_truncated) try self.noticeComposerFull(gpa);
         },
-        .rejected_full => {
-            if (!self.composer_full_noticed) {
-                self.composer_full_noticed = true;
-                try self.notice(gpa, .warning, "input too large: composer is full, extra input dropped");
-            }
-        },
+        .rejected_full => try self.noticeComposerFull(gpa),
     }
     return null;
+}
+
+fn noticeComposerFull(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    if (self.composer_full_noticed) return;
+    self.composer_full_noticed = true;
+    try self.notice(gpa, .warning, "input too large: composer is full, extra input dropped");
+}
+
+fn openExternalEditor(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!Effect {
+    return .{ .edit_composer_external = try gpa.dupe(u8, self.composer.text()) };
 }
 
 fn noteGreeterCharacterInput(self: *App) void {
@@ -679,6 +694,7 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
         if (self.composer.text().len != 0) self.composer.clear();
         self.resetHistoryNavigation();
         self.completion.noteEdit();
+        self.syncComposerScrollHint();
         self.dirty = true;
         return null;
     };
@@ -691,6 +707,7 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.composer_full_noticed = false;
     self.dirty = true;
     return .{ .submit_text = submitted };
@@ -701,12 +718,14 @@ fn composerTextEdit(self: *App, comptime edit: fn (*Composer) void) void {
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.dirty = true;
 }
 
 fn composerCursorEdit(self: *App, comptime edit: fn (*Composer) void) void {
     edit(&self.composer);
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.dirty = true;
 }
 
@@ -714,6 +733,7 @@ fn composerUpOrHistory(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!vo
     if (self.composer.text().len != 0 and
         self.composer.moveVertical(render.composerTextWidth(self.width), .up) == .moved)
     {
+        self.syncComposerScrollHint();
         self.dirty = true;
         return;
     }
@@ -724,6 +744,7 @@ fn composerDownOrHistory(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!
     if (self.composer.text().len != 0 and
         self.composer.moveVertical(render.composerTextWidth(self.width), .down) == .moved)
     {
+        self.syncComposerScrollHint();
         self.dirty = true;
         return;
     }
@@ -746,6 +767,7 @@ fn historyPrevious(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
     self.history_cursor_from_newest = next_offset;
     self.completion.noteEdit();
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.composer_full_noticed = false;
     self.dirty = true;
 }
@@ -767,6 +789,7 @@ fn historyNext(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
     }
     self.completion.noteEdit();
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.composer_full_noticed = false;
     self.dirty = true;
 }
@@ -798,6 +821,47 @@ fn composerCompletionVisible(self: *App) bool {
 
 fn syncComposerCompletion(self: *App) void {
     self.completion.sync(self);
+}
+
+fn syncComposerScrollHint(self: *App) void {
+    var rows: [Composer.visible_rows_max]Composer.VisualRow = undefined;
+    const projection = self.composer.visibleRows(render.composerTextWidth(self.width), &rows);
+    const hidden_above = projection.first_visible_row;
+    const hidden_below = projection.total_rows -| (projection.first_visible_row + projection.visible_count);
+
+    _ = self.status.clear(.{ .slot = .composer_bottom_right, .id = composer_scroll_status_id });
+    if (hidden_above == 0 and hidden_below == 0) {
+        _ = self.status.clear(.{ .slot = .composer_bottom_left, .id = composer_scroll_status_id });
+        return;
+    }
+
+    var buffer: [64]u8 = undefined;
+    const text = if (hidden_above > 0 and hidden_below > 0)
+        std.fmt.bufPrint(&buffer, "↑ {} more · ↓ {} more", .{ hidden_above, hidden_below }) catch return
+    else if (hidden_above > 0)
+        std.fmt.bufPrint(&buffer, "↑ {} more", .{hidden_above}) catch return
+    else
+        std.fmt.bufPrint(&buffer, "↓ {} more", .{hidden_below}) catch return;
+    _ = self.status.set(.{
+        .slot = .composer_bottom_left,
+        .id = composer_scroll_status_id,
+        .priority = -1000,
+        .text = text,
+    }, self.now_ms);
+}
+
+fn statusHasAnimated(self: *const App) bool {
+    const slots = [_]status_mod.Slot{
+        .composer_left,
+        .composer_right,
+        .composer_bottom_left,
+        .composer_bottom_right,
+        .status_line,
+    };
+    for (slots) |slot| {
+        if (self.status.hasAnimated(slot, self.now_ms)) return true;
+    }
+    return false;
 }
 
 fn completionHasNoSelection(self: *App) bool {
@@ -880,6 +944,7 @@ fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemor
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.composer_full_noticed = false;
     self.dirty = true;
     return null;
@@ -904,6 +969,7 @@ fn acceptComposerArgCompletion(
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.composer_full_noticed = false;
     self.dirty = true;
 }
@@ -920,6 +986,7 @@ fn selectComposerArgCompletion(
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.composer_full_noticed = false;
     self.dirty = true;
     return .{ .picker_selected = .{ .picker_id = completion.picker.id, .item_id = item_id } };
@@ -935,6 +1002,7 @@ fn clearOrExit(self: *App) ?Effect {
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
+    self.syncComposerScrollHint();
     self.composer_full_noticed = false;
     self.last_clear_ms = self.now_ms;
     self.dirty = true;
@@ -1472,6 +1540,26 @@ test "paste mode turns enter into a newline and never submits" {
     try std.testing.expectEqualStrings("line1\nline2", app.composer.text());
 }
 
+test "composer overflow fills remaining capacity before warning" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    const almost_big = try gpa.alloc(u8, Composer.buffer_size_bytes_max - 1);
+    defer gpa.free(almost_big);
+    @memset(almost_big, 'x');
+    _ = try app.apply(gpa, .{ .replace_composer_text = almost_big });
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("yz") } });
+
+    try std.testing.expectEqual(Composer.buffer_size_bytes_max, app.composer.text().len);
+    try std.testing.expectEqual('y', app.composer.text()[app.composer.text().len - 1]);
+    var warnings: usize = 0;
+    for (app.transcript.items.items) |item| {
+        if (item.body == .status and item.body.status.level == .warning) warnings += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), warnings);
+}
+
 test "composer overflow degrades to one notice instead of an error" {
     const gpa = std.testing.allocator;
     var app = App.init(80, 24, .{});
@@ -1525,6 +1613,20 @@ test "escape interrupts and ctrl+d exits only when empty" {
     try std.testing.expect((try app.apply(gpa, .{ .input = .{ .key = .ctrl_d } })) == null);
     _ = try app.apply(gpa, .{ .input = .{ .key = .ctrl_c } });
     try std.testing.expect((try app.apply(gpa, .{ .input = .{ .key = .ctrl_d } })).? == .request_shutdown);
+}
+
+test "ctrl+g emits an owned external editor request" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("draft") } });
+    const effect = (try app.apply(gpa, .{ .input = .{ .key = .ctrl_g } })).?;
+    defer effect.deinit(gpa);
+
+    try std.testing.expect(effect == .edit_composer_external);
+    try std.testing.expectEqualStrings("draft", effect.edit_composer_external);
+    try std.testing.expectEqualStrings("draft", app.composer.text());
 }
 
 test "tick marks dirty only while something animates" {

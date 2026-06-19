@@ -1292,26 +1292,14 @@ fn drawComposer(app: *App, painter: *Painter, composer_rows: usize, bottom_reser
     if (app.width >= 2 and box_height >= 2) {
         painter.roundedBorder(0, box_y, app.width, box_height, app.theme.composer_chrome);
         if (app.width >= 4) {
-            const inner = app.width - 2;
-            const left_x: usize = 2;
-            var right_start: usize = @as(usize, app.width) - 2;
-            var right_visible = false;
-            if (app.status.highestPriority(.composer_right)) |view| {
-                const label_width = text_mod.displayWidth(view.text);
-                if (inner >= 2 + label_width) {
-                    right_start = @as(usize, app.width) - 2 - label_width;
-                    painter.writeText(@intCast(right_start), box_y, view.text, app.theme.composer_slot);
-                    right_visible = true;
-                }
-            }
-            if (app.status.highestPriority(.composer_left)) |view| {
-                const available = if (right_visible)
-                    right_start -| (left_x + 1)
-                else
-                    @as(usize, app.width) -| (left_x + 2);
-                const label = fitToWidth(view.text, available);
-                if (label.len > 0) painter.writeText(@intCast(left_x), box_y, label, app.theme.composer_slot);
-            }
+            drawComposerSlots(app, painter, box_y, .composer_left, .composer_right);
+            drawComposerSlots(
+                app,
+                painter,
+                @intCast(@as(usize, box_y) + height - 1),
+                .composer_bottom_left,
+                .composer_bottom_right,
+            );
         }
     }
 
@@ -1329,6 +1317,35 @@ fn drawComposer(app: *App, painter: *Painter, composer_rows: usize, bottom_reser
         if (cursor_x < app.width and cursor_y < app.height) {
             painter.setCursor(@intCast(cursor_x), @intCast(cursor_y));
         }
+    }
+}
+
+fn drawComposerSlots(
+    app: *App,
+    painter: *Painter,
+    y: u16,
+    left_slot: status_mod.Slot,
+    right_slot: status_mod.Slot,
+) void {
+    const inner = app.width - 2;
+    const left_x: usize = 2;
+    var right_start: usize = @as(usize, app.width) - 2;
+    var right_visible = false;
+    if (app.status.highestPriority(right_slot)) |view| {
+        const label_width = text_mod.displayWidth(view.text);
+        if (inner >= 2 + label_width) {
+            right_start = @as(usize, app.width) - 2 - label_width;
+            painter.writeText(@intCast(right_start), y, view.text, app.theme.composer_slot);
+            right_visible = true;
+        }
+    }
+    if (app.status.highestPriority(left_slot)) |view| {
+        const available = if (right_visible)
+            right_start -| (left_x + 1)
+        else
+            @as(usize, app.width) -| (left_x + 2);
+        const label = fitToWidth(view.text, available);
+        if (label.len > 0) painter.writeText(@intCast(left_x), y, label, app.theme.composer_slot);
     }
 }
 
@@ -1798,6 +1815,34 @@ test "composer top border draws cwd and session chrome without overlap" {
     try std.testing.expect(screenContainsText(vx.window(), "/repo"));
     try std.testing.expect(screenContainsText(vx.window(), "67.5%/272k"));
     try std.testing.expect(screenContainsText(vx.window(), "openai/gpt (high)"));
+}
+
+test "composer overflow window shows a scroll hint" {
+    var env = std.process.Environ.Map.init(testing_gpa);
+    defer env.deinit();
+
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var output_storage: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_storage);
+    defer vx.deinit(testing_gpa, &writer);
+
+    try vx.resize(testing_gpa, &writer, .{ .cols = 32, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(32, 8, .{});
+    defer app.deinit(testing_gpa);
+    _ = try app.apply(testing_gpa, .{ .replace_composer_text = "a\nb\nc\nd\ne\nf" });
+    _ = try app.apply(testing_gpa, .{ .input = .{ .key = .arrow_up } });
+    _ = try app.apply(testing_gpa, .{ .input = .{ .key = .arrow_up } });
+    _ = try app.apply(testing_gpa, .{ .input = .{ .key = .arrow_up } });
+    _ = try app.apply(testing_gpa, .{ .input = .{ .key = .arrow_up } });
+    try std.testing.expectEqual(@as(usize, 1), app.status.count(.composer_bottom_left));
+    try std.testing.expectEqual(@as(usize, 0), app.status.count(.composer_bottom_right));
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try std.testing.expect(screenContainsText(vx.window(), "↑ 1 more · ↓ 1 more"));
 }
 
 test "vaxis screen receives the frame" {
