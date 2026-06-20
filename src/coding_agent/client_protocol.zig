@@ -424,6 +424,7 @@ pub const QueueChanged = struct {
 };
 
 pub const CompactionReason = enum {
+    manual,
     threshold,
     overflow,
 };

@@ -13,6 +13,7 @@ pub const Settings = struct {
 
     pub const Compaction = struct {
         keep_recent_tokens: ?u64 = null,
+        reserve_tokens: ?u64 = null,
         enabled: ?bool = null,
     };
 
@@ -143,6 +144,7 @@ fn optionalCompaction(value: ?std.json.Value) !?Settings.Compaction {
     if (resolved != .object) return error.InvalidSettings;
     return .{
         .keep_recent_tokens = try optionalNonNegativeInteger(resolved.object.get("keepRecentTokens")),
+        .reserve_tokens = try optionalNonNegativeInteger(resolved.object.get("reserveTokens")),
         .enabled = try optionalBool(resolved.object.get("enabled")),
     };
 }

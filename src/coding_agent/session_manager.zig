@@ -21,6 +21,7 @@ pub const max_model_provider_bytes = 64;
 pub const max_model_id_bytes = 128;
 pub const max_thinking_level_bytes = 32;
 pub const max_compaction_keep_recent_tokens = 1_000_000;
+pub const max_compaction_reserve_tokens = 1_000_000;
 pub const max_compaction_serialized_input_bytes = 512 * 1024;
 pub const max_compaction_tool_result_chars = 16 * 1024;
 
@@ -34,7 +35,8 @@ pub const SessionHeader = struct {
 
 pub const CompactionSettings = struct {
     keep_recent_tokens: u64 = 20_000,
-    auto_enabled: bool = false,
+    reserve_tokens: u64 = 16_384,
+    auto_enabled: bool = true,
 };
 
 pub const SessionEntry = union(enum) {
@@ -583,7 +585,9 @@ pub const SessionManager = struct {
         allocator: std.mem.Allocator,
         settings: CompactionSettings,
     ) Error!CompactionSummaryInput {
-        if (settings.keep_recent_tokens > max_compaction_keep_recent_tokens) {
+        if (settings.keep_recent_tokens > max_compaction_keep_recent_tokens or
+            settings.reserve_tokens > max_compaction_reserve_tokens)
+        {
             return error.CompactionSettingsOutOfBounds;
         }
         const entries = self.entries.items;

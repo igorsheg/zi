@@ -586,7 +586,7 @@ pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdi
     if (!context.overflow_retry_used and
         self.event_drain.context_overflow_count > context.overflow_count_before)
     {
-        if (try self.startCompactionRun(.overflow, true)) |compaction_run| {
+        if (try self.startCompactionRun(.overflow, true, null)) |compaction_run| {
             return .{ .compact = compaction_run };
         }
     }
@@ -706,12 +706,24 @@ fn buildSystemPromptText(
 /// when compaction is disabled or there is nothing to compact. Emits
 /// compaction_start and spawns the summary producer; the caller owns the
 /// run and must drive it to settle, then destroy it.
+pub fn shouldRunThresholdCompaction(self: *const AgentSession) bool {
+    const settings = self.compaction_settings;
+    if (!settings.auto_enabled) return false;
+    const window = self.agent.state.model.context_window;
+    if (window == 0) return false;
+    const usage = self.clientContextUsage();
+    const tokens = usage.tokens orelse return false;
+    if (settings.reserve_tokens >= window) return true;
+    return tokens > window - settings.reserve_tokens;
+}
+
 pub fn startCompactionRun(
     self: *AgentSession,
     reason: client_protocol.CompactionReason,
     will_retry: bool,
+    custom_instructions: ?[]const u8,
 ) !?*CompactionRun {
-    if (!self.compaction_settings.auto_enabled) return null;
+    if (reason != .manual and !self.compaction_settings.auto_enabled) return null;
     var input = self.manager.buildCompactionSummaryInput(
         self.allocator,
         self.compaction_settings,
@@ -724,13 +736,23 @@ pub fn startCompactionRun(
     const serialized_input = try input.serialize(self.allocator);
     defer self.allocator.free(serialized_input);
     const prefix =
-        "Summarize the conversation for future continuation. Preserve user intent, decisions, files, " ++
-        "tool outcomes, and unresolved work. Return only the summary.\n\n";
+        "The messages below are conversation history to compact. Create a structured context checkpoint " ++
+        "summary that another LLM can use to continue the work. Preserve exact file paths, function " ++
+        "names, decisions, tool outcomes, constraints, unresolved work, and next steps. Return only " ++
+        "the summary.\n\n";
     if (serialized_input.len > max_compaction_summary_prompt_bytes - prefix.len - 1) {
         return error.CompactionSummaryPromptTooLarge;
     }
-    const summary_prompt = try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ prefix, serialized_input });
+    const summary_prompt = if (custom_instructions) |instructions|
+        try std.fmt.allocPrint(
+            self.allocator,
+            "{s}Additional focus: {s}\n\n{s}\n",
+            .{ prefix, instructions, serialized_input },
+        )
+    else
+        try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ prefix, serialized_input });
     errdefer self.allocator.free(summary_prompt);
+    if (summary_prompt.len > max_compaction_summary_prompt_bytes) return error.CompactionSummaryPromptTooLarge;
 
     const run = try self.allocator.create(CompactionRun);
     errdefer self.allocator.destroy(run);
@@ -827,6 +849,7 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
                 self.event_drain.failRetry(@errorName(err));
                 return .failed;
             }
+            if (run.reason == .manual) return .failed;
             return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
         },
     };
@@ -868,7 +891,9 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
             .delay_ms = 0,
             .error_message = error_message,
         } });
+        return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
     }
+    if (run.reason == .manual) return .completed;
     return .{ .retry = .{ .kind = .resubmit_prompt, .delay_ms = 0 } };
 }
 
@@ -1453,7 +1478,7 @@ test "agent session auto compaction summarizes persists and replaces context" {
     drainAllPublicEvents(&session);
     const kept = session.manager.entries.items[1].id();
 
-    const run = (try session.startCompactionRun(.threshold, false)).?;
+    const run = (try session.startCompactionRun(.threshold, false, null)).?;
     try driveCompactionRun(&session, run);
     const verdict = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
@@ -1498,7 +1523,7 @@ test "agent session auto compaction failure does not mutate history" {
 
     try appendTwoCompactableMessages(&session);
 
-    const run = (try session.startCompactionRun(.threshold, false)).?;
+    const run = (try session.startCompactionRun(.threshold, false, null)).?;
     try driveCompactionRun(&session, run);
     const verdict = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
@@ -1546,7 +1571,7 @@ test "agent session auto compaction oversized summary does not mutate history" {
 
     try appendTwoCompactableMessages(&session);
 
-    const run = (try session.startCompactionRun(.threshold, false)).?;
+    const run = (try session.startCompactionRun(.threshold, false, null)).?;
     try driveCompactionRun(&session, run);
     try std.testing.expect(run.outcome == .failure);
     try std.testing.expectEqual(error.CompactionSummaryTooLarge, run.outcome.failure);
@@ -1624,7 +1649,7 @@ test "start compaction run returns null when disabled or nothing to compact" {
     defer shutdownAndDeinit(&disabled_session);
     try std.testing.expectEqual(
         @as(?*AgentSession.CompactionRun, null),
-        try disabled_session.startCompactionRun(.threshold, false),
+        try disabled_session.startCompactionRun(.threshold, false, null),
     );
 
     var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
@@ -1633,7 +1658,7 @@ test "start compaction run returns null when disabled or nothing to compact" {
     defer shutdownAndDeinit(&empty_session);
     try std.testing.expectEqual(
         @as(?*AgentSession.CompactionRun, null),
-        try empty_session.startCompactionRun(.threshold, false),
+        try empty_session.startCompactionRun(.threshold, false, null),
     );
 }
 
@@ -1650,7 +1675,7 @@ test "cancel compaction run emits the aborted compaction end" {
     defer shutdownAndDeinit(&session);
     try appendTwoCompactableMessages(&session);
 
-    const run = (try session.startCompactionRun(.threshold, false)).?;
+    const run = (try session.startCompactionRun(.threshold, false, null)).?;
     session.cancelCompactionRun(run);
     session.destroyCompactionRun(run);
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);

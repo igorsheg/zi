@@ -263,6 +263,7 @@ fn resolveSessionOptions(services: *RuntimeServices, options: Options) AgentSess
     for ([2]settings_mod.Settings{ global, project }) |scope| {
         if (scope.compaction) |value| {
             if (value.keep_recent_tokens) |tokens| compaction.keep_recent_tokens = tokens;
+            if (value.reserve_tokens) |tokens| compaction.reserve_tokens = tokens;
             if (value.enabled) |enabled| compaction.auto_enabled = enabled;
         }
         if (scope.retry) |value| {
@@ -754,8 +755,10 @@ pub const SessionRuntime = struct {
                 // due; its settle verdict starts the prompt run. A failure to
                 // even start it degrades: the prompt runs uncompacted.
                 const phase: ActiveOperation.Phase = blk: {
-                    if (self.session.startCompactionRun(.threshold, false) catch null) |compaction_run| {
-                        break :blk .{ .compacting = compaction_run };
+                    if (self.session.shouldRunThresholdCompaction()) {
+                        if (self.session.startCompactionRun(.threshold, false, null) catch null) |compaction_run| {
+                            break :blk .{ .compacting = compaction_run };
+                        }
                     }
                     const run = self.session.startPromptRun(prompt.text, &.{}) catch |err| {
                         self.allocator.free(prompt_text);
@@ -1020,6 +1023,7 @@ pub const SessionRuntime = struct {
             .session => try self.enqueueSessionPromptCommand(request_id, spec.name),
             .model => try self.handleModelSlashCommand(request_id, spec.name, invocation.args),
             .resume_session => try self.handleResumeSlashCommand(request_id, spec.name, invocation.args),
+            .compact => try self.handleCompactSlashCommand(request_id, spec.name, invocation.args),
         }
         return true;
     }
@@ -1079,6 +1083,41 @@ pub const SessionRuntime = struct {
             return;
         }
         try self.switchSession(request_id, args);
+    }
+
+    fn handleCompactSlashCommand(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        command: []const u8,
+        args: []const u8,
+    ) !void {
+        if (self.active != null) {
+            try self.enqueuePromptCommand(request_id, command, .failed, "cancel active operation before compaction");
+            return;
+        }
+        const compaction_run = self.session.startCompactionRun(.manual, false, if (args.len == 0) null else args) catch |err| {
+            try self.enqueuePromptCommand(request_id, command, .failed, @errorName(err));
+            return;
+        } orelse {
+            try self.enqueuePromptCommand(request_id, command, .failed, "nothing to compact");
+            return;
+        };
+        errdefer self.session.destroyCompactionRun(compaction_run);
+        const prompt_text = try self.allocator.dupe(u8, "");
+        errdefer self.allocator.free(prompt_text);
+        self.active = .{
+            .phase = .{ .compacting = compaction_run },
+            .request_id = request_id,
+            .operation_id = self.nextOperationId(),
+            .prompt_text = prompt_text,
+            .overflow_count_before = self.session.contextOverflowCount(),
+        };
+        try self.enqueueEvent(.{
+            .request_id = request_id,
+            .operation_id = self.active.?.operation_id,
+            .event = .operation_started,
+        });
+        try self.drainSessionEvents(request_id);
     }
 
     fn handleModelSlashCommand(
@@ -1946,7 +1985,7 @@ test "session runtime handles slash command without starting an operation" {
     try std.testing.expect(event.event.prompt_command.result == .handled);
     try std.testing.expectEqualStrings("help", event.event.prompt_command.command.text);
     try std.testing.expectEqualStrings(
-        "available commands: /help, /session, /model, /resume",
+        "available commands: /help, /session, /model, /resume, /compact",
         event.event.prompt_command.message.text,
     );
     // No operation started, nothing queued, nothing persisted.
@@ -2568,30 +2607,57 @@ fn testModel() ai.Model {
 /// requests, then succeeds. Call count is container-level test state.
 const FlakyStream = struct {
     var call_count: usize = 0;
+    var non_compaction_call_count: usize = 0;
     var fail_calls: usize = 1;
+    var error_text: []const u8 = "rate limit exceeded";
+    var success_usage_total_tokens: u64 = 0;
+    var last_prompt_buffer: [4096]u8 = undefined;
+    var last_prompt: []const u8 = "";
 
     fn reset(fails: usize) void {
         call_count = 0;
+        non_compaction_call_count = 0;
         fail_calls = fails;
+        error_text = "rate limit exceeded";
+        success_usage_total_tokens = 0;
+        last_prompt = "";
     }
 
     fn stream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
         call_count += 1;
+        var is_compaction_request = false;
+        for (request.context.messages) |message| {
+            if (message != .user) continue;
+            const text = switch (message.user.content) {
+                .string => |value| value,
+                .blocks => "",
+            };
+            if (text.len == 0) continue;
+            const copied_len = @min(text.len, last_prompt_buffer.len);
+            @memcpy(last_prompt_buffer[0..copied_len], text[0..copied_len]);
+            last_prompt = last_prompt_buffer[0..copied_len];
+            if (std.mem.indexOf(u8, text, "conversation history to compact") != null) {
+                is_compaction_request = true;
+            }
+        }
+        if (!is_compaction_request) non_compaction_call_count += 1;
         var assistant_stream = ai.AssistantMessageEventStream.initBuffered();
         const sink = assistant_stream.sink();
-        if (call_count <= fail_calls) {
+        if (!is_compaction_request and non_compaction_call_count <= fail_calls) {
             sink.endError(
                 request.io,
                 .error_,
-                ai.protocol.emptyAssistantMessageFromRequest(request, .error_, "rate limit exceeded"),
+                ai.protocol.emptyAssistantMessageFromRequest(request, .error_, error_text),
             ) catch std.debug.assert(false);
         } else {
+            var usage = ai.protocol.emptyUsage();
+            usage.total_tokens = success_usage_total_tokens;
             sink.endDone(request.io, .stop, .{
                 .content = &.{.{ .text = .{ .text = "recovered" } }},
                 .api = request.model.api,
                 .provider = request.model.provider,
                 .model = request.model.id,
-                .usage = ai.protocol.emptyUsage(),
+                .usage = usage,
                 .stop_reason = .stop,
                 .timestamp = 0,
             }) catch std.debug.assert(false);
@@ -2711,6 +2777,7 @@ test "session runtime retries transient failure through the live owner loop" {
 
 const DriveOutcome = struct {
     reason: client_protocol.OperationFinished.Reason,
+    compaction_start_count: usize = 0,
     saw_compaction_start: bool = false,
     saw_compaction_end_result: bool = false,
 };
@@ -2724,7 +2791,10 @@ fn driveUntilOperationFinished(session_runtime: *SessionRuntime) !DriveOutcome {
             var owned = event;
             defer owned.deinit(std.testing.allocator);
             switch (owned.event) {
-                .compaction_start => outcome.saw_compaction_start = true,
+                .compaction_start => {
+                    outcome.saw_compaction_start = true;
+                    outcome.compaction_start_count += 1;
+                },
                 .compaction_end => |payload| {
                     if (payload.result != null) outcome.saw_compaction_end_result = true;
                 },
@@ -2740,6 +2810,40 @@ fn driveUntilOperationFinished(session_runtime: *SessionRuntime) !DriveOutcome {
     return error.OperationDidNotFinish;
 }
 
+test "session runtime does not threshold compact below reserve" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    FlakyStream.reset(0);
+    FlakyStream.success_usage_total_tokens = 100;
+    var session_runtime = try initRetryTestRuntime(
+        &tmp,
+        task_runtime,
+        "{\"compaction\":{\"enabled\":true,\"keepRecentTokens\":1,\"reserveTokens\":1000}}",
+    );
+    defer session_runtime.deinit();
+
+    var first_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
+    var first_owned = true;
+    defer if (first_owned) first_prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(first_prompt);
+    first_owned = false;
+    const first = try driveUntilOperationFinished(&session_runtime);
+    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.completed, first.reason);
+    try std.testing.expect(!first.saw_compaction_start);
+
+    var second_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "again", .auto);
+    var second_owned = true;
+    defer if (second_owned) second_prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(second_prompt);
+    second_owned = false;
+    const second = try driveUntilOperationFinished(&session_runtime);
+    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.completed, second.reason);
+    try std.testing.expect(!second.saw_compaction_start);
+    try std.testing.expectEqual(@as(usize, 2), FlakyStream.call_count);
+}
+
 test "session runtime runs threshold compaction as the operation's opening phase" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2749,7 +2853,7 @@ test "session runtime runs threshold compaction as the operation's opening phase
     var session_runtime = try initRetryTestRuntime(
         &tmp,
         task_runtime,
-        "{\"compaction\":{\"enabled\":true,\"keepRecentTokens\":1}}",
+        "{\"compaction\":{\"enabled\":true,\"keepRecentTokens\":1,\"reserveTokens\":1000000}}",
     );
     defer session_runtime.deinit();
 
@@ -2778,6 +2882,193 @@ test "session runtime runs threshold compaction as the operation's opening phase
     // compaction entry before the second turn.
     try std.testing.expectEqual(@as(usize, 3), FlakyStream.call_count);
     try std.testing.expect(session_runtime.session.manager.entries.items[2] == .compaction);
+    try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime manual compact slash command starts compaction operation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    FlakyStream.reset(0);
+    FlakyStream.success_usage_total_tokens = 100;
+    var session_runtime = try initRetryTestRuntime(
+        &tmp,
+        task_runtime,
+        "{\"compaction\":{\"enabled\":false,\"keepRecentTokens\":1}}",
+    );
+    defer session_runtime.deinit();
+
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
+    var prompt_owned = true;
+    defer if (prompt_owned) prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(prompt);
+    prompt_owned = false;
+    _ = try driveUntilOperationFinished(&session_runtime);
+
+    var compact = try client_protocol.CommandEnvelope.initSubmitPrompt(
+        std.testing.allocator,
+        2,
+        "/compact focus on files",
+        .auto,
+    );
+    var compact_owned = true;
+    defer if (compact_owned) compact.deinit(std.testing.allocator);
+    try session_runtime.submit(compact);
+    compact_owned = false;
+    const compact_outcome = try driveUntilOperationFinished(&session_runtime);
+
+    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.completed, compact_outcome.reason);
+    try std.testing.expect(compact_outcome.saw_compaction_start);
+    try std.testing.expect(compact_outcome.saw_compaction_end_result);
+    try std.testing.expectEqual(@as(usize, 2), FlakyStream.call_count);
+    try std.testing.expect(std.mem.indexOf(u8, FlakyStream.last_prompt, "Additional focus: focus on files") != null);
+    try std.testing.expect(session_runtime.session.manager.entries.items[2] == .compaction);
+}
+
+test "session runtime manual compact reports nothing to compact" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    FlakyStream.reset(0);
+    var session_runtime = try initRetryTestRuntime(
+        &tmp,
+        task_runtime,
+        "{\"compaction\":{\"enabled\":false}}",
+    );
+    defer session_runtime.deinit();
+
+    var compact = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "/compact", .auto);
+    var compact_owned = true;
+    defer if (compact_owned) compact.deinit(std.testing.allocator);
+    try session_runtime.submit(compact);
+    compact_owned = false;
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expect(event.event.prompt_command.result == .failed);
+    try std.testing.expectEqualStrings("compact", event.event.prompt_command.command.text);
+    try std.testing.expectEqualStrings("nothing to compact", event.event.prompt_command.message.text);
+    try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime manual compact rejects while active" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    FlakyStream.reset(0);
+    var session_runtime = try initRetryTestRuntime(
+        &tmp,
+        task_runtime,
+        "{\"compaction\":{\"enabled\":false}}",
+    );
+    defer session_runtime.deinit();
+
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
+    var prompt_owned = true;
+    defer if (prompt_owned) prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(prompt);
+    prompt_owned = false;
+    try session_runtime.step();
+    try std.testing.expect(session_runtime.active != null);
+    while (session_runtime.drainEvent()) |event| {
+        var owned = event;
+        owned.deinit(std.testing.allocator);
+    }
+
+    var compact = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "/compact", .auto);
+    var compact_owned = true;
+    defer if (compact_owned) compact.deinit(std.testing.allocator);
+    try session_runtime.submit(compact);
+    compact_owned = false;
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event.event == .prompt_command);
+    try std.testing.expect(event.event.prompt_command.result == .failed);
+    try std.testing.expectEqualStrings("cancel active operation before compaction", event.event.prompt_command.message.text);
+}
+
+test "session runtime does not retrigger threshold from kept pre-compaction usage" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    FlakyStream.reset(0);
+    FlakyStream.success_usage_total_tokens = 127500;
+    var session_runtime = try initRetryTestRuntime(
+        &tmp,
+        task_runtime,
+        "{\"compaction\":{\"enabled\":true,\"keepRecentTokens\":1000,\"reserveTokens\":1000}}",
+    );
+    defer session_runtime.deinit();
+
+    var first_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
+    var first_owned = true;
+    defer if (first_owned) first_prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(first_prompt);
+    first_owned = false;
+    _ = try driveUntilOperationFinished(&session_runtime);
+
+    try std.testing.expect(session_runtime.session.shouldRunThresholdCompaction());
+    const first_kept_entry_id = session_runtime.session.manager.entries.items[0].id();
+    const compaction = try session_runtime.session.manager.prepareCompactionEntry(
+        "summary",
+        first_kept_entry_id,
+        127500,
+        "2026-06-09T00:00:00Z",
+    );
+    _ = session_runtime.session.manager.commitPreparedEntry(compaction);
+    try std.testing.expect(!session_runtime.session.shouldRunThresholdCompaction());
+
+    FlakyStream.success_usage_total_tokens = 0;
+    var third_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 3, "after compact", .auto);
+    var third_owned = true;
+    defer if (third_owned) third_prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(third_prompt);
+    third_owned = false;
+    const third = try driveUntilOperationFinished(&session_runtime);
+    try std.testing.expect(!third.saw_compaction_start);
+    try std.testing.expectEqual(@as(usize, 2), FlakyStream.call_count);
+}
+
+test "session runtime overflow compaction retries once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    FlakyStream.reset(0);
+    var session_runtime = try initRetryTestRuntime(
+        &tmp,
+        task_runtime,
+        "{\"compaction\":{\"enabled\":true,\"keepRecentTokens\":1}}",
+    );
+    defer session_runtime.deinit();
+
+    var seed = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "seed", .auto);
+    var seed_owned = true;
+    defer if (seed_owned) seed.deinit(std.testing.allocator);
+    try session_runtime.submit(seed);
+    seed_owned = false;
+    _ = try driveUntilOperationFinished(&session_runtime);
+
+    FlakyStream.reset(2);
+    FlakyStream.error_text = "maximum context length exceeded";
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "hello", .auto);
+    var prompt_owned = true;
+    defer if (prompt_owned) prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(prompt);
+    prompt_owned = false;
+    const outcome = try driveUntilOperationFinished(&session_runtime);
+
+    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.failed, outcome.reason);
+    try std.testing.expectEqual(@as(usize, 1), outcome.compaction_start_count);
+    try std.testing.expectEqual(@as(usize, 3), FlakyStream.call_count);
     try std.testing.expect(session_runtime.active == null);
 }
 
