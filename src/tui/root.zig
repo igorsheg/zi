@@ -9,6 +9,7 @@ pub const glyphs = @import("glyphs.zig");
 pub const Greeter = @import("Greeter.zig");
 pub const Picker = @import("Picker.zig");
 pub const PromptHistory = @import("PromptHistory.zig");
+pub const notify = @import("notify.zig");
 pub const Terminal = @import("Terminal.zig");
 pub const Transcript = @import("Transcript.zig");
 pub const input = @import("input.zig");
@@ -32,6 +33,7 @@ test {
     _ = Greeter;
     _ = Picker;
     _ = PromptHistory;
+    _ = notify;
     _ = Terminal;
     _ = Transcript;
     _ = input;

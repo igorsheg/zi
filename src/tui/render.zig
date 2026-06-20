@@ -16,6 +16,7 @@ const Picker = @import("Picker.zig");
 const glyphs = @import("glyphs.zig");
 const input_mod = @import("input.zig");
 const markdown = @import("markdown.zig");
+const notify_mod = @import("notify.zig");
 const shimmer = @import("shimmer.zig");
 const shuffle_text = @import("shuffle_text.zig");
 const status_mod = @import("status.zig");
@@ -116,6 +117,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
         const y: u16 = @intCast(@as(usize, app.height) - picker_rows - composer_rows - 1);
         drawStatusLine(app, &painter, y);
     }
+    drawNotifyOverlay(app, &painter, scratch, composer_rows, picker_rows, status_rows);
     drawComposer(app, &painter, composer_rows, picker_rows);
     if (app.visiblePicker()) |picker| {
         drawPicker(app, picker, &painter, picker_rows, app.visiblePickerFocusesFilter());
@@ -1162,19 +1164,22 @@ fn statusShimmerConfig(theme: *const theme_mod.Theme) shimmer.Config {
 }
 
 fn drawStatusLine(app: *App, painter: *Painter, y: u16) void {
+    if (app.width == 0) return;
+    painter.fillRect(0, y, app.width, 1, .{});
+    _ = drawPersistentStatusLine(app, painter, y);
+}
+
+fn drawPersistentStatusLine(app: *App, painter: *Painter, y: u16) u16 {
     var views: [status_mod.entry_count_max]status_mod.View = undefined;
     const view_count = app.status.ordered(.status_line, views[0..]);
-    if (view_count == 0 or app.width == 0) return;
-    painter.fillRect(0, y, app.width, 1, .{});
-
     var x: u16 = 0;
     var rendered_any = false;
     for (views[0..view_count]) |view| {
         if (view.text.len == 0) continue;
         const remaining: usize = if (x < app.width) app.width - x else 0;
-        if (remaining == 0) return;
+        if (remaining == 0) return x;
         const separator_width: usize = if (rendered_any) text_mod.displayWidth(glyphs.status_separator) else 0;
-        if (separator_width >= remaining) return;
+        if (separator_width >= remaining) return x;
         const available = remaining - separator_width;
         const fitted = fitToWidth(view.text, available);
         if (fitted.len == 0) continue;
@@ -1201,6 +1206,86 @@ fn drawStatusLine(app: *App, painter: *Painter, y: u16) void {
         }
         rendered_any = true;
     }
+    return x;
+}
+
+fn drawNotifyOverlay(
+    app: *App,
+    painter: *Painter,
+    scratch: *RowScratch,
+    composer_rows: usize,
+    picker_rows: usize,
+    status_rows: usize,
+) void {
+    var views: [notify_mod.item_count_max]notify_mod.View = undefined;
+    const view_count = app.notify.ordered(app.now_ms, views[0..]);
+    if (view_count == 0 or app.width == 0) return;
+
+    const reserved_bottom = composer_rows + picker_rows;
+    if (@as(usize, app.height) <= reserved_bottom) return;
+    const base_y = @as(usize, app.height) - reserved_bottom - 1;
+    const status_left = if (status_rows > 0) statusLineWidth(app) else 0;
+    var text_buffer: [notify_mod.text_bytes_max + notify_mod.annote_bytes_max + 32]u8 = undefined;
+
+    for (views[0..view_count], 0..) |view, index| {
+        if (index > base_y) return;
+        const y: u16 = @intCast(base_y - index);
+        const left_limit = if (index == 0 and status_left > 0)
+            @min(@as(usize, app.width), status_left + text_mod.displayWidth(glyphs.status_separator))
+        else
+            0;
+        if (left_limit >= app.width) continue;
+
+        const text = formatNotifyText(&text_buffer, scratch, view);
+        const fitted = fitToWidth(text, app.width - left_limit);
+        if (fitted.len == 0) continue;
+        const width = text_mod.displayWidth(fitted);
+        const x = @as(usize, app.width) - width;
+        painter.fillRect(@intCast(x), y, @intCast(width), 1, .{});
+        _ = drawShuffleText(
+            painter,
+            @intCast(x),
+            y,
+            fitted,
+            app.now_ms,
+            view.started_ms,
+            statusToneStyle(view.tone, &app.theme),
+        );
+    }
+}
+
+fn statusLineWidth(app: *App) usize {
+    var views: [status_mod.entry_count_max]status_mod.View = undefined;
+    const view_count = app.status.ordered(.status_line, views[0..]);
+    var width: usize = 0;
+    var rendered_any = false;
+    for (views[0..view_count]) |view| {
+        if (view.text.len == 0) continue;
+        if (rendered_any) width += text_mod.displayWidth(glyphs.status_separator);
+        width += text_mod.displayWidth(view.text);
+        rendered_any = true;
+    }
+    return @min(width, app.width);
+}
+
+fn formatNotifyText(buffer: []u8, scratch: *RowScratch, view: notify_mod.View) []const u8 {
+    if (view.count > 1 and view.annote.len > 0) {
+        const text = std.fmt.bufPrint(
+            buffer,
+            "({d}x) {s} {s}",
+            .{ view.count, view.message, view.annote },
+        ) catch return view.message;
+        return internText(scratch, text);
+    }
+    if (view.count > 1) {
+        const text = std.fmt.bufPrint(buffer, "({d}x) {s}", .{ view.count, view.message }) catch return view.message;
+        return internText(scratch, text);
+    }
+    if (view.annote.len > 0) {
+        const text = std.fmt.bufPrint(buffer, "{s} {s}", .{ view.message, view.annote }) catch return view.message;
+        return internText(scratch, text);
+    }
+    return view.message;
 }
 
 /// Longest grapheme-aligned prefix fitting in `available` display columns.
@@ -1856,6 +1941,29 @@ test "composer overflow window shows a scroll hint" {
     draw(&app, &vx, scratch);
 
     try std.testing.expect(screenContainsText(vx.window(), "↑ 1 more · ↓ 1 more"));
+}
+
+test "notification overlay keeps formatted text alive for vaxis cells" {
+    var env = std.process.Environ.Map.init(testing_gpa);
+    defer env.deinit();
+
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var output_storage: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_storage);
+    defer vx.deinit(testing_gpa, &writer);
+
+    try vx.resize(testing_gpa, &writer, .{ .cols = 40, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(40, 8, .{});
+    defer app.deinit(testing_gpa);
+    try std.testing.expectEqual(notify_mod.SetResult.ok, app.notify.notify(.{ .message = "hello" }, 0));
+    app.now_ms = 1_000;
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try std.testing.expect(screenContainsText(vx.window(), "hello INFO"));
 }
 
 test "vaxis screen receives the frame" {

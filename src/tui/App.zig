@@ -14,6 +14,7 @@ const Picker = @import("Picker.zig");
 const PromptHistory = @import("PromptHistory.zig");
 const Transcript = @import("Transcript.zig");
 const input_mod = @import("input.zig");
+const notify_mod = @import("notify.zig");
 const render = @import("render.zig");
 const status_mod = @import("status.zig");
 const text_mod = @import("text.zig");
@@ -101,6 +102,7 @@ transcript: Transcript = .{},
 greeter: ?Greeter = null,
 completion: Completion = .{},
 status: status_mod.Store = .{},
+notify: notify_mod.Store = .{},
 viewport: TranscriptViewport = .{},
 theme: theme_mod.Theme,
 tools_expanded: bool = false,
@@ -330,6 +332,8 @@ pub const Command = union(enum) {
     replace_composer_text: []const u8,
     set_status: status_mod.Set,
     clear_status: status_mod.Clear,
+    notify: notify_mod.Notify,
+    clear_notify: notify_mod.Clear,
 };
 
 pub const Effect = union(enum) {
@@ -365,7 +369,8 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         .tick => |tick| {
             if (tick.now_ms != self.now_ms) {
                 self.now_ms = tick.now_ms;
-                if (self.statusHasAnimated()) self.dirty = true;
+                const expired = self.notify.tick(self.now_ms);
+                if (expired or self.statusHasAnimated()) self.dirty = true;
             }
             return null;
         },
@@ -505,6 +510,18 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         },
         .clear_status => |request| {
             if (self.status.clear(request)) self.dirty = true;
+            return null;
+        },
+        .notify => |update| {
+            switch (self.notify.notify(update, self.now_ms)) {
+                .ok => self.dirty = true,
+                .dropped_full => try self.notice(gpa, .warning, "notifications full"),
+                .update_only_miss => {},
+            }
+            return null;
+        },
+        .clear_notify => |request| {
+            if (self.notify.clear(request)) self.dirty = true;
             return null;
         },
     }
@@ -868,6 +885,7 @@ fn syncComposerScrollHint(self: *App) void {
 }
 
 fn statusHasAnimated(self: *const App) bool {
+    if (self.notify.hasAnimated(self.now_ms)) return true;
     const slots = [_]status_mod.Slot{
         .composer_left,
         .composer_right,
@@ -1077,7 +1095,11 @@ fn notice(self: *App, gpa: std.mem.Allocator, level: Transcript.StatusLevel, tex
 }
 
 pub fn hasAnimation(self: *const App) bool {
-    return self.status.hasAnimated(.status_line, self.now_ms);
+    return self.status.hasAnimated(.status_line, self.now_ms) or self.notify.hasAnimated(self.now_ms);
+}
+
+pub fn nextDeadlineMs(self: *const App) ?i64 {
+    return self.notify.nextDeadlineMs(self.now_ms);
 }
 
 test "submit returns owned text and clears the composer" {

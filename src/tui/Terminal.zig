@@ -144,6 +144,10 @@ pub fn hasAnimation(self: *const Terminal) bool {
     return self.app.hasAnimation();
 }
 
+pub fn nextDeadlineMs(self: *const Terminal) ?i64 {
+    return self.app.nextDeadlineMs();
+}
+
 pub fn composerText(self: *const Terminal) []const u8 {
     return self.app.composer.text();
 }

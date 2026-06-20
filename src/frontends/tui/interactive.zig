@@ -43,7 +43,8 @@ const status_id_working: tui.status.ContributionId = 1;
 const status_id_queue: tui.status.ContributionId = 2;
 const status_id_recovery: tui.status.ContributionId = 3;
 const status_id_completion: tui.status.ContributionId = 4;
-const status_id_notice: tui.status.ContributionId = 5;
+const notify_key_cancel: tui.notify.Key = 1;
+const notify_key_recovery: tui.notify.Key = 2;
 const retry_reason_bytes_max: usize = 64;
 const composer_cwd_slot_id: tui.status.ContributionId = 1;
 const composer_session_slot_id: tui.status.ContributionId = 2;
@@ -248,9 +249,10 @@ const InteractiveController = struct {
             if (!self.terminal.isRunning()) break;
 
             const frame_active = self.terminal.hasAnimation() or (self.operation_active and self.terminal.isDirty());
+            const wake_delay = self.clampWakeDelayToDeadline(nextWakeDelayMs(immediate, frame_active));
             const wake = try self.app.waitAndApplyWake(
                 self.terminal.inputFd(),
-                nextWakeDelayMs(immediate, frame_active),
+                wake_delay,
             );
             // Time enters the product through ticks; refresh before handling
             // the wake so wall-clock policies (ctrl+c double press, shimmer)
@@ -275,6 +277,13 @@ const InteractiveController = struct {
         if (!self.terminal.isDirty()) return;
         if (!self.render_throttle.shouldRender(now_ms, self.operation_active)) return;
         try self.terminal.renderIfDirty();
+    }
+
+    fn clampWakeDelayToDeadline(self: *InteractiveController, delay_ms: u64) u64 {
+        const deadline = self.terminal.nextDeadlineMs() orelse return delay_ms;
+        const now_ms = self.nowMs();
+        if (deadline <= now_ms) return 0;
+        return @min(delay_ms, @as(u64, @intCast(deadline - now_ms)));
     }
 
     fn drainInput(self: *InteractiveController) !void {
@@ -545,7 +554,7 @@ const InteractiveController = struct {
         if (self.cancel_requested) return;
         if (try self.submitCommand(.{ .command = .{ .cancel = .{} } }) == .queued) {
             self.cancel_requested = true;
-            try self.appendStatusWithTone(.info, "cancel requested", .canceled);
+            try self.appendKeyedStatusWithTone(notify_key_cancel, .info, "cancel requested", .canceled);
         }
     }
 
@@ -600,6 +609,7 @@ const InteractiveController = struct {
             self.event_cursor.last_seq = envelope.seq;
             self.event_cursor.recovery = .live;
             try self.clearStatus(status_id_recovery);
+            try self.clearNotify(notify_key_recovery);
             try self.applyClientEvent(envelope.event);
             return;
         }
@@ -609,13 +619,23 @@ const InteractiveController = struct {
                 .replay => {
                     self.event_cursor.last_seq = envelope.seq;
                     self.event_cursor.recovery = .snapshot_requested;
-                    try self.appendStatus(.warning, "replay requires snapshot in TUI adapter");
+                    try self.appendKeyedStatusWithTone(
+                        notify_key_recovery,
+                        .warning,
+                        "replay requires snapshot in TUI adapter",
+                        .warning,
+                    );
                     try self.requestSnapshot();
                 },
                 .replay_gap => {
                     self.event_cursor.last_seq = envelope.seq;
                     self.event_cursor.recovery = .snapshot_requested;
-                    try self.appendStatus(.warning, "replay gap; requesting snapshot");
+                    try self.appendKeyedStatusWithTone(
+                        notify_key_recovery,
+                        .warning,
+                        "replay gap; requesting snapshot",
+                        .warning,
+                    );
                     try self.requestSnapshot();
                 },
                 else => {},
@@ -627,6 +647,7 @@ const InteractiveController = struct {
         if (envelope.seq != expected) {
             self.event_cursor.recovery = .snapshot_requested;
             try self.setRecoveryStatus("recovering event gap");
+            try self.appendKeyedStatusWithTone(notify_key_recovery, .warning, "recovering event gap", .warning);
             try self.requestSnapshot();
             return;
         }
@@ -675,12 +696,22 @@ const InteractiveController = struct {
             .history_page => |page| try self.applyHistoryPage(page),
             .replay => {
                 self.event_cursor.recovery = .snapshot_requested;
-                try self.appendStatus(.warning, "replay requires snapshot in TUI adapter");
+                try self.appendKeyedStatusWithTone(
+                    notify_key_recovery,
+                    .warning,
+                    "replay requires snapshot in TUI adapter",
+                    .warning,
+                );
                 try self.requestSnapshot();
             },
             .replay_gap => {
                 self.event_cursor.recovery = .snapshot_requested;
-                try self.appendStatus(.warning, "replay gap; requesting snapshot");
+                try self.appendKeyedStatusWithTone(
+                    notify_key_recovery,
+                    .warning,
+                    "replay gap; requesting snapshot",
+                    .warning,
+                );
                 try self.requestSnapshot();
             },
             .shutdown_started => self.terminal.requestStop(),
@@ -698,7 +729,7 @@ const InteractiveController = struct {
                     "event overflow: dropped {d}",
                     .{overflow.dropped_count},
                 ) catch "event overflow";
-                try self.appendStatus(.warning, text);
+                try self.appendKeyedStatusWithTone(notify_key_recovery, .warning, text, .warning);
                 self.event_cursor.recovery = .snapshot_requested;
                 try self.requestSnapshot();
             },
@@ -816,7 +847,7 @@ const InteractiveController = struct {
         try self.clearStatus(status_id_working);
         try self.clearStatus(status_id_queue);
         try self.clearStatus(status_id_completion);
-        try self.clearStatus(status_id_notice);
+        _ = try self.terminal.applyCommand(.{ .clear_notify = .all });
         self.completion_snapshot_requested = false;
         self.completion_snapshot_loaded = false;
         try self.requestSnapshot();
@@ -1064,7 +1095,7 @@ const InteractiveController = struct {
             .canceled => {
                 _ = try self.terminal.applyCommand(.mark_pending_tools_canceled);
                 try self.clearStatus(status_id_working);
-                try self.appendStatusWithTone(.info, "canceled", .canceled);
+                try self.appendKeyedStatusWithTone(notify_key_cancel, .info, "canceled", .canceled);
             },
             .failed => try self.clearStatus(status_id_working),
         }
@@ -1200,19 +1231,22 @@ const InteractiveController = struct {
         text: []const u8,
         tone: tui.status.Tone,
     ) !void {
+        try self.appendKeyedStatusWithTone(0, level, text, tone);
+    }
+
+    fn appendKeyedStatusWithTone(
+        self: *InteractiveController,
+        key: tui.notify.Key,
+        level: tui.Transcript.StatusLevel,
+        text: []const u8,
+        tone: tui.status.Tone,
+    ) !void {
         if (text.len == 0) return;
-        var buffer: [tui.status.text_bytes_max]u8 = undefined;
-        const display = switch (level) {
-            .info => text,
-            .warning => std.fmt.bufPrint(&buffer, "warning: {s}", .{text}) catch text,
-            .err => std.fmt.bufPrint(&buffer, "error: {s}", .{text}) catch text,
-        };
-        _ = try self.terminal.applyCommand(.{ .set_status = .{
-            .slot = .status_line,
-            .id = status_id_notice,
-            .priority = 10,
-            .text = boundedChunk(display),
-            .effect = .shuffle,
+        _ = try self.terminal.applyCommand(.{ .notify = .{
+            .key = key,
+            .message = boundedChunk(text),
+            .level = notifyLevel(level),
+            .annote = notifyAnnote(level),
             .tone = tone,
         } });
     }
@@ -1271,6 +1305,10 @@ const InteractiveController = struct {
 
     fn clearStatus(self: *InteractiveController, id: tui.status.ContributionId) !void {
         _ = try self.terminal.applyCommand(.{ .clear_status = .{ .slot = .status_line, .id = id } });
+    }
+
+    fn clearNotify(self: *InteractiveController, key: tui.notify.Key) !void {
+        _ = try self.terminal.applyCommand(.{ .clear_notify = .{ .item = .{ .key = key } } });
     }
 
     fn tickTime(self: *InteractiveController) !i64 {
@@ -1358,6 +1396,21 @@ fn boundedChunk(text: []const u8) []const u8 {
     const prefix = tui.text.utf8Prefix(text, transcript_append_max);
     if (prefix.len > 0) return prefix;
     return text[0..@min(text.len, transcript_append_max)];
+}
+
+fn notifyLevel(level: tui.Transcript.StatusLevel) tui.notify.Level {
+    return switch (level) {
+        .info => .info,
+        .warning => .warning,
+        .err => .err,
+    };
+}
+
+fn notifyAnnote(level: tui.Transcript.StatusLevel) ?[]const u8 {
+    return switch (level) {
+        .info => "",
+        .warning, .err => null,
+    };
 }
 
 fn formatRejectionMessage(buffer: []u8, rejection: client_protocol.Rejection) []const u8 {
@@ -1579,7 +1632,7 @@ test "completion picker items come only from protocol snapshot data" {
     try std.testing.expectEqualStrings("custom detail", mapped[0].detail);
 }
 
-test "operation completion does not clear notice status" {
+test "operation completion does not clear notification" {
     const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
     defer terminal.deinit();
     var stdout_discard = std.Io.Writer.Discarding.init(&.{});
@@ -1597,16 +1650,38 @@ test "operation completion does not clear notice status" {
     try controller.setWorkingStatus("working");
     try controller.applyOperationFinished(.{ .reason = .completed });
 
-    var views: [tui.status.entry_count_max]tui.status.View = undefined;
-    const count = terminal.app.status.ordered(.status_line, &views);
-    var saw_notice = false;
-    var saw_working = false;
-    for (views[0..count]) |view| {
-        saw_notice = saw_notice or std.mem.eql(u8, view.text, "warning: keep me");
-        saw_working = saw_working or std.mem.eql(u8, view.text, "working");
-    }
-    try std.testing.expect(saw_notice);
-    try std.testing.expect(!saw_working);
+    var status_views: [tui.status.entry_count_max]tui.status.View = undefined;
+    const status_count = terminal.app.status.ordered(.status_line, &status_views);
+    try std.testing.expectEqual(@as(usize, 0), status_count);
+
+    var notify_views: [tui.notify.item_count_max]tui.notify.View = undefined;
+    const notify_count = terminal.app.notify.ordered(terminal.app.now_ms, &notify_views);
+    try std.testing.expectEqual(@as(usize, 1), notify_count);
+    try std.testing.expectEqualStrings("keep me", notify_views[0].message);
+}
+
+test "cancel notification updates in place without info annote" {
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+
+    try controller.appendKeyedStatusWithTone(notify_key_cancel, .info, "cancel requested", .canceled);
+    try controller.appendKeyedStatusWithTone(notify_key_cancel, .info, "canceled", .canceled);
+
+    var notify_views: [tui.notify.item_count_max]tui.notify.View = undefined;
+    const notify_count = terminal.app.notify.ordered(terminal.app.now_ms, &notify_views);
+    try std.testing.expectEqual(@as(usize, 1), notify_count);
+    try std.testing.expectEqualStrings("canceled", notify_views[0].message);
+    try std.testing.expectEqualStrings("", notify_views[0].annote);
 }
 
 test "compaction end keeps working status while operation remains active" {
@@ -1855,6 +1930,11 @@ test "TUI recovers event gaps by requesting snapshot directly" {
     });
     const command = app.commands.pop().?;
     try std.testing.expect(command.command == .snapshot);
+
+    var notify_views: [tui.notify.item_count_max]tui.notify.View = undefined;
+    const notify_count = terminal.app.notify.ordered(terminal.app.now_ms, &notify_views);
+    try std.testing.expectEqual(@as(usize, 1), notify_count);
+    try std.testing.expectEqualStrings("recovering event gap", notify_views[0].message);
 }
 
 fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options: Options) !?[]const u8 {
