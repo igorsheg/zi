@@ -31,7 +31,7 @@ revision: u64 = 0,
 pub const Role = enum { user, assistant, system, thinking };
 pub const StatusLevel = enum { info, warning, err };
 pub const ToolPresentation = enum { generic, command, file, patch };
-pub const ToolStatus = enum { pending, success, err };
+pub const ToolStatus = enum { pending, success, err, canceled };
 pub const ToolBodyMode = enum { visible, hidden_on_success };
 pub const ToolCollapseMode = enum { head, tail };
 
@@ -288,6 +288,18 @@ pub fn replaceFrontToolOutput(
     return outcome;
 }
 
+pub fn replaceFrontToolFooter(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    tool_call_id: []const u8,
+    footer: []const u8,
+) error{OutOfMemory}!Outcome {
+    const index = self.findToolFromFront(tool_call_id) orelse return .{};
+    const outcome = try self.replaceToolFooterAt(gpa, index, footer);
+    self.evictNewestUntilBounded(gpa);
+    return outcome;
+}
+
 pub fn replaceToolFooter(
     self: *Transcript,
     gpa: std.mem.Allocator,
@@ -295,6 +307,17 @@ pub fn replaceToolFooter(
     footer: []const u8,
 ) error{OutOfMemory}!Outcome {
     const index = self.findTool(tool_call_id) orelse return .{};
+    const outcome = try self.replaceToolFooterAt(gpa, index, footer);
+    self.evictUntilBounded(gpa);
+    return outcome;
+}
+
+fn replaceToolFooterAt(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    index: usize,
+    footer: []const u8,
+) error{OutOfMemory}!Outcome {
     const item = &self.items.items[index];
     const tool = &item.body.tool;
     const old_size = tool.sizeBytes();
@@ -305,8 +328,21 @@ pub fn replaceToolFooter(
     tool.footer = copy;
 
     self.noteItemMutation(item, old_size, tool.sizeBytes());
-    self.evictUntilBounded(gpa);
     return .{ .truncated = bounded.len < footer.len };
+}
+
+pub fn markPendingToolsCanceled(self: *Transcript) bool {
+    var changed = false;
+    for (self.items.items) |*item| {
+        if (item.body != .tool) continue;
+        if (item.body.tool.status != .pending) continue;
+        item.body.tool.status = .canceled;
+        item.version +%= 1;
+        if (item.version == 0) item.version = 1;
+        changed = true;
+    }
+    if (changed) self.revision +%= 1;
+    return changed;
 }
 
 fn insertMessageAt(
@@ -580,8 +616,9 @@ fn insertOwnedItem(self: *Transcript, gpa: std.mem.Allocator, index: usize, item
 
 fn mergeToolStatus(old: ToolStatus, new: ToolStatus) ToolStatus {
     return switch (new) {
-        .pending => if (old == .success or old == .err) old else .pending,
-        .success, .err => new,
+        .pending => if (old == .pending) .pending else old,
+        .canceled => if (old == .success or old == .err) old else .canceled,
+        .success, .err => if (old == .canceled) old else new,
     };
 }
 
@@ -893,6 +930,30 @@ test "tool end reuses the start item and never downgrades a terminal status" {
     const tool = transcript.items.items[0].body.tool;
     try std.testing.expectEqual(ToolStatus.success, tool.status);
     try std.testing.expectEqualStrings("$ pwd", tool.title); // empty update keeps the old title
+}
+
+test "pending tools can be marked canceled without changing completed cards" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "pending", .name = "bash" } });
+    _ = try transcript.append(gpa, .{ .tool = .{
+        .tool_call_id = "done",
+        .name = "read",
+        .status = .success,
+    } });
+    _ = try transcript.append(gpa, .{ .tool = .{
+        .tool_call_id = "failed",
+        .name = "edit",
+        .status = .err,
+    } });
+
+    try std.testing.expect(transcript.markPendingToolsCanceled());
+    try std.testing.expect(!transcript.markPendingToolsCanceled());
+    try std.testing.expectEqual(ToolStatus.canceled, transcript.items.items[0].body.tool.status);
+    try std.testing.expectEqual(ToolStatus.success, transcript.items.items[1].body.tool.status);
+    try std.testing.expectEqual(ToolStatus.err, transcript.items.items[2].body.tool.status);
 }
 
 test "reused terminal tool id starts a new item and updates newest" {

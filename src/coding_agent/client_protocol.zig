@@ -855,6 +855,7 @@ pub const HistorySnapshotItem = struct {
     tool_call_id: ?EventText = null,
     tool_name: ?EventText = null,
     is_error: bool = false,
+    details_json: ?EventText = null,
 
     pub const Kind = enum { user, assistant, system, tool_result };
 
@@ -865,6 +866,7 @@ pub const HistorySnapshotItem = struct {
         if (self.tool_calls.len > 0) allocator.free(self.tool_calls);
         if (self.tool_call_id) |*id| id.deinit(allocator);
         if (self.tool_name) |*name| name.deinit(allocator);
+        if (self.details_json) |*json| json.deinit(allocator);
         self.* = undefined;
     }
 
@@ -877,11 +879,13 @@ pub const HistoryToolCall = struct {
     id: EventText,
     name: EventText,
     title: EventText,
+    arguments_json: EventText,
 
     pub fn deinit(self: *HistoryToolCall, allocator: std.mem.Allocator) void {
         self.id.deinit(allocator);
         self.name.deinit(allocator);
         self.title.deinit(allocator);
+        self.arguments_json.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -948,13 +952,17 @@ fn itemTextBytes(item: HistorySnapshotItem) usize {
     var total = item.text.text.len + toolCallsTextBytes(item.tool_calls);
     if (item.tool_call_id) |id| total += id.text.len;
     if (item.tool_name) |name| total += name.text.len;
+    if (item.details_json) |json| total += json.text.len;
     return total;
 }
 
 fn toolCallsTextBytes(tool_calls: []const HistoryToolCall) usize {
     var total: usize = 0;
     for (tool_calls) |tool_call| {
-        total += tool_call.id.text.len + tool_call.name.text.len + tool_call.title.text.len;
+        total += tool_call.id.text.len +
+            tool_call.name.text.len +
+            tool_call.title.text.len +
+            tool_call.arguments_json.text.len;
     }
     return total;
 }
@@ -1088,10 +1096,18 @@ fn historyToolCall(
     errdefer id.text.deinit(allocator);
     var name = try boundedHistoryText(allocator, tool_call.name, history_tool_name_bytes_max);
     errdefer name.text.deinit(allocator);
-    const title = try toolCallTitle(allocator, tool_call, item_text_bytes_max);
+    var title = try toolCallTitle(allocator, tool_call, item_text_bytes_max);
+    errdefer title.text.deinit(allocator);
+    var arguments_json = try boundedJsonText(allocator, tool_call.arguments, item_text_bytes_max);
+    errdefer arguments_json.text.deinit(allocator);
     return .{
-        .tool_call = .{ .id = id.text, .name = name.text, .title = title.text },
-        .full_text_bytes = id.full_bytes + name.full_bytes + title.full_bytes,
+        .tool_call = .{
+            .id = id.text,
+            .name = name.text,
+            .title = title.text,
+            .arguments_json = arguments_json.text,
+        },
+        .full_text_bytes = id.full_bytes + name.full_bytes + title.full_bytes + arguments_json.full_bytes,
     };
 }
 
@@ -1129,6 +1145,11 @@ fn toolResultHistoryItem(
     errdefer tool_call_id.text.deinit(allocator);
     var tool_name = try boundedHistoryText(allocator, tool_result.tool_name, history_tool_name_bytes_max);
     errdefer tool_name.text.deinit(allocator);
+    var details_json: ?BoundedHistoryText = if (tool_result.details) |details|
+        try boundedJsonText(allocator, details, item_text_bytes_max)
+    else
+        null;
+    errdefer if (details_json) |*json| json.text.deinit(allocator);
     const text = try toolResultText(allocator, tool_result.content, item_text_bytes_max);
     return .{
         .item = .{
@@ -1138,8 +1159,10 @@ fn toolResultHistoryItem(
             .tool_call_id = tool_call_id.text,
             .tool_name = tool_name.text,
             .is_error = tool_result.is_error,
+            .details_json = if (details_json) |json| json.text else null,
         },
-        .full_text_bytes = text.full_bytes + tool_call_id.full_bytes + tool_name.full_bytes,
+        .full_text_bytes = text.full_bytes + tool_call_id.full_bytes + tool_name.full_bytes +
+            if (details_json) |json| json.full_bytes else 0,
     };
 }
 
@@ -1169,6 +1192,21 @@ fn toolResultText(
     return .{
         .text = try EventText.init(allocator, utf8Prefix(writer.buffered(), writer.buffered().len)),
         .full_bytes = full_bytes,
+    };
+}
+
+fn boundedJsonText(allocator: std.mem.Allocator, value: std.json.Value, max_bytes: usize) !BoundedHistoryText {
+    var buffer: [snapshot_history_item_text_bytes_max]u8 = undefined;
+    var writer = boundedHistoryWriter(&buffer, max_bytes);
+    std.json.Stringify.value(value, .{}, &writer) catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
+
+    var counter = std.Io.Writer.Discarding.init(&.{});
+    try std.json.Stringify.value(value, .{}, &counter.writer);
+    return .{
+        .text = try EventText.init(allocator, utf8Prefix(writer.buffered(), writer.buffered().len)),
+        .full_bytes = std.math.lossyCast(usize, counter.fullCount()),
     };
 }
 
@@ -1388,11 +1426,15 @@ test "history snapshot projects assistant tool calls and tool results" {
         .stop_reason = .tool_use,
         .timestamp = 0,
     } }, "t1");
+    var details = std.json.ObjectMap.empty;
+    defer details.deinit(std.testing.allocator);
+    try details.put(std.testing.allocator, "diff", .{ .string = "patch text" });
     _ = try appendTestMessage(&manager, .{ .tool_result = .{
         .tool_call_id = "call-1",
         .tool_name = "read",
         .content = &.{.{ .text = .{ .text = "file contents" } }},
         .is_error = false,
+        .details = .{ .object = details },
         .timestamp = 0,
     } }, "t2");
 
@@ -1405,9 +1447,11 @@ test "history snapshot projects assistant tool calls and tool results" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.items[0].tool_calls.len);
     try std.testing.expectEqualStrings("call-1", snapshot.items[0].tool_calls[0].id.text);
     try std.testing.expectEqualStrings("read", snapshot.items[0].tool_calls[0].name.text);
+    try std.testing.expectEqualStrings("{}", snapshot.items[0].tool_calls[0].arguments_json.text);
     try std.testing.expectEqual(HistorySnapshotItem.Kind.tool_result, snapshot.items[1].kind);
     try std.testing.expectEqualStrings("call-1", snapshot.items[1].tool_call_id.?.text);
     try std.testing.expectEqualStrings("file contents", snapshot.items[1].text.text);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.items[1].details_json.?.text, "patch text") != null);
 }
 
 test "history bounds tool text before storing snapshot items" {
@@ -1502,7 +1546,7 @@ test "history budget counts assistant tool call titles" {
 
     const session_items = try manager.reconstructSession(std.testing.allocator);
     defer std.testing.allocator.free(session_items);
-    const tool_call_bytes = tool_call.id.len + tool_call.name.len + title.text.text.len;
+    const tool_call_bytes = tool_call.id.len + tool_call.name.len + title.text.text.len + "{}".len;
     const collected = try collectHistoryBefore(std.testing.allocator, session_items, session_items.len, .{
         .items_max = 8,
         .item_text_bytes_max = 128,

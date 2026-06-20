@@ -82,6 +82,45 @@ pub fn endAppend(payload: agent_mod.AgentEvent.ToolExecutionEnd) tui.Transcript.
     );
 }
 
+pub fn historyCallAppend(
+    allocator: std.mem.Allocator,
+    buffers: *TitleBuffers,
+    tool_call: coding_agent.client_protocol.HistoryToolCall,
+    home_dir: ?[]const u8,
+) !tui.Transcript.Append.ToolAppend {
+    var parsed = try parseOptionalJson(allocator, tool_call.arguments_json.text);
+    defer if (parsed) |*value| value.deinit();
+    if (parsed) |value| {
+        const title = formatCallTitleWithHome(&buffers.title, tool_call.name.text, value.value, home_dir);
+        return append(
+            tool_call.id.text,
+            tool_call.name.text,
+            .pending,
+            if (title.len > 0) title else tool_call.title.text,
+            formatCompactCallTitle(&buffers.compact_title, tool_call.name.text, value.value),
+            false,
+        );
+    }
+    return append(tool_call.id.text, tool_call.name.text, .pending, tool_call.title.text, "", false);
+}
+
+pub fn historyFinish(
+    allocator: std.mem.Allocator,
+    metadata_buffer: []u8,
+    tool_name: []const u8,
+    is_error: bool,
+    text: []const u8,
+    details_json: ?[]const u8,
+) !FinishView {
+    var parsed_details = try parseOptionalJson(allocator, details_json);
+    defer if (parsed_details) |*value| value.deinit();
+    const details: ?std.json.Value = if (parsed_details) |value| value.value else null;
+    return .{
+        .output = try resultOutputFromText(allocator, tool_name, is_error, text, details),
+        .metadata = metadataForDetails(metadata_buffer, tool_name, details),
+    };
+}
+
 pub fn finish(
     allocator: std.mem.Allocator,
     metadata_buffer: []u8,
@@ -202,23 +241,56 @@ pub fn resultOutput(
     allocator: std.mem.Allocator,
     payload: agent_mod.AgentEvent.ToolExecutionEnd,
 ) !?[]u8 {
-    if (shouldHideSuccessfulToolResult(payload.tool_name, payload.is_error, payload.result.details)) return null;
-    if (kind(payload.tool_name) == .edit and !payload.is_error) {
-        if (payload.result.details) |details| {
-            if (details == .object) {
-                if (details.object.get("diff")) |diff| {
-                    if (diff == .string) {
-                        const copy = try allocator.dupe(u8, diff.string);
-                        return copy;
-                    }
-                }
-            }
-        }
-    }
     const text = try formatResultContent(allocator, payload.result.content, .{
         .trim_trailing_empty_lines = shouldTrimResult(payload.tool_name, payload.is_error),
-    }) orelse return null;
-    const normalized = try normalizeResultOutput(allocator, payload.tool_name, payload.result.details, text);
+    });
+    return resultOutputFromOwnedText(
+        allocator,
+        payload.tool_name,
+        payload.is_error,
+        text,
+        payload.result.details,
+    );
+}
+
+fn resultOutputFromText(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    is_error: bool,
+    text: []const u8,
+    details: ?std.json.Value,
+) !?[]u8 {
+    const body = if (shouldTrimResult(tool_name, is_error)) trimTrailingEmptyLines(text) else text;
+    const owned = try allocator.dupe(u8, body);
+    return resultOutputFromOwnedText(allocator, tool_name, is_error, owned, details);
+}
+
+fn resultOutputFromOwnedText(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    is_error: bool,
+    owned_text: ?[]u8,
+    details: ?std.json.Value,
+) !?[]u8 {
+    var text = owned_text;
+    errdefer if (text) |value| allocator.free(value);
+    if (shouldHideSuccessfulToolResult(tool_name, is_error, details)) {
+        if (text) |value| allocator.free(value);
+        return null;
+    }
+    if (kind(tool_name) == .edit and !is_error) {
+        if (details) |value| if (value == .object) if (value.object.get("diff")) |diff| if (diff == .string) {
+            if (text) |owned| {
+                allocator.free(owned);
+                text = null;
+            }
+            const copy = try allocator.dupe(u8, diff.string);
+            return copy;
+        };
+    }
+    const output = text orelse return null;
+    text = null;
+    const normalized = try normalizeResultOutput(allocator, tool_name, details, output);
     return normalized;
 }
 
@@ -699,6 +771,18 @@ fn jsonInt(object: std.json.ObjectMap, key: []const u8) ?i64 {
     return if (value == .integer) value.integer else null;
 }
 
+fn parseOptionalJson(
+    allocator: std.mem.Allocator,
+    text: ?[]const u8,
+) !?std.json.Parsed(std.json.Value) {
+    const json = text orelse return null;
+    if (json.len == 0) return null;
+    return std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+}
+
 fn homePathSuffix(path: []const u8, home_dir_raw: ?[]const u8) ?[]const u8 {
     const home_raw = home_dir_raw orelse return null;
     const home = trimTrailingPathSeparators(home_raw);
@@ -960,4 +1044,75 @@ test "metadata chips join with bullets" {
         "Truncated: x • Took 0.1s",
         joinMetadata(&buffer, "Truncated: x", "Took 0.1s"),
     );
+}
+
+test "history tool call title uses retained arguments json" {
+    const allocator = std.testing.allocator;
+    var buffers: TitleBuffers = .{};
+    var call: coding_agent.client_protocol.HistoryToolCall = .{
+        .id = try coding_agent.client_protocol.EventText.init(allocator, "call"),
+        .name = try coding_agent.client_protocol.EventText.init(allocator, "read"),
+        .title = try coding_agent.client_protocol.EventText.init(allocator, "read old-title"),
+        .arguments_json = try coding_agent.client_protocol.EventText.init(
+            allocator,
+            "{\"path\":\"AGENTS.md\",\"limit\":10}",
+        ),
+    };
+    defer call.deinit(allocator);
+
+    const append_item = try historyCallAppend(allocator, &buffers, call, null);
+    try std.testing.expectEqualStrings("read AGENTS.md:1-10", append_item.title);
+    try std.testing.expectEqualStrings("read resource AGENTS.md:1-10 (ctrl+o to expand)", append_item.compact_title);
+}
+
+test "history tool call falls back to retained title when arguments json is bad" {
+    const allocator = std.testing.allocator;
+    var buffers: TitleBuffers = .{};
+    var call: coding_agent.client_protocol.HistoryToolCall = .{
+        .id = try coding_agent.client_protocol.EventText.init(allocator, "call"),
+        .name = try coding_agent.client_protocol.EventText.init(allocator, "read"),
+        .title = try coding_agent.client_protocol.EventText.init(allocator, "read fallback"),
+        .arguments_json = try coding_agent.client_protocol.EventText.init(allocator, "{"),
+    };
+    defer call.deinit(allocator);
+
+    const append_item = try historyCallAppend(allocator, &buffers, call, null);
+    try std.testing.expectEqualStrings("read fallback", append_item.title);
+}
+
+test "history tool result uses retained details for body and footer" {
+    const allocator = std.testing.allocator;
+    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
+    var view = try historyFinish(
+        allocator,
+        &metadata_buffer,
+        "read",
+        false,
+        "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
+        "{\"nextOffset\":4,\"truncation\":{\"truncated\":false,\"userLimit\":true," ++
+            "\"remainingLines\":1,\"outputBytes\":9}}",
+    );
+    defer view.deinit(allocator);
+
+    try std.testing.expectEqualStrings("two\nthree", view.output.?);
+    try std.testing.expectEqualStrings(
+        "Limited: 1 more lines in file; use offset=4 to continue",
+        view.metadata,
+    );
+}
+
+test "history edit result shows diff from retained details" {
+    const allocator = std.testing.allocator;
+    var metadata_buffer: [metadata_bytes_max]u8 = undefined;
+    var view = try historyFinish(
+        allocator,
+        &metadata_buffer,
+        "edit",
+        false,
+        "Edited file",
+        "{\"diff\":\"--- a/file\\n+++ b/file\"}",
+    );
+    defer view.deinit(allocator);
+
+    try std.testing.expectEqualStrings("--- a/file\n+++ b/file", view.output.?);
 }

@@ -214,7 +214,7 @@ pub fn run(
                     const chunk = result catch |err| switch (err) {
                         error.ChannelClosed => continue,
                     };
-                    if (options.on_output) |observer| try observer.call(chunk.stream, chunk.slice());
+                    try emitOutputChunk(options.on_output, chunk);
                 },
             }
         }
@@ -258,7 +258,7 @@ pub fn run(
                     const chunk = result catch |err| switch (err) {
                         error.ChannelClosed => continue,
                     };
-                    if (options.on_output) |observer| try observer.call(chunk.stream, chunk.slice());
+                    try emitOutputChunk(options.on_output, chunk);
                 },
             }
         }
@@ -266,6 +266,7 @@ pub fn run(
 
     stdout_reader.join();
     stderr_reader.join();
+    try drainOutputChunks(options.on_output, &output_chunks);
     if (stdout_buffer.err) |err| return err;
     if (stderr_buffer.err) |err| return err;
     if (stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded) return error.StreamTooLong;
@@ -300,6 +301,19 @@ fn completeProcessWait(
     const completed_term = try result;
     process_wait_state.* = .drained;
     return completed_term;
+}
+
+fn emitOutputChunk(observer: ?OutputObserver, chunk: OutputChunk) !void {
+    if (observer) |callback| try callback.call(chunk.stream, chunk.slice());
+}
+
+fn drainOutputChunks(observer: ?OutputObserver, output_chunks: *zio.Channel(OutputChunk)) !void {
+    while (true) {
+        const chunk = output_chunks.tryReceive() catch |err| switch (err) {
+            error.ChannelEmpty, error.ChannelClosed => return,
+        };
+        try emitOutputChunk(observer, chunk);
+    }
 }
 
 fn terminateAndDrainProcess(
@@ -376,6 +390,32 @@ fn readPipeToBuffer(
             },
         };
         chunks.send(OutputChunk.init(stream, buffer[0..count])) catch return;
+    }
+}
+
+const OutputObserverCapture = struct {
+    stdout: std.Io.Writer.Allocating,
+    stderr: std.Io.Writer.Allocating,
+
+    fn init(allocator: std.mem.Allocator) OutputObserverCapture {
+        return .{
+            .stdout = .init(allocator),
+            .stderr = .init(allocator),
+        };
+    }
+
+    fn deinit(self: *OutputObserverCapture) void {
+        self.stdout.deinit();
+        self.stderr.deinit();
+        self.* = undefined;
+    }
+};
+
+fn captureProcessOutput(context: ?*anyopaque, stream: OutputStream, bytes: []const u8) anyerror!void {
+    const capture: *OutputObserverCapture = @ptrCast(@alignCast(context.?));
+    switch (stream) {
+        .stdout => try capture.stdout.writer.writeAll(bytes),
+        .stderr => try capture.stderr.writer.writeAll(bytes),
     }
 }
 
@@ -512,6 +552,35 @@ test "process runner drains larger stdout and stderr without truncation" {
     try std.testing.expectEqualStrings("fedcba9876543210", result.stderr[0..16]);
     const expected_term: std.process.Child.Term = .{ .exited = 0 };
     try std.testing.expectEqual(expected_term, result.term);
+}
+
+test "process runner drains queued output to observer after fast process exit" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var task_runtime = try Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var capture = OutputObserverCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 512 ]; do printf 0123456789abcdef; printf fedcba9876543210 >&2; i=$((i + 1)); done",
+    };
+
+    const result = try run(std.testing.allocator, task_runtime.io(), task_runtime, .{
+        .argv = &argv,
+        .timeout_ms = 1_000,
+        .max_stdout_bytes = 16 * 1024,
+        .max_stderr_bytes = 16 * 1024,
+        .on_output = .{ .context = &capture, .call_fn = captureProcessOutput },
+    });
+    defer freeRunResult(std.testing.allocator, result);
+
+    try std.testing.expectEqualStrings(result.stdout, capture.stdout.written());
+    try std.testing.expectEqualStrings(result.stderr, capture.stderr.written());
+    try std.testing.expectEqual(@as(usize, 512 * 16), capture.stdout.written().len);
+    try std.testing.expectEqual(@as(usize, 512 * 16), capture.stderr.written().len);
 }
 
 test "process runner kills child when stdout bound is exceeded" {

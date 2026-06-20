@@ -319,6 +319,8 @@ pub const Command = union(enum) {
     replace_tool_output: ToolText,
     replace_front_tool_output: ToolText,
     replace_tool_footer: ToolText,
+    replace_front_tool_footer: ToolText,
+    mark_pending_tools_canceled,
     prepend_transcript: Transcript.Prepend,
     set_greeter: Greeter.Set,
     open_picker: Picker.Open,
@@ -429,6 +431,21 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
             self.dirty = true;
+            return null;
+        },
+        .replace_front_tool_footer => |footer| {
+            const outcome = try self.transcript.replaceFrontToolFooter(gpa, footer.tool_call_id, footer.text);
+            self.noteOutcome(gpa, outcome);
+            self.viewport.historyPrepended(render.transcriptScrollMax(self));
+            self.dirty = true;
+            return null;
+        },
+        .mark_pending_tools_canceled => {
+            const before_max = render.transcriptScrollMax(self);
+            if (self.transcript.markPendingToolsCanceled()) {
+                self.applyTailMutationScroll(before_max);
+                self.dirty = true;
+            }
             return null;
         },
         .prepend_transcript => |rows| {
@@ -1294,6 +1311,33 @@ test "prepending transcript history keeps the viewport on older content" {
 
     try std.testing.expect(app.viewport.scroll_rows == render.transcriptScrollMax(&app));
     try std.testing.expectEqual(Transcript.Role.user, app.transcript.items.items[0].body.message.role);
+}
+
+test "mark pending tools canceled leaves completed tool cards alone" {
+    const gpa = std.testing.allocator;
+    var app = App.init(40, 8, .{});
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .tool = .{
+        .tool_call_id = "pending",
+        .name = "bash",
+    } } });
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .tool = .{
+        .tool_call_id = "done",
+        .name = "read",
+        .status = .success,
+    } } });
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .tool = .{
+        .tool_call_id = "failed",
+        .name = "edit",
+        .status = .err,
+    } } });
+
+    _ = try app.apply(gpa, .mark_pending_tools_canceled);
+
+    try std.testing.expectEqual(Transcript.ToolStatus.canceled, app.transcript.items.items[0].body.tool.status);
+    try std.testing.expectEqual(Transcript.ToolStatus.success, app.transcript.items.items[1].body.tool.status);
+    try std.testing.expectEqual(Transcript.ToolStatus.err, app.transcript.items.items[2].body.tool.status);
 }
 
 test "prepending history tool result merges with its older tool call" {

@@ -11,6 +11,7 @@ pub const max_edit_read_bytes = 4 * 1024 * 1024;
 pub const max_edit_output_bytes = 4 * 1024 * 1024;
 pub const max_edits_per_call = 64;
 pub const max_diff_bytes = edit_diff.diff_bytes_max;
+const duplicate_line_hint_max = 8;
 
 const utf8_bom = "\xef\xbb\xbf";
 
@@ -129,11 +130,17 @@ const EditFailure = struct {
     other_edit_index: usize = 0,
     occurrences: usize = 0,
     total_edits: usize = 0,
+    match_lines: [duplicate_line_hint_max]usize = @splat(0),
+    match_line_count: usize = 0,
+    match_lines_truncated: bool = false,
 };
 
 const MatchCount = struct {
     first: ?usize = null,
     occurrences: usize = 0,
+    match_lines: [duplicate_line_hint_max]usize = @splat(0),
+    match_line_count: usize = 0,
+    match_lines_truncated: bool = false,
 };
 
 const LineEnding = enum { lf, crlf };
@@ -185,22 +192,51 @@ fn execute(
         else => return err,
     };
     defer args.deinit(allocator);
-    const resolved_path = try paths_mod.ToolPaths.resolveExisting(allocator, io, .{
+    const resolved_path = paths_mod.ToolPaths.resolveExisting(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
         .home_dir = self.config.home_dir,
-    }, args.path);
+    }, args.path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.InvalidToolArguments, error.PathOutsideCwd => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Invalid edit path {s}: {s}",
+            "invalid_path",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
+        else => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Edit path resolution failed for {s}: {s}",
+            "path_error",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
+    };
     defer allocator.free(resolved_path);
 
     try token.throwIfRequested();
-    const original = try std.Io.Dir.readFileAlloc(
+    const original = std.Io.Dir.readFileAlloc(
         .cwd(),
         io,
         resolved_path,
         allocator,
         .limited(self.config.max_read_bytes),
-    );
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Edit failed to read {s}: {s}",
+            "read_failed",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
+    };
     defer allocator.free(original);
+    if (!std.unicode.utf8ValidateSlice(original)) return nonUtf8FileResult(allocator, args.path);
     var failure: EditFailure = .{};
     var edited = applyEditsPreservingTextShape(
         allocator,
@@ -415,6 +451,9 @@ fn applyEdits(
                 .edit_index = index,
                 .occurrences = count.occurrences,
                 .total_edits = edits.len,
+                .match_lines = count.match_lines,
+                .match_line_count = count.match_line_count,
+                .match_lines_truncated = count.match_lines_truncated,
             });
             return error.EditTextNotUnique;
         }
@@ -529,10 +568,21 @@ fn countMatches(haystack: []const u8, needle: []const u8) MatchCount {
     std.debug.assert(needle.len > 0);
     var result: MatchCount = .{};
     var offset: usize = 0;
+    var line_scan_offset: usize = 0;
+    var line: usize = 1;
     while (offset <= haystack.len) {
         const found = std.mem.find(u8, haystack[offset..], needle) orelse break;
         const absolute = offset + found;
         if (result.first == null) result.first = absolute;
+        if (result.match_line_count < duplicate_line_hint_max) {
+            while (line_scan_offset < absolute) : (line_scan_offset += 1) {
+                if (haystack[line_scan_offset] == '\n') line += 1;
+            }
+            result.match_lines[result.match_line_count] = line;
+            result.match_line_count += 1;
+        } else {
+            result.match_lines_truncated = true;
+        }
         result.occurrences += 1;
         offset = absolute + needle.len;
     }
@@ -584,19 +634,21 @@ fn editFailureResult(
             );
         },
         .old_text_not_unique => {
+            var line_hint_buffer: [160]u8 = undefined;
+            const line_hint = duplicateLineHint(&line_hint_buffer, failure);
             if (failure.total_edits == 1) return editFailureResultFmt(
                 allocator,
-                "Found {d} occurrences of the text in {s}. " ++
+                "Found {d} occurrences of the text in {s}{s}. " ++
                     "The text must be unique. Please provide more context to make it unique.",
                 editFailureReason(failure.kind),
-                .{ failure.occurrences, path },
+                .{ failure.occurrences, path, line_hint },
             );
             return editFailureResultFmt(
                 allocator,
-                "Found {d} occurrences of edits[{d}] in {s}. " ++
+                "Found {d} occurrences of edits[{d}] in {s}{s}. " ++
                     "Each oldText must be unique. Please provide more context to make it unique.",
                 editFailureReason(failure.kind),
-                .{ failure.occurrences, failure.edit_index, path },
+                .{ failure.occurrences, failure.edit_index, path, line_hint },
             );
         },
         .overlapping_edits => return editFailureResultFmt(
@@ -649,6 +701,18 @@ fn editFailureResultFmt(
     return path_utils.errorResultFmt(allocator, fmt, reason, args);
 }
 
+fn duplicateLineHint(buffer: []u8, failure: EditFailure) []const u8 {
+    if (failure.match_line_count == 0) return "";
+    var writer = std.Io.Writer.fixed(buffer);
+    writer.writeAll(" at lines ") catch return "";
+    for (failure.match_lines[0..failure.match_line_count], 0..) |line, index| {
+        if (index > 0) writer.writeAll(", ") catch return writer.buffered();
+        writer.print("{d}", .{line}) catch return writer.buffered();
+    }
+    if (failure.match_lines_truncated) writer.writeAll(" and more") catch return writer.buffered();
+    return writer.buffered();
+}
+
 fn editTooLargeResult(allocator: std.mem.Allocator, max_output_bytes: usize) !agent.ToolExecutionResult {
     const message = try std.fmt.allocPrint(
         allocator,
@@ -676,6 +740,18 @@ fn editDiffTooLargeResult(allocator: std.mem.Allocator) !agent.ToolExecutionResu
         .isError = true,
         .reason = @as([]const u8, "diff_too_large"),
         .maxBytes = max_diff_bytes,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
+}
+
+fn nonUtf8FileResult(allocator: std.mem.Allocator, path: []const u8) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(allocator, "Edit failed: {s} is not valid UTF-8 text.", .{path});
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = @as([]const u8, "non_utf8_file"),
+        .path = path,
     });
     errdefer runtime.freeJsonValue(allocator, details);
     return path_utils.ownedTextResult(allocator, message, details);
@@ -867,9 +943,31 @@ test "edit tool reports duplicate oldText with occurrence count" {
     defer duplicate.deinit();
 
     try std.testing.expectEqualStrings(
-        "Found 3 occurrences of edits[0] in file.txt. " ++
+        "Found 3 occurrences of edits[0] in file.txt at lines 1, 3, 4. " ++
             "Each oldText must be unique. Please provide more context to make it unique.",
         duplicate.result.content[0].text.text,
+    );
+}
+
+test "edit tool bounds duplicate line hints" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "hit\nhit\nhit\nhit\nhit\nhit\nhit\nhit\nhit\nhit\n");
+
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer edit_tool.deinit();
+
+    var result = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.txt","edits":[{"oldText":"hit","newText":"miss"}]}
+        ,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Found 10 occurrences of the text in file.txt at lines 1, 2, 3, 4, 5, 6, 7, 8 and more. " ++
+            "The text must be unique. Please provide more context to make it unique.",
+        result.result.content[0].text.text,
     );
 }
 
@@ -899,7 +997,7 @@ test "edit tool returns actionable operational errors" {
     );
     defer duplicate.deinit();
     try std.testing.expectEqualStrings(
-        "Found 2 occurrences of the text in file.txt. " ++
+        "Found 2 occurrences of the text in file.txt at lines 1, 1. " ++
             "The text must be unique. Please provide more context to make it unique.",
         duplicate.result.content[0].text.text,
     );
@@ -930,6 +1028,93 @@ test "edit tool returns actionable operational errors" {
     const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("abc abc", written);
+}
+
+test "edit tool reports path and read failures operationally" {
+    var fixture = try test_support.Fixture.init("repo/app");
+    defer fixture.deinit();
+    try fixture.dir("repo/other");
+    try fixture.write("repo/other/file.txt", "outside");
+    try fixture.write("repo/app/blocker", "x");
+
+    var edit_tool = try EditTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .allow_paths_outside_cwd = false,
+    });
+    defer edit_tool.deinit();
+
+    var missing = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"missing.txt","edits":[{"oldText":"x","newText":"y"}]}
+        ,
+    );
+    defer missing.deinit();
+    try std.testing.expect(missing.result.details.?.object.get("isError").?.bool);
+    try std.testing.expectEqualStrings("path_error", missing.result.details.?.object.get("reason").?.string);
+    try std.testing.expectEqualStrings("missing.txt", missing.result.details.?.object.get("path").?.string);
+    try std.testing.expectEqualStrings("FileNotFound", missing.result.details.?.object.get("errorName").?.string);
+
+    var outside = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"../other/file.txt","edits":[{"oldText":"outside","newText":"inside"}]}
+        ,
+    );
+    defer outside.deinit();
+    try std.testing.expect(outside.result.details.?.object.get("isError").?.bool);
+    try std.testing.expectEqualStrings("invalid_path", outside.result.details.?.object.get("reason").?.string);
+    try std.testing.expectEqualStrings("../other/file.txt", outside.result.details.?.object.get("path").?.string);
+    try std.testing.expectEqualStrings("PathOutsideCwd", outside.result.details.?.object.get("errorName").?.string);
+
+    var edit_read_tool = try EditTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .allow_paths_outside_cwd = true,
+    });
+    defer edit_read_tool.deinit();
+    var read_failed = try test_support.execute(
+        edit_read_tool.tool(),
+        \\{"path":"missing-open.txt","edits":[{"oldText":"x","newText":"y"}]}
+        ,
+    );
+    defer read_failed.deinit();
+    try std.testing.expect(read_failed.result.details.?.object.get("isError").?.bool);
+    try std.testing.expectEqualStrings("read_failed", read_failed.result.details.?.object.get("reason").?.string);
+    try std.testing.expectEqualStrings("missing-open.txt", read_failed.result.details.?.object.get("path").?.string);
+    try std.testing.expectEqualStrings("FileNotFound", read_failed.result.details.?.object.get("errorName").?.string);
+    var unreadable = try test_support.execute(
+        edit_read_tool.tool(),
+        \\{"path":"blocker/file.txt","edits":[{"oldText":"x","newText":"y"}]}
+        ,
+    );
+    defer unreadable.deinit();
+    try std.testing.expect(unreadable.result.details.?.object.get("isError").?.bool);
+    try std.testing.expectEqualStrings("path_error", unreadable.result.details.?.object.get("reason").?.string);
+    try std.testing.expectEqualStrings("blocker/file.txt", unreadable.result.details.?.object.get("path").?.string);
+    try std.testing.expect(unreadable.result.details.?.object.get("errorName").?.string.len > 0);
+}
+
+test "edit tool rejects non utf8 target without mutation" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    const original = "ok\xffbad";
+    try fixture.write("repo/file.bin", original);
+
+    var edit_tool = try EditTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer edit_tool.deinit();
+
+    var result = try test_support.execute(
+        edit_tool.tool(),
+        \\{"path":"file.bin","edits":[{"oldText":"ok","newText":"changed"}]}
+        ,
+    );
+    defer result.deinit();
+
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("non_utf8_file", details.get("reason").?.string);
+    try std.testing.expectEqualStrings("file.bin", details.get("path").?.string);
+    const written = try fixture.read("repo/file.bin");
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualSlices(u8, original, written);
 }
 
 test "edit tool does not stream full edited file on success" {

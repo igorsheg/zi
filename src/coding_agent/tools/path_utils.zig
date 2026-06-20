@@ -100,6 +100,28 @@ pub fn errorResultFmt(
     return ownedTextResult(allocator, message, details);
 }
 
+pub fn errorResultWithPathFmt(
+    allocator: std.mem.Allocator,
+    comptime fmt: []const u8,
+    reason: []const u8,
+    path: []const u8,
+    err: anyerror,
+    args: anytype,
+) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    var message_owned = true;
+    errdefer if (message_owned) allocator.free(message);
+    const details = try jsonDetails(allocator, .{
+        .isError = true,
+        .reason = reason,
+        .path = path,
+        .errorName = @errorName(err),
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    message_owned = false;
+    return ownedTextResult(allocator, message, details);
+}
+
 /// Build an owned `std.json.Value` object from an anonymous struct literal.
 /// Field types: bool, integers, string slices/literals (duped), an already
 /// owned `std.json.Value` (adopted), and optionals of those (null omitted).

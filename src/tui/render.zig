@@ -750,8 +750,8 @@ fn buildToolRows(
     theme: *const theme_mod.Theme,
     expanded: bool,
 ) void {
-    // Error rail tints only the result/body chrome; the title stays plain.
-    const rail = if (tool.status == .err) theme.status_error else theme.tool_chrome;
+    // Error/cancel rail tints only the result/body chrome; the title stays plain.
+    const rail = toolRail(tool.status, theme);
     const inner = innerWidth(width);
 
     var title_buffer: [title_bytes_max]u8 = undefined;
@@ -993,9 +993,22 @@ fn physicalLineStart(text: []const u8, offset: usize) usize {
 // ("$ cmd", "read path:1-20", ...); the tool name is only a fallback.
 fn toolTitle(tool: *const Transcript.Tool, expanded: bool, buffer: *[title_bytes_max]u8) []const u8 {
     const title = if (!expanded and tool.compact_title.len > 0) tool.compact_title else tool.title;
-    if (title.len == 0) return tool.name;
-    if (title.len <= buffer.len) return title;
-    return text_mod.utf8Prefix(title, buffer.len);
+    const base = if (title.len == 0) tool.name else title;
+    if (tool.status == .canceled) {
+        const suffix = " (canceled)";
+        const clipped = text_mod.utf8Prefix(base, buffer.len -| suffix.len);
+        return std.fmt.bufPrint(buffer, "{s}{s}", .{ clipped, suffix }) catch suffix;
+    }
+    if (base.len <= buffer.len) return base;
+    return text_mod.utf8Prefix(base, buffer.len);
+}
+
+fn toolRail(status: Transcript.ToolStatus, theme: *const theme_mod.Theme) theme_mod.Style {
+    return switch (status) {
+        .err => theme.status_error,
+        .canceled => theme.transcript_secondary,
+        .pending, .success => theme.tool_chrome,
+    };
 }
 
 fn toolTitleSegments(
@@ -2111,6 +2124,23 @@ test "assistant markdown row cache advances only at newline boundaries" {
     tail_count = 0;
     buildAssistantMarkdownTailRows(null, &tail_count, item, app.width, &app.theme);
     try std.testing.expectEqual(@as(usize, 2), tail_count);
+}
+
+test "canceled tool title renders terminal state" {
+    const gpa = std.testing.allocator;
+    var app = App.init(40, 8, .{});
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .append_transcript = .{ .tool = .{
+        .tool_call_id = "call",
+        .name = "bash",
+        .title = "$ sleep 10",
+    } } });
+    _ = try app.apply(gpa, .mark_pending_tools_canceled);
+
+    var buffer: [title_bytes_max]u8 = undefined;
+    const title = toolTitle(&app.transcript.items.items[0].body.tool, true, &buffer);
+    try std.testing.expectEqualStrings("$ sleep 10 (canceled)", title);
 }
 
 test "frame scratch keeps generated tool titles stable" {

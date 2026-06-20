@@ -369,6 +369,7 @@ pub const SessionRuntime = struct {
         resume_task: runtime.Task(anyerror!client_protocol.CompletionList),
         cwd: []u8,
         agent_dir: []u8,
+        current_session_leaf: ?[]u8,
     };
 
     pub fn deinit(self: *SessionRuntime) void {
@@ -894,11 +895,15 @@ pub const SessionRuntime = struct {
             .allow_paths_outside_cwd = self.host_config.allow_paths_outside_cwd,
             .public_event_capacity = self.host_config.public_event_capacity,
         }) catch |err| {
-            try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            next_services.deinit();
+            next_services_owned = false;
+            try self.enqueueResumeRejected(request_id, session_file_name, err);
             return;
         };
         var next_session_owned = true;
         errdefer if (next_session_owned) shutdownAndDeinitSession(&next_session);
+
+        self.cancelCompletionLoad();
 
         var old_session = self.session;
         var old_services = self.services;
@@ -1267,6 +1272,8 @@ pub const SessionRuntime = struct {
         errdefer self.allocator.free(cwd);
         const agent_dir = try self.allocator.dupe(u8, self.services.agent_dir);
         errdefer self.allocator.free(agent_dir);
+        var current_session_leaf = try self.dupeCurrentSessionLeaf();
+        errdefer if (current_session_leaf) |leaf| self.allocator.free(leaf);
 
         const resume_task = self.task_runtime.spawn(buildResumeCompletionListWorker, .{
             self.allocator,
@@ -1275,8 +1282,14 @@ pub const SessionRuntime = struct {
             self.host_config.environ,
             cwd,
             agent_dir,
+            current_session_leaf,
         }) catch |err| {
             try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            if (current_session_leaf) |leaf| self.allocator.free(leaf);
+            current_session_leaf = null;
+            self.allocator.free(agent_dir);
+            self.allocator.free(cwd);
+            models.deinit(self.allocator);
             return;
         };
 
@@ -1286,6 +1299,7 @@ pub const SessionRuntime = struct {
             .resume_task = resume_task,
             .cwd = cwd,
             .agent_dir = agent_dir,
+            .current_session_leaf = current_session_leaf,
         };
     }
 
@@ -1310,6 +1324,7 @@ pub const SessionRuntime = struct {
         self.completion_load = null;
         defer self.allocator.free(load.cwd);
         defer self.allocator.free(load.agent_dir);
+        defer if (load.current_session_leaf) |leaf| self.allocator.free(leaf);
 
         const resume_sessions = resume_result catch |err| {
             load.models.deinit(self.allocator);
@@ -1347,6 +1362,7 @@ pub const SessionRuntime = struct {
         load.models.deinit(self.allocator);
         self.allocator.free(load.cwd);
         self.allocator.free(load.agent_dir);
+        if (load.current_session_leaf) |leaf| self.allocator.free(leaf);
     }
 
     const CompletionStatus = enum { ready, missing_auth, unavailable };
@@ -1365,10 +1381,9 @@ pub const SessionRuntime = struct {
                     break :outer;
                 }
                 const id = try std.fmt.allocPrint(arena_allocator, "{s}/{s}", .{ model.provider, model.id });
-                const detail = try std.fmt.allocPrint(arena_allocator, "{s} - {s}", .{
-                    model.name,
-                    completionStatusText(self.modelCompletionStatus(model)),
-                });
+                const status = self.modelCompletionStatus(model);
+                const current = self.isCurrentModel(model);
+                const detail = try modelCompletionDetail(arena_allocator, model, status, current);
                 try sources.append(arena_allocator, .{ .id = id, .label = id, .detail = detail });
             }
         }
@@ -1382,12 +1397,51 @@ pub const SessionRuntime = struct {
         return .ready;
     }
 
+    fn isCurrentModel(self: *const SessionRuntime, model: ai.Model) bool {
+        const current = self.session.agent.state.model;
+        return std.mem.eql(u8, current.provider, model.provider) and std.mem.eql(u8, current.id, model.id);
+    }
+
     fn completionStatusText(status: CompletionStatus) []const u8 {
         return switch (status) {
             .ready => "ready",
             .missing_auth => "missing auth",
             .unavailable => "unavailable",
         };
+    }
+
+    fn modelCompletionDetail(
+        allocator: std.mem.Allocator,
+        model: ai.Model,
+        status: CompletionStatus,
+        current: bool,
+    ) ![]const u8 {
+        var context_buffer: [24]u8 = undefined;
+        var cost_buffer: [80]u8 = undefined;
+        return std.fmt.allocPrint(allocator, "{s} - {s}{s}; ctx {s}; {s}", .{
+            model.name,
+            if (current) "current, " else "",
+            completionStatusText(status),
+            formatModelTokenCount(&context_buffer, model.context_window),
+            formatModelCost(&cost_buffer, model.cost),
+        });
+    }
+
+    fn formatModelTokenCount(buffer: []u8, tokens: u64) []const u8 {
+        if (tokens >= 1_000_000 and tokens % 1_000_000 == 0) {
+            return std.fmt.bufPrint(buffer, "{d}m", .{tokens / 1_000_000}) catch "?";
+        }
+        if (tokens >= 1_000 and tokens % 1_000 == 0) {
+            return std.fmt.bufPrint(buffer, "{d}k", .{tokens / 1_000}) catch "?";
+        }
+        return std.fmt.bufPrint(buffer, "{d}", .{tokens}) catch "?";
+    }
+
+    fn formatModelCost(buffer: []u8, cost: ai.Model.Cost) []const u8 {
+        return std.fmt.bufPrint(buffer, "${d:.2} in/${d:.2} out per 1M", .{
+            cost.input,
+            cost.output,
+        }) catch "$? in/$? out per 1M";
     }
 
     fn enqueueSessionChrome(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
@@ -1423,6 +1477,26 @@ pub const SessionRuntime = struct {
             .request_id = request_id,
             .event = .{ .rejected = .{ .code = code, .message = owned_message } },
         });
+    }
+
+    fn enqueueResumeRejected(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        session_file_name: []const u8,
+        err: anyerror,
+    ) !void {
+        var buffer: [session_command_message_bytes_max]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "could not resume {s}: {s}", .{
+            std.fs.path.basename(session_file_name),
+            @errorName(err),
+        }) catch "could not resume session";
+        try self.enqueueRejected(request_id, rejectionCode(err), text);
+    }
+
+    fn dupeCurrentSessionLeaf(self: *SessionRuntime) !?[]u8 {
+        const store = self.session.store orelse return null;
+        const leaf = try self.allocator.dupe(u8, std.fs.path.basename(store.file_name));
+        return leaf;
     }
 
     fn enqueueEvent(self: *SessionRuntime, envelope: client_protocol.EventEnvelope) !void {
@@ -1468,8 +1542,17 @@ fn buildResumeCompletionListWorker(
     environ: ?*const std.process.Environ.Map,
     cwd: []const u8,
     agent_dir: []const u8,
+    current_session_leaf: ?[]const u8,
 ) anyerror!client_protocol.CompletionList {
-    return buildResumeCompletionListFor(allocator, io, dir, environ, cwd, agent_dir);
+    return buildResumeCompletionListFor(
+        allocator,
+        io,
+        dir,
+        environ,
+        cwd,
+        agent_dir,
+        current_session_leaf,
+    );
 }
 
 fn buildResumeCompletionListFor(
@@ -1479,6 +1562,7 @@ fn buildResumeCompletionListFor(
     environ: ?*const std.process.Environ.Map,
     cwd: []const u8,
     agent_dir: []const u8,
+    current_session_leaf: ?[]const u8,
 ) !client_protocol.CompletionList {
     var summaries = try session_listing.listRuntimeSessionSummaries(allocator, io, .{
         .cwd = cwd,
@@ -1492,6 +1576,9 @@ fn buildResumeCompletionListFor(
     var sources: [client_protocol.completion_item_count_max]client_protocol.CompletionItem.Source = undefined;
     var count: usize = 0;
     for (summaries.items) |summary| {
+        if (current_session_leaf) |leaf| {
+            if (std.mem.eql(u8, summary.file_name, leaf)) continue;
+        }
         sources[count] = .{
             .id = summary.file_name,
             .label = summary.title,
@@ -1685,6 +1772,15 @@ test "session runtime completion snapshot reports model status and resume sessio
     var session_runtime = try initTestRuntime(&tmp, task_runtime);
     defer session_runtime.deinit();
 
+    const current_model = ai.getModels(ai.getProviders()[0])[0];
+    session_runtime.session.agent.setModel(current_model);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/sessions/--repo--/2026-06-08T00:00:00Z_other.jsonl",
+        .data = "{\"type\":\"session\",\"version\":3,\"id\":\"other\"," ++
+            "\"timestamp\":\"2026-06-08T00:00:00Z\",\"cwd\":\"repo\"}\n",
+    });
+
     try session_runtime.submit(.{ .id = 4, .command = .completion_snapshot });
 
     var event: client_protocol.EventEnvelope = event: {
@@ -1701,9 +1797,9 @@ test "session runtime completion snapshot reports model status and resume sessio
     try std.testing.expect(event.event == .completion_snapshot);
     const snapshot = event.event.completion_snapshot;
     try std.testing.expect(snapshot.models.items.len > 0);
-    try std.testing.expect(snapshot.resume_sessions.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.resume_sessions.items.len);
     try std.testing.expectEqualStrings(
-        "2026-06-09T00:00:00Z_session.jsonl",
+        "2026-06-08T00:00:00Z_other.jsonl",
         snapshot.resume_sessions.items[0].id.text,
     );
 
@@ -1712,6 +1808,41 @@ test "session runtime completion snapshot reports model status and resume sessio
         if (std.mem.indexOf(u8, item.detail.text, "missing auth") != null) found_missing_auth = true;
     }
     try std.testing.expect(found_missing_auth);
+    var current_id_buffer: [client_protocol.completion_id_bytes_max]u8 = undefined;
+    const current_id = std.fmt.bufPrint(&current_id_buffer, "{s}/{s}", .{
+        current_model.provider,
+        current_model.id,
+    }) catch current_model.id;
+    var found_current_model = false;
+    for (snapshot.models.items) |item| {
+        if (!std.mem.eql(u8, item.id.text, current_id)) continue;
+        found_current_model = true;
+        try std.testing.expect(std.mem.indexOf(u8, item.detail.text, "current") != null);
+        try std.testing.expect(std.mem.indexOf(u8, item.detail.text, "ctx") != null);
+        try std.testing.expect(std.mem.indexOf(u8, item.detail.text, "per 1M") != null);
+    }
+    try std.testing.expect(found_current_model);
+}
+
+test "model completion detail includes current marker context and costs" {
+    const model: ai.Model = .{
+        .id = "m",
+        .name = "Model",
+        .api = "api",
+        .provider = "provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 1.25, .output = 10, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 4096,
+    };
+    const detail = try SessionRuntime.modelCompletionDetail(std.testing.allocator, model, .ready, true);
+    defer std.testing.allocator.free(detail);
+    try std.testing.expectEqualStrings(
+        "Model - current, ready; ctx 128k; $1.25 in/$10.00 out per 1M",
+        detail,
+    );
 }
 
 test "session runtime acknowledges queue clear with a correlated queue fact" {
@@ -1857,6 +1988,42 @@ test "session runtime switches to a selected session through the mailbox" {
     try std.testing.expect(event.event == .session_changed);
     try std.testing.expectEqualStrings("other", session_runtime.session.manager.header.id);
     try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime keeps current session when resume file is invalid" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/sessions/--repo--/2026-06-10T00:00:00Z_bad.jsonl",
+        .data = "{\"type\":\"not-session\"}\n",
+    });
+
+    var envelope = try client_protocol.CommandEnvelope.initSwitchSession(
+        std.testing.allocator,
+        11,
+        "2026-06-10T00:00:00Z_bad.jsonl",
+    );
+    var envelope_owned = true;
+    errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    envelope_owned = false;
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 11), event.request_id);
+    try std.testing.expect(event.event == .rejected);
+    try std.testing.expectEqualStrings("session", session_runtime.session.manager.header.id);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        event.event.rejected.message.text,
+        "could not resume 2026-06-10T00:00:00Z_bad.jsonl",
+    ) != null);
 }
 
 test "session runtime keeps owned task runtime across session switch" {

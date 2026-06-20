@@ -95,11 +95,29 @@ fn execute(
             "Invalid read arguments: provide path/file_path and positive offset/limit integers.",
         ),
     };
-    const resolved_path = try paths_mod.ToolPaths.resolveExisting(allocator, io, .{
+    const resolved_path = paths_mod.ToolPaths.resolveExisting(allocator, io, .{
         .cwd = self.config.cwd,
         .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
         .home_dir = self.config.home_dir,
-    }, args.path);
+    }, args.path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.InvalidToolArguments, error.PathOutsideCwd => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Invalid read path {s}: {s}",
+            "invalid_path",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
+        else => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Read path resolution failed for {s}: {s}",
+            "path_error",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
+    };
     defer allocator.free(resolved_path);
 
     const content = std.Io.Dir.readFileAlloc(
@@ -109,8 +127,16 @@ fn execute(
         allocator,
         .limited(self.config.max_read_bytes),
     ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
         error.FileTooBig, error.StreamTooLong => return readTooLargeResult(allocator, self.config.max_read_bytes),
-        else => return err,
+        else => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Read failed for {s}: {s}",
+            "read_failed",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
     };
     defer allocator.free(content);
     try token.throwIfRequested();
@@ -534,6 +560,66 @@ test "read tool reports invalid arguments operationally" {
         result.result.content[0].text.text,
     );
     try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
+}
+
+test "read tool reports missing file operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .allow_paths_outside_cwd = true,
+    });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"missing.txt\"}");
+    defer result.deinit();
+
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("read_failed", details.get("reason").?.string);
+    try std.testing.expectEqualStrings("missing.txt", details.get("path").?.string);
+    try std.testing.expectEqualStrings("FileNotFound", details.get("errorName").?.string);
+}
+
+test "read tool reports outside cwd operationally" {
+    var fixture = try test_support.Fixture.init("repo/app");
+    defer fixture.deinit();
+    try fixture.dir("repo/other");
+    try fixture.write("repo/other/file.txt", "outside");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"../other/file.txt\"}");
+    defer result.deinit();
+
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("invalid_path", details.get("reason").?.string);
+    try std.testing.expectEqualStrings("../other/file.txt", details.get("path").?.string);
+    try std.testing.expectEqualStrings("PathOutsideCwd", details.get("errorName").?.string);
+}
+
+test "read tool reports parent path failures operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/blocker", "x");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .allow_paths_outside_cwd = true,
+    });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"blocker/file.txt\"}");
+    defer result.deinit();
+
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("path_error", details.get("reason").?.string);
+    try std.testing.expectEqualStrings("blocker/file.txt", details.get("path").?.string);
+    try std.testing.expect(details.get("errorName").?.string.len > 0);
 }
 
 test "read tool reports oversized file operationally" {

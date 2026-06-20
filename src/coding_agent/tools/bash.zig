@@ -23,7 +23,7 @@ const parameters_schema =
     \\  "properties": {
     \\    "command": {
     \\      "type": "string",
-    \\      "description": "Shell command to run in the session cwd",
+    \\      "description": "Bash command to run in the session cwd via bash -c",
     \\      "maxLength": 16384
     \\    },
     \\    "timeout": { "type": "integer", "description": "Optional timeout in seconds, max 120" }
@@ -91,7 +91,8 @@ pub const BashTool = struct {
     pub fn tool(self: *BashTool) agent.AgentTool {
         return .{
             .name = "bash",
-            .description = "Execute a bash command in the current working directory. Returns stdout and stderr. " ++
+            .description = "Execute a bash command via bash -c in the current working directory. " ++
+                "Falls back to sh only when bash is unavailable on Unix. Returns stdout and stderr. " ++
                 "Output is truncated to last 2000 lines or 50KB.",
             .parameters = self.parsed_parameters.value,
             .label = "bash",
@@ -182,9 +183,9 @@ fn runProcess(
     token: runtime.CancelToken,
     update_context: *BashUpdateContext,
 ) anyerror!std.process.RunResult {
-    const argv = shellArgv(args.command);
-    const run_result = try runtime.runProcess(allocator, io, task_runtime, .{
-        .argv = &argv,
+    const shell = shellArgv(io, args.command);
+    const run_result = runtime.runProcess(allocator, io, task_runtime, .{
+        .argv = &shell.argv,
         .cwd = config.cwd,
         .environ = config.environ,
         .timeout_ms = args.timeout_ms,
@@ -192,7 +193,22 @@ fn runProcess(
         .max_stderr_bytes = config.max_stderr_bytes,
         .cancel_token = token,
         .on_output = .{ .context = update_context, .call_fn = emitBashOutputUpdate },
-    });
+    }) catch |err| switch (err) {
+        error.FileNotFound => if (shell.fallback_to_sh_on_not_found)
+            try runtime.runProcess(allocator, io, task_runtime, .{
+                .argv = &.{ "sh", "-c", args.command },
+                .cwd = config.cwd,
+                .environ = config.environ,
+                .timeout_ms = args.timeout_ms,
+                .max_stdout_bytes = config.max_stdout_bytes,
+                .max_stderr_bytes = config.max_stderr_bytes,
+                .cancel_token = token,
+                .on_output = .{ .context = update_context, .call_fn = emitBashOutputUpdate },
+            })
+        else
+            return err,
+        else => return err,
+    };
     errdefer freeRunResult(allocator, run_result);
     return run_result;
 }
@@ -254,11 +270,37 @@ fn parseArgs(config: BashTool.Config, params: std.json.Value) !Args {
     return .{ .command = command_value.string, .timeout_ms = timeout_ms };
 }
 
-fn shellArgv(command: []const u8) [3][]const u8 {
+const ShellArgv = struct {
+    argv: [3][]const u8,
+    fallback_to_sh_on_not_found: bool = false,
+};
+
+fn shellArgv(io: std.Io, command: []const u8) ShellArgv {
     return switch (builtin.os.tag) {
-        .windows => .{ "cmd.exe", "/C", command },
-        else => .{ "/bin/sh", "-c", command },
+        .windows => .{ .argv = .{ windowsBashPath(io), "-c", command } },
+        else => if (executableExists(io, "/bin/bash"))
+            .{ .argv = .{ "/bin/bash", "-c", command } }
+        else
+            .{ .argv = .{ "bash", "-c", command }, .fallback_to_sh_on_not_found = true },
     };
+}
+
+fn windowsBashPath(io: std.Io) []const u8 {
+    const git_bash = "C:\\Program Files\\Git\\bin\\bash.exe";
+    if (executableExists(io, git_bash)) return git_bash;
+    const git_bash_x86 = "C:\\Program Files (x86)\\Git\\bin\\bash.exe";
+    if (executableExists(io, git_bash_x86)) return git_bash_x86;
+    return "bash.exe";
+}
+
+fn executableExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.access(.cwd(), io, path, .{
+        .read = false,
+        .write = false,
+        .execute = true,
+        .follow_symlinks = true,
+    }) catch return false;
+    return true;
 }
 
 const FailureKind = enum {
@@ -480,6 +522,7 @@ fn resultDetails(
 }
 
 test "bash tool runs one cwd-bound command" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var fixture = try test_support.Fixture.init("repo");
     defer fixture.deinit();
     try fixture.write("repo/file.txt", "ok");
@@ -492,6 +535,30 @@ test "bash tool runs one cwd-bound command" {
 
     try std.testing.expect(std.mem.endsWith(u8, result.result.content[0].text.text, "repo\nok"));
     try std.testing.expectEqual(@as(i64, 0), result.result.details.?.object.get("exitCode").?.integer);
+}
+
+test "bash tool executes bash syntax on unix" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer tool.deinit();
+
+    var result = try test_support.execute(tool.tool(), "{\"command\":\"value=(ok); printf %s \\\"${value[0]}\\\"\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("ok", result.result.content[0].text.text);
+    try std.testing.expectEqual(@as(i64, 0), result.result.details.?.object.get("exitCode").?.integer);
+}
+
+test "bash tool description names bash shell contract" {
+    var tool = try BashTool.init(std.testing.allocator, .{ .cwd = "." });
+    defer tool.deinit();
+
+    const description = tool.tool().description;
+    try std.testing.expect(std.mem.indexOf(u8, description, "bash command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "bash -c") != null);
 }
 
 test "bash tool passes explicit environment to child process" {

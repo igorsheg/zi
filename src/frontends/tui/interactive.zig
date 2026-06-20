@@ -43,6 +43,8 @@ const status_id_working: tui.status.ContributionId = 1;
 const status_id_queue: tui.status.ContributionId = 2;
 const status_id_recovery: tui.status.ContributionId = 3;
 const status_id_completion: tui.status.ContributionId = 4;
+const status_id_notice: tui.status.ContributionId = 5;
+const retry_reason_bytes_max: usize = 64;
 const composer_cwd_slot_id: tui.status.ContributionId = 1;
 const composer_session_slot_id: tui.status.ContributionId = 2;
 const model_picker_id: tui.Picker.Id = 1;
@@ -101,7 +103,7 @@ const EventCursor = struct {
     last_seq: client_protocol.EventSeq = 0,
     recovery: Recovery = .live,
 
-    const Recovery = enum { live, replay_requested, snapshot_requested };
+    const Recovery = enum { live, snapshot_requested };
 };
 
 const RenderThrottle = struct {
@@ -564,10 +566,6 @@ const InteractiveController = struct {
         try self.requestCompletionSnapshot();
     }
 
-    fn requestReplay(self: *InteractiveController, after: client_protocol.EventSeq) !void {
-        _ = try self.submitCommand(.{ .command = .{ .replay = .{ .after = after } } });
-    }
-
     fn requestHistoryPage(self: *InteractiveController) !void {
         if (!canRequestHistoryPage(self.history_request_in_flight, self.history_has_more_before)) return;
         const before_entry_id = self.history_oldest_entry_id orelse return self.requestSnapshot();
@@ -627,9 +625,9 @@ const InteractiveController = struct {
 
         const expected = self.event_cursor.last_seq + 1;
         if (envelope.seq != expected) {
-            self.event_cursor.recovery = .replay_requested;
+            self.event_cursor.recovery = .snapshot_requested;
             try self.setRecoveryStatus("recovering event gap");
-            try self.requestReplay(self.event_cursor.last_seq);
+            try self.requestSnapshot();
             return;
         }
         self.event_cursor.last_seq = envelope.seq;
@@ -654,7 +652,8 @@ const InteractiveController = struct {
                     self.completion_snapshot_loaded = false;
                     try self.clearStatus(status_id_completion);
                 }
-                try self.appendStatus(.err, rejection.message.text);
+                var buffer: [tui.status.text_bytes_max]u8 = undefined;
+                try self.appendStatus(.err, formatRejectionMessage(&buffer, rejection));
             },
             .prompt_command => |command| {
                 switch (command.presentation) {
@@ -686,18 +685,10 @@ const InteractiveController = struct {
             },
             .shutdown_started => self.terminal.requestStop(),
             .compaction_start => try self.setWorkingStatus("compacting"),
-            .compaction_end => |payload| if (payload.error_message) |message|
-                try self.appendStatus(.warning, message.text)
-            else
-                try self.clearStatus(status_id_working),
+            .compaction_end => |payload| try self.applyCompactionEnd(payload),
             .auto_retry_start => |payload| {
-                var buffer: [96]u8 = undefined;
-                const text = std.fmt.bufPrint(
-                    &buffer,
-                    "retry {d}/{d} in {d}ms",
-                    .{ payload.attempt, payload.max_attempts, payload.delay_ms },
-                ) catch "retrying";
-                try self.setWorkingStatus(text);
+                var buffer: [tui.status.text_bytes_max]u8 = undefined;
+                try self.setWorkingStatus(formatRetryStatus(&buffer, payload));
             },
             .auto_retry_end => try self.clearStatus(status_id_working),
             .event_overflow => |overflow| {
@@ -708,8 +699,8 @@ const InteractiveController = struct {
                     .{overflow.dropped_count},
                 ) catch "event overflow";
                 try self.appendStatus(.warning, text);
-                self.event_cursor.recovery = .replay_requested;
-                try self.requestReplay(self.event_cursor.last_seq -| 1);
+                self.event_cursor.recovery = .snapshot_requested;
+                try self.requestSnapshot();
             },
         }
     }
@@ -783,6 +774,7 @@ const InteractiveController = struct {
         try self.appendTool(tool_view.startAppend(&buffers, payload, self.home_dir));
         if (tool_view.clearsCallPreviewOnStart(payload.tool_name)) {
             try self.replaceToolOutput(payload.tool_call_id, "");
+            try self.replaceToolFooter(payload.tool_call_id, "");
         }
         if (tool_view.showsDuration(payload.tool_name)) self.startToolTimer(payload.tool_call_id);
     }
@@ -824,6 +816,7 @@ const InteractiveController = struct {
         try self.clearStatus(status_id_working);
         try self.clearStatus(status_id_queue);
         try self.clearStatus(status_id_completion);
+        try self.clearStatus(status_id_notice);
         self.completion_snapshot_requested = false;
         self.completion_snapshot_loaded = false;
         try self.requestSnapshot();
@@ -847,7 +840,6 @@ const InteractiveController = struct {
         try self.applySessionChromeParts(
             snapshot.header.cwd.text,
             snapshot.model,
-            snapshot.thinking_level,
             snapshot.context,
         );
         for (snapshot.history.items) |item| try self.applyHistoryItem(item, .append);
@@ -858,7 +850,6 @@ const InteractiveController = struct {
         try self.applySessionChromeParts(
             chrome.cwd.text,
             chrome.model,
-            chrome.thinking_level,
             chrome.context,
         );
     }
@@ -867,7 +858,6 @@ const InteractiveController = struct {
         self: *InteractiveController,
         cwd: []const u8,
         model: client_protocol.ModelSnapshot,
-        thinking_level: agent_mod.ThinkingLevel,
         context: client_protocol.ContextUsageSnapshot,
     ) !void {
         var left_buffer: [tui.status.text_bytes_max]u8 = undefined;
@@ -888,7 +878,7 @@ const InteractiveController = struct {
             .slot = .composer_right,
             .id = composer_session_slot_id,
             .priority = 1,
-            .text = formatComposerRight(&right_buffer, model, thinking_level, context),
+            .text = formatComposerRight(&right_buffer, model, context),
         } });
     }
 
@@ -926,13 +916,12 @@ const InteractiveController = struct {
                 }
                 if (item.kind == .assistant) {
                     for (item.tool_calls) |tool_call| {
-                        try self.appendTool(tool_view.append(
-                            tool_call.id.text,
-                            tool_call.name.text,
-                            .pending,
-                            tool_call.title.text,
-                            "",
-                            false,
+                        var buffers: tool_view.TitleBuffers = .{};
+                        try self.appendTool(try tool_view.historyCallAppend(
+                            self.allocator,
+                            &buffers,
+                            tool_call,
+                            self.home_dir,
                         ));
                     }
                 }
@@ -948,7 +937,18 @@ const InteractiveController = struct {
                     "",
                     item.is_error,
                 ));
-                try self.replaceToolOutput(id, item.text.text);
+                var metadata_buffer: [tool_view.metadata_bytes_max]u8 = undefined;
+                var view = try tool_view.historyFinish(
+                    self.allocator,
+                    &metadata_buffer,
+                    name,
+                    item.is_error,
+                    item.text.text,
+                    if (item.details_json) |json| json.text else null,
+                );
+                defer view.deinit(self.allocator);
+                if (view.metadata.len > 0) try self.replaceToolFooter(id, view.metadata);
+                if (view.output) |text| try self.replaceToolOutput(id, text);
             },
         }
     }
@@ -959,15 +959,19 @@ const InteractiveController = struct {
             .assistant => {
                 var tools = std.ArrayList(tui.Transcript.Append.ToolAppend).empty;
                 defer tools.deinit(self.allocator);
+                var title_buffers = std.ArrayList(tool_view.TitleBuffers).empty;
+                defer title_buffers.deinit(self.allocator);
                 try tools.ensureTotalCapacity(self.allocator, item.tool_calls.len);
-                for (item.tool_calls) |tool_call| tools.appendAssumeCapacity(tool_view.append(
-                    tool_call.id.text,
-                    tool_call.name.text,
-                    .pending,
-                    tool_call.title.text,
-                    "",
-                    false,
-                ));
+                try title_buffers.ensureTotalCapacity(self.allocator, item.tool_calls.len);
+                for (item.tool_calls) |tool_call| {
+                    title_buffers.appendAssumeCapacity(.{});
+                    try tools.append(self.allocator, try tool_view.historyCallAppend(
+                        self.allocator,
+                        &title_buffers.items[title_buffers.items.len - 1],
+                        tool_call,
+                        self.home_dir,
+                    ));
+                }
                 const message: ?tui.Transcript.Append.MessageAppend = if (item.text.text.len > 0) .{
                     .role = .assistant,
                     .text = item.text.text,
@@ -981,15 +985,33 @@ const InteractiveController = struct {
             .tool_result => {
                 const id = if (item.tool_call_id) |id| id.text else return;
                 const name = if (item.tool_name) |name| name.text else return;
-                _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{ .tools = &.{tool_view.append(
-                    id,
+                _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{ .tools = &.{
+                    tool_view.append(
+                        id,
+                        name,
+                        if (item.is_error) .err else .success,
+                        "",
+                        "",
+                        item.is_error,
+                    ),
+                } } });
+                var metadata_buffer: [tool_view.metadata_bytes_max]u8 = undefined;
+                var view = try tool_view.historyFinish(
+                    self.allocator,
+                    &metadata_buffer,
                     name,
-                    if (item.is_error) .err else .success,
-                    "",
-                    "",
                     item.is_error,
-                )} } });
-                try self.replaceFrontToolOutput(id, item.text.text);
+                    item.text.text,
+                    if (item.details_json) |json| json.text else null,
+                );
+                defer view.deinit(self.allocator);
+                if (view.metadata.len > 0) {
+                    _ = try self.terminal.applyCommand(.{ .replace_front_tool_footer = .{
+                        .tool_call_id = id,
+                        .text = view.metadata,
+                    } });
+                }
+                if (view.output) |text| try self.replaceFrontToolOutput(id, text);
             },
         }
     }
@@ -1023,7 +1045,7 @@ const InteractiveController = struct {
         var buffer: [80]u8 = undefined;
         const text = std.fmt.bufPrint(
             &buffer,
-            "queued steer={d} followup={d}",
+            "queued: {d} steering, {d} follow-up",
             .{ steering_count, follow_up_count },
         ) catch "queued prompts";
         _ = try self.terminal.applyCommand(.{ .set_status = .{
@@ -1040,12 +1062,20 @@ const InteractiveController = struct {
         switch (finished.reason) {
             .completed => try self.clearStatus(status_id_working),
             .canceled => {
+                _ = try self.terminal.applyCommand(.mark_pending_tools_canceled);
                 try self.clearStatus(status_id_working);
                 try self.appendStatusWithTone(.info, "canceled", .canceled);
             },
-            // The failure path emits the provider/tool/persistence error first;
-            // do not clear or overwrite it with a generic status.
-            .failed => {},
+            .failed => try self.clearStatus(status_id_working),
+        }
+    }
+
+    fn applyCompactionEnd(self: *InteractiveController, payload: client_protocol.CompactionEnd) !void {
+        if (payload.error_message) |message| try self.appendStatus(.warning, message.text);
+        if (payload.will_retry or self.operation_active) {
+            try self.setWorkingStatus("working");
+        } else {
+            try self.clearStatus(status_id_working);
         }
     }
 
@@ -1179,7 +1209,7 @@ const InteractiveController = struct {
         };
         _ = try self.terminal.applyCommand(.{ .set_status = .{
             .slot = .status_line,
-            .id = status_id_working,
+            .id = status_id_notice,
             .priority = 10,
             .text = boundedChunk(display),
             .effect = .shuffle,
@@ -1330,19 +1360,49 @@ fn boundedChunk(text: []const u8) []const u8 {
     return text[0..@min(text.len, transcript_append_max)];
 }
 
+fn formatRejectionMessage(buffer: []u8, rejection: client_protocol.Rejection) []const u8 {
+    return switch (rejection.code) {
+        .queue_full => std.fmt.bufPrint(
+            buffer,
+            "prompt queue full ({d})",
+            .{agent_mod.Agent.max_queued_messages},
+        ) catch "prompt queue full",
+        else => rejection.message.text,
+    };
+}
+
+fn formatRetryStatus(buffer: []u8, retry: client_protocol.AutoRetryStart) []const u8 {
+    const reason = tui.text.utf8Prefix(retry.error_message.text, retry_reason_bytes_max);
+    if (reason.len == 0) {
+        return std.fmt.bufPrint(buffer, "retry {d}/{d} in {d}ms", .{
+            retry.attempt,
+            retry.max_attempts,
+            retry.delay_ms,
+        }) catch "retrying";
+    }
+    return std.fmt.bufPrint(buffer, "retry {d}/{d} in {d}ms: {s}", .{
+        retry.attempt,
+        retry.max_attempts,
+        retry.delay_ms,
+        reason,
+    }) catch "retrying";
+}
+
 fn formatComposerRight(
     buffer: []u8,
     model: client_protocol.ModelSnapshot,
-    thinking_level: agent_mod.ThinkingLevel,
     context: client_protocol.ContextUsageSnapshot,
 ) []const u8 {
     var context_buffer: [32]u8 = undefined;
     const context_text = formatContextUsage(&context_buffer, context);
-    return std.fmt.bufPrint(buffer, "{s} • {s}/{s} ({s})", .{
+    if (std.mem.eql(u8, model.provider.text, "unknown") and std.mem.eql(u8, model.id.text, "unknown")) {
+        return std.fmt.bufPrint(buffer, "{s} • no authenticated model", .{context_text}) catch
+            "?/? • no authenticated model";
+    }
+    return std.fmt.bufPrint(buffer, "{s} • {s}/{s}", .{
         context_text,
         model.provider.text,
         model.id.text,
-        thinkingLevelName(thinking_level),
     }) catch model.id.text;
 }
 
@@ -1383,17 +1443,6 @@ fn formatContextUsage(buffer: []u8, context: client_protocol.ContextUsageSnapsho
 fn formatTokenCount(buffer: []u8, tokens: u64) []const u8 {
     if (tokens >= 1000) return std.fmt.bufPrint(buffer, "{d}k", .{(tokens + 500) / 1000}) catch "?";
     return std.fmt.bufPrint(buffer, "{d}", .{tokens}) catch "?";
-}
-
-fn thinkingLevelName(level: agent_mod.ThinkingLevel) []const u8 {
-    return switch (level) {
-        .off => "off",
-        .minimal => "minimal",
-        .low => "low",
-        .medium => "medium",
-        .high => "high",
-        .xhigh => "xhigh",
-    };
 }
 
 fn formatSessionInfo(buffer: []u8, info: client_protocol.PromptCommandSessionInfo) []const u8 {
@@ -1466,6 +1515,38 @@ fn completionPickerItems(
     return buffer[0..keep];
 }
 
+fn testModelSnapshot(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    id: []const u8,
+) !client_protocol.ModelSnapshot {
+    var provider_text = try client_protocol.EventText.init(allocator, provider);
+    errdefer provider_text.deinit(allocator);
+    return .{
+        .provider = provider_text,
+        .id = try client_protocol.EventText.init(allocator, id),
+    };
+}
+
+test "composer right reports unauthenticated unknown model" {
+    var model = try testModelSnapshot(std.testing.allocator, "unknown", "unknown");
+    defer model.deinit(std.testing.allocator);
+
+    var buffer: [tui.status.text_bytes_max]u8 = undefined;
+    const text = formatComposerRight(&buffer, model, .{});
+    try std.testing.expectEqualStrings("?/? • no authenticated model", text);
+}
+
+test "composer right omits thinking level until providers enforce it" {
+    var model = try testModelSnapshot(std.testing.allocator, "openai", "gpt-5");
+    defer model.deinit(std.testing.allocator);
+
+    var buffer: [tui.status.text_bytes_max]u8 = undefined;
+    const text = formatComposerRight(&buffer, model, .{ .window = 100_000, .percent_tenths = 123 });
+    try std.testing.expectEqualStrings("12.3%/100k • openai/gpt-5", text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "thinking") == null);
+}
+
 test "model slash parser only claims bare command" {
     try std.testing.expect(isBareModelCommand("/model"));
     try std.testing.expect(isBareModelCommand("/model   "));
@@ -1498,6 +1579,168 @@ test "completion picker items come only from protocol snapshot data" {
     try std.testing.expectEqualStrings("custom detail", mapped[0].detail);
 }
 
+test "operation completion does not clear notice status" {
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+
+    try controller.appendStatus(.warning, "keep me");
+    try controller.setWorkingStatus("working");
+    try controller.applyOperationFinished(.{ .reason = .completed });
+
+    var views: [tui.status.entry_count_max]tui.status.View = undefined;
+    const count = terminal.app.status.ordered(.status_line, &views);
+    var saw_notice = false;
+    var saw_working = false;
+    for (views[0..count]) |view| {
+        saw_notice = saw_notice or std.mem.eql(u8, view.text, "warning: keep me");
+        saw_working = saw_working or std.mem.eql(u8, view.text, "working");
+    }
+    try std.testing.expect(saw_notice);
+    try std.testing.expect(!saw_working);
+}
+
+test "compaction end keeps working status while operation remains active" {
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+        .operation_active = true,
+    };
+
+    try controller.setWorkingStatus("compacting");
+    try controller.applyCompactionEnd(.{
+        .reason = .threshold,
+        .aborted = false,
+        .will_retry = false,
+    });
+
+    var views: [tui.status.entry_count_max]tui.status.View = undefined;
+    const count = terminal.app.status.ordered(.status_line, &views);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqualStrings("working", views[0].text);
+}
+
+test "compaction end clears working status only when operation is done" {
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+
+    try controller.setWorkingStatus("compacting");
+    try controller.applyCompactionEnd(.{
+        .reason = .threshold,
+        .aborted = false,
+        .will_retry = false,
+    });
+
+    var views: [tui.status.entry_count_max]tui.status.View = undefined;
+    const count = terminal.app.status.ordered(.status_line, &views);
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "queue status is human text" {
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+
+    try controller.applyQueueCounts(2, 3);
+
+    var views: [tui.status.entry_count_max]tui.status.View = undefined;
+    const count = terminal.app.status.ordered(.status_line, &views);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqualStrings("queued: 2 steering, 3 follow-up", views[0].text);
+}
+
+test "queue full rejection uses bounded friendly text" {
+    var message = try client_protocol.EventText.init(std.testing.allocator, "QueueFull");
+    defer message.deinit(std.testing.allocator);
+    var buffer: [tui.status.text_bytes_max]u8 = undefined;
+    const text = formatRejectionMessage(&buffer, .{ .code = .queue_full, .message = message });
+    try std.testing.expectEqualStrings("prompt queue full (128)", text);
+}
+
+test "retry status includes bounded reason" {
+    var message = try client_protocol.EventText.init(std.testing.allocator, "provider overloaded");
+    defer message.deinit(std.testing.allocator);
+    var buffer: [tui.status.text_bytes_max]u8 = undefined;
+    const text = formatRetryStatus(&buffer, .{
+        .attempt = 2,
+        .max_attempts = 3,
+        .delay_ms = 250,
+        .error_message = message,
+    });
+    try std.testing.expectEqualStrings("retry 2/3 in 250ms: provider overloaded", text);
+}
+
+test "write preview footer clears when execution starts" {
+    const allocator = std.testing.allocator;
+    const terminal = try tui.Terminal.init(allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+
+    var args = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"path":"file.txt","content":"1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12"}
+    ,
+        .{},
+    );
+    defer args.deinit();
+
+    try controller.applyToolCall(.{ .id = "call-write", .name = "write", .arguments = args.value });
+    try std.testing.expectEqualStrings(
+        "Showing lines 1-10 of 12",
+        terminal.app.transcript.items.items[0].body.tool.footer,
+    );
+
+    try controller.applyToolStart(.{ .tool_call_id = "call-write", .tool_name = "write", .args = args.value });
+    try std.testing.expectEqualStrings("", terminal.app.transcript.items.items[0].body.tool.footer);
+}
+
 test "immediate TUI work polls instead of starving input" {
     try std.testing.expectEqual(@as(u64, 0), nextWakeDelayMs(true, false));
     try std.testing.expectEqual(@as(u64, frame_interval_ms), nextWakeDelayMs(false, true));
@@ -1522,8 +1765,104 @@ test "render throttle coalesces active streaming but lets input render immediate
     try std.testing.expect(throttle.shouldRender(102 + @as(i64, @intCast(frame_interval_ms)), true));
 }
 
+test "resume picker starts from newest existing session when present" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent/sessions/--repo--");
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/sessions/--repo--/2026-06-10T00:00:00Z_old.jsonl",
+        .data = "{\"type\":\"session\",\"version\":3,\"id\":\"old\"," ++
+            "\"timestamp\":\"2026-06-10T00:00:00Z\",\"cwd\":\"repo\"}\n",
+    });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const process: runtime.Process = .{
+        .arena = std.testing.allocator,
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = &environ,
+    };
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+
+    const selected = try selectResumeSession(process, &stderr_discard.writer, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = &environ,
+        .startup_action = .resume_picker,
+    });
+    defer std.testing.allocator.free(selected.?);
+    try std.testing.expectEqualStrings("2026-06-10T00:00:00Z_old.jsonl", selected.?);
+}
+
+test "resume picker creates new session when no resumable session exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const process: runtime.Process = .{
+        .arena = std.testing.allocator,
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = &environ,
+    };
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+
+    const selected = try selectResumeSession(process, &stderr_discard.writer, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .dir = tmp.dir,
+        .environ = &environ,
+        .startup_action = .resume_picker,
+    });
+    try std.testing.expect(selected == null);
+}
+
+test "TUI recovers event gaps by requesting snapshot directly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer app.deinit();
+
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = &app,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+
+    try controller.acceptEnvelope(.{
+        .seq = 2,
+        .event = .{ .queue_changed = .{ .steering_count = 0, .follow_up_count = 0, .revision = 0 } },
+    });
+    const command = app.commands.pop().?;
+    try std.testing.expect(command.command == .snapshot);
+}
+
 fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options: Options) !?[]const u8 {
-    if (options.session_selector == null and !options.continue_latest) return null;
+    const picker_latest = options.startup_action == .resume_picker and options.session_selector == null and
+        !options.continue_latest;
+    const wants_latest = options.continue_latest or picker_latest;
+    if (options.session_selector == null and !wants_latest) return null;
+
     const selected = session_listing.selectRuntimeSession(process.gpa, process.io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
@@ -1545,7 +1884,7 @@ fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options
         },
         else => return err,
     };
-    if (selected == null) {
+    if (selected == null and !picker_latest) {
         try stderr.writeAll("no resumable session found\n");
         return error.NoResumableSession;
     }
