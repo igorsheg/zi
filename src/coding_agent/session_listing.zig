@@ -36,8 +36,12 @@ pub const SessionSummary = struct {
     file_name: []const u8,
     title: []const u8,
     detail: []const u8,
+    meta: []const u8,
+    aux: []const u8,
 
     pub fn deinit(self: *SessionSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.aux);
+        allocator.free(self.meta);
         allocator.free(self.detail);
         allocator.free(self.title);
         allocator.free(self.file_name);
@@ -372,34 +376,27 @@ fn summaryFromBuilder(
     const title_source = if (builder.first_user_len > 0) builder.firstUserSlice() else fallbackTitle(file_name);
     const title = try dupeBounded(allocator, summary_title_bytes_max, title_source);
     errdefer allocator.free(title);
-    var detail_buffer: [summary_detail_bytes_max]u8 = undefined;
-    const detail = try allocator.dupe(u8, formatSummaryDetail(&detail_buffer, file_name, builder));
-    return .{ .file_name = file_copy, .title = title, .detail = detail };
-}
-
-fn formatSummaryDetail(
-    buffer: []u8,
-    file_name: []const u8,
-    builder: *const RuntimeSessionSummaryBuilder,
-) []const u8 {
     const cwd = builder.cwdSlice();
     const cwd_base = if (cwd.len == 0) "session" else std.fs.path.basename(cwd);
-    const date_source = if (builder.timestamp_len >= 10) builder.timestampSlice()[0..10] else fallbackDate(file_name);
+    const detail = try allocator.dupe(u8, cwd_base);
+    errdefer allocator.free(detail);
+    var meta_buffer: [32]u8 = undefined;
+    const meta = try allocator.dupe(u8, formatSummaryMessageCount(&meta_buffer, builder));
+    errdefer allocator.free(meta);
+    const aux = try allocator.dupe(u8, summaryDate(file_name, builder));
+    return .{ .file_name = file_copy, .title = title, .detail = detail, .meta = meta, .aux = aux };
+}
+
+fn formatSummaryMessageCount(buffer: []u8, builder: *const RuntimeSessionSummaryBuilder) []const u8 {
     const noun = if (builder.message_count == 1) "msg" else "msgs";
     if (builder.scan_truncated) {
-        return std.fmt.bufPrint(buffer, "{s} · ≥{d} {s} · {s}", .{
-            cwd_base,
-            builder.message_count,
-            noun,
-            date_source,
-        }) catch cwd_base;
+        return std.fmt.bufPrint(buffer, "≥{d} {s}", .{ builder.message_count, noun }) catch "msgs";
     }
-    return std.fmt.bufPrint(buffer, "{s} · {d} {s} · {s}", .{
-        cwd_base,
-        builder.message_count,
-        noun,
-        date_source,
-    }) catch cwd_base;
+    return std.fmt.bufPrint(buffer, "{d} {s}", .{ builder.message_count, noun }) catch "msgs";
+}
+
+fn summaryDate(file_name: []const u8, builder: *const RuntimeSessionSummaryBuilder) []const u8 {
+    return if (builder.timestamp_len >= 10) builder.timestampSlice()[0..10] else fallbackDate(file_name);
 }
 
 fn firstTextContent(value: ?std.json.Value) ?[]const u8 {
@@ -552,7 +549,9 @@ test "session summaries use first user message and bounded metadata" {
     try std.testing.expectEqual(@as(usize, 1), summaries.items.len);
     try std.testing.expectEqualStrings("2026-05-28T00:00:00Z_second.jsonl", summaries.items[0].file_name);
     try std.testing.expectEqualStrings("Fix resume picker labels", summaries.items[0].title);
-    try std.testing.expectEqualStrings("repo · 2 msgs · 2026-05-28", summaries.items[0].detail);
+    try std.testing.expectEqualStrings("repo", summaries.items[0].detail);
+    try std.testing.expectEqualStrings("2 msgs", summaries.items[0].meta);
+    try std.testing.expectEqualStrings("2026-05-28", summaries.items[0].aux);
 }
 
 test "session listing returns resumable leaf names newest first" {

@@ -33,6 +33,8 @@ pub const completion_item_count_max = 384;
 pub const completion_id_bytes_max = 256;
 pub const completion_label_bytes_max = 160;
 pub const completion_detail_bytes_max = 160;
+pub const completion_meta_bytes_max = 80;
+pub const completion_aux_bytes_max = 80;
 
 pub const CommandQueue = runtime.BoundedQueue(CommandEnvelope);
 pub const EventQueue = runtime.BoundedQueue(EventEnvelope);
@@ -559,11 +561,15 @@ pub const CompletionItem = struct {
     id: EventText,
     label: EventText,
     detail: EventText,
+    meta: EventText,
+    aux: EventText,
 
     pub const Source = struct {
         id: []const u8,
         label: []const u8,
         detail: []const u8 = "",
+        meta: []const u8 = "",
+        aux: []const u8 = "",
     };
 
     pub fn init(allocator: std.mem.Allocator, source: Source) !CompletionItem {
@@ -571,10 +577,16 @@ pub const CompletionItem = struct {
         errdefer id.deinit(allocator);
         var label = try EventText.init(allocator, utf8Prefix(source.label, completion_label_bytes_max));
         errdefer label.deinit(allocator);
+        var detail = try EventText.init(allocator, utf8Prefix(source.detail, completion_detail_bytes_max));
+        errdefer detail.deinit(allocator);
+        var meta = try EventText.init(allocator, utf8Prefix(source.meta, completion_meta_bytes_max));
+        errdefer meta.deinit(allocator);
         return .{
             .id = id,
             .label = label,
-            .detail = try EventText.init(allocator, utf8Prefix(source.detail, completion_detail_bytes_max)),
+            .detail = detail,
+            .meta = meta,
+            .aux = try EventText.init(allocator, utf8Prefix(source.aux, completion_aux_bytes_max)),
         };
     }
 
@@ -582,6 +594,8 @@ pub const CompletionItem = struct {
         self.id.deinit(allocator);
         self.label.deinit(allocator);
         self.detail.deinit(allocator);
+        self.meta.deinit(allocator);
+        self.aux.deinit(allocator);
         self.* = undefined;
     }
 

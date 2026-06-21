@@ -101,7 +101,7 @@ fn internSegments(out: ?*RowScratch, segments: []const RowSegment) []const RowSe
 pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
     scratch.reset();
     var painter = Painter.init(vx);
-    painter.clear();
+    painter.clear(app.theme.app_bg);
     if (app.width == 0 or app.height == 0) return;
 
     const composer_rows = composerRows(app);
@@ -1165,7 +1165,7 @@ fn statusShimmerConfig(theme: *const theme_mod.Theme) shimmer.Config {
 
 fn drawStatusLine(app: *App, painter: *Painter, y: u16) void {
     if (app.width == 0) return;
-    painter.fillRect(0, y, app.width, 1, .{});
+    painter.fillRect(0, y, app.width, 1, app.theme.app_bg);
     _ = drawPersistentStatusLine(app, painter, y);
 }
 
@@ -1241,7 +1241,7 @@ fn drawNotifyOverlay(
         if (fitted.len == 0) continue;
         const width = text_mod.displayWidth(fitted);
         const x = @as(usize, app.width) - width;
-        painter.fillRect(@intCast(x), y, @intCast(width), 1, .{});
+        painter.fillRect(@intCast(x), y, @intCast(width), 1, app.theme.app_bg);
         _ = drawShuffleText(
             painter,
             @intCast(x),
@@ -1461,9 +1461,9 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
     const y: u16 = @intCast(@as(usize, app.height) - rows_reserved);
 
     // Clear the area behind the picker so it does not composite over the
-    // transcript; the chromeless style relies on content and position, not
-    // a border, so we keep the default background.
-    painter.fillRect(x, y, box_width, @intCast(rows_reserved), .{});
+    // transcript. Row background and text roles are separate so selection can
+    // highlight the full row instead of only printed glyph cells.
+    painter.fillRect(x, y, box_width, @intCast(rows_reserved), app.theme.picker_row);
 
     const inner_width = if (box_width > 2) @as(usize, box_width) - 2 else 1;
     const item_start_row: usize = if (focus_filter) 1 else 0;
@@ -1493,24 +1493,133 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
         const is_selected = item_index == selected;
         const row_y: u16 = @intCast(@as(usize, y) + item_start_row + row);
         const marker = if (is_selected) glyphs.picker_selected else glyphs.picker_unselected;
-        const item_style = if (is_selected) app.theme.picker_selected else app.theme.picker_unselected;
+        const row_style = if (is_selected) app.theme.picker_selected_row else app.theme.picker_row;
+        const item_style = if (is_selected) app.theme.picker_selected_item else app.theme.picker_item;
+        const detail_style = if (is_selected) app.theme.picker_selected_detail else app.theme.picker_detail;
+        painter.fillRect(x, row_y, box_width, 1, row_style);
         painter.writeText(x + 1, row_y, marker, item_style);
-        const label_x = x + 3;
-        const label_width = inner_width -| 2;
-        const label = fitToWidth(item.labelSlice(), label_width);
-        painter.writeText(label_x, row_y, label, item_style);
-        const used = text_mod.displayWidth(label) + 2;
-        const detail = item.detailSlice();
-        if (detail.len > 0 and used + 2 < inner_width) {
-            const detail_x = advance(x + 1, used + 2);
-            painter.writeText(
-                detail_x,
-                row_y,
-                fitToWidth(detail, inner_width - used - 2),
-                app.theme.picker_detail,
-            );
+        switch (picker.layout) {
+            .line => drawLinePickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
+            .two_column => drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
+            .four_column => drawFourColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
         }
     }
+}
+
+fn drawLinePickerItem(
+    app: *App,
+    painter: *Painter,
+    item: *const Picker.OwnedItem,
+    x: u16,
+    row_y: u16,
+    inner_width: usize,
+    item_style: theme_mod.Style,
+    detail_style: theme_mod.Style,
+) void {
+    _ = app;
+    const label_x = x + 3;
+    const label_width = inner_width -| 2;
+    const label = fitToWidth(item.labelSlice(), label_width);
+    painter.writeText(label_x, row_y, label, item_style);
+    const used = text_mod.displayWidth(label) + 2;
+    const detail = item.detailSlice();
+    if (detail.len > 0 and used + 2 < inner_width) {
+        const detail_x = advance(x + 1, used + 2);
+        painter.writeText(detail_x, row_y, fitToWidth(detail, inner_width - used - 2), detail_style);
+    }
+}
+
+fn drawTwoColumnPickerItem(
+    app: *App,
+    painter: *Painter,
+    item: *const Picker.OwnedItem,
+    x: u16,
+    row_y: u16,
+    inner_width: usize,
+    item_style: theme_mod.Style,
+    detail_style: theme_mod.Style,
+) void {
+    _ = app;
+    const label_x = x + 3;
+    const content_width = inner_width -| 2;
+    if (content_width == 0) return;
+
+    const detail = item.detailSlice();
+    if (detail.len == 0 or content_width < 24) {
+        painter.writeText(label_x, row_y, fitToWidth(item.labelSlice(), content_width), item_style);
+        return;
+    }
+
+    const detail_width = @min(@as(usize, 28), @max(@as(usize, 12), content_width / 3));
+    const gap_width: usize = 2;
+    if (content_width <= detail_width + gap_width) {
+        painter.writeText(label_x, row_y, fitToWidth(item.labelSlice(), content_width), item_style);
+        return;
+    }
+
+    const label_width = content_width - detail_width - gap_width;
+    drawPickerCell(painter, label_x, row_y, item.labelSlice(), label_width, .left, item_style);
+    drawPickerCell(painter, advance(label_x, label_width + gap_width), row_y, detail, detail_width, .left, detail_style);
+}
+
+fn drawFourColumnPickerItem(
+    app: *App,
+    painter: *Painter,
+    item: *const Picker.OwnedItem,
+    x: u16,
+    row_y: u16,
+    inner_width: usize,
+    item_style: theme_mod.Style,
+    detail_style: theme_mod.Style,
+) void {
+    const start_x = x + 3;
+    const content_width = inner_width -| 2;
+    if (content_width == 0) return;
+    if (content_width < 44) {
+        drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style);
+        return;
+    }
+
+    const gap: usize = 2;
+    const detail_width: usize = 16;
+    const meta_width: usize = 8;
+    const aux_width: usize = 10;
+    const fixed = detail_width + meta_width + aux_width + gap * 3;
+    if (content_width <= fixed) {
+        drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style);
+        return;
+    }
+
+    const label_width = content_width - fixed;
+    var cell_x = start_x;
+    drawPickerCell(painter, cell_x, row_y, item.labelSlice(), label_width, .left, item_style);
+    cell_x = advance(cell_x, label_width + gap);
+    drawPickerCell(painter, cell_x, row_y, item.detailSlice(), detail_width, .left, detail_style);
+    cell_x = advance(cell_x, detail_width + gap);
+    drawPickerCell(painter, cell_x, row_y, item.metaSlice(), meta_width, .right, detail_style);
+    cell_x = advance(cell_x, meta_width + gap);
+    drawPickerCell(painter, cell_x, row_y, item.auxSlice(), aux_width, .left, detail_style);
+}
+
+const PickerCellAlign = enum { left, right };
+
+fn drawPickerCell(
+    painter: *Painter,
+    x: u16,
+    y: u16,
+    text: []const u8,
+    width: usize,
+    alignment: PickerCellAlign,
+    style: theme_mod.Style,
+) void {
+    if (width == 0 or text.len == 0) return;
+    const clipped = fitToWidth(text, width);
+    const used = text_mod.displayWidth(clipped);
+    const offset = switch (alignment) {
+        .left => 0,
+        .right => width -| used,
+    };
+    painter.writeText(advance(x, offset), y, clipped, style);
 }
 
 // --- painter ---
@@ -1526,9 +1635,10 @@ const Painter = struct {
         return .{ .vx = vx, .width = vx.screen.width, .height = vx.screen.height };
     }
 
-    fn clear(self: *Painter) void {
+    fn clear(self: *Painter, style: theme_mod.Style) void {
         self.vx.window().clear();
         self.vx.window().hideCursor();
+        self.fillRect(0, 0, self.width, self.height, style);
     }
 
     fn writeText(self: *Painter, x: u16, y: u16, bytes: []const u8, style: theme_mod.Style) void {
@@ -2160,7 +2270,7 @@ fn expectScreenText(window: vaxis.Window, x: u16, y: u16, expected: []const u8) 
 }
 
 test "markdown inline spans strip markers and keep styles" {
-    const theme = theme_mod.Theme.codex(.{});
+    const theme = theme_mod.Theme.kansoZen(.{});
     var scratch: RowScratch = undefined;
     scratch.reset();
     var count: usize = 0;
@@ -2183,7 +2293,7 @@ test "markdown inline spans strip markers and keep styles" {
 }
 
 test "markdown list continuations align under marker" {
-    const theme = theme_mod.Theme.codex(.{});
+    const theme = theme_mod.Theme.kansoZen(.{});
     var scratch: RowScratch = undefined;
     scratch.reset();
     var count: usize = 0;

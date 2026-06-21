@@ -15,12 +15,22 @@ pub const visible_rows_max: usize = 8;
 pub const id_bytes_max: usize = 256;
 pub const label_bytes_max: usize = 160;
 pub const detail_bytes_max: usize = 160;
+pub const meta_bytes_max: usize = 80;
+pub const aux_bytes_max: usize = 80;
 pub const query_bytes_max: usize = 256;
 
 pub const Item = struct {
     id: []const u8,
     label: []const u8,
     detail: []const u8 = "",
+    meta: []const u8 = "",
+    aux: []const u8 = "",
+};
+
+pub const Layout = enum {
+    line,
+    two_column,
+    four_column,
 };
 
 pub const Open = struct {
@@ -28,6 +38,7 @@ pub const Open = struct {
     query: []const u8 = "",
     items: []const Item,
     search_detail: bool = false,
+    layout: Layout = .line,
 };
 
 pub const Selection = struct {
@@ -48,12 +59,18 @@ pub const OwnedItem = struct {
     label_len: u16 = 0,
     detail: [detail_bytes_max]u8 = undefined,
     detail_len: u16 = 0,
+    meta: [meta_bytes_max]u8 = undefined,
+    meta_len: u16 = 0,
+    aux: [aux_bytes_max]u8 = undefined,
+    aux_len: u16 = 0,
 
     fn init(item: Item) OwnedItem {
         var self: OwnedItem = .{};
         self.id_len = copyBounded(id_bytes_max, &self.id, item.id);
         self.label_len = copyBounded(label_bytes_max, &self.label, item.label);
         self.detail_len = copyBounded(detail_bytes_max, &self.detail, item.detail);
+        self.meta_len = copyBounded(meta_bytes_max, &self.meta, item.meta);
+        self.aux_len = copyBounded(aux_bytes_max, &self.aux, item.aux);
         return self;
     }
 
@@ -68,6 +85,14 @@ pub const OwnedItem = struct {
     pub fn detailSlice(self: *const OwnedItem) []const u8 {
         return self.detail[0..self.detail_len];
     }
+
+    pub fn metaSlice(self: *const OwnedItem) []const u8 {
+        return self.meta[0..self.meta_len];
+    }
+
+    pub fn auxSlice(self: *const OwnedItem) []const u8 {
+        return self.aux[0..self.aux_len];
+    }
 };
 
 id: Id,
@@ -79,9 +104,10 @@ match_len: u16 = 0,
 selected_index: usize = 0,
 dropped_items: usize = 0,
 search_detail: bool = false,
+layout: Layout = .line,
 
 pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
-    var self: Picker = .{ .id = open.id, .search_detail = open.search_detail };
+    var self: Picker = .{ .id = open.id, .search_detail = open.search_detail, .layout = open.layout };
     errdefer self.deinit(gpa);
 
     self.query_len = copyBounded(query_bytes_max, &self.query, open.query);
@@ -290,7 +316,11 @@ fn itemScore(self: *const Picker, index: usize) ?match_mod.Score {
     var best: ?match_mod.Score = null;
     best = bestScore(best, fieldScore(item.idSlice(), query_text, 0));
     best = bestScore(best, fieldScore(item.labelSlice(), query_text, 4));
-    if (self.search_detail) best = bestScore(best, fieldScore(item.detailSlice(), query_text, 8));
+    if (self.search_detail) {
+        best = bestScore(best, fieldScore(item.detailSlice(), query_text, 8));
+        best = bestScore(best, fieldScore(item.metaSlice(), query_text, 12));
+        best = bestScore(best, fieldScore(item.auxSlice(), query_text, 12));
+    }
     return best;
 }
 
@@ -318,7 +348,11 @@ fn pathItemScore(item: *const OwnedItem, query_text: []const u8, search_detail: 
     best = bestScore(best, fieldScore(leaf, query_text, if (is_dir) 10 else 0));
     best = bestScore(best, fieldScore(path, query_text, 20));
     best = bestScore(best, fieldScore(item.labelSlice(), query_text, 24));
-    if (search_detail) best = bestScore(best, fieldScore(item.detailSlice(), query_text, 32));
+    if (search_detail) {
+        best = bestScore(best, fieldScore(item.detailSlice(), query_text, 32));
+        best = bestScore(best, fieldScore(item.metaSlice(), query_text, 36));
+        best = bestScore(best, fieldScore(item.auxSlice(), query_text, 36));
+    }
     return best;
 }
 

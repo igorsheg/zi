@@ -1712,6 +1712,8 @@ fn buildResumeCompletionListFor(
             .id = summary.file_name,
             .label = summary.title,
             .detail = summary.detail,
+            .meta = summary.meta,
+            .aux = summary.aux,
         };
         count += 1;
     }

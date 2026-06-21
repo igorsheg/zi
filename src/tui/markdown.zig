@@ -379,7 +379,7 @@ fn isBoundarySpace(byte: u8) bool {
 }
 
 test "classifyLine tracks fences and recognizes structures" {
-    const theme = theme_mod.Theme.codex(.{});
+    const theme = theme_mod.Theme.kansoZen(.{});
     var state: State = .{};
 
     try std.testing.expectEqual(LineKind.heading, classifyLine(&state, "# Title", &theme).kind);
@@ -395,7 +395,7 @@ test "classifyLine tracks fences and recognizes structures" {
 }
 
 test "list markers keep source marker and indent continuations" {
-    const theme = theme_mod.Theme.codex(.{});
+    const theme = theme_mod.Theme.kansoZen(.{});
     var state: State = .{};
 
     try std.testing.expectEqual(LineKind.plain, classifyLine(&state, "-no space", &theme).kind);
@@ -410,7 +410,7 @@ test "list markers keep source marker and indent continuations" {
 }
 
 test "inline parser recognizes common pi markdown spans" {
-    const theme = theme_mod.Theme.codex(.{});
+    const theme = theme_mod.Theme.kansoZen(.{});
     const base = theme.transcript_text;
     const line = "a `code` **bold** *em* ~~gone~~ [link](https://e.test)";
     var index: usize = 0;

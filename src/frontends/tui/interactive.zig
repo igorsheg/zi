@@ -528,6 +528,7 @@ const InteractiveController = struct {
                 .id = resume_picker_id,
                 .items = mapped,
                 .search_detail = true,
+                .layout = .four_column,
             },
         } });
     }
@@ -1596,6 +1597,8 @@ fn completionPickerItems(
             .id = item.id.text,
             .label = item.label.text,
             .detail = item.detail.text,
+            .meta = item.meta.text,
+            .aux = item.aux.text,
         };
     }
     return buffer[0..keep];

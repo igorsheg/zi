@@ -3,18 +3,16 @@
 //! and `Color` from here instead of vaxis, so the real vendor surface stays
 //! confined to Terminal.zig, render.zig, input.zig, and text.zig.
 //!
-//! Theme colors are chosen from the terminal's ANSI palette by default.  A
-//! TerminalInfo capability lets the frontend supply the terminal's real
-//! background and color level so the theme can adapt without probing inside
-//! the TUI core.
+//! Zi owns its product colors. Terminal capabilities decide only how the
+//! chosen palette is encoded: truecolor RGB, fixed xterm-256 approximation, or
+//! terminal default as a last-resort degradation.
 const std = @import("std");
-const ansi = @import("ansi.zig");
 const vaxis = @import("vaxis");
 
 pub const Style = vaxis.Style;
 pub const Color = vaxis.Color;
 
-pub const ThemeId = enum { codex };
+pub const ThemeId = enum { kanso_zen };
 
 pub const Rgb = [3]u8;
 
@@ -29,8 +27,56 @@ pub const TerminalInfo = struct {
     color_level: ColorLevel = .unknown,
 };
 
+const Palette = struct {
+    bg0: Rgb,
+    bg1: Rgb,
+    bg2: Rgb,
+    bg3: Rgb,
+    bg4: Rgb,
+    fg: Rgb,
+    fg_bright: Rgb,
+    muted: Rgb,
+    muted2: Rgb,
+    red: Rgb,
+    yellow: Rgb,
+    green: Rgb,
+    blue: Rgb,
+    violet: Rgb,
+    aqua: Rgb,
+    orange: Rgb,
+    diff_add_bg: Rgb,
+    diff_del_bg: Rgb,
+};
+
+const kanso_zen = Palette{
+    .bg0 = .{ 0x09, 0x0e, 0x13 },
+    .bg1 = .{ 0x1c, 0x1e, 0x25 },
+    .bg2 = .{ 0x22, 0x26, 0x2d },
+    .bg3 = .{ 0x39, 0x3b, 0x44 },
+    .bg4 = .{ 0x4b, 0x4e, 0x57 },
+    .fg = .{ 0xc5, 0xc9, 0xc7 },
+    .fg_bright = .{ 0xf2, 0xf1, 0xef },
+    .muted = .{ 0x90, 0x93, 0x98 },
+    .muted2 = .{ 0x5c, 0x60, 0x66 },
+    .red = .{ 0xc3, 0x40, 0x43 },
+    .yellow = .{ 0xdc, 0xa5, 0x61 },
+    .green = .{ 0x98, 0xbb, 0x6c },
+    .blue = .{ 0x7f, 0xb4, 0xca },
+    .violet = .{ 0x89, 0x92, 0xa7 },
+    .aqua = .{ 0x8e, 0xa4, 0xa2 },
+    .orange = .{ 0xb6, 0x92, 0x7b },
+    .diff_add_bg = .{ 0x2b, 0x33, 0x28 },
+    .diff_del_bg = .{ 0x43, 0x24, 0x2b },
+};
+
 pub const Theme = struct {
     id: ThemeId,
+
+    app_bg: Style,
+    panel_bg: Style,
+    selection_bg: Style,
+    border: Style,
+    border_active: Style,
 
     shell_label: Style,
     composer_chrome: Style,
@@ -51,111 +97,87 @@ pub const Theme = struct {
     status_error: Style,
     shimmer_base: Style,
     shimmer_peak: Style,
-    picker_selected: Style,
-    picker_unselected: Style,
-    picker_detail: Style,
-    picker_empty: Style,
+    picker_row: Style,
     picker_filter: Style,
+    picker_empty: Style,
+    picker_item: Style,
+    picker_detail: Style,
+    picker_selected_row: Style,
+    picker_selected_item: Style,
+    picker_selected_detail: Style,
 
-    pub fn codex(info: TerminalInfo) Theme {
-        const scheme = resolveScheme(info);
-        const accent = accentStyle(info, scheme);
-        const muted: Style = .{ .dim = true };
-        const user_bg = userMessageBg(info, scheme);
+    pub fn kansoZen(info: TerminalInfo) Theme {
+        const p = kanso_zen;
+        const bg0 = bestColor(info, p.bg0);
+        const bg1 = bestColor(info, p.bg1);
+        const bg3 = bestColor(info, p.bg3);
+        const fg_text = bestColor(info, p.fg);
+        const fg_bright = bestColor(info, p.fg_bright);
+        const muted = bestColor(info, p.muted);
+        const muted2 = bestColor(info, p.muted2);
+        const blue = bestColor(info, p.blue);
+        const violet = bestColor(info, p.violet);
+        const red = bestColor(info, p.red);
+        const yellow = bestColor(info, p.yellow);
+        const green = bestColor(info, p.green);
+        const diff_add_bg = bestColor(info, p.diff_add_bg);
+        const diff_del_bg = bestColor(info, p.diff_del_bg);
 
         return .{
-            .id = .codex,
-            .shell_label = .{ .fg = ansi.magenta, .bold = true },
-            .composer_chrome = muted,
-            .composer_slot = muted,
-            .composer_prompt = accent,
-            .composer_text = .{},
-            .transcript_text = .{},
-            .transcript_user = if (user_bg) |c| .{ .bg = c } else .{},
-            .transcript_secondary = muted,
-            .tool_chrome = muted,
-            .tool_title = .{ .bold = true },
-            .tool_output = muted,
-            .diff_add = .{ .fg = ansi.green },
-            .diff_del = .{ .fg = ansi.red },
-            .status_accent = accent,
-            .status_canceled = canceledStyle(info, scheme),
-            .status_warning = .{ .fg = ansi.yellow, .bold = true },
-            .status_error = .{ .fg = ansi.red, .bold = true },
-            .shimmer_base = shimmerBaseStyle(info, scheme),
-            .shimmer_peak = shimmerPeakStyle(info, scheme),
-            .picker_selected = accent,
-            .picker_unselected = .{},
-            .picker_detail = muted,
-            .picker_empty = muted,
-            .picker_filter = .{},
+            .id = .kanso_zen,
+            .app_bg = .{ .fg = fg_text, .bg = bg0 },
+            .panel_bg = .{ .fg = fg_text, .bg = bg1 },
+            .selection_bg = .{ .fg = fg_bright, .bg = bg3 },
+            .border = .{ .fg = muted2, .bg = bg0 },
+            .border_active = .{ .fg = blue, .bg = bg0, .bold = true },
+            .shell_label = .{ .fg = violet, .bg = bg0, .bold = true },
+            .composer_chrome = .{ .fg = muted2, .bg = bg0 },
+            .composer_slot = .{ .fg = muted, .bg = bg0 },
+            .composer_prompt = .{ .fg = blue, .bg = bg0, .bold = true },
+            .composer_text = .{ .fg = fg_text, .bg = bg0 },
+            .transcript_text = .{ .fg = fg_text, .bg = bg0 },
+            .transcript_user = .{ .fg = fg_bright, .bg = bg1 },
+            .transcript_secondary = .{ .fg = muted, .bg = bg0 },
+            .tool_chrome = .{ .fg = muted2, .bg = bg0 },
+            .tool_title = .{ .fg = blue, .bg = bg0, .bold = true },
+            .tool_output = .{ .fg = muted, .bg = bg0 },
+            .diff_add = .{ .fg = green, .bg = diff_add_bg },
+            .diff_del = .{ .fg = red, .bg = diff_del_bg },
+            .status_accent = .{ .fg = blue, .bg = bg0, .bold = true },
+            .status_canceled = .{ .fg = violet, .bg = bg0, .bold = true },
+            .status_warning = .{ .fg = yellow, .bg = bg0, .bold = true },
+            .status_error = .{ .fg = red, .bg = bg0, .bold = true },
+            .shimmer_base = .{ .fg = muted2, .bg = bg0, .dim = true },
+            .shimmer_peak = .{ .fg = fg_bright, .bg = bg0, .bold = true },
+            .picker_row = .{ .fg = fg_text, .bg = bg0 },
+            .picker_filter = .{ .fg = blue, .bg = bg0 },
+            .picker_empty = .{ .fg = muted, .bg = bg0 },
+            .picker_item = .{ .fg = fg_text, .bg = bg0 },
+            .picker_detail = .{ .fg = muted, .bg = bg0 },
+            .picker_selected_row = .{ .fg = fg_text, .bg = bg0 },
+            .picker_selected_item = .{ .fg = blue, .bg = bg0, .bold = true },
+            .picker_selected_detail = .{ .fg = blue, .bg = bg0, .bold = true },
         };
     }
 };
 
 pub fn resolve(id: ThemeId, info: TerminalInfo) Theme {
     return switch (id) {
-        .codex => .codex(info),
+        .kanso_zen => .kansoZen(info),
     };
 }
 
-fn resolveScheme(info: TerminalInfo) ColorScheme {
-    if (info.scheme) |scheme| return scheme;
-    if (info.bg) |bg| return if (isLight(bg)) .light else .dark;
-    return .dark;
+/// Terminal-safe encoding for an opinionated RGB color. This chooses no color:
+/// the theme already did that. It only adapts the representation to terminal
+/// capability.
+pub fn transparent() Style {
+    return .{};
 }
 
-fn accentStyle(info: TerminalInfo, scheme: ColorScheme) Style {
-    const cyan: Color = switch (scheme) {
-        .dark => ansi.cyan,
-        .light => if (info.color_level == .ansi256 or info.color_level == .truecolor)
-            bestColor(info, .{ 0, 95, 135 })
-        else
-            ansi.cyan,
-    };
-    return .{ .fg = cyan, .bold = true };
-}
-
-fn canceledStyle(info: TerminalInfo, scheme: ColorScheme) Style {
-    return .{ .fg = switch (info.color_level) {
-        .truecolor, .ansi256 => bestColor(info, switch (scheme) {
-            .dark => .{ 180, 140, 255 },
-            .light => .{ 95, 0, 135 },
-        }),
-        .ansi16, .unknown => ansi.magenta,
-    }, .bold = true };
-}
-
-fn shimmerBaseStyle(info: TerminalInfo, scheme: ColorScheme) Style {
-    return .{ .fg = .{ .rgb = info.fg orelse switch (scheme) {
-        .dark => .{ 128, 128, 128 },
-        .light => .{ 96, 96, 96 },
-    } }, .dim = true };
-}
-
-fn shimmerPeakStyle(_: TerminalInfo, scheme: ColorScheme) Style {
-    return .{ .fg = .{ .rgb = switch (scheme) {
-        .dark => .{ 255, 255, 255 },
-        .light => .{ 0, 0, 0 },
-    } }, .bold = true };
-}
-
-fn userMessageBg(info: TerminalInfo, scheme: ColorScheme) ?Color {
-    return switch (info.color_level) {
-        .truecolor, .ansi256 => if (info.bg) |bg| bestColor(info, blendUserMessageBg(bg, scheme)) else switch (scheme) {
-            .dark => .{ .index = 236 },
-            .light => .{ .index = 253 },
-        },
-        .ansi16, .unknown => null,
-    };
-}
-
-/// Terminal-safe approximation for a target RGB color. This deliberately
-/// returns fixed xterm-256 indexes instead of raw RGB: shimmer is the only TUI
-/// path allowed to emit custom colors.
 pub fn bestColor(info: TerminalInfo, target: Rgb) Color {
     return switch (info.color_level) {
-        .truecolor, .ansi256 => .{ .index = nearestXtermFixedIndex(target) },
+        .truecolor => .{ .rgb = target },
+        .ansi256 => .{ .index = nearestXtermFixedIndex(target) },
         .ansi16, .unknown => .default,
     };
 }
@@ -204,44 +226,18 @@ fn channelDistanceSquared(a: u8, b: u8) u32 {
     return @intCast(delta * delta);
 }
 
-fn blendUserMessageBg(bg: Rgb, scheme: ColorScheme) Rgb {
-    const top: Rgb = switch (scheme) {
-        .dark => .{ 255, 255, 255 },
-        .light => .{ 0, 0, 0 },
-    };
-    const alpha: f32 = switch (scheme) {
-        .dark => 0.12,
-        .light => 0.04,
-    };
-    return .{
-        blendChannel(top[0], bg[0], alpha),
-        blendChannel(top[1], bg[1], alpha),
-        blendChannel(top[2], bg[2], alpha),
-    };
+test "kanso zen uses truecolor rgb when available" {
+    const theme = Theme.kansoZen(.{ .color_level = .truecolor });
+    try std.testing.expect(theme.transcript_text.fg == .rgb);
+    try std.testing.expectEqual(@as(Rgb, .{ 0xc5, 0xc9, 0xc7 }), theme.transcript_text.fg.rgb);
+    try std.testing.expect(theme.app_bg.bg == .rgb);
+    try std.testing.expectEqual(@as(Rgb, .{ 0x09, 0x0e, 0x13 }), theme.app_bg.bg.rgb);
 }
 
-fn blendChannel(top: u8, bottom: u8, alpha: f32) u8 {
-    const t = @as(f32, top);
-    const b = @as(f32, bottom);
-    return @intFromFloat(std.math.clamp(t * alpha + b * (1.0 - alpha), 0.0, 255.0));
-}
-
-fn isLight(rgb: Rgb) bool {
-    const r = @as(f32, rgb[0]);
-    const g = @as(f32, rgb[1]);
-    const b = @as(f32, rgb[2]);
-    const y = 0.299 * r + 0.587 * g + 0.114 * b;
-    return y > 128.0;
-}
-
-test "bestColor avoids terminal-remapped ANSI palette" {
-    const color = bestColor(.{ .color_level = .ansi256 }, .{ 180, 140, 255 });
-    try std.testing.expect(color == .index);
-    try std.testing.expect(color.index >= 16);
-}
-
-test "canceled status uses fixed palette when available" {
-    const theme = Theme.codex(.{ .color_level = .ansi256 });
+test "kanso zen degrades to fixed xterm colors for ansi256" {
+    const theme = Theme.kansoZen(.{ .color_level = .ansi256 });
     try std.testing.expect(theme.status_canceled.fg == .index);
     try std.testing.expect(theme.status_canceled.fg.index >= 16);
+    try std.testing.expect(theme.app_bg.bg == .index);
+    try std.testing.expect(theme.app_bg.bg.index >= 16);
 }

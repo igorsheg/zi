@@ -118,7 +118,7 @@ pub fn init(width: u16, height: u16, terminal_info: theme_mod.TerminalInfo) App 
     return .{
         .width = width,
         .height = height,
-        .theme = theme_mod.resolve(.codex, terminal_info),
+        .theme = theme_mod.resolve(.kanso_zen, terminal_info),
     };
 }
 
