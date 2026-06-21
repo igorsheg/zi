@@ -266,6 +266,7 @@ const InteractiveController = struct {
                 .input => try self.drainInput(),
                 .session, .frame => {},
             }
+            if (try self.terminal.drainPendingResize()) self.render_throttle.requestImmediate();
         }
     }
 

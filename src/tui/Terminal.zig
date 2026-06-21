@@ -10,6 +10,7 @@
 //! mode, size, and writes, while the owner loop selects/reads *stdin* for
 //! readiness, because kqueue on macOS cannot poll /dev/tty reliably.
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const App = @import("App.zig");
 const input_mod = @import("input.zig");
@@ -36,6 +37,8 @@ parser: vaxis.Parser = .{},
 pending: [pending_input_bytes_max]u8 = undefined,
 pending_len: usize = 0,
 running: bool = false,
+resize_handler_installed: bool = false,
+resize_pending: std.atomic.Value(bool) = .init(false),
 
 pub const ReadResult = struct {
     bytes_read: usize = 0,
@@ -99,6 +102,7 @@ pub fn setup(self: *Terminal) !void {
         .y_pixel = 0,
     };
     try self.applyWinsize(ws);
+    try self.installResizeHandler();
     self.running = true;
 }
 
@@ -110,6 +114,7 @@ pub fn shutdown(self: *Terminal) !void {
 pub fn suspendForExternalProgram(self: *Terminal) !void {
     self.pending_len = 0;
     self.parser = .{};
+    self.resize_pending.store(false, .release);
     if (self.tty) |*tty| {
         try self.vx.resetState(tty.writer());
         tty.deinit();
@@ -245,6 +250,34 @@ pub fn renderIfDirty(self: *Terminal) !void {
 pub fn resizeFromTerminal(self: *Terminal) !void {
     const ws = try self.tty.?.getWinsize();
     try self.applyWinsize(ws);
+}
+
+pub fn drainPendingResize(self: *Terminal) !bool {
+    if (!self.resize_pending.swap(false, .acquire)) return false;
+    try self.resizeFromTerminal();
+    return true;
+}
+
+fn installResizeHandler(self: *Terminal) !void {
+    if (self.resize_handler_installed) return;
+    switch (builtin.os.tag) {
+        .windows => {},
+        else => if (!builtin.is_test) {
+            const handler: vaxis.Tty.SignalHandler = .{
+                .context = self,
+                .callback = Terminal.winsizeCallback,
+            };
+            try vaxis.Tty.notifyWinsize(handler);
+        },
+    }
+    self.resize_handler_installed = true;
+}
+
+fn winsizeCallback(context: *anyopaque) void {
+    const self: *Terminal = @ptrCast(@alignCast(context));
+    // SIGWINCH may arrive outside the owner loop. The handler records only a
+    // bounded fact; the owner applies the resize at its next wake/drain site.
+    self.resize_pending.store(true, .release);
 }
 
 fn applyWinsize(self: *Terminal, ws: vaxis.Winsize) !void {
