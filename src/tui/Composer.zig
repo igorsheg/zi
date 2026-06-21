@@ -13,6 +13,10 @@ const Composer = @This();
 
 pub const buffer_size_bytes_max: usize = 16 * 1024;
 pub const visible_rows_max: usize = 4;
+pub const paste_line_threshold: usize = 10;
+pub const paste_byte_threshold: usize = 1000;
+pub const paste_payload_bytes_max: usize = 64 * 1024;
+pub const paste_slots_max: usize = 8;
 
 bytes: std.ArrayList(u8) = .empty,
 cursor_byte_index: usize = 0,
@@ -20,8 +24,18 @@ vertical_target_col: ?usize = null,
 first_visible_row: usize = 0,
 revision: u64 = 0,
 projection_cache: ?ProjectionCache = null,
+pastes: std.ArrayList(Paste) = .empty,
+next_paste_id: u32 = 1,
+
+const Paste = struct {
+    id: u32,
+    marker: []u8,
+    payload: []u8,
+};
 
 pub fn deinit(self: *Composer, gpa: std.mem.Allocator) void {
+    self.clearPastes(gpa);
+    self.pastes.deinit(gpa);
     self.bytes.deinit(gpa);
     self.* = undefined;
 }
@@ -67,6 +81,77 @@ fn insertNormalized(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) 
     return if (inserted.len == bytes.len) .ok else .inserted_truncated;
 }
 
+/// Insert a bracketed paste. Large payloads are kept out of the visible
+/// composer buffer and represented by a generated marker that expands only
+/// while its exact marker storage is still live.
+pub fn insertPaste(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!InsertResult {
+    std.debug.assert(std.unicode.utf8ValidateSlice(bytes));
+    const normalized = try normalizedPaste(gpa, bytes);
+    defer if (normalized.owned) |owned| gpa.free(owned);
+    const paste = normalized.bytes;
+    if (!isLargePaste(paste) or self.pastes.items.len >= paste_slots_max) return self.insertNormalized(gpa, paste);
+
+    var marker_buffer: [64]u8 = undefined;
+    const marker = makePasteMarker(&marker_buffer, self.next_paste_id, paste) catch unreachable;
+    if (marker.len > buffer_size_bytes_max - self.bytes.items.len) return .rejected_full;
+
+    const payload_copy = try gpa.dupe(u8, paste);
+    errdefer gpa.free(payload_copy);
+    const marker_copy = try gpa.dupe(u8, marker);
+    errdefer gpa.free(marker_copy);
+    try self.bytes.insertSlice(gpa, self.cursor_byte_index, marker_copy);
+    errdefer self.bytes.replaceRangeAssumeCapacity(self.cursor_byte_index, marker_copy.len, "");
+    try self.pastes.append(gpa, .{ .id = self.next_paste_id, .marker = marker_copy, .payload = payload_copy });
+    self.next_paste_id +%= 1;
+    if (self.next_paste_id == 0) self.next_paste_id = 1;
+    self.cursor_byte_index += marker_copy.len;
+    self.noteEdit();
+    return .ok;
+}
+
+const NormalizedPaste = struct {
+    bytes: []const u8,
+    owned: ?[]u8 = null,
+};
+
+fn normalizedPaste(gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!NormalizedPaste {
+    if (std.mem.indexOfScalar(u8, bytes, '\r') == null) return .{ .bytes = bytes };
+    var normalized: std.ArrayList(u8) = .empty;
+    errdefer normalized.deinit(gpa);
+    try normalized.ensureTotalCapacity(gpa, bytes.len);
+    var index: usize = 0;
+    while (index < bytes.len) : (index += 1) {
+        const byte = bytes[index];
+        if (byte == '\r') {
+            if (index + 1 < bytes.len and bytes[index + 1] == '\n') index += 1;
+            normalized.appendAssumeCapacity('\n');
+        } else {
+            normalized.appendAssumeCapacity(byte);
+        }
+    }
+    return .{ .bytes = normalized.items, .owned = try normalized.toOwnedSlice(gpa) };
+}
+
+fn isLargePaste(bytes: []const u8) bool {
+    if (bytes.len > paste_byte_threshold) return true;
+    var lines: usize = 1;
+    for (bytes) |byte| {
+        if (byte == '\n') lines += 1;
+    }
+    return lines > paste_line_threshold;
+}
+
+fn makePasteMarker(buffer: []u8, id: u32, bytes: []const u8) error{NoSpaceLeft}![]const u8 {
+    var lines: usize = 1;
+    for (bytes) |byte| {
+        if (byte == '\n') lines += 1;
+    }
+    if (lines > paste_line_threshold) {
+        return std.fmt.bufPrint(buffer, "[paste #{d} +{d} lines]", .{ id, lines });
+    }
+    return std.fmt.bufPrint(buffer, "[paste #{d} {d} bytes]", .{ id, bytes.len });
+}
+
 pub fn clear(self: *Composer) void {
     if (self.bytes.items.len == 0 and
         self.cursor_byte_index == 0 and
@@ -76,6 +161,20 @@ pub fn clear(self: *Composer) void {
     self.cursor_byte_index = 0;
     self.first_visible_row = 0;
     self.noteEdit();
+}
+
+pub fn clearAndFreePastes(self: *Composer, gpa: std.mem.Allocator) void {
+    self.clear();
+    self.clearPastes(gpa);
+    self.next_paste_id = 1;
+}
+
+fn clearPastes(self: *Composer, gpa: std.mem.Allocator) void {
+    for (self.pastes.items) |paste| {
+        gpa.free(paste.marker);
+        gpa.free(paste.payload);
+    }
+    self.pastes.clearRetainingCapacity();
 }
 
 pub fn replaceText(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!void {
@@ -106,16 +205,100 @@ pub fn submitSlice(self: *const Composer) ?[]const u8 {
     return if (trimmed.len == 0) null else trimmed;
 }
 
-pub fn backspace(self: *Composer) void {
+pub fn submitOwned(self: *const Composer, gpa: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
+    const text_to_submit = self.submitSlice() orelse return null;
+    if (self.pastes.items.len == 0) return try gpa.dupe(u8, text_to_submit);
+
+    var expanded: std.ArrayList(u8) = .empty;
+    defer expanded.deinit(gpa);
+    var index: usize = 0;
+    while (index < text_to_submit.len) {
+        if (self.pasteAt(text_to_submit[index..])) |paste| {
+            try expanded.appendSlice(gpa, paste.payload);
+            index += paste.marker.len;
+        } else {
+            try expanded.append(gpa, text_to_submit[index]);
+            index += 1;
+        }
+    }
+    const trimmed = std.mem.trim(u8, expanded.items, " \t\n\r");
+    if (trimmed.len == 0) return null;
+    return try gpa.dupe(u8, trimmed);
+}
+
+pub fn expandedTextOwned(self: *const Composer, gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
+    if (self.pastes.items.len == 0) return gpa.dupe(u8, self.bytes.items);
+    var expanded: std.ArrayList(u8) = .empty;
+    errdefer expanded.deinit(gpa);
+    var index: usize = 0;
+    while (index < self.bytes.items.len) {
+        if (self.pasteAt(self.bytes.items[index..])) |paste| {
+            try expanded.appendSlice(gpa, paste.payload);
+            index += paste.marker.len;
+        } else {
+            try expanded.append(gpa, self.bytes.items[index]);
+            index += 1;
+        }
+    }
+    return expanded.toOwnedSlice(gpa);
+}
+
+fn pasteAt(self: *const Composer, bytes: []const u8) ?Paste {
+    for (self.pastes.items) |paste| {
+        if (std.mem.startsWith(u8, bytes, paste.marker)) return paste;
+    }
+    return null;
+}
+
+const PasteSpan = struct {
+    paste_index: usize,
+    start: usize,
+    end: usize,
+};
+
+fn pasteSpanContaining(self: *const Composer, byte_index: usize) ?PasteSpan {
+    for (self.pastes.items, 0..) |paste, paste_index| {
+        var search_start: usize = 0;
+        while (std.mem.indexOfPos(u8, self.bytes.items, search_start, paste.marker)) |start| {
+            const end = start + paste.marker.len;
+            if (byte_index >= start and byte_index < end) return .{
+                .paste_index = paste_index,
+                .start = start,
+                .end = end,
+            };
+            search_start = end;
+        }
+    }
+    return null;
+}
+
+fn removePasteSpan(self: *Composer, gpa: std.mem.Allocator, span: PasteSpan) void {
+    self.bytes.replaceRangeAssumeCapacity(span.start, span.end - span.start, "");
+    const paste = self.pastes.swapRemove(span.paste_index);
+    gpa.free(paste.marker);
+    gpa.free(paste.payload);
+    self.cursor_byte_index = span.start;
+    self.noteEdit();
+}
+
+pub fn backspace(self: *Composer, gpa: std.mem.Allocator) void {
     if (self.cursor_byte_index == 0) return;
+    if (self.pasteSpanContaining(self.cursor_byte_index - 1)) |span| {
+        self.removePasteSpan(gpa, span);
+        return;
+    }
     const start = text_mod.previousGraphemeStart(self.bytes.items, self.cursor_byte_index);
     self.bytes.replaceRangeAssumeCapacity(start, self.cursor_byte_index - start, "");
     self.cursor_byte_index = start;
     self.noteEdit();
 }
 
-pub fn deleteForward(self: *Composer) void {
+pub fn deleteForward(self: *Composer, gpa: std.mem.Allocator) void {
     if (self.cursor_byte_index >= self.bytes.items.len) return;
+    if (self.pasteSpanContaining(self.cursor_byte_index)) |span| {
+        self.removePasteSpan(gpa, span);
+        return;
+    }
     const end = text_mod.nextGraphemeEnd(self.bytes.items, self.cursor_byte_index);
     self.bytes.replaceRangeAssumeCapacity(self.cursor_byte_index, end - self.cursor_byte_index, "");
     self.noteEdit();
@@ -387,8 +570,36 @@ test "deleteForward removes the grapheme under the cursor" {
 
     _ = try composer.insert(gpa, "ab");
     composer.moveStart();
-    composer.deleteForward();
+    composer.deleteForward(gpa);
     try std.testing.expectEqualStrings("b", composer.text());
+}
+
+test "backspace removes a paste marker and its stored payload" {
+    const gpa = std.testing.allocator;
+    var composer: Composer = .{};
+    defer composer.deinit(gpa);
+
+    _ = try composer.insertPaste(gpa, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11");
+    try std.testing.expectEqualStrings("[paste #1 +11 lines]", composer.text());
+    try std.testing.expectEqual(@as(usize, 1), composer.pastes.items.len);
+
+    composer.backspace(gpa);
+
+    try std.testing.expectEqualStrings("", composer.text());
+    try std.testing.expectEqual(@as(usize, 0), composer.pastes.items.len);
+}
+
+test "deleteForward removes a paste marker and its stored payload" {
+    const gpa = std.testing.allocator;
+    var composer: Composer = .{};
+    defer composer.deinit(gpa);
+
+    _ = try composer.insertPaste(gpa, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11");
+    composer.moveStart();
+    composer.deleteForward(gpa);
+
+    try std.testing.expectEqualStrings("", composer.text());
+    try std.testing.expectEqual(@as(usize, 0), composer.pastes.items.len);
 }
 
 test "vertical movement follows wrapped rows" {
@@ -427,7 +638,7 @@ test "projection cache invalidates on edit and tracks the cursor" {
     var projection = composer.visibleRows(6, &rows);
     try std.testing.expect(projection.cursor_visible);
 
-    composer.backspace();
+    composer.backspace(gpa);
     projection = composer.visibleRows(6, &rows);
     try std.testing.expectEqualStrings("worl", rows[projection.visible_count - 1].text);
 }

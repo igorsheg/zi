@@ -109,6 +109,8 @@ tools_expanded: bool = false,
 now_ms: i64 = 0,
 last_clear_ms: ?i64 = null,
 in_paste: bool = false,
+paste_buffer: std.ArrayList(u8) = .empty,
+paste_truncated: bool = false,
 /// Coalesces the composer-full notice: a 17 KB paste arrives as hundreds of
 /// rejected inserts and must produce one warning, not hundreds.
 composer_full_noticed: bool = false,
@@ -127,6 +129,7 @@ pub fn deinit(self: *App, gpa: std.mem.Allocator) void {
     self.prompt_history.deinit(gpa);
     self.completion.deinit(gpa);
     self.transcript.deinit(gpa);
+    self.paste_buffer.deinit(gpa);
     self.composer.deinit(gpa);
     self.* = undefined;
 }
@@ -563,12 +566,11 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
     switch (event) {
         .paste_begin => {
             self.in_paste = true;
+            self.paste_buffer.clearRetainingCapacity();
+            self.paste_truncated = false;
             return null;
         },
-        .paste_end => {
-            self.in_paste = false;
-            return null;
-        },
+        .paste_end => return self.finishPaste(gpa),
         else => {},
     }
     if (self.completion.modal != null) return self.applyPickerInput(gpa, event);
@@ -579,21 +581,22 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
     // markers. Enter inside a paste is data, not a submit.
     if (self.in_paste) {
         switch (event) {
-            .text => |bytes| return self.composerInsert(gpa, bytes.slice()),
+            .text => |bytes| try self.appendPasteBytes(gpa, bytes.slice()),
             .key => |key| switch (key) {
-                .enter, .newline => return self.composerInsert(gpa, "\n"),
-                .tab => return self.composerInsert(gpa, "\t"),
+                .enter, .newline => try self.appendPasteBytes(gpa, "\n"),
+                .tab => try self.appendPasteBytes(gpa, "\t"),
                 else => return null,
             },
             else => return null,
         }
+        return null;
     }
 
     switch (input_mod.resolve(event)) {
         .composer_insert => |bytes| return self.composerInsert(gpa, bytes.slice()),
         .composer_newline => return self.composerInsert(gpa, "\n"),
-        .composer_backspace => self.composerTextEdit(Composer.backspace),
-        .composer_delete_forward => self.composerTextEdit(Composer.deleteForward),
+        .composer_backspace => self.composerTextEdit(gpa, Composer.backspace),
+        .composer_delete_forward => self.composerTextEdit(gpa, Composer.deleteForward),
         .composer_left => self.composerCursorEdit(Composer.moveLeft),
         .composer_right => self.composerCursorEdit(Composer.moveRight),
         .composer_up => try self.composerUpOrHistory(gpa),
@@ -618,7 +621,7 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
             self.dirty = true;
         },
         .interrupt => return .interrupt,
-        .clear_or_exit => return self.clearOrExit(),
+        .clear_or_exit => return self.clearOrExit(gpa),
         .exit_if_composer_empty => if (self.composer.text().len == 0) return .request_shutdown,
         .open_external_editor => return try self.openExternalEditor(gpa),
         .none => {},
@@ -711,6 +714,45 @@ fn applyPickerInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) 
     }
 }
 
+fn appendPasteBytes(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!void {
+    const remaining = Composer.paste_payload_bytes_max - self.paste_buffer.items.len;
+    if (remaining == 0) {
+        self.paste_truncated = true;
+        return;
+    }
+    var clean_buffer: [input_mod.inline_text_bytes_max * 3]u8 = undefined;
+    const clean = if (std.unicode.utf8ValidateSlice(bytes))
+        bytes
+    else
+        text_mod.sanitizeInto(&clean_buffer, bytes);
+    const prefix = text_mod.utf8Prefix(clean, remaining);
+    try self.paste_buffer.appendSlice(gpa, prefix);
+    if (prefix.len < clean.len) self.paste_truncated = true;
+}
+
+fn finishPaste(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
+    self.in_paste = false;
+    defer self.paste_buffer.clearRetainingCapacity();
+    defer self.paste_truncated = false;
+    if (self.paste_buffer.items.len == 0) return null;
+
+    switch (try self.composer.insertPaste(gpa, self.paste_buffer.items)) {
+        .ok, .inserted_truncated => |result| {
+            self.noteGreeterCharacterInput();
+            self.resetHistoryNavigation();
+            self.completion.noteEdit();
+            self.syncComposerCompletion();
+            self.syncComposerScrollHint();
+            self.composer_full_noticed = false;
+            self.dirty = true;
+            if (result == .inserted_truncated) try self.noticeComposerFull(gpa);
+        },
+        .rejected_full => try self.noticeComposerFull(gpa),
+    }
+    if (self.paste_truncated) try self.notice(gpa, .warning, "paste too large: extra input dropped");
+    return null;
+}
+
 fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!?Effect {
     // Key text is operational input; sanitize so Composer's valid-UTF-8
     // contract holds even against a terminal that emits garbage. Worst case
@@ -743,7 +785,7 @@ fn noticeComposerFull(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!voi
 }
 
 fn openExternalEditor(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!Effect {
-    return .{ .edit_composer_external = try gpa.dupe(u8, self.composer.text()) };
+    return .{ .edit_composer_external = try self.composer.expandedTextOwned(gpa) };
 }
 
 fn noteGreeterCharacterInput(self: *App) void {
@@ -756,8 +798,8 @@ fn noteGreeterCharacterInput(self: *App) void {
 }
 
 fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
-    const text = self.composer.submitSlice() orelse {
-        if (self.composer.text().len != 0) self.composer.clear();
+    const visible_text = self.composer.submitSlice() orelse {
+        if (self.composer.text().len != 0) self.composer.clearAndFreePastes(gpa);
         self.resetHistoryNavigation();
         self.completion.noteEdit();
         self.syncComposerScrollHint();
@@ -765,11 +807,11 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
         return null;
     };
 
-    const submitted = try gpa.dupe(u8, text);
+    const submitted = (try self.composer.submitOwned(gpa)).?;
     errdefer gpa.free(submitted);
-    try self.prompt_history.record(gpa, text);
+    try self.prompt_history.record(gpa, visible_text);
 
-    self.composer.clear();
+    self.composer.clearAndFreePastes(gpa);
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
@@ -779,8 +821,8 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
     return .{ .submit_text = submitted };
 }
 
-fn composerTextEdit(self: *App, comptime edit: fn (*Composer) void) void {
-    edit(&self.composer);
+fn composerTextEdit(self: *App, gpa: std.mem.Allocator, comptime edit: fn (*Composer, std.mem.Allocator) void) void {
+    edit(&self.composer, gpa);
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
@@ -1120,7 +1162,7 @@ fn selectComposerArgCompletion(
     const index = completion.picker.selectedIndex() orelse return null;
     const item = completion.picker.itemAt(index);
     const item_id = try gpa.dupe(u8, item.idSlice());
-    self.composer.clear();
+    self.composer.clearAndFreePastes(gpa);
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
@@ -1130,13 +1172,13 @@ fn selectComposerArgCompletion(
     return .{ .picker_selected = .{ .picker_id = completion.picker.id, .item_id = item_id } };
 }
 
-fn clearOrExit(self: *App) ?Effect {
+fn clearOrExit(self: *App, gpa: std.mem.Allocator) ?Effect {
     if (self.last_clear_ms) |last_ms| {
         if (self.now_ms >= last_ms and self.now_ms - last_ms <= double_press_window_ms) {
             return .request_shutdown;
         }
     }
-    self.composer.clear();
+    self.composer.clearAndFreePastes(gpa);
     self.resetHistoryNavigation();
     self.completion.noteEdit();
     self.syncComposerCompletion();
@@ -1791,6 +1833,27 @@ test "paste mode turns enter into a newline and never submits" {
     _ = try app.apply(gpa, .{ .input = .paste_end });
 
     try std.testing.expectEqualStrings("line1\nline2", app.composer.text());
+}
+
+test "large bracketed paste inserts marker and submits expanded text" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .input = .paste_begin });
+    inline for (0..11) |index| {
+        if (index != 0) _ = try app.apply(gpa, .{ .input = .{ .key = .enter } });
+        _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("line") } });
+    }
+    _ = try app.apply(gpa, .{ .input = .paste_end });
+
+    try std.testing.expectEqualStrings("[paste #1 +11 lines]", app.composer.text());
+    const effect = (try app.apply(gpa, .{ .input = .{ .key = .enter } })).?;
+    defer effect.deinit(gpa);
+    try std.testing.expectEqualStrings(
+        "line\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline",
+        effect.submit_text,
+    );
 }
 
 test "composer overflow fills remaining capacity before warning" {
