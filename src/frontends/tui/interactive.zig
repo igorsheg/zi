@@ -543,6 +543,9 @@ const InteractiveController = struct {
             .id = file_picker_id,
             .items = mapped,
             .search_detail = true,
+            .layout = .two_column,
+            .truncated = result.items.truncated,
+            .min_visible_rows = 4,
         } });
     }
 

@@ -989,6 +989,7 @@ const ComposerArgQuery = struct {
 const FileQuery = struct {
     start: usize,
     end: usize,
+    path_end: usize,
     text: []const u8,
 };
 
@@ -1011,9 +1012,25 @@ fn composerFileQuery(self: *const App) ?FileQuery {
     if (cursor == 0 or cursor > text.len) return null;
 
     var start = cursor;
-    while (start > 0 and !std.ascii.isWhitespace(text[start - 1])) : (start -= 1) {}
+    while (start > 0 and isFileMentionBodyByte(text[start - 1])) : (start -= 1) {}
     if (start >= cursor or text[start] != '@') return null;
-    return .{ .start = start, .end = cursor, .text = text[start + 1 .. cursor] };
+    if (start > 0 and isFileMentionBodyByte(text[start - 1])) return null;
+    const path_end = fileMentionPathEnd(text, start + 1, cursor);
+    return .{ .start = start, .end = cursor, .path_end = path_end, .text = text[start + 1 .. path_end] };
+}
+
+fn fileMentionPathEnd(text: []const u8, start: usize, cursor: usize) usize {
+    var index = cursor;
+    while (index > start and std.ascii.isDigit(text[index - 1])) : (index -= 1) {}
+    if (index > start and index < cursor and text[index - 1] == ':') return index - 1;
+    return cursor;
+}
+
+fn isFileMentionBodyByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or switch (byte) {
+        '/', '.', '_', '-', '+', ':', '#', '@' => true,
+        else => false,
+    };
 }
 
 fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
@@ -1055,10 +1072,12 @@ fn acceptFileCompletion(self: *App, gpa: std.mem.Allocator, completion: *Picker)
     var next: std.ArrayList(u8) = .empty;
     defer next.deinit(gpa);
     const text = self.composer.text();
-    try next.ensureTotalCapacity(gpa, text.len - (query.end - query.start) + 1 + item.idSlice().len);
+    const suffix = text[query.path_end..query.end];
+    try next.ensureTotalCapacity(gpa, text.len - (query.path_end - query.start) + 1 + item.idSlice().len);
     next.appendSliceAssumeCapacity(text[0..query.start]);
     next.appendAssumeCapacity('@');
     next.appendSliceAssumeCapacity(item.idSlice());
+    next.appendSliceAssumeCapacity(suffix);
     next.appendSliceAssumeCapacity(text[query.end..]);
     try self.composer.replaceTextAtCursor(gpa, next.items, query.start + 1 + item.idSlice().len);
     self.resetHistoryNavigation();
@@ -1561,6 +1580,30 @@ test "composer file query follows cursor" {
 
     try app.composer.replaceTextAtCursor(gpa, "ask @src then @docs", "ask @src".len);
     try std.testing.expectEqualStrings("src", app.activeFileCompletionQuery().?);
+}
+
+test "composer file query accepts punctuation boundaries and strips line suffix" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    try app.composer.replaceTextAtCursor(gpa, "see (@src/App.zig:12)", "see (@src/App.zig:12".len);
+    try std.testing.expectEqualStrings("src/App.zig", app.activeFileCompletionQuery().?);
+}
+
+test "composer file completion preserves line suffix" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{
+        .{ .id = "src/tui/App.zig", .label = "App.zig", .detail = "src/tui" },
+    };
+    _ = try app.apply(gpa, .{ .set_file_completions = .{ .id = 4, .items = &items } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("see (@app:12") } });
+    _ = try app.apply(gpa, .{ .input = .{ .key = .tab } });
+    try std.testing.expectEqualStrings("see (@src/tui/App.zig:12", app.composer.text());
 }
 
 test "composer file completion filters with composer focus and inserts mention" {

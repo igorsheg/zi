@@ -462,14 +462,18 @@ pub fn pickerRows(app: *App) usize {
     const picker = app.visiblePicker() orelse return 0;
     if (app.height < 4) return 0;
     const match_count = picker.matchCount();
-    const item_rows = @min(@max(match_count, 1), Picker.visible_rows_max);
+    const footer_rows: usize = if (picker.isTruncated()) 1 else 0;
+    const body_rows = if (picker.minVisibleRows() > 0)
+        picker.minVisibleRows()
+    else
+        @min(@max(match_count, 1), Picker.visible_rows_max) + footer_rows;
     // Picker is chromeless: no border, no title. Modal pickers still need a
     // filter input row; inline completions borrow the composer as their filter.
     const chrome_rows: usize = if (app.visiblePickerFocusesFilter()) 1 else 0;
     // Keep at least a one-line composer box and its border budget visible;
     // the picker is below the composer and yields first on tiny terminals.
     const rows_max = @as(usize, app.height) -| 3;
-    return @min(item_rows + chrome_rows, rows_max);
+    return @min(body_rows + chrome_rows, rows_max);
 }
 
 pub fn composerTextWidth(width: u16) u16 {
@@ -1454,8 +1458,10 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
 
     const match_count = picker.matchCount();
     const chrome_rows: usize = if (focus_filter) 1 else 0;
+    const footer_rows: usize = if (picker.isTruncated()) 1 else 0;
     if (rows_reserved < chrome_rows + 1) return;
-    const item_rows = @min(@max(match_count, 1), rows_reserved - chrome_rows);
+    const body_rows = rows_reserved - chrome_rows;
+    const item_rows = if (body_rows > footer_rows) body_rows - footer_rows else body_rows;
     const box_width: u16 = app.width;
     const x: u16 = 0;
     const y: u16 = @intCast(@as(usize, app.height) - rows_reserved);
@@ -1503,6 +1509,15 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
             .two_column => drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
             .four_column => drawFourColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
         }
+    }
+
+    if (footer_rows > 0) {
+        const footer_y: u16 = @intCast(@as(usize, y) + rows_reserved - 1);
+        const message = if (picker.omittedCount() > 0)
+            "results truncated; keep typing"
+        else
+            "scan truncated; keep typing";
+        painter.writeText(x + 1, footer_y, fitToWidth(message, inner_width), app.theme.picker_detail);
     }
 }
 

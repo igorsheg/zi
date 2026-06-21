@@ -39,6 +39,8 @@ pub const Open = struct {
     items: []const Item,
     search_detail: bool = false,
     layout: Layout = .line,
+    truncated: bool = false,
+    min_visible_rows: u8 = 0,
 };
 
 pub const Selection = struct {
@@ -103,11 +105,19 @@ matches: [item_count_max]u16 = undefined,
 match_len: u16 = 0,
 selected_index: usize = 0,
 dropped_items: usize = 0,
+truncated: bool = false,
+min_visible_rows: u8 = 0,
 search_detail: bool = false,
 layout: Layout = .line,
 
 pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
-    var self: Picker = .{ .id = open.id, .search_detail = open.search_detail, .layout = open.layout };
+    var self: Picker = .{
+        .id = open.id,
+        .truncated = open.truncated,
+        .min_visible_rows = @min(open.min_visible_rows, visible_rows_max),
+        .search_detail = open.search_detail,
+        .layout = open.layout,
+    };
     errdefer self.deinit(gpa);
 
     self.query_len = copyBounded(query_bytes_max, &self.query, open.query);
@@ -145,6 +155,18 @@ pub fn itemAt(self: *const Picker, index: usize) *const OwnedItem {
 
 pub fn matchCount(self: *const Picker) usize {
     return self.match_len;
+}
+
+pub fn omittedCount(self: *const Picker) usize {
+    return self.dropped_items;
+}
+
+pub fn minVisibleRows(self: *const Picker) usize {
+    return self.min_visible_rows;
+}
+
+pub fn isTruncated(self: *const Picker) bool {
+    return self.truncated or self.dropped_items > 0;
 }
 
 pub fn selectedIndex(self: *const Picker) ?usize {

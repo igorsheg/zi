@@ -56,7 +56,11 @@ pub const Result = struct {
         const index = self.item_len;
         self.item_len += 1;
         self.items[index].id_len = copyRawField(client_protocol.completion_id_bytes_max, &self.items[index].id, path);
-        self.items[index].label_len = copyRawField(client_protocol.completion_label_bytes_max, &self.items[index].label, path);
+        self.items[index].label_len = copyRawField(
+            client_protocol.completion_label_bytes_max,
+            &self.items[index].label,
+            pathLabel(path),
+        );
         self.items[index].detail_len = copyRawField(client_protocol.completion_detail_bytes_max, &self.items[index].detail, detail);
     }
 
@@ -92,7 +96,14 @@ pub fn build(root_dir: std.Io.Dir, query: []const u8) !*Result {
     const scope = bounded_query[0..scope_end];
     const leaf_query = bounded_query[scope_end..];
     if (leaf_query.len == 0) {
-        try collectDirectoryChildren(root_dir.handle, scope, result);
+        const listed = try collectDirectoryChildren(root_dir.handle, scope, result);
+        if (!listed and scope.len > 0) {
+            if (try resolveDirectoryAlias(root_dir.handle, scope[0 .. scope.len - 1])) |resolved_scope| {
+                _ = try collectDirectoryChildren(root_dir.handle, resolved_scope, result);
+            } else {
+                try collectDirectoryMatches(root_dir.handle, scope[0 .. scope.len - 1], result);
+            }
+        }
     } else {
         try collectMatches(root_dir.handle, bounded_query, result);
     }
@@ -126,16 +137,16 @@ fn collectDirectoryChildren(
     root_fd: std.posix.fd_t,
     scope: []const u8,
     result: *Result,
-) !void {
-    const dir_path = scopeDirPath(scope) orelse return;
+) !bool {
+    const dir_path = scopeDirPath(scope) orelse return false;
     const dir_fd = std.posix.openat(root_fd, dir_path, .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
         .CLOEXEC = true,
-    }, 0) catch return;
+    }, 0) catch return false;
     const c_dir = std.c.fdopendir(dir_fd) orelse {
         _ = std.c.close(dir_fd);
-        return;
+        return false;
     };
     defer _ = std.c.closedir(c_dir);
 
@@ -162,8 +173,34 @@ fn collectDirectoryChildren(
             result.truncated = true;
             continue;
         }
-        result.append(path, if (is_dir) "directory" else pathDirname(path));
+        result.append(path, pathDirname(path));
     }
+    return true;
+}
+
+fn resolveDirectoryAlias(root_fd: std.posix.fd_t, query: []const u8) !?[]const u8 {
+    var scratch: Result = .{};
+    try collectDirectoryMatches(root_fd, query, &scratch);
+    if (scratch.item_len != 1) return null;
+    return scratch.items[0].idSlice();
+}
+
+fn collectDirectoryMatches(
+    root_fd: std.posix.fd_t,
+    query: []const u8,
+    result: *Result,
+) !void {
+    const before = result.item_len;
+    try collectMatches(root_fd, query, result);
+    var read: usize = before;
+    var write: usize = before;
+    while (read < result.item_len) : (read += 1) {
+        const item = result.items[read];
+        if (!std.mem.endsWith(u8, item.idSlice(), "/")) continue;
+        result.items[write] = item;
+        write += 1;
+    }
+    result.item_len = @intCast(write);
 }
 
 fn collectMatches(
@@ -232,7 +269,7 @@ fn collectMatches(
                 continue;
             }
             if (scope.len > 0 and is_dir) scope_matches += 1;
-            result.append(completion_path, if (is_dir) "directory" else pathDirname(completion_path));
+            result.append(completion_path, pathDirname(completion_path));
         }
     }
 }
@@ -347,8 +384,15 @@ fn joinPath(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8
 }
 
 fn pathDirname(path: []const u8) []const u8 {
-    const index = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
-    return path[0..index];
+    const trimmed = if (std.mem.endsWith(u8, path, "/")) path[0 .. path.len - 1] else path;
+    const index = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return "";
+    return trimmed[0..index];
+}
+
+fn pathLabel(path: []const u8) []const u8 {
+    const trimmed = if (std.mem.endsWith(u8, path, "/")) path[0 .. path.len - 1] else path;
+    const index = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return path;
+    return path[index + 1 ..];
 }
 
 fn pathLeaf(path: []const u8) []const u8 {
@@ -382,8 +426,40 @@ test "lists direct directory children deterministically" {
 
     try std.testing.expectEqual(@as(u16, 3), result.item_len);
     try std.testing.expectEqualStrings("src/agent/", result.items[0].idSlice());
+    try std.testing.expectEqualStrings("agent/", result.items[0].label[0..result.items[0].label_len]);
+    try std.testing.expectEqualStrings("src", result.items[0].detail[0..result.items[0].detail_len]);
     try std.testing.expectEqualStrings("src/tui/", result.items[1].idSlice());
     try std.testing.expectEqualStrings("src/main.zig", result.items[2].idSlice());
+    try std.testing.expectEqualStrings("main.zig", result.items[2].label[0..result.items[2].label_len]);
+}
+
+test "manual slash descends into a unique directory alias" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src/agent");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/agent/root.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/agent/App.zig", .data = "" });
+
+    const result = try build(tmp.dir, "agent/");
+    defer result.destroy();
+
+    try std.testing.expectEqual(@as(u16, 2), result.item_len);
+    try std.testing.expectEqualStrings("src/agent/App.zig", result.items[0].idSlice());
+    try std.testing.expectEqualStrings("src/agent/root.zig", result.items[1].idSlice());
+}
+
+test "manual slash shows directory choices when alias is ambiguous" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src/agent");
+    try tmp.dir.createDirPath(std.testing.io, "docs/agent");
+
+    const result = try build(tmp.dir, "agent/");
+    defer result.destroy();
+
+    try std.testing.expectEqual(@as(u16, 2), result.item_len);
+    try std.testing.expectEqualStrings("docs/agent/", result.items[0].idSlice());
+    try std.testing.expectEqualStrings("src/agent/", result.items[1].idSlice());
 }
 
 test "hides dotfiles until dot is requested" {
