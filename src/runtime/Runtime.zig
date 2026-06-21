@@ -252,6 +252,14 @@ pub const Runtime = struct {
         return .{ .handle = try self.inner.spawn(function, args) };
     }
 
+    pub fn spawnBlocking(
+        self: *Runtime,
+        function: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(function)),
+    ) !Task(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
+        return .{ .handle = try self.inner.spawnBlocking(function, args) };
+    }
+
     pub fn sleep(self: *Runtime, duration: Duration) Cancelable!void {
         _ = self;
         try zio.sleep(duration.inner);

@@ -15,6 +15,7 @@ pub const wire_protocol = @import("wire_protocol.zig");
 const AgentSession = @import("AgentSession.zig");
 const auth = @import("auth.zig");
 const event_drain = @import("event_drain.zig");
+const file_completion = @import("file_completion.zig");
 const message_policy = @import("message_policy.zig");
 const paths = @import("paths.zig");
 const queue_mirror = @import("queue_mirror.zig");
@@ -33,6 +34,7 @@ test {
     _ = AgentSession;
     _ = auth;
     _ = event_drain;
+    _ = file_completion;
     _ = message_policy;
     _ = paths;
     _ = queue_mirror;

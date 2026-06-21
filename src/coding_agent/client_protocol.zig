@@ -30,7 +30,7 @@ pub const history_page_total_text_bytes_max = 64 * 1024;
 pub const snapshot_model_text_bytes_max = 256;
 /// Mirrors current TUI picker caps without importing TUI into the core protocol.
 pub const completion_item_count_max = 384;
-pub const completion_id_bytes_max = 128;
+pub const completion_id_bytes_max = 256;
 pub const completion_label_bytes_max = 160;
 pub const completion_detail_bytes_max = 160;
 
@@ -70,6 +70,16 @@ pub const CommandEnvelope = struct {
         } } };
     }
 
+    pub fn initFileCompletion(
+        allocator: std.mem.Allocator,
+        id: ?RequestId,
+        query: []const u8,
+    ) !CommandEnvelope {
+        return .{ .id = id, .command = .{ .file_completion = .{
+            .query = try allocator.dupe(u8, utf8Prefix(query, file_completion_query_bytes_max)),
+        } } };
+    }
+
     pub fn deinit(self: *CommandEnvelope, allocator: std.mem.Allocator) void {
         self.command.deinit(allocator);
         self.* = undefined;
@@ -82,6 +92,7 @@ pub const ClientCommand = union(enum) {
     queue: QueueCommand,
     snapshot,
     completion_snapshot,
+    file_completion: FileCompletionRequest,
     replay: ReplayRequest,
     history_page: HistoryPageRequest,
     switch_session: SwitchSession,
@@ -92,6 +103,7 @@ pub const ClientCommand = union(enum) {
             .submit => |prompt| allocator.free(prompt.text),
             .history_page => |request| allocator.free(request.before_entry_id),
             .switch_session => |request| allocator.free(request.session_file_name),
+            .file_completion => |request| allocator.free(request.query),
             .cancel, .queue, .snapshot, .completion_snapshot, .replay, .shutdown => {},
         }
         self.* = undefined;
@@ -131,6 +143,12 @@ pub const SwitchSession = struct {
     session_file_name: []u8,
 };
 
+pub const file_completion_query_bytes_max = 256;
+
+pub const FileCompletionRequest = struct {
+    query: []u8,
+};
+
 pub const EventEnvelope = struct {
     seq: EventSeq = 0,
     request_id: ?RequestId = null,
@@ -161,6 +179,7 @@ pub const ClientEvent = union(enum) {
     queue_changed: QueueChanged,
     snapshot: Snapshot,
     completion_snapshot: CompletionSnapshot,
+    file_completion: FileCompletionResult,
     replay: ReplayBatch,
     replay_gap: ReplayGap,
     history_page: HistoryPage,
@@ -179,6 +198,7 @@ pub const ClientEvent = union(enum) {
             .agent_event => |*payload| payload.deinit(allocator),
             .snapshot => |*payload| payload.deinit(allocator),
             .completion_snapshot => |*payload| payload.deinit(allocator),
+            .file_completion => |*payload| payload.deinit(allocator),
             .replay => |*payload| payload.deinit(allocator),
             .history_page => |*payload| payload.deinit(allocator),
             .prompt_command => |*payload| payload.deinit(allocator),
@@ -632,6 +652,35 @@ pub const CompletionSnapshot = struct {
 
     pub fn jsonStringify(self: CompletionSnapshot, stringify: *std.json.Stringify) !void {
         try writeObject("completion_snapshot", stringify, self);
+    }
+};
+
+pub const FileCompletionResult = struct {
+    query: EventText,
+    items: CompletionList,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        query: []const u8,
+        items: []const CompletionItem.Source,
+        truncated: bool,
+    ) !FileCompletionResult {
+        var owned_query = try EventText.init(allocator, utf8Prefix(query, file_completion_query_bytes_max));
+        errdefer owned_query.deinit(allocator);
+        return .{
+            .query = owned_query,
+            .items = try CompletionList.init(allocator, items, truncated),
+        };
+    }
+
+    pub fn deinit(self: *FileCompletionResult, allocator: std.mem.Allocator) void {
+        self.query.deinit(allocator);
+        self.items.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: FileCompletionResult, stringify: *std.json.Stringify) !void {
+        try writeObject("file_completion", stringify, self);
     }
 };
 

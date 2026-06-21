@@ -194,12 +194,31 @@ pub fn sanitizeInto(buffer: []u8, bytes: []const u8) []const u8 {
     return buffer[0..out];
 }
 
-/// Longest valid-UTF-8 prefix of `bytes` no longer than `max_bytes`.
+/// Longest prefix no longer than `max_bytes` without cutting a valid-looking
+/// multibyte sequence. Invalid bytes before the boundary are kept so callers
+/// that sanitize after bounding still report replacement characters.
 pub fn utf8Prefix(bytes: []const u8, max_bytes: usize) []const u8 {
     if (bytes.len <= max_bytes) return bytes;
-    var end = max_bytes;
-    while (end > 0 and (bytes[end] & 0xc0) == 0x80) : (end -= 1) {}
-    return bytes[0..end];
+    var index: usize = 0;
+    const limit = max_bytes;
+    while (index < limit) {
+        const byte = bytes[index];
+        if (byte < 0x80) {
+            index += 1;
+            continue;
+        }
+        const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            index += 1;
+            continue;
+        };
+        if (index + sequence_len > limit) break;
+        if (std.unicode.utf8ValidateSlice(bytes[index .. index + sequence_len])) {
+            index += sequence_len;
+        } else {
+            index += 1;
+        }
+    }
+    return bytes[0..index];
 }
 
 fn previousScalarStart(bytes: []const u8, cursor: usize) usize {
@@ -258,4 +277,16 @@ test "sanitizeInto truncates at buffer end on codepoint boundary" {
     var buffer: [4]u8 = undefined;
     const out = sanitizeInto(&buffer, "ab❤x");
     try std.testing.expectEqualStrings("ab", out); // heart needs 3 bytes, only 2 left
+}
+
+test "utf8Prefix never returns an incomplete starter byte when clipping" {
+    const heart = "❤";
+    try std.testing.expectEqualStrings("", utf8Prefix(heart, 1));
+    try std.testing.expectEqualStrings("", utf8Prefix(heart, 2));
+    try std.testing.expectEqualStrings(heart, utf8Prefix(heart, 3));
+}
+
+test "utf8Prefix keeps invalid bytes for later sanitization" {
+    const bytes = "ok" ++ [_]u8{0xff} ++ "!";
+    try std.testing.expectEqualStrings(bytes, utf8Prefix(bytes, bytes.len));
 }

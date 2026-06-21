@@ -10,7 +10,6 @@ const test_support = @import("test_support.zig");
 pub const max_edit_read_bytes = 4 * 1024 * 1024;
 pub const max_edit_output_bytes = 4 * 1024 * 1024;
 pub const max_edits_per_call = 64;
-pub const max_diff_bytes = edit_diff.diff_bytes_max;
 const duplicate_line_hint_max = 8;
 
 const utf8_bom = "\xef\xbb\xbf";
@@ -257,16 +256,13 @@ fn execute(
     defer edited.deinit(allocator);
     try token.throwIfRequested();
     _ = on_update;
-    var result = editResult(
+    var result = try editResult(
         allocator,
         args.edits.len,
         args.path,
         edited.first_changed_line,
         edited.diff,
-    ) catch |err| switch (err) {
-        error.EditTooLarge => return editDiffTooLargeResult(allocator),
-        else => return err,
-    };
+    );
     errdefer result.deinit();
     try token.throwIfRequested();
     const mutation_queue = self.config.mutation_queue orelse &self.default_mutation_queue;
@@ -729,22 +725,6 @@ fn editTooLargeResult(allocator: std.mem.Allocator, max_output_bytes: usize) !ag
     return path_utils.ownedTextResult(allocator, message, details);
 }
 
-fn editDiffTooLargeResult(allocator: std.mem.Allocator) !agent.ToolExecutionResult {
-    const message = try std.fmt.allocPrint(
-        allocator,
-        "Edit failed: diff would exceed the {d} byte limit.",
-        .{max_diff_bytes},
-    );
-    errdefer allocator.free(message);
-    const details = try path_utils.jsonDetails(allocator, .{
-        .isError = true,
-        .reason = @as([]const u8, "diff_too_large"),
-        .maxBytes = max_diff_bytes,
-    });
-    errdefer runtime.freeJsonValue(allocator, details);
-    return path_utils.ownedTextResult(allocator, message, details);
-}
-
 fn nonUtf8FileResult(allocator: std.mem.Allocator, path: []const u8) !agent.ToolExecutionResult {
     const message = try std.fmt.allocPrint(allocator, "Edit failed: {s} is not valid UTF-8 text.", .{path});
     errdefer allocator.free(message);
@@ -770,7 +750,10 @@ fn editResult(
         .{ path, path, diff },
     );
     defer allocator.free(patch);
-    if (patch.len > max_diff_bytes) return error.EditTooLarge;
+    // The diff is already bounded and truncated by edit_diff.render (diff_bytes_max).
+    // A large edit still lands; the confirmation diff is just summarized rather than
+    // turning a valid replacement into a hard error (which previously forced callers
+    // into bash string-surgery that corrupted files).
     const details = try path_utils.jsonDetails(allocator, .{
         .path = path,
         .replacements = replacements,
@@ -1214,10 +1197,18 @@ test "edit tool returns operational error when success result is too large" {
     );
     defer result.deinit();
 
-    try std.testing.expectEqualStrings("diff_too_large", result.result.details.?.object.get("reason").?.string);
+    // Large edits now succeed; the confirmation diff is truncated by edit_diff.render
+    // instead of refusing the edit. The file is written and the diff carries a marker.
+    try std.testing.expectEqualStrings(
+        "Successfully replaced 1 block(s) in file.txt.",
+        result.result.content[0].text.text,
+    );
+    const details = result.result.details.?.object;
+    try std.testing.expectEqualStrings("file.txt", details.get("path").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, details.get("diff").?.string, "truncated") != null);
     const written = try fixture.read("repo/file.txt");
     defer std.testing.allocator.free(written);
-    try std.testing.expectEqualStrings(original, written);
+    try std.testing.expectEqualStrings(replacement, written);
 }
 
 test "edit tool rejects bad replacements before mutation" {

@@ -4,9 +4,10 @@ const bash_tool = @import("tools/bash.zig");
 const edit_tool = @import("tools/edit.zig");
 const file_mutation_queue = @import("tools/file_mutation_queue.zig");
 const read_tool = @import("tools/read.zig");
+const symbols_tool = @import("tools/symbols.zig");
 const write_tool = @import("tools/write.zig");
 
-pub const default_active_tool_names: []const []const u8 = &.{ "read", "bash", "edit", "write" };
+pub const default_active_tool_names: []const []const u8 = &.{ "read", "bash", "edit", "write", "symbols" };
 const max_tools = default_active_tool_names.len;
 
 /// Bounded set of executable tools plus the per-tool system prompt snippet.
@@ -50,12 +51,14 @@ pub const BuiltinTools = struct {
     bash: BashTool,
     edit: EditTool,
     write: WriteTool,
+    symbols: SymbolsTool,
     mutation_queue: file_mutation_queue.FileMutationQueue = .{},
 
     const ReadTool = read_tool.ReadTool;
     const BashTool = bash_tool.BashTool;
     const EditTool = edit_tool.EditTool;
     const WriteTool = write_tool.WriteTool;
+    const SymbolsTool = symbols_tool.SymbolsTool;
 
     pub const Options = struct {
         cwd: []const u8,
@@ -70,7 +73,9 @@ pub const BuiltinTools = struct {
         var read_init = false;
         var bash_init = false;
         var edit_init = false;
+        var symbols_init = false;
         errdefer {
+            if (symbols_init) self.symbols.deinit();
             if (edit_init) self.edit.deinit();
             if (bash_init) self.bash.deinit();
             if (read_init) self.read.deinit();
@@ -101,12 +106,19 @@ pub const BuiltinTools = struct {
             .allow_paths_outside_cwd = outside,
             .mutation_queue = &self.mutation_queue,
         });
+        self.symbols = try SymbolsTool.init(allocator, .{
+            .cwd = cwd,
+            .home_dir = home_dir,
+            .allow_paths_outside_cwd = outside,
+        });
+        symbols_init = true;
         return self;
     }
 
     // ziglint-ignore: Z030 heap owner is poisoned before allocator.destroy(self).
     pub fn deinit(self: *BuiltinTools) void {
         const allocator = self.allocator;
+        self.symbols.deinit();
         self.write.deinit();
         self.edit.deinit();
         self.bash.deinit();
@@ -132,6 +144,10 @@ pub const BuiltinTools = struct {
         try out.append(
             self.write.tool(),
             "Create or overwrite a text file, creating parent directories as needed.",
+        );
+        try out.append(
+            self.symbols.tool(),
+            "List functions, tests, and const/var declarations in a .zig file with line numbers. Use before read to navigate large Zig files.",
         );
         return out;
     }

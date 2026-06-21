@@ -12,10 +12,10 @@ const Picker = @This();
 pub const Id = u32;
 pub const item_count_max: usize = 384;
 pub const visible_rows_max: usize = 8;
-pub const id_bytes_max: usize = 128;
+pub const id_bytes_max: usize = 256;
 pub const label_bytes_max: usize = 160;
 pub const detail_bytes_max: usize = 160;
-pub const query_bytes_max: usize = 128;
+pub const query_bytes_max: usize = 256;
 
 pub const Item = struct {
     id: []const u8,
@@ -284,11 +284,65 @@ fn insertScoredMatch(
 fn itemScore(self: *const Picker, index: usize) ?match_mod.Score {
     const query_text = self.querySlice();
     const item = &self.items.items[index];
+    if (std.mem.indexOfScalar(u8, item.idSlice(), '/') != null) {
+        return pathItemScore(item, query_text, self.search_detail);
+    }
     var best: ?match_mod.Score = null;
     best = bestScore(best, fieldScore(item.idSlice(), query_text, 0));
     best = bestScore(best, fieldScore(item.labelSlice(), query_text, 4));
     if (self.search_detail) best = bestScore(best, fieldScore(item.detailSlice(), query_text, 8));
     return best;
+}
+
+fn pathItemScore(item: *const OwnedItem, query_text: []const u8, search_detail: bool) ?match_mod.Score {
+    const path = item.idSlice();
+    const leaf = pathLeaf(path);
+    const is_dir = std.mem.endsWith(u8, path, "/");
+    if (std.mem.lastIndexOfScalar(u8, query_text, '/')) |slash| {
+        const scope = query_text[0 .. slash + 1];
+        const tail = query_text[slash + 1 ..];
+        const scope_start = indexOfAsciiIgnoreCase(path, scope) orelse return null;
+        const scoped_path = path[scope_start + scope.len ..];
+        var best: ?match_mod.Score = null;
+        if (tail.len == 0) {
+            const dir_penalty: u32 = if (is_dir) 4 else 12;
+            best = .{ .value = @as(u32, @intCast(scope_start)) + dir_penalty, .first_match = 0, .last_match = 0 };
+        } else {
+            best = bestScore(best, fieldScore(leaf, tail, if (is_dir) 10 else 0));
+            best = bestScore(best, fieldScore(scoped_path, tail, if (is_dir) 18 else 12));
+        }
+        return best;
+    }
+
+    var best: ?match_mod.Score = null;
+    best = bestScore(best, fieldScore(leaf, query_text, if (is_dir) 10 else 0));
+    best = bestScore(best, fieldScore(path, query_text, 20));
+    best = bestScore(best, fieldScore(item.labelSlice(), query_text, 24));
+    if (search_detail) best = bestScore(best, fieldScore(item.detailSlice(), query_text, 32));
+    return best;
+}
+
+fn pathLeaf(path: []const u8) []const u8 {
+    const trimmed = if (std.mem.endsWith(u8, path, "/")) path[0 .. path.len - 1] else path;
+    const index = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return trimmed;
+    return trimmed[index + 1 ..];
+}
+
+fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        var matched = true;
+        for (needle, 0..) |byte, offset| {
+            if (std.ascii.toLower(haystack[index + offset]) != std.ascii.toLower(byte)) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return index;
+    }
+    return null;
 }
 
 fn fieldScore(field: []const u8, query: []const u8, bias: u32) ?match_mod.Score {
@@ -366,4 +420,20 @@ test "picker falls back to fuzzy search and wraps navigation" {
 
     _ = try picker.applyInput(gpa, .{ .key = .arrow_down });
     try std.testing.expectEqual(@as(usize, 1), picker.selectedIndex().?);
+}
+
+test "path picker displays full paths and ranks leaf matches before directory matches" {
+    const gpa = std.testing.allocator;
+    const source = [_]Item{
+        .{ .id = "src/coding_agent/", .label = "src/coding_agent/", .detail = "directory" },
+        .{ .id = "src/agent/code.zig", .label = "src/agent/code.zig", .detail = "src/agent" },
+    };
+    var picker = try Picker.init(gpa, .{ .id = 7, .items = &source, .query = "cod", .search_detail = true });
+    defer picker.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), picker.matchCount());
+    const first = picker.itemAt(picker.nthMatchIndex(0).?);
+    const second = picker.itemAt(picker.nthMatchIndex(1).?);
+    try std.testing.expectEqualStrings("src/agent/code.zig", first.labelSlice());
+    try std.testing.expectEqualStrings("src/coding_agent/", second.labelSlice());
 }

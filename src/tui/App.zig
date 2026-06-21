@@ -131,6 +131,11 @@ pub fn deinit(self: *App, gpa: std.mem.Allocator) void {
     self.* = undefined;
 }
 
+pub fn activeFileCompletionQuery(self: *const App) ?[]const u8 {
+    const query = self.composerFileQuery() orelse return null;
+    return query.text;
+}
+
 pub const Size = struct {
     width: u16,
     height: u16,
@@ -202,9 +207,12 @@ const Completion = struct {
     slash_args: [slash_arg_completion_count_max]?SlashArgCompletion = @splat(null),
     hidden_until_edit: bool = false,
 
+    file: ?Picker = null,
+
     fn deinit(self: *Completion, gpa: std.mem.Allocator) void {
         if (self.modal) |*picker| picker.deinit(gpa);
         if (self.command) |*picker| picker.deinit(gpa);
+        if (self.file) |*picker| picker.deinit(gpa);
         self.clearSlashArgSlots(gpa);
         self.* = undefined;
     }
@@ -230,6 +238,13 @@ const Completion = struct {
         errdefer next.deinit(gpa);
         if (self.command) |*picker| picker.deinit(gpa);
         self.command = next;
+    }
+
+    fn setFile(self: *Completion, gpa: std.mem.Allocator, open: Picker.Open) error{OutOfMemory}!void {
+        var next = try Picker.init(gpa, open);
+        errdefer next.deinit(gpa);
+        if (self.file) |*picker| picker.deinit(gpa);
+        self.file = next;
     }
 
     fn setSlashArg(
@@ -278,6 +293,9 @@ const Completion = struct {
         if (self.command) |*picker| {
             if (app.composerCompletionQuery()) |query| picker.replaceQuery(query);
         }
+        if (self.file) |*picker| {
+            if (app.composerFileQuery()) |query| picker.replaceQuery(query.text);
+        }
         for (&self.slash_args) |*slot| {
             const completion = if (slot.*) |*value| value else continue;
             if (app.composerArgQuery(completion.commandName())) |query| {
@@ -288,6 +306,7 @@ const Completion = struct {
 
     fn visiblePicker(self: *Completion, app: *const App) ?*Picker {
         if (self.modal) |*picker| return picker;
+        if (self.activeFile(app)) |picker| return picker;
         if (self.activeSlashArg(app)) |completion| return &completion.picker;
         if (self.activeCommand(app)) |picker| return picker;
         return null;
@@ -295,13 +314,19 @@ const Completion = struct {
 
     fn activeCommand(self: *Completion, app: *const App) ?*Picker {
         if (self.hidden_until_edit) return null;
-        if (self.modal != null or self.activeSlashArg(app) != null) return null;
+        if (self.modal != null or self.activeFile(app) != null or self.activeSlashArg(app) != null) return null;
         if (self.command == null or app.composerCompletionQuery() == null) return null;
         return &self.command.?;
     }
 
-    fn activeSlashArg(self: *Completion, app: *const App) ?*SlashArgCompletion {
+    fn activeFile(self: *Completion, app: *const App) ?*Picker {
         if (self.hidden_until_edit or self.modal != null) return null;
+        if (self.file == null or app.composerFileQuery() == null) return null;
+        return &self.file.?;
+    }
+
+    fn activeSlashArg(self: *Completion, app: *const App) ?*SlashArgCompletion {
+        if (self.hidden_until_edit or self.modal != null or self.activeFile(app) != null) return null;
         for (&self.slash_args) |*slot| {
             const completion = if (slot.*) |*value| value else continue;
             if (app.composerArgQuery(completion.commandName()) != null) return completion;
@@ -329,6 +354,7 @@ pub const Command = union(enum) {
     close_picker,
     set_composer_completions: Picker.Open,
     set_composer_arg_completions: SlashArgCompletionOpen,
+    set_file_completions: Picker.Open,
     replace_composer_text: []const u8,
     set_status: status_mod.Set,
     clear_status: status_mod.Clear,
@@ -483,6 +509,12 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         },
         .set_composer_arg_completions => |open| {
             try self.completion.setSlashArg(gpa, open);
+            self.syncComposerCompletion();
+            self.dirty = true;
+            return null;
+        },
+        .set_file_completions => |open| {
+            try self.completion.setFile(gpa, open);
             self.syncComposerCompletion();
             self.dirty = true;
             return null;
@@ -905,6 +937,12 @@ fn completionHasNoSelection(self: *App) bool {
 }
 
 fn composerCompletionQueryMatchesSelected(self: *App) bool {
+    if (self.activeFileCompletion()) |completion| {
+        const query = self.composerFileQuery() orelse return false;
+        const index = completion.selectedIndex() orelse return false;
+        const item = completion.itemAt(index);
+        return std.ascii.eqlIgnoreCase(item.idSlice(), query.text);
+    }
     if (self.activeComposerArgCompletion()) |completion| {
         if (completion.accept != .insert_argument) return false;
         const query = self.composerArgQuery(completion.commandName()) orelse return false;
@@ -927,6 +965,10 @@ fn activeComposerArgCompletion(self: *App) ?*SlashArgCompletion {
     return self.completion.activeSlashArg(self);
 }
 
+fn activeFileCompletion(self: *App) ?*Picker {
+    return self.completion.activeFile(self);
+}
+
 fn composerCompletionQuery(self: *const App) ?[]const u8 {
     const text = self.composer.text();
     if (text.len == 0 or text[0] != '/') return null;
@@ -939,6 +981,12 @@ fn composerCompletionQuery(self: *const App) ?[]const u8 {
 }
 
 const ComposerArgQuery = struct {
+    start: usize,
+    end: usize,
+    text: []const u8,
+};
+
+const FileQuery = struct {
     start: usize,
     end: usize,
     text: []const u8,
@@ -957,7 +1005,22 @@ fn composerArgQuery(self: *const App, command_name: []const u8) ?ComposerArgQuer
     return .{ .start = arg_start, .end = cursor, .text = text[arg_start..cursor] };
 }
 
+fn composerFileQuery(self: *const App) ?FileQuery {
+    const text = self.composer.text();
+    const cursor = self.composer.cursor_byte_index;
+    if (cursor == 0 or cursor > text.len) return null;
+
+    var start = cursor;
+    while (start > 0 and !std.ascii.isWhitespace(text[start - 1])) : (start -= 1) {}
+    if (start >= cursor or text[start] != '@') return null;
+    return .{ .start = start, .end = cursor, .text = text[start + 1 .. cursor] };
+}
+
 fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
+    if (self.activeFileCompletion()) |completion| {
+        try self.acceptFileCompletion(gpa, completion);
+        return null;
+    }
     if (self.activeComposerArgCompletion()) |completion| {
         return switch (completion.accept) {
             .insert_argument => blk: {
@@ -983,6 +1046,27 @@ fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemor
     self.composer_full_noticed = false;
     self.dirty = true;
     return null;
+}
+
+fn acceptFileCompletion(self: *App, gpa: std.mem.Allocator, completion: *Picker) error{OutOfMemory}!void {
+    const query = self.composerFileQuery() orelse return;
+    const index = completion.selectedIndex() orelse return;
+    const item = completion.itemAt(index);
+    var next: std.ArrayList(u8) = .empty;
+    defer next.deinit(gpa);
+    const text = self.composer.text();
+    try next.ensureTotalCapacity(gpa, text.len - (query.end - query.start) + 1 + item.idSlice().len);
+    next.appendSliceAssumeCapacity(text[0..query.start]);
+    next.appendAssumeCapacity('@');
+    next.appendSliceAssumeCapacity(item.idSlice());
+    next.appendSliceAssumeCapacity(text[query.end..]);
+    try self.composer.replaceTextAtCursor(gpa, next.items, query.start + 1 + item.idSlice().len);
+    self.resetHistoryNavigation();
+    if (!std.mem.endsWith(u8, item.idSlice(), "/")) self.completion.hideUntilEdit();
+    self.syncComposerCompletion();
+    self.syncComposerScrollHint();
+    self.composer_full_noticed = false;
+    self.dirty = true;
 }
 
 fn acceptComposerArgCompletion(
@@ -1468,6 +1552,66 @@ test "composer slash completion filters while typing and tab accepts" {
     _ = try app.apply(gpa, .{ .input = .{ .key = .tab } });
     try std.testing.expectEqualStrings("/model ", app.composer.text());
     try std.testing.expect(app.visiblePicker() == null);
+}
+
+test "composer file query follows cursor" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    try app.composer.replaceTextAtCursor(gpa, "ask @src then @docs", "ask @src".len);
+    try std.testing.expectEqualStrings("src", app.activeFileCompletionQuery().?);
+}
+
+test "composer file completion filters with composer focus and inserts mention" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{
+        .{ .id = "src/tui/App.zig", .label = "src/tui/App.zig", .detail = "src/tui" },
+        .{ .id = "src/tui/Picker.zig", .label = "src/tui/Picker.zig", .detail = "src/tui" },
+    };
+    _ = try app.apply(gpa, .{ .set_file_completions = .{
+        .id = 4,
+        .items = &items,
+        .search_detail = true,
+    } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("read @app") } });
+    try std.testing.expectEqualStrings("read @app", app.composer.text());
+    try std.testing.expect(app.visiblePicker() != null);
+    try std.testing.expectEqualStrings("app", app.completion.file.?.querySlice());
+    try std.testing.expectEqual(@as(usize, 1), app.completion.file.?.matchCount());
+
+    _ = try app.apply(gpa, .{ .input = .{ .key = .tab } });
+    try std.testing.expectEqualStrings("read @src/tui/App.zig", app.composer.text());
+    try std.testing.expect(app.visiblePicker() == null);
+}
+
+test "composer file completion keeps picker open after accepting directory" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    const items = [_]Picker.Item{
+        .{ .id = "src/coding_agent/", .label = "src/coding_agent/", .detail = "directory" },
+        .{ .id = "src/coding_agent/session_runtime.zig", .label = "src/coding_agent/session_runtime.zig", .detail = "src/coding_agent" },
+    };
+    _ = try app.apply(gpa, .{ .set_file_completions = .{
+        .id = 4,
+        .items = &items,
+        .search_detail = true,
+    } });
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("@coding") } });
+    _ = try app.apply(gpa, .{ .input = .{ .key = .tab } });
+    try std.testing.expectEqualStrings("@src/coding_agent/", app.composer.text());
+    try std.testing.expect(app.visiblePicker() != null);
+
+    _ = try app.apply(gpa, .{ .input = .{ .text = input_mod.InlineBytes.from("session") } });
+    try std.testing.expectEqualStrings("src/coding_agent/session", app.completion.file.?.querySlice());
+    try std.testing.expectEqual(@as(usize, 1), app.completion.file.?.matchCount());
 }
 
 test "composer slash arg completions are keyed by command" {

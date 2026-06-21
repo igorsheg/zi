@@ -10,6 +10,7 @@ const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const client_protocol = @import("client_protocol.zig");
+const file_completion = @import("file_completion.zig");
 const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_listing = @import("session_listing.zig");
@@ -312,6 +313,11 @@ fn parseThinkingLevel(text: []const u8) ?agent_mod.ThinkingLevel {
 
 const TaskRuntimeOwner = enum { owned, borrowed };
 
+const PendingFileCompletion = struct {
+    request_id: ?client_protocol.RequestId,
+    query: []u8,
+};
+
 pub const SessionRuntime = struct {
     allocator: std.mem.Allocator,
     services: RuntimeServices,
@@ -327,6 +333,7 @@ pub const SessionRuntime = struct {
     wake_event: runtime.ResetEvent = .init,
     active: ?ActiveOperation = null,
     completion_load: ?CompletionLoad = null,
+    pending_file_completion: ?PendingFileCompletion = null,
     next_operation_id: client_protocol.OperationId = 1,
     next_event_seq: client_protocol.EventSeq = 1,
     pending_event: ?client_protocol.EventEnvelope = null,
@@ -366,15 +373,17 @@ pub const SessionRuntime = struct {
 
     const CompletionLoad = struct {
         request_id: ?client_protocol.RequestId,
-        models: client_protocol.CompletionList,
-        resume_task: runtime.Task(anyerror!client_protocol.CompletionList),
-        cwd: []u8,
-        agent_dir: []u8,
-        current_session_leaf: ?[]u8,
+        models: ?client_protocol.CompletionList = null,
+        task: runtime.Task(anyerror!CompletionLoadResult),
+        cwd: ?[]u8 = null,
+        agent_dir: ?[]u8 = null,
+        current_session_leaf: ?[]u8 = null,
+        query: ?[]u8 = null,
     };
 
     pub fn deinit(self: *SessionRuntime) void {
         self.cancelCompletionLoad();
+        if (self.pending_file_completion) |pending| self.allocator.free(pending.query);
         if (self.active) |active| {
             self.destroyActivePhase(active);
             self.allocator.free(active.prompt_text);
@@ -415,7 +424,8 @@ pub const SessionRuntime = struct {
         return self.pending_event != null or
             self.events.count() > 0 or
             self.commands.count() > 0 or
-            (self.completion_load != null and self.completion_load.?.resume_task.hasResult());
+            (self.pending_file_completion != null and self.completion_load == null) or
+            (self.completion_load != null and self.completion_load.?.task.hasResult());
     }
 
     pub fn rejectClientCommand(
@@ -448,7 +458,7 @@ pub const SessionRuntime = struct {
                     switch (try runtime.select(.{
                         .input = &input,
                         .prompt = &progress,
-                        .completion = &load.resume_task,
+                        .completion = &load.task,
                         .public_event = public_event_wake,
                         .command = command_wake,
                         .frame = &frame,
@@ -521,7 +531,7 @@ pub const SessionRuntime = struct {
                     switch (try runtime.select(.{
                         .input = &input,
                         .retry = &retry,
-                        .completion = &load.resume_task,
+                        .completion = &load.task,
                         .public_event = public_event_wake,
                         .command = command_wake,
                         .frame = &frame,
@@ -581,7 +591,7 @@ pub const SessionRuntime = struct {
         if (self.completion_load) |*load| {
             switch (try runtime.select(.{
                 .input = &input,
-                .completion = &load.resume_task,
+                .completion = &load.task,
                 .public_event = public_event_wake,
                 .command = command_wake,
                 .frame = &frame,
@@ -632,6 +642,7 @@ pub const SessionRuntime = struct {
     pub fn step(self: *SessionRuntime) !void {
         if (!self.flushPendingEvent()) return;
         if (self.hasEventCapacity()) try self.finishReadyCompletionLoad();
+        if (self.hasEventCapacity()) try self.startPendingFileCompletionLoad();
         while (self.hasEventCapacity()) {
             const envelope = self.commands.pop() orelse break;
             var command = envelope;
@@ -814,6 +825,7 @@ pub const SessionRuntime = struct {
                 try self.enqueueEvent(.{ .request_id = envelope.id, .event = .{ .snapshot = snapshot } });
             },
             .completion_snapshot => try self.startCompletionLoad(envelope.id),
+            .file_completion => |request| try self.startFileCompletionLoad(envelope.id, request.query),
             .replay => |request| {
                 var replay = try self.retained_events.buildReplay(self.allocator, request);
                 replay.request_id = envelope.id;
@@ -1295,6 +1307,34 @@ pub const SessionRuntime = struct {
         );
     }
 
+    fn startFileCompletionLoad(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        query: []const u8,
+    ) !void {
+        if (self.completion_load != null) {
+            const pending_query = try self.allocator.dupe(u8, query);
+            if (self.pending_file_completion) |old| self.allocator.free(old.query);
+            self.pending_file_completion = .{ .request_id = request_id, .query = pending_query };
+            return;
+        }
+        const owned_query = try self.allocator.dupe(u8, query);
+        errdefer self.allocator.free(owned_query);
+        const task = self.task_runtime.spawnBlocking(buildProjectFileCompletionWorker, .{
+            self.host_config.dir,
+            owned_query,
+        }) catch |err| {
+            try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            self.allocator.free(owned_query);
+            return;
+        };
+        self.completion_load = .{
+            .request_id = request_id,
+            .task = task,
+            .query = owned_query,
+        };
+    }
+
     fn startCompletionLoad(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
         if (self.completion_load != null) {
             try self.enqueueRejected(request_id, .busy, "completion snapshot already loading");
@@ -1314,7 +1354,7 @@ pub const SessionRuntime = struct {
         var current_session_leaf = try self.dupeCurrentSessionLeaf();
         errdefer if (current_session_leaf) |leaf| self.allocator.free(leaf);
 
-        const resume_task = self.task_runtime.spawn(buildResumeCompletionListWorker, .{
+        const task = self.task_runtime.spawn(buildResumeCompletionListWorker, .{
             self.allocator,
             self.services.io,
             self.host_config.dir,
@@ -1335,7 +1375,7 @@ pub const SessionRuntime = struct {
         self.completion_load = .{
             .request_id = request_id,
             .models = models,
-            .resume_task = resume_task,
+            .task = task,
             .cwd = cwd,
             .agent_dir = agent_dir,
             .current_session_leaf = current_session_leaf,
@@ -1344,64 +1384,102 @@ pub const SessionRuntime = struct {
 
     fn finishReadyCompletionLoad(self: *SessionRuntime) !void {
         const load = if (self.completion_load) |*completion| completion else return;
-        if (!load.resume_task.hasResult()) return;
-        try self.applyCompletionLoadResult(load.resume_task.getResult());
+        if (!load.task.hasResult()) return;
+        try self.applyCompletionLoadResult(load.task.join());
     }
 
     fn applyCompletionLoadResult(
         self: *SessionRuntime,
-        resume_result: anyerror!client_protocol.CompletionList,
+        result: anyerror!CompletionLoadResult,
     ) !void {
-        self.finishCompletionLoad(resume_result) catch |err| switch (err) {
+        self.finishCompletionLoad(result) catch |err| switch (err) {
             error.EventQueueFull => return,
             else => return err,
         };
     }
 
-    fn finishCompletionLoad(self: *SessionRuntime, resume_result: anyerror!client_protocol.CompletionList) !void {
+    fn finishCompletionLoad(self: *SessionRuntime, result: anyerror!CompletionLoadResult) !void {
         var load = self.completion_load orelse return;
         self.completion_load = null;
-        defer self.allocator.free(load.cwd);
-        defer self.allocator.free(load.agent_dir);
+        defer if (load.cwd) |cwd| self.allocator.free(cwd);
+        defer if (load.agent_dir) |agent_dir| self.allocator.free(agent_dir);
         defer if (load.current_session_leaf) |leaf| self.allocator.free(leaf);
+        defer if (load.query) |query| self.allocator.free(query);
 
-        const resume_sessions = resume_result catch |err| {
-            load.models.deinit(self.allocator);
+        const payload = result catch |err| {
+            if (load.models) |*models| models.deinit(self.allocator);
             try self.enqueueRejected(load.request_id, rejectionCode(err), @errorName(err));
             return;
         };
 
-        var snapshot: client_protocol.CompletionSnapshot = .{
-            .models = load.models,
-            .resume_sessions = resume_sessions,
-        };
-        var snapshot_owned = true;
-        errdefer if (snapshot_owned) snapshot.deinit(self.allocator);
-        self.enqueueEvent(.{
-            .request_id = load.request_id,
-            .event = .{ .completion_snapshot = snapshot },
-        }) catch |err| switch (err) {
-            error.EventQueueFull => {
+        switch (payload) {
+            .resume_sessions => |sessions| {
+                var snapshot: client_protocol.CompletionSnapshot = .{
+                    .models = load.models.?,
+                    .resume_sessions = sessions,
+                };
+                var snapshot_owned = true;
+                errdefer if (snapshot_owned) snapshot.deinit(self.allocator);
+                self.enqueueEvent(.{
+                    .request_id = load.request_id,
+                    .event = .{ .completion_snapshot = snapshot },
+                }) catch |err| switch (err) {
+                    error.EventQueueFull => {
+                        snapshot_owned = false;
+                        return error.EventQueueFull;
+                    },
+                    else => return err,
+                };
                 snapshot_owned = false;
-                return error.EventQueueFull;
             },
-            else => return err,
-        };
-        snapshot_owned = false;
+            .file_completion => |raw| {
+                defer raw.destroy();
+                var raw_sources: [file_completion.item_count_max]client_protocol.CompletionItem.Source = undefined;
+                var event = try client_protocol.FileCompletionResult.init(
+                    self.allocator,
+                    raw.querySlice(),
+                    raw.sources(&raw_sources),
+                    raw.truncated,
+                );
+                var event_owned = true;
+                errdefer if (event_owned) event.deinit(self.allocator);
+                self.enqueueEvent(.{
+                    .request_id = load.request_id,
+                    .event = .{ .file_completion = event },
+                }) catch |err| switch (err) {
+                    error.EventQueueFull => {
+                        event_owned = false;
+                        return error.EventQueueFull;
+                    },
+                    else => return err,
+                };
+                event_owned = false;
+            },
+        }
+    }
+
+    fn startPendingFileCompletionLoad(self: *SessionRuntime) !void {
+        if (self.completion_load != null) return;
+        const pending = self.pending_file_completion orelse return;
+        self.pending_file_completion = null;
+        defer self.allocator.free(pending.query);
+        try self.startFileCompletionLoad(pending.request_id, pending.query);
     }
 
     fn cancelCompletionLoad(self: *SessionRuntime) void {
         var load = self.completion_load orelse return;
         self.completion_load = null;
-        load.resume_task.cancel();
-        if (load.resume_task.getResult()) |resume_sessions| {
-            var owned = resume_sessions;
+        load.task.cancel();
+        const payload = load.task.join() catch null;
+        if (payload) |value| {
+            var owned = value;
             owned.deinit(self.allocator);
-        } else |_| {}
-        load.models.deinit(self.allocator);
-        self.allocator.free(load.cwd);
-        self.allocator.free(load.agent_dir);
+        }
+        if (load.models) |*models| models.deinit(self.allocator);
+        if (load.cwd) |cwd| self.allocator.free(cwd);
+        if (load.agent_dir) |agent_dir| self.allocator.free(agent_dir);
         if (load.current_session_leaf) |leaf| self.allocator.free(leaf);
+        if (load.query) |query| self.allocator.free(query);
     }
 
     const CompletionStatus = enum { ready, missing_auth, unavailable };
@@ -1574,6 +1652,19 @@ pub const SessionRuntime = struct {
     }
 };
 
+const CompletionLoadResult = union(enum) {
+    resume_sessions: client_protocol.CompletionList,
+    file_completion: *file_completion.Result,
+
+    fn deinit(self: *CompletionLoadResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .resume_sessions => |*list| list.deinit(allocator),
+            .file_completion => |result| result.destroy(),
+        }
+        self.* = undefined;
+    }
+};
+
 fn buildResumeCompletionListWorker(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1582,16 +1673,15 @@ fn buildResumeCompletionListWorker(
     cwd: []const u8,
     agent_dir: []const u8,
     current_session_leaf: ?[]const u8,
-) anyerror!client_protocol.CompletionList {
-    return buildResumeCompletionListFor(
-        allocator,
-        io,
-        dir,
-        environ,
-        cwd,
-        agent_dir,
-        current_session_leaf,
-    );
+) anyerror!CompletionLoadResult {
+    return .{ .resume_sessions = try buildResumeCompletionListFor(allocator, io, dir, environ, cwd, agent_dir, current_session_leaf) };
+}
+
+fn buildProjectFileCompletionWorker(
+    dir: std.Io.Dir,
+    query: []const u8,
+) anyerror!CompletionLoadResult {
+    return .{ .file_completion = try file_completion.build(dir, query) };
 }
 
 fn buildResumeCompletionListFor(
@@ -1826,7 +1916,11 @@ test "session runtime completion snapshot reports model status and resume sessio
         var iterations: usize = 0;
         while (iterations < 2000) : (iterations += 1) {
             try session_runtime.step();
-            if (session_runtime.drainEvent()) |event| break :event event;
+            if (session_runtime.drainEvent()) |event| {
+                if (event.event == .completion_snapshot) break :event event;
+                var ignored = event;
+                ignored.deinit(std.testing.allocator);
+            }
             try runtime.sleep(.fromMilliseconds(1));
         }
         return error.TestUnexpectedResult;

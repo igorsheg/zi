@@ -152,6 +152,10 @@ pub fn composerText(self: *const Terminal) []const u8 {
     return self.app.composer.text();
 }
 
+pub fn activeFileCompletionQuery(self: *const Terminal) ?[]const u8 {
+    return self.app.activeFileCompletionQuery();
+}
+
 pub fn applyCommand(self: *Terminal, command: App.Command) error{OutOfMemory}!?App.Effect {
     return self.app.apply(self.gpa, command);
 }

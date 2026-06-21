@@ -51,6 +51,7 @@ const composer_session_slot_id: tui.status.ContributionId = 2;
 const model_picker_id: tui.Picker.Id = 1;
 const command_completion_picker_id: tui.Picker.Id = 2;
 const resume_picker_id: tui.Picker.Id = 3;
+const file_picker_id: tui.Picker.Id = 4;
 const transcript_append_max = tui.Transcript.append_size_bytes_max;
 const tool_timer_count_max = 8;
 const tool_timer_id_bytes_max = 96;
@@ -182,6 +183,8 @@ const InteractiveController = struct {
     history_request_in_flight: bool = false,
     completion_snapshot_requested: bool = false,
     completion_snapshot_loaded: bool = false,
+    last_file_completion_query: std.ArrayList(u8) = .empty,
+    last_file_completion_query_active: bool = false,
     event_cursor: EventCursor = .{},
     assistant_text_delta_seen: bool = false,
     render_throttle: RenderThrottle = .{},
@@ -238,6 +241,7 @@ const InteractiveController = struct {
 
     fn deinit(self: *InteractiveController) void {
         if (self.history_oldest_entry_id) |id| self.allocator.free(id);
+        self.last_file_completion_query.deinit(self.allocator);
         self.terminal.shutdown() catch |err| ignoreBestEffortError(err);
         self.terminal.deinit();
         self.* = undefined;
@@ -292,6 +296,7 @@ const InteractiveController = struct {
         defer for (effects[0..result.effect_count]) |effect| effect.deinit(self.allocator);
         for (effects[0..result.effect_count]) |effect| try self.handleEffect(effect);
         try self.requestLazyCompletionSnapshot();
+        try self.requestFileCompletionForComposer();
         if (result.event_count > 0) self.render_throttle.requestImmediate();
         if (result.truncated) try self.appendStatus(.warning, "input truncated");
         if (result.effect_overflow) try self.appendStatus(.warning, "input effects dropped");
@@ -527,6 +532,18 @@ const InteractiveController = struct {
         } });
     }
 
+    fn installFileCompletions(self: *InteractiveController, result: client_protocol.FileCompletionResult) !void {
+        if (!self.last_file_completion_query_active) return;
+        if (!std.mem.eql(u8, result.query.text, self.last_file_completion_query.items)) return;
+        var items: [client_protocol.completion_item_count_max]tui.Picker.Item = undefined;
+        const mapped = completionPickerItems(&items, result.items);
+        _ = try self.terminal.applyCommand(.{ .set_file_completions = .{
+            .id = file_picker_id,
+            .items = mapped,
+            .search_detail = true,
+        } });
+    }
+
     fn installSlashCompletions(self: *InteractiveController) !void {
         var items: [slash_commands.command_count_max]tui.Picker.Item = undefined;
         var labels: [slash_commands.command_count_max][1 + slash_commands.name_bytes_max]u8 = undefined;
@@ -573,6 +590,21 @@ const InteractiveController = struct {
     fn requestLazyCompletionSnapshot(self: *InteractiveController) !void {
         if (!needsLazyCompletionSnapshot(self.terminal.composerText())) return;
         try self.requestCompletionSnapshot();
+    }
+
+    fn requestFileCompletionForComposer(self: *InteractiveController) !void {
+        const raw_query = self.terminal.activeFileCompletionQuery() orelse {
+            self.last_file_completion_query_active = false;
+            self.last_file_completion_query.clearRetainingCapacity();
+            return;
+        };
+        const query = tui.text.utf8Prefix(raw_query, client_protocol.file_completion_query_bytes_max);
+        if (self.last_file_completion_query_active and std.mem.eql(u8, query, self.last_file_completion_query.items)) return;
+        self.last_file_completion_query_active = true;
+        self.last_file_completion_query.clearRetainingCapacity();
+        try self.last_file_completion_query.appendSlice(self.allocator, query);
+        const envelope = try client_protocol.CommandEnvelope.initFileCompletion(self.allocator, null, query);
+        _ = try self.submitCommand(envelope);
     }
 
     fn requestHistoryPage(self: *InteractiveController) !void {
@@ -691,6 +723,7 @@ const InteractiveController = struct {
             .queue_changed => |queue| try self.applyQueueChanged(queue),
             .snapshot => |snapshot| try self.applySnapshot(snapshot),
             .completion_snapshot => |snapshot| try self.applyCompletionSnapshot(snapshot),
+            .file_completion => |result| try self.installFileCompletions(result),
             .session_changed => try self.applySessionChanged(),
             .session_chrome => |chrome| try self.applySessionChrome(chrome),
             .history_page => |page| try self.applyHistoryPage(page),

@@ -70,6 +70,7 @@ fn drainEvents(
             .queue_changed,
             .snapshot,
             .completion_snapshot,
+            .file_completion,
             .session_chrome,
             .session_changed,
             .history_page,

@@ -83,6 +83,9 @@ fn appendGuidelines(
     if (containsString(selected_tools, "bash")) {
         try appendGuideline(writer, "Use bash for shell-based file exploration");
     }
+    if (containsString(selected_tools, "symbols")) {
+        try appendGuideline(writer, "Use symbols to locate declarations in a .zig file before reading it; then read with the reported line as offset instead of reading the whole file");
+    }
 
     try appendGuideline(writer, "Be concise in your responses");
     try appendGuideline(writer, "Show file paths clearly when working with files");
@@ -248,6 +251,24 @@ test "skills are included only when read tool is selected" {
     defer std.testing.allocator.free(no_read_prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, no_read_prompt, "<available_skills>") == null);
+}
+
+test "symbols guideline appears only when symbols is selected" {
+    const with_symbols = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{"symbols"},
+    });
+    defer std.testing.allocator.free(with_symbols);
+    try std.testing.expect(std.mem.indexOf(u8, with_symbols, "Use symbols to locate declarations") != null);
+
+    const without_symbols = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{"read"},
+    });
+    defer std.testing.allocator.free(without_symbols);
+    try std.testing.expect(std.mem.indexOf(u8, without_symbols, "Use symbols to locate declarations") == null);
 }
 
 test "custom prompt appends context date and cwd" {

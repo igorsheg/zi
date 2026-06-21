@@ -61,6 +61,12 @@ pub fn decodeCommandLine(
     if (std.mem.eql(u8, command_type, "completion_snapshot")) {
         return .{ .id = id, .command = .completion_snapshot };
     }
+    if (std.mem.eql(u8, command_type, "file_completion")) {
+        const query_value = object.get("query") orelse return error.InvalidMessage;
+        if (query_value != .string) return error.InvalidMessage;
+        const envelope = try client_protocol.CommandEnvelope.initFileCompletion(allocator, id, query_value.string);
+        return envelope;
+    }
     if (std.mem.eql(u8, command_type, "replay")) {
         return .{ .id = id, .command = .{ .replay = try decodeReplay(object) } };
     }
