@@ -157,6 +157,8 @@ fn itemRows(item: *Transcript.Item, width: u16, theme: *const theme_mod.Theme, e
     }
     const count = if (item.body == .message and item.body.message.role == .assistant)
         cachedAssistantMarkdownRows(item, width, theme)
+    else if (item.body == .thinking and !item.body.thinking.hidden)
+        cachedThinkingMarkdownRows(item, width, theme)
     else blk: {
         var rows: usize = 0;
         buildItemRows(null, &rows, item, width, theme, expanded);
@@ -197,6 +199,36 @@ fn cachedAssistantMarkdownRows(item: *Transcript.Item, width: u16, theme: *const
     if (rows >= item_rows_max) return item_rows_max;
     var tail_count: usize = 0;
     buildAssistantMarkdownTailRows(null, &tail_count, item, width, theme);
+    return @min(rows + tail_count, item_rows_max);
+}
+
+fn cachedThinkingMarkdownRows(item: *Transcript.Item, width: u16, theme: *const theme_mod.Theme) usize {
+    std.debug.assert(item.body == .thinking);
+    const text = item.body.thinking.text.items;
+    const stable_end = markdownStableEnd(text);
+    if (item.layout.markdown_width != width or item.layout.markdown_stable_end > stable_end) {
+        item.layout.markdown_width = width;
+        item.layout.markdown_stable_end = 0;
+        item.layout.markdown_stable_rows = 0;
+        item.layout.markdown_fence = .none;
+    }
+
+    const inner = innerWidth(width);
+    var rows: usize = item.layout.markdown_stable_rows;
+    var state = markdownStateFromCache(item.layout.markdown_fence);
+    var start = item.layout.markdown_stable_end;
+    while (start < stable_end and rows < item_rows_max) {
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse stable_end;
+        addMarkdownLineRows(null, &rows, &state, text[start..end], inner, theme);
+        start = if (end < stable_end) end + 1 else end;
+    }
+    item.layout.markdown_stable_end = stable_end;
+    item.layout.markdown_stable_rows = @intCast(@min(rows, item_rows_max));
+    item.layout.markdown_fence = cacheFenceFromState(state);
+
+    if (rows >= item_rows_max) return item_rows_max;
+    var tail_count: usize = 0;
+    buildThinkingMarkdownTailRows(null, &tail_count, item, width, theme);
     return @min(rows + tail_count, item_rows_max);
 }
 
@@ -581,6 +613,32 @@ fn buildItemRows(
     buildItemRowsFrame(out, count, item, width, theme, expanded);
 }
 
+fn buildThinkingMarkdownTailRows(
+    out: ?*RowScratch,
+    count: *usize,
+    item: *const Transcript.Item,
+    width: u16,
+    theme: *const theme_mod.Theme,
+) void {
+    std.debug.assert(item.body == .thinking);
+    if (out) |scratch| scratch.reset();
+    const text = item.body.thinking.text.items;
+    const stable_end = @min(item.layout.markdown_stable_end, text.len);
+    var state = markdownStateFromCache(item.layout.markdown_fence);
+    const inner = innerWidth(width);
+    if (stable_end < text.len) {
+        var tail_lines: PhysicalLineIterator = .{ .text = text[stable_end..] };
+        while (tail_lines.next()) |line| {
+            addMarkdownLineRows(out, count, &state, line, inner, theme);
+            if (count.* >= item_rows_max) return;
+        }
+    } else if (text.len == 0 or text[text.len - 1] == '\n') {
+        addMarkdownLineRows(out, count, &state, "", inner, theme);
+    }
+    var margin: usize = 0;
+    while (margin < item_margin_bottom and count.* < item_rows_max) : (margin += 1) putRow(out, count, .{});
+}
+
 fn buildItemRowsFrame(
     out: ?*RowScratch,
     count: *usize,
@@ -606,6 +664,18 @@ fn buildItemRowsFrame(
                 .row_style = style,
                 .inner_width = innerWidth(width),
             });
+        },
+        .thinking => |*thinking| if (thinking.hidden) {
+            emitWrappedText(out, count, .{
+                .prefix = "",
+                .text = "Thinking...",
+                .prefix_style = theme.transcript_secondary,
+                .text_style = theme.transcript_secondary,
+                .row_style = theme.transcript_secondary,
+                .inner_width = innerWidth(width),
+            });
+        } else {
+            buildMarkdownRows(out, count, thinking.text.items, width, theme);
         },
         .status => |status| emitWrappedText(out, count, .{
             .prefix = statusPrefix(status.level),
@@ -645,6 +715,7 @@ fn itemStyle(item: *const Transcript.Item, theme: *const theme_mod.Theme) theme_
             .assistant => theme.transcript_text,
             .system, .thinking => theme.transcript_secondary,
         },
+        .thinking => theme.transcript_secondary,
         .status => |status| switch (status.level) {
             .info => theme.status_accent,
             .warning => theme.status_warning,

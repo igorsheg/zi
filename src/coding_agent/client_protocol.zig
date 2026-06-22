@@ -752,6 +752,7 @@ pub const Snapshot = struct {
     header: SessionHeaderSnapshot,
     model: ModelSnapshot,
     thinking_level: agent_mod.ThinkingLevel,
+    hide_thinking: bool = true,
     context: ContextUsageSnapshot,
     queue: QueueSnapshot,
     active_request_id: ?RequestId,
@@ -848,6 +849,7 @@ pub const SessionChromeSnapshot = struct {
     cwd: EventText,
     model: ModelSnapshot,
     thinking_level: agent_mod.ThinkingLevel,
+    hide_thinking: bool = true,
     context: ContextUsageSnapshot,
 
     pub fn init(
@@ -855,6 +857,7 @@ pub const SessionChromeSnapshot = struct {
         cwd: []const u8,
         model: ai.Model,
         thinking_level: agent_mod.ThinkingLevel,
+        hide_thinking: bool,
         context: ContextUsageSnapshot,
     ) !SessionChromeSnapshot {
         var cwd_text = try EventText.init(allocator, cwd);
@@ -865,6 +868,7 @@ pub const SessionChromeSnapshot = struct {
             .cwd = cwd_text,
             .model = model_snapshot,
             .thinking_level = thinking_level,
+            .hide_thinking = hide_thinking,
             .context = context,
         };
     }
@@ -965,6 +969,7 @@ pub const HistorySnapshotItem = struct {
     entry_id: EventText,
     kind: Kind,
     text: EventText,
+    has_thinking: bool = false,
     tool_calls: []HistoryToolCall = &.{},
     tool_call_id: ?EventText = null,
     tool_name: ?EventText = null,
@@ -1148,6 +1153,7 @@ fn assistantHistoryItem(
     var writer = boundedHistoryWriter(&buffer, item_text_bytes_max);
     var text_full_bytes: usize = 0;
     var wrote_text = false;
+    var has_thinking = false;
     var tool_calls_full_bytes: usize = 0;
     var tool_calls = std.ArrayList(HistoryToolCall).empty;
     errdefer {
@@ -1173,7 +1179,7 @@ fn assistantHistoryItem(
             };
             tool_calls_full_bytes += built.full_text_bytes;
         },
-        .thinking => {},
+        .thinking => has_thinking = true,
     };
 
     if (writer.buffered().len == 0 and tool_calls.items.len == 0) {
@@ -1195,6 +1201,7 @@ fn assistantHistoryItem(
             .entry_id = owned_entry_id,
             .kind = .assistant,
             .text = text,
+            .has_thinking = has_thinking,
             .tool_calls = try tool_calls.toOwnedSlice(allocator),
         },
         .full_text_bytes = text_full_bytes + tool_calls_full_bytes,

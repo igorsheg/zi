@@ -201,7 +201,7 @@ fn loadContextFileFromDir(
     dir: std.Io.Dir,
     search_dir: []const u8,
 ) !?ContextFile {
-    const candidates = [_][]const u8{ "AGENTS.md", "CLAUDE.md" };
+    const candidates = [_][]const u8{ paths_mod.context_file_name, paths_mod.claude_context_file_name };
     for (candidates) |candidate| {
         const path = try std.fs.path.join(allocator, &.{ search_dir, candidate });
         errdefer allocator.free(path);

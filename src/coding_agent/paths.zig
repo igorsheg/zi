@@ -11,6 +11,8 @@ pub const auth_file_name = "auth.json";
 pub const sessions_dir_name = "sessions";
 pub const skills_dir_name = "skills";
 pub const skill_file_name = "SKILL.md";
+pub const context_file_name = "AGENTS.md";
+pub const claude_context_file_name = "CLAUDE.md";
 pub const system_prompt_file_name = "SYSTEM.md";
 pub const append_system_prompt_file_name = "APPEND_SYSTEM.md";
 

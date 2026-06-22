@@ -945,8 +945,9 @@ pub fn visiblePicker(self: *App) ?*Picker {
     return self.completion.visiblePicker(self);
 }
 
-pub fn visiblePickerFocusesFilter(self: *const App) bool {
-    return self.completion.modal != null;
+pub fn visiblePickerFocusesFilter(self: *App) bool {
+    const picker = self.visiblePicker() orelse return false;
+    return self.completion.modal != null and picker.filtersInput();
 }
 
 fn composerCompletionVisible(self: *App) bool {

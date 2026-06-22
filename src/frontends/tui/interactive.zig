@@ -53,6 +53,8 @@ const model_picker_id: tui.Picker.Id = 1;
 const command_completion_picker_id: tui.Picker.Id = 2;
 const resume_picker_id: tui.Picker.Id = 3;
 const file_picker_id: tui.Picker.Id = 4;
+const settings_picker_id: tui.Picker.Id = 5;
+const settings_thinking_picker_id: tui.Picker.Id = 6;
 const transcript_append_max = tui.Transcript.append_size_bytes_max;
 const clipboard_image_attachment_count_max = client_protocol.submit_image_count_max;
 const tool_timer_count_max = 8;
@@ -212,6 +214,8 @@ const InteractiveController = struct {
     assistant_text_delta_seen: bool = false,
     render_throttle: RenderThrottle = .{},
     tool_timers: [tool_timer_count_max]?ToolTimer = @splat(null),
+    thinking_level: agent_mod.ThinkingLevel = .off,
+    hide_thinking: bool = true,
     home_dir: ?[]const u8 = null,
     editor: ?[]const u8 = null,
     tmp_dir: []const u8 = "/tmp",
@@ -554,6 +558,10 @@ const InteractiveController = struct {
             try self.editModelCommand();
             return true;
         }
+        if (isBareSettingsCommand(text)) {
+            try self.openSettingsPicker();
+            return true;
+        }
         return false;
     }
 
@@ -561,6 +569,8 @@ const InteractiveController = struct {
         switch (selection.picker_id) {
             model_picker_id => try self.submitSelectedModel(selection.item_id),
             resume_picker_id => try self.submitSelectedSession(selection.item_id),
+            settings_picker_id => try self.handleSettingsSelection(selection.item_id),
+            settings_thinking_picker_id => try self.submitSelectedSetting(selection.item_id),
             else => {},
         }
     }
@@ -574,6 +584,69 @@ const InteractiveController = struct {
     fn submitSelectedSession(self: *InteractiveController, item_id: []const u8) !void {
         const envelope = try client_protocol.CommandEnvelope.initSwitchSession(self.allocator, null, item_id);
         _ = try self.submitCommand(envelope);
+    }
+
+    fn handleSettingsSelection(self: *InteractiveController, item_id: []const u8) !void {
+        if (std.mem.eql(u8, item_id, "open:thinking")) {
+            try self.openThinkingEffortPicker();
+            return;
+        }
+        try self.submitSelectedSetting(item_id);
+    }
+
+    fn submitSelectedSetting(self: *InteractiveController, item_id: []const u8) !void {
+        var buffer: [64]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&buffer, "/settings {s}", .{item_id}) catch return;
+        try self.submitPrompt(prompt);
+    }
+
+    fn openSettingsPicker(self: *InteractiveController) !void {
+        const hide_value = if (self.hide_thinking) "thinking:shown" else "thinking:hidden";
+        const thinking_visibility_label = if (self.hide_thinking) "Show thinking" else "Hide thinking";
+        const thinking_visibility_detail = if (self.hide_thinking)
+            "Currently hidden; Enter to show reasoning text"
+        else
+            "Currently shown; Enter to show compact Thinking blocks";
+        const items = [_]tui.Picker.Item{
+            .{
+                .id = "open:thinking",
+                .label = "Thinking effort",
+                .detail = @tagName(self.thinking_level),
+                .meta = "configure",
+            },
+            .{
+                .id = hide_value,
+                .label = thinking_visibility_label,
+                .detail = thinking_visibility_detail,
+                .meta = if (self.hide_thinking) "hidden" else "shown",
+            },
+        };
+        _ = try self.terminal.applyCommand(.{ .open_picker = .{
+            .id = settings_picker_id,
+            .items = &items,
+            .search_detail = true,
+            .layout = .two_column,
+            .min_visible_rows = 2,
+        } });
+    }
+
+    fn openThinkingEffortPicker(self: *InteractiveController) !void {
+        const items = [_]tui.Picker.Item{
+            .{ .id = "thinking:off", .label = "off", .detail = "No reasoning", .meta = if (self.thinking_level == .off) "current" else "" },
+            .{ .id = "thinking:minimal", .label = "minimal", .detail = "Very brief reasoning", .meta = if (self.thinking_level == .minimal) "current" else "" },
+            .{ .id = "thinking:low", .label = "low", .detail = "Light reasoning", .meta = if (self.thinking_level == .low) "current" else "" },
+            .{ .id = "thinking:medium", .label = "medium", .detail = "Moderate reasoning", .meta = if (self.thinking_level == .medium) "current" else "" },
+            .{ .id = "thinking:high", .label = "high", .detail = "Deep reasoning", .meta = if (self.thinking_level == .high) "current" else "" },
+            .{ .id = "thinking:xhigh", .label = "xhigh", .detail = "Maximum reasoning", .meta = if (self.thinking_level == .xhigh) "current" else "" },
+        };
+        _ = try self.terminal.applyCommand(.{ .open_picker = .{
+            .id = settings_thinking_picker_id,
+            .items = &items,
+            .search_detail = true,
+            .filter_enabled = false,
+            .layout = .two_column,
+            .min_visible_rows = 6,
+        } });
     }
 
     fn editModelCommand(self: *InteractiveController) !void {
@@ -955,7 +1028,7 @@ const InteractiveController = struct {
                 self.assistant_text_delta_seen = true;
                 try self.appendMessage(.assistant, payload.delta, .extend_previous_assistant_message);
             },
-            .thinking_delta => |payload| try self.appendMessage(.thinking, payload.delta, .extend_previous_same_role),
+            .thinking_delta => |payload| try self.appendThinking(payload.delta),
             .toolcall_start => |payload| try self.applyToolCallPreview(payload.content_index, payload.partial),
             .toolcall_delta => |payload| try self.applyToolCallPreview(payload.content_index, payload.partial),
             .toolcall_end => |payload| try self.applyToolCall(payload.tool_call),
@@ -1066,6 +1139,8 @@ const InteractiveController = struct {
         } else {
             self.clearOldestHistoryEntryId();
         }
+        self.thinking_level = snapshot.thinking_level;
+        self.hide_thinking = snapshot.hide_thinking;
         try self.applySessionChromeParts(
             snapshot.header.cwd.text,
             snapshot.model,
@@ -1076,6 +1151,8 @@ const InteractiveController = struct {
     }
 
     fn applySessionChrome(self: *InteractiveController, chrome: client_protocol.SessionChromeSnapshot) !void {
+        self.thinking_level = chrome.thinking_level;
+        self.hide_thinking = chrome.hide_thinking;
         try self.applySessionChromeParts(
             chrome.cwd.text,
             chrome.model,
@@ -1107,7 +1184,7 @@ const InteractiveController = struct {
             .slot = .composer_right,
             .id = composer_session_slot_id,
             .priority = 1,
-            .text = formatComposerRight(&right_buffer, model, context),
+            .text = formatComposerRight(&right_buffer, model, self.thinking_level, context),
         } });
     }
 
@@ -1140,6 +1217,7 @@ const InteractiveController = struct {
     fn appendHistoryItem(self: *InteractiveController, item: client_protocol.HistorySnapshotItem) !void {
         switch (item.kind) {
             .user, .assistant, .system => {
+                if (item.kind == .assistant and item.has_thinking) try self.appendThinking("");
                 if (item.text.text.len > 0) {
                     try self.appendMessage(historyMessageRole(item.kind).?, item.text.text, .new_item);
                 }
@@ -1311,6 +1389,29 @@ const InteractiveController = struct {
     /// Append in transcript-cap-sized chunks. Sanitization (invalid UTF-8,
     /// split codepoints) is the transcript's job; chunk boundaries fall back
     /// to raw bytes when no UTF-8 boundary exists in range.
+    fn appendThinking(self: *InteractiveController, text: []const u8) !void {
+        if (text.len == 0) {
+            _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .thinking = .{
+                .text = "",
+                .hidden = self.hide_thinking,
+                .mode = .new_item,
+            } } });
+            return;
+        }
+        var remaining = text;
+        var chunk_mode: tui.Transcript.AppendMode = .extend_previous_same_role;
+        while (remaining.len > 0) {
+            const chunk = boundedChunk(remaining);
+            _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .thinking = .{
+                .text = chunk,
+                .hidden = self.hide_thinking,
+                .mode = chunk_mode,
+            } } });
+            remaining = remaining[chunk.len..];
+            chunk_mode = .extend_previous_same_role;
+        }
+    }
+
     fn appendMessage(
         self: *InteractiveController,
         role: tui.Transcript.Role,
@@ -1348,7 +1449,7 @@ const InteractiveController = struct {
     fn appendAssistantFinalText(self: *InteractiveController, assistant: ai.AssistantMessage) !void {
         for (assistant.content) |content| switch (content) {
             .text => |text| try self.appendMessage(.assistant, text.text, .extend_previous_assistant_message),
-            .thinking => |thinking| try self.appendMessage(.thinking, thinking.thinking, .extend_previous_same_role),
+            .thinking => |thinking| try self.appendThinking(thinking.thinking),
             .tool_call => {},
         };
     }
@@ -1642,6 +1743,7 @@ fn formatRetryStatus(buffer: []u8, retry: client_protocol.AutoRetryStart) []cons
 fn formatComposerRight(
     buffer: []u8,
     model: client_protocol.ModelSnapshot,
+    thinking_level: agent_mod.ThinkingLevel,
     context: client_protocol.ContextUsageSnapshot,
 ) []const u8 {
     var context_buffer: [32]u8 = undefined;
@@ -1650,10 +1752,11 @@ fn formatComposerRight(
         return std.fmt.bufPrint(buffer, "{s} • no authenticated model", .{context_text}) catch
             "?/? • no authenticated model";
     }
-    return std.fmt.bufPrint(buffer, "{s} • {s}/{s}", .{
+    return std.fmt.bufPrint(buffer, "{s} • {s}/{s} ({s})", .{
         context_text,
         model.provider.text,
         model.id.text,
+        @tagName(thinking_level),
     }) catch model.id.text;
 }
 
@@ -1730,6 +1833,10 @@ fn isBareModelCommand(text: []const u8) bool {
     return isBareSlashCommand(text, .model);
 }
 
+fn isBareSettingsCommand(text: []const u8) bool {
+    return isBareSlashCommand(text, .settings);
+}
+
 fn isBareResumeCommand(text: []const u8) bool {
     return isBareSlashCommand(text, .resume_session);
 }
@@ -1786,18 +1893,17 @@ test "composer right reports unauthenticated unknown model" {
     defer model.deinit(std.testing.allocator);
 
     var buffer: [tui.status.text_bytes_max]u8 = undefined;
-    const text = formatComposerRight(&buffer, model, .{});
+    const text = formatComposerRight(&buffer, model, .off, .{});
     try std.testing.expectEqualStrings("?/? • no authenticated model", text);
 }
 
-test "composer right omits thinking level until providers enforce it" {
+test "composer right includes thinking level" {
     var model = try testModelSnapshot(std.testing.allocator, "openai", "gpt-5");
     defer model.deinit(std.testing.allocator);
 
     var buffer: [tui.status.text_bytes_max]u8 = undefined;
-    const text = formatComposerRight(&buffer, model, .{ .window = 100_000, .percent_tenths = 123 });
-    try std.testing.expectEqualStrings("12.3%/100k • openai/gpt-5", text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "thinking") == null);
+    const text = formatComposerRight(&buffer, model, .medium, .{ .window = 100_000, .percent_tenths = 123 });
+    try std.testing.expectEqualStrings("12.3%/100k • openai/gpt-5 (medium)", text);
 }
 
 test "model slash parser only claims bare command" {

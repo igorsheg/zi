@@ -37,6 +37,7 @@ event_drain: *event_drain_mod.EventDrain,
 lifecycle: Lifecycle = .accepting,
 compaction_settings: session_manager.CompactionSettings = .{},
 retry_settings: RetrySettings = .{},
+hide_thinking: bool = true,
 
 pub const Options = struct {
     cwd: []const u8,
@@ -48,6 +49,7 @@ pub const Options = struct {
     thinking_level: agent_mod.ThinkingLevel = .off,
     compaction_settings: session_manager.CompactionSettings = .{},
     retry_settings: RetrySettings = .{},
+    hide_thinking: bool = true,
     stream: ?ai.StreamFunction = null,
     get_api_key: ?agent_mod.GetApiKeyHook = null,
     dir: std.Io.Dir = .cwd(),
@@ -277,6 +279,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .lifecycle = .accepting,
         .compaction_settings = options.compaction_settings,
         .retry_settings = options.retry_settings,
+        .hide_thinking = options.hide_thinking,
     };
 }
 
@@ -448,6 +451,7 @@ pub fn clientSnapshot(
         .header = header,
         .model = model,
         .thinking_level = self.agent.state.thinking_level,
+        .hide_thinking = self.hide_thinking,
         .context = self.clientContextUsage(),
         .queue = queue,
         .active_request_id = active_request_id,
@@ -464,6 +468,7 @@ pub fn clientChromeSnapshot(
         self.manager.header.cwd,
         self.agent.state.model,
         self.agent.state.thinking_level,
+        self.hide_thinking,
         self.clientContextUsage(),
     );
 }

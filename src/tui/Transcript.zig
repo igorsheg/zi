@@ -49,6 +49,7 @@ pub const CustomFormat = enum { plain, markdown };
 
 pub const Append = union(enum) {
     message: MessageAppend,
+    thinking: ThinkingAppend,
     status: StatusAppend,
     tool: ToolAppend,
     custom: CustomAppend,
@@ -57,6 +58,11 @@ pub const Append = union(enum) {
         role: Role,
         text: []const u8,
         mode: AppendMode = .new_item,
+    };
+    pub const ThinkingAppend = struct {
+        text: []const u8,
+        hidden: bool = true,
+        mode: AppendMode = .extend_previous_same_role,
     };
     pub const StatusAppend = struct {
         level: StatusLevel,
@@ -112,6 +118,7 @@ pub const Item = struct {
 
     pub const Body = union(enum) {
         message: Message,
+        thinking: Thinking,
         status: Status,
         tool: Tool,
         custom: Custom,
@@ -120,6 +127,7 @@ pub const Item = struct {
     fn deinitBody(self: *Item, gpa: std.mem.Allocator) void {
         switch (self.body) {
             .message => |*message| message.text.deinit(gpa),
+            .thinking => |*thinking| thinking.text.deinit(gpa),
             .status => |status| gpa.free(status.text),
             .custom => |*custom| {
                 gpa.free(custom.title);
@@ -140,6 +148,7 @@ pub const Item = struct {
     pub fn sizeBytes(self: *const Item) usize {
         return switch (self.body) {
             .message => |message| message.text.items.len,
+            .thinking => |thinking| thinking.text.items.len,
             .status => |status| status.text.len,
             .custom => |custom| custom.title.len + custom.text.len,
             .tool => |tool| tool.sizeBytes(),
@@ -151,6 +160,12 @@ pub const Message = struct {
     role: Role,
     text: std.ArrayList(u8) = .empty,
     pending: PendingUtf8 = .{},
+};
+
+pub const Thinking = struct {
+    text: std.ArrayList(u8) = .empty,
+    pending: PendingUtf8 = .{},
+    hidden: bool = true,
 };
 
 pub const Status = struct {
@@ -206,6 +221,7 @@ pub fn append(self: *Transcript, gpa: std.mem.Allocator, entry: Append) error{Ou
     defer self.revision +%= 1;
     return switch (entry) {
         .message => |message| self.appendMessage(gpa, message),
+        .thinking => |thinking| self.appendThinking(gpa, thinking),
         .status => |status| self.appendStatus(gpa, status),
         .tool => |tool| self.appendTool(gpa, tool),
         .custom => |custom| self.appendCustom(gpa, custom),
@@ -390,6 +406,34 @@ fn appendMessage(
     errdefer body.text.deinit(gpa);
     try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
     try self.items.append(gpa, .{ .body = .{ .message = body } });
+    self.total_size_bytes += body.text.items.len;
+    self.evictUntilBounded(gpa);
+    return .{ .truncated = truncated };
+}
+
+fn appendThinking(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    thinking: Append.ThinkingAppend,
+) error{OutOfMemory}!Outcome {
+    const bounded = text_mod.utf8Prefix(thinking.text, append_size_bytes_max);
+    const truncated = bounded.len < thinking.text.len;
+
+    if (thinking.mode != .new_item and self.items.items.len > 0) {
+        const last = &self.items.items[self.items.items.len - 1];
+        if (last.body == .thinking and last.body.thinking.hidden == thinking.hidden) {
+            const old_size = last.sizeBytes();
+            try appendStreamBytes(gpa, &last.body.thinking.text, &last.body.thinking.pending, bounded);
+            self.noteItemMutation(last, old_size, last.sizeBytes());
+            self.evictUntilBounded(gpa);
+            return .{ .truncated = truncated };
+        }
+    }
+
+    var body: Thinking = .{ .hidden = thinking.hidden };
+    errdefer body.text.deinit(gpa);
+    if (bounded.len > 0) try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
+    try self.items.append(gpa, .{ .body = .{ .thinking = body } });
     self.total_size_bytes += body.text.items.len;
     self.evictUntilBounded(gpa);
     return .{ .truncated = truncated };

@@ -258,6 +258,7 @@ fn resolveSessionOptions(services: *RuntimeServices, options: Options) AgentSess
         }
         break :level .off;
     };
+    const hide_thinking = project.hide_thinking_block orelse global.hide_thinking_block orelse true;
 
     var compaction: session_manager.CompactionSettings = .{};
     var retry: AgentSession.RetrySettings = .{};
@@ -282,6 +283,7 @@ fn resolveSessionOptions(services: *RuntimeServices, options: Options) AgentSess
         .timestamp = "",
         .model = model,
         .thinking_level = thinking_level,
+        .hide_thinking = hide_thinking,
         .compaction_settings = compaction,
         .retry_settings = retry,
         .stream = options.stream orelse if (services.provider_registry.get(model.api)) |provider|
@@ -1048,6 +1050,7 @@ pub const SessionRuntime = struct {
             .model => try self.handleModelSlashCommand(request_id, spec.name, invocation.args),
             .resume_session => try self.handleResumeSlashCommand(request_id, spec.name, invocation.args),
             .compact => try self.handleCompactSlashCommand(request_id, spec.name, invocation.args),
+            .settings => try self.handleSettingsSlashCommand(request_id, spec.name, invocation.args),
         }
         return true;
     }
@@ -1107,6 +1110,43 @@ pub const SessionRuntime = struct {
             return;
         }
         try self.switchSession(request_id, args);
+    }
+
+    fn handleSettingsSlashCommand(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        command: []const u8,
+        args: []const u8,
+    ) !void {
+        if (args.len == 0) {
+            try self.enqueuePromptCommand(request_id, command, .handled, "usage: /settings <thinking:level|thinking:hidden|thinking:shown>");
+            return;
+        }
+        if (std.mem.startsWith(u8, args, "thinking:")) {
+            const value = args["thinking:".len..];
+            if (std.mem.eql(u8, value, "hidden")) {
+                try self.setHideThinking(true);
+                try self.enqueuePromptCommand(request_id, command, .handled, "thinking: hidden");
+                try self.enqueueSessionChrome(request_id);
+                return;
+            }
+            if (std.mem.eql(u8, value, "shown")) {
+                try self.setHideThinking(false);
+                try self.enqueuePromptCommand(request_id, command, .handled, "thinking: shown");
+                try self.enqueueSessionChrome(request_id);
+                return;
+            }
+            if (parseThinkingLevel(value)) |level| {
+                try self.setSessionThinkingLevel(level);
+                var reply_buffer: [64]u8 = undefined;
+                const reply = std.fmt.bufPrint(&reply_buffer, "thinking effort: {s}", .{@tagName(level)}) catch
+                    "thinking effort changed";
+                try self.enqueuePromptCommand(request_id, command, .handled, reply);
+                try self.enqueueSessionChrome(request_id);
+                return;
+            }
+        }
+        try self.enqueuePromptCommand(request_id, command, .failed, "unknown setting");
     }
 
     fn handleCompactSlashCommand(
@@ -1221,6 +1261,27 @@ pub const SessionRuntime = struct {
         return found orelse error.UnknownModel;
     }
 
+    fn setSessionThinkingLevel(self: *SessionRuntime, level: agent_mod.ThinkingLevel) !void {
+        const entry = try self.session.manager.prepareThinkingLevelChangeEntry(
+            @tagName(level),
+            self.session.timestamp,
+        );
+        var entry_committed = false;
+        errdefer if (!entry_committed) self.session.manager.deinitPreparedEntry(entry);
+        if (self.session.store) |store| {
+            try store.appendEntry(self.session.io, entry, self.session.manager.lastEntryId());
+        }
+        _ = self.session.manager.commitPreparedEntry(entry);
+        entry_committed = true;
+        try self.services.settings_manager.setDefaultThinkingLevel(self.services.io, self.host_config.dir, @tagName(level));
+        self.session.agent.setThinkingLevel(level);
+    }
+
+    fn setHideThinking(self: *SessionRuntime, hidden: bool) !void {
+        try self.services.settings_manager.setHideThinkingBlock(self.services.io, self.host_config.dir, hidden);
+        self.session.hide_thinking = hidden;
+    }
+
     fn setSessionModel(self: *SessionRuntime, model: ai.Model) !void {
         const entry = try self.session.manager.prepareModelChangeEntry(
             model.provider,
@@ -1234,6 +1295,7 @@ pub const SessionRuntime = struct {
         }
         _ = self.session.manager.commitPreparedEntry(entry);
         entry_committed = true;
+        try self.services.settings_manager.setDefaultModel(self.services.io, self.host_config.dir, model.provider, model.id);
         self.session.agent.setModel(model);
         if (self.services.provider_registry.get(model.api)) |provider| {
             self.session.agent.setStream(provider.stream_simple);
@@ -2105,7 +2167,7 @@ test "session runtime handles slash command without starting an operation" {
     try std.testing.expect(event.event.prompt_command.result == .handled);
     try std.testing.expectEqualStrings("help", event.event.prompt_command.command.text);
     try std.testing.expectEqualStrings(
-        "available commands: /help, /session, /model, /resume, /compact",
+        "available commands: /help, /session, /model, /resume, /compact, /settings",
         event.event.prompt_command.message.text,
     );
     // No operation started, nothing queued, nothing persisted.

@@ -38,6 +38,7 @@ pub const Open = struct {
     query: []const u8 = "",
     items: []const Item,
     search_detail: bool = false,
+    filter_enabled: bool = true,
     layout: Layout = .line,
     truncated: bool = false,
     min_visible_rows: u8 = 0,
@@ -108,6 +109,7 @@ dropped_items: usize = 0,
 truncated: bool = false,
 min_visible_rows: u8 = 0,
 search_detail: bool = false,
+filter_enabled: bool = true,
 layout: Layout = .line,
 
 pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
@@ -116,6 +118,7 @@ pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
         .truncated = open.truncated,
         .min_visible_rows = @min(open.min_visible_rows, visible_rows_max),
         .search_detail = open.search_detail,
+        .filter_enabled = open.filter_enabled,
         .layout = open.layout,
     };
     errdefer self.deinit(gpa);
@@ -137,6 +140,10 @@ pub fn deinit(self: *Picker, gpa: std.mem.Allocator) void {
 
 pub fn querySlice(self: *const Picker) []const u8 {
     return self.query[0..self.query_len];
+}
+
+pub fn filtersInput(self: *const Picker) bool {
+    return self.filter_enabled;
 }
 
 pub fn replaceQuery(self: *Picker, bytes: []const u8) void {
@@ -200,18 +207,18 @@ pub fn applyInput(
 ) error{OutOfMemory}!InputResult {
     switch (event) {
         .text => |bytes| {
-            self.insertQuery(bytes.slice());
+            if (self.filter_enabled) self.insertQuery(bytes.slice());
             return .none;
         },
         .key => |key| switch (key) {
             .enter => return self.select(gpa),
             .escape, .ctrl_c => return .closed,
             .backspace => {
-                self.backspaceQuery();
+                if (self.filter_enabled) self.backspaceQuery();
                 return .none;
             },
             .delete => {
-                self.clearQuery();
+                if (self.filter_enabled) self.clearQuery();
                 return .none;
             },
             .arrow_up => {
