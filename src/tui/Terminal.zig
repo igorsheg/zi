@@ -84,7 +84,7 @@ pub fn deinit(self: *Terminal) void {
         var discard = std.Io.Writer.Discarding.init(&.{});
         self.vx.deinit(gpa, &discard.writer);
     }
-    if (self.tty) |tty| tty.deinit();
+    if (self.tty) |*tty| tty.deinit();
     self.env.deinit();
     self.* = undefined;
     gpa.destroy(self);
