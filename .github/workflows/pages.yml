@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  WEBSITE_ZIG_VERSION: 0.15.2
+  WEBSITE_ZIG_VERSION: 0.16.0
   WEBSITE_ZINE_VERSION: v0.11.2
   CLOUDFLARE_PAGES_PROJECT: withzi
   WEBSITE_OUT_DIR: zig-out/web
@@ -27,7 +27,6 @@ jobs:
       - name: Setup website Zig
         uses: mlugg/setup-zig@v2
         with:
-          # The website/Zine dependency stack is still pinned to Zig 0.15.x.
           version: ${{ env.WEBSITE_ZIG_VERSION }}
 
       - name: Setup Zine

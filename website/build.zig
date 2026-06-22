@@ -1,0 +1,74 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const clean_host_files = b.addSystemCommand(&.{
+        "rm",
+        "-rf",
+        b.fmt("{s}/_redirects", .{b.install_prefix}),
+        b.fmt("{s}/man", .{b.install_prefix}),
+    });
+
+    const zine_site = b.addSystemCommand(&.{
+        "zine",
+        "release",
+        "--force",
+        b.fmt("--output={s}", .{b.install_prefix}),
+    });
+    zine_site.step.dependOn(&clean_host_files.step);
+
+    const mdman = b.addExecutable(.{
+        .name = "mdman",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("mdman/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const man_pages = .{
+        .{ "docs/man/00-intro.md", "man/index.html", "man/index.md", "zi(1)", "", "", "cli", "cli.html" },
+        .{ "docs/man/10-cli.md", "man/cli.html", "man/cli.md", "cli", "intro", "index.html", "settings", "settings.html" },
+        .{ "docs/man/12-settings.md", "man/settings.html", "man/settings.md", "settings", "cli", "cli.html", "resources", "resources.html" },
+        .{ "docs/man/15-resources.md", "man/resources.html", "man/resources.md", "resources", "settings", "settings.html", "skills", "skills.html" },
+        .{ "docs/man/16-skills.md", "man/skills.html", "man/skills.md", "skills", "resources", "resources.html", "prompts", "prompts.html" },
+        .{ "docs/man/17-prompts.md", "man/prompts.html", "man/prompts.md", "prompts", "skills", "skills.html", "frontends", "frontend.html" },
+        .{ "docs/man/18-frontends.md", "man/frontend.html", "man/frontend.md", "frontends", "prompts", "prompts.html", "agent context", "agent-context.html" },
+        .{ "docs/man/19-agent-context.md", "man/agent-context.html", "man/agent-context.md", "agent context", "frontends", "frontend.html", "", "" },
+    };
+
+    const web = b.step("web", "Build the compound static website");
+    web.dependOn(&zine_site.step);
+
+    const install_redirects = b.addInstallFileWithDir(b.path("_redirects"), .prefix, "_redirects");
+    install_redirects.step.dependOn(&zine_site.step);
+    web.dependOn(&install_redirects.step);
+
+    inline for (man_pages) |entry| {
+        const md_file, const html_file, const markdown_file, const page_title, const prev_label, const prev_url, const next_label, const next_url = entry;
+
+        const run_mdman_html = b.addRunArtifact(mdman);
+        const markdown_url = markdown_file[4..];
+        run_mdman_html.addArgs(&.{ "--html-fragment", "--name", "zi", "--section", "1", "--page-label", "ZI(1)", "--page-title", page_title, "--markdown-url", markdown_url });
+        if (prev_label.len > 0) run_mdman_html.addArgs(&.{ "--prev-label", prev_label });
+        if (prev_url.len > 0) run_mdman_html.addArgs(&.{ "--prev-url", prev_url });
+        if (next_label.len > 0) run_mdman_html.addArgs(&.{ "--next-label", next_label });
+        if (next_url.len > 0) run_mdman_html.addArgs(&.{ "--next-url", next_url });
+        run_mdman_html.addFileArg(b.path(md_file));
+        const man_fragment = run_mdman_html.captureStdOut(.{});
+
+        const man_page = b.addSystemCommand(&.{ "cat", "--" });
+        man_page.addFileArg(b.path("docs/web/man-header.html"));
+        man_page.addFileArg(man_fragment);
+        man_page.addFileArg(b.path("docs/web/man-footer.html"));
+        const install_man = b.addInstallFileWithDir(man_page.captureStdOut(.{}), .prefix, html_file);
+        web.dependOn(&install_man.step);
+
+        const install_markdown = b.addInstallFileWithDir(b.path(md_file), .prefix, markdown_file);
+        web.dependOn(&install_markdown.step);
+    }
+
+    b.getInstallStep().dependOn(web);
+}

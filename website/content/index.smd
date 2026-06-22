@@ -1,0 +1,14 @@
+---
+.title = "zi",
+.date = @date("2026-06-22T00:00:00"),
+.author = "zi",
+.layout = "index.shtml",
+.draft = false,
+---
+Zi is a coding agent you can build with.
+
+It runs in your repo. It keeps the work visible. It gives the model a small set of tools: read, bash, edit, write, and symbols.
+
+Start with a prompt. Resume the thread later. Change the rules when your project needs different habits.
+
+[Read the manual](https://withzi.dev/man/)

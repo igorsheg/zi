@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#050507">
+    <meta name="description" content="zi is a local-first, extensible coding agent. Ask it to shape itself around your workflow.">
+    <link rel="canonical" href="https://withzi.dev/">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="zi">
+    <meta property="og:title" content="zi">
+    <meta property="og:description" content="zi is a local-first, extensible coding agent. Ask it to shape itself around your workflow.">
+    <meta property="og:url" content="https://withzi.dev/">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="zi">
+    <meta name="twitter:description" content="zi is a local-first, extensible coding agent. Ask it to shape itself around your workflow.">
+    <title>zi</title>
+    <link rel="icon" href="$site.asset('favicon.ico').link()" sizes="any">
+    <link rel="icon" href="$site.asset('favicon.svg').link()" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="$site.asset('apple-touch-icon.png').link()">
+    <link rel="preload" href="/fonts/fragment-mono-400.ttf" as="font" type="font/ttf" crossorigin>
+    <link rel="stylesheet" href="$site.asset('style.css').link()">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">skip to content</a>
+    <main id="content" class="home site-center stack" aria-labelledby="title">
+      <pre class="logo" aria-hidden="true">░▀▀█░▀█▀
+░▄▀░░░█░
+░▀▀▀░▀▀▀</pre>
+      <h1 class="title" id="title">A coding agent you can build with.</h1>
+      <p class="lede">zi is a local-first, extensible coding agent. ask it to shape itself around your workflow.</p>
+      <nav class="cluster" aria-label="links">
+        <a href="/man/">manual</a>
+        <a href="https://github.com/igorsheg/zi" rel="me">github</a>
+      </nav>
+    </main>
+  </body>
+</html>
