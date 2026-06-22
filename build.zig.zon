@@ -1,6 +1,6 @@
 .{
     .name = .zi,
-    .version = "0.0.0",
+    .version = "0.0.1-dev",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xa0675a7fe10398b2,
     .dependencies = .{
@@ -16,10 +16,11 @@
         "AGENTS.md",
         "build.zig",
         "build.zig.zon",
-        "docs",
         "src",
         "vendor/zio",
         "vendor/libvaxis",
+        "vendor/zigimg",
+        "vendor/uucode",
         "LICENSE",
         "README.md",
     },

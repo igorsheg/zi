@@ -3,7 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const version = b.option([]const u8, "version", "Zi version string") orelse "0.0.0-local";
+    const strip = b.option(bool, "strip", "Omit debug information") orelse false;
+    const version = b.option([]const u8, "version", "Zi version string") orelse "0.0.1-dev";
 
     const app_options = b.addOptions();
     app_options.addOption([]const u8, "version", version);
@@ -12,6 +13,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     zi.addOptions("build_options", app_options);
     const zio_dep = b.dependency("zio", .{
@@ -30,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .imports = &.{
             .{ .name = "zio", .module = zio_dep.module("zio") },
             .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
@@ -53,6 +56,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("scripts/generate-models.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
     const generate_models_cmd = b.addRunArtifact(generate_models);
@@ -66,5 +70,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
-    _ = b.step("pty-test", "PTY harness removed with ADR 0006 TUI reset");
+    _ = b.step("pty-test", "PTY harness removed with TUI reset");
 }

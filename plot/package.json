@@ -1,8 +1,0 @@
-{
-	"name": "plot-zi-pr-reviewer",
-	"private": true,
-	"type": "module",
-	"dependencies": {
-		"plot-ai": "latest"
-	}
-}

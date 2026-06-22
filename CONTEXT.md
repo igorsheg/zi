@@ -62,10 +62,11 @@ two facts follow from this and are load-bearing:
   Zi-specific policy lives in `coding_agent`.
 
 vendored dependencies are deliberate and minimal: `zio` (lalinsky/zio, the Zig
-0.16 `std.Io` runtime — task spawning, channels, select, cancellation) and
+0.16 `std.Io` runtime — task spawning, channels, select, cancellation),
 `libvaxis` (terminal raw mode, parsing, screen/window primitives, diff/render,
-Unicode width). The model catalog is generated into
-`src/ai/models.generated.zig` via `zig build generate-models`.
+Unicode width), and the small transitive libvaxis packages `zigimg` and
+`uucode`. The model catalog is generated into `src/ai/models.generated.zig` via
+`zig build generate-models`.
 
 ## coding-agent spine
 
@@ -100,8 +101,8 @@ RuntimeServices
   host task runtime from SessionRuntime.
 
 SessionRuntime
-  the client mailbox host (docs/mailbox-contract.md): bounded command and
-  event queues, monotonically sequenced EventEnvelopes, the retained-event
+  the client mailbox host: bounded command and event queues, monotonically
+  sequenced EventEnvelopes, the retained-event
   replay ledger, slash commands (/help, /session, /model, /resume — handled at
   the mailbox, never reaching the model or queues), session switching through
   a typed command, and the active-operation state machine whose phase (running
@@ -130,9 +131,9 @@ assistant tool calls and tool results) used to seed a frontend transcript on
 resume. the agent's in-memory transcript is runtime
 context, not the source of truth.
 
-The public boundary contracts are `docs/agent-event-contract.md` and
-`docs/mailbox-contract.md`. In short: events are facts, snapshots are state,
-owners hold state, and pipes do not smuggle unbounded state.
+The public boundary contracts are encoded in tests and protocol types. In
+short: events are facts, snapshots are state, owners hold state, and pipes do
+not smuggle unbounded state.
 
 ## agent runtime
 
@@ -381,7 +382,7 @@ notes:
 
 - every envelope carries a monotonically increasing `seq`; clients recover
   from gaps via `replay`, and from replay gaps via `snapshot`
-  (docs/mailbox-contract.md).
+  through the mailbox protocol.
 - queues are bounded. on overflow, events are dropped and a single
   `event_overflow { dropped_count }` is emitted so clients learn of loss.
 - stored string payloads are owned; the drained envelope's `deinit` frees them.
@@ -425,13 +426,7 @@ not yet built, and not to be built speculatively:
 - future Lua extensions that request through the same commands/events/slots the
   built-in product uses; they never receive mutable stores or terminal cells.
 
-the parity ledger drives behavior work:
-
-```text
-docs/behavioral-parity.md
-```
-
-a behavior is done only when it has a Zi owner, a pi-mono reference, and a
+Behavior work is done only when it has a Zi owner, a pi-mono reference, and a
 public-boundary test.
 
 ## rejected shortcuts

@@ -2400,10 +2400,9 @@ test "frame scratch keeps generated tool titles stable" {
     } } });
     _ = try app.apply(testing_gpa, .{ .replace_tool_output = .{
         .tool_call_id = "call-custom",
-        .text = ".claude/\n.forks/\n.git/\n.github/\n.gitignore\n.pi/\n.references/\n.tmp/\n" ++
-            ".zi/\n.zig-cache/\n.ziglint.zon\nAGENTS.md\nautoresearch.checks.sh\n" ++
-            "autoresearch.ideas.md\nautoresearch.md\nautoresearch.sh\nbuild.zig\n" ++
-            "build.zig.zon\nCONTEXT.md\ndocs/\n",
+        .text = ".claude/\n.forks/\n.git/\n.github/\n.gitignore\n.references/\n.tmp/\n" ++
+            ".zi/\n.zig-cache/\n.ziglint.zon\nAGENTS.md\nbuild.zig\n" ++
+            "build.zig.zon\nCONTEXT.md\nREADME.md\nsrc/\nvendor/\n",
     } });
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .tool = .{
         .tool_call_id = "call-custom",
