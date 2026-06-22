@@ -50,6 +50,7 @@ pub const Key = enum {
     ctrl_g,
     ctrl_o,
     ctrl_u,
+    alt_v,
 };
 
 pub const Input = union(enum) {
@@ -109,6 +110,7 @@ fn fromVaxisKey(key: vaxis.Key) Input {
     if (key.matches('g', .{ .ctrl = true })) return .{ .key = .ctrl_g };
     if (key.matches('o', .{ .ctrl = true })) return .{ .key = .ctrl_o };
     if (key.matches('u', .{ .ctrl = true })) return .{ .key = .ctrl_u };
+    if (key.matches('v', .{ .alt = true })) return .{ .key = .alt_v };
     if (key.text) |text| {
         const plain_text = !key.mods.ctrl and !key.mods.alt;
         const alt_gr_text = key.mods.ctrl and key.mods.alt;
@@ -141,6 +143,7 @@ pub const KeyAction = union(enum) {
     clear_or_exit,
     exit_if_composer_empty,
     open_external_editor,
+    paste_image,
     none,
 };
 
@@ -175,6 +178,7 @@ fn resolveKey(key: Key) KeyAction {
         .ctrl_o => .toggle_tool_expansion,
         .ctrl_u => .transcript_page_up,
         .ctrl_d => .exit_if_composer_empty,
+        .alt_v => .paste_image,
         // No completion UI yet; mapped explicitly so the gap is a decision,
         // not an accident.
         .tab => .none,
@@ -229,6 +233,7 @@ test "resolve maps editing keys" {
     try std.testing.expectEqual(KeyAction.composer_newline, resolve(.{ .key = .newline }));
     try std.testing.expectEqual(KeyAction.composer_submit, resolve(.{ .key = .enter }));
     try std.testing.expectEqual(KeyAction.open_external_editor, resolve(.{ .key = .ctrl_g }));
+    try std.testing.expectEqual(KeyAction.paste_image, resolve(.{ .key = .alt_v }));
 }
 
 test "ctrl alt printable text passes through for AltGr" {

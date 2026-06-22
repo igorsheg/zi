@@ -359,6 +359,7 @@ pub const Command = union(enum) {
     set_composer_arg_completions: SlashArgCompletionOpen,
     set_file_completions: Picker.Open,
     replace_composer_text: []const u8,
+    insert_composer_paste_marker: []const u8,
     set_status: status_mod.Set,
     clear_status: status_mod.Clear,
     notify: notify_mod.Notify,
@@ -369,6 +370,7 @@ pub const Effect = union(enum) {
     submit_text: []u8,
     edit_composer_external: []u8,
     picker_selected: Picker.Selection,
+    request_clipboard_image_paste,
     interrupt,
     request_shutdown,
     request_transcript_history,
@@ -377,7 +379,7 @@ pub const Effect = union(enum) {
         switch (self) {
             .submit_text, .edit_composer_external => |text| gpa.free(text),
             .picker_selected => |selection| gpa.free(selection.item_id),
-            .interrupt, .request_shutdown, .request_transcript_history => {},
+            .request_clipboard_image_paste, .interrupt, .request_shutdown, .request_transcript_history => {},
         }
     }
 };
@@ -536,6 +538,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.dirty = true;
             return null;
         },
+        .insert_composer_paste_marker => |text| return self.insertComposerPasteMarker(gpa, text),
         .set_status => |update| {
             if (self.status.set(update, self.now_ms) == .dropped_full) {
                 try self.notice(gpa, .warning, "status line full");
@@ -624,6 +627,7 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
         .clear_or_exit => return self.clearOrExit(gpa),
         .exit_if_composer_empty => if (self.composer.text().len == 0) return .request_shutdown,
         .open_external_editor => return try self.openExternalEditor(gpa),
+        .paste_image => return .request_clipboard_image_paste,
         .none => {},
     }
     return null;
@@ -750,6 +754,28 @@ fn finishPaste(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
         .rejected_full => try self.noticeComposerFull(gpa),
     }
     if (self.paste_truncated) try self.notice(gpa, .warning, "paste too large: extra input dropped");
+    return null;
+}
+
+fn insertComposerPasteMarker(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!?Effect {
+    var clean_buffer: [Composer.buffer_size_bytes_max]u8 = undefined;
+    const clean = if (std.unicode.utf8ValidateSlice(bytes))
+        text_mod.utf8Prefix(bytes, Composer.buffer_size_bytes_max)
+    else
+        text_mod.sanitizeInto(&clean_buffer, bytes);
+    switch (try self.composer.insertPasteMarker(gpa, clean)) {
+        .ok, .inserted_truncated => |result| {
+            if (clean.len > 0) self.noteGreeterCharacterInput();
+            self.resetHistoryNavigation();
+            self.completion.noteEdit();
+            self.syncComposerCompletion();
+            self.syncComposerScrollHint();
+            self.composer_full_noticed = false;
+            self.dirty = true;
+            if (result == .inserted_truncated) try self.noticeComposerFull(gpa);
+        },
+        .rejected_full => try self.noticeComposerFull(gpa),
+    }
     return null;
 }
 

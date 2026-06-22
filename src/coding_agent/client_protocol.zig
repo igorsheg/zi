@@ -35,6 +35,9 @@ pub const completion_label_bytes_max = 160;
 pub const completion_detail_bytes_max = 160;
 pub const completion_meta_bytes_max = 80;
 pub const completion_aux_bytes_max = 80;
+pub const submit_image_count_max = 4;
+pub const submit_image_data_bytes_max = 80 * 1024 * 1024;
+pub const submit_image_mime_bytes_max = 64;
 
 pub const CommandQueue = runtime.BoundedQueue(CommandEnvelope);
 pub const EventQueue = runtime.BoundedQueue(EventEnvelope);
@@ -50,6 +53,22 @@ pub const CommandEnvelope = struct {
         mode: Submit.Mode,
     ) !CommandEnvelope {
         return .{ .id = id, .command = .{ .submit = .{ .text = try allocator.dupe(u8, text), .mode = mode } } };
+    }
+
+    pub fn initSubmitPromptWithImages(
+        allocator: std.mem.Allocator,
+        id: ?RequestId,
+        text: []const u8,
+        images: []const ai.ImageContent,
+        mode: Submit.Mode,
+    ) !CommandEnvelope {
+        const text_copy = try allocator.dupe(u8, text);
+        errdefer allocator.free(text_copy);
+        return .{ .id = id, .command = .{ .submit = .{
+            .text = text_copy,
+            .images = try copySubmitImages(allocator, images),
+            .mode = mode,
+        } } };
     }
 
     pub fn initHistoryPage(
@@ -102,7 +121,10 @@ pub const ClientCommand = union(enum) {
 
     pub fn deinit(self: *ClientCommand, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .submit => |prompt| allocator.free(prompt.text),
+            .submit => |prompt| {
+                allocator.free(prompt.text);
+                freeSubmitImages(allocator, prompt.images);
+            },
             .history_page => |request| allocator.free(request.before_entry_id),
             .switch_session => |request| allocator.free(request.session_file_name),
             .file_completion => |request| allocator.free(request.query),
@@ -114,10 +136,38 @@ pub const ClientCommand = union(enum) {
 
 pub const Submit = struct {
     text: []u8,
+    images: []ai.ImageContent = &.{},
     mode: Mode = .auto,
 
     pub const Mode = enum { auto, start, enqueue, steer };
 };
+
+pub fn copySubmitImages(allocator: std.mem.Allocator, images: []const ai.ImageContent) ![]ai.ImageContent {
+    if (images.len == 0) return &.{};
+    if (images.len > submit_image_count_max) return error.TooManyImages;
+    const copy = try allocator.alloc(ai.ImageContent, images.len);
+    errdefer allocator.free(copy);
+    var copied: usize = 0;
+    errdefer freeSubmitImages(allocator, copy[0..copied]);
+    for (images, 0..) |image, index| {
+        if (image.data.len > submit_image_data_bytes_max) return error.ImageTooLarge;
+        if (image.mime_type.len > submit_image_mime_bytes_max) return error.ImageMimeTooLong;
+        const data = try allocator.dupe(u8, image.data);
+        errdefer allocator.free(data);
+        const mime_type = try allocator.dupe(u8, image.mime_type);
+        copy[index] = .{ .data = data, .mime_type = mime_type };
+        copied += 1;
+    }
+    return copy;
+}
+
+pub fn freeSubmitImages(allocator: std.mem.Allocator, images: []const ai.ImageContent) void {
+    for (images) |image| {
+        allocator.free(image.data);
+        allocator.free(image.mime_type);
+    }
+    if (images.len > 0) allocator.free(images);
+}
 
 pub const Cancel = struct {
     target: Target = .active,

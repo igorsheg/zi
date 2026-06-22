@@ -7,6 +7,7 @@ const agent_mod = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../../coding_agent/root.zig");
 const client_protocol = coding_agent.client_protocol;
+const clipboard_image = @import("clipboard_image.zig");
 const slash_commands = coding_agent.slash_commands;
 const session_listing = coding_agent.session_listing;
 const session_runtime = coding_agent.session_runtime;
@@ -53,6 +54,7 @@ const command_completion_picker_id: tui.Picker.Id = 2;
 const resume_picker_id: tui.Picker.Id = 3;
 const file_picker_id: tui.Picker.Id = 4;
 const transcript_append_max = tui.Transcript.append_size_bytes_max;
+const clipboard_image_attachment_count_max = client_protocol.submit_image_count_max;
 const tool_timer_count_max = 8;
 const tool_timer_id_bytes_max = 96;
 
@@ -68,6 +70,27 @@ fn canRequestHistoryPage(history_request_in_flight: bool, history_has_more_befor
 fn nonEmptyEnv(value: ?[]const u8) ?[]const u8 {
     const text = value orelse return null;
     return if (std.mem.trim(u8, text, " \t\r\n").len == 0) null else text;
+}
+
+fn isPromptPathByte(byte: u8) bool {
+    return switch (byte) {
+        0...32, '"', '\'', '<', '>' => false,
+        else => true,
+    };
+}
+
+fn isZiClipboardImagePath(path: []const u8) bool {
+    const leaf = std.fs.path.basename(path);
+    return std.mem.startsWith(u8, leaf, "zi-clipboard-") and mimeTypeForImagePath(path) != null;
+}
+
+fn mimeTypeForImagePath(path: []const u8) ?[]const u8 {
+    const ext = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(ext, ".png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(ext, ".jpg") or std.ascii.eqlIgnoreCase(ext, ".jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(ext, ".webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(ext, ".gif")) return "image/gif";
+    return null;
 }
 
 fn resolveTerminalInfo(process: runtime.Process) tui.theme.TerminalInfo {
@@ -308,6 +331,7 @@ const InteractiveController = struct {
             .submit_text => |text| if (!try self.handleSubmittedCommand(text)) try self.submitPrompt(text),
             .edit_composer_external => |text| try self.editComposerExternal(text),
             .picker_selected => |selection| try self.handlePickerSelection(selection),
+            .request_clipboard_image_paste => try self.handleClipboardImagePaste(),
             .interrupt => try self.cancelActive(),
             .request_transcript_history => try self.requestHistoryPage(),
             .request_shutdown => {
@@ -327,6 +351,78 @@ const InteractiveController = struct {
             return self.bytes[0..self.len];
         }
     };
+
+    fn handleClipboardImagePaste(self: *InteractiveController) !void {
+        var image = clipboard_image.read(
+            self.allocator,
+            self.io,
+            self.app.task_runtime,
+            self.app.services.environ,
+        ) catch |err| {
+            try self.appendClipboardImageError(err);
+            return;
+        };
+        defer image.deinit(self.allocator);
+
+        const path = self.createClipboardImageTempFile(&image) catch |err| {
+            try self.appendClipboardImageError(err);
+            return;
+        };
+        defer self.allocator.free(path);
+
+        const payload = try std.fmt.allocPrint(self.allocator, "@{s}", .{path});
+        defer self.allocator.free(payload);
+        _ = try self.terminal.applyCommand(.{ .insert_composer_paste_marker = payload });
+    }
+
+    fn createClipboardImageTempFile(self: *InteractiveController, image: *const clipboard_image.ClipboardImage) ![]u8 {
+        const ext = clipboard_image.extensionForMimeType(image.mime_type) orelse return error.UnsupportedFormat;
+        var attempts: usize = 0;
+        while (attempts < 16) : (attempts += 1) {
+            self.external_editor_counter +%= 1;
+            const stamp = std.Io.Clock.awake.now(self.io).nanoseconds;
+            var name_buffer: [96]u8 = undefined;
+            const name = std.fmt.bufPrint(
+                &name_buffer,
+                "zi-clipboard-{d}-{d}.{s}",
+                .{ stamp, self.external_editor_counter, ext },
+            ) catch unreachable;
+            const path = try std.fs.path.join(self.allocator, &.{ self.tmp_dir, name });
+            errdefer self.allocator.free(path);
+
+            var file = std.Io.Dir.createFileAbsolute(self.io, path, .{
+                .read = true,
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    self.allocator.free(path);
+                    continue;
+                },
+                else => return err,
+            };
+            defer file.close(self.io);
+
+            var write_buffer: [4096]u8 = undefined;
+            var writer = file.writer(self.io, &write_buffer);
+            try writer.interface.writeAll(image.bytes);
+            try writer.flush();
+            return path;
+        }
+        return error.PathAlreadyExists;
+    }
+
+    fn appendClipboardImageError(self: *InteractiveController, err: anyerror) !void {
+        const message: []const u8 = switch (err) {
+            error.NoImage => "clipboard has no image",
+            error.UnsupportedFormat => "clipboard image format unsupported",
+            error.ToolUnavailable => "clipboard image tool unavailable",
+            error.ImageTooLarge => "clipboard image too large",
+            error.Timeout => "clipboard image paste timed out",
+            else => "could not paste clipboard image",
+        };
+        try self.appendStatus(.warning, message);
+    }
 
     fn editComposerExternal(self: *InteractiveController, text: []const u8) !void {
         const path = self.createEditorTempFile(text) catch |err| {
@@ -568,8 +664,71 @@ const InteractiveController = struct {
     }
 
     fn submitPrompt(self: *InteractiveController, prompt: []const u8) !void {
-        const envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(self.allocator, null, prompt, .auto);
+        var attachments = try self.clipboardImageAttachmentsFromPrompt(prompt);
+        defer attachments.deinit(self.allocator);
+        const envelope = try client_protocol.CommandEnvelope.initSubmitPromptWithImages(
+            self.allocator,
+            null,
+            prompt,
+            attachments.images(),
+            .auto,
+        );
         if (try self.submitCommand(envelope) == .queued) self.cancel_requested = false;
+    }
+
+    const PromptImageAttachments = struct {
+        list: std.ArrayList(ai.ImageContent) = .empty,
+
+        fn images(self: *const PromptImageAttachments) []const ai.ImageContent {
+            return self.list.items;
+        }
+
+        fn deinit(self: *PromptImageAttachments, allocator: std.mem.Allocator) void {
+            for (self.list.items) |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            }
+            self.list.deinit(allocator);
+            self.* = undefined;
+        }
+    };
+
+    fn clipboardImageAttachmentsFromPrompt(self: *InteractiveController, prompt: []const u8) !PromptImageAttachments {
+        var attachments: PromptImageAttachments = .{};
+        errdefer attachments.deinit(self.allocator);
+        var index: usize = 0;
+        while (index < prompt.len and attachments.list.items.len < clipboard_image_attachment_count_max) {
+            const at = std.mem.indexOfScalarPos(u8, prompt, index, '@') orelse break;
+            index = at + 1;
+            const path_start = index;
+            while (index < prompt.len and isPromptPathByte(prompt[index])) : (index += 1) {}
+            if (index == path_start) continue;
+            const path = prompt[path_start..index];
+            if (!isZiClipboardImagePath(path)) continue;
+            try attachments.list.append(self.allocator, try self.readPromptImageAttachment(path));
+        }
+        return attachments;
+    }
+
+    fn readPromptImageAttachment(self: *InteractiveController, path: []const u8) !ai.ImageContent {
+        const mime_type = mimeTypeForImagePath(path) orelse return error.UnsupportedFormat;
+        var file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
+        defer file.close(self.io);
+        const file_len = try file.length(self.io);
+        if (file_len == 0) return error.NoImage;
+        if (file_len > client_protocol.submit_image_data_bytes_max) return error.ImageTooLarge;
+        const raw = try self.allocator.alloc(u8, @intCast(file_len));
+        defer self.allocator.free(raw);
+        const read_len = try file.readPositionalAll(self.io, raw, 0);
+        if (read_len != raw.len) return error.ShortRead;
+
+        const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+        const encoded = try self.allocator.alloc(u8, encoded_len);
+        errdefer self.allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, raw);
+        const mime = try self.allocator.dupe(u8, mime_type);
+        errdefer self.allocator.free(mime);
+        return .{ .data = encoded, .mime_type = mime };
     }
 
     fn cancelActive(self: *InteractiveController) !void {

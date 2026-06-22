@@ -356,6 +356,7 @@ pub const SessionRuntime = struct {
         request_id: ?client_protocol.RequestId,
         operation_id: client_protocol.OperationId,
         prompt_text: []u8,
+        prompt_images: []ai.ImageContent,
         overflow_count_before: usize,
         overflow_retry_used: bool = false,
 
@@ -387,6 +388,7 @@ pub const SessionRuntime = struct {
         if (self.active) |active| {
             self.destroyActivePhase(active);
             self.allocator.free(active.prompt_text);
+            client_protocol.freeSubmitImages(self.allocator, active.prompt_images);
             self.active = null;
         }
         while (self.commands.pop()) |envelope| {
@@ -691,7 +693,7 @@ pub const SessionRuntime = struct {
         };
         if (self.nowNanoseconds() < wait.resume_at_ns) return;
         const run = switch (wait.kind) {
-            .resubmit_prompt => self.session.startPromptRun(active.prompt_text, &.{}),
+            .resubmit_prompt => self.session.startPromptRun(active.prompt_text, active.prompt_images),
             .continue_run => self.session.startContinueRun(),
         } catch |err| {
             self.failActiveOperation(err);
@@ -746,7 +748,7 @@ pub const SessionRuntime = struct {
                         .enqueue => .follow_up,
                         .start => unreachable,
                     };
-                    self.session.queuePrompt(prompt.text, &.{}, delivery) catch |err| {
+                    self.session.queuePrompt(prompt.text, prompt.images, delivery) catch |err| {
                         try self.enqueueRejected(envelope.id, rejectionCode(err), @errorName(err));
                         return;
                     };
@@ -761,6 +763,11 @@ pub const SessionRuntime = struct {
                     try self.enqueueRejected(envelope.id, .exhausted, @errorName(err));
                     return;
                 };
+                const prompt_images = client_protocol.copySubmitImages(self.allocator, prompt.images) catch |err| {
+                    self.allocator.free(prompt_text);
+                    try self.enqueueRejected(envelope.id, .exhausted, @errorName(err));
+                    return;
+                };
                 const overflow_count_before = self.session.contextOverflowCount();
                 // Threshold compaction is the operation's opening phase when
                 // due; its settle verdict starts the prompt run. A failure to
@@ -771,8 +778,9 @@ pub const SessionRuntime = struct {
                             break :blk .{ .compacting = compaction_run };
                         }
                     }
-                    const run = self.session.startPromptRun(prompt.text, &.{}) catch |err| {
+                    const run = self.session.startPromptRun(prompt.text, prompt.images) catch |err| {
                         self.allocator.free(prompt_text);
+                        client_protocol.freeSubmitImages(self.allocator, prompt_images);
                         try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                         return;
                     };
@@ -783,6 +791,7 @@ pub const SessionRuntime = struct {
                     .request_id = envelope.id,
                     .operation_id = self.nextOperationId(),
                     .prompt_text = prompt_text,
+                    .prompt_images = prompt_images,
                     .overflow_count_before = overflow_count_before,
                 };
                 try self.enqueueEvent(.{
@@ -805,6 +814,7 @@ pub const SessionRuntime = struct {
                 const active = self.takeActive().?;
                 self.cancelAndDestroyActivePhase(active);
                 self.allocator.free(active.prompt_text);
+                client_protocol.freeSubmitImages(self.allocator, active.prompt_images);
                 try self.drainSessionEvents(envelope.id);
                 try self.enqueueEvent(.{
                     .request_id = envelope.id,
@@ -848,6 +858,7 @@ pub const SessionRuntime = struct {
                     const active = self.takeActive().?;
                     self.cancelAndDestroyActivePhase(active);
                     self.allocator.free(active.prompt_text);
+                    client_protocol.freeSubmitImages(self.allocator, active.prompt_images);
                     try self.drainSessionEvents(active.request_id);
                     try self.enqueueEvent(.{
                         .request_id = active.request_id,
@@ -990,6 +1001,7 @@ pub const SessionRuntime = struct {
             .completed, .failed => {
                 const finished = self.takeActive().?;
                 defer self.allocator.free(finished.prompt_text);
+                defer client_protocol.freeSubmitImages(self.allocator, finished.prompt_images);
                 const reason: client_protocol.OperationFinished.Reason = switch (verdict) {
                     .completed => .completed,
                     .failed => .failed,
@@ -1122,6 +1134,7 @@ pub const SessionRuntime = struct {
             .request_id = request_id,
             .operation_id = self.nextOperationId(),
             .prompt_text = prompt_text,
+            .prompt_images = &.{},
             .overflow_count_before = self.session.contextOverflowCount(),
         };
         try self.enqueueEvent(.{
@@ -1277,6 +1290,7 @@ pub const SessionRuntime = struct {
     fn finishOperationRejected(self: *SessionRuntime, err: anyerror) !void {
         const finished = self.takeActive().?;
         defer self.allocator.free(finished.prompt_text);
+        defer client_protocol.freeSubmitImages(self.allocator, finished.prompt_images);
         try self.enqueueRejected(finished.request_id, rejectionCode(err), @errorName(err));
         try self.enqueueEvent(.{
             .request_id = finished.request_id,
@@ -1291,6 +1305,7 @@ pub const SessionRuntime = struct {
         const active = self.takeActive() orelse return;
         self.cancelAndDestroyActivePhase(active);
         self.allocator.free(active.prompt_text);
+        client_protocol.freeSubmitImages(self.allocator, active.prompt_images);
         self.enqueueRejected(active.request_id, rejectionCode(err), @errorName(err)) catch |enqueue_err|
             ignoreBestEffortError(enqueue_err);
         self.enqueueEvent(.{
@@ -2408,6 +2423,7 @@ test "session runtime model command does not mutate while active" {
         .request_id = 1,
         .operation_id = 1,
         .prompt_text = try session_runtime.allocator.dupe(u8, "original"),
+        .prompt_images = &.{},
         .overflow_count_before = 0,
     };
 
@@ -2475,6 +2491,7 @@ test "session runtime slash command never queues while an operation is active" {
         .request_id = 1,
         .operation_id = 1,
         .prompt_text = try std.testing.allocator.dupe(u8, "original"),
+        .prompt_images = &.{},
         .overflow_count_before = 0,
     };
 

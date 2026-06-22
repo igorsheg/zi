@@ -90,7 +90,27 @@ pub fn insertPaste(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) e
     defer if (normalized.owned) |owned| gpa.free(owned);
     const paste = normalized.bytes;
     if (!isLargePaste(paste) or self.pastes.items.len >= paste_slots_max) return self.insertNormalized(gpa, paste);
+    return self.insertPasteMarkerNormalized(gpa, paste);
+}
 
+/// Insert a bracketed-paste marker regardless of payload size. This is for
+/// operational payloads that should stay out of the visible composer even when
+/// their expansion is short, such as an image temp-file reference.
+pub fn insertPasteMarker(self: *Composer, gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!InsertResult {
+    std.debug.assert(std.unicode.utf8ValidateSlice(bytes));
+    const normalized = try normalizedPaste(gpa, bytes);
+    defer if (normalized.owned) |owned| gpa.free(owned);
+    const paste = normalized.bytes;
+    if (paste.len == 0) return .ok;
+    if (self.pastes.items.len >= paste_slots_max) return self.insertNormalized(gpa, paste);
+    return self.insertPasteMarkerNormalized(gpa, paste);
+}
+
+fn insertPasteMarkerNormalized(
+    self: *Composer,
+    gpa: std.mem.Allocator,
+    paste: []const u8,
+) error{OutOfMemory}!InsertResult {
     var marker_buffer: [64]u8 = undefined;
     const marker = makePasteMarker(&marker_buffer, self.next_paste_id, paste) catch unreachable;
     if (marker.len > buffer_size_bytes_max - self.bytes.items.len) return .rejected_full;
