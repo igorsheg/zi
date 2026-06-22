@@ -4,6 +4,7 @@
 //! only the blocking scan, match policy, bounds, and raw result lifetime.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const client_protocol = @import("client_protocol.zig");
 
@@ -330,6 +331,41 @@ fn entryKind(
 }
 
 fn statEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
+    if (builtin.os.tag == .linux) return linuxStatEntryKind(dir_fd, name);
+    return libcStatEntryKind(dir_fd, name);
+}
+
+fn linuxStatEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
+    const linux = std.os.linux;
+    if (name.len > std.Io.Dir.max_name_bytes) return null;
+    var name_z: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
+    @memcpy(name_z[0..name.len], name);
+    name_z[name.len] = 0;
+    const name_c: [:0]u8 = name_z[0..name.len :0];
+
+    var statx = std.mem.zeroes(linux.Statx);
+    while (true) {
+        switch (linux.errno(linux.statx(
+            @intCast(dir_fd),
+            name_c.ptr,
+            linux.AT.SYMLINK_NOFOLLOW,
+            .{ .TYPE = true },
+            &statx,
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return null,
+        }
+    }
+
+    return switch (statx.mode & linux.S.IFMT) {
+        linux.S.IFDIR => .directory,
+        linux.S.IFREG => .file,
+        else => null,
+    };
+}
+
+fn libcStatEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
     if (name.len > std.Io.Dir.max_name_bytes) return null;
     var name_z: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
     @memcpy(name_z[0..name.len], name);
@@ -338,7 +374,12 @@ fn statEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
 
     var stat = std.mem.zeroes(std.c.Stat);
     while (true) {
-        switch (std.c.errno(std.c.fstatat(dir_fd, name_c.ptr, &stat, std.c.AT.SYMLINK_NOFOLLOW))) {
+        switch (std.c.errno(std.c.fstatat(
+            dir_fd,
+            name_c.ptr,
+            &stat,
+            std.c.AT.SYMLINK_NOFOLLOW,
+        ))) {
             .SUCCESS => break,
             .INTR => continue,
             else => return null,
@@ -387,7 +428,10 @@ fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 }
 
 fn direntName(entry: *const std.c.dirent) []const u8 {
-    return entry.name[0..entry.namlen];
+    return switch (builtin.os.tag) {
+        .linux => std.mem.sliceTo(entry.name[0..], 0),
+        else => entry.name[0..entry.namlen],
+    };
 }
 
 fn joinPath(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8) ![]u8 {
