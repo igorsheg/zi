@@ -1,6 +1,6 @@
 ---
 slug: intro
-title: Zi
+title: Start here
 order: 0
 aliases:
   - overview
@@ -9,65 +9,85 @@ aliases:
   - about
 ---
 
-# Zi
+# Start here
 
-`zi` is a local coding agent harness.
+Most coding agents make the first five minutes feel amazing.
 
-It runs in your project, keeps a durable session log, and lets small Lua extensions teach it new habits.
+Then the work gets real. You need to know what it changed. You need to continue tomorrow. You need it to follow your repo's rules. You need it to stop forgetting the same instruction.
 
-Use it when you want agent work that you can inspect, resume, and change.
+Zi is built for that part.
 
-## Start
+It runs in your repo, gives the model a small set of tools, and keeps a session log you can resume.
+
+## Install
+
+```sh
+curl -fsSL https://withzi.dev/install | sh
+```
+
+Or build it:
+
+```sh
+git clone https://github.com/igorsheg/zi
+cd zi
+zig build -Doptimize=ReleaseSafe
+./zig-out/bin/zi --version
+```
+
+## Your first run
+
+Open Zi in a project:
+
+```sh
+zi
+```
+
+Ask it something concrete:
+
+```text
+explain how tests are organized in this repo
+```
+
+Zi can read files, run shell commands, edit files, write files, and inspect Zig declarations. It works best when you ask for a small piece of real work, then let the session build up context.
+
+## Use the right shape for the job
+
+Interactive work:
 
 ```sh
 zi
 zi "fix the failing build"
-zi -p "write a commit message"
-zi --mode json "inspect this project"
 ```
 
-## What zi keeps
+One answer for a shell script:
 
-zi keeps sessions on disk as JSONL. The TUI, replay tools, compaction, and extensions all work from that record.
+```sh
+zi -p "write a commit message for the staged diff"
+```
 
-Disable this for a startup run with `--no-session`.
+Events for another program:
 
-## What zi extends
+```sh
+zi --mode json "summarize this repo"
+zi --mode rpc
+```
 
-Extensions can add:
+## The core loop
 
-- slash commands
-- model-visible tools
-- prompt/context hooks
-- provider/model claims
-- session notes and labels
-- small UI surfaces
-- delegated child zi runs
+1. Start Zi in the repo.
+2. Ask for a small, inspectable piece of work.
+3. Watch the tool calls.
+4. Resume the session when you need to continue.
+5. Move repeated instructions into `AGENTS.md` or a skill.
 
-An extension is just Lua loaded from an extension root. No framework is required.
+That last step is the important one. Zi gets better when you stop retyping instructions and start teaching the repo.
 
-## Who this is for
+## What to read next
 
-These docs are for:
-
-- people using zi
-- people writing zi extensions
-- zi itself, when asked to write an extension
-
-When generating an extension, prefer the API documented here. Keep behavior small, named, and visible in the session.
-
-Markdown pages live next to the HTML pages. If a link ends in `.html`, the matching `.md` page usually exists too.
-
-## Pages
-
-- [CLI](cli.html) — run modes, prompt inputs, sessions, flags
-- [Settings](settings.html) — user/project configuration
-- [Resource discovery](resources.html) — user/project roots, settings paths, packages
-- [Skills](skills.html) — reusable Markdown craft notes
-- [Prompts](prompts.html) — Markdown prompt templates
-- [Themes](themes.html) — TUI color JSON
-- [Agent context](agent-context.html) — `AGENTS.md` and `CLAUDE.md`
-- [Extensions](extensions.html) — extension files, loading, lifecycle
-- [API](api.html) — tools, commands, providers, events, jobs, JSON
-- [Context](context.html) — `ctx.ui`, `ctx.composer`, `ctx.session`, `ctx.models`, `ctx.ai`
-- [Guidance](guidance.html) — rules for useful extensions
+- [CLI](cli.html) — choose interactive, text, JSON, or RPC mode
+- [Agent context](agent-context.html) — make Zi understand your repo
+- [Skills](skills.html) — teach Zi reusable habits
+- [Settings](settings.html) — choose provider, model, retry, and compaction defaults
+- [Prompts](prompts.html) — replace or extend the system prompt
+- [Resources](resources.html) — see where Zi stores files
+- [Frontends](frontend.html) — understand the output modes

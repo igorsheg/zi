@@ -1,42 +1,51 @@
-pub const agent_session = @import("agent_session.zig");
-pub const sdk = @import("sdk.zig");
-pub const session_error_classifier = @import("session_error_classifier.zig");
-pub const session_event = @import("session_event.zig");
-pub const runtime_host = @import("runtime_host.zig");
-pub const session_runner = @import("session_runner.zig");
-pub const request = @import("request.zig");
-pub const system_prompt = @import("system_prompt.zig");
-pub const slash_commands = @import("slash_commands.zig");
-pub const auth = @import("auth/root.zig");
-pub const settings = @import("settings/root.zig");
-pub const cli = @import("cli/root.zig");
-pub const session = @import("session/root.zig");
-pub const model_registry = @import("model_registry.zig");
-pub const resolve = @import("resolve.zig");
-pub const defaults = @import("defaults.zig");
+//! Public surface of the coding agent core. Everything outside
+//! `src/coding_agent` imports this file, never the internals directly.
 
-pub const AgentSession = agent_session.AgentSession;
-pub const SessionStore = agent_session.SessionStore;
-pub const ExtensionRunner = agent_session.ExtensionRunner;
-pub const ExtensionRunnerRef = agent_session.ExtensionRunnerRef;
-pub const ContextUsage = agent_session.ContextUsage;
-pub const SessionStats = agent_session.SessionStats;
-pub const OpenSessionResult = session.store.OpenSessionResult;
-pub const openSession = session.store.SessionStore.openForResume;
-pub const RuntimeHost = runtime_host.RuntimeHost;
-pub const RuntimeHostOptions = session_runner.Options;
-pub const SyncSnapshotSink = runtime_host.SyncSnapshotSink;
-pub const RunOutcome = session_runner.RunOutcome;
-pub const RetryStart = session_runner.RetryStart;
-pub const RetryEnd = session_runner.RetryEnd;
-pub const CompactionReason = session_runner.CompactionReason;
-pub const CompactionEnd = session_runner.CompactionEnd;
-pub const SessionEvent = session_event.SessionEvent;
-pub const LifecycleHooks = session_runner.LifecycleHooks;
-pub const AgentRequest = request.AgentRequest;
-pub const RequestQueue = request.RequestQueue;
-pub const RetryPolicy = session_runner.RetryPolicy;
-pub const CompactionPolicy = session_runner.CompactionPolicy;
-pub const CompactionExecutor = session_runner.CompactionExecutor;
-pub const SessionCompactionResult = session_runner.CompactionResult;
-pub const ModelRegistry = model_registry.ModelRegistry;
+const std = @import("std");
+
+pub const auth_mode = @import("auth_mode.zig");
+pub const client_protocol = @import("client_protocol.zig");
+pub const session_listing = @import("session_listing.zig");
+pub const session_runtime = @import("session_runtime.zig");
+pub const slash_commands = @import("slash_commands.zig");
+pub const tool_metadata = @import("tool_metadata.zig");
+pub const wire_protocol = @import("wire_protocol.zig");
+
+// Internal modules, referenced here so `zig build test` reaches their tests.
+const AgentSession = @import("AgentSession.zig");
+const auth = @import("auth.zig");
+const event_drain = @import("event_drain.zig");
+const file_completion = @import("file_completion.zig");
+const message_policy = @import("message_policy.zig");
+const paths = @import("paths.zig");
+const queue_mirror = @import("queue_mirror.zig");
+const resources = @import("resources.zig");
+const runtime_services = @import("runtime_services.zig");
+const session_manager = @import("session_manager.zig");
+const settings = @import("settings.zig");
+const skills = @import("skills.zig");
+const system_prompt = @import("system_prompt.zig");
+const tool_registry = @import("tool_registry.zig");
+const tool_output_policy = @import("tool_output_policy.zig");
+const tools = @import("tools/root.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = AgentSession;
+    _ = auth;
+    _ = event_drain;
+    _ = file_completion;
+    _ = message_policy;
+    _ = paths;
+    _ = queue_mirror;
+    _ = resources;
+    _ = runtime_services;
+    _ = session_manager;
+    _ = settings;
+    _ = skills;
+    _ = system_prompt;
+    _ = tool_metadata;
+    _ = tool_registry;
+    _ = tool_output_policy;
+    _ = tools;
+}

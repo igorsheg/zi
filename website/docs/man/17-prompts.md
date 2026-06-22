@@ -1,72 +1,89 @@
 ---
 slug: prompts
-title: Prompts
+title: Change the system prompt
 order: 17
 aliases:
-  - prompt
-  - prompt templates
-  - slash prompt
+  - SYSTEM.md
+  - APPEND_SYSTEM.md
+  - system prompt
 ---
 
-# Prompts
+# Change the system prompt
 
-A prompt is a Markdown template loaded from disk and made available by name.
+Most of the time, you should not replace Zi's system prompt.
 
-Use prompts for repeated asks: release notes, handoff notes, review checklists, issue summaries. If the behavior needs state, tools, or UI, write an extension instead.
+Zi's default prompt wires in the tools, repo context, skills, date, and cwd. If you replace it, you own all of that.
 
-## Locations
+So start with append.
 
-zi loads prompt files from:
+## Add instructions
 
-```text
-~/.zi/agent/prompts/
-<project>/.zi/prompts/
-```
-
-Extra prompt paths may be listed in `settings.json`:
-
-```json
-{
-  "prompts": ["../zi-prompts", "../one-off/release.md"]
-}
-```
-
-A prompt path may be a directory or a single `.md` file. Directory loading is shallow: zi reads `.md` files directly inside that directory.
-
-See [Resource discovery](resources.html) for path rules.
-
-## Names
-
-The prompt name is the Markdown filename without `.md`.
+Create:
 
 ```text
-prompts/
-├─ release.md       # release
-└─ handoff.md       # handoff
+~/.zi/agent/APPEND_SYSTEM.md
+<repo>/.zi/APPEND_SYSTEM.md
 ```
 
-Names are the handle users and zi use to find the prompt. Rename carefully.
+Example:
 
-## Content
+```markdown
+# Extra rules
 
-A prompt file is plain Markdown:
-
-```md
-Write release notes for this change.
-
-Include:
-
-- user-visible changes
-- migration notes
-- known risks
-
-Keep it short. Link to evidence when possible.
+- Prefer small patches.
+- Ask before adding a dependency.
+- If a command fails, show the exact command and failure.
 ```
 
-Keep prompts specific. A prompt should ask for one thing and make the expected shape visible.
+Use this when Zi's default prompt is right, but you need a few more rules.
 
-## Collisions
+## Replace everything
 
-The first prompt with a name wins. Later prompts with the same name are skipped and reported as collisions.
+Create:
 
-Prefer project prompts for project language. Prefer user prompts for personal habits. If a prompt grows conditionals and side effects, it has become an extension wearing a hat.
+```text
+~/.zi/agent/SYSTEM.md
+<repo>/.zi/SYSTEM.md
+```
+
+This replaces the default prompt.
+
+Use it only when you want full control over the model's instructions. A custom `SYSTEM.md` should still explain the available tools and how you expect the agent to use them.
+
+## Project beats global
+
+For both files, project scope wins over global scope.
+
+```text
+<repo>/.zi/APPEND_SYSTEM.md
+```
+
+beats:
+
+```text
+~/.zi/agent/APPEND_SYSTEM.md
+```
+
+That lets a repo set stricter behavior without changing your global setup.
+
+## Prompt or context?
+
+Use `AGENTS.md` for repo knowledge:
+
+```text
+Run `zig build test` before claiming done.
+```
+
+Use `APPEND_SYSTEM.md` for assistant behavior:
+
+```text
+When a validation command fails, summarize the failure before proposing a fix.
+```
+
+If you are unsure, choose `AGENTS.md`. It is easier for future maintainers to find.
+
+## Keep it short
+
+A system prompt is not a wiki.
+
+If a rule only matters for one workflow, make it a [skill](skills.html). If a rule always matters for the repo, put it in `AGENTS.md`. Use prompt files for behavior that truly belongs at the system level.

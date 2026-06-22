@@ -16,8 +16,8 @@ pub const Options = struct {
 };
 
 pub fn render(allocator: std.mem.Allocator, doc: Document, title: []const u8, options: Options) ![]const u8 {
-    var buffer: std.ArrayListUnmanaged(u8) = .empty;
-    const writer = buffer.writer(allocator);
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    const writer = &buffer.writer;
 
     if (!options.fragment) {
         try writer.print(
@@ -66,7 +66,7 @@ pub fn render(allocator: std.mem.Allocator, doc: Document, title: []const u8, op
         try writer.writeAll("</body>\n</html>\n");
     }
 
-    return buffer.toOwnedSlice(allocator);
+    return buffer.toOwnedSlice();
 }
 
 fn renderNode(writer: anytype, node: Node) !void {

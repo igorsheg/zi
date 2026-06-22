@@ -1,19 +1,48 @@
-pub const cell = @import("cell.zig");
-pub const primitives = @import("primitives/root.zig");
-pub const grapheme = @import("grapheme.zig");
-pub const renderer = @import("renderer.zig");
-pub const terminal = @import("terminal/mod.zig");
-pub const components = @import("components/root.zig");
-pub const wrap = @import("wrap/root.zig");
-pub const text = @import("text/root.zig");
-pub const ui_event = @import("ui_event.zig");
-pub const conversation = @import("conversation/root.zig");
-pub const transcript = @import("transcript/root.zig");
-pub const tui = @import("tui.zig");
-pub const edit = @import("edit/root.zig");
+//! Agent-agnostic terminal UI product on vendored libvaxis. It never names
+//! a session, provider, tool, or agent event; the concrete coding-agent
+//! adapter lives in src/frontends/tui and talks to this package only
+//! through App.Command / App.Effect.
+pub const ansi = @import("ansi.zig");
+pub const App = @import("App.zig");
+pub const Composer = @import("Composer.zig");
+pub const glyphs = @import("glyphs.zig");
+pub const Greeter = @import("Greeter.zig");
+pub const Picker = @import("Picker.zig");
+pub const PromptHistory = @import("PromptHistory.zig");
+pub const notify = @import("notify.zig");
+pub const Terminal = @import("Terminal.zig");
+pub const Transcript = @import("Transcript.zig");
+pub const input = @import("input.zig");
+pub const markdown = @import("markdown.zig");
+pub const match = @import("match.zig");
+pub const render = @import("render.zig");
+pub const shimmer = @import("shimmer.zig");
+pub const shuffle_text = @import("shuffle_text.zig");
+pub const status = @import("status.zig");
+pub const text = @import("text.zig");
 pub const theme = @import("theme.zig");
-pub const status_data = @import("status_data.zig");
-pub const autocomplete = @import("autocomplete/root.zig");
-pub const keybindings = @import("keybindings.zig");
-pub const interactive = @import("interactive.zig");
-pub const property_tests = @import("property_tests.zig");
+
+pub const Command = App.Command;
+pub const Effect = App.Effect;
+
+test {
+    _ = ansi;
+    _ = App;
+    _ = Composer;
+    _ = glyphs;
+    _ = Greeter;
+    _ = Picker;
+    _ = PromptHistory;
+    _ = notify;
+    _ = Terminal;
+    _ = Transcript;
+    _ = input;
+    _ = markdown;
+    _ = match;
+    _ = render;
+    _ = shimmer;
+    _ = shuffle_text;
+    _ = status;
+    _ = text;
+    _ = theme;
+}

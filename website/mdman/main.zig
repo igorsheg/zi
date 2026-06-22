@@ -3,18 +3,13 @@ const parser = @import("parser.zig");
 const roff = @import("roff.zig");
 const html = @import("html.zig");
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
 
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const args = try std.process.argsAlloc(allocator);
+    const args = try init.minimal.args.toSlice(allocator);
 
     if (args.len < 2) {
-        try printUsage();
+        try printUsage(init.io);
         std.process.exit(1);
     }
 
@@ -35,7 +30,7 @@ pub fn main() !void {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            try printUsage();
+            try printUsage(init.io);
             return;
         } else if (std.mem.eql(u8, arg, "--html")) {
             output_format = .html;
@@ -99,7 +94,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const source = try std.fs.cwd().readFileAlloc(allocator, file_path, 1024 * 1024);
+    const source = try std.Io.Dir.cwd().readFileAlloc(init.io, file_path, allocator, .limited(1024 * 1024));
     const doc = try parser.parse(allocator, source);
 
     const output = switch (output_format) {
@@ -117,7 +112,7 @@ pub fn main() !void {
     };
 
     var buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
+    var stdout = std.Io.File.stdout().writer(init.io, &buf);
     defer stdout.interface.flush() catch {};
     try stdout.interface.writeAll(output);
 }
@@ -127,9 +122,9 @@ fn fatalMissing(option: []const u8) noreturn {
     std.process.exit(1);
 }
 
-fn printUsage() !void {
+fn printUsage(io: std.Io) !void {
     var buf: [4096]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&buf);
+    var stderr = std.Io.File.stderr().writer(io, &buf);
     defer stderr.interface.flush() catch {};
     try stderr.interface.writeAll(
         \\Usage: mdman [OPTIONS] <FILE>

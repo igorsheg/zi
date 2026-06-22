@@ -1,116 +1,131 @@
 ---
 slug: cli
-title: CLI
+title: Choose a run mode
 order: 10
 aliases:
   - flags
   - options
-  - batch
+  - print
   - json mode
+  - rpc
 ---
 
-# CLI
+# Choose a run mode
 
-Run `zi` in a project.
+The first question is not "which flag do I need?"
 
-No selector means interactive mode. Batch mode is explicit: use `-p`, `--print`, or `--mode`.
+It is: **who is Zi talking to?**
 
-A pipe does not switch zi into batch mode by itself. That keeps accidental shell pipes from changing the run shape.
+- You, in a terminal? Use interactive mode.
+- A shell script? Use text mode.
+- A log parser? Use JSON mode.
+- A custom frontend? Use RPC mode.
 
-## Common commands
+## Interactive: when you are working with it
 
-`zi`
-: Start interactive mode in the current project.
-
-`zi "fix the failing build"`
-: Start interactive mode with an initial prompt.
-
-`zi @README.md "summarize this"`
-: Start interactive mode with file content plus prompt text.
-
-`zi -p "write a commit message"`
-: Run batch text mode. Print the final assistant text.
-
-`zi --mode json "inspect this project"`
-: Run batch JSON mode. Emits a session header, then event lines, when persistence is enabled.
-
-`printf 'diff...' | zi -p @README.md "review this"`
-: In batch mode, combine stdin, `@file` content, and prompt text.
-
-`zi --continue`
-: Resume the most recent session for this project.
-
-`zi --resume`
-: Open the session picker.
-
-`zi --session ./path/to/session.jsonl`
-: Resume a specific session file.
-
-`zi --list-models claude`
-: List models, optionally filtered.
-
-## Options
-
-`-p`, `--print`
-: Batch text mode. Prints final assistant text after the run.
-
-`--mode <text|json>`
-: Explicit batch mode. `text` prints final text. `json` emits event lines.
-
-`-c`, `--continue`
-: Resume the latest saved session for this project. Interactive-only.
-
-`-r`, `--resume`
-: Open the session picker. Interactive-only.
-
-`--session <path|id>`
-: Resume a session by path or ID prefix. Interactive-only.
-
-`--model <id>`
-: Select a model by ID or pattern.
-
-`--api-key <key>`
-: Override the provider API key for this run.
-
-`--no-session`
-: Start without persistence. In interactive mode, later `/resume` may enter a persisted session and `/new` starts a normal persisted session.
-
-`--tools <filter>`
-: Restrict the tool set with a comma-separated filter.
-
-`--append-system-prompt <text|path>`
-: Append literal text or file contents to the system prompt.
-
-`--list-models [search]`
-: List available models. The optional value filters the list.
-
-`-h`, `--help`
-: Show help.
-
-`-v`, `--version`
-: Show version.
-
-## Environment
-
-`ZI_CODEX_FAST_MODE=1`
-: For `openai-codex/gpt-5.4` and `openai-codex/gpt-5.5`, send Codex requests with `text.verbosity = "low"` and `service_tier = "priority"`. Accepted enabled values are `1`, `true`, `on`, and `yes`.
-
-## Prompt inputs
-
-Prompt input may come from:
-
-- positional prompt text
-- one or more `@file` arguments
-- piped stdin, in explicit batch mode
-
-Batch assembly order:
-
-```text
-stdin + @file text + positional prompt
+```sh
+zi
+zi "fix the failing build"
 ```
 
-`@file` works for interactive startup and batch mode. Text files are inserted into the prompt. Supported image files attach to the model request and add text references.
+This opens the TUI. Use it when you want to watch the work happen, steer the session, switch models, resume sessions, or inspect tool calls.
 
-Empty stdin is ignored. Empty `@file` inputs are skipped.
+No flag is needed when stdin is a TTY.
 
-Session selectors (`--continue`, `--resume`, `--session`) are interactive-only and cannot be combined with startup prompt text or `@file` arguments.
+## Text: when you need one answer
+
+```sh
+zi -p "write a commit message for the staged diff"
+zi --mode text "summarize this file"
+```
+
+Text mode runs one prompt and prints the final assistant text.
+
+Use it for shell workflows where progress events would be noise.
+
+## JSON: when progress matters
+
+```sh
+zi --mode json "inspect this repo"
+```
+
+JSON mode emits public events as lines. Use it when another program wants to see starts, updates, tool calls, finishes, and errors.
+
+It is not terminal output with braces. It is the public event stream.
+
+## RPC: when you are building a frontend
+
+```sh
+zi --mode rpc
+```
+
+RPC mode exposes Zi's typed stdio protocol.
+
+Use this when you want to build an integration that submits commands, drains events, and owns its own UI.
+
+## Continue work
+
+Most useful agent work spans more than one prompt. Zi gives you three ways back in.
+
+```sh
+zi --continue
+```
+
+Continue the newest saved session for this cwd.
+
+```sh
+zi --resume
+```
+
+Open the session picker.
+
+```sh
+zi --session <path-or-id-prefix>
+```
+
+Resume a specific session.
+
+Zi rejects conflicting resume flags. If you ask for two different sessions at once, it makes you choose.
+
+## Authenticate Codex
+
+```sh
+zi auth login openai-codex
+zi auth status openai-codex
+zi auth logout openai-codex
+```
+
+Use these if you want Zi to use OpenAI Codex OAuth credentials instead of an environment-provided key.
+
+## TUI slash commands
+
+Inside the interactive session:
+
+`/help`
+: Show commands.
+
+`/session`
+: Show session info.
+
+`/model`
+: Select a model.
+
+`/resume`
+: Resume another session.
+
+`/compact`
+: Compact the session context.
+
+## Reference
+
+```text
+zi [options] [prompt]
+
+-p, --print              Run text mode and exit
+--mode <text|json|rpc>   Select output mode
+-r, --resume             Select a session to resume
+--session <session>      Use a session file or id prefix
+-c, --continue           Continue the newest session for this cwd
+--version                Show zi version
+-h, --help               Show help
+```

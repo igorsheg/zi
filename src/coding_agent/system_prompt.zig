@@ -1,302 +1,293 @@
 const std = @import("std");
-const resource_types = @import("resources/types.zig");
-const time_util = @import("../lib/time_util.zig");
+const resources = @import("resources.zig");
+const skills_mod = @import("skills.zig");
 
-pub const ContextFile = resource_types.AgentsFile;
-
-const default_tool_names = [_][]const u8{ "read", "bash", "edit", "write" };
+pub const max_prompt_bytes = 512 * 1024;
+pub const max_tool_snippets = 128;
 
 pub const ToolSnippet = struct {
     name: []const u8,
     snippet: []const u8,
 };
 
-pub const Options = struct {
-    custom_prompt: ?[]const u8 = null,
-    tool_names: []const []const u8 = &.{},
+pub const BuildOptions = struct {
+    cwd: []const u8,
+    current_date: []const u8,
+    selected_tools: []const []const u8 = &.{ "read", "bash", "edit", "write" },
     tool_snippets: []const ToolSnippet = &.{},
-    guidelines: []const []const u8 = &.{},
-
-    skills_section: ?[]const u8 = null,
-
-    append_system_prompt: []const []const u8 = &.{},
-    cwd: []const u8 = ".",
-
-    context_files: []const ContextFile = &.{},
+    context_files: []const resources.ContextFile = &.{},
+    skills: []const skills_mod.Skill = &.{},
+    custom_prompt: ?[]const u8 = null,
+    append_system_prompt: ?[]const u8 = null,
 };
 
-fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
-    for (haystack) |item| {
-        if (std.mem.eql(u8, item, needle)) return true;
-    }
-    return false;
-}
+pub fn build(allocator: std.mem.Allocator, options: BuildOptions) ![]u8 {
+    if (options.selected_tools.len > max_tool_snippets) return error.ToolSnippetLimitExceeded;
+    if (options.tool_snippets.len > max_tool_snippets) return error.ToolSnippetLimitExceeded;
 
-fn effectiveToolNames(tool_names: []const []const u8) []const []const u8 {
-    return if (tool_names.len > 0) tool_names else default_tool_names[0..];
-}
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
 
-fn normalizeCwd(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
-    const result = try allocator.dupe(u8, cwd);
-    for (result) |*c| {
-        if (c.* == '\\') c.* = '/';
-    }
-    return result;
-}
-
-pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: Options) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
-    const date = try time_util.isoDateNow(allocator);
-    defer allocator.free(date);
-
-    const cwd = try normalizeCwd(allocator, options.cwd);
-    defer allocator.free(cwd);
-
-    const tool_names = effectiveToolNames(options.tool_names);
-    const has_read = containsStr(tool_names, "read");
-
-    if (options.custom_prompt) |custom| {
-        try w.writeAll(custom);
-        try writeAppendSystemPrompt(w, options.append_system_prompt);
-        try writeContextFiles(w, options.context_files);
-        if (has_read) {
-            try writeSkillsSection(w, options.skills_section);
-        }
-        try w.print("\nCurrent date: {s}", .{date});
-        try w.print("\nCurrent working directory: {s}", .{cwd});
-        return try aw.toOwnedSlice();
-    }
-
-    try w.writeAll(
-        "You are an expert coding assistant operating inside zi, a coding agent harness." ++
-            " You help users by reading files, executing commands, editing code, and writing new files.",
-    );
-
-    try w.writeAll("\n\nAvailable tools:\n");
-    var visible_count: usize = 0;
-    for (tool_names) |name| {
-        if (findSnippet(options.tool_snippets, name)) |snippet| {
-            try w.print("- {s}: {s}\n", .{ name, snippet });
-            visible_count += 1;
-        }
-    }
-    if (visible_count == 0) {
-        try w.writeAll("(none)\n");
-    }
-
-    try w.writeAll(
-        "\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n",
-    );
-
-    try w.writeAll("\nGuidelines:\n");
-
-    var guideline_list: std.ArrayList([]const u8) = .empty;
-    defer guideline_list.deinit(allocator);
-
-    const has_bash = containsStr(tool_names, "bash");
-    const has_grep = containsStr(tool_names, "grep");
-    const has_find = containsStr(tool_names, "find");
-    const has_ls = containsStr(tool_names, "ls");
-
-    if (has_bash and !has_grep and !has_find and !has_ls) {
-        try guideline_list.append(allocator, "Use bash for file operations like ls, rg, find");
-    } else if (has_bash and (has_grep or has_find or has_ls)) {
-        try guideline_list.append(allocator, "Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)");
-    }
-
-    for (options.guidelines) |g| {
-        const trimmed = std.mem.trim(u8, g, " \t\r\n");
-        if (trimmed.len > 0 and !containsGuideline(guideline_list.items, trimmed)) {
-            try guideline_list.append(allocator, trimmed);
-        }
-    }
-
-    const always = [_][]const u8{
-        "Be concise in your responses",
-        "Show file paths clearly when working with files",
+    if (options.custom_prompt) |custom_prompt| if (custom_prompt.len > 0) {
+        try appendBounded(&writer, custom_prompt);
+        try appendAppendSystemPrompt(&writer, options.append_system_prompt);
+        try appendProjectContext(&writer, options.context_files);
+        if (containsString(options.selected_tools, "read")) try appendSkills(&writer, options.skills);
+        try appendDateAndCwd(&writer, options.current_date, options.cwd);
+        return writer.toOwnedSlice();
     };
-    for (&always) |g| {
-        if (!containsGuideline(guideline_list.items, g)) {
-            try guideline_list.append(allocator, g);
+
+    try appendBounded(
+        &writer,
+        "You are an expert coding assistant operating inside zi, a coding agent harness. " ++
+            "You help users by reading files, executing commands, editing code, and writing new files.\n\n",
+    );
+    try appendBounded(&writer, "Available tools:\n");
+    try appendTools(&writer, options.selected_tools, options.tool_snippets);
+    try appendBounded(
+        &writer,
+        "\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\n",
+    );
+    try appendBounded(&writer, "Guidelines:\n");
+    try appendGuidelines(&writer, options.selected_tools);
+    try appendAppendSystemPrompt(&writer, options.append_system_prompt);
+    try appendProjectContext(&writer, options.context_files);
+    if (containsString(options.selected_tools, "read")) try appendSkills(&writer, options.skills);
+    try appendDateAndCwd(&writer, options.current_date, options.cwd);
+    return writer.toOwnedSlice();
+}
+
+fn appendTools(
+    writer: *std.Io.Writer.Allocating,
+    selected_tools: []const []const u8,
+    tool_snippets: []const ToolSnippet,
+) !void {
+    var visible: usize = 0;
+    for (selected_tools) |tool_name| {
+        if (findSnippet(tool_snippets, tool_name)) |snippet| {
+            if (visible > 0) try appendBounded(writer, "\n");
+            try appendBounded(writer, "- ");
+            try appendBounded(writer, tool_name);
+            try appendBounded(writer, ": ");
+            try appendBounded(writer, snippet);
+            visible += 1;
         }
     }
+    if (visible == 0) try appendBounded(writer, "(none)");
+}
 
-    for (guideline_list.items) |g| {
-        try w.print("- {s}\n", .{g});
+fn appendGuidelines(
+    writer: *std.Io.Writer.Allocating,
+    selected_tools: []const []const u8,
+) !void {
+    if (containsString(selected_tools, "bash")) {
+        try appendGuideline(writer, "Use bash for shell-based file exploration");
+    }
+    if (containsString(selected_tools, "symbols")) {
+        try appendGuideline(
+            writer,
+            "Use symbols to locate declarations in a .zig file before reading it; " ++
+                "then read with the reported line as offset instead of reading the whole file",
+        );
     }
 
-    try writeZiDocsSection(w);
-    try writeAppendSystemPrompt(w, options.append_system_prompt);
-    try writeContextFiles(w, options.context_files);
-    if (has_read) {
-        try writeSkillsSection(w, options.skills_section);
+    try appendGuideline(writer, "Be concise in your responses");
+    try appendGuideline(writer, "Show file paths clearly when working with files");
+}
+
+fn appendGuideline(writer: *std.Io.Writer.Allocating, guideline: []const u8) !void {
+    try appendBounded(writer, "- ");
+    try appendBounded(writer, guideline);
+    try appendBounded(writer, "\n");
+}
+
+fn appendAppendSystemPrompt(writer: *std.Io.Writer.Allocating, append_system_prompt: ?[]const u8) !void {
+    if (append_system_prompt) |append| {
+        if (append.len == 0) return;
+        try appendBounded(writer, "\n\n");
+        try appendBounded(writer, append);
     }
+}
 
-    try w.print("\nCurrent date: {s}", .{date});
-    try w.print("\nCurrent working directory: {s}", .{cwd});
+fn appendProjectContext(writer: *std.Io.Writer.Allocating, context_files: []const resources.ContextFile) !void {
+    if (context_files.len == 0) return;
+    try appendBounded(writer, "\n\n# Project Context\n\n");
+    try appendBounded(writer, "Project-specific instructions and guidelines:\n\n");
+    for (context_files) |file| {
+        try appendBounded(writer, "## ");
+        try appendBounded(writer, file.path);
+        try appendBounded(writer, "\n\n");
+        try appendBounded(writer, file.content);
+        try appendBounded(writer, "\n\n");
+    }
+}
 
-    return try aw.toOwnedSlice();
+fn appendSkills(writer: *std.Io.Writer.Allocating, loaded_skills: []const skills_mod.Skill) !void {
+    if (loaded_skills.len == 0) return;
+    try appendBounded(writer, "\n\nThe following skills provide specialized instructions for specific tasks.\n");
+    try appendBounded(writer, "Use the read tool to load a skill's file when the task matches its description.\n");
+    try appendBounded(
+        writer,
+        "When a skill file references a relative path, resolve it against the skill directory " ++
+            "(parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n",
+    );
+    try appendBounded(writer, "<available_skills>\n");
+    for (loaded_skills) |skill| {
+        try appendBounded(writer, "  <skill>\n    <name>");
+        try appendXmlEscaped(writer, skill.name);
+        try appendBounded(writer, "</name>\n    <description>");
+        try appendXmlEscaped(writer, skill.description);
+        try appendBounded(writer, "</description>\n    <location>");
+        try appendXmlEscaped(writer, skill.path);
+        try appendBounded(writer, "</location>\n  </skill>\n");
+    }
+    try appendBounded(writer, "</available_skills>");
+}
+
+fn appendXmlEscaped(writer: *std.Io.Writer.Allocating, text: []const u8) !void {
+    for (text) |char| {
+        switch (char) {
+            '&' => try appendBounded(writer, "&amp;"),
+            '<' => try appendBounded(writer, "&lt;"),
+            '>' => try appendBounded(writer, "&gt;"),
+            '"' => try appendBounded(writer, "&quot;"),
+            '\'' => try appendBounded(writer, "&apos;"),
+            else => {
+                if (writer.writer.end + 1 > max_prompt_bytes) return error.PromptTooLarge;
+                try writer.writer.writeByte(char);
+            },
+        }
+    }
+}
+
+fn appendDateAndCwd(writer: *std.Io.Writer.Allocating, current_date: []const u8, cwd: []const u8) !void {
+    try appendBounded(writer, "\nCurrent date: ");
+    try appendBounded(writer, current_date);
+    try appendBounded(writer, "\nCurrent working directory: ");
+    for (cwd) |char| {
+        if (writer.writer.end + 1 > max_prompt_bytes) return error.PromptTooLarge;
+        try writer.writer.writeByte(if (char == '\\') '/' else char);
+    }
+}
+
+fn appendBounded(writer: *std.Io.Writer.Allocating, text: []const u8) !void {
+    if (writer.writer.end + text.len > max_prompt_bytes) return error.PromptTooLarge;
+    try writer.writer.writeAll(text);
 }
 
 fn findSnippet(snippets: []const ToolSnippet, name: []const u8) ?[]const u8 {
-    for (snippets) |s| {
-        if (std.mem.eql(u8, s.name, name)) return s.snippet;
+    for (snippets) |snippet| {
+        if (std.mem.eql(u8, snippet.name, name)) return snippet.snippet;
     }
     return null;
 }
 
-fn containsGuideline(list: []const []const u8, needle: []const u8) bool {
-    for (list) |item| {
-        if (std.mem.eql(u8, item, needle)) return true;
+fn containsString(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
     }
     return false;
 }
 
-fn writeZiDocsSection(w: *std.Io.Writer) !void {
-    try w.writeAll(
-        "\nZi documentation (read only when the user asks about zi itself, its CLI, settings, resources, tools, sessions, skills, prompts, themes, agent context, extensions, or TUI):\n" ++
-            "- Search documentation: `zi --docs <query>`\n" ++
-            "- Read documentation topics: `zi --man [topic]`\n" ++
-            "- CLI usage and actions: `zi --help`\n" ++
-            "- Topics: `intro`, `cli`, `settings`, `resources`, `skills`, `prompts`, `themes`, `agent-context`, `extensions`, `api`, `context`, `guidance`\n" ++
-            "- When asked about: CLI usage, configuration, resource discovery, skills, prompts, themes, AGENTS.md/CLAUDE.md, tools, sessions, providers, adding models, or zi internals\n" ++
-            "- When working on zi topics, use `zi --docs <query>` and `zi --man [topic]` before implementing\n" ++
-            "- Follow cross-references from `zi --man` topics to related embedded docs\n" ++
-            "- Prefer the docs over memory. Stale assumptions are bugs with better posture.\n",
-    );
+test "empty tools shows none and default guidelines" {
+    const prompt = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{},
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Available tools:\n(none)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Show file paths clearly") != null);
 }
 
-fn writeSkillsSection(w: *std.Io.Writer, section: ?[]const u8) !void {
-    const value = section orelse return;
-    if (value.len == 0) return;
-    try w.writeAll(value);
+test "tool snippets are shown only for selected tools with snippets" {
+    const prompt = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{ "read", "dynamic" },
+        .tool_snippets = &.{.{ .name = "dynamic", .snippet = "Run dynamic behavior" }},
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "- dynamic: Run dynamic behavior") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "- read:") == null);
 }
 
-fn writeAppendSystemPrompt(w: *std.Io.Writer, prompts: []const []const u8) !void {
-    if (prompts.len == 0) return;
-    for (prompts) |prompt| {
-        try w.writeAll("\n\n");
-        try w.writeAll(prompt);
-    }
+test "empty custom and append prompts are ignored" {
+    const prompt = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{},
+        .custom_prompt = "",
+        .append_system_prompt = "",
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "You are an expert coding assistant"));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\n\n\nCurrent date") == null);
 }
 
-fn writeContextFiles(w: *std.Io.Writer, files: []const ContextFile) !void {
-    if (files.len == 0) return;
-    try w.writeAll("\n\n# Project Context\n\n");
-    try w.writeAll("Project-specific instructions and guidelines:\n\n");
-    for (files) |f| {
-        try w.print("## {s}\n\n{s}\n\n", .{ f.path, f.content });
-    }
+test "skills are included only when read tool is selected" {
+    const loaded_skills = [_]skills_mod.Skill{.{
+        .path = "/repo/.zi/skills/zig/SKILL.md",
+        .name = "zig<&",
+        .description = "use > zig",
+    }};
+    const prompt = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{"read"},
+        .skills = &loaded_skills,
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "zig&lt;&amp;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "use &gt; zig") != null);
+
+    const no_read_prompt = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{"bash"},
+        .skills = &loaded_skills,
+    });
+    defer std.testing.allocator.free(no_read_prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, no_read_prompt, "<available_skills>") == null);
 }
 
-fn expectOrderedSubstrings(haystack: []const u8, needles: []const []const u8) !void {
-    var previous_index: usize = 0;
-    var have_previous = false;
-    for (needles) |needle| {
-        const index = std.mem.indexOf(u8, haystack, needle) orelse return error.MissingSubstring;
-        if (have_previous) {
-            try std.testing.expect(previous_index < index);
-        }
-        previous_index = index;
-        have_previous = true;
-    }
+test "symbols guideline appears only when symbols is selected" {
+    const with_symbols = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{"symbols"},
+    });
+    defer std.testing.allocator.free(with_symbols);
+    try std.testing.expect(std.mem.indexOf(u8, with_symbols, "Use symbols to locate declarations") != null);
+
+    const without_symbols = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{"read"},
+    });
+    defer std.testing.allocator.free(without_symbols);
+    try std.testing.expect(std.mem.indexOf(u8, without_symbols, "Use symbols to locate declarations") == null);
 }
 
-test "default prompt includes zi identity help and cwd" {
-    const result = try buildSystemPrompt(std.testing.allocator, .{
-        .cwd = "/home/user/project",
+test "custom prompt appends context date and cwd" {
+    const context = [_]resources.ContextFile{.{ .path = "/repo/AGENTS.md", .content = "rules" }};
+    const prompt = try build(std.testing.allocator, .{
+        .cwd = "/repo",
+        .current_date = "2026-05-25",
+        .selected_tools = &.{},
+        .context_files = &context,
+        .custom_prompt = "custom",
+        .append_system_prompt = "append",
     });
-    defer std.testing.allocator.free(result);
+    defer std.testing.allocator.free(prompt);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "operating inside zi, a coding agent harness") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Zi documentation (read only when the user asks about zi itself") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "`settings`, `resources`, `skills`, `prompts`, `themes`, `agent-context`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "docs/README.md") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Current working directory: /home/user/project") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Be concise in your responses") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Available tools:") != null);
-}
-
-test "custom prompt orders append context skills and footer like pi-mono" {
-    const files = [_]ContextFile{.{ .path = "AGENTS.md", .content = "be nice" }};
-    const result = try buildSystemPrompt(std.testing.allocator, .{
-        .custom_prompt = "You are a pirate.",
-        .append_system_prompt = &.{"appended guidance"},
-        .context_files = &files,
-        .skills_section = "\n\n<available_skills>\n  <skill><name>caveman</name></skill>\n</available_skills>",
-        .cwd = "/tmp",
-    });
-    defer std.testing.allocator.free(result);
-
-    try std.testing.expect(std.mem.indexOf(u8, result, "You are a pirate.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "operating inside zi") == null);
-    try expectOrderedSubstrings(result, &.{
-        "You are a pirate.",
-        "appended guidance",
-        "# Project Context",
-        "<available_skills>",
-        "Current date:",
-        "Current working directory: /tmp",
-    });
-}
-
-test "default prompt falls back to pi-mono default tool set" {
-    const result = try buildSystemPrompt(std.testing.allocator, .{
-        .tool_snippets = &.{
-            .{ .name = "read", .snippet = "Read files" },
-            .{ .name = "bash", .snippet = "Run commands" },
-            .{ .name = "grep", .snippet = "Search files" },
-        },
-    });
-    defer std.testing.allocator.free(result);
-
-    try std.testing.expect(std.mem.indexOf(u8, result, "- read: Read files") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "- bash: Run commands") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "- grep: Search files") == null);
-}
-
-test "tool guidelines adapt to available tools" {
-    const bash_only = try buildSystemPrompt(std.testing.allocator, .{
-        .tool_names = &.{"bash"},
-    });
-    defer std.testing.allocator.free(bash_only);
-    try std.testing.expect(std.mem.indexOf(u8, bash_only, "Use bash for file operations") != null);
-
-    const bash_grep = try buildSystemPrompt(std.testing.allocator, .{
-        .tool_names = &.{ "bash", "grep" },
-    });
-    defer std.testing.allocator.free(bash_grep);
-    try std.testing.expect(std.mem.indexOf(u8, bash_grep, "Prefer grep/find/ls tools over bash") != null);
-}
-
-test "default prompt orders zi help append context and read-gated skills" {
-    const files = [_]ContextFile{
-        .{ .path = "/proj/AGENTS.md", .content = "rule 1" },
-        .{ .path = "/proj/docs/STYLE.md", .content = "rule 2" },
-    };
-    const with_read = try buildSystemPrompt(std.testing.allocator, .{
-        .append_system_prompt = &.{"appended guidance"},
-        .context_files = &files,
-        .skills_section = "\n\n<available_skills>\n  <skill><name>caveman</name></skill>\n</available_skills>",
-    });
-    defer std.testing.allocator.free(with_read);
-
-    try expectOrderedSubstrings(with_read, &.{
-        "Zi documentation (read only when the user asks about zi itself",
-        "appended guidance",
-        "# Project Context",
-        "<available_skills>",
-        "Current date:",
-    });
-
-    const without_read = try buildSystemPrompt(std.testing.allocator, .{
-        .tool_names = &.{"bash"},
-        .skills_section = "\n\n<available_skills>\n  <skill><name>caveman</name></skill>\n</available_skills>",
-    });
-    defer std.testing.allocator.free(without_read);
-
-    try std.testing.expect(std.mem.indexOf(u8, without_read, "<available_skills>") == null);
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "custom\n\nappend"));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## /repo/AGENTS.md\n\nrules") != null);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "Current working directory: /repo"));
 }

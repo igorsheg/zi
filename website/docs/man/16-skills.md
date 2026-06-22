@@ -1,97 +1,90 @@
 ---
 slug: skills
-title: Skills
+title: Stop repeating instructions
 order: 16
 aliases:
   - skill
   - SKILL.md
-  - skill commands
 ---
 
-# Skills
+# Stop repeating instructions
 
-A skill is a Markdown file that teaches zi when and how to do one kind of work.
+If you keep telling Zi the same thing, make it a skill.
 
-Use a skill for reusable craft: debugging a Zig failure, shipping a change, reviewing a diff, using a house style. Keep it narrower than a handbook and clearer than a vibe.
+A skill is a Markdown file Zi can discover, describe to the model, and load only when it is relevant.
 
-## Locations
+Use skills for repeatable workflows:
 
-zi loads skills from:
+- committing safely
+- debugging flaky tests
+- doing a strict review
+- following a house style
+- using a project-specific release process
+
+## Skill or AGENTS.md?
+
+Use `AGENTS.md` when the rule always applies.
+
+Use a skill when the rule applies to one kind of task.
+
+```text
+Always run zig fmt before claiming done.      -> AGENTS.md
+When asked to commit, stage files explicitly. -> skill
+```
+
+That split keeps the default prompt small while making specialized behavior available.
+
+## Where skills live
 
 ```text
 ~/.zi/agent/skills/
 <project>/.zi/skills/
 ```
 
-Extra paths may be listed in `settings.json`:
+Global skills are your personal toolkit. Project skills travel with the repo.
 
-```json
-{
-  "skills": ["../zi-skills"]
-}
-```
-
-See [Resource discovery](resources.html) for path rules.
-
-## File shapes
-
-The usual shape is a directory with `SKILL.md`:
+## The smallest useful skill
 
 ```text
-skills/
-└─ git/
-   └─ SKILL.md
+.zi/skills/git/SKILL.md
 ```
 
-zi also accepts root-level Markdown files in a skill path:
-
-```text
-skills/
-└─ commit-message.md
-```
-
-Discovery is recursive. Dot directories and `node_modules` are skipped. If a directory contains `SKILL.md`, that file represents the directory and zi does not keep looking below it.
-
-## Frontmatter
-
-```md
+```markdown
 ---
 name: git
-description: Stage explicit files, commit with a conventional message, and never force-push.
-disable-model-invocation: false
+description: Use when the user asks to stage, commit, push, or inspect git state.
 ---
 # git
 
-Use this when the user asks to commit, stage, push, split hunks, or manage worktrees.
+Always run `git status` first.
+Stage files explicitly. Never use `git add -A`.
+Use conventional commits.
 ```
 
-`description`
-: Required. Empty descriptions are ignored.
+The description matters. It is the router. If the description is vague, the model will not know when to load it.
 
-`name`
-: Optional. Defaults to the parent directory name. If set, it should match the parent directory.
+## How Zi uses skills
 
-`disable-model-invocation`
-: Optional boolean. Use `true` to keep the skill from being invoked by the model.
+Zi does not paste every skill into every prompt.
 
-Skill names must be lowercase letters, digits, and single dashes. They cannot start or end with a dash. Keep them under 64 characters.
+It gives the model a list of skill names, descriptions, and file paths. When the task matches, the model reads the skill file.
 
-Descriptions should be short enough to scan. The loader warns above 1024 characters. That is already too long for a tired maintainer.
+That means you can have a useful skill library without turning every prompt into a handbook.
 
-## Body
+## Make skills sharp
 
-The body is instructions for zi and future agents. Write it like an operator note:
+A good skill has:
 
-- what triggers the skill
-- what to read first
-- what commands are safe
-- what commands are forbidden
-- what output or artifact to produce
+- a clear trigger
+- a short process
+- commands the agent can run
+- rules that are easy to verify
+- examples of bad and good behavior when useful
 
-Prefer checklists and examples. Avoid hidden policy. If the skill needs code, make an extension.
+Avoid writing a philosophy essay. Write the thing you wish you did not have to repeat.
 
-## Collisions
+## Bounds
 
-The first loaded skill with a name wins. Later skills with the same name are skipped and reported as collisions.
+Zi loads at most 128 skills. Each skill file is capped at 256 KiB.
 
-Use distinct names. Boring names are good names.
+If you hit those limits, the problem is probably not Zi. It is that your skills have become docs.

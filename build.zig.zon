@@ -1,19 +1,27 @@
 .{
     .name = .zi,
-    .version = "0.0.1",
+    .version = "0.0.1-dev",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xa0675a7fe10398b2,
     .dependencies = .{
-        .lua = .{
-            .url = "https://www.lua.org/ftp/lua-5.4.7.tar.gz",
-            .hash = "N-V-__8AAIMvFABt-Qcpk24RD10ldEN743D8Q2e19Er8x3dJ",
+        .zio = .{
+            .path = "vendor/zio",
+        },
+        .vaxis = .{
+            .path = "vendor/libvaxis",
         },
     },
-    .minimum_zig_version = "0.15.0",
-    .fingerprint = 0xa0675a7fe10398b2,
     .paths = .{
+        ".ziglint.zon",
+        "AGENTS.md",
         "build.zig",
         "build.zig.zon",
-        "docs",
-        "examples",
-        "packages",
+        "src",
+        "vendor/zio",
+        "vendor/libvaxis",
+        "vendor/zigimg",
+        "vendor/uucode",
+        "LICENSE",
+        "README.md",
     },
 }

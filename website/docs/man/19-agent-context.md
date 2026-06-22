@@ -1,89 +1,105 @@
 ---
 slug: agent-context
-title: Agent context
+title: Teach Zi your repo
 order: 19
 aliases:
-  - agents
   - AGENTS.md
   - CLAUDE.md
-  - context files
-  - project instructions
+  - project context
 ---
 
-# Agent context
+# Teach Zi your repo
 
-Agent context files are Markdown instructions loaded into zi's prompt input.
+Agents waste time when they have to rediscover the same rules every session.
 
-Use them for durable project facts: commands, invariants, local style, forbidden actions, and where evidence lives. Keep them true. Stale context is worse than no context; it fails with confidence.
+Put the rules in the repo.
 
-## Files
-
-zi looks for these names:
+Zi reads:
 
 ```text
 AGENTS.md
 CLAUDE.md
 ```
 
-`AGENTS.md` wins when both exist in the same directory.
-
-## User context
-
-User-wide context lives in the agent directory:
-
-```text
-~/.zi/agent/AGENTS.md
-~/.zi/agent/CLAUDE.md
-```
-
-Use this for personal operating rules that apply everywhere.
-
-## Project context
-
-Project context lives in the project tree, not under `<project>/.zi/`:
-
-```text
-<project>/AGENTS.md
-<project>/CLAUDE.md
-```
-
-zi walks from the current working directory up through its ancestors and loads context files it finds. Parent instructions come before child instructions. More local files therefore get the last word.
-
-Example:
-
-```text
-repo/
-├─ AGENTS.md
-└─ crates/
-   └─ tui/
-      └─ AGENTS.md
-```
-
-Starting zi in `repo/crates/tui` loads the repo context, then the `crates/tui` context.
+Use them for instructions that should be true every time Zi works in this codebase.
 
 ## What belongs here
 
-Good context:
+Good context answers questions the agent would otherwise guess:
 
-- build and test commands
-- project-specific terminology
-- architectural constraints
-- safety rules
-- links to deeper docs
-- short examples of house style
+- How do I build this?
+- How do I test it?
+- Which files are generated?
+- Which directories own which behavior?
+- What should never import what?
+- What does "done" mean?
 
-Bad context:
+Example:
 
-- long tutorials
-- secrets
-- wishful policy
-- stale TODO lists
-- instructions that only one tool understands
+~~~markdown
+# Agent rules
 
-If the instruction is reusable craft, make a [Skill](skills.html). If it needs behavior, make an [Extension](extensions.html). If it is just a knob, make it [Settings](settings.html).
+Before claiming a code change is done, run:
 
-## Extra agent paths
+```sh
+zig build test
+zig build
+zig fmt --check src
+```
 
-Extensions may add extra agent-context directories through resource extension paths. zi reads `.md` files directly inside those directories.
+Do not edit `src/ai/models.generated.zig` by hand. Run `zig build generate-models`.
+~~~
 
-For normal use, prefer `AGENTS.md` in the repo. It is visible to humans, grep, review, and blame. That is the point.
+## What does not belong here
+
+Avoid vague taste:
+
+```text
+Write clean code.
+```
+
+Prefer operational rules:
+
+```text
+Keep path policy in `src/coding_agent/paths.zig`. Do not hardcode `.zi` elsewhere.
+```
+
+The second one changes behavior. The first one mostly spends tokens.
+
+## Global and project context
+
+Use global context for your personal defaults:
+
+```text
+~/.zi/agent/AGENTS.md
+```
+
+Use project context for repo-specific rules:
+
+```text
+<repo>/AGENTS.md
+```
+
+Zi also checks parent directories. In a monorepo, a root `AGENTS.md` can set broad rules and a nested one can add local rules.
+
+## A good first AGENTS.md
+
+Start small:
+
+```markdown
+# Agent rules
+
+## Build
+
+Run `zig build test` before claiming done.
+
+## Style
+
+Prefer small changes. Do not add dependencies without asking.
+
+## Generated files
+
+Do not edit generated files by hand.
+```
+
+Then add rules only when you catch yourself repeating them.

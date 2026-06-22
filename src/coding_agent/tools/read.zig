@@ -1,446 +1,841 @@
 const std = @import("std");
-const protocol = @import("../../agent/types.zig");
-const tool_def = @import("definition.zig");
-const util = @import("util.zig");
-const output_buffer = @import("output_buffer.zig");
-const image = @import("../../image/root.zig");
-const zio_fs = @import("../../zio/root.zig").file;
-const anchors = @import("anchors.zig");
-const observations = @import("observations.zig");
+const agent = @import("../../agent/root.zig");
+const ai = @import("../../ai/root.zig");
+const runtime = @import("../../runtime/root.zig");
+const path_utils = @import("path_utils.zig");
+const paths_mod = @import("../paths.zig");
+const test_support = @import("test_support.zig");
+const tool_output_policy = @import("../tool_output_policy.zig");
 
-const MAX_LINES: usize = 500;
-const MAX_FILE_BYTES: usize = util.Limits.text_result_bytes;
-const MAX_LINE_BYTES: usize = 4096;
-const MAX_DIR_ENTRIES: usize = util.Limits.listing_entries;
-const MAX_DIR_SCAN_ENTRIES: usize = util.Limits.listing_scan_entries;
+pub const max_read_bytes = 1024 * 1024;
+pub const max_image_bytes = 512 * 1024;
+pub const max_output_bytes = tool_output_policy.default_max_bytes;
+pub const max_output_lines = tool_output_policy.default_max_lines;
 
-const SCHEMA =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"The absolute path to the file or directory (MUST be absolute, not relative)."},"read_range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2,"description":"An array of two integers specifying the start and end line numbers to view. Line numbers are 1-indexed. If not provided, defaults to [1, 500]. Examples: [500, 700], [700, 1400]"}},"required":["path"]}
+const parameters_schema =
+    \\{
+    \\  "type": "object",
+    \\  "properties": {
+    \\    "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
+    \\    "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
+    \\    "limit": { "type": "integer", "description": "Maximum number of lines to read" }
+    \\  },
+    \\  "required": ["path"]
+    \\}
 ;
 
-const DESCRIPTION =
-    "Read a file or list a directory from the file system. If the path is a directory, it returns a list of entries. If the file or directory doesn't exist, an error is returned.\n\n" ++
-    "- The path parameter MUST be an absolute path.\n" ++
-    "- By default, this tool returns the first 500 lines. To read more, call it multiple times with different read_ranges.\n" ++
-    "- Use the Grep tool to find specific content in large files or files with long lines.\n" ++
-    "- If you are unsure of the correct file path, use the glob tool to look up filenames by glob pattern.\n" ++
-    "- Text file lines are returned with edit anchors in the form LINE:HASH: text. Use these anchors with the edit tool. For directories, entries are returned one per line (without line numbers) with a trailing \"/\" for subdirectories.\n" ++
-    "- This tool can read images (such as PNG, JPEG, and GIF files) and present them to the model visually.\n" ++
-    "- When possible, call this tool in parallel for all files you will want to read.\n" ++
-    "      - Avoid tiny repeated slices (e.g., 50‑line chunks). If you need more context from the same file, read a larger range or the full default window instead.";
-
-pub fn definition(ctx: *util.BuiltinCtx) tool_def.ToolDefinition {
-    return .{
-        .name = "read",
-        .description = DESCRIPTION,
-        .label = "Read",
-        .display_call = "path",
-        .parameters = util.parseSchema(SCHEMA),
-        .prompt_snippet = "Read file contents",
-        .prompt_guidelines = &.{"Use read to examine files instead of cat or sed."},
-        .impl = .{ .builtin = .{ .ctx = @ptrCast(ctx), .execute = &execute } },
-        .source = .{ .kind = "builtin", .id = "read" },
-    };
-}
-
-fn execute(
-    raw_ctx: ?*anyopaque,
+pub const ReadTool = struct {
     allocator: std.mem.Allocator,
-    tool_call_id: []const u8,
-    args: std.json.Value,
-    signal: protocol.Token,
-    on_update: ?protocol.AgentToolUpdateCallback,
-    update_ctx: ?*anyopaque,
-) protocol.AgentToolExecution {
-    return .{ .ready = executeSync(raw_ctx, allocator, tool_call_id, args, signal, on_update, update_ctx) };
-}
+    config: Config,
+    parsed_parameters: runtime.JsonOwned(std.json.Value),
 
-fn executeSync(
-    raw_ctx: ?*anyopaque,
-    allocator: std.mem.Allocator,
-    _: []const u8,
-    args: std.json.Value,
-    _: protocol.Token,
-    _: ?protocol.AgentToolUpdateCallback,
-    _: ?*anyopaque,
-) protocol.AgentToolResult {
-    const ctx: *util.BuiltinCtx = @ptrCast(@alignCast(raw_ctx orelse
-        return util.errorResult(allocator, "read tool: missing context")));
-
-    const path = util.getString(args, "path") orelse
-        return util.errorResult(allocator, "read tool: missing 'path' argument");
-
-    const resolved = util.resolvePath(allocator, path, ctx.cwd) catch
-        return util.errorResult(allocator, "read tool: failed to resolve path");
-
-    if (util.isSecretFile(resolved)) {
-        return util.errorf(
-            allocator,
-            "refused to read {s}: file may contain secrets. ask the user to share relevant values.",
-            .{std.fs.path.basename(resolved)},
-        );
-    }
-
-    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, resolved, .{}) catch |err| {
-        return util.errorf(allocator, "read tool: {s}: {s}", .{ resolved, @errorName(err) });
+    pub const Config = struct {
+        cwd: []const u8,
+        home_dir: ?[]const u8 = null,
+        allow_paths_outside_cwd: bool = false,
+        max_read_bytes: usize = max_read_bytes,
+        max_image_bytes: usize = max_image_bytes,
+        max_output_bytes: usize = max_output_bytes,
+        max_output_lines: usize = max_output_lines,
     };
 
-    if (stat.kind == .directory) {
-        return readDirectory(allocator, resolved);
-    }
-
-    const maybe_image_mime = sniffImageMime(resolved) catch |err|
-        return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
-    if (maybe_image_mime) |mime| {
-        return readImage(allocator, resolved, mime, .{ .auto_resize = ctx.image_auto_resize });
-    }
-
-    return readTextFile(allocator, ctx, resolved, util.getIntPair(args, "read_range"));
-}
-
-fn sniffImageMime(path: []const u8) !?image.Mime {
-    const file = try std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{});
-    defer file.close(std.Options.debug_io);
-
-    var header_buf: [64]u8 = undefined;
-    var file_reader = file.reader(std.Options.debug_io, &header_buf);
-    const header = file_reader.interface.allocRemaining(std.heap.smp_allocator, .limited(64)) catch return null;
-    defer std.heap.smp_allocator.free(header);
-    return image.sniffMime(header);
-}
-
-fn readImage(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    mime: image.Mime,
-    policy: image.InlinePolicy,
-) protocol.AgentToolResult {
-    const file = std.Io.Dir.cwd().openFile(std.Options.debug_io, path, .{}) catch |err|
-        return util.errorf(allocator, "failed to open image: {s}", .{@errorName(err)});
-    defer file.close(std.Options.debug_io);
-    var image_read_buf: [4096]u8 = undefined;
-    var image_reader = file.reader(std.Options.debug_io, &image_read_buf);
-    const raw = image_reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024)) catch |err|
-        return util.errorf(allocator, "failed to read image: {s}", .{@errorName(err)});
-    defer allocator.free(raw);
-
-    const mime_str = image.mimeString(mime);
-    const dims = image.sniffDimensions(raw, mime);
-    const decision = image.evaluateInlineImage(raw.len, dims, policy);
-
-    const companion = switch (decision) {
-        .attach_original => std.fmt.allocPrint(allocator, "Read image file [{s}]", .{mime_str}) catch
-            return util.errorResult(allocator, "image companion alloc failed"),
-        .needs_resize => std.fmt.allocPrint(
-            allocator,
-            "Read image file [{s}]\n{s}",
-            .{ mime_str, image.omittedInlineNote() },
-        ) catch return util.errorResult(allocator, "image companion alloc failed"),
-    };
-    errdefer allocator.free(companion);
-
-    switch (decision) {
-        .needs_resize => {
-            const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 1) catch
-                return util.errorResult(allocator, "image alloc failed");
-            blocks[0] = .{ .text = .{ .text = companion } };
-            return .{ .content = blocks };
-        },
-        .attach_original => {
-            const Encoder = std.base64.standard.Encoder;
-            const encoded_len = Encoder.calcSize(raw.len);
-            const encoded = allocator.alloc(u8, encoded_len) catch
-                return util.errorResult(allocator, "image alloc failed");
-            errdefer allocator.free(encoded);
-            _ = Encoder.encode(encoded, raw);
-
-            const mime_owned = allocator.dupe(u8, mime_str) catch
-                return util.errorResult(allocator, "image mime alloc failed");
-            errdefer allocator.free(mime_owned);
-
-            const blocks = allocator.alloc(protocol.AgentToolResult.ContentBlock, 2) catch
-                return util.errorResult(allocator, "image alloc failed");
-            blocks[0] = .{ .text = .{ .text = companion } };
-            blocks[1] = .{ .image = .{ .data = encoded, .mime_type = mime_owned } };
-            return .{ .content = blocks };
-        },
-    }
-}
-
-fn readDirectory(allocator: std.mem.Allocator, path: []const u8) protocol.AgentToolResult {
-    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, path, .{ .iterate = true }) catch |err|
-        return util.errorf(allocator, "cannot list directory: {s}", .{@errorName(err)});
-    defer dir.close(std.Options.debug_io);
-
-    var names: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (names.items) |n| allocator.free(n);
-        names.deinit(allocator);
-    }
-
-    var it = dir.iterate();
-    var scanned: usize = 0;
-    while (it.next(std.Options.debug_io) catch null) |entry| {
-        if (scanned >= MAX_DIR_SCAN_ENTRIES) break;
-        scanned += 1;
-        const formatted = if (entry.kind == .directory)
-            std.fmt.allocPrint(allocator, "{s}/", .{entry.name}) catch continue
-        else
-            allocator.dupe(u8, entry.name) catch continue;
-        names.append(allocator, formatted) catch {
-            allocator.free(formatted);
-            continue;
+    pub fn init(allocator: std.mem.Allocator, config: Config) !ReadTool {
+        const cwd = try allocator.dupe(u8, config.cwd);
+        errdefer allocator.free(cwd);
+        const home_dir = if (config.home_dir) |path| try allocator.dupe(u8, path) else null;
+        errdefer if (home_dir) |path| allocator.free(path);
+        const parsed_parameters = try runtime.JsonOwned(std.json.Value).parseJson(allocator, parameters_schema, .{});
+        var owned_config = config;
+        owned_config.cwd = cwd;
+        owned_config.home_dir = home_dir;
+        return .{
+            .allocator = allocator,
+            .config = owned_config,
+            .parsed_parameters = parsed_parameters,
         };
     }
 
-    std.mem.sort([]const u8, names.items, {}, lessThanStrings);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    output_buffer.appendHeadTail(&aw.writer, names.items, MAX_DIR_ENTRIES, "... [{d} more entries] ...") catch
-        return util.errorResult(allocator, "directory listing failed");
-    if (scanned >= MAX_DIR_SCAN_ENTRIES) {
-        aw.writer.print("\n\n(stopped after {d} entries; narrow the path to inspect more.)", .{MAX_DIR_SCAN_ENTRIES}) catch {};
+    pub fn deinit(self: *ReadTool) void {
+        self.allocator.free(self.config.cwd);
+        if (self.config.home_dir) |path| self.allocator.free(path);
+        self.parsed_parameters.deinit();
+        self.* = undefined;
     }
 
-    const out = aw.toOwnedSlice() catch
-        return util.errorResult(allocator, "directory listing alloc failed");
-    var details_obj: std.json.ObjectMap = .{};
-    errdefer details_obj.deinit(allocator);
-    util.jsonPutString(&details_obj, allocator, "kind", "directory") catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutString(&details_obj, allocator, "path", path) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutBool(&details_obj, allocator, "raw_filesystem_listing", true) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutInt(&details_obj, allocator, "entries_returned", @intCast(@min(names.items.len, MAX_DIR_ENTRIES))) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutInt(&details_obj, allocator, "entries_scanned", @intCast(scanned)) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutBool(&details_obj, allocator, "scan_stopped", scanned >= MAX_DIR_SCAN_ENTRIES) catch return util.ownedTextResult(allocator, out, false);
-    var result = util.ownedTextResult(allocator, out, false);
-    result.details = .{ .object = details_obj };
-    return result;
-}
+    pub fn tool(self: *ReadTool) agent.AgentTool {
+        return .{
+            .name = "read",
+            .description = "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). " ++
+                "Images are sent as attachments. For text files, output is truncated to 2000 lines " ++
+                "or 50KB (whichever is hit first). Use offset/limit for large files. " ++
+                "When you need the full file, continue with offset until complete.",
+            .parameters = self.parsed_parameters.value,
+            .label = "read",
+            .execute = .{ .context = self, .call_fn = execute },
+        };
+    }
+};
 
-fn lessThanStrings(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
-}
-
-fn readTextFile(
+fn execute(
     allocator: std.mem.Allocator,
-    _: *util.BuiltinCtx,
-    path: []const u8,
-    range: ?[2]i64,
-) protocol.AgentToolResult {
-    var input = zio_fs.readOnlyBytes(std.Options.debug_io, allocator, path, .{ .max_bytes = 4 * 1024 * 1024 }) catch |err|
-        return util.errorf(allocator, "failed to read file: {s}", .{@errorName(err)});
-    defer input.deinit(allocator);
-    const raw = input.bytes();
-    const stat = std.Io.Dir.cwd().statFile(std.Options.debug_io, path, .{}) catch null;
-    const observe_effect = if (stat) |s| observations.sideEffectFromBytes(allocator, path, s, raw, .read) catch null else null;
+    io: std.Io,
+    _: *agent.ToolRuntime,
+    context: ?*anyopaque,
+    token: runtime.CancelToken,
+    _: []const u8,
+    params: std.json.Value,
+    _: ?agent.AgentToolUpdateCallback,
+) anyerror!agent.ToolExecutionResult {
+    try token.throwIfRequested();
+    const self: *ReadTool = @ptrCast(@alignCast(context orelse return error.MissingToolContext));
+    const args = parseArgs(params) catch |err| switch (err) {
+        error.InvalidToolArguments => return path_utils.errorResult(
+            allocator,
+            "invalid_arguments",
+            "Invalid read arguments: provide path/file_path and positive offset/limit integers.",
+        ),
+    };
+    const resolved_path = paths_mod.ToolPaths.resolveExisting(allocator, io, .{
+        .cwd = self.config.cwd,
+        .allow_paths_outside_cwd = self.config.allow_paths_outside_cwd,
+        .home_dir = self.config.home_dir,
+    }, args.path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.InvalidToolArguments, error.PathOutsideCwd => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Invalid read path {s}: {s}",
+            "invalid_path",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
+        else => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Read path resolution failed for {s}: {s}",
+            "path_error",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
+    };
+    defer allocator.free(resolved_path);
 
-    var total_lines: usize = 1;
-    for (raw) |byte| {
-        if (byte == '\n') total_lines += 1;
+    const content = std.Io.Dir.readFileAlloc(
+        .cwd(),
+        io,
+        resolved_path,
+        allocator,
+        .limited(self.config.max_read_bytes),
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.FileTooBig, error.StreamTooLong => return readTooLargeResult(allocator, self.config.max_read_bytes),
+        else => return path_utils.errorResultWithPathFmt(
+            allocator,
+            "Read failed for {s}: {s}",
+            "read_failed",
+            args.path,
+            err,
+            .{ args.path, @errorName(err) },
+        ),
+    };
+    defer allocator.free(content);
+    try token.throwIfRequested();
+
+    if (detectImageMimeType(resolved_path, content)) |mime_type| {
+        if (content.len > self.config.max_image_bytes) {
+            return imageTooLargeResult(allocator, self.config.max_image_bytes, mime_type);
+        }
+        return imageReadResult(allocator, content, mime_type);
+    }
+    if (!std.unicode.utf8ValidateSlice(content)) {
+        return path_utils.textResult(allocator, "[File omitted: content is not valid UTF-8 text.]", null);
     }
 
-    const start: usize = blk: {
-        const r0: i64 = if (range) |r| r[0] else 1;
-        break :blk @intCast(@max(@as(i64, 1), r0));
-    };
-    const end: usize = blk: {
-        const def_end: i64 = @intCast(@min(total_lines, start + MAX_LINES - 1));
-        const r1: i64 = if (range) |r| r[1] else def_end;
-        const clamped = @min(@as(i64, @intCast(total_lines)), r1);
-        break :blk @intCast(@max(@as(i64, @intCast(start)), clamped));
-    };
+    var formatted = try formatReadOutput(allocator, self.config, args, content);
+    var formatted_owned = true;
+    errdefer if (formatted_owned) formatted.deinit(allocator);
+    const details = try formatted.details(allocator);
+    errdefer if (details) |value| runtime.freeJsonValue(allocator, value);
+    formatted_owned = false;
+    return path_utils.ownedTextResult(allocator, formatted.text, details);
+}
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
+const ReadArgs = struct {
+    path: []const u8,
+    offset: ?usize,
+    limit: ?usize,
+};
 
+fn readTooLargeResult(allocator: std.mem.Allocator, max_bytes: usize) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Read failed: file exceeds the {d} byte read limit.",
+        .{max_bytes},
+    );
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .isError = true,
+        .reason = @as([]const u8, "file_too_large"),
+        .maxBytes = max_bytes,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
+}
+
+fn imageTooLargeResult(
+    allocator: std.mem.Allocator,
+    max_bytes: usize,
+    mime_type: []const u8,
+) !agent.ToolExecutionResult {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "[Image omitted: {s} exceeds the {d} byte inline image limit.]",
+        .{ mime_type, max_bytes },
+    );
+    errdefer allocator.free(message);
+    const details = try path_utils.jsonDetails(allocator, .{
+        .reason = @as([]const u8, "image_too_large"),
+        .mimeType = mime_type,
+        .maxBytes = max_bytes,
+    });
+    errdefer runtime.freeJsonValue(allocator, details);
+    return path_utils.ownedTextResult(allocator, message, details);
+}
+
+fn imageReadResult(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    mime_type: []const u8,
+) !agent.ToolExecutionResult {
+    const encoded_len = std.base64.standard.Encoder.calcSize(content.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    errdefer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, content);
+
+    const note = try std.fmt.allocPrint(allocator, "Read image file [{s}]", .{mime_type});
+    errdefer allocator.free(note);
+    const mime = try allocator.dupe(u8, mime_type);
+    errdefer allocator.free(mime);
+
+    const result_content = try allocator.alloc(ai.ToolResultContent, 2);
+    errdefer allocator.free(result_content);
+    result_content[0] = .{ .text = .{ .text = note } };
+    result_content[1] = .{ .image = .{ .data = encoded, .mime_type = mime } };
+    return .{
+        .allocator = allocator,
+        .result = .{ .content = result_content, .details = null },
+    };
+}
+
+fn detectImageMimeType(path: []const u8, content: []const u8) ?[]const u8 {
+    _ = path;
+    if (isJpeg(content)) return "image/jpeg";
+    if (isPng(content)) return "image/png";
+    if (hasPrefix(content, "GIF")) return "image/gif";
+    if (isWebp(content)) return "image/webp";
+    return null;
+}
+
+fn hasPrefix(content: []const u8, prefix: []const u8) bool {
+    return content.len >= prefix.len and std.mem.eql(u8, content[0..prefix.len], prefix);
+}
+
+fn isJpeg(content: []const u8) bool {
+    return content.len >= 4 and
+        content[0] == 0xff and
+        content[1] == 0xd8 and
+        content[2] == 0xff and
+        content[3] != 0xf7;
+}
+
+fn isPng(content: []const u8) bool {
+    return content.len >= 16 and
+        hasPrefix(content, "\x89PNG\r\n\x1a\n") and
+        readU32Be(content, 8) == 13 and
+        std.mem.eql(u8, content[12..16], "IHDR") and
+        !isAnimatedPng(content);
+}
+
+fn isAnimatedPng(content: []const u8) bool {
+    var offset: usize = 8;
+    while (offset + 8 <= content.len) {
+        const chunk_len = readU32Be(content, offset);
+        const chunk_type = content[offset + 4 .. offset + 8];
+        if (std.mem.eql(u8, chunk_type, "acTL")) return true;
+        if (std.mem.eql(u8, chunk_type, "IDAT")) return false;
+
+        const next = offset + 8 + @as(usize, chunk_len) + 4;
+        if (next <= offset or next > content.len) return false;
+        offset = next;
+    }
+    return false;
+}
+
+fn readU32Be(content: []const u8, offset: usize) u32 {
+    return (@as(u32, content[offset]) << 24) |
+        (@as(u32, content[offset + 1]) << 16) |
+        (@as(u32, content[offset + 2]) << 8) |
+        @as(u32, content[offset + 3]);
+}
+
+fn isWebp(content: []const u8) bool {
+    return content.len >= 12 and
+        std.mem.eql(u8, content[0..4], "RIFF") and
+        std.mem.eql(u8, content[8..12], "WEBP");
+}
+
+fn parseArgs(params: std.json.Value) !ReadArgs {
+    if (params != .object) return error.InvalidToolArguments;
+    const path_value = params.object.get("path") orelse params.object.get("file_path") orelse
+        return error.InvalidToolArguments;
+    if (path_value != .string or path_value.string.len == 0) return error.InvalidToolArguments;
+    return .{
+        .path = path_value.string,
+        .offset = try optionalPositiveInteger(params.object.get("offset")),
+        .limit = try optionalPositiveInteger(params.object.get("limit")),
+    };
+}
+
+fn optionalPositiveInteger(value: ?std.json.Value) !?usize {
+    const raw = value orelse return null;
+    if (raw != .integer or raw.integer < 1) return error.InvalidToolArguments;
+    return std.math.cast(usize, raw.integer) orelse error.InvalidToolArguments;
+}
+
+const ReadTruncatedBy = enum { lines, bytes };
+
+const FormattedReadOutput = struct {
+    text: []const u8,
+    truncated: bool,
+    user_limit: bool,
+    truncated_by: ReadTruncatedBy,
+    offset_beyond_eof: bool,
+    requested_offset: usize,
+    first_line_exceeds_limit: bool,
+    first_line_bytes: usize,
+    output_lines: usize,
+    remaining_lines: usize,
+    total_lines: usize,
+    total_bytes: usize,
+    output_bytes: usize,
+    max_bytes: usize,
+    max_lines: usize,
+    next_offset: ?usize,
+
+    fn deinit(self: FormattedReadOutput, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+
+    fn details(self: FormattedReadOutput, allocator: std.mem.Allocator) !?std.json.Value {
+        if (self.offset_beyond_eof) {
+            const value = try path_utils.jsonDetails(allocator, .{
+                .isError = true,
+                .reason = @as([]const u8, "offset_beyond_eof"),
+                .offset = self.requested_offset,
+                .totalLines = self.total_lines,
+            });
+            return value;
+        }
+        if (!self.truncated and !self.user_limit and self.next_offset == null) return null;
+        const value = try path_utils.jsonDetails(allocator, .{
+            .nextOffset = self.next_offset,
+            .truncation = try path_utils.jsonDetails(allocator, .{
+                .truncated = self.truncated,
+                .userLimit = self.user_limit,
+                .truncatedBy = @as([]const u8, switch (self.truncated_by) {
+                    .lines => "lines",
+                    .bytes => "bytes",
+                }),
+                .firstLineExceedsLimit = self.first_line_exceeds_limit,
+                .firstLineBytes = if (self.first_line_bytes > 0) self.first_line_bytes else null,
+                .outputLines = self.output_lines,
+                .remainingLines = self.remaining_lines,
+                .totalLines = self.total_lines,
+                .totalBytes = self.total_bytes,
+                .outputBytes = self.output_bytes,
+                .maxBytes = self.max_bytes,
+                .maxLines = self.max_lines,
+            }),
+        });
+        return value;
+    }
+};
+
+fn formatReadOutput(
+    allocator: std.mem.Allocator,
+    config: ReadTool.Config,
+    args: ReadArgs,
+    content: []const u8,
+) !FormattedReadOutput {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+
+    const start_line = args.offset orelse 1;
+    var current_line: usize = 1;
+    var emitted_lines: usize = 0;
+    var last_emitted_line: ?usize = null;
     var bytes_written: usize = 0;
-    var line_it = std.mem.splitScalar(u8, raw, '\n');
-    var line_no: usize = 1;
-    var first = true;
-    while (line_it.next()) |line| : (line_no += 1) {
-        if (line_no < start) continue;
-        if (line_no > end) break;
-        if (!first) {
-            aw.writer.writeAll("\n") catch break;
+    var remaining_lines: usize = 0;
+    var total_lines: usize = 0;
+    var skipped_to_start = false;
+    var offset_beyond_eof = false;
+    var first_line_exceeds_limit = false;
+    var first_line_bytes: usize = 0;
+    var user_limit = false;
+    var output_truncated = false;
+    var truncated_by: ReadTruncatedBy = .lines;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| : (current_line += 1) {
+        total_lines += 1;
+        if (current_line < start_line) continue;
+        skipped_to_start = true;
+        if (args.limit) |limit| if (emitted_lines == limit) {
+            user_limit = true;
+            remaining_lines += 1;
+            continue;
+        };
+        if (emitted_lines == config.max_output_lines) {
+            output_truncated = true;
+            truncated_by = .lines;
+            remaining_lines += 1;
+            continue;
+        }
+        const separator_bytes: usize = if (emitted_lines == 0) 0 else 1;
+        if (bytes_written + separator_bytes + line.len > config.max_output_bytes) {
+            output_truncated = true;
+            truncated_by = .bytes;
+            if (emitted_lines == 0) {
+                first_line_exceeds_limit = true;
+                first_line_bytes = line.len;
+            }
+            remaining_lines += 1;
+            continue;
+        }
+        if (emitted_lines > 0) {
+            try writer.writer.writeByte('\n');
             bytes_written += 1;
         }
-        first = false;
-        const anchor_line = std.mem.trimEnd(u8, line, "\r");
-        if (line.len > MAX_LINE_BYTES) {
-            const kept = line[0..MAX_LINE_BYTES];
-            anchors.write(&aw.writer, line_no, anchor_line) catch break;
-            aw.writer.print(" {s}... (line truncated)", .{kept}) catch break;
-            bytes_written += std.fmt.count("{d}:0000: ", .{line_no}) + kept.len + "... (line truncated)".len;
+        try writer.writer.writeAll(line);
+        bytes_written += line.len;
+        emitted_lines += 1;
+        last_emitted_line = current_line;
+    }
+
+    if (!skipped_to_start) {
+        offset_beyond_eof = true;
+        try writer.writer.print(
+            "[Offset {d} is beyond end of file ({d} lines total).]",
+            .{ start_line, total_lines },
+        );
+    }
+    const next_offset = if (remaining_lines > 0 and last_emitted_line != null) last_emitted_line.? + 1 else null;
+    if (first_line_exceeds_limit) {
+        var line_size_buffer: [32]u8 = undefined;
+        var limit_size_buffer: [32]u8 = undefined;
+        try writer.writer.print(
+            "[Line {d} is {s}, exceeds {s} limit. Use bash: sed -n '{d}p' {s} | head -c {d}]",
+            .{
+                start_line,
+                formatSize(&line_size_buffer, first_line_bytes),
+                formatSize(&limit_size_buffer, config.max_output_bytes),
+                start_line,
+                args.path,
+                config.max_output_bytes,
+            },
+        );
+    } else if (next_offset) |offset| {
+        if (output_truncated) {
+            const end_line = offset - 1;
+            if (truncated_by == .bytes) {
+                var size_buffer: [32]u8 = undefined;
+                try writer.writer.print(
+                    "\n\n[Showing lines {d}-{d} of {d} ({s} limit). Use offset={d} to continue.]",
+                    .{
+                        start_line,
+                        end_line,
+                        total_lines,
+                        formatSize(&size_buffer, config.max_output_bytes),
+                        offset,
+                    },
+                );
+            } else {
+                try writer.writer.print(
+                    "\n\n[Showing lines {d}-{d} of {d}. Use offset={d} to continue.]",
+                    .{ start_line, end_line, total_lines, offset },
+                );
+            }
         } else {
-            anchors.write(&aw.writer, line_no, anchor_line) catch break;
-            aw.writer.print(" {s}", .{line}) catch break;
-            bytes_written += std.fmt.count("{d}:0000: ", .{line_no}) + line.len;
-        }
-        if (bytes_written >= MAX_FILE_BYTES) {
-            aw.writer.writeAll("\n... [output truncated, 64KB limit reached] ...") catch {};
-            break;
+            try writer.writer.print(
+                "\n\n[{d} more lines in file. Use offset={d} to continue.]",
+                .{ remaining_lines, offset },
+            );
         }
     }
-
-    if (end < total_lines) {
-        aw.writer.print(
-            "\n\n(showing lines {d}-{d} of {d}. use read_range to see more.)",
-            .{ start, end, total_lines },
-        ) catch {};
-    }
-
-    const out = aw.toOwnedSlice() catch
-        return util.errorResult(allocator, "read alloc failed");
-    var details_obj: std.json.ObjectMap = .{};
-    errdefer details_obj.deinit(allocator);
-    util.jsonPutString(&details_obj, allocator, "kind", "file") catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutString(&details_obj, allocator, "path", path) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutInt(&details_obj, allocator, "start_line", @intCast(start)) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutInt(&details_obj, allocator, "end_line", @intCast(end)) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutInt(&details_obj, allocator, "total_lines", @intCast(total_lines)) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutBool(&details_obj, allocator, "truncated", bytes_written >= MAX_FILE_BYTES or end < total_lines) catch return util.ownedTextResult(allocator, out, false);
-    util.jsonPutString(&details_obj, allocator, "line_hash_scheme", "zi-line-v1") catch return util.ownedTextResult(allocator, out, false);
-    if (observe_effect) |effect| switch (effect) {
-        .observe_file => |event| util.jsonPutOwnedString(&details_obj, allocator, "observation_hash", observations.hashHex(allocator, event.hash) catch return util.ownedTextResult(allocator, out, false)) catch return util.ownedTextResult(allocator, out, false),
-    };
-    var result = util.ownedTextResult(allocator, out, false);
-    result.details = .{ .object = details_obj };
-    if (observe_effect) |effect| {
-        const side_effects = allocator.alloc(protocol.ToolSideEffect, 1) catch return result;
-        side_effects[0] = effect;
-        result.side_effects = side_effects;
-    }
-    return result;
-}
-
-fn usizeFromI64(v: i64) usize {
-    if (v < 0) return 0;
-    return @intCast(v);
-}
-
-fn pngHeader(width: u32, height: u32) [24]u8 {
     return .{
-        0x89,                                    0x50,                                    0x4E,                                   0x47,                            0x0D,                                     0x0A,                                     0x1A,                                    0x0A,
-        0x00,                                    0x00,                                    0x00,                                   0x0D,                            0x49,                                     0x48,                                     0x44,                                    0x52,
-        @as(u8, @intCast((width >> 24) & 0xFF)), @as(u8, @intCast((width >> 16) & 0xFF)), @as(u8, @intCast((width >> 8) & 0xFF)), @as(u8, @intCast(width & 0xFF)), @as(u8, @intCast((height >> 24) & 0xFF)), @as(u8, @intCast((height >> 16) & 0xFF)), @as(u8, @intCast((height >> 8) & 0xFF)), @as(u8, @intCast(height & 0xFF)),
+        .text = try writer.toOwnedSlice(),
+        .truncated = output_truncated,
+        .user_limit = user_limit,
+        .truncated_by = truncated_by,
+        .offset_beyond_eof = offset_beyond_eof,
+        .requested_offset = start_line,
+        .first_line_exceeds_limit = first_line_exceeds_limit,
+        .first_line_bytes = first_line_bytes,
+        .output_lines = emitted_lines,
+        .remaining_lines = remaining_lines,
+        .total_lines = total_lines,
+        .total_bytes = content.len,
+        .output_bytes = bytes_written,
+        .max_bytes = config.max_output_bytes,
+        .max_lines = config.max_output_lines,
+        .next_offset = next_offset,
     };
 }
 
-fn tmpPath(allocator: std.mem.Allocator, tmp: anytype, sub_path: []const u8) ![]u8 {
-    const cwd = try tmp.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.join(allocator, &.{ cwd, sub_path });
+fn formatSize(buffer: []u8, bytes: usize) []const u8 {
+    if (bytes >= 1024 and bytes % 1024 == 0) {
+        return std.fmt.bufPrint(buffer, "{d}KB", .{bytes / 1024}) catch "limit";
+    }
+    return std.fmt.bufPrint(buffer, "{d}B", .{bytes}) catch "limit";
 }
 
-fn expectOnlyText(result: protocol.AgentToolResult) ![]const u8 {
-    try std.testing.expectEqual(@as(usize, 1), result.content.len);
-    return switch (result.content[0]) {
-        .text => |text| text.text,
-        else => error.ExpectedTextBlock,
-    };
-}
+test "read tool reads bounded text with offset and limit" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "one\ntwo\nthree\nfour");
 
-test "readTextFile numbers requested ranges and caps oversized lines" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
 
-    const long_line = try allocator.alloc(u8, MAX_LINE_BYTES + 8);
-    defer allocator.free(long_line);
-    @memset(long_line, 'x');
-
-    const data = try std.fmt.allocPrint(allocator, "first\n{s}\nthird\nfourth\n", .{long_line});
-    defer allocator.free(data);
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "story.txt", .data = data });
-
-    const path = try tmpPath(allocator, &tmp, "story.txt");
-    defer allocator.free(path);
-
-    var ctx: util.BuiltinCtx = .{ .cwd = "" };
-    defer ctx.deinit(allocator);
-    const result = readTextFile(allocator, &ctx, path, .{ 2, 3 });
-    defer result.free(allocator);
-    const text = try expectOnlyText(result);
-
-    try std.testing.expect(std.mem.startsWith(u8, text, "2:"));
-    try std.testing.expect(std.mem.indexOf(u8, text, "... (line truncated)\n3:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "showing lines 2-3 of 5") != null);
-}
-
-test "sniffImageMime detects supported image bytes regardless of extension" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const png = pngHeader(16, 32);
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "mystery.txt", .data = &png });
-
-    const path = try tmpPath(allocator, &tmp, "mystery.txt");
-    defer allocator.free(path);
-
-    try std.testing.expectEqual(image.Mime.png, (try sniffImageMime(path)).?);
-}
-
-test "readImage omits oversized inline images when auto-resize is enabled" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const png = pngHeader(300, 200);
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "large.png", .data = &png });
-
-    const path = try tmpPath(allocator, &tmp, "large.png");
-    defer allocator.free(path);
-
-    const result = readImage(allocator, path, .png, .{
-        .auto_resize = true,
-        .max_width = 100,
-        .max_height = 100,
-        .max_base64_bytes = 1024,
-    });
-    defer result.free(allocator);
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\",\"offset\":2,\"limit\":2}");
+    defer result.deinit();
 
     try std.testing.expectEqualStrings(
-        "Read image file [image/png]\n[Image omitted: could not be resized below the inline image size limit.]",
-        try expectOnlyText(result),
+        "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
+        result.result.content[0].text.text,
+    );
+    const truncation = result.result.details.?.object.get("truncation").?.object;
+    try std.testing.expect(!truncation.get("truncated").?.bool);
+    try std.testing.expect(truncation.get("userLimit").?.bool);
+    try std.testing.expectEqual(@as(i64, 4), truncation.get("totalLines").?.integer);
+    try std.testing.expectEqual(@as(i64, max_output_lines), truncation.get("maxLines").?.integer);
+    try std.testing.expectEqual(@as(i64, 18), truncation.get("totalBytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), truncation.get("outputBytes").?.integer);
+    try std.testing.expectEqual(@as(i64, max_output_bytes), truncation.get("maxBytes").?.integer);
+}
+
+test "read tool expands configured home directory" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.dir("home/project");
+    try fixture.write("home/project/file.txt", "home ok");
+
+    var home_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const home_len = try fixture.tmp.dir.realPathFile(std.testing.io, "home", &home_buffer);
+    var read_tool = try ReadTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .home_dir = home_buffer[0..home_len],
+        .allow_paths_outside_cwd = true,
+    });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"~/project/file.txt\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("home ok", result.result.content[0].text.text);
+}
+
+test "read tool reports invalid arguments operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\",\"offset\":0}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Invalid read arguments: provide path/file_path and positive offset/limit integers.",
+        result.result.content[0].text.text,
+    );
+    try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
+}
+
+test "read tool reports missing file operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .allow_paths_outside_cwd = true,
+    });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"missing.txt\"}");
+    defer result.deinit();
+
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("read_failed", details.get("reason").?.string);
+    try std.testing.expectEqualStrings("missing.txt", details.get("path").?.string);
+    try std.testing.expectEqualStrings("FileNotFound", details.get("errorName").?.string);
+}
+
+test "read tool reports outside cwd operationally" {
+    var fixture = try test_support.Fixture.init("repo/app");
+    defer fixture.deinit();
+    try fixture.dir("repo/other");
+    try fixture.write("repo/other/file.txt", "outside");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"../other/file.txt\"}");
+    defer result.deinit();
+
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("invalid_path", details.get("reason").?.string);
+    try std.testing.expectEqualStrings("../other/file.txt", details.get("path").?.string);
+    try std.testing.expectEqualStrings("PathOutsideCwd", details.get("errorName").?.string);
+}
+
+test "read tool reports parent path failures operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/blocker", "x");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .allow_paths_outside_cwd = true,
+    });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"blocker/file.txt\"}");
+    defer result.deinit();
+
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("path_error", details.get("reason").?.string);
+    try std.testing.expectEqualStrings("blocker/file.txt", details.get("path").?.string);
+    try std.testing.expect(details.get("errorName").?.string.len > 0);
+}
+
+test "read tool reports oversized file operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "hello");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd(), .max_read_bytes = 3 });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "Read failed: file exceeds the 3 byte read limit.",
+        result.result.content[0].text.text,
+    );
+    try std.testing.expect(result.result.details.?.object.get("isError").?.bool);
+    try std.testing.expectEqualStrings("file_too_large", result.result.details.?.object.get("reason").?.string);
+}
+
+test "read tool accepts file_path compatibility argument" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "ok");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"file_path\":\"file.txt\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("ok", result.result.content[0].text.text);
+}
+
+test "read tool omits invalid utf8 text operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/binary.dat", "ok\xffbad");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"binary.dat\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "[File omitted: content is not valid UTF-8 text.]",
+        result.result.content[0].text.text,
     );
 }
 
-test "readImage attaches original when auto-resize is disabled" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+test "read tool returns image attachment for supported image file" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    const png_header = "\x89PNG\r\n\x1a\n" ++ "\x00\x00\x00\x0d" ++ "IHDR";
+    try fixture.write("repo/image.png", png_header);
 
-    const png = pngHeader(300, 200);
-    try tmp.dir.writeFile(std.Options.debug_io, .{ .sub_path = "large.png", .data = &png });
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
 
-    const path = try tmpPath(allocator, &tmp, "large.png");
-    defer allocator.free(path);
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"image.png\"}");
+    defer result.deinit();
 
-    const result = readImage(allocator, path, .png, .{
-        .auto_resize = false,
-        .max_width = 100,
-        .max_height = 100,
-        .max_base64_bytes = 8,
+    try std.testing.expectEqual(@as(usize, 2), result.result.content.len);
+    try std.testing.expectEqualStrings("Read image file [image/png]", result.result.content[0].text.text);
+    try std.testing.expectEqualStrings("image/png", result.result.content[1].image.mime_type);
+    try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUg==", result.result.content[1].image.data);
+}
+
+test "read tool omits images over inline image limit" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    const png_header = "\x89PNG\r\n\x1a\n" ++ "\x00\x00\x00\x0d" ++ "IHDR";
+    try fixture.write("repo/image.png", png_header);
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{
+        .cwd = fixture.cwd(),
+        .max_image_bytes = png_header.len - 1,
     });
-    defer result.free(allocator);
+    defer read_tool.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), result.content.len);
-    switch (result.content[0]) {
-        .text => |text| try std.testing.expectEqualStrings("Read image file [image/png]", text.text),
-        else => return error.ExpectedTextBlock,
-    }
-    switch (result.content[1]) {
-        .image => |img| {
-            try std.testing.expectEqualStrings("image/png", img.mime_type);
-            const Encoder = std.base64.standard.Encoder;
-            const expected_len = Encoder.calcSize(png.len);
-            const expected = try allocator.alloc(u8, expected_len);
-            defer allocator.free(expected);
-            _ = Encoder.encode(expected, &png);
-            try std.testing.expectEqualStrings(expected, img.data);
-        },
-        else => return error.ExpectedImageBlock,
-    }
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"image.png\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.result.content.len);
+    try std.testing.expectEqualStrings(
+        "[Image omitted: image/png exceeds the 15 byte inline image limit.]",
+        result.result.content[0].text.text,
+    );
+    try std.testing.expectEqualStrings("image_too_large", result.result.details.?.object.get("reason").?.string);
+}
+
+test "read tool does not classify animated png as supported image" {
+    const animated_png = "\x89PNG\r\n\x1a\n" ++
+        "\x00\x00\x00\x0d" ++ "IHDR" ++ "1234567890123" ++ "\x00\x00\x00\x00" ++
+        "\x00\x00\x00\x08" ++ "acTL" ++ "12345678" ++ "\x00\x00\x00\x00";
+    try std.testing.expectEqual(@as(?[]const u8, null), detectImageMimeType("animated.png", animated_png));
+    try std.testing.expectEqual(@as(?[]const u8, null), detectImageMimeType("fake.png", "not an image"));
+}
+
+test "read tool reports pi-style automatic truncation ranges" {
+    const formatted = try formatReadOutput(
+        std.testing.allocator,
+        .{ .cwd = "/repo", .max_output_lines = 2, .max_output_bytes = 100 },
+        .{ .path = "file.txt", .offset = null, .limit = null },
+        "one\ntwo\nthree\nfour",
+    );
+    defer formatted.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "one\ntwo\n\n[Showing lines 1-2 of 4. Use offset=3 to continue.]",
+        formatted.text,
+    );
+}
+
+test "read tool reports pi-style byte truncation ranges" {
+    const formatted = try formatReadOutput(
+        std.testing.allocator,
+        .{ .cwd = "/repo", .max_output_lines = 20, .max_output_bytes = 8 },
+        .{ .path = "file.txt", .offset = 2, .limit = null },
+        "skip\none\ntwo\nthree",
+    );
+    defer formatted.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "one\ntwo\n\n[Showing lines 2-3 of 4 (8B limit). Use offset=4 to continue.]",
+        formatted.text,
+    );
+}
+
+test "read full untruncated file has no details" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "one\ntwo");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\"}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("one\ntwo", result.result.content[0].text.text);
+    try std.testing.expect(result.result.details == null);
+}
+
+test "read tool can reject paths outside cwd by config" {
+    var fixture = try test_support.Fixture.init("repo/app");
+    defer fixture.deinit();
+    try fixture.dir("repo/other");
+    try fixture.write("repo/other/file.txt", "x");
+
+    try std.testing.expectError(error.PathOutsideCwd, paths_mod.ToolPaths.resolveExisting(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .cwd = fixture.cwd(), .allow_paths_outside_cwd = false },
+        "../other/file.txt",
+    ));
+}
+
+test "read tool allows first line exactly at byte limit" {
+    const formatted = try formatReadOutput(
+        std.testing.allocator,
+        .{ .cwd = "/repo", .max_output_bytes = 3 },
+        .{ .path = "file.txt", .offset = null, .limit = null },
+        "abc\nsecond",
+    );
+    defer formatted.deinit(std.testing.allocator);
+
+    try std.testing.expect(!formatted.first_line_exceeds_limit);
+    try std.testing.expectEqualStrings(
+        "abc\n\n[Showing lines 1-1 of 2 (3B limit). Use offset=2 to continue.]",
+        formatted.text,
+    );
+}
+
+test "read tool reports first line exceeding output limit" {
+    const formatted = try formatReadOutput(
+        std.testing.allocator,
+        .{ .cwd = "/repo", .max_output_bytes = 3 },
+        .{ .path = "file.txt", .offset = null, .limit = null },
+        "abcdef\nsecond",
+    );
+    defer formatted.deinit(std.testing.allocator);
+
+    try std.testing.expect(formatted.first_line_exceeds_limit);
+    try std.testing.expectEqual(@as(?usize, null), formatted.next_offset);
+    try std.testing.expectEqualStrings(
+        "[Line 1 is 6B, exceeds 3B limit. Use bash: sed -n '1p' file.txt | head -c 3]",
+        formatted.text,
+    );
+    const details = (try formatted.details(std.testing.allocator)).?;
+    defer runtime.freeJsonValue(std.testing.allocator, details);
+    const truncation = details.object.get("truncation").?.object;
+    try std.testing.expectEqualStrings("bytes", truncation.get("truncatedBy").?.string);
+    try std.testing.expectEqual(@as(i64, 6), truncation.get("firstLineBytes").?.integer);
+}
+
+test "read tool reports offset beyond end operationally" {
+    var fixture = try test_support.Fixture.init("repo");
+    defer fixture.deinit();
+    try fixture.write("repo/file.txt", "one");
+
+    var read_tool = try ReadTool.init(std.testing.allocator, .{ .cwd = fixture.cwd() });
+    defer read_tool.deinit();
+
+    var result = try test_support.execute(read_tool.tool(), "{\"path\":\"file.txt\",\"offset\":3}");
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(
+        "[Offset 3 is beyond end of file (1 lines total).]",
+        result.result.content[0].text.text,
+    );
+    const details = result.result.details.?.object;
+    try std.testing.expect(details.get("isError").?.bool);
+    try std.testing.expectEqualStrings("offset_beyond_eof", details.get("reason").?.string);
+    try std.testing.expectEqual(@as(i64, 3), details.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), details.get("totalLines").?.integer);
 }

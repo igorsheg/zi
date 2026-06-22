@@ -5,8 +5,8 @@ const Span = parser.Span;
 const Document = parser.Document;
 
 pub fn render(allocator: std.mem.Allocator, doc: Document, name: []const u8, section: []const u8) ![]const u8 {
-    var buffer: std.ArrayListUnmanaged(u8) = .empty;
-    const writer = buffer.writer(allocator);
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    const writer = &buffer.writer;
 
     var upper_name: [64]u8 = undefined;
     const name_upper = std.ascii.upperString(&upper_name, name);
@@ -16,7 +16,7 @@ pub fn render(allocator: std.mem.Allocator, doc: Document, name: []const u8, sec
         try renderNode(allocator, writer, node, &upper_name);
     }
 
-    return buffer.toOwnedSlice(allocator);
+    return buffer.toOwnedSlice();
 }
 
 fn renderNode(allocator: std.mem.Allocator, writer: anytype, node: Node, upper_buf: *[64]u8) !void {

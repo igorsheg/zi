@@ -1,233 +1,138 @@
+//! Shimmer math for animated status text: a brightness band sweeps across
+//! the text. Pure functions of (config, time, column); render.zig owns the
+//! actual terminal writes.
 const std = @import("std");
-const buffer_mod = @import("primitives/surface.zig");
-const cell_mod = @import("cell.zig");
-const grapheme_mod = @import("grapheme.zig");
+const text_mod = @import("text.zig");
+const theme = @import("theme.zig");
 
-const Region = buffer_mod.Region;
-const Color = cell_mod.Color;
-const Attributes = cell_mod.Attributes;
+const phase_scale: u32 = 256;
 
 pub const Config = struct {
-    step_ns: i128 = 33_333_333,
-
-    lead_pad_cols: u32 = 6,
-
-    tail_pad_cols: u32 = 10,
-
-    band_half_width: u32 = 2,
-
-    base_fg: Color,
-    edge_fg: Color,
-    peak_fg: Color,
-
-    base_attrs: Attributes = .{ .dim = true },
-    edge_attrs: Attributes = .{},
-    peak_attrs: Attributes = .{ .bold = true },
-    width_method: grapheme_mod.WidthMethod = .wcwidth,
+    lead_pad_cols: u16 = 6,
+    tail_pad_cols: u16 = 10,
+    band_half_width: u16 = 3,
+    base_style: theme.Style,
+    peak_style: theme.Style,
+    /// Strengths at or below the floor render as base; above it the band
+    /// fades in. Keeps the sweep from tinting the whole line.
+    floor: u8 = 0,
+    /// Milliseconds per column of band travel. Phase is fixed-point, so a
+    /// 16ms frame still changes intensity even before the band reaches the
+    /// next whole cell.
+    ms_per_col: u64 = 32,
 };
 
-pub const Bucket = enum {
-    base,
-    edge,
-    peak,
-};
-
-pub fn nextDeadline(now_ns: i128, cfg: Config) i128 {
-    if (cfg.step_ns <= 0) return now_ns;
-    const current_step = @divFloor(now_ns, cfg.step_ns);
-    return (current_step + 1) * cfg.step_ns;
+pub fn phaseForMs(now_ms: i64, config: Config, text: []const u8) u32 {
+    const period_cols = text_mod.displayWidth(text) + config.lead_pad_cols + config.tail_pad_cols;
+    if (period_cols == 0 or config.ms_per_col == 0) return 0;
+    const elapsed: u64 = @intCast(@max(0, now_ms));
+    const period = @as(u64, @intCast(period_cols)) * phase_scale;
+    return @intCast(((elapsed * phase_scale) / config.ms_per_col) % period);
 }
 
-pub fn phaseForTime(now_ns: i128, cfg: Config, text: []const u8) u32 {
-    const period = shimmerPeriod(cfg, text);
-    if (period == 0 or cfg.step_ns <= 0) return 0;
-    const current_step = @divFloor(now_ns, cfg.step_ns);
-    return @intCast(@mod(current_step, @as(i128, period)));
-}
-
-pub fn write(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, phase: u32) u32 {
-    if (text.len == 0 or y >= region.height or x >= region.width) return 0;
-    var effective_cfg = cfg;
-    effective_cfg.width_method = region.buf.width_method;
-
-    var written_cols: u32 = 0;
-    var visual_col: u32 = 0;
-    var run_start: usize = 0;
-    var run_bucket: ?Bucket = null;
-
-    var i: usize = 0;
-    while (i < text.len) {
-        const char_start = i;
-        const width = decodeWidth(text, &i, effective_cfg.width_method);
-        const bucket = bucketForColumn(effective_cfg, phase, visual_col);
-
-        if (run_bucket == null) {
-            run_bucket = bucket;
-        } else if (run_bucket.? != bucket) {
-            written_cols += flushRun(region, x + written_cols, y, text[run_start..char_start], effective_cfg, run_bucket.?);
-            run_start = char_start;
-            run_bucket = bucket;
-        }
-
-        visual_col += width;
-    }
-
-    if (run_bucket) |bucket| {
-        written_cols += flushRun(region, x + written_cols, y, text[run_start..], effective_cfg, bucket);
-    }
-
-    return written_cols;
-}
-
-fn shimmerPeriod(cfg: Config, text: []const u8) u32 {
-    const text_cols: u32 = @intCast(grapheme_mod.strWidth(text, cfg.width_method));
-    return text_cols + cfg.lead_pad_cols + cfg.tail_pad_cols;
-}
-
-pub fn bucketForColumn(cfg: Config, phase: u32, visual_col: u32) Bucket {
-    const text_pos = @as(i64, cfg.lead_pad_cols) + @as(i64, visual_col);
-    const center = @as(i64, phase);
-    const dist = if (text_pos >= center) text_pos - center else center - text_pos;
-    const half_width = @as(i64, cfg.band_half_width);
-
-    if (dist == 0) return .peak;
-    if (half_width == 0 or dist > half_width) return .base;
-    if (dist * 2 <= half_width) return .peak;
-    return .edge;
-}
-
-pub fn strengthForColumn(cfg: Config, phase: u32, visual_col: u32) u8 {
-    const text_pos = @as(i64, cfg.lead_pad_cols) + @as(i64, visual_col);
-    const center = @as(i64, phase);
-    const dist = if (text_pos >= center) text_pos - center else center - text_pos;
-    const radius = @as(i64, cfg.band_half_width);
+pub fn strengthForColumn(config: Config, phase: u32, visual_col: usize) u8 {
+    const text_pos = (@as(i64, @intCast(@as(usize, config.lead_pad_cols) + visual_col)) * phase_scale);
+    const center: i64 = phase;
+    const dist = @abs(text_pos - center);
+    const radius = @as(i64, config.band_half_width) * phase_scale;
     if (radius <= 0) return if (dist == 0) 255 else 0;
     if (dist > radius) return 0;
-
-    const numerator = (radius - dist + 1) * 255;
-    const denominator = radius + 1;
-    return @intCast(@min(@divTrunc(numerator, denominator), 255));
+    const numerator = (radius - @as(i64, @intCast(dist))) * 255;
+    return @intCast(@min(@divTrunc(numerator, radius), 255));
 }
 
-pub fn floorStrength(raw_strength: u8, floor: u8) u8 {
+/// Style for one column at the given band phase: base color lerped toward
+/// the peak, with the peak style's attributes merged in near the center.
+pub fn styleForColumn(config: Config, phase: u32, visual_col: usize) theme.Style {
+    const strength = flooredStrength(strengthForColumn(config, phase, visual_col), config.floor);
+    var style = config.base_style;
+    if (strength > 0) style.fg = lerpColor(config.base_style.fg, config.peak_style.fg, strength);
+    if (strength >= 224) style = mergeStyle(style, config.peak_style);
+    return style;
+}
+
+fn flooredStrength(raw_strength: u8, floor: u8) u8 {
     const raw: i32 = raw_strength;
     const floor_i: i32 = floor;
     if (raw <= floor_i) return 0;
-
-    const numer = (raw - floor_i) * 255;
-    const denom = 255 - floor_i;
-    return @intCast(@divTrunc(numer, denom));
+    return @intCast(@divTrunc((raw - floor_i) * 255, 255 - floor_i));
 }
 
-pub fn lerpColor(from: Color, to: Color, t: u8) Color {
+pub fn lerpColor(from: theme.Color, to: theme.Color, t: u8) theme.Color {
     return switch (from) {
-        .default_color => if (t == 0) from else to,
-        .rgb24 => |from_rgb| switch (to) {
-            .default_color => if (t == 255) to else from,
-            .rgb24 => |to_rgb| Color.rgb(
-                lerpChannel(from_rgb.r, to_rgb.r, t),
-                lerpChannel(from_rgb.g, to_rgb.g, t),
-                lerpChannel(from_rgb.b, to_rgb.b, t),
-            ),
+        .default => if (t == 0) from else to,
+        .rgb => |from_rgb| switch (to) {
+            .default => if (t == 255) to else from,
+            .rgb => |to_rgb| .{ .rgb = .{
+                lerpChannel(from_rgb[0], to_rgb[0], t),
+                lerpChannel(from_rgb[1], to_rgb[1], t),
+                lerpChannel(from_rgb[2], to_rgb[2], t),
+            } },
             .index => if (t < 128) from else to,
         },
         .index => switch (to) {
-            .default_color => if (t == 255) to else from,
-            .rgb24, .index => if (t < 128) from else to,
+            .default => if (t == 255) to else from,
+            .rgb, .index => if (t < 128) from else to,
         },
-    };
-}
-
-pub fn writeSmooth(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, phase: u32, floor: u8) u32 {
-    if (text.len == 0 or y >= region.height or x >= region.width) return 0;
-    var effective_cfg = cfg;
-    effective_cfg.width_method = region.buf.width_method;
-
-    var written_cols: u32 = 0;
-    var visual_col: u32 = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const char_start = i;
-        const width = decodeWidth(text, &i, effective_cfg.width_method);
-        const strength = floorStrength(strengthForColumn(effective_cfg, phase, visual_col), floor);
-        const fg = if (strength == 0) effective_cfg.base_fg else lerpColor(effective_cfg.base_fg, effective_cfg.peak_fg, strength);
-        const attrs = if (strength >= 224) mergeAttrs(effective_cfg.base_attrs, effective_cfg.peak_attrs) else effective_cfg.base_attrs;
-        written_cols += region.writeStr(x + written_cols, y, text[char_start..i], fg, Color.default, attrs);
-        visual_col += width;
-    }
-
-    return written_cols;
-}
-
-fn flushRun(region: Region, x: u32, y: u32, text: []const u8, cfg: Config, bucket: Bucket) u32 {
-    return switch (bucket) {
-        .base => region.writeStr(x, y, text, cfg.base_fg, Color.default, cfg.base_attrs),
-        .edge => region.writeStr(x, y, text, cfg.edge_fg, Color.default, cfg.edge_attrs),
-        .peak => region.writeStr(x, y, text, cfg.peak_fg, Color.default, cfg.peak_attrs),
     };
 }
 
 fn lerpChannel(from: u8, to: u8, t: u8) u8 {
-    const from_i: i32 = from;
-    const to_i: i32 = to;
-    const delta = to_i - from_i;
-    const value = from_i + @divTrunc(delta * @as(i32, t), 255);
+    const delta = @as(i32, to) - @as(i32, from);
+    const value = @as(i32, from) + @divTrunc(delta * @as(i32, t), 255);
     return @intCast(@max(0, @min(value, 255)));
 }
 
-fn mergeAttrs(base: Attributes, overlay: Attributes) Attributes {
+fn mergeStyle(base: theme.Style, overlay: theme.Style) theme.Style {
     return .{
+        .fg = if (overlay.fg == .default) base.fg else overlay.fg,
+        .bg = if (overlay.bg == .default) base.bg else overlay.bg,
         .bold = base.bold or overlay.bold,
         .dim = base.dim or overlay.dim,
-        .italic = base.italic or overlay.italic,
-        .underline = base.underline or overlay.underline,
-        .blink = base.blink or overlay.blink,
-        .inverse = base.inverse or overlay.inverse,
-        .hidden = base.hidden or overlay.hidden,
-        .strikethrough = base.strikethrough or overlay.strikethrough,
+        .ul = if (overlay.ul == .default) base.ul else overlay.ul,
+        .ul_style = if (overlay.ul_style == .off) base.ul_style else overlay.ul_style,
     };
 }
 
-fn decodeWidth(text: []const u8, i: *usize, width_method: grapheme_mod.WidthMethod) u32 {
-    const cluster = grapheme_mod.nextCluster(text, i.*, width_method) orelse return 0;
-    if (cluster.bytes.len == 0) return 0;
-    i.* += cluster.bytes.len;
-    return cluster.width;
+test "phase advances with time and wraps at the period" {
+    const config: Config = .{ .base_style = .{}, .peak_style = .{ .bold = true } };
+    const period: u64 = text_mod.displayWidth("abc") + config.lead_pad_cols + config.tail_pad_cols;
+    const p0 = phaseForMs(0, config, "abc");
+    const half = phaseForMs(@intCast(config.ms_per_col / 2), config, "abc");
+    const p1 = phaseForMs(@intCast(config.ms_per_col), config, "abc");
+    try std.testing.expectEqual(@as(u32, 0), p0);
+    try std.testing.expectEqual(@as(u32, phase_scale / 2), half);
+    try std.testing.expectEqual(@as(u32, phase_scale), p1);
+    const wrapped = phaseForMs(@intCast(period * config.ms_per_col), config, "abc");
+    try std.testing.expectEqual(@as(u32, 0), wrapped);
 }
 
-test "writeSmooth keeps grapheme clusters atomic" {
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 12, 1, .wcwidth);
-    defer buf.deinit();
-
-    const cfg = Config{
-        .base_fg = Color.default,
-        .edge_fg = Color.rgb(120, 120, 120),
-        .peak_fg = Color.rgb(255, 255, 255),
-    };
-    _ = writeSmooth(buf.region(), 0, 0, "e\u{0301}👩‍🚀", cfg, 0, 0);
-
-    try std.testing.expect(buf.get(0, 0).grapheme == .pooled);
-    try std.testing.expect(buf.get(1, 0).grapheme == .pooled);
-    try std.testing.expectEqual(@as(u2, 2), buf.get(1, 0).width);
-    try std.testing.expectEqual(@as(u2, 0), buf.get(2, 0).width);
+test "strength peaks at the band center and fades to zero" {
+    const config: Config = .{ .band_half_width = 2, .base_style = .{}, .peak_style = .{} };
+    const phase: u32 = @as(u32, config.lead_pad_cols) * phase_scale; // center over column 0
+    try std.testing.expectEqual(@as(u8, 255), strengthForColumn(config, phase, 0));
+    try std.testing.expect(strengthForColumn(config, phase, 1) < 255);
+    try std.testing.expect(strengthForColumn(config, phase, 1) > 0);
+    try std.testing.expectEqual(@as(u8, 0), strengthForColumn(config, phase, 5));
 }
 
-test "write groups contiguous shimmer buckets into styled runs" {
-    var buf = try buffer_mod.Buffer.init(std.testing.allocator, 16, 1, .wcwidth);
-    defer buf.deinit();
+test "sub-column phase changes strength before the band reaches the next cell" {
+    const config: Config = .{ .band_half_width = 2, .base_style = .{}, .peak_style = .{} };
+    const whole: u32 = @as(u32, config.lead_pad_cols) * phase_scale;
+    const half = whole + phase_scale / 2;
+    try std.testing.expect(strengthForColumn(config, half, 0) < strengthForColumn(config, whole, 0));
+    try std.testing.expect(strengthForColumn(config, half, 1) > strengthForColumn(config, whole, 1));
+}
 
-    const cfg = Config{
-        .step_ns = 10,
-        .lead_pad_cols = 0,
-        .tail_pad_cols = 0,
-        .band_half_width = 1,
-        .base_fg = Color.rgb(1, 1, 1),
-        .edge_fg = Color.rgb(2, 2, 2),
-        .peak_fg = Color.rgb(3, 3, 3),
+test "rgb styles interpolate instead of jumping to peak" {
+    const config: Config = .{
+        .band_half_width = 2,
+        .base_style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } } },
+        .peak_style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } } },
     };
-
-    _ = write(buf.region(), 0, 0, "abc", cfg, 1);
-    try std.testing.expect(buf.get(0, 0).fg.eql(cfg.edge_fg));
-    try std.testing.expect(buf.get(1, 0).fg.eql(cfg.peak_fg));
-    try std.testing.expect(buf.get(2, 0).fg.eql(cfg.edge_fg));
+    const phase = @as(u32, config.lead_pad_cols) * phase_scale + phase_scale / 2;
+    const style = styleForColumn(config, phase, 0);
+    try std.testing.expect(style.fg == .rgb);
+    try std.testing.expect(style.fg.rgb[0] > 0);
+    try std.testing.expect(style.fg.rgb[0] < 255);
 }

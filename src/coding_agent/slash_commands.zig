@@ -1,162 +1,120 @@
+//! Small slash-command catalog and parser. This is deliberately metadata +
+//! typed ids, not a callback registry: SessionRuntime remains the owner that
+//! applies command effects.
 const std = @import("std");
 
-pub const CommandAction = union(enum) {
-    builtin: *const fn (args: []const u8, ctx: *CommandContext) anyerror!void,
+pub const command_count_max: usize = 32;
+pub const name_bytes_max: usize = 32;
+pub const summary_bytes_max: usize = 96;
 
-    extension: void,
-
-    prompt_template,
-
-    skill,
+pub const Id = enum {
+    help,
+    session,
+    model,
+    resume_session,
+    compact,
 };
 
-pub const CommandContext = struct {
-    _reserved: ?*anyopaque = null,
+pub const PickerKind = enum {
+    none,
+    model,
+    session,
 };
 
-pub const Source = enum {
-    builtin,
-    extension,
-    prompt,
-    skill,
-};
-
-pub const SlashCommand = struct {
+pub const Command = struct {
+    id: Id,
     name: []const u8,
-    description: ?[]const u8 = null,
-    source: Source,
-    action: CommandAction,
+    summary: []const u8,
+    picker: PickerKind = .none,
 };
 
-fn builtinMarker(_: []const u8, _: *CommandContext) anyerror!void {}
-
-pub const BUILTIN_COMMANDS = [_]SlashCommand{
-    .{ .name = "model", .description = "Select model", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "compact", .description = "Compact session context", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "new", .description = "Start a new session", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "clear", .description = "Clear conversation", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "quit", .description = "Quit zi", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "resume", .description = "Resume a different session", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "fork", .description = "Create a new fork from a previous message", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "tree", .description = "Navigate session tree", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "export", .description = "Export session", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "import", .description = "Import and resume a session from a JSONL file", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "copy", .description = "Copy last agent message to clipboard", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "name", .description = "Set session display name", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "session", .description = "Show session info and stats", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "hotkeys", .description = "Show all keyboard shortcuts", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "memory", .description = "Show memory telemetry", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "tui", .description = "Show TUI diagnostics", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "logs", .description = "Show log path or write a log snapshot", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "settings", .description = "Open settings menu", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "login", .description = "Login with OAuth provider", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "logout", .description = "Logout from OAuth provider", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "reload", .description = "Reload keybindings, extensions, skills, prompts, and themes", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "share", .description = "Share session as a secret GitHub gist", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "changelog", .description = "Show changelog entries", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
-    .{ .name = "scoped-models", .description = "Enable/disable models for Ctrl+P cycling", .source = .builtin, .action = .{ .builtin = &builtinMarker } },
+pub const Invocation = struct {
+    name: []const u8,
+    args: []const u8,
 };
 
-pub const CommandRegistry = struct {
-    builtins: []const SlashCommand,
-    dynamic: std.ArrayListUnmanaged(SlashCommand) = .empty,
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) CommandRegistry {
-        return .{
-            .builtins = &BUILTIN_COMMANDS,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *CommandRegistry) void {
-        for (self.dynamic.items) |*cmd| {
-            self.allocator.free(cmd.name);
-            if (cmd.description) |d| self.allocator.free(d);
-        }
-        self.dynamic.deinit(self.allocator);
-    }
-
-    pub fn register(self: *CommandRegistry, cmd: SlashCommand) void {
-        self.dynamic.append(self.allocator, cmd) catch {
-            self.allocator.free(cmd.name);
-            if (cmd.description) |d| self.allocator.free(d);
-            return;
-        };
-    }
-
-    pub fn unregister(self: *CommandRegistry, name: []const u8) bool {
-        for (self.dynamic.items, 0..) |_, i| {
-            if (std.mem.eql(u8, self.dynamic.items[i].name, name)) {
-                const cmd = self.dynamic.orderedRemove(i);
-                self.allocator.free(cmd.name);
-                if (cmd.description) |d| self.allocator.free(d);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    pub fn count(self: *const CommandRegistry) usize {
-        return self.builtins.len + self.dynamic.items.len;
-    }
-
-    pub fn findCommand(self: *const CommandRegistry, name: []const u8) ?*const SlashCommand {
-        for (self.builtins) |*cmd| {
-            if (std.mem.eql(u8, cmd.name, name)) return cmd;
-        }
-        for (self.dynamic.items) |*cmd| {
-            if (std.mem.eql(u8, cmd.name, name)) return cmd;
-        }
-        return null;
-    }
+pub const builtins = [_]Command{
+    .{ .id = .help, .name = "help", .summary = "Show commands" },
+    .{ .id = .session, .name = "session", .summary = "Show session info and stats" },
+    .{
+        .id = .model,
+        .name = "model",
+        .summary = "Select model",
+        .picker = .model,
+    },
+    .{
+        .id = .resume_session,
+        .name = "resume",
+        .summary = "Resume session",
+        .picker = .session,
+    },
+    .{ .id = .compact, .name = "compact", .summary = "Compact session context" },
 };
 
-test "CommandRegistry finds builtin commands" {
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    try std.testing.expect(reg.count() > 0);
-    const quit = reg.findCommand("quit").?;
-    try std.testing.expectEqualStrings("quit", quit.name);
-    try std.testing.expectEqualStrings("Quit zi", quit.description.?);
-    try std.testing.expect(reg.findCommand("model") != null);
-    try std.testing.expect(reg.findCommand("settings") != null);
-    try std.testing.expect(reg.findCommand("nonexistent") == null);
+comptime {
+    if (builtins.len > command_count_max) @compileError("too many builtin slash commands");
+    for (builtins) |command| {
+        if (command.name.len == 0 or command.name.len > name_bytes_max) @compileError("invalid slash command name");
+        if (command.summary.len == 0 or command.summary.len > summary_bytes_max) {
+            @compileError("invalid slash command summary");
+        }
+    }
 }
 
-test "CommandRegistry register and unregister dynamic" {
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
-
-    reg.register(.{
-        .name = try std.testing.allocator.dupe(u8, "myplugin"),
-        .description = try std.testing.allocator.dupe(u8, "A test plugin"),
-        .source = .extension,
-        .action = .prompt_template,
-    });
-
-    const found = reg.findCommand("myplugin");
-    try std.testing.expect(found != null);
-    try std.testing.expectEqualStrings("myplugin", found.?.name);
-
-    try std.testing.expect(reg.unregister("myplugin"));
-    try std.testing.expect(reg.findCommand("myplugin") == null);
-    try std.testing.expect(!reg.unregister("myplugin"));
+pub fn lookup(name: []const u8) ?Command {
+    for (builtins) |command| {
+        if (std.mem.eql(u8, command.name, name)) return command;
+    }
+    return null;
 }
 
-test "CommandRegistry dynamic commands provide command names" {
-    var reg = CommandRegistry.init(std.testing.allocator);
-    defer reg.deinit();
+pub fn parseInvocation(text: []const u8) ?Invocation {
+    if (text.len < 2 or text[0] != '/') return null;
+    var end: usize = 1;
+    while (end < text.len and !std.ascii.isWhitespace(text[end])) end += 1;
+    if (end == 1) return null;
+    var args_start = end;
+    while (args_start < text.len and std.ascii.isWhitespace(text[args_start])) args_start += 1;
+    return .{ .name = text[1..end], .args = std.mem.trim(u8, text[args_start..], " \t\r\n") };
+}
 
-    reg.register(.{
-        .name = try std.testing.allocator.dupe(u8, "quit"),
-        .description = try std.testing.allocator.dupe(u8, "Extension quit"),
-        .source = .extension,
-        .action = .prompt_template,
-    });
+pub fn parseName(text: []const u8) ?[]const u8 {
+    const invocation = parseInvocation(text) orelse return null;
+    return invocation.name;
+}
 
-    const found = reg.findCommand("quit").?;
-    try std.testing.expectEqual(Source.builtin, found.source);
-    try std.testing.expectEqualStrings("Quit zi", found.description.?);
+pub fn formatAvailable(buffer: []u8) []const u8 {
+    var written: usize = 0;
+    written = appendLiteral(buffer, written, "available commands: ") orelse return "available commands";
+    for (builtins, 0..) |command, index| {
+        if (index > 0) written = appendLiteral(buffer, written, ", ") orelse return "available commands";
+        written = appendLiteral(buffer, written, "/") orelse return "available commands";
+        written = appendLiteral(buffer, written, command.name) orelse return "available commands";
+    }
+    return buffer[0..written];
+}
+
+fn appendLiteral(buffer: []u8, written: usize, text: []const u8) ?usize {
+    if (written + text.len > buffer.len) return null;
+    @memcpy(buffer[written..][0..text.len], text);
+    return written + text.len;
+}
+
+test "slash command parser extracts name and trimmed args" {
+    const parsed = parseInvocation("/model  openai/gpt-5.1 \n").?;
+    try std.testing.expectEqualStrings("model", parsed.name);
+    try std.testing.expectEqualStrings("openai/gpt-5.1", parsed.args);
+    try std.testing.expect(parseInvocation("/") == null);
+    try std.testing.expect(parseInvocation("/ help") == null);
+    try std.testing.expect(parseInvocation("hello") == null);
+}
+
+test "slash command catalog formats help from builtin source" {
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "available commands: /help, /session, /model, /resume, /compact",
+        formatAvailable(&buffer),
+    );
+    try std.testing.expectEqual(Id.model, lookup("model").?.id);
+    try std.testing.expect(lookup("missing") == null);
 }

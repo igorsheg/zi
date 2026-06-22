@@ -1,226 +1,134 @@
+//! Deterministic text-reveal animation for short status strings.
+//!
+//! This is deliberately not the stateful widget shape from the sketch: Zi's
+//! status store already owns the text and the animation start time. Render can
+//! derive each frame from (text, start_ms, now_ms) with no allocation, I/O, or
+//! hidden randomness.
 const std = @import("std");
+const text_mod = @import("text.zig");
 
-pub const ShuffleText = struct {
-    allocator: std.mem.Allocator,
-    options: Options,
-    prng: std.Random.DefaultPrng,
-
-    original: []const u8 = "",
-    original_spans: std.ArrayList(Span) = .empty,
-    random_spans: std.ArrayList(Span) = .empty,
-    reveal_at: std.ArrayList(u16) = .empty,
-    output: std.ArrayList(u8) = .empty,
-
-    running: bool = false,
-    start_ms: u64 = 0,
-    next_frame_ms: u64 = 0,
-
-    pub const Options = struct {
-        duration_ms: u64 = 600,
-
-        frame_ms: u64 = 33,
-
-        random_chars: []const u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
-
-        empty_char: []const u8 = "-",
-
-        io: std.Io = std.Options.debug_io,
-
-        seed: ?u64 = null,
-    };
-
-    pub const Error = error{
-        EmptyRandomCharacterSet,
-        InvalidUtf8,
-        DurationIsZero,
-    } || std.mem.Allocator.Error;
-
-    pub fn init(allocator: std.mem.Allocator, options: Options) Error!ShuffleText {
-        if (options.duration_ms == 0) return error.DurationIsZero;
-
-        var self = ShuffleText{
-            .allocator = allocator,
-            .options = options,
-            .prng = std.Random.DefaultPrng.init(options.seed orelse randomSeed(options.io)),
-        };
-        errdefer self.deinit();
-
-        try self.setRandomChars(options.random_chars);
-        try validateUtf8(options.empty_char);
-
-        return self;
-    }
-
-    pub fn deinit(self: *ShuffleText) void {
-        self.original_spans.deinit(self.allocator);
-        self.random_spans.deinit(self.allocator);
-        self.reveal_at.deinit(self.allocator);
-        self.output.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    pub fn setText(self: *ShuffleText, text: []const u8) Error!void {
-        self.original = text;
-        self.original_spans.clearRetainingCapacity();
-        try appendUtf8Spans(self.allocator, &self.original_spans, text);
-        try self.reveal_at.resize(self.allocator, self.original_spans.items.len);
-
-        self.output.clearRetainingCapacity();
-        try self.output.appendSlice(self.allocator, text);
-    }
-
-    pub fn setRandomChars(self: *ShuffleText, chars: []const u8) Error!void {
-        self.random_spans.clearRetainingCapacity();
-        try appendUtf8Spans(self.allocator, &self.random_spans, chars);
-        if (self.random_spans.items.len == 0) return error.EmptyRandomCharacterSet;
-        self.options.random_chars = chars;
-    }
-
-    pub fn start(self: *ShuffleText, now_ms: u64) Error!void {
-        self.running = true;
-        self.start_ms = now_ms;
-        self.next_frame_ms = now_ms;
-
-        const len = self.original_spans.items.len;
-        try self.reveal_at.resize(self.allocator, len);
-        if (len == 0) {
-            self.running = false;
-            return;
-        }
-
-        const random = self.prng.random();
-        const max = std.math.maxInt(u16);
-        for (self.reveal_at.items, 0..) |*slot, i| {
-            const rate: u32 = @intCast((i * max) / len);
-            const remaining: u32 = max - rate;
-            const jitter = random.intRangeLessThan(u32, 0, remaining + 1);
-            slot.* = @intCast(rate + jitter);
-        }
-
-        self.output.clearRetainingCapacity();
-        for (0..len) |_| try self.output.appendSlice(self.allocator, self.options.empty_char);
-    }
-
-    pub fn stop(self: *ShuffleText) void {
-        self.running = false;
-    }
-
-    pub fn isRunning(self: ShuffleText) bool {
-        return self.running;
-    }
-
-    pub fn rendered(self: ShuffleText) []const u8 {
-        return self.output.items;
-    }
-
-    pub fn tick(self: *ShuffleText, now_ms: u64) Error!bool {
-        if (!self.running) return false;
-        if (now_ms < self.next_frame_ms) return false;
-
-        self.next_frame_ms = now_ms + self.options.frame_ms;
-
-        const elapsed = now_ms - self.start_ms;
-        if (elapsed >= self.options.duration_ms) {
-            self.running = false;
-            self.output.clearRetainingCapacity();
-            try self.output.appendSlice(self.allocator, self.original);
-            return true;
-        }
-
-        const max = std.math.maxInt(u16);
-        const percent: u32 = @intCast((elapsed * max) / self.options.duration_ms);
-        const random = self.prng.random();
-
-        self.output.clearRetainingCapacity();
-        for (self.original_spans.items, 0..) |span, i| {
-            const reveal = self.reveal_at.items[i];
-            if (percent >= reveal) {
-                try self.output.appendSlice(self.allocator, span.bytes(self.original));
-            } else if (percent < reveal / 3) {
-                try self.output.appendSlice(self.allocator, self.options.empty_char);
-            } else {
-                const random_span = self.random_spans.items[random.uintLessThan(usize, self.random_spans.items.len)];
-                try self.output.appendSlice(self.allocator, random_span.bytes(self.options.random_chars));
-            }
-        }
-
-        return true;
-    }
+pub const Config = struct {
+    duration_ms: u64 = 600,
+    frame_ms: u64 = 33,
+    random_chars: []const u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+    empty_char: []const u8 = "-",
+    seed: u64 = 0x9e37_79b9_7f4a_7c15,
 };
 
-const Span = struct {
+pub const Span = struct {
     start: usize,
     len: usize,
 
-    fn bytes(self: Span, source: []const u8) []const u8 {
+    pub fn bytes(self: Span, source: []const u8) []const u8 {
         return source[self.start .. self.start + self.len];
     }
 };
 
-fn randomSeed(io: std.Io) u64 {
-    var bytes: [8]u8 = undefined;
-    io.randomSecure(&bytes) catch io.random(&bytes);
-    return std.mem.readInt(u64, &bytes, .little);
+pub fn isRunning(now_ms: i64, start_ms: i64, config: Config) bool {
+    if (config.duration_ms == 0) return false;
+    const elapsed = elapsedMs(now_ms, start_ms);
+    return elapsed <= config.duration_ms + config.frame_ms;
 }
 
-fn appendUtf8Spans(allocator: std.mem.Allocator, spans: *std.ArrayList(Span), text: []const u8) ShuffleText.Error!void {
-    var i: usize = 0;
-    while (i < text.len) {
-        const len = try utf8SequenceLength(text[i]);
-        if (i + len > text.len) return error.InvalidUtf8;
-        for (text[i + 1 .. i + len]) |byte| {
-            if ((byte & 0b1100_0000) != 0b1000_0000) return error.InvalidUtf8;
-        }
-        try spans.append(allocator, .{ .start = i, .len = len });
-        i += len;
+pub fn countSpans(text: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (nextSpan(text, index)) |span| {
+        count += 1;
+        index = span.start + span.len;
     }
+    return count;
 }
 
-fn validateUtf8(text: []const u8) ShuffleText.Error!void {
-    var i: usize = 0;
-    while (i < text.len) {
-        const len = try utf8SequenceLength(text[i]);
-        if (i + len > text.len) return error.InvalidUtf8;
-        for (text[i + 1 .. i + len]) |byte| {
-            if ((byte & 0b1100_0000) != 0b1000_0000) return error.InvalidUtf8;
-        }
-        i += len;
+pub fn nextSpan(text: []const u8, start: usize) ?Span {
+    if (start >= text.len) return null;
+    const grapheme = text_mod.nextGrapheme(text[start..]);
+    if (grapheme.end == 0) return null;
+    return .{ .start = start, .len = grapheme.end };
+}
+
+pub fn renderedSpan(
+    config: Config,
+    text: []const u8,
+    span: Span,
+    span_index: usize,
+    span_count: usize,
+    now_ms: i64,
+    start_ms: i64,
+) []const u8 {
+    if (span_count == 0 or config.duration_ms == 0) return span.bytes(text);
+
+    const elapsed = elapsedMs(now_ms, start_ms);
+    if (elapsed >= config.duration_ms) return span.bytes(text);
+
+    const reveal = revealAt(config.seed, span_index, span_count);
+    const percent = progress(elapsed, config.duration_ms);
+    if (percent >= reveal) return span.bytes(text);
+    if (percent < reveal / 3) return config.empty_char;
+
+    const random_count = countSpans(config.random_chars);
+    if (random_count == 0) return config.empty_char;
+    const frame = elapsed / @max(config.frame_ms, 1);
+    const random_index = boundedHash(config.seed ^ frame, span_index, random_count);
+    return spanAt(config.random_chars, random_index) orelse config.empty_char;
+}
+
+fn spanAt(text: []const u8, target: usize) ?[]const u8 {
+    var index: usize = 0;
+    var current: usize = 0;
+    while (nextSpan(text, index)) |span| {
+        if (current == target) return span.bytes(text);
+        current += 1;
+        index = span.start + span.len;
     }
+    return null;
 }
 
-fn utf8SequenceLength(byte: u8) error{InvalidUtf8}!usize {
-    if (byte < 0x80) return 1;
-    if ((byte & 0b1110_0000) == 0b1100_0000) return 2;
-    if ((byte & 0b1111_0000) == 0b1110_0000) return 3;
-    if ((byte & 0b1111_1000) == 0b1111_0000) return 4;
-    return error.InvalidUtf8;
+fn revealAt(seed: u64, index: usize, count: usize) u32 {
+    if (count == 0) return 0;
+    const max = std.math.maxInt(u16);
+    const rate: u32 = @intCast((@as(u128, index) * max) / count);
+    const remaining = max - rate;
+    const jitter = boundedHash(seed, index, remaining + 1);
+    return rate + @as(u32, @intCast(jitter));
 }
 
-test "shuffle text owns randomness and rate limits frames" {
-    const testing = std.testing;
-    var shuffle = try ShuffleText.init(testing.allocator, .{ .seed = 1 });
-    defer shuffle.deinit();
+fn progress(elapsed: u64, duration: u64) u32 {
+    if (duration == 0 or elapsed >= duration) return std.math.maxInt(u16);
+    return @intCast((@as(u128, elapsed) * std.math.maxInt(u16)) / duration);
+}
 
-    try shuffle.setText("TEXT");
-    try shuffle.start(1000);
+fn elapsedMs(now_ms: i64, start_ms: i64) u64 {
+    if (now_ms <= start_ms) return 0;
+    return @intCast(now_ms - start_ms);
+}
 
-    try testing.expectEqualStrings("----", shuffle.rendered());
-    try testing.expect(try shuffle.tick(1000));
-    try testing.expect(!try shuffle.tick(1001));
-    try testing.expect(try shuffle.tick(1033));
-    try testing.expect(try shuffle.tick(1600));
-    try testing.expectEqualStrings("TEXT", shuffle.rendered());
-    try testing.expect(!shuffle.isRunning());
+fn boundedHash(seed: u64, value: usize, bound: usize) usize {
+    std.debug.assert(bound > 0);
+    return @intCast(mix(seed +% @as(u64, @intCast(value))) % bound);
+}
+
+fn mix(value: u64) u64 {
+    var x = value +% 0x9e37_79b9_7f4a_7c15;
+    x = (x ^ (x >> 30)) *% 0xbf58_476d_1ce4_e5b9;
+    x = (x ^ (x >> 27)) *% 0x94d0_49bb_1331_11eb;
+    return x ^ (x >> 31);
+}
+
+test "shuffle text rate limits frames and resolves to original" {
+    const config: Config = .{ .seed = 1 };
+    const text = "TEXT";
+    const first = nextSpan(text, 0).?;
+    try std.testing.expectEqualStrings("-", renderedSpan(config, text, first, 0, countSpans(text), 1000, 1000));
+    try std.testing.expect(isRunning(1000, 1000, config));
+    try std.testing.expectEqualStrings("T", renderedSpan(config, text, first, 0, countSpans(text), 1600, 1000));
+    try std.testing.expect(!isRunning(1634, 1000, config));
 }
 
 test "shuffle text keeps utf8 random characters intact" {
-    const testing = std.testing;
-    var shuffle = try ShuffleText.init(testing.allocator, .{ .seed = 2, .duration_ms = 1000, .random_chars = "░▒▓█" });
-    defer shuffle.deinit();
-
-    try shuffle.setText("abcd");
-    try shuffle.start(0);
-    _ = try shuffle.tick(400);
-
-    try testing.expect(std.unicode.utf8ValidateSlice(shuffle.rendered()));
+    const config: Config = .{ .seed = 2, .duration_ms = 1000, .random_chars = "░▒▓█" };
+    const text = "abcd";
+    const span = nextSpan(text, 2).?;
+    const rendered = renderedSpan(config, text, span, 2, countSpans(text), 400, 0);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(rendered));
 }
