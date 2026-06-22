@@ -111,13 +111,19 @@ pub fn read(
 
     if (wayland) {
         return readViaWlPaste(allocator, io, task_runtime, environ) catch |err| switch (err) {
-            error.NoImage, error.ToolUnavailable, error.CommandFailed => readViaXclip(allocator, io, task_runtime, environ),
+            error.NoImage,
+            error.ToolUnavailable,
+            error.CommandFailed,
+            => readViaXclip(allocator, io, task_runtime, environ),
             else => err,
         };
     }
 
     return readViaXclip(allocator, io, task_runtime, environ) catch |err| switch (err) {
-        error.NoImage, error.ToolUnavailable, error.CommandFailed => readViaWlPaste(allocator, io, task_runtime, environ),
+        error.NoImage,
+        error.ToolUnavailable,
+        error.CommandFailed,
+        => readViaWlPaste(allocator, io, task_runtime, environ),
         else => err,
     };
 }
@@ -200,7 +206,15 @@ fn readViaWlPaste(
     task_runtime: *runtime.Runtime,
     environ: ?*const std.process.Environ.Map,
 ) ReadError!ClipboardImage {
-    const list = try runCapture(allocator, io, task_runtime, &.{ "wl-paste", "--list-types" }, list_timeout_ms, 16 * 1024, environ);
+    const list = try runCapture(
+        allocator,
+        io,
+        task_runtime,
+        &.{ "wl-paste", "--list-types" },
+        list_timeout_ms,
+        16 * 1024,
+        environ,
+    );
     defer allocator.free(list.stdout);
     defer allocator.free(list.stderr);
     if (!exitedSuccessfully(list.term)) return error.ToolUnavailable;
@@ -276,7 +290,13 @@ fn readViaXclip(
 }
 
 test "selects preferred supported image type" {
-    try std.testing.expectEqualStrings("image/png", selectPreferredImageMimeType("text/plain\nimage/jpeg\nimage/png\n").?);
-    try std.testing.expectEqualStrings("image/webp;foo", selectPreferredImageMimeType("image/bmp\nimage/webp;foo\n").?);
+    try std.testing.expectEqualStrings(
+        "image/png",
+        selectPreferredImageMimeType("text/plain\nimage/jpeg\nimage/png\n").?,
+    );
+    try std.testing.expectEqualStrings(
+        "image/webp;foo",
+        selectPreferredImageMimeType("image/bmp\nimage/webp;foo\n").?,
+    );
     try std.testing.expect(selectPreferredImageMimeType("text/plain\n") == null);
 }

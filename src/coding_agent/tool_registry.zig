@@ -147,7 +147,8 @@ pub const BuiltinTools = struct {
         );
         try out.append(
             self.symbols.tool(),
-            "List functions, tests, and const/var declarations in a .zig file with line numbers. Use before read to navigate large Zig files.",
+            "List functions, tests, and const/var declarations in a .zig file with line numbers. " ++
+                "Use before read to navigate large Zig files.",
         );
         return out;
     }

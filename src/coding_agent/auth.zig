@@ -100,7 +100,12 @@ pub const AuthStore = struct {
     fn reload(self: *AuthStore, io: std.Io) !void {
         const dir = self.dir orelse return error.AuthStoreReadOnly;
         const auth_path = self.auth_path orelse return error.AuthStoreReadOnly;
-        const bytes = dir.readFileAlloc(io, auth_path, self.allocator, .limited(max_auth_file_bytes)) catch |err| switch (err) {
+        const bytes = dir.readFileAlloc(
+            io,
+            auth_path,
+            self.allocator,
+            .limited(max_auth_file_bytes),
+        ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return self.replaceCredentials(try self.allocator.alloc(OAuthCredential, 0)),
         };

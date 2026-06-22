@@ -48,7 +48,7 @@ const Palette = struct {
     diff_del_bg: Rgb,
 };
 
-const kanso_zen = Palette{
+const kanso_zen: Palette = .{
     .bg0 = .{ 0x09, 0x0e, 0x13 },
     .bg1 = .{ 0x1c, 0x1e, 0x25 },
     .bg2 = .{ 0x22, 0x26, 0x2d },

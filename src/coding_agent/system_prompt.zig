@@ -84,7 +84,11 @@ fn appendGuidelines(
         try appendGuideline(writer, "Use bash for shell-based file exploration");
     }
     if (containsString(selected_tools, "symbols")) {
-        try appendGuideline(writer, "Use symbols to locate declarations in a .zig file before reading it; then read with the reported line as offset instead of reading the whole file");
+        try appendGuideline(
+            writer,
+            "Use symbols to locate declarations in a .zig file before reading it; " ++
+                "then read with the reported line as offset instead of reading the whole file",
+        );
     }
 
     try appendGuideline(writer, "Be concise in your responses");

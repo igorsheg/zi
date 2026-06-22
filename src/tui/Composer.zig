@@ -227,7 +227,10 @@ pub fn submitSlice(self: *const Composer) ?[]const u8 {
 
 pub fn submitOwned(self: *const Composer, gpa: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
     const text_to_submit = self.submitSlice() orelse return null;
-    if (self.pastes.items.len == 0) return try gpa.dupe(u8, text_to_submit);
+    if (self.pastes.items.len == 0) {
+        const copy = try gpa.dupe(u8, text_to_submit);
+        return copy;
+    }
 
     var expanded: std.ArrayList(u8) = .empty;
     defer expanded.deinit(gpa);
@@ -243,7 +246,8 @@ pub fn submitOwned(self: *const Composer, gpa: std.mem.Allocator) error{OutOfMem
     }
     const trimmed = std.mem.trim(u8, expanded.items, " \t\n\r");
     if (trimmed.len == 0) return null;
-    return try gpa.dupe(u8, trimmed);
+    const copy = try gpa.dupe(u8, trimmed);
+    return copy;
 }
 
 pub fn expandedTextOwned(self: *const Composer, gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
@@ -279,7 +283,7 @@ const PasteSpan = struct {
 fn pasteSpanContaining(self: *const Composer, byte_index: usize) ?PasteSpan {
     for (self.pastes.items, 0..) |paste, paste_index| {
         var search_start: usize = 0;
-        while (std.mem.indexOfPos(u8, self.bytes.items, search_start, paste.marker)) |start| {
+        while (std.mem.findPos(u8, self.bytes.items, search_start, paste.marker)) |start| {
             const end = start + paste.marker.len;
             if (byte_index >= start and byte_index < end) return .{
                 .paste_index = paste_index,

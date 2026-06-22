@@ -55,13 +55,21 @@ pub const Result = struct {
         }
         const index = self.item_len;
         self.item_len += 1;
-        self.items[index].id_len = copyRawField(client_protocol.completion_id_bytes_max, &self.items[index].id, path);
+        self.items[index].id_len = copyRawField(
+            client_protocol.completion_id_bytes_max,
+            &self.items[index].id,
+            path,
+        );
         self.items[index].label_len = copyRawField(
             client_protocol.completion_label_bytes_max,
             &self.items[index].label,
             pathLabel(path),
         );
-        self.items[index].detail_len = copyRawField(client_protocol.completion_detail_bytes_max, &self.items[index].detail, detail);
+        self.items[index].detail_len = copyRawField(
+            client_protocol.completion_detail_bytes_max,
+            &self.items[index].detail,
+            detail,
+        );
     }
 
     fn sort(self: *Result) void {
@@ -92,7 +100,7 @@ pub fn build(root_dir: std.Io.Dir, query: []const u8) !*Result {
     result.* = .{};
     result.query_len = copyRawField(client_protocol.file_completion_query_bytes_max, &result.query, query);
     const bounded_query = result.querySlice();
-    const scope_end = if (std.mem.lastIndexOfScalar(u8, bounded_query, '/')) |slash| slash + 1 else 0;
+    const scope_end = if (std.mem.findScalarLast(u8, bounded_query, '/')) |slash| slash + 1 else 0;
     const scope = bounded_query[0..scope_end];
     const leaf_query = bounded_query[scope_end..];
     if (leaf_query.len == 0) {
@@ -216,7 +224,7 @@ fn collectMatches(
     var entries_seen: usize = 0;
     var scope_matches: usize = 0;
 
-    const scope_end = if (std.mem.lastIndexOfScalar(u8, query, '/')) |slash| slash + 1 else 0;
+    const scope_end = if (std.mem.findScalarLast(u8, query, '/')) |slash| slash + 1 else 0;
     const scope = query[0..scope_end];
     const leaf_query = query[scope_end..];
 
@@ -264,7 +272,11 @@ fn collectMatches(
                 continue;
             }
             if (!pathMatchesQuery(completion_path, query, scope, leaf_query)) continue;
-            if (scope.len > 0 and is_dir and !std.mem.eql(u8, completion_path, scope) and scope_matches >= scope_match_max) {
+            if (scope.len > 0 and
+                is_dir and
+                !std.mem.eql(u8, completion_path, scope) and
+                scope_matches >= scope_match_max)
+            {
                 result.truncated = true;
                 continue;
             }

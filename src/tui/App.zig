@@ -1707,7 +1707,11 @@ test "composer file completion keeps picker open after accepting directory" {
 
     const items = [_]Picker.Item{
         .{ .id = "src/coding_agent/", .label = "src/coding_agent/", .detail = "directory" },
-        .{ .id = "src/coding_agent/session_runtime.zig", .label = "src/coding_agent/session_runtime.zig", .detail = "src/coding_agent" },
+        .{
+            .id = "src/coding_agent/session_runtime.zig",
+            .label = "src/coding_agent/session_runtime.zig",
+            .detail = "src/coding_agent",
+        },
     };
     _ = try app.apply(gpa, .{ .set_file_completions = .{
         .id = 4,

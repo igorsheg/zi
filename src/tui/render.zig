@@ -1506,8 +1506,26 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
         painter.writeText(x + 1, row_y, marker, item_style);
         switch (picker.layout) {
             .line => drawLinePickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
-            .two_column => drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
-            .four_column => drawFourColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
+            .two_column => drawTwoColumnPickerItem(
+                app,
+                painter,
+                item,
+                x,
+                row_y,
+                inner_width,
+                item_style,
+                detail_style,
+            ),
+            .four_column => drawFourColumnPickerItem(
+                app,
+                painter,
+                item,
+                x,
+                row_y,
+                inner_width,
+                item_style,
+                detail_style,
+            ),
         }
     }
 
@@ -1574,7 +1592,15 @@ fn drawTwoColumnPickerItem(
 
     const label_width = content_width - detail_width - gap_width;
     drawPickerCell(painter, label_x, row_y, item.labelSlice(), label_width, .left, item_style);
-    drawPickerCell(painter, advance(label_x, label_width + gap_width), row_y, detail, detail_width, .left, detail_style);
+    drawPickerCell(
+        painter,
+        advance(label_x, label_width + gap_width),
+        row_y,
+        detail,
+        detail_width,
+        .left,
+        detail_style,
+    );
 }
 
 fn drawFourColumnPickerItem(

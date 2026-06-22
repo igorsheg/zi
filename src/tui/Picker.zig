@@ -350,7 +350,7 @@ fn pathItemScore(item: *const OwnedItem, query_text: []const u8, search_detail: 
     const path = item.idSlice();
     const leaf = pathLeaf(path);
     const is_dir = std.mem.endsWith(u8, path, "/");
-    if (std.mem.lastIndexOfScalar(u8, query_text, '/')) |slash| {
+    if (std.mem.findScalarLast(u8, query_text, '/')) |slash| {
         const scope = query_text[0 .. slash + 1];
         const tail = query_text[slash + 1 ..];
         const scope_start = indexOfAsciiIgnoreCase(path, scope) orelse return null;

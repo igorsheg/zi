@@ -665,7 +665,7 @@ const InteractiveController = struct {
 
     fn submitPrompt(self: *InteractiveController, prompt: []const u8) !void {
         var attachments = try self.clipboardImageAttachmentsFromPrompt(prompt);
-        defer attachments.deinit(self.allocator);
+        defer PromptImageAttachments.deinit(self.allocator, &attachments);
         const envelope = try client_protocol.CommandEnvelope.initSubmitPromptWithImages(
             self.allocator,
             null,
@@ -683,7 +683,7 @@ const InteractiveController = struct {
             return self.list.items;
         }
 
-        fn deinit(self: *PromptImageAttachments, allocator: std.mem.Allocator) void {
+        fn deinit(allocator: std.mem.Allocator, self: *PromptImageAttachments) void {
             for (self.list.items) |image| {
                 allocator.free(image.data);
                 allocator.free(image.mime_type);
@@ -695,7 +695,7 @@ const InteractiveController = struct {
 
     fn clipboardImageAttachmentsFromPrompt(self: *InteractiveController, prompt: []const u8) !PromptImageAttachments {
         var attachments: PromptImageAttachments = .{};
-        errdefer attachments.deinit(self.allocator);
+        errdefer PromptImageAttachments.deinit(self.allocator, &attachments);
         var index: usize = 0;
         while (index < prompt.len and attachments.list.items.len < clipboard_image_attachment_count_max) {
             const at = std.mem.indexOfScalarPos(u8, prompt, index, '@') orelse break;
@@ -763,7 +763,8 @@ const InteractiveController = struct {
             return;
         };
         const query = tui.text.utf8Prefix(raw_query, client_protocol.file_completion_query_bytes_max);
-        if (self.last_file_completion_query_active and std.mem.eql(u8, query, self.last_file_completion_query.items)) return;
+        if (self.last_file_completion_query_active and
+            std.mem.eql(u8, query, self.last_file_completion_query.items)) return;
         self.last_file_completion_query_active = true;
         self.last_file_completion_query.clearRetainingCapacity();
         try self.last_file_completion_query.appendSlice(self.allocator, query);

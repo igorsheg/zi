@@ -1119,7 +1119,8 @@ pub const SessionRuntime = struct {
             try self.enqueuePromptCommand(request_id, command, .failed, "cancel active operation before compaction");
             return;
         }
-        const compaction_run = self.session.startCompactionRun(.manual, false, if (args.len == 0) null else args) catch |err| {
+        const compaction_prompt = if (args.len == 0) null else args;
+        const compaction_run = self.session.startCompactionRun(.manual, false, compaction_prompt) catch |err| {
             try self.enqueuePromptCommand(request_id, command, .failed, @errorName(err));
             return;
         } orelse {
@@ -1689,7 +1690,15 @@ fn buildResumeCompletionListWorker(
     agent_dir: []const u8,
     current_session_leaf: ?[]const u8,
 ) anyerror!CompletionLoadResult {
-    return .{ .resume_sessions = try buildResumeCompletionListFor(allocator, io, dir, environ, cwd, agent_dir, current_session_leaf) };
+    return .{ .resume_sessions = try buildResumeCompletionListFor(
+        allocator,
+        io,
+        dir,
+        environ,
+        cwd,
+        agent_dir,
+        current_session_leaf,
+    ) };
 }
 
 fn buildProjectFileCompletionWorker(
@@ -3104,7 +3113,10 @@ test "session runtime manual compact rejects while active" {
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event.event == .prompt_command);
     try std.testing.expect(event.event.prompt_command.result == .failed);
-    try std.testing.expectEqualStrings("cancel active operation before compaction", event.event.prompt_command.message.text);
+    try std.testing.expectEqualStrings(
+        "cancel active operation before compaction",
+        event.event.prompt_command.message.text,
+    );
 }
 
 test "session runtime does not retrigger threshold from kept pre-compaction usage" {
@@ -3140,7 +3152,12 @@ test "session runtime does not retrigger threshold from kept pre-compaction usag
     try std.testing.expect(!session_runtime.session.shouldRunThresholdCompaction());
 
     FlakyStream.success_usage_total_tokens = 0;
-    var third_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 3, "after compact", .auto);
+    var third_prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(
+        std.testing.allocator,
+        3,
+        "after compact",
+        .auto,
+    );
     var third_owned = true;
     defer if (third_owned) third_prompt.deinit(std.testing.allocator);
     try session_runtime.submit(third_prompt);
