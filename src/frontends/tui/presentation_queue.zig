@@ -6,6 +6,7 @@ const tui = @import("../../tui/root.zig");
 // busy stream can catch the next session wake without making animation spin
 // faster. RenderThrottle still backs off when terminal flushes are expensive.
 pub const assistant_reveal_interval_ms: i64 = 12;
+pub const tool_call_preview_interval_ms: i64 = 32;
 pub const tool_output_interval_ms: i64 = 200;
 pub const animation_frame_interval_ms: i64 = 16;
 pub const background_pending_work_interval_ms: i64 = 100;
@@ -77,6 +78,13 @@ pub const Work = union(enum) {
             allocator.free(self.title);
             allocator.free(self.compact_title);
             self.* = undefined;
+        }
+
+        fn presentationIntervalMs(self: *const ToolAppend) i64 {
+            if (self.status == .pending and (self.title.len > 0 or self.compact_title.len > 0)) {
+                return tool_call_preview_interval_ms;
+            }
+            return background_pending_work_interval_ms;
         }
 
         pub fn append(self: *const ToolAppend) tui.Transcript.Append.ToolAppend {
@@ -168,7 +176,7 @@ pub const Work = union(enum) {
         return switch (self.*) {
             .append_message, .append_thinking => assistant_reveal_interval_ms,
             .tool_output_delta, .replace_tool_output => tool_output_interval_ms,
-            .append_tool,
+            .append_tool => |*tool| tool.presentationIntervalMs(),
             .replace_tool_footer,
             .set_status,
             .clear_status,
@@ -337,6 +345,54 @@ test "presentation queue coalescing counts shared tool id once" {
     try std.testing.expectEqual(@as(usize, 0), queue.bytes);
     try std.testing.expectEqualStrings("tool", popped.work.tool_output_delta.tool_call_id);
     try std.testing.expectEqualStrings("abc", popped.work.tool_output_delta.text);
+}
+
+fn testToolAppend(
+    allocator: std.mem.Allocator,
+    status: tui.Transcript.ToolStatus,
+    title: []const u8,
+) !Work {
+    const tool_call_id = try allocator.dupe(u8, "tool");
+    errdefer allocator.free(tool_call_id);
+    const name = try allocator.dupe(u8, "read");
+    errdefer allocator.free(name);
+    const owned_title = try allocator.dupe(u8, title);
+    errdefer allocator.free(owned_title);
+    const compact_title = try allocator.dupe(u8, "");
+    errdefer allocator.free(compact_title);
+
+    return .{ .append_tool = .{
+        .tool_call_id = tool_call_id,
+        .name = name,
+        .presentation = .file,
+        .status = status,
+        .body_mode = .visible,
+        .collapse = .{},
+        .title = owned_title,
+        .compact_title = compact_title,
+    } };
+}
+
+test "pending titled tool previews are paced separately from background tool updates" {
+    const allocator = std.testing.allocator;
+    var queue: Queue = .{};
+    defer queue.deinit(allocator);
+
+    try std.testing.expectEqual(.queued, try queue.push(
+        allocator,
+        try testToolAppend(allocator, .pending, "read src/main.zig"),
+    ));
+    try std.testing.expect(queue.popFirstDue(assistant_reveal_interval_ms) == null);
+    var preview = queue.popFirstDue(tool_call_preview_interval_ms).?;
+    defer preview.work.deinit(allocator);
+
+    try std.testing.expectEqual(.queued, try queue.push(
+        allocator,
+        try testToolAppend(allocator, .success, ""),
+    ));
+    try std.testing.expect(queue.popFirstDue(tool_call_preview_interval_ms) == null);
+    var terminal = queue.popFirstDue(background_pending_work_interval_ms).?;
+    defer terminal.work.deinit(allocator);
 }
 
 test "presentation queue drops oversize work and records notice once" {
