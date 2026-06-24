@@ -65,9 +65,10 @@ pub fn listRuntimeSessions(
     io: std.Io,
     options: SessionListOptions,
 ) !SessionList {
-    const sessions_dir = try runtimeSessionsDir(allocator, .{
+    const sessions_dir = try runtimeSessionsDir(allocator, io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
+        .dir = options.dir,
         .environ = options.environ,
     });
     defer allocator.free(sessions_dir);
@@ -81,10 +82,10 @@ pub fn listRuntimeSessions(
     };
     defer dir.close(io);
 
-    var file_names = std.ArrayList([]const u8).empty;
+    var files = std.ArrayList(RuntimeSessionFile).empty;
     errdefer {
-        for (file_names.items) |file_name| allocator.free(file_name);
-        file_names.deinit(allocator);
+        for (files.items) |file| allocator.free(file.name);
+        files.deinit(allocator);
     }
 
     var iterator = dir.iterate();
@@ -98,20 +99,30 @@ pub fn listRuntimeSessions(
         directory_entries_seen += 1;
         if (entry.kind != .file) continue;
         if (!paths_mod.isSessionFileLeafName(entry.name)) continue;
+        const stat = dir.statFile(io, entry.name, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (stat.kind != .file) continue;
         const copy = try allocator.dupe(u8, entry.name);
-        file_names.append(allocator, copy) catch |err| {
+        files.append(allocator, .{ .name = copy, .mtime = stat.mtime }) catch |err| {
             allocator.free(copy);
             return err;
         };
     }
 
-    std.mem.sort([]const u8, file_names.items, {}, newerSessionFile);
-    while (file_names.items.len > options.max_sessions) {
-        allocator.free(file_names.pop().?);
+    std.mem.sort(RuntimeSessionFile, files.items, {}, newerSessionFile);
+    while (files.items.len > options.max_sessions) {
+        allocator.free(files.pop().?.name);
         truncated = true;
     }
+
+    const file_names = try allocator.alloc([]const u8, files.items.len);
+    errdefer allocator.free(file_names);
+    for (files.items, file_names) |file, *file_name| file_name.* = file.name;
+    files.deinit(allocator);
     return .{
-        .file_names = try file_names.toOwnedSlice(allocator),
+        .file_names = file_names,
         .truncated = truncated,
     };
 }
@@ -121,9 +132,10 @@ pub fn listRuntimeSessionSummaries(
     io: std.Io,
     options: SessionListOptions,
 ) !SessionSummaryList {
-    const sessions_dir = try runtimeSessionsDir(allocator, .{
+    const sessions_dir = try runtimeSessionsDir(allocator, io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
+        .dir = options.dir,
         .environ = options.environ,
     });
     defer allocator.free(sessions_dir);
@@ -178,9 +190,10 @@ fn selectExistingLeaf(
     options: SessionSelectionOptions,
     file_name: []const u8,
 ) !?[]const u8 {
-    const sessions_dir = try runtimeSessionsDir(allocator, .{
+    const sessions_dir = try runtimeSessionsDir(allocator, io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
+        .dir = options.dir,
         .environ = options.environ,
     });
     defer allocator.free(sessions_dir);
@@ -205,9 +218,10 @@ fn selectBySessionIdPrefix(
     options: SessionSelectionOptions,
     selector: []const u8,
 ) !?[]const u8 {
-    const sessions_dir = try runtimeSessionsDir(allocator, .{
+    const sessions_dir = try runtimeSessionsDir(allocator, io, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
+        .dir = options.dir,
         .environ = options.environ,
     });
     defer allocator.free(sessions_dir);
@@ -487,11 +501,13 @@ fn utf8Prefix(bytes: []const u8, max: usize) []const u8 {
 const RuntimeSessionDirOptions = struct {
     cwd: []const u8,
     agent_dir_override: ?[]const u8,
+    dir: std.Io.Dir,
     environ: ?*const std.process.Environ.Map,
 };
 
 fn runtimeSessionsDir(
     allocator: std.mem.Allocator,
+    io: std.Io,
     options: RuntimeSessionDirOptions,
 ) ![]const u8 {
     const resolved_agent_dir = if (options.agent_dir_override) |agent_dir_override|
@@ -500,15 +516,27 @@ fn runtimeSessionsDir(
         try paths_mod.resolveGlobalAgentDirFromEnv(allocator, options.environ);
     defer if (options.agent_dir_override == null) allocator.free(resolved_agent_dir);
 
+    const resolved_cwd = if (std.mem.eql(u8, options.cwd, "."))
+        try options.dir.realPathFileAlloc(io, options.cwd, allocator)
+    else
+        try allocator.dupe(u8, options.cwd);
+    defer allocator.free(resolved_cwd);
+
     const paths: paths_mod.PersistencePaths = .{
         .global_dir = resolved_agent_dir,
-        .cwd = options.cwd,
+        .cwd = resolved_cwd,
     };
     return paths.sessionsDirForCwd(allocator);
 }
 
-fn newerSessionFile(_: void, left: []const u8, right: []const u8) bool {
-    return std.mem.order(u8, left, right) == .gt;
+const RuntimeSessionFile = struct {
+    name: []const u8,
+    mtime: std.Io.Timestamp,
+};
+
+fn newerSessionFile(_: void, left: RuntimeSessionFile, right: RuntimeSessionFile) bool {
+    if (left.mtime.nanoseconds != right.mtime.nanoseconds) return left.mtime.nanoseconds > right.mtime.nanoseconds;
+    return std.mem.order(u8, left.name, right.name) == .gt;
 }
 
 fn createSessionListingTestDirs(dir: std.Io.Dir) !void {
@@ -521,6 +549,14 @@ fn writeSessionListingTestFile(dir: std.Io.Dir, file_name: []const u8) !void {
     var path_buffer: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, "agent/sessions/--repo--/{s}", .{file_name});
     try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "{}\n" });
+}
+
+fn setSessionListingTestFileMtime(dir: std.Io.Dir, file_name: []const u8, nanoseconds: i96) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "agent/sessions/--repo--/{s}", .{file_name});
+    try dir.setTimestamps(std.testing.io, path, .{
+        .modify_timestamp = .{ .new = .{ .nanoseconds = nanoseconds } },
+    });
 }
 
 test "session summaries use first user message and bounded metadata" {
@@ -554,13 +590,15 @@ test "session summaries use first user message and bounded metadata" {
     try std.testing.expectEqualStrings("2026-05-28", summaries.items[0].aux);
 }
 
-test "session listing returns resumable leaf names newest first" {
+test "session listing returns resumable leaf names last updated first" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try createSessionListingTestDirs(tmp.dir);
-    try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl");
     try writeSessionListingTestFile(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl");
+    try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl");
+    try setSessionListingTestFileMtime(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl", 1);
+    try setSessionListingTestFileMtime(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl", 2);
 
     var list = try listRuntimeSessions(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",
@@ -571,8 +609,8 @@ test "session listing returns resumable leaf names newest first" {
 
     try std.testing.expectEqual(@as(usize, 2), list.file_names.len);
     try std.testing.expect(!list.truncated);
-    try std.testing.expectEqualStrings("2026-05-28T00:00:00Z_second.jsonl", list.file_names[0]);
-    try std.testing.expectEqualStrings("2026-05-27T00:00:00Z_first.jsonl", list.file_names[1]);
+    try std.testing.expectEqualStrings("2026-05-27T00:00:00Z_first.jsonl", list.file_names[0]);
+    try std.testing.expectEqualStrings("2026-05-28T00:00:00Z_second.jsonl", list.file_names[1]);
 }
 
 test "session listing is bounded and ignores non session files" {

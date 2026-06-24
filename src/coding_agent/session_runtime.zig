@@ -103,8 +103,14 @@ pub fn openSessionRuntime(allocator: std.mem.Allocator, options: Options) !Sessi
     const task_runtime = options.task_runtime orelse try runtime.Runtime.init(allocator, .{});
     errdefer if (options.task_runtime == null) task_runtime.deinit();
 
+    const resolved_cwd = if (std.mem.eql(u8, options.cwd, "."))
+        try options.dir.realPathFileAlloc(task_runtime.io(), options.cwd, allocator)
+    else
+        try allocator.dupe(u8, options.cwd);
+    defer allocator.free(resolved_cwd);
+
     var services = try RuntimeServices.init(allocator, .{
-        .cwd = options.cwd,
+        .cwd = resolved_cwd,
         .agent_dir = resolved_agent_dir,
         .dir = options.dir,
         .environ = options.environ,
@@ -161,7 +167,7 @@ fn openSession(allocator: std.mem.Allocator, services: *RuntimeServices, options
 
     switch (options.open) {
         .create => |create| {
-            var store = try session_manager.SessionStore.create(allocator, services.io, options.dir, .{
+            var store = try session_manager.SessionStore.createDeferred(allocator, services.io, options.dir, .{
                 .sessions_dir = sessions_dir,
                 .cwd = services.cwd,
                 .session_id = create.session_id,
@@ -337,6 +343,7 @@ pub const SessionRuntime = struct {
     active: ?ActiveOperation = null,
     completion_load: ?CompletionLoad = null,
     pending_file_completion: ?PendingFileCompletion = null,
+    file_index: FileIndexState = .not_started,
     next_operation_id: client_protocol.OperationId = 1,
     next_event_seq: client_protocol.EventSeq = 1,
     pending_event: ?client_protocol.EventEnvelope = null,
@@ -375,7 +382,10 @@ pub const SessionRuntime = struct {
         };
     };
 
+    const CompletionLoadKind = enum { resume_sessions, file_index_build, file_query };
+
     const CompletionLoad = struct {
+        kind: CompletionLoadKind,
         request_id: ?client_protocol.RequestId,
         models: ?client_protocol.CompletionList = null,
         task: runtime.Task(anyerror!CompletionLoadResult),
@@ -385,9 +395,43 @@ pub const SessionRuntime = struct {
         query: ?[]u8 = null,
     };
 
+    const FileIndexState = union(enum) {
+        not_started,
+        building,
+        ready: file_completion.Index,
+        failed: BuildFailure,
+
+        fn deinit(self: *FileIndexState) void {
+            switch (self.*) {
+                .ready => |*index| index.deinit(std.heap.page_allocator),
+                .not_started, .building, .failed => {},
+            }
+            self.* = undefined;
+        }
+    };
+
+    const BuildFailure = struct {
+        query: [client_protocol.file_completion_query_bytes_max]u8 = undefined,
+        query_len: u16 = 0,
+        message: [64]u8 = undefined,
+        message_len: u8 = 0,
+
+        fn init(query: []const u8, message: []const u8) BuildFailure {
+            var failure: BuildFailure = .{};
+            failure.query_len = copyBytes(&failure.query, query);
+            failure.message_len = @intCast(copyBytes(&failure.message, message));
+            return failure;
+        }
+
+        fn querySlice(self: *const BuildFailure) []const u8 {
+            return self.query[0..self.query_len];
+        }
+    };
+
     pub fn deinit(self: *SessionRuntime) void {
         self.cancelCompletionLoad();
         if (self.pending_file_completion) |pending| self.allocator.free(pending.query);
+        self.file_index.deinit();
         if (self.active) |active| {
             self.destroyActivePhase(active);
             self.allocator.free(active.prompt_text);
@@ -900,6 +944,29 @@ pub const SessionRuntime = struct {
         defer self.allocator.free(session_file_name);
 
         const stamp = SessionStamp.now(self.services.io);
+        try self.replaceSession(request_id, stamp, .{ .resume_existing = .{ .session_file_name = session_file_name } }, .resumed, session_file_name);
+    }
+
+    fn createNewSession(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
+        if (self.active != null) {
+            try self.enqueueRejected(request_id, .busy, "cancel active operation before new session");
+            return;
+        }
+        const stamp = SessionStamp.now(self.services.io);
+        var session_id_buffer: [48]u8 = undefined;
+        const session_id = std.fmt.bufPrint(&session_id_buffer, "session-{d}", .{stamp.nanoseconds}) catch
+            "session";
+        try self.replaceSession(request_id, stamp, .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } }, .created, null);
+    }
+
+    fn replaceSession(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        stamp: SessionStamp,
+        open: Open,
+        reason: client_protocol.SessionChanged.Reason,
+        resume_file_name: ?[]const u8,
+    ) !void {
         var next_services = try RuntimeServices.init(self.allocator, .{
             .cwd = self.services.cwd,
             .agent_dir = self.services.agent_dir,
@@ -914,7 +981,7 @@ pub const SessionRuntime = struct {
             .cwd = self.services.cwd,
             .agent_dir_override = self.services.agent_dir,
             .current_date = stamp.date(),
-            .open = .{ .resume_existing = .{ .session_file_name = session_file_name } },
+            .open = open,
             .model = self.host_config.model,
             .thinking_level = self.host_config.thinking_level,
             .stream = self.host_config.stream,
@@ -926,13 +993,18 @@ pub const SessionRuntime = struct {
         }) catch |err| {
             next_services.deinit();
             next_services_owned = false;
-            try self.enqueueResumeRejected(request_id, session_file_name, err);
+            if (resume_file_name) |file_name| {
+                try self.enqueueResumeRejected(request_id, file_name, err);
+            } else {
+                try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            }
             return;
         };
         var next_session_owned = true;
         errdefer if (next_session_owned) shutdownAndDeinitSession(&next_session);
 
         self.cancelCompletionLoad();
+        self.resetFileCompletionState();
 
         var old_session = self.session;
         var old_services = self.services;
@@ -943,7 +1015,7 @@ pub const SessionRuntime = struct {
         shutdownAndDeinitSession(&old_session);
         old_services.deinit();
 
-        try self.enqueueEvent(.{ .request_id = request_id, .event = .session_changed });
+        try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .session_changed = .{ .reason = reason } } });
         try self.enqueueSessionChrome(request_id);
     }
 
@@ -1050,6 +1122,7 @@ pub const SessionRuntime = struct {
             .session => try self.enqueueSessionPromptCommand(request_id, spec.name),
             .model => try self.handleModelSlashCommand(request_id, spec.name, invocation.args),
             .resume_session => try self.handleResumeSlashCommand(request_id, spec.name, invocation.args),
+            .new_session => try self.handleNewSlashCommand(request_id),
             .compact => try self.handleCompactSlashCommand(request_id, spec.name, invocation.args),
             .settings => try self.handleSettingsSlashCommand(request_id, spec.name, invocation.args),
         }
@@ -1111,6 +1184,10 @@ pub const SessionRuntime = struct {
             return;
         }
         try self.switchSession(request_id, args);
+    }
+
+    fn handleNewSlashCommand(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
+        try self.createNewSession(request_id);
     }
 
     fn handleSettingsSlashCommand(
@@ -1392,15 +1469,81 @@ pub const SessionRuntime = struct {
         query: []const u8,
     ) !void {
         if (self.completion_load != null) {
-            const pending_query = try self.allocator.dupe(u8, query);
-            if (self.pending_file_completion) |old| self.allocator.free(old.query);
-            self.pending_file_completion = .{ .request_id = request_id, .query = pending_query };
+            try self.setPendingFileCompletion(request_id, query);
             return;
         }
+
+        switch (self.file_index) {
+            .not_started => {
+                try self.setPendingFileCompletion(request_id, query);
+                try self.startFileIndexBuild(request_id, query);
+            },
+            .building => try self.setPendingFileCompletion(request_id, query),
+            .ready => |*index| try self.startReadyFileQuery(request_id, query, index),
+            .failed => |failure| {
+                if (std.mem.eql(u8, failure.querySlice(), query)) {
+                    try self.enqueueRejected(request_id, .exhausted, failure.message[0..failure.message_len]);
+                    return;
+                }
+                self.file_index = .not_started;
+                try self.setPendingFileCompletion(request_id, query);
+                try self.startFileIndexBuild(request_id, query);
+            },
+        }
+    }
+
+    fn setPendingFileCompletion(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        query: []const u8,
+    ) !void {
+        const pending_query = try self.allocator.dupe(u8, query);
+        if (self.pending_file_completion) |old| self.allocator.free(old.query);
+        self.pending_file_completion = .{ .request_id = request_id, .query = pending_query };
+    }
+
+    fn startFileIndexBuild(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        query: []const u8,
+    ) !void {
+        std.debug.assert(self.completion_load == null);
+        const cwd = try self.allocator.dupe(u8, self.services.cwd);
+        errdefer self.allocator.free(cwd);
+        const task = self.task_runtime.spawnBlocking(buildProjectFileIndexWorker, .{
+            self.host_config.dir,
+            cwd,
+        }) catch |err| {
+            self.file_index = .{ .failed = .init(query, @errorName(err)) };
+            if (self.pending_file_completion) |pending| {
+                try self.enqueueRejected(pending.request_id, rejectionCode(err), @errorName(err));
+                self.allocator.free(pending.query);
+                self.pending_file_completion = null;
+            } else {
+                try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            }
+            self.allocator.free(cwd);
+            return;
+        };
+        self.file_index = .building;
+        self.completion_load = .{
+            .kind = .file_index_build,
+            .request_id = request_id,
+            .task = task,
+            .cwd = cwd,
+        };
+    }
+
+    fn startReadyFileQuery(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        query: []const u8,
+        index: *const file_completion.Index,
+    ) !void {
         const owned_query = try self.allocator.dupe(u8, query);
         errdefer self.allocator.free(owned_query);
-        const task = self.task_runtime.spawnBlocking(buildProjectFileCompletionWorker, .{
-            self.host_config.dir,
+        const task = self.task_runtime.spawnBlocking(queryProjectFileCompletionWorker, .{
+            index,
             owned_query,
         }) catch |err| {
             try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
@@ -1408,6 +1551,7 @@ pub const SessionRuntime = struct {
             return;
         };
         self.completion_load = .{
+            .kind = .file_query,
             .request_id = request_id,
             .task = task,
             .query = owned_query,
@@ -1452,6 +1596,7 @@ pub const SessionRuntime = struct {
         };
 
         self.completion_load = .{
+            .kind = .resume_sessions,
             .request_id = request_id,
             .models = models,
             .task = task,
@@ -1487,7 +1632,19 @@ pub const SessionRuntime = struct {
 
         const payload = result catch |err| {
             if (load.models) |*models| models.deinit(self.allocator);
-            try self.enqueueRejected(load.request_id, rejectionCode(err), @errorName(err));
+            if (load.kind == .file_index_build) {
+                if (self.pending_file_completion) |pending| {
+                    self.file_index = .{ .failed = .init(pending.query, @errorName(err)) };
+                    try self.enqueueRejected(pending.request_id, rejectionCode(err), @errorName(err));
+                    self.allocator.free(pending.query);
+                    self.pending_file_completion = null;
+                } else {
+                    self.file_index = .{ .failed = .init("", @errorName(err)) };
+                    try self.enqueueRejected(load.request_id, rejectionCode(err), @errorName(err));
+                }
+            } else {
+                try self.enqueueRejected(load.request_id, rejectionCode(err), @errorName(err));
+            }
             return;
         };
 
@@ -1511,8 +1668,12 @@ pub const SessionRuntime = struct {
                 };
                 snapshot_owned = false;
             },
+            .file_index_built => |index| {
+                std.debug.assert(load.kind == .file_index_build);
+                self.file_index = .{ .ready = index };
+            },
             .file_completion => |raw| {
-                defer raw.destroy();
+                defer raw.destroy(std.heap.page_allocator);
                 var raw_sources: [file_completion.item_count_max]client_protocol.CompletionItem.Source = undefined;
                 var event = try client_protocol.FileCompletionResult.init(
                     self.allocator,
@@ -1543,6 +1704,13 @@ pub const SessionRuntime = struct {
         self.pending_file_completion = null;
         defer self.allocator.free(pending.query);
         try self.startFileCompletionLoad(pending.request_id, pending.query);
+    }
+
+    fn resetFileCompletionState(self: *SessionRuntime) void {
+        if (self.pending_file_completion) |pending| self.allocator.free(pending.query);
+        self.pending_file_completion = null;
+        self.file_index.deinit();
+        self.file_index = .not_started;
     }
 
     fn cancelCompletionLoad(self: *SessionRuntime) void {
@@ -1741,14 +1909,22 @@ pub const SessionRuntime = struct {
     }
 };
 
+fn copyBytes(dest: []u8, source: []const u8) u16 {
+    const keep = @min(dest.len, source.len);
+    @memcpy(dest[0..keep], source[0..keep]);
+    return @intCast(keep);
+}
+
 const CompletionLoadResult = union(enum) {
     resume_sessions: client_protocol.CompletionList,
+    file_index_built: file_completion.Index,
     file_completion: *file_completion.Result,
 
     fn deinit(self: *CompletionLoadResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .resume_sessions => |*list| list.deinit(allocator),
-            .file_completion => |result| result.destroy(),
+            .file_index_built => |*index| index.deinit(std.heap.page_allocator),
+            .file_completion => |result| result.destroy(std.heap.page_allocator),
         }
         self.* = undefined;
     }
@@ -1774,11 +1950,22 @@ fn buildResumeCompletionListWorker(
     ) };
 }
 
-fn buildProjectFileCompletionWorker(
-    dir: std.Io.Dir,
+fn buildProjectFileIndexWorker(dir: std.Io.Dir, cwd: []const u8) anyerror!CompletionLoadResult {
+    const project_fd = try std.posix.openat(dir.handle, cwd, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    defer _ = std.c.close(project_fd);
+    const project_dir: std.Io.Dir = .{ .handle = project_fd };
+    return .{ .file_index_built = try file_completion.Index.build(std.heap.page_allocator, project_dir) };
+}
+
+fn queryProjectFileCompletionWorker(
+    index: *const file_completion.Index,
     query: []const u8,
 ) anyerror!CompletionLoadResult {
-    return .{ .file_completion = try file_completion.build(dir, query) };
+    return .{ .file_completion = try index.query(std.heap.page_allocator, query) };
 }
 
 fn buildResumeCompletionListFor(
@@ -2056,6 +2243,64 @@ test "session runtime completion snapshot reports model status and resume sessio
     try std.testing.expect(found_current_model);
 }
 
+fn waitForFileCompletionEvent(session_runtime: *SessionRuntime) !client_protocol.EventEnvelope {
+    var iterations: usize = 0;
+    while (iterations < 2000) : (iterations += 1) {
+        try session_runtime.step();
+        if (session_runtime.drainEvent()) |event| {
+            if (event.event == .file_completion) return event;
+            var ignored = event;
+            ignored.deinit(std.testing.allocator);
+        }
+        try runtime.sleep(.fromMilliseconds(1));
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "session runtime file completion lazily builds index coalesces and keeps ready index stable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/a.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/b.zig", .data = "" });
+
+    try session_runtime.submit(try client_protocol.CommandEnvelope.initFileCompletion(
+        std.testing.allocator,
+        1,
+        "src/",
+    ));
+    try session_runtime.submit(try client_protocol.CommandEnvelope.initFileCompletion(
+        std.testing.allocator,
+        2,
+        "src/a",
+    ));
+
+    var coalesced = try waitForFileCompletionEvent(&session_runtime);
+    defer coalesced.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 2), coalesced.request_id);
+    try std.testing.expectEqualStrings("src/a", coalesced.event.file_completion.query.text);
+    try std.testing.expectEqual(@as(usize, 1), coalesced.event.file_completion.items.items.len);
+    try std.testing.expectEqualStrings("src/a.zig", coalesced.event.file_completion.items.items[0].id.text);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/added.zig", .data = "" });
+    try session_runtime.submit(try client_protocol.CommandEnvelope.initFileCompletion(
+        std.testing.allocator,
+        3,
+        "added",
+    ));
+
+    var stale = try waitForFileCompletionEvent(&session_runtime);
+    defer stale.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 3), stale.request_id);
+    try std.testing.expectEqualStrings("added", stale.event.file_completion.query.text);
+    try std.testing.expectEqual(@as(usize, 0), stale.event.file_completion.items.items.len);
+}
+
 test "model completion detail includes current marker context and costs" {
     const model: ai.Model = .{
         .id = "m",
@@ -2178,7 +2423,7 @@ test "session runtime handles slash command without starting an operation" {
     try std.testing.expect(event.event.prompt_command.result == .handled);
     try std.testing.expectEqualStrings("help", event.event.prompt_command.command.text);
     try std.testing.expectEqualStrings(
-        "available commands: /help, /session, /model, /resume, /compact, /settings",
+        "available commands: /help, /session, /model, /resume, /new, /compact, /settings",
         event.event.prompt_command.message.text,
     );
     // No operation started, nothing queued, nothing persisted.
@@ -2218,7 +2463,32 @@ test "session runtime switches to a selected session through the mailbox" {
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 9), event.request_id);
     try std.testing.expect(event.event == .session_changed);
+    try std.testing.expectEqual(client_protocol.SessionChanged.Reason.resumed, event.event.session_changed.reason);
     try std.testing.expectEqualStrings("other", session_runtime.session.manager.header.id);
+    try std.testing.expect(session_runtime.active == null);
+}
+
+test "session runtime slash new starts a fresh session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 12, "/new", .auto);
+    errdefer envelope.deinit(std.testing.allocator);
+    try session_runtime.submit(envelope);
+    try session_runtime.step();
+
+    var event = session_runtime.drainEvent().?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 12), event.request_id);
+    try std.testing.expect(event.event == .session_changed);
+    try std.testing.expectEqual(client_protocol.SessionChanged.Reason.created, event.event.session_changed.reason);
+    try std.testing.expect(!std.mem.eql(u8, "session", session_runtime.session.manager.header.id));
+    try std.testing.expect(std.mem.startsWith(u8, session_runtime.session.manager.header.id, "session-"));
+    try std.testing.expectEqual(@as(usize, 0), session_runtime.session.manager.entries.items.len);
     try std.testing.expect(session_runtime.active == null);
 }
 
@@ -2297,6 +2567,7 @@ test "session runtime keeps owned task runtime across session switch" {
     var event = session_runtime.drainEvent().?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event.event == .session_changed);
+    try std.testing.expectEqual(client_protocol.SessionChanged.Reason.resumed, event.event.session_changed.reason);
     try std.testing.expect(session_runtime.task_runtime == host_runtime);
     try std.testing.expect(session_runtime.services.task_runtime == host_runtime);
 }
@@ -2448,6 +2719,7 @@ test "session runtime switch restores persisted session model" {
     var event = session_runtime.drainEvent().?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event.event == .session_changed);
+    try std.testing.expectEqual(client_protocol.SessionChanged.Reason.resumed, event.event.session_changed.reason);
     try std.testing.expectEqualStrings("openai", session_runtime.session.agent.state.model.provider);
     try std.testing.expectEqualStrings("gpt-5.1", session_runtime.session.agent.state.model.id);
     try std.testing.expectEqual(agent_mod.ThinkingLevel.high, session_runtime.session.agent.state.thinking_level);

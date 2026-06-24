@@ -771,6 +771,7 @@ pub const SessionStore = struct {
     allocator: std.mem.Allocator,
     dir: std.Io.Dir,
     file_name: []const u8,
+    pending_header: ?SessionHeader = null,
 
     pub const CreateOptions = struct {
         /// Directory for the session file, created if missing; null writes
@@ -787,6 +788,18 @@ pub const SessionStore = struct {
         dir: std.Io.Dir,
         options: CreateOptions,
     ) !SessionStore {
+        var store = try createDeferred(allocator, io, dir, options);
+        errdefer store.deinit();
+        try store.ensureCreated(io);
+        return store;
+    }
+
+    pub fn createDeferred(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        options: CreateOptions,
+    ) !SessionStore {
         const file_name = blk: {
             const leaf_name = try paths_mod.sessionFileLeafName(allocator, options.timestamp, options.session_id);
             const sessions_dir = options.sessions_dir orelse break :blk leaf_name;
@@ -795,18 +808,32 @@ pub const SessionStore = struct {
             break :blk try std.fs.path.join(allocator, &.{ sessions_dir, leaf_name });
         };
         errdefer allocator.free(file_name);
-        const line = try formatHeaderLine(allocator, .{
-            .id = options.session_id,
-            .timestamp = options.timestamp,
-            .cwd = options.cwd,
-        });
-        defer allocator.free(line);
-        try writeFileAtomic(allocator, io, dir, file_name, line);
-        return .{ .allocator = allocator, .dir = dir, .file_name = file_name };
+        const id = try allocator.dupe(u8, options.session_id);
+        errdefer allocator.free(id);
+        const timestamp = try allocator.dupe(u8, options.timestamp);
+        errdefer allocator.free(timestamp);
+        const cwd = try allocator.dupe(u8, options.cwd);
+        errdefer allocator.free(cwd);
+        return .{
+            .allocator = allocator,
+            .dir = dir,
+            .file_name = file_name,
+            .pending_header = .{
+                .id = id,
+                .timestamp = timestamp,
+                .cwd = cwd,
+            },
+        };
     }
 
     pub fn deinit(self: *SessionStore) void {
         self.allocator.free(self.file_name);
+        if (self.pending_header) |header| {
+            self.allocator.free(header.id);
+            self.allocator.free(header.timestamp);
+            self.allocator.free(header.cwd);
+            if (header.parent_session) |parent_session| self.allocator.free(parent_session);
+        }
         self.* = undefined;
     }
 
@@ -814,11 +841,12 @@ pub const SessionStore = struct {
     /// (null for the first): the parent link is derived at the encoding
     /// boundary, not stored in the entry.
     pub fn appendEntry(
-        self: SessionStore,
+        self: *SessionStore,
         io: std.Io,
         entry: SessionEntry,
         parent_id: ?[]const u8,
     ) !void {
+        try self.ensureCreated(io);
         const line = try formatEntryLine(self.allocator, entry, parent_id);
         defer self.allocator.free(line);
         try appendLine(io, self.dir, self.file_name, line);
@@ -844,6 +872,18 @@ pub const SessionStore = struct {
         const file = try self.dir.openFile(io, self.file_name, .{ .mode = .read_write });
         defer file.close(io);
         try file.setLength(io, length);
+    }
+
+    fn ensureCreated(self: *SessionStore, io: std.Io) !void {
+        const header = self.pending_header orelse return;
+        const line = try formatHeaderLine(self.allocator, header);
+        defer self.allocator.free(line);
+        try writeFileAtomic(self.allocator, io, self.dir, self.file_name, line);
+        self.pending_header = null;
+        self.allocator.free(header.id);
+        self.allocator.free(header.timestamp);
+        self.allocator.free(header.cwd);
+        if (header.parent_session) |parent_session| self.allocator.free(parent_session);
     }
 };
 

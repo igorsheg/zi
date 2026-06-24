@@ -236,7 +236,7 @@ pub const ClientEvent = union(enum) {
     replay_gap: ReplayGap,
     history_page: HistoryPage,
     prompt_command: PromptCommand,
-    session_changed,
+    session_changed: SessionChanged,
     session_chrome: SessionChromeSnapshot,
     compaction_start: CompactionStart,
     compaction_end: CompactionEnd,
@@ -277,7 +277,7 @@ pub const ClientEvent = union(enum) {
             .snapshot => |payload| try stringify.write(payload),
             .history_page => |payload| try stringify.write(payload),
             .replay => |payload| try stringify.write(payload),
-            inline .shutdown_started, .operation_started, .session_changed => |_, tag| try writeObject(
+            inline .shutdown_started, .operation_started => |_, tag| try writeObject(
                 @tagName(tag),
                 stringify,
                 .{},
@@ -285,6 +285,12 @@ pub const ClientEvent = union(enum) {
             inline else => |payload, tag| try writeObject(@tagName(tag), stringify, payload),
         }
     }
+};
+
+pub const SessionChanged = struct {
+    reason: Reason,
+
+    pub const Reason = enum { created, resumed };
 };
 
 pub const Rejection = struct {

@@ -1406,7 +1406,7 @@ const InteractiveController = struct {
             .snapshot => |snapshot| try self.applySnapshot(snapshot),
             .completion_snapshot => |snapshot| try self.applyCompletionSnapshot(snapshot),
             .file_completion => |result| try self.installFileCompletions(result),
-            .session_changed => try self.applySessionChanged(),
+            .session_changed => |changed| try self.applySessionChanged(changed),
             .session_chrome => |chrome| try self.applySessionChrome(chrome),
             .history_page => |page| try self.applyHistoryPage(page),
             .replay => {
@@ -1593,7 +1593,7 @@ const InteractiveController = struct {
         try self.replaceToolOutput(payload.tool_call_id, text);
     }
 
-    fn applySessionChanged(self: *InteractiveController) !void {
+    fn applySessionChanged(self: *InteractiveController, changed: client_protocol.SessionChanged) !void {
         self.clearPendingUiWork();
         self.operation_active = false;
         self.cancel_requested = false;
@@ -1612,7 +1612,10 @@ const InteractiveController = struct {
         self.completion_snapshot_requested = false;
         self.completion_snapshot_loaded = false;
         try self.requestSnapshot();
-        try self.appendStatus(.info, "resumed session");
+        try self.appendStatus(.info, switch (changed.reason) {
+            .created => "started new session",
+            .resumed => "resumed session",
+        });
     }
 
     fn applySnapshot(self: *InteractiveController, snapshot: client_protocol.Snapshot) !void {

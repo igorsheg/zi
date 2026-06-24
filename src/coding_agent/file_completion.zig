@@ -1,7 +1,8 @@
 //! Filesystem-backed `@file` completion policy.
 //!
-//! SessionRuntime owns request coalescing and event delivery. This module owns
-//! only the blocking scan, match policy, bounds, and raw result lifetime.
+//! SessionRuntime owns request coalescing, index lifetime, and event delivery.
+//! This module owns bounded index construction, immutable queries, ranking, and
+//! raw result lifetime.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -9,9 +10,11 @@ const builtin = @import("builtin");
 const client_protocol = @import("client_protocol.zig");
 
 pub const item_count_max: usize = client_protocol.completion_item_count_max;
+pub const index_entry_count_max: usize = 20_000;
+pub const index_path_bytes_max: usize = 2 * 1024 * 1024;
+pub const index_path_bytes_per_entry_max: usize = client_protocol.completion_id_bytes_max;
 
-const scan_count_max: usize = 20_000;
-const pending_dirs_max: usize = 2_000;
+const pending_dirs_max: usize = index_entry_count_max;
 const scope_match_max: usize = 32;
 
 const PendingDir = struct { path: []u8 };
@@ -73,8 +76,15 @@ pub const Result = struct {
         );
     }
 
+    fn appendUnique(self: *Result, path: []const u8, detail: []const u8) void {
+        for (self.items[0..self.item_len]) |*item| {
+            if (std.mem.eql(u8, item.idSlice(), path)) return;
+        }
+        self.append(path, detail);
+    }
+
     fn sort(self: *Result) void {
-        std.mem.sort(Item, self.items[0..self.item_len], {}, rawLessThan);
+        std.mem.sort(Item, self.items[0..self.item_len], {}, itemLessThan);
     }
 
     pub fn sources(
@@ -89,40 +99,289 @@ pub const Result = struct {
         self.* = undefined;
     }
 
-    pub fn destroy(self: *Result) void {
+    pub fn destroy(self: *Result, allocator: std.mem.Allocator) void {
         self.deinit();
-        std.heap.page_allocator.destroy(self);
+        allocator.destroy(self);
     }
 };
 
-pub fn build(root_dir: std.Io.Dir, query: []const u8) !*Result {
-    const result = try std.heap.page_allocator.create(Result);
-    errdefer std.heap.page_allocator.destroy(result);
-    result.* = .{};
-    result.query_len = copyRawField(client_protocol.file_completion_query_bytes_max, &result.query, query);
-    const bounded_query = result.querySlice();
-    const scope_end = if (std.mem.findScalarLast(u8, bounded_query, '/')) |slash| slash + 1 else 0;
-    const scope = bounded_query[0..scope_end];
-    const leaf_query = bounded_query[scope_end..];
-    if (leaf_query.len == 0) {
-        const listed = try collectDirectoryChildren(root_dir.handle, scope, result);
-        if (!listed and scope.len > 0) {
-            if (try resolveDirectoryAlias(root_dir.handle, scope[0 .. scope.len - 1])) |resolved_scope| {
-                _ = try collectDirectoryChildren(root_dir.handle, resolved_scope, result);
-            } else {
-                try collectDirectoryMatches(root_dir.handle, scope[0 .. scope.len - 1], result);
+pub const Index = struct {
+    entries: []Entry,
+    path_bytes: []u8,
+    truncated: bool = false,
+
+    const Entry = struct {
+        path_start: u32,
+        path_len: u16,
+        kind: EntryKind,
+    };
+
+    pub fn build(allocator: std.mem.Allocator, root_dir: std.Io.Dir) !Index {
+        var entries = std.ArrayList(Entry).empty;
+        errdefer entries.deinit(allocator);
+        var path_bytes = std.ArrayList(u8).empty;
+        errdefer path_bytes.deinit(allocator);
+        var truncated = false;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+        var pending = std.ArrayList(PendingDir).empty;
+        try pending.append(arena_allocator, .{ .path = try arena_allocator.dupe(u8, ".") });
+
+        var index: usize = 0;
+        walk: while (index < pending.items.len) : (index += 1) {
+            const current = pending.items[index];
+            const dir_fd = std.posix.openat(root_dir.handle, current.path, .{
+                .ACCMODE = .RDONLY,
+                .DIRECTORY = true,
+                .CLOEXEC = true,
+            }, 0) catch continue;
+            const c_dir = std.c.fdopendir(dir_fd) orelse {
+                _ = std.c.close(dir_fd);
+                continue;
+            };
+            defer _ = std.c.closedir(c_dir);
+
+            while (std.c.readdir(c_dir)) |entry_ptr| {
+                const dir_entry = entry_ptr.*;
+                const entry_name = direntName(&dir_entry);
+                if (std.mem.eql(u8, entry_name, ".") or std.mem.eql(u8, entry_name, "..")) continue;
+                if (!std.unicode.utf8ValidateSlice(entry_name)) continue;
+                const kind = entryKind(dir_fd, &dir_entry, entry_name) orelse continue;
+                const is_dir = kind == .directory;
+                if (is_dir and isIgnoredDir(entry_name)) continue;
+
+                const entry_path = try joinPath(arena_allocator, current.path, entry_name);
+                const added = try appendIndexEntry(allocator, &entries, &path_bytes, entry_path, kind, &truncated);
+                if (!added) break :walk;
+
+                if (is_dir) {
+                    if (pending.items.len == pending_dirs_max) {
+                        truncated = true;
+                    } else {
+                        try pending.append(arena_allocator, .{ .path = entry_path });
+                    }
+                }
             }
         }
-    } else {
-        try collectMatches(root_dir.handle, bounded_query, result);
+
+        const owned_entries = try entries.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_entries);
+        const owned_path_bytes = try path_bytes.toOwnedSlice(allocator);
+        return .{
+            .entries = owned_entries,
+            .path_bytes = owned_path_bytes,
+            .truncated = truncated,
+        };
     }
-    result.sort();
-    return result;
+
+    pub fn deinit(self: *Index, allocator: std.mem.Allocator) void {
+        allocator.free(self.path_bytes);
+        allocator.free(self.entries);
+        self.* = undefined;
+    }
+
+    pub fn query(self: *const Index, allocator: std.mem.Allocator, raw_query: []const u8) !*Result {
+        const result = try allocator.create(Result);
+        errdefer allocator.destroy(result);
+        result.* = .{};
+        result.truncated = self.truncated;
+        result.query_len = copyRawField(client_protocol.file_completion_query_bytes_max, &result.query, raw_query);
+
+        const bounded_query = result.querySlice();
+        const scope_end = if (std.mem.findScalarLast(u8, bounded_query, '/')) |slash| slash + 1 else 0;
+        const scope = bounded_query[0..scope_end];
+        const leaf_query = bounded_query[scope_end..];
+
+        if (leaf_query.len == 0) {
+            const listed = try self.collectDirectChildren(scope, result);
+            if (!listed and scope.len > 0) {
+                try self.collectDirectoryAlias(scope[0 .. scope.len - 1], result);
+            }
+        } else {
+            try self.collectSearchMatches(bounded_query, scope, leaf_query, result);
+        }
+        result.sort();
+        return result;
+    }
+
+    fn entryPath(self: *const Index, entry: Entry) []const u8 {
+        const start: usize = entry.path_start;
+        return self.path_bytes[start .. start + entry.path_len];
+    }
+
+    fn hasDirectory(self: *const Index, dir_path: []const u8) bool {
+        if (dir_path.len == 0) return true;
+        for (self.entries) |entry| {
+            if (entry.kind == .directory and std.mem.eql(u8, self.entryPath(entry), dir_path)) return true;
+        }
+        return false;
+    }
+
+    fn collectDirectChildren(self: *const Index, scope: []const u8, result: *Result) !bool {
+        const scope_path = scopePath(scope) orelse return false;
+        if (!self.hasDirectory(scope_path)) return false;
+
+        for (self.entries) |entry| {
+            const entry_path = self.entryPath(entry);
+            var path_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            const child = directChildPath(&path_buffer, scope_path, entry_path, entry.kind) orelse continue;
+            if (!shouldShowPath(child, scope, "")) continue;
+            result.appendUnique(child, pathDirname(child));
+        }
+        return true;
+    }
+
+    fn collectDirectoryAlias(self: *const Index, alias_query: []const u8, result: *Result) !void {
+        const exact_count = self.countDirectoryAliasMatches(alias_query, true);
+        if (exact_count == 1) {
+            const resolved = self.firstDirectoryAliasMatch(alias_query, true).?;
+            var scope_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            const resolved_scope = std.fmt.bufPrint(&scope_buffer, "{s}/", .{resolved}) catch return;
+            _ = try self.collectDirectChildren(resolved_scope, result);
+            return;
+        }
+        if (exact_count > 1) {
+            self.appendDirectoryAliasChoices(alias_query, true, result);
+            return;
+        }
+
+        const fuzzy_count = self.countDirectoryAliasMatches(alias_query, false);
+        if (fuzzy_count == 1) {
+            const resolved = self.firstDirectoryAliasMatch(alias_query, false).?;
+            var scope_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            const resolved_scope = std.fmt.bufPrint(&scope_buffer, "{s}/", .{resolved}) catch return;
+            _ = try self.collectDirectChildren(resolved_scope, result);
+            return;
+        }
+        if (fuzzy_count > 1) self.appendDirectoryAliasChoices(alias_query, false, result);
+    }
+
+    fn countDirectoryAliasMatches(self: *const Index, alias_query: []const u8, exact: bool) usize {
+        var count: usize = 0;
+        for (self.entries) |entry| {
+            if (entry.kind != .directory) continue;
+            const entry_path = self.entryPath(entry);
+            if (!shouldShowPath(entry_path, "", alias_query)) continue;
+            if (!directoryAliasMatches(entry_path, alias_query, exact)) continue;
+            count += 1;
+            if (count > scope_match_max) return count;
+        }
+        return count;
+    }
+
+    fn firstDirectoryAliasMatch(self: *const Index, alias_query: []const u8, exact: bool) ?[]const u8 {
+        for (self.entries) |entry| {
+            if (entry.kind != .directory) continue;
+            const entry_path = self.entryPath(entry);
+            if (!shouldShowPath(entry_path, "", alias_query)) continue;
+            if (directoryAliasMatches(entry_path, alias_query, exact)) return entry_path;
+        }
+        return null;
+    }
+
+    fn appendDirectoryAliasChoices(self: *const Index, alias_query: []const u8, exact: bool, result: *Result) void {
+        for (self.entries) |entry| {
+            if (entry.kind != .directory) continue;
+            const entry_path = self.entryPath(entry);
+            if (!shouldShowPath(entry_path, "", alias_query)) continue;
+            if (!directoryAliasMatches(entry_path, alias_query, exact)) continue;
+            var path_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            const completion_path = std.fmt.bufPrint(&path_buffer, "{s}/", .{entry_path}) catch {
+                result.truncated = true;
+                continue;
+            };
+            result.append(completion_path, pathDirname(completion_path));
+        }
+    }
+
+    fn collectSearchMatches(
+        self: *const Index,
+        raw_query: []const u8,
+        scope: []const u8,
+        leaf_query: []const u8,
+        result: *Result,
+    ) !void {
+        var candidates: [item_count_max]ScoredPath = undefined;
+        var candidate_len: usize = 0;
+        var matched_count: usize = 0;
+
+        for (self.entries) |entry| {
+            const entry_path = self.entryPath(entry);
+            if (!shouldShowPath(entry_path, scope, leaf_query)) continue;
+            const score = scorePath(entry_path, entry.kind == .directory, raw_query, scope, leaf_query) orelse continue;
+            matched_count += 1;
+            const candidate: ScoredPath = .{
+                .path = entry_path,
+                .kind = entry.kind,
+                .score = score,
+            };
+            if (candidate_len < candidates.len) {
+                candidates[candidate_len] = candidate;
+                candidate_len += 1;
+            } else if (candidateBetter(candidate, worstCandidate(candidates[0..candidate_len]))) |replace_index| {
+                candidates[replace_index] = candidate;
+            }
+        }
+        if (matched_count > candidate_len) result.truncated = true;
+
+        std.mem.sort(ScoredPath, candidates[0..candidate_len], {}, scoredPathLessThan);
+        for (candidates[0..candidate_len]) |candidate| {
+            var path_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            const completion_path = if (candidate.kind == .directory)
+                std.fmt.bufPrint(&path_buffer, "{s}/", .{candidate.path}) catch {
+                    result.truncated = true;
+                    continue;
+                }
+            else
+                candidate.path;
+            result.append(completion_path, pathDirname(completion_path));
+        }
+    }
+};
+
+const ScoredPath = struct {
+    path: []const u8,
+    kind: EntryKind,
+    score: i32,
+};
+
+fn appendIndexEntry(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(Index.Entry),
+    path_bytes: *std.ArrayList(u8),
+    path: []const u8,
+    kind: EntryKind,
+    truncated: *bool,
+) !bool {
+    if (path.len > index_path_bytes_per_entry_max) {
+        truncated.* = true;
+        return true;
+    }
+    if (entries.items.len == index_entry_count_max) {
+        truncated.* = true;
+        return false;
+    }
+    if (path_bytes.items.len + path.len > index_path_bytes_max) {
+        truncated.* = true;
+        return false;
+    }
+    const start = path_bytes.items.len;
+    try path_bytes.appendSlice(allocator, path);
+    try entries.append(allocator, .{
+        .path_start = @intCast(start),
+        .path_len = @intCast(path.len),
+        .kind = kind,
+    });
+    return true;
 }
 
-fn rawLessThan(_: void, a: Item, b: Item) bool {
-    const a_id = a.idSlice();
-    const b_id = b.idSlice();
+fn itemLessThan(_: void, a: Item, b: Item) bool {
+    return rawPathLessThan(a.idSlice(), b.idSlice());
+}
+
+fn rawPathLessThan(a_id: []const u8, b_id: []const u8) bool {
     const a_dir = std.mem.endsWith(u8, a_id, "/");
     const b_dir = std.mem.endsWith(u8, b_id, "/");
     if (a_dir != b_dir) return a_dir;
@@ -142,153 +401,8 @@ fn utf8Prefix(bytes: []const u8, max: usize) []const u8 {
     return bytes[0..end];
 }
 
-fn collectDirectoryChildren(
-    root_fd: std.posix.fd_t,
-    scope: []const u8,
-    result: *Result,
-) !bool {
-    const dir_path = scopeDirPath(scope) orelse return false;
-    const dir_fd = std.posix.openat(root_fd, dir_path, .{
-        .ACCMODE = .RDONLY,
-        .DIRECTORY = true,
-        .CLOEXEC = true,
-    }, 0) catch return false;
-    const c_dir = std.c.fdopendir(dir_fd) orelse {
-        _ = std.c.close(dir_fd);
-        return false;
-    };
-    defer _ = std.c.closedir(c_dir);
-
-    while (std.c.readdir(c_dir)) |entry_ptr| {
-        const entry = entry_ptr.*;
-        const entry_name = direntName(&entry);
-        if (std.mem.eql(u8, entry_name, ".") or std.mem.eql(u8, entry_name, "..")) continue;
-        if (!std.unicode.utf8ValidateSlice(entry_name)) continue;
-        const kind = entryKind(dir_fd, &entry, entry_name) orelse continue;
-        const is_dir = kind == .directory;
-        if (is_dir and isIgnoredDir(entry_name)) continue;
-        if (!shouldShowHiddenEntry(dir_path, entry_name, scope, "")) continue;
-
-        var path_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buffer, "{s}{s}{s}", .{
-            scope,
-            entry_name,
-            if (is_dir) "/" else "",
-        }) catch {
-            result.truncated = true;
-            continue;
-        };
-        if (path.len > client_protocol.completion_id_bytes_max) {
-            result.truncated = true;
-            continue;
-        }
-        result.append(path, pathDirname(path));
-    }
-    return true;
-}
-
-fn resolveDirectoryAlias(root_fd: std.posix.fd_t, query: []const u8) !?[]const u8 {
-    var scratch: Result = .{};
-    try collectDirectoryMatches(root_fd, query, &scratch);
-    if (scratch.item_len != 1) return null;
-    return scratch.items[0].idSlice();
-}
-
-fn collectDirectoryMatches(
-    root_fd: std.posix.fd_t,
-    query: []const u8,
-    result: *Result,
-) !void {
-    const before = result.item_len;
-    try collectMatches(root_fd, query, result);
-    var read: usize = before;
-    var write: usize = before;
-    while (read < result.item_len) : (read += 1) {
-        const item = result.items[read];
-        if (!std.mem.endsWith(u8, item.idSlice(), "/")) continue;
-        result.items[write] = item;
-        write += 1;
-    }
-    result.item_len = @intCast(write);
-}
-
-fn collectMatches(
-    root_fd: std.posix.fd_t,
-    query: []const u8,
-    result: *Result,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var pending = std.ArrayList(PendingDir).empty;
-    try pending.append(allocator, .{ .path = try allocator.dupe(u8, ".") });
-    var entries_seen: usize = 0;
-    var scope_matches: usize = 0;
-
-    const scope_end = if (std.mem.findScalarLast(u8, query, '/')) |slash| slash + 1 else 0;
-    const scope = query[0..scope_end];
-    const leaf_query = query[scope_end..];
-
-    var index: usize = 0;
-    while (index < pending.items.len) : (index += 1) {
-        const current = pending.items[index];
-        const dir_fd = std.posix.openat(root_fd, current.path, .{
-            .ACCMODE = .RDONLY,
-            .DIRECTORY = true,
-            .CLOEXEC = true,
-        }, 0) catch continue;
-        const c_dir = std.c.fdopendir(dir_fd) orelse {
-            _ = std.c.close(dir_fd);
-            continue;
-        };
-        defer _ = std.c.closedir(c_dir);
-        while (std.c.readdir(c_dir)) |entry_ptr| {
-            const entry = entry_ptr.*;
-            const entry_name = direntName(&entry);
-            if (entries_seen == scan_count_max) {
-                result.truncated = true;
-                return;
-            }
-            entries_seen += 1;
-            if (std.mem.eql(u8, entry_name, ".") or std.mem.eql(u8, entry_name, "..")) continue;
-            if (!std.unicode.utf8ValidateSlice(entry_name)) continue;
-            const kind = entryKind(dir_fd, &entry, entry_name) orelse continue;
-            const is_dir = kind == .directory;
-            if (is_dir and isIgnoredDir(entry_name)) continue;
-            if (!shouldShowHiddenEntry(current.path, entry_name, scope, leaf_query)) continue;
-
-            const path = try joinPath(allocator, current.path, entry_name);
-            const completion_path = if (is_dir) try std.fmt.allocPrint(allocator, "{s}/", .{path}) else path;
-
-            if (is_dir) {
-                if (pending.items.len == pending_dirs_max) {
-                    result.truncated = true;
-                } else {
-                    try pending.append(allocator, .{ .path = path });
-                }
-            }
-
-            if (completion_path.len > client_protocol.completion_id_bytes_max) {
-                result.truncated = true;
-                continue;
-            }
-            if (!pathMatchesQuery(completion_path, query, scope, leaf_query)) continue;
-            if (scope.len > 0 and
-                is_dir and
-                !std.mem.eql(u8, completion_path, scope) and
-                scope_matches >= scope_match_max)
-            {
-                result.truncated = true;
-                continue;
-            }
-            if (scope.len > 0 and is_dir) scope_matches += 1;
-            result.append(completion_path, pathDirname(completion_path));
-        }
-    }
-}
-
-fn scopeDirPath(scope: []const u8) ?[]const u8 {
-    if (scope.len == 0) return ".";
+fn scopePath(scope: []const u8) ?[]const u8 {
+    if (scope.len == 0) return "";
     if (scope[0] == '/') return null;
     const trimmed = if (std.mem.endsWith(u8, scope, "/")) scope[0 .. scope.len - 1] else scope;
     if (trimmed.len == 0 or hasUnsafePathSegment(trimmed)) return null;
@@ -305,101 +419,88 @@ fn hasUnsafePathSegment(path: []const u8) bool {
     return false;
 }
 
-fn shouldShowHiddenEntry(
-    current_path: []const u8,
-    entry_name: []const u8,
+fn directChildPath(
+    buffer: *[client_protocol.completion_id_bytes_max + 1]u8,
     scope: []const u8,
-    leaf_query: []const u8,
-) bool {
-    if (entry_name.len == 0 or entry_name[0] != '.') return true;
+    entry_path: []const u8,
+    kind: EntryKind,
+) ?[]const u8 {
+    const rest = if (scope.len == 0) blk: {
+        break :blk entry_path;
+    } else blk: {
+        if (std.mem.eql(u8, entry_path, scope)) return null;
+        if (!std.mem.startsWith(u8, entry_path, scope)) return null;
+        if (entry_path.len <= scope.len or entry_path[scope.len] != '/') return null;
+        break :blk entry_path[scope.len + 1 ..];
+    };
+    if (rest.len == 0) return null;
+
+    if (std.mem.findScalar(u8, rest, '/')) |slash| {
+        const child_len = entry_path.len - rest.len + slash;
+        return std.fmt.bufPrint(buffer, "{s}/", .{entry_path[0..child_len]}) catch null;
+    }
+    if (kind == .directory) return std.fmt.bufPrint(buffer, "{s}/", .{entry_path}) catch null;
+    return entry_path;
+}
+
+fn directoryAliasMatches(entry_path: []const u8, query: []const u8, exact: bool) bool {
+    const leaf = pathLeaf(entry_path);
+    if (exact) return asciiEqlIgnoreCase(leaf, query);
+    return matchPathPart(leaf, query) or matchPathPart(entry_path, query);
+}
+
+fn shouldShowPath(path: []const u8, scope: []const u8, leaf_query: []const u8) bool {
+    if (!pathHasHiddenSegment(path)) return true;
     if (std.mem.startsWith(u8, leaf_query, ".")) return true;
-    if (!std.mem.eql(u8, current_path, ".")) return false;
-    return scope.len > entry_name.len and
-        scope[entry_name.len] == '/' and
-        std.mem.eql(u8, scope[0..entry_name.len], entry_name);
+    return scopeHasHiddenSegment(scope);
 }
 
-fn entryKind(
-    dir_fd: std.posix.fd_t,
-    entry: *const std.c.dirent,
-    name: []const u8,
-) ?EntryKind {
-    if (entry.type == std.c.DT.DIR) return .directory;
-    if (entry.type == std.c.DT.REG) return .file;
-    if (entry.type != std.c.DT.UNKNOWN) return null;
-    return statEntryKind(dir_fd, name);
-}
-
-fn statEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
-    if (builtin.os.tag == .linux) return linuxStatEntryKind(dir_fd, name);
-    return libcStatEntryKind(dir_fd, name);
-}
-
-fn linuxStatEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
-    const linux = std.os.linux;
-    if (name.len > std.Io.Dir.max_name_bytes) return null;
-    var name_z: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
-    @memcpy(name_z[0..name.len], name);
-    name_z[name.len] = 0;
-    const name_c: [:0]u8 = name_z[0..name.len :0];
-
-    var statx = std.mem.zeroes(linux.Statx);
-    while (true) {
-        switch (linux.errno(linux.statx(
-            @intCast(dir_fd),
-            name_c.ptr,
-            linux.AT.SYMLINK_NOFOLLOW,
-            .{ .TYPE = true },
-            &statx,
-        ))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            else => return null,
-        }
+fn pathHasHiddenSegment(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        if (segment.len > 0 and segment[0] == '.') return true;
     }
-
-    return switch (statx.mode & linux.S.IFMT) {
-        linux.S.IFDIR => .directory,
-        linux.S.IFREG => .file,
-        else => null,
-    };
+    return false;
 }
 
-fn libcStatEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
-    if (name.len > std.Io.Dir.max_name_bytes) return null;
-    var name_z: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
-    @memcpy(name_z[0..name.len], name);
-    name_z[name.len] = 0;
-    const name_c: [:0]u8 = name_z[0..name.len :0];
-
-    var stat = std.mem.zeroes(std.c.Stat);
-    while (true) {
-        switch (std.c.errno(std.c.fstatat(
-            dir_fd,
-            name_c.ptr,
-            &stat,
-            std.c.AT.SYMLINK_NOFOLLOW,
-        ))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            else => return null,
-        }
+fn scopeHasHiddenSegment(scope: []const u8) bool {
+    const trimmed = if (std.mem.endsWith(u8, scope, "/")) scope[0 .. scope.len - 1] else scope;
+    var segments = std.mem.splitScalar(u8, trimmed, '/');
+    while (segments.next()) |segment| {
+        if (segment.len > 0 and segment[0] == '.') return true;
     }
-
-    return switch (stat.mode & std.c.S.IFMT) {
-        std.c.S.IFDIR => .directory,
-        std.c.S.IFREG => .file,
-        else => null,
-    };
+    return false;
 }
 
-fn pathMatchesQuery(path: []const u8, query: []const u8, scope: []const u8, leaf_query: []const u8) bool {
-    if (query.len == 0) return true;
-    if (scope.len == 0) return matchPathPart(path, query);
-    const scope_start = indexOfAsciiIgnoreCase(path, scope) orelse return false;
-    const scoped_tail = path[scope_start + scope.len ..];
-    if (leaf_query.len == 0) return true;
-    return matchPathPart(pathLeaf(scoped_tail), leaf_query) or matchPathPart(scoped_tail, leaf_query);
+fn scorePath(path: []const u8, is_dir: bool, query: []const u8, scope: []const u8, leaf_query: []const u8) ?i32 {
+    if (query.len == 0) return 1;
+    const scoped_tail = if (scope.len == 0) path else blk: {
+        const scope_start = indexOfAsciiIgnoreCase(path, scope) orelse return null;
+        break :blk path[scope_start + scope.len ..];
+    };
+    if (leaf_query.len == 0) return 1;
+    const leaf = pathLeaf(scoped_tail);
+    var score: i32 = if (asciiEqlIgnoreCase(leaf, leaf_query))
+        1000
+    else if (asciiStartsWithIgnoreCase(leaf, leaf_query))
+        900
+    else if (boundaryPrefixMatch(scoped_tail, leaf_query))
+        850
+    else if (indexOfAsciiIgnoreCase(leaf, leaf_query) != null)
+        700
+    else if (fuzzySubsequence(leaf, leaf_query))
+        550
+    else if (indexOfAsciiIgnoreCase(scoped_tail, leaf_query) != null)
+        450
+    else if (fuzzySubsequence(scoped_tail, leaf_query))
+        300
+    else
+        return null;
+
+    const len_bonus: i32 = @intCast(@max(0, 200 - @min(path.len, 200)));
+    score += len_bonus;
+    if (is_dir) score += 20;
+    return score;
 }
 
 fn matchPathPart(text: []const u8, query: []const u8) bool {
@@ -415,6 +516,24 @@ fn fuzzySubsequence(text: []const u8, query: []const u8) bool {
     return qi == query.len;
 }
 
+fn boundaryPrefixMatch(text: []const u8, query: []const u8) bool {
+    if (query.len == 0) return true;
+    var index: usize = 0;
+    while (index < text.len) : (index += 1) {
+        if (!isBoundary(text, index)) continue;
+        if (asciiStartsWithIgnoreCase(text[index..], query)) return true;
+    }
+    return false;
+}
+
+fn isBoundary(text: []const u8, index: usize) bool {
+    if (index == 0) return true;
+    const previous = text[index - 1];
+    const current = text[index];
+    return previous == '/' or previous == '_' or previous == '-' or previous == '.' or
+        (std.ascii.isLower(previous) and std.ascii.isUpper(current));
+}
+
 fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
@@ -425,6 +544,43 @@ fn indexOfAsciiIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
         } else return index;
     }
     return null;
+}
+
+fn asciiStartsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    return asciiEqlIgnoreCase(haystack[0..needle.len], needle);
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |a_byte, b_byte| {
+        if (std.ascii.toLower(a_byte) != std.ascii.toLower(b_byte)) return false;
+    }
+    return true;
+}
+
+fn candidateBetter(candidate: ScoredPath, current_worst: WorstCandidate) ?usize {
+    if (scoredPathLessThan({}, candidate, current_worst.path)) return current_worst.index;
+    return null;
+}
+
+const WorstCandidate = struct { index: usize, path: ScoredPath };
+
+fn worstCandidate(candidates: []const ScoredPath) WorstCandidate {
+    std.debug.assert(candidates.len > 0);
+    var worst: WorstCandidate = .{ .index = 0, .path = candidates[0] };
+    for (candidates[1..], 1..) |candidate, index| {
+        if (scoredPathLessThan({}, worst.path, candidate)) {
+            worst = .{ .index = index, .path = candidate };
+        }
+    }
+    return worst;
+}
+
+fn scoredPathLessThan(_: void, a: ScoredPath, b: ScoredPath) bool {
+    if (a.score != b.score) return a.score > b.score;
+    if (a.kind != b.kind) return a.kind == .directory;
+    return std.mem.lessThan(u8, a.path, b.path);
 }
 
 fn direntName(entry: *const std.c.dirent) []const u8 {
@@ -468,6 +624,84 @@ fn isIgnoredDir(name: []const u8) bool {
     return false;
 }
 
+fn entryKind(
+    dir_fd: std.posix.fd_t,
+    entry: *const std.c.dirent,
+    name: []const u8,
+) ?EntryKind {
+    if (entry.type == std.c.DT.DIR) return .directory;
+    if (entry.type == std.c.DT.REG) return .file;
+    if (entry.type != std.c.DT.UNKNOWN) return null;
+    return statEntryKind(dir_fd, name);
+}
+
+fn statEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
+    if (builtin.os.tag == .linux) return linuxStatEntryKind(dir_fd, name);
+    return libcStatEntryKind(dir_fd, name);
+}
+
+fn linuxStatEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
+    const linux = std.os.linux;
+    if (name.len > std.Io.Dir.max_name_bytes) return null;
+    var name_z: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
+    @memcpy(name_z[0..name.len], name);
+    name_z[name.len] = 0;
+    const name_c: [:0]u8 = name_z[0..name.len :0];
+
+    var statx = std.mem.zeroes(linux.Statx);
+    while (true) {
+        switch (linux.E.init(linux.statx(
+            dir_fd,
+            name_c.ptr,
+            linux.AT.SYMLINK_NOFOLLOW,
+            linux.STATX_TYPE,
+            &statx,
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return null,
+        }
+    }
+
+    const mode = statx.mode & linux.S.IFMT;
+    if (mode == linux.S.IFDIR) return .directory;
+    if (mode == linux.S.IFREG) return .file;
+    return null;
+}
+
+fn libcStatEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
+    if (name.len > std.Io.Dir.max_name_bytes) return null;
+    var name_z: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
+    @memcpy(name_z[0..name.len], name);
+    name_z[name.len] = 0;
+    const name_c: [:0]u8 = name_z[0..name.len :0];
+
+    var stat: std.posix.Stat = undefined;
+    while (true) {
+        switch (std.posix.errno(std.posix.system.fstatat(
+            dir_fd,
+            name_c.ptr,
+            &stat,
+            std.posix.AT.SYMLINK_NOFOLLOW,
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return null,
+        }
+    }
+
+    const mode = stat.mode & std.posix.S.IFMT;
+    if (mode == std.posix.S.IFDIR) return .directory;
+    if (mode == std.posix.S.IFREG) return .file;
+    return null;
+}
+
+fn buildAndQuery(allocator: std.mem.Allocator, dir: std.Io.Dir, query: []const u8) !*Result {
+    var index = try Index.build(allocator, dir);
+    defer index.deinit(allocator);
+    return index.query(allocator, query);
+}
+
 test "lists direct directory children deterministically" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -477,8 +711,8 @@ test "lists direct directory children deterministically" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/tui/App.zig", .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/.secret", .data = "" });
 
-    const result = try build(tmp.dir, "src/");
-    defer result.destroy();
+    const result = try buildAndQuery(std.testing.allocator, tmp.dir, "src/");
+    defer result.destroy(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 3), result.item_len);
     try std.testing.expectEqualStrings("src/agent/", result.items[0].idSlice());
@@ -496,8 +730,8 @@ test "manual slash descends into a unique directory alias" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/agent/root.zig", .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/agent/App.zig", .data = "" });
 
-    const result = try build(tmp.dir, "agent/");
-    defer result.destroy();
+    const result = try buildAndQuery(std.testing.allocator, tmp.dir, "agent/");
+    defer result.destroy(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 2), result.item_len);
     try std.testing.expectEqualStrings("src/agent/App.zig", result.items[0].idSlice());
@@ -510,8 +744,8 @@ test "manual slash shows directory choices when alias is ambiguous" {
     try tmp.dir.createDirPath(std.testing.io, "src/agent");
     try tmp.dir.createDirPath(std.testing.io, "docs/agent");
 
-    const result = try build(tmp.dir, "agent/");
-    defer result.destroy();
+    const result = try buildAndQuery(std.testing.allocator, tmp.dir, "agent/");
+    defer result.destroy(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 2), result.item_len);
     try std.testing.expectEqualStrings("docs/agent/", result.items[0].idSlice());
@@ -524,12 +758,32 @@ test "hides dotfiles until dot is requested" {
     try tmp.dir.createDirPath(std.testing.io, "src");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/.secret", .data = "" });
 
-    const hidden = try build(tmp.dir, "src/");
-    defer hidden.destroy();
+    const hidden = try buildAndQuery(std.testing.allocator, tmp.dir, "src/");
+    defer hidden.destroy(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 0), hidden.item_len);
 
-    const shown = try build(tmp.dir, "src/.");
-    defer shown.destroy();
+    const shown = try buildAndQuery(std.testing.allocator, tmp.dir, "src/.");
+    defer shown.destroy(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 1), shown.item_len);
     try std.testing.expectEqualStrings("src/.secret", shown.items[0].idSlice());
+}
+
+test "ignored directories do not enter the index" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git/hooks");
+    try tmp.dir.createDirPath(std.testing.io, "node_modules/pkg");
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".git/config", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "node_modules/pkg/index.js", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/main.zig", .data = "" });
+
+    var index = try Index.build(std.testing.allocator, tmp.dir);
+    defer index.deinit(std.testing.allocator);
+
+    for (index.entries) |entry| {
+        const path = index.entryPath(entry);
+        try std.testing.expect(std.mem.indexOf(u8, path, ".git") == null);
+        try std.testing.expect(std.mem.indexOf(u8, path, "node_modules") == null);
+    }
 }

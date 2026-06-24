@@ -12,6 +12,7 @@ pub const Id = enum {
     session,
     model,
     resume_session,
+    new_session,
     compact,
     settings,
 };
@@ -49,6 +50,7 @@ pub const builtins = [_]Command{
         .summary = "Resume session",
         .picker = .session,
     },
+    .{ .id = .new_session, .name = "new", .summary = "Start a new session" },
     .{ .id = .compact, .name = "compact", .summary = "Compact session context" },
     .{ .id = .settings, .name = "settings", .summary = "Open settings" },
 };
@@ -114,7 +116,7 @@ test "slash command parser extracts name and trimmed args" {
 test "slash command catalog formats help from builtin source" {
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "available commands: /help, /session, /model, /resume, /compact, /settings",
+        "available commands: /help, /session, /model, /resume, /new, /compact, /settings",
         formatAvailable(&buffer),
     );
     try std.testing.expectEqual(Id.model, lookup("model").?.id);
