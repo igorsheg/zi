@@ -347,6 +347,7 @@ pub const SessionRuntime = struct {
     next_operation_id: client_protocol.OperationId = 1,
     next_event_seq: client_protocol.EventSeq = 1,
     pending_event: ?client_protocol.EventEnvelope = null,
+    session_chrome_dirty: bool = false,
 
     const HostConfig = struct {
         dir: std.Io.Dir,
@@ -472,6 +473,7 @@ pub const SessionRuntime = struct {
     pub fn hasImmediateWork(self: *const SessionRuntime) bool {
         return self.pending_event != null or
             self.events.count() > 0 or
+            self.session_chrome_dirty or
             self.commands.count() > 0 or
             (self.pending_file_completion != null and self.completion_load == null) or
             (self.completion_load != null and self.completion_load.?.task.hasResult());
@@ -1088,7 +1090,7 @@ pub const SessionRuntime = struct {
                     .operation_id = finished.operation_id,
                     .event = .{ .operation_finished = .{ .reason = reason } },
                 });
-                try self.enqueueSessionChrome(finished.request_id);
+                if (self.session_chrome_dirty) try self.enqueueSessionChrome(finished.request_id);
             },
         }
     }
@@ -1809,10 +1811,14 @@ pub const SessionRuntime = struct {
     }
 
     fn enqueueSessionChrome(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
-        if (!self.hasEventCapacity()) return;
+        if (!self.hasEventCapacity()) {
+            self.session_chrome_dirty = true;
+            return;
+        }
         var chrome = try self.session.clientChromeSnapshot(self.allocator);
         errdefer chrome.deinit(self.allocator);
         try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .session_chrome = chrome } });
+        self.session_chrome_dirty = false;
     }
 
     fn drainSessionEvents(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
@@ -1826,10 +1832,20 @@ pub const SessionRuntime = struct {
     ) !void {
         var count: usize = 0;
         while (count < limit and self.hasEventCapacity()) : (count += 1) {
-            const event = self.session.drainPublicEvent() orelse return;
+            const event = self.session.drainPublicEvent() orelse break;
+            if (eventRefreshesSessionChrome(event)) self.session_chrome_dirty = true;
             try self.enqueueEvent(.{ .request_id = request_id, .event = event });
         }
         if (!self.session.publicEventsEmpty()) self.session.publicEventWake().set();
+        if (self.session_chrome_dirty) try self.enqueueSessionChrome(request_id);
+    }
+
+    fn eventRefreshesSessionChrome(event: client_protocol.ClientEvent) bool {
+        return switch (event) {
+            .agent_event => |payload| payload.event == .message_end,
+            .compaction_end => |payload| payload.result != null,
+            else => false,
+        };
     }
 
     fn rejectionCode(err: anyerror) client_protocol.Rejection.Code {
@@ -2320,6 +2336,47 @@ test "model completion detail includes current marker context and costs" {
         "Model - current, ready; ctx 128k; $1.25 in/$10.00 out per 1M",
         detail,
     );
+}
+
+test "session runtime refreshes context chrome after persisted messages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    session_runtime.session.agent.setModel(.{
+        .id = "model",
+        .name = "Model",
+        .api = "api",
+        .provider = "provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{.text},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 100,
+        .max_tokens = 10,
+    });
+
+    _ = try session_runtime.session.agent.beginRun();
+    try session_runtime.session.agent.emitEvent(.{ .message_end = .{ .message = .{ .user = .{
+        .content = .{ .string = "hello world" },
+        .timestamp = 0,
+    } } } });
+    session_runtime.session.agent.finishRun();
+    try session_runtime.drainSessionEvents(7);
+
+    var agent_event = session_runtime.drainEvent().?;
+    defer agent_event.deinit(std.testing.allocator);
+    try std.testing.expect(agent_event.event == .agent_event);
+    var chrome_event = session_runtime.drainEvent().?;
+    defer chrome_event.deinit(std.testing.allocator);
+    try std.testing.expect(chrome_event.event == .session_chrome);
+    try std.testing.expectEqual(@as(?client_protocol.RequestId, 7), chrome_event.request_id);
+    try std.testing.expectEqual(@as(?u64, 3), chrome_event.event.session_chrome.context.tokens);
+    try std.testing.expectEqual(@as(u64, 100), chrome_event.event.session_chrome.context.window);
+    try std.testing.expectEqual(@as(?u32, 30), chrome_event.event.session_chrome.context.percent_tenths);
 }
 
 test "session runtime acknowledges queue clear with a correlated queue fact" {

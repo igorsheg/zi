@@ -27,10 +27,26 @@ pub const Item = struct {
     aux: []const u8 = "",
 };
 
-pub const Layout = enum {
+pub const Layout = union(enum) {
     line,
-    two_column,
-    four_column,
+    two_column: TwoColumn,
+    four_column: FourColumn,
+};
+
+pub const TwoColumn = struct {
+    /// Preferred display columns. `null` keeps the layout default; rendering
+    /// clamps widths to the available row.
+    label_width: ?u16 = null,
+    detail_width: ?u16 = null,
+};
+
+pub const FourColumn = struct {
+    /// Preferred display columns. `null` keeps the layout default; rendering
+    /// clamps widths to the available row.
+    label_width: ?u16 = null,
+    detail_width: ?u16 = null,
+    meta_width: ?u16 = null,
+    aux_width: ?u16 = null,
 };
 
 pub const Open = struct {

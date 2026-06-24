@@ -1031,7 +1031,7 @@ const InteractiveController = struct {
             .id = settings_picker_id,
             .items = &items,
             .search_detail = true,
-            .layout = .two_column,
+            .layout = .{ .two_column = .{} },
             .min_visible_rows = 2,
         } });
     }
@@ -1080,7 +1080,7 @@ const InteractiveController = struct {
             .items = &items,
             .search_detail = true,
             .filter_enabled = false,
-            .layout = .two_column,
+            .layout = .{ .two_column = .{} },
             .min_visible_rows = 6,
         } });
     }
@@ -1120,6 +1120,8 @@ const InteractiveController = struct {
             .picker = .{
                 .id = model_picker_id,
                 .items = mapped,
+                .search_detail = true,
+                .layout = .{ .two_column = .{ .label_width = 28, .detail_width = 44 } },
             },
         } });
     }
@@ -1134,7 +1136,12 @@ const InteractiveController = struct {
                 .id = resume_picker_id,
                 .items = mapped,
                 .search_detail = true,
-                .layout = .four_column,
+                .layout = .{ .four_column = .{
+                    .label_width = 40,
+                    .detail_width = 14,
+                    .meta_width = 8,
+                    .aux_width = 10,
+                } },
             },
         } });
     }
@@ -1148,7 +1155,7 @@ const InteractiveController = struct {
             .id = file_picker_id,
             .items = mapped,
             .search_detail = true,
-            .layout = .two_column,
+            .layout = .{ .two_column = .{ .label_width = 32, .detail_width = 48 } },
             .truncated = result.items.truncated,
             .min_visible_rows = 4,
         } });

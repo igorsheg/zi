@@ -1840,7 +1840,7 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
         painter.writeText(x + 1, row_y, marker, item_style);
         switch (picker.layout) {
             .line => drawLinePickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style),
-            .two_column => drawTwoColumnPickerItem(
+            .two_column => |layout| drawTwoColumnPickerItem(
                 app,
                 painter,
                 item,
@@ -1849,8 +1849,9 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
                 inner_width,
                 item_style,
                 detail_style,
+                layout,
             ),
-            .four_column => drawFourColumnPickerItem(
+            .four_column => |layout| drawFourColumnPickerItem(
                 app,
                 painter,
                 item,
@@ -1859,6 +1860,7 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
                 inner_width,
                 item_style,
                 detail_style,
+                layout,
             ),
         }
     }
@@ -1905,6 +1907,7 @@ fn drawTwoColumnPickerItem(
     inner_width: usize,
     item_style: theme_mod.Style,
     detail_style: theme_mod.Style,
+    layout: Picker.TwoColumn,
 ) void {
     _ = app;
     const label_x = x + 3;
@@ -1912,19 +1915,35 @@ fn drawTwoColumnPickerItem(
     if (content_width == 0) return;
 
     const detail = item.detailSlice();
-    if (detail.len == 0 or content_width < 24) {
+    const has_custom_width = layout.label_width != null or layout.detail_width != null;
+    if (detail.len == 0 or (!has_custom_width and content_width < 24)) {
         painter.writeText(label_x, row_y, fitToWidth(item.labelSlice(), content_width), item_style);
         return;
     }
 
-    const detail_width = @min(@as(usize, 28), @max(@as(usize, 12), content_width / 3));
     const gap_width: usize = 2;
-    if (content_width <= detail_width + gap_width) {
+    var detail_width = columnWidth(layout.detail_width) orelse
+        @min(@as(usize, 28), @max(@as(usize, 12), content_width / 3));
+    var label_width: usize = undefined;
+    if (columnWidth(layout.label_width)) |requested_label_width| {
+        label_width = @min(requested_label_width, content_width);
+        if (content_width <= label_width + gap_width) {
+            painter.writeText(label_x, row_y, fitToWidth(item.labelSlice(), content_width), item_style);
+            return;
+        }
+        detail_width = @min(detail_width, content_width - label_width - gap_width);
+    } else {
+        if (content_width <= detail_width + gap_width) {
+            painter.writeText(label_x, row_y, fitToWidth(item.labelSlice(), content_width), item_style);
+            return;
+        }
+        label_width = content_width - detail_width - gap_width;
+    }
+    if (label_width == 0 or detail_width == 0) {
         painter.writeText(label_x, row_y, fitToWidth(item.labelSlice(), content_width), item_style);
         return;
     }
 
-    const label_width = content_width - detail_width - gap_width;
     drawPickerCell(painter, label_x, row_y, item.labelSlice(), label_width, .left, item_style);
     drawPickerCell(
         painter,
@@ -1946,26 +1965,43 @@ fn drawFourColumnPickerItem(
     inner_width: usize,
     item_style: theme_mod.Style,
     detail_style: theme_mod.Style,
+    layout: Picker.FourColumn,
 ) void {
+    const two_column_fallback: Picker.TwoColumn = .{
+        .label_width = layout.label_width,
+        .detail_width = layout.detail_width,
+    };
     const start_x = x + 3;
     const content_width = inner_width -| 2;
     if (content_width == 0) return;
-    if (content_width < 44) {
-        drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style);
+    const has_custom_width = layout.label_width != null or
+        layout.detail_width != null or
+        layout.meta_width != null or
+        layout.aux_width != null;
+    if (!has_custom_width and content_width < 44) {
+        drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style, two_column_fallback);
         return;
     }
 
     const gap: usize = 2;
-    const detail_width: usize = 16;
-    const meta_width: usize = 8;
-    const aux_width: usize = 10;
+    const detail_width = columnWidth(layout.detail_width) orelse 16;
+    const meta_width = columnWidth(layout.meta_width) orelse 8;
+    const aux_width = columnWidth(layout.aux_width) orelse 10;
     const fixed = detail_width + meta_width + aux_width + gap * 3;
     if (content_width <= fixed) {
-        drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style);
+        drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style, two_column_fallback);
         return;
     }
 
-    const label_width = content_width - fixed;
+    const label_width = if (columnWidth(layout.label_width)) |requested|
+        @min(requested, content_width - fixed)
+    else
+        content_width - fixed;
+    if (label_width == 0 or label_width + fixed > content_width) {
+        drawTwoColumnPickerItem(app, painter, item, x, row_y, inner_width, item_style, detail_style, two_column_fallback);
+        return;
+    }
+
     var cell_x = start_x;
     drawPickerCell(painter, cell_x, row_y, item.labelSlice(), label_width, .left, item_style);
     cell_x = advance(cell_x, label_width + gap);
@@ -1974,6 +2010,10 @@ fn drawFourColumnPickerItem(
     drawPickerCell(painter, cell_x, row_y, item.metaSlice(), meta_width, .right, detail_style);
     cell_x = advance(cell_x, meta_width + gap);
     drawPickerCell(painter, cell_x, row_y, item.auxSlice(), aux_width, .left, detail_style);
+}
+
+fn columnWidth(width: ?u16) ?usize {
+    return if (width) |value| @as(usize, value) else null;
 }
 
 const PickerCellAlign = enum { left, right };
@@ -2355,6 +2395,38 @@ test "picker reserves bottom rows and pushes composer/status upward" {
     const reserved = pickerRows(&app);
     try std.testing.expect(reserved > 0);
     try std.testing.expectEqual(before - reserved, transcriptVisibleRows(&app));
+}
+
+test "picker column widths keep detail near fixed label column" {
+    var env = std.process.Environ.Map.init(testing_gpa);
+    defer env.deinit();
+
+    var vx = try vaxis.init(std.testing.io, testing_gpa, &env, .{});
+    var output_storage: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&output_storage);
+    defer vx.deinit(testing_gpa, &writer);
+
+    try vx.resize(testing_gpa, &writer, .{ .cols = 80, .rows = 8, .x_pixel = 0, .y_pixel = 0 });
+
+    var app = App.init(80, 8, .{});
+    defer app.deinit(testing_gpa);
+    const items = [_]Picker.Item{.{
+        .id = "src/tui/very-long-filename.zig",
+        .label = "very-long-filename.zig",
+        .detail = "src/tui",
+    }};
+    _ = try app.apply(testing_gpa, .{ .open_picker = .{
+        .id = 1,
+        .items = &items,
+        .layout = .{ .two_column = .{ .label_width = 12, .detail_width = 20 } },
+    } });
+
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    draw(&app, &vx, scratch);
+
+    try expectScreenText(vx.window(), 3, 7, "very-long-fi");
+    try expectScreenText(vx.window(), 17, 7, "src/tui");
 }
 
 test "scroll max accounts for composer and status reservations" {
