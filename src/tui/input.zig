@@ -29,6 +29,61 @@ pub const InlineBytes = struct {
     }
 };
 
+pub const Mods = packed struct(u6) {
+    shift: bool = false,
+    alt: bool = false,
+    ctrl: bool = false,
+    super: bool = false,
+    hyper: bool = false,
+    meta: bool = false,
+
+    fn fromVaxis(mods: vaxis.Key.Modifiers) Mods {
+        return .{
+            .shift = mods.shift,
+            .alt = mods.alt,
+            .ctrl = mods.ctrl,
+            .super = mods.super,
+            .hyper = mods.hyper,
+            .meta = mods.meta,
+        };
+    }
+
+    fn eql(self: Mods, other: Mods) bool {
+        return @as(u6, @bitCast(self)) == @as(u6, @bitCast(other));
+    }
+
+    fn isShortcut(self: Mods) bool {
+        return self.ctrl or self.alt or self.super or self.hyper or self.meta;
+    }
+};
+
+pub const Chord = struct {
+    codepoint: u21,
+    mods: Mods,
+
+    pub fn ctrl(codepoint: u21) Chord {
+        return .{ .codepoint = normalizedCodepoint(codepoint), .mods = .{ .ctrl = true } };
+    }
+
+    fn fromVaxis(key: vaxis.Key) ?Chord {
+        const mods = Mods.fromVaxis(key.mods);
+        if (!mods.isShortcut()) return null;
+        return .{
+            .codepoint = normalizedCodepoint(key.base_layout_codepoint orelse key.codepoint),
+            .mods = mods,
+        };
+    }
+
+    pub fn eql(self: Chord, other: Chord) bool {
+        return self.codepoint == other.codepoint and self.mods.eql(other.mods);
+    }
+};
+
+fn normalizedCodepoint(codepoint: u21) u21 {
+    if (codepoint >= 'A' and codepoint <= 'Z') return codepoint + ('a' - 'A');
+    return codepoint;
+}
+
 pub const Key = enum {
     escape,
     enter,
@@ -55,6 +110,7 @@ pub const Key = enum {
 
 pub const Input = union(enum) {
     key: Key,
+    shortcut: Chord,
     text: InlineBytes,
     paste_begin,
     paste_end,
@@ -118,6 +174,7 @@ fn fromVaxisKey(key: vaxis.Key) Input {
             return .{ .text = InlineBytes.from(text) };
         }
     }
+    if (Chord.fromVaxis(key)) |chord| return .{ .shortcut = chord };
     return .ignored;
 }
 
@@ -151,6 +208,7 @@ pub fn resolve(event: Input) KeyAction {
     return switch (event) {
         .text => |bytes| .{ .composer_insert = bytes },
         .key => |key| resolveKey(key),
+        .shortcut => .none,
         .wheel_up => .transcript_scroll_up,
         .wheel_down => .transcript_scroll_down,
         else => .none,
@@ -244,6 +302,10 @@ test "ctrl alt printable text passes through for AltGr" {
     } });
     try std.testing.expect(input == .text);
     try std.testing.expectEqualStrings("@", input.text.slice());
+}
+
+test "unknown ctrl key becomes shortcut chord" {
+    try std.testing.expectEqual(Input{ .shortcut = Chord.ctrl('l') }, try parseInput("\x0c"));
 }
 
 test "inline text truncates on utf8 boundaries" {

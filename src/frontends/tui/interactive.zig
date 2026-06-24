@@ -61,6 +61,7 @@ const resume_picker_id: tui.Picker.Id = 3;
 const file_picker_id: tui.Picker.Id = 4;
 const settings_picker_id: tui.Picker.Id = 5;
 const settings_thinking_picker_id: tui.Picker.Id = 6;
+const binding_open_model_picker: tui.keybind.Id = 1;
 const transcript_append_max = tui.Transcript.append_size_bytes_max;
 const pending_ui_work_per_tick_max: usize = 4;
 const pending_ui_work_bytes_per_tick_max: usize = 4 * 1024;
@@ -365,6 +366,7 @@ const InteractiveController = struct {
             .editor = nonEmptyEnv(process.env("EDITOR")),
             .tmp_dir = tmp_dir,
         };
+        try self.installKeyBindings();
         try self.installGreeter(version);
         try self.installSlashCompletions();
         try self.requestSnapshot();
@@ -744,6 +746,7 @@ const InteractiveController = struct {
             .interrupt => try self.cancelActive(),
             .request_transcript_history => try self.requestHistoryPage(),
             .request_transcript_tail => try self.requestTailSnapshot(),
+            .key_binding_triggered => |id| try self.handleKeyBinding(id),
             .request_shutdown => {
                 if (try self.submitCommand(.{ .command = .shutdown }) == .queued) {
                     self.terminal.requestStop();
@@ -761,6 +764,13 @@ const InteractiveController = struct {
             return self.bytes[0..self.len];
         }
     };
+
+    fn handleKeyBinding(self: *InteractiveController, id: tui.keybind.Id) !void {
+        switch (id) {
+            binding_open_model_picker => try self.editModelCommand(),
+            else => {},
+        }
+    }
 
     fn handleClipboardImagePaste(self: *InteractiveController) !void {
         var image = clipboard_image.read(
@@ -1093,6 +1103,14 @@ const InteractiveController = struct {
     fn editResumeCommand(self: *InteractiveController) !void {
         _ = try self.terminal.applyCommand(.{ .replace_composer_text = "/resume " });
         try self.requestCompletionSnapshot();
+    }
+
+    fn installKeyBindings(self: *InteractiveController) !void {
+        const bindings = [_]tui.keybind.Binding{.{
+            .id = binding_open_model_picker,
+            .chord = tui.input.Chord.ctrl('l'),
+        }};
+        _ = try self.terminal.applyCommand(.{ .set_key_bindings = &bindings });
     }
 
     fn installGreeter(self: *InteractiveController, version: []const u8) !void {

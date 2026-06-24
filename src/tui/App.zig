@@ -14,6 +14,7 @@ const Picker = @import("Picker.zig");
 const PromptHistory = @import("PromptHistory.zig");
 const Transcript = @import("Transcript.zig");
 const input_mod = @import("input.zig");
+const keybind = @import("keybind.zig");
 const notify_mod = @import("notify.zig");
 const render = @import("render.zig");
 const status_mod = @import("status.zig");
@@ -103,6 +104,7 @@ greeter: ?Greeter = null,
 completion: Completion = .{},
 status: status_mod.Store = .{},
 notify: notify_mod.Store = .{},
+key_bindings: keybind.Store = .{},
 viewport: TranscriptViewport = .{},
 theme: theme_mod.Theme,
 tools_expanded: bool = false,
@@ -343,6 +345,7 @@ pub const Command = union(enum) {
     input: input_mod.Input,
     tick: Tick,
     clear_transcript,
+    set_key_bindings: []const keybind.Binding,
     append_transcript: Transcript.Append,
     tool_output_delta: ToolOutputDelta,
     front_tool_output_delta: ToolOutputDelta,
@@ -375,6 +378,7 @@ pub const Effect = union(enum) {
     request_shutdown,
     request_transcript_history,
     request_transcript_tail,
+    key_binding_triggered: keybind.Id,
 
     pub fn deinit(self: Effect, gpa: std.mem.Allocator) void {
         switch (self) {
@@ -385,6 +389,7 @@ pub const Effect = union(enum) {
             .request_shutdown,
             .request_transcript_history,
             .request_transcript_tail,
+            .key_binding_triggered,
             => {},
         }
     }
@@ -416,6 +421,10 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.viewport.clear();
             self.viewport.assertInvariants();
             self.dirty = true;
+            return null;
+        },
+        .set_key_bindings => |bindings| {
+            self.key_bindings.set(bindings);
             return null;
         },
         .append_transcript => |entry| {
@@ -604,6 +613,10 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
             else => return null,
         }
         return null;
+    }
+
+    if (event == .shortcut) {
+        if (self.key_bindings.match(event.shortcut)) |id| return .{ .key_binding_triggered = id };
     }
 
     switch (input_mod.resolve(event)) {
@@ -1884,6 +1897,22 @@ test "picker escape closes without interrupting the session" {
 
     try std.testing.expect(effect == null);
     try std.testing.expect(app.completion.modal == null);
+}
+
+test "configured shortcut emits opaque key binding id" {
+    const gpa = std.testing.allocator;
+    var app = App.init(80, 24, .{});
+    defer app.deinit(gpa);
+
+    _ = try app.apply(gpa, .{ .set_key_bindings = &.{.{
+        .id = 11,
+        .chord = input_mod.Chord.ctrl('l'),
+    }} });
+
+    const effect = (try app.apply(gpa, .{ .input = .{ .shortcut = input_mod.Chord.ctrl('l') } })).?;
+    defer effect.deinit(gpa);
+    try std.testing.expect(effect == .key_binding_triggered);
+    try std.testing.expectEqual(@as(keybind.Id, 11), effect.key_binding_triggered);
 }
 
 test "paste mode turns enter into a newline and never submits" {

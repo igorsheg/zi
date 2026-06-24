@@ -13,6 +13,7 @@ pub const notify = @import("notify.zig");
 pub const Terminal = @import("Terminal.zig");
 pub const Transcript = @import("Transcript.zig");
 pub const input = @import("input.zig");
+pub const keybind = @import("keybind.zig");
 pub const markdown = @import("markdown.zig");
 pub const match = @import("match.zig");
 pub const render = @import("render.zig");
@@ -37,6 +38,7 @@ test {
     _ = Terminal;
     _ = Transcript;
     _ = input;
+    _ = keybind;
     _ = markdown;
     _ = match;
     _ = render;

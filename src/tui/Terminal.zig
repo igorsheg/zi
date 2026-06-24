@@ -259,6 +259,7 @@ pub const RenderTiming = struct {
 };
 
 fn inputPriority(event: input_mod.Input) InputPriority {
+    if (event == .shortcut) return .foreground;
     return switch (input_mod.resolve(event)) {
         .transcript_scroll_up, .transcript_scroll_down, .transcript_page_up, .transcript_page_down => .scroll,
         .none => .none,
