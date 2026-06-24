@@ -24,16 +24,15 @@ const App = @This();
 
 /// Second ctrl+c within this window exits; the first clears the composer.
 pub const double_press_window_ms: i64 = 500;
-pub const mouse_wheel_scroll_rows: usize = 3;
-pub const tail_autoscroll_detach_rows: usize = mouse_wheel_scroll_rows * 2;
+pub const mouse_wheel_scroll_rows: usize = 1;
 const composer_scroll_status_id: status_mod.ContributionId = std.math.maxInt(status_mod.ContributionId);
 
 const ScrollResult = enum { moved, boundary };
-const ScrollAttachment = enum { auto, detached };
+const TailFollow = enum { follow_tail, detached };
 
 const TranscriptViewport = struct {
     scroll_rows: usize = 0,
-    attachment: ScrollAttachment = .auto,
+    tail_follow: TailFollow = .follow_tail,
 
     fn clear(self: *TranscriptViewport) void {
         self.* = .{};
@@ -41,7 +40,7 @@ const TranscriptViewport = struct {
 
     fn historyPrepended(self: *TranscriptViewport, max_scroll: usize) void {
         self.scroll_rows = max_scroll;
-        self.attachment = .detached;
+        self.tail_follow = .detached;
     }
 
     fn scrollUp(self: *TranscriptViewport, rows: usize, max_scroll: usize) ScrollResult {
@@ -49,7 +48,7 @@ const TranscriptViewport = struct {
         const next = @min(max_scroll, self.scroll_rows + rows);
         if (next == self.scroll_rows) return .boundary;
         self.scroll_rows = next;
-        self.updateAttachmentFromDistance();
+        self.tail_follow = .detached;
         return .moved;
     }
 
@@ -58,36 +57,37 @@ const TranscriptViewport = struct {
         const next = self.scroll_rows -| rows;
         if (next == self.scroll_rows) return false;
         self.scroll_rows = next;
-        self.updateAttachmentFromDistance();
+        if (self.scroll_rows == 0) self.tail_follow = .follow_tail;
         return true;
     }
 
     fn followTail(self: *TranscriptViewport) bool {
-        if (self.scroll_rows == 0 and self.attachment == .auto) return false;
+        if (self.scroll_rows == 0 and self.tail_follow == .follow_tail) return false;
         self.scroll_rows = 0;
-        self.attachment = .auto;
+        self.tail_follow = .follow_tail;
         return true;
     }
 
     fn tailMutated(self: *TranscriptViewport, before_max: usize, after_max: usize) void {
-        if (self.attachment == .auto or self.scroll_rows <= tail_autoscroll_detach_rows) {
-            self.attachment = .auto;
+        if (self.tail_follow == .follow_tail) {
             self.scroll_rows = 0;
             return;
         }
         self.scroll_rows = @min(after_max, self.scroll_rows + (after_max -| before_max));
+        if (self.scroll_rows == 0) self.tail_follow = .follow_tail;
     }
 
     fn clampOrFollow(self: *TranscriptViewport, max_scroll: usize) void {
-        if (self.attachment == .auto) {
+        if (self.tail_follow == .follow_tail) {
             self.scroll_rows = 0;
         } else {
             self.scroll_rows = @min(self.scroll_rows, max_scroll);
+            if (self.scroll_rows == 0) self.tail_follow = .follow_tail;
         }
     }
 
-    fn updateAttachmentFromDistance(self: *TranscriptViewport) void {
-        self.attachment = if (self.scroll_rows > tail_autoscroll_detach_rows) .detached else .auto;
+    fn assertInvariants(self: *const TranscriptViewport) void {
+        if (self.tail_follow == .follow_tail) std.debug.assert(self.scroll_rows == 0);
     }
 };
 
@@ -374,12 +374,18 @@ pub const Effect = union(enum) {
     interrupt,
     request_shutdown,
     request_transcript_history,
+    request_transcript_tail,
 
     pub fn deinit(self: Effect, gpa: std.mem.Allocator) void {
         switch (self) {
             .submit_text, .edit_composer_external => |text| gpa.free(text),
             .picker_selected => |selection| gpa.free(selection.item_id),
-            .request_clipboard_image_paste, .interrupt, .request_shutdown, .request_transcript_history => {},
+            .request_clipboard_image_paste,
+            .interrupt,
+            .request_shutdown,
+            .request_transcript_history,
+            .request_transcript_tail,
+            => {},
         }
     }
 };
@@ -408,6 +414,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         .clear_transcript => {
             self.transcript.clear(gpa);
             self.viewport.clear();
+            self.viewport.assertInvariants();
             self.dirty = true;
             return null;
         },
@@ -443,6 +450,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             );
             self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
+            self.viewport.assertInvariants();
             self.dirty = true;
             return null;
         },
@@ -458,6 +466,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             const outcome = try self.transcript.replaceFrontToolOutput(gpa, replace.tool_call_id, replace.text);
             self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
+            self.viewport.assertInvariants();
             self.dirty = true;
             return null;
         },
@@ -473,6 +482,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             const outcome = try self.transcript.replaceFrontToolFooter(gpa, footer.tool_call_id, footer.text);
             self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
+            self.viewport.assertInvariants();
             self.dirty = true;
             return null;
         },
@@ -488,6 +498,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             const outcome = try self.transcript.prepend(gpa, rows);
             self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
+            self.viewport.assertInvariants();
             self.dirty = true;
             return null;
         },
@@ -617,7 +628,10 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
             return .request_transcript_history;
         },
         .transcript_scroll_down => self.scrollDown(mouse_wheel_scroll_rows),
-        .transcript_follow_tail => self.followTail(),
+        .transcript_follow_tail => {
+            self.followTail();
+            return .request_transcript_tail;
+        },
         .toggle_tool_expansion => {
             self.tools_expanded = !self.tools_expanded;
             self.clampOrFollowViewport();
@@ -1218,16 +1232,23 @@ fn clearOrExit(self: *App, gpa: std.mem.Allocator) ?Effect {
 
 fn scrollUp(self: *App, rows: usize) ScrollResult {
     const result = self.viewport.scrollUp(rows, render.transcriptScrollMax(self));
+    self.viewport.assertInvariants();
     if (result == .moved) self.dirty = true;
     return result;
 }
 
 fn scrollDown(self: *App, rows: usize) void {
-    if (self.viewport.scrollDown(rows)) self.dirty = true;
+    if (self.viewport.scrollDown(rows)) {
+        self.viewport.assertInvariants();
+        self.dirty = true;
+    }
 }
 
 fn followTail(self: *App) void {
-    if (self.viewport.followTail()) self.dirty = true;
+    if (self.viewport.followTail()) {
+        self.viewport.assertInvariants();
+        self.dirty = true;
+    }
 }
 
 /// Tail mutations are append/replace operations at the live end of the
@@ -1236,10 +1257,12 @@ fn followTail(self: *App) void {
 /// not drift while an agent streams below it.
 fn applyTailMutationScroll(self: *App, before_max: usize) void {
     self.viewport.tailMutated(before_max, render.transcriptScrollMax(self));
+    self.viewport.assertInvariants();
 }
 
 fn clampOrFollowViewport(self: *App) void {
     self.viewport.clampOrFollow(render.transcriptScrollMax(self));
+    self.viewport.assertInvariants();
 }
 
 fn noteOutcome(self: *App, gpa: std.mem.Allocator, outcome: Transcript.Outcome) void {
@@ -1266,12 +1289,21 @@ fn notice(self: *App, gpa: std.mem.Allocator, level: Transcript.StatusLevel, tex
     self.dirty = true;
 }
 
+pub fn transcriptAtTail(self: *const App) bool {
+    return self.viewport.scroll_rows == 0;
+}
+
 pub fn hasAnimation(self: *const App) bool {
     return self.status.hasAnimated(.status_line, self.now_ms) or self.notify.hasAnimated(self.now_ms);
 }
 
 pub fn nextDeadlineMs(self: *const App) ?i64 {
-    return self.notify.nextDeadlineMs(self.now_ms);
+    var deadline = self.notify.nextDeadlineMs(self.now_ms);
+    if (self.hasAnimation()) {
+        const animation_deadline = self.now_ms + 16;
+        if (deadline == null or animation_deadline < deadline.?) deadline = animation_deadline;
+    }
+    return deadline;
 }
 
 test "submit returns owned text and clears the composer" {
@@ -1365,14 +1397,14 @@ test "scrolling without overflow keeps sticky tail attached" {
     const effect = try app.apply(gpa, .{ .input = .wheel_up });
     try std.testing.expect(effect.? == .request_transcript_history);
     try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
-    try std.testing.expectEqual(ScrollAttachment.auto, app.viewport.attachment);
+    try std.testing.expectEqual(TailFollow.follow_tail, app.viewport.tail_follow);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
         .role = .assistant,
         .text = "tail",
     } } });
     try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
-    try std.testing.expectEqual(ScrollAttachment.auto, app.viewport.attachment);
+    try std.testing.expectEqual(TailFollow.follow_tail, app.viewport.tail_follow);
 }
 
 test "greeter hides on first typed character by default" {
@@ -1403,7 +1435,7 @@ test "greeter can opt out of first character auto hide" {
     try std.testing.expectEqualStrings("h", app.composer.text());
 }
 
-test "tail appends stick to bottom while near tail" {
+test "any user scroll up detaches tail autoscroll" {
     const gpa = std.testing.allocator;
     var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
@@ -1413,14 +1445,18 @@ test "tail appends stick to bottom while near tail" {
         .text = "one\ntwo\nthree\nfour\nfive\nsix",
     } } });
     _ = try app.apply(gpa, .{ .input = .wheel_up });
-    try std.testing.expect(app.viewport.scroll_rows > 0);
-    try std.testing.expect(app.viewport.scroll_rows <= tail_autoscroll_detach_rows);
+    const before_scroll = app.viewport.scroll_rows;
+    const before_max = render.transcriptScrollMax(&app);
+    try std.testing.expect(before_scroll > 0);
+    try std.testing.expectEqual(TailFollow.detached, app.viewport.tail_follow);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
         .role = .assistant,
         .text = "tail",
     } } });
-    try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
+    const after_max = render.transcriptScrollMax(&app);
+    try std.testing.expectEqual(@min(after_max, before_scroll + (after_max - before_max)), app.viewport.scroll_rows);
+    try std.testing.expectEqual(TailFollow.detached, app.viewport.tail_follow);
 }
 
 test "detached scrolling preserves viewport distance while tail grows" {
@@ -1432,9 +1468,7 @@ test "detached scrolling preserves viewport distance while tail grows" {
         .role = .assistant,
         .text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten",
     } } });
-    while (app.viewport.scroll_rows <= tail_autoscroll_detach_rows) {
-        _ = try app.apply(gpa, .{ .input = .wheel_up });
-    }
+    _ = try app.apply(gpa, .{ .input = .wheel_up });
     const before_scroll = app.viewport.scroll_rows;
     const before_max = render.transcriptScrollMax(&app);
 
@@ -1447,7 +1481,7 @@ test "detached scrolling preserves viewport distance while tail grows" {
     try std.testing.expectEqual(@min(after_max, before_scroll + (after_max - before_max)), app.viewport.scroll_rows);
 }
 
-test "scrolling back near the tail reattaches on next tail append" {
+test "scrolling back to the tail reattaches immediately" {
     const gpa = std.testing.allocator;
     var app = App.init(20, 6, .{});
     defer app.deinit(gpa);
@@ -1456,12 +1490,13 @@ test "scrolling back near the tail reattaches on next tail append" {
         .role = .assistant,
         .text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten",
     } } });
-    while (app.viewport.scroll_rows <= tail_autoscroll_detach_rows) {
-        _ = try app.apply(gpa, .{ .input = .wheel_up });
-    }
-    while (app.viewport.scroll_rows > tail_autoscroll_detach_rows) {
+    _ = try app.apply(gpa, .{ .input = .wheel_up });
+    try std.testing.expectEqual(TailFollow.detached, app.viewport.tail_follow);
+
+    while (app.viewport.scroll_rows > 0) {
         _ = try app.apply(gpa, .{ .input = .wheel_down });
     }
+    try std.testing.expectEqual(TailFollow.follow_tail, app.viewport.tail_follow);
 
     _ = try app.apply(gpa, .{ .append_transcript = .{ .message = .{
         .role = .assistant,
@@ -1479,13 +1514,13 @@ test "ctrl end follows the transcript tail immediately" {
         .role = .assistant,
         .text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten",
     } } });
-    while (app.viewport.scroll_rows <= tail_autoscroll_detach_rows) {
-        _ = try app.apply(gpa, .{ .input = .wheel_up });
-    }
+    _ = try app.apply(gpa, .{ .input = .wheel_up });
+    try std.testing.expectEqual(TailFollow.detached, app.viewport.tail_follow);
 
-    _ = try app.apply(gpa, .{ .input = .{ .key = .ctrl_end } });
+    const effect = (try app.apply(gpa, .{ .input = .{ .key = .ctrl_end } })).?;
+    try std.testing.expect(effect == .request_transcript_tail);
     try std.testing.expectEqual(@as(usize, 0), app.viewport.scroll_rows);
-    try std.testing.expectEqual(ScrollAttachment.auto, app.viewport.attachment);
+    try std.testing.expectEqual(TailFollow.follow_tail, app.viewport.tail_follow);
 }
 
 test "prepending transcript history keeps the viewport on older content" {

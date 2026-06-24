@@ -21,6 +21,7 @@ const slash_commands = @import("slash_commands.zig");
 pub const WakeResult = enum { input, session, frame };
 
 const session_command_message_bytes_max: usize = 160;
+const session_public_events_per_turn_max: usize = 16;
 const SessionStats = client_protocol.PromptCommandSessionStats;
 
 fn ignoreBestEffortError(err: anyerror) void {
@@ -1647,10 +1648,20 @@ pub const SessionRuntime = struct {
     }
 
     fn drainSessionEvents(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
-        while (self.hasEventCapacity()) {
+        try self.drainSessionEventsBounded(request_id, session_public_events_per_turn_max);
+    }
+
+    fn drainSessionEventsBounded(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        limit: usize,
+    ) !void {
+        var count: usize = 0;
+        while (count < limit and self.hasEventCapacity()) : (count += 1) {
             const event = self.session.drainPublicEvent() orelse return;
             try self.enqueueEvent(.{ .request_id = request_id, .event = event });
         }
+        if (!self.session.publicEventsEmpty()) self.session.publicEventWake().set();
     }
 
     fn rejectionCode(err: anyerror) client_protocol.Rejection.Code {

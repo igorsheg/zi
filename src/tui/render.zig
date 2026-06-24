@@ -40,6 +40,8 @@ const footer_bytes_max: usize = 256;
 /// tool titles, collapse hints, and omission notices. Static literals and
 /// transcript text are borrowed and need no copy.
 pub const generated_text_bytes_max: usize = 16 * 1024;
+const collapsed_tool_tail_scan_bytes_max = 2 * 1024;
+const collapsed_tool_tail_scan_lines_max = 64;
 
 pub const RowSegment = struct {
     text: []const u8,
@@ -95,34 +97,92 @@ fn internSegments(out: ?*RowScratch, segments: []const RowSegment) []const RowSe
     return dest;
 }
 
+pub const DrawTiming = struct {
+    clear_ns: u64 = 0,
+    layout_ns: u64 = 0,
+    transcript_ns: u64 = 0,
+    transcript_total_ns: u64 = 0,
+    transcript_item_rows_ns: u64 = 0,
+    transcript_tail_ns: u64 = 0,
+    transcript_build_ns: u64 = 0,
+    transcript_build_message_ns: u64 = 0,
+    transcript_build_thinking_ns: u64 = 0,
+    transcript_build_tool_ns: u64 = 0,
+    transcript_build_status_ns: u64 = 0,
+    transcript_build_custom_ns: u64 = 0,
+    transcript_emit_ns: u64 = 0,
+    greeter_ns: u64 = 0,
+    status_ns: u64 = 0,
+    notify_ns: u64 = 0,
+    composer_ns: u64 = 0,
+    picker_ns: u64 = 0,
+};
+
 /// Paint the whole frame into vaxis' screen. Infallible by design: the
 /// fallible half of the render transaction is the terminal write that
 /// follows in Terminal.renderIfDirty.
 pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
+    drawProfiled(app, vx, scratch, null, null);
+}
+
+pub fn drawTimed(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch, io: std.Io) DrawTiming {
+    var timing: DrawTiming = .{};
+    drawProfiled(app, vx, scratch, io, &timing);
+    return timing;
+}
+
+fn drawProfiled(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch, maybe_io: ?std.Io, timing: ?*DrawTiming) void {
+    var mark = DrawMark.init(maybe_io);
     scratch.reset();
     var painter = Painter.init(vx);
     painter.clear(app.theme.app_bg);
+    if (timing) |t| t.clear_ns = mark.lap();
     if (app.width == 0 or app.height == 0) return;
 
     const composer_rows = composerRows(app);
     const picker_rows = pickerRows(app);
     const status_rows = statusRows(app);
     const greeter_rows = greeterRows(app);
-    drawTranscript(app, &painter, scratch, transcriptVisibleRows(app));
+    const visible_rows = transcriptVisibleRows(app);
+    if (timing) |t| t.layout_ns = mark.lap();
+
+    drawTranscript(app, &painter, scratch, visible_rows, maybe_io, timing);
+    if (timing) |t| t.transcript_ns = mark.lap();
     if (greeter_rows > 0) {
         const y: u16 = @intCast(@as(usize, app.height) - picker_rows - composer_rows - status_rows - greeter_rows);
         drawGreeter(app, &painter, y);
     }
+    if (timing) |t| t.greeter_ns = mark.lap();
     if (status_rows > 0 and @as(usize, app.height) > composer_rows + picker_rows) {
         const y: u16 = @intCast(@as(usize, app.height) - picker_rows - composer_rows - 1);
         drawStatusLine(app, &painter, y);
     }
+    if (timing) |t| t.status_ns = mark.lap();
     drawNotifyOverlay(app, &painter, scratch, composer_rows, picker_rows, status_rows);
+    if (timing) |t| t.notify_ns = mark.lap();
     drawComposer(app, &painter, composer_rows, picker_rows);
+    if (timing) |t| t.composer_ns = mark.lap();
     if (app.visiblePicker()) |picker| {
         drawPicker(app, picker, &painter, picker_rows, app.visiblePickerFocusesFilter());
     }
+    if (timing) |t| t.picker_ns = mark.lap();
 }
+
+const DrawMark = struct {
+    io: ?std.Io,
+    last_ns: i96 = 0,
+
+    fn init(io: ?std.Io) DrawMark {
+        return .{ .io = io, .last_ns = if (io) |value| std.Io.Clock.awake.now(value).nanoseconds else 0 };
+    }
+
+    fn lap(self: *DrawMark) u64 {
+        const io = self.io orelse return 0;
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        defer self.last_ns = now;
+        return @intCast(now - self.last_ns);
+    }
+};
 
 fn clampedScrollRows(app: *App) usize {
     return @min(app.viewport.scroll_rows, transcriptScrollMax(app));
@@ -204,7 +264,7 @@ fn cachedAssistantMarkdownRows(item: *Transcript.Item, width: u16, theme: *const
 
 fn cachedThinkingMarkdownRows(item: *Transcript.Item, width: u16, theme: *const theme_mod.Theme) usize {
     std.debug.assert(item.body == .thinking);
-    const text = item.body.thinking.text.items;
+    const text = visibleThinkingText(item);
     const stable_end = markdownStableEnd(text);
     if (item.layout.markdown_width != width or item.layout.markdown_stable_end > stable_end) {
         item.layout.markdown_width = width;
@@ -219,7 +279,7 @@ fn cachedThinkingMarkdownRows(item: *Transcript.Item, width: u16, theme: *const 
     var start = item.layout.markdown_stable_end;
     while (start < stable_end and rows < item_rows_max) {
         const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse stable_end;
-        addMarkdownLineRows(null, &rows, &state, text[start..end], inner, theme);
+        addThinkingMarkdownLineRows(null, &rows, &state, text[start..end], inner, theme);
         start = if (end < stable_end) end + 1 else end;
     }
     item.layout.markdown_stable_end = stable_end;
@@ -239,6 +299,17 @@ fn buildAssistantMarkdownTailRows(
     width: u16,
     theme: *const theme_mod.Theme,
 ) void {
+    buildAssistantMarkdownTailRowsWindow(out, count, item, width, theme, .{});
+}
+
+fn buildAssistantMarkdownTailRowsWindow(
+    out: ?*RowScratch,
+    count: *usize,
+    item: *const Transcript.Item,
+    width: u16,
+    theme: *const theme_mod.Theme,
+    window: RowBuildWindow,
+) void {
     std.debug.assert(item.body == .message);
     std.debug.assert(item.body.message.role == .assistant);
     if (out) |scratch| scratch.reset();
@@ -246,17 +317,20 @@ fn buildAssistantMarkdownTailRows(
     const stable_end = @min(item.layout.markdown_stable_end, text.len);
     var state = markdownStateFromCache(item.layout.markdown_fence);
     const inner = innerWidth(width);
+    var active_window = window;
     if (stable_end < text.len) {
         var tail_lines: PhysicalLineIterator = .{ .text = text[stable_end..] };
         while (tail_lines.next()) |line| {
-            addMarkdownLineRows(out, count, &state, line, inner, theme);
-            if (count.* >= item_rows_max) return;
+            addMarkdownLineRowsWindow(out, count, &state, line, inner, theme, &active_window);
+            if (count.* >= item_rows_max or active_window.emitted >= active_window.limit) return;
         }
     } else if (text.len == 0 or text[text.len - 1] == '\n') {
-        addMarkdownLineRows(out, count, &state, "", inner, theme);
+        addMarkdownLineRowsWindow(out, count, &state, "", inner, theme, &active_window);
     }
     var margin: usize = 0;
-    while (margin < item_margin_bottom and count.* < item_rows_max) : (margin += 1) putRow(out, count, .{});
+    while (margin < item_margin_bottom and count.* < item_rows_max and active_window.emitted < active_window.limit) : (margin += 1) {
+        if (active_window.includeNext()) putRow(out, count, .{});
+    }
 }
 
 fn addMarkdownLineRows(
@@ -270,6 +344,40 @@ fn addMarkdownLineRows(
     emitMarkdownProjection(out, rows, markdown.classifyLine(state, line, theme), inner, theme);
 }
 
+fn addThinkingMarkdownLineRows(
+    out: ?*RowScratch,
+    rows: *usize,
+    state: *markdown.State,
+    line: []const u8,
+    inner: u16,
+    theme: *const theme_mod.Theme,
+) void {
+    var projected = markdown.classifyLine(state, line, theme);
+    const style = thinkingStyle(theme);
+    projected.prefix_style = style;
+    projected.text_style = style;
+    projected.row_style = style;
+    emitMarkdownProjection(out, rows, projected, inner, theme);
+}
+
+fn thinkingStyle(theme: *const theme_mod.Theme) theme_mod.Style {
+    var style = theme.transcript_secondary;
+    style.italic = true;
+    return style;
+}
+
+fn addMarkdownLineRowsWindow(
+    out: ?*RowScratch,
+    rows: *usize,
+    state: *markdown.State,
+    line: []const u8,
+    inner: u16,
+    theme: *const theme_mod.Theme,
+    window: *RowBuildWindow,
+) void {
+    emitMarkdownProjectionWindow(out, rows, markdown.classifyLine(state, line, theme), inner, theme, window);
+}
+
 fn emitMarkdownProjection(
     out: ?*RowScratch,
     rows: *usize,
@@ -277,8 +385,19 @@ fn emitMarkdownProjection(
     inner: u16,
     theme: *const theme_mod.Theme,
 ) void {
+    emitMarkdownProjectionWindow(out, rows, projected, inner, theme, null);
+}
+
+fn emitMarkdownProjectionWindow(
+    out: ?*RowScratch,
+    rows: *usize,
+    projected: markdown.Projection,
+    inner: u16,
+    theme: *const theme_mod.Theme,
+    window: ?*RowBuildWindow,
+) void {
     if (!projected.parse_inline) {
-        emitWrappedText(out, rows, .{
+        emitWrappedTextWindow(out, rows, .{
             .prefix = projected.prefix,
             .continuation_prefix = projected.continuation_prefix,
             .text = projected.text,
@@ -287,7 +406,7 @@ fn emitMarkdownProjection(
             .text_style = projected.text_style,
             .row_style = projected.row_style,
             .inner_width = inner,
-        });
+        }, window);
         return;
     }
     emitWrappedInlineMarkdown(out, rows, .{
@@ -300,6 +419,7 @@ fn emitMarkdownProjection(
         .row_style = projected.row_style,
         .inner_width = inner,
         .theme = theme,
+        .window = window,
     });
 }
 
@@ -313,6 +433,7 @@ const InlineMarkdownOptions = struct {
     row_style: theme_mod.Style,
     inner_width: u16,
     theme: *const theme_mod.Theme,
+    window: ?*RowBuildWindow = null,
 };
 
 const InlineRowBuilder = struct {
@@ -423,7 +544,11 @@ const InlineRowBuilder = struct {
                 row.segments = scratch.segments[self.row_segment_start..scratch.segment_len];
             }
         }
-        putRow(self.out, self.count, row);
+        if (self.options.window) |window| {
+            if (window.includeNext()) putRow(self.out, self.count, row);
+        } else {
+            putRow(self.out, self.count, row);
+        }
         self.visual_index += 1;
         self.row_started = false;
     }
@@ -514,9 +639,18 @@ pub fn composerTextWidth(width: u16) u16 {
 
 // --- transcript ---
 
-fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_rows: usize) void {
+fn drawTranscript(
+    app: *App,
+    painter: *Painter,
+    scratch: *RowScratch,
+    visible_rows: usize,
+    maybe_io: ?std.Io,
+    timing: ?*DrawTiming,
+) void {
     if (visible_rows == 0 or app.width == 0) return;
+    var mark = DrawMark.init(maybe_io);
     const total = transcriptTotalRows(app);
+    if (timing) |t| t.transcript_total_ns += mark.lap();
     var skip_remaining = clampedScrollRows(app);
     const drawn = @min(total - skip_remaining, visible_rows);
     if (drawn == 0) return;
@@ -531,6 +665,7 @@ fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_ro
         index -= 1;
         const item = &app.transcript.items.items[index];
         const rows = itemRows(item, app.width, &app.theme, app.tools_expanded);
+        if (timing) |t| t.transcript_item_rows_ns += mark.lap();
         if (skip_remaining >= rows) {
             skip_remaining -= rows;
             continue;
@@ -539,11 +674,26 @@ fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_ro
         skip_remaining = 0;
         const draw_end = rows - skip_from_bottom;
         const draw_start = draw_end - @min(draw_end, sink.draw_remaining);
-        if (tryDrawAssistantTailWindow(app, scratch, item, draw_start, draw_end, &sink)) continue;
+        if (tryDrawAssistantTailWindow(app, scratch, item, draw_start, draw_end, &sink)) {
+            if (timing) |t| t.transcript_tail_ns += mark.lap();
+            continue;
+        }
+        if (timing) |t| t.transcript_tail_ns += mark.lap();
 
         sink.skip_remaining = skip_from_bottom;
         var count: usize = 0;
         buildItemRowsFrame(scratch, &count, item, app.width, &app.theme, app.tools_expanded);
+        if (timing) |t| {
+            const elapsed = mark.lap();
+            t.transcript_build_ns += elapsed;
+            switch (item.body) {
+                .message => t.transcript_build_message_ns += elapsed,
+                .thinking => t.transcript_build_thinking_ns += elapsed,
+                .tool => t.transcript_build_tool_ns += elapsed,
+                .status => t.transcript_build_status_ns += elapsed,
+                .custom => t.transcript_build_custom_ns += elapsed,
+            }
+        }
         std.debug.assert(count == rows); // memo and fresh build must agree
         // Rows are built top-down; the sink consumes newest-first.
         var k = count;
@@ -551,6 +701,7 @@ fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_ro
             k -= 1;
             sink.emit(scratch.rows[k]);
         }
+        if (timing) |t| t.transcript_emit_ns += mark.lap();
     }
 }
 
@@ -565,19 +716,37 @@ fn tryDrawAssistantTailWindow(
     if (item.body != .message or item.body.message.role != .assistant) return false;
     const stable_rows: usize = item.layout.markdown_stable_rows;
     if (stable_rows == 0 or draw_start < stable_rows) return false;
-
-    var tail_count: usize = 0;
-    buildAssistantMarkdownTailRows(scratch, &tail_count, item, app.width, &app.theme);
-    if (draw_end - stable_rows > tail_count) return false;
-
     const tail_start = draw_start - stable_rows;
-    var tail_index = draw_end - stable_rows;
-    while (tail_index > tail_start and sink.draw_remaining > 0) {
+    const tail_limit = draw_end - stable_rows;
+    var tail_count: usize = 0;
+    buildAssistantMarkdownTailRowsWindow(scratch, &tail_count, item, app.width, &app.theme, .{
+        .skip = tail_start,
+        .limit = tail_limit -| tail_start,
+    });
+    if (tail_count == 0) return false;
+
+    var tail_index = tail_count;
+    while (tail_index > 0 and sink.draw_remaining > 0) {
         tail_index -= 1;
         sink.emit(scratch.rows[tail_index]);
     }
     return true;
 }
+
+const RowBuildWindow = struct {
+    skip: usize = 0,
+    limit: usize = std.math.maxInt(usize),
+    seen: usize = 0,
+    emitted: usize = 0,
+
+    fn includeNext(self: *RowBuildWindow) bool {
+        defer self.seen += 1;
+        if (self.seen < self.skip) return false;
+        if (self.emitted >= self.limit) return false;
+        self.emitted += 1;
+        return true;
+    }
+};
 
 const RowSink = struct {
     painter: *Painter,
@@ -622,18 +791,18 @@ fn buildThinkingMarkdownTailRows(
 ) void {
     std.debug.assert(item.body == .thinking);
     if (out) |scratch| scratch.reset();
-    const text = item.body.thinking.text.items;
+    const text = visibleThinkingText(item);
     const stable_end = @min(item.layout.markdown_stable_end, text.len);
     var state = markdownStateFromCache(item.layout.markdown_fence);
     const inner = innerWidth(width);
     if (stable_end < text.len) {
         var tail_lines: PhysicalLineIterator = .{ .text = text[stable_end..] };
         while (tail_lines.next()) |line| {
-            addMarkdownLineRows(out, count, &state, line, inner, theme);
+            addThinkingMarkdownLineRows(out, count, &state, line, inner, theme);
             if (count.* >= item_rows_max) return;
         }
     } else if (text.len == 0 or text[text.len - 1] == '\n') {
-        addMarkdownLineRows(out, count, &state, "", inner, theme);
+        addThinkingMarkdownLineRows(out, count, &state, "", inner, theme);
     }
     var margin: usize = 0;
     while (margin < item_margin_bottom and count.* < item_rows_max) : (margin += 1) putRow(out, count, .{});
@@ -675,7 +844,7 @@ fn buildItemRowsFrame(
                 .inner_width = innerWidth(width),
             });
         } else {
-            buildMarkdownRows(out, count, thinking.text.items, width, theme);
+            buildThinkingMarkdownRows(out, count, item, width, theme);
         },
         .status => |status| emitWrappedText(out, count, .{
             .prefix = statusPrefix(status.level),
@@ -693,6 +862,33 @@ fn buildItemRowsFrame(
     while (index < padding) : (index += 1) putRow(out, count, .{ .row_style = style });
     var margin: usize = 0;
     while (margin < item_margin_bottom) : (margin += 1) putRow(out, count, .{});
+}
+
+fn buildThinkingMarkdownRows(
+    out: ?*RowScratch,
+    count: *usize,
+    item: *const Transcript.Item,
+    width: u16,
+    theme: *const theme_mod.Theme,
+) void {
+    std.debug.assert(item.body == .thinking);
+    const text = visibleThinkingText(item);
+    const inner = innerWidth(width);
+    var state: markdown.State = .{};
+    var lines: PhysicalLineIterator = .{ .text = text };
+    while (lines.next()) |line| {
+        if (count.* >= item_rows_max) return;
+        addThinkingMarkdownLineRows(out, count, &state, line, inner, theme);
+    }
+    if (text.len == 0) putRow(out, count, .{ .row_style = thinkingStyle(theme) });
+}
+
+fn visibleThinkingText(item: *const Transcript.Item) []const u8 {
+    std.debug.assert(item.body == .thinking);
+    const text = item.body.thinking.text.items;
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r')) : (end -= 1) {}
+    return text[0..end];
 }
 
 fn putRow(out: ?*RowScratch, count: *usize, row: Row) void {
@@ -893,7 +1089,6 @@ fn buildToolBodyRows(
 ) void {
     const body = tool.output.items;
     const prefix_width: u16 = @intCast(@min(text_mod.displayWidth(glyphs.tool_body_prefix), inner));
-    const body_rows_total = countWrappedRows(body, inner, prefix_width);
     const rows_max: usize = tool.collapse.rows_max;
 
     var options: WrapOptions = .{
@@ -908,34 +1103,73 @@ fn buildToolBodyRows(
         .theme = theme,
     };
 
-    if (expanded or body_rows_total <= rows_max) {
+    if (expanded) {
         emitWrappedText(out, count, options);
         return;
     }
 
-    const hidden = body_rows_total - rows_max;
+    switch (tool.collapse.mode) {
+        .head => {
+            const visible_or_more = countWrappedRowsBounded(body, inner, prefix_width, rows_max + 1);
+            if (visible_or_more <= rows_max) {
+                emitWrappedText(out, count, options);
+                return;
+            }
+            options.window = .{ .skip = 0, .limit = rows_max };
+            emitWrappedText(out, count, options);
+            putCollapseHint(out, count, tool.collapse.mode, 1, rail, theme);
+        },
+        .tail => {
+            const suffix = collapsedToolTailSlice(body);
+            options.text = suffix.text;
+            const visible_or_more = countWrappedRowsBounded(suffix.text, inner, prefix_width, rows_max + 1);
+            const hidden = if (suffix.start > 0 or visible_or_more > rows_max or tool.dropped_head_lines > 0)
+                @max(@as(usize, 1), tool.dropped_head_lines)
+            else
+                0;
+            if (hidden > 0) putCollapseHint(out, count, tool.collapse.mode, hidden, rail, theme);
+            options.window = .{ .skip = visible_or_more -| rows_max, .limit = rows_max };
+            emitWrappedText(out, count, options);
+        },
+    }
+}
+
+const TailSlice = struct {
+    text: []const u8,
+    start: usize,
+};
+
+fn collapsedToolTailSlice(text: []const u8) TailSlice {
+    if (text.len <= collapsed_tool_tail_scan_bytes_max) return .{ .text = text, .start = 0 };
+    var start = text.len;
+    var lines: usize = 0;
+    while (start > 0 and text.len - start < collapsed_tool_tail_scan_bytes_max and lines < collapsed_tool_tail_scan_lines_max) {
+        start -= 1;
+        if (text[start] == '\n') lines += 1;
+    }
+    if (start > 0) {
+        while (start < text.len and text[start - 1] != '\n') start += 1;
+    }
+    return .{ .text = text[start..], .start = start };
+}
+
+fn putCollapseHint(
+    out: ?*RowScratch,
+    count: *usize,
+    mode: Transcript.ToolCollapseMode,
+    hidden_rows: usize,
+    rail: theme_mod.Style,
+    theme: *const theme_mod.Theme,
+) void {
     var hint_buffer: [hint_bytes_max]u8 = undefined;
-    const hint_row: Row = .{
+    putRow(out, count, .{
         .prefix = glyphs.tool_body_prefix,
-        .text = internText(out, collapseHint(&hint_buffer, tool.collapse.mode, hidden)),
+        .text = internText(out, collapseHint(&hint_buffer, mode, hidden_rows)),
         .show_prefix = true,
         .prefix_style = rail,
         .text_style = theme.transcript_secondary,
         .row_style = theme.transcript_secondary,
-    };
-
-    switch (tool.collapse.mode) {
-        .tail => {
-            putRow(out, count, hint_row);
-            options.window = .{ .skip = hidden, .limit = rows_max };
-            emitWrappedText(out, count, options);
-        },
-        .head => {
-            options.window = .{ .skip = 0, .limit = rows_max };
-            emitWrappedText(out, count, options);
-            putRow(out, count, hint_row);
-        },
-    }
+    });
 }
 
 const WrapWindow = struct {
@@ -962,6 +1196,10 @@ const WrapOptions = struct {
 /// only when `repeat_prefix` is set. The first row wraps at
 /// `inner - prefix_width`, continuations at full inner width.
 fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void {
+    emitWrappedTextWindow(out, count, options, null);
+}
+
+fn emitWrappedTextWindow(out: ?*RowScratch, count: *usize, options: WrapOptions, row_window: ?*RowBuildWindow) void {
     var start: usize = 0;
     var visual_index: usize = 0;
     var window_index: usize = 0;
@@ -978,7 +1216,7 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
             .row_style = options.row_style,
         };
         if (width == 0) {
-            emitWindowed(out, count, &window_index, options.window, row);
+            emitWindowedBuild(out, count, &window_index, options.window, row, row_window);
             return;
         }
         const visual = text_mod.nextVisualLineBreak(options.text, start, width);
@@ -987,19 +1225,28 @@ fn emitWrappedText(out: ?*RowScratch, count: *usize, options: WrapOptions) void 
         row.text = options.text[visual.start..visual.end];
         row.text_style = line_style;
         if ((options.presentation orelse .generic) == .patch) row.row_style = line_style;
-        emitWindowed(out, count, &window_index, options.window, row);
+        emitWindowedBuild(out, count, &window_index, options.window, row, row_window);
+        if (wrapWindowComplete(options.window, window_index, row_window)) return;
         start = visual.next;
     }
     if (options.text.len == 0 and count.* < item_rows_max) {
         const prefix = wrapPrefix(options, 0);
-        emitWindowed(out, count, &window_index, options.window, .{
+        emitWindowedBuild(out, count, &window_index, options.window, .{
             .prefix = prefix,
             .show_prefix = prefix.len > 0,
             .prefix_style = options.prefix_style,
             .text_style = options.text_style,
             .row_style = options.row_style,
-        });
+        }, row_window);
     }
+}
+
+fn wrapWindowComplete(window: WrapWindow, window_index: usize, row_window: ?*RowBuildWindow) bool {
+    if (row_window) |build_window| {
+        if (build_window.emitted >= build_window.limit) return true;
+    }
+    if (window.limit == std.math.maxInt(usize)) return false;
+    return window_index >= window.skip + window.limit;
 }
 
 fn wrapPrefix(options: WrapOptions, visual_index: usize) []const u8 {
@@ -1008,26 +1255,42 @@ fn wrapPrefix(options: WrapOptions, visual_index: usize) []const u8 {
 }
 
 fn emitWindowed(out: ?*RowScratch, count: *usize, window_index: *usize, window: WrapWindow, row: Row) void {
+    emitWindowedBuild(out, count, window_index, window, row, null);
+}
+
+fn emitWindowedBuild(
+    out: ?*RowScratch,
+    count: *usize,
+    window_index: *usize,
+    window: WrapWindow,
+    row: Row,
+    row_window: ?*RowBuildWindow,
+) void {
     defer window_index.* += 1;
     if (window_index.* < window.skip) return;
     if (window_index.* - window.skip >= window.limit) return;
-    putRow(out, count, row);
+    if (row_window) |build_window| {
+        if (build_window.includeNext()) putRow(out, count, row);
+    } else {
+        putRow(out, count, row);
+    }
 }
 
 /// Visual rows `text` wraps to, ignoring styles. Must agree with
 /// emitWrappedText's walk; both use nextVisualLineBreak with the same
 /// first-row prefix reservation.
 fn countWrappedRows(text: []const u8, inner: u16, prefix_width: u16) usize {
+    return countWrappedRowsBounded(text, inner, prefix_width, std.math.maxInt(usize));
+}
+
+fn countWrappedRowsBounded(text: []const u8, inner: u16, prefix_width: u16, limit: usize) usize {
     if (text.len == 0) return 1;
     var rows: usize = 0;
     var start: usize = 0;
     var visual_index: usize = 0;
-    while (start < text.len) : (visual_index += 1) {
+    while (start < text.len and rows < limit) : (visual_index += 1) {
         const width = if (visual_index == 0) inner - @min(prefix_width, inner) else inner;
-        if (width == 0) {
-            rows += 1;
-            return rows;
-        }
+        if (width == 0) return rows + 1;
         const visual = text_mod.nextVisualLineBreak(text, start, width);
         if (visual.next == start) break;
         rows += 1;
@@ -2401,6 +2664,34 @@ test "markdown inline spans strip markers and keep styles" {
 
     var counted: usize = 0;
     buildMarkdownRows(null, &counted, "use `foo` and **bar**", 80, &theme);
+    try std.testing.expectEqual(counted, count);
+}
+
+test "visible thinking is muted italic without extra trailing blank row" {
+    var app = App.init(60, 12, .{});
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .thinking = .{
+        .text = "**plan** first\n\n",
+        .hidden = false,
+        .mode = .new_item,
+    } });
+
+    var scratch: RowScratch = undefined;
+    scratch.reset();
+    var count: usize = 0;
+    buildItemRows(&scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("", scratch.rows[0].text);
+    try std.testing.expectEqualStrings("plan", scratch.rows[0].segments[0].text);
+    try std.testing.expect(theme_mod.Color.eql(app.theme.transcript_secondary.fg, scratch.rows[0].segments[0].style.fg));
+    try std.testing.expect(theme_mod.Color.eql(app.theme.transcript_secondary.bg, scratch.rows[0].segments[0].style.bg));
+    try std.testing.expect(scratch.rows[0].segments[0].style.italic);
+    try std.testing.expect(scratch.rows[0].segments[0].style.bold);
+
+    var counted: usize = 0;
+    buildItemRows(null, &counted, &app.transcript.items.items[0], app.width, &app.theme, false);
     try std.testing.expectEqual(counted, count);
 }
 

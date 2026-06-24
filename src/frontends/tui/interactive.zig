@@ -14,6 +14,8 @@ const session_runtime = coding_agent.session_runtime;
 const runtime = @import("../../runtime/root.zig");
 const tui = @import("../../tui/root.zig");
 const tool_view = @import("tool_view.zig");
+const trace_mod = @import("trace.zig");
+const presentation_queue = @import("presentation_queue.zig");
 
 pub const StartupAction = enum {
     none,
@@ -32,10 +34,13 @@ pub const Options = struct {
     version: []const u8 = "0.0.0-local",
 };
 
-/// Frame pacing: 16ms while something animates (shimmer, tool timers run
-/// under an active operation's shimmer), otherwise a slow heartbeat. Session
-/// and input wakes interrupt either; an idle zi must not spin.
+/// Frame pacing: foreground input can still render immediately, but animation
+/// is background work. A pretty shimmer must never spend the user's latency
+/// budget while model/tool output is already expensive.
 const frame_interval_ms: u64 = 16;
+const assistant_reveal_interval_ms = presentation_queue.assistant_reveal_interval_ms;
+const animation_frame_interval_ms = presentation_queue.animation_frame_interval_ms;
+const background_pending_work_interval_ms = presentation_queue.background_pending_work_interval_ms;
 const idle_frame_interval_ms: u64 = 30_000;
 
 const effect_count_max = tui.Terminal.effects_per_read_max;
@@ -46,6 +51,7 @@ const status_id_recovery: tui.status.ContributionId = 3;
 const status_id_completion: tui.status.ContributionId = 4;
 const notify_key_cancel: tui.notify.Key = 1;
 const notify_key_recovery: tui.notify.Key = 2;
+const notify_key_transcript_tail: tui.notify.Key = 3;
 const retry_reason_bytes_max: usize = 64;
 const composer_cwd_slot_id: tui.status.ContributionId = 1;
 const composer_session_slot_id: tui.status.ContributionId = 2;
@@ -56,9 +62,16 @@ const file_picker_id: tui.Picker.Id = 4;
 const settings_picker_id: tui.Picker.Id = 5;
 const settings_thinking_picker_id: tui.Picker.Id = 6;
 const transcript_append_max = tui.Transcript.append_size_bytes_max;
+const pending_ui_work_per_tick_max: usize = 4;
+const pending_ui_work_bytes_per_tick_max: usize = 4 * 1024;
+const pending_ui_work_time_budget_ns: u64 = 6 * std.time.ns_per_ms;
+const transcript_ui_chunk_bytes_max: usize = 1024;
+const tool_output_ui_chunk_bytes_max: usize = 1024;
+const background_frame_interval_ms_max: i64 = 500;
 const clipboard_image_attachment_count_max = client_protocol.submit_image_count_max;
 const tool_timer_count_max = 8;
 const tool_timer_id_bytes_max = 96;
+const assistant_content_index_max = 256;
 
 fn nextWakeDelayMs(immediate_work_pending: bool, animation_active: bool) u64 {
     if (immediate_work_pending) return 0;
@@ -126,6 +139,9 @@ fn ignoreBestEffortError(err: anyerror) void {
 
 const SubmitResult = enum { queued, queue_full };
 
+const TracePhase = trace_mod.Phase;
+const TraceStats = trace_mod.Stats;
+
 const EventCursor = struct {
     last_seq: client_protocol.EventSeq = 0,
     recovery: Recovery = .live,
@@ -133,19 +149,97 @@ const EventCursor = struct {
     const Recovery = enum { live, snapshot_requested };
 };
 
-const RenderThrottle = struct {
-    next_render_ms: i64 = 0,
-    force: bool = true,
+const PendingUiWork = presentation_queue.Work;
 
-    fn requestImmediate(self: *RenderThrottle) void {
-        self.force = true;
+const FramePriority = enum { none, background, scroll, foreground };
+
+const RenderThrottle = struct {
+    next_background_render_ms: i64 = 0,
+    requested_background_interval_ms: i64 = background_frame_interval_ms_max,
+    last_render_ns: u64 = 0,
+    render_request_interval_ms: i64 = background_frame_interval_ms_max,
+    pending: FramePriority = .foreground,
+
+    fn requestForegroundFrame(self: *RenderThrottle) void {
+        self.pending = .foreground;
     }
 
-    fn shouldRender(self: *RenderThrottle, now_ms: i64, coalesce: bool) bool {
-        if (!self.force and coalesce and now_ms < self.next_render_ms) return false;
-        self.force = false;
-        self.next_render_ms = now_ms + @as(i64, @intCast(frame_interval_ms));
-        return true;
+    fn requestScrollFrame(self: *RenderThrottle) void {
+        if (self.pending == .none or self.pending == .background) self.pending = .scroll;
+    }
+
+    fn requestBackgroundFrame(self: *RenderThrottle, interval_ms: i64) void {
+        self.requested_background_interval_ms = @min(self.requested_background_interval_ms, interval_ms);
+        if (self.pending == .none) self.pending = .background;
+    }
+
+    fn backgroundDue(self: *const RenderThrottle, now_ms: i64) bool {
+        return now_ms >= self.next_background_render_ms;
+    }
+
+    fn shouldRender(self: *RenderThrottle, now_ms: i64) ?FramePriority {
+        switch (self.pending) {
+            .none => return null,
+            .foreground => {
+                self.pending = .none;
+                self.render_request_interval_ms = assistant_reveal_interval_ms;
+                self.requested_background_interval_ms = background_frame_interval_ms_max;
+                return .foreground;
+            },
+            .scroll => {
+                self.pending = .none;
+                self.render_request_interval_ms = 0;
+                self.requested_background_interval_ms = background_frame_interval_ms_max;
+                return .scroll;
+            },
+            .background => {
+                if (now_ms < self.next_background_render_ms) return null;
+                self.pending = .none;
+                self.render_request_interval_ms = self.requested_background_interval_ms;
+                self.requested_background_interval_ms = background_frame_interval_ms_max;
+                return .background;
+            },
+        }
+    }
+
+    fn noteRenderCost(self: *RenderThrottle, priority: FramePriority, now_ms: i64, duration_ns: u64) void {
+        self.last_render_ns = duration_ns;
+        switch (priority) {
+            .foreground => {
+                self.next_background_render_ms = @max(
+                    self.next_background_render_ms,
+                    now_ms + self.backgroundIntervalMs(.background, assistant_reveal_interval_ms),
+                );
+            },
+            .scroll => {
+                self.next_background_render_ms = @max(
+                    self.next_background_render_ms,
+                    now_ms + self.backgroundIntervalMs(.background, assistant_reveal_interval_ms),
+                );
+            },
+            .background => {
+                self.next_background_render_ms = now_ms + self.backgroundIntervalMs(
+                    .background,
+                    self.render_request_interval_ms,
+                );
+            },
+            .none => {},
+        }
+        self.render_request_interval_ms = background_frame_interval_ms_max;
+    }
+
+    fn backgroundIntervalMs(
+        self: *const RenderThrottle,
+        priority: FramePriority,
+        requested_interval_ms: i64,
+    ) i64 {
+        const render_ms: i64 = @intCast(self.last_render_ns / std.time.ns_per_ms);
+        const base_interval = if (priority == .background)
+            requested_interval_ms
+        else
+            background_pending_work_interval_ms;
+        const base = @max(base_interval, render_ms * 3);
+        return @min(background_frame_interval_ms_max, base);
     }
 };
 
@@ -206,12 +300,21 @@ const InteractiveController = struct {
     history_oldest_entry_id: ?[]u8 = null,
     history_has_more_before: bool = false,
     history_request_in_flight: bool = false,
+    history_has_more_after: bool = false,
+    history_tail_request_in_flight: bool = false,
+    history_tail_notice_shown: bool = false,
     completion_snapshot_requested: bool = false,
     completion_snapshot_loaded: bool = false,
     last_file_completion_query: std.ArrayList(u8) = .empty,
     last_file_completion_query_active: bool = false,
+    pending_ui_work: presentation_queue.Queue = .{},
+    trace: TraceStats = .{},
+    trace_path: ?[]u8 = null,
+    last_assistant_accept_ns: ?i96 = null,
+    last_assistant_apply_ns: ?i96 = null,
     event_cursor: EventCursor = .{},
     assistant_text_delta_seen: bool = false,
+    assistant_thinking_seen: [assistant_content_index_max]bool = @splat(false),
     render_throttle: RenderThrottle = .{},
     tool_timers: [tool_timer_count_max]?ToolTimer = @splat(null),
     thinking_level: agent_mod.ThinkingLevel = .off,
@@ -236,6 +339,19 @@ const InteractiveController = struct {
         try terminal.setup();
         errdefer terminal.shutdown() catch |err| ignoreBestEffortError(err);
 
+        const tmp_dir = nonEmptyEnv(process.env("TMPDIR")) orelse
+            nonEmptyEnv(process.env("TEMP")) orelse
+            nonEmptyEnv(process.env("TMP")) orelse
+            "/tmp";
+        const trace = TraceStats.init(process);
+        const trace_path = if (trace.enabled) blk: {
+            var name_buffer: [96]u8 = undefined;
+            const stamp = std.Io.Clock.awake.now(process.io).nanoseconds;
+            const name = std.fmt.bufPrint(&name_buffer, "zi-tui-trace-{d}.log", .{stamp}) catch unreachable;
+            break :blk try std.fs.path.join(process.gpa, &.{ tmp_dir, name });
+        } else null;
+        errdefer if (trace_path) |path| process.gpa.free(path);
+
         var self: InteractiveController = .{
             .allocator = process.gpa,
             .io = process.io,
@@ -243,12 +359,11 @@ const InteractiveController = struct {
             .stdout = stdout,
             .stderr = stderr,
             .terminal = terminal,
+            .trace = trace,
+            .trace_path = trace_path,
             .home_dir = process.env("HOME") orelse process.env("USERPROFILE"),
             .editor = nonEmptyEnv(process.env("EDITOR")),
-            .tmp_dir = nonEmptyEnv(process.env("TMPDIR")) orelse
-                nonEmptyEnv(process.env("TEMP")) orelse
-                nonEmptyEnv(process.env("TMP")) orelse
-                "/tmp",
+            .tmp_dir = tmp_dir,
         };
         try self.installGreeter(version);
         try self.installSlashCompletions();
@@ -268,47 +383,145 @@ const InteractiveController = struct {
 
     fn deinit(self: *InteractiveController) void {
         if (self.history_oldest_entry_id) |id| self.allocator.free(id);
+        self.pending_ui_work.deinit(self.allocator);
         self.last_file_completion_query.deinit(self.allocator);
+        self.flushTraceReport();
         self.terminal.shutdown() catch |err| ignoreBestEffortError(err);
+        if (self.trace_path) |path| self.stderr.print("zi tui trace: {s}\n", .{path}) catch |err| {
+            ignoreBestEffortError(err);
+        };
         self.terminal.deinit();
+        if (self.trace_path) |path| self.allocator.free(path);
         self.* = undefined;
     }
 
     fn run(self: *InteractiveController) !void {
         while (self.terminal.isRunning()) {
+            if (try self.pollAndDrainInput()) continue;
+
             const immediate = try self.serviceImmediateWork();
             if (!self.terminal.isRunning()) break;
 
-            const frame_active = self.terminal.hasAnimation() or (self.operation_active and self.terminal.isDirty());
+            const frame_active = self.pending_ui_work.items.items.len > 0 or
+                self.terminal.isDirty() or
+                self.terminal.hasAnimation();
             const wake_delay = self.clampWakeDelayToDeadline(nextWakeDelayMs(immediate, frame_active));
+            const wait_start = self.nowNs();
             const wake = try self.app.waitAndApplyWake(
                 self.terminal.inputFd(),
                 wake_delay,
             );
+            self.recordWakeDuration(wake, wait_start);
             // Time enters the product through ticks; refresh before handling
             // the wake so wall-clock policies (ctrl+c double press, shimmer)
             // never see stale time after a long idle wait.
-            _ = try self.tickTime();
+            _ = try self.timedTickTime();
             switch (wake) {
-                .input => try self.drainInput(),
+                .input => self.requestInputFrame(try self.timedDrainInput()),
                 .session, .frame => {},
             }
-            if (try self.terminal.drainPendingResize()) self.render_throttle.requestImmediate();
+            if (try self.terminal.drainPendingResize()) self.render_throttle.requestForegroundFrame();
+        }
+    }
+
+    fn pollAndDrainInput(self: *InteractiveController) !bool {
+        const start = self.nowNs();
+        const readable = runtime.ReadableFd.initBorrowed(self.terminal.inputFd());
+        var input = readable.asyncReadable();
+        var timeout = runtime.Timeout.fromMilliseconds(0);
+        switch (try runtime.select(.{ .input = &input, .timeout = &timeout })) {
+            .input => |result| {
+                self.recordDuration(.poll_input, start);
+                result catch return false;
+                _ = try self.timedTickTime();
+                const input_priority = try self.timedDrainInput();
+                self.requestInputFrame(input_priority);
+                if (try self.terminal.drainPendingResize()) self.render_throttle.requestForegroundFrame();
+                try self.renderIfDue(try self.timedTickTime(), .animation);
+                return true;
+            },
+            .timeout => {
+                self.recordDuration(.poll_input, start);
+                return false;
+            },
         }
     }
 
     fn serviceImmediateWork(self: *InteractiveController) !bool {
+        var start = self.nowNs();
         try self.app.step();
+        self.recordDuration(.session_step, start);
+        start = self.nowNs();
         const drained = try self.drainClientEventsBounded(client_events_per_tick_max);
-        const now_ms = try self.tickTime();
-        try self.renderIfDue(now_ms);
-        return drained == client_events_per_tick_max or self.app.hasImmediateWork();
+        self.recordDuration(.client_event_drain, start);
+        const now_ms = try self.timedTickTime();
+        const work_interval_ms = self.nextPendingUiWorkIntervalMs();
+        const background_due = self.render_throttle.backgroundDue(now_ms);
+        const applied = if (background_due) blk: {
+            start = self.nowNs();
+            const count = try self.applyPendingUiWorkBounded(work_interval_ms);
+            self.recordDuration(.pending_ui_work, start);
+            break :blk count;
+        } else 0;
+        const background_reason: BackgroundRenderReason = if (applied > 0) .pending_work else .animation;
+        try self.renderIfDue(now_ms, background_reason);
+        return drained == client_events_per_tick_max or
+            applied == pending_ui_work_per_tick_max or
+            (self.pending_ui_work.items.items.len > 0 and background_due) or
+            self.app.hasImmediateWork();
     }
 
-    fn renderIfDue(self: *InteractiveController, now_ms: i64) !void {
+    const BackgroundRenderReason = enum { pending_work, animation };
+
+    fn renderIfDue(self: *InteractiveController, now_ms: i64, reason: BackgroundRenderReason) !void {
         if (!self.terminal.isDirty()) return;
-        if (!self.render_throttle.shouldRender(now_ms, self.operation_active)) return;
-        try self.terminal.renderIfDirty();
+        self.render_throttle.requestBackgroundFrame(self.nextPendingUiWorkIntervalMs());
+        const priority = self.render_throttle.shouldRender(now_ms) orelse return;
+        if (priority == .foreground and self.pending_ui_work.items.items.len > 0) {
+            self.trace.noteForegroundWithPendingBackground();
+        }
+        if (try self.terminal.renderIfDirtyTimed(self.trace.enabled)) |timing| {
+            self.trace.noteRender(priority);
+            switch (priority) {
+                .foreground, .scroll => {
+                    self.trace.record(.render_draw_foreground, timing.draw_ns);
+                    self.trace.record(.render_flush_foreground, timing.flush_ns);
+                },
+                .background => {
+                    self.trace.record(.render_draw_background, timing.draw_ns);
+                    self.trace.record(.render_flush_background, timing.flush_ns);
+                    self.trace.noteBackgroundReason(reason == .pending_work);
+                },
+                .none => unreachable,
+            }
+            if (self.last_assistant_apply_ns) |applied_ns| {
+                self.recordSince(.assistant_apply_to_flush, applied_ns, self.nowNs());
+                self.last_assistant_apply_ns = null;
+            }
+            if (timing.draw_detail) |detail| self.traceDrawDetail(detail);
+            self.render_throttle.noteRenderCost(priority, self.nowMs(), timing.draw_ns + timing.flush_ns);
+        }
+    }
+
+    fn traceDrawDetail(self: *InteractiveController, detail: tui.render.DrawTiming) void {
+        self.trace.record(.render_clear, detail.clear_ns);
+        self.trace.record(.render_layout, detail.layout_ns);
+        self.trace.record(.render_transcript, detail.transcript_ns);
+        self.trace.record(.render_transcript_total, detail.transcript_total_ns);
+        self.trace.record(.render_transcript_item_rows, detail.transcript_item_rows_ns);
+        self.trace.record(.render_transcript_tail, detail.transcript_tail_ns);
+        self.trace.record(.render_transcript_build, detail.transcript_build_ns);
+        self.trace.record(.render_transcript_build_message, detail.transcript_build_message_ns);
+        self.trace.record(.render_transcript_build_thinking, detail.transcript_build_thinking_ns);
+        self.trace.record(.render_transcript_build_tool, detail.transcript_build_tool_ns);
+        self.trace.record(.render_transcript_build_status, detail.transcript_build_status_ns);
+        self.trace.record(.render_transcript_build_custom, detail.transcript_build_custom_ns);
+        self.trace.record(.render_transcript_emit, detail.transcript_emit_ns);
+        self.trace.record(.render_greeter, detail.greeter_ns);
+        self.trace.record(.render_status, detail.status_ns);
+        self.trace.record(.render_notify, detail.notify_ns);
+        self.trace.record(.render_composer, detail.composer_ns);
+        self.trace.record(.render_picker, detail.picker_ns);
     }
 
     fn clampWakeDelayToDeadline(self: *InteractiveController, delay_ms: u64) u64 {
@@ -318,16 +531,208 @@ const InteractiveController = struct {
         return @min(delay_ms, @as(u64, @intCast(deadline - now_ms)));
     }
 
-    fn drainInput(self: *InteractiveController) !void {
+    fn flushTraceReport(self: *InteractiveController) void {
+        const path = self.trace_path orelse return;
+        var file = std.Io.Dir.createFileAbsolute(self.io, path, .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        }) catch return;
+        defer file.close(self.io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(self.io, &buffer);
+        self.trace.writeReport(&writer.interface);
+        writer.flush() catch return;
+    }
+
+    fn nowNs(self: *const InteractiveController) i96 {
+        return std.Io.Clock.awake.now(self.io).nanoseconds;
+    }
+
+    fn recordDuration(self: *InteractiveController, phase: TracePhase, start_ns: i96) void {
+        const end = self.nowNs();
+        self.trace.record(phase, @intCast(end - start_ns));
+    }
+
+    fn recordWakeDuration(self: *InteractiveController, wake: session_runtime.WakeResult, start_ns: i96) void {
+        const phase: TracePhase = switch (wake) {
+            .input => .wait_input,
+            .session => .wait_session,
+            .frame => .wait_frame,
+        };
+        self.recordDuration(phase, start_ns);
+    }
+
+    fn timedTickTime(self: *InteractiveController) !i64 {
+        const start = self.nowNs();
+        const now_ms = try self.tickTime();
+        self.recordDuration(.tick_time, start);
+        return now_ms;
+    }
+
+    fn timedDrainInput(self: *InteractiveController) !tui.Terminal.InputPriority {
+        const start = self.nowNs();
+        const priority = try self.drainInput();
+        self.recordDuration(.drain_input, start);
+        return priority;
+    }
+
+    fn requestInputFrame(self: *InteractiveController, priority: tui.Terminal.InputPriority) void {
+        switch (priority) {
+            .none => {},
+            .scroll => self.render_throttle.requestScrollFrame(),
+            .foreground => self.render_throttle.requestForegroundFrame(),
+        }
+    }
+
+    fn drainInput(self: *InteractiveController) !tui.Terminal.InputPriority {
         var effects: [effect_count_max]tui.Effect = undefined;
         const result = try self.terminal.readAvailableInput(&effects);
         defer for (effects[0..result.effect_count]) |effect| effect.deinit(self.allocator);
         for (effects[0..result.effect_count]) |effect| try self.handleEffect(effect);
         try self.requestLazyCompletionSnapshot();
         try self.requestFileCompletionForComposer();
-        if (result.event_count > 0) self.render_throttle.requestImmediate();
         if (result.truncated) try self.appendStatus(.warning, "input truncated");
         if (result.effect_overflow) try self.appendStatus(.warning, "input effects dropped");
+        return result.priority;
+    }
+
+    fn queuePendingUiWork(self: *InteractiveController, work: PendingUiWork) !void {
+        var owned = work;
+        errdefer owned.deinit(self.allocator);
+
+        if (self.history_has_more_after and tailTranscriptWork(owned)) {
+            owned.deinit(self.allocator);
+            owned = undefined;
+            self.noteHistoryHasNewerTail() catch |err| ignoreBestEffortError(err);
+            return;
+        }
+
+        switch (try self.pending_ui_work.push(self.allocator, owned)) {
+            .queued => {},
+            .dropped_first => self.appendStatus(.warning, "TUI update backlog dropped") catch |err| {
+                ignoreBestEffortError(err);
+            },
+        }
+        owned = undefined;
+    }
+
+    fn tailTranscriptWork(work: PendingUiWork) bool {
+        return switch (work) {
+            .append_message,
+            .append_thinking,
+            .append_tool,
+            .replace_tool_footer,
+            .tool_output_delta,
+            .replace_tool_output,
+            => true,
+            .set_status,
+            .clear_status,
+            => false,
+        };
+    }
+
+    fn noteHistoryHasNewerTail(self: *InteractiveController) !void {
+        if (self.history_tail_notice_shown) return;
+        self.history_tail_notice_shown = true;
+        try self.appendKeyedStatusWithTone(
+            notify_key_transcript_tail,
+            .info,
+            "new output below; ctrl+end reloads tail",
+            .accent,
+        );
+    }
+
+    fn clearPendingUiWork(self: *InteractiveController) void {
+        self.pending_ui_work.clear(self.allocator);
+    }
+
+    fn nextPendingUiWorkIntervalMs(self: *const InteractiveController) i64 {
+        return self.pending_ui_work.nextIntervalMs();
+    }
+
+    fn applyPendingUiWorkBounded(self: *InteractiveController, due_interval_ms: i64) !usize {
+        const started_ns = self.nowNs();
+        var applied: usize = 0;
+        var bytes: usize = 0;
+        while (applied < pending_ui_work_per_tick_max) {
+            const popped = self.pending_ui_work.popFirstDue(due_interval_ms) orelse break;
+            if (applied > 0 and bytes + popped.bytes > pending_ui_work_bytes_per_tick_max) {
+                self.pending_ui_work.pushFront(popped.work, popped.bytes);
+                break;
+            }
+            if (applied > 0 and self.nowNs() - started_ns >= pending_ui_work_time_budget_ns) {
+                self.pending_ui_work.pushFront(popped.work, popped.bytes);
+                break;
+            }
+            var work = popped.work;
+            const next_bytes = popped.bytes;
+            const phase = pendingWorkTracePhase(work);
+            const work_start = self.nowNs();
+            defer work.deinit(self.allocator);
+            switch (work) {
+                .append_message => |payload| {
+                    if (payload.role == .assistant) {
+                        self.recordSince(.assistant_queue_wait, payload.queued_ns, self.nowNs());
+                    }
+                    _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .message = .{
+                        .role = payload.role,
+                        .text = payload.text,
+                        .mode = payload.mode,
+                    } } });
+                    if (payload.role == .assistant) self.last_assistant_apply_ns = self.nowNs();
+                },
+                .append_thinking => |payload| {
+                    self.recordSince(.assistant_queue_wait, payload.queued_ns, self.nowNs());
+                    _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .thinking = .{
+                        .text = payload.text,
+                        .hidden = payload.hidden,
+                        .mode = payload.mode,
+                    } } });
+                    self.last_assistant_apply_ns = self.nowNs();
+                },
+                .append_tool => |payload| _ = try self.terminal.applyCommand(.{
+                    .append_transcript = .{ .tool = payload.append() },
+                }),
+                .replace_tool_footer => |payload| _ = try self.terminal.applyCommand(.{ .replace_tool_footer = .{
+                    .tool_call_id = payload.tool_call_id,
+                    .text = payload.text,
+                } }),
+                .set_status => |payload| _ = try self.terminal.applyCommand(.{ .set_status = .{
+                    .slot = payload.slot,
+                    .id = payload.id,
+                    .priority = payload.priority,
+                    .text = payload.text,
+                    .effect = payload.effect,
+                    .tone = payload.tone,
+                } }),
+                .clear_status => |payload| _ = try self.terminal.applyCommand(.{ .clear_status = .{
+                    .slot = payload.slot,
+                    .id = payload.id,
+                } }),
+                .tool_output_delta => |payload| _ = try self.terminal.applyCommand(.{ .tool_output_delta = .{
+                    .tool_call_id = payload.tool_call_id,
+                    .text = payload.text,
+                } }),
+                .replace_tool_output => |payload| _ = try self.terminal.applyCommand(.{ .replace_tool_output = .{
+                    .tool_call_id = payload.tool_call_id,
+                    .text = payload.text,
+                } }),
+            }
+            self.recordDuration(phase, work_start);
+            bytes += next_bytes;
+            applied += 1;
+        }
+        return applied;
+    }
+
+    fn pendingWorkTracePhase(work: PendingUiWork) TracePhase {
+        return switch (work) {
+            .append_message => .pending_message,
+            .append_thinking => .pending_thinking,
+            .tool_output_delta, .replace_tool_output => .pending_tool_output,
+            .append_tool, .replace_tool_footer => .pending_tool_structure,
+            .set_status, .clear_status => .pending_status,
+        };
     }
 
     fn handleEffect(self: *InteractiveController, effect: tui.Effect) !void {
@@ -338,6 +743,7 @@ const InteractiveController = struct {
             .request_clipboard_image_paste => try self.handleClipboardImagePaste(),
             .interrupt => try self.cancelActive(),
             .request_transcript_history => try self.requestHistoryPage(),
+            .request_transcript_tail => try self.requestTailSnapshot(),
             .request_shutdown => {
                 if (try self.submitCommand(.{ .command = .shutdown }) == .queued) {
                     self.terminal.requestStop();
@@ -632,12 +1038,42 @@ const InteractiveController = struct {
 
     fn openThinkingEffortPicker(self: *InteractiveController) !void {
         const items = [_]tui.Picker.Item{
-            .{ .id = "thinking:off", .label = "off", .detail = "No reasoning", .meta = if (self.thinking_level == .off) "current" else "" },
-            .{ .id = "thinking:minimal", .label = "minimal", .detail = "Very brief reasoning", .meta = if (self.thinking_level == .minimal) "current" else "" },
-            .{ .id = "thinking:low", .label = "low", .detail = "Light reasoning", .meta = if (self.thinking_level == .low) "current" else "" },
-            .{ .id = "thinking:medium", .label = "medium", .detail = "Moderate reasoning", .meta = if (self.thinking_level == .medium) "current" else "" },
-            .{ .id = "thinking:high", .label = "high", .detail = "Deep reasoning", .meta = if (self.thinking_level == .high) "current" else "" },
-            .{ .id = "thinking:xhigh", .label = "xhigh", .detail = "Maximum reasoning", .meta = if (self.thinking_level == .xhigh) "current" else "" },
+            .{
+                .id = "thinking:off",
+                .label = "off",
+                .detail = "No reasoning",
+                .meta = if (self.thinking_level == .off) "current" else "",
+            },
+            .{
+                .id = "thinking:minimal",
+                .label = "minimal",
+                .detail = "Very brief reasoning",
+                .meta = if (self.thinking_level == .minimal) "current" else "",
+            },
+            .{
+                .id = "thinking:low",
+                .label = "low",
+                .detail = "Light reasoning",
+                .meta = if (self.thinking_level == .low) "current" else "",
+            },
+            .{
+                .id = "thinking:medium",
+                .label = "medium",
+                .detail = "Moderate reasoning",
+                .meta = if (self.thinking_level == .medium) "current" else "",
+            },
+            .{
+                .id = "thinking:high",
+                .label = "high",
+                .detail = "Deep reasoning",
+                .meta = if (self.thinking_level == .high) "current" else "",
+            },
+            .{
+                .id = "thinking:xhigh",
+                .label = "xhigh",
+                .detail = "Maximum reasoning",
+                .meta = if (self.thinking_level == .xhigh) "current" else "",
+            },
         };
         _ = try self.terminal.applyCommand(.{ .open_picker = .{
             .id = settings_thinking_picker_id,
@@ -816,6 +1252,14 @@ const InteractiveController = struct {
         _ = try self.submitCommand(.{ .command = .snapshot });
     }
 
+    fn requestTailSnapshot(self: *InteractiveController) !void {
+        if (!self.history_has_more_after or self.history_tail_request_in_flight) return;
+        if (try self.submitCommand(.{ .command = .snapshot }) == .queued) {
+            self.history_tail_request_in_flight = true;
+            try self.clearNotify(notify_key_transcript_tail);
+        }
+    }
+
     fn requestCompletionSnapshot(self: *InteractiveController) !void {
         if (self.completion_snapshot_requested or self.completion_snapshot_loaded) return;
         if (try self.submitCommand(.{ .command = .completion_snapshot }) == .queued) {
@@ -927,7 +1371,7 @@ const InteractiveController = struct {
 
     fn applyClientEvent(self: *InteractiveController, event: client_protocol.ClientEvent) !void {
         switch (event) {
-            .agent_event => |payload| try self.applyAgentEvent(payload.event),
+            .agent_event => |payload| try self.applyAgentEventTimed(payload.event, payload),
             .operation_started => {
                 self.operation_active = true;
                 try self.setWorkingStatus("working");
@@ -1008,27 +1452,66 @@ const InteractiveController = struct {
     }
 
     fn applyAgentEvent(self: *InteractiveController, event: agent_mod.AgentEvent) !void {
+        try self.applyAgentEventTimed(event, null);
+    }
+
+    fn traceAssistantFrontendAccept(self: *InteractiveController, trace: ?client_protocol.OwnedAgentEvent) void {
+        _ = trace;
+        self.last_assistant_accept_ns = self.nowNs();
+    }
+
+    fn recordSince(self: *InteractiveController, phase: TracePhase, start_ns: i96, now_ns: i96) void {
+        if (start_ns == 0 or now_ns < start_ns) return;
+        self.trace.record(phase, @intCast(now_ns - start_ns));
+    }
+
+    fn applyAgentEventTimed(
+        self: *InteractiveController,
+        event: agent_mod.AgentEvent,
+        trace: ?client_protocol.OwnedAgentEvent,
+    ) !void {
         switch (event) {
             .message_start => |payload| {
-                if (payload.message == .assistant) self.assistant_text_delta_seen = false;
+                if (payload.message == .assistant) self.resetAssistantStreamState();
             },
-            .message_update => |payload| try self.applyMessageUpdate(payload),
+            .message_update => |payload| try self.applyMessageUpdateTimed(payload, trace),
             .message_end => |payload| try self.applyMessageEnd(payload.message),
             .tool_execution_start => |payload| try self.applyToolStart(payload),
             .tool_execution_update => |payload| try self.applyToolUpdate(payload),
             .tool_execution_end => |payload| try self.applyToolEnd(payload),
             .agent_start, .agent_end, .turn_end => {},
-            .turn_start => self.assistant_text_delta_seen = false,
+            .turn_start => self.resetAssistantStreamState(),
         }
     }
 
     fn applyMessageUpdate(self: *InteractiveController, update: agent_mod.AgentEvent.MessageUpdate) !void {
+        try self.applyMessageUpdateTimed(update, null);
+    }
+
+    fn applyMessageUpdateTimed(
+        self: *InteractiveController,
+        update: agent_mod.AgentEvent.MessageUpdate,
+        trace: ?client_protocol.OwnedAgentEvent,
+    ) !void {
         switch (update.assistant_message_event) {
             .text_delta => |payload| {
                 self.assistant_text_delta_seen = true;
+                self.traceAssistantFrontendAccept(trace);
                 try self.appendMessage(.assistant, payload.delta, .extend_previous_assistant_message);
             },
-            .thinking_delta => |payload| try self.appendThinking(payload.delta),
+            .thinking_start => try self.appendThinking(""),
+            .thinking_delta => |payload| {
+                if (payload.delta.len > 0) self.markAssistantThinkingSeen(payload.content_index);
+                self.traceAssistantFrontendAccept(trace);
+                try self.appendThinking(payload.delta);
+            },
+            .thinking_end => |payload| {
+                if (!self.assistantThinkingSeen(payload.content_index) and payload.content.len > 0) {
+                    self.traceAssistantFrontendAccept(trace);
+                    try self.appendThinking(payload.content);
+                    self.markAssistantThinkingSeen(payload.content_index);
+                }
+            },
             .toolcall_start => |payload| try self.applyToolCallPreview(payload.content_index, payload.partial),
             .toolcall_delta => |payload| try self.applyToolCallPreview(payload.content_index, payload.partial),
             .toolcall_end => |payload| try self.applyToolCall(payload.tool_call),
@@ -1043,8 +1526,8 @@ const InteractiveController = struct {
                 if (assistant.error_message) |message_text| {
                     if (!self.cancel_requested) try self.appendStatus(.err, message_text);
                 }
-                if (!self.assistant_text_delta_seen) try self.appendAssistantFinalText(assistant);
-                self.assistant_text_delta_seen = false;
+                try self.appendAssistantFinalText(assistant);
+                self.resetAssistantStreamState();
             },
             .tool_result => {},
             .custom => {},
@@ -1088,30 +1571,37 @@ const InteractiveController = struct {
 
     fn applyToolEnd(self: *InteractiveController, payload: agent_mod.AgentEvent.ToolExecutionEnd) !void {
         var metadata_buffer: [tool_view.metadata_bytes_max]u8 = undefined;
-        var view = try tool_view.finish(self.allocator, &metadata_buffer, payload);
-        defer view.deinit(self.allocator);
+        const metadata = tool_view.metadataForDetails(&metadata_buffer, payload.tool_name, payload.result.details);
 
         try self.appendTool(tool_view.endAppend(payload));
 
         var duration_buffer: [64]u8 = undefined;
         const duration = self.finishToolTimer(payload.tool_call_id, &duration_buffer) orelse "";
         var footer_buffer: [tool_view.footer_bytes_max]u8 = undefined;
-        const footer = tool_view.joinMetadata(&footer_buffer, view.metadata, duration);
+        const footer = tool_view.joinMetadata(&footer_buffer, metadata, duration);
         if (footer.len > 0) {
             try self.replaceToolFooter(payload.tool_call_id, footer);
         } else if (payload.is_error) {
             try self.replaceToolFooter(payload.tool_call_id, "");
         }
 
+        if (tool_view.streamsOutput(payload.tool_name)) return;
+
+        var view = try tool_view.finish(self.allocator, &metadata_buffer, payload);
+        defer view.deinit(self.allocator);
         const text = view.output orelse return;
         try self.replaceToolOutput(payload.tool_call_id, text);
     }
 
     fn applySessionChanged(self: *InteractiveController) !void {
+        self.clearPendingUiWork();
         self.operation_active = false;
         self.cancel_requested = false;
         self.history_request_in_flight = false;
         self.history_has_more_before = false;
+        self.history_has_more_after = false;
+        self.history_tail_request_in_flight = false;
+        self.history_tail_notice_shown = false;
         self.clearOldestHistoryEntryId();
         self.clearToolTimers();
         _ = try self.terminal.applyCommand(.clear_transcript);
@@ -1126,9 +1616,13 @@ const InteractiveController = struct {
     }
 
     fn applySnapshot(self: *InteractiveController, snapshot: client_protocol.Snapshot) !void {
+        self.clearPendingUiWork();
         _ = try self.terminal.applyCommand(.clear_transcript);
         self.operation_active = snapshot.active_request_id != null;
         self.history_request_in_flight = false;
+        self.history_has_more_after = false;
+        self.history_tail_request_in_flight = false;
+        self.history_tail_notice_shown = false;
         // Snapshot history can be wider than the TUI resident item cap. Track
         // the oldest item the TUI will actually retain after append eviction,
         // otherwise the next page would skip the evicted snapshot prefix.
@@ -1193,6 +1687,14 @@ const InteractiveController = struct {
         self.history_has_more_before = page.has_more_before;
         if (page.items.len == 0) return;
 
+        // History prepends slide the resident window backward and may evict the live tail.
+        // Do not let queued live-tail presentation mutate that old window; the jsonl snapshot
+        // is the source of truth when the user returns to the tail.
+        self.clearPendingUiWork();
+        self.history_has_more_after = true;
+        self.history_tail_request_in_flight = false;
+        self.history_tail_notice_shown = false;
+
         try self.setOldestHistoryEntryId(page.items[0].entry_id.text);
         var index = page.items.len;
         while (index > 0) {
@@ -1217,45 +1719,90 @@ const InteractiveController = struct {
     fn appendHistoryItem(self: *InteractiveController, item: client_protocol.HistorySnapshotItem) !void {
         switch (item.kind) {
             .user, .assistant, .system => {
-                if (item.kind == .assistant and item.has_thinking) try self.appendThinking("");
+                if (item.kind == .assistant and item.has_thinking) try self.appendHistoryThinkingPlaceholder();
                 if (item.text.text.len > 0) {
-                    try self.appendMessage(historyMessageRole(item.kind).?, item.text.text, .new_item);
+                    try self.appendHistoryMessage(historyMessageRole(item.kind).?, item.text.text);
                 }
                 if (item.kind == .assistant) {
                     for (item.tool_calls) |tool_call| {
                         var buffers: tool_view.TitleBuffers = .{};
-                        try self.appendTool(try tool_view.historyCallAppend(
+                        const tool = try tool_view.historyCallAppend(
                             self.allocator,
                             &buffers,
                             tool_call,
                             self.home_dir,
-                        ));
+                        );
+                        _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .tool = tool } });
                     }
                 }
             },
-            .tool_result => {
-                const id = if (item.tool_call_id) |id| id.text else return;
-                const name = if (item.tool_name) |name| name.text else return;
-                try self.appendTool(tool_view.append(
-                    id,
-                    name,
-                    if (item.is_error) .err else .success,
-                    "",
-                    "",
-                    item.is_error,
-                ));
-                var metadata_buffer: [tool_view.metadata_bytes_max]u8 = undefined;
-                var view = try tool_view.historyFinish(
-                    self.allocator,
-                    &metadata_buffer,
-                    name,
-                    item.is_error,
-                    item.text.text,
-                    if (item.details_json) |json| json.text else null,
-                );
-                defer view.deinit(self.allocator);
-                if (view.metadata.len > 0) try self.replaceToolFooter(id, view.metadata);
-                if (view.output) |text| try self.replaceToolOutput(id, text);
+            .tool_result => try self.applyHistoryToolResult(item, .append),
+        }
+    }
+
+    fn appendHistoryThinkingPlaceholder(self: *InteractiveController) !void {
+        if (!self.hide_thinking) return;
+        _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .thinking = .{
+            .text = "",
+            .hidden = true,
+            .mode = .new_item,
+        } } });
+    }
+
+    fn appendHistoryMessage(
+        self: *InteractiveController,
+        role: tui.Transcript.Role,
+        text: []const u8,
+    ) !void {
+        var remaining = text;
+        var mode: tui.Transcript.AppendMode = .new_item;
+        while (remaining.len > 0) {
+            const chunk = boundedUiChunk(remaining);
+            _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .message = .{
+                .role = role,
+                .text = chunk,
+                .mode = mode,
+            } } });
+            remaining = remaining[chunk.len..];
+            mode = .extend_previous_same_role;
+        }
+    }
+
+    fn applyHistoryToolResult(
+        self: *InteractiveController,
+        item: client_protocol.HistorySnapshotItem,
+        direction: HistoryApplyDirection,
+    ) !void {
+        const id = if (item.tool_call_id) |id| id.text else return;
+        const name = if (item.tool_name) |name| name.text else return;
+        var metadata_buffer: [tool_view.metadata_bytes_max]u8 = undefined;
+        var view = try tool_view.historyFinish(
+            self.allocator,
+            &metadata_buffer,
+            name,
+            item.is_error,
+            item.text.text,
+            if (item.details_json) |json| json.text else null,
+        );
+        defer view.deinit(self.allocator);
+
+        var tool = tool_view.append(
+            id,
+            name,
+            if (item.is_error) .err else .success,
+            "",
+            "",
+            item.is_error,
+        );
+        tool.output = view.output orelse "";
+        tool.footer = view.metadata;
+
+        switch (direction) {
+            .append => {
+                _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .tool = tool } });
+            },
+            .prepend => {
+                _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{ .tools = &.{tool} } });
             },
         }
     }
@@ -1289,37 +1836,7 @@ const InteractiveController = struct {
                     .tools = tools.items,
                 } });
             },
-            .tool_result => {
-                const id = if (item.tool_call_id) |id| id.text else return;
-                const name = if (item.tool_name) |name| name.text else return;
-                _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{ .tools = &.{
-                    tool_view.append(
-                        id,
-                        name,
-                        if (item.is_error) .err else .success,
-                        "",
-                        "",
-                        item.is_error,
-                    ),
-                } } });
-                var metadata_buffer: [tool_view.metadata_bytes_max]u8 = undefined;
-                var view = try tool_view.historyFinish(
-                    self.allocator,
-                    &metadata_buffer,
-                    name,
-                    item.is_error,
-                    item.text.text,
-                    if (item.details_json) |json| json.text else null,
-                );
-                defer view.deinit(self.allocator);
-                if (view.metadata.len > 0) {
-                    _ = try self.terminal.applyCommand(.{ .replace_front_tool_footer = .{
-                        .tool_call_id = id,
-                        .text = view.metadata,
-                    } });
-                }
-                if (view.output) |text| try self.replaceFrontToolOutput(id, text);
-            },
+            .tool_result => try self.applyHistoryToolResult(item, .prepend),
         }
     }
 
@@ -1391,22 +1908,15 @@ const InteractiveController = struct {
     /// to raw bytes when no UTF-8 boundary exists in range.
     fn appendThinking(self: *InteractiveController, text: []const u8) !void {
         if (text.len == 0) {
-            _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .thinking = .{
-                .text = "",
-                .hidden = self.hide_thinking,
-                .mode = .new_item,
-            } } });
+            if (!self.hide_thinking) return;
+            try self.queueThinking("", .new_item);
             return;
         }
         var remaining = text;
         var chunk_mode: tui.Transcript.AppendMode = .extend_previous_same_role;
         while (remaining.len > 0) {
-            const chunk = boundedChunk(remaining);
-            _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .thinking = .{
-                .text = chunk,
-                .hidden = self.hide_thinking,
-                .mode = chunk_mode,
-            } } });
+            const chunk = boundedUiChunk(remaining);
+            try self.queueThinking(chunk, chunk_mode);
             remaining = remaining[chunk.len..];
             chunk_mode = .extend_previous_same_role;
         }
@@ -1422,15 +1932,54 @@ const InteractiveController = struct {
         var remaining = text;
         var chunk_mode = mode;
         while (remaining.len > 0) {
-            const chunk = boundedChunk(remaining);
-            _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .message = .{
-                .role = role,
-                .text = chunk,
-                .mode = chunk_mode,
-            } } });
+            const chunk = boundedUiChunk(remaining);
+            try self.queueMessage(role, chunk, chunk_mode);
             remaining = remaining[chunk.len..];
             chunk_mode = .extend_previous_same_role;
         }
+    }
+
+    fn queueMessage(
+        self: *InteractiveController,
+        role: tui.Transcript.Role,
+        text: []const u8,
+        mode: tui.Transcript.AppendMode,
+    ) !void {
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        const queued_ns = self.nowNs();
+        if (role == .assistant) {
+            if (self.last_assistant_accept_ns) |accept_ns| {
+                self.recordSince(.assistant_frontend_accept_to_queue, accept_ns, queued_ns);
+            }
+            self.last_assistant_accept_ns = null;
+        }
+        try self.queuePendingUiWork(.{ .append_message = .{
+            .role = role,
+            .mode = mode,
+            .text = owned_text,
+            .queued_ns = queued_ns,
+        } });
+    }
+
+    fn queueThinking(
+        self: *InteractiveController,
+        text: []const u8,
+        mode: tui.Transcript.AppendMode,
+    ) !void {
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        const queued_ns = self.nowNs();
+        if (self.last_assistant_accept_ns) |accept_ns| {
+            self.recordSince(.assistant_frontend_accept_to_queue, accept_ns, queued_ns);
+        }
+        self.last_assistant_accept_ns = null;
+        try self.queuePendingUiWork(.{ .append_thinking = .{
+            .hidden = self.hide_thinking,
+            .mode = mode,
+            .text = owned_text,
+            .queued_ns = queued_ns,
+        } });
     }
 
     fn prependMessage(
@@ -1447,26 +1996,59 @@ const InteractiveController = struct {
     }
 
     fn appendAssistantFinalText(self: *InteractiveController, assistant: ai.AssistantMessage) !void {
-        for (assistant.content) |content| switch (content) {
-            .text => |text| try self.appendMessage(.assistant, text.text, .extend_previous_assistant_message),
-            .thinking => |thinking| try self.appendThinking(thinking.thinking),
+        for (assistant.content, 0..) |content, index| switch (content) {
+            .text => |text| if (!self.assistant_text_delta_seen)
+                try self.appendMessage(.assistant, text.text, .extend_previous_assistant_message),
+            .thinking => |thinking| if (!self.assistantThinkingSeen(index) and thinking.thinking.len > 0)
+                try self.appendThinking(thinking.thinking),
             .tool_call => {},
         };
     }
 
-    fn appendTool(self: *InteractiveController, tool: tui.Transcript.Append.ToolAppend) !void {
-        _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .tool = tool } });
+    fn resetAssistantStreamState(self: *InteractiveController) void {
+        self.assistant_text_delta_seen = false;
+        self.assistant_thinking_seen = @splat(false);
     }
 
-    /// Final tool result replaces the streamed preview (pi-mono semantics):
-    /// the first normalized chunk overwrites, remaining chunks append.
+    fn markAssistantThinkingSeen(self: *InteractiveController, content_index: usize) void {
+        if (content_index >= self.assistant_thinking_seen.len) return;
+        self.assistant_thinking_seen[content_index] = true;
+    }
+
+    fn assistantThinkingSeen(self: *const InteractiveController, content_index: usize) bool {
+        if (content_index >= self.assistant_thinking_seen.len) return true;
+        return self.assistant_thinking_seen[content_index];
+    }
+
+    fn appendTool(self: *InteractiveController, tool: tui.Transcript.Append.ToolAppend) !void {
+        const owned_id = try self.allocator.dupe(u8, tool.tool_call_id);
+        errdefer self.allocator.free(owned_id);
+        const owned_name = try self.allocator.dupe(u8, tool.name);
+        errdefer self.allocator.free(owned_name);
+        const owned_title = try self.allocator.dupe(u8, tool.title);
+        errdefer self.allocator.free(owned_title);
+        const owned_compact_title = try self.allocator.dupe(u8, tool.compact_title);
+        errdefer self.allocator.free(owned_compact_title);
+        try self.queuePendingUiWork(.{ .append_tool = .{
+            .tool_call_id = owned_id,
+            .name = owned_name,
+            .presentation = tool.presentation,
+            .status = tool.status,
+            .body_mode = tool.body_mode,
+            .collapse = tool.collapse,
+            .title = owned_title,
+            .compact_title = owned_compact_title,
+        } });
+    }
+
+    /// Non-streaming final tool results replace the preview: the first
+    /// normalized chunk overwrites, remaining chunks append. Streaming tools
+    /// append output as it arrives; their terminal event updates status/footer
+    /// only so the UI never replays a large body in one owner-loop turn.
     fn replaceToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
         var buffer: [transcript_append_max]u8 = undefined;
         const first = tool_view.normalizedOutputChunk(&buffer, text);
-        _ = try self.terminal.applyCommand(.{ .replace_tool_output = .{
-            .tool_call_id = tool_call_id,
-            .text = first.text,
-        } });
+        try self.queueReplaceToolOutput(tool_call_id, first.text);
         try self.appendToolOutput(tool_call_id, text[first.consumed..]);
     }
 
@@ -1483,17 +2065,28 @@ const InteractiveController = struct {
     fn appendToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
         var remaining = text;
         while (remaining.len > 0) {
-            var buffer: [transcript_append_max]u8 = undefined;
+            var buffer: [tool_output_ui_chunk_bytes_max]u8 = undefined;
             const chunk = tool_view.normalizedOutputChunk(&buffer, remaining);
             if (chunk.consumed == 0) return;
-            if (chunk.text.len > 0) {
-                _ = try self.terminal.applyCommand(.{ .tool_output_delta = .{
-                    .tool_call_id = tool_call_id,
-                    .text = chunk.text,
-                } });
-            }
+            if (chunk.text.len > 0) try self.queueToolOutputDelta(tool_call_id, chunk.text);
             remaining = remaining[chunk.consumed..];
         }
+    }
+
+    fn queueToolOutputDelta(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
+        const owned_id = try self.allocator.dupe(u8, tool_call_id);
+        errdefer self.allocator.free(owned_id);
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        try self.queuePendingUiWork(.{ .tool_output_delta = .{ .tool_call_id = owned_id, .text = owned_text } });
+    }
+
+    fn queueReplaceToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
+        const owned_id = try self.allocator.dupe(u8, tool_call_id);
+        errdefer self.allocator.free(owned_id);
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        try self.queuePendingUiWork(.{ .replace_tool_output = .{ .tool_call_id = owned_id, .text = owned_text } });
     }
 
     fn appendFrontToolOutput(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
@@ -1573,23 +2166,23 @@ const InteractiveController = struct {
     }
 
     fn setWorkingStatus(self: *InteractiveController, text: []const u8) !void {
-        _ = try self.terminal.applyCommand(.{ .set_status = .{
+        try self.queueStatus(.{
             .slot = .status_line,
             .id = status_id_working,
             .priority = 10,
             .text = text,
             .effect = .shimmer,
-        } });
+        });
     }
 
     fn setRecoveryStatus(self: *InteractiveController, text: []const u8) !void {
-        _ = try self.terminal.applyCommand(.{ .set_status = .{
+        try self.queueStatus(.{
             .slot = .status_line,
             .id = status_id_recovery,
             .priority = 9,
             .text = text,
             .effect = .shimmer,
-        } });
+        });
     }
 
     fn setCompletionStatus(self: *InteractiveController) !void {
@@ -1603,7 +2196,7 @@ const InteractiveController = struct {
     }
 
     fn clearStatus(self: *InteractiveController, id: tui.status.ContributionId) !void {
-        _ = try self.terminal.applyCommand(.{ .clear_status = .{ .slot = .status_line, .id = id } });
+        try self.queuePendingUiWork(.{ .clear_status = .{ .slot = .status_line, .id = id } });
     }
 
     fn clearNotify(self: *InteractiveController, key: tui.notify.Key) !void {
@@ -1680,17 +2273,37 @@ const InteractiveController = struct {
         return tool_view.durationChip(buffer, label, elapsed_ms);
     }
 
-    fn replaceToolFooter(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
-        _ = try self.terminal.applyCommand(.{ .replace_tool_footer = .{
-            .tool_call_id = tool_call_id,
-            .text = text,
+    fn queueStatus(self: *InteractiveController, status: tui.status.Set) !void {
+        const owned_text = try self.allocator.dupe(u8, status.text);
+        errdefer self.allocator.free(owned_text);
+        try self.queuePendingUiWork(.{ .set_status = .{
+            .slot = status.slot,
+            .id = status.id,
+            .priority = status.priority,
+            .text = owned_text,
+            .effect = status.effect,
+            .tone = status.tone,
         } });
+    }
+
+    fn replaceToolFooter(self: *InteractiveController, tool_call_id: []const u8, text: []const u8) !void {
+        const owned_id = try self.allocator.dupe(u8, tool_call_id);
+        errdefer self.allocator.free(owned_id);
+        const owned_text = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned_text);
+        try self.queuePendingUiWork(.{ .replace_tool_footer = .{ .tool_call_id = owned_id, .text = owned_text } });
     }
 };
 
 /// Largest prefix that fits one transcript append, preferring a UTF-8
 /// boundary; falls back to a raw cut when the head has no boundary (the
 /// transcript sanitizes whatever arrives).
+fn boundedUiChunk(text: []const u8) []const u8 {
+    const prefix = tui.text.utf8Prefix(text, transcript_ui_chunk_bytes_max);
+    if (prefix.len > 0) return prefix;
+    return text[0..@min(text.len, transcript_ui_chunk_bytes_max)];
+}
+
 fn boundedChunk(text: []const u8) []const u8 {
     const prefix = tui.text.utf8Prefix(text, transcript_append_max);
     if (prefix.len > 0) return prefix;
@@ -1951,10 +2564,13 @@ test "operation completion does not clear notification" {
         .stderr = &stderr_discard.writer,
         .terminal = terminal,
     };
+    defer controller.pending_ui_work.deinit(std.testing.allocator);
+    defer controller.clearPendingUiWork();
 
     try controller.appendStatus(.warning, "keep me");
     try controller.setWorkingStatus("working");
     try controller.applyOperationFinished(.{ .reason = .completed });
+    _ = try controller.applyPendingUiWorkBounded(std.math.maxInt(i64));
 
     var status_views: [tui.status.entry_count_max]tui.status.View = undefined;
     const status_count = terminal.app.status.ordered(.status_line, &status_views);
@@ -2004,6 +2620,8 @@ test "compaction end keeps working status while operation remains active" {
         .terminal = terminal,
         .operation_active = true,
     };
+    defer controller.pending_ui_work.deinit(std.testing.allocator);
+    defer controller.clearPendingUiWork();
 
     try controller.setWorkingStatus("compacting");
     try controller.applyCompactionEnd(.{
@@ -2011,6 +2629,7 @@ test "compaction end keeps working status while operation remains active" {
         .aborted = false,
         .will_retry = false,
     });
+    _ = try controller.applyPendingUiWorkBounded(std.math.maxInt(i64));
 
     var views: [tui.status.entry_count_max]tui.status.View = undefined;
     const count = terminal.app.status.ordered(.status_line, &views);
@@ -2031,6 +2650,8 @@ test "compaction end clears working status only when operation is done" {
         .stderr = &stderr_discard.writer,
         .terminal = terminal,
     };
+    defer controller.pending_ui_work.deinit(std.testing.allocator);
+    defer controller.clearPendingUiWork();
 
     try controller.setWorkingStatus("compacting");
     try controller.applyCompactionEnd(.{
@@ -2038,6 +2659,7 @@ test "compaction end clears working status only when operation is done" {
         .aborted = false,
         .will_retry = false,
     });
+    _ = try controller.applyPendingUiWorkBounded(std.math.maxInt(i64));
 
     var views: [tui.status.entry_count_max]tui.status.View = undefined;
     const count = terminal.app.status.ordered(.status_line, &views);
@@ -2057,8 +2679,11 @@ test "queue status is human text" {
         .stderr = &stderr_discard.writer,
         .terminal = terminal,
     };
+    defer controller.pending_ui_work.deinit(std.testing.allocator);
+    defer controller.clearPendingUiWork();
 
     try controller.applyQueueCounts(2, 3);
+    _ = try controller.applyPendingUiWorkBounded(std.math.maxInt(i64));
 
     var views: [tui.status.entry_count_max]tui.status.View = undefined;
     const count = terminal.app.status.ordered(.status_line, &views);
@@ -2102,6 +2727,8 @@ test "write preview footer clears when execution starts" {
         .stderr = &stderr_discard.writer,
         .terminal = terminal,
     };
+    defer controller.pending_ui_work.deinit(allocator);
+    defer controller.clearPendingUiWork();
 
     var args = try std.json.parseFromSlice(
         std.json.Value,
@@ -2113,12 +2740,14 @@ test "write preview footer clears when execution starts" {
     defer args.deinit();
 
     try controller.applyToolCall(.{ .id = "call-write", .name = "write", .arguments = args.value });
+    _ = try controller.applyPendingUiWorkBounded(std.math.maxInt(i64));
     try std.testing.expectEqualStrings(
         "Showing lines 1-10 of 12",
         terminal.app.transcript.items.items[0].body.tool.footer,
     );
 
     try controller.applyToolStart(.{ .tool_call_id = "call-write", .tool_name = "write", .args = args.value });
+    _ = try controller.applyPendingUiWorkBounded(std.math.maxInt(i64));
     try std.testing.expectEqualStrings("", terminal.app.transcript.items.items[0].body.tool.footer);
 }
 
@@ -2134,16 +2763,101 @@ test "history paging is gated only by history state" {
     try std.testing.expect(!canRequestHistoryPage(false, false));
 }
 
-test "render throttle coalesces active streaming but lets input render immediately" {
+test "history tool result installs settled output without presentation queue" {
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+    defer controller.pending_ui_work.deinit(std.testing.allocator);
+
+    try controller.appendHistoryItem(.{
+        .entry_id = .{ .text = "entry-1" },
+        .kind = .tool_result,
+        .text = .{ .text = "tool output" },
+        .tool_call_id = .{ .text = "call-1" },
+        .tool_name = .{ .text = "read" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), controller.pending_ui_work.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), terminal.app.transcript.items.items.len);
+    const tool = terminal.app.transcript.items.items[0].body.tool;
+    try std.testing.expectEqual(tui.Transcript.ToolStatus.success, tool.status);
+    try std.testing.expectEqualStrings("tool output", tool.output.items);
+}
+
+test "history window with newer tail drops live transcript work until reloaded" {
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+        .history_has_more_after = true,
+    };
+    defer controller.pending_ui_work.deinit(std.testing.allocator);
+    defer controller.clearPendingUiWork();
+
+    try controller.appendMessage(.assistant, "live tail", .new_item);
+
+    try std.testing.expectEqual(@as(usize, 0), controller.pending_ui_work.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), terminal.app.transcript.items.items.len);
+
+    var notify_views: [tui.notify.item_count_max]tui.notify.View = undefined;
+    const notify_count = terminal.app.notify.ordered(terminal.app.now_ms, &notify_views);
+    try std.testing.expectEqual(@as(usize, 1), notify_count);
+    try std.testing.expectEqualStrings("new output below; ctrl+end reloads tail", notify_views[0].message);
+}
+
+test "render throttle adapts background frames but foreground renders immediately" {
     var throttle: RenderThrottle = .{};
-    try std.testing.expect(throttle.shouldRender(100, true));
-    try std.testing.expect(!throttle.shouldRender(101, true));
-    try std.testing.expect(throttle.shouldRender(101, false));
-    try std.testing.expect(!throttle.shouldRender(102, true));
-    throttle.requestImmediate();
-    try std.testing.expect(throttle.shouldRender(102, true));
-    try std.testing.expect(!throttle.shouldRender(103, true));
-    try std.testing.expect(throttle.shouldRender(102 + @as(i64, @intCast(frame_interval_ms)), true));
+    const first = throttle.shouldRender(100).?;
+    try std.testing.expectEqual(FramePriority.foreground, first);
+    throttle.noteRenderCost(first, 100, 0);
+    try std.testing.expect(throttle.shouldRender(101) == null);
+
+    throttle.requestBackgroundFrame(background_pending_work_interval_ms);
+    try std.testing.expect(throttle.shouldRender(101) == null);
+    const background = throttle.shouldRender(100 + assistant_reveal_interval_ms).?;
+    try std.testing.expectEqual(FramePriority.background, background);
+    throttle.noteRenderCost(background, 100 + assistant_reveal_interval_ms, 80 * std.time.ns_per_ms);
+
+    throttle.requestBackgroundFrame(assistant_reveal_interval_ms);
+    try std.testing.expect(throttle.shouldRender(101 + assistant_reveal_interval_ms) == null);
+    try std.testing.expectEqual(
+        FramePriority.background,
+        throttle.shouldRender(100 + assistant_reveal_interval_ms + 240).?,
+    );
+
+    throttle.requestBackgroundFrame(background_pending_work_interval_ms);
+    throttle.requestForegroundFrame();
+    const foreground = throttle.shouldRender(400).?;
+    try std.testing.expectEqual(FramePriority.foreground, foreground);
+    throttle.noteRenderCost(foreground, 400, 90 * std.time.ns_per_ms);
+    throttle.requestBackgroundFrame(assistant_reveal_interval_ms);
+    try std.testing.expect(throttle.shouldRender(400 + assistant_reveal_interval_ms) == null);
+
+    throttle.requestScrollFrame();
+    const scroll = throttle.shouldRender(401).?;
+    try std.testing.expectEqual(FramePriority.scroll, scroll);
+    throttle.noteRenderCost(scroll, 401, 90 * std.time.ns_per_ms);
+    throttle.requestScrollFrame();
+    try std.testing.expectEqual(FramePriority.scroll, throttle.shouldRender(402).?);
+
+    throttle.requestBackgroundFrame(assistant_reveal_interval_ms);
+    try std.testing.expectEqual(FramePriority.background, throttle.shouldRender(401 + 270).?);
 }
 
 test "resume picker starts from newest existing session when present" {
@@ -2229,6 +2943,8 @@ test "TUI recovers event gaps by requesting snapshot directly" {
         .stderr = &stderr_discard.writer,
         .terminal = terminal,
     };
+    defer controller.pending_ui_work.deinit(std.testing.allocator);
+    defer controller.clearPendingUiWork();
 
     try controller.acceptEnvelope(.{
         .seq = 2,

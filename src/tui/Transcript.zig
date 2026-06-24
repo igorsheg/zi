@@ -82,6 +82,8 @@ pub const Append = union(enum) {
         collapse: ToolCollapse = .{},
         title: []const u8 = "",
         compact_title: []const u8 = "",
+        output: []const u8 = "",
+        footer: []const u8 = "",
     };
 };
 
@@ -532,22 +534,41 @@ fn insertToolAt(
     const name_bounded = text_mod.utf8Prefix(tool.name, append_size_bytes_max);
     const title_bounded = text_mod.utf8Prefix(tool.title, append_size_bytes_max);
     const compact_title_bounded = text_mod.utf8Prefix(tool.compact_title, append_size_bytes_max);
+    const output_bounded = text_mod.utf8Prefix(tool.output, tool_preview_bytes_max);
+    const footer_bounded = text_mod.utf8Prefix(tool.footer, append_size_bytes_max);
     const truncated = id_bounded.len < tool.tool_call_id.len or
         name_bounded.len < tool.name.len or
         title_bounded.len < tool.title.len or
-        compact_title_bounded.len < tool.compact_title.len;
+        compact_title_bounded.len < tool.compact_title.len or
+        output_bounded.len < tool.output.len or
+        footer_bounded.len < tool.footer.len;
 
     const id = try sanitizedCopy(gpa, id_bounded);
-    errdefer gpa.free(id);
+    var id_owned = true;
+    errdefer if (id_owned) gpa.free(id);
     const name = try sanitizedCopy(gpa, name_bounded);
-    errdefer gpa.free(name);
+    var name_owned = true;
+    errdefer if (name_owned) gpa.free(name);
     const title = try sanitizedCopy(gpa, title_bounded);
-    errdefer gpa.free(title);
+    var title_owned = true;
+    errdefer if (title_owned) gpa.free(title);
     const compact_title = try sanitizedCopy(gpa, compact_title_bounded);
-    errdefer gpa.free(compact_title);
-    const footer = try gpa.dupe(u8, "");
-    errdefer gpa.free(footer);
+    var compact_title_owned = true;
+    errdefer if (compact_title_owned) gpa.free(compact_title);
+    var output = try settledToolOutput(gpa, output_bounded);
+    const output_trim = trimToTailWindow(&output, tool_preview_bytes_max, tool_preview_lines_max);
+    var output_owned = true;
+    errdefer if (output_owned) output.deinit(gpa);
+    const footer = try sanitizedCopy(gpa, footer_bounded);
+    var footer_owned = true;
+    errdefer if (footer_owned) gpa.free(footer);
 
+    id_owned = false;
+    name_owned = false;
+    title_owned = false;
+    compact_title_owned = false;
+    output_owned = false;
+    footer_owned = false;
     try self.insertOwnedItem(gpa, index, .{ .body = .{ .tool = .{
         .id = id,
         .name = name,
@@ -557,9 +578,12 @@ fn insertToolAt(
         .collapse = tool.collapse,
         .title = title,
         .compact_title = compact_title,
+        .output = output,
         .footer = footer,
+        .dropped_head_bytes = output_trim.dropped_bytes,
+        .dropped_head_lines = output_trim.dropped_lines,
     } } });
-    return .{ .truncated = truncated };
+    return .{ .truncated = truncated or output_trim.dropped_bytes > 0 };
 }
 
 fn updateToolAt(
@@ -572,15 +596,27 @@ fn updateToolAt(
     const name_bounded = text_mod.utf8Prefix(tool.name, append_size_bytes_max);
     const title_bounded = text_mod.utf8Prefix(tool.title, append_size_bytes_max);
     const compact_title_bounded = text_mod.utf8Prefix(tool.compact_title, append_size_bytes_max);
+    const output_bounded = text_mod.utf8Prefix(tool.output, tool_preview_bytes_max);
+    const footer_bounded = text_mod.utf8Prefix(tool.footer, append_size_bytes_max);
     const truncated = id_bounded.len < tool.tool_call_id.len or
         name_bounded.len < tool.name.len or
         title_bounded.len < tool.title.len or
-        compact_title_bounded.len < tool.compact_title.len;
+        compact_title_bounded.len < tool.compact_title.len or
+        output_bounded.len < tool.output.len or
+        footer_bounded.len < tool.footer.len;
 
     const title = if (title_bounded.len > 0) try sanitizedCopy(gpa, title_bounded) else null;
     errdefer if (title) |value| gpa.free(value);
     const compact_title = if (compact_title_bounded.len > 0) try sanitizedCopy(gpa, compact_title_bounded) else null;
     errdefer if (compact_title) |value| gpa.free(value);
+    var output = if (tool.output.len > 0) try settledToolOutput(gpa, output_bounded) else null;
+    const output_trim: TailTrim = if (output) |*value|
+        trimToTailWindow(value, tool_preview_bytes_max, tool_preview_lines_max)
+    else
+        .{};
+    errdefer if (output) |*value| value.deinit(gpa);
+    const footer = if (tool.footer.len > 0) try sanitizedCopy(gpa, footer_bounded) else null;
+    errdefer if (footer) |value| gpa.free(value);
 
     const item = &self.items.items[index];
     const existing = &item.body.tool;
@@ -593,12 +629,31 @@ fn updateToolAt(
         gpa.free(existing.compact_title);
         existing.compact_title = value;
     }
+    if (output) |value| {
+        existing.output.deinit(gpa);
+        existing.output = value;
+        existing.pending = .{};
+        existing.dropped_head_bytes = output_trim.dropped_bytes;
+        existing.dropped_head_lines = output_trim.dropped_lines;
+        output = null;
+    }
+    if (footer) |value| {
+        gpa.free(existing.footer);
+        existing.footer = value;
+    }
     existing.presentation = tool.presentation;
     existing.status = mergeToolStatus(existing.status, tool.status);
     existing.body_mode = tool.body_mode;
     existing.collapse = tool.collapse;
     self.noteItemMutation(item, old_size, existing.sizeBytes());
-    return .{ .truncated = truncated };
+    return .{ .truncated = truncated or output_trim.dropped_bytes > 0 };
+}
+
+fn settledToolOutput(gpa: std.mem.Allocator, output: []const u8) error{OutOfMemory}!std.ArrayList(u8) {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    try text_mod.appendSanitized(gpa, &list, output);
+    return list;
 }
 
 fn appendToolOutputAt(
@@ -943,6 +998,26 @@ test "tool output is tail-windowed with drop accounting" {
     try std.testing.expect(tool.output.items.len <= tool_preview_bytes_max);
     try std.testing.expect(tool.dropped_head_bytes > 0);
     try std.testing.expectEqual(transcript.items.items[0].sizeBytes(), transcript.total_size_bytes);
+}
+
+test "settled tool append stores result output and footer atomically" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "read",
+        .status = .success,
+        .title = "read file",
+        .output = "file contents",
+        .footer = "10 lines",
+    } });
+
+    const tool = transcript.items.items[0].body.tool;
+    try std.testing.expectEqual(ToolStatus.success, tool.status);
+    try std.testing.expectEqualStrings("file contents", tool.output.items);
+    try std.testing.expectEqualStrings("10 lines", tool.footer);
 }
 
 test "replaceToolOutput supersedes the stream and clears drop counters" {

@@ -40,10 +40,13 @@ running: bool = false,
 resize_handler_installed: bool = false,
 resize_pending: std.atomic.Value(bool) = .init(false),
 
+pub const InputPriority = enum { none, scroll, foreground };
+
 pub const ReadResult = struct {
     bytes_read: usize = 0,
     event_count: usize = 0,
     effect_count: usize = 0,
+    priority: InputPriority = .none,
     /// Input bytes were dropped (unparseable or pending overflow). The
     /// caller surfaces this as a warning; it never tears the loop down.
     truncated: bool = false,
@@ -153,8 +156,16 @@ pub fn nextDeadlineMs(self: *const Terminal) ?i64 {
     return self.app.nextDeadlineMs();
 }
 
+pub fn transcriptAtTail(self: *const Terminal) bool {
+    return self.app.transcriptAtTail();
+}
+
 pub fn composerText(self: *const Terminal) []const u8 {
     return self.app.composer.text();
+}
+
+fn nowNs(self: *const Terminal) i96 {
+    return std.Io.Clock.awake.now(self.io).nanoseconds;
 }
 
 pub fn activeFileCompletionQuery(self: *const Terminal) ?[]const u8 {
@@ -207,7 +218,10 @@ pub fn readAvailableInput(self: *Terminal, effects: []App.Effect) !ReadResult {
         result.event_count += 1;
         const event = parsed.event orelse continue;
         switch (event) {
-            .winsize => |ws| try self.applyWinsize(ws),
+            .winsize => |ws| {
+                try self.applyWinsize(ws);
+                noteInputPriority(&result, .foreground);
+            },
             else => try self.applyInput(input_mod.fromVaxis(event), effects, &result),
         }
     }
@@ -226,6 +240,7 @@ fn applyInput(
     result: *ReadResult,
 ) error{OutOfMemory}!void {
     if (event == .ignored) return;
+    noteInputPriority(result, inputPriority(event));
     if (try self.app.apply(self.gpa, .{ .input = event })) |effect| {
         if (result.effect_count == effects.len) {
             effect.deinit(self.gpa);
@@ -237,14 +252,53 @@ fn applyInput(
     }
 }
 
+pub const RenderTiming = struct {
+    draw_ns: u64,
+    flush_ns: u64,
+    draw_detail: ?render.DrawTiming = null,
+};
+
+fn inputPriority(event: input_mod.Input) InputPriority {
+    return switch (input_mod.resolve(event)) {
+        .transcript_scroll_up, .transcript_scroll_down, .transcript_page_up, .transcript_page_down => .scroll,
+        .none => .none,
+        else => .foreground,
+    };
+}
+
+fn noteInputPriority(result: *ReadResult, priority: InputPriority) void {
+    result.priority = switch (result.priority) {
+        .foreground => .foreground,
+        .scroll => if (priority == .foreground) .foreground else .scroll,
+        .none => priority,
+    };
+}
+
 /// The render transaction: paint into vaxis' screen, then write the diff to
 /// the terminal. State stays dirty until the write succeeds, so a failed
 /// write retries on the next wake instead of losing the frame.
 pub fn renderIfDirty(self: *Terminal) !void {
-    if (!self.app.dirty) return;
-    render.draw(&self.app, &self.vx, &self.scratch);
+    _ = try self.renderIfDirtyTimed(false);
+}
+
+pub fn renderIfDirtyTimed(self: *Terminal, collect_detail: bool) !?RenderTiming {
+    if (!self.app.dirty) return null;
+    const draw_start = self.nowNs();
+    const draw_detail: ?render.DrawTiming = if (collect_detail) blk: {
+        break :blk render.drawTimed(&self.app, &self.vx, &self.scratch, self.io);
+    } else blk: {
+        render.draw(&self.app, &self.vx, &self.scratch);
+        break :blk null;
+    };
+    const flush_start = self.nowNs();
     try self.vx.render(self.tty.?.writer());
+    const done = self.nowNs();
     self.app.dirty = false;
+    return .{
+        .draw_ns = @intCast(flush_start - draw_start),
+        .flush_ns = @intCast(done - flush_start),
+        .draw_detail = draw_detail,
+    };
 }
 
 pub fn resizeFromTerminal(self: *Terminal) !void {

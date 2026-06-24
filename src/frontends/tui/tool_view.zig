@@ -172,6 +172,10 @@ pub fn showsDuration(name: []const u8) bool {
     return tool_metadata.displayForTool(name).shows_duration;
 }
 
+pub fn streamsOutput(name: []const u8) bool {
+    return kind(name) == .bash;
+}
+
 pub fn callPreviewText(name: []const u8, args_value: std.json.Value) ?[]const u8 {
     if (kind(name) != .write) return null;
     const content = argString(args_value, "content") orelse return null;

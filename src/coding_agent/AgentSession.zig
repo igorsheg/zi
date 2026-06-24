@@ -554,6 +554,10 @@ pub fn publicEventWake(self: *AgentSession) *runtime.ResetEvent {
     return self.event_drain.publicEventWake();
 }
 
+pub fn publicEventsEmpty(self: *const AgentSession) bool {
+    return self.event_drain.publicEventsEmpty();
+}
+
 pub fn queuePrompt(
     self: *AgentSession,
     text: []const u8,
