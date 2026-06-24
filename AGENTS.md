@@ -178,6 +178,37 @@ agent event
   live, slow idle heartbeat otherwise — an idle zi must not spin). typing must
   not be required for shimmer or transcript progress; frame ticks and session
   wakes must render without input.
+- composer responsiveness is a product invariant, not a best effort. Terminal
+  input and command wakes are foreground work; agent/session/public-event drains,
+  transcript ingestion, layout projection, and rendering are background work.
+  The user must never compete with the model for an unbounded owner-loop turn.
+- every TUI owner loop must have named per-turn work budgets for background
+  drains (event count and/or elapsed time). Never drain agent/session/tool
+  events with `while queue has data` unless the loop first proves a hard bound
+  for that turn. If a budget is exhausted, keep state dirty/woken and yield back
+  to input/render scheduling.
+- streaming deltas are coalesced facts. Multiple agent/tool text fragments that
+  arrive before the next frame should become at most one transcript mutation per
+  affected item/tool where the adapter can do so without changing ordering
+  semantics. Appending bytes may be cheap; wrapping/layout/projection must not
+  run once per network fragment by accident.
+- rendering is frame-gated, not event-gated. Agent progress marks product state
+  dirty; frame deadlines decide when to draw. Many stream events inside one
+  frame produce one render. User input may request an immediate frame, but model
+  progress must not force render churn.
+- foreground frames and background frames are different product facts. Composer
+  input must render foreground interaction state without paying for queued model
+  transcript/tool progress. Background transcript ingestion may lag; composer
+  echo and cursor movement may not. Scroll input is interaction work but may be
+  coalesced under terminal flush debt; typed composer edits are foreground.
+- terminal flush is the slowest TUI resource. Treat synchronous render/flush as
+  scheduled work with priority and backpressure, not as an automatic consequence
+  of any dirty state. If a background render is expensive, future background
+  renders must back off; foreground input remains allowed to request a frame.
+- latency work starts with measurement. Before broad TUI scheduling changes, add
+  bounded debug timing/counter instrumentation around select wait, input drain,
+  command apply, agent/public-event drain, transcript mutation, layout/draw, and
+  terminal flush. Hot-path instrumentation must be allocation-free and bounded.
 - do not use `vaxis.Loop` for Zi's product loop by default. it is a thread + queue
   runtime and creates another lifecycle/overflow boundary. If it is introduced,
   document the queue bound, overflow policy, shutdown order, and why the extra
