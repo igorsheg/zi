@@ -2,7 +2,10 @@ const std = @import("std");
 
 const tui = @import("../../tui/root.zig");
 
-pub const assistant_reveal_interval_ms: i64 = 16;
+// Assistant text is eligible slightly ahead of the 16ms frame cadence so a
+// busy stream can catch the next session wake without making animation spin
+// faster. RenderThrottle still backs off when terminal flushes are expensive.
+pub const assistant_reveal_interval_ms: i64 = 12;
 pub const tool_output_interval_ms: i64 = 200;
 pub const animation_frame_interval_ms: i64 = 16;
 pub const background_pending_work_interval_ms: i64 = 100;
