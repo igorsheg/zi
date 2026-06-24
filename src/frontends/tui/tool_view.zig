@@ -189,7 +189,7 @@ pub fn callPreviewFooter(buffer: []u8, name: []const u8, args_value: std.json.Va
     const preview = trimTrailingEmptyLines(content);
     if (preview.len == 0) return "";
     const total_lines = countLines(preview);
-    const visible_lines: usize = @min(total_lines, tool_metadata.displayForTool("write").collapse.rows_max);
+    const visible_lines: usize = @min(total_lines, tool_metadata.displayForTool("write").collapse.lines_max);
     if (visible_lines == total_lines) return "";
     return std.fmt.bufPrint(buffer, "Showing lines 1-{d} of {d}", .{ visible_lines, total_lines }) catch "";
 }
@@ -650,7 +650,7 @@ fn collapse(name: []const u8) tui.Transcript.ToolCollapse {
             .head => .head,
             .tail => .tail,
         },
-        .rows_max = metadata.rows_max,
+        .lines_max = metadata.lines_max,
     };
 }
 

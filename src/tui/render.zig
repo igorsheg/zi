@@ -40,8 +40,6 @@ const footer_bytes_max: usize = 256;
 /// tool titles, collapse hints, and omission notices. Static literals and
 /// transcript text are borrowed and need no copy.
 pub const generated_text_bytes_max: usize = 16 * 1024;
-const collapsed_tool_tail_scan_bytes_max = 2 * 1024;
-const collapsed_tool_tail_scan_lines_max = 64;
 
 pub const RowSegment = struct {
     text: []const u8,
@@ -1073,11 +1071,10 @@ fn buildToolRows(
     }
 }
 
-/// Collapsed tools show a bounded window over the wrapped body rows: tail
-/// tools keep the newest rows with an "earlier lines" hint above, head tools
-/// keep the first rows with a "more lines" hint below. Rows are counted
-/// after wrapping so the window is stable across widths, the same way scroll
-/// accounting works.
+/// Collapsed tools mirror pi-mono: the window is measured in physical
+/// newline-delimited lines before wrapping. Tail tools keep the newest lines;
+/// head tools keep the first lines. Rendering wraps the selected text after
+/// collapse, while scroll accounting still uses wrapped display rows.
 fn buildToolBodyRows(
     out: ?*RowScratch,
     count: *usize,
@@ -1088,8 +1085,8 @@ fn buildToolBodyRows(
     expanded: bool,
 ) void {
     const body = tool.output.items;
-    const prefix_width: u16 = @intCast(@min(text_mod.displayWidth(glyphs.tool_body_prefix), inner));
-    const rows_max: usize = tool.collapse.rows_max;
+    const lines_max: usize = tool.collapse.lines_max;
+    std.debug.assert(lines_max > 0);
 
     var options: WrapOptions = .{
         .prefix = glyphs.tool_body_prefix,
@@ -1108,63 +1105,54 @@ fn buildToolBodyRows(
         return;
     }
 
+    const line_count = Transcript.countPhysicalLines(body);
+    if (line_count <= lines_max) {
+        emitWrappedText(out, count, options);
+        return;
+    }
+
+    const hidden_lines = line_count - lines_max;
     switch (tool.collapse.mode) {
         .head => {
-            const visible_or_more = countWrappedRowsBounded(body, inner, prefix_width, rows_max + 1);
-            if (visible_or_more <= rows_max) {
-                emitWrappedText(out, count, options);
-                return;
-            }
-            options.window = .{ .skip = 0, .limit = rows_max };
+            options.text = body[0..lineStart(body, lines_max + 1)];
+            // Keep the continuation fact visible even when retained lines wrap
+            // to the per-item row cap.
+            options.window = .{ .limit = item_rows_max -| count.* -| 1 };
             emitWrappedText(out, count, options);
-            putCollapseHint(out, count, tool.collapse.mode, 1, rail, theme);
+            putCollapseHint(out, count, tool.collapse.mode, hidden_lines, rail, theme);
         },
         .tail => {
-            const suffix = collapsedToolTailSlice(body);
-            options.text = suffix.text;
-            const visible_or_more = countWrappedRowsBounded(suffix.text, inner, prefix_width, rows_max + 1);
-            const hidden = if (suffix.start > 0 or visible_or_more > rows_max or tool.dropped_head_lines > 0)
-                @max(@as(usize, 1), tool.dropped_head_lines)
-            else
-                0;
-            if (hidden > 0) putCollapseHint(out, count, tool.collapse.mode, hidden, rail, theme);
-            options.window = .{ .skip = visible_or_more -| rows_max, .limit = rows_max };
+            options.text = body[lineStart(body, hidden_lines + 1)..];
+            putCollapseHint(out, count, tool.collapse.mode, hidden_lines, rail, theme);
             emitWrappedText(out, count, options);
         },
     }
 }
 
-const TailSlice = struct {
-    text: []const u8,
-    start: usize,
-};
-
-fn collapsedToolTailSlice(text: []const u8) TailSlice {
-    if (text.len <= collapsed_tool_tail_scan_bytes_max) return .{ .text = text, .start = 0 };
-    var start = text.len;
-    var lines: usize = 0;
-    while (start > 0 and text.len - start < collapsed_tool_tail_scan_bytes_max and lines < collapsed_tool_tail_scan_lines_max) {
-        start -= 1;
-        if (text[start] == '\n') lines += 1;
+fn lineStart(text: []const u8, line_number: usize) usize {
+    if (line_number <= 1) return 0;
+    var current_line: usize = 1;
+    for (text, 0..) |byte, index| {
+        if (byte == '\n') {
+            current_line += 1;
+            if (current_line == line_number) return index + 1;
+        }
     }
-    if (start > 0) {
-        while (start < text.len and text[start - 1] != '\n') start += 1;
-    }
-    return .{ .text = text[start..], .start = start };
+    return text.len;
 }
 
 fn putCollapseHint(
     out: ?*RowScratch,
     count: *usize,
     mode: Transcript.ToolCollapseMode,
-    hidden_rows: usize,
+    hidden_lines: usize,
     rail: theme_mod.Style,
     theme: *const theme_mod.Theme,
 ) void {
     var hint_buffer: [hint_bytes_max]u8 = undefined;
     putRow(out, count, .{
         .prefix = glyphs.tool_body_prefix,
-        .text = internText(out, collapseHint(&hint_buffer, mode, hidden_rows)),
+        .text = internText(out, collapseHint(&hint_buffer, mode, hidden_lines)),
         .show_prefix = true,
         .prefix_style = rail,
         .text_style = theme.transcript_secondary,
@@ -1433,12 +1421,12 @@ fn toolBodyVisible(tool: *const Transcript.Tool, expanded: bool) bool {
     };
 }
 
-/// Wording mirrors pi-mono: tail windows hide *earlier* lines, head windows
-/// hide the *remaining* lines.
-fn collapseHint(buffer: []u8, mode: Transcript.ToolCollapseMode, hidden_rows: usize) []const u8 {
+/// Pi-mono counts hidden tool output in physical newline-delimited lines.
+/// Wrapping happens after the collapse window is chosen.
+fn collapseHint(buffer: []u8, mode: Transcript.ToolCollapseMode, hidden_lines: usize) []const u8 {
     const result = switch (mode) {
-        .tail => std.fmt.bufPrint(buffer, "... ({d} earlier lines, ctrl+o to expand)", .{hidden_rows}),
-        .head => std.fmt.bufPrint(buffer, "... ({d} more lines, ctrl+o to expand)", .{hidden_rows}),
+        .tail => std.fmt.bufPrint(buffer, "... ({d} earlier lines, ctrl+o to expand)", .{hidden_lines}),
+        .head => std.fmt.bufPrint(buffer, "... ({d} more lines, ctrl+o to expand)", .{hidden_lines}),
     };
     return result catch "... (ctrl+o to expand)";
 }
@@ -2132,34 +2120,54 @@ test "wrapped row counting terminates when width is zero" {
     try std.testing.expectEqual(@as(usize, 1), countWrappedRows("abc", 1, 1));
 }
 
-test "collapsed tool body shows a bounded window with a hint row" {
+test "tool collapse line counting follows pi-mono trailing newline semantics" {
+    try std.testing.expectEqual(@as(usize, 0), Transcript.countPhysicalLines(""));
+    try std.testing.expectEqual(@as(usize, 1), Transcript.countPhysicalLines("one"));
+    try std.testing.expectEqual(@as(usize, 1), Transcript.countPhysicalLines("one\n"));
+    try std.testing.expectEqual(@as(usize, 2), Transcript.countPhysicalLines("one\ntwo\n"));
+    try std.testing.expectEqual(@as(usize, 4), lineStart("one\ntwo\nthree\n", 2));
+    try std.testing.expectEqual(@as(usize, 8), lineStart("one\ntwo\nthree\n", 3));
+}
+
+test "tail-collapsed tool keeps newest physical lines with exact hidden count" {
     var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "bash",
-        .collapse = .{ .mode = .tail, .rows_max = 5 },
+        .collapse = .{ .mode = .tail, .lines_max = 5 },
         .title = "$ seq 8",
     } });
     _ = try app.transcript.appendToolOutput(testing_gpa, "call-1", "1\n2\n3\n4\n5\n6\n7\n8", 0, 0);
 
-    // Collapsed: title + top + hint + 5 window rows + bottom + margin.
-    try std.testing.expectEqual(@as(usize, 10), countItem(&app, 0));
+    const scratch = try testing_gpa.create(RowScratch);
+    defer testing_gpa.destroy(scratch);
+    var count: usize = 0;
+    buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
+
+    // Collapsed: title + top + hint + newest 5 physical lines + bottom + margin.
+    try std.testing.expectEqualStrings("... (3 earlier lines, ctrl+o to expand)", scratch.rows[2].text);
+    try std.testing.expectEqualStrings("4", scratch.rows[3].text);
+    try std.testing.expectEqualStrings("5", scratch.rows[4].text);
+    try std.testing.expectEqualStrings("6", scratch.rows[5].text);
+    try std.testing.expectEqualStrings("7", scratch.rows[6].text);
+    try std.testing.expectEqualStrings("8", scratch.rows[7].text);
+    try std.testing.expectEqual(@as(usize, 10), count);
 
     // Expanded: title + top + all 8 body rows + bottom + margin, no hint.
     app.tools_expanded = true;
     try std.testing.expectEqual(@as(usize, 12), countItem(&app, 0));
 }
 
-test "head-collapsed tool keeps the first rows with the hint below" {
+test "head-collapsed tool keeps first physical lines with exact hidden count" {
     var app = App.init(80, 24, .{});
     defer app.deinit(testing_gpa);
 
     _ = try app.transcript.append(testing_gpa, .{ .tool = .{
         .tool_call_id = "call-1",
         .name = "custom",
-        .collapse = .{ .mode = .head, .rows_max = 2 },
+        .collapse = .{ .mode = .head, .lines_max = 2 },
     } });
     _ = try app.transcript.appendToolOutput(testing_gpa, "call-1", "a\nb\nc\nd", 0, 0);
 
@@ -2168,11 +2176,11 @@ test "head-collapsed tool keeps the first rows with the hint below" {
     var count: usize = 0;
     buildItemRows(scratch, &count, &app.transcript.items.items[0], app.width, &app.theme, false);
 
-    // Top-down: title, top border, window rows a/b, hint, bottom, margin.
+    // Top-down: title, top border, physical lines a/b, hint, bottom, margin.
     try std.testing.expectEqualStrings(glyphs.tool_top_line, scratch.rows[1].text);
     try std.testing.expectEqualStrings("a", scratch.rows[2].text);
     try std.testing.expectEqualStrings("b", scratch.rows[3].text);
-    try std.testing.expect(std.mem.indexOf(u8, scratch.rows[4].text, "more lines") != null);
+    try std.testing.expectEqualStrings("... (2 more lines, ctrl+o to expand)", scratch.rows[4].text);
     try std.testing.expectEqual(@as(usize, 7), count);
 }
 
@@ -2260,7 +2268,7 @@ test "successful read hides body until expanded" {
         .presentation = .file,
         .status = .success,
         .body_mode = .hidden_on_success,
-        .collapse = .{ .mode = .head, .rows_max = 10 },
+        .collapse = .{ .mode = .head, .lines_max = 10 },
         .title = "read src/main.zig:1-2",
     } });
     _ = try app.transcript.appendToolOutput(testing_gpa, "call-1", "one\ntwo", 0, 0);
@@ -2855,7 +2863,7 @@ test "frame scratch keeps generated tool titles stable" {
         .tool_call_id = "call-custom",
         .name = "custom",
         .status = .pending,
-        .collapse = .{ .mode = .head, .rows_max = 20 },
+        .collapse = .{ .mode = .head, .lines_max = 20 },
         .title = "custom list",
     } } });
     _ = try app.apply(testing_gpa, .{ .replace_tool_output = .{
@@ -2868,7 +2876,7 @@ test "frame scratch keeps generated tool titles stable" {
         .tool_call_id = "call-custom",
         .name = "custom",
         .status = .success,
-        .collapse = .{ .mode = .head, .rows_max = 20 },
+        .collapse = .{ .mode = .head, .lines_max = 20 },
     } } });
     _ = try app.apply(testing_gpa, .{ .append_transcript = .{ .message = .{
         .role = .assistant,
@@ -2883,7 +2891,7 @@ test "frame scratch keeps generated tool titles stable" {
         .name = "bash",
         .presentation = .command,
         .status = .pending,
-        .collapse = .{ .mode = .tail, .rows_max = 5 },
+        .collapse = .{ .mode = .tail, .lines_max = 5 },
         .title = "$ pwd (timeout 10s)",
     } } });
     _ = try app.apply(testing_gpa, .{ .replace_tool_output = .{
@@ -2895,7 +2903,7 @@ test "frame scratch keeps generated tool titles stable" {
         .name = "bash",
         .presentation = .command,
         .status = .success,
-        .collapse = .{ .mode = .tail, .rows_max = 5 },
+        .collapse = .{ .mode = .tail, .lines_max = 5 },
     } } });
     _ = try app.apply(testing_gpa, .{ .replace_tool_footer = .{
         .tool_call_id = "call-bash",

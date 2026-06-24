@@ -35,12 +35,13 @@ pub const ToolStatus = enum { pending, success, err, canceled };
 pub const ToolBodyMode = enum { visible, hidden_on_success };
 pub const ToolCollapseMode = enum { head, tail };
 
-/// Collapsed-view window over a tool's output, measured in visual rows.
-/// Bash keeps the tail (errors live at the end); file/patch tools keep the
-/// head. Expansion (ctrl+o) shows the full retained preview.
+/// Collapsed-view window over a tool's output, measured in physical
+/// newline-delimited lines like pi-mono. Rendering wraps the selected lines
+/// after collapse. Bash keeps the tail (errors live at the end); file/patch
+/// tools keep the head. Expansion (ctrl+o) shows the full retained preview.
 pub const ToolCollapse = struct {
     mode: ToolCollapseMode = .tail,
-    rows_max: u8 = 5,
+    lines_max: u8 = 5,
 };
 
 pub const AppendMode = enum { new_item, extend_previous_assistant_message, extend_previous_same_role };
@@ -841,7 +842,7 @@ fn trimToTailWindow(list: *std.ArrayList(u8), max_bytes: usize, max_lines: usize
     const window = tailWindow(list.items, max_bytes, max_lines);
     if (window.start == 0 and window.end == list.items.len) return .{};
     const dropped_bytes = window.start;
-    const dropped_lines = countLines(list.items[0..window.start]);
+    const dropped_lines = countPhysicalLines(list.items[0..window.start]);
     const kept = window.end - window.start;
     @memmove(list.items[0..kept], list.items[window.start..window.end]);
     list.shrinkRetainingCapacity(kept);
@@ -855,7 +856,7 @@ const TailWindow = struct {
 
 fn tailWindow(bytes: []const u8, max_bytes: usize, max_lines: usize) TailWindow {
     if (bytes.len == 0 or max_bytes == 0 or max_lines == 0) return .{ .start = bytes.len, .end = bytes.len };
-    const total_lines = countLines(bytes);
+    const total_lines = countPhysicalLines(bytes);
     if (total_lines <= max_lines and bytes.len <= max_bytes) return .{ .start = 0, .end = bytes.len };
 
     var end = bytes.len;
@@ -894,7 +895,7 @@ fn utf8SuffixStart(bytes: []const u8, max_bytes: usize) usize {
     return start;
 }
 
-fn countLines(bytes: []const u8) usize {
+pub fn countPhysicalLines(bytes: []const u8) usize {
     if (bytes.len == 0) return 0;
     var count: usize = 1;
     for (bytes) |byte| {
