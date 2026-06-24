@@ -5,6 +5,7 @@ const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
 const runtime = @import("../../runtime/root.zig");
 const shared = @import("openai_responses_shared.zig");
+const models_api = @import("../models.zig");
 const simple_options = @import("simple_options.zig");
 const transform_messages = @import("transform_messages.zig");
 
@@ -263,6 +264,11 @@ fn buildRequestBody(allocator: std.mem.Allocator, request: protocol.StreamReques
     try writeInputMessages(allocator, writer, transformed_context);
     try writer.writeByte(']');
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"}");
+    if (codexReasoningEffort(request)) |effort| {
+        try writer.writeAll(",\"reasoning\":{\"effort\":");
+        try std.json.Stringify.value(effort, .{}, writer);
+        try writer.writeAll(",\"summary\":\"auto\"}");
+    }
     try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
     try writer.writeAll(",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
     if (request.options.temperature) |temperature| try writer.print(",\"temperature\":{d}", .{temperature});
@@ -288,6 +294,17 @@ fn buildRequestBody(allocator: std.mem.Allocator, request: protocol.StreamReques
     };
     try writer.writeByte('}');
     return out.toOwnedSlice();
+}
+
+fn codexReasoningEffort(request: protocol.StreamRequest) ?[]const u8 {
+    const level = request.options.reasoning orelse return null;
+    return switch (level) {
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => if (models_api.supportsXhigh(request.model)) "xhigh" else "high",
+    };
 }
 
 fn writeInputMessages(allocator: std.mem.Allocator, writer: *std.Io.Writer, context: protocol.Context) !void {
@@ -449,6 +466,28 @@ test "endpoint url appends codex responses path" {
     defer std.testing.allocator.free(url);
 
     try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/responses", url);
+}
+
+test "request body includes codex reasoning summary when requested" {
+    var request = testRequest();
+    request.options.reasoning = .xhigh;
+    request.model.id = "gpt-5.5";
+
+    const body = try buildRequestBody(std.testing.allocator, request);
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"xhigh\",\"summary\":\"auto\"}") != null);
+}
+
+test "request body clamps codex xhigh when model does not support it" {
+    var request = testRequest();
+    request.options.reasoning = .xhigh;
+    request.model.id = "gpt-test";
+
+    const body = try buildRequestBody(std.testing.allocator, request);
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"high\",\"summary\":\"auto\"}") != null);
 }
 
 test "request body includes model stream input and tools" {

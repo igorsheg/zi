@@ -48,6 +48,7 @@ pub const ProviderResponse = struct {
 pub const StreamOptions = struct {
     temperature: ?f64 = null,
     max_tokens: ?u32 = null,
+    reasoning: ?ThinkingLevel = null,
     api_key: ?[]const u8 = null,
     auth_extra: ?std.json.Value = null,
     transport: ?Transport = null,

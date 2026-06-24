@@ -348,10 +348,15 @@ pub const ResponseStreamReducer = struct {
             };
         } else if (std.mem.eql(u8, event_type, "response.output_item.added")) {
             if (object.get("item")) |item| if (item == .object) try self.startItem(io, sink, item.object);
+        } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.added")) {
+            // The part object is only a container for following text deltas; the
+            // final output_item.done carries the durable summary text.
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) {
             if (jsonString(object.get("delta"))) |delta| try self.appendThinking(io, sink, delta);
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
             try self.appendThinking(io, sink, "\n\n");
+        } else if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) {
+            if (jsonString(object.get("delta"))) |delta| try self.appendThinking(io, sink, delta);
         } else if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
             if (jsonString(object.get("delta"))) |delta| try self.appendText(io, sink, delta);
         } else if (std.mem.eql(u8, event_type, "response.refusal.delta")) {
@@ -565,7 +570,14 @@ pub const ResponseStreamReducer = struct {
         item: std.json.ObjectMap,
     ) anyerror!void {
         const item_type = jsonString(item.get("type")) orelse return;
-        if (std.mem.eql(u8, item_type, "message") and self.current == .text) {
+        if (std.mem.eql(u8, item_type, "reasoning") and self.current == .thinking) {
+            const state = &self.current.thinking;
+            if (try self.reasoningTextFromItem(item)) |text| {
+                state.bytes.clearRetainingCapacity();
+                try state.bytes.append(text);
+            }
+            self.content.items[state.content_index].thinking.thinking_signature = try self.encodeItemSignature(item);
+        } else if (std.mem.eql(u8, item_type, "message") and self.current == .text) {
             const index = self.current.text.content_index;
             if (jsonString(item.get("id"))) |id| {
                 self.content.items[index].text.text_signature = encodeTextSignature(
@@ -591,6 +603,39 @@ pub const ResponseStreamReducer = struct {
     fn parseStreamingToolArguments(self: *ResponseStreamReducer, state: *ToolCallState) !void {
         const parsed = try json_parse.parseStreamingJson(self.arena.allocator(), state.partial_json.items());
         self.content.items[state.content_index].tool_call.arguments = parsed.value();
+    }
+
+    fn reasoningTextFromItem(self: *ResponseStreamReducer, item: std.json.ObjectMap) !?[]const u8 {
+        if (try self.textParts(item.get("summary"))) |text| return text;
+        return self.textParts(item.get("content"));
+    }
+
+    fn textParts(self: *ResponseStreamReducer, value: ?std.json.Value) !?[]const u8 {
+        const resolved = value orelse return null;
+        if (resolved != .array) return null;
+        var out = std.Io.Writer.Allocating.init(self.arena.allocator());
+        errdefer out.deinit();
+        var wrote = false;
+        for (resolved.array.items) |part| {
+            if (part != .object) continue;
+            const text = jsonString(part.object.get("text")) orelse continue;
+            if (text.len == 0) continue;
+            if (wrote) try out.writer.writeAll("\n\n");
+            try out.writer.writeAll(text);
+            wrote = true;
+        }
+        if (!wrote) {
+            out.deinit();
+            return null;
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn encodeItemSignature(self: *ResponseStreamReducer, item: std.json.ObjectMap) ![]const u8 {
+        var out = std.Io.Writer.Allocating.init(self.arena.allocator());
+        errdefer out.deinit();
+        try std.json.Stringify.value(std.json.Value{ .object = item }, .{}, &out.writer);
+        return out.toOwnedSlice();
     }
 
     fn applyCompleted(self: *ResponseStreamReducer, response: std.json.ObjectMap) !void {
@@ -733,6 +778,65 @@ test "responses reducer emits text deltas and done" {
     try std.testing.expectEqual(@as(u64, 7), result.usage.input);
     try std.testing.expectEqual(@as(u64, 3), result.usage.cache_read);
     try std.testing.expectEqual(protocol.StopReason.stop, result.stop_reason);
+}
+
+test "responses reducer finalizes reasoning summary from item done" {
+    const model = testModel();
+    var reducer = ResponseStreamReducer.init(std.testing.allocator, model, 123);
+    defer reducer.deinit();
+    var stream = protocol.AssistantMessageEventStream.initBuffered();
+    const sink = stream.sink();
+
+    try sink.emit(std.Io.failing, .{ .start = .{ .partial = try reducer.partial() } });
+    try reducer.applySseData(std.Io.failing, sink,
+        \\{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}
+    );
+    try reducer.applySseData(std.Io.failing, sink,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1",
+        \\"summary":[{"type":"summary_text","text":"looked"},{"type":"summary_text","text":"decided"}],
+        \\"encrypted_content":"secret"}}
+    );
+    try reducer.applySseData(std.Io.failing, sink,
+        \\{"type":"response.completed","response":{"status":"completed"}}
+    );
+    try reducer.finish(std.Io.failing, sink);
+
+    var saw_end = false;
+    while (try stream.next(std.Io.failing)) |event| {
+        if (event == .thinking_end) {
+            saw_end = true;
+            try std.testing.expectEqualStrings("looked\n\ndecided", event.thinking_end.content);
+        }
+    }
+    const result = stream.result().?;
+    try std.testing.expect(saw_end);
+    try std.testing.expectEqualStrings("looked\n\ndecided", result.content[0].thinking.thinking);
+    try std.testing.expect(result.content[0].thinking.thinking_signature != null);
+}
+
+test "responses reducer streams reasoning text deltas" {
+    const model = testModel();
+    var reducer = ResponseStreamReducer.init(std.testing.allocator, model, 123);
+    defer reducer.deinit();
+    var stream = protocol.AssistantMessageEventStream.initBuffered();
+    const sink = stream.sink();
+
+    try sink.emit(std.Io.failing, .{ .start = .{ .partial = try reducer.partial() } });
+    try reducer.applySseData(std.Io.failing, sink,
+        \\{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}
+    );
+    try reducer.applySseData(std.Io.failing, sink,
+        \\{"type":"response.reasoning_text.delta","delta":"raw"}
+    );
+
+    var saw_delta = false;
+    while (try stream.next(std.Io.failing)) |event| {
+        if (event == .thinking_delta) {
+            saw_delta = true;
+            try std.testing.expectEqualStrings("raw", event.thinking_delta.delta);
+        }
+    }
+    try std.testing.expect(saw_delta);
 }
 
 test "responses reducer parses tool call arguments and maps stop to tool use" {
