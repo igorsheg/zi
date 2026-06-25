@@ -256,10 +256,10 @@ pub const ClientEvent = union(enum) {
             .prompt_command => |*payload| payload.deinit(allocator),
             .session_chrome => |*payload| payload.deinit(allocator),
             .compaction_end => |*payload| payload.deinit(allocator),
-            .auto_retry_start => |*payload| payload.error_message.deinit(allocator),
-            .auto_retry_end => |*payload| if (payload.final_error) |*err| err.deinit(allocator),
+            .auto_retry_start => |*payload| payload.deinit(allocator),
+            .auto_retry_end => |*payload| payload.deinit(allocator),
+            .operation_finished => |*payload| payload.deinit(allocator),
             .operation_started,
-            .operation_finished,
             .session_changed,
             .shutdown_started,
             .queue_changed,
@@ -311,13 +311,73 @@ pub const Rejection = struct {
 
 pub const OperationFinished = struct {
     reason: Reason,
+    failure: ?OperationalFailure = null,
 
     pub const Reason = enum {
         completed,
         canceled,
         failed,
     };
+
+    pub fn deinit(self: *OperationFinished, allocator: std.mem.Allocator) void {
+        if (self.failure) |*failure| failure.deinit(allocator);
+        self.* = undefined;
+    }
 };
+
+pub const OperationalFailure = struct {
+    category: Category,
+    message: EventText,
+    detail: ?EventText = null,
+    retryable: Retryable,
+    provider: ?EventText = null,
+    model: ?EventText = null,
+
+    pub const Category = ai.OperationalFailure.Category;
+    pub const Retryable = ai.OperationalFailure.Retryable;
+
+    pub fn init(allocator: std.mem.Allocator, source: ai.OperationalFailure) !OperationalFailure {
+        var message = try initBoundedText(allocator, source.message, ai.OperationalFailure.message_bytes_max);
+        errdefer message.deinit(allocator);
+        var detail = if (source.detail) |text| try initBoundedText(allocator, text, ai.OperationalFailure.detail_bytes_max) else null;
+        errdefer if (detail) |*text| text.deinit(allocator);
+        var provider = if (source.provider) |text| try initBoundedText(allocator, text, snapshot_model_text_bytes_max) else null;
+        errdefer if (provider) |*text| text.deinit(allocator);
+        var model = if (source.model) |text| try initBoundedText(allocator, text, snapshot_model_text_bytes_max) else null;
+        errdefer if (model) |*text| text.deinit(allocator);
+        return .{
+            .category = source.category,
+            .message = message,
+            .detail = detail,
+            .retryable = source.retryable,
+            .provider = provider,
+            .model = model,
+        };
+    }
+
+    pub fn deinit(self: *OperationalFailure, allocator: std.mem.Allocator) void {
+        self.message.deinit(allocator);
+        if (self.detail) |*detail| detail.deinit(allocator);
+        if (self.provider) |*provider| provider.deinit(allocator);
+        if (self.model) |*model| model.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn jsonStringify(self: OperationalFailure, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("category", stringify, jsonOperationalFailureCategory(self.category));
+        try writeJsonField("message", stringify, self.message);
+        if (self.detail) |detail| try writeJsonField("detail", stringify, detail);
+        try writeJsonField("retryable", stringify, jsonOperationalFailureRetryable(self.retryable));
+        if (self.provider) |provider| try writeJsonField("provider", stringify, provider);
+        if (self.model) |model| try writeJsonField("model", stringify, model);
+        try stringify.endObject();
+    }
+};
+
+fn initBoundedText(allocator: std.mem.Allocator, text: []const u8, max_bytes: usize) !EventText {
+    return EventText.init(allocator, utf8Prefix(text, max_bytes));
+}
 
 /// Reply to a slash command intercepted at the mailbox boundary. The text
 /// is a session fact for display; it never reaches the model or the prompt
@@ -530,12 +590,26 @@ pub const AutoRetryStart = struct {
     max_attempts: usize,
     delay_ms: u64,
     error_message: EventText,
+    failure: ?OperationalFailure = null,
+
+    pub fn deinit(self: *AutoRetryStart, allocator: std.mem.Allocator) void {
+        self.error_message.deinit(allocator);
+        if (self.failure) |*failure| failure.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 pub const AutoRetryEnd = struct {
     success: bool,
     attempt: usize,
     final_error: ?EventText = null,
+    failure: ?OperationalFailure = null,
+
+    pub fn deinit(self: *AutoRetryEnd, allocator: std.mem.Allocator) void {
+        if (self.final_error) |*err| err.deinit(allocator);
+        if (self.failure) |*failure| failure.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 pub const EventOverflow = struct {
@@ -762,12 +836,14 @@ pub const Snapshot = struct {
     context: ContextUsageSnapshot,
     queue: QueueSnapshot,
     active_request_id: ?RequestId,
+    latest_failure: ?OperationalFailure = null,
     history: HistorySnapshot,
 
     pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
         self.header.deinit(allocator);
         self.model.deinit(allocator);
         self.queue.deinit(allocator);
+        if (self.latest_failure) |*failure| failure.deinit(allocator);
         self.history.deinit(allocator);
         self.* = undefined;
     }
@@ -1189,10 +1265,13 @@ fn assistantHistoryItem(
     };
 
     if (writer.buffered().len == 0 and tool_calls.items.len == 0) {
-        const error_message = assistant.error_message orelse {
-            owned_entry_id.deinit(allocator);
-            return null;
-        };
+        const error_message = if (assistant.operational_failure) |failure|
+            failure.message
+        else
+            assistant.error_message orelse {
+                owned_entry_id.deinit(allocator);
+                return null;
+            };
         const text = try boundedHistoryText(allocator, error_message, item_text_bytes_max);
         return .{
             .item = .{ .entry_id = owned_entry_id, .kind = .system, .text = text.text },
@@ -1390,6 +1469,28 @@ pub const QueueSnapshot = struct {
         try writeObject(null, stringify, self);
     }
 };
+
+fn jsonOperationalFailureCategory(category: OperationalFailure.Category) []const u8 {
+    return switch (category) {
+        .auth_missing => "authMissing",
+        .auth_rejected => "authRejected",
+        .rate_limited => "rateLimited",
+        .context_overflow => "contextOverflow",
+        .provider_unavailable => "providerUnavailable",
+        .transport => "transport",
+        .malformed_response => "malformedResponse",
+        .canceled => "canceled",
+        .unknown => "unknown",
+    };
+}
+
+fn jsonOperationalFailureRetryable(retryable: OperationalFailure.Retryable) []const u8 {
+    return switch (retryable) {
+        .yes => "yes",
+        .no => "no",
+        .unknown => "unknown",
+    };
+}
 
 /// Write a payload struct as a JSON object: optional `"type"` tag first,
 /// then every field under its camelCase name; null optionals are omitted.

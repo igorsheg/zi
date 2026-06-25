@@ -34,6 +34,9 @@ pub fn copyAssistantMessage(
     const response_id = try copyOptionalString(allocator, source.response_id);
     errdefer if (response_id) |value| allocator.free(value);
     const error_message = try copyOptionalString(allocator, source.error_message);
+    errdefer if (error_message) |value| allocator.free(value);
+    const operational_failure = try copyOptionalOperationalFailure(allocator, source.operational_failure);
+    errdefer if (operational_failure) |failure| deinitOperationalFailure(allocator, failure);
 
     return .{
         .content = content,
@@ -44,6 +47,7 @@ pub fn copyAssistantMessage(
         .usage = source.usage,
         .stop_reason = source.stop_reason,
         .error_message = error_message,
+        .operational_failure = operational_failure,
         .timestamp = source.timestamp,
     };
 }
@@ -55,6 +59,37 @@ pub fn deinitAssistantMessage(allocator: std.mem.Allocator, message: protocol.As
     allocator.free(message.model);
     if (message.response_id) |value| allocator.free(value);
     if (message.error_message) |value| allocator.free(value);
+    if (message.operational_failure) |failure| deinitOperationalFailure(allocator, failure);
+}
+
+fn copyOptionalOperationalFailure(
+    allocator: std.mem.Allocator,
+    source: ?protocol.OperationalFailure,
+) !?protocol.OperationalFailure {
+    const failure = source orelse return null;
+    const message = try allocator.dupe(u8, failure.message);
+    errdefer allocator.free(message);
+    const detail = try copyOptionalString(allocator, failure.detail);
+    errdefer if (detail) |value| allocator.free(value);
+    const provider = try copyOptionalString(allocator, failure.provider);
+    errdefer if (provider) |value| allocator.free(value);
+    const model = try copyOptionalString(allocator, failure.model);
+    errdefer if (model) |value| allocator.free(value);
+    return .{
+        .category = failure.category,
+        .message = message,
+        .detail = detail,
+        .retryable = failure.retryable,
+        .provider = provider,
+        .model = model,
+    };
+}
+
+fn deinitOperationalFailure(allocator: std.mem.Allocator, failure: protocol.OperationalFailure) void {
+    allocator.free(failure.message);
+    if (failure.detail) |value| allocator.free(value);
+    if (failure.provider) |value| allocator.free(value);
+    if (failure.model) |value| allocator.free(value);
 }
 
 pub fn deinitAssistantMessageEvent(allocator: std.mem.Allocator, event: protocol.AssistantMessageEvent) void {

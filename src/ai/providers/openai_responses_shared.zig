@@ -16,17 +16,170 @@ const max_stream_thinking_block_bytes = 4 * 1024 * 1024;
 const max_stream_tool_arguments_bytes = 1024 * 1024;
 const max_stream_content_blocks = 256;
 
+pub fn outOfMemoryStream() protocol.AssistantMessageEventStream {
+    return protocol.AssistantMessageEventStream.initCustom(.{
+        .context = null,
+        .next_fn = outOfMemoryNext,
+        .result_fn = emptyResult,
+    });
+}
+
+fn outOfMemoryNext(_: ?*anyopaque, _: std.Io) anyerror!?protocol.AssistantMessageEvent {
+    return error.OutOfMemory;
+}
+
+fn emptyResult(_: ?*anyopaque) ?protocol.AssistantMessage {
+    return null;
+}
+
 pub fn errorStream(request: protocol.StreamRequest, err: anyerror) protocol.AssistantMessageEventStream {
     var stream = protocol.AssistantMessageEventStream.initBuffered();
     const sink = stream.sink();
     if (err == error.OperationCancelled or err == error.Canceled) {
-        const message = protocol.emptyAssistantMessageFromRequest(request, .aborted, "Request was aborted");
+        var message = protocol.emptyAssistantMessageFromRequest(request, .aborted, "Request was aborted");
+        message.operational_failure = classifyOpenError(request, err);
         sink.endAborted(request.io, message) catch unreachable;
     } else {
-        const message = protocol.emptyAssistantMessageFromRequest(request, .error_, @errorName(err));
+        var message = protocol.emptyAssistantMessageFromRequest(request, .error_, @errorName(err));
+        message.operational_failure = classifyOpenError(request, err);
         sink.endError(request.io, .error_, message) catch unreachable;
     }
     return stream;
+}
+
+pub fn httpFailure(request: protocol.StreamRequest, status: std.http.Status, detail: []const u8) protocol.OperationalFailure {
+    return .{
+        .category = switch (status) {
+            .unauthorized, .forbidden => .auth_rejected,
+            .too_many_requests => .rate_limited,
+            .bad_request, .request_header_fields_too_large => if (containsContextOverflow(detail)) .context_overflow else .unknown,
+            .internal_server_error, .bad_gateway, .service_unavailable, .gateway_timeout => .provider_unavailable,
+            else => .unknown,
+        },
+        .message = switch (status) {
+            .unauthorized, .forbidden => "Provider rejected credentials",
+            .too_many_requests => "Provider rate limit exceeded",
+            .bad_request, .request_header_fields_too_large => if (containsContextOverflow(detail)) "Request exceeds model context window" else "Provider request failed",
+            .internal_server_error, .bad_gateway, .service_unavailable, .gateway_timeout => "Provider service failed",
+            else => "Provider request failed",
+        },
+        .detail = detail,
+        .retryable = switch (status) {
+            .too_many_requests, .internal_server_error, .bad_gateway, .service_unavailable, .gateway_timeout => .yes,
+            .unauthorized, .forbidden => .no,
+            else => .unknown,
+        },
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+}
+
+fn containsContextOverflow(text: []const u8) bool {
+    return protocol.isContextOverflowText(text);
+}
+
+fn classifyOpenError(request: protocol.StreamRequest, err: anyerror) protocol.OperationalFailure {
+    if (err == error.OperationCancelled or err == error.Canceled) return .{
+        .category = .canceled,
+        .message = "Request was aborted",
+        .retryable = .no,
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+    if (err == error.MissingApiKey) return .{
+        .category = .auth_missing,
+        .message = "Missing provider API key",
+        .detail = @errorName(err),
+        .retryable = .no,
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+    if (isMalformedResponseError(err)) return .{
+        .category = .malformed_response,
+        .message = @errorName(err),
+        .retryable = .no,
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+    if (isTransportError(err)) return .{
+        .category = .transport,
+        .message = @errorName(err),
+        .retryable = .yes,
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+    return .{
+        .category = .unknown,
+        .message = @errorName(err),
+        .retryable = .unknown,
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+}
+
+fn classifyStreamError(request: protocol.StreamRequest, err: anyerror) protocol.OperationalFailure {
+    if (isMalformedResponseError(err)) return .{
+        .category = .malformed_response,
+        .message = @errorName(err),
+        .retryable = .no,
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+    if (isTransportError(err)) return .{
+        .category = .transport,
+        .message = @errorName(err),
+        .retryable = .yes,
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+    return .{
+        .category = .unknown,
+        .message = @errorName(err),
+        .retryable = .unknown,
+        .provider = request.model.provider,
+        .model = request.model.id,
+    };
+}
+
+fn isMalformedResponseError(err: anyerror) bool {
+    return err == error.InvalidJson or
+        err == error.SyntaxError or
+        err == error.UnexpectedToken or
+        err == error.UnexpectedEndOfInput or
+        err == error.InvalidCharacter or
+        err == error.InvalidNumber or
+        err == error.InvalidEnumTag or
+        err == error.InvalidType or
+        err == error.MissingField or
+        err == error.UnknownField;
+}
+
+fn isTransportError(err: anyerror) bool {
+    const name = @errorName(err);
+    return containsErrorWord(name, "Connection") or
+        containsErrorWord(name, "Connect") or
+        containsErrorWord(name, "Socket") or
+        containsErrorWord(name, "Tls") or
+        containsErrorWord(name, "TLS") or
+        containsErrorWord(name, "Dns") or
+        containsErrorWord(name, "DNS") or
+        containsErrorWord(name, "Http") or
+        containsErrorWord(name, "HTTP") or
+        containsErrorWord(name, "Timeout") or
+        containsErrorWord(name, "TimedOut") or
+        containsErrorWord(name, "BrokenPipe") or
+        containsErrorWord(name, "Reset") or
+        containsErrorWord(name, "EndOfStream") or
+        err == error.NetworkUnreachable or
+        err == error.ConnectionRefused or
+        err == error.ConnectionResetByPeer or
+        err == error.ConnectionTimedOut or
+        err == error.TemporaryNameServerFailure or
+        err == error.UnknownHostName;
+}
+
+fn containsErrorWord(name: []const u8, word: []const u8) bool {
+    return std.mem.indexOf(u8, name, word) != null;
 }
 
 pub const PullStreamOptions = struct {
@@ -53,6 +206,7 @@ pub fn SsePullStream(comptime Owner: type, comptime options: PullStreamOptions) 
         pending: std.ArrayList(protocol.AssistantMessageEvent) = .empty,
         pending_index: usize = 0,
         result: ?protocol.AssistantMessage = null,
+        owned_error_detail: ?[]const u8 = null,
         started: bool = false,
         done: bool = false,
         has_request: bool = false,
@@ -106,9 +260,11 @@ pub fn SsePullStream(comptime Owner: type, comptime options: PullStreamOptions) 
             self.reader = self.response.reader(&self.transfer_buffer);
         }
 
-        pub fn emitError(self: *Self, detail: []const u8) !void {
+        pub fn emitError(self: *Self, detail: []const u8, owns_detail: bool, failure: protocol.OperationalFailure) !void {
             var message = protocol.emptyAssistantMessageFromRequest(self.request, .error_, detail);
             message.stop_reason = .error_;
+            message.operational_failure = failure;
+            if (owns_detail) self.owned_error_detail = detail;
             try self.pending.append(self.allocator, .{ .@"error" = .{ .reason = .error_, .@"error" = message } });
             self.result = message;
             self.done = true;
@@ -116,6 +272,7 @@ pub fn SsePullStream(comptime Owner: type, comptime options: PullStreamOptions) 
 
         pub fn deinit(self: *Self) void {
             if (self.has_request) self.req.deinit();
+            if (self.owned_error_detail) |detail| self.allocator.free(detail);
             self.pending.deinit(self.allocator);
             self.reducer.deinit();
             self.parser.deinit();
@@ -153,24 +310,38 @@ pub fn SsePullStream(comptime Owner: type, comptime options: PullStreamOptions) 
                 var writer: std.Io.Writer = .fixed(&self.chunk);
                 const n = self.reader.?.stream(&writer, .limited(self.chunk.len)) catch |err| switch (err) {
                     error.EndOfStream => {
-                        try self.finish();
+                        self.finish() catch |finish_err| switch (finish_err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.ErrorEmitted => return self.popPending(),
+                            else => return self.completeOperationalError(finish_err),
+                        };
                         return self.popPending();
                     },
-                    else => return err,
+                    else => return self.completeOperationalError(err),
                 };
                 if (n == 0) continue;
                 var sink = self.reducerSink();
-                try self.parser.feed(self.chunk[0..n], &sink);
+                self.parser.feed(self.chunk[0..n], &sink) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ErrorEmitted => return self.popPending(),
+                    else => return self.completeOperationalError(err),
+                };
                 if (self.popPending()) |event| return event;
             }
             return self.popPending();
         }
 
         fn finish(self: *Self) !void {
-            self.done = true;
             var sink = self.reducerSink();
             try self.parser.finish(&sink);
             try self.reducer.finish(self.request.io, sink.assistant_sink);
+            self.done = true;
+        }
+
+        fn completeOperationalError(self: *Self, err: anyerror) !?protocol.AssistantMessageEvent {
+            if (self.done) return self.popPending();
+            try self.emitError(@errorName(err), false, classifyStreamError(self.request, err));
+            return self.popPending();
         }
 
         fn reducerSink(self: *Self) ReducerSseSink {
@@ -375,11 +546,13 @@ pub const ResponseStreamReducer = struct {
         } else if (std.mem.eql(u8, event_type, "error")) {
             self.output.stop_reason = .error_;
             self.output.error_message = try self.formatProviderError(object);
+            self.output.operational_failure = self.providerEventFailure(self.output.error_message.?);
             try sink.endError(io, .error_, try self.partial());
             return error.ErrorEmitted;
         } else if (std.mem.eql(u8, event_type, "response.failed")) {
             self.output.stop_reason = .error_;
             self.output.error_message = try self.formatFailedResponse(object);
+            self.output.operational_failure = self.providerEventFailure(self.output.error_message.?);
             try sink.endError(io, .error_, try self.partial());
             return error.ErrorEmitted;
         }
@@ -656,10 +829,22 @@ pub const ResponseStreamReducer = struct {
         self.output.stop_reason = mapStopReason(jsonString(response.get("status")));
     }
 
+    fn providerEventFailure(self: *ResponseStreamReducer, message: []const u8) protocol.OperationalFailure {
+        const category: protocol.OperationalFailure.Category = if (containsContextOverflow(message)) .context_overflow else .unknown;
+        return .{
+            .category = category,
+            .message = if (category == .context_overflow) "Request exceeds model context window" else "Provider stream failed",
+            .detail = message,
+            .retryable = .unknown,
+            .provider = self.output.provider,
+            .model = self.output.model,
+        };
+    }
+
     fn formatProviderError(self: *ResponseStreamReducer, object: std.json.ObjectMap) ![]const u8 {
         const code = jsonString(object.get("code")) orelse "unknown";
         const message = jsonString(object.get("message")) orelse "Unknown error";
-        return std.fmt.allocPrint(self.arena.allocator(), "Error Code {s}: {s}", .{ code, message });
+        return formatErrorMessage(self.arena.allocator(), "Error Code ", code, ": ", message);
     }
 
     fn formatFailedResponse(self: *ResponseStreamReducer, object: std.json.ObjectMap) ![]const u8 {
@@ -667,17 +852,40 @@ pub const ResponseStreamReducer = struct {
             if (response.object.get("error")) |err| if (err == .object) {
                 const code = jsonString(err.object.get("code")) orelse "unknown";
                 const message = jsonString(err.object.get("message")) orelse "no message";
-                return std.fmt.allocPrint(self.arena.allocator(), "{s}: {s}", .{ code, message });
+                return formatErrorMessage(self.arena.allocator(), "", code, ": ", message);
             };
             if (response.object.get("incomplete_details")) |details| if (details == .object) {
                 if (jsonString(details.object.get("reason"))) |reason| {
-                    return std.fmt.allocPrint(self.arena.allocator(), "incomplete: {s}", .{reason});
+                    return formatErrorMessage(self.arena.allocator(), "incomplete: ", reason, "", "");
                 }
             };
         };
         return dupe(self, "Unknown error (no error details in response)");
     }
 };
+
+fn formatErrorMessage(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    code: []const u8,
+    separator: []const u8,
+    message: []const u8,
+) ![]const u8 {
+    var buffer: [protocol.OperationalFailure.detail_bytes_max]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    writer.writeAll(prefix) catch {};
+    writer.writeAll(utf8Prefix(code, buffer.len - writer.buffered().len)) catch {};
+    writer.writeAll(separator[0..@min(separator.len, buffer.len - writer.buffered().len)]) catch {};
+    writer.writeAll(utf8Prefix(message, buffer.len - writer.buffered().len)) catch {};
+    return allocator.dupe(u8, writer.buffered());
+}
+
+fn utf8Prefix(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and !std.unicode.utf8ValidateSlice(text[0..end])) end -= 1;
+    return text[0..end];
+}
 
 fn jsonString(value: ?std.json.Value) ?[]const u8 {
     const resolved = value orelse return null;
@@ -744,6 +952,62 @@ fn concat(allocator: std.mem.Allocator, left: []const u8, right: []const u8) ![]
 
 fn dupe(self: *ResponseStreamReducer, value: []const u8) ![]const u8 {
     return self.arena.allocator().dupe(u8, value);
+}
+
+test "context overflow fallback follows common provider wording" {
+    try std.testing.expect(containsContextOverflow("Your input exceeds the context window of this model"));
+    try std.testing.expect(containsContextOverflow("prompt is too long: 213462 tokens > 200000 maximum"));
+    try std.testing.expect(containsContextOverflow("maximum context length is 100 tokens"));
+    try std.testing.expect(!containsContextOverflow("rate limit: too many tokens, please wait"));
+}
+
+test "stream errors classify transport and malformed response" {
+    var cancel = try mem.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
+    const request: protocol.StreamRequest = .{
+        .allocator = std.testing.allocator,
+        .io = std.Io.failing,
+        .model = testModel(),
+        .context = .{ .messages = &.{} },
+        .cancel_token = cancel.token(),
+    };
+    try std.testing.expectEqual(
+        protocol.OperationalFailure.Category.malformed_response,
+        classifyStreamError(request, error.InvalidJson).category,
+    );
+    try std.testing.expectEqual(
+        protocol.OperationalFailure.Category.transport,
+        classifyStreamError(request, error.ConnectionResetByPeer).category,
+    );
+}
+
+test "open errors classify transport and malformed response" {
+    var cancel = try mem.CancelSource.init(std.testing.allocator);
+    defer cancel.deinit();
+    const request: protocol.StreamRequest = .{
+        .allocator = std.testing.allocator,
+        .io = std.Io.failing,
+        .model = testModel(),
+        .context = .{ .messages = &.{} },
+        .cancel_token = cancel.token(),
+    };
+    var stream = errorStream(request, error.InvalidJson);
+    var event = (try stream.next(std.Io.failing)).?.@"error";
+    try std.testing.expectEqual(protocol.OperationalFailure.Category.malformed_response, event.@"error".operational_failure.?.category);
+    stream.deinit();
+
+    stream = errorStream(request, error.ConnectionRefused);
+    event = (try stream.next(std.Io.failing)).?.@"error";
+    try std.testing.expectEqual(protocol.OperationalFailure.Category.transport, event.@"error".operational_failure.?.category);
+    stream.deinit();
+}
+
+test "provider error formatting is bounded" {
+    const huge = "x" ** (protocol.OperationalFailure.detail_bytes_max * 2);
+    const formatted = try formatErrorMessage(std.testing.allocator, "", "code", ": ", huge);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expect(formatted.len <= protocol.OperationalFailure.detail_bytes_max);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(formatted));
 }
 
 test "responses reducer emits text deltas and done" {

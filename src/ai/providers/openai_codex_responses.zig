@@ -14,7 +14,7 @@ pub const source_id = "openai-codex-responses-provider";
 const default_codex_base_url = "https://chatgpt.com/backend-api";
 const read_buffer_len = 8192;
 const redirect_buffer_len = 0;
-const max_error_body_bytes = 16 * 1024;
+const max_error_body_bytes = protocol.OperationalFailure.detail_bytes_max;
 const default_retry_count_max: u32 = 3;
 const hard_retry_count_max: u32 = 5;
 const default_retry_delay_ms: u64 = 1000;
@@ -60,7 +60,10 @@ fn streamSimpleFunction(context: ?*anyopaque, request: protocol.StreamRequest) p
 fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protocol.AssistantMessageEventStream {
     const self: *Provider = @ptrCast(@alignCast(context.?));
     _ = self;
-    const state = createCodexResponseStream(request) catch |err| return shared.errorStream(request, err);
+    const state = createCodexResponseStream(request) catch |err| switch (err) {
+        error.OutOfMemory => return shared.outOfMemoryStream(),
+        else => return shared.errorStream(request, err),
+    };
     return state.stream();
 }
 
@@ -153,7 +156,7 @@ fn openWithRetries(state: *CodexResponseStream) !void {
     var attempt: u32 = 0;
     var last_error: ?anyerror = null;
     while (attempt <= retry_count_max) : (attempt += 1) {
-        openOnce(state) catch |err| switch (err) {
+        openOnce(state, attempt == retry_count_max) catch |err| switch (err) {
             error.RetryableRequestFailed => {
                 last_error = err;
                 if (attempt == retry_count_max) return err;
@@ -180,7 +183,7 @@ fn openWithRetries(state: *CodexResponseStream) !void {
     return last_error orelse error.RetryableRequestFailed;
 }
 
-fn openOnce(state: *CodexResponseStream) !void {
+fn openOnce(state: *CodexResponseStream, final_attempt: bool) !void {
     const uri = try std.Uri.parse(state.owner.url);
     var headers: [7]std.http.Header = undefined;
     var header_count: usize = 0;
@@ -203,16 +206,23 @@ fn openOnce(state: *CodexResponseStream) !void {
 
     try state.openRequest(uri, headers[0..header_count], state.owner.body);
     if (state.response.head.status != .ok) {
-        const detail = readErrorBody(state.allocator, state.reader.?) catch try std.fmt.allocPrint(
-            state.allocator,
-            "HTTP {s}",
-            .{@tagName(state.response.head.status)},
-        );
+        const detail = readErrorBody(state.allocator, state.reader.?) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => try std.fmt.allocPrint(
+                state.allocator,
+                "HTTP {s}",
+                .{@tagName(state.response.head.status)},
+            ),
+        };
         if (isRetryableStatus(state.response.head.status) or isRetryableErrorText(detail)) {
+            if (final_attempt) {
+                try state.emitError(detail, true, shared.httpFailure(state.request, state.response.head.status, detail));
+                return;
+            }
             state.allocator.free(detail);
             return error.RetryableRequestFailed;
         }
-        try state.emitError(detail);
+        try state.emitError(detail, true, shared.httpFailure(state.request, state.response.head.status, detail));
     }
 }
 
@@ -459,6 +469,10 @@ test "provider stream without auth emits missing api key error" {
     const err = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, err.reason);
     try std.testing.expectEqualStrings("MissingApiKey", err.@"error".error_message.?);
+    const failure = err.@"error".operational_failure.?;
+    try std.testing.expectEqual(protocol.OperationalFailure.Category.auth_missing, failure.category);
+    try std.testing.expectEqual(protocol.OperationalFailure.Retryable.no, failure.retryable);
+    try std.testing.expectEqualStrings("Missing provider API key", failure.message);
 }
 
 test "endpoint url appends codex responses path" {

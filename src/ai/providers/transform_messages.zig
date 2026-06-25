@@ -194,6 +194,7 @@ fn transformAssistantMessageForModel(
         .usage = source.usage,
         .stop_reason = source.stop_reason,
         .error_message = try copyOptionalString(allocator, source.error_message),
+        .operational_failure = null,
         .timestamp = source.timestamp,
     };
 }

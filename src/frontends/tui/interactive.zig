@@ -52,6 +52,9 @@ const status_id_completion: tui.status.ContributionId = 4;
 const notify_key_cancel: tui.notify.Key = 1;
 const notify_key_recovery: tui.notify.Key = 2;
 const notify_key_transcript_tail: tui.notify.Key = 3;
+const notify_key_operation_failure: tui.notify.Key = 4;
+const notify_key_retry: tui.notify.Key = 5;
+const notify_key_context: tui.notify.Key = 6;
 const retry_reason_bytes_max: usize = 64;
 const composer_cwd_slot_id: tui.status.ContributionId = 1;
 const composer_session_slot_id: tui.status.ContributionId = 2;
@@ -1455,13 +1458,33 @@ const InteractiveController = struct {
                 try self.requestSnapshot();
             },
             .shutdown_started => self.terminal.requestStop(),
-            .compaction_start => try self.setWorkingStatus("compacting"),
+            .compaction_start => try self.setWorkingStatus("compacting context"),
             .compaction_end => |payload| try self.applyCompactionEnd(payload),
             .auto_retry_start => |payload| {
                 var buffer: [tui.status.text_bytes_max]u8 = undefined;
                 try self.setWorkingStatus(formatRetryStatus(&buffer, payload));
+                try self.appendKeyedNotice(
+                    notify_key_retry,
+                    .warning,
+                    retryNoticeMessage(&buffer, payload),
+                    "retry",
+                    .warning,
+                    5_000,
+                );
             },
-            .auto_retry_end => try self.clearStatus(status_id_working),
+            .auto_retry_end => |payload| {
+                try self.clearStatus(status_id_working);
+                if (!payload.success) {
+                    var buffer: [tui.status.text_bytes_max]u8 = undefined;
+                    const message = if (payload.failure) |failure|
+                        formatOperationalFailureMessage(&buffer, failure)
+                    else if (payload.final_error) |err|
+                        err.text
+                    else
+                        "retry failed";
+                    try self.appendKeyedNotice(notify_key_retry, .err, message, "retry", .err, 10_000);
+                }
+            },
             .event_overflow => |overflow| {
                 var buffer: [96]u8 = undefined;
                 const text = std.fmt.bufPrint(
@@ -1918,7 +1941,10 @@ const InteractiveController = struct {
                 try self.clearStatus(status_id_working);
                 try self.appendKeyedStatusWithTone(notify_key_cancel, .info, "canceled", .canceled);
             },
-            .failed => try self.clearStatus(status_id_working),
+            .failed => {
+                try self.clearStatus(status_id_working);
+                if (finished.failure) |failure| try self.appendOperationalFailure(failure);
+            },
         }
     }
 
@@ -2161,14 +2187,40 @@ const InteractiveController = struct {
         text: []const u8,
         tone: tui.status.Tone,
     ) !void {
+        try self.appendKeyedNotice(key, level, text, notifyAnnote(level), tone, null);
+    }
+
+    fn appendKeyedNotice(
+        self: *InteractiveController,
+        key: tui.notify.Key,
+        level: tui.Transcript.StatusLevel,
+        text: []const u8,
+        annote: ?[]const u8,
+        tone: tui.status.Tone,
+        ttl_ms: ?i64,
+    ) !void {
         if (text.len == 0) return;
         _ = try self.terminal.applyCommand(.{ .notify = .{
             .key = key,
             .message = boundedChunk(text),
             .level = notifyLevel(level),
-            .annote = notifyAnnote(level),
+            .annote = annote,
             .tone = tone,
+            .ttl_ms = ttl_ms,
         } });
+    }
+
+    fn appendOperationalFailure(self: *InteractiveController, failure: client_protocol.OperationalFailure) !void {
+        var buffer: [tui.status.text_bytes_max]u8 = undefined;
+        const semantic = operationalFailureNotifySemantic(failure.category);
+        try self.appendKeyedNotice(
+            notify_key_operation_failure,
+            semantic.level,
+            formatOperationalFailureMessage(&buffer, failure),
+            semantic.annote,
+            semantic.tone,
+            semantic.ttl_ms,
+        );
     }
 
     fn appendSessionInfo(
@@ -2351,6 +2403,47 @@ fn notifyAnnote(level: tui.Transcript.StatusLevel) ?[]const u8 {
         .info => "",
         .warning, .err => null,
     };
+}
+
+const NotifySemantic = struct {
+    annote: []const u8,
+    level: tui.Transcript.StatusLevel,
+    tone: tui.status.Tone,
+    ttl_ms: i64,
+};
+
+fn operationalFailureNotifySemantic(category: client_protocol.OperationalFailure.Category) NotifySemantic {
+    return switch (category) {
+        .auth_missing => .{ .annote = "auth", .level = .err, .tone = .err, .ttl_ms = 15_000 },
+        .auth_rejected => .{ .annote = "auth", .level = .err, .tone = .err, .ttl_ms = 15_000 },
+        .rate_limited => .{ .annote = "rate", .level = .warning, .tone = .warning, .ttl_ms = 10_000 },
+        .context_overflow => .{ .annote = "context", .level = .warning, .tone = .warning, .ttl_ms = 12_000 },
+        .provider_unavailable => .{ .annote = "provider", .level = .warning, .tone = .warning, .ttl_ms = 10_000 },
+        .transport => .{ .annote = "network", .level = .warning, .tone = .warning, .ttl_ms = 10_000 },
+        .malformed_response => .{ .annote = "provider", .level = .err, .tone = .err, .ttl_ms = 10_000 },
+        .canceled => .{ .annote = "cancel", .level = .info, .tone = .canceled, .ttl_ms = 3_000 },
+        .unknown => .{ .annote = "error", .level = .err, .tone = .err, .ttl_ms = 10_000 },
+    };
+}
+
+fn formatOperationalFailureMessage(buffer: []u8, failure: client_protocol.OperationalFailure) []const u8 {
+    if (failure.message.text.len > 0) return failure.message.text;
+    return switch (failure.category) {
+        .auth_missing => "Missing provider credentials",
+        .auth_rejected => "Provider rejected credentials",
+        .rate_limited => "Provider rate limit exceeded",
+        .context_overflow => "Request exceeds model context window",
+        .provider_unavailable => "Provider service unavailable",
+        .transport => "Network request failed",
+        .malformed_response => "Provider response could not be read",
+        .canceled => "Canceled",
+        .unknown => std.fmt.bufPrint(buffer, "Operation failed", .{}) catch "Operation failed",
+    };
+}
+
+fn retryNoticeMessage(buffer: []u8, retry: client_protocol.AutoRetryStart) []const u8 {
+    if (retry.failure) |failure| return formatOperationalFailureMessage(buffer, failure);
+    return retry.error_message.text;
 }
 
 fn formatRejectionMessage(buffer: []u8, rejection: client_protocol.Rejection) []const u8 {

@@ -6,6 +6,7 @@
 const std = @import("std");
 
 const agent_mod = @import("../agent/root.zig");
+const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const message_policy = @import("message_policy.zig");
 const queue_mirror_mod = @import("queue_mirror.zig");
@@ -100,15 +101,20 @@ pub const EventDrain = struct {
 
     /// Settle an in-flight retry as failed and report the terminal error.
     /// No-op when no retry is in flight.
-    pub fn failRetry(self: *EventDrain, error_text: []const u8) void {
+    pub fn failRetry(self: *EventDrain, error_text: []const u8, failure: ?ai.OperationalFailure) void {
         if (self.retry_attempt == 0) return;
         const attempt = self.retry_attempt;
         self.retry_attempt = 0;
         const final_error = client_protocol.EventText.init(self.allocator, error_text) catch null;
+        const owned_failure = if (failure) |value|
+            client_protocol.OperationalFailure.init(self.allocator, value) catch null
+        else
+            null;
         self.enqueuePublicEvent(.{ .auto_retry_end = .{
             .success = false,
             .attempt = attempt,
             .final_error = final_error,
+            .failure = owned_failure,
         } });
     }
 

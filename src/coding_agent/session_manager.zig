@@ -1126,6 +1126,7 @@ fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !agent.Agen
                 try jsonString(object.get("stopReason") orelse return error.InvalidEntry),
             ),
             .error_message = try jsonOptionalFieldString(object.get("errorMessage")),
+            .operational_failure = try parseOperationalFailure(object.get("operationalFailure")),
             .timestamp = try jsonInteger(object.get("timestamp") orelse return error.InvalidEntry),
         } };
     }
@@ -1172,6 +1173,53 @@ fn parseUserContent(allocator: std.mem.Allocator, values: []const std.json.Value
         }
     }
     return out;
+}
+
+fn parseOperationalFailure(value: ?std.json.Value) !?ai.OperationalFailure {
+    const object = try jsonObject(value orelse return null, error.InvalidEntry);
+    return .{
+        .category = try parseOperationalFailureCategory(try jsonString(object.get("category") orelse return error.InvalidEntry)),
+        .message = boundedJsonString(
+            try jsonString(object.get("message") orelse return error.InvalidEntry),
+            ai.OperationalFailure.message_bytes_max,
+        ),
+        .detail = boundedOptionalJsonString(try jsonOptionalFieldString(object.get("detail")), ai.OperationalFailure.detail_bytes_max),
+        .retryable = try parseOperationalFailureRetryable(try jsonString(object.get("retryable") orelse return error.InvalidEntry)),
+        .provider = boundedOptionalJsonString(try jsonOptionalFieldString(object.get("provider")), max_model_provider_bytes),
+        .model = boundedOptionalJsonString(try jsonOptionalFieldString(object.get("model")), max_model_id_bytes),
+    };
+}
+
+fn boundedOptionalJsonString(text: ?[]const u8, max_bytes: usize) ?[]const u8 {
+    const value = text orelse return null;
+    return boundedJsonString(value, max_bytes);
+}
+
+fn boundedJsonString(text: []const u8, max_bytes: usize) []const u8 {
+    if (text.len <= max_bytes) return text;
+    var end = max_bytes;
+    while (end > 0 and !std.unicode.utf8ValidateSlice(text[0..end])) end -= 1;
+    return text[0..end];
+}
+
+fn parseOperationalFailureCategory(text: []const u8) !ai.OperationalFailure.Category {
+    if (std.mem.eql(u8, text, "authMissing")) return .auth_missing;
+    if (std.mem.eql(u8, text, "authRejected")) return .auth_rejected;
+    if (std.mem.eql(u8, text, "rateLimited")) return .rate_limited;
+    if (std.mem.eql(u8, text, "contextOverflow")) return .context_overflow;
+    if (std.mem.eql(u8, text, "providerUnavailable")) return .provider_unavailable;
+    if (std.mem.eql(u8, text, "transport")) return .transport;
+    if (std.mem.eql(u8, text, "malformedResponse")) return .malformed_response;
+    if (std.mem.eql(u8, text, "canceled")) return .canceled;
+    if (std.mem.eql(u8, text, "unknown")) return .unknown;
+    return error.InvalidEntry;
+}
+
+fn parseOperationalFailureRetryable(text: []const u8) !ai.OperationalFailure.Retryable {
+    if (std.mem.eql(u8, text, "yes")) return .yes;
+    if (std.mem.eql(u8, text, "no")) return .no;
+    if (std.mem.eql(u8, text, "unknown")) return .unknown;
+    return error.InvalidEntry;
 }
 
 fn parseAssistantContent(allocator: std.mem.Allocator, values: []const std.json.Value) ![]const ai.AssistantContent {
@@ -1895,7 +1943,16 @@ test "session store round trips agent message variants" {
         .provider = "anthropic",
         .model = "claude",
         .usage = ai.protocol.emptyUsage(),
-        .stop_reason = .tool_use,
+        .stop_reason = .error_,
+        .error_message = "MissingApiKey",
+        .operational_failure = .{
+            .category = .auth_missing,
+            .message = "Missing provider API key",
+            .detail = "MissingApiKey",
+            .retryable = .no,
+            .provider = "anthropic",
+            .model = "claude",
+        },
         .timestamp = 12,
     } }, "t2");
     _ = try manager.appendMessage(.{ .tool_result = .{
@@ -1925,6 +1982,11 @@ test "session store round trips agent message variants" {
     try std.testing.expectEqualStrings("hello", messages[0].user.content.blocks[0].text.text);
     try std.testing.expectEqualStrings("hi", messages[1].assistant.content[0].text.text);
     try std.testing.expectEqualStrings("call-1", messages[1].assistant.content[2].tool_call.id);
+    const failure = messages[1].assistant.operational_failure.?;
+    try std.testing.expectEqual(ai.OperationalFailure.Category.auth_missing, failure.category);
+    try std.testing.expectEqual(ai.OperationalFailure.Retryable.no, failure.retryable);
+    try std.testing.expectEqualStrings("Missing provider API key", failure.message);
+    try std.testing.expectEqualStrings("MissingApiKey", failure.detail.?);
     try std.testing.expectEqualStrings("ok", messages[2].tool_result.content[0].text.text);
     try std.testing.expectEqualStrings("extension", messages[3].custom.kind);
 
@@ -1934,6 +1996,7 @@ test "session store round trips agent message variants" {
     try std.testing.expectEqualStrings("00000002", reconstructed[1].entry_id);
     try std.testing.expect(reconstructed[1].content == .message);
     try std.testing.expectEqualStrings("call-1", reconstructed[1].content.message.assistant.content[2].tool_call.id);
+    try std.testing.expectEqual(ai.OperationalFailure.Category.auth_missing, reconstructed[1].content.message.assistant.operational_failure.?.category);
     try std.testing.expect(reconstructed[2].content == .message);
     try std.testing.expectEqualStrings("call-1", reconstructed[2].content.message.tool_result.tool_call_id);
     try std.testing.expectEqualStrings("ok", reconstructed[2].content.message.tool_result.content[0].text.text);

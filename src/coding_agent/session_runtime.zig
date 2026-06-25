@@ -519,10 +519,7 @@ pub const SessionRuntime = struct {
                             return .input;
                         },
                         .prompt => |result| {
-                            self.applyActiveProgress(result) catch |err| switch (err) {
-                                error.EventQueueFull => {},
-                                else => self.failActiveOperation(err),
-                            };
+                            self.applyActiveProgress(result) catch |err| self.failActiveOperation(err);
                             return .session;
                         },
                         .completion => |result| {
@@ -553,10 +550,7 @@ pub const SessionRuntime = struct {
                         return .input;
                     },
                     .prompt => |result| {
-                        self.applyActiveProgress(result) catch |err| switch (err) {
-                            error.EventQueueFull => {},
-                            else => self.failActiveOperation(err),
-                        };
+                        self.applyActiveProgress(result) catch |err| self.failActiveOperation(err);
                         return .session;
                     },
                     .public_event => {
@@ -698,18 +692,12 @@ pub const SessionRuntime = struct {
             const envelope = self.commands.pop() orelse break;
             var command = envelope;
             defer command.deinit(self.allocator);
-            self.applyCommand(command) catch |err| switch (err) {
-                error.EventQueueFull => return,
-                else => return err,
-            };
+            try self.applyCommand(command);
             if (!self.flushPendingEvent()) return;
         }
         if (!self.hasEventCapacity()) return;
         self.startDueRetry();
-        self.stepPromptProgressBounded(64) catch |err| switch (err) {
-            error.EventQueueFull => return,
-            else => self.failActiveOperation(err),
-        };
+        self.stepPromptProgressBounded(64) catch |err| self.failActiveOperation(err);
         self.startDueRetry();
         if (!self.flushPendingEvent()) return;
         self.drainSessionEvents(null) catch return;
@@ -865,10 +853,12 @@ pub const SessionRuntime = struct {
                 self.allocator.free(active.prompt_text);
                 client_protocol.freeSubmitImages(self.allocator, active.prompt_images);
                 try self.drainSessionEvents(envelope.id);
+                var failure = try self.canceledOperationFailure();
+                errdefer failure.deinit(self.allocator);
                 try self.enqueueEvent(.{
                     .request_id = envelope.id,
                     .operation_id = active.operation_id,
-                    .event = .{ .operation_finished = .{ .reason = .canceled } },
+                    .event = .{ .operation_finished = .{ .reason = .canceled, .failure = failure } },
                 });
             },
             .queue => |queue_command| switch (queue_command) {
@@ -909,10 +899,12 @@ pub const SessionRuntime = struct {
                     self.allocator.free(active.prompt_text);
                     client_protocol.freeSubmitImages(self.allocator, active.prompt_images);
                     try self.drainSessionEvents(active.request_id);
+                    var failure = try self.canceledOperationFailure();
+                    errdefer failure.deinit(self.allocator);
                     try self.enqueueEvent(.{
                         .request_id = active.request_id,
                         .operation_id = active.operation_id,
-                        .event = .{ .operation_finished = .{ .reason = .canceled } },
+                        .event = .{ .operation_finished = .{ .reason = .canceled, .failure = failure } },
                     });
                 }
                 self.session.requestShutdown();
@@ -1084,15 +1076,36 @@ pub const SessionRuntime = struct {
                     .failed => .failed,
                     .retry, .compact => unreachable,
                 };
+                var failure = if (reason == .failed)
+                    try self.copyLatestOperationalFailure()
+                else
+                    null;
+                errdefer if (failure) |*owned| owned.deinit(self.allocator);
                 try self.drainSessionEvents(finished.request_id);
                 try self.enqueueEvent(.{
                     .request_id = finished.request_id,
                     .operation_id = finished.operation_id,
-                    .event = .{ .operation_finished = .{ .reason = reason } },
+                    .event = .{ .operation_finished = .{ .reason = reason, .failure = failure } },
                 });
                 if (self.session_chrome_dirty) try self.enqueueSessionChrome(finished.request_id);
             },
         }
+    }
+
+    fn copyLatestOperationalFailure(self: *SessionRuntime) !?client_protocol.OperationalFailure {
+        const failure = self.session.latestOperationalFailure() orelse return null;
+        return try client_protocol.OperationalFailure.init(self.allocator, failure);
+    }
+
+    fn canceledOperationFailure(self: *SessionRuntime) !client_protocol.OperationalFailure {
+        const failure: ai.OperationalFailure = .{
+            .category = .canceled,
+            .message = "Request was aborted",
+            .retryable = .no,
+            .provider = self.session.agent.state.model.provider,
+            .model = self.session.agent.state.model.id,
+        };
+        return client_protocol.OperationalFailure.init(self.allocator, failure);
     }
 
     /// Handle one slash command. Returns false when the text is not a
@@ -1618,10 +1631,7 @@ pub const SessionRuntime = struct {
         self: *SessionRuntime,
         result: anyerror!CompletionLoadResult,
     ) !void {
-        self.finishCompletionLoad(result) catch |err| switch (err) {
-            error.EventQueueFull => return,
-            else => return err,
-        };
+        try self.finishCompletionLoad(result);
     }
 
     fn finishCompletionLoad(self: *SessionRuntime, result: anyerror!CompletionLoadResult) !void {
@@ -1658,16 +1668,10 @@ pub const SessionRuntime = struct {
                 };
                 var snapshot_owned = true;
                 errdefer if (snapshot_owned) snapshot.deinit(self.allocator);
-                self.enqueueEvent(.{
+                try self.enqueueEvent(.{
                     .request_id = load.request_id,
                     .event = .{ .completion_snapshot = snapshot },
-                }) catch |err| switch (err) {
-                    error.EventQueueFull => {
-                        snapshot_owned = false;
-                        return error.EventQueueFull;
-                    },
-                    else => return err,
-                };
+                });
                 snapshot_owned = false;
             },
             .file_index_built => |index| {
@@ -1685,16 +1689,10 @@ pub const SessionRuntime = struct {
                 );
                 var event_owned = true;
                 errdefer if (event_owned) event.deinit(self.allocator);
-                self.enqueueEvent(.{
+                try self.enqueueEvent(.{
                     .request_id = load.request_id,
                     .event = .{ .file_completion = event },
-                }) catch |err| switch (err) {
-                    error.EventQueueFull => {
-                        event_owned = false;
-                        return error.EventQueueFull;
-                    },
-                    else => return err,
-                };
+                });
                 event_owned = false;
             },
         }
@@ -1889,7 +1887,7 @@ pub const SessionRuntime = struct {
         return leaf;
     }
 
-    fn enqueueEvent(self: *SessionRuntime, envelope: client_protocol.EventEnvelope) !void {
+    fn enqueueEvent(self: *SessionRuntime, envelope: client_protocol.EventEnvelope) std.mem.Allocator.Error!void {
         var sequenced = envelope;
         sequenced.seq = self.next_event_seq;
         self.next_event_seq += 1;
@@ -1897,11 +1895,11 @@ pub const SessionRuntime = struct {
         if (self.events.pushOrDrop(sequenced)) return;
         if (self.pending_event == null) {
             self.pending_event = sequenced;
-        } else {
-            var owned_envelope = sequenced;
-            owned_envelope.deinit(self.allocator);
+            return;
         }
-        return error.EventQueueFull;
+        var owned_envelope = sequenced;
+        owned_envelope.deinit(self.allocator);
+        return;
     }
 
     fn nextOperationId(self: *SessionRuntime) client_protocol.OperationId {
@@ -3168,10 +3166,24 @@ const FlakyStream = struct {
         var assistant_stream = ai.AssistantMessageEventStream.initBuffered();
         const sink = assistant_stream.sink();
         if (!is_compaction_request and non_compaction_call_count <= fail_calls) {
+            var message = ai.protocol.emptyAssistantMessageFromRequest(request, .error_, error_text);
+            message.operational_failure = .{
+                .category = if (std.ascii.indexOfIgnoreCase(error_text, "context") != null)
+                    .context_overflow
+                else if (std.ascii.indexOfIgnoreCase(error_text, "rate") != null)
+                    .rate_limited
+                else
+                    .unknown,
+                .message = error_text,
+                .detail = error_text,
+                .retryable = .yes,
+                .provider = request.model.provider,
+                .model = request.model.id,
+            };
             sink.endError(
                 request.io,
                 .error_,
-                ai.protocol.emptyAssistantMessageFromRequest(request, .error_, error_text),
+                message,
             ) catch std.debug.assert(false);
         } else {
             var usage = ai.protocol.emptyUsage();
@@ -3604,6 +3616,131 @@ test "session runtime overflow compaction retries once" {
     try std.testing.expect(session_runtime.active == null);
 }
 
+test "pending event owns failed operation failure when event queue is full" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+    FlakyStream.reset(1);
+    var session_runtime = try openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+        .model = testModel(),
+        .stream = .{ .call_fn = FlakyStream.stream },
+        .event_capacity = 1,
+    });
+    defer session_runtime.deinit();
+
+    try session_runtime.enqueueEvent(.{ .event = .operation_started });
+    var failure = try client_protocol.OperationalFailure.init(std.testing.allocator, .{
+        .category = .rate_limited,
+        .message = "rate limit exceeded",
+        .retryable = .yes,
+        .provider = "openai",
+        .model = "gpt",
+    });
+    var failure_needs_deinit = true;
+    errdefer if (failure_needs_deinit) failure.deinit(std.testing.allocator);
+    try session_runtime.enqueueEvent(.{ .event = .{ .operation_finished = .{
+        .reason = .failed,
+        .failure = failure,
+    } } });
+    failure_needs_deinit = false;
+    try std.testing.expect(session_runtime.pending_event != null);
+
+    var dropped_failure = try client_protocol.OperationalFailure.init(std.testing.allocator, .{
+        .category = .provider_unavailable,
+        .message = "provider unavailable",
+        .retryable = .yes,
+        .provider = "openai",
+        .model = "gpt",
+    });
+    var dropped_failure_needs_deinit = true;
+    errdefer if (dropped_failure_needs_deinit) dropped_failure.deinit(std.testing.allocator);
+    try session_runtime.enqueueEvent(.{ .event = .{ .operation_finished = .{
+        .reason = .failed,
+        .failure = dropped_failure,
+    } } });
+    dropped_failure_needs_deinit = false;
+
+    if (session_runtime.drainEvent()) |event| {
+        var owned = event;
+        defer owned.deinit(std.testing.allocator);
+        try std.testing.expect(owned.event == .operation_started);
+    } else return error.MissingOperationStarted;
+    try std.testing.expect(session_runtime.flushPendingEvent());
+
+    var saw_failure = false;
+    while (session_runtime.drainEvent()) |event| {
+        var owned = event;
+        defer owned.deinit(std.testing.allocator);
+        if (owned.event == .operation_finished) {
+            try std.testing.expectEqual(client_protocol.OperationFinished.Reason.failed, owned.event.operation_finished.reason);
+            try std.testing.expectEqual(client_protocol.OperationalFailure.Category.rate_limited, owned.event.operation_finished.failure.?.category);
+            saw_failure = true;
+        }
+    }
+    try std.testing.expect(saw_failure);
+}
+
+test "session runtime snapshot preserves latest terminal failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    FlakyStream.reset(1);
+    var session_runtime = try initRetryTestRuntime(
+        &tmp,
+        task_runtime,
+        "{\"retry\":{\"enabled\":false}}",
+    );
+    defer session_runtime.deinit();
+
+    var prompt = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "hello", .auto);
+    var prompt_owned = true;
+    defer if (prompt_owned) prompt.deinit(std.testing.allocator);
+    try session_runtime.submit(prompt);
+    prompt_owned = false;
+    const outcome = try driveUntilOperationFinished(&session_runtime);
+    try std.testing.expectEqual(client_protocol.OperationFinished.Reason.failed, outcome.reason);
+
+    try session_runtime.submit(.{ .id = 2, .command = .{ .replay = .{ .after = 0 } } });
+    try session_runtime.step();
+    var saw_replay_failure = false;
+    while (session_runtime.drainEvent()) |event| {
+        var owned = event;
+        defer owned.deinit(std.testing.allocator);
+        if (owned.event != .replay) continue;
+        for (owned.event.replay.events) |retained| {
+            if (std.mem.indexOf(u8, retained.json.text, "\"operation_finished\"") == null) continue;
+            if (std.mem.indexOf(u8, retained.json.text, "\"failure\"") == null) continue;
+            if (std.mem.indexOf(u8, retained.json.text, "\"rateLimited\"") == null) continue;
+            saw_replay_failure = true;
+        }
+    }
+    try std.testing.expect(saw_replay_failure);
+
+    try session_runtime.submit(.{ .id = 3, .command = .snapshot });
+    try session_runtime.step();
+    var saw_snapshot_failure = false;
+    while (session_runtime.drainEvent()) |event| {
+        var owned = event;
+        defer owned.deinit(std.testing.allocator);
+        if (owned.event != .snapshot) continue;
+        const failure = owned.event.snapshot.latest_failure orelse continue;
+        try std.testing.expectEqual(client_protocol.OperationalFailure.Category.rate_limited, failure.category);
+        try std.testing.expectEqualStrings("rate limit exceeded", failure.message.text);
+        saw_snapshot_failure = true;
+    }
+    try std.testing.expect(saw_snapshot_failure);
+}
+
 test "session runtime cancel during retry backoff settles operation as canceled" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3651,7 +3788,10 @@ test "session runtime cancel during retry backoff settles operation as canceled"
                 }
             },
             .operation_finished => |payload| {
-                if (payload.reason == .canceled) found_canceled = true;
+                if (payload.reason == .canceled) {
+                    found_canceled = true;
+                    try std.testing.expectEqual(client_protocol.OperationalFailure.Category.canceled, payload.failure.?.category);
+                }
             },
             else => {},
         }

@@ -11,7 +11,7 @@ pub const source_id = "openai-responses-provider";
 
 const read_buffer_len = 8192;
 const redirect_buffer_len = 0;
-const max_error_body_bytes = 16 * 1024;
+const max_error_body_bytes = protocol.OperationalFailure.detail_bytes_max;
 
 pub const Options = struct {
     environ: ?*const std.process.Environ.Map = null,
@@ -54,7 +54,10 @@ fn streamSimpleFunction(context: ?*anyopaque, request: protocol.StreamRequest) p
 
 fn streamFunction(context: ?*anyopaque, request: protocol.StreamRequest) protocol.AssistantMessageEventStream {
     const self: *Provider = @ptrCast(@alignCast(context.?));
-    const state = createResponseStream(self, request) catch |err| return shared.errorStream(request, err);
+    const state = createResponseStream(self, request) catch |err| switch (err) {
+        error.OutOfMemory => return shared.outOfMemoryStream(),
+        else => return shared.errorStream(request, err),
+    };
     return state.stream();
 }
 
@@ -89,12 +92,15 @@ fn createResponseStream(provider: *Provider, request: protocol.StreamRequest) !*
 
     try state.openRequest(uri, &headers, body);
     if (state.response.head.status != .ok) {
-        const detail = readErrorBody(request.allocator, state.reader.?) catch try std.fmt.allocPrint(
-            request.allocator,
-            "HTTP {s}",
-            .{@tagName(state.response.head.status)},
-        );
-        try state.emitError(detail);
+        const detail = readErrorBody(request.allocator, state.reader.?) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => try std.fmt.allocPrint(
+                request.allocator,
+                "HTTP {s}",
+                .{@tagName(state.response.head.status)},
+            ),
+        };
+        try state.emitError(detail, true, shared.httpFailure(request, state.response.head.status, detail));
     }
     return state;
 }
@@ -321,6 +327,10 @@ test "provider stream without auth emits missing api key error" {
     const err = (try stream.next(std.Io.failing)).?.@"error";
     try std.testing.expectEqual(protocol.ErrorReason.error_, err.reason);
     try std.testing.expectEqualStrings("MissingApiKey", err.@"error".error_message.?);
+    const failure = err.@"error".operational_failure.?;
+    try std.testing.expectEqual(protocol.OperationalFailure.Category.auth_missing, failure.category);
+    try std.testing.expectEqual(protocol.OperationalFailure.Retryable.no, failure.retryable);
+    try std.testing.expectEqualStrings("Missing provider API key", failure.message);
 }
 
 test "endpoint url appends responses path" {

@@ -1598,8 +1598,8 @@ fn formatNotifyText(buffer: []u8, scratch: *RowScratch, view: notify_mod.View) [
     if (view.count > 1 and view.annote.len > 0) {
         const text = std.fmt.bufPrint(
             buffer,
-            "({d}x) {s} {s}",
-            .{ view.count, view.message, view.annote },
+            "({d}x) [{s}] {s}",
+            .{ view.count, view.annote, view.message },
         ) catch return view.message;
         return internText(scratch, text);
     }
@@ -1608,7 +1608,7 @@ fn formatNotifyText(buffer: []u8, scratch: *RowScratch, view: notify_mod.View) [
         return internText(scratch, text);
     }
     if (view.annote.len > 0) {
-        const text = std.fmt.bufPrint(buffer, "{s} {s}", .{ view.message, view.annote }) catch return view.message;
+        const text = std.fmt.bufPrint(buffer, "[{s}] {s}", .{ view.annote, view.message }) catch return view.message;
         return internText(scratch, text);
     }
     return view.message;
@@ -2528,7 +2528,7 @@ test "notification overlay keeps formatted text alive for vaxis cells" {
     defer testing_gpa.destroy(scratch);
     draw(&app, &vx, scratch);
 
-    try std.testing.expect(screenContainsText(vx.window(), "hello INFO"));
+    try std.testing.expect(screenContainsText(vx.window(), "[INFO] hello"));
 }
 
 test "vaxis screen receives the frame" {

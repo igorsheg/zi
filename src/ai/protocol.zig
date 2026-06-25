@@ -45,6 +45,84 @@ pub const ProviderResponse = struct {
     headers: std.json.Value,
 };
 
+pub fn isContextOverflowText(text: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(text, "rate limit") != null or
+        std.ascii.indexOfIgnoreCase(text, "too many requests") != null) return false;
+    const needles = [_][]const u8{
+        "prompt is too long",
+        "request_too_large",
+        "input is too long for requested model",
+        "exceeds the context window",
+        "maximum context length",
+        "input token count",
+        "exceeds the maximum",
+        "maximum prompt length",
+        "reduce the length of the messages",
+        "maximum allowed input length",
+        "context length",
+        "context window exceeds limit",
+        "exceeded model token limit",
+        "model_context_window_exceeded",
+        "prompt too long",
+        "context_length_exceeded",
+        "context length exceeded",
+        "too many tokens",
+        "token limit exceeded",
+    };
+    for (needles) |needle| {
+        if (std.ascii.indexOfIgnoreCase(text, needle) != null) return true;
+    }
+    return (std.ascii.indexOfIgnoreCase(text, "context") != null and
+        (std.ascii.indexOfIgnoreCase(text, "overflow") != null or
+            std.ascii.indexOfIgnoreCase(text, "too large") != null or
+            std.ascii.indexOfIgnoreCase(text, "maximum") != null or
+            std.ascii.indexOfIgnoreCase(text, "length") != null)) or
+        (std.ascii.indexOfIgnoreCase(text, "token") != null and
+            std.ascii.indexOfIgnoreCase(text, "limit") != null and
+            std.ascii.indexOfIgnoreCase(text, "exceed") != null);
+}
+
+pub const OperationalFailure = struct {
+    pub const message_bytes_max = 512;
+    pub const detail_bytes_max = 2048;
+
+    category: Category,
+    message: []const u8,
+    detail: ?[]const u8 = null,
+    retryable: Retryable = .unknown,
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+
+    pub const Category = enum {
+        auth_missing,
+        auth_rejected,
+        rate_limited,
+        context_overflow,
+        provider_unavailable,
+        transport,
+        malformed_response,
+        canceled,
+        unknown,
+    };
+
+    pub const Retryable = enum {
+        yes,
+        no,
+        unknown,
+    };
+
+    pub fn jsonStringify(self: OperationalFailure, stringify: *std.json.Stringify) !void {
+        try stringify.beginObject();
+        try writeJsonField("category", stringify, jsonOperationalFailureCategory(self.category));
+        try writeJsonField("message", stringify, self.message);
+        if (self.detail) |detail| try writeJsonField("detail", stringify, detail);
+        try writeJsonField("retryable", stringify, jsonOperationalFailureRetryable(self.retryable));
+        if (self.provider) |provider| try writeJsonField("provider", stringify, provider);
+        if (self.model) |model| try writeJsonField("model", stringify, model);
+        try stringify.endObject();
+    }
+};
+
 pub const StreamOptions = struct {
     temperature: ?f64 = null,
     max_tokens: ?u32 = null,
@@ -312,6 +390,7 @@ pub const AssistantMessage = struct {
     usage: Usage,
     stop_reason: StopReason,
     error_message: ?[]const u8 = null,
+    operational_failure: ?OperationalFailure = null,
     timestamp: Timestamp,
 
     pub fn jsonStringify(self: AssistantMessage, stringify: *std.json.Stringify) !void {
@@ -325,6 +404,7 @@ pub const AssistantMessage = struct {
         try writeJsonField("usage", stringify, self.usage);
         try writeJsonField("stopReason", stringify, jsonStopReason(self.stop_reason));
         if (self.error_message) |message| try writeJsonField("errorMessage", stringify, message);
+        if (self.operational_failure) |failure| try writeJsonField("operationalFailure", stringify, failure);
         try writeJsonField("timestamp", stringify, self.timestamp);
         try stringify.endObject();
     }
@@ -527,6 +607,28 @@ fn jsonDoneReason(reason: DoneReason) []const u8 {
         .stop => "stop",
         .length => "length",
         .tool_use => "toolUse",
+    };
+}
+
+fn jsonOperationalFailureCategory(category: OperationalFailure.Category) []const u8 {
+    return switch (category) {
+        .auth_missing => "authMissing",
+        .auth_rejected => "authRejected",
+        .rate_limited => "rateLimited",
+        .context_overflow => "contextOverflow",
+        .provider_unavailable => "providerUnavailable",
+        .transport => "transport",
+        .malformed_response => "malformedResponse",
+        .canceled => "canceled",
+        .unknown => "unknown",
+    };
+}
+
+fn jsonOperationalFailureRetryable(retryable: OperationalFailure.Retryable) []const u8 {
+    return switch (retryable) {
+        .yes => "yes",
+        .no => "no",
+        .unknown => "unknown",
     };
 }
 

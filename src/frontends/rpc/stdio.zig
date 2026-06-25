@@ -248,15 +248,7 @@ fn emitRejected(
     message: []const u8,
 ) Error!void {
     if (try drive(app, stdout, null) == .shutdown) return;
-    app.rejectClientCommand(request_id, code, message) catch |err| switch (err) {
-        error.EventQueueFull => {
-            _ = try drainEvents(app, stdout, null);
-            try app.step();
-            _ = try drainEvents(app, stdout, null);
-            try app.rejectClientCommand(request_id, code, message);
-        },
-        else => return err,
-    };
+    try app.rejectClientCommand(request_id, code, message);
     _ = try drainEvents(app, stdout, null);
 }
 
@@ -673,6 +665,77 @@ test "rpc submit command runs to completed operation" {
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "operation_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "completed") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "shutdown_started") != null);
+    try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "rpc json exposes typed operation failure" {
+    const Test = struct {
+        const ai = @import("../../ai/root.zig");
+
+        fn model() ai.Model {
+            return .{
+                .id = "test-model",
+                .name = "test model",
+                .api = ai.KnownApi.openai_responses,
+                .provider = ai.KnownProvider.openai,
+                .base_url = "",
+                .reasoning = false,
+                .input = &.{},
+                .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+                .context_window = 128000,
+                .max_tokens = 4096,
+            };
+        }
+
+        fn stream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
+            var assistant_stream = ai.AssistantMessageEventStream.initBuffered();
+            const sink = assistant_stream.sink();
+            var message = ai.protocol.emptyAssistantMessageFromRequest(request, .error_, "rate limit exceeded");
+            message.operational_failure = .{
+                .category = .rate_limited,
+                .message = "Provider rate limit exceeded",
+                .detail = "rate limit exceeded",
+                .retryable = .yes,
+                .provider = request.model.provider,
+                .model = request.model.id,
+            };
+            sink.endError(request.io, .error_, message) catch std.debug.assert(false);
+            return assistant_stream;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "rpc-session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+        .model = Test.model(),
+        .stream = .{ .call_fn = Test.stream },
+    });
+    defer app.deinit();
+
+    var input = std.Io.Reader.fixed(
+        \\{"id":1,"type":"submit","text":"hello"}
+        \\
+    );
+    var stdout_buffer: [32768]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+
+    try run(&app, &input, &stdout, &stderr);
+
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "operation_finished") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "rateLimited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "Provider rate limit exceeded") != null);
     try std.testing.expectEqualStrings("", stderr.buffered());
 }
 

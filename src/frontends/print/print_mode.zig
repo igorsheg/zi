@@ -130,6 +130,7 @@ const PrintDrain = struct {
             .agent_event => |agent_event| switch (agent_event.event) {
                 .message_end => |payload| switch (payload.message) {
                     .assistant => |assistant| {
+                        if (assistant.operational_failure) |failure| return printAssistantFailure(self.stderr, failure);
                         if (assistant.error_message) |message| return printAssistantError(self.stderr, message);
                         if (assistant.stop_reason == .error_) {
                             return printAssistantError(self.stderr, "assistant request failed");
@@ -148,6 +149,24 @@ const PrintDrain = struct {
         }
     }
 };
+
+fn printAssistantFailure(stderr: *std.Io.Writer, failure: ai.OperationalFailure) !void {
+    const prefix: []const u8 = switch (failure.category) {
+        .auth_missing => "missing credentials",
+        .auth_rejected => "credentials rejected",
+        .rate_limited => "rate limited",
+        .context_overflow => "context too large",
+        .provider_unavailable => "provider unavailable",
+        .transport => "network error",
+        .malformed_response => "provider response error",
+        .canceled => "canceled",
+        .unknown => "assistant request failed",
+    };
+    if (failure.message.len == 0 or std.mem.eql(u8, failure.message, prefix)) {
+        return printAssistantError(stderr, prefix);
+    }
+    try stderr.print("{s}: {s}\n", .{ prefix, failure.message });
+}
 
 fn printAssistantError(stderr: *std.Io.Writer, message: []const u8) !void {
     try stderr.writeAll(message);
@@ -196,6 +215,50 @@ test "print mode emits assistant text from injected stream" {
     try run(&app, &stdout, &stderr, .{ .prompt = "hello" });
     try std.testing.expectEqualStrings("hi\n", stdout.buffered());
     try std.testing.expectEqualStrings("", stderr.buffered());
+}
+
+test "print mode renders typed operational failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo");
+
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{ .min_token_size = 1, .max_token_size = 1 });
+    defer provider.deinit();
+    const message = ai.faux.assistantMessage(&.{}, .{
+        .stop_reason = .error_,
+        .error_message = "MissingApiKey",
+        .operational_failure = .{
+            .category = .auth_missing,
+            .message = "Missing provider API key",
+            .retryable = .no,
+            .provider = "faux",
+            .model = "faux-model",
+        },
+    });
+    try provider.setResponses(&.{message});
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+
+    var app = try session_runtime.openSessionRuntime(std.testing.allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-05-27",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-05-27T00:00:00Z" } },
+        .dir = tmp.dir,
+        .stream = provider.apiProvider().stream,
+    });
+    defer app.deinit();
+
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+
+    try run(&app, &stdout, &stderr, .{ .prompt = "hello" });
+    try std.testing.expectEqualStrings("", stdout.buffered());
+    try std.testing.expectEqualStrings("missing credentials: Missing provider API key\n", stderr.buffered());
 }
 
 test "json print mode streams client protocol events" {

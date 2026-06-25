@@ -258,6 +258,7 @@ pub fn assistantMessage(
         .usage = protocol.emptyUsage(),
         .stop_reason = options.stop_reason,
         .error_message = options.error_message,
+        .operational_failure = options.operational_failure,
         .timestamp = options.timestamp,
     };
 }
@@ -265,6 +266,7 @@ pub fn assistantMessage(
 pub const AssistantMessageOptions = struct {
     stop_reason: protocol.StopReason = .stop,
     error_message: ?[]const u8 = null,
+    operational_failure: ?protocol.OperationalFailure = null,
     response_id: ?[]const u8 = null,
     timestamp: protocol.Timestamp = 0,
 };

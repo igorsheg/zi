@@ -446,6 +446,11 @@ pub fn clientSnapshot(
     errdefer header.deinit(allocator);
     var model = try client_protocol.ModelSnapshot.init(allocator, self.agent.state.model);
     errdefer model.deinit(allocator);
+    var latest_failure = if (self.latestOperationalFailure()) |failure|
+        try client_protocol.OperationalFailure.init(allocator, failure)
+    else
+        null;
+    errdefer if (latest_failure) |*failure| failure.deinit(allocator);
     const history = try client_protocol.HistorySnapshot.fromSession(allocator, self.manager);
     return .{
         .header = header,
@@ -455,6 +460,7 @@ pub fn clientSnapshot(
         .context = self.clientContextUsage(),
         .queue = queue,
         .active_request_id = active_request_id,
+        .latest_failure = latest_failure,
         .history = history,
     };
 }
@@ -611,24 +617,37 @@ pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdi
     {
         const attempt = self.event_drain.beginRetryAttempt();
         const delay_ms = retryBackoffMs(self.retry_settings, attempt);
-        const error_message = try client_protocol.EventText.init(self.allocator, error_text);
+        var error_message = try client_protocol.EventText.init(self.allocator, error_text);
+        errdefer error_message.deinit(self.allocator);
+        var failure = if (last.assistant.operational_failure) |value|
+            try client_protocol.OperationalFailure.init(self.allocator, value)
+        else
+            null;
+        errdefer if (failure) |*value| value.deinit(self.allocator);
         self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
             .attempt = attempt,
             .max_attempts = self.retry_settings.max_attempts,
             .delay_ms = delay_ms,
             .error_message = error_message,
+            .failure = failure,
         } });
         try self.removeLastAssistantRuntimeMessage();
         return .{ .retry = .{ .kind = .continue_run, .delay_ms = delay_ms } };
     }
 
-    self.event_drain.failRetry(error_text);
+    self.event_drain.failRetry(error_text, last.assistant.operational_failure);
     return .failed;
 }
 
 /// Settle an in-flight retry that will not run (cancel or shutdown).
 pub fn cancelRetryWait(self: *AgentSession) void {
-    self.event_drain.failRetry("Retry cancelled");
+    self.event_drain.failRetry("Retry cancelled", .{
+        .category = .canceled,
+        .message = "Retry cancelled",
+        .retryable = .no,
+        .provider = self.agent.state.model.provider,
+        .model = self.agent.state.model.id,
+    });
 }
 
 fn retryBackoffMs(settings: RetrySettings, attempt: u8) u64 {
@@ -855,7 +874,7 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
                 .error_message = error_message,
             } });
             if (run.will_retry) {
-                self.event_drain.failRetry(@errorName(err));
+                self.event_drain.failRetry(@errorName(err), null);
                 return .failed;
             }
             if (run.reason == .manual) return .failed;
@@ -960,6 +979,14 @@ fn extractCompactionSummary(
     };
     if (writer.written().len == 0) return error.MissingCompactionSummary;
     return writer.toOwnedSlice();
+}
+
+pub fn latestOperationalFailure(self: *const AgentSession) ?ai.OperationalFailure {
+    if (self.agent.state.messages.len == 0) return null;
+    const last = self.agent.state.messages[self.agent.state.messages.len - 1];
+    if (last != .assistant) return null;
+    if (last.assistant.stop_reason != .error_ and last.assistant.stop_reason != .aborted) return null;
+    return last.assistant.operational_failure;
 }
 
 fn latestAssistantError(self: *const AgentSession) ?[]const u8 {
@@ -1080,6 +1107,19 @@ fn emitAssistantError(session: *AgentSession, error_message: []const u8) !void {
         .usage = ai.protocol.emptyUsage(),
         .stop_reason = .error_,
         .error_message = error_message,
+        .operational_failure = .{
+            .category = if (std.ascii.indexOfIgnoreCase(error_message, "context") != null)
+                .context_overflow
+            else if (std.ascii.indexOfIgnoreCase(error_message, "rate") != null)
+                .rate_limited
+            else
+                .unknown,
+            .message = error_message,
+            .detail = error_message,
+            .retryable = if (std.ascii.indexOfIgnoreCase(error_message, "rate") != null) .yes else .unknown,
+            .provider = ai.KnownProvider.openai,
+            .model = "gpt",
+        },
         .timestamp = 0,
     } } } });
 }
@@ -1130,6 +1170,7 @@ test "settle verdict arms backoff retry and repairs the runtime transcript" {
     try std.testing.expectEqual(@as(usize, 3), start_event.auto_retry_start.max_attempts);
     try std.testing.expectEqual(@as(u64, 100), start_event.auto_retry_start.delay_ms);
     try std.testing.expectEqualStrings("rate limit exceeded", start_event.auto_retry_start.error_message.text);
+    try std.testing.expectEqual(client_protocol.OperationalFailure.Category.rate_limited, start_event.auto_retry_start.failure.?.category);
 
     // Second failure backs off exponentially.
     _ = try session.agent.beginRun();
@@ -1166,6 +1207,7 @@ test "settle verdict fails after exhausted attempts with terminal retry end" {
     try std.testing.expect(!end_event.auto_retry_end.success);
     try std.testing.expectEqual(@as(usize, 2), end_event.auto_retry_end.attempt);
     try std.testing.expectEqualStrings("rate limit exceeded", end_event.auto_retry_end.final_error.?.text);
+    try std.testing.expectEqual(client_protocol.OperationalFailure.Category.rate_limited, end_event.auto_retry_end.failure.?.category);
 }
 
 test "retry failure still emits end event when final error allocation fails" {
@@ -1196,7 +1238,7 @@ test "retry failure still emits end event when final error allocation fails" {
 
     session.event_drain.retry_attempt = 1;
     failing.fail_index = failing.alloc_index;
-    session.event_drain.failRetry("rate limit exceeded");
+    session.event_drain.failRetry("rate limit exceeded", null);
     failing.fail_index = std.math.maxInt(usize);
 
     var end_event = session.drainPublicEvent().?;

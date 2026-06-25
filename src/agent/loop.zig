@@ -429,6 +429,25 @@ fn copyAssistantMetadataWithContent(
     const response_id = if (source.response_id) |value| try allocator.dupe(u8, value) else null;
     errdefer if (response_id) |value| allocator.free(value);
     const error_message = if (source.error_message) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (error_message) |value| allocator.free(value);
+    const operational_failure = if (source.operational_failure) |failure| blk: {
+        const message = try allocator.dupe(u8, failure.message);
+        errdefer allocator.free(message);
+        const detail = if (failure.detail) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (detail) |value| allocator.free(value);
+        const failure_provider = if (failure.provider) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (failure_provider) |value| allocator.free(value);
+        const failure_model = if (failure.model) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (failure_model) |value| allocator.free(value);
+        break :blk ai.OperationalFailure{
+            .category = failure.category,
+            .message = message,
+            .detail = detail,
+            .retryable = failure.retryable,
+            .provider = failure_provider,
+            .model = failure_model,
+        };
+    } else null;
     return .{
         .content = content,
         .api = api,
@@ -438,6 +457,7 @@ fn copyAssistantMetadataWithContent(
         .usage = source.usage,
         .stop_reason = source.stop_reason,
         .error_message = error_message,
+        .operational_failure = operational_failure,
         .timestamp = source.timestamp,
     };
 }
