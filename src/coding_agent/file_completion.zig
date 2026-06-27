@@ -650,11 +650,11 @@ fn linuxStatEntryKind(dir_fd: std.posix.fd_t, name: []const u8) ?EntryKind {
 
     var statx = std.mem.zeroes(linux.Statx);
     while (true) {
-        switch (linux.E.init(linux.statx(
+        switch (linux.errno(linux.statx(
             dir_fd,
             name_c.ptr,
             linux.AT.SYMLINK_NOFOLLOW,
-            linux.STATX_TYPE,
+            .{ .TYPE = true },
             &statx,
         ))) {
             .SUCCESS => break,
