@@ -16,7 +16,10 @@ const ByteQueue = std.Io.Queue(u8);
 
 pub const InputReader = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
+    queue_io: std.Io,
+    // The frontend wake is waited through the session runtime's std.Io so its
+    // cooperative completion tasks keep making progress while the TUI sleeps.
+    wake_io: std.Io,
     wake: *runtime.WakeEvent,
     storage: []u8,
     queue: ByteQueue,
@@ -35,7 +38,8 @@ pub const InputReader = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        io: std.Io,
+        queue_io: std.Io,
+        wake_io: std.Io,
         wake: *runtime.WakeEvent,
     ) !*InputReader {
         const self = try allocator.create(InputReader);
@@ -44,7 +48,8 @@ pub const InputReader = struct {
         errdefer allocator.free(storage);
         self.* = .{
             .allocator = allocator,
-            .io = io,
+            .queue_io = queue_io,
+            .wake_io = wake_io,
             .wake = wake,
             .storage = storage,
             .queue = ByteQueue.init(storage),
@@ -88,7 +93,7 @@ pub const InputReader = struct {
     /// pending terminal input.
     pub fn stop(self: *InputReader) void {
         const thread = self.thread orelse return;
-        self.queue.close(self.io);
+        self.queue.close(self.queue_io);
         if (self.cancel_fds) |fds| wakeCancel(fds[1]);
         thread.join();
         self.thread = null;
@@ -111,7 +116,7 @@ pub const InputReader = struct {
     /// Non-blocking owner drain. At most `out.len` bytes are returned; callers
     /// pass a bounded chunk to enforce foreground turn budget.
     pub fn drain(self: *InputReader, out: []u8) DrainResult {
-        const count = self.queue.get(self.io, out, 0) catch 0;
+        const count = self.queue.get(self.queue_io, out, 0) catch 0;
         const enqueue_ns = if (count > 0) blk: {
             _ = self.queued_count.fetchSub(count, .release);
             const ns = self.last_enqueue_ns.swap(0, .acq_rel);
@@ -159,28 +164,28 @@ pub const InputReader = struct {
             };
             if (read_count == 0) {
                 self.eof.store(true, .release);
-                self.wake.set(self.io);
+                self.wake.set(self.wake_io);
                 return;
             }
 
             var offset: usize = 0;
             while (offset < read_count) {
-                const queued = self.queue.put(self.io, buf[offset..read_count], 1) catch return;
+                const queued = self.queue.put(self.queue_io, buf[offset..read_count], 1) catch return;
                 const previous_count = self.queued_count.fetchAdd(queued, .release);
                 if (previous_count == 0) self.last_enqueue_ns.store(self.nowNs(), .release);
                 offset += queued;
-                self.wake.set(self.io);
+                self.wake.set(self.wake_io);
             }
         }
     }
 
     fn publishFault(self: *InputReader) void {
         self.faulted.store(true, .release);
-        self.wake.set(self.io);
+        self.wake.set(self.wake_io);
     }
 
     fn nowNs(self: *InputReader) i64 {
-        const ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+        const ns = std.Io.Clock.awake.now(self.queue_io).nanoseconds;
         if (ns > std.math.maxInt(i64)) return std.math.maxInt(i64);
         if (ns < std.math.minInt(i64)) return std.math.minInt(i64);
         return @intCast(ns);
@@ -214,7 +219,7 @@ test "input reader queues bytes and wakes owner" {
     const io = threaded.io();
 
     var wake: runtime.WakeEvent = .init;
-    const reader = try InputReader.init(std.testing.allocator, io, &wake);
+    const reader = try InputReader.init(std.testing.allocator, io, io, &wake);
     defer reader.deinit();
 
     const source = try createPipe();
@@ -231,13 +236,38 @@ test "input reader queues bytes and wakes owner" {
     try std.testing.expect(drained.enqueue_ns != null);
 }
 
+test "input reader wakes session runtime io waiter" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const queue_io = threaded.io();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    const wake_io = task_runtime.io();
+
+    var wake: runtime.WakeEvent = .init;
+    const reader = try InputReader.init(std.testing.allocator, queue_io, wake_io, &wake);
+    defer reader.deinit();
+
+    const source = try createPipe();
+    defer closePipe(source);
+    try reader.start(source[0]);
+
+    const bytes = "abc";
+    try std.testing.expectEqual(@as(isize, bytes.len), std.c.write(source[1], bytes.ptr, bytes.len));
+    try wake.waitTimeout(wake_io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+
+    var out: [drain_chunk_bytes_max]u8 = undefined;
+    const drained = reader.drain(&out);
+    try std.testing.expectEqualStrings(bytes, drained.bytes);
+}
+
 test "input reader reports eof as bounded fact" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     var wake: runtime.WakeEvent = .init;
-    const reader = try InputReader.init(std.testing.allocator, io, &wake);
+    const reader = try InputReader.init(std.testing.allocator, io, io, &wake);
     defer reader.deinit();
 
     const source = try createPipe();

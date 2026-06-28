@@ -363,7 +363,12 @@ const InteractiveController = struct {
         const frontend_wake = try process.gpa.create(runtime.WakeEvent);
         errdefer process.gpa.destroy(frontend_wake);
         frontend_wake.* = .init;
-        const input_reader = try input_reader_mod.InputReader.init(process.gpa, process.io, frontend_wake);
+        const input_reader = try input_reader_mod.InputReader.init(
+            process.gpa,
+            process.io,
+            app.task_runtime.io(),
+            frontend_wake,
+        );
         errdefer input_reader.deinit();
 
         var self: InteractiveController = .{
@@ -460,29 +465,11 @@ const InteractiveController = struct {
     }
 
     fn waitForFrontendWake(self: *InteractiveController, frame_ms: u64) !session_runtime.WakeResult {
-        const input_reader = self.input_reader orelse return self.app.waitAndApplyWake(-1, frame_ms);
+        const input_reader = self.input_reader orelse return self.app.waitForFrontendWake(frame_ms);
         if (input_reader.hasQueuedBytes() or input_reader.hasTerminalFact()) return .input;
-        if (self.app.hasReadyWork()) return .session;
-        if (frame_ms == 0) return .frame;
-
-        const timeout_ms = self.app.waitDelayMs(frame_ms);
-        const frontend_wake = self.frontend_wake orelse unreachable;
-        frontend_wake.reset();
+        const wake = try self.app.waitForFrontendWake(frame_ms);
         if (input_reader.hasQueuedBytes() or input_reader.hasTerminalFact()) return .input;
-        if (self.app.hasReadyWork()) return .session;
-        frontend_wake.waitTimeout(self.io, .{ .duration = .{
-            .raw = .fromMilliseconds(@intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i64)))))),
-            .clock = .awake,
-        } }) catch |err| switch (err) {
-            error.Timeout => {},
-            error.Canceled => return error.Canceled,
-        };
-        if (frontend_wake.isSet()) frontend_wake.reset();
-
-        if (input_reader.hasQueuedBytes() or input_reader.hasTerminalFact()) return .input;
-        if (self.app.hasReadyWork()) return .session;
-        if (timeout_ms == frame_ms) return .frame;
-        return .session;
+        return wake;
     }
 
     fn serviceImmediateWork(self: *InteractiveController) !bool {
@@ -660,7 +647,9 @@ const InteractiveController = struct {
         if (result.truncated) try self.appendStatus(.warning, "input truncated");
         if (result.effect_overflow) try self.appendStatus(.warning, "input effects dropped");
         if (drained.faulted) try self.appendStatus(.warning, "input reader stopped");
-        if (input_reader.hasQueuedBytes()) (self.frontend_wake orelse unreachable).set(self.io);
+        if (input_reader.hasQueuedBytes()) {
+            (self.frontend_wake orelse unreachable).set(self.app.task_runtime.io());
+        }
         return result.priority;
     }
 

@@ -536,12 +536,10 @@ pub const SessionRuntime = struct {
         if (self.completion_load) |*load| load.result_slot.wake = self.ownerWake();
     }
 
-    pub fn hasReadyWork(self: *const SessionRuntime) bool {
-        return self.hasReadySessionWork();
-    }
-
-    pub fn waitDelayMs(self: *const SessionRuntime, frame_ms: u64) u64 {
-        return self.nextWaitTimeoutMs(frame_ms);
+    /// Frontends that provide input through their own bounded queue still wait
+    /// through the session runtime so cooperative session tasks make progress.
+    pub fn waitForFrontendWake(self: *SessionRuntime, frame_ms: u64) !WakeResult {
+        return self.waitAndApplyWake(-1, frame_ms);
     }
 
     pub fn rejectClientCommand(
