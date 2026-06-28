@@ -66,7 +66,16 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{ .root_module = zi });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
 
+    const zio_import_check = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "if grep -R '@import(\"zio\")\\|\\bzio\\.' -n src | grep -v 'src/runtime/zio_backend.zig'; then exit 1; fi",
+    });
+    const zio_import_check_step = b.step("check-zio-imports", "Ensure zio is only imported by the private runtime backend");
+    zio_import_check_step.dependOn(&zio_import_check.step);
+
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&zio_import_check.step);
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 

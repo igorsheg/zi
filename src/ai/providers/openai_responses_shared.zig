@@ -962,7 +962,7 @@ test "context overflow fallback follows common provider wording" {
 }
 
 test "stream errors classify transport and malformed response" {
-    var cancel = try mem.CancelSource.init(std.testing.allocator);
+    var cancel = try mem.CancelSource.init(std.testing.allocator, std.testing.io);
     defer cancel.deinit();
     const request: protocol.StreamRequest = .{
         .allocator = std.testing.allocator,
@@ -982,7 +982,7 @@ test "stream errors classify transport and malformed response" {
 }
 
 test "open errors classify transport and malformed response" {
-    var cancel = try mem.CancelSource.init(std.testing.allocator);
+    var cancel = try mem.CancelSource.init(std.testing.allocator, std.testing.io);
     defer cancel.deinit();
     const request: protocol.StreamRequest = .{
         .allocator = std.testing.allocator,

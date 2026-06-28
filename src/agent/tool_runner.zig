@@ -231,7 +231,7 @@ const ToolWorkerEvent = union(enum) {
     };
 };
 
-const ToolWorkerChannel = runtime.Channel(ToolWorkerEvent);
+const ToolWorkerChannel = std.Io.Queue(ToolWorkerEvent);
 const tool_worker_event_capacity_count = agent.max_tool_calls_per_turn + agent.max_tool_updates_per_batch;
 
 // Runtime task groups only report aggregate completion/failure. The agent loop
@@ -239,7 +239,7 @@ const tool_worker_event_capacity_count = agent.max_tool_calls_per_turn + agent.m
 // finalization remains deterministic even when workers complete out of order.
 const ToolWorkerGroup = struct {
     task_runtime: *runtime.Runtime,
-    handles: [agent.max_tool_calls_per_turn]runtime.Task(anyerror!void) = undefined,
+    handles: [agent.max_tool_calls_per_turn]std.Io.Future(anyerror!void) = undefined,
     started: usize = 0,
     state: State = .idle,
 
@@ -265,7 +265,7 @@ const ToolWorkerGroup = struct {
     ) anyerror!void {
         if (self.started == agent.max_tool_calls_per_turn) return error.TooManyTools;
         std.debug.assert(self.state == .idle or self.state == .active);
-        self.handles[self.started] = try self.task_runtime.spawn(function, args);
+        self.handles[self.started] = try std.Io.concurrent(self.task_runtime.io(), function, args);
         self.started += 1;
         self.state = .active;
     }
@@ -274,7 +274,7 @@ const ToolWorkerGroup = struct {
         std.debug.assert(self.state != .drained);
         var first_error: ?anyerror = null;
         for (self.handles[0..self.started]) |*handle| {
-            handle.join() catch |err| {
+            handle.await(self.task_runtime.io()) catch |err| {
                 if (first_error == null) first_error = err;
             };
         }
@@ -284,13 +284,14 @@ const ToolWorkerGroup = struct {
 
     fn cancel(self: *ToolWorkerGroup) void {
         if (self.state != .active) return;
-        for (self.handles[0..self.started]) |*handle| handle.cancel();
+        for (self.handles[0..self.started]) |*handle| _ = handle.cancel(self.task_runtime.io()) catch {};
         self.state = .drained;
     }
 };
 
 const ParallelToolUpdateContext = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     channel: *ToolWorkerChannel,
     tool_call: ai.ToolCall,
     args: std.json.Value,
@@ -318,7 +319,7 @@ fn executeToolCallsParallel(
     var update_count: std.atomic.Value(usize) = .init(0);
     var group = ToolWorkerGroup.init(task_runtime);
     defer group.deinit();
-    errdefer cancelParallelToolWorkers(allocator, &group, &channel);
+    errdefer cancelParallelToolWorkers(allocator, io, &group, &channel);
 
     for (prepared[0..prepared_count]) |item| {
         try group.spawn(
@@ -333,7 +334,7 @@ fn executeToolCallsParallel(
 
     var completed_count: usize = 0;
     while (completed_count < prepared_count) {
-        const event = try channel.receive();
+        const event = try channel.getOne(io);
         switch (event) {
             .update => |update| {
                 defer agent.deinitAgentToolResult(allocator, update.partial_result);
@@ -397,18 +398,21 @@ fn executeToolCallsParallel(
 
 fn cancelParallelToolWorkers(
     allocator: std.mem.Allocator,
+    io: std.Io,
     group: *ToolWorkerGroup,
     channel: *ToolWorkerChannel,
 ) void {
     group.cancel();
-    channel.close(.graceful);
-    drainPendingToolWorkerEvents(allocator, channel);
+    channel.close(io);
+    drainPendingToolWorkerEvents(allocator, io, channel);
 }
 
-fn drainPendingToolWorkerEvents(allocator: std.mem.Allocator, channel: *ToolWorkerChannel) void {
+fn drainPendingToolWorkerEvents(allocator: std.mem.Allocator, io: std.Io, channel: *ToolWorkerChannel) void {
     while (true) {
-        var event = channel.tryReceive() catch break;
-        deinitToolWorkerEvent(allocator, &event);
+        var item: [1]ToolWorkerEvent = undefined;
+        const count = channel.get(io, &item, 0) catch break;
+        if (count == 0) break;
+        deinitToolWorkerEvent(allocator, &item[0]);
     }
 }
 
@@ -470,6 +474,7 @@ fn executePreparedToolCallWorker(
 ) anyerror!void {
     var update_context: ParallelToolUpdateContext = .{
         .allocator = allocator,
+        .io = io,
         .channel = channel,
         .tool_call = prepared.toolCall(),
         .args = prepared.args(),
@@ -483,13 +488,13 @@ fn executePreparedToolCallWorker(
         token,
         .{ .context = &update_context, .call_fn = enqueueToolUpdate },
     ) catch |err| {
-        channel.send(.{ .failed = .{ .prepared = prepared, .error_name = @errorName(err) } }) catch |channel_err| {
+        channel.putOne(io, .{ .failed = .{ .prepared = prepared, .error_name = @errorName(err) } }) catch |channel_err| {
             if (channel_err == error.Canceled) return error.Canceled;
             return;
         };
         return;
     };
-    channel.send(.{ .complete = executed }) catch |channel_err| {
+    channel.putOne(io, .{ .complete = executed }) catch |channel_err| {
         executed.result.deinit();
         if (channel_err == error.Canceled) return error.Canceled;
     };
@@ -664,7 +669,7 @@ fn enqueueToolUpdate(context: ?*anyopaque, partial_result: agent.AgentToolResult
     if (previous_count >= agent.max_tool_updates_per_batch) return error.TooManyToolUpdates;
     const owned_partial = try agent.copyAgentToolResult(update.allocator, partial_result);
     errdefer agent.deinitAgentToolResult(update.allocator, owned_partial);
-    try update.channel.send(.{ .update = .{
+    try update.channel.putOne(update.io, .{ .update = .{
         .tool_call_id = update.tool_call.id,
         .tool_name = update.tool_call.name,
         .args = update.args,

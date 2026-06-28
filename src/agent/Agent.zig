@@ -71,7 +71,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !Agent {
         .allocator = allocator,
         .io = io,
         .task_runtime = options.task_runtime,
-        .cancel_source = try runtime.CancelSource.init(allocator),
+        .cancel_source = try runtime.CancelSource.init(allocator, io),
         .message_arena = std.heap.ArenaAllocator.init(allocator),
         .streaming_arena = std.heap.ArenaAllocator.init(allocator),
         .event_scratch_arena = std.heap.ArenaAllocator.init(allocator),

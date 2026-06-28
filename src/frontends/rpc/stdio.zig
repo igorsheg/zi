@@ -187,7 +187,7 @@ fn drive(
         }
         if (terminal_request_id == null) return .idle;
         idle_ticks += 1;
-        if (idle_ticks > 0) try runtime.sleep(.fromMilliseconds(10));
+        if (idle_ticks > 0) try runtime.sleep(app.task_runtime.io(), .fromMilliseconds(10));
     }
 }
 

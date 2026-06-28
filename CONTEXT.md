@@ -48,7 +48,7 @@ the reverse:
 ```text
 ai        depends on std (+ runtime mechanism for I/O). knows nothing above it.
 agent     depends on std, ai, runtime. must not import coding_agent or tui.
-runtime   depends on std + vendored zio. pure mechanism, no product policy.
+runtime   depends on std; vendored zio is private backend adapter only. pure mechanism, no product policy.
 tui       depends on std + vendored vaxis only. no runtime, agent, ai, or coding_agent.
 coding_agent  depends on std, ai, agent, and runtime. no tui or concrete frontend adapters.
 ```
@@ -61,12 +61,12 @@ two facts follow from this and are load-bearing:
 - `src/agent` is product-agnostic. it runs any tool set against any provider;
   Zi-specific policy lives in `coding_agent`.
 
-vendored dependencies are deliberate and minimal: `zio` (lalinsky/zio, the Zig
-0.16 `std.Io` runtime — task spawning, channels, select, cancellation),
-`libvaxis` (terminal raw mode, parsing, screen/window primitives, diff/render,
-Unicode width), and the small transitive libvaxis packages `zigimg` and
-`uucode`. The model catalog is generated into `src/ai/models.generated.zig` via
-`zig build generate-models`.
+vendored dependencies are deliberate and minimal: `zio` (lalinsky/zio, current
+private `std.Io` backend adapter while runtime is migrated away from zio-native
+wait protocols), `libvaxis` (terminal raw mode, parsing, screen/window
+primitives, diff/render, Unicode width), and the small transitive libvaxis
+packages `zigimg` and `uucode`. The model catalog is generated into
+`src/ai/models.generated.zig` via `zig build generate-models`.
 
 ## coding-agent spine
 

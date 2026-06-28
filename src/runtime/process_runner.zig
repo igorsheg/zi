@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const zio = @import("zio");
 const async_runtime = @import("Runtime.zig");
 const cancel = @import("cancel.zig");
+const WakeEvent = @import("wake_event.zig").WakeEvent;
 const ByteBuilder = @import("byte_builder.zig").ByteBuilder;
 const Runtime = async_runtime.Runtime;
 
@@ -51,9 +51,14 @@ const OutputChunk = struct {
 
 const OutputBuffer = struct {
     bytes: ByteBuilder,
-    output_fault: *zio.ResetEvent,
+    io: std.Io,
+    wake: *WakeEvent,
     limit_exceeded: bool = false,
     err: ?anyerror = null,
+
+    fn fault(self: *OutputBuffer) void {
+        self.wake.set(self.io);
+    }
 
     fn deinit(self: *OutputBuffer) void {
         self.bytes.deinit();
@@ -64,11 +69,49 @@ const OutputBuffer = struct {
 const process_wait_error = @typeInfo(@typeInfo(@TypeOf(waitForProcess)).@"fn".return_type.?)
     .error_union.error_set;
 const ProcessWaitResult = process_wait_error!std.process.Child.Term;
+const TimeoutResult = std.Io.Cancelable!void;
+const CancelWaitResult = error{ OperationCancelled, Canceled }!void;
 const ProcessWaitState = enum {
     before_wait,
     active,
     drained,
 };
+
+fn ResultSlot(comptime Result: type) type {
+    return struct {
+        ready: std.atomic.Value(bool) = .init(false),
+        result: Result = undefined,
+        io: std.Io,
+        wake: *WakeEvent,
+
+        fn complete(self: *@This(), result: Result) void {
+            self.result = result;
+            self.ready.store(true, .release);
+            self.wake.set(self.io);
+        }
+
+        fn isReady(self: *const @This()) bool {
+            return self.ready.load(.acquire);
+        }
+    };
+}
+
+const ProcessWaitSlot = ResultSlot(ProcessWaitResult);
+const TimeoutSlot = ResultSlot(TimeoutResult);
+const CancelSlot = ResultSlot(CancelWaitResult);
+const OutputChunkQueue = std.Io.Queue(OutputChunk);
+
+fn publishProcessWait(slot: *ProcessWaitSlot, io: std.Io, child: *std.process.Child) void {
+    slot.complete(waitForProcess(io, child));
+}
+
+fn publishTimeout(slot: *TimeoutSlot, io: std.Io, timeout_ms: u64) void {
+    slot.complete(waitForTimeout(io, timeout_ms));
+}
+
+fn publishCancel(slot: *CancelSlot, token: cancel.CancelToken) void {
+    slot.complete(waitForCancel(token));
+}
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -76,6 +119,7 @@ pub fn run(
     task_runtime: *Runtime,
     options: RunOptions,
 ) !std.process.RunResult {
+    _ = task_runtime;
     std.debug.assert(options.argv.len > 0);
     std.debug.assert(options.timeout_ms > 0);
     std.debug.assert(options.termination_grace_ms > 0);
@@ -99,43 +143,49 @@ pub fn run(
     child.stdout = null;
     child.stderr = null;
 
-    var output_fault: zio.ResetEvent = .init;
+    var owner_wake: WakeEvent = .init;
     var output_chunks_storage: [output_chunk_queue_capacity]OutputChunk = undefined;
-    var output_chunks = zio.Channel(OutputChunk).init(&output_chunks_storage);
-    defer output_chunks.close(.immediate);
+    var output_chunks = OutputChunkQueue.init(&output_chunks_storage);
 
     var stdout_buffer: OutputBuffer = .{
         .bytes = ByteBuilder.initBounded(allocator, options.max_stdout_bytes),
-        .output_fault = &output_fault,
+        .io = io,
+        .wake = &owner_wake,
     };
     defer stdout_buffer.deinit();
     var stderr_buffer: OutputBuffer = .{
         .bytes = ByteBuilder.initBounded(allocator, options.max_stderr_bytes),
-        .output_fault = &output_fault,
+        .io = io,
+        .wake = &owner_wake,
     };
     defer stderr_buffer.deinit();
 
-    var stdout_reader = try task_runtime.spawn(readPipeToBuffer, .{
-        zio.Pipe.fromFd(stdout_file.handle),
+    var stdout_reader = try std.Io.concurrent(io, readPipeToBuffer, .{
+        io,
+        stdout_file,
         &stdout_buffer,
         OutputStream.stdout,
         &output_chunks,
+        &owner_wake,
     });
-    defer stdout_reader.cancel();
-    var stderr_reader = try task_runtime.spawn(readPipeToBuffer, .{
-        zio.Pipe.fromFd(stderr_file.handle),
+    defer stdout_reader.cancel(io);
+    var stderr_reader = try std.Io.concurrent(io, readPipeToBuffer, .{
+        io,
+        stderr_file,
         &stderr_buffer,
         OutputStream.stderr,
         &output_chunks,
+        &owner_wake,
     });
-    defer stderr_reader.cancel();
+    defer stderr_reader.cancel(io);
 
-    var process_wait = try task_runtime.spawn(waitForProcess, .{ io, &child });
+    var process_slot: ProcessWaitSlot = .{ .io = io, .wake = &owner_wake };
+    var process_wait = try std.Io.concurrent(io, publishProcessWait, .{ &process_slot, io, &child });
     process_wait_state = .active;
-    defer if (process_wait_state == .active) process_wait.cancel();
+    defer if (process_wait_state == .active) process_wait.cancel(io);
     errdefer if (process_wait_state == .active) {
         terminateAndDrainProcess(
-            task_runtime,
+            io,
             &child,
             &process_wait,
             options.termination_grace_ms,
@@ -143,133 +193,103 @@ pub fn run(
             &stdout_reader,
             &stderr_reader,
         ) catch {
-            process_wait.cancel();
-            stdout_reader.cancel();
-            stderr_reader.cancel();
+            process_wait.cancel(io);
+            stdout_reader.cancel(io);
+            stderr_reader.cancel(io);
             process_wait_state = .drained;
         };
     };
-    var timeout_wait = try task_runtime.spawn(waitForTimeout, .{options.timeout_ms});
-    defer timeout_wait.cancel();
 
-    const term = if (options.cancel_token) |cancel_token| blk: {
-        var cancel_wait = try task_runtime.spawn(waitForCancel, .{cancel_token});
-        defer cancel_wait.cancel();
-        while (true) {
-            const output_receive = output_chunks.asyncReceive();
-            switch (try zio.select(.{
-                .process = &process_wait,
-                .timeout = &timeout_wait,
-                .cancel = &cancel_wait,
-                .output_fault = &output_fault,
-                .output = output_receive,
-            })) {
-                .process => |result| break :blk try completeProcessWait(result, &process_wait_state),
-                .timeout => {
-                    try terminateAndDrainProcess(
-                        task_runtime,
-                        &child,
-                        &process_wait,
-                        options.termination_grace_ms,
-                        &process_wait_state,
-                        &stdout_reader,
-                        &stderr_reader,
-                    );
-                    return error.Timeout;
-                },
-                .cancel => |result| {
-                    result catch |err| switch (err) {
-                        error.OperationCancelled => {
-                            try terminateAndDrainProcess(
-                                task_runtime,
-                                &child,
-                                &process_wait,
-                                options.termination_grace_ms,
-                                &process_wait_state,
-                                &stdout_reader,
-                                &stderr_reader,
-                            );
-                            return error.OperationCancelled;
-                        },
-                        error.Canceled => return error.Canceled,
-                    };
-                    std.debug.assert(false);
-                    return error.Canceled;
-                },
-                .output_fault => {
-                    try terminateAndDrainProcess(
-                        task_runtime,
-                        &child,
-                        &process_wait,
-                        options.termination_grace_ms,
-                        &process_wait_state,
-                        &stdout_reader,
-                        &stderr_reader,
-                    );
-                    if (stdout_buffer.err) |err| return err;
-                    if (stderr_buffer.err) |err| return err;
-                    return error.StreamTooLong;
-                },
-                .output => |result| {
-                    const chunk = result catch |err| switch (err) {
-                        error.ChannelClosed => continue,
-                    };
-                    try emitOutputChunk(options.on_output, chunk);
-                },
-            }
+    var timeout_slot: TimeoutSlot = .{ .io = io, .wake = &owner_wake };
+    var timeout_wait = try std.Io.concurrent(io, publishTimeout, .{ &timeout_slot, io, options.timeout_ms });
+    defer timeout_wait.cancel(io);
+
+    var cancel_slot: CancelSlot = .{ .io = io, .wake = &owner_wake };
+    var cancel_wait: ?std.Io.Future(void) = if (options.cancel_token) |cancel_token|
+        try std.Io.concurrent(io, publishCancel, .{ &cancel_slot, cancel_token })
+    else
+        null;
+    defer if (cancel_wait) |*future| future.cancel(io);
+
+    const term = while (true) {
+        try drainOutputChunks(io, options.on_output, &output_chunks);
+
+        if (process_slot.isReady()) {
+            process_wait.await(io);
+            break try completeProcessWait(process_slot.result, &process_wait_state);
         }
-    } else blk: {
-        while (true) {
-            const output_receive = output_chunks.asyncReceive();
-            switch (try zio.select(.{
-                .process = &process_wait,
-                .timeout = &timeout_wait,
-                .output_fault = &output_fault,
-                .output = output_receive,
-            })) {
-                .process => |result| break :blk try completeProcessWait(result, &process_wait_state),
-                .timeout => {
-                    try terminateAndDrainProcess(
-                        task_runtime,
-                        &child,
-                        &process_wait,
-                        options.termination_grace_ms,
-                        &process_wait_state,
-                        &stdout_reader,
-                        &stderr_reader,
-                    );
-                    return error.Timeout;
-                },
-                .output_fault => {
-                    try terminateAndDrainProcess(
-                        task_runtime,
-                        &child,
-                        &process_wait,
-                        options.termination_grace_ms,
-                        &process_wait_state,
-                        &stdout_reader,
-                        &stderr_reader,
-                    );
-                    if (stdout_buffer.err) |err| return err;
-                    if (stderr_buffer.err) |err| return err;
-                    return error.StreamTooLong;
-                },
-                .output => |result| {
-                    const chunk = result catch |err| switch (err) {
-                        error.ChannelClosed => continue,
-                    };
-                    try emitOutputChunk(options.on_output, chunk);
-                },
-            }
+
+        if (timeout_slot.isReady()) {
+            timeout_wait.await(io);
+            try terminateAndDrainProcess(
+                io,
+                &child,
+                &process_wait,
+                options.termination_grace_ms,
+                &process_wait_state,
+                &stdout_reader,
+                &stderr_reader,
+            );
+            return error.Timeout;
         }
+
+        if (options.cancel_token != null and cancel_slot.isReady()) {
+            cancel_wait.?.await(io);
+            cancel_slot.result catch |err| switch (err) {
+                error.OperationCancelled => {
+                    try terminateAndDrainProcess(
+                        io,
+                        &child,
+                        &process_wait,
+                        options.termination_grace_ms,
+                        &process_wait_state,
+                        &stdout_reader,
+                        &stderr_reader,
+                    );
+                    return error.OperationCancelled;
+                },
+                error.Canceled => return error.Canceled,
+            };
+            std.debug.assert(false);
+            return error.Canceled;
+        }
+
+        if (stdout_buffer.err != null or stderr_buffer.err != null or
+            stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded)
+        {
+            try terminateAndDrainProcess(
+                io,
+                &child,
+                &process_wait,
+                options.termination_grace_ms,
+                &process_wait_state,
+                &stdout_reader,
+                &stderr_reader,
+            );
+            if (stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded) return error.StreamTooLong;
+            if (stdout_buffer.err) |err| return err;
+            if (stderr_buffer.err) |err| return err;
+            return error.StreamTooLong;
+        }
+
+        owner_wake.reset();
+        try drainOutputChunks(io, options.on_output, &output_chunks);
+        if (process_slot.isReady() or timeout_slot.isReady() or
+            (options.cancel_token != null and cancel_slot.isReady()) or
+            stdout_buffer.err != null or stderr_buffer.err != null or
+            stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded)
+        {
+            continue;
+        }
+        try owner_wake.wait(io);
     };
 
-    stdout_reader.join();
-    stderr_reader.join();
-    try drainOutputChunks(options.on_output, &output_chunks);
+    stdout_reader.await(io);
+    stderr_reader.await(io);
+    try drainOutputChunks(io, options.on_output, &output_chunks);
+    if (stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded) return error.StreamTooLong;
     if (stdout_buffer.err) |err| return err;
     if (stderr_buffer.err) |err| return err;
-    if (stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded) return error.StreamTooLong;
 
     const stdout = try stdout_buffer.bytes.toOwnedSlice();
     errdefer allocator.free(stdout);
@@ -286,8 +306,8 @@ fn waitForProcess(io: std.Io, child: *std.process.Child) !std.process.Child.Term
     return child.wait(io);
 }
 
-fn waitForTimeout(timeout_ms: u64) zio.Cancelable!void {
-    try zio.sleep(.fromMilliseconds(timeout_ms));
+fn waitForTimeout(io: std.Io, timeout_ms: u64) std.Io.Cancelable!void {
+    try io.sleep(durationFromMilliseconds(timeout_ms), .awake);
 }
 
 fn waitForCancel(token: cancel.CancelToken) error{ OperationCancelled, Canceled }!void {
@@ -307,33 +327,36 @@ fn emitOutputChunk(observer: ?OutputObserver, chunk: OutputChunk) !void {
     if (observer) |callback| try callback.call(chunk.stream, chunk.slice());
 }
 
-fn drainOutputChunks(observer: ?OutputObserver, output_chunks: *zio.Channel(OutputChunk)) !void {
+fn drainOutputChunks(io: std.Io, observer: ?OutputObserver, output_chunks: *OutputChunkQueue) !void {
     while (true) {
-        const chunk = output_chunks.tryReceive() catch |err| switch (err) {
-            error.ChannelEmpty, error.ChannelClosed => return,
+        var item: [1]OutputChunk = undefined;
+        const count = output_chunks.get(io, &item, 0) catch |err| switch (err) {
+            error.Closed => return,
+            error.Canceled => return error.Canceled,
         };
-        try emitOutputChunk(observer, chunk);
+        if (count == 0) return;
+        try emitOutputChunk(observer, item[0]);
     }
 }
 
 fn terminateAndDrainProcess(
-    task_runtime: *Runtime,
+    io: std.Io,
     child: *std.process.Child,
-    process_wait: *async_runtime.Task(ProcessWaitResult),
+    process_wait: *std.Io.Future(void),
     termination_grace_ms: u64,
     process_wait_state: *ProcessWaitState,
-    stdout_reader: *async_runtime.Task(void),
-    stderr_reader: *async_runtime.Task(void),
+    stdout_reader: *std.Io.Future(void),
+    stderr_reader: *std.Io.Future(void),
 ) !void {
     std.debug.assert(process_wait_state.* == .active);
     const process_id = child.id;
     requestChildTermination(process_id, .graceful);
-    var kill_after_grace = try task_runtime.spawn(killAfterGrace, .{ process_id, termination_grace_ms });
-    defer kill_after_grace.cancel();
-    _ = try process_wait.join();
+    var kill_after_grace = try std.Io.concurrent(io, killAfterGrace, .{ io, process_id, termination_grace_ms });
+    defer _ = kill_after_grace.cancel(io) catch {};
+    process_wait.await(io);
     process_wait_state.* = .drained;
-    stdout_reader.cancel();
-    stderr_reader.cancel();
+    stdout_reader.cancel(io);
+    stderr_reader.cancel(io);
 }
 
 const TerminationMode = enum {
@@ -341,9 +364,13 @@ const TerminationMode = enum {
     forced,
 };
 
-fn killAfterGrace(process_id: ?std.process.Child.Id, termination_grace_ms: u64) zio.Cancelable!void {
-    try zio.sleep(.fromMilliseconds(termination_grace_ms));
+fn killAfterGrace(io: std.Io, process_id: ?std.process.Child.Id, termination_grace_ms: u64) std.Io.Cancelable!void {
+    try io.sleep(durationFromMilliseconds(termination_grace_ms), .awake);
     requestChildTermination(process_id, .forced);
+}
+
+fn durationFromMilliseconds(ms: u64) std.Io.Duration {
+    return .fromMilliseconds(std.math.cast(i64, ms) orelse std.math.maxInt(i64));
 }
 
 fn requestChildTermination(process_id: ?std.process.Child.Id, mode: TerminationMode) void {
@@ -362,34 +389,43 @@ fn requestChildTermination(process_id: ?std.process.Child.Id, mode: TerminationM
 }
 
 fn readPipeToBuffer(
-    pipe: zio.Pipe,
+    io: std.Io,
+    file: std.Io.File,
     output: *OutputBuffer,
     stream: OutputStream,
-    chunks: *zio.Channel(OutputChunk),
+    chunks: *OutputChunkQueue,
+    wake: *WakeEvent,
 ) void {
-    defer pipe.close();
+    var owned_file = file;
+    defer owned_file.close(io);
     var buffer: [4096]u8 = undefined;
     while (true) {
-        const count = pipe.read(&buffer, .none) catch |err| {
-            if (err == error.BrokenPipe) return;
-            output.err = err;
-            output.output_fault.set();
-            return;
+        const count = owned_file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+            error.EndOfStream => return,
+            error.WouldBlock => {
+                async_runtime.yield() catch return;
+                continue;
+            },
+            else => {
+                output.err = err;
+                output.fault();
+                return;
+            },
         };
-        if (count == 0) return;
         output.bytes.append(buffer[0..count]) catch |err| switch (err) {
             error.CapacityExceeded => {
                 output.limit_exceeded = true;
-                output.output_fault.set();
+                output.fault();
                 return;
             },
             error.OutOfMemory => {
                 output.err = err;
-                output.output_fault.set();
+                output.fault();
                 return;
             },
         };
-        chunks.send(OutputChunk.init(stream, buffer[0..count])) catch return;
+        chunks.putOne(io, OutputChunk.init(stream, buffer[0..count])) catch return;
+        wake.set(io);
     }
 }
 
@@ -711,7 +747,7 @@ test "process runner cancellation terminates child through single wait owner" {
 
     var task_runtime = try Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel_source = try cancel.CancelSource.init(std.testing.allocator);
+    var cancel_source = try cancel.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel_source.deinit();
     const argv = [_][]const u8{ "/bin/sh", "-c", "while :; do printf x; sleep 1; done" };
 

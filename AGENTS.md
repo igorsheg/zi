@@ -47,8 +47,9 @@ ai             provider protocol, models, registry, wire adapters, streams.
                no session, UI, persistence, retry/compaction, or tool policy.
 agent          generic agent loop: transcript, tool execution, steering/follow-up
                queues, agent events, cancel source. must not import coding_agent or tui.
-runtime        zio-backed mechanism: process, select, bounded queues, cancel
-               tokens, event pipes, process runner, byte/json ownership. no app policy.
+runtime        std.Io-first mechanism: backend host, process, bounded queues,
+               cancel tokens, event pipes, process runner, byte/json ownership.
+               zio may exist only as a private backend adapter. no app policy.
 coding_agent   the app core: resources, settings, model/session config, tools,
                prompt preflight, persistence, public events, host replacement,
                CLI, and typed client protocol. no TUI or concrete frontend policy.
@@ -61,7 +62,7 @@ import rules (enforced by review; they are real today):
 
 - `ai` imports std (+ runtime for I/O). nothing above it.
 - `agent` imports std, ai, runtime. never coding_agent or tui.
-- `runtime` imports std + vendored zio. never product modules.
+- `runtime` imports std and may import vendored zio only through private backend adapters. never product modules.
 - `tui` imports std + vendored vaxis only. never runtime, ai, agent, coding_agent.
 - `coding_agent` imports ai, agent, runtime, and std. never tui or frontend adapters.
 - concrete frontends live outside `src/coding_agent`; a TUI adapter may import both
@@ -69,10 +70,11 @@ import rules (enforced by review; they are real today):
 
 ## runtime discipline
 
-`runtime` is mechanism, not policy. the shipped substrate is zio: `Process`,
-`select`, `ResetEvent`, `Timeout`, `BoundedQueue`, `ReadableFd`, `EventPipe`,
-`CancelSource`/`CancelToken`, `runProcess`. use them; do not build a second
-runtime above them.
+`runtime` is mechanism, not policy. its public seam is `std.Io` plus Zi-owned
+bounded mechanisms (`Process`, `BoundedQueue`, `CancelSource`/`CancelToken`,
+`EventPipe`, `runProcess`). zio is the current backend adapter, not product
+architecture. do not expose zio-native types or wait protocols above the backend
+adapter.
 
 the invariant, whatever the mechanism:
 
@@ -93,12 +95,12 @@ rules:
 - cancellation intent is not cancellation completion. observe the terminal outcome.
 - shutdown is request -> stop accepting -> cancel -> drain -> stopped -> deinit.
   `deinit` must not race active work.
-- do not build a central operation/completion/limits table speculatively. zio
-  `select` + per-owner bounded queues already provide the property.
-- `zio` is the substrate, not bare `std.Io`: zio's `std.Io` is a proactor that
-  cannot poll pipe/tty fds, so pipe/tty I/O (`runProcess`, `ReadableFd`) and
-  coordination stay zio-native. `std.process.run` / `Io.File.MultiReader` do not
-  work for child-output capture on zio — do not reach for them.
+- do not build a central operation/completion/limits table speculatively.
+  prefer coalesced owner wakes plus bounded queues/result slots. if a backend
+  select remains necessary, keep it private to `runtime`.
+- pipe/tty I/O (`runProcess`, terminal input readiness) is runtime-owned. do not
+  reach for unbounded `std.process.run`-style capture; preserve explicit caps,
+  cancellation, terminate/drain order, and owner-loop wake semantics.
 
 ## coding-agent rules
 

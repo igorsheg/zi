@@ -123,16 +123,6 @@ pub const AuthStore = struct {
         self.credentials = credentials;
     }
 
-    fn lockFile(self: *const AuthStore, io: std.Io) !std.Io.File {
-        const dir = self.dir orelse return error.AuthStoreReadOnly;
-        const auth_path = self.auth_path orelse return error.AuthStoreReadOnly;
-        const lock_path = try std.fmt.allocPrint(self.allocator, "{s}.lock", .{auth_path});
-        defer self.allocator.free(lock_path);
-        const parent = std.fs.path.dirname(lock_path) orelse ".";
-        try dir.createDirPath(io, parent);
-        return dir.createFile(io, lock_path, .{ .read = true, .truncate = false, .lock = .exclusive });
-    }
-
     pub fn setOAuth(self: *AuthStore, io: std.Io, provider: ai.Provider, credentials: ai.OAuthCredentials) !void {
         var owned = try copyOAuthCredential(self.allocator, provider, credentials);
         errdefer owned.deinit(self.allocator);
@@ -292,12 +282,7 @@ pub const AuthManager = struct {
         const credentials = self.findOAuthCredentials(provider.id) orelse return null;
         if (now_ms < credentials.expires) return credentials;
 
-        var lock_file = self.store.lockFile(self.io) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return self.refreshExpiredUnlocked(provider, credentials),
-        };
-        defer lock_file.close(self.io);
-
+        // ponytail: zio-backed std.Io panics on file locks today; reload before refresh is the useful part.
         try self.store.reload(self.io);
         const current = self.findOAuthCredentials(provider.id) orelse return null;
         if (now_ms < current.expires) return current;

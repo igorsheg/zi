@@ -352,7 +352,7 @@ pub fn startContinueRun(self: *AgentSession) !*PromptRun {
 pub fn applyPromptRunProgress(
     self: *AgentSession,
     run: *PromptRun,
-    progress: @TypeOf(run.stream.asyncNext()).Result,
+    progress: ?agent_mod.loop.StreamEvent,
 ) !bool {
     if (!run.isActive()) return false;
     var event = progress orelse {
@@ -556,7 +556,7 @@ pub fn drainPublicEvent(self: *AgentSession) ?client_protocol.ClientEvent {
     return self.event_drain.drainPublicEvent();
 }
 
-pub fn publicEventWake(self: *AgentSession) *runtime.ResetEvent {
+pub fn publicEventWake(self: *AgentSession) *runtime.WakeEvent {
     return self.event_drain.publicEventWake();
 }
 
@@ -785,7 +785,7 @@ pub fn startCompactionRun(
     const run = try self.allocator.create(CompactionRun);
     errdefer self.allocator.destroy(run);
     run.* = .{
-        .cancel = try runtime.CancelSource.init(self.allocator),
+        .cancel = try runtime.CancelSource.init(self.allocator, self.io),
         .reason = reason,
         .will_retry = will_retry,
         .input = input,
@@ -823,7 +823,7 @@ pub fn startCompactionRun(
 pub fn applyCompactionRunProgress(
     self: *AgentSession,
     run: *CompactionRun,
-    progress: @TypeOf(run.stream.asyncNext()).Result,
+    progress: ?agent_mod.loop.StreamEvent,
 ) !bool {
     if (run.state == .settled) return false;
     var event = progress orelse {
@@ -1469,13 +1469,14 @@ fn initCompactionTestSession(
 fn driveCompactionRun(session: *AgentSession, run: *AgentSession.CompactionRun) !void {
     var iterations: usize = 0;
     while (iterations < 10_000) : (iterations += 1) {
-        var progress = run.stream.asyncNext();
-        var idle = runtime.Timeout.fromMilliseconds(1);
-        switch (try runtime.select(.{ .progress = &progress, .idle = &idle })) {
-            .progress => |result| {
-                if (!try session.applyCompactionRunProgress(run, result)) return;
+        switch (run.stream.poll()) {
+            .event => |event| {
+                if (!try session.applyCompactionRunProgress(run, event)) return;
             },
-            .idle => {},
+            .terminal => {
+                if (!try session.applyCompactionRunProgress(run, null)) return;
+            },
+            .empty => try runtime.yield(),
         }
     }
     return error.CompactionRunDidNotSettle;
