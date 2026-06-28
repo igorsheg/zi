@@ -20,10 +20,36 @@ const slash_commands = @import("slash_commands.zig");
 
 pub const WakeResult = enum { input, session, frame };
 
+pub const StepTiming = struct {
+    flush_pending_ns: u64 = 0,
+    completion_ns: u64 = 0,
+    commands_ns: u64 = 0,
+    prompt_progress_ns: u64 = 0,
+    prompt_progress_poll_ns: u64 = 0,
+    prompt_progress_apply_ns: u64 = 0,
+    prompt_progress_public_event_drain_ns: u64 = 0,
+    prompt_progress_yield_ns: u64 = 0,
+    public_event_drain_ns: u64 = 0,
+};
+
 const session_command_message_bytes_max: usize = 160;
 const session_public_events_per_turn_max: usize = 16;
+const prompt_progress_events_per_turn_max: usize = 16;
+const prompt_progress_time_budget_ns: u64 = 6 * std.time.ns_per_ms;
 const active_work_poll_interval_ms: u64 = 16;
 const SessionStats = client_protocol.PromptCommandSessionStats;
+
+const PromptProgressTiming = struct {
+    poll_ns: u64 = 0,
+    apply_ns: u64 = 0,
+    public_event_drain_ns: u64 = 0,
+    yield_ns: u64 = 0,
+};
+
+const ActiveProgressTiming = struct {
+    apply_ns: u64 = 0,
+    public_event_drain_ns: u64 = 0,
+};
 
 fn ignoreBestEffortError(err: anyerror) void {
     std.debug.assert(@errorName(err).len > 0);
@@ -342,6 +368,7 @@ pub const SessionRuntime = struct {
     events: client_protocol.EventQueue,
     retained_events: RetainedEventLedger,
     owner_wake: runtime.WakeEvent = .init,
+    frontend_wake: ?*runtime.WakeEvent = null,
     active: ?ActiveOperation = null,
     completion_load: ?CompletionLoad = null,
     pending_file_completion: ?PendingFileCompletion = null,
@@ -499,6 +526,24 @@ pub const SessionRuntime = struct {
             (self.completion_load != null and self.completion_load.?.result_slot.isReady());
     }
 
+    pub fn setFrontendWake(self: *SessionRuntime, wake: ?*runtime.WakeEvent) void {
+        self.frontend_wake = wake;
+        if (self.active) |*operation| switch (operation.phase) {
+            .running => |run| self.watchRunProgress(run),
+            .compacting => |run| self.watchRunProgress(run),
+            .retry_wait => {},
+        };
+        if (self.completion_load) |*load| load.result_slot.wake = self.ownerWake();
+    }
+
+    pub fn hasReadyWork(self: *const SessionRuntime) bool {
+        return self.hasReadySessionWork();
+    }
+
+    pub fn waitDelayMs(self: *const SessionRuntime, frame_ms: u64) u64 {
+        return self.nextWaitTimeoutMs(frame_ms);
+    }
+
     pub fn rejectClientCommand(
         self: *SessionRuntime,
         request_id: ?client_protocol.RequestId,
@@ -519,17 +564,18 @@ pub const SessionRuntime = struct {
         if (frame_ms == 0) return .frame;
 
         const timeout_ms = self.nextWaitTimeoutMs(frame_ms);
-        self.owner_wake.reset();
+        const wake = self.ownerWake();
+        wake.reset();
 
         if (!has_input_fd or self.hasOwnerWakeProducer()) {
-            self.owner_wake.waitTimeout(self.services.io, .{ .duration = .{
+            wake.waitTimeout(self.services.io, .{ .duration = .{
                 .raw = .fromMilliseconds(@intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i64)))))),
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => {},
                 error.Canceled => return error.Canceled,
             };
-            if (self.owner_wake.isSet()) self.owner_wake.reset();
+            if (wake.isSet()) wake.reset();
         } else if (try runtime.pollReadableFdTimeout(input_fd, timeout_ms)) {
             return .input;
         }
@@ -578,57 +624,125 @@ pub const SessionRuntime = struct {
         return @max(@as(u64, 1), std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch 1);
     }
 
+    fn ownerWake(self: *SessionRuntime) *runtime.WakeEvent {
+        return self.frontend_wake orelse &self.owner_wake;
+    }
+
     fn wakeOwner(self: *SessionRuntime) void {
-        self.owner_wake.set(self.services.io);
+        self.ownerWake().set(self.services.io);
     }
 
     fn watchRunProgress(self: *SessionRuntime, run: anytype) void {
-        run.stream.setWake(self.services.io, &self.owner_wake);
+        run.stream.setWake(self.services.io, self.ownerWake());
     }
 
     fn createCompletionResultSlot(self: *SessionRuntime) !*CompletionResultSlot {
         const slot = try self.allocator.create(CompletionResultSlot);
-        slot.* = .{ .io = self.services.io, .wake = &self.owner_wake };
+        slot.* = .{ .io = self.services.io, .wake = self.ownerWake() };
         return slot;
     }
 
     pub fn step(self: *SessionRuntime) !void {
-        if (!self.flushPendingEvent()) return;
+        _ = try self.stepTimed();
+    }
+
+    pub fn stepTimed(self: *SessionRuntime) !StepTiming {
+        var timing: StepTiming = .{};
+        var start = self.nowNanoseconds();
+        if (!self.flushPendingEvent()) {
+            timing.flush_pending_ns = elapsedNs(start, self.nowNanoseconds());
+            return timing;
+        }
+        timing.flush_pending_ns = elapsedNs(start, self.nowNanoseconds());
+
+        start = self.nowNanoseconds();
         if (self.hasEventCapacity()) try self.finishReadyCompletionLoad();
         if (self.hasEventCapacity()) try self.startPendingFileCompletionLoad();
+        timing.completion_ns = elapsedNs(start, self.nowNanoseconds());
+
+        start = self.nowNanoseconds();
         while (self.hasEventCapacity()) {
             const envelope = self.commands.pop() orelse break;
             var command = envelope;
             defer command.deinit(self.allocator);
             try self.applyCommand(command);
-            if (!self.flushPendingEvent()) return;
+            if (!self.flushPendingEvent()) {
+                timing.commands_ns = elapsedNs(start, self.nowNanoseconds());
+                return timing;
+            }
         }
-        if (!self.hasEventCapacity()) return;
+        timing.commands_ns = elapsedNs(start, self.nowNanoseconds());
+
+        if (!self.hasEventCapacity()) return timing;
         self.startDueRetry();
-        self.stepPromptProgressBounded(64) catch |err| self.failActiveOperation(err);
+        start = self.nowNanoseconds();
+        const prompt_timing = self.stepPromptProgressBounded(
+            prompt_progress_events_per_turn_max,
+            prompt_progress_time_budget_ns,
+        ) catch |err| blk: {
+            self.failActiveOperation(err);
+            break :blk PromptProgressTiming{};
+        };
+        timing.prompt_progress_ns = elapsedNs(start, self.nowNanoseconds());
+        timing.prompt_progress_poll_ns = prompt_timing.poll_ns;
+        timing.prompt_progress_apply_ns = prompt_timing.apply_ns;
+        timing.prompt_progress_public_event_drain_ns = prompt_timing.public_event_drain_ns;
+        timing.prompt_progress_yield_ns = prompt_timing.yield_ns;
         self.startDueRetry();
-        if (!self.flushPendingEvent()) return;
-        self.drainSessionEvents(null) catch return;
+
+        start = self.nowNanoseconds();
+        if (!self.flushPendingEvent()) {
+            timing.flush_pending_ns += elapsedNs(start, self.nowNanoseconds());
+            return timing;
+        }
+        timing.flush_pending_ns += elapsedNs(start, self.nowNanoseconds());
+        start = self.nowNanoseconds();
+        self.drainSessionEvents(null) catch return timing;
+        timing.public_event_drain_ns = elapsedNs(start, self.nowNanoseconds());
+        return timing;
     }
 
-    fn stepPromptProgressBounded(self: *SessionRuntime, limit: usize) !void {
+    fn stepPromptProgressBounded(
+        self: *SessionRuntime,
+        limit: usize,
+        time_budget_ns: u64,
+    ) !PromptProgressTiming {
+        var timing: PromptProgressTiming = .{};
+        const started_ns = self.nowNanoseconds();
         var count: usize = 0;
         while (count < limit) : (count += 1) {
-            const active = if (self.active) |*operation| operation else return;
+            const active = if (self.active) |*operation| operation else return timing;
+            var start = self.nowNanoseconds();
             const poll = switch (active.phase) {
                 .running => |run| run.stream.poll(),
                 .compacting => |run| run.stream.poll(),
-                .retry_wait => return,
+                .retry_wait => return timing,
             };
+            timing.poll_ns += elapsedNs(start, self.nowNanoseconds());
             switch (poll) {
-                .event => |event| try self.applyActiveProgress(event),
-                .terminal => try self.applyActiveProgress(null),
+                .event => |event| {
+                    start = self.nowNanoseconds();
+                    const active_timing = try self.applyActiveProgressTimed(event);
+                    timing.apply_ns += elapsedNs(start, self.nowNanoseconds());
+                    timing.public_event_drain_ns += active_timing.public_event_drain_ns;
+                },
+                .terminal => {
+                    start = self.nowNanoseconds();
+                    const active_timing = try self.applyActiveProgressTimed(null);
+                    timing.apply_ns += elapsedNs(start, self.nowNanoseconds());
+                    timing.public_event_drain_ns += active_timing.public_event_drain_ns;
+                },
                 .empty => {
+                    start = self.nowNanoseconds();
                     try runtime.yield();
-                    return;
+                    timing.yield_ns += elapsedNs(start, self.nowNanoseconds());
+                    return timing;
                 },
             }
+            if (count + 1 == limit) continue;
+            if (elapsedNs(started_ns, self.nowNanoseconds()) >= time_budget_ns) return timing;
         }
+        return timing;
     }
 
     /// Begin the armed retry run once its backoff deadline has passed.
@@ -650,6 +764,11 @@ pub const SessionRuntime = struct {
         self.watchRunProgress(run);
         active.phase = .{ .running = run };
         self.drainSessionEvents(active.request_id) catch |err| ignoreBestEffortError(err);
+    }
+
+    fn elapsedNs(start_ns: i96, end_ns: i96) u64 {
+        if (end_ns <= start_ns) return 0;
+        return @intCast(end_ns - start_ns);
     }
 
     fn nowNanoseconds(self: *const SessionRuntime) i96 {
@@ -927,13 +1046,16 @@ pub const SessionRuntime = struct {
         try self.enqueueSessionChrome(request_id);
     }
 
-    fn applyActiveProgress(self: *SessionRuntime, result: anytype) !void {
-        const active = if (self.active) |*operation| operation else return;
+    fn applyActiveProgressTimed(self: *SessionRuntime, result: anytype) !ActiveProgressTiming {
+        var timing: ActiveProgressTiming = .{};
+        const active = if (self.active) |*operation| operation else return timing;
         switch (active.phase) {
             .running => |run| {
                 const more = try self.session.applyPromptRunProgress(run, result);
+                const start = self.nowNanoseconds();
                 try self.drainSessionEvents(active.request_id);
-                if (more) return;
+                timing.public_event_drain_ns += elapsedNs(start, self.nowNanoseconds());
+                if (more) return timing;
                 // The run settled. Destroy it, then act on the session's
                 // verdict. State transitions happen before any fallible emit
                 // so a full event queue can never leave the phase pointing
@@ -942,21 +1064,29 @@ pub const SessionRuntime = struct {
                 const verdict = self.session.settlePromptRun(.{
                     .overflow_count_before = active.overflow_count_before,
                     .overflow_retry_used = active.overflow_retry_used,
-                }) catch |err| return self.finishOperationRejected(err);
+                }) catch |err| {
+                    try self.finishOperationRejected(err);
+                    return timing;
+                };
                 try self.applyVerdict(active, verdict);
+                return timing;
             },
             .compacting => |run| {
                 const more = try self.session.applyCompactionRunProgress(run, result);
+                const start = self.nowNanoseconds();
                 try self.drainSessionEvents(active.request_id);
-                if (more) return;
+                timing.public_event_drain_ns += elapsedNs(start, self.nowNanoseconds());
+                if (more) return timing;
                 const verdict = self.session.settleCompactionRun(run) catch |err| {
                     self.session.destroyCompactionRun(run);
-                    return self.finishOperationRejected(err);
+                    try self.finishOperationRejected(err);
+                    return timing;
                 };
                 self.session.destroyCompactionRun(run);
                 try self.applyVerdict(active, verdict);
+                return timing;
             },
-            .retry_wait => return,
+            .retry_wait => return timing,
         }
     }
 

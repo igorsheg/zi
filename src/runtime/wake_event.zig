@@ -49,3 +49,46 @@ test "wake event reports timeout while unset" {
         .clock = .awake,
     } }));
 }
+
+test "wake event set before wait is observed" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var wake: WakeEvent = .init;
+    wake.set(io);
+    try wake.waitTimeout(io, .{ .duration = .{
+        .raw = .fromMilliseconds(1),
+        .clock = .awake,
+    } });
+    try std.testing.expect(wake.isSet());
+}
+
+test "wake event set from raw thread wakes std io waiter" {
+    const Producer = struct {
+        io: std.Io,
+        wake: *WakeEvent,
+        ready: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            while (!self.ready.load(.acquire)) std.Thread.yield() catch {};
+            self.wake.set(self.io);
+        }
+    };
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var wake: WakeEvent = .init;
+    var producer: Producer = .{ .io = io, .wake = &wake };
+    const thread = try std.Thread.spawn(.{}, Producer.run, .{&producer});
+    defer thread.join();
+
+    producer.ready.store(true, .release);
+    try wake.waitTimeout(io, .{ .duration = .{
+        .raw = .fromMilliseconds(1000),
+        .clock = .awake,
+    } });
+    try std.testing.expect(wake.isSet());
+}

@@ -6,7 +6,24 @@ pub const Phase = enum {
     poll_input,
     drain_input,
     session_step,
+    session_step_flush_pending,
+    session_step_completion,
+    session_step_commands,
+    session_step_prompt_progress,
+    session_step_prompt_progress_poll,
+    session_step_prompt_progress_apply,
+    session_step_prompt_progress_public_event_drain,
+    session_step_prompt_progress_yield,
+    session_step_public_event_drain,
     client_event_drain,
+    client_event_accept_snapshot,
+    client_event_accept_agent,
+    client_event_accept_history,
+    client_event_accept_completion,
+    client_event_accept_session_chrome,
+    client_event_accept_prompt_command,
+    client_event_accept_replay,
+    client_event_accept_other,
     pending_ui_work,
     tick_time,
     render_draw_foreground,
@@ -34,6 +51,7 @@ pub const Phase = enum {
     wait_input,
     wait_session,
     wait_frame,
+    input_reader_enqueue_to_owner_drain,
     pending_message,
     pending_thinking,
     assistant_queue_wait,
@@ -55,7 +73,6 @@ const Sample = struct {
 pub const Stats = struct {
     enabled: bool = false,
     samples: [sample_count_max]Sample = undefined,
-    sample_start: usize = 0,
     sample_len: usize = 0,
     max_ns: [@typeInfo(Phase).@"enum".fields.len]u64 = @splat(0),
     foreground_with_pending_background_count: usize = 0,
@@ -71,17 +88,24 @@ pub const Stats = struct {
 
     pub fn record(self: *Stats, phase: Phase, duration_ns: u64) void {
         if (!self.enabled) return;
-        const index = @intFromEnum(phase);
-        self.max_ns[index] = @max(self.max_ns[index], duration_ns);
+        const phase_index = @intFromEnum(phase);
+        self.max_ns[phase_index] = @max(self.max_ns[phase_index], duration_ns);
         if (duration_ns < slow_threshold_ns or isWaitPhase(phase)) return;
         const sample: Sample = .{ .phase = phase, .duration_ns = duration_ns };
         if (self.sample_len < self.samples.len) {
-            self.samples[(self.sample_start + self.sample_len) % self.samples.len] = sample;
+            self.samples[self.sample_len] = sample;
             self.sample_len += 1;
-        } else {
-            self.samples[self.sample_start] = sample;
-            self.sample_start = (self.sample_start + 1) % self.samples.len;
+            return;
         }
+
+        var replace_index: usize = 0;
+        var replace_ns = self.samples[0].duration_ns;
+        for (self.samples[1..], 1..) |stored, sample_index| {
+            if (stored.duration_ns >= replace_ns) continue;
+            replace_index = sample_index;
+            replace_ns = stored.duration_ns;
+        }
+        if (duration_ns > replace_ns) self.samples[replace_index] = sample;
     }
 
     pub fn noteRender(self: *Stats, priority: anytype) void {
@@ -134,9 +158,20 @@ pub const Stats = struct {
             self.background_render_animation_count,
         }) catch return;
         if (self.sample_len == 0) return;
-        writer.writeAll("zi tui trace slow samples:\n") catch return;
-        for (0..self.sample_len) |offset| {
-            const sample = self.samples[(self.sample_start + offset) % self.samples.len];
+        writer.writeAll("zi tui trace slowest samples:\n") catch return;
+        var printed: [sample_count_max]bool = @splat(false);
+        for (0..self.sample_len) |_| {
+            var best_index: ?usize = null;
+            for (self.samples[0..self.sample_len], 0..) |sample, index| {
+                if (printed[index]) continue;
+                if (best_index) |best| {
+                    if (sample.duration_ns <= self.samples[best].duration_ns) continue;
+                }
+                best_index = index;
+            }
+            const index = best_index orelse break;
+            printed[index] = true;
+            const sample = self.samples[index];
             writer.print("  {s}: {d}.{d:0>3}ms\n", .{
                 @tagName(sample.phase),
                 sample.duration_ns / std.time.ns_per_ms,

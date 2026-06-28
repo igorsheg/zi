@@ -16,6 +16,7 @@ const tui = @import("../../tui/root.zig");
 const tool_view = @import("tool_view.zig");
 const trace_mod = @import("trace.zig");
 const presentation_queue = @import("presentation_queue.zig");
+const input_reader_mod = @import("input_reader.zig");
 
 pub const StartupAction = enum {
     none,
@@ -69,6 +70,7 @@ const transcript_append_max = tui.Transcript.append_size_bytes_max;
 const pending_ui_work_per_tick_max: usize = 4;
 const pending_ui_work_bytes_per_tick_max: usize = 4 * 1024;
 const pending_ui_work_time_budget_ns: u64 = 6 * std.time.ns_per_ms;
+const client_event_drain_time_budget_ns: u64 = 6 * std.time.ns_per_ms;
 const transcript_ui_chunk_bytes_max: usize = 1024;
 const tool_output_ui_chunk_bytes_max: usize = 1024;
 const background_frame_interval_ms_max: i64 = 500;
@@ -299,6 +301,8 @@ const InteractiveController = struct {
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     terminal: *tui.Terminal,
+    input_reader: ?*input_reader_mod.InputReader = null,
+    frontend_wake: ?*runtime.WakeEvent = null,
     cancel_requested: bool = false,
     operation_active: bool = false,
     history_oldest_entry_id: ?[]u8 = null,
@@ -356,6 +360,12 @@ const InteractiveController = struct {
         } else null;
         errdefer if (trace_path) |path| process.gpa.free(path);
 
+        const frontend_wake = try process.gpa.create(runtime.WakeEvent);
+        errdefer process.gpa.destroy(frontend_wake);
+        frontend_wake.* = .init;
+        const input_reader = try input_reader_mod.InputReader.init(process.gpa, process.io, frontend_wake);
+        errdefer input_reader.deinit();
+
         var self: InteractiveController = .{
             .allocator = process.gpa,
             .io = process.io,
@@ -363,12 +373,18 @@ const InteractiveController = struct {
             .stdout = stdout,
             .stderr = stderr,
             .terminal = terminal,
+            .input_reader = input_reader,
+            .frontend_wake = frontend_wake,
             .trace = trace,
             .trace_path = trace_path,
             .home_dir = process.env("HOME") orelse process.env("USERPROFILE"),
             .editor = nonEmptyEnv(process.env("EDITOR")),
             .tmp_dir = tmp_dir,
         };
+        self.app.setFrontendWake(frontend_wake);
+        errdefer self.app.setFrontendWake(null);
+        try self.input_reader.?.start(self.terminal.inputFd());
+        errdefer self.input_reader.?.stop();
         try self.installKeyBindings();
         try self.installGreeter(version);
         try self.installSlashCompletions();
@@ -390,6 +406,9 @@ const InteractiveController = struct {
         if (self.history_oldest_entry_id) |id| self.allocator.free(id);
         self.pending_ui_work.deinit(self.allocator);
         self.last_file_completion_query.deinit(self.allocator);
+        self.app.setFrontendWake(null);
+        if (self.input_reader) |input_reader| input_reader.deinit();
+        if (self.frontend_wake) |wake| self.allocator.destroy(wake);
         self.flushTraceReport();
         self.terminal.shutdown() catch |err| ignoreBestEffortError(err);
         if (self.trace_path) |path| self.stderr.print("zi tui trace: {s}\n", .{path}) catch |err| {
@@ -412,10 +431,7 @@ const InteractiveController = struct {
                 self.terminal.hasAnimation();
             const wake_delay = self.clampWakeDelayToDeadline(nextWakeDelayMs(immediate, frame_active));
             const wait_start = self.nowNs();
-            const wake = try self.app.waitAndApplyWake(
-                self.terminal.inputFd(),
-                wake_delay,
-            );
+            const wake = try self.waitForFrontendWake(wake_delay);
             self.recordWakeDuration(wake, wait_start);
             // Time enters the product through ticks; refresh before handling
             // the wake so wall-clock policies (ctrl+c double press, shimmer)
@@ -430,8 +446,9 @@ const InteractiveController = struct {
     }
 
     fn pollAndDrainInput(self: *InteractiveController) !bool {
+        const input_reader = self.input_reader orelse return false;
         const start = self.nowNs();
-        const ready = runtime.pollReadableFd(self.terminal.inputFd()) catch return false;
+        const ready = input_reader.hasQueuedBytes() or input_reader.hasTerminalFact();
         self.recordDuration(.poll_input, start);
         if (!ready) return false;
         _ = try self.timedTickTime();
@@ -442,12 +459,53 @@ const InteractiveController = struct {
         return true;
     }
 
+    fn waitForFrontendWake(self: *InteractiveController, frame_ms: u64) !session_runtime.WakeResult {
+        const input_reader = self.input_reader orelse return self.app.waitAndApplyWake(-1, frame_ms);
+        if (input_reader.hasQueuedBytes() or input_reader.hasTerminalFact()) return .input;
+        if (self.app.hasReadyWork()) return .session;
+        if (frame_ms == 0) return .frame;
+
+        const timeout_ms = self.app.waitDelayMs(frame_ms);
+        const frontend_wake = self.frontend_wake orelse unreachable;
+        frontend_wake.reset();
+        if (input_reader.hasQueuedBytes() or input_reader.hasTerminalFact()) return .input;
+        if (self.app.hasReadyWork()) return .session;
+        frontend_wake.waitTimeout(self.io, .{ .duration = .{
+            .raw = .fromMilliseconds(@intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i64)))))),
+            .clock = .awake,
+        } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => return error.Canceled,
+        };
+        if (frontend_wake.isSet()) frontend_wake.reset();
+
+        if (input_reader.hasQueuedBytes() or input_reader.hasTerminalFact()) return .input;
+        if (self.app.hasReadyWork()) return .session;
+        if (timeout_ms == frame_ms) return .frame;
+        return .session;
+    }
+
     fn serviceImmediateWork(self: *InteractiveController) !bool {
         var start = self.nowNs();
-        try self.app.step();
+        const step_timing = try self.app.stepTimed();
         self.recordDuration(.session_step, start);
+        self.trace.record(.session_step_flush_pending, step_timing.flush_pending_ns);
+        self.trace.record(.session_step_completion, step_timing.completion_ns);
+        self.trace.record(.session_step_commands, step_timing.commands_ns);
+        self.trace.record(.session_step_prompt_progress, step_timing.prompt_progress_ns);
+        self.trace.record(.session_step_prompt_progress_poll, step_timing.prompt_progress_poll_ns);
+        self.trace.record(.session_step_prompt_progress_apply, step_timing.prompt_progress_apply_ns);
+        self.trace.record(
+            .session_step_prompt_progress_public_event_drain,
+            step_timing.prompt_progress_public_event_drain_ns,
+        );
+        self.trace.record(.session_step_prompt_progress_yield, step_timing.prompt_progress_yield_ns);
+        self.trace.record(.session_step_public_event_drain, step_timing.public_event_drain_ns);
         start = self.nowNs();
-        const drained = try self.drainClientEventsBounded(client_events_per_tick_max);
+        const drained = try self.drainClientEventsBounded(
+            client_events_per_tick_max,
+            client_event_drain_time_budget_ns,
+        );
         self.recordDuration(.client_event_drain, start);
         const now_ms = try self.timedTickTime();
         const work_interval_ms = self.nextPendingUiWorkIntervalMs();
@@ -460,7 +518,8 @@ const InteractiveController = struct {
         } else 0;
         const background_reason: BackgroundRenderReason = if (applied > 0) .pending_work else .animation;
         try self.renderIfDue(now_ms, background_reason);
-        return drained == client_events_per_tick_max or
+        return drained.count == client_events_per_tick_max or
+            drained.time_budget_exhausted or
             applied == pending_ui_work_per_tick_max or
             (self.pending_ui_work.items.items.len > 0 and background_due) or
             self.app.hasImmediateWork();
@@ -580,14 +639,28 @@ const InteractiveController = struct {
     }
 
     fn drainInput(self: *InteractiveController) !tui.Terminal.InputPriority {
+        const input_reader = self.input_reader orelse return .none;
+        var bytes: [input_reader_mod.drain_chunk_bytes_max]u8 = undefined;
+        const drained = input_reader.drain(&bytes);
+        const drain_ns = self.nowNs();
+        if (drained.enqueue_ns) |enqueue_ns| {
+            self.recordSince(.input_reader_enqueue_to_owner_drain, @intCast(enqueue_ns), drain_ns);
+        }
         var effects: [effect_count_max]tui.Effect = undefined;
-        const result = try self.terminal.readAvailableInput(&effects);
+        const result = if (drained.bytes.len > 0)
+            try self.terminal.applyInputBytes(drained.bytes, &effects)
+        else if (drained.eof)
+            self.terminal.applyInputEof()
+        else
+            tui.Terminal.ReadResult{};
         defer for (effects[0..result.effect_count]) |effect| effect.deinit(self.allocator);
         for (effects[0..result.effect_count]) |effect| try self.handleEffect(effect);
         try self.requestLazyCompletionSnapshot();
         try self.requestFileCompletionForComposer();
         if (result.truncated) try self.appendStatus(.warning, "input truncated");
         if (result.effect_overflow) try self.appendStatus(.warning, "input effects dropped");
+        if (drained.faulted) try self.appendStatus(.warning, "input reader stopped");
+        if (input_reader.hasQueuedBytes()) (self.frontend_wake orelse unreachable).set(self.io);
         return result.priority;
     }
 
@@ -845,12 +918,18 @@ const InteractiveController = struct {
         defer self.allocator.free(path);
         defer std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
 
+        if (self.input_reader) |input_reader| input_reader.stop();
         self.terminal.suspendForExternalProgram() catch |err| {
             try self.appendEditorError("could not suspend terminal", err);
+            if (self.input_reader) |input_reader| try input_reader.start(self.terminal.inputFd());
             return;
         };
         const term = self.runEditor(path);
         try self.terminal.resumeAfterExternalProgram();
+        if (self.input_reader) |input_reader| input_reader.start(self.terminal.inputFd()) catch |err| {
+            try self.appendEditorError("could not restart terminal input", err);
+            return;
+        };
 
         const completed = term catch |err| {
             try self.appendEditorError("editor failed", err);
@@ -1326,14 +1405,47 @@ const InteractiveController = struct {
         return .queued;
     }
 
-    fn drainClientEventsBounded(self: *InteractiveController, limit: usize) !usize {
-        var count: usize = 0;
-        while (count < limit) : (count += 1) {
-            var envelope = self.app.drainEvent() orelse return count;
+    const ClientEventDrain = struct {
+        count: usize = 0,
+        time_budget_exhausted: bool = false,
+    };
+
+    fn drainClientEventsBounded(
+        self: *InteractiveController,
+        limit: usize,
+        time_budget_ns: u64,
+    ) !ClientEventDrain {
+        const started_ns = self.nowNs();
+        var result: ClientEventDrain = .{};
+        while (result.count < limit) : (result.count += 1) {
+            var envelope = self.app.drainEvent() orelse return result;
             defer envelope.deinit(self.allocator);
+            const phase = clientEventAcceptTracePhase(envelope.event);
+            const event_start = self.nowNs();
             try self.acceptEnvelope(envelope);
+            self.recordDuration(phase, event_start);
+            if (result.count + 1 == limit) continue;
+            const elapsed_ns = self.nowNs() - started_ns;
+            if (elapsed_ns > 0 and @as(u64, @intCast(elapsed_ns)) >= time_budget_ns) {
+                result.count += 1;
+                result.time_budget_exhausted = true;
+                return result;
+            }
         }
-        return count;
+        return result;
+    }
+
+    fn clientEventAcceptTracePhase(event: client_protocol.ClientEvent) TracePhase {
+        return switch (event) {
+            .snapshot => .client_event_accept_snapshot,
+            .agent_event => .client_event_accept_agent,
+            .history_page => .client_event_accept_history,
+            .completion_snapshot, .file_completion => .client_event_accept_completion,
+            .session_chrome, .session_changed => .client_event_accept_session_chrome,
+            .prompt_command => .client_event_accept_prompt_command,
+            .replay, .replay_gap => .client_event_accept_replay,
+            else => .client_event_accept_other,
+        };
     }
 
     fn acceptEnvelope(self: *InteractiveController, envelope: client_protocol.EventEnvelope) !void {

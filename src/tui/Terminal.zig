@@ -181,22 +181,27 @@ pub fn applyCommand(self: *Terminal, command: App.Command) error{OutOfMemory}!?A
 /// the owner loop. Resize events are applied to vaxis and App here; product
 /// effects land in `effects`.
 pub fn readAvailableInput(self: *Terminal, effects: []App.Effect) !ReadResult {
-    var buf: [pending_input_bytes_max + read_size_bytes_max]u8 = undefined;
-    @memcpy(buf[0..self.pending_len], self.pending[0..self.pending_len]);
-    const read_count = std.posix.read(
-        std.posix.STDIN_FILENO,
-        buf[self.pending_len..][0..read_size_bytes_max],
-    ) catch |err| switch (err) {
+    var bytes: [read_size_bytes_max]u8 = undefined;
+    const read_count = std.posix.read(std.posix.STDIN_FILENO, &bytes) catch |err| switch (err) {
         error.WouldBlock => return .{},
         else => return err,
     };
-    if (read_count == 0) {
-        self.requestStop();
-        return .{ .eof = true, .shutdown_requested = true };
-    }
-    const total = self.pending_len + read_count;
+    if (read_count == 0) return self.applyInputEof();
+    return self.applyInputBytes(bytes[0..read_count], effects);
+}
+
+/// Apply raw terminal bytes already read by the frontend. Terminal remains the
+/// only Vaxis parser owner; the frontend reader is allowed to move bytes only.
+pub fn applyInputBytes(self: *Terminal, bytes: []const u8, effects: []App.Effect) !ReadResult {
+    var buf: [pending_input_bytes_max + read_size_bytes_max]u8 = undefined;
+    @memcpy(buf[0..self.pending_len], self.pending[0..self.pending_len]);
+    const copy_len = @min(bytes.len, read_size_bytes_max);
+    @memcpy(buf[self.pending_len..][0..copy_len], bytes[0..copy_len]);
+    var result: ReadResult = .{ .bytes_read = copy_len };
+    if (copy_len < bytes.len) result.truncated = true;
+
+    const total = self.pending_len + copy_len;
     self.pending_len = 0;
-    var result: ReadResult = .{ .bytes_read = read_count };
     var start: usize = 0;
     while (start < total) {
         const parsed = self.parser.parse(buf[start..total], null) catch {
@@ -231,6 +236,11 @@ pub fn readAvailableInput(self: *Terminal, effects: []App.Effect) !ReadResult {
         self.requestStop();
     }
     return result;
+}
+
+pub fn applyInputEof(self: *Terminal) ReadResult {
+    self.requestStop();
+    return .{ .eof = true, .shutdown_requested = true };
 }
 
 fn applyInput(

@@ -4,7 +4,7 @@
 
 ```text
 accepted plan: draft
-implementation: not started
+implementation: code complete; pending manual/trace validation
 reason: first implementation attempt was rolled back because it froze idle TUI input
 ```
 
@@ -164,6 +164,53 @@ Manual/trace validation:
 ```sh
 ZI_TUI_TRACE=1 zig build run -- "hello"
 ```
+
+Latest trace samples (`zig build run -- zi tui trace`, 2026-06-28):
+
+- First trace:
+  - input reader enqueue -> owner drain max: `0.049ms`.
+  - input drain max: `1.361ms`.
+  - foreground render flush max: `6.498ms`; background render flush max: `18.226ms`.
+  - idle wait still parks: frame wait max reached `30001.071ms`.
+  - no foreground render was forced to carry pending background work.
+  - follow-up trace should keep the slowest samples (not the latest samples) because
+    this run showed `session_step_prompt_progress` at `52.071ms`, while the retained
+    slow-sample ring was filled by later `assistant_queue_wait` samples.
+- Second trace after slowest-sample retention:
+  - input reader enqueue -> owner drain max: `0.054ms`.
+  - input drain max: `0.514ms`.
+  - idle wait still parks: frame wait max reached `30001.035ms`.
+  - slowest retained samples confirm `session_step_prompt_progress` dominates
+    (`38.385ms`, `25.631ms`, `19.431ms`) rather than input/render.
+  - next trace splits prompt progress into stream poll, apply, and public-event drain.
+- Third trace after prompt-progress split:
+  - input reader enqueue -> owner drain max: `0.059ms`.
+  - input drain max: `0.557ms`.
+  - `session_step_prompt_progress` still dominates at `26.108ms`.
+  - stream poll is not the cause (`0.050ms`), public-event drain is not the cause
+    (`0.638ms`), and measured apply work is bounded (`7.906ms`).
+  - the remaining gap is the cooperative `runtime.yield()` on empty stream polls.
+    A follow-up attempt to skip that yield when `frontend_wake` was installed
+    starved producer progress: the TUI stayed in "working" with no transcript.
+    Keep the yield until runtime offers a producer-driving wait that does not
+    cost a full foreground turn.
+- Fourth trace after restoring the yield:
+  - transcript progress is restored.
+  - input reader enqueue -> owner drain max: `0.253ms`.
+  - input drain max: `0.315ms`.
+  - `session_step_prompt_progress` reached `133.972ms`; split timings show poll
+    (`0.439ms`), apply (`12.531ms`), and public-event drain (`1.175ms`) are not
+    enough to explain it.
+- Automated tmux trace after adding direct yield timing:
+  - prompt: `Reply with exactly: OK`.
+  - transcript completed and TUI exited with `ctrl+d`.
+  - input reader enqueue -> owner drain max: `0.061ms`.
+  - input drain max: `0.074ms`.
+  - `session_step_prompt_progress` max: `17.621ms`.
+  - `session_step_prompt_progress_yield` max: `17.619ms`.
+  - conclusion: the bounded input reader path is healthy; the remaining foreground
+    turn cost is zio producer-driving yield, not terminal input, frontend event
+    drain, transcript projection, or render.
 
 Scenarios:
 
