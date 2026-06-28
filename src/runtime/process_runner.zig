@@ -266,6 +266,7 @@ pub fn run(
                 &stdout_reader,
                 &stderr_reader,
             );
+            if (stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded) return error.StreamTooLong;
             if (stdout_buffer.err) |err| return err;
             if (stderr_buffer.err) |err| return err;
             return error.StreamTooLong;
@@ -286,9 +287,9 @@ pub fn run(
     stdout_reader.await(io);
     stderr_reader.await(io);
     try drainOutputChunks(io, options.on_output, &output_chunks);
+    if (stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded) return error.StreamTooLong;
     if (stdout_buffer.err) |err| return err;
     if (stderr_buffer.err) |err| return err;
-    if (stdout_buffer.limit_exceeded or stderr_buffer.limit_exceeded) return error.StreamTooLong;
 
     const stdout = try stdout_buffer.bytes.toOwnedSlice();
     errdefer allocator.free(stdout);
