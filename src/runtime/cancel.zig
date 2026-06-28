@@ -1,10 +1,12 @@
 const std = @import("std");
+const WakeEvent = @import("wake_event.zig").WakeEvent;
 const async_runtime = @import("Runtime.zig");
 const Runtime = async_runtime.Runtime;
 
 pub const CancelSource = struct {
     const WakeStorage = struct {
-        event: async_runtime.ResetEvent = .init,
+        io: std.Io,
+        event: WakeEvent = .init,
     };
 
     requested: std.atomic.Value(bool) = .init(false),
@@ -12,9 +14,9 @@ pub const CancelSource = struct {
     allocator: std.mem.Allocator,
     wake_storage: *WakeStorage,
 
-    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!CancelSource {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!CancelSource {
         const wake_storage = try allocator.create(WakeStorage);
-        wake_storage.* = .{};
+        wake_storage.* = .{ .io = io };
         return .{
             .allocator = allocator,
             .wake_storage = wake_storage,
@@ -31,13 +33,14 @@ pub const CancelSource = struct {
             .requested = &self.requested,
             .generation = &self.generation,
             .generation_value = self.generation.load(.acquire),
+            .wake_io = self.wake_storage.io,
             .wake_event = &self.wake_storage.event,
         };
     }
 
     pub fn request(self: *CancelSource) void {
         if (self.requested.swap(true, .acq_rel)) return;
-        self.wake_storage.event.set();
+        self.wake_storage.event.set(self.wake_storage.io);
     }
 
     pub fn resetAfterDrain(self: *CancelSource) void {
@@ -53,7 +56,8 @@ pub const CancelToken = struct {
     requested: *const std.atomic.Value(bool),
     generation: *const std.atomic.Value(u64),
     generation_value: u64,
-    wake_event: *async_runtime.ResetEvent,
+    wake_io: std.Io,
+    wake_event: *WakeEvent,
 
     pub fn isRequested(self: CancelToken) bool {
         if (self.generation.load(.acquire) != self.generation_value) return true;
@@ -66,7 +70,7 @@ pub const CancelToken = struct {
 
     pub fn wait(self: CancelToken) error{ OperationCancelled, Canceled }!void {
         if (self.isRequested()) return error.OperationCancelled;
-        self.wake_event.wait() catch |err| switch (err) {
+        self.wake_event.wait(self.wake_io) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
         };
         return error.OperationCancelled;
@@ -84,7 +88,7 @@ pub fn sleepUntilCancel(
     }
     const cancel_token = token.?;
     try cancel_token.throwIfRequested();
-    cancel_token.wake_event.timedWait(toTimeout(duration)) catch |err| switch (err) {
+    cancel_token.wake_event.waitTimeout(cancel_token.wake_io, toTimeout(duration)) catch |err| switch (err) {
         error.Timeout => {
             try cancel_token.throwIfRequested();
             return;
@@ -94,10 +98,8 @@ pub fn sleepUntilCancel(
     return error.OperationCancelled;
 }
 
-fn toTimeout(duration: std.Io.Duration) async_runtime.Timeout {
-    const nanoseconds = duration.toNanoseconds();
-    std.debug.assert(nanoseconds >= 0);
-    return .fromNanoseconds(std.math.cast(u64, nanoseconds) orelse std.math.maxInt(u64));
+fn toTimeout(duration: std.Io.Duration) std.Io.Timeout {
+    return .{ .duration = .{ .raw = duration, .clock = .awake } };
 }
 
 fn waitForCancelWake(token: CancelToken) error{ OperationCancelled, Canceled }!void {
@@ -105,7 +107,7 @@ fn waitForCancelWake(token: CancelToken) error{ OperationCancelled, Canceled }!v
 }
 
 test "cancel source owns mutation and token only observes" {
-    var source = try CancelSource.init(std.testing.allocator);
+    var source = try CancelSource.init(std.testing.allocator, std.testing.io);
     defer source.deinit();
     const token = source.token();
 
@@ -120,7 +122,7 @@ test "cancel source owns mutation and token only observes" {
 test "cancel token wait wakes without sleep polling" {
     var task_runtime = try Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var source = try CancelSource.init(std.testing.allocator);
+    var source = try CancelSource.init(std.testing.allocator, task_runtime.io());
     defer source.deinit();
     const token = source.token();
     var future = try task_runtime.spawn(waitForCancelWake, .{token});
@@ -134,7 +136,7 @@ test "cancel token wait wakes without sleep polling" {
 test "cancel request wakes all current waiters" {
     var task_runtime = try Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var source = try CancelSource.init(std.testing.allocator);
+    var source = try CancelSource.init(std.testing.allocator, task_runtime.io());
     defer source.deinit();
     const token = source.token();
     var first = try task_runtime.spawn(waitForCancelWake, .{token});
@@ -151,7 +153,7 @@ test "cancel request wakes all current waiters" {
 test "cancel source reopens wake channel after owner drain" {
     var task_runtime = try Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var source = try CancelSource.init(std.testing.allocator);
+    var source = try CancelSource.init(std.testing.allocator, task_runtime.io());
     defer source.deinit();
     const first = source.token();
     source.request();
@@ -170,7 +172,7 @@ test "cancel source reopens wake channel after owner drain" {
 test "cancel source can move after init without invalidating token wake storage" {
     var task_runtime = try Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    const source = try CancelSource.init(std.testing.allocator);
+    const source = try CancelSource.init(std.testing.allocator, task_runtime.io());
     var moved = source;
     defer moved.deinit();
     const token = moved.token();
@@ -185,7 +187,7 @@ test "cancel source can move after init without invalidating token wake storage"
 test "sleep returns immediately when token is already canceled" {
     var task_runtime = try Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var source = try CancelSource.init(std.testing.allocator);
+    var source = try CancelSource.init(std.testing.allocator, task_runtime.io());
     defer source.deinit();
     source.request();
 
@@ -198,24 +200,24 @@ test "sleep returns immediately when token is already canceled" {
 const SleepWorkerState = struct {
     io: std.Io,
     source: *CancelSource,
-    entered: async_runtime.ResetEvent = .init,
+    entered: WakeEvent = .init,
 };
 
 fn cancelableSleepWorker(state: *SleepWorkerState) !void {
-    state.entered.set();
+    state.entered.set(state.io);
     try sleepUntilCancel(state.io, .fromSeconds(60), state.source.token());
 }
 
 test "sleep observes cancellation during retry delay" {
     var task_runtime = try Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var source = try CancelSource.init(std.testing.allocator);
+    var source = try CancelSource.init(std.testing.allocator, task_runtime.io());
     defer source.deinit();
     var state: SleepWorkerState = .{ .io = task_runtime.io(), .source = &source };
     var future = try task_runtime.spawn(cancelableSleepWorker, .{&state});
     defer future.cancel();
 
-    try state.entered.wait();
+    try state.entered.wait(task_runtime.io());
     state.source.request();
 
     try std.testing.expectError(error.OperationCancelled, future.join());

@@ -23,7 +23,7 @@ pub const EventDrain = struct {
     public_event_buffer: []client_protocol.ClientEvent,
     public_events: PublicEventQueue,
     queue_mirror: queue_mirror_mod.QueueMirror = .{},
-    public_event_wake: runtime.ResetEvent = .init,
+    public_event_wake: runtime.WakeEvent = .init,
     timestamp: []const u8,
     context_overflow_count: usize = 0,
     pending_public_event_overflow_count: usize = 0,
@@ -138,7 +138,7 @@ pub const EventDrain = struct {
             std.debug.assert(self.pending_public_event_overflow_count < std.math.maxInt(usize));
             self.pending_public_event_overflow_count += 1;
         }
-        self.public_event_wake.set();
+        self.public_event_wake.set(self.io);
     }
 
     pub fn queueSnapshot(self: *const EventDrain, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
@@ -172,13 +172,13 @@ pub const EventDrain = struct {
             const dropped_count = self.pending_public_event_overflow_count;
             if (self.public_events.pushOrDrop(.{ .event_overflow = .{ .dropped_count = dropped_count } })) {
                 self.pending_public_event_overflow_count = 0;
-                self.public_event_wake.set();
+                self.public_event_wake.set(self.io);
             }
         }
         return event;
     }
 
-    pub fn publicEventWake(self: *EventDrain) *runtime.ResetEvent {
+    pub fn publicEventWake(self: *EventDrain) *runtime.WakeEvent {
         return &self.public_event_wake;
     }
 

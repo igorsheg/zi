@@ -791,7 +791,7 @@ test "bash tool cancels running process through owner race" {
     defer object.deinit(std.testing.allocator);
     try object.put(std.testing.allocator, "command", .{ .string = "sleep 60" });
 
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel_source.deinit();
     var future = try task_runtime.spawn(execute, .{
         std.testing.allocator,

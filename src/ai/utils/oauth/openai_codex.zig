@@ -323,29 +323,31 @@ fn waitForLoginCode(
 }
 
 const LoginCodeResult = anyerror![]const u8;
-const LoginCodeTaskState = enum {
-    active,
-    drained,
+
+const LoginCodeEvent = union(enum) {
+    callback: LoginCodeResult,
+    manual: LoginCodeResult,
+
+    fn deinit(self: LoginCodeEvent, allocator: std.mem.Allocator) void {
+        const result = switch (self) {
+            .callback => |value| value,
+            .manual => |value| value,
+        };
+        if (result) |code| allocator.free(code) else |_| {}
+    }
 };
 
+const LoginCodeQueue = std.Io.Queue(LoginCodeEvent);
+
 const LoginCodeTask = struct {
-    handle: runtime.Task(LoginCodeResult),
-    state: LoginCodeTaskState = .active,
+    io: std.Io,
+    handle: std.Io.Future(void),
+    drained: bool = false,
 
-    fn cancelAndDiscard(self: *LoginCodeTask, allocator: std.mem.Allocator) void {
-        if (self.state == .drained) return;
-        self.state = .drained;
-        self.handle.cancel();
-        if (self.handle.result) |code| {
-            allocator.free(code);
-        } else |_| {}
-    }
-
-    fn joinAndTakeResult(self: *LoginCodeTask) LoginCodeResult {
-        std.debug.assert(self.state == .active);
-        self.state = .drained;
-        self.handle.cancel();
-        return self.handle.result;
+    fn cancelAndJoin(self: *LoginCodeTask) void {
+        if (self.drained) return;
+        self.handle.cancel(self.io);
+        self.drained = true;
     }
 };
 
@@ -357,47 +359,81 @@ fn raceLoginCode(
     server: *CallbackServer,
     expected_state: []const u8,
 ) ![]const u8 {
+    _ = task_runtime;
+    var event_buffer: [2]LoginCodeEvent = undefined;
+    var events = LoginCodeQueue.init(&event_buffer);
     var callback: LoginCodeTask = .{
-        .handle = try task_runtime.spawn(waitForCallbackCode, .{ allocator, io, server, expected_state }),
+        .io = io,
+        .handle = try std.Io.concurrent(io, publishCallbackCode, .{ allocator, io, server, expected_state, &events }),
     };
-    errdefer callback.cancelAndDiscard(allocator);
+    errdefer callback.cancelAndJoin();
     var manual: LoginCodeTask = .{
-        .handle = try task_runtime.spawn(waitForManualCode, .{ allocator, callbacks, expected_state }),
+        .io = io,
+        .handle = try std.Io.concurrent(io, publishManualCode, .{ allocator, io, callbacks, expected_state, &events }),
     };
-    errdefer manual.cancelAndDiscard(allocator);
+    errdefer manual.cancelAndJoin();
 
-    switch (try runtime.select(.{
-        .callback = &callback.handle,
-        .manual = &manual.handle,
-    })) {
-        .callback => {
-            manual.cancelAndDiscard(allocator);
-            return callback.joinAndTakeResult();
+    const first = try events.getOne(io);
+    defer drainLoginCodeEvents(allocator, io, &events);
+    switch (first) {
+        .callback => |result| {
+            manual.cancelAndJoin();
+            callback.cancelAndJoin();
+            return result;
         },
-        .manual => {
+        .manual => |result| {
             server.shutdown(io);
-            callback.cancelAndDiscard(allocator);
-            return manual.joinAndTakeResult();
+            callback.cancelAndJoin();
+            manual.cancelAndJoin();
+            return result;
         },
     }
 }
 
-fn waitForCallbackCode(
+fn drainLoginCodeEvents(allocator: std.mem.Allocator, io: std.Io, events: *LoginCodeQueue) void {
+    var buffer: [2]LoginCodeEvent = undefined;
+    const count = events.get(io, &buffer, 0) catch 0;
+    for (buffer[0..count]) |event| event.deinit(allocator);
+}
+
+fn publishCallbackCode(
     allocator: std.mem.Allocator,
     io: std.Io,
     server: *CallbackServer,
     expected_state: []const u8,
-) LoginCodeResult {
-    return server.waitForCode(allocator, io, expected_state);
+    events: *LoginCodeQueue,
+) void {
+    publishLoginCodeEvent(allocator, io, events, .{
+        .callback = server.waitForCode(allocator, io, expected_state),
+    });
 }
 
-fn waitForManualCode(
+fn publishManualCode(
     allocator: std.mem.Allocator,
+    io: std.Io,
     callbacks: oauth.OAuthLoginCallbacks,
     expected_state: []const u8,
-) LoginCodeResult {
-    const manual = (try callbacks.onManualCodeInput()) orelse return error.ManualOAuthInputUnavailable;
-    return codeFromInput(allocator, manual, expected_state);
+    events: *LoginCodeQueue,
+) void {
+    const manual = (callbacks.onManualCodeInput() catch |err| {
+        publishLoginCodeEvent(allocator, io, events, .{ .manual = err });
+        return;
+    }) orelse {
+        publishLoginCodeEvent(allocator, io, events, .{ .manual = error.ManualOAuthInputUnavailable });
+        return;
+    };
+    publishLoginCodeEvent(allocator, io, events, .{ .manual = codeFromInput(allocator, manual, expected_state) });
+}
+
+fn publishLoginCodeEvent(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    events: *LoginCodeQueue,
+    event: LoginCodeEvent,
+) void {
+    events.putOneUncancelable(io, event) catch |err| switch (err) {
+        error.Closed => event.deinit(allocator),
+    };
 }
 
 fn completeLogin(
@@ -852,7 +888,7 @@ test "oauth login race returns manual code and shuts callback waiter down" {
 
     var server = try CallbackServer.start(io);
     defer server.deinit(io);
-    var state: LoginRaceTestState = .{ .expected_state = "state-a", .manual_input = "manual-code#state-a" };
+    var state: LoginRaceTestState = .{ .io = io, .expected_state = "state-a", .manual_input = "manual-code#state-a" };
     const callbacks = loginRaceCallbacks(&state, immediateManualInput);
 
     const code = try raceLoginCode(std.testing.allocator, io, task_runtime, callbacks, &server, state.expected_state);
@@ -869,7 +905,7 @@ test "oauth login race shuts callback waiter down when manual input is unavailab
 
     var server = try CallbackServer.start(io);
     defer server.deinit(io);
-    var state: LoginRaceTestState = .{ .expected_state = "state-unavailable", .manual_input = "" };
+    var state: LoginRaceTestState = .{ .io = io, .expected_state = "state-unavailable", .manual_input = "" };
     const callbacks = loginRaceCallbacks(&state, unavailableManualInput);
 
     try std.testing.expectError(
@@ -887,7 +923,7 @@ test "oauth login race returns callback code while manual input is blocked" {
 
     var server = try CallbackServer.start(io);
     defer server.deinit(io);
-    var state: LoginRaceTestState = .{ .expected_state = "state-b", .manual_input = "manual-code#state-b" };
+    var state: LoginRaceTestState = .{ .io = io, .expected_state = "state-b", .manual_input = "manual-code#state-b" };
     const callbacks = loginRaceCallbacks(&state, delayedManualInput);
     var callback_client = try task_runtime.spawn(sendCallbackRequest, .{ io, state.expected_state, "callback-code" });
     defer callback_client.cancel();
@@ -901,6 +937,7 @@ test "oauth login race returns callback code while manual input is blocked" {
 }
 
 const LoginRaceTestState = struct {
+    io: std.Io,
     expected_state: []const u8,
     manual_input: []const u8,
     manual_count: std.atomic.Value(usize) = .init(0),
@@ -939,12 +976,12 @@ fn unavailableManualInput(context: ?*anyopaque) ![]const u8 {
 fn delayedManualInput(context: ?*anyopaque) ![]const u8 {
     const state: *LoginRaceTestState = @ptrCast(@alignCast(context.?));
     _ = state.manual_count.fetchAdd(1, .monotonic);
-    try runtime.sleep(.fromMilliseconds(250));
+    try runtime.sleep(state.io, .fromMilliseconds(250));
     return state.manual_input;
 }
 
 fn sendCallbackRequest(io: std.Io, state: []const u8, code: []const u8) !void {
-    try runtime.sleep(.fromMilliseconds(10));
+    try runtime.sleep(io, .fromMilliseconds(10));
     const address: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(callback_port) };
     const stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
     defer stream.close(io);

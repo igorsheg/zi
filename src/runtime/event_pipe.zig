@@ -1,17 +1,22 @@
 const std = @import("std");
-const zio = @import("zio");
-const Runtime = zio.Runtime;
+const WakeEvent = @import("wake_event.zig").WakeEvent;
 
 pub fn EventPipe(comptime Event: type, comptime TerminalResult: type) type {
     return struct {
         const Self = @This();
-        const Channel = zio.Channel(Event);
-        const ChannelReceive = @TypeOf(@as(*Channel, undefined).asyncReceive());
+        const Queue = std.Io.Queue(Event);
 
-        channel: Channel,
+        io: std.Io,
+        queue: Queue,
         capacity_count: usize,
+        wake: ?WakeRegistration = null,
         closed: bool = false,
         terminal_result: ?TerminalResult = null,
+
+        const WakeRegistration = struct {
+            io: std.Io,
+            event: *WakeEvent,
+        };
 
         pub const EmitError = error{
             Closed,
@@ -23,10 +28,11 @@ pub fn EventPipe(comptime Event: type, comptime TerminalResult: type) type {
             Canceled,
         };
 
-        pub fn init(buffer: []Event) Self {
+        pub fn init(io: std.Io, buffer: []Event) Self {
             std.debug.assert(buffer.len > 0);
             return .{
-                .channel = Channel.init(buffer),
+                .io = io,
+                .queue = Queue.init(buffer),
                 .capacity_count = buffer.len,
             };
         }
@@ -41,6 +47,10 @@ pub fn EventPipe(comptime Event: type, comptime TerminalResult: type) type {
 
         pub fn stream(self: *Self) Stream {
             return .{ .pipe = self };
+        }
+
+        pub fn setWake(self: *Self, io: std.Io, event: *WakeEvent) void {
+            self.wake = .{ .io = io, .event = event };
         }
 
         pub const Sink = struct {
@@ -76,85 +86,69 @@ pub fn EventPipe(comptime Event: type, comptime TerminalResult: type) type {
                 return self.pipe.poll();
             }
 
-            pub fn asyncNext(self: Stream) AsyncNext {
-                return .{ .receive = self.pipe.channel.asyncReceive() };
-            }
-
             pub fn result(self: Stream) ?TerminalResult {
                 return self.pipe.result();
             }
-
-            pub const AsyncNext = struct {
-                receive: ChannelReceive,
-
-                pub const Result = ?Event;
-                pub const WaitContext = ChannelReceive.WaitContext;
-
-                pub fn asyncWait(self: *const AsyncNext, waiter: anytype, context: *WaitContext) bool {
-                    return self.receive.asyncWait(waiter, context);
-                }
-
-                pub fn asyncCancelWait(self: *const AsyncNext, waiter: anytype, context: *WaitContext) bool {
-                    return self.receive.asyncCancelWait(waiter, context);
-                }
-
-                pub fn getResult(self: *const AsyncNext, context: *WaitContext) Result {
-                    return self.receive.getResult(context) catch |err| switch (err) {
-                        error.ChannelClosed => null,
-                    };
-                }
-            };
         };
 
         fn emit(self: *Self, event: Event) EmitError!void {
             if (self.closed) return error.Terminal;
-            self.channel.send(event) catch |err| switch (err) {
-                error.ChannelClosed => return error.Terminal,
+            self.queue.putAll(self.io, &.{event}) catch |err| switch (err) {
+                error.Closed => return error.Terminal,
                 error.Canceled => return error.Canceled,
             };
+            self.wakeOwner();
         }
 
         fn end(self: *Self, event: Event, terminal_result: TerminalResult) EmitError!void {
             if (self.closed) return error.Terminal;
             self.terminal_result = terminal_result;
             self.closed = true;
-            self.channel.send(event) catch |err| switch (err) {
-                error.ChannelClosed => {
+            self.queue.putAll(self.io, &.{event}) catch |err| switch (err) {
+                error.Closed => {
                     self.terminal_result = null;
                     return error.Terminal;
                 },
                 error.Canceled => {
                     self.terminal_result = null;
-                    self.channel.close(.graceful);
+                    self.queue.close(self.io);
                     return error.Canceled;
                 },
             };
-            self.channel.close(.graceful);
+            self.queue.close(self.io);
+            self.wakeOwner();
         }
 
         fn abort(self: *Self) void {
             if (self.closed) return;
             self.closed = true;
-            self.channel.close(.graceful);
+            self.queue.close(self.io);
+            self.wakeOwner();
         }
 
         fn next(self: *Self) NextError!?Event {
-            return self.channel.receive() catch |err| switch (err) {
-                error.ChannelClosed => null,
+            return self.queue.getOne(self.io) catch |err| switch (err) {
+                error.Closed => null,
                 error.Canceled => error.Canceled,
             };
         }
 
         fn poll(self: *Self) Stream.Poll {
-            const event = self.channel.tryReceive() catch |err| switch (err) {
-                error.ChannelEmpty => return .empty,
-                error.ChannelClosed => return .terminal,
+            var item: [1]Event = undefined;
+            const count = self.queue.get(self.io, &item, 0) catch |err| switch (err) {
+                error.Closed => return .terminal,
+                error.Canceled => return .empty,
             };
-            return .{ .event = event };
+            if (count == 0) return .empty;
+            return .{ .event = item[0] };
         }
 
         fn result(self: *const Self) ?TerminalResult {
             return self.terminal_result;
+        }
+
+        fn wakeOwner(self: *Self) void {
+            if (self.wake) |wake| wake.event.set(wake.io);
         }
     };
 }
@@ -162,15 +156,38 @@ pub fn EventPipe(comptime Event: type, comptime TerminalResult: type) type {
 test "event pipe exposes explicit capacity" {
     const Pipe = EventPipe(u8, u8);
     var buffer: [2]u8 = undefined;
-    var pipe = Pipe.init(&buffer);
+    var pipe = Pipe.init(std.testing.io, &buffer);
 
     try std.testing.expectEqual(@as(usize, 2), pipe.capacity());
+}
+
+test "event pipe wakes owner on emit end and abort" {
+    const Pipe = EventPipe(u8, u8);
+    var buffer: [2]u8 = undefined;
+    var pipe = Pipe.init(std.testing.io, &buffer);
+    var wake: WakeEvent = .init;
+    pipe.setWake(std.testing.io, &wake);
+    const sink = pipe.sink();
+
+    try sink.emit(1);
+    try std.testing.expect(wake.isSet());
+    wake.reset();
+
+    try sink.end(2, 9);
+    try std.testing.expect(wake.isSet());
+
+    var abort_buffer: [1]u8 = undefined;
+    var abort_pipe = Pipe.init(std.testing.io, &abort_buffer);
+    var abort_wake: WakeEvent = .init;
+    abort_pipe.setWake(std.testing.io, &abort_wake);
+    abort_pipe.sink().abort();
+    try std.testing.expect(abort_wake.isSet());
 }
 
 test "event pipe drains events in order before terminal" {
     const Pipe = EventPipe(u8, u8);
     var buffer: [2]u8 = undefined;
-    var pipe = Pipe.init(&buffer);
+    var pipe = Pipe.init(std.testing.io, &buffer);
     const sink = pipe.sink();
     const stream = pipe.stream();
 
@@ -186,7 +203,7 @@ test "event pipe drains events in order before terminal" {
 test "event pipe commits terminal result before terminal event is observed" {
     const Pipe = EventPipe(u8, u8);
     var buffer: [1]u8 = undefined;
-    var pipe = Pipe.init(&buffer);
+    var pipe = Pipe.init(std.testing.io, &buffer);
     const sink = pipe.sink();
     const stream = pipe.stream();
 
@@ -200,7 +217,7 @@ test "event pipe commits terminal result before terminal event is observed" {
 test "event pipe rejects events after terminal" {
     const Pipe = EventPipe(u8, u8);
     var buffer: [1]u8 = undefined;
-    var pipe = Pipe.init(&buffer);
+    var pipe = Pipe.init(std.testing.io, &buffer);
     const sink = pipe.sink();
 
     try sink.end(1, 9);
@@ -210,7 +227,7 @@ test "event pipe rejects events after terminal" {
 test "event pipe abort drains queued events without terminal result" {
     const Pipe = EventPipe(u8, u8);
     var buffer: [2]u8 = undefined;
-    var pipe = Pipe.init(&buffer);
+    var pipe = Pipe.init(std.testing.io, &buffer);
     const sink = pipe.sink();
     const stream = pipe.stream();
 
@@ -226,7 +243,7 @@ test "event pipe abort drains queued events without terminal result" {
 test "event pipe leaves terminal empty when nonterminal event is queued" {
     const Pipe = EventPipe(u8, u8);
     var buffer: [1]u8 = undefined;
-    var pipe = Pipe.init(&buffer);
+    var pipe = Pipe.init(std.testing.io, &buffer);
     const sink = pipe.sink();
     const stream = pipe.stream();
 
@@ -237,11 +254,11 @@ test "event pipe leaves terminal empty when nonterminal event is queued" {
 
 const ConcurrentProducerState = struct {
     pipe: *EventPipe(u8, u8),
-    entered: zio.ResetEvent = .init,
+    entered: WakeEvent = .init,
 };
 
-fn produceMoreThanCapacity(state: *ConcurrentProducerState) !void {
-    state.entered.set();
+fn produceMoreThanCapacity(state: *ConcurrentProducerState) anyerror!void {
+    state.entered.set(state.pipe.io);
     const sink = state.pipe.sink();
     try sink.emit(1);
     try sink.emit(2);
@@ -250,17 +267,18 @@ fn produceMoreThanCapacity(state: *ConcurrentProducerState) !void {
 }
 
 test "event pipe supports bounded concurrent producer and owner drain" {
-    var task_runtime = try Runtime.init(std.testing.allocator, .{});
-    defer task_runtime.deinit();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
     const Pipe = EventPipe(u8, u8);
     var buffer: [1]u8 = undefined;
-    var pipe = Pipe.init(&buffer);
+    var pipe = Pipe.init(io, &buffer);
     var state: ConcurrentProducerState = .{ .pipe = &pipe };
-    var future = try task_runtime.spawn(produceMoreThanCapacity, .{&state});
-    defer future.cancel();
+    var future = try std.Io.concurrent(io, produceMoreThanCapacity, .{&state});
+    defer _ = future.cancel(io) catch {};
 
-    try state.entered.wait();
+    try state.entered.wait(io);
 
     const stream = pipe.stream();
     try std.testing.expectEqual(@as(?u8, 1), try stream.next());
@@ -269,5 +287,5 @@ test "event pipe supports bounded concurrent producer and owner drain" {
     try std.testing.expectEqual(@as(?u8, 4), try stream.next());
     try std.testing.expectEqual(@as(?u8, null), try stream.next());
     try std.testing.expectEqual(@as(?u8, 9), stream.result());
-    try future.join();
+    try future.await(io);
 }

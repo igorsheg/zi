@@ -1,27 +1,14 @@
+const std = @import("std");
 const async_runtime = @import("Runtime.zig");
 
 pub const Process = @import("Process.zig").Process;
 pub const Runtime = async_runtime.Runtime;
-pub const ResetEvent = async_runtime.ResetEvent;
 pub const Mutex = async_runtime.Mutex;
 pub const Duration = async_runtime.Duration;
-pub const Timeout = async_runtime.Timeout;
 pub const Cancelable = async_runtime.Cancelable;
 
-pub fn Channel(comptime Event: type) type {
-    return async_runtime.Channel(Event);
-}
-
-pub fn Task(comptime Result: type) type {
-    return async_runtime.Task(Result);
-}
-
-pub fn select(args: anytype) @TypeOf(async_runtime.select(args)) {
-    return async_runtime.select(args);
-}
-
-pub fn sleep(duration: Duration) Cancelable!void {
-    return async_runtime.sleep(duration);
+pub fn sleep(io: std.Io, duration: Duration) Cancelable!void {
+    return async_runtime.sleep(io, duration);
 }
 
 pub fn yield() Cancelable!void {
@@ -35,15 +22,18 @@ const fd_readiness = @import("fd_readiness.zig");
 const json_owned = @import("json_owned.zig");
 const operation = @import("operation.zig");
 const process_runner = @import("process_runner.zig");
+const wake_event = @import("wake_event.zig");
 
 pub const BoundedQueue = bounded_queue.BoundedQueue;
 pub const ByteBuilder = @import("byte_builder.zig").ByteBuilder;
 pub const CancelSource = cancel.CancelSource;
 pub const CancelToken = cancel.CancelToken;
 pub const EventPipe = event_pipe.EventPipe;
-pub const ReadableFd = fd_readiness.ReadableFd;
-pub const ReadableFdError = fd_readiness.ReadableFdError;
+pub const PollReadableFdError = fd_readiness.PollReadableFdError;
+pub const pollReadableFd = fd_readiness.pollReadableFd;
+pub const pollReadableFdTimeout = fd_readiness.pollReadableFdTimeout;
 pub const JsonOwned = json_owned.JsonOwned;
+pub const WakeEvent = wake_event.WakeEvent;
 pub const OperationId = operation.OperationId;
 pub const OperationIdAllocator = operation.OperationIdAllocator;
 pub const sleepUntilCancel = cancel.sleepUntilCancel;
@@ -63,4 +53,5 @@ test {
     _ = @import("json_owned.zig");
     _ = @import("operation.zig");
     _ = @import("process_runner.zig");
+    _ = @import("wake_event.zig");
 }

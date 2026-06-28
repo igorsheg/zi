@@ -29,15 +29,15 @@ pub const AgentEventStream = struct {
     producer: Producer = .settled,
 
     const Producer = union(enum) {
-        running: runtime.Task(anyerror!void),
+        running: std.Io.Future(anyerror!void),
         spawn_failed: anyerror,
         settled,
     };
 
-    pub fn init(allocator: std.mem.Allocator, buffer: []StreamEvent) AgentEventStream {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, buffer: []StreamEvent) AgentEventStream {
         return .{
             .allocator = allocator,
-            .pipe = AgentEventPipe.init(buffer),
+            .pipe = AgentEventPipe.init(io, buffer),
         };
     }
 
@@ -56,15 +56,15 @@ pub const AgentEventStream = struct {
         return self.pipe.stream().poll();
     }
 
-    pub fn asyncNext(self: *AgentEventStream) @TypeOf(self.pipe.stream().asyncNext()) {
-        return self.pipe.stream().asyncNext();
+    pub fn setWake(self: *AgentEventStream, io: std.Io, event: *runtime.WakeEvent) void {
+        self.pipe.setWake(io, event);
     }
 
     pub fn awaitProducer(self: *AgentEventStream) anyerror!void {
         switch (self.producer) {
             .running => |*handle| {
                 defer self.producer = .settled;
-                try handle.join();
+                try handle.await(self.pipe.io);
             },
             .spawn_failed => |err| {
                 self.producer = .settled;
@@ -78,8 +78,7 @@ pub const AgentEventStream = struct {
         switch (self.producer) {
             .running => |*handle| {
                 defer self.producer = .settled;
-                handle.cancel();
-                try handle.result;
+                try handle.cancel(self.pipe.io);
             },
             .spawn_failed => |err| {
                 self.producer = .settled;
@@ -113,8 +112,9 @@ pub fn startPromptStream(
     buffer: []StreamEvent,
 ) void {
     const stream_io = task_runtime.io();
-    stream.* = AgentEventStream.init(allocator, buffer);
-    stream.producer = .{ .running = task_runtime.spawn(
+    stream.* = AgentEventStream.init(allocator, stream_io, buffer);
+    stream.producer = .{ .running = std.Io.concurrent(
+        stream_io,
         runPromptStreamProducer,
         .{ allocator, stream_io, prompts, context, config, token, task_runtime, stream },
     ) catch |err| {
@@ -153,8 +153,9 @@ pub fn startContinueStream(
     buffer: []StreamEvent,
 ) void {
     const stream_io = task_runtime.io();
-    stream.* = AgentEventStream.init(allocator, buffer);
-    stream.producer = .{ .running = task_runtime.spawn(
+    stream.* = AgentEventStream.init(allocator, stream_io, buffer);
+    stream.producer = .{ .running = std.Io.concurrent(
+        stream_io,
         runContinueStreamProducer,
         .{ allocator, stream_io, context, config, token, task_runtime, stream },
     ) catch |err| {
@@ -1147,7 +1148,7 @@ fn overflowingUpdatesTool(
 
 fn sleepingTool(
     _: std.mem.Allocator,
-    _: std.Io,
+    io: std.Io,
     _: *runtime.Runtime,
     context: ?*anyopaque,
     _: runtime.CancelToken,
@@ -1155,9 +1156,9 @@ fn sleepingTool(
     _: std.json.Value,
     _: ?agent.AgentToolUpdateCallback,
 ) anyerror!agent.ToolExecutionResult {
-    const entered: *runtime.ResetEvent = @ptrCast(@alignCast(context.?));
-    entered.set();
-    try runtime.sleep(.fromSeconds(60));
+    const entered: *runtime.WakeEvent = @ptrCast(@alignCast(context.?));
+    entered.set(io);
+    try runtime.sleep(io, .fromSeconds(60));
     return error.TestUnexpectedResult;
 }
 
@@ -1173,7 +1174,7 @@ test "run prompt emits prompt assistant and agent end events" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     const prompt = userMessage("hello");
 
@@ -1199,7 +1200,7 @@ test "run prompt emits prompt assistant and agent end events" {
 test "prompt stream exposes events through event pipe" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     const prompt = userMessage("hello");
     var buffer: [8]StreamEvent = undefined;
@@ -1234,7 +1235,7 @@ test "prompt stream exposes events through event pipe" {
 test "prompt stream drains many fast deltas through bounded pipe" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     const prompt = userMessage("hello");
     var buffer: [8]StreamEvent = undefined;
@@ -1269,7 +1270,7 @@ test "prompt stream drains many fast deltas through bounded pipe" {
 test "prompt stream closes event pipe when producer fails before terminal event" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     const prompt = userMessage("hello");
     var buffer: [8]StreamEvent = undefined;
@@ -1301,7 +1302,7 @@ test "prompt stream closes event pipe when producer fails before terminal event"
 test "prompt stream cancellation drains producer blocked on bounded event pipe" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     const prompt = userMessage("hello");
     var buffer: [1]StreamEvent = undefined;
@@ -1332,11 +1333,11 @@ test "prompt stream cancellation drains producer blocked on bounded event pipe" 
 test "prompt stream cancellation while tool is running drains as canceled" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     const prompt = userMessage("hello");
     var stream_calls: usize = 0;
-    var entered: runtime.ResetEvent = .init;
+    var entered: runtime.WakeEvent = .init;
     const tool: agent.AgentTool = .{
         .name = "echo",
         .description = "Echo",
@@ -1363,7 +1364,7 @@ test "prompt stream cancellation while tool is running drains as canceled" {
     );
     defer stream.deinit();
 
-    try entered.wait();
+    try entered.wait(task_runtime.io());
 
     try std.testing.expectError(error.Canceled, stream.cancelProducer());
 }
@@ -1375,7 +1376,7 @@ test "run prompt executes tool result then continues assistant turn" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
@@ -1415,7 +1416,7 @@ test "parallel tool calls emit bounded live updates through owner" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
@@ -1460,7 +1461,7 @@ test "parallel tool calls cancel and drain workers when owner update drain fails
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
@@ -1499,7 +1500,7 @@ test "parallel tool calls bound live updates before completing worker result" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
@@ -1553,7 +1554,7 @@ test "parallel tool calls finalize results in assistant source order" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     var stream_calls: usize = 0;
     var tool_calls: usize = 0;
@@ -1602,7 +1603,7 @@ test "run continue rejects assistant tail" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     const assistant: agent.AgentMessage = .{ .assistant = assistantMessage("done") };
 
@@ -1624,7 +1625,7 @@ test "run continue rejects assistant tail" {
 test "queued message emit failure releases pending batch once" {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
     const seed = userMessage("seed");
 
@@ -1666,7 +1667,7 @@ test "run prompt emits one tool result message_end per executed tool" {
     var events = std.ArrayList(agent.AgentEvent).empty;
     defer events.deinit(std.testing.allocator);
     defer deinitTestEvents(events.items);
-    var cancel = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel.deinit();
 
     var stream_calls: usize = 0;

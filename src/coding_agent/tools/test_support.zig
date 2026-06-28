@@ -53,7 +53,7 @@ pub fn executeWithUpdate(
 ) !agent.ToolExecutionResult {
     var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel_source.deinit();
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, args_json, .{});
     defer parsed.deinit();

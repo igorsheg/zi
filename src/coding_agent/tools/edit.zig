@@ -1124,7 +1124,7 @@ test "edit tool does not stream full edited file on success" {
 
     var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel_source.deinit();
     var capture: test_support.UpdateCapture = .{ .writer = .init(std.testing.allocator) };
     defer capture.deinit();
@@ -1183,7 +1183,7 @@ test "edit tool returns operational error when success result is too large" {
 
     var task_runtime = try agent.ToolRuntime.init(std.testing.allocator, .{});
     defer task_runtime.deinit();
-    var cancel_source = try runtime.CancelSource.init(std.testing.allocator);
+    var cancel_source = try runtime.CancelSource.init(std.testing.allocator, task_runtime.io());
     defer cancel_source.deinit();
     var result = try execute(
         std.testing.allocator,

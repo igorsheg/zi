@@ -431,25 +431,15 @@ const InteractiveController = struct {
 
     fn pollAndDrainInput(self: *InteractiveController) !bool {
         const start = self.nowNs();
-        const readable = runtime.ReadableFd.initBorrowed(self.terminal.inputFd());
-        var input = readable.asyncReadable();
-        var timeout = runtime.Timeout.fromMilliseconds(0);
-        switch (try runtime.select(.{ .input = &input, .timeout = &timeout })) {
-            .input => |result| {
-                self.recordDuration(.poll_input, start);
-                result catch return false;
-                _ = try self.timedTickTime();
-                const input_priority = try self.timedDrainInput();
-                self.requestInputFrame(input_priority);
-                if (try self.terminal.drainPendingResize()) self.render_throttle.requestForegroundFrame();
-                try self.renderIfDue(try self.timedTickTime(), .animation);
-                return true;
-            },
-            .timeout => {
-                self.recordDuration(.poll_input, start);
-                return false;
-            },
-        }
+        const ready = runtime.pollReadableFd(self.terminal.inputFd()) catch return false;
+        self.recordDuration(.poll_input, start);
+        if (!ready) return false;
+        _ = try self.timedTickTime();
+        const input_priority = try self.timedDrainInput();
+        self.requestInputFrame(input_priority);
+        if (try self.terminal.drainPendingResize()) self.render_throttle.requestForegroundFrame();
+        try self.renderIfDue(try self.timedTickTime(), .animation);
+        return true;
     }
 
     fn serviceImmediateWork(self: *InteractiveController) !bool {

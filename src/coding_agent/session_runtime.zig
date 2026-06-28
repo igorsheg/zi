@@ -22,6 +22,7 @@ pub const WakeResult = enum { input, session, frame };
 
 const session_command_message_bytes_max: usize = 160;
 const session_public_events_per_turn_max: usize = 16;
+const active_work_poll_interval_ms: u64 = 16;
 const SessionStats = client_protocol.PromptCommandSessionStats;
 
 fn ignoreBestEffortError(err: anyerror) void {
@@ -103,10 +104,11 @@ pub fn openSessionRuntime(allocator: std.mem.Allocator, options: Options) !Sessi
     const task_runtime = options.task_runtime orelse try runtime.Runtime.init(allocator, .{});
     errdefer if (options.task_runtime == null) task_runtime.deinit();
 
-    const resolved_cwd = if (std.mem.eql(u8, options.cwd, "."))
-        try options.dir.realPathFileAlloc(task_runtime.io(), options.cwd, allocator)
-    else
-        try allocator.dupe(u8, options.cwd);
+    const resolved_cwd = if (std.mem.eql(u8, options.cwd, ".")) blk: {
+        var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = try options.dir.realPathFile(task_runtime.io(), options.cwd, &buffer);
+        break :blk try allocator.dupe(u8, buffer[0..len]);
+    } else try allocator.dupe(u8, options.cwd);
     defer allocator.free(resolved_cwd);
 
     var services = try RuntimeServices.init(allocator, .{
@@ -339,7 +341,7 @@ pub const SessionRuntime = struct {
     commands: client_protocol.CommandQueue,
     events: client_protocol.EventQueue,
     retained_events: RetainedEventLedger,
-    wake_event: runtime.ResetEvent = .init,
+    owner_wake: runtime.WakeEvent = .init,
     active: ?ActiveOperation = null,
     completion_load: ?CompletionLoad = null,
     pending_file_completion: ?PendingFileCompletion = null,
@@ -385,11 +387,29 @@ pub const SessionRuntime = struct {
 
     const CompletionLoadKind = enum { resume_sessions, file_index_build, file_query };
 
+    const CompletionResultSlot = struct {
+        ready: std.atomic.Value(bool) = .init(false),
+        result: anyerror!CompletionLoadResult = undefined,
+        io: std.Io,
+        wake: *runtime.WakeEvent,
+
+        fn complete(self: *CompletionResultSlot, result: anyerror!CompletionLoadResult) void {
+            self.result = result;
+            self.ready.store(true, .release);
+            self.wake.set(self.io);
+        }
+
+        fn isReady(self: *const CompletionResultSlot) bool {
+            return self.ready.load(.acquire);
+        }
+    };
+
     const CompletionLoad = struct {
         kind: CompletionLoadKind,
         request_id: ?client_protocol.RequestId,
         models: ?client_protocol.CompletionList = null,
-        task: runtime.Task(anyerror!CompletionLoadResult),
+        task: std.Io.Future(void),
+        result_slot: *CompletionResultSlot,
         cwd: ?[]u8 = null,
         agent_dir: ?[]u8 = null,
         current_session_leaf: ?[]u8 = null,
@@ -463,7 +483,7 @@ pub const SessionRuntime = struct {
 
     pub fn submit(self: *SessionRuntime, envelope: client_protocol.CommandEnvelope) !void {
         try self.commands.push(envelope);
-        self.wake_event.set();
+        self.wakeOwner();
     }
 
     pub fn drainEvent(self: *SessionRuntime) ?client_protocol.EventEnvelope {
@@ -476,7 +496,7 @@ pub const SessionRuntime = struct {
             self.session_chrome_dirty or
             self.commands.count() > 0 or
             (self.pending_file_completion != null and self.completion_load == null) or
-            (self.completion_load != null and self.completion_load.?.task.hasResult());
+            (self.completion_load != null and self.completion_load.?.result_slot.isReady());
     }
 
     pub fn rejectClientCommand(
@@ -493,195 +513,83 @@ pub const SessionRuntime = struct {
         input_fd: std.posix.fd_t,
         frame_ms: u64,
     ) !WakeResult {
-        const readable = runtime.ReadableFd.initBorrowed(input_fd);
-        var input = readable.asyncReadable();
-        var frame = runtime.Timeout.fromMilliseconds(frame_ms);
-        const public_event_wake = self.session.publicEventWake();
-        const command_wake = &self.wake_event;
-        if (self.active) |*active| switch (active.phase) {
-            .running, .compacting => {
-                var progress = switch (active.phase) {
-                    .running => |run| run.stream.asyncNext(),
-                    .compacting => |run| run.stream.asyncNext(),
-                    .retry_wait => unreachable,
-                };
-                if (self.completion_load) |*load| {
-                    switch (try runtime.select(.{
-                        .input = &input,
-                        .prompt = &progress,
-                        .completion = &load.task,
-                        .public_event = public_event_wake,
-                        .command = command_wake,
-                        .frame = &frame,
-                    })) {
-                        .input => |result| {
-                            result catch return .session;
-                            return .input;
-                        },
-                        .prompt => |result| {
-                            self.applyActiveProgress(result) catch |err| self.failActiveOperation(err);
-                            return .session;
-                        },
-                        .completion => |result| {
-                            if (self.hasEventCapacity()) try self.applyCompletionLoadResult(result);
-                            return .session;
-                        },
-                        .public_event => {
-                            public_event_wake.reset();
-                            self.drainSessionEvents(null) catch return .session;
-                            return .session;
-                        },
-                        .command => {
-                            self.wake_event.reset();
-                            return .session;
-                        },
-                        .frame => return .frame,
-                    }
-                }
-                switch (try runtime.select(.{
-                    .input = &input,
-                    .prompt = &progress,
-                    .public_event = public_event_wake,
-                    .command = command_wake,
-                    .frame = &frame,
-                })) {
-                    .input => |result| {
-                        result catch return .session;
-                        return .input;
-                    },
-                    .prompt => |result| {
-                        self.applyActiveProgress(result) catch |err| self.failActiveOperation(err);
-                        return .session;
-                    },
-                    .public_event => {
-                        public_event_wake.reset();
-                        self.drainSessionEvents(null) catch return .session;
-                        return .session;
-                    },
-                    .command => {
-                        self.wake_event.reset();
-                        return .session;
-                    },
-                    .frame => return .frame,
-                }
-            },
-            .retry_wait => |wait| {
-                const remaining_ns = wait.resume_at_ns - self.nowNanoseconds();
-                if (remaining_ns <= 0) {
-                    self.startDueRetry();
-                    return .session;
-                }
-                var retry = runtime.Timeout.fromNanoseconds(@intCast(remaining_ns));
-                if (self.completion_load) |*load| {
-                    switch (try runtime.select(.{
-                        .input = &input,
-                        .retry = &retry,
-                        .completion = &load.task,
-                        .public_event = public_event_wake,
-                        .command = command_wake,
-                        .frame = &frame,
-                    })) {
-                        .input => |result| {
-                            result catch return .session;
-                            return .input;
-                        },
-                        .retry => {
-                            self.startDueRetry();
-                            return .session;
-                        },
-                        .completion => |result| {
-                            if (self.hasEventCapacity()) try self.applyCompletionLoadResult(result);
-                            return .session;
-                        },
-                        .public_event => {
-                            public_event_wake.reset();
-                            self.drainSessionEvents(null) catch return .session;
-                            return .session;
-                        },
-                        .command => {
-                            self.wake_event.reset();
-                            return .session;
-                        },
-                        .frame => return .frame,
-                    }
-                }
-                switch (try runtime.select(.{
-                    .input = &input,
-                    .retry = &retry,
-                    .public_event = public_event_wake,
-                    .command = command_wake,
-                    .frame = &frame,
-                })) {
-                    .input => |result| {
-                        result catch return .session;
-                        return .input;
-                    },
-                    .retry => {
-                        self.startDueRetry();
-                        return .session;
-                    },
-                    .public_event => {
-                        public_event_wake.reset();
-                        self.drainSessionEvents(null) catch return .session;
-                        return .session;
-                    },
-                    .command => {
-                        self.wake_event.reset();
-                        return .session;
-                    },
-                    .frame => return .frame,
-                }
-            },
+        const has_input_fd = input_fd >= 0;
+        if (has_input_fd and try runtime.pollReadableFd(input_fd)) return .input;
+        if (self.hasReadySessionWork()) return .session;
+        if (frame_ms == 0) return .frame;
+
+        const timeout_ms = self.nextWaitTimeoutMs(frame_ms);
+        self.owner_wake.reset();
+
+        if (!has_input_fd or self.hasOwnerWakeProducer()) {
+            self.owner_wake.waitTimeout(self.services.io, .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i64)))))),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return error.Canceled,
+            };
+            if (self.owner_wake.isSet()) self.owner_wake.reset();
+        } else if (try runtime.pollReadableFdTimeout(input_fd, timeout_ms)) {
+            return .input;
+        }
+
+        if (has_input_fd and try runtime.pollReadableFd(input_fd)) return .input;
+        if (self.hasReadySessionWork()) return .session;
+        if (timeout_ms == frame_ms) return .frame;
+        return .session;
+    }
+
+    fn hasReadySessionWork(self: *const SessionRuntime) bool {
+        return self.hasImmediateWork() or self.retryDue();
+    }
+
+    fn hasOwnerWakeProducer(self: *const SessionRuntime) bool {
+        return self.active != null or self.completion_load != null;
+    }
+
+    fn nextWaitTimeoutMs(self: *const SessionRuntime, frame_ms: u64) u64 {
+        var timeout_ms = frame_ms;
+        if (self.completion_load != null or self.active != null) {
+            timeout_ms = @min(timeout_ms, active_work_poll_interval_ms);
+        }
+        if (self.retryDelayMs()) |retry_ms| timeout_ms = @min(timeout_ms, retry_ms);
+        return timeout_ms;
+    }
+
+    fn retryDue(self: *const SessionRuntime) bool {
+        const active = if (self.active) |*operation| operation else return false;
+        const wait = switch (active.phase) {
+            .retry_wait => |wait| wait,
+            .running, .compacting => return false,
         };
-        if (self.completion_load) |*load| {
-            switch (try runtime.select(.{
-                .input = &input,
-                .completion = &load.task,
-                .public_event = public_event_wake,
-                .command = command_wake,
-                .frame = &frame,
-            })) {
-                .input => |result| {
-                    result catch return .session;
-                    return .input;
-                },
-                .completion => |result| {
-                    if (self.hasEventCapacity()) try self.applyCompletionLoadResult(result);
-                    return .session;
-                },
-                .public_event => {
-                    public_event_wake.reset();
-                    self.drainSessionEvents(null) catch return .session;
-                    return .session;
-                },
-                .command => {
-                    self.wake_event.reset();
-                    return .session;
-                },
-                .frame => return .frame,
-            }
-        }
-        switch (try runtime.select(.{
-            .input = &input,
-            .public_event = public_event_wake,
-            .command = command_wake,
-            .frame = &frame,
-        })) {
-            .input => |result| {
-                result catch return .session;
-                return .input;
-            },
-            .public_event => {
-                public_event_wake.reset();
-                self.drainSessionEvents(null) catch return .session;
-                return .session;
-            },
-            .command => {
-                self.wake_event.reset();
-                return .session;
-            },
-            .frame => return .frame,
-        }
+        return self.nowNanoseconds() >= wait.resume_at_ns;
+    }
+
+    fn retryDelayMs(self: *const SessionRuntime) ?u64 {
+        const active = if (self.active) |*operation| operation else return null;
+        const wait = switch (active.phase) {
+            .retry_wait => |wait| wait,
+            .running, .compacting => return null,
+        };
+        const remaining_ns = wait.resume_at_ns - self.nowNanoseconds();
+        if (remaining_ns <= 0) return 0;
+        const remaining: u64 = @intCast(remaining_ns);
+        return @max(@as(u64, 1), std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch 1);
+    }
+
+    fn wakeOwner(self: *SessionRuntime) void {
+        self.owner_wake.set(self.services.io);
+    }
+
+    fn watchRunProgress(self: *SessionRuntime, run: anytype) void {
+        run.stream.setWake(self.services.io, &self.owner_wake);
+    }
+
+    fn createCompletionResultSlot(self: *SessionRuntime) !*CompletionResultSlot {
+        const slot = try self.allocator.create(CompletionResultSlot);
+        slot.* = .{ .io = self.services.io, .wake = &self.owner_wake };
+        return slot;
     }
 
     pub fn step(self: *SessionRuntime) !void {
@@ -707,15 +615,18 @@ pub const SessionRuntime = struct {
         var count: usize = 0;
         while (count < limit) : (count += 1) {
             const active = if (self.active) |*operation| operation else return;
-            var progress = switch (active.phase) {
-                .running => |run| run.stream.asyncNext(),
-                .compacting => |run| run.stream.asyncNext(),
+            const poll = switch (active.phase) {
+                .running => |run| run.stream.poll(),
+                .compacting => |run| run.stream.poll(),
                 .retry_wait => return,
             };
-            var ready = runtime.Timeout.fromMilliseconds(0);
-            switch (try runtime.select(.{ .prompt = &progress, .ready = &ready })) {
-                .prompt => |result| try self.applyActiveProgress(result),
-                .ready => return,
+            switch (poll) {
+                .event => |event| try self.applyActiveProgress(event),
+                .terminal => try self.applyActiveProgress(null),
+                .empty => {
+                    try runtime.yield();
+                    return;
+                },
             }
         }
     }
@@ -736,6 +647,7 @@ pub const SessionRuntime = struct {
             self.failActiveOperation(err);
             return;
         };
+        self.watchRunProgress(run);
         active.phase = .{ .running = run };
         self.drainSessionEvents(active.request_id) catch |err| ignoreBestEffortError(err);
     }
@@ -812,6 +724,7 @@ pub const SessionRuntime = struct {
                 const phase: ActiveOperation.Phase = blk: {
                     if (self.session.shouldRunThresholdCompaction()) {
                         if (self.session.startCompactionRun(.threshold, false, null) catch null) |compaction_run| {
+                            self.watchRunProgress(compaction_run);
                             break :blk .{ .compacting = compaction_run };
                         }
                     }
@@ -821,6 +734,7 @@ pub const SessionRuntime = struct {
                         try self.enqueueRejected(envelope.id, .invalid_command, @errorName(err));
                         return;
                     };
+                    self.watchRunProgress(run);
                     break :blk .{ .running = run };
                 };
                 self.active = .{
@@ -1055,6 +969,7 @@ pub const SessionRuntime = struct {
     ) !void {
         switch (verdict) {
             .compact => |compaction_run| {
+                self.watchRunProgress(compaction_run);
                 active.overflow_retry_used = true;
                 active.phase = .{ .compacting = compaction_run };
                 try self.drainSessionEvents(active.request_id);
@@ -1261,6 +1176,7 @@ pub const SessionRuntime = struct {
             return;
         };
         errdefer self.session.destroyCompactionRun(compaction_run);
+        self.watchRunProgress(compaction_run);
         const prompt_text = try self.allocator.dupe(u8, "");
         errdefer self.allocator.free(prompt_text);
         self.active = .{
@@ -1525,7 +1441,10 @@ pub const SessionRuntime = struct {
         std.debug.assert(self.completion_load == null);
         const cwd = try self.allocator.dupe(u8, self.services.cwd);
         errdefer self.allocator.free(cwd);
-        const task = self.task_runtime.spawnBlocking(buildProjectFileIndexWorker, .{
+        const result_slot = try self.createCompletionResultSlot();
+        errdefer self.allocator.destroy(result_slot);
+        const task = std.Io.concurrent(self.services.io, publishProjectFileIndexWorker, .{
+            result_slot,
             self.host_config.dir,
             cwd,
         }) catch |err| {
@@ -1545,6 +1464,7 @@ pub const SessionRuntime = struct {
             .kind = .file_index_build,
             .request_id = request_id,
             .task = task,
+            .result_slot = result_slot,
             .cwd = cwd,
         };
     }
@@ -1557,7 +1477,10 @@ pub const SessionRuntime = struct {
     ) !void {
         const owned_query = try self.allocator.dupe(u8, query);
         errdefer self.allocator.free(owned_query);
-        const task = self.task_runtime.spawnBlocking(queryProjectFileCompletionWorker, .{
+        const result_slot = try self.createCompletionResultSlot();
+        errdefer self.allocator.destroy(result_slot);
+        const task = std.Io.concurrent(self.services.io, publishProjectFileCompletionWorker, .{
+            result_slot,
             index,
             owned_query,
         }) catch |err| {
@@ -1569,6 +1492,7 @@ pub const SessionRuntime = struct {
             .kind = .file_query,
             .request_id = request_id,
             .task = task,
+            .result_slot = result_slot,
             .query = owned_query,
         };
     }
@@ -1591,8 +1515,11 @@ pub const SessionRuntime = struct {
         errdefer self.allocator.free(agent_dir);
         var current_session_leaf = try self.dupeCurrentSessionLeaf();
         errdefer if (current_session_leaf) |leaf| self.allocator.free(leaf);
+        const result_slot = try self.createCompletionResultSlot();
+        errdefer self.allocator.destroy(result_slot);
 
-        const task = self.task_runtime.spawn(buildResumeCompletionListWorker, .{
+        const task = std.Io.concurrent(self.services.io, publishResumeCompletionListWorker, .{
+            result_slot,
             self.allocator,
             self.services.io,
             self.host_config.dir,
@@ -1615,6 +1542,7 @@ pub const SessionRuntime = struct {
             .request_id = request_id,
             .models = models,
             .task = task,
+            .result_slot = result_slot,
             .cwd = cwd,
             .agent_dir = agent_dir,
             .current_session_leaf = current_session_leaf,
@@ -1623,8 +1551,9 @@ pub const SessionRuntime = struct {
 
     fn finishReadyCompletionLoad(self: *SessionRuntime) !void {
         const load = if (self.completion_load) |*completion| completion else return;
-        if (!load.task.hasResult()) return;
-        try self.applyCompletionLoadResult(load.task.join());
+        if (!load.result_slot.isReady()) return;
+        load.task.await(self.services.io);
+        try self.applyCompletionLoadResult(load.result_slot.result);
     }
 
     fn applyCompletionLoadResult(
@@ -1637,6 +1566,7 @@ pub const SessionRuntime = struct {
     fn finishCompletionLoad(self: *SessionRuntime, result: anyerror!CompletionLoadResult) !void {
         var load = self.completion_load orelse return;
         self.completion_load = null;
+        defer self.allocator.destroy(load.result_slot);
         defer if (load.cwd) |cwd| self.allocator.free(cwd);
         defer if (load.agent_dir) |agent_dir| self.allocator.free(agent_dir);
         defer if (load.current_session_leaf) |leaf| self.allocator.free(leaf);
@@ -1716,12 +1646,14 @@ pub const SessionRuntime = struct {
     fn cancelCompletionLoad(self: *SessionRuntime) void {
         var load = self.completion_load orelse return;
         self.completion_load = null;
-        load.task.cancel();
-        const payload = load.task.join() catch null;
-        if (payload) |value| {
-            var owned = value;
-            owned.deinit(self.allocator);
+        load.task.cancel(self.services.io);
+        if (load.result_slot.isReady()) {
+            if (load.result_slot.result) |value| {
+                var owned = value;
+                owned.deinit(self.allocator);
+            } else |_| {}
         }
+        self.allocator.destroy(load.result_slot);
         if (load.models) |*models| models.deinit(self.allocator);
         if (load.cwd) |cwd| self.allocator.free(cwd);
         if (load.agent_dir) |agent_dir| self.allocator.free(agent_dir);
@@ -1834,7 +1766,7 @@ pub const SessionRuntime = struct {
             if (eventRefreshesSessionChrome(event)) self.session_chrome_dirty = true;
             try self.enqueueEvent(.{ .request_id = request_id, .event = event });
         }
-        if (!self.session.publicEventsEmpty()) self.session.publicEventWake().set();
+        if (!self.session.publicEventsEmpty()) self.session.publicEventWake().set(self.services.io);
         if (self.session_chrome_dirty) try self.enqueueSessionChrome(request_id);
     }
 
@@ -1892,9 +1824,13 @@ pub const SessionRuntime = struct {
         sequenced.seq = self.next_event_seq;
         self.next_event_seq += 1;
         try self.retained_events.append(sequenced);
-        if (self.events.pushOrDrop(sequenced)) return;
+        if (self.events.pushOrDrop(sequenced)) {
+            self.wakeOwner();
+            return;
+        }
         if (self.pending_event == null) {
             self.pending_event = sequenced;
+            self.wakeOwner();
             return;
         }
         var owned_envelope = sequenced;
@@ -1943,6 +1879,43 @@ const CompletionLoadResult = union(enum) {
         self.* = undefined;
     }
 };
+
+fn publishResumeCompletionListWorker(
+    slot: *SessionRuntime.CompletionResultSlot,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    environ: ?*const std.process.Environ.Map,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    current_session_leaf: ?[]const u8,
+) void {
+    slot.complete(buildResumeCompletionListWorker(
+        allocator,
+        io,
+        dir,
+        environ,
+        cwd,
+        agent_dir,
+        current_session_leaf,
+    ));
+}
+
+fn publishProjectFileIndexWorker(
+    slot: *SessionRuntime.CompletionResultSlot,
+    dir: std.Io.Dir,
+    cwd: []const u8,
+) void {
+    slot.complete(buildProjectFileIndexWorker(dir, cwd));
+}
+
+fn publishProjectFileCompletionWorker(
+    slot: *SessionRuntime.CompletionResultSlot,
+    index: *const file_completion.Index,
+    query: []const u8,
+) void {
+    slot.complete(queryProjectFileCompletionWorker(index, query));
+}
 
 fn buildResumeCompletionListWorker(
     allocator: std.mem.Allocator,
@@ -2221,7 +2194,7 @@ test "session runtime completion snapshot reports model status and resume sessio
                 var ignored = event;
                 ignored.deinit(std.testing.allocator);
             }
-            try runtime.sleep(.fromMilliseconds(1));
+            try runtime.sleep(session_runtime.task_runtime.io(), .fromMilliseconds(1));
         }
         return error.TestUnexpectedResult;
     };
@@ -2266,7 +2239,7 @@ fn waitForFileCompletionEvent(session_runtime: *SessionRuntime) !client_protocol
             var ignored = event;
             ignored.deinit(std.testing.allocator);
         }
-        try runtime.sleep(.fromMilliseconds(1));
+        try runtime.sleep(session_runtime.task_runtime.io(), .fromMilliseconds(1));
     }
     return error.TestUnexpectedResult;
 }
@@ -3301,7 +3274,7 @@ test "session runtime retries transient failure through the live owner loop" {
                 else => {},
             }
         }
-        try runtime.sleep(.fromMilliseconds(1));
+        try runtime.sleep(session_runtime.task_runtime.io(), .fromMilliseconds(1));
     }
 
     try std.testing.expectEqual(client_protocol.OperationFinished.Reason.completed, finished_reason.?);
@@ -3341,7 +3314,7 @@ fn driveUntilOperationFinished(session_runtime: *SessionRuntime) !DriveOutcome {
                 else => {},
             }
         }
-        try runtime.sleep(.fromMilliseconds(1));
+        try runtime.sleep(session_runtime.task_runtime.io(), .fromMilliseconds(1));
     }
     return error.OperationDidNotFinish;
 }
@@ -3768,7 +3741,7 @@ test "session runtime cancel during retry backoff settles operation as canceled"
         if (session_runtime.active) |active| {
             if (active.phase == .retry_wait) break;
         }
-        try runtime.sleep(.fromMilliseconds(1));
+        try runtime.sleep(session_runtime.task_runtime.io(), .fromMilliseconds(1));
     }
     try std.testing.expect(session_runtime.active.?.phase == .retry_wait);
 
