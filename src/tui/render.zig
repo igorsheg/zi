@@ -30,6 +30,14 @@ pub const item_rows_max: usize = 512;
 
 const transcript_top: u16 = 0;
 const padding_x: u16 = 1;
+
+pub fn transcriptTop() u16 {
+    return transcript_top;
+}
+
+pub fn transcriptPaddingX() u16 {
+    return padding_x;
+}
 const item_margin_bottom: usize = 1;
 const hint_bytes_max: usize = 96;
 const notice_bytes_max: usize = 96;
@@ -54,6 +62,24 @@ pub const Row = struct {
     prefix_style: theme_mod.Style = .{},
     text_style: theme_mod.Style = .{},
     row_style: theme_mod.Style = .{},
+};
+
+const NormalizedSelection = struct {
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
+};
+
+const ColumnRange = struct {
+    start: usize,
+    end: usize,
+};
+
+pub const SelectionCopy = union(enum) {
+    empty,
+    too_large,
+    text: []u8,
 };
 
 /// Draw scratch for one item's rows plus an arena for generated row text,
@@ -650,13 +676,17 @@ fn drawTranscript(
     const total = transcriptTotalRows(app);
     if (timing) |t| t.transcript_total_ns += mark.lap();
     var skip_remaining = clampedScrollRows(app);
+    const initial_skip = skip_remaining;
     const drawn = @min(total - skip_remaining, visible_rows);
     if (drawn == 0) return;
 
     var sink: RowSink = .{
         .painter = painter,
+        .app = app,
         .draw_remaining = drawn,
         .next_y = transcript_top + @as(u16, @intCast(drawn)) - 1,
+        .next_row = total - initial_skip - 1,
+        .selection = normalizedSelection(app),
     };
     var index = app.transcript.items.items.len;
     while (index > 0 and sink.draw_remaining > 0) {
@@ -748,21 +778,144 @@ const RowBuildWindow = struct {
 
 const RowSink = struct {
     painter: *Painter,
+    app: *const App,
     skip_remaining: usize = 0,
     draw_remaining: usize,
     next_y: u16,
+    next_row: usize,
+    selection: ?NormalizedSelection,
 
     fn emit(self: *RowSink, row: Row) void {
         if (self.skip_remaining > 0) {
             self.skip_remaining -= 1;
+            self.next_row -|= 1;
             return;
         }
         if (self.draw_remaining == 0) return;
-        self.painter.drawRow(self.next_y, row);
+        self.painter.drawRowSelected(self.next_y, row, self.app.theme.selection_bg, rowSelectionColumns(
+            self.selection,
+            self.next_row,
+            rowContentWidth(row),
+        ));
         self.draw_remaining -= 1;
         self.next_y -|= 1;
+        self.next_row -|= 1;
     }
 };
+
+fn normalizedSelection(app: *const App) ?NormalizedSelection {
+    const range = app.selection.range() orelse return null;
+    const start_before_end = range.anchor.row < range.focus.row or
+        (range.anchor.row == range.focus.row and range.anchor.col <= range.focus.col);
+    if (start_before_end) return .{
+        .start_row = range.anchor.row,
+        .start_col = range.anchor.col,
+        .end_row = range.focus.row,
+        .end_col = range.focus.col,
+    };
+    return .{
+        .start_row = range.focus.row,
+        .start_col = range.focus.col,
+        .end_row = range.anchor.row,
+        .end_col = range.anchor.col,
+    };
+}
+
+fn rowSelectionColumns(selection: ?NormalizedSelection, row_index: usize, row_width: usize) ?ColumnRange {
+    const selected = selection orelse return null;
+    if (row_index < selected.start_row or row_index > selected.end_row) return null;
+    var start: usize = 0;
+    var end: usize = row_width;
+    if (row_index == selected.start_row) start = @min(selected.start_col, row_width);
+    if (row_index == selected.end_row) end = @min(selected.end_col, row_width);
+    if (start >= end) return null;
+    return .{ .start = start, .end = end };
+}
+
+fn rowContentWidth(row: Row) usize {
+    var width: usize = 0;
+    if (row.show_prefix) width += text_mod.displayWidth(row.prefix);
+    if (row.segments.len > 0) {
+        for (row.segments) |segment| width += text_mod.displayWidth(segment.text);
+    } else {
+        width += text_mod.displayWidth(row.text);
+    }
+    return width;
+}
+
+pub fn selectedText(
+    gpa: std.mem.Allocator,
+    app: *App,
+    scratch: *RowScratch,
+    max_bytes: usize,
+) error{OutOfMemory}!SelectionCopy {
+    const selection = normalizedSelection(app) orelse return .empty;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var emitted = false;
+    var absolute_row: usize = 0;
+    for (app.transcript.items.items) |*item| {
+        const rows = itemRows(item, app.width, &app.theme, app.tools_expanded);
+        var count: usize = 0;
+        buildItemRows(scratch, &count, item, app.width, &app.theme, app.tools_expanded);
+        std.debug.assert(count == rows);
+        for (scratch.rows[0..count]) |row| {
+            const columns = rowSelectionColumns(selection, absolute_row, rowContentWidth(row));
+            if (columns) |range| {
+                if (emitted) {
+                    if (out.items.len + 1 > max_bytes) return .too_large;
+                    try out.append(gpa, '\n');
+                }
+                if (!try appendRowSelection(gpa, &out, row, range, max_bytes)) return .too_large;
+                emitted = true;
+            }
+            absolute_row += 1;
+        }
+    }
+    if (!emitted) return .empty;
+    return .{ .text = try out.toOwnedSlice(gpa) };
+}
+
+fn appendRowSelection(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    row: Row,
+    range: ColumnRange,
+    max_bytes: usize,
+) error{OutOfMemory}!bool {
+    var col: usize = 0;
+    if (row.show_prefix and !try appendTextSelection(gpa, out, row.prefix, &col, range, max_bytes)) return false;
+    if (row.segments.len > 0) {
+        for (row.segments) |segment| {
+            if (!try appendTextSelection(gpa, out, segment.text, &col, range, max_bytes)) return false;
+        }
+    } else if (!try appendTextSelection(gpa, out, row.text, &col, range, max_bytes)) return false;
+    return true;
+}
+
+fn appendTextSelection(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    bytes: []const u8,
+    col: *usize,
+    range: ColumnRange,
+    max_bytes: usize,
+) error{OutOfMemory}!bool {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const grapheme = text_mod.nextGrapheme(bytes[index..]);
+        if (grapheme.end == 0) break;
+        const next_col = col.* + grapheme.width;
+        if (next_col > range.start and col.* < range.end) {
+            const piece = bytes[index .. index + grapheme.end];
+            if (out.items.len + piece.len > max_bytes) return false;
+            try out.appendSlice(gpa, piece);
+        }
+        col.* = next_col;
+        index += grapheme.end;
+    }
+    return true;
+}
 
 /// The single producer of an item's visual rows, top-down, including the
 /// margin row below the item. With `out == null` it only counts. Row count
@@ -2087,21 +2240,88 @@ const Painter = struct {
     }
 
     fn drawRow(self: *Painter, y: u16, row: Row) void {
+        self.drawRowSelected(y, row, .{}, null);
+    }
+
+    fn drawRowSelected(
+        self: *Painter,
+        y: u16,
+        row: Row,
+        selection_style: theme_mod.Style,
+        selection: ?ColumnRange,
+    ) void {
         self.fillRect(0, y, self.width, 1, row.row_style);
         var x: u16 = @min(padding_x, self.width);
+        var col: usize = 0;
         if (row.show_prefix and row.prefix.len > 0) {
-            self.writeText(x, y, row.prefix, row.prefix_style);
-            x = advance(x, text_mod.displayWidth(row.prefix));
+            self.writeSelectableText(
+                &x,
+                &col,
+                y,
+                row.prefix,
+                row.prefix_style,
+                selection_style,
+                selection,
+            );
         }
         if (row.segments.len > 0) {
             for (row.segments) |segment| {
                 if (x >= self.width) break;
-                self.writeText(x, y, segment.text, segment.style);
-                x = advance(x, text_mod.displayWidth(segment.text));
+                self.writeSelectableText(
+                    &x,
+                    &col,
+                    y,
+                    segment.text,
+                    segment.style,
+                    selection_style,
+                    selection,
+                );
             }
         } else if (x < self.width and row.text.len > 0) {
-            self.writeText(x, y, row.text, row.text_style);
-            x = advance(x, text_mod.displayWidth(row.text));
+            self.writeSelectableText(
+                &x,
+                &col,
+                y,
+                row.text,
+                row.text_style,
+                selection_style,
+                selection,
+            );
+        }
+    }
+
+    fn writeSelectableText(
+        self: *Painter,
+        x: *u16,
+        col: *usize,
+        y: u16,
+        bytes: []const u8,
+        style: theme_mod.Style,
+        selection_style: theme_mod.Style,
+        selection: ?ColumnRange,
+    ) void {
+        if (selection == null) {
+            self.writeText(x.*, y, bytes, style);
+            x.* = advance(x.*, text_mod.displayWidth(bytes));
+            col.* += text_mod.displayWidth(bytes);
+            return;
+        }
+        var index: usize = 0;
+        while (index < bytes.len and x.* < self.width) {
+            const grapheme = text_mod.nextGrapheme(bytes[index..]);
+            if (grapheme.end == 0) break;
+            const piece = bytes[index .. index + grapheme.end];
+            const width = grapheme.width;
+            const selected = if (selection) |range| blk: {
+                const next_col = col.* + width;
+                break :blk next_col > range.start and col.* < range.end;
+            } else false;
+            var piece_style = style;
+            if (selected) piece_style.bg = selection_style.bg;
+            self.writeText(x.*, y, piece, piece_style);
+            x.* = advance(x.*, width);
+            col.* += width;
+            index += grapheme.end;
         }
     }
 };
@@ -2387,6 +2607,30 @@ test "memoized item rows match a fresh build and invalidate on mutation" {
     var narrow_fresh: usize = 0;
     buildItemRows(null, &narrow_fresh, &app.transcript.items.items[0], app.width, &app.theme, false);
     try std.testing.expectEqual(narrow_fresh, countItem(&app, 0));
+}
+
+test "selected text uses transcript row projection and column bounds" {
+    var app = App.init(40, 10, .{});
+    defer app.deinit(testing_gpa);
+
+    _ = try app.transcript.append(testing_gpa, .{ .message = .{
+        .role = .assistant,
+        .text = "hello world\nsecond row",
+    } });
+    app.selection = .{ .selected = .{
+        .anchor = .{ .row = 0, .col = 6 },
+        .focus = .{ .row = 1, .col = 6 },
+    } };
+
+    var scratch: RowScratch = undefined;
+    const copied = try selectedText(testing_gpa, &app, &scratch, App.copy_selection_bytes_max);
+    switch (copied) {
+        .text => |text| {
+            defer testing_gpa.free(text);
+            try std.testing.expectEqualStrings("world\nsecond", text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "picker reserves bottom rows and pushes composer/status upward" {

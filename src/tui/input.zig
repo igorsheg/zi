@@ -101,6 +101,8 @@ pub const Key = enum {
     page_up,
     page_down,
     ctrl_c,
+    ctrl_shift_c,
+    super_c,
     ctrl_d,
     ctrl_g,
     ctrl_o,
@@ -108,10 +110,18 @@ pub const Key = enum {
     alt_v,
 };
 
+pub const MousePoint = struct {
+    col: u16,
+    row: u16,
+};
+
 pub const Input = union(enum) {
     key: Key,
     shortcut: Chord,
     text: InlineBytes,
+    mouse_down: MousePoint,
+    mouse_drag: MousePoint,
+    mouse_up: MousePoint,
     paste_begin,
     paste_end,
     wheel_up,
@@ -134,11 +144,19 @@ pub fn fromVaxis(event: vaxis.Event) Input {
 }
 
 fn fromVaxisMouse(mouse: vaxis.Mouse) Input {
-    if (mouse.type != .press) return .ignored;
-    return switch (mouse.button) {
-        .wheel_up => .wheel_up,
-        .wheel_down => .wheel_down,
-        else => .ignored,
+    const col: u16 = @intCast(@max(mouse.col, 0));
+    const row: u16 = @intCast(@max(mouse.row, 0));
+    const point: MousePoint = .{ .col = col, .row = row };
+    return switch (mouse.type) {
+        .press => switch (mouse.button) {
+            .left => .{ .mouse_down = point },
+            .wheel_up => .wheel_up,
+            .wheel_down => .wheel_down,
+            else => .ignored,
+        },
+        .drag => if (mouse.button == .left) .{ .mouse_drag = point } else .ignored,
+        .release => .{ .mouse_up = point },
+        .motion => .ignored,
     };
 }
 
@@ -161,6 +179,8 @@ fn fromVaxisKey(key: vaxis.Key) Input {
     if (key.matches(vaxis.Key.end, .{})) return .{ .key = .end };
     if (key.matches(vaxis.Key.page_up, .{})) return .{ .key = .page_up };
     if (key.matches(vaxis.Key.page_down, .{})) return .{ .key = .page_down };
+    if (key.matches('c', .{ .super = true })) return .{ .key = .super_c };
+    if (key.matches('c', .{ .ctrl = true, .shift = true })) return .{ .key = .ctrl_shift_c };
     if (key.matches('c', .{ .ctrl = true })) return .{ .key = .ctrl_c };
     if (key.matches('d', .{ .ctrl = true })) return .{ .key = .ctrl_d };
     if (key.matches('g', .{ .ctrl = true })) return .{ .key = .ctrl_g };
@@ -195,6 +215,7 @@ pub const KeyAction = union(enum) {
     transcript_scroll_up,
     transcript_scroll_down,
     transcript_follow_tail,
+    copy_selection,
     toggle_tool_expansion,
     interrupt,
     clear_or_exit,
@@ -230,6 +251,7 @@ fn resolveKey(key: Key) KeyAction {
         .page_up => .transcript_page_up,
         .page_down => .transcript_page_down,
         .ctrl_end => .transcript_follow_tail,
+        .ctrl_shift_c, .super_c => .copy_selection,
         .escape => .interrupt,
         .ctrl_c => .clear_or_exit,
         .ctrl_g => .open_external_editor,
@@ -257,7 +279,7 @@ test "raw parser bytes map paste markers and mouse wheel" {
     try std.testing.expectEqual(Input.wheel_down, try parseInput("\x1b[<65;10;5M"));
 }
 
-test "fromVaxis maps only mouse wheel presses" {
+test "fromVaxis maps mouse wheel and selection drag events" {
     try std.testing.expectEqual(Input.wheel_up, fromVaxis(.{ .mouse = .{
         .col = 0,
         .row = 0,
@@ -272,12 +294,19 @@ test "fromVaxis maps only mouse wheel presses" {
         .mods = .{},
         .type = .press,
     } }));
-    try std.testing.expectEqual(Input.ignored, fromVaxis(.{ .mouse = .{
+    try std.testing.expectEqual(@as(Input, .{ .mouse_down = .{ .col = 0, .row = 0 } }), fromVaxis(.{ .mouse = .{
         .col = 0,
         .row = 0,
         .button = .left,
         .mods = .{},
         .type = .press,
+    } }));
+    try std.testing.expectEqual(@as(Input, .{ .mouse_drag = .{ .col = 2, .row = 1 } }), fromVaxis(.{ .mouse = .{
+        .col = 2,
+        .row = 1,
+        .button = .left,
+        .mods = .{},
+        .type = .drag,
     } }));
 }
 
@@ -288,6 +317,8 @@ test "resolve maps editing keys" {
     try std.testing.expectEqual(KeyAction.transcript_scroll_up, resolve(.wheel_up));
     try std.testing.expectEqual(KeyAction.transcript_scroll_down, resolve(.wheel_down));
     try std.testing.expectEqual(KeyAction.transcript_follow_tail, resolve(.{ .key = .ctrl_end }));
+    try std.testing.expectEqual(KeyAction.copy_selection, resolve(.{ .key = .super_c }));
+    try std.testing.expectEqual(KeyAction.copy_selection, resolve(.{ .key = .ctrl_shift_c }));
     try std.testing.expectEqual(KeyAction.composer_newline, resolve(.{ .key = .newline }));
     try std.testing.expectEqual(KeyAction.composer_submit, resolve(.{ .key = .enter }));
     try std.testing.expectEqual(KeyAction.open_external_editor, resolve(.{ .key = .ctrl_g }));
@@ -305,7 +336,7 @@ test "ctrl alt printable text passes through for AltGr" {
 }
 
 test "unknown ctrl key becomes shortcut chord" {
-    try std.testing.expectEqual(Input{ .shortcut = Chord.ctrl('l') }, try parseInput("\x0c"));
+    try std.testing.expectEqual(@as(Input, .{ .shortcut = Chord.ctrl('l') }), try parseInput("\x0c"));
 }
 
 test "inline text truncates on utf8 boundaries" {
