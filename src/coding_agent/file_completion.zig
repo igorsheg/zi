@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 
 const client_protocol = @import("client_protocol.zig");
 
-pub const item_count_max: usize = client_protocol.completion_item_count_max;
+pub const item_count_max: usize = 64;
 pub const index_entry_count_max: usize = 20_000;
 pub const index_path_bytes_max: usize = 2 * 1024 * 1024;
 pub const index_path_bytes_per_entry_max: usize = client_protocol.completion_id_bytes_max;

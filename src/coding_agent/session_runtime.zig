@@ -431,11 +431,32 @@ pub const SessionRuntime = struct {
         }
     };
 
+    const CompletionTask = union(enum) {
+        io: std.Io.Future(void),
+        thread: std.Thread,
+
+        fn join(self: *CompletionTask, io: std.Io) void {
+            switch (self.*) {
+                .io => |*future| _ = future.await(io),
+                .thread => |thread| thread.join(),
+            }
+        }
+
+        fn cancelAndJoin(self: *CompletionTask, io: std.Io) void {
+            switch (self.*) {
+                .io => |*future| _ = future.cancel(io),
+                // File completion work is bounded by the index caps. std.Thread has no
+                // safe cancellation; joining preserves the result-slot lifetime.
+                .thread => |thread| thread.join(),
+            }
+        }
+    };
+
     const CompletionLoad = struct {
         kind: CompletionLoadKind,
         request_id: ?client_protocol.RequestId,
         models: ?client_protocol.CompletionList = null,
-        task: std.Io.Future(void),
+        task: CompletionTask,
         result_slot: *CompletionResultSlot,
         cwd: ?[]u8 = null,
         agent_dir: ?[]u8 = null,
@@ -1571,7 +1592,7 @@ pub const SessionRuntime = struct {
         errdefer self.allocator.free(cwd);
         const result_slot = try self.createCompletionResultSlot();
         errdefer self.allocator.destroy(result_slot);
-        const task = std.Io.concurrent(self.services.io, publishProjectFileIndexWorker, .{
+        const task = std.Thread.spawn(.{}, publishProjectFileIndexWorker, .{
             result_slot,
             self.host_config.dir,
             cwd,
@@ -1591,7 +1612,7 @@ pub const SessionRuntime = struct {
         self.completion_load = .{
             .kind = .file_index_build,
             .request_id = request_id,
-            .task = task,
+            .task = .{ .thread = task },
             .result_slot = result_slot,
             .cwd = cwd,
         };
@@ -1607,7 +1628,7 @@ pub const SessionRuntime = struct {
         errdefer self.allocator.free(owned_query);
         const result_slot = try self.createCompletionResultSlot();
         errdefer self.allocator.destroy(result_slot);
-        const task = std.Io.concurrent(self.services.io, publishProjectFileCompletionWorker, .{
+        const task = std.Thread.spawn(.{}, publishProjectFileCompletionWorker, .{
             result_slot,
             index,
             owned_query,
@@ -1619,7 +1640,7 @@ pub const SessionRuntime = struct {
         self.completion_load = .{
             .kind = .file_query,
             .request_id = request_id,
-            .task = task,
+            .task = .{ .thread = task },
             .result_slot = result_slot,
             .query = owned_query,
         };
@@ -1669,7 +1690,7 @@ pub const SessionRuntime = struct {
             .kind = .resume_sessions,
             .request_id = request_id,
             .models = models,
-            .task = task,
+            .task = .{ .io = task },
             .result_slot = result_slot,
             .cwd = cwd,
             .agent_dir = agent_dir,
@@ -1680,7 +1701,7 @@ pub const SessionRuntime = struct {
     fn finishReadyCompletionLoad(self: *SessionRuntime) !void {
         const load = if (self.completion_load) |*completion| completion else return;
         if (!load.result_slot.isReady()) return;
-        load.task.await(self.services.io);
+        load.task.join(self.services.io);
         try self.applyCompletionLoadResult(load.result_slot.result);
     }
 
@@ -1774,7 +1795,7 @@ pub const SessionRuntime = struct {
     fn cancelCompletionLoad(self: *SessionRuntime) void {
         var load = self.completion_load orelse return;
         self.completion_load = null;
-        load.task.cancel(self.services.io);
+        load.task.cancelAndJoin(self.services.io);
         if (load.result_slot.isReady()) {
             if (load.result_slot.result) |value| {
                 var owned = value;
@@ -1951,7 +1972,7 @@ pub const SessionRuntime = struct {
         var sequenced = envelope;
         sequenced.seq = self.next_event_seq;
         self.next_event_seq += 1;
-        try self.retained_events.append(sequenced);
+        if (shouldRetainClientEvent(sequenced.event)) try self.retained_events.append(sequenced);
         if (self.events.pushOrDrop(sequenced)) {
             self.wakeOwner();
             return;
@@ -1986,6 +2007,19 @@ pub const SessionRuntime = struct {
         return false;
     }
 };
+
+fn shouldRetainClientEvent(event: client_protocol.ClientEvent) bool {
+    return switch (event) {
+        .completion_snapshot,
+        .file_completion,
+        .snapshot,
+        .history_page,
+        .replay,
+        .replay_gap,
+        => false,
+        else => true,
+    };
+}
 
 fn copyBytes(dest: []u8, source: []const u8) u16 {
     const keep = @min(dest.len, source.len);
@@ -2519,6 +2553,50 @@ test "session runtime replays retained event envelopes" {
     try std.testing.expectEqual(original_seq, replay.event.replay.events[0].seq);
     try std.testing.expect(
         std.mem.indexOf(u8, replay.event.replay.events[0].json.text, "\"queue_changed\"") != null,
+    );
+}
+
+test "session runtime does not retain request scoped completion replies" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(std.testing.allocator, .{});
+    defer task_runtime.deinit();
+    var session_runtime = try initTestRuntime(&tmp, task_runtime);
+    defer session_runtime.deinit();
+
+    const no_items: []const client_protocol.CompletionItem.Source = &.{};
+    try session_runtime.enqueueEvent(.{ .request_id = 1, .event = .{
+        .file_completion = try client_protocol.FileCompletionResult.init(
+            std.testing.allocator,
+            "src",
+            no_items,
+            false,
+        ),
+    } });
+    var completion = session_runtime.drainEvent().?;
+    completion.deinit(std.testing.allocator);
+
+    try session_runtime.enqueueEvent(.{ .request_id = 2, .event = .{ .queue_changed = .{
+        .steering_count = 0,
+        .follow_up_count = 0,
+        .revision = 7,
+    } } });
+    var queue = session_runtime.drainEvent().?;
+    const queue_seq = queue.seq;
+    queue.deinit(std.testing.allocator);
+
+    try session_runtime.submit(.{ .id = 3, .command = .{ .replay = .{ .after = 0 } } });
+    try session_runtime.step();
+    var replay = session_runtime.drainEvent().?;
+    defer replay.deinit(std.testing.allocator);
+    try std.testing.expect(replay.event == .replay);
+    try std.testing.expectEqual(@as(usize, 1), replay.event.replay.events.len);
+    try std.testing.expectEqual(queue_seq, replay.event.replay.events[0].seq);
+    try std.testing.expect(
+        std.mem.indexOf(u8, replay.event.replay.events[0].json.text, "\"queue_changed\"") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, replay.event.replay.events[0].json.text, "\"file_completion\"") == null,
     );
 }
 
