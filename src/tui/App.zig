@@ -31,6 +31,31 @@ const composer_scroll_status_id: status_mod.ContributionId = std.math.maxInt(sta
 const ScrollResult = enum { moved, boundary };
 const TailFollow = enum { follow_tail, detached };
 
+pub const copy_selection_bytes_max: usize = 100_000;
+
+pub const SelectionPoint = struct {
+    row: usize,
+    col: usize,
+};
+
+pub const SelectionRange = struct {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+};
+
+pub const Selection = union(enum) {
+    none,
+    dragging: SelectionRange,
+    selected: SelectionRange,
+
+    pub fn range(self: Selection) ?SelectionRange {
+        return switch (self) {
+            .none => null,
+            .dragging, .selected => |range_value| range_value,
+        };
+    }
+};
+
 const TranscriptViewport = struct {
     scroll_rows: usize = 0,
     tail_follow: TailFollow = .follow_tail,
@@ -106,6 +131,7 @@ status: status_mod.Store = .{},
 notify: notify_mod.Store = .{},
 key_bindings: keybind.Store = .{},
 viewport: TranscriptViewport = .{},
+selection: Selection = .none,
 theme: theme_mod.Theme,
 tools_expanded: bool = false,
 now_ms: i64 = 0,
@@ -374,6 +400,7 @@ pub const Effect = union(enum) {
     edit_composer_external: []u8,
     picker_selected: Picker.Selection,
     request_clipboard_image_paste,
+    request_copy_selection,
     interrupt,
     request_shutdown,
     request_transcript_history,
@@ -385,6 +412,7 @@ pub const Effect = union(enum) {
             .submit_text, .edit_composer_external => |text| gpa.free(text),
             .picker_selected => |selection| gpa.free(selection.item_id),
             .request_clipboard_image_paste,
+            .request_copy_selection,
             .interrupt,
             .request_shutdown,
             .request_transcript_history,
@@ -401,6 +429,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             if (self.width != size.width or self.height != size.height) {
                 self.width = size.width;
                 self.height = size.height;
+                self.selection = .none;
                 self.clampOrFollowViewport();
                 self.syncComposerScrollHint();
                 self.dirty = true;
@@ -419,6 +448,7 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
         .clear_transcript => {
             self.transcript.clear(gpa);
             self.viewport.clear();
+            self.selection = .none;
             self.viewport.assertInvariants();
             self.dirty = true;
             return null;
@@ -615,8 +645,27 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
         return null;
     }
 
+    switch (event) {
+        .mouse_down => |point| {
+            self.beginSelection(point);
+            return null;
+        },
+        .mouse_drag => |point| {
+            self.updateSelection(point);
+            return null;
+        },
+        .mouse_up => |point| {
+            self.endSelection(point);
+            return null;
+        },
+        else => {},
+    }
+
     if (event == .shortcut) {
         if (self.key_bindings.match(event.shortcut)) |id| return .{ .key_binding_triggered = id };
+    }
+    if (self.selection.range() != null and event == .text and std.mem.eql(u8, event.text.slice(), "y")) {
+        return .request_copy_selection;
     }
 
     switch (input_mod.resolve(event)) {
@@ -645,6 +694,7 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
             self.followTail();
             return .request_transcript_tail;
         },
+        .copy_selection => return .request_copy_selection,
         .toggle_tool_expansion => {
             self.tools_expanded = !self.tools_expanded;
             self.clampOrFollowViewport();
@@ -1264,11 +1314,64 @@ fn followTail(self: *App) void {
     }
 }
 
+fn beginSelection(self: *App, mouse: input_mod.MousePoint) void {
+    const point = self.mouseSelectionPoint(mouse) orelse {
+        if (self.selection != .none) {
+            self.selection = .none;
+            self.dirty = true;
+        }
+        return;
+    };
+    self.selection = .{ .dragging = .{ .anchor = point, .focus = point } };
+    self.dirty = true;
+}
+
+fn updateSelection(self: *App, mouse: input_mod.MousePoint) void {
+    const point = self.mouseSelectionPoint(mouse) orelse return;
+    switch (self.selection) {
+        .dragging => |range| self.selection = .{ .dragging = .{ .anchor = range.anchor, .focus = point } },
+        .selected => |range| self.selection = .{ .dragging = .{ .anchor = range.anchor, .focus = point } },
+        .none => return,
+    }
+    self.dirty = true;
+}
+
+fn endSelection(self: *App, mouse: input_mod.MousePoint) void {
+    const point = self.mouseSelectionPoint(mouse) orelse return;
+    switch (self.selection) {
+        .dragging => |range| {
+            if (range.anchor.row == point.row and range.anchor.col == point.col) {
+                self.selection = .none;
+            } else {
+                self.selection = .{ .selected = .{ .anchor = range.anchor, .focus = point } };
+            }
+            self.dirty = true;
+        },
+        .selected, .none => {},
+    }
+}
+
+fn mouseSelectionPoint(self: *App, mouse: input_mod.MousePoint) ?SelectionPoint {
+    if (mouse.row < render.transcriptTop()) return null;
+    const total = render.transcriptTotalRows(self);
+    const scroll_rows = @min(self.viewport.scroll_rows, render.transcriptScrollMax(self));
+    const visible_rows = render.transcriptVisibleRows(self);
+    const drawn = @min(total - scroll_rows, visible_rows);
+    const local_row = @as(usize, mouse.row - render.transcriptTop());
+    if (local_row >= drawn) return null;
+    const top_row = total - scroll_rows - drawn;
+    return .{
+        .row = top_row + local_row,
+        .col = mouse.col -| render.transcriptPaddingX(),
+    };
+}
+
 /// Tail mutations are append/replace operations at the live end of the
 /// transcript. When auto-attached, they pin to the tail. When detached, they
 /// add any new bottom distance to `scroll_rows` so the user's viewport does
 /// not drift while an agent streams below it.
 fn applyTailMutationScroll(self: *App, before_max: usize) void {
+    self.selection = .none;
     self.viewport.tailMutated(before_max, render.transcriptScrollMax(self));
     self.viewport.assertInvariants();
 }

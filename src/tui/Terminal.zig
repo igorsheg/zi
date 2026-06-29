@@ -176,6 +176,14 @@ pub fn applyCommand(self: *Terminal, command: App.Command) error{OutOfMemory}!?A
     return self.app.apply(self.gpa, command);
 }
 
+pub fn selectedText(self: *Terminal) error{OutOfMemory}!render.SelectionCopy {
+    return render.selectedText(self.gpa, &self.app, &self.scratch, App.copy_selection_bytes_max);
+}
+
+pub fn copyTextWithOsc52(self: *Terminal, text: []const u8) !void {
+    try self.vx.copyToSystemClipboard(self.tty.?.writer(), text, self.gpa);
+}
+
 /// Read whatever bytes are available on stdin and apply them as input.
 /// Call only after the input fd reported readable so the read cannot block
 /// the owner loop. Resize events are applied to vaxis and App here; product
@@ -269,7 +277,7 @@ pub const RenderTiming = struct {
 };
 
 fn inputPriority(event: input_mod.Input) InputPriority {
-    if (event == .shortcut) return .foreground;
+    if (event == .shortcut or event == .mouse_down or event == .mouse_drag or event == .mouse_up) return .foreground;
     return switch (input_mod.resolve(event)) {
         .transcript_scroll_up, .transcript_scroll_down, .transcript_page_up, .transcript_page_down => .scroll,
         .none => .none,

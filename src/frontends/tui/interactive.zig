@@ -8,6 +8,7 @@ const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../../coding_agent/root.zig");
 const client_protocol = coding_agent.client_protocol;
 const clipboard_image = @import("clipboard_image.zig");
+const clipboard_text = @import("clipboard_text.zig");
 const slash_commands = coding_agent.slash_commands;
 const session_listing = coding_agent.session_listing;
 const session_runtime = coding_agent.session_runtime;
@@ -798,6 +799,7 @@ const InteractiveController = struct {
             .edit_composer_external => |text| try self.editComposerExternal(text),
             .picker_selected => |selection| try self.handlePickerSelection(selection),
             .request_clipboard_image_paste => try self.handleClipboardImagePaste(),
+            .request_copy_selection => try self.handleCopySelection(),
             .interrupt => try self.cancelActive(),
             .request_transcript_history => try self.requestHistoryPage(),
             .request_transcript_tail => try self.requestTailSnapshot(),
@@ -824,6 +826,26 @@ const InteractiveController = struct {
         switch (id) {
             binding_open_model_picker => try self.editModelCommand(),
             else => {},
+        }
+    }
+
+    fn handleCopySelection(self: *InteractiveController) !void {
+        const selected = try self.terminal.selectedText();
+        switch (selected) {
+            .empty => try self.appendStatus(.warning, "no selection to copy"),
+            .too_large => try self.appendStatus(.warning, "selection too large to copy"),
+            .text => |text| {
+                defer self.allocator.free(text);
+                _ = clipboard_text.copyNative(self.io, self.app.services.environ, text) catch {
+                    self.terminal.copyTextWithOsc52(text) catch {
+                        try self.appendStatus(.warning, "clipboard copy failed");
+                        return;
+                    };
+                    try self.appendStatus(.info, "selection copied via terminal clipboard");
+                    return;
+                };
+                try self.appendStatus(.info, "selection copied");
+            },
         }
     }
 
