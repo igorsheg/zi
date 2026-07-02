@@ -682,6 +682,7 @@ const InteractiveController = struct {
             .replace_tool_footer,
             .tool_output_delta,
             .replace_tool_output,
+            .tag_source,
             => true,
             .set_status,
             .clear_status,
@@ -698,6 +699,21 @@ const InteractiveController = struct {
             "new output below; ctrl+end reloads tail",
             .accent,
         );
+    }
+
+    fn captureOldestSourceId(self: *const InteractiveController, buffer: *[tui.Transcript.source_id_bytes_max]u8) ?[]const u8 {
+        const source_id = self.terminal.transcriptOldestSourceId() orelse return null;
+        const len = @min(source_id.len, buffer.len);
+        @memcpy(buffer[0..len], source_id[0..len]);
+        return buffer[0..len];
+    }
+
+    fn noteOldestSourceAfterTailWork(self: *InteractiveController, before: ?[]const u8) !void {
+        const after = self.terminal.transcriptOldestSourceId() orelse return;
+        if (before) |oldest| {
+            if (!std.mem.eql(u8, oldest, after)) self.history_has_more_before = true;
+        }
+        try self.setOldestHistoryEntryId(after);
     }
 
     fn clearPendingUiWork(self: *InteractiveController) void {
@@ -726,6 +742,9 @@ const InteractiveController = struct {
             const next_bytes = popped.bytes;
             const phase = pendingWorkTracePhase(work);
             const work_start = self.nowNs();
+            const tail_work = tailTranscriptWork(work);
+            var oldest_before_buffer: [tui.Transcript.source_id_bytes_max]u8 = undefined;
+            const oldest_before = if (tail_work) self.captureOldestSourceId(&oldest_before_buffer) else null;
             defer work.deinit(self.allocator);
             switch (work) {
                 .append_message => |payload| {
@@ -755,6 +774,7 @@ const InteractiveController = struct {
                     .tool_call_id = payload.tool_call_id,
                     .text = payload.text,
                 } }),
+                .tag_source => |payload| _ = try self.terminal.applyCommand(.{ .tag_transcript_source = payload.command() }),
                 .set_status => |payload| _ = try self.terminal.applyCommand(.{ .set_status = .{
                     .slot = payload.slot,
                     .id = payload.id,
@@ -776,6 +796,7 @@ const InteractiveController = struct {
                     .text = payload.text,
                 } }),
             }
+            if (tail_work) try self.noteOldestSourceAfterTailWork(oldest_before);
             self.recordDuration(phase, work_start);
             bytes += next_bytes;
             applied += 1;
@@ -788,7 +809,7 @@ const InteractiveController = struct {
             .append_message => .pending_message,
             .append_thinking => .pending_thinking,
             .tool_output_delta, .replace_tool_output => .pending_tool_output,
-            .append_tool, .replace_tool_footer => .pending_tool_structure,
+            .append_tool, .replace_tool_footer, .tag_source => .pending_tool_structure,
             .set_status, .clear_status => .pending_status,
         };
     }
@@ -1514,6 +1535,7 @@ const InteractiveController = struct {
     fn applyClientEvent(self: *InteractiveController, event: client_protocol.ClientEvent) !void {
         switch (event) {
             .agent_event => |payload| try self.applyAgentEventTimed(payload.event, payload),
+            .message_committed => |payload| try self.applyMessageCommitted(payload),
             .operation_started => {
                 self.operation_active = true;
                 try self.setWorkingStatus("working");
@@ -1615,6 +1637,16 @@ const InteractiveController = struct {
 
     fn applyAgentEvent(self: *InteractiveController, event: agent_mod.AgentEvent) !void {
         try self.applyAgentEventTimed(event, null);
+    }
+
+    fn applyMessageCommitted(self: *InteractiveController, committed: client_protocol.MessageCommitted) !void {
+        switch (committed.kind) {
+            .user => try self.queueSourceTag(.latest_user_message, committed.entry_id.text, null),
+            .assistant => try self.queueSourceTag(.latest_assistant_run, committed.entry_id.text, null),
+            .tool_result => if (committed.tool_call_id) |id|
+                try self.queueSourceTag(.latest_tool, committed.entry_id.text, id.text),
+            .custom => {},
+        }
     }
 
     fn traceAssistantFrontendAccept(self: *InteractiveController, trace: ?client_protocol.OwnedAgentEvent) void {
@@ -1788,16 +1820,8 @@ const InteractiveController = struct {
         self.history_has_more_after = false;
         self.history_tail_request_in_flight = false;
         self.history_tail_notice_shown = false;
-        // Snapshot history can be wider than the TUI resident item cap. Track
-        // the oldest item the TUI will actually retain after append eviction,
-        // otherwise the next page would skip the evicted snapshot prefix.
-        const retained_start = snapshot.history.items.len -| tui.Transcript.item_count_max;
-        self.history_has_more_before = snapshot.history.dropped_items > 0 or retained_start > 0;
-        if (snapshot.history.items.len > 0) {
-            try self.setOldestHistoryEntryId(snapshot.history.items[retained_start].entry_id.text);
-        } else {
-            self.clearOldestHistoryEntryId();
-        }
+        self.history_has_more_before = snapshot.history.dropped_items > 0;
+        self.clearOldestHistoryEntryId();
         self.thinking_level = snapshot.thinking_level;
         self.hide_thinking = snapshot.hide_thinking;
         try self.applySessionChromeParts(
@@ -1806,6 +1830,7 @@ const InteractiveController = struct {
             snapshot.context,
         );
         for (snapshot.history.items) |item| try self.applyHistoryItem(item, .append);
+        try self.refreshHistoryCursorFromResidentSnapshot(snapshot.history);
         try self.applyQueueCounts(snapshot.queue.steering.items.len, snapshot.queue.follow_up.items.len);
     }
 
@@ -1860,12 +1885,43 @@ const InteractiveController = struct {
         self.history_tail_request_in_flight = false;
         self.history_tail_notice_shown = false;
 
-        try self.setOldestHistoryEntryId(page.items[0].entry_id.text);
         var index = page.items.len;
         while (index > 0) {
             index -= 1;
             try self.applyHistoryItem(page.items[index], .prepend);
         }
+        try self.refreshHistoryCursorFromResidentPage(page);
+    }
+
+    fn refreshHistoryCursorFromResidentSnapshot(
+        self: *InteractiveController,
+        history: client_protocol.HistorySnapshot,
+    ) !void {
+        const oldest = self.terminal.transcriptOldestSourceId() orelse {
+            self.clearOldestHistoryEntryId();
+            self.history_has_more_before = history.dropped_items > 0;
+            return;
+        };
+        if (history.items.len > 0 and !std.mem.eql(u8, oldest, history.items[0].entry_id.text)) {
+            self.history_has_more_before = true;
+        }
+        try self.setOldestHistoryEntryId(oldest);
+    }
+
+    fn refreshHistoryCursorFromResidentPage(
+        self: *InteractiveController,
+        page: client_protocol.HistoryPage,
+    ) !void {
+        const oldest = self.terminal.transcriptOldestSourceId() orelse {
+            self.clearOldestHistoryEntryId();
+            self.history_has_more_before = page.has_more_before;
+            return;
+        };
+        self.history_has_more_before = page.has_more_before;
+        if (page.items.len > 0 and !std.mem.eql(u8, oldest, page.items[0].entry_id.text)) {
+            self.history_has_more_before = true;
+        }
+        try self.setOldestHistoryEntryId(oldest);
     }
 
     const HistoryApplyDirection = enum { append, prepend };
@@ -1884,19 +1940,20 @@ const InteractiveController = struct {
     fn appendHistoryItem(self: *InteractiveController, item: client_protocol.HistorySnapshotItem) !void {
         switch (item.kind) {
             .user, .assistant, .system => {
-                if (item.kind == .assistant and item.has_thinking) try self.appendHistoryThinkingPlaceholder();
+                if (item.kind == .assistant and item.has_thinking) try self.appendHistoryThinkingPlaceholder(item.entry_id.text);
                 if (item.text.text.len > 0) {
-                    try self.appendHistoryMessage(historyMessageRole(item.kind).?, item.text.text);
+                    try self.appendHistoryMessage(historyMessageRole(item.kind).?, item.text.text, item.entry_id.text);
                 }
                 if (item.kind == .assistant) {
                     for (item.tool_calls) |tool_call| {
                         var buffers: tool_view.TitleBuffers = .{};
-                        const tool = try tool_view.historyCallAppend(
+                        var tool = try tool_view.historyCallAppend(
                             self.allocator,
                             &buffers,
                             tool_call,
                             self.home_dir,
                         );
+                        tool.source_id = item.entry_id.text;
                         _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .tool = tool } });
                     }
                 }
@@ -1905,12 +1962,13 @@ const InteractiveController = struct {
         }
     }
 
-    fn appendHistoryThinkingPlaceholder(self: *InteractiveController) !void {
+    fn appendHistoryThinkingPlaceholder(self: *InteractiveController, source_id: []const u8) !void {
         if (!self.hide_thinking) return;
         _ = try self.terminal.applyCommand(.{ .append_transcript = .{ .thinking = .{
             .text = "",
             .hidden = true,
             .mode = .new_item,
+            .source_id = source_id,
         } } });
     }
 
@@ -1918,6 +1976,7 @@ const InteractiveController = struct {
         self: *InteractiveController,
         role: tui.Transcript.Role,
         text: []const u8,
+        source_id: []const u8,
     ) !void {
         var remaining = text;
         var mode: tui.Transcript.AppendMode = .new_item;
@@ -1927,6 +1986,7 @@ const InteractiveController = struct {
                 .role = role,
                 .text = chunk,
                 .mode = mode,
+                .source_id = source_id,
             } } });
             remaining = remaining[chunk.len..];
             mode = .extend_previous_same_role;
@@ -1959,6 +2019,7 @@ const InteractiveController = struct {
             "",
             item.is_error,
         );
+        tool.source_id = item.entry_id.text;
         tool.output = view.output orelse "";
         tool.footer = view.metadata;
 
@@ -1974,7 +2035,7 @@ const InteractiveController = struct {
 
     fn prependHistoryItem(self: *InteractiveController, item: client_protocol.HistorySnapshotItem) !void {
         switch (item.kind) {
-            .user, .system => try self.prependMessage(historyMessageRole(item.kind).?, item.text.text),
+            .user, .system => try self.prependMessage(historyMessageRole(item.kind).?, item.text.text, item.entry_id.text),
             .assistant => {
                 var tools = std.ArrayList(tui.Transcript.Append.ToolAppend).empty;
                 defer tools.deinit(self.allocator);
@@ -1984,17 +2045,20 @@ const InteractiveController = struct {
                 try title_buffers.ensureTotalCapacity(self.allocator, item.tool_calls.len);
                 for (item.tool_calls) |tool_call| {
                     title_buffers.appendAssumeCapacity(.{});
-                    try tools.append(self.allocator, try tool_view.historyCallAppend(
+                    var tool = try tool_view.historyCallAppend(
                         self.allocator,
                         &title_buffers.items[title_buffers.items.len - 1],
                         tool_call,
                         self.home_dir,
-                    ));
+                    );
+                    tool.source_id = item.entry_id.text;
+                    try tools.append(self.allocator, tool);
                 }
                 const message: ?tui.Transcript.Append.MessageAppend = if (item.text.text.len > 0) .{
                     .role = .assistant,
                     .text = item.text.text,
                     .mode = .new_item,
+                    .source_id = item.entry_id.text,
                 } else null;
                 _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{
                     .message = message,
@@ -2142,6 +2206,23 @@ const InteractiveController = struct {
         } });
     }
 
+    fn queueSourceTag(
+        self: *InteractiveController,
+        kind: presentation_queue.Work.SourceTag.Kind,
+        source_id: []const u8,
+        tool_call_id: ?[]const u8,
+    ) !void {
+        const owned_source_id = try self.allocator.dupe(u8, source_id);
+        errdefer self.allocator.free(owned_source_id);
+        const owned_tool_call_id = if (tool_call_id) |id| try self.allocator.dupe(u8, id) else null;
+        errdefer if (owned_tool_call_id) |id| self.allocator.free(id);
+        try self.queuePendingUiWork(.{ .tag_source = .{
+            .kind = kind,
+            .source_id = owned_source_id,
+            .tool_call_id = owned_tool_call_id,
+        } });
+    }
+
     fn queueThinking(
         self: *InteractiveController,
         text: []const u8,
@@ -2166,12 +2247,14 @@ const InteractiveController = struct {
         self: *InteractiveController,
         role: tui.Transcript.Role,
         text: []const u8,
+        source_id: []const u8,
     ) !void {
         if (text.len == 0) return;
         _ = try self.terminal.applyCommand(.{ .prepend_transcript = .{ .message = .{
             .role = role,
             .text = text,
             .mode = .new_item,
+            .source_id = source_id,
         } } });
     }
 

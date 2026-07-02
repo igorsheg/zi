@@ -67,6 +67,7 @@ fn drainEvents(
         defer owned_event.deinit(app.allocator);
         switch (owned_event.event) {
             .agent_event,
+            .message_committed,
             .queue_changed,
             .snapshot,
             .completion_snapshot,

@@ -1571,6 +1571,8 @@ test "drain settles in-flight retry on successful assistant message" {
     try std.testing.expectEqual(@as(u8, 0), session.event_drain.retry_attempt);
     var message_event = session.drainPublicEvent().?;
     message_event.deinit(std.testing.allocator);
+    var commit_event = session.drainPublicEvent().?;
+    commit_event.deinit(std.testing.allocator);
     var end_event = session.drainPublicEvent().?;
     defer end_event.deinit(std.testing.allocator);
     try std.testing.expect(end_event == .auto_retry_end);
@@ -1681,11 +1683,15 @@ test "agent session persists message_end and exposes caller-drained events" {
     session.agent.finishRun();
 
     try std.testing.expectEqual(@as(usize, 1), session.manager.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), session.event_drain.publicEventCount());
+    try std.testing.expectEqual(@as(usize, 2), session.event_drain.publicEventCount());
     var event = session.drainPublicEvent().?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event == .agent_event);
     try std.testing.expect(event.agent_event.event == .message_end);
+    var commit = session.drainPublicEvent().?;
+    defer commit.deinit(std.testing.allocator);
+    try std.testing.expect(commit == .message_committed);
+    try std.testing.expectEqualStrings(session.manager.entries.items[0].id(), commit.message_committed.entry_id.text);
     try std.testing.expect(session.drainPublicEvent() == null);
 }
 
@@ -1716,14 +1722,14 @@ test "agent session public event queue overflow is explicit" {
     try emitUserMessageEnd(&session, "overflow");
 
     try std.testing.expectEqual(@as(usize, 1), session.event_drain.publicEventCount());
-    try std.testing.expectEqual(@as(usize, 1), session.event_drain.droppedPublicEventCount());
+    try std.testing.expectEqual(@as(usize, 3), session.event_drain.droppedPublicEventCount());
 
     var first = session.drainPublicEvent().?;
     first.deinit(std.testing.allocator);
     var overflow_event = session.drainPublicEvent().?;
     defer overflow_event.deinit(std.testing.allocator);
     try std.testing.expect(overflow_event == .event_overflow);
-    try std.testing.expectEqual(@as(usize, 1), overflow_event.event_overflow.dropped_count);
+    try std.testing.expectEqual(@as(usize, 3), overflow_event.event_overflow.dropped_count);
 }
 
 fn initCompactionTestSession(

@@ -160,6 +160,10 @@ pub fn transcriptAtTail(self: *const Terminal) bool {
     return self.app.transcriptAtTail();
 }
 
+pub fn transcriptOldestSourceId(self: *const Terminal) ?[]const u8 {
+    return self.app.transcript.oldestSourceId();
+}
+
 pub fn composerText(self: *const Terminal) []const u8 {
     return self.app.composer.text();
 }

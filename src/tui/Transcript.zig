@@ -21,6 +21,7 @@ const Transcript = @This();
 pub const item_count_max: usize = 200;
 pub const total_size_bytes_max: usize = 256 * 1024;
 pub const append_size_bytes_max: usize = 8 * 1024;
+pub const source_id_bytes_max: usize = 256;
 pub const tool_preview_bytes_max: usize = total_size_bytes_max / 8;
 pub const tool_preview_lines_max: usize = 1024;
 
@@ -59,11 +60,13 @@ pub const Append = union(enum) {
         role: Role,
         text: []const u8,
         mode: AppendMode = .new_item,
+        source_id: ?[]const u8 = null,
     };
     pub const ThinkingAppend = struct {
         text: []const u8,
         hidden: bool = true,
         mode: AppendMode = .extend_previous_same_role,
+        source_id: ?[]const u8 = null,
     };
     pub const StatusAppend = struct {
         level: StatusLevel,
@@ -77,6 +80,7 @@ pub const Append = union(enum) {
     pub const ToolAppend = struct {
         tool_call_id: []const u8,
         name: []const u8,
+        source_id: ?[]const u8 = null,
         presentation: ToolPresentation = .generic,
         status: ToolStatus = .pending,
         body_mode: ToolBodyMode = .visible,
@@ -117,6 +121,7 @@ pub const MarkdownFence = enum { none, backtick, tilde };
 pub const Item = struct {
     version: u32 = 1,
     layout: Layout = .{},
+    source_id: ?[]u8 = null,
     body: Body,
 
     pub const Body = union(enum) {
@@ -128,6 +133,7 @@ pub const Item = struct {
     };
 
     fn deinitBody(self: *Item, gpa: std.mem.Allocator) void {
+        if (self.source_id) |source_id| gpa.free(source_id);
         switch (self.body) {
             .message => |*message| message.text.deinit(gpa),
             .thinking => |*thinking| thinking.text.deinit(gpa),
@@ -218,6 +224,45 @@ pub fn clear(self: *Transcript, gpa: std.mem.Allocator) void {
     self.items.clearRetainingCapacity();
     self.total_size_bytes = 0;
     self.revision +%= 1;
+}
+
+pub fn oldestSourceId(self: *const Transcript) ?[]const u8 {
+    for (self.items.items) |*item| {
+        if (item.source_id) |source_id| return source_id;
+    }
+    return null;
+}
+
+pub fn newestSourceId(self: *const Transcript) ?[]const u8 {
+    var index = self.items.items.len;
+    while (index > 0) {
+        index -= 1;
+        if (self.items.items[index].source_id) |source_id| return source_id;
+    }
+    return null;
+}
+
+pub const SourceTag = union(enum) {
+    latest_message: SourceMessage,
+    latest_assistant_run: []const u8,
+    latest_tool: SourceTool,
+
+    pub const SourceMessage = struct {
+        role: Role,
+        source_id: []const u8,
+    };
+    pub const SourceTool = struct {
+        tool_call_id: []const u8,
+        source_id: []const u8,
+    };
+};
+
+pub fn tagSource(self: *Transcript, gpa: std.mem.Allocator, tag: SourceTag) error{OutOfMemory}!void {
+    switch (tag) {
+        .latest_message => |message| try self.tagLatestMessage(gpa, message.role, message.source_id),
+        .latest_assistant_run => |source_id| try self.tagLatestAssistantRun(gpa, source_id),
+        .latest_tool => |tool| try self.tagLatestTool(gpa, tool.tool_call_id, tool.source_id),
+    }
 }
 
 pub fn append(self: *Transcript, gpa: std.mem.Allocator, entry: Append) error{OutOfMemory}!Outcome {
@@ -364,6 +409,90 @@ pub fn markPendingToolsCanceled(self: *Transcript) bool {
     return changed;
 }
 
+fn copySourceId(gpa: std.mem.Allocator, source_id: ?[]const u8) error{OutOfMemory}!?[]u8 {
+    const id = source_id orelse return null;
+    const bounded = text_mod.utf8Prefix(id, source_id_bytes_max);
+    return try sanitizedCopy(gpa, bounded);
+}
+
+fn sameSourceId(existing: ?[]const u8, incoming: ?[]const u8) bool {
+    if (existing == null and incoming == null) return true;
+    if (existing) |a| if (incoming) |b| return std.mem.eql(u8, a, b);
+    return false;
+}
+
+fn setItemSourceId(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    item: *Item,
+    source_id: []const u8,
+) error{OutOfMemory}!void {
+    _ = self;
+    if (item.source_id != null) return;
+    item.source_id = try copySourceId(gpa, source_id);
+    item.version +%= 1;
+    if (item.version == 0) item.version = 1;
+}
+
+fn tagLatestMessage(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    role: Role,
+    source_id: []const u8,
+) error{OutOfMemory}!void {
+    var index = self.items.items.len;
+    while (index > 0) {
+        index -= 1;
+        const item = &self.items.items[index];
+        if (item.source_id != null) continue;
+        if (item.body == .message and item.body.message.role == role) {
+            try self.setItemSourceId(gpa, item, source_id);
+            self.revision +%= 1;
+            return;
+        }
+    }
+}
+
+fn tagLatestAssistantRun(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    source_id: []const u8,
+) error{OutOfMemory}!void {
+    var changed = false;
+    var index = self.items.items.len;
+    while (index > 0) {
+        index -= 1;
+        const item = &self.items.items[index];
+        if (item.source_id != null) break;
+        switch (item.body) {
+            .message => |message| if (message.role != .assistant) break,
+            .thinking, .tool => {},
+            .status, .custom => break,
+        }
+        try self.setItemSourceId(gpa, item, source_id);
+        changed = true;
+    }
+    if (changed) self.revision +%= 1;
+}
+
+fn tagLatestTool(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    tool_call_id: []const u8,
+    source_id: []const u8,
+) error{OutOfMemory}!void {
+    var index = self.items.items.len;
+    while (index > 0) {
+        index -= 1;
+        const item = &self.items.items[index];
+        if (item.body != .tool) continue;
+        if (!std.mem.eql(u8, item.body.tool.id, tool_call_id)) continue;
+        try self.setItemSourceId(gpa, item, source_id);
+        self.revision +%= 1;
+        return;
+    }
+}
+
 fn insertMessageAt(
     self: *Transcript,
     gpa: std.mem.Allocator,
@@ -373,11 +502,14 @@ fn insertMessageAt(
     const bounded = text_mod.utf8Prefix(message.text, append_size_bytes_max);
     const truncated = bounded.len < message.text.len;
 
+    var source_id = try copySourceId(gpa, message.source_id);
+    errdefer if (source_id) |id| gpa.free(id);
     var body: Message = .{ .role = message.role };
     errdefer body.text.deinit(gpa);
     try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
 
-    try self.insertOwnedItem(gpa, index, .{ .body = .{ .message = body } });
+    try self.insertOwnedItem(gpa, index, .{ .source_id = source_id, .body = .{ .message = body } });
+    source_id = null;
     return .{ .truncated = truncated };
 }
 
@@ -391,7 +523,7 @@ fn appendMessage(
 
     if (message.mode != .new_item and self.items.items.len > 0) {
         const last = &self.items.items[self.items.items.len - 1];
-        const matches = last.body == .message and switch (message.mode) {
+        const matches = last.body == .message and sameSourceId(last.source_id, message.source_id) and switch (message.mode) {
             .new_item => false,
             .extend_previous_assistant_message => last.body.message.role == .assistant and message.role == .assistant,
             .extend_previous_same_role => last.body.message.role == message.role,
@@ -405,10 +537,13 @@ fn appendMessage(
         }
     }
 
+    var source_id = try copySourceId(gpa, message.source_id);
+    errdefer if (source_id) |id| gpa.free(id);
     var body: Message = .{ .role = message.role };
     errdefer body.text.deinit(gpa);
     try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
-    try self.items.append(gpa, .{ .body = .{ .message = body } });
+    try self.items.append(gpa, .{ .source_id = source_id, .body = .{ .message = body } });
+    source_id = null;
     self.total_size_bytes += body.text.items.len;
     self.evictUntilBounded(gpa);
     return .{ .truncated = truncated };
@@ -424,7 +559,10 @@ fn appendThinking(
 
     if (thinking.mode != .new_item and self.items.items.len > 0) {
         const last = &self.items.items[self.items.items.len - 1];
-        if (last.body == .thinking and last.body.thinking.hidden == thinking.hidden) {
+        if (last.body == .thinking and
+            last.body.thinking.hidden == thinking.hidden and
+            sameSourceId(last.source_id, thinking.source_id))
+        {
             const old_size = last.sizeBytes();
             try appendStreamBytes(gpa, &last.body.thinking.text, &last.body.thinking.pending, bounded);
             self.noteItemMutation(last, old_size, last.sizeBytes());
@@ -433,10 +571,13 @@ fn appendThinking(
         }
     }
 
+    var source_id = try copySourceId(gpa, thinking.source_id);
+    errdefer if (source_id) |id| gpa.free(id);
     var body: Thinking = .{ .hidden = thinking.hidden };
     errdefer body.text.deinit(gpa);
     if (bounded.len > 0) try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
-    try self.items.append(gpa, .{ .body = .{ .thinking = body } });
+    try self.items.append(gpa, .{ .source_id = source_id, .body = .{ .thinking = body } });
+    source_id = null;
     self.total_size_bytes += body.text.items.len;
     self.evictUntilBounded(gpa);
     return .{ .truncated = truncated };
@@ -563,6 +704,8 @@ fn insertToolAt(
     const footer = try sanitizedCopy(gpa, footer_bounded);
     var footer_owned = true;
     errdefer if (footer_owned) gpa.free(footer);
+    var source_id = try copySourceId(gpa, tool.source_id);
+    errdefer if (source_id) |id_value| gpa.free(id_value);
 
     id_owned = false;
     name_owned = false;
@@ -570,7 +713,7 @@ fn insertToolAt(
     compact_title_owned = false;
     output_owned = false;
     footer_owned = false;
-    try self.insertOwnedItem(gpa, index, .{ .body = .{ .tool = .{
+    try self.insertOwnedItem(gpa, index, .{ .source_id = source_id, .body = .{ .tool = .{
         .id = id,
         .name = name,
         .presentation = tool.presentation,
@@ -584,6 +727,7 @@ fn insertToolAt(
         .dropped_head_bytes = output_trim.dropped_bytes,
         .dropped_head_lines = output_trim.dropped_lines,
     } } });
+    source_id = null;
     return .{ .truncated = truncated or output_trim.dropped_bytes > 0 };
 }
 
@@ -620,6 +764,8 @@ fn updateToolAt(
     errdefer if (footer) |value| gpa.free(value);
 
     const item = &self.items.items[index];
+    var source_id = if (item.source_id == null) try copySourceId(gpa, tool.source_id) else null;
+    errdefer if (source_id) |id_value| gpa.free(id_value);
     const existing = &item.body.tool;
     const old_size = existing.sizeBytes();
     if (title) |value| {
@@ -641,6 +787,10 @@ fn updateToolAt(
     if (footer) |value| {
         gpa.free(existing.footer);
         existing.footer = value;
+    }
+    if (item.source_id == null) {
+        item.source_id = source_id;
+        source_id = null;
     }
     existing.presentation = tool.presentation;
     existing.status = mergeToolStatus(existing.status, tool.status);
@@ -1115,6 +1265,64 @@ test "unknown tool ids are a no-op, not an error" {
     _ = try transcript.appendToolOutput(gpa, "missing", "data", 0, 0);
     _ = try transcript.replaceToolFooter(gpa, "missing", "Took 1s");
     try std.testing.expectEqual(@as(usize, 0), transcript.items.items.len);
+}
+
+test "source ids are owned, bounded, and queryable" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = "hello",
+        .source_id = "entry-1",
+    } });
+    _ = try transcript.append(gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .source_id = "entry-2",
+    } });
+
+    try std.testing.expectEqualStrings("entry-1", transcript.oldestSourceId().?);
+    try std.testing.expectEqualStrings("entry-2", transcript.newestSourceId().?);
+}
+
+test "tool updates do not leak unused source ids" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .source_id = "entry-1",
+    } });
+    _ = try transcript.append(gpa, .{ .tool = .{
+        .tool_call_id = "call-1",
+        .name = "bash",
+        .source_id = "entry-2",
+        .status = .success,
+    } });
+
+    try std.testing.expectEqualStrings("entry-1", transcript.items.items[0].source_id.?);
+}
+
+test "committed source tags attach to recent live items" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .{ .message = .{ .role = .user, .text = "hello" } });
+    try transcript.tagSource(gpa, .{ .latest_message = .{ .role = .user, .source_id = "user-entry" } });
+    try std.testing.expectEqualStrings("user-entry", transcript.items.items[0].source_id.?);
+
+    _ = try transcript.append(gpa, .{ .thinking = .{ .text = "", .hidden = true, .mode = .new_item } });
+    _ = try transcript.append(gpa, .{ .message = .{ .role = .assistant, .text = "ok" } });
+    _ = try transcript.append(gpa, .{ .tool = .{ .tool_call_id = "call-1", .name = "bash" } });
+    try transcript.tagSource(gpa, .{ .latest_assistant_run = "assistant-entry" });
+    try std.testing.expectEqualStrings("assistant-entry", transcript.items.items[1].source_id.?);
+    try std.testing.expectEqualStrings("assistant-entry", transcript.items.items[2].source_id.?);
+    try std.testing.expectEqualStrings("assistant-entry", transcript.items.items[3].source_id.?);
 }
 
 test "mutation bumps item version so layout memos invalidate" {

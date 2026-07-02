@@ -21,6 +21,7 @@ pub const Work = union(enum) {
     append_thinking: ThinkingText,
     append_tool: ToolAppend,
     replace_tool_footer: ToolText,
+    tag_source: SourceTag,
     set_status: StatusSet,
     clear_status: StatusClear,
     tool_output_delta: ToolText,
@@ -101,6 +102,35 @@ pub const Work = union(enum) {
         }
     };
 
+    pub const SourceTag = struct {
+        kind: Kind,
+        source_id: []u8,
+        tool_call_id: ?[]u8 = null,
+
+        pub const Kind = enum { latest_user_message, latest_assistant_run, latest_tool };
+
+        fn sizeBytes(self: *const SourceTag) usize {
+            return self.source_id.len + if (self.tool_call_id) |id| id.len else 0;
+        }
+
+        fn deinit(self: *SourceTag, allocator: std.mem.Allocator) void {
+            allocator.free(self.source_id);
+            if (self.tool_call_id) |id| allocator.free(id);
+            self.* = undefined;
+        }
+
+        pub fn command(self: *const SourceTag) tui.Transcript.SourceTag {
+            return switch (self.kind) {
+                .latest_user_message => .{ .latest_message = .{ .role = .user, .source_id = self.source_id } },
+                .latest_assistant_run => .{ .latest_assistant_run = self.source_id },
+                .latest_tool => .{ .latest_tool = .{
+                    .tool_call_id = self.tool_call_id orelse "",
+                    .source_id = self.source_id,
+                } },
+            };
+        }
+    };
+
     const StatusSet = struct {
         slot: tui.status.Slot,
         id: tui.status.ContributionId,
@@ -153,6 +183,7 @@ pub const Work = union(enum) {
             .append_thinking => |*text| text.sizeBytes(),
             .append_tool => |*tool| tool.sizeBytes(),
             .replace_tool_footer => |*text| text.sizeBytes(),
+            .tag_source => |*tag| tag.sizeBytes(),
             .set_status => |*status| status.sizeBytes(),
             .clear_status => |*status| status.sizeBytes(),
             .tool_output_delta, .replace_tool_output => |*text| text.sizeBytes(),
@@ -165,6 +196,7 @@ pub const Work = union(enum) {
             .append_thinking => |*text| text.deinit(allocator),
             .append_tool => |*tool| tool.deinit(allocator),
             .replace_tool_footer => |*text| text.deinit(allocator),
+            .tag_source => |*tag| tag.deinit(allocator),
             .set_status => |*status| status.deinit(allocator),
             .clear_status => |*status| status.deinit(allocator),
             .tool_output_delta, .replace_tool_output => |*text| text.deinit(allocator),
@@ -178,6 +210,7 @@ pub const Work = union(enum) {
             .tool_output_delta, .replace_tool_output => tool_output_interval_ms,
             .append_tool => |*tool| tool.presentationIntervalMs(),
             .replace_tool_footer,
+            .tag_source,
             .set_status,
             .clear_status,
             => background_pending_work_interval_ms,

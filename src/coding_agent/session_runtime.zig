@@ -2505,6 +2505,9 @@ test "session runtime refreshes context chrome after persisted messages" {
     var agent_event = session_runtime.drainEvent().?;
     defer agent_event.deinit(std.testing.allocator);
     try std.testing.expect(agent_event.event == .agent_event);
+    var commit_event = session_runtime.drainEvent().?;
+    defer commit_event.deinit(std.testing.allocator);
+    try std.testing.expect(commit_event.event == .message_committed);
     var chrome_event = session_runtime.drainEvent().?;
     defer chrome_event.deinit(std.testing.allocator);
     try std.testing.expect(chrome_event.event == .session_chrome);

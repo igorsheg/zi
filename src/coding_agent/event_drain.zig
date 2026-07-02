@@ -70,9 +70,19 @@ pub const EventDrain = struct {
         // window; terminal policy still runs when persistence fails.
         var persist_error: ?anyerror = null;
         if (event == .message_end) {
-            self.persistMessage(event.message_end.message) catch |err| {
+            const entry_id = self.persistMessage(event.message_end.message) catch |err| blk: {
                 persist_error = err;
+                break :blk null;
             };
+            if (entry_id) |id| {
+                self.enqueuePublicEvent(.{
+                    .message_committed = try client_protocol.MessageCommitted.init(
+                        self.allocator,
+                        id,
+                        event.message_end.message,
+                    ),
+                });
+            }
         }
 
         if (event == .message_end and event.message_end.message == .assistant) {
@@ -120,14 +130,14 @@ pub const EventDrain = struct {
         return 0;
     }
 
-    fn persistMessage(self: *EventDrain, message: agent_mod.AgentMessage) !void {
+    fn persistMessage(self: *EventDrain, message: agent_mod.AgentMessage) !?[]const u8 {
         const timestamp = session_manager.timestampNow(self.io);
         const entry = try self.manager.prepareMessageEntry(message, &timestamp);
         errdefer self.manager.deinitPreparedEntry(entry);
         if (self.store) |store| {
             try store.appendEntry(self.io, entry, self.manager.lastEntryId());
         }
-        _ = self.manager.commitPreparedEntry(entry);
+        return self.manager.commitPreparedEntry(entry);
     }
 
     pub fn emitQueueUpdate(self: *EventDrain) void {

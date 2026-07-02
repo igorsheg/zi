@@ -228,6 +228,7 @@ pub const ClientEvent = union(enum) {
     operation_finished: OperationFinished,
     shutdown_started,
     agent_event: OwnedAgentEvent,
+    message_committed: MessageCommitted,
     queue_changed: QueueChanged,
     snapshot: Snapshot,
     completion_snapshot: CompletionSnapshot,
@@ -248,6 +249,7 @@ pub const ClientEvent = union(enum) {
         switch (self.*) {
             .rejected => |*rejection| rejection.message.deinit(allocator),
             .agent_event => |*payload| payload.deinit(allocator),
+            .message_committed => |*payload| payload.deinit(allocator),
             .snapshot => |*payload| payload.deinit(allocator),
             .completion_snapshot => |*payload| payload.deinit(allocator),
             .file_completion => |*payload| payload.deinit(allocator),
@@ -552,6 +554,41 @@ pub const OwnedAgentEvent = struct {
 
     pub fn jsonStringify(self: OwnedAgentEvent, stringify: *std.json.Stringify) !void {
         try stringify.write(self.event);
+    }
+};
+
+pub const MessageCommitted = struct {
+    entry_id: EventText,
+    kind: Kind,
+    tool_call_id: ?EventText = null,
+
+    pub const Kind = enum { user, assistant, tool_result, custom };
+
+    pub fn init(allocator: std.mem.Allocator, entry_id: []const u8, message: agent_mod.AgentMessage) !MessageCommitted {
+        var owned_entry_id = try EventText.init(allocator, entry_id);
+        errdefer owned_entry_id.deinit(allocator);
+        const kind: Kind = switch (message) {
+            .user => .user,
+            .assistant => .assistant,
+            .tool_result => .tool_result,
+            .custom => .custom,
+        };
+        var tool_call_id: ?EventText = null;
+        errdefer if (tool_call_id) |*id| id.deinit(allocator);
+        if (message == .tool_result) {
+            tool_call_id = try EventText.init(allocator, message.tool_result.tool_call_id);
+        }
+        return .{
+            .entry_id = owned_entry_id,
+            .kind = kind,
+            .tool_call_id = tool_call_id,
+        };
+    }
+
+    pub fn deinit(self: *MessageCommitted, allocator: std.mem.Allocator) void {
+        self.entry_id.deinit(allocator);
+        if (self.tool_call_id) |*id| id.deinit(allocator);
+        self.* = undefined;
     }
 };
 

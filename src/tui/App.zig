@@ -373,6 +373,7 @@ pub const Command = union(enum) {
     clear_transcript,
     set_key_bindings: []const keybind.Binding,
     append_transcript: Transcript.Append,
+    tag_transcript_source: Transcript.SourceTag,
     tool_output_delta: ToolOutputDelta,
     front_tool_output_delta: ToolOutputDelta,
     replace_tool_output: ToolText,
@@ -462,6 +463,11 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             const outcome = try self.transcript.append(gpa, entry);
             self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
+            self.dirty = true;
+            return null;
+        },
+        .tag_transcript_source => |tag| {
+            try self.transcript.tagSource(gpa, tag);
             self.dirty = true;
             return null;
         },
