@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const paths_mod = @import("paths.zig");
+const session_manager = @import("session_manager.zig");
 
 pub const SessionListOptions = struct {
     cwd: []const u8 = ".",
@@ -104,8 +105,10 @@ pub fn listRuntimeSessions(
             else => return err,
         };
         if (stat.kind != .file) continue;
+        const activity_key = loadRuntimeSessionActivityKey(allocator, io, dir, entry.name, entry.name, stat.mtime) catch
+            fallbackActivityKey(entry.name, stat.mtime);
         const copy = try allocator.dupe(u8, entry.name);
-        files.append(allocator, .{ .name = copy, .mtime = stat.mtime }) catch |err| {
+        files.append(allocator, .{ .name = copy, .activity_key = activity_key }) catch |err| {
             allocator.free(copy);
             return err;
         };
@@ -333,12 +336,17 @@ fn loadRuntimeSessionSummary(
     while (lines.next()) |line| {
         parseSummaryLine(allocator, std.mem.trim(u8, line, " \t\r"), &builder) catch continue;
     }
-    return summaryFromBuilder(allocator, file_name, &builder);
+    const activity_key = blk: {
+        const stat = dir.statFile(io, path, .{}) catch break :blk null;
+        if (stat.kind != .file) break :blk null;
+        break :blk loadRuntimeSessionActivityKey(allocator, io, dir, path, file_name, stat.mtime) catch null;
+    };
+    return summaryFromBuilder(allocator, file_name, &builder, activity_key);
 }
 
 fn fallbackRuntimeSessionSummary(allocator: std.mem.Allocator, file_name: []const u8) !SessionSummary {
     var builder: RuntimeSessionSummaryBuilder = .{};
-    return summaryFromBuilder(allocator, file_name, &builder);
+    return summaryFromBuilder(allocator, file_name, &builder, null);
 }
 
 fn completeLinePrefix(data: []const u8) []const u8 {
@@ -384,6 +392,7 @@ fn summaryFromBuilder(
     allocator: std.mem.Allocator,
     file_name: []const u8,
     builder: *const RuntimeSessionSummaryBuilder,
+    activity_key: ?[session_manager.timestamp_bytes_len]u8,
 ) !SessionSummary {
     const file_copy = try allocator.dupe(u8, file_name);
     errdefer allocator.free(file_copy);
@@ -397,7 +406,7 @@ fn summaryFromBuilder(
     var meta_buffer: [32]u8 = undefined;
     const meta = try allocator.dupe(u8, formatSummaryMessageCount(&meta_buffer, builder));
     errdefer allocator.free(meta);
-    const aux = try allocator.dupe(u8, summaryDate(file_name, builder));
+    const aux = try allocator.dupe(u8, summaryDate(file_name, builder, activity_key));
     return .{ .file_name = file_copy, .title = title, .detail = detail, .meta = meta, .aux = aux };
 }
 
@@ -409,8 +418,81 @@ fn formatSummaryMessageCount(buffer: []u8, builder: *const RuntimeSessionSummary
     return std.fmt.bufPrint(buffer, "{d} {s}", .{ builder.message_count, noun }) catch "msgs";
 }
 
-fn summaryDate(file_name: []const u8, builder: *const RuntimeSessionSummaryBuilder) []const u8 {
+fn summaryDate(
+    file_name: []const u8,
+    builder: *const RuntimeSessionSummaryBuilder,
+    activity_key: ?[session_manager.timestamp_bytes_len]u8,
+) []const u8 {
+    if (activity_key) |key| return key[0..10];
     return if (builder.timestamp_len >= 10) builder.timestampSlice()[0..10] else fallbackDate(file_name);
+}
+
+fn loadRuntimeSessionActivityKey(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    fallback_file_name: []const u8,
+    mtime: std.Io.Timestamp,
+) ![session_manager.timestamp_bytes_len]u8 {
+    var key = fallbackActivityKey(fallback_file_name, mtime);
+    var file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+
+    const file_size = try file.length(io);
+    if (file_size == 0) return key;
+    const keep: usize = @intCast(@min(file_size, summary_scan_bytes_max));
+    const offset = file_size - keep;
+    const buffer = try allocator.alloc(u8, keep);
+    defer allocator.free(buffer);
+    const read_len = try file.readPositionalAll(io, buffer, offset);
+    var complete = buffer[0..read_len];
+    if (offset > 0) {
+        const first_newline = std.mem.indexOfScalar(u8, complete, '\n') orelse return key;
+        complete = complete[first_newline + 1 ..];
+    }
+    if (complete.len > 0 and complete[complete.len - 1] != '\n') {
+        const last_newline = std.mem.lastIndexOfScalar(u8, complete, '\n') orelse return key;
+        complete = complete[0 .. last_newline + 1];
+    }
+
+    var lines = std.mem.splitScalar(u8, complete, '\n');
+    while (lines.next()) |line| {
+        const next = activityKeyFromLine(allocator, std.mem.trim(u8, line, " \t\r")) catch continue;
+        if (next) |activity| key = activity;
+    }
+    return key;
+}
+
+fn activityKeyFromLine(allocator: std.mem.Allocator, line: []const u8) !?[session_manager.timestamp_bytes_len]u8 {
+    if (line.len == 0) return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const object = parsed.value.object;
+    const entry_type = jsonString(object.get("type")) orelse return null;
+    if (!std.mem.eql(u8, entry_type, "message")) return null;
+    return timestampKey(jsonString(object.get("timestamp")) orelse return null);
+}
+
+fn fallbackActivityKey(file_name: []const u8, mtime: std.Io.Timestamp) [session_manager.timestamp_bytes_len]u8 {
+    if (std.mem.indexOfScalar(u8, file_name, '_')) |underscore| {
+        if (timestampKey(file_name[0..underscore])) |key| return key;
+    }
+    return session_manager.timestampFromNanoseconds(mtime.nanoseconds);
+}
+
+fn timestampKey(text: []const u8) ?[session_manager.timestamp_bytes_len]u8 {
+    if (text.len < session_manager.timestamp_bytes_len) return null;
+    const prefix = text[0..session_manager.timestamp_bytes_len];
+    if (prefix[4] != '-' or prefix[7] != '-' or prefix[10] != 'T' or
+        prefix[13] != ':' or prefix[16] != ':' or prefix[19] != 'Z') return null;
+    inline for (.{ 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18 }) |index| {
+        if (!std.ascii.isDigit(prefix[index])) return null;
+    }
+    var key: [session_manager.timestamp_bytes_len]u8 = undefined;
+    @memcpy(key[0..], prefix);
+    return key;
 }
 
 fn firstTextContent(value: ?std.json.Value) ?[]const u8 {
@@ -531,11 +613,12 @@ fn runtimeSessionsDir(
 
 const RuntimeSessionFile = struct {
     name: []const u8,
-    mtime: std.Io.Timestamp,
+    activity_key: [session_manager.timestamp_bytes_len]u8,
 };
 
 fn newerSessionFile(_: void, left: RuntimeSessionFile, right: RuntimeSessionFile) bool {
-    if (left.mtime.nanoseconds != right.mtime.nanoseconds) return left.mtime.nanoseconds > right.mtime.nanoseconds;
+    const activity_order = std.mem.order(u8, &left.activity_key, &right.activity_key);
+    if (activity_order != .eq) return activity_order == .gt;
     return std.mem.order(u8, left.name, right.name) == .gt;
 }
 
@@ -590,15 +673,26 @@ test "session summaries use first user message and bounded metadata" {
     try std.testing.expectEqualStrings("2026-05-28", summaries.items[0].aux);
 }
 
-test "session listing returns resumable leaf names last updated first" {
+test "session listing returns resumable leaf names by durable activity first" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try createSessionListingTestDirs(tmp.dir);
-    try writeSessionListingTestFile(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl");
-    try writeSessionListingTestFile(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl");
-    try setSessionListingTestFileMtime(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl", 1);
-    try setSessionListingTestFileMtime(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl", 2);
+    try tmp.dir.createDirPath(std.testing.io, "agent/sessions/--repo--");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/sessions/--repo--/2026-05-28T00:00:00Z_second.jsonl",
+        .data = "{\"type\":\"session\",\"timestamp\":\"2026-05-28T00:00:00Z\"}\n" ++
+            "{\"type\":\"message\",\"id\":\"1\",\"parentId\":null," ++
+            "\"timestamp\":\"2026-05-28T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"old\"}}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/sessions/--repo--/2026-05-27T00:00:00Z_first.jsonl",
+        .data = "{\"type\":\"session\",\"timestamp\":\"2026-05-27T00:00:00Z\"}\n" ++
+            "{\"type\":\"message\",\"id\":\"1\",\"parentId\":null," ++
+            "\"timestamp\":\"2026-05-29T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"new\"}}\n",
+    });
+    try setSessionListingTestFileMtime(tmp.dir, "2026-05-28T00:00:00Z_second.jsonl", 2);
+    try setSessionListingTestFileMtime(tmp.dir, "2026-05-27T00:00:00Z_first.jsonl", 1);
 
     var list = try listRuntimeSessions(std.testing.allocator, std.testing.io, .{
         .cwd = "repo",

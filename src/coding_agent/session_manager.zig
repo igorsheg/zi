@@ -24,6 +24,31 @@ pub const max_compaction_keep_recent_tokens = 1_000_000;
 pub const max_compaction_reserve_tokens = 1_000_000;
 pub const max_compaction_serialized_input_bytes = 512 * 1024;
 pub const max_compaction_tool_result_chars = 16 * 1024;
+pub const timestamp_bytes_len: usize = 20;
+
+pub fn timestampFromNanoseconds(nanoseconds: i96) [timestamp_bytes_len]u8 {
+    const seconds_total = @divFloor(nanoseconds, std.time.ns_per_s);
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{
+        .secs = if (seconds_total > 0) @intCast(seconds_total) else 0,
+    };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    var text: [timestamp_bytes_len]u8 = undefined;
+    _ = std.fmt.bufPrint(&text, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    }) catch unreachable;
+    return text;
+}
+
+pub fn timestampNow(io: std.Io) [timestamp_bytes_len]u8 {
+    return timestampFromNanoseconds(std.Io.Timestamp.now(io, .real).nanoseconds);
+}
 
 pub const SessionHeader = struct {
     version: u32 = current_session_version,
@@ -101,6 +126,8 @@ pub const ReconstructedSessionItem = struct {
 pub const CompactionSummaryInput = struct {
     allocator: std.mem.Allocator,
     messages: []const agent.AgentMessage,
+    turn_prefix_messages: []const agent.AgentMessage = &.{},
+    is_split_turn: bool = false,
     previous_summary: ?[]const u8 = null,
     first_kept_entry_id: []const u8,
     tokens_before: u64,
@@ -108,6 +135,8 @@ pub const CompactionSummaryInput = struct {
     pub fn deinit(self: *CompactionSummaryInput) void {
         for (self.messages) |message| agent.deinitAgentMessage(self.allocator, message);
         self.allocator.free(self.messages);
+        for (self.turn_prefix_messages) |message| agent.deinitAgentMessage(self.allocator, message);
+        if (self.turn_prefix_messages.len > 0) self.allocator.free(self.turn_prefix_messages);
         if (self.previous_summary) |summary| self.allocator.free(summary);
         self.allocator.free(self.first_kept_entry_id);
         self.* = undefined;
@@ -121,18 +150,31 @@ pub const CompactionSummaryInput = struct {
     pub fn serialize(self: CompactionSummaryInput, allocator: std.mem.Allocator) SerializeError![]const u8 {
         var writer: std.Io.Writer.Allocating = .init(allocator);
         errdefer writer.deinit();
-        if (self.previous_summary) |summary| {
-            try appendBounded(&writer, "<previous-summary>\n");
-            try appendBounded(&writer, summary);
-            try appendBounded(&writer, "\n</previous-summary>\n\n");
-        }
         try appendBounded(&writer, "<conversation>\n");
-        for (self.messages, 0..) |message, index| {
-            if (index > 0) try appendBounded(&writer, "\n\n");
-            try serializeMessage(&writer, message);
-        }
+        try serializeMessages(&writer, self.messages);
         try appendBounded(&writer, "\n</conversation>\n");
+        if (self.previous_summary) |summary| {
+            try appendBounded(&writer, "\n<previous-summary>\n");
+            try appendBounded(&writer, summary);
+            try appendBounded(&writer, "\n</previous-summary>\n");
+        }
         return writer.toOwnedSlice();
+    }
+
+    pub fn serializeTurnPrefix(self: CompactionSummaryInput, allocator: std.mem.Allocator) SerializeError![]const u8 {
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        try appendBounded(&writer, "<turn-prefix>\n");
+        try serializeMessages(&writer, self.turn_prefix_messages);
+        try appendBounded(&writer, "\n</turn-prefix>\n");
+        return writer.toOwnedSlice();
+    }
+
+    fn serializeMessages(writer: *std.Io.Writer.Allocating, messages: []const agent.AgentMessage) SerializeError!void {
+        for (messages, 0..) |message, index| {
+            if (index > 0) try appendBounded(writer, "\n\n");
+            try serializeMessage(writer, message);
+        }
     }
 
     fn serializeMessage(writer: *std.Io.Writer.Allocating, message: agent.AgentMessage) SerializeError!void {
@@ -611,43 +653,31 @@ pub const SessionManager = struct {
 
         // Cut so the kept suffix holds at least keep_recent_tokens. Only a
         // non-tool-result message is a valid cut point.
-        var first_valid_cut = boundary_start;
-        while (first_valid_cut < entries.len and !isValidCompactionCut(entries[first_valid_cut])) {
-            first_valid_cut += 1;
-        }
-        var cut_index = first_valid_cut;
-        if (first_valid_cut == entries.len) {
-            cut_index = boundary_start;
-        } else {
-            var accumulated_tokens: u64 = 0;
-            index = entries.len;
-            while (index > boundary_start) {
-                index -= 1;
-                if (entries[index] != .message) continue;
-                accumulated_tokens +|= estimateEntryTokens(entries[index]);
-                if (accumulated_tokens >= settings.keep_recent_tokens) {
-                    cut_index = first_valid_cut;
-                    for (entries[index..], index..) |entry, candidate_index| {
-                        if (isValidCompactionCut(entry)) {
-                            cut_index = candidate_index;
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
-        }
+        const cut_point = findCompactionCutPoint(entries, boundary_start, entries.len, settings.keep_recent_tokens);
+        const cut_index = cut_point.first_kept_index;
         if (cut_index <= boundary_start) return error.NothingToCompact;
 
+        const history_end = if (cut_point.is_split_turn) cut_point.turn_start_index.? else cut_index;
         var messages = std.ArrayList(agent.AgentMessage).empty;
         errdefer freeContextMessages(allocator, &messages);
-        for (entries[boundary_start..cut_index]) |entry| {
+        for (entries[boundary_start..history_end]) |entry| {
             if (entry != .message) continue;
             const copy = try agent.copyAgentMessage(allocator, entry.message.message);
             errdefer agent.deinitAgentMessage(allocator, copy);
             try messages.append(allocator, copy);
         }
-        if (messages.items.len == 0) return error.NothingToCompact;
+
+        var turn_prefix_messages = std.ArrayList(agent.AgentMessage).empty;
+        errdefer freeContextMessages(allocator, &turn_prefix_messages);
+        if (cut_point.is_split_turn) {
+            for (entries[cut_point.turn_start_index.?..cut_index]) |entry| {
+                if (entry != .message) continue;
+                const copy = try agent.copyAgentMessage(allocator, entry.message.message);
+                errdefer agent.deinitAgentMessage(allocator, copy);
+                try turn_prefix_messages.append(allocator, copy);
+            }
+        }
+        if (messages.items.len == 0 and turn_prefix_messages.items.len == 0) return error.NothingToCompact;
 
         const first_kept_entry_id = try allocator.dupe(u8, entries[cut_index].id());
         errdefer allocator.free(first_kept_entry_id);
@@ -660,10 +690,77 @@ pub const SessionManager = struct {
         return .{
             .allocator = allocator,
             .messages = try messages.toOwnedSlice(allocator),
+            .turn_prefix_messages = try turn_prefix_messages.toOwnedSlice(allocator),
+            .is_split_turn = cut_point.is_split_turn,
             .previous_summary = previous_summary,
             .first_kept_entry_id = first_kept_entry_id,
             .tokens_before = tokens_before,
         };
+    }
+
+    const CompactionCutPoint = struct {
+        first_kept_index: usize,
+        turn_start_index: ?usize = null,
+        is_split_turn: bool = false,
+    };
+
+    fn findCompactionCutPoint(
+        entries: []const SessionEntry,
+        start_index: usize,
+        end_index: usize,
+        keep_recent_tokens: u64,
+    ) CompactionCutPoint {
+        var first_valid_cut = start_index;
+        while (first_valid_cut < end_index and !isValidCompactionCut(entries[first_valid_cut])) {
+            first_valid_cut += 1;
+        }
+        if (first_valid_cut == end_index) return .{ .first_kept_index = start_index };
+
+        var cut_index = first_valid_cut;
+        var accumulated_tokens: u64 = 0;
+        var index = end_index;
+        while (index > start_index) {
+            index -= 1;
+            if (entries[index] != .message) continue;
+            accumulated_tokens +|= estimateEntryTokens(entries[index]);
+            if (accumulated_tokens >= keep_recent_tokens) {
+                cut_index = first_valid_cut;
+                for (entries[index..end_index], index..) |entry, candidate_index| {
+                    if (isValidCompactionCut(entry)) {
+                        cut_index = candidate_index;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        while (cut_index > start_index) {
+            const previous = entries[cut_index - 1];
+            if (previous == .compaction) break;
+            if (previous == .message) break;
+            cut_index -= 1;
+        }
+
+        const is_user_message = entries[cut_index] == .message and entries[cut_index].message.message == .user;
+        if (is_user_message) return .{ .first_kept_index = cut_index };
+        const turn_start_index = findCompactionTurnStartIndex(entries, cut_index, start_index) orelse
+            return .{ .first_kept_index = cut_index };
+        return .{ .first_kept_index = cut_index, .turn_start_index = turn_start_index, .is_split_turn = true };
+    }
+
+    fn findCompactionTurnStartIndex(entries: []const SessionEntry, entry_index: usize, start_index: usize) ?usize {
+        var index = entry_index + 1;
+        while (index > start_index) {
+            index -= 1;
+            const entry = entries[index];
+            if (entry != .message) continue;
+            switch (entry.message.message) {
+                .user, .custom => return index,
+                .assistant, .tool_result => {},
+            }
+        }
+        return null;
     }
 
     fn freeContextMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(agent.AgentMessage)) void {
@@ -1385,6 +1482,18 @@ fn userMessage(text: []const u8) agent.AgentMessage {
     return .{ .user = .{ .content = .{ .string = text }, .timestamp = 0 } };
 }
 
+fn assistantTextMessage(content: []const ai.AssistantContent) agent.AgentMessage {
+    return .{ .assistant = .{
+        .content = content,
+        .api = ai.KnownApi.openai_responses,
+        .provider = "openai",
+        .model = "gpt",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    } };
+}
+
 test "new session stores header metadata" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "2026-01-01T00:00:00Z");
     defer manager.deinit();
@@ -1523,6 +1632,26 @@ test "compaction summary input keeps bounded recent suffix" {
     try std.testing.expect(input.previous_summary == null);
 }
 
+test "compaction summary input splits oversized turn prefix" {
+    var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
+    defer manager.deinit();
+
+    const assistant_blocks = [_]ai.AssistantContent{.{ .text = .{ .text = "assistant suffix" } }};
+    _ = try manager.appendMessage(userMessage("old history"), "t1");
+    _ = try manager.appendMessage(userMessage("large turn request"), "t2");
+    const kept = try manager.appendMessage(assistantTextMessage(&assistant_blocks), "t3");
+
+    var input = try manager.buildCompactionSummaryInput(std.testing.allocator, .{ .keep_recent_tokens = 1 });
+    defer input.deinit();
+
+    try std.testing.expect(input.is_split_turn);
+    try std.testing.expectEqual(@as(usize, 1), input.messages.len);
+    try std.testing.expectEqual(@as(usize, 1), input.turn_prefix_messages.len);
+    try std.testing.expectEqualStrings("old history", input.messages[0].user.content.string);
+    try std.testing.expectEqualStrings("large turn request", input.turn_prefix_messages[0].user.content.string);
+    try std.testing.expectEqualStrings(kept, input.first_kept_entry_id);
+}
+
 test "compaction summary input reuses previous first kept boundary and summary" {
     var manager = try SessionManager.init(std.testing.allocator, "/repo", "session-1", "t0");
     defer manager.deinit();
@@ -1580,16 +1709,16 @@ test "serialize compaction summary input writes deterministic bounded text" {
     defer std.testing.allocator.free(serialized);
 
     try std.testing.expectEqualStrings(
-        "<previous-summary>\n" ++
-            "prior summary\n" ++
-            "</previous-summary>\n\n" ++
-            "<conversation>\n" ++
+        "<conversation>\n" ++
             "[User]: question\n\n" ++
             "[Assistant thinking]: thought\n" ++
             "[Assistant]: answer\n" ++
             "[Assistant tool call]: read\n\n" ++
             "[Tool result]: tool output\n" ++
-            "</conversation>\n",
+            "</conversation>\n" ++
+            "\n<previous-summary>\n" ++
+            "prior summary\n" ++
+            "</previous-summary>\n",
         serialized,
     );
 }

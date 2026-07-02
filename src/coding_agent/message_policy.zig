@@ -11,16 +11,29 @@ pub fn userText(message: ai.UserMessage) ?[]const u8 {
     };
 }
 
-pub fn isContextOverflowAssistant(message: ai.AssistantMessage) bool {
-    if (message.stop_reason != .error_) return false;
-    if (message.operational_failure) |failure| return failure.category == .context_overflow;
-    const text = message.error_message orelse return false;
-    return ai.isContextOverflowText(text);
+pub fn isContextOverflowAssistant(message: ai.AssistantMessage, context_window: u64) bool {
+    if (message.operational_failure) |failure| {
+        if (failure.category == .context_overflow) return true;
+    }
+    if (message.stop_reason == .error_) {
+        const text = message.error_message orelse return false;
+        return ai.isContextOverflowText(text);
+    }
+    if (context_window == 0) return false;
+    if (message.stop_reason == .stop) {
+        const input_tokens = message.usage.input +| message.usage.cache_read;
+        return input_tokens > context_window;
+    }
+    if (message.stop_reason == .length and message.usage.output == 0) {
+        const input_tokens = message.usage.input +| message.usage.cache_read;
+        return input_tokens >= context_window;
+    }
+    return false;
 }
 
 pub fn isRetryableAssistant(message: ai.AssistantMessage) bool {
     if (message.stop_reason != .error_) return false;
-    if (isContextOverflowAssistant(message)) return false;
+    if (isContextOverflowAssistant(message, 0)) return false;
     if (message.operational_failure) |failure| switch (failure.retryable) {
         .yes => return true,
         .no => return false,
@@ -57,4 +70,30 @@ test "retryable and overflow classification" {
     try std.testing.expect(ai.isContextOverflowText("This endpoint's maximum context length is 100 tokens"));
     try std.testing.expect(ai.isContextOverflowText("token limit exceeded"));
     try std.testing.expect(!ai.isContextOverflowText("rate limit: too many tokens, please wait"));
+
+    var usage = ai.protocol.emptyUsage();
+    usage.input = 101;
+    const silent_overflow: ai.AssistantMessage = .{
+        .content = &.{},
+        .api = ai.KnownApi.openai_responses,
+        .provider = "openai",
+        .model = "gpt",
+        .usage = usage,
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    try std.testing.expect(isContextOverflowAssistant(silent_overflow, 100));
+
+    usage.output = 0;
+    usage.input = 100;
+    const length_overflow: ai.AssistantMessage = .{
+        .content = &.{},
+        .api = ai.KnownApi.openai_responses,
+        .provider = "openai",
+        .model = "gpt",
+        .usage = usage,
+        .stop_reason = .length,
+        .timestamp = 0,
+    };
+    try std.testing.expect(isContextOverflowAssistant(length_overflow, 100));
 }

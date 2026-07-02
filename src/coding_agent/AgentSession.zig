@@ -21,13 +21,111 @@ const tool_registry = @import("tool_registry.zig");
 const AgentSession = @This();
 
 pub const public_event_capacity_default = 256;
-const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 4096;
+const max_compaction_summary_prompt_bytes = session_manager.max_compaction_serialized_input_bytes + 16 * 1024;
 const live_prompt_event_capacity_count = 64;
+
+const summarization_system_prompt =
+    \\You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
+    \\
+    \\Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.
+;
+
+const summarization_prompt =
+    \\The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+    \\
+    \\Use this EXACT format:
+    \\
+    \\## Goal
+    \\[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+    \\
+    \\## Constraints & Preferences
+    \\- [Any constraints, preferences, or requirements mentioned by user]
+    \\- [Or "(none)" if none were mentioned]
+    \\
+    \\## Progress
+    \\### Done
+    \\- [x] [Completed tasks/changes]
+    \\
+    \\### In Progress
+    \\- [ ] [Current work]
+    \\
+    \\### Blocked
+    \\- [Issues preventing progress, if any]
+    \\
+    \\## Key Decisions
+    \\- **[Decision]**: [Brief rationale]
+    \\
+    \\## Next Steps
+    \\1. [Ordered list of what should happen next]
+    \\
+    \\## Critical Context
+    \\- [Any data, examples, or references needed to continue]
+    \\- [Or "(none)" if not applicable]
+    \\
+    \\Keep each section concise. Preserve exact file paths, function names, and error messages.
+;
+
+const update_summarization_prompt =
+    \\The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+    \\
+    \\Update the existing structured summary with new information. RULES:
+    \\- PRESERVE all existing information from the previous summary
+    \\- ADD new progress, decisions, and context from the new messages
+    \\- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
+    \\- UPDATE "Next Steps" based on what was accomplished
+    \\- PRESERVE exact file paths, function names, and error messages
+    \\- If something is no longer relevant, you may remove it
+    \\
+    \\Use this EXACT format:
+    \\
+    \\## Goal
+    \\[Preserve existing goals, add new ones if the task expanded]
+    \\
+    \\## Constraints & Preferences
+    \\- [Preserve existing, add new ones discovered]
+    \\
+    \\## Progress
+    \\### Done
+    \\- [x] [Include previously done items AND newly completed items]
+    \\
+    \\### In Progress
+    \\- [ ] [Current work - update based on progress]
+    \\
+    \\### Blocked
+    \\- [Current blockers - remove if resolved]
+    \\
+    \\## Key Decisions
+    \\- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+    \\
+    \\## Next Steps
+    \\1. [Update based on current state]
+    \\
+    \\## Critical Context
+    \\- [Preserve important context, add new if needed]
+    \\
+    \\Keep each section concise. Preserve exact file paths, function names, and error messages.
+;
+
+const turn_prefix_summarization_prompt =
+    \\This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+    \\
+    \\Summarize the prefix to provide context for the retained suffix:
+    \\
+    \\## Original Request
+    \\[What did the user ask for in this turn?]
+    \\
+    \\## Early Progress
+    \\- [Key decisions and work done in the prefix]
+    \\
+    \\## Context for Suffix
+    \\- [Information needed to understand the retained recent work]
+    \\
+    \\Be concise. Focus on what's needed to understand the kept suffix.
+;
 
 allocator: std.mem.Allocator,
 io: std.Io,
 task_runtime: *runtime.Runtime,
-timestamp: []const u8,
 system_prompt_text: []const u8,
 builtin_tools: *tool_registry.BuiltinTools,
 manager: *session_manager.SessionManager,
@@ -178,9 +276,6 @@ const Lifecycle = enum {
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSession {
     const task_runtime = options.task_runtime;
 
-    const timestamp = try allocator.dupe(u8, options.timestamp);
-    errdefer allocator.free(timestamp);
-
     var prompt_resources = try resources.PromptResources.load(allocator, io, .{
         .dir = options.dir,
         .agent_dir = options.agent_dir,
@@ -258,7 +353,6 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         io,
         manager,
         store,
-        timestamp,
         options.public_event_capacity,
     );
     errdefer event_drain.deinit();
@@ -269,7 +363,6 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .allocator = allocator,
         .io = io,
         .task_runtime = task_runtime,
-        .timestamp = timestamp,
         .system_prompt_text = system_prompt_text,
         .builtin_tools = builtin_tools,
         .manager = manager,
@@ -299,7 +392,6 @@ pub fn deinit(self: *AgentSession) void {
     self.allocator.destroy(self.manager);
     self.builtin_tools.deinit();
     self.allocator.free(self.system_prompt_text);
-    self.allocator.free(self.timestamp);
     self.* = undefined;
 }
 
@@ -763,24 +855,18 @@ pub fn startCompactionRun(
 
     const serialized_input = try input.serialize(self.allocator);
     defer self.allocator.free(serialized_input);
-    const prefix =
-        "The messages below are conversation history to compact. Create a structured context checkpoint " ++
-        "summary that another LLM can use to continue the work. Preserve exact file paths, function " ++
-        "names, decisions, tool outcomes, constraints, unresolved work, and next steps. Return only " ++
-        "the summary.\n\n";
-    if (serialized_input.len > max_compaction_summary_prompt_bytes - prefix.len - 1) {
-        return error.CompactionSummaryPromptTooLarge;
-    }
-    const summary_prompt = if (custom_instructions) |instructions|
-        try std.fmt.allocPrint(
-            self.allocator,
-            "{s}Additional focus: {s}\n\n{s}\n",
-            .{ prefix, instructions, serialized_input },
-        )
+    const turn_prefix_input = if (input.is_split_turn)
+        try input.serializeTurnPrefix(self.allocator)
     else
-        try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ prefix, serialized_input });
+        null;
+    defer if (turn_prefix_input) |text| self.allocator.free(text);
+    const summary_prompt = try self.buildCompactionSummaryPrompt(
+        serialized_input,
+        turn_prefix_input,
+        input.previous_summary != null,
+        custom_instructions,
+    );
     errdefer self.allocator.free(summary_prompt);
-    if (summary_prompt.len > max_compaction_summary_prompt_bytes) return error.CompactionSummaryPromptTooLarge;
 
     const run = try self.allocator.create(CompactionRun);
     errdefer self.allocator.destroy(run);
@@ -799,6 +885,7 @@ pub fn startCompactionRun(
     // The summary call is a bare one-shot loop run: empty context, no tools,
     // no queue or tool hooks. The loop owns provider auth and streaming.
     var config = self.agent.loopConfig();
+    config.options.stream.max_tokens = compactionSummaryMaxTokens(self.agent.state.model, self.compaction_settings.reserve_tokens);
     config.get_steering_messages = null;
     config.get_follow_up_messages = null;
     config.before_tool_call = null;
@@ -810,12 +897,163 @@ pub fn startCompactionRun(
         self.allocator,
         self.task_runtime,
         &run.prompts,
-        .{ .system_prompt = "", .messages = &.{}, .tools = &.{} },
+        .{ .system_prompt = summarization_system_prompt, .messages = &.{}, .tools = &.{} },
         config,
         run.cancel.token(),
         &run.buffer,
     );
     return run;
+}
+
+fn buildCompactionSummaryPrompt(
+    self: *AgentSession,
+    serialized_input: []const u8,
+    turn_prefix_input: ?[]const u8,
+    has_previous_summary: bool,
+    custom_instructions: ?[]const u8,
+) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer writer.deinit();
+    try appendCompactionPromptBounded(&writer, serialized_input);
+    try appendCompactionPromptBounded(&writer, "\n\n");
+    try appendCompactionPromptBounded(&writer, if (has_previous_summary) update_summarization_prompt else summarization_prompt);
+    if (custom_instructions) |instructions| {
+        try appendCompactionPromptBounded(&writer, "\n\nAdditional focus: ");
+        try appendCompactionPromptBounded(&writer, instructions);
+    }
+    if (turn_prefix_input) |prefix_input| {
+        try appendCompactionPromptBounded(&writer, "\n\n---\n\n");
+        try appendCompactionPromptBounded(&writer, prefix_input);
+        try appendCompactionPromptBounded(&writer, "\n\n");
+        try appendCompactionPromptBounded(&writer, turn_prefix_summarization_prompt);
+        try appendCompactionPromptBounded(
+            &writer,
+            "\n\nAppend the result after the main summary under this heading exactly:\n\n" ++
+                "---\n\n**Turn Context (split turn):**\n\n",
+        );
+    }
+    return writer.toOwnedSlice();
+}
+
+fn appendCompactionPromptBounded(writer: *std.Io.Writer.Allocating, text: []const u8) !void {
+    if (text.len > max_compaction_summary_prompt_bytes or
+        writer.written().len > max_compaction_summary_prompt_bytes - text.len)
+    {
+        return error.CompactionSummaryPromptTooLarge;
+    }
+    try writer.writer.writeAll(text);
+}
+
+fn compactionSummaryMaxTokens(model: ai.Model, reserve_tokens: u64) ?u32 {
+    const reserve_output = (reserve_tokens * 8) / 10;
+    const model_limit = if (model.max_tokens > 0) model.max_tokens else std.math.maxInt(u32);
+    const raw = @min(reserve_output, model_limit, std.math.maxInt(u32));
+    if (raw == 0) return 1;
+    return @intCast(raw);
+}
+
+fn compactionSummaryWithFileOperations(
+    self: *AgentSession,
+    summary: []const u8,
+    input: session_manager.CompactionSummaryInput,
+) ![]const u8 {
+    var read_files = std.ArrayList([]const u8).empty;
+    defer read_files.deinit(self.allocator);
+    var modified_files = std.ArrayList([]const u8).empty;
+    defer modified_files.deinit(self.allocator);
+
+    try collectCompactionFileOperations(self.allocator, input.messages, &read_files, &modified_files);
+    try collectCompactionFileOperations(self.allocator, input.turn_prefix_messages, &read_files, &modified_files);
+    removeModifiedFilesFromReadFiles(&read_files, modified_files.items);
+    sortStringSlices(read_files.items);
+    sortStringSlices(modified_files.items);
+
+    if (read_files.items.len == 0 and modified_files.items.len == 0) return self.allocator.dupe(u8, summary);
+
+    var writer: std.Io.Writer.Allocating = .init(self.allocator);
+    errdefer writer.deinit();
+    try appendCompactionSummaryBounded(&writer, summary);
+    if (read_files.items.len > 0) {
+        try appendCompactionSummaryBounded(&writer, "\n\n<read-files>\n");
+        for (read_files.items) |path| {
+            try appendCompactionSummaryBounded(&writer, path);
+            try appendCompactionSummaryBounded(&writer, "\n");
+        }
+        try appendCompactionSummaryBounded(&writer, "</read-files>");
+    }
+    if (modified_files.items.len > 0) {
+        try appendCompactionSummaryBounded(&writer, "\n\n<modified-files>\n");
+        for (modified_files.items) |path| {
+            try appendCompactionSummaryBounded(&writer, path);
+            try appendCompactionSummaryBounded(&writer, "\n");
+        }
+        try appendCompactionSummaryBounded(&writer, "</modified-files>");
+    }
+    return writer.toOwnedSlice();
+}
+
+fn collectCompactionFileOperations(
+    allocator: std.mem.Allocator,
+    messages: []const agent_mod.AgentMessage,
+    read_files: *std.ArrayList([]const u8),
+    modified_files: *std.ArrayList([]const u8),
+) !void {
+    for (messages) |message| {
+        if (message != .assistant) continue;
+        for (message.assistant.content) |content| {
+            if (content != .tool_call) continue;
+            const path = toolCallPath(content.tool_call) orelse continue;
+            if (std.mem.eql(u8, content.tool_call.name, "read")) {
+                try appendUniqueString(allocator, read_files, path);
+            } else if (std.mem.eql(u8, content.tool_call.name, "write") or
+                std.mem.eql(u8, content.tool_call.name, "edit"))
+            {
+                try appendUniqueString(allocator, modified_files, path);
+            }
+        }
+    }
+}
+
+fn toolCallPath(tool_call: ai.ToolCall) ?[]const u8 {
+    if (tool_call.arguments != .object) return null;
+    const value = tool_call.arguments.object.get("path") orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn appendUniqueString(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), value: []const u8) !void {
+    for (list.items) |item| if (std.mem.eql(u8, item, value)) return;
+    try list.append(allocator, value);
+}
+
+fn removeModifiedFilesFromReadFiles(read_files: *std.ArrayList([]const u8), modified_files: []const []const u8) void {
+    var index: usize = 0;
+    while (index < read_files.items.len) {
+        for (modified_files) |modified| {
+            if (std.mem.eql(u8, read_files.items[index], modified)) {
+                _ = read_files.swapRemove(index);
+                break;
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn sortStringSlices(items: [][]const u8) void {
+    std.mem.sort([]const u8, items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+}
+
+fn appendCompactionSummaryBounded(writer: *std.Io.Writer.Allocating, text: []const u8) !void {
+    if (text.len > session_manager.max_compaction_summary_bytes or
+        writer.written().len > session_manager.max_compaction_summary_bytes - text.len)
+    {
+        return error.CompactionSummaryTooLarge;
+    }
+    try writer.writer.writeAll(text);
 }
 
 /// Apply one summary-stream progress result. Returns true while the run is
@@ -882,12 +1120,16 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
         },
     };
 
+    const durable_summary = try self.compactionSummaryWithFileOperations(summary, run.input);
+    defer self.allocator.free(durable_summary);
+
     // Persist the compaction entry durably before committing it in memory.
+    const timestamp = session_manager.timestampNow(self.io);
     const entry = try self.manager.prepareCompactionEntry(
-        summary,
+        durable_summary,
         run.input.first_kept_entry_id,
         run.input.tokens_before,
-        self.timestamp,
+        &timestamp,
     );
     var entry_committed = false;
     errdefer if (!entry_committed) self.manager.deinitPreparedEntry(entry);
@@ -1043,6 +1285,40 @@ test "tool result details can request error classification" {
     try object.put(std.testing.allocator, "isError", .{ .bool = true });
     try std.testing.expect(toolResultRequestsError(.{ .object = object }));
     try std.testing.expect(!toolResultRequestsError(null));
+}
+
+test "compaction summary appends file operation tags" {
+    var read_args: std.json.ObjectMap = .empty;
+    defer read_args.deinit(std.testing.allocator);
+    try read_args.put(std.testing.allocator, "path", .{ .string = "README.md" });
+    var edit_args: std.json.ObjectMap = .empty;
+    defer edit_args.deinit(std.testing.allocator);
+    try edit_args.put(std.testing.allocator, "path", .{ .string = "src/main.zig" });
+    const blocks = [_]ai.AssistantContent{
+        .{ .tool_call = .{ .id = "read-1", .name = "read", .arguments = .{ .object = read_args } } },
+        .{ .tool_call = .{ .id = "edit-1", .name = "edit", .arguments = .{ .object = edit_args } } },
+    };
+    const messages = [_]agent_mod.AgentMessage{.{ .assistant = .{
+        .content = &blocks,
+        .api = ai.KnownApi.openai_responses,
+        .provider = "openai",
+        .model = "gpt",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    } }};
+    const input: session_manager.CompactionSummaryInput = .{
+        .allocator = std.testing.allocator,
+        .messages = &messages,
+        .first_kept_entry_id = "00000002",
+        .tokens_before = 1,
+    };
+    var session: AgentSession = undefined;
+    session.allocator = std.testing.allocator;
+    const summary = try session.compactionSummaryWithFileOperations("summary", input);
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "<read-files>\nREADME.md\n</read-files>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "<modified-files>\nsrc/main.zig\n</modified-files>") != null);
 }
 
 // -- tests --------------------------------------------------------------
