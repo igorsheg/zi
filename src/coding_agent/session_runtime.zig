@@ -1420,9 +1420,10 @@ pub const SessionRuntime = struct {
     }
 
     fn setSessionThinkingLevel(self: *SessionRuntime, level: agent_mod.ThinkingLevel) !void {
+        const timestamp = session_manager.timestampNow(self.services.io);
         const entry = try self.session.manager.prepareThinkingLevelChangeEntry(
             @tagName(level),
-            self.session.timestamp,
+            &timestamp,
         );
         var entry_committed = false;
         errdefer if (!entry_committed) self.session.manager.deinitPreparedEntry(entry);
@@ -1441,10 +1442,11 @@ pub const SessionRuntime = struct {
     }
 
     fn setSessionModel(self: *SessionRuntime, model: ai.Model) !void {
+        const timestamp = session_manager.timestampNow(self.services.io);
         const entry = try self.session.manager.prepareModelChangeEntry(
             model.provider,
             model.id,
-            self.session.timestamp,
+            &timestamp,
         );
         var entry_committed = false;
         errdefer if (!entry_committed) self.session.manager.deinitPreparedEntry(entry);
@@ -3337,7 +3339,7 @@ const FlakyStream = struct {
             const copied_len = @min(text.len, last_prompt_buffer.len);
             @memcpy(last_prompt_buffer[0..copied_len], text[0..copied_len]);
             last_prompt = last_prompt_buffer[0..copied_len];
-            if (std.mem.indexOf(u8, text, "conversation history to compact") != null) {
+            if (std.mem.indexOf(u8, text, "context checkpoint summary") != null) {
                 is_compaction_request = true;
             }
         }

@@ -1237,6 +1237,7 @@ const InteractiveController = struct {
                 .id = resume_picker_id,
                 .items = mapped,
                 .search_detail = true,
+                .match_order = .input,
                 .layout = .{ .four_column = .{
                     .label_width = 40,
                     .detail_width = 14,
@@ -2062,12 +2063,24 @@ const InteractiveController = struct {
     }
 
     fn applyCompactionEnd(self: *InteractiveController, payload: client_protocol.CompactionEnd) !void {
+        if (payload.result != null) try self.appendCompactionTranscriptItem(payload);
         if (payload.error_message) |message| try self.appendStatus(.warning, message.text);
         if (payload.will_retry or self.operation_active) {
             try self.setWorkingStatus("working");
         } else {
             try self.clearStatus(status_id_working);
         }
+    }
+
+    fn appendCompactionTranscriptItem(self: *InteractiveController, payload: client_protocol.CompactionEnd) !void {
+        const result = payload.result orelse return;
+        var title_buffer: [128]u8 = undefined;
+        const title = std.fmt.bufPrint(
+            &title_buffer,
+            "Context Compacted ({s}, {d} tokens before)",
+            .{ @tagName(payload.reason), result.tokens_before },
+        ) catch "Context Compacted";
+        try self.appendCustom(title, result.summary.text, .markdown);
     }
 
     /// Append in transcript-cap-sized chunks. Sanitization (invalid UTF-8,
@@ -2869,6 +2882,46 @@ test "compaction end keeps working status while operation remains active" {
     const count = terminal.app.status.ordered(.status_line, &views);
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqualStrings("working", views[0].text);
+}
+
+test "compaction end appends custom transcript summary" {
+    const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .app = undefined,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+    defer controller.pending_ui_work.deinit(std.testing.allocator);
+    defer controller.clearPendingUiWork();
+
+    var result: client_protocol.CompactionResult = .{
+        .summary = try client_protocol.EventText.init(std.testing.allocator, "## Goal\ncompacted"),
+        .first_kept_entry_id = try client_protocol.EventText.init(std.testing.allocator, "00000002"),
+        .tokens_before = 123,
+    };
+    defer result.deinit(std.testing.allocator);
+
+    try controller.applyCompactionEnd(.{
+        .reason = .manual,
+        .result = result,
+        .aborted = false,
+        .will_retry = false,
+    });
+    _ = try controller.applyPendingUiWorkBounded(std.math.maxInt(i64));
+
+    try std.testing.expectEqual(@as(usize, 1), terminal.app.transcript.items.items.len);
+    try std.testing.expect(terminal.app.transcript.items.items[0].body == .custom);
+    try std.testing.expectEqualStrings(
+        "Context Compacted (manual, 123 tokens before)",
+        terminal.app.transcript.items.items[0].body.custom.title,
+    );
+    try std.testing.expectEqualStrings("## Goal\ncompacted", terminal.app.transcript.items.items[0].body.custom.text);
 }
 
 test "compaction end clears working status only when operation is done" {

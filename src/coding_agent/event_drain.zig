@@ -24,7 +24,6 @@ pub const EventDrain = struct {
     public_events: PublicEventQueue,
     queue_mirror: queue_mirror_mod.QueueMirror = .{},
     public_event_wake: runtime.WakeEvent = .init,
-    timestamp: []const u8,
     context_overflow_count: usize = 0,
     pending_public_event_overflow_count: usize = 0,
     /// Auto-retry attempt counter. The drain owns it so the success path is
@@ -37,7 +36,6 @@ pub const EventDrain = struct {
         io: std.Io,
         manager: *session_manager.SessionManager,
         store: ?*session_manager.SessionStore,
-        timestamp: []const u8,
         public_event_capacity: usize,
     ) !EventDrain {
         if (public_event_capacity == 0) return error.PublicEventCapacityZero;
@@ -49,7 +47,6 @@ pub const EventDrain = struct {
             .store = store,
             .public_event_buffer = buffer,
             .public_events = PublicEventQueue.init(buffer),
-            .timestamp = timestamp,
         };
     }
 
@@ -80,7 +77,7 @@ pub const EventDrain = struct {
 
         if (event == .message_end and event.message_end.message == .assistant) {
             const assistant = event.message_end.message.assistant;
-            if (message_policy.isContextOverflowAssistant(assistant)) {
+            if (message_policy.isContextOverflowAssistant(assistant, assistantContextWindow(assistant))) {
                 self.context_overflow_count += 1;
             }
             if (assistant.stop_reason != .error_ and self.retry_attempt > 0) {
@@ -118,8 +115,14 @@ pub const EventDrain = struct {
         } });
     }
 
+    fn assistantContextWindow(message: ai.AssistantMessage) u64 {
+        if (ai.getModel(message.provider, message.model)) |model| return model.context_window;
+        return 0;
+    }
+
     fn persistMessage(self: *EventDrain, message: agent_mod.AgentMessage) !void {
-        const entry = try self.manager.prepareMessageEntry(message, self.timestamp);
+        const timestamp = session_manager.timestampNow(self.io);
+        const entry = try self.manager.prepareMessageEntry(message, &timestamp);
         errdefer self.manager.deinitPreparedEntry(entry);
         if (self.store) |store| {
             try store.appendEntry(self.io, entry, self.manager.lastEntryId());

@@ -33,6 +33,11 @@ pub const Layout = union(enum) {
     four_column: FourColumn,
 };
 
+pub const MatchOrder = enum {
+    score,
+    input,
+};
+
 pub const TwoColumn = struct {
     /// Preferred display columns. `null` keeps the layout default; rendering
     /// clamps widths to the available row.
@@ -56,6 +61,7 @@ pub const Open = struct {
     search_detail: bool = false,
     filter_enabled: bool = true,
     layout: Layout = .line,
+    match_order: MatchOrder = .score,
     truncated: bool = false,
     min_visible_rows: u8 = 0,
 };
@@ -127,6 +133,7 @@ min_visible_rows: u8 = 0,
 search_detail: bool = false,
 filter_enabled: bool = true,
 layout: Layout = .line,
+match_order: MatchOrder = .score,
 
 pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
     var self: Picker = .{
@@ -136,6 +143,7 @@ pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
         .search_detail = open.search_detail,
         .filter_enabled = open.filter_enabled,
         .layout = open.layout,
+        .match_order = open.match_order,
     };
     errdefer self.deinit(gpa);
 
@@ -321,6 +329,14 @@ fn refreshMatches(self: *Picker) void {
         return;
     }
 
+    if (self.match_order == .input) {
+        for (self.items.items, 0..) |_, index| {
+            if (self.itemScore(index) != null) self.appendMatch(index);
+        }
+        self.selected_index = if (self.match_len > 0) self.matches[0] else 0;
+        return;
+    }
+
     var scores: [item_count_max]match_mod.Score = undefined;
     for (self.items.items, 0..) |_, index| {
         const score = self.itemScore(index) orelse continue;
@@ -482,6 +498,20 @@ test "picker optionally searches detail text" {
     _ = try picker.applyInput(gpa, .{ .text = input_mod.InlineBytes.from("beta") });
     try std.testing.expectEqual(@as(usize, 1), picker.matchCount());
     try std.testing.expectEqual(@as(usize, 1), picker.selectedIndex().?);
+}
+
+test "picker can preserve input order while filtering" {
+    const gpa = std.testing.allocator;
+    const source = [_]Item{
+        .{ .id = "older", .label = "fix resume sorting" },
+        .{ .id = "newer", .label = "resume" },
+    };
+    var picker = try Picker.init(gpa, .{ .id = 7, .items = &source, .query = "resume", .match_order = .input });
+    defer picker.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), picker.matchCount());
+    try std.testing.expectEqual(@as(usize, 0), picker.nthMatchIndex(0).?);
+    try std.testing.expectEqual(@as(usize, 1), picker.nthMatchIndex(1).?);
 }
 
 test "picker falls back to fuzzy search and wraps navigation" {
