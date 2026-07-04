@@ -12,11 +12,11 @@ const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_listing = @import("session_listing.zig");
 const session_manager = @import("session_manager.zig");
 const settings_mod = @import("settings.zig");
+const slash_commands = @import("slash_commands.zig");
 const vm = @import("view_model.zig");
 
 const prompt_progress_events_per_turn_max: usize = 16;
 const active_work_poll_interval_ms: u64 = 16;
-const idle_wait_ms: i32 = 30_000;
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -51,20 +51,13 @@ pub const Engine = struct {
     };
 
     const ActiveOperation = struct {
-        phase: Phase,
-        request_id: ?client_protocol.RequestId,
-        operation_id: u64,
+        handle: ?AgentSession.RunHandle,
+        retry_wait: ?RetryWait = null,
         prompt_text: []u8,
         prompt_images: []ai.ImageContent,
         overflow_count_before: usize,
         overflow_retry_used: bool = false,
         cancel_requested: bool = false,
-
-        const Phase = union(enum) {
-            running: *AgentSession.PromptRun,
-            retry_wait: RetryWait,
-            compacting: *AgentSession.CompactionRun,
-        };
 
         const RetryWait = struct {
             kind: AgentSession.SettleVerdict.Retry.Kind,
@@ -92,9 +85,6 @@ pub const Engine = struct {
         allow_paths_outside_cwd: bool = true,
         public_event_capacity: usize = AgentSession.public_event_capacity_default,
         command_capacity: usize = client_protocol.command_queue_capacity_default,
-        event_capacity: usize = client_protocol.event_queue_capacity_default,
-        retained_event_capacity: usize = client_protocol.retained_event_count_default,
-        retained_event_bytes: usize = client_protocol.retained_event_bytes_default,
     };
 
     pub const SessionStamp = struct {
@@ -320,16 +310,12 @@ pub const Engine = struct {
         switch (envelope.command) {
             .submit => |prompt| {
                 if (!self.initialized) {
-                    try self.startNewSession(envelope.id);
+                    try self.startNewSession();
                     self.drain.notice(.warn, .generic, "opening session; submit again");
                     return;
                 }
-                if (std.mem.eql(u8, prompt.text, "/compact")) {
-                    try self.startManualCompaction(envelope.id);
-                    return;
-                }
-                if (std.mem.eql(u8, prompt.text, "/new")) {
-                    try self.startNewSession(envelope.id);
+                if (slash_commands.dispatch(prompt.text)) |action| {
+                    try self.applySlashCommand(action);
                     return;
                 }
                 if (self.active != null) {
@@ -340,21 +326,18 @@ pub const Engine = struct {
                 errdefer self.allocator.free(prompt_text);
                 const prompt_images = try client_protocol.copySubmitImages(self.allocator, prompt.images);
                 errdefer client_protocol.freeSubmitImages(self.allocator, prompt_images);
-                const prompt_run = self.session.startPromptRun(prompt.text, prompt.images) catch |err| {
+                var handle = self.session.startPromptHandle(prompt.text, prompt.images) catch |err| {
                     self.drain.notice(.err, .operation_failed, @errorName(err));
                     return;
                 };
-                prompt_run.stream.setWake(self.services.io, &self.owner_wake);
-                const op_id = self.nextOperationId();
+                handle.setWake(self.services.io, &self.owner_wake);
                 self.active = .{
-                    .phase = .{ .running = prompt_run },
-                    .request_id = envelope.id,
-                    .operation_id = op_id,
+                    .handle = handle,
                     .prompt_text = prompt_text,
                     .prompt_images = prompt_images,
                     .overflow_count_before = self.session.contextOverflowCount(),
                 };
-                self.drain.operationRunning(op_id);
+                self.drain.operationRunning(self.nextOperationId());
             },
             .cancel => {
                 if (self.active == null) {
@@ -369,13 +352,52 @@ pub const Engine = struct {
             },
             .completion_snapshot => try self.publishCompletionSnapshot(envelope.id orelse 0),
             .file_completion => |request| try self.publishFileCompletion(envelope.id orelse 0, request.query),
-            .switch_session => |request| try self.startSwitchSession(envelope.id, request.session_file_name),
+            .switch_session => |request| try self.startSwitchSession(request.session_file_name),
             .history_tail => self.drain.closeHistory(),
             .snapshot,
             .replay,
             .history_page,
             => self.drain.notice(.warn, .operation_failed, "command not implemented in Engine run B"),
         }
+    }
+
+    fn applySlashCommand(self: *Engine, action: slash_commands.Action) !void {
+        switch (action) {
+            .help => {
+                var buffer: [160]u8 = undefined;
+                self.drain.notice(.info, .generic, slash_commands.formatAvailable(&buffer));
+            },
+            .new_session => try self.startNewSession(),
+            .compact => try self.startManualCompaction(),
+            .resume_session => |selector| if (selector.len > 0) try self.startSwitchSession(selector),
+            .model => |name| {
+                if (self.active != null) return self.drain.notice(.warn, .queue_full, "operation already active");
+                const slash = std.mem.indexOfScalar(u8, name, '/') orelse return self.drain.notice(.warn, .operation_failed, "unknown model");
+                const model = ai.getModel(name[0..slash], name[slash + 1 ..]) orelse return self.drain.notice(.warn, .operation_failed, "unknown model");
+                const stream = if (self.services.provider_registry.get(model.api)) |provider| provider.stream_simple else null;
+                try self.session.setModel(model, stream);
+                self.publishChrome();
+            },
+            .thinking_level => |level| try self.applySessionSetting(level, null),
+            .hide_thinking => |hidden| try self.applySessionSetting(null, hidden),
+            .session => self.publishChrome(),
+            .settings => self.drain.notice(.info, .generic, "choose a setting"),
+            .unknown => |name| self.drain.notice(.warn, .operation_failed, name),
+        }
+    }
+
+    fn applySessionSetting(self: *Engine, level: ?agent_mod.ThinkingLevel, hidden: ?bool) !void {
+        if (self.active != null) return self.drain.notice(.warn, .queue_full, "operation already active");
+        if (level) |value| try self.session.setThinkingLevel(value);
+        if (hidden) |value| {
+            try self.services.settings_manager.setHideThinkingBlock(
+                self.services.io,
+                self.dir,
+                value,
+            );
+            try self.session.setHideThinking(value);
+        }
+        self.publishChrome();
     }
 
     fn publishCompletionSnapshot(self: *Engine, query_id: u64) !void {
@@ -434,7 +456,7 @@ pub const Engine = struct {
         try self.drain.setCompletion(query_id, .file, items[0..count]);
     }
 
-    fn startSwitchSession(self: *Engine, _: ?client_protocol.RequestId, selector: []const u8) !void {
+    fn startSwitchSession(self: *Engine, selector: []const u8) !void {
         if (self.session_open != null) {
             self.drain.notice(.warn, .queue_full, "session open already loading");
             return;
@@ -442,7 +464,7 @@ pub const Engine = struct {
         self.session_open = .{ .selector = try self.allocator.dupe(u8, selector) };
     }
 
-    fn startNewSession(self: *Engine, _: ?client_protocol.RequestId) !void {
+    fn startNewSession(self: *Engine) !void {
         var buffer: [64]u8 = undefined;
         const id = std.fmt.bufPrint(&buffer, "session-{d}", .{nowMs()}) catch "session-new";
         if (self.session_open != null) {
@@ -503,21 +525,19 @@ pub const Engine = struct {
         self.publishChrome();
     }
 
-    fn startManualCompaction(self: *Engine, request_id: ?client_protocol.RequestId) !void {
+    fn startManualCompaction(self: *Engine) !void {
         if (self.active != null) {
             self.drain.notice(.warn, .queue_full, "operation already active");
             return;
         }
-        const compaction_run = try self.session.startCompactionRun(.manual, false, null) orelse {
+        var handle = try self.session.startCompactionHandle(.manual, false, null) orelse {
             self.drain.notice(.info, .generic, "nothing to compact");
             return;
         };
-        compaction_run.stream.setWake(self.services.io, &self.owner_wake);
+        handle.setWake(self.services.io, &self.owner_wake);
         const prompt_text = try self.allocator.dupe(u8, "");
         self.active = .{
-            .phase = .{ .compacting = compaction_run },
-            .request_id = request_id,
-            .operation_id = self.nextOperationId(),
+            .handle = handle,
             .prompt_text = prompt_text,
             .prompt_images = &.{},
             .overflow_count_before = self.session.contextOverflowCount(),
@@ -529,89 +549,52 @@ pub const Engine = struct {
         var count: usize = 0;
         while (count < prompt_progress_events_per_turn_max) : (count += 1) {
             const active = if (self.active) |*active| active else return;
-            switch (active.phase) {
-                .running => |prompt_run| switch (prompt_run.stream.poll()) {
-                    .event => |event| {
-                        const more = try self.session.applyPromptRunProgress(prompt_run, event);
-                        if (!more) try self.settleRun(active, prompt_run);
-                    },
-                    .terminal => {
-                        const more = try self.session.applyPromptRunProgress(prompt_run, null);
-                        if (!more) try self.settleRun(active, prompt_run);
-                    },
+            if (active.handle) |*handle| {
+                switch (try handle.poll(&self.session)) {
+                    .live => {},
                     .empty => {
-                        runtime.yield() catch {};
+                        if (handle.kind == .prompt) runtime.yield() catch {};
                         return;
                     },
-                },
-                .compacting => |compaction_run| switch (compaction_run.stream.poll()) {
-                    .event => |event| {
-                        const more = try self.session.applyCompactionRunProgress(compaction_run, event);
-                        if (!more) try self.settleCompaction(active, compaction_run);
-                    },
-                    .terminal => {
-                        const more = try self.session.applyCompactionRunProgress(compaction_run, null);
-                        if (!more) try self.settleCompaction(active, compaction_run);
-                    },
-                    .empty => return,
-                },
-                .retry_wait => |wait| {
-                    if (nowMs() < wait.resume_at_ms) return;
-                    const prompt_run = switch (wait.kind) {
-                        .resubmit_prompt => try self.session.startPromptRun(active.prompt_text, active.prompt_images),
-                        .continue_run => try self.session.startContinueRun(),
-                    };
-                    prompt_run.stream.setWake(self.services.io, &self.owner_wake);
-                    active.phase = .{ .running = prompt_run };
-                },
+                    .settled => try self.settleActive(active, handle),
+                }
+                continue;
             }
+            const wait = active.retry_wait orelse return;
+            if (nowMs() < wait.resume_at_ms) return;
+            var handle = switch (wait.kind) {
+                .resubmit_prompt => try self.session.startPromptHandle(active.prompt_text, active.prompt_images),
+                .continue_run => try self.session.startContinueHandle(),
+            };
+            handle.setWake(self.services.io, &self.owner_wake);
+            active.retry_wait = null;
+            active.handle = handle;
         }
     }
 
-    fn settleRun(self: *Engine, active: *ActiveOperation, prompt_run: *AgentSession.PromptRun) !void {
-        const was_cancel = active.cancel_requested;
-        self.session.destroyPromptRun(prompt_run);
-        const verdict = self.session.settlePromptRun(.{
+    fn settleActive(self: *Engine, active: *ActiveOperation, handle: *AgentSession.RunHandle) !void {
+        const verdict = handle.settle(&self.session, .{
             .overflow_count_before = active.overflow_count_before,
             .overflow_retry_used = active.overflow_retry_used,
         }) catch |err| {
+            handle.deinitAfterSettled(&self.session);
+            active.handle = null;
             self.finishActiveFailed(@errorName(err));
             return;
         };
+        handle.deinitAfterSettled(&self.session);
+        active.handle = null;
         switch (verdict) {
-            .completed => if (was_cancel) self.finishActiveCanceled() else self.finishActiveCompleted(),
-            .failed => if (was_cancel) self.finishActiveCanceled() else self.finishActiveFailed("operation failed"),
-            .retry => |retry| {
-                active.phase = .{ .retry_wait = .{
-                    .kind = retry.kind,
-                    .resume_at_ms = nowMs() + @as(i64, @intCast(retry.delay_ms)),
-                } };
-            },
-            .compact => |compaction_run| {
-                compaction_run.stream.setWake(self.services.io, &self.owner_wake);
-                active.overflow_retry_used = true;
-                active.phase = .{ .compacting = compaction_run };
-            },
-        }
-    }
-
-    fn settleCompaction(self: *Engine, active: *ActiveOperation, compaction_run: *AgentSession.CompactionRun) !void {
-        const verdict = self.session.settleCompactionRun(compaction_run) catch |err| {
-            self.session.destroyCompactionRun(compaction_run);
-            self.finishActiveFailed(@errorName(err));
-            return;
-        };
-        self.session.destroyCompactionRun(compaction_run);
-        switch (verdict) {
-            .completed => self.finishActiveCompleted(),
-            .failed => self.finishActiveFailed("compaction failed"),
-            .retry => |retry| active.phase = .{ .retry_wait = .{
+            .completed => if (active.cancel_requested) self.finishActiveCanceled() else self.finishActiveCompleted(),
+            .failed => if (active.cancel_requested) self.finishActiveCanceled() else self.finishActiveFailed("operation failed"),
+            .retry => |retry| active.retry_wait = .{
                 .kind = retry.kind,
                 .resume_at_ms = nowMs() + @as(i64, @intCast(retry.delay_ms)),
-            } },
-            .compact => |next| {
-                next.stream.setWake(self.services.io, &self.owner_wake);
-                active.phase = .{ .compacting = next };
+            },
+            .compact => |compaction_run| {
+                active.overflow_retry_used = true;
+                active.handle = AgentSession.RunHandle.compaction(compaction_run);
+                active.handle.?.setWake(self.services.io, &self.owner_wake);
             },
         }
     }
@@ -650,19 +633,22 @@ pub const Engine = struct {
         if (self.active) |*active| {
             if (active.cancel_requested) return;
             active.cancel_requested = true;
-            self.session.agent.abort();
+            if (active.handle) |*handle| {
+                handle.cancelRequest(&self.session);
+            } else if (active.retry_wait != null) {
+                self.session.cancelRetryWait();
+                active.retry_wait = null;
+            }
             self.drain.operationCancelRequested();
             self.drain.cancelStreaming();
         }
     }
 
     fn destroyActive(self: *Engine, active: ActiveOperation) void {
-        switch (active.phase) {
-            .running => |prompt_run| self.session.destroyPromptRun(prompt_run),
-            .compacting => |compaction_run| self.session.destroyCompactionRun(compaction_run),
-            .retry_wait => {},
-        }
-        self.freeActive(active);
+        var owned = active;
+        if (owned.handle) |*handle| handle.deinitAfterSettled(&self.session);
+        if (owned.retry_wait != null) self.session.cancelRetryWait();
+        self.freeActive(owned);
     }
 
     fn freeActive(self: *Engine, active: ActiveOperation) void {
@@ -684,7 +670,7 @@ pub const Engine = struct {
             return;
         }
         var fds = [_]std.posix.pollfd{.{ .fd = self.wake_pipe[0], .events = std.posix.POLL.IN, .revents = 0 }};
-        _ = std.posix.poll(&fds, idle_wait_ms) catch {};
+        _ = std.posix.poll(&fds, 30_000) catch {};
     }
 
     fn wakeReadersIfDirty(self: *Engine) void {
@@ -695,20 +681,12 @@ pub const Engine = struct {
     }
 
     fn publishChrome(self: *Engine) void {
-        var chrome: vm.Chrome = .{};
-        chrome.cwd.set(self.services.cwd);
-        chrome.model_id.set(self.session.agent.state.model.id);
-        chrome.model_label.set(self.session.agent.state.model.id);
-        chrome.provider_label.set(self.session.agent.state.model.provider);
-        chrome.hide_thinking = self.session.hide_thinking;
-        chrome.thinking_level = toVmThinking(self.session.agent.state.thinking_level);
-        self.drain.setChrome(chrome);
+        self.drain.setChrome(self.session.chrome(self.services.cwd));
     }
 
     fn nextOperationId(self: *Engine) u64 {
-        const id = self.next_operation_id;
-        self.next_operation_id +%= 1;
-        return id;
+        defer self.next_operation_id +%= 1;
+        return self.next_operation_id;
     }
 
     fn drainWakePipe(self: *Engine) void {
@@ -812,17 +790,6 @@ fn settingsValue(file: settings_mod.SettingsFile) settings_mod.Settings {
 fn shutdownAndDeinitSession(session: *AgentSession) void {
     session.requestShutdown();
     session.deinit();
-}
-
-fn toVmThinking(level: agent_mod.ThinkingLevel) vm.ThinkingLevel {
-    return switch (level) {
-        .off => .off,
-        .minimal => .minimal,
-        .low => .low,
-        .medium => .medium,
-        .high => .high,
-        .xhigh => .xhigh,
-    };
 }
 
 fn buildProjectFileIndex(dir: std.Io.Dir, cwd: []const u8) !file_completion.Index {

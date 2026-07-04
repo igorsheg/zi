@@ -17,6 +17,7 @@ const client_protocol = @import("client_protocol.zig");
 const session_manager = @import("session_manager.zig");
 const system_prompt = @import("system_prompt.zig");
 const tool_registry = @import("tool_registry.zig");
+const vm = @import("view_model.zig");
 
 const AgentSession = @This();
 
@@ -267,6 +268,75 @@ pub const PromptRun = struct {
     }
 };
 
+pub const RunHandle = struct {
+    kind: Kind,
+    run: Run,
+    settled: bool = false,
+
+    pub const Kind = enum { prompt, compaction };
+    pub const PollResult = enum { live, empty, settled };
+
+    const Run = union(enum) {
+        prompt: *PromptRun,
+        compaction: *CompactionRun,
+    };
+
+    pub fn prompt(run: *PromptRun) RunHandle {
+        return .{ .kind = .prompt, .run = .{ .prompt = run } };
+    }
+
+    pub fn compaction(run: *CompactionRun) RunHandle {
+        return .{ .kind = .compaction, .run = .{ .compaction = run } };
+    }
+
+    pub fn setWake(self: *RunHandle, io: std.Io, wake: *runtime.WakeEvent) void {
+        switch (self.run) {
+            .prompt => |run| run.stream.setWake(io, wake),
+            .compaction => |run| run.stream.setWake(io, wake),
+        }
+    }
+
+    pub fn poll(self: *RunHandle, session: *AgentSession) !PollResult {
+        if (self.settled) return .settled;
+        return switch (self.run) {
+            .prompt => |run| if (!run.isActive()) .settled else switch (run.stream.poll()) {
+                .event => |event| if (try session.applyPromptRunProgress(run, event)) .live else .settled,
+                .terminal => if (try session.applyPromptRunProgress(run, null)) .live else .settled,
+                .empty => .empty,
+            },
+            .compaction => |run| if (run.state == .settled) .settled else switch (run.stream.poll()) {
+                .event => |event| if (try session.applyCompactionRunProgress(run, event)) .live else .settled,
+                .terminal => if (try session.applyCompactionRunProgress(run, null)) .live else .settled,
+                .empty => .empty,
+            },
+        };
+    }
+
+    pub fn settle(self: *RunHandle, session: *AgentSession, context: SettleContext) !SettleVerdict {
+        std.debug.assert(!self.settled);
+        self.settled = true;
+        return switch (self.run) {
+            .prompt => session.settlePromptRun(context),
+            .compaction => |run| session.settleCompactionRun(run),
+        };
+    }
+
+    pub fn cancelRequest(self: *RunHandle, session: *AgentSession) void {
+        switch (self.run) {
+            .prompt => |run| session.cancelPromptRun(run) catch {},
+            .compaction => |run| session.cancelCompactionRun(run),
+        }
+    }
+
+    pub fn deinitAfterSettled(self: *RunHandle, session: *AgentSession) void {
+        switch (self.run) {
+            .prompt => |run| session.destroyPromptRun(run),
+            .compaction => |run| session.destroyCompactionRun(run),
+        }
+        self.* = undefined;
+    }
+};
+
 const Lifecycle = enum {
     accepting,
     cancel_requested,
@@ -395,6 +465,28 @@ pub fn deinit(self: *AgentSession) void {
     self.builtin_tools.deinit();
     self.allocator.free(self.system_prompt_text);
     self.* = undefined;
+}
+
+pub fn startPromptHandle(
+    self: *AgentSession,
+    text: []const u8,
+    images: []const ai.ImageContent,
+) !RunHandle {
+    return RunHandle.prompt(try self.startPromptRun(text, images));
+}
+
+pub fn startContinueHandle(self: *AgentSession) !RunHandle {
+    return RunHandle.prompt(try self.startContinueRun());
+}
+
+pub fn startCompactionHandle(
+    self: *AgentSession,
+    reason: client_protocol.CompactionReason,
+    will_retry: bool,
+    custom_instructions: ?[]const u8,
+) !?RunHandle {
+    const run = try self.startCompactionRun(reason, will_retry, custom_instructions) orelse return null;
+    return RunHandle.compaction(run);
 }
 
 pub fn startPromptRun(
@@ -644,6 +736,53 @@ pub fn clientHistoryPage(
 pub fn clearQueue(self: *AgentSession) void {
     self.agent.clearAllQueues();
     self.event_drain.clearQueueMirror();
+}
+
+pub fn setModel(self: *AgentSession, model: ai.Model, stream: ?ai.StreamFunction) !void {
+    const timestamp = session_manager.timestampNow(self.io);
+    const entry = try self.manager.prepareModelChangeEntry(model.provider, model.id, &timestamp);
+    var committed = false;
+    errdefer if (!committed) self.manager.deinitPreparedEntry(entry);
+    if (self.store) |store| try store.appendEntry(self.io, entry, self.manager.lastEntryId());
+    _ = self.manager.commitPreparedEntry(entry);
+    committed = true;
+    self.agent.setModel(model);
+    if (stream) |stream_fn| self.agent.setStream(stream_fn);
+}
+
+pub fn setThinkingLevel(self: *AgentSession, level: agent_mod.ThinkingLevel) !void {
+    const timestamp = session_manager.timestampNow(self.io);
+    const entry = try self.manager.prepareThinkingLevelChangeEntry(@tagName(level), &timestamp);
+    var committed = false;
+    errdefer if (!committed) self.manager.deinitPreparedEntry(entry);
+    if (self.store) |store| try store.appendEntry(self.io, entry, self.manager.lastEntryId());
+    _ = self.manager.commitPreparedEntry(entry);
+    committed = true;
+    self.agent.setThinkingLevel(level);
+}
+
+/// Hide-thinking is a settings fact, not a session jsonl fact; the caller
+/// persists it through the settings owner before this mutation.
+pub fn setHideThinking(self: *AgentSession, hidden: bool) !void {
+    self.hide_thinking = hidden;
+}
+
+pub fn chrome(self: *const AgentSession, cwd: []const u8) vm.Chrome {
+    var out: vm.Chrome = .{};
+    out.cwd.set(cwd);
+    out.model_id.set(self.agent.state.model.id);
+    out.model_label.set(self.agent.state.model.id);
+    out.provider_label.set(self.agent.state.model.provider);
+    out.hide_thinking = self.hide_thinking;
+    out.thinking_level = switch (self.agent.state.thinking_level) {
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
+    return out;
 }
 
 pub fn drainPublicEvent(self: *AgentSession) ?client_protocol.ClientEvent {

@@ -523,6 +523,54 @@ pub const SessionManager = struct {
         self.next_id = @max(self.next_id, numeric_id +| 1);
     }
 
+    pub const ProjectedSessionIterator = struct {
+        manager: *const SessionManager,
+        next_index: usize,
+        compaction_index: ?usize,
+        emitted_summary: bool = false,
+
+        fn init(manager: *const SessionManager) ProjectedSessionIterator {
+            var latest_compaction_index: ?usize = null;
+            for (manager.entries.items, 0..) |entry, index| {
+                if (entry == .compaction) latest_compaction_index = index;
+            }
+            var start: usize = 0;
+            if (latest_compaction_index) |index| {
+                const compaction = manager.entries.items[index].compaction;
+                start = manager.findEntryIndex(compaction.first_kept_entry_id) orelse index + 1;
+            }
+            return .{ .manager = manager, .next_index = start, .compaction_index = latest_compaction_index };
+        }
+
+        pub fn next(self: *ProjectedSessionIterator) ?ReconstructedSessionItem {
+            if (!self.emitted_summary) {
+                self.emitted_summary = true;
+                if (self.compaction_index) |index| {
+                    const compaction = self.manager.entries.items[index].compaction;
+                    return .{
+                        .entry_id = compaction.base.id,
+                        .timestamp = compaction.base.timestamp,
+                        .content = .{ .compaction_summary = .{
+                            .summary = compaction.summary,
+                            .tokens_before = compaction.tokens_before,
+                        } },
+                    };
+                }
+            }
+            while (self.next_index < self.manager.entries.items.len) : (self.next_index += 1) {
+                const entry = self.manager.entries.items[self.next_index];
+                if (entry != .message) continue;
+                self.next_index += 1;
+                return .{
+                    .entry_id = entry.message.base.id,
+                    .timestamp = entry.message.base.timestamp,
+                    .content = .{ .message = entry.message.message },
+                };
+            }
+            return null;
+        }
+    };
+
     /// Project the entries into the agent's runtime context: the latest
     /// compaction summary (if any), the kept tail before it, then everything
     /// after it. The caller owns the returned messages.
@@ -530,9 +578,8 @@ pub const SessionManager = struct {
         var messages = std.ArrayList(agent.AgentMessage).empty;
         errdefer freeContextMessages(allocator, &messages);
 
-        const items = try self.reconstructSession(allocator);
-        defer allocator.free(items);
-        for (items) |item| switch (item.content) {
+        var projection = self.projectSession();
+        while (projection.next()) |item| switch (item.content) {
             .compaction_summary => |summary| {
                 const summary_text = try std.fmt.allocPrint(
                     allocator,
@@ -555,6 +602,10 @@ pub const SessionManager = struct {
         return messages.toOwnedSlice(allocator);
     }
 
+    pub fn projectSession(self: *const SessionManager) ProjectedSessionIterator {
+        return ProjectedSessionIterator.init(self);
+    }
+
     /// Rebuild the durable session transcript view. The returned slice is owned
     /// by the caller; item payloads borrow from this manager.
     pub fn reconstructSession(
@@ -563,35 +614,8 @@ pub const SessionManager = struct {
     ) Error![]ReconstructedSessionItem {
         var items = std.ArrayList(ReconstructedSessionItem).empty;
         errdefer items.deinit(allocator);
-
-        const entries = self.entries.items;
-        var latest_compaction_index: ?usize = null;
-        for (entries, 0..) |entry, index| {
-            if (entry == .compaction) latest_compaction_index = index;
-        }
-
-        var start: usize = 0;
-        if (latest_compaction_index) |compaction_index| {
-            const compaction = entries[compaction_index].compaction;
-            try items.append(allocator, .{
-                .entry_id = compaction.base.id,
-                .timestamp = compaction.base.timestamp,
-                .content = .{ .compaction_summary = .{
-                    .summary = compaction.summary,
-                    .tokens_before = compaction.tokens_before,
-                } },
-            });
-            start = self.findEntryIndex(compaction.first_kept_entry_id) orelse compaction_index + 1;
-        }
-
-        for (entries[start..]) |entry| {
-            if (entry != .message) continue;
-            try items.append(allocator, .{
-                .entry_id = entry.message.base.id,
-                .timestamp = entry.message.base.timestamp,
-                .content = .{ .message = entry.message.message },
-            });
-        }
+        var projection = self.projectSession();
+        while (projection.next()) |item| try items.append(allocator, item);
         return items.toOwnedSlice(allocator);
     }
 
