@@ -722,14 +722,44 @@ fn openSession(
         if (value.base_delay_ms) |delay| retry.base_delay_ms = delay;
     }
 
+    // Startup resolution: explicit option -> project settings -> global
+    // settings -> first authed model -> default. Provider and model are
+    // scope-atomic: they resolve as a pair from one scope, never mixed.
+    const model = options.model orelse model: {
+        const pair = if (project.default_provider != null or project.default_model != null) project else global;
+        if (pair.default_provider) |provider_name| {
+            if (pair.default_model) |model_id| {
+                if (ai.getModel(provider_name, model_id)) |model| {
+                    if (services.auth_manager.hasAuth(model.provider) and
+                        services.provider_registry.get(model.api) != null) break :model model;
+                }
+            }
+        }
+        for (ai.getProviders()) |provider_name| {
+            for (ai.getModels(provider_name)) |model| {
+                if (services.auth_manager.hasAuth(model.provider) and
+                    services.provider_registry.get(model.api) != null) break :model model;
+            }
+        }
+        break :model agent_mod.Agent.defaultModel();
+    };
+    const thinking_level = options.thinking_level orelse level: {
+        if (project.default_thinking_level orelse global.default_thinking_level) |text| {
+            if (parseThinkingLevel(text)) |parsed| break :level parsed;
+        }
+        break :level .off;
+    };
+    const hide_thinking = project.hide_thinking_block orelse global.hide_thinking_block orelse true;
+
     var session_options: AgentSession.Options = .{
         .cwd = services.cwd,
         .agent_dir = services.agent_dir,
         .current_date = options.current_date,
         .session_id = "",
         .timestamp = "",
-        .model = options.model orelse agent_mod.Agent.defaultModel(),
-        .thinking_level = options.thinking_level orelse .off,
+        .model = model,
+        .thinking_level = thinking_level,
+        .hide_thinking = hide_thinking,
         .stream = options.stream,
         .get_api_key = services.auth_manager.hook(),
         .dir = options.dir,
@@ -785,6 +815,13 @@ fn settingsValue(file: settings_mod.SettingsFile) settings_mod.Settings {
         .missing => .{},
         .loaded => |settings| settings.value,
     };
+}
+
+fn parseThinkingLevel(text: []const u8) ?agent_mod.ThinkingLevel {
+    inline for (@typeInfo(agent_mod.ThinkingLevel).@"enum".fields) |field| {
+        if (std.ascii.eqlIgnoreCase(text, field.name)) return @field(agent_mod.ThinkingLevel, field.name);
+    }
+    return null;
 }
 
 fn shutdownAndDeinitSession(session: *AgentSession) void {

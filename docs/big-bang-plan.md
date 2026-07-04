@@ -714,6 +714,7 @@ The implementer must account for every row; none may be silently dropped.
 | 23 | Print mode streaming output | Phase 4: print frontend samples the VM at a 30ms cadence with its own `ViewCursor`, writes appended text to stdout. Proves the multi-reader design. |
 | 24 | RPC stdio frontend | Parked: `cli` rpc mode prints "rpc frontend is being rebuilt; use --print" to stderr and exits code 2. `src/frontends/rpc/stdio.zig` is deleted (git history keeps it). Rebuild against a VM-derived wire stream is explicitly out of scope of this plan. |
 | 25 | Latency tracing (`trace.zig`, 60 phases) | Shrunk in Phase 6 to: wait, input_drain, sample, diff_apply, tick, draw, flush, watchdog. Delete queue-wait/accept-apply chain phases with the queue. |
+| 26 | Startup model/thinking/hide-thinking resolution from settings (scope-atomic provider+model pair, auth+registry-validated, first-authed fallback) | POST-CUTOVER FIX (added 2026-07-04): this row was MISSING from the original inventory — `resolveSessionOptions` lived in session_runtime and was not ported; every engine test bypassed it via `Options.stream` injection, so the binary shipped prompting provider "unknown" (empty turns, no streaming). Ported into Engine's buildAgentSession. Lesson: test seams that bypass resolution must be listed as inventory rows themselves. |
 
 ## 8. Phases and gates
 
