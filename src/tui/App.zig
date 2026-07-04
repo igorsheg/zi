@@ -370,6 +370,7 @@ pub const Command = union(enum) {
     resize: Size,
     input: input_mod.Input,
     tick: Tick,
+    force_redraw,
     clear_transcript,
     set_key_bindings: []const keybind.Binding,
     append_transcript: Transcript.Append,
@@ -444,6 +445,10 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
                 const expired = self.notify.tick(self.now_ms);
                 if (expired or self.statusHasAnimated()) self.dirty = true;
             }
+            return null;
+        },
+        .force_redraw => {
+            self.dirty = true;
             return null;
         },
         .clear_transcript => {

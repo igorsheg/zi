@@ -2,8 +2,14 @@ const std = @import("std");
 
 const coding_agent = @import("../../coding_agent/root.zig");
 const tui = @import("../../tui/root.zig");
+const failure_text = @import("failure_text.zig");
+const pickers = @import("pickers.zig");
+const tool_view = @import("tool_view.zig");
 
 const vm = coding_agent.view_model;
+
+const status_id_working: tui.status.ContributionId = 1;
+const status_id_queue: tui.status.ContributionId = 2;
 
 pub const ViewCursor = struct {
     epoch: u32 = 0,
@@ -16,6 +22,9 @@ pub const ViewCursor = struct {
     last_notice_id: u64 = 0,
     items: std.ArrayList(ItemCursor) = .empty,
     latest_query_id: u64 = 0,
+    latest_query_kind: vm.CompletionSlot.Kind = .none,
+    queue_status_bytes: [64]u8 = undefined,
+    queue_status_len: usize = 0,
 
     pub fn deinit(self: *ViewCursor, gpa: std.mem.Allocator) void {
         self.items.deinit(gpa);
@@ -24,12 +33,22 @@ pub const ViewCursor = struct {
 
     pub fn noteQuery(self: *ViewCursor, query_id: u64) void {
         self.latest_query_id = query_id;
+        self.latest_query_kind = .none;
+    }
+
+    pub fn noteCompletionQuery(self: *ViewCursor, query_id: u64, kind: vm.CompletionSlot.Kind) void {
+        self.latest_query_id = query_id;
+        self.latest_query_kind = kind;
     }
 
     fn resetForEpoch(self: *ViewCursor, gpa: std.mem.Allocator, epoch: u32) void {
         self.items.clearRetainingCapacity();
         _ = gpa;
-        self.* = .{ .epoch = epoch, .latest_query_id = self.latest_query_id };
+        self.* = .{
+            .epoch = epoch,
+            .latest_query_id = self.latest_query_id,
+            .latest_query_kind = self.latest_query_kind,
+        };
     }
 
     fn findItem(self: *ViewCursor, id: u64) ?*ItemCursor {
@@ -44,6 +63,22 @@ const ItemCursor = struct {
     consumed_len: usize = 0,
     text_replaced_rev: ?u32 = null,
     state: vm.Item.State = .streaming,
+    footer_bytes: [96]u8 = undefined,
+    footer_len: usize = 0,
+    tool_call_id: [128]u8 = undefined,
+    tool_call_id_len: usize = 0,
+    shows_duration: bool = false,
+    started_ms: ?i64 = null,
+    duration_ms: ?u64 = null,
+
+    fn footer(self: *const ItemCursor, fallback: []const u8) []const u8 {
+        if (self.footer_len > 0) return self.footer_bytes[0..self.footer_len];
+        return fallback;
+    }
+
+    fn toolCallId(self: *const ItemCursor) []const u8 {
+        return self.tool_call_id[0..self.tool_call_id_len];
+    }
 };
 
 pub const DiffResult = struct {
@@ -55,8 +90,25 @@ pub const DiffResult = struct {
     }
 };
 
+pub fn tickDurations(gpa: std.mem.Allocator, cursor: *ViewCursor, now_ms: i64) !DiffResult {
+    var result: DiffResult = .{ .commands = .empty };
+    errdefer result.deinit(gpa);
+    for (cursor.items.items) |*item| {
+        if (!item.shows_duration or item.started_ms == null or item.duration_ms != null) continue;
+        if (item.tool_call_id_len == 0) continue;
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), now_ms - item.started_ms.?));
+        const footer = tool_view.durationChip(&item.footer_bytes, "running", elapsed);
+        item.footer_len = footer.len;
+        try result.commands.append(gpa, .{ .replace_tool_footer = .{
+            .tool_call_id = item.toolCallId(),
+            .text = item.footer(""),
+        } });
+    }
+    return result;
+}
+
 pub fn diff(gpa: std.mem.Allocator, sample: *const vm.Sample, cursor: *ViewCursor) !DiffResult {
-    var result = DiffResult{ .commands = .empty };
+    var result: DiffResult = .{ .commands = .empty };
     errdefer result.deinit(gpa);
 
     if (cursor.epoch != sample.session_epoch) {
@@ -65,10 +117,16 @@ pub fn diff(gpa: std.mem.Allocator, sample: *const vm.Sample, cursor: *ViewCurso
     }
 
     try emitNotices(gpa, sample, cursor, &result.commands);
+    try emitOperation(gpa, sample, cursor, &result.commands);
+    try emitQueue(gpa, sample, cursor, &result.commands);
     try emitCompletion(gpa, sample, cursor, &result.commands);
 
     for (sample.items.items) |*item| {
-        if (item.kind == .thinking and item.state == .streaming and sample.chrome.hide_thinking and cursor.findItem(item.id) == null) {
+        if (item.kind == .thinking and
+            item.state == .streaming and
+            sample.chrome.hide_thinking and
+            cursor.findItem(item.id) == null)
+        {
             try cursor.items.append(gpa, .{ .id = item.id, .rev = item.rev, .state = item.state });
             continue;
         }
@@ -96,14 +154,21 @@ fn appendNewItem(
     commands: *std.ArrayList(tui.Command),
 ) !void {
     _ = sample;
-    try commands.append(gpa, .{ .append_transcript = appendCommandForItem(item, .new_item) });
-    try cursor.items.append(gpa, .{
+    var item_cursor: ItemCursor = .{
         .id = item.id,
         .rev = item.rev,
         .consumed_len = item.text_suffix.len,
         .text_replaced_rev = item.text_replaced_at_rev,
         .state = item.state,
-    });
+    };
+    updateDurationFooter(&item_cursor, item);
+    try cursor.items.append(gpa, item_cursor);
+    const stored_cursor = &cursor.items.items[cursor.items.items.len - 1];
+    try commands.append(gpa, .{ .append_transcript = appendCommandForItem(
+        item,
+        .new_item,
+        stored_cursor.footer(item.footer.slice()),
+    ) });
 }
 
 fn diffExistingItem(
@@ -119,17 +184,23 @@ fn diffExistingItem(
                 .text = item.text_suffix,
             } });
         } else {
-            try commands.append(gpa, .{ .append_transcript = appendCommandForItem(item, .new_item) });
+            try commands.append(gpa, .{ .append_transcript = appendCommandForItem(
+                item,
+                .new_item,
+                cursor.footer(item.footer.slice()),
+            ) });
         }
         cursor.text_replaced_rev = item.text_replaced_at_rev;
     } else if (item.text_suffix.len > 0) {
         try appendDeltaCommand(gpa, item, item.text_suffix, commands);
     }
 
-    if (item.kind == .tool and item.tool != null and item.footer.slice().len > 0) {
+    updateDurationFooter(cursor, item);
+    const footer = cursor.footer(item.footer.slice());
+    if (item.kind == .tool and item.tool != null and footer.len > 0) {
         try commands.append(gpa, .{ .replace_tool_footer = .{
             .tool_call_id = item.tool.?.tool_call_id.slice(),
-            .text = item.footer.slice(),
+            .text = footer,
         } });
     }
     if (item.state == .canceled and cursor.state != .canceled) try commands.append(gpa, .mark_pending_tools_canceled);
@@ -167,19 +238,23 @@ fn appendDeltaCommand(
     }
 }
 
-fn appendCommandForItem(item: *const vm.ItemDelta, mode: tui.Transcript.AppendMode) tui.Transcript.Append {
+fn appendCommandForItem(
+    item: *const vm.ItemDelta,
+    mode: tui.Transcript.AppendMode,
+    footer: []const u8,
+) tui.Transcript.Append {
     return switch (item.kind) {
         .user => .{ .message = .{ .role = .user, .text = item.text_suffix, .mode = mode } },
         .assistant => .{ .message = .{ .role = .assistant, .text = item.text_suffix, .mode = mode } },
         .thinking => .{ .thinking = .{ .text = item.text_suffix, .hidden = false, .mode = mode } },
-        .tool => .{ .tool = toolAppend(item) },
+        .tool => .{ .tool = toolAppend(item, footer) },
         .banner => .{ .custom = .{ .title = "notice", .text = item.text_suffix } },
         .compaction_summary => .{ .custom = .{ .title = "compaction", .text = item.text_suffix, .format = .markdown } },
         .system_notice => .{ .status = .{ .level = .info, .text = item.text_suffix } },
     };
 }
 
-fn toolAppend(item: *const vm.ItemDelta) tui.Transcript.Append.ToolAppend {
+fn toolAppend(item: *const vm.ItemDelta, footer: []const u8) tui.Transcript.Append.ToolAppend {
     const tool = item.tool.?;
     const display = tool.display;
     return .{
@@ -192,7 +267,7 @@ fn toolAppend(item: *const vm.ItemDelta) tui.Transcript.Append.ToolAppend {
         .title = tool.title.slice(),
         .compact_title = tool.title.slice(),
         .output = item.text_suffix,
-        .footer = item.footer.slice(),
+        .footer = footer,
     };
 }
 
@@ -227,6 +302,42 @@ fn toolStatus(state: vm.Item.State) tui.Transcript.ToolStatus {
     };
 }
 
+fn updateDurationFooter(cursor: *ItemCursor, item: *const vm.ItemDelta) void {
+    const tool = item.tool orelse {
+        cursor.footer_len = 0;
+        cursor.shows_duration = false;
+        return;
+    };
+    cursor.shows_duration = tool.display.shows_duration;
+    cursor.started_ms = tool.started_ms;
+    cursor.duration_ms = tool.duration_ms;
+    const call_id = tool.tool_call_id.slice();
+    @memcpy(cursor.tool_call_id[0..call_id.len], call_id);
+    cursor.tool_call_id_len = call_id.len;
+    if (!tool.display.shows_duration) {
+        cursor.footer_len = 0;
+        return;
+    }
+    var duration_buffer: [32]u8 = undefined;
+    const duration = if (tool.duration_ms) |duration_ms|
+        tool_view.durationChip(&duration_buffer, "took", duration_ms)
+    else if (tool.started_ms != null)
+        tool_view.durationChip(&duration_buffer, "running", 0)
+    else
+        "";
+    if (duration.len > 0) {
+        if (item.footer.slice().len == 0) {
+            @memcpy(cursor.footer_bytes[0..duration.len], duration);
+            cursor.footer_len = duration.len;
+            return;
+        }
+        const text = tool_view.joinMetadata(&cursor.footer_bytes, item.footer.slice(), duration);
+        cursor.footer_len = text.len;
+        return;
+    }
+    cursor.footer_len = 0;
+}
+
 fn emitNotices(
     gpa: std.mem.Allocator,
     sample: *const vm.Sample,
@@ -235,18 +346,98 @@ fn emitNotices(
 ) !void {
     for (sample.notices.items) |notice| {
         if (notice.id <= cursor.last_notice_id) continue;
+        var buffer: [512]u8 = undefined;
+        const copy = failure_text.noticeCopy(&buffer, notice);
         try commands.append(gpa, .{ .notify = .{
             .key = @intCast(@min(notice.id, std.math.maxInt(u32))),
-            .message = notice.text.slice(),
-            .level = switch (notice.severity) {
-                .info => .info,
-                .warn => .warning,
-                .err => .err,
-            },
+            .message = copy.text,
+            .level = copy.level,
             .skip_dedup = true,
         } });
         cursor.last_notice_id = notice.id;
     }
+}
+
+fn emitOperation(
+    gpa: std.mem.Allocator,
+    sample: *const vm.Sample,
+    cursor: *ViewCursor,
+    commands: *std.ArrayList(tui.Command),
+) !void {
+    if (sample.op.rev == cursor.op_rev) return;
+    if (sample.op.cancel_requested) {
+        try commands.append(gpa, .{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_working,
+            .priority = 100,
+            .text = "cancel requested",
+            .tone = .canceled,
+        } });
+        return;
+    }
+    switch (sample.op.phase) {
+        .idle, .stopped => try commands.append(gpa, .{ .clear_status = .{
+            .slot = .status_line,
+            .id = status_id_working,
+        } }),
+        .running => try commands.append(gpa, .{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_working,
+            .priority = 100,
+            .text = "working",
+            .effect = .shimmer,
+            .tone = .accent,
+        } }),
+        .compacting => try commands.append(gpa, .{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_working,
+            .priority = 100,
+            .text = "compacting",
+            .effect = .shimmer,
+            .tone = .accent,
+        } }),
+        .retry_wait => |retry| try commands.append(gpa, .{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_working,
+            .priority = 100,
+            .text = retry.reason.slice(),
+            .tone = .warning,
+        } }),
+        .shutting_down => try commands.append(gpa, .{ .set_status = .{
+            .slot = .status_line,
+            .id = status_id_working,
+            .priority = 100,
+            .text = "shutting down",
+            .tone = .secondary,
+        } }),
+    }
+}
+
+fn emitQueue(
+    gpa: std.mem.Allocator,
+    sample: *const vm.Sample,
+    cursor: *ViewCursor,
+    commands: *std.ArrayList(tui.Command),
+) !void {
+    if (sample.queue.rev == cursor.queue_rev) return;
+    const steering = sample.queue.steering.len;
+    const follow_up = sample.queue.follow_up.len;
+    if (steering == 0 and follow_up == 0) {
+        try commands.append(gpa, .{ .clear_status = .{ .slot = .status_line, .id = status_id_queue } });
+        return;
+    }
+    const text = std.fmt.bufPrint(&cursor.queue_status_bytes, "queued: {d} steering, {d} follow-up", .{
+        steering,
+        follow_up,
+    }) catch "queued prompts";
+    cursor.queue_status_len = text.len;
+    try commands.append(gpa, .{ .set_status = .{
+        .slot = .status_line,
+        .id = status_id_queue,
+        .priority = 80,
+        .text = text,
+        .tone = .secondary,
+    } });
 }
 
 fn emitCompletion(
@@ -258,22 +449,13 @@ fn emitCompletion(
     const completion = sample.completion orelse return;
     if (completion.rev == cursor.completion_rev) return;
     if (completion.query_id != cursor.latest_query_id) return;
-    if (completion.kind == .none) return;
-    var items = try gpa.alloc(tui.Picker.Item, completion.items.items.len);
-    errdefer gpa.free(items);
-    for (completion.items.items, 0..) |item, index| {
-        items[index] = .{ .id = item.id.slice(), .label = item.label.slice(), .detail = item.detail.slice() };
-    }
-    switch (completion.kind) {
-        .file => try commands.append(gpa, .{ .set_file_completions = .{ .id = @intCast(completion.query_id), .items = items } }),
-        .model, .resume_session, .settings => try commands.append(gpa, .{ .open_picker = .{ .id = @intCast(completion.query_id), .items = items } }),
-        .slash_arg => {},
-        .none => {},
-    }
+    if (cursor.latest_query_kind != .none and completion.kind != cursor.latest_query_kind) return;
+    const command = try pickers.commandForCompletion(gpa, completion) orelse return;
+    try commands.append(gpa, command);
 }
 
 fn oneItemSample(gpa: std.mem.Allocator, item: *const vm.Item, chrome: vm.Chrome) !vm.Sample {
-    var sample = vm.Sample{
+    var sample: vm.Sample = .{
         .generation = 1,
         .session_epoch = 1,
         .chrome = chrome,
@@ -293,7 +475,7 @@ fn oneItemSample(gpa: std.mem.Allocator, item: *const vm.Item, chrome: vm.Chrome
 
 test "new item append golden" {
     const gpa = std.testing.allocator;
-    var item = vm.Item{ .id = 1, .kind = .assistant, .state = .streaming };
+    var item: vm.Item = .{ .id = 1, .kind = .assistant, .state = .streaming };
     defer item.deinit(gpa);
     try item.text.appendSlice(gpa, "hello");
     var sample = try oneItemSample(gpa, &item, .{});
@@ -302,14 +484,17 @@ test "new item append golden" {
     defer cursor.deinit(gpa);
     var out = try diff(gpa, &sample, &cursor);
     defer out.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 2), out.commands.items.len);
     try std.testing.expect(out.commands.items[0] == .clear_transcript);
-    try std.testing.expectEqualStrings("hello", out.commands.items[1].append_transcript.message.text);
+    try std.testing.expect(out.commands.items[out.commands.items.len - 1] == .append_transcript);
+    try std.testing.expectEqualStrings(
+        "hello",
+        out.commands.items[out.commands.items.len - 1].append_transcript.message.text,
+    );
 }
 
 test "streaming delta append via consumed_len" {
     const gpa = std.testing.allocator;
-    var item = vm.Item{ .id = 1, .kind = .assistant, .state = .streaming, .rev = 1 };
+    var item: vm.Item = .{ .id = 1, .kind = .assistant, .state = .streaming, .rev = 1 };
     defer item.deinit(gpa);
     try item.text.appendSlice(gpa, "he");
     var sample = try oneItemSample(gpa, &item, .{});
@@ -332,7 +517,7 @@ test "text_replaced full replace and footer change" {
     var tool: vm.ToolMeta = .{};
     tool.tool_call_id.set("t1");
     tool.name.set("bash");
-    var item = vm.Item{ .id = 1, .kind = .tool, .state = .streaming, .tool = tool };
+    var item: vm.Item = .{ .id = 1, .kind = .tool, .state = .streaming, .tool = tool };
     defer item.deinit(gpa);
     try item.text.appendSlice(gpa, "old");
     var sample = try oneItemSample(gpa, &item, .{});
@@ -354,9 +539,51 @@ test "text_replaced full replace and footer change" {
     try std.testing.expect(second.commands.items[1] == .replace_tool_footer);
 }
 
+test "tool duration footer golden" {
+    const gpa = std.testing.allocator;
+    var tool: vm.ToolMeta = .{};
+    tool.tool_call_id.set("t1");
+    tool.name.set("bash");
+    tool.display = coding_agent.tool_metadata.displayForTool("bash");
+    tool.duration_ms = 1234;
+    var item: vm.Item = .{ .id = 1, .kind = .tool, .state = .streaming, .tool = tool, .rev = 1 };
+    defer item.deinit(gpa);
+    try item.text.appendSlice(gpa, "out");
+    var sample = try oneItemSample(gpa, &item, .{});
+    defer sample.deinit(gpa);
+    var cursor: ViewCursor = .{ .epoch = 1 };
+    defer cursor.deinit(gpa);
+    var first = try diff(gpa, &sample, &cursor);
+    defer first.deinit(gpa);
+    const append = first.commands.items[first.commands.items.len - 1].append_transcript;
+    try std.testing.expectEqualStrings("took 1.2s", append.tool.footer);
+}
+
+test "tool duration tick footer golden" {
+    const gpa = std.testing.allocator;
+    var tool: vm.ToolMeta = .{};
+    tool.tool_call_id.set("t1");
+    tool.name.set("bash");
+    tool.display = coding_agent.tool_metadata.displayForTool("bash");
+    tool.started_ms = 1_000;
+    var item: vm.Item = .{ .id = 1, .kind = .tool, .state = .streaming, .tool = tool, .rev = 1 };
+    defer item.deinit(gpa);
+    try item.text.appendSlice(gpa, "out");
+    var sample = try oneItemSample(gpa, &item, .{});
+    defer sample.deinit(gpa);
+    var cursor: ViewCursor = .{ .epoch = 1 };
+    defer cursor.deinit(gpa);
+    var first = try diff(gpa, &sample, &cursor);
+    first.deinit(gpa);
+    var tick = try tickDurations(gpa, &cursor, 2_250);
+    defer tick.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), tick.commands.items.len);
+    try std.testing.expectEqualStrings("running 1.2s", tick.commands.items[0].replace_tool_footer.text);
+}
+
 test "epoch reset produces clear_transcript" {
     const gpa = std.testing.allocator;
-    var item = vm.Item{ .id = 1, .kind = .user, .state = .streaming };
+    var item: vm.Item = .{ .id = 1, .kind = .user, .state = .streaming };
     defer item.deinit(gpa);
     try item.text.appendSlice(gpa, "u");
     var sample = try oneItemSample(gpa, &item, .{});
@@ -370,7 +597,7 @@ test "epoch reset produces clear_transcript" {
 
 test "hide_thinking filters first append" {
     const gpa = std.testing.allocator;
-    var item = vm.Item{ .id = 1, .kind = .thinking, .state = .streaming };
+    var item: vm.Item = .{ .id = 1, .kind = .thinking, .state = .streaming };
     defer item.deinit(gpa);
     try item.text.appendSlice(gpa, "secret");
     var chrome: vm.Chrome = .{};
@@ -381,13 +608,12 @@ test "hide_thinking filters first append" {
     defer cursor.deinit(gpa);
     var out = try diff(gpa, &sample, &cursor);
     defer out.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 1), out.commands.items.len);
     try std.testing.expect(out.commands.items[0] == .clear_transcript);
 }
 
 test "stale completion query_id ignored" {
     const gpa = std.testing.allocator;
-    var sample = vm.Sample{
+    var sample: vm.Sample = .{
         .generation = 1,
         .session_epoch = 1,
         .chrome = .{},
@@ -405,5 +631,5 @@ test "stale completion query_id ignored" {
     defer cursor.deinit(gpa);
     var out = try diff(gpa, &sample, &cursor);
     defer out.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 0), out.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 2), out.commands.items.len);
 }

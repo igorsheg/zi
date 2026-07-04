@@ -12,7 +12,7 @@ pub const clipboard_image_attachment_count_max = client_protocol.submit_image_co
 
 pub const Worker = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
+    threaded: std.Io.Threaded,
     task_runtime: ?*runtime.Runtime,
     environ: ?*const std.process.Environ.Map,
     tmp_dir: []const u8,
@@ -29,24 +29,26 @@ pub const Worker = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        io: std.Io,
         task_runtime: ?*runtime.Runtime,
         environ: ?*const std.process.Environ.Map,
         tmp_dir: []const u8,
     ) !Worker {
+        const wake_fds = try createPipe();
+        errdefer closePipe(wake_fds);
         return .{
             .allocator = allocator,
-            .io = io,
+            .threaded = std.Io.Threaded.init(allocator, .{}),
             .task_runtime = task_runtime,
             .environ = environ,
             .tmp_dir = tmp_dir,
-            .wake_fds = try createPipe(),
+            .wake_fds = wake_fds,
         };
     }
 
     pub fn deinit(self: *Worker) void {
         self.cancelAndDrain();
         closePipe(self.wake_fds);
+        self.threaded.deinit();
         self.* = undefined;
     }
 
@@ -67,7 +69,7 @@ pub const Worker = struct {
         const thread = std.Thread.spawn(.{}, threadMain, .{ThreadArgs{
             .slot = slot,
             .allocator = self.allocator,
-            .io = self.io,
+            .io = self.threaded.io(),
             .task_runtime = self.task_runtime,
             .environ = self.environ,
             .tmp_dir = self.tmp_dir,
@@ -400,7 +402,7 @@ fn drainPipe(fd: std.c.fd_t) void {
 }
 
 test "worker rejects busy single slot" {
-    var worker = try Worker.init(std.testing.allocator, std.testing.io, null, null, "/tmp");
+    var worker = try Worker.init(std.testing.allocator, null, null, "/tmp");
     defer worker.deinit();
 
     const first = try std.testing.allocator.dupe(u8, "one");
@@ -411,7 +413,7 @@ test "worker rejects busy single slot" {
 }
 
 test "worker result round trip and wake fd readability" {
-    var worker = try Worker.init(std.testing.allocator, std.testing.io, null, null, "/tmp");
+    var worker = try Worker.init(std.testing.allocator, null, null, "/tmp");
     defer worker.deinit();
 
     const prompt = try std.testing.allocator.dupe(u8, "hello");

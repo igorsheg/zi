@@ -130,6 +130,10 @@ pub fn resumeAfterExternalProgram(self: *Terminal) !void {
     self.app.dirty = true;
 }
 
+pub fn resumeAfterExternalProgramCommandPath(self: *Terminal) !void {
+    if (self.tty == null) try self.setup();
+}
+
 pub fn requestStop(self: *Terminal) void {
     self.running = false;
 }

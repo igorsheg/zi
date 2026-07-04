@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const coding_agent = @import("../../coding_agent/root.zig");
 const tui = @import("../../tui/root.zig");
 const input_reader_mod = @import("input_reader.zig");
+const pickers = @import("pickers.zig");
 const view_diff = @import("view_diff.zig");
 const worker_mod = @import("worker.zig");
 
@@ -28,6 +29,10 @@ pub const Loop = struct {
     render_due_ms: i64 = 0,
     last_render_cost_ns: u64 = 0,
     next_request_id: u64 = 1,
+    chrome: vm.Chrome = .{},
+    history_oldest_entry_id: ?u64 = null,
+    last_file_completion_query: std.ArrayList(u8) = .empty,
+    external_editor_counter: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -52,6 +57,7 @@ pub const Loop = struct {
     pub fn deinit(self: *Loop) void {
         self.reader_cursor.deinit(self.allocator);
         self.view_cursor.deinit(self.allocator);
+        self.last_file_completion_query.deinit(self.allocator);
         closePipe(self.engine_wake_fds);
         self.* = undefined;
     }
@@ -59,6 +65,7 @@ pub const Loop = struct {
     pub fn run(self: *Loop) !void {
         try self.input_reader.start(self.terminal.inputFd());
         defer self.input_reader.stop();
+        _ = try self.terminal.applyCommand(pickers.installKeyBindingsCommand());
         self.render_due_ms = nowMs();
         while (self.terminal.isRunning()) try self.step();
     }
@@ -83,7 +90,9 @@ pub const Loop = struct {
         try self.drainInput();
         try self.drainOneWorkerResult();
         try self.sampleViewModel();
-        _ = try self.applyCommand(.{ .tick = .{ .now_ms = nowMs() } });
+        const tick_ms = nowMs();
+        _ = try self.applyCommand(.{ .tick = .{ .now_ms = tick_ms } });
+        try self.tickToolDurations(tick_ms);
         if (try self.terminal.drainPendingResize()) self.render_due_ms = nowMs();
         try self.renderIfDue(nowMs());
     }
@@ -97,6 +106,7 @@ pub const Loop = struct {
                 const result = try self.terminal.applyInputBytes(drained.bytes, &effects);
                 if (result.priority != .none) self.render_due_ms = nowMs();
                 try self.dispatchEffects(effects[0..result.effect_count]);
+                try self.requestFileCompletionForComposer();
             }
             if (drained.eof) self.terminal.requestStop();
             if (drained.faulted) try self.notice("terminal input reader failed");
@@ -113,12 +123,138 @@ pub const Loop = struct {
 
     fn dispatchEffect(self: *Loop, effect: tui.App.Effect) !void {
         switch (effect) {
-            .submit_text => |text| {
-                var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(
+            .submit_text => |text| try self.submitText(text),
+            .interrupt => self.submitSimple(.{ .cancel = .{} }) catch |err| try self.notice(@errorName(err)),
+            .request_shutdown => {
+                self.engine.requestShutdown();
+                self.terminal.requestStop();
+            },
+            .request_clipboard_image_paste => try self.spawnClipboardImagePaste(),
+            .request_copy_selection => try self.spawnCopySelection(),
+            .request_transcript_history => try self.requestHistoryPage(),
+            .request_transcript_tail => try self.requestTranscriptTail(),
+            .edit_composer_external => |text| try self.editComposerExternal(text),
+            .picker_selected => |selection| try self.handlePickerSelection(selection),
+            .key_binding_triggered => |id| try self.handleKeyBinding(id),
+        }
+    }
+
+    fn submitText(self: *Loop, text: []const u8) !void {
+        switch (pickers.bareCommand(text)) {
+            .model => {
+                _ = try self.applyCommand(.{ .replace_composer_text = "/model " });
+                try self.requestCompletion(.model);
+                return;
+            },
+            .resume_session => {
+                _ = try self.applyCommand(.{ .replace_composer_text = "/resume " });
+                try self.requestCompletion(.resume_session);
+                return;
+            },
+            .settings => {
+                var items: [2]tui.Picker.Item = undefined;
+                _ = try self.applyCommand(pickers.settingsCommand(&items, self.chrome));
+                return;
+            },
+            .none => {},
+        }
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        self.worker.spawn(.prompt_attachments, .{ .prompt_attachments = owned }) catch |err| switch (err) {
+            error.Busy => {
+                try self.notice("clipboard operation already running");
+                return;
+            },
+            else => return err,
+        };
+    }
+
+    fn requestCompletion(self: *Loop, kind: vm.CompletionSlot.Kind) !void {
+        const query_id = pickers.commandQueryId(kind);
+        self.view_cursor.noteCompletionQuery(query_id, kind);
+        try self.submitSimpleWithId(query_id, .completion_snapshot);
+    }
+
+    fn requestFileCompletionForComposer(self: *Loop) !void {
+        const raw_query = self.terminal.activeFileCompletionQuery() orelse {
+            self.last_file_completion_query.clearRetainingCapacity();
+            return;
+        };
+        const query = tui.text.utf8Prefix(raw_query, client_protocol.file_completion_query_bytes_max);
+        if (std.mem.eql(u8, query, self.last_file_completion_query.items)) return;
+        self.last_file_completion_query.clearRetainingCapacity();
+        try self.last_file_completion_query.appendSlice(self.allocator, query);
+        const query_id = pickers.commandQueryId(.file);
+        self.view_cursor.noteCompletionQuery(query_id, .file);
+        var envelope = try client_protocol.CommandEnvelope.initFileCompletion(self.allocator, query_id, query);
+        errdefer envelope.deinit(self.allocator);
+        self.engine.submit(envelope) catch |err| {
+            envelope.deinit(self.allocator);
+            try self.notice(@errorName(err));
+        };
+    }
+
+    fn spawnClipboardImagePaste(self: *Loop) !void {
+        self.worker.spawn(.clipboard_image_paste, .clipboard_image_paste) catch |err| switch (err) {
+            error.Busy => return self.notice("clipboard operation already running"),
+            else => return err,
+        };
+    }
+
+    fn spawnCopySelection(self: *Loop) !void {
+        const selected = try self.terminal.selectedText();
+        switch (selected) {
+            .empty => try self.notice("no selection to copy"),
+            .too_large => try self.notice("selection too large to copy"),
+            .text => |text| self.worker.spawn(.clipboard_copy, .{ .clipboard_copy = text }) catch |err| switch (err) {
+                error.Busy => {
+                    self.allocator.free(text);
+                    return self.notice("clipboard operation already running");
+                },
+                else => {
+                    self.allocator.free(text);
+                    return err;
+                },
+            },
+        }
+    }
+
+    fn requestHistoryPage(self: *Loop) !void {
+        var buffer: [32]u8 = undefined;
+        const before = if (self.history_oldest_entry_id) |id|
+            std.fmt.bufPrint(&buffer, "{d}", .{id}) catch ""
+        else
+            self.terminal.transcriptOldestSourceId() orelse "";
+        if (before.len == 0) return;
+        var envelope = try client_protocol.CommandEnvelope.initHistoryPage(
+            self.allocator,
+            self.nextRequestId(),
+            before,
+        );
+        errdefer envelope.deinit(self.allocator);
+        self.engine.submit(envelope) catch |err| {
+            envelope.deinit(self.allocator);
+            try self.notice(@errorName(err));
+        };
+    }
+
+    fn requestTranscriptTail(self: *Loop) !void {
+        // ponytail: no tail-close command exists yet; old snapshot command is the only current mailbox shape.
+        try self.submitSimple(.snapshot);
+    }
+
+    fn handlePickerSelection(self: *Loop, selection: tui.Picker.Selection) !void {
+        switch (selection.picker_id) {
+            pickers.model_picker_id => {
+                var buffer: [tui.Picker.id_bytes_max + 8]u8 = undefined;
+                const prompt = pickers.modelSelectionPrompt(&buffer, selection.item_id) orelse return;
+                try self.submitText(prompt);
+            },
+            pickers.resume_picker_id => {
+                var envelope = try client_protocol.CommandEnvelope.initSwitchSession(
                     self.allocator,
                     self.nextRequestId(),
-                    text,
-                    .auto,
+                    selection.item_id,
                 );
                 errdefer envelope.deinit(self.allocator);
                 self.engine.submit(envelope) catch |err| {
@@ -126,29 +262,180 @@ pub const Loop = struct {
                     try self.notice(@errorName(err));
                 };
             },
-            .interrupt => self.submitSimple(.{ .cancel = .{} }) catch |err| try self.notice(@errorName(err)),
-            .request_shutdown => {
-                self.engine.requestShutdown();
-                self.terminal.requestStop();
+            pickers.settings_picker_id => {
+                if (std.mem.eql(u8, selection.item_id, "open:thinking")) {
+                    var items: [6]tui.Picker.Item = undefined;
+                    _ = try self.applyCommand(pickers.thinkingCommand(&items, self.chrome.thinking_level));
+                    return;
+                }
+                var buffer: [64]u8 = undefined;
+                const prompt = pickers.settingsSelectionPrompt(&buffer, selection.item_id) orelse return;
+                try self.submitText(prompt);
             },
-            .request_clipboard_image_paste,
-            .request_copy_selection,
-            .request_transcript_history,
-            .request_transcript_tail,
-            .edit_composer_external,
-            .picker_selected,
-            .key_binding_triggered,
-            => try self.notice("TODO: frame loop run B effect wiring"),
+            pickers.settings_thinking_picker_id => {
+                var buffer: [64]u8 = undefined;
+                const prompt = pickers.settingsSelectionPrompt(&buffer, selection.item_id) orelse return;
+                try self.submitText(prompt);
+            },
+            else => {},
+        }
+    }
+
+    fn handleKeyBinding(self: *Loop, id: tui.keybind.Id) !void {
+        switch (id) {
+            pickers.binding_open_model_picker => {
+                _ = try self.applyCommand(.{ .replace_composer_text = "/model " });
+                try self.requestCompletion(.model);
+            },
+            else => {},
         }
     }
 
     fn submitSimple(self: *Loop, command: client_protocol.ClientCommand) !void {
-        var envelope: client_protocol.CommandEnvelope = .{ .id = self.nextRequestId(), .command = command };
+        try self.submitSimpleWithId(self.nextRequestId(), command);
+    }
+
+    fn submitSimpleWithId(self: *Loop, id: client_protocol.RequestId, command: client_protocol.ClientCommand) !void {
+        var envelope: client_protocol.CommandEnvelope = .{ .id = id, .command = command };
         errdefer envelope.deinit(self.allocator);
         self.engine.submit(envelope) catch |err| {
             envelope.deinit(self.allocator);
             return err;
         };
+    }
+
+    const EditorRead = struct {
+        bytes: []u8,
+        len: usize,
+        truncated: bool,
+
+        fn slice(self: *const EditorRead) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+
+    fn editComposerExternal(self: *Loop, text: []const u8) !void {
+        const path = self.createEditorTempFile(text) catch |err| {
+            try self.editorError("could not create editor temp file", err);
+            return;
+        };
+        defer self.allocator.free(path);
+        defer std.Io.Dir.deleteFileAbsolute(self.terminal.io, path) catch {};
+
+        self.input_reader.stop();
+        self.terminal.suspendForExternalProgram() catch |err| {
+            try self.editorError("could not suspend terminal", err);
+            try self.input_reader.start(self.terminal.inputFd());
+            return;
+        };
+        const term = self.runEditor(path);
+        try self.terminal.resumeAfterExternalProgramCommandPath();
+        _ = try self.terminal.applyCommand(.force_redraw);
+        self.render_due_ms = nowMs();
+        self.input_reader.start(self.terminal.inputFd()) catch |err| {
+            try self.editorError("could not restart terminal input", err);
+            return;
+        };
+
+        const completed = term catch |err| {
+            try self.editorError("editor failed", err);
+            return;
+        };
+        if (!editorExitedSuccessfully(completed)) {
+            try self.notice("editor exited nonzero; composer unchanged");
+            return;
+        }
+
+        const edited = self.readEditorTempFile(path) catch |err| {
+            try self.editorError("could not read editor temp file", err);
+            return;
+        };
+        defer self.allocator.free(edited.bytes);
+        _ = try self.applyCommand(.{ .replace_composer_text = edited.slice() });
+        if (edited.truncated) try self.notice("editor input too large: pasted prefix only");
+    }
+
+    fn createEditorTempFile(self: *Loop, text: []const u8) ![]u8 {
+        var attempts: usize = 0;
+        while (attempts < 16) : (attempts += 1) {
+            self.external_editor_counter +%= 1;
+            const stamp = std.Io.Clock.awake.now(self.terminal.io).nanoseconds;
+            var name_buffer: [96]u8 = undefined;
+            const name = std.fmt.bufPrint(
+                &name_buffer,
+                "zi-composer-{d}-{d}.md",
+                .{ stamp, self.external_editor_counter },
+            ) catch unreachable;
+            const path = try std.fs.path.join(self.allocator, &.{ self.worker.tmp_dir, name });
+            errdefer self.allocator.free(path);
+
+            var file = std.Io.Dir.createFileAbsolute(self.terminal.io, path, .{
+                .read = true,
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    self.allocator.free(path);
+                    continue;
+                },
+                else => return err,
+            };
+            defer file.close(self.terminal.io);
+
+            var write_buffer: [4096]u8 = undefined;
+            var writer = file.writer(self.terminal.io, &write_buffer);
+            try writer.interface.writeAll(text);
+            try writer.flush();
+            return path;
+        }
+        return error.PathAlreadyExists;
+    }
+
+    fn readEditorTempFile(self: *Loop, path: []const u8) !EditorRead {
+        var file = try std.Io.Dir.openFileAbsolute(self.terminal.io, path, .{});
+        defer file.close(self.terminal.io);
+        const read_limit = tui.Composer.buffer_size_bytes_max + 3;
+        const file_len = try file.length(self.terminal.io);
+        const read_len: usize = @intCast(@min(file_len, @as(u64, read_limit)));
+        const bytes = try self.allocator.alloc(u8, read_len);
+        errdefer self.allocator.free(bytes);
+        const len = try file.readPositionalAll(self.terminal.io, bytes, 0);
+        return .{ .bytes = bytes, .len = len, .truncated = file_len > read_limit };
+    }
+
+    fn runEditor(self: *Loop, path: []const u8) !std.process.Child.Term {
+        const fallbacks = [_][]const u8{ "nvim", "vim", "nano" };
+        for (fallbacks) |editor| {
+            const argv = [_][]const u8{ editor, path };
+            return self.spawnAndWait(&argv) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+        }
+        return error.FileNotFound;
+    }
+
+    fn spawnAndWait(self: *Loop, argv: []const []const u8) !std.process.Child.Term {
+        var child = try std.process.spawn(self.terminal.io, .{
+            .argv = argv,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
+        return child.wait(self.terminal.io);
+    }
+
+    fn editorExitedSuccessfully(term: std.process.Child.Term) bool {
+        return switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+    }
+
+    fn editorError(self: *Loop, message: []const u8, err: anyerror) !void {
+        var buffer: [tui.status.text_bytes_max]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "{s}: {s}", .{ message, @errorName(err) }) catch message;
+        try self.notice(text);
     }
 
     fn drainOneWorkerResult(self: *Loop) !void {
@@ -198,12 +485,20 @@ pub const Loop = struct {
             vm.sample_bytes_per_frame_max,
         );
         defer sample.deinit(self.allocator);
+        self.chrome = sample.chrome;
+        if (sample.history) |history| self.history_oldest_entry_id = history.oldest_entry_id;
         if (sample.generation == self.view_cursor.generation and
             sample.session_epoch == self.view_cursor.epoch and
             !sample.partial) return;
         var diff = try view_diff.diff(self.allocator, &sample, &self.view_cursor);
         defer diff.deinit(self.allocator);
         for (diff.commands.items) |command| try self.applyDiffCommand(command);
+    }
+
+    fn tickToolDurations(self: *Loop, now_ms: i64) !void {
+        var commands = try view_diff.tickDurations(self.allocator, &self.view_cursor, now_ms);
+        defer commands.deinit(self.allocator);
+        for (commands.commands.items) |command| try self.applyDiffCommand(command);
     }
 
     fn applyDiffCommand(self: *Loop, command: tui.Command) !void {
@@ -291,6 +586,8 @@ fn freeDiffCommandScratch(allocator: std.mem.Allocator, command: tui.Command) vo
     switch (command) {
         .open_picker => |open| allocator.free(open.items),
         .set_file_completions => |open| allocator.free(open.items),
+        .set_composer_completions => |open| allocator.free(open.items),
+        .set_composer_arg_completions => |open| allocator.free(open.picker.items),
         else => {},
     }
 }
