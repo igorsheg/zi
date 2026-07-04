@@ -199,6 +199,15 @@ pub const EngineDrain = struct {
         self.finish(&writer);
     }
 
+    pub fn closeHistory(self: *EngineDrain) void {
+        var writer = self.view_model.lockWriter();
+        writer.vm.history.state = .closed;
+        writer.vm.history.rev +%= 1;
+        if (writer.vm.history.rev == 0) writer.vm.history.rev = 1;
+        writer.touched = true;
+        self.finish(&writer);
+    }
+
     pub fn setCompletion(self: *EngineDrain, query_id: u64, kind: vm.CompletionSlot.Kind, items: []const vm.CompletionItem) !void {
         var writer = self.view_model.lockWriter();
         defer self.finish(&writer);

@@ -21,8 +21,9 @@ shutdown/deinit.
 _Avoid_: manager (unless the code already uses that name)
 
 **Mailbox**:
-A bounded command/event boundary owned by `SessionRuntime`. Frontends submit
-commands and drain events; they do not mutate sessions directly.
+A bounded command boundary owned by `Engine`. Frontends submit commands; they do
+not mutate sessions directly. UI reads presentation through ViewModel sampling,
+not event replay.
 _Avoid_: callback API, observer bus
 
 **Runtime mechanism**:
@@ -31,11 +32,16 @@ cancel tokens, event pipes, process running, byte/json ownership. Vendored `zio`
 is a private backend adapter.
 _Avoid_: app runtime, product layer
 
-**SessionRuntime**:
-The stable mailbox host. It owns or borrows the task runtime for its lifetime and
-owns exactly one live session slot. Session replacement builds the next slot
-first, then swaps through the mailbox owner path.
+**Engine**:
+The stable mailbox host and ViewModel writer. It owns its thread, the session
+runtime mechanism, and exactly one live session slot. Session replacement builds
+the next slot first, then swaps through the engine owner path.
 _Avoid_: session service, session manager (unless referring to existing code)
+
+**ViewModel**:
+Bounded, versioned, engine-owned presentation state sampled by frontends at frame
+rate. It contains renderable facts, not a replay protocol.
+_Avoid_: event stream, client ledger
 
 **RuntimeServices**:
 Cwd-scoped services replaceable with a session: cwd, agent dir, settings, auth,
@@ -57,12 +63,12 @@ view; the agent transcript is runtime context.
 _Avoid_: transcript as source of truth
 
 **ClientEvent**:
-A public event fact emitted by `coding_agent` for frontends. It is bounded and
-sequenced; overflow is itself reported as an event.
+Legacy/future wire protocol fact retained in `client_protocol.zig`; the in-process
+TUI no longer consumes it. RPC will rebuild a wire stream from the ViewModel.
 
-**Snapshot**:
-Owned state copied out for a client, for example resume transcript state. Events
-are facts; snapshots are state.
+**Sample**:
+Owned ViewModel state copied out for a frontend reader. Samples are bounded by a
+per-frame byte cap; reader cursors own diff progress.
 
 **Frontend adapter**:
 Concrete bridge in `src/frontends/*`. The TUI adapter may import both
@@ -89,10 +95,10 @@ All `.zi`, settings, auth, skills, and prompt-resource path policy belongs in
 
 - `main.zig` builds process/runtime and calls `cli.main`; it owns no product
   policy.
-- `cli/` parses mode and dispatches to concrete frontends: TUI, print/text,
-  json, rpc, or auth.
-- `coding_agent` owns sessions, resources, settings, tools, persistence, and the
-  public client protocol.
+- `cli/` parses mode and dispatches to concrete frontends: TUI frame loop,
+  print/text, json, parked rpc, or auth.
+- `coding_agent` owns Engine, ViewModel, sessions, resources, settings, tools,
+  persistence, and mailbox commands.
 - `agent` owns the generic turn loop and tool execution protocol.
 - `ai` owns provider protocol, model catalog, provider registry, wire adapters,
   and streams.
@@ -107,8 +113,8 @@ ai            -> std (+ runtime I/O mechanism)
 agent         -> std, ai, runtime
 runtime       -> std (zio private behind adapters)
 tui           -> std, vaxis
-coding_agent  -> std, ai, agent, runtime
-frontends     -> bridge concrete packages
+coding_agent  -> std, ai, agent, runtime (Engine/ViewModel)
+frontends     -> bridge concrete packages (frame_loop samples ViewModel)
 ```
 
 Lower layers do not import higher layers.
@@ -117,8 +123,8 @@ Lower layers do not import higher layers.
 
 - **Session history vs transcript**: session jsonl is durable truth; transcript
   is runtime/UI context.
-- **Wake vs event**: a wake only says "inspect owned state"; it carries no
-  authority or payload.
+- **Wake vs sample**: a wake only says "inspect owned state"; it carries no
+  authority or payload. The UI samples the ViewModel after wake/deadline.
 - **Cancellation request vs completion**: requesting cancel is intent; the owner
   must still observe the terminal outcome and drain/join before deinit.
 - **TUI vs TUI frontend**: `src/tui` is agent-agnostic product state;

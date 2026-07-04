@@ -5,6 +5,7 @@ const coding_agent = @import("../../coding_agent/root.zig");
 const tui = @import("../../tui/root.zig");
 const input_reader_mod = @import("input_reader.zig");
 const pickers = @import("pickers.zig");
+const trace_mod = @import("trace.zig");
 const view_diff = @import("view_diff.zig");
 const worker_mod = @import("worker.zig");
 
@@ -29,6 +30,7 @@ pub const Loop = struct {
     render_due_ms: i64 = 0,
     last_render_cost_ns: u64 = 0,
     next_request_id: u64 = 1,
+    trace: trace_mod.Stats = .{},
     chrome: vm.Chrome = .{},
     history_oldest_entry_id: ?u64 = null,
     last_file_completion_query: std.ArrayList(u8) = .empty,
@@ -62,10 +64,21 @@ pub const Loop = struct {
         self.* = undefined;
     }
 
+    pub fn bootstrap(self: *Loop, version: []const u8, resume_picker: bool, initial_prompt: ?[]const u8) !void {
+        try self.installGreeter(version);
+        try self.installSlashCompletions();
+        _ = try self.terminal.applyCommand(pickers.installKeyBindingsCommand());
+        if (resume_picker) {
+            _ = try self.applyCommand(.{ .replace_composer_text = "/resume " });
+            try self.requestCompletion(.resume_session);
+        }
+        if (initial_prompt) |prompt| try self.submitText(prompt);
+        try self.terminal.renderIfDirty();
+    }
+
     pub fn run(self: *Loop) !void {
         try self.input_reader.start(self.terminal.inputFd());
         defer self.input_reader.stop();
-        _ = try self.terminal.applyCommand(pickers.installKeyBindingsCommand());
         self.render_due_ms = nowMs();
         while (self.terminal.isRunning()) try self.step();
     }
@@ -82,19 +95,52 @@ pub const Loop = struct {
             .{ .fd = self.engine_wake_fds[0], .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = self.worker.wakeFd(), .events = std.posix.POLL.IN, .revents = 0 },
         };
+        const wait_start = nowNs();
         _ = try std.posix.poll(&poll_fds, timeout);
+        self.trace.record(.wait, @intCast(nowNs() - wait_start));
         if (hasReadable(poll_fds[0].revents)) self.input_reader.drainWakeFd();
         if (hasReadable(poll_fds[1].revents)) drainPipe(self.engine_wake_fds[0]);
         if (hasReadable(poll_fds[2].revents)) self.worker.drainWakeFd();
 
+        var phase_start = nowNs();
         try self.drainInput();
+        self.trace.record(.input_drain, @intCast(nowNs() - phase_start));
         try self.drainOneWorkerResult();
         try self.sampleViewModel();
         const tick_ms = nowMs();
+        phase_start = nowNs();
         _ = try self.applyCommand(.{ .tick = .{ .now_ms = tick_ms } });
         try self.tickToolDurations(tick_ms);
+        self.trace.record(.tick, @intCast(nowNs() - phase_start));
         if (try self.terminal.drainPendingResize()) self.render_due_ms = nowMs();
         try self.renderIfDue(nowMs());
+    }
+
+    fn installGreeter(self: *Loop, version: []const u8) !void {
+        var title: [tui.Greeter.text_bytes_max]u8 = undefined;
+        const title_text = std.fmt.bufPrint(&title, "zi {s}", .{version}) catch "zi";
+        _ = try self.terminal.applyCommand(.{ .set_greeter = .{
+            .title = title_text,
+            .subtitle = "Type / for commands. Ask zi about zi if you get lost.",
+        } });
+    }
+
+    fn installSlashCompletions(self: *Loop) !void {
+        var items: [coding_agent.slash_commands.command_count_max]tui.Picker.Item = undefined;
+        var labels: [coding_agent.slash_commands.command_count_max][1 + coding_agent.slash_commands.name_bytes_max]u8 = undefined;
+        for (coding_agent.slash_commands.builtins, 0..) |command, index| {
+            labels[index][0] = '/';
+            @memcpy(labels[index][1..][0..command.name.len], command.name);
+            items[index] = .{
+                .id = command.name,
+                .label = labels[index][0 .. 1 + command.name.len],
+                .detail = command.summary,
+            };
+        }
+        _ = try self.terminal.applyCommand(.{ .set_composer_completions = .{
+            .id = pickers.command_completion_picker_id,
+            .items = items[0..coding_agent.slash_commands.builtins.len],
+        } });
     }
 
     fn drainInput(self: *Loop) !void {
@@ -239,8 +285,7 @@ pub const Loop = struct {
     }
 
     fn requestTranscriptTail(self: *Loop) !void {
-        // ponytail: no tail-close command exists yet; old snapshot command is the only current mailbox shape.
-        try self.submitSimple(.snapshot);
+        try self.submitSimple(.history_tail);
     }
 
     fn handlePickerSelection(self: *Loop, selection: tui.Picker.Selection) !void {
@@ -479,20 +524,24 @@ pub const Loop = struct {
     }
 
     fn sampleViewModel(self: *Loop) !void {
+        var phase_start = nowNs();
         var sample = try self.engine.viewModel().sample(
             self.allocator,
             &self.reader_cursor,
             vm.sample_bytes_per_frame_max,
         );
+        self.trace.record(.sample, @intCast(nowNs() - phase_start));
         defer sample.deinit(self.allocator);
         self.chrome = sample.chrome;
         if (sample.history) |history| self.history_oldest_entry_id = history.oldest_entry_id;
         if (sample.generation == self.view_cursor.generation and
             sample.session_epoch == self.view_cursor.epoch and
             !sample.partial) return;
+        phase_start = nowNs();
         var diff = try view_diff.diff(self.allocator, &sample, &self.view_cursor);
         defer diff.deinit(self.allocator);
         for (diff.commands.items) |command| try self.applyDiffCommand(command);
+        self.trace.record(.diff_apply, @intCast(nowNs() - phase_start));
     }
 
     fn tickToolDurations(self: *Loop, now_ms: i64) !void {
@@ -508,16 +557,15 @@ pub const Loop = struct {
 
     fn applyCommand(self: *Loop, command: tui.Command) !?tui.App.Effect {
         const maybe_effect = try self.terminal.applyCommand(command);
-        if (maybe_effect) |effect| {
-            var single = [_]tui.App.Effect{effect};
-            try self.dispatchEffects(&single);
-        }
+        if (maybe_effect) |effect| effect.deinit(self.allocator);
         return null;
     }
 
     fn renderIfDue(self: *Loop, now_ms: i64) !void {
         if (!self.terminal.isDirty() or now_ms < self.render_due_ms) return;
         if (try self.terminal.renderIfDirtyTimed(false)) |timing| {
+            self.trace.record(.draw, timing.draw_ns);
+            self.trace.record(.flush, timing.flush_ns);
             self.last_render_cost_ns = timing.draw_ns + timing.flush_ns;
             self.render_due_ms = nextRenderDueMs(now_ms, self.last_render_cost_ns);
         }
@@ -598,11 +646,14 @@ fn hasReadable(revents: anytype) bool {
 }
 
 fn nowMs() i64 {
-    return std.time.milliTimestamp();
+    return @intCast(@divFloor(nowNs(), std.time.ns_per_ms));
 }
 
 fn nowNs() i128 {
-    return std.time.nanoTimestamp();
+    var timespec: std.posix.timespec = undefined;
+    const rc = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec);
+    if (std.posix.errno(rc) != .SUCCESS) return 0;
+    return @as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec;
 }
 
 fn createPipe() ![2]std.c.fd_t {

@@ -11,7 +11,6 @@ const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
 const session_listing = @import("session_listing.zig");
 const session_manager = @import("session_manager.zig");
-const session_runtime = @import("session_runtime.zig");
 const settings_mod = @import("settings.zig");
 const vm = @import("view_model.zig");
 
@@ -73,7 +72,64 @@ pub const Engine = struct {
         };
     };
 
-    pub const Options = session_runtime.Options;
+    pub const Open = union(enum) {
+        create: struct { session_id: []const u8, timestamp: []const u8 },
+        resume_existing: struct { session_file_name: []const u8 },
+    };
+
+    pub const Options = struct {
+        cwd: []const u8 = ".",
+        agent_dir_override: ?[]const u8 = null,
+        current_date: []const u8,
+        open: Open,
+        model: ?ai.Model = null,
+        thinking_level: ?agent_mod.ThinkingLevel = null,
+        stream: ?ai.StreamFunction = null,
+        dir: std.Io.Dir = .cwd(),
+        environ: ?*const std.process.Environ.Map = null,
+        task_runtime: ?*runtime.Runtime = null,
+        allow_paths_outside_cwd: bool = true,
+        public_event_capacity: usize = AgentSession.public_event_capacity_default,
+        command_capacity: usize = client_protocol.command_queue_capacity_default,
+        event_capacity: usize = client_protocol.event_queue_capacity_default,
+        retained_event_capacity: usize = client_protocol.retained_event_count_default,
+        retained_event_bytes: usize = client_protocol.retained_event_bytes_default,
+    };
+
+    pub const SessionStamp = struct {
+        text: [20]u8,
+        nanoseconds: i96,
+
+        pub fn now(io: std.Io) SessionStamp {
+            const nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds;
+            const seconds_total = @divFloor(nanoseconds, std.time.ns_per_s);
+            const epoch_seconds: std.time.epoch.EpochSeconds = .{
+                .secs = if (seconds_total > 0) @intCast(seconds_total) else 0,
+            };
+            const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+            const day_seconds = epoch_seconds.getDaySeconds();
+            var self: SessionStamp = .{ .text = undefined, .nanoseconds = nanoseconds };
+            _ = std.fmt.bufPrint(&self.text, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+                year_day.year,
+                month_day.month.numeric(),
+                month_day.day_index + 1,
+                day_seconds.getHoursIntoDay(),
+                day_seconds.getMinutesIntoHour(),
+                day_seconds.getSecondsIntoMinute(),
+            }) catch unreachable;
+            return self;
+        }
+
+        pub fn date(self: *const SessionStamp) []const u8 {
+            return self.text[0..10];
+        }
+
+        pub fn timestamp(self: *const SessionStamp) []const u8 {
+            return &self.text;
+        }
+    };
+
     pub const SubmitError = error{ Full, ShuttingDown };
 
     pub fn start(allocator: std.mem.Allocator, process_runtime: ?*runtime.Runtime, options: Options) !*Engine {
@@ -302,6 +358,7 @@ pub const Engine = struct {
             .completion_snapshot => try self.publishCompletionSnapshot(envelope.id orelse 0),
             .file_completion => |request| try self.publishFileCompletion(envelope.id orelse 0, request.query),
             .switch_session => |request| try self.startSwitchSession(envelope.id, request.session_file_name),
+            .history_tail => self.drain.closeHistory(),
             .snapshot,
             .replay,
             .history_page,
@@ -379,7 +436,7 @@ pub const Engine = struct {
         errdefer next_services.deinit();
         var next_drain = engine_drain.EngineDrain.init(self.allocator, &self.view_model);
         errdefer next_drain.deinit();
-        const open: session_runtime.Open = if (load.create)
+        const open: Open = if (load.create)
             .{ .create = .{ .session_id = load.selector, .timestamp = "2026-07-04T00:00:00Z" } }
         else
             .{ .resume_existing = .{ .session_file_name = load.selector } };
@@ -663,7 +720,7 @@ fn openSession(
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
         .retry_settings = retry,
-        .event_sink = .{ .view_model = drain },
+        .event_sink = drain,
         .task_runtime = services.task_runtime,
     };
     if (session_options.stream == null) {

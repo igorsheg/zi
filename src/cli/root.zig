@@ -3,12 +3,16 @@ const app_info = @import("../app_info.zig");
 const runtime = @import("../runtime/root.zig");
 const coding_agent = @import("../coding_agent/root.zig");
 const auth_mode = coding_agent.auth_mode;
-const session_runtime = coding_agent.session_runtime;
 const session_listing = coding_agent.session_listing;
+const Engine = coding_agent.Engine;
 const args_mod = @import("args.zig");
 const print_mode = @import("../frontends/print/print_mode.zig");
-const rpc_mode = @import("../frontends/rpc/stdio.zig");
-const interactive = @import("../frontends/tui/interactive.zig");
+const frame_loop = @import("../frontends/tui/frame_loop.zig");
+const trace_mod = @import("../frontends/tui/trace.zig");
+const input_reader_mod = @import("../frontends/tui/input_reader.zig");
+const pickers = @import("../frontends/tui/pickers.zig");
+const worker_mod = @import("../frontends/tui/worker.zig");
+const tui = @import("../tui/root.zig");
 
 const CliError = error{
     InvalidCliUsage,
@@ -146,19 +150,91 @@ fn runApp(
         },
         .interactive => {
             if (app.messages.count > 1 or (app.resume_picker and app.messages.count > 0)) return usage(stderr);
-            return interactive.run(process, stdout, stderr, .{
-                .cwd = options.cwd,
-                .agent_dir_override = options.agent_dir_override,
-                .dir = options.dir,
-                .environ = options.environ,
-                .session_selector = app.session_selector,
-                .continue_latest = app.continue_latest,
-                .startup_action = if (app.resume_picker) .resume_picker else .none,
-                .initial_prompt = if (app.messages.count == 1) app.messages.slice()[0] else null,
-                .version = app_info.version,
-            });
+            return runTui(process, stderr, app, options);
         },
     };
+}
+
+fn runTui(
+    process: runtime.Process,
+    stderr: *std.Io.Writer,
+    app_args: anytype,
+    options: auth_mode.Options,
+) !void {
+    const engine = try openEngineRuntime("tui", process, stderr, app_args, options);
+    defer {
+        engine.requestShutdown();
+        engine.join();
+    }
+
+    const terminal = try tui.Terminal.init(process.gpa, process.io, 80, 24, resolveTerminalInfo(process));
+    defer terminal.deinit();
+    try terminal.setup();
+    defer terminal.shutdown() catch |err| ignoreBestEffortError(err);
+
+    var frontend_wake: runtime.WakeEvent = .init;
+    const input_reader = try input_reader_mod.InputReader.init(process.gpa, process.io, process.io, &frontend_wake);
+    defer input_reader.deinit();
+
+    const tmp_dir = nonEmptyEnv(process.env("TMPDIR")) orelse
+        nonEmptyEnv(process.env("TEMP")) orelse
+        nonEmptyEnv(process.env("TMP")) orelse
+        "/tmp";
+    var worker = try worker_mod.Worker.init(process.gpa, null, options.environ, tmp_dir);
+    defer worker.deinit();
+
+    var loop = try frame_loop.Loop.init(process.gpa, terminal, engine, input_reader, &worker);
+    loop.trace = trace_mod.Stats.init(process);
+    defer loop.deinit();
+    try loop.bootstrap(
+        app_info.version,
+        app_args.resume_picker,
+        if (app_args.messages.count == 1) app_args.messages.slice()[0] else null,
+    );
+    try loop.run();
+    if (process.env("ZI_TUI_TRACE") != null) try writeTracePath(process, tmp_dir, &loop.trace);
+}
+
+fn writeTracePath(process: runtime.Process, tmp_dir: []const u8, trace: *const trace_mod.Stats) !void {
+    var name_buffer: [96]u8 = undefined;
+    const stamp = std.Io.Clock.awake.now(process.io).nanoseconds;
+    const name = std.fmt.bufPrint(&name_buffer, "zi-tui-trace-{d}.log", .{stamp}) catch unreachable;
+    const path = try std.fs.path.join(process.gpa, &.{ tmp_dir, name });
+    defer process.gpa.free(path);
+    var file = try std.Io.Dir.createFileAbsolute(process.io, path, .{});
+    defer file.close(process.io);
+    var buffer: [512]u8 = undefined;
+    var writer = file.writer(process.io, &buffer);
+    trace.writeReport(&writer.interface);
+    try writer.flush();
+    std.debug.print("zi tui trace: {s}\n", .{path});
+}
+
+fn resolveTerminalInfo(process: runtime.Process) tui.theme.TerminalInfo {
+    return .{
+        .scheme = if (process.env("ZI_THEME_LIGHT") != null) .light else null,
+        .color_level = resolveColorLevel(process),
+    };
+}
+
+fn resolveColorLevel(process: runtime.Process) tui.theme.ColorLevel {
+    if (process.env("COLORTERM")) |value| {
+        if (std.mem.indexOf(u8, value, "truecolor") != null) return .truecolor;
+        if (std.mem.indexOf(u8, value, "24bit") != null) return .truecolor;
+    }
+    if (process.env("TERM")) |value| {
+        if (std.mem.indexOf(u8, value, "256color") != null) return .ansi256;
+    }
+    return .unknown;
+}
+
+fn nonEmptyEnv(value: ?[]const u8) ?[]const u8 {
+    const text = value orelse return null;
+    return if (std.mem.trim(u8, text, " \t\r\n").len == 0) null else text;
+}
+
+fn ignoreBestEffortError(err: anyerror) void {
+    std.debug.assert(@errorName(err).len > 0);
 }
 
 fn runPrompt(
@@ -170,10 +246,13 @@ fn runPrompt(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    var app = try openCliRuntime("cli", process, stderr, app_args, options);
-    defer app.deinit();
+    var app = try openEngineRuntime("cli", process, stderr, app_args, options);
+    defer {
+        app.requestShutdown();
+        app.join();
+    }
 
-    try print_mode.run(&app, stdout, stderr, .{
+    try print_mode.run(app, stdout, stderr, .{
         .prompt = prompt,
         .output = if (json_output) .json else .text,
     });
@@ -186,27 +265,25 @@ fn runRpc(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    var app = try openCliRuntime("rpc", process, stderr, app_args, options);
-    defer app.deinit();
-
-    if (app_args.messages.count == 1) {
-        try rpc_mode.runPrompt(&app, stdout, app_args.messages.slice()[0]);
-        return;
-    }
-    try rpc_mode.runFd(&app, std.posix.STDIN_FILENO, stdout, stderr);
+    _ = process;
+    _ = stdout;
+    _ = app_args;
+    _ = options;
+    try stderr.writeAll("rpc frontend is being rebuilt; use --print\n");
+    return error.UnsupportedCliFeature;
 }
 
-fn openCliRuntime(
+fn openEngineRuntime(
     comptime id_prefix: []const u8,
     process: runtime.Process,
     stderr: *std.Io.Writer,
     app_args: anytype,
     options: auth_mode.Options,
-) !session_runtime.SessionRuntime {
-    const stamp = session_runtime.SessionStamp.now(process.io);
+) !*Engine {
+    const stamp = Engine.SessionStamp.now(process.io);
     if (try selectResumeSession(process, stderr, app_args, options)) |session_file| {
         defer process.gpa.free(session_file);
-        return session_runtime.openSessionRuntime(process.gpa, .{
+        return Engine.start(process.gpa, null, .{
             .cwd = options.cwd,
             .agent_dir_override = options.agent_dir_override,
             .current_date = stamp.date(),
@@ -218,7 +295,7 @@ fn openCliRuntime(
     var session_id_buffer: [48]u8 = undefined;
     const session_id = std.fmt.bufPrint(&session_id_buffer, id_prefix ++ "-{d}", .{stamp.nanoseconds}) catch
         unreachable;
-    return session_runtime.openSessionRuntime(process.gpa, .{
+    return Engine.start(process.gpa, null, .{
         .cwd = options.cwd,
         .agent_dir_override = options.agent_dir_override,
         .current_date = stamp.date(),
@@ -499,7 +576,7 @@ fn createCliTestDirs(dir: std.Io.Dir) !void {
 }
 
 fn createCliStoredSession(dir: std.Io.Dir, session_id: []const u8, timestamp: []const u8) !void {
-    var app_runtime = try session_runtime.openSessionRuntime(std.testing.allocator, .{
+    var app_runtime = try Engine.start(std.testing.allocator, .{
         .cwd = "repo",
         .agent_dir_override = "agent",
         .current_date = "2026-05-27",

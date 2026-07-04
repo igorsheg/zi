@@ -19,7 +19,7 @@ main.zig       process/runtime setup, then cli.main
 ai             provider protocol, models, registry, wire adapters, streams
 agent          generic transcript/tool/stream loop
 runtime        std.Io-first mechanism; zio private behind adapters
-coding_agent   sessions, resources, settings, tools, persistence, client protocol
+coding_agent   Engine, ViewModel, sessions, resources, settings, tools, persistence, commands
 tui            agent-agnostic terminal product on vaxis
 frontends      concrete adapters between clients and coding_agent/tui
 ```
@@ -51,19 +51,20 @@ When touching `src/runtime` or code that uses it:
 
 ## coding_agent changes
 
-- `SessionRuntime` is the mailbox host and owns one live session slot.
+- `Engine` is the mailbox host, owns its thread, writes the ViewModel, and owns
+  one live session slot.
 - Session replacement must build the next slot completely before swapping.
-- Frontends submit commands and drain events/snapshots; they do not mutate
-  sessions directly.
+- Frontends submit commands and sample the ViewModel; they do not mutate sessions
+  directly.
 - `AgentSession` owns one long-lived `agent.Agent` plus resources, tools,
-  persistence, public events, retry, and compaction.
-- The event drain is the only writer of queue mirrors, message-derived history,
-  retry/compaction state, and public events.
+  persistence, retry, and compaction.
+- The event drain is the only writer of message-derived ViewModel state,
+  retry/compaction state, and jsonl commit facts.
 - Drain order is:
 
 ```text
-agent event -> queue/status mirror -> bounded ClientEvent queue
-            -> jsonl persistence on message_end -> terminal policy
+agent event -> ViewModel mutation -> jsonl persistence on message_end
+            -> terminal policy
 ```
 
 - Persist durable session facts before mutating the live agent when mailbox-owned
@@ -78,13 +79,18 @@ agent event -> queue/status mirror -> bounded ClientEvent queue
   oversize, invalid UTF-8, unknown IDs, and slot-full inputs degrade before
   mutation. Only `OutOfMemory` propagates.
 - Time enters through `Command.tick`; App does not read clocks.
-- Keep `src/tui` agent-agnostic. Translate `ClientEvent` in a frontend adapter.
+- Keep `src/tui` agent-agnostic. Translate sampled ViewModel state in a frontend adapter.
 - Use Vaxis for terminal mechanism: raw tty, parsing, cells, windows, borders,
   diff/render, colors/styles, and width.
 - Rendering is draw -> synchronous flush -> clear dirty only after success.
-- Every owner loop drain must have a per-turn event and/or time budget.
+- The frame loop blocks only in `std.posix.poll` over input/engine/worker wake fds
+  with a deadline.
+- Rendering uses one `render_due` rule: 16ms floor and 3x last render cost
+  backoff; typed input and resize render immediately.
+- The debug watchdog budget is 33ms until ratcheted; no exemption enum.
 - The owner loop performs no filesystem read of unbounded size, no subprocess wait, and no blocking network I/O.
-- Treat typed input as foreground work; model/session drains are background work.
+- Treat typed input as foreground work; ViewModel sampling is background work and
+  bounded by the 64KiB sample cap.
 - Coalesce stream fragments before layout/render when ordering allows.
 - Do not introduce local ANSI encoders, raw-mode managers, cell buffers, diff
   renderers, style/color encodings, or width engines without a proven bounded

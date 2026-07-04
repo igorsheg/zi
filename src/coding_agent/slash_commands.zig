@@ -1,5 +1,5 @@
 //! Small slash-command catalog and parser. This is deliberately metadata +
-//! typed ids, not a callback registry: SessionRuntime remains the owner that
+//! typed ids, not a callback registry: Engine remains the owner that
 //! applies command effects.
 const std = @import("std");
 

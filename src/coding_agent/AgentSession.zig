@@ -154,7 +154,7 @@ pub const Options = struct {
     environ: ?*const std.process.Environ.Map = null,
     allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = public_event_capacity_default,
-    event_sink: event_drain_mod.Sink = .client_events,
+    event_sink: event_drain_mod.Sink = null,
     store: ?StoreOptions = null,
     task_runtime: *runtime.Runtime,
 };

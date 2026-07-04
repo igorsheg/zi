@@ -1,6 +1,6 @@
 //! Filesystem-backed `@file` completion policy.
 //!
-//! SessionRuntime owns request coalescing, index lifetime, and event delivery.
+//! Engine owns request coalescing, index lifetime, and ViewModel delivery.
 //! This module owns bounded index construction, immutable queries, ranking, and
 //! raw result lifetime.
 

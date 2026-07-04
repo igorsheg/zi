@@ -119,6 +119,7 @@ pub const ClientCommand = union(enum) {
     file_completion: FileCompletionRequest,
     replay: ReplayRequest,
     history_page: HistoryPageRequest,
+    history_tail,
     switch_session: SwitchSession,
     shutdown,
 
@@ -131,7 +132,7 @@ pub const ClientCommand = union(enum) {
             .history_page => |request| allocator.free(request.before_entry_id),
             .switch_session => |request| allocator.free(request.session_file_name),
             .file_completion => |request| allocator.free(request.query),
-            .cancel, .queue, .snapshot, .completion_snapshot, .replay, .shutdown => {},
+            .cancel, .queue, .snapshot, .completion_snapshot, .replay, .history_tail, .shutdown => {},
         }
         self.* = undefined;
     }
@@ -241,7 +242,7 @@ pub const ClientEvent = union(enum) {
     history_page: HistoryPage,
     prompt_command: PromptCommand,
     session_changed: SessionChanged,
-    session_chrome: SessionChromeSnapshot,
+    sessionChrome: SessionChromeSnapshot,
     compaction_start: CompactionStart,
     compaction_end: CompactionEnd,
     auto_retry_start: AutoRetryStart,
@@ -259,7 +260,7 @@ pub const ClientEvent = union(enum) {
             .replay => |*payload| payload.deinit(allocator),
             .history_page => |*payload| payload.deinit(allocator),
             .prompt_command => |*payload| payload.deinit(allocator),
-            .session_chrome => |*payload| payload.deinit(allocator),
+            .sessionChrome => |*payload| payload.deinit(allocator),
             .compaction_end => |*payload| payload.deinit(allocator),
             .auto_retry_start => |*payload| payload.deinit(allocator),
             .auto_retry_end => |*payload| payload.deinit(allocator),
@@ -1002,7 +1003,7 @@ pub const SessionChromeSnapshot = struct {
     }
 
     pub fn jsonStringify(self: SessionChromeSnapshot, stringify: *std.json.Stringify) !void {
-        try writeObject("session_chrome", stringify, self);
+        try writeObject("sessionChrome", stringify, self);
     }
 };
 
