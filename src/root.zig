@@ -5,6 +5,7 @@ const coding_agent = @import("coding_agent/root.zig");
 const frontend_print = @import("frontends/print/print_mode.zig");
 const frontend_rpc = @import("frontends/rpc/stdio.zig");
 const frontend_tui = @import("frontends/tui/interactive.zig");
+const frontend_tui_view_diff = @import("frontends/tui/view_diff.zig");
 const runtime = @import("runtime/root.zig");
 const tui = @import("tui/root.zig");
 
@@ -16,6 +17,7 @@ test {
     _ = frontend_print;
     _ = frontend_rpc;
     _ = frontend_tui;
+    _ = frontend_tui_view_diff;
     _ = runtime;
     _ = tui;
 }

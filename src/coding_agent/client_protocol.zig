@@ -9,6 +9,9 @@ const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const message_policy = @import("message_policy.zig");
 const session_manager = @import("session_manager.zig");
+const view_model = @import("view_model.zig");
+
+const utf8Prefix = view_model.utf8Prefix;
 
 pub const RequestId = u64;
 pub const OperationId = u64;
@@ -20,13 +23,13 @@ pub const retained_event_count_default = 256;
 pub const retained_event_bytes_default = 512 * 1024;
 pub const replay_event_count_max = 64;
 pub const snapshot_history_items_max = 512;
-pub const snapshot_history_item_text_bytes_max = 16 * 1024;
-pub const snapshot_history_total_text_bytes_max = 128 * 1024;
+pub const snapshot_history_item_text_bytes_max = view_model.snapshot_history_item_text_bytes_max;
+pub const snapshot_history_total_text_bytes_max = view_model.snapshot_history_total_text_bytes_max;
 const history_tool_id_bytes_max = 256;
 const history_tool_name_bytes_max = 128;
 pub const history_page_items_max = 64;
-pub const history_page_item_text_bytes_max = snapshot_history_item_text_bytes_max;
-pub const history_page_total_text_bytes_max = 64 * 1024;
+pub const history_page_item_text_bytes_max = view_model.history_page_item_text_bytes_max;
+pub const history_page_total_text_bytes_max = view_model.history_page_total_text_bytes_max;
 pub const snapshot_model_text_bytes_max = 256;
 /// Mirrors current TUI picker caps without importing TUI into the core protocol.
 pub const completion_item_count_max = 384;
@@ -1568,13 +1571,6 @@ fn camelCase(comptime name: []const u8) []const u8 {
         const final = out[0..len].*;
         return &final;
     }
-}
-
-fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
-    if (value.len <= max_bytes) return value;
-    var end = max_bytes;
-    while (end > 0 and (value[end] & 0xc0) == 0x80) : (end -= 1) {}
-    return value[0..end];
 }
 
 fn writeJsonField(comptime name: []const u8, stringify: *std.json.Stringify, value: anytype) !void {

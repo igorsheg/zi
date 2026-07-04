@@ -201,7 +201,10 @@ advances, revs of fully-copied items) IS retained, so successive frames make
 monotone progress and convergence is guaranteed even when the backlog exceeds
 the cap. A sample never re-copies bytes it already delivered. This is the
 bounded policy: backpressure by frame, never a long lock hold, never a
-livelock. Debug-assert lock hold < 2ms in both reader and writer.
+livelock. Debug-assert lock hold < 10ms in both reader and writer (amended
+2026-07-04: generous because debug allocators inflate bounded work 10-50x;
+the assert catches category errors — I/O or O(session) scans under the lock —
+while the byte caps are the real bound).
 
 Memory: the ViewModel owns all its payload bytes via the gpa passed at init.
 Readers copy; readers never retain pointers into the ViewModel. Section
