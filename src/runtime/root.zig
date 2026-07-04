@@ -33,6 +33,7 @@ pub const EventPipe = event_pipe.EventPipe;
 pub const PollReadableFdError = fd_readiness.PollReadableFdError;
 pub const SharedMutex = shared_mutex.SharedMutex;
 pub const SharedMutexHoldTimer = shared_mutex.HoldTimer;
+pub const monotonicNowNs = shared_mutex.nowNs;
 pub const pollReadableFd = fd_readiness.pollReadableFd;
 pub const pollReadableFdTimeout = fd_readiness.pollReadableFdTimeout;
 pub const JsonOwned = json_owned.JsonOwned;

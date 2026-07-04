@@ -199,6 +199,20 @@ pub const EngineDrain = struct {
         self.finish(&writer);
     }
 
+    pub fn setCompletion(self: *EngineDrain, query_id: u64, kind: vm.CompletionSlot.Kind, items: []const vm.CompletionItem) !void {
+        var writer = self.view_model.lockWriter();
+        defer self.finish(&writer);
+        try writer.vm.completion.set(self.allocator, query_id, kind, items);
+        writer.touched = true;
+    }
+
+    pub fn bumpEpoch(self: *EngineDrain) void {
+        var writer = self.view_model.lockWriter();
+        writer.bumpEpoch();
+        writer.finish();
+        self.dirty = true;
+    }
+
     fn messageStart(self: *EngineDrain, writer: *vm.Writer, message: agent_mod.AgentMessage) !void {
         switch (message) {
             .user => |user| self.pending.user = try writer.addItem(self.allocator, .user, .streaming, userText(user), null),
@@ -259,18 +273,18 @@ pub const EngineDrain = struct {
         for (assistant.content, 0..) |content, index| switch (content) {
             .text => |text| {
                 if (self.assistant_item == null) self.assistant_item = try writer.addItem(self.allocator, .assistant, .streaming, "", null);
-                try writer.replaceItemText(self.allocator, self.assistant_item.?, text.text);
+                try replaceIfChanged(writer, self.allocator, self.assistant_item.?, text.text, vm.assistant_text_bytes_max);
                 self.pending.assistant = self.assistant_item;
             },
             .thinking => |thinking| {
                 if (self.thinking_item == null) self.thinking_item = try writer.addItem(self.allocator, .thinking, .streaming, "", null);
-                try writer.replaceItemText(self.allocator, self.thinking_item.?, thinking.thinking);
+                try replaceIfChanged(writer, self.allocator, self.thinking_item.?, thinking.thinking, vm.thinking_text_bytes_max);
             },
             .tool_call => try self.toolPreview(writer, assistant, index),
         };
         if (assistant.content.len == 0) if (assistant.error_message) |message| {
             if (self.assistant_item == null) self.assistant_item = try writer.addItem(self.allocator, .assistant, .streaming, "", null);
-            try writer.replaceItemText(self.allocator, self.assistant_item.?, message);
+            try replaceIfChanged(writer, self.allocator, self.assistant_item.?, message, vm.assistant_text_bytes_max);
             self.pending.assistant = self.assistant_item;
         };
     }
@@ -352,6 +366,14 @@ pub const EngineDrain = struct {
 fn findItem(writer: *vm.Writer, id: u64) ?*vm.Item {
     for (writer.vm.transcript.items.items) |*item| if (item.id == id) return item;
     return null;
+}
+
+fn replaceIfChanged(writer: *vm.Writer, allocator: std.mem.Allocator, id: u64, text: []const u8, cap: usize) !void {
+    const clipped = vm.utf8Prefix(text, cap);
+    if (findItem(writer, id)) |item| {
+        if (std.mem.eql(u8, item.text.items, clipped)) return;
+    }
+    try writer.replaceItemText(allocator, id, text);
 }
 
 fn bumpItem(item: *vm.Item) void {

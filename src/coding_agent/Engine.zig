@@ -6,10 +6,13 @@ const runtime = @import("../runtime/root.zig");
 const AgentSession = @import("AgentSession.zig");
 const client_protocol = @import("client_protocol.zig");
 const engine_drain = @import("engine_drain.zig");
+const file_completion = @import("file_completion.zig");
 const paths_mod = @import("paths.zig");
 const RuntimeServices = @import("runtime_services.zig").RuntimeServices;
+const session_listing = @import("session_listing.zig");
 const session_manager = @import("session_manager.zig");
 const session_runtime = @import("session_runtime.zig");
+const settings_mod = @import("settings.zig");
 const vm = @import("view_model.zig");
 
 const prompt_progress_events_per_turn_max: usize = 16;
@@ -21,6 +24,7 @@ pub const Engine = struct {
     services: RuntimeServices = undefined,
     session: AgentSession = undefined,
     task_runtime: *runtime.Runtime = undefined,
+    dir: std.Io.Dir = .cwd(),
     initialized: bool = false,
     init_state: std.atomic.Value(u8) = .init(0), // 0 initing, 1 ready, 2 failed
     init_error: ?anyerror = null,
@@ -38,7 +42,14 @@ pub const Engine = struct {
     reader_fds_len: usize = 0,
     reader_mutex: runtime.SharedMutex = .{},
     active: ?ActiveOperation = null,
+    file_index: ?file_completion.Index = null,
+    session_open: ?SessionOpenLoad = null,
     next_operation_id: u64 = 1,
+
+    const SessionOpenLoad = struct {
+        selector: []u8,
+        create: bool = false,
+    };
 
     const ActiveOperation = struct {
         phase: Phase,
@@ -52,8 +63,13 @@ pub const Engine = struct {
 
         const Phase = union(enum) {
             running: *AgentSession.PromptRun,
-            retry_wait,
-            compacting,
+            retry_wait: RetryWait,
+            compacting: *AgentSession.CompactionRun,
+        };
+
+        const RetryWait = struct {
+            kind: AgentSession.SettleVerdict.Retry.Kind,
+            resume_at_ms: i64,
         };
     };
 
@@ -76,6 +92,7 @@ pub const Engine = struct {
             .allocator = allocator,
             .view_model = view_model,
             .drain = undefined,
+            .dir = options.dir,
             .mailbox_storage = mailbox_storage,
             .mailbox = client_protocol.CommandQueue.init(mailbox_storage),
             .wake_pipe = wake_pipe,
@@ -138,6 +155,8 @@ pub const Engine = struct {
         }
         if (self.initialized) {
             if (self.active) |active| self.destroyActive(active);
+            if (self.file_index) |*index| index.deinit(std.heap.page_allocator);
+            if (self.session_open) |load| self.allocator.free(load.selector);
             shutdownAndDeinitSession(&self.session);
             self.services.deinit();
             self.task_runtime.deinit();
@@ -200,6 +219,7 @@ pub const Engine = struct {
         while (true) {
             self.drainWakePipe();
             try self.drainMailbox();
+            try self.finishSessionOpen();
             try self.stepActive();
             self.wakeReadersIfDirty();
 
@@ -236,6 +256,14 @@ pub const Engine = struct {
     fn applyCommand(self: *Engine, envelope: client_protocol.CommandEnvelope) !void {
         switch (envelope.command) {
             .submit => |prompt| {
+                if (std.mem.eql(u8, prompt.text, "/compact")) {
+                    try self.startManualCompaction(envelope.id);
+                    return;
+                }
+                if (std.mem.eql(u8, prompt.text, "/new")) {
+                    try self.startNewSession(envelope.id);
+                    return;
+                }
                 if (self.active != null) {
                     self.drain.notice(.warn, .queue_full, "operation already active");
                     return;
@@ -271,14 +299,134 @@ pub const Engine = struct {
             .queue => |queue_command| switch (queue_command) {
                 .clear => self.session.clearQueue(),
             },
+            .completion_snapshot => try self.publishCompletionSnapshot(envelope.id orelse 0),
+            .file_completion => |request| try self.publishFileCompletion(envelope.id orelse 0, request.query),
+            .switch_session => |request| try self.startSwitchSession(envelope.id, request.session_file_name),
             .snapshot,
-            .completion_snapshot,
-            .file_completion,
             .replay,
             .history_page,
-            .switch_session,
-            => self.drain.notice(.warn, .operation_failed, "command not implemented in Engine run A"),
+            => self.drain.notice(.warn, .operation_failed, "command not implemented in Engine run B"),
         }
+    }
+
+    fn publishCompletionSnapshot(self: *Engine, query_id: u64) !void {
+        var items = std.ArrayList(vm.CompletionItem).empty;
+        defer items.deinit(self.allocator);
+        outer: for (ai.getProviders()) |provider| {
+            for (ai.getModels(provider)) |model| {
+                if (items.items.len == vm.completion_items_max) break :outer;
+                var item: vm.CompletionItem = .{};
+                const id = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ model.provider, model.id });
+                defer self.allocator.free(id);
+                item.id.set(id);
+                item.label.set(id);
+                item.detail.set(model.name);
+                try items.append(self.allocator, item);
+            }
+        }
+        try self.drain.setCompletion(query_id, .model, items.items);
+    }
+
+    fn publishFileCompletion(self: *Engine, query_id: u64, query: []const u8) !void {
+        if (self.file_index == null) self.file_index = try buildProjectFileIndex(self.dir, self.services.cwd);
+        const result = try self.file_index.?.query(std.heap.page_allocator, query);
+        defer result.destroy(std.heap.page_allocator);
+        var items: [file_completion.item_count_max]vm.CompletionItem = undefined;
+        var count: usize = 0;
+        for (result.items[0..result.item_len]) |*source| {
+            items[count] = .{};
+            items[count].id.set(source.idSlice());
+            items[count].label.set(source.label[0..source.label_len]);
+            items[count].detail.set(source.detail[0..source.detail_len]);
+            count += 1;
+        }
+        try self.drain.setCompletion(query_id, .file, items[0..count]);
+    }
+
+    fn startSwitchSession(self: *Engine, _: ?client_protocol.RequestId, selector: []const u8) !void {
+        if (self.session_open != null) {
+            self.drain.notice(.warn, .queue_full, "session open already loading");
+            return;
+        }
+        self.session_open = .{ .selector = try self.allocator.dupe(u8, selector) };
+    }
+
+    fn startNewSession(self: *Engine, _: ?client_protocol.RequestId) !void {
+        var buffer: [64]u8 = undefined;
+        const id = std.fmt.bufPrint(&buffer, "session-{d}", .{nowMs()}) catch "session-new";
+        if (self.session_open != null) {
+            self.drain.notice(.warn, .queue_full, "session open already loading");
+            return;
+        }
+        self.session_open = .{ .selector = try self.allocator.dupe(u8, id), .create = true };
+    }
+
+    fn finishSessionOpen(self: *Engine) !void {
+        const load = self.session_open orelse return;
+        self.session_open = null;
+        defer self.allocator.free(load.selector);
+        if (self.active != null) {
+            self.drain.notice(.warn, .queue_full, "cancel active operation before resume");
+            return;
+        }
+        var next_services = try RuntimeServices.init(self.allocator, .{
+            .cwd = self.services.cwd,
+            .agent_dir = self.services.agent_dir,
+            .dir = self.dir,
+            .environ = self.services.environ,
+            .task_runtime = self.task_runtime,
+        });
+        errdefer next_services.deinit();
+        var next_drain = engine_drain.EngineDrain.init(self.allocator, &self.view_model);
+        errdefer next_drain.deinit();
+        const open: session_runtime.Open = if (load.create)
+            .{ .create = .{ .session_id = load.selector, .timestamp = "2026-07-04T00:00:00Z" } }
+        else
+            .{ .resume_existing = .{ .session_file_name = load.selector } };
+        var next_session = try openSession(self.allocator, &next_services, .{
+            .cwd = self.services.cwd,
+            .agent_dir_override = self.services.agent_dir,
+            .current_date = "2026-07-04",
+            .open = open,
+            .model = self.session.agent.state.model,
+            .thinking_level = self.session.agent.state.thinking_level,
+            .stream = self.session.agent.loopConfig().stream,
+            .dir = self.dir,
+            .environ = self.services.environ,
+        }, &next_drain);
+        errdefer shutdownAndDeinitSession(&next_session);
+        var old_session = self.session;
+        var old_services = self.services;
+        self.session = next_session;
+        self.services = next_services;
+        self.drain.deinit();
+        self.drain = next_drain;
+        shutdownAndDeinitSession(&old_session);
+        old_services.deinit();
+        self.drain.bumpEpoch();
+        self.publishChrome();
+    }
+
+    fn startManualCompaction(self: *Engine, request_id: ?client_protocol.RequestId) !void {
+        if (self.active != null) {
+            self.drain.notice(.warn, .queue_full, "operation already active");
+            return;
+        }
+        const compaction_run = try self.session.startCompactionRun(.manual, false, null) orelse {
+            self.drain.notice(.info, .generic, "nothing to compact");
+            return;
+        };
+        compaction_run.stream.setWake(self.services.io, &self.owner_wake);
+        const prompt_text = try self.allocator.dupe(u8, "");
+        self.active = .{
+            .phase = .{ .compacting = compaction_run },
+            .request_id = request_id,
+            .operation_id = self.nextOperationId(),
+            .prompt_text = prompt_text,
+            .prompt_images = &.{},
+            .overflow_count_before = self.session.contextOverflowCount(),
+        };
+        self.drain.compactionStart(.manual);
     }
 
     fn stepActive(self: *Engine) !void {
@@ -300,7 +448,26 @@ pub const Engine = struct {
                         return;
                     },
                 },
-                .retry_wait, .compacting => return,
+                .compacting => |compaction_run| switch (compaction_run.stream.poll()) {
+                    .event => |event| {
+                        const more = try self.session.applyCompactionRunProgress(compaction_run, event);
+                        if (!more) try self.settleCompaction(active, compaction_run);
+                    },
+                    .terminal => {
+                        const more = try self.session.applyCompactionRunProgress(compaction_run, null);
+                        if (!more) try self.settleCompaction(active, compaction_run);
+                    },
+                    .empty => return,
+                },
+                .retry_wait => |wait| {
+                    if (nowMs() < wait.resume_at_ms) return;
+                    const prompt_run = switch (wait.kind) {
+                        .resubmit_prompt => try self.session.startPromptRun(active.prompt_text, active.prompt_images),
+                        .continue_run => try self.session.startContinueRun(),
+                    };
+                    prompt_run.stream.setWake(self.services.io, &self.owner_wake);
+                    active.phase = .{ .running = prompt_run };
+                },
             }
         }
     }
@@ -318,14 +485,37 @@ pub const Engine = struct {
         switch (verdict) {
             .completed => if (was_cancel) self.finishActiveCanceled() else self.finishActiveCompleted(),
             .failed => if (was_cancel) self.finishActiveCanceled() else self.finishActiveFailed("operation failed"),
-            .retry => {
-                self.drain.notice(.warn, .retry_start, "retry deferred to Engine run B");
-                self.finishActiveFailed("retry deferred");
+            .retry => |retry| {
+                active.phase = .{ .retry_wait = .{
+                    .kind = retry.kind,
+                    .resume_at_ms = nowMs() + @as(i64, @intCast(retry.delay_ms)),
+                } };
             },
             .compact => |compaction_run| {
-                self.session.destroyCompactionRun(compaction_run);
-                self.drain.notice(.warn, .operation_failed, "compaction deferred to Engine run B");
-                self.finishActiveFailed("compaction deferred");
+                compaction_run.stream.setWake(self.services.io, &self.owner_wake);
+                active.overflow_retry_used = true;
+                active.phase = .{ .compacting = compaction_run };
+            },
+        }
+    }
+
+    fn settleCompaction(self: *Engine, active: *ActiveOperation, compaction_run: *AgentSession.CompactionRun) !void {
+        const verdict = self.session.settleCompactionRun(compaction_run) catch |err| {
+            self.session.destroyCompactionRun(compaction_run);
+            self.finishActiveFailed(@errorName(err));
+            return;
+        };
+        self.session.destroyCompactionRun(compaction_run);
+        switch (verdict) {
+            .completed => self.finishActiveCompleted(),
+            .failed => self.finishActiveFailed("compaction failed"),
+            .retry => |retry| active.phase = .{ .retry_wait = .{
+                .kind = retry.kind,
+                .resume_at_ms = nowMs() + @as(i64, @intCast(retry.delay_ms)),
+            } },
+            .compact => |next| {
+                next.stream.setWake(self.services.io, &self.owner_wake);
+                active.phase = .{ .compacting = next };
             },
         }
     }
@@ -373,7 +563,8 @@ pub const Engine = struct {
     fn destroyActive(self: *Engine, active: ActiveOperation) void {
         switch (active.phase) {
             .running => |prompt_run| self.session.destroyPromptRun(prompt_run),
-            .retry_wait, .compacting => {},
+            .compacting => |compaction_run| self.session.destroyCompactionRun(compaction_run),
+            .retry_wait => {},
         }
         self.freeActive(active);
     }
@@ -446,6 +637,17 @@ fn openSession(
     const sessions_dir = try (paths_mod.PersistencePaths{ .global_dir = services.agent_dir, .cwd = services.cwd }).sessionsDirForCwd(allocator);
     defer allocator.free(sessions_dir);
 
+    const snapshot = services.settings_manager.current();
+    const project = settingsValue(snapshot.project);
+    const global = settingsValue(snapshot.global);
+    var retry: AgentSession.RetrySettings = .{};
+    const retry_settings = project.retry orelse global.retry;
+    if (retry_settings) |value| {
+        if (value.enabled) |enabled| retry.enabled = enabled;
+        if (value.max_retries) |attempts| retry.max_attempts = std.math.lossyCast(u8, attempts);
+        if (value.base_delay_ms) |delay| retry.base_delay_ms = delay;
+    }
+
     var session_options: AgentSession.Options = .{
         .cwd = services.cwd,
         .agent_dir = services.agent_dir,
@@ -460,6 +662,7 @@ fn openSession(
         .environ = options.environ,
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
+        .retry_settings = retry,
         .event_sink = .{ .view_model = drain },
         .task_runtime = services.task_runtime,
     };
@@ -481,8 +684,32 @@ fn openSession(
             session_options.store = .{ .create = store };
             return AgentSession.init(allocator, services.io, session_options);
         },
-        .resume_existing => return error.EngineResumeDeferredToRunB,
+        .resume_existing => |resume_open| {
+            const selected = try session_listing.selectRuntimeSession(allocator, services.io, .{
+                .cwd = services.cwd,
+                .agent_dir_override = services.agent_dir,
+                .dir = options.dir,
+                .environ = options.environ,
+                .selector = resume_open.session_file_name,
+            }) orelse return error.SessionNotFound;
+            defer allocator.free(selected);
+            const file_name = try std.fs.path.join(allocator, &.{ sessions_dir, selected });
+            errdefer allocator.free(file_name);
+            session_options.store = .{ .restore = .{
+                .allocator = allocator,
+                .dir = options.dir,
+                .file_name = file_name,
+            } };
+            return AgentSession.init(allocator, services.io, session_options);
+        },
     }
+}
+
+fn settingsValue(file: settings_mod.SettingsFile) settings_mod.Settings {
+    return switch (file) {
+        .missing => .{},
+        .loaded => |settings| settings.value,
+    };
 }
 
 fn shutdownAndDeinitSession(session: *AgentSession) void {
@@ -499,6 +726,21 @@ fn toVmThinking(level: agent_mod.ThinkingLevel) vm.ThinkingLevel {
         .high => .high,
         .xhigh => .xhigh,
     };
+}
+
+fn buildProjectFileIndex(dir: std.Io.Dir, cwd: []const u8) !file_completion.Index {
+    const project_fd = try std.posix.openat(dir.handle, cwd, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    defer _ = std.c.close(project_fd);
+    const project_dir: std.Io.Dir = .{ .handle = project_fd };
+    return file_completion.Index.build(std.heap.page_allocator, project_dir);
+}
+
+fn nowMs() i64 {
+    return @intCast(@divFloor(@import("../runtime/root.zig").SharedMutexHoldTimer.start().start_ns, std.time.ns_per_ms));
 }
 
 fn createPipe() ![2]std.c.fd_t {
@@ -582,6 +824,110 @@ test "engine cancel marks streaming items canceled and op idle" {
     try waitForCanceledIdle(engine);
 }
 
+const RetryStream = struct {
+    var calls: usize = 0;
+
+    fn reset() void {
+        calls = 0;
+    }
+
+    fn stream(_: ?*anyopaque, request: ai.StreamRequest) ai.AssistantMessageEventStream {
+        calls += 1;
+        var out = ai.AssistantMessageEventStream.initBuffered();
+        const sink = out.sink();
+        if (calls == 1) {
+            var message = ai.protocol.emptyAssistantMessageFromRequest(request, .error_, "rate limit");
+            message.operational_failure = .{
+                .category = .rate_limited,
+                .message = "rate limit",
+                .retryable = .yes,
+                .provider = request.model.provider,
+                .model = request.model.id,
+            };
+            sink.endError(request.io, .error_, message) catch unreachable;
+        } else {
+            sink.endDone(request.io, .stop, .{
+                .content = &.{.{ .text = .{ .text = "recovered" } }},
+                .api = request.model.api,
+                .provider = request.model.provider,
+                .model = request.model.id,
+                .usage = ai.protocol.emptyUsage(),
+                .stop_reason = .stop,
+                .timestamp = 0,
+            }) catch unreachable;
+        }
+        return out;
+    }
+};
+
+test "engine retry wait phase visible then resolves" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    var options = try engineTestOptions(&tmp, &provider);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.zi/settings.json", .data = "{\"retry\":{\"enabled\":true,\"maxRetries\":2,\"baseDelayMs\":1}}" });
+    options.stream = .{ .call_fn = RetryStream.stream };
+    RetryStream.reset();
+    const engine = try Engine.start(std.testing.allocator, null, options);
+    defer engine.join();
+    defer engine.requestShutdown();
+    try engine.submit(try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "ping", .auto));
+    try waitForRetryWait(engine);
+    try waitForAssistant(engine, "recovered", true);
+}
+
+test "engine file completion publishes latest slot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/src/a.zig", .data = "" });
+    const engine = try Engine.start(std.testing.allocator, null, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-07-04",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-07-04T00:00:00Z" } },
+        .dir = tmp.dir,
+        .model = provider.getModel(),
+        .stream = provider.apiProvider().stream,
+    });
+    defer engine.join();
+    defer engine.requestShutdown();
+
+    try engine.submit(try client_protocol.CommandEnvelope.initFileCompletion(std.testing.allocator, 42, "src/a"));
+    try waitForCompletion(engine, 42, .file, "src/a.zig");
+}
+
+test "engine new session bumps epoch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const engine = try Engine.start(std.testing.allocator, null, try engineTestOptions(&tmp, &provider));
+    defer engine.join();
+    defer engine.requestShutdown();
+
+    try engine.submit(try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 9, "/new", .auto));
+    try waitForEpoch(engine, 1);
+}
+
+test "engine session open while in flight rejects busy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const engine = try Engine.start(std.testing.allocator, null, try engineTestOptions(&tmp, &provider));
+    defer engine.join();
+    defer engine.requestShutdown();
+
+    try engine.submit(try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "/new", .auto));
+    try engine.submit(try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 2, "/new", .auto));
+    try waitForNotice(engine, .queue_full);
+}
+
 test "engine submit after shutdown rejects" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -603,6 +949,49 @@ fn waitForAssistant(engine: *Engine, text: []const u8, committed: bool) !void {
         for (sample.items.items) |item| {
             if (item.kind == .assistant and item.text_len == text.len and (!committed or item.entry_id != null)) return;
         }
+        std.Thread.yield() catch {};
+    }
+    return error.Timeout;
+}
+
+fn waitForRetryWait(engine: *Engine) !void {
+    var cursor: vm.ReaderCursor = .{};
+    defer cursor.deinit(std.testing.allocator);
+    var iterations: usize = 0;
+    while (iterations < 4000) : (iterations += 1) {
+        var sample = try engine.viewModel().sample(std.testing.allocator, &cursor, vm.sample_bytes_per_frame_max);
+        defer sample.deinit(std.testing.allocator);
+        if (sample.op.phase == .retry_wait) return;
+        std.Thread.yield() catch {};
+    }
+    return error.Timeout;
+}
+
+fn waitForCompletion(engine: *Engine, query_id: u64, kind: vm.CompletionSlot.Kind, id: []const u8) !void {
+    var cursor: vm.ReaderCursor = .{};
+    defer cursor.deinit(std.testing.allocator);
+    var iterations: usize = 0;
+    while (iterations < 4000) : (iterations += 1) {
+        var sample = try engine.viewModel().sample(std.testing.allocator, &cursor, vm.sample_bytes_per_frame_max);
+        defer sample.deinit(std.testing.allocator);
+        if (sample.completion) |completion| {
+            if (completion.query_id == query_id and completion.kind == kind) {
+                for (completion.items.items) |item| if (std.mem.eql(u8, item.id.slice(), id)) return;
+            }
+        }
+        std.Thread.yield() catch {};
+    }
+    return error.Timeout;
+}
+
+fn waitForEpoch(engine: *Engine, epoch: u32) !void {
+    var cursor: vm.ReaderCursor = .{};
+    defer cursor.deinit(std.testing.allocator);
+    var iterations: usize = 0;
+    while (iterations < 4000) : (iterations += 1) {
+        var sample = try engine.viewModel().sample(std.testing.allocator, &cursor, vm.sample_bytes_per_frame_max);
+        defer sample.deinit(std.testing.allocator);
+        if (sample.session_epoch >= epoch) return;
         std.Thread.yield() catch {};
     }
     return error.Timeout;

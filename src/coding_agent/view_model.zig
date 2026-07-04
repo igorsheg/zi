@@ -6,6 +6,7 @@ pub const frame_interval_ms: i64 = 16;
 pub const idle_wait_ms: i64 = 30_000;
 pub const sample_bytes_per_frame_max: usize = 64 * 1024;
 pub const resident_items_max: usize = 256;
+pub const transcript_resident_bytes_max: usize = 512 * 1024;
 pub const notice_ring_len: usize = 32;
 pub const completion_items_max: usize = 64;
 pub const queue_echo_cap: usize = 8;
@@ -13,12 +14,13 @@ pub const reader_wake_list_max: usize = 4;
 
 pub const cwd_bytes_max: usize = 1024;
 pub const footer_bytes_max: usize = 256;
-pub const assistant_text_bytes_max: usize = 16 * 1024;
+pub const assistant_text_bytes_max: usize = 256 * 1024;
 pub const thinking_text_bytes_max: usize = assistant_text_bytes_max;
 pub const tool_output_bytes_max: usize = 64 * 1024;
-pub const history_page_item_text_bytes_max: usize = assistant_text_bytes_max;
+pub const history_item_text_bytes_max: usize = 16 * 1024;
+pub const history_page_item_text_bytes_max: usize = history_item_text_bytes_max;
 pub const history_page_total_text_bytes_max: usize = 64 * 1024;
-pub const snapshot_history_item_text_bytes_max: usize = assistant_text_bytes_max;
+pub const snapshot_history_item_text_bytes_max: usize = history_item_text_bytes_max;
 pub const snapshot_history_total_text_bytes_max: usize = 128 * 1024;
 
 pub fn utf8Prefix(value: []const u8, max_bytes: usize) []const u8 {
@@ -398,11 +400,13 @@ pub const ItemStore = struct {
     pub fn appendText(self: *ItemStore, gpa: std.mem.Allocator, id: u64, text: []const u8) !void {
         const item = self.find(id) orelse return error.UnknownItem;
         try item.appendStreaming(gpa, text);
+        self.evictOldest(gpa);
     }
 
     pub fn replaceText(self: *ItemStore, gpa: std.mem.Allocator, id: u64, text: []const u8) !void {
         const item = self.find(id) orelse return error.UnknownItem;
         try item.replaceText(gpa, text);
+        self.evictOldest(gpa);
     }
 
     pub fn setFooter(self: *ItemStore, id: u64, footer: []const u8) !void {
@@ -417,11 +421,18 @@ pub const ItemStore = struct {
     }
 
     fn evictOldest(self: *ItemStore, gpa: std.mem.Allocator) void {
-        while (self.items.items.len > resident_items_max) {
+        while (self.items.items.len > resident_items_max or self.residentTextBytes() > transcript_resident_bytes_max) {
+            if (self.items.items.len <= 1) break;
             self.evicted_through_id = self.items.items[0].id;
             self.items.items[0].deinit(gpa);
             _ = self.items.orderedRemove(0);
         }
+    }
+
+    fn residentTextBytes(self: *const ItemStore) usize {
+        var total: usize = 0;
+        for (self.items.items) |*item| total += item.text.items.len;
+        return total;
     }
 };
 
@@ -751,6 +762,20 @@ test "residency eviction advances evicted_through_id" {
     try std.testing.expectEqual(@as(u64, 4), store.items.items[0].id);
 }
 
+test "total resident text bytes eviction advances evicted_through_id" {
+    const gpa = std.testing.allocator;
+    var store: ItemStore = .{};
+    defer store.deinit(gpa);
+    const chunk = try gpa.alloc(u8, 200 * 1024);
+    defer gpa.free(chunk);
+    @memset(chunk, 'a');
+    _ = try store.append(gpa, .assistant, .streaming, chunk, null);
+    _ = try store.append(gpa, .assistant, .streaming, chunk, null);
+    _ = try store.append(gpa, .assistant, .streaming, chunk, null);
+    try std.testing.expectEqual(@as(u64, 1), store.evicted_through_id);
+    try std.testing.expectEqual(@as(usize, 2), store.items.items.len);
+}
+
 test "notice-ring overflow reports gap" {
     const gpa = std.testing.allocator;
     var ring: NoticeRing = .{};
@@ -873,6 +898,109 @@ test "partially consumed new item continues without re-copying bytes" {
     try std.testing.expect(!third.items.items[0].full_text);
     try std.testing.expectEqualStrings("89", third.items.items[0].text_suffix);
     try std.testing.expectEqual(vm.generation, cursor.generation);
+}
+
+const StressState = struct {
+    gpa: std.mem.Allocator,
+    vm: *ViewModel,
+    source: []const u8,
+    out: []u8,
+    out_len: usize = 0,
+    item_id: std.atomic.Value(u64) = .init(0),
+    done: std.atomic.Value(bool) = .init(false),
+    bad: std.atomic.Value(bool) = .init(false),
+    generation: std.atomic.Value(u64) = .init(0),
+};
+
+fn stressWriter(state: *StressState) void {
+    var writer = state.vm.lockWriter();
+    const id = writer.addItem(state.gpa, .assistant, .streaming, "", null) catch {
+        state.bad.store(true, .release);
+        writer.finish();
+        return;
+    };
+    writer.finish();
+    state.item_id.store(id, .release);
+
+    var offset: usize = 0;
+    while (offset < state.source.len) {
+        const end = @min(offset + 64, state.source.len);
+        var append_writer = state.vm.lockWriter();
+        append_writer.appendItemText(state.gpa, id, state.source[offset..end]) catch {
+            state.bad.store(true, .release);
+            append_writer.finish();
+            return;
+        };
+        append_writer.finish();
+        offset = end;
+    }
+
+    var final_writer = state.vm.lockWriter();
+    if (final_writer.vm.transcript.find(id)) |item| {
+        item.entry_id = 1;
+        item.state = .final;
+        item.bumpRev();
+        final_writer.touched = true;
+    } else {
+        state.bad.store(true, .release);
+    }
+    final_writer.finish();
+}
+
+fn stressReader(state: *StressState) void {
+    var cursor: ReaderCursor = .{};
+    defer cursor.deinit(state.gpa);
+    while (!state.done.load(.acquire)) {
+        var sample = state.vm.sample(state.gpa, &cursor, sample_bytes_per_frame_max) catch {
+            state.bad.store(true, .release);
+            return;
+        };
+        defer sample.deinit(state.gpa);
+        var final = false;
+        for (sample.items.items) |item| {
+            if (item.kind != .assistant) continue;
+            if (item.text_suffix.len > 0) {
+                if (state.out_len + item.text_suffix.len > state.out.len) {
+                    state.bad.store(true, .release);
+                    return;
+                }
+                @memcpy(state.out[state.out_len .. state.out_len + item.text_suffix.len], item.text_suffix);
+                state.out_len += item.text_suffix.len;
+            }
+            if (item.state == .final and item.entry_id != null and item.footer.eql("output truncated")) final = true;
+        }
+        state.generation.store(cursor.generation, .release);
+        if (final and !sample.partial and cursor.generation == sample.generation) {
+            state.done.store(true, .release);
+            return;
+        }
+        std.Thread.yield() catch {};
+    }
+}
+
+test "cross-thread reader samples 1mb stream up to live cap without gaps" {
+    const gpa = std.testing.allocator;
+    var model = try ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    const source = try gpa.alloc(u8, 1024 * 1024);
+    defer gpa.free(source);
+    for (source, 0..) |*byte, index| byte.* = 'a' + @as(u8, @intCast(index % 26));
+    const out = try gpa.alloc(u8, assistant_text_bytes_max);
+    defer gpa.free(out);
+    var state = StressState{ .gpa = gpa, .vm = &model, .source = source, .out = out };
+    const reader = try std.Thread.spawn(.{}, stressReader, .{&state});
+    const writer = try std.Thread.spawn(.{}, stressWriter, .{&state});
+    writer.join();
+    const convergence_deadline_ns = runtime.monotonicNowNs() + 10 * std.time.ns_per_s;
+    while (!state.done.load(.acquire) and runtime.monotonicNowNs() < convergence_deadline_ns) {
+        std.Thread.yield() catch {};
+    }
+    state.done.store(true, .release);
+    reader.join();
+    try std.testing.expect(!state.bad.load(.acquire));
+    try std.testing.expectEqual(assistant_text_bytes_max, state.out_len);
+    try std.testing.expectEqualStrings(source[0..assistant_text_bytes_max], state.out[0..state.out_len]);
+    try std.testing.expectEqual(model.generation, state.generation.load(.acquire));
 }
 
 test "reader cursor prunes entries for evicted items" {
