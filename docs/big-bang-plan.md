@@ -164,8 +164,20 @@ Reader protocol (UI thread, at most once per frame):
 1. `vm.mutex.lock()`; if `generation == last_seen_generation`, unlock, done.
 2. If `session_epoch != last_seen_epoch`: record "epoch reset" and copy
    everything fresh (do not diff).
-3. Copy out only sections/items whose `rev` differs from the reader's
-   recorded value, into the reader's frame arena. Record new revs/cursors.
+3. Copy out only what changed, into the reader's frame arena (pinned, amended
+   2026-07-04): the POD sections (chrome/op/queue) are copied by value always
+   (no allocation); the allocating sections (history, completion) are copied
+   ONLY when their `rev` differs from the cursor's recorded value and are
+   `null` in the sample otherwise. For transcript items, the sample delivers
+   per-item DELTAS, not whole items: for each item whose `rev` differs from
+   the cursor's, copy metadata plus `text[cursor.consumed_len..]` up to the
+   remaining byte budget, advance `cursor.consumed_len` by exactly the bytes
+   copied, and record the item's new `rev` in the cursor only when its suffix
+   was fully copied. If `text_replaced_at_rev` is newer than the cursor's
+   recorded rev for that item, reset `consumed_len` to 0 first and mark the
+   delta as a replace. A sample never re-copies bytes it already delivered:
+   steady-state streaming cost is O(new bytes since last frame), never
+   O(message).
 4. `vm.mutex.unlock()`. All translation to `tui.Command` happens after unlock.
 
 **Locking primitive (pinned, amended 2026-07-04):** Zig 0.16 has no
@@ -182,11 +194,14 @@ writer-once-per-batch vs reader-at-most-60Hz. The ViewModel public API takes
 allocators but never `std.Io`.
 
 Lock-hold bound: the reader copies at most `sample_bytes_per_frame_max =
-64 * 1024` bytes per sample; if dirty payload exceeds this, copy what fits
-(whole items only, oldest-first), leave `generation` unconsumed (do not update
-`last_seen_generation`), and finish next frame. This is the bounded policy:
-backpressure by frame, never a long lock hold. Debug-assert lock hold
-< 2ms in both reader and writer.
+64 * 1024` bytes per sample; if dirty payload exceeds this, the sample is
+partial: `generation` is not consumed (do not update `last_seen_generation`),
+but per-item cursor progress made during the partial sample (consumed_len
+advances, revs of fully-copied items) IS retained, so successive frames make
+monotone progress and convergence is guaranteed even when the backlog exceeds
+the cap. A sample never re-copies bytes it already delivered. This is the
+bounded policy: backpressure by frame, never a long lock hold, never a
+livelock. Debug-assert lock hold < 2ms in both reader and writer.
 
 Memory: the ViewModel owns all its payload bytes via the gpa passed at init.
 Readers copy; readers never retain pointers into the ViewModel. Section
@@ -649,6 +664,11 @@ Rules:
   replace commands; state → `.canceled` participates in
   `mark_pending_tools_canceled` semantics as today; footer rev change →
   `replace_tool_footer`.
+- The sample already delivers per-item text SUFFIXES (§3.1 reader protocol);
+  the differ appends them via the delta commands and issues replaces when the
+  delta is marked replaced. The differ never re-slices full item texts; the
+  per-item `{rev, consumed_len}` bookkeeping lives in the reader cursor shared
+  with `ViewModel.sample`.
 - The differ is a pure function of (sampled copy, cursor) → (commands, next
   cursor). Unit-test it with hand-built ViewModel fixtures and golden command
   sequences; no engine, no terminal.
