@@ -760,7 +760,12 @@ Done when: both modules fully tested standalone; `zi` binary unchanged.
   open; shutdown order (submit after shutdown returns `ShuttingDown`).
 - Cross-thread stress test: engine floods 1MB in 64-byte deltas while a test
   reader thread samples at 1ms cadence with the 64KiB cap; assert no
-  invariant violations, monotone consumed text equals sent text.
+  invariant violations and monotone delivery (amended 2026-07-04: the
+  reconstructed text must be exactly the sent text up to the per-item cap —
+  no gaps, duplicates, or reordering — the item must end `.final` with the
+  truncation chip at exactly the cap, and generation must converge after the
+  flood; full-1MB retention is not expected because live items are capped at
+  256KiB by design).
 
 Done when: engine tests green; old `session_runtime` path still ships; the
 binary still runs on the old path.
@@ -846,7 +851,9 @@ still green.
 | `notice_ring_len` | 32 | overwrite-oldest, gap-notice on missed |
 | `completion_items_max` | 64 | matches existing cap |
 | queue echo caps | 8 + 8 | reject beyond, `dropped` counter |
-| item text caps | reuse existing `client_protocol` `..._bytes_max` values, relocated | truncate-with-chip |
+| assistant/thinking item text cap | 262_144 (256KiB) | truncate-with-chip (amended 2026-07-04: live items mirror `tui.Transcript.total_size_bytes_max` — the UI retains at most 256KiB total, so the VM must never be the binding constraint below it; the old 16KiB values are HISTORY-snapshot caps and apply only to `HistoryWindow` items) |
+| tool item text cap | 65_536 (64KiB) | truncate-with-chip (≥ `tui.Transcript.tool_preview_bytes_max`) |
+| ItemStore total resident text bytes | 524_288 (512KiB) | evict oldest whole items, advance `evicted_through_id` (2x TUI retention; bounds worst-case VM memory independently of per-item caps) |
 | watchdog budget | 33ms → 17ms after Phase 3 gate | debug assert |
 | reader wake list | 4 | reject beyond |
 
