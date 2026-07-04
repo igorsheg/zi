@@ -161,7 +161,16 @@ fn runTui(
     app_args: anytype,
     options: auth_mode.Options,
 ) !void {
-    const engine = try openEngineRuntime("tui", process, stderr, app_args, options);
+    const engine = if (app_args.resume_picker)
+        try Engine.start(process.gpa, null, .{
+            .cwd = options.cwd,
+            .agent_dir_override = options.agent_dir_override,
+            .current_date = Engine.SessionStamp.now(process.io).date(),
+            .dir = options.dir,
+            .environ = options.environ,
+        })
+    else
+        try openEngineRuntime("tui", process, stderr, app_args, options);
     defer {
         engine.requestShutdown();
         engine.join();

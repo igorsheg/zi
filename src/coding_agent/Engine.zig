@@ -73,6 +73,7 @@ pub const Engine = struct {
     };
 
     pub const Open = union(enum) {
+        none,
         create: struct { session_id: []const u8, timestamp: []const u8 },
         resume_existing: struct { session_file_name: []const u8 },
     };
@@ -81,7 +82,7 @@ pub const Engine = struct {
         cwd: []const u8 = ".",
         agent_dir_override: ?[]const u8 = null,
         current_date: []const u8,
-        open: Open,
+        open: Open = .none,
         model: ?ai.Model = null,
         thinking_level: ?agent_mod.ThinkingLevel = null,
         stream: ?ai.StreamFunction = null,
@@ -265,10 +266,16 @@ pub const Engine = struct {
             .task_runtime = self.task_runtime,
         });
         errdefer self.services.deinit();
-        self.session = try openSession(self.allocator, &self.services, options, &self.drain);
-        errdefer shutdownAndDeinitSession(&self.session);
-        self.initialized = true;
-        self.publishChrome();
+        if (options.open != .none) {
+            self.session = try openSession(self.allocator, &self.services, options, &self.drain);
+            errdefer shutdownAndDeinitSession(&self.session);
+            self.initialized = true;
+            self.publishChrome();
+        } else {
+            var chrome: vm.Chrome = .{};
+            chrome.cwd.set(self.services.cwd);
+            self.drain.setChrome(chrome);
+        }
     }
 
     fn run(self: *Engine) !void {
@@ -287,7 +294,7 @@ pub const Engine = struct {
                     self.waitForWork();
                     continue;
                 }
-                self.session.requestShutdown();
+                if (self.initialized) self.session.requestShutdown();
                 self.drain.stopped();
                 self.wakeReadersIfDirty();
                 return;
@@ -312,6 +319,11 @@ pub const Engine = struct {
     fn applyCommand(self: *Engine, envelope: client_protocol.CommandEnvelope) !void {
         switch (envelope.command) {
             .submit => |prompt| {
+                if (!self.initialized) {
+                    try self.startNewSession(envelope.id);
+                    self.drain.notice(.warn, .generic, "opening session; submit again");
+                    return;
+                }
                 if (std.mem.eql(u8, prompt.text, "/compact")) {
                     try self.startManualCompaction(envelope.id);
                     return;
@@ -353,7 +365,7 @@ pub const Engine = struct {
             },
             .shutdown => self.requestShutdown(),
             .queue => |queue_command| switch (queue_command) {
-                .clear => self.session.clearQueue(),
+                .clear => if (self.initialized) self.session.clearQueue(),
             },
             .completion_snapshot => try self.publishCompletionSnapshot(envelope.id orelse 0),
             .file_completion => |request| try self.publishFileCompletion(envelope.id orelse 0, request.query),
@@ -367,6 +379,7 @@ pub const Engine = struct {
     }
 
     fn publishCompletionSnapshot(self: *Engine, query_id: u64) !void {
+        if (query_id == 3) return self.publishResumeCompletion(query_id);
         var items = std.ArrayList(vm.CompletionItem).empty;
         defer items.deinit(self.allocator);
         outer: for (ai.getProviders()) |provider| {
@@ -382,6 +395,27 @@ pub const Engine = struct {
             }
         }
         try self.drain.setCompletion(query_id, .model, items.items);
+    }
+
+    fn publishResumeCompletion(self: *Engine, query_id: u64) !void {
+        var summaries = try session_listing.listRuntimeSessionSummaries(self.allocator, self.services.io, .{
+            .cwd = self.services.cwd,
+            .agent_dir_override = self.services.agent_dir,
+            .dir = self.dir,
+            .environ = self.services.environ,
+        });
+        defer summaries.deinit(self.allocator);
+        var items = std.ArrayList(vm.CompletionItem).empty;
+        defer items.deinit(self.allocator);
+        for (summaries.items) |summary| {
+            if (items.items.len == vm.completion_items_max) break;
+            var item: vm.CompletionItem = .{};
+            item.id.set(summary.file_name);
+            item.label.set(summary.title);
+            item.detail.set(summary.detail);
+            try items.append(self.allocator, item);
+        }
+        try self.drain.setCompletion(query_id, .resume_session, items.items);
     }
 
     fn publishFileCompletion(self: *Engine, query_id: u64, query: []const u8) !void {
@@ -440,25 +474,30 @@ pub const Engine = struct {
             .{ .create = .{ .session_id = load.selector, .timestamp = "2026-07-04T00:00:00Z" } }
         else
             .{ .resume_existing = .{ .session_file_name = load.selector } };
+        const current_model = if (self.initialized) self.session.agent.state.model else agent_mod.Agent.defaultModel();
+        const current_thinking = if (self.initialized) self.session.agent.state.thinking_level else agent_mod.ThinkingLevel.off;
+        const current_stream = if (self.initialized) self.session.agent.loopConfig().stream else null;
         var next_session = try openSession(self.allocator, &next_services, .{
             .cwd = self.services.cwd,
             .agent_dir_override = self.services.agent_dir,
             .current_date = "2026-07-04",
             .open = open,
-            .model = self.session.agent.state.model,
-            .thinking_level = self.session.agent.state.thinking_level,
-            .stream = self.session.agent.loopConfig().stream,
+            .model = current_model,
+            .thinking_level = current_thinking,
+            .stream = current_stream,
             .dir = self.dir,
             .environ = self.services.environ,
         }, &next_drain);
         errdefer shutdownAndDeinitSession(&next_session);
         var old_session = self.session;
         var old_services = self.services;
+        const had_session = self.initialized;
         self.session = next_session;
         self.services = next_services;
+        self.initialized = true;
         self.drain.deinit();
         self.drain = next_drain;
-        shutdownAndDeinitSession(&old_session);
+        if (had_session) shutdownAndDeinitSession(&old_session);
         old_services.deinit();
         self.drain.bumpEpoch();
         self.publishChrome();
@@ -728,6 +767,7 @@ fn openSession(
     }
 
     switch (options.open) {
+        .none => return error.SessionRequired,
         .create => |create| {
             var store = try session_manager.SessionStore.createDeferred(allocator, services.io, options.dir, .{
                 .sessions_dir = sessions_dir,

@@ -1,27 +1,31 @@
 
 zi tui trace max phase durations:
-  wait: 18.019ms
-  input_drain: 31.134ms
-  sample: 0.103ms
-  diff_apply: 0.203ms
-  tick: 0.006ms
+  wait: 17.016ms
+  input_drain: 9.077ms
+  sample: 0.342ms
+  diff_apply: 0.224ms
+  tick: 0.463ms
   draw: 0.001ms
-  flush: 0.000ms
+  flush: 0.001ms
 zi tui trace samples:
-  wait: 0.004ms
+  wait: 0.020ms
   input_drain: 0.003ms
-  sample: 0.003ms
-  diff_apply: 0.031ms
+  sample: 0.004ms
+  diff_apply: 0.034ms
   tick: 0.000ms
-  wait: 0.013ms
+  wait: 0.018ms
+  input_drain: 0.001ms
+  sample: 0.001ms
+  tick: 0.001ms
+  wait: 0.014ms
   input_drain: 0.001ms
   sample: 0.001ms
   tick: 0.000ms
-  wait: 0.013ms
+  wait: 0.014ms
   input_drain: 0.001ms
   sample: 0.001ms
   tick: 0.000ms
-  wait: 0.013ms
+  wait: 0.014ms
   input_drain: 0.001ms
   sample: 0.001ms
   tick: 0.000ms
@@ -29,11 +33,19 @@ zi tui trace samples:
   input_drain: 0.001ms
   sample: 0.001ms
   tick: 0.000ms
-  wait: 0.002ms
+  wait: 0.003ms
   input_drain: 0.001ms
   sample: 0.001ms
   tick: 0.000ms
-  wait: 0.002ms
+  wait: 0.018ms
+  input_drain: 0.002ms
+  sample: 0.001ms
+  tick: 0.001ms
+  wait: 0.018ms
+  input_drain: 0.001ms
+  sample: 0.003ms
+  tick: 0.000ms
+  wait: 0.012ms
   input_drain: 0.002ms
   sample: 0.001ms
   tick: 0.000ms
@@ -41,34 +53,22 @@ zi tui trace samples:
   input_drain: 0.001ms
   sample: 0.001ms
   tick: 0.000ms
-  wait: 0.002ms
-  input_drain: 0.001ms
-  sample: 0.001ms
-  tick: 0.000ms
-  wait: 0.002ms
-  input_drain: 0.001ms
-  sample: 0.000ms
-  tick: 0.000ms
   wait: 0.013ms
-  input_drain: 0.001ms
+  input_drain: 0.002ms
   sample: 0.001ms
   tick: 0.000ms
   wait: 0.003ms
   input_drain: 0.001ms
   sample: 0.001ms
   tick: 0.000ms
-  wait: 0.002ms
+  wait: 0.003ms
   input_drain: 0.001ms
-  sample: 0.001ms
-  tick: 0.000ms
-  wait: 0.013ms
-  input_drain: 0.001ms
-  sample: 0.001ms
-  tick: 0.001ms
-  wait: 0.002ms
-  input_drain: 0.001ms
-  sample: 0.001ms
+  sample: 0.002ms
   tick: 0.000ms
   wait: 0.002ms
+  input_drain: 0.002ms
+  sample: 0.001ms
+  tick: 0.000ms
+  wait: 0.017ms
   input_drain: 0.001ms
   sample: 0.001ms

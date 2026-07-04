@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const ai = @import("../../ai/root.zig");
 const coding_agent = @import("../../coding_agent/root.zig");
+const runtime = @import("../../runtime/root.zig");
 const tui = @import("../../tui/root.zig");
 const input_reader_mod = @import("input_reader.zig");
 const pickers = @import("pickers.zig");
@@ -14,8 +16,9 @@ const vm = coding_agent.view_model;
 
 pub const frame_interval_ms: i64 = 16;
 pub const idle_wait_ms: i64 = 30_000;
-const watchdog_budget_ms: u64 = 33;
+const watchdog_budget_ms: u64 = 17;
 const watchdog_budget_ns: u64 = watchdog_budget_ms * std.time.ns_per_ms;
+const input_bytes_per_iteration_max: usize = 4 * 1024;
 const notice_key_todo: tui.notify.Key = 90_000;
 
 pub const Loop = struct {
@@ -84,12 +87,11 @@ pub const Loop = struct {
     }
 
     pub fn step(self: *Loop) !void {
-        var watchdog: FrameWatchdog = .{};
-        watchdog.begin(nowNs());
-        defer watchdog.assertWithinBudget(nowNs());
-
         const now = nowMs();
-        const timeout = pollTimeoutMs(now, self.terminal.nextDeadlineMs(), self.render_due_ms);
+        const timeout = if (self.input_reader.hasQueuedBytes() or self.input_reader.hasTerminalFact())
+            0
+        else
+            pollTimeoutMs(now, self.terminal.nextDeadlineMs(), self.render_due_ms);
         var poll_fds = [_]std.posix.pollfd{
             .{ .fd = self.input_reader.wakeFd(), .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = self.engine_wake_fds[0], .events = std.posix.POLL.IN, .revents = 0 },
@@ -102,18 +104,10 @@ pub const Loop = struct {
         if (hasReadable(poll_fds[1].revents)) drainPipe(self.engine_wake_fds[0]);
         if (hasReadable(poll_fds[2].revents)) self.worker.drainWakeFd();
 
-        var phase_start = nowNs();
-        try self.drainInput();
-        self.trace.record(.input_drain, @intCast(nowNs() - phase_start));
-        try self.drainOneWorkerResult();
-        try self.sampleViewModel();
-        const tick_ms = nowMs();
-        phase_start = nowNs();
-        _ = try self.applyCommand(.{ .tick = .{ .now_ms = tick_ms } });
-        try self.tickToolDurations(tick_ms);
-        self.trace.record(.tick, @intCast(nowNs() - phase_start));
-        if (try self.terminal.drainPendingResize()) self.render_due_ms = nowMs();
-        try self.renderIfDue(nowMs());
+        var watchdog: FrameWatchdog = .{};
+        watchdog.begin(nowNs());
+        defer watchdog.assertWithinBudget(nowNs());
+        try self.serviceOnce();
     }
 
     fn installGreeter(self: *Loop, version: []const u8) !void {
@@ -143,13 +137,33 @@ pub const Loop = struct {
         } });
     }
 
+    pub fn serviceOnce(self: *Loop) !void {
+        var phase_start = nowNs();
+        try self.drainInput();
+        self.trace.record(.input_drain, @intCast(nowNs() - phase_start));
+        try self.drainOneWorkerResult();
+        try self.sampleViewModel();
+        const tick_ms = nowMs();
+        phase_start = nowNs();
+        _ = try self.applyCommand(.{ .tick = .{ .now_ms = tick_ms } });
+        try self.tickToolDurations(tick_ms);
+        self.trace.record(.tick, @intCast(nowNs() - phase_start));
+        if (try self.terminal.drainPendingResize()) self.render_due_ms = nowMs();
+        try self.renderIfDue(nowMs());
+    }
+
     fn drainInput(self: *Loop) !void {
         var bytes: [input_reader_mod.drain_chunk_bytes_max]u8 = undefined;
-        while (self.input_reader.hasQueuedBytes() or self.input_reader.hasTerminalFact()) {
-            const drained = self.input_reader.drain(&bytes);
+        var processed: usize = 0;
+        while (processed < input_bytes_per_iteration_max and
+            (self.input_reader.hasQueuedBytes() or self.input_reader.hasTerminalFact()))
+        {
+            const limit = @min(bytes.len, input_bytes_per_iteration_max - processed);
+            const drained = self.input_reader.drain(bytes[0..limit]);
             if (drained.bytes.len > 0) {
                 var effects: [tui.Terminal.effects_per_read_max]tui.App.Effect = undefined;
                 const result = try self.terminal.applyInputBytes(drained.bytes, &effects);
+                processed += drained.bytes.len;
                 if (result.priority != .none) self.render_due_ms = nowMs();
                 try self.dispatchEffects(effects[0..result.effect_count]);
                 try self.requestFileCompletionForComposer();
@@ -158,6 +172,7 @@ pub const Loop = struct {
             if (drained.faulted) try self.notice("terminal input reader failed");
             if (drained.bytes.len == 0) break;
         }
+        if (self.input_reader.hasQueuedBytes()) self.render_due_ms = nowMs();
     }
 
     fn dispatchEffects(self: *Loop, effects: []tui.App.Effect) !void {
@@ -689,4 +704,129 @@ test "frame loop deadline uses nearest app render or idle deadline" {
 test "frame loop render due backs off by cost" {
     try std.testing.expectEqual(@as(i64, 116), nextRenderDueMs(100, 1 * std.time.ns_per_ms));
     try std.testing.expectEqual(@as(i64, 160), nextRenderDueMs(100, 20 * std.time.ns_per_ms));
+}
+
+const TestLoop = struct {
+    tmp: std.testing.TmpDir,
+    provider: *ai.FauxProvider,
+    engine: *coding_agent.Engine,
+    terminal: *tui.Terminal,
+    wake: runtime.WakeEvent = .init,
+    input_reader: *input_reader_mod.InputReader,
+    worker: *worker_mod.Worker,
+    loop: Loop,
+
+    fn init(reply: []const u8) !TestLoop {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.createDirPath(std.testing.io, "agent");
+        try tmp.dir.createDirPath(std.testing.io, "repo/.zi");
+
+        const provider = try std.testing.allocator.create(ai.FauxProvider);
+        errdefer std.testing.allocator.destroy(provider);
+        provider.* = try ai.FauxProvider.init(std.testing.allocator, .{ .min_token_size = 512, .max_token_size = 512 });
+        errdefer provider.deinit();
+        const content = [_]ai.AssistantContent{ai.faux.text(reply)};
+        const message = ai.faux.assistantMessage(&content, .{});
+        try provider.setResponses(&.{message});
+
+        const engine = try coding_agent.Engine.start(std.testing.allocator, null, .{
+            .cwd = "repo",
+            .agent_dir_override = "agent",
+            .current_date = "2026-07-04",
+            .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-07-04T00:00:00Z" } },
+            .dir = tmp.dir,
+            .stream = provider.apiProvider().stream,
+        });
+        errdefer {
+            engine.requestShutdown();
+            engine.join();
+        }
+
+        const terminal = try tui.Terminal.init(std.testing.allocator, std.testing.io, 80, 24, .{});
+        errdefer terminal.deinit();
+        var wake: runtime.WakeEvent = .init;
+        const input_reader = try input_reader_mod.InputReader.init(std.testing.allocator, std.testing.io, std.testing.io, &wake);
+        errdefer input_reader.deinit();
+        const worker = try std.testing.allocator.create(worker_mod.Worker);
+        errdefer std.testing.allocator.destroy(worker);
+        worker.* = try worker_mod.Worker.init(std.testing.allocator, null, null, "/tmp");
+        errdefer worker.deinit();
+        var loop = try Loop.init(std.testing.allocator, terminal, engine, input_reader, worker);
+        loop.render_due_ms = std.math.maxInt(i64);
+        return .{
+            .tmp = tmp,
+            .provider = provider,
+            .engine = engine,
+            .terminal = terminal,
+            .wake = wake,
+            .input_reader = input_reader,
+            .worker = worker,
+            .loop = loop,
+        };
+    }
+
+    fn deinit(self: *TestLoop) void {
+        self.loop.deinit();
+        self.worker.deinit();
+        std.testing.allocator.destroy(self.worker);
+        self.input_reader.deinit();
+        self.terminal.deinit();
+        self.engine.requestShutdown();
+        self.engine.join();
+        self.provider.deinit();
+        std.testing.allocator.destroy(self.provider);
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+};
+
+fn submitPromptForTest(engine: *coding_agent.Engine, text: []const u8) !void {
+    var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(engine.allocator, 1, text, .auto);
+    errdefer envelope.deinit(engine.allocator);
+    try engine.submit(envelope);
+}
+
+fn engineAssistantFinal(engine: *coding_agent.Engine) !bool {
+    var cursor: vm.ReaderCursor = .{};
+    defer cursor.deinit(std.testing.allocator);
+    var sample = try engine.viewModel().sample(std.testing.allocator, &cursor, vm.sample_bytes_per_frame_max);
+    defer sample.deinit(std.testing.allocator);
+    for (sample.items.items) |item| {
+        if (item.kind == .assistant and item.state == .final) return true;
+    }
+    return false;
+}
+
+test "frame loop samples assistant flood within 17ms and echoes input" {
+    const gpa = std.testing.allocator;
+    const flood = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(flood);
+    @memset(flood, 'x');
+
+    var fixture = try TestLoop.init(flood);
+    defer fixture.deinit();
+    try submitPromptForTest(fixture.engine, "flood");
+
+    var echoed = false;
+    var max_ns: u64 = 0;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        if (i == 4) {
+            var effects: [tui.Terminal.effects_per_read_max]tui.App.Effect = undefined;
+            const result = try fixture.terminal.applyInputBytes("z", &effects);
+            try fixture.loop.dispatchEffects(effects[0..result.effect_count]);
+        }
+        const start = nowNs();
+        try fixture.loop.serviceOnce();
+        const elapsed: u64 = @intCast(nowNs() - start);
+        max_ns = @max(max_ns, elapsed);
+        try std.testing.expect(elapsed <= watchdog_budget_ns);
+        if (std.mem.eql(u8, fixture.terminal.composerText(), "z")) echoed = true;
+        if (echoed and try engineAssistantFinal(fixture.engine)) break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(echoed);
+    try std.testing.expect(max_ns <= watchdog_budget_ns);
+    try std.testing.expect(i < 4000);
 }
