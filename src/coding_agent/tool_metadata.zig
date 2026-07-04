@@ -14,6 +14,7 @@ pub const Display = struct {
     body_mode: BodyMode = .visible,
     collapse: Collapse = .{},
     shows_duration: bool = false,
+    streams_output: bool = false,
 };
 
 pub fn displayForTool(name: []const u8) Display {
@@ -21,6 +22,7 @@ pub fn displayForTool(name: []const u8) Display {
         .presentation = .command,
         .collapse = .{ .mode = .tail, .lines_max = 5 },
         .shows_duration = true,
+        .streams_output = true,
     };
     if (std.mem.eql(u8, name, "read")) return .{
         .presentation = .file,
@@ -44,6 +46,7 @@ test "builtin display metadata covers pi-mono-style tool chrome" {
     try std.testing.expectEqual(CollapseMode.tail, bash.collapse.mode);
     try std.testing.expectEqual(@as(u8, 5), bash.collapse.lines_max);
     try std.testing.expect(bash.shows_duration);
+    try std.testing.expect(bash.streams_output);
 
     const read = displayForTool("read");
     try std.testing.expectEqual(Presentation.file, read.presentation);

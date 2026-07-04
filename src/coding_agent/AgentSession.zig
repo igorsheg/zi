@@ -154,6 +154,7 @@ pub const Options = struct {
     environ: ?*const std.process.Environ.Map = null,
     allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = public_event_capacity_default,
+    event_sink: event_drain_mod.Sink = .client_events,
     store: ?StoreOptions = null,
     task_runtime: *runtime.Runtime,
 };
@@ -348,12 +349,13 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
 
     const event_drain = try allocator.create(event_drain_mod.EventDrain);
     errdefer allocator.destroy(event_drain);
-    event_drain.* = try event_drain_mod.EventDrain.init(
+    event_drain.* = try event_drain_mod.EventDrain.initWithSink(
         allocator,
         io,
         manager,
         store,
         options.public_event_capacity,
+        options.event_sink,
     );
     errdefer event_drain.deinit();
 

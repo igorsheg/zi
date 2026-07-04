@@ -3,6 +3,7 @@
 
 const std = @import("std");
 
+pub const Engine = @import("Engine.zig").Engine;
 pub const auth_mode = @import("auth_mode.zig");
 pub const client_protocol = @import("client_protocol.zig");
 pub const session_listing = @import("session_listing.zig");
@@ -15,6 +16,7 @@ pub const wire_protocol = @import("wire_protocol.zig");
 // Internal modules, referenced here so `zig build test` reaches their tests.
 const AgentSession = @import("AgentSession.zig");
 const auth = @import("auth.zig");
+const engine_drain = @import("engine_drain.zig");
 const event_drain = @import("event_drain.zig");
 const file_completion = @import("file_completion.zig");
 const message_policy = @import("message_policy.zig");
@@ -34,6 +36,8 @@ test {
     std.testing.refAllDecls(@This());
     _ = AgentSession;
     _ = auth;
+    _ = Engine;
+    _ = engine_drain;
     _ = event_drain;
     _ = file_completion;
     _ = message_policy;
