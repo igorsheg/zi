@@ -59,14 +59,20 @@ pub const Selection = union(enum) {
 const TranscriptViewport = struct {
     scroll_rows: usize = 0,
     tail_follow: TailFollow = .follow_tail,
+    revision: u64 = 0,
 
     fn clear(self: *TranscriptViewport) void {
-        self.* = .{};
+        if (self.scroll_rows == 0 and self.tail_follow == .follow_tail) return;
+        self.scroll_rows = 0;
+        self.tail_follow = .follow_tail;
+        self.revision +%= 1;
     }
 
     fn historyPrepended(self: *TranscriptViewport, max_scroll: usize) void {
+        if (self.scroll_rows == max_scroll and self.tail_follow == .detached) return;
         self.scroll_rows = max_scroll;
         self.tail_follow = .detached;
+        self.revision +%= 1;
     }
 
     fn scrollUp(self: *TranscriptViewport, rows: usize, max_scroll: usize) ScrollResult {
@@ -75,6 +81,7 @@ const TranscriptViewport = struct {
         if (next == self.scroll_rows) return .boundary;
         self.scroll_rows = next;
         self.tail_follow = .detached;
+        self.revision +%= 1;
         return .moved;
     }
 
@@ -84,6 +91,7 @@ const TranscriptViewport = struct {
         if (next == self.scroll_rows) return false;
         self.scroll_rows = next;
         if (self.scroll_rows == 0) self.tail_follow = .follow_tail;
+        self.revision +%= 1;
         return true;
     }
 
@@ -91,25 +99,32 @@ const TranscriptViewport = struct {
         if (self.scroll_rows == 0 and self.tail_follow == .follow_tail) return false;
         self.scroll_rows = 0;
         self.tail_follow = .follow_tail;
+        self.revision +%= 1;
         return true;
     }
 
     fn tailMutated(self: *TranscriptViewport, before_max: usize, after_max: usize) void {
+        const old_scroll = self.scroll_rows;
+        const old_follow = self.tail_follow;
         if (self.tail_follow == .follow_tail) {
             self.scroll_rows = 0;
-            return;
+        } else {
+            self.scroll_rows = @min(after_max, self.scroll_rows + (after_max -| before_max));
+            if (self.scroll_rows == 0) self.tail_follow = .follow_tail;
         }
-        self.scroll_rows = @min(after_max, self.scroll_rows + (after_max -| before_max));
-        if (self.scroll_rows == 0) self.tail_follow = .follow_tail;
+        if (self.scroll_rows != old_scroll or self.tail_follow != old_follow) self.revision +%= 1;
     }
 
     fn clampOrFollow(self: *TranscriptViewport, max_scroll: usize) void {
+        const old_scroll = self.scroll_rows;
+        const old_follow = self.tail_follow;
         if (self.tail_follow == .follow_tail) {
             self.scroll_rows = 0;
         } else {
             self.scroll_rows = @min(self.scroll_rows, max_scroll);
             if (self.scroll_rows == 0) self.tail_follow = .follow_tail;
         }
+        if (self.scroll_rows != old_scroll or self.tail_follow != old_follow) self.revision +%= 1;
     }
 
     fn assertInvariants(self: *const TranscriptViewport) void {
@@ -132,6 +147,8 @@ notify: notify_mod.Store = .{},
 key_bindings: keybind.Store = .{},
 viewport: TranscriptViewport = .{},
 selection: Selection = .none,
+greeter_revision: u64 = 0,
+selection_revision: u64 = 0,
 theme: theme_mod.Theme,
 tools_expanded: bool = false,
 now_ms: i64 = 0,
@@ -237,6 +254,7 @@ const Completion = struct {
     command: ?Picker = null,
     slash_args: [slash_arg_completion_count_max]?SlashArgCompletion = @splat(null),
     hidden_until_edit: bool = false,
+    revision: u64 = 0,
 
     file: ?Picker = null,
 
@@ -253,12 +271,14 @@ const Completion = struct {
         errdefer next.deinit(gpa);
         if (self.modal) |*picker| picker.deinit(gpa);
         self.modal = next;
+        self.revision +%= 1;
     }
 
     fn closeModal(self: *Completion, gpa: std.mem.Allocator) bool {
         if (self.modal) |*picker| {
             picker.deinit(gpa);
             self.modal = null;
+            self.revision +%= 1;
             return true;
         }
         return false;
@@ -269,6 +289,7 @@ const Completion = struct {
         errdefer next.deinit(gpa);
         if (self.command) |*picker| picker.deinit(gpa);
         self.command = next;
+        self.revision +%= 1;
     }
 
     fn setFile(self: *Completion, gpa: std.mem.Allocator, open: Picker.Open) error{OutOfMemory}!void {
@@ -276,6 +297,7 @@ const Completion = struct {
         errdefer next.deinit(gpa);
         if (self.file) |*picker| picker.deinit(gpa);
         self.file = next;
+        self.revision +%= 1;
     }
 
     fn setSlashArg(
@@ -289,6 +311,7 @@ const Completion = struct {
         const slot = self.slashArgSlot(open.command_name) orelse self.emptySlashArgSlot() orelse &self.slash_args[0];
         if (slot.*) |*completion| completion.deinit(gpa);
         slot.* = next;
+        self.revision +%= 1;
     }
 
     fn clearSlashArgSlots(self: *Completion, gpa: std.mem.Allocator) void {
@@ -313,11 +336,15 @@ const Completion = struct {
     }
 
     fn hideUntilEdit(self: *Completion) void {
+        if (self.hidden_until_edit) return;
         self.hidden_until_edit = true;
+        self.revision +%= 1;
     }
 
     fn noteEdit(self: *Completion) void {
+        if (!self.hidden_until_edit) return;
         self.hidden_until_edit = false;
+        self.revision +%= 1;
     }
 
     fn sync(self: *Completion, app: *const App) void {
@@ -425,57 +452,77 @@ pub const Effect = union(enum) {
     }
 };
 
+const DirtySnapshot = struct {
+    width: u16,
+    height: u16,
+    transcript: u64,
+    composer: u64,
+    status: u64,
+    notify: u64,
+    completion: u64,
+    picker: u64,
+    viewport: u64,
+    greeter: u64,
+    selection: u64,
+    tools_expanded: bool,
+
+    fn changed(before: DirtySnapshot, after: DirtySnapshot) bool {
+        return !std.meta.eql(before, after);
+    }
+};
+
+fn dirtySnapshot(self: *App) DirtySnapshot {
+    return .{
+        .width = self.width,
+        .height = self.height,
+        .transcript = self.transcript.revision,
+        .composer = self.composer.revision,
+        .status = self.status.revision,
+        .notify = self.notify.revision,
+        .completion = self.completion.revision,
+        .picker = if (self.visiblePicker()) |picker| picker.revision else 0,
+        .viewport = self.viewport.revision,
+        .greeter = self.greeter_revision,
+        .selection = self.selection_revision,
+        .tools_expanded = self.tools_expanded,
+    };
+}
+
 pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMemory}!?Effect {
+    const before = self.dirtySnapshot();
+    var force_dirty = false;
+    var effect: ?Effect = null;
+
     switch (command) {
-        .resize => |size| {
-            if (self.width != size.width or self.height != size.height) {
-                self.width = size.width;
-                self.height = size.height;
-                self.selection = .none;
-                self.clampOrFollowViewport();
-                self.syncComposerScrollHint();
-                self.dirty = true;
-            }
-            return null;
+        .resize => |size| if (self.width != size.width or self.height != size.height) {
+            self.width = size.width;
+            self.height = size.height;
+            self.clearSelection();
+            self.clampOrFollowViewport();
+            self.syncComposerScrollHint();
+            force_dirty = true;
         },
-        .input => |event| return self.applyInput(gpa, event),
-        .tick => |tick| {
-            if (tick.now_ms != self.now_ms) {
-                self.now_ms = tick.now_ms;
-                const expired = self.notify.tick(self.now_ms);
-                if (expired or self.statusHasAnimated()) self.dirty = true;
-            }
-            return null;
+        .input => |event| effect = try self.applyInput(gpa, event),
+        .tick => |tick| if (tick.now_ms != self.now_ms) {
+            self.now_ms = tick.now_ms;
+            const expired = self.notify.tick(self.now_ms);
+            force_dirty = expired or self.statusHasAnimated();
         },
-        .force_redraw => {
-            self.dirty = true;
-            return null;
-        },
+        .force_redraw => force_dirty = true,
         .clear_transcript => {
             self.transcript.clear(gpa);
             self.viewport.clear();
-            self.selection = .none;
+            self.clearSelection();
             self.viewport.assertInvariants();
-            self.dirty = true;
-            return null;
         },
-        .set_key_bindings => |bindings| {
-            self.key_bindings.set(bindings);
-            return null;
-        },
+        .set_key_bindings => |bindings| self.key_bindings.set(bindings),
         .append_transcript => |entry| {
             const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.append(gpa, entry);
             self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
-            self.dirty = true;
-            return null;
         },
-        .tag_transcript_source => |tag| {
-            try self.transcript.tagSource(gpa, tag);
-            self.dirty = true;
-            return null;
-        },
+        .tag_transcript_source => |tag| try self.transcript.tagSource(gpa, tag),
         .tool_output_delta => |delta| {
             const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.appendToolOutput(
@@ -487,8 +534,6 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             );
             self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
-            self.dirty = true;
-            return null;
         },
         .front_tool_output_delta => |delta| {
             const outcome = try self.transcript.appendFrontToolOutput(
@@ -501,89 +546,58 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.viewport.assertInvariants();
-            self.dirty = true;
-            return null;
         },
         .replace_tool_output => |replace| {
             const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.replaceToolOutput(gpa, replace.tool_call_id, replace.text);
             self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
-            self.dirty = true;
-            return null;
         },
         .replace_front_tool_output => |replace| {
             const outcome = try self.transcript.replaceFrontToolOutput(gpa, replace.tool_call_id, replace.text);
             self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.viewport.assertInvariants();
-            self.dirty = true;
-            return null;
         },
         .replace_tool_footer => |footer| {
             const before_max = render.transcriptScrollMax(self);
             const outcome = try self.transcript.replaceToolFooter(gpa, footer.tool_call_id, footer.text);
             self.noteOutcome(gpa, outcome);
             self.applyTailMutationScroll(before_max);
-            self.dirty = true;
-            return null;
         },
         .replace_front_tool_footer => |footer| {
             const outcome = try self.transcript.replaceFrontToolFooter(gpa, footer.tool_call_id, footer.text);
             self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.viewport.assertInvariants();
-            self.dirty = true;
-            return null;
         },
         .mark_pending_tools_canceled => {
             const before_max = render.transcriptScrollMax(self);
-            if (self.transcript.markPendingToolsCanceled()) {
-                self.applyTailMutationScroll(before_max);
-                self.dirty = true;
-            }
-            return null;
+            if (self.transcript.markPendingToolsCanceled()) self.applyTailMutationScroll(before_max);
         },
         .prepend_transcript => |rows| {
             const outcome = try self.transcript.prepend(gpa, rows);
             self.noteOutcome(gpa, outcome);
             self.viewport.historyPrepended(render.transcriptScrollMax(self));
             self.viewport.assertInvariants();
-            self.dirty = true;
-            return null;
         },
         .set_greeter => |greeter| {
-            self.greeter = Greeter.from(greeter);
+            self.setGreeter(Greeter.from(greeter));
             self.clampOrFollowViewport();
-            self.dirty = true;
-            return null;
         },
-        .open_picker => |open| {
-            try self.completion.setModal(gpa, open);
-            self.dirty = true;
-            return null;
-        },
-        .close_picker => {
-            if (self.completion.closeModal(gpa)) self.dirty = true;
-            return null;
-        },
+        .open_picker => |open| try self.completion.setModal(gpa, open),
+        .close_picker => _ = self.completion.closeModal(gpa),
         .set_composer_completions => |open| {
             try self.completion.setCommand(gpa, open);
             self.syncComposerCompletion();
-            self.dirty = true;
-            return null;
         },
         .set_composer_arg_completions => |open| {
             try self.completion.setSlashArg(gpa, open);
             self.syncComposerCompletion();
-            self.dirty = true;
-            return null;
         },
         .set_file_completions => |open| {
             try self.completion.setFile(gpa, open);
             self.syncComposerCompletion();
-            self.dirty = true;
-            return null;
         },
         .replace_composer_text => |text| {
             var clean_buffer: [Composer.buffer_size_bytes_max]u8 = undefined;
@@ -596,34 +610,21 @@ pub fn apply(self: *App, gpa: std.mem.Allocator, command: Command) error{OutOfMe
             self.completion.noteEdit();
             self.syncComposerCompletion();
             self.syncComposerScrollHint();
-            self.dirty = true;
-            return null;
         },
-        .insert_composer_paste_marker => |text| return self.insertComposerPasteMarker(gpa, text),
-        .set_status => |update| {
-            if (self.status.set(update, self.now_ms) == .dropped_full) {
-                try self.notice(gpa, .warning, "status line full");
-            }
-            self.dirty = true;
-            return null;
+        .insert_composer_paste_marker => |text| effect = try self.insertComposerPasteMarker(gpa, text),
+        .set_status => |update| if (self.status.set(update, self.now_ms) == .dropped_full) {
+            try self.notice(gpa, .warning, "status line full");
         },
-        .clear_status => |request| {
-            if (self.status.clear(request)) self.dirty = true;
-            return null;
+        .clear_status => |request| _ = self.status.clear(request),
+        .notify => |update| switch (self.notify.notify(update, self.now_ms)) {
+            .ok, .update_only_miss => {},
+            .dropped_full => try self.notice(gpa, .warning, "notifications full"),
         },
-        .notify => |update| {
-            switch (self.notify.notify(update, self.now_ms)) {
-                .ok => self.dirty = true,
-                .dropped_full => try self.notice(gpa, .warning, "notifications full"),
-                .update_only_miss => {},
-            }
-            return null;
-        },
-        .clear_notify => |request| {
-            if (self.notify.clear(request)) self.dirty = true;
-            return null;
-        },
+        .clear_notify => |request| _ = self.notify.clear(request),
     }
+
+    self.dirty = self.dirty or force_dirty or before.changed(self.dirtySnapshot());
+    return effect;
 }
 
 fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{OutOfMemory}!?Effect {
@@ -709,7 +710,6 @@ fn applyInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) error{
         .toggle_tool_expansion => {
             self.tools_expanded = !self.tools_expanded;
             self.clampOrFollowViewport();
-            self.dirty = true;
         },
         .interrupt => return .interrupt,
         .clear_or_exit => return self.clearOrExit(gpa),
@@ -745,30 +745,25 @@ fn applyCompletionInput(
             },
             .escape => {
                 self.completion.hideUntilEdit();
-                self.dirty = true;
                 return .{ .consumed = true };
             },
             .tab => return .{ .consumed = true, .effect = try self.acceptComposerCompletion(gpa) },
             .arrow_up => {
                 _ = try completion_picker.applyInput(gpa, .{ .key = .arrow_up });
-                self.dirty = true;
                 return .{ .consumed = true };
             },
             .arrow_down => {
                 _ = try completion_picker.applyInput(gpa, .{ .key = .arrow_down });
-                self.dirty = true;
                 return .{ .consumed = true };
             },
             else => return .{},
         },
         .wheel_up => {
             _ = try completion_picker.applyInput(gpa, .wheel_up);
-            self.dirty = true;
             return .{ .consumed = true };
         },
         .wheel_down => {
             _ = try completion_picker.applyInput(gpa, .wheel_down);
-            self.dirty = true;
             return .{ .consumed = true };
         },
         else => return .{},
@@ -792,7 +787,6 @@ fn applyPickerInput(self: *App, gpa: std.mem.Allocator, event: input_mod.Input) 
 
     const modal = if (self.completion.modal) |*picker| picker else return null;
     const result = try modal.applyInput(gpa, event);
-    self.dirty = true;
     switch (result) {
         .none => return null,
         .closed => {
@@ -836,7 +830,6 @@ fn finishPaste(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect {
             self.syncComposerCompletion();
             self.syncComposerScrollHint();
             self.composer_full_noticed = false;
-            self.dirty = true;
             if (result == .inserted_truncated) try self.noticeComposerFull(gpa);
         },
         .rejected_full => try self.noticeComposerFull(gpa),
@@ -859,7 +852,6 @@ fn insertComposerPasteMarker(self: *App, gpa: std.mem.Allocator, bytes: []const 
             self.syncComposerCompletion();
             self.syncComposerScrollHint();
             self.composer_full_noticed = false;
-            self.dirty = true;
             if (result == .inserted_truncated) try self.noticeComposerFull(gpa);
         },
         .rejected_full => try self.noticeComposerFull(gpa),
@@ -884,7 +876,6 @@ fn composerInsert(self: *App, gpa: std.mem.Allocator, bytes: []const u8) error{O
             self.syncComposerCompletion();
             self.syncComposerScrollHint();
             self.composer_full_noticed = false;
-            self.dirty = true;
             if (result == .inserted_truncated) try self.noticeComposerFull(gpa);
         },
         .rejected_full => try self.noticeComposerFull(gpa),
@@ -902,10 +893,25 @@ fn openExternalEditor(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!Eff
     return .{ .edit_composer_external = try self.composer.expandedTextOwned(gpa) };
 }
 
+fn setGreeter(self: *App, greeter: ?Greeter) void {
+    self.greeter = greeter;
+    self.greeter_revision +%= 1;
+}
+
+fn setSelection(self: *App, selection: Selection) void {
+    self.selection = selection;
+    self.selection_revision +%= 1;
+}
+
+fn clearSelection(self: *App) void {
+    if (self.selection == .none) return;
+    self.setSelection(.none);
+}
+
 fn noteGreeterCharacterInput(self: *App) void {
     if (self.greeter) |greeter| {
         if (greeter.auto_hide_on_first_input) {
-            self.greeter = null;
+            self.setGreeter(null);
             self.clampOrFollowViewport();
         }
     }
@@ -917,7 +923,6 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
         self.resetHistoryNavigation();
         self.completion.noteEdit();
         self.syncComposerScrollHint();
-        self.dirty = true;
         return null;
     };
 
@@ -931,7 +936,6 @@ fn composerSubmit(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!?Effect
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
     self.composer_full_noticed = false;
-    self.dirty = true;
     return .{ .submit_text = submitted };
 }
 
@@ -941,14 +945,12 @@ fn composerTextEdit(self: *App, gpa: std.mem.Allocator, comptime edit: fn (*Comp
     self.completion.noteEdit();
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
-    self.dirty = true;
 }
 
 fn composerCursorEdit(self: *App, comptime edit: fn (*Composer) void) void {
     edit(&self.composer);
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
-    self.dirty = true;
 }
 
 fn composerUpOrHistory(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
@@ -956,7 +958,6 @@ fn composerUpOrHistory(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!vo
         self.composer.moveVertical(render.composerTextWidth(self.width), .up) == .moved)
     {
         self.syncComposerScrollHint();
-        self.dirty = true;
         return;
     }
     try self.historyPrevious(gpa);
@@ -967,7 +968,6 @@ fn composerDownOrHistory(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!
         self.composer.moveVertical(render.composerTextWidth(self.width), .down) == .moved)
     {
         self.syncComposerScrollHint();
-        self.dirty = true;
         return;
     }
     try self.historyNext(gpa);
@@ -991,7 +991,6 @@ fn historyPrevious(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
     self.composer_full_noticed = false;
-    self.dirty = true;
 }
 
 fn historyNext(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
@@ -1013,7 +1012,6 @@ fn historyNext(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
     self.composer_full_noticed = false;
-    self.dirty = true;
 }
 
 fn saveHistoryDraft(self: *App, gpa: std.mem.Allocator) error{OutOfMemory}!void {
@@ -1218,7 +1216,6 @@ fn acceptComposerCompletion(self: *App, gpa: std.mem.Allocator) error{OutOfMemor
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
     self.composer_full_noticed = false;
-    self.dirty = true;
     return null;
 }
 
@@ -1242,7 +1239,6 @@ fn acceptFileCompletion(self: *App, gpa: std.mem.Allocator, completion: *Picker)
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
     self.composer_full_noticed = false;
-    self.dirty = true;
 }
 
 fn acceptComposerArgCompletion(
@@ -1266,7 +1262,6 @@ fn acceptComposerArgCompletion(
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
     self.composer_full_noticed = false;
-    self.dirty = true;
 }
 
 fn selectComposerArgCompletion(
@@ -1283,7 +1278,6 @@ fn selectComposerArgCompletion(
     self.syncComposerCompletion();
     self.syncComposerScrollHint();
     self.composer_full_noticed = false;
-    self.dirty = true;
     return .{ .picker_selected = .{ .picker_id = completion.picker.id, .item_id = item_id } };
 }
 
@@ -1300,51 +1294,44 @@ fn clearOrExit(self: *App, gpa: std.mem.Allocator) ?Effect {
     self.syncComposerScrollHint();
     self.composer_full_noticed = false;
     self.last_clear_ms = self.now_ms;
-    self.dirty = true;
     return null;
 }
 
 fn scrollUp(self: *App, rows: usize) ScrollResult {
     const result = self.viewport.scrollUp(rows, render.transcriptScrollMax(self));
     self.viewport.assertInvariants();
-    if (result == .moved) self.dirty = true;
     return result;
 }
 
 fn scrollDown(self: *App, rows: usize) void {
     if (self.viewport.scrollDown(rows)) {
         self.viewport.assertInvariants();
-        self.dirty = true;
     }
 }
 
 fn followTail(self: *App) void {
     if (self.viewport.followTail()) {
         self.viewport.assertInvariants();
-        self.dirty = true;
     }
 }
 
 fn beginSelection(self: *App, mouse: input_mod.MousePoint) void {
     const point = self.mouseSelectionPoint(mouse) orelse {
         if (self.selection != .none) {
-            self.selection = .none;
-            self.dirty = true;
+            self.clearSelection();
         }
         return;
     };
-    self.selection = .{ .dragging = .{ .anchor = point, .focus = point } };
-    self.dirty = true;
+    self.setSelection(.{ .dragging = .{ .anchor = point, .focus = point } });
 }
 
 fn updateSelection(self: *App, mouse: input_mod.MousePoint) void {
     const point = self.mouseSelectionPoint(mouse) orelse return;
     switch (self.selection) {
-        .dragging => |range| self.selection = .{ .dragging = .{ .anchor = range.anchor, .focus = point } },
-        .selected => |range| self.selection = .{ .dragging = .{ .anchor = range.anchor, .focus = point } },
+        .dragging => |range| self.setSelection(.{ .dragging = .{ .anchor = range.anchor, .focus = point } }),
+        .selected => |range| self.setSelection(.{ .dragging = .{ .anchor = range.anchor, .focus = point } }),
         .none => return,
     }
-    self.dirty = true;
 }
 
 fn endSelection(self: *App, mouse: input_mod.MousePoint) void {
@@ -1352,23 +1339,22 @@ fn endSelection(self: *App, mouse: input_mod.MousePoint) void {
     switch (self.selection) {
         .dragging => |range| {
             if (range.anchor.row == point.row and range.anchor.col == point.col) {
-                self.selection = .none;
+                self.clearSelection();
             } else {
-                self.selection = .{ .selected = .{ .anchor = range.anchor, .focus = point } };
+                self.setSelection(.{ .selected = .{ .anchor = range.anchor, .focus = point } });
             }
-            self.dirty = true;
         },
         .selected, .none => {},
     }
 }
 
 fn mouseSelectionPoint(self: *App, mouse: input_mod.MousePoint) ?SelectionPoint {
-    if (mouse.row < render.transcriptTop()) return null;
+    const rect = render.transcriptRect(self);
+    if (@as(usize, mouse.row) < rect.y) return null;
     const total = render.transcriptTotalRows(self);
     const scroll_rows = @min(self.viewport.scroll_rows, render.transcriptScrollMax(self));
-    const visible_rows = render.transcriptVisibleRows(self);
-    const drawn = @min(total - scroll_rows, visible_rows);
-    const local_row = @as(usize, mouse.row - render.transcriptTop());
+    const drawn = @min(total - scroll_rows, rect.rows);
+    const local_row = @as(usize, mouse.row) - rect.y;
     if (local_row >= drawn) return null;
     const top_row = total - scroll_rows - drawn;
     return .{
@@ -1382,7 +1368,7 @@ fn mouseSelectionPoint(self: *App, mouse: input_mod.MousePoint) ?SelectionPoint 
 /// add any new bottom distance to `scroll_rows` so the user's viewport does
 /// not drift while an agent streams below it.
 fn applyTailMutationScroll(self: *App, before_max: usize) void {
-    self.selection = .none;
+    self.clearSelection();
     self.viewport.tailMutated(before_max, render.transcriptScrollMax(self));
     self.viewport.assertInvariants();
 }
@@ -1404,7 +1390,6 @@ fn appendNotice(
     text: []const u8,
 ) error{OutOfMemory}!void {
     _ = try self.transcript.append(gpa, .{ .status = .{ .level = level, .text = text } });
-    self.dirty = true;
 }
 
 /// Internal degradation notices share the transcript status vocabulary so
@@ -1413,7 +1398,6 @@ fn notice(self: *App, gpa: std.mem.Allocator, level: Transcript.StatusLevel, tex
     const before_max = render.transcriptScrollMax(self);
     try self.appendNotice(gpa, level, text);
     self.applyTailMutationScroll(before_max);
-    self.dirty = true;
 }
 
 pub fn transcriptAtTail(self: *const App) bool {

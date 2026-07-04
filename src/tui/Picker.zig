@@ -134,6 +134,7 @@ search_detail: bool = false,
 filter_enabled: bool = true,
 layout: Layout = .line,
 match_order: MatchOrder = .score,
+revision: u64 = 0,
 
 pub fn init(gpa: std.mem.Allocator, open: Open) error{OutOfMemory}!Picker {
     var self: Picker = .{
@@ -171,9 +172,11 @@ pub fn filtersInput(self: *const Picker) bool {
 }
 
 pub fn replaceQuery(self: *Picker, bytes: []const u8) void {
+    if (std.mem.eql(u8, self.querySlice(), bytes)) return;
     self.query_len = 0;
     self.insertQuery(bytes);
     if (self.query_len == 0) self.refreshMatches();
+    self.revision +%= 1;
 }
 
 pub fn itemCount(self: *const Picker) usize {
@@ -289,18 +292,21 @@ fn insertQuery(self: *Picker, bytes: []const u8) void {
     @memcpy(self.query[self.query_len..][0..piece.len], piece);
     self.query_len += @intCast(piece.len);
     self.refreshMatches();
+    self.revision +%= 1;
 }
 
 fn backspaceQuery(self: *Picker) void {
     if (self.query_len == 0) return;
     self.query_len = @intCast(text_mod.previousGraphemeStart(self.querySlice(), self.query_len));
     self.refreshMatches();
+    self.revision +%= 1;
 }
 
 fn clearQuery(self: *Picker) void {
     if (self.query_len == 0) return;
     self.query_len = 0;
     self.refreshMatches();
+    self.revision +%= 1;
 }
 
 const Direction = enum { up, down };
@@ -312,7 +318,9 @@ fn moveSelection(self: *Picker, direction: Direction) void {
         .up => if (current == 0) self.match_len - 1 else current - 1,
         .down => if (current + 1 >= self.match_len) 0 else current + 1,
     };
+    if (self.selected_index == self.matches[next]) return;
     self.selected_index = self.matches[next];
+    self.revision +%= 1;
 }
 
 fn refreshMatches(self: *Picker) void {

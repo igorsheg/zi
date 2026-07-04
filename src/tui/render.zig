@@ -31,9 +31,22 @@ pub const item_rows_max: usize = 512;
 const transcript_top: u16 = 0;
 const padding_x: u16 = 1;
 
-pub fn transcriptTop() u16 {
-    return transcript_top;
-}
+pub const Rect = struct {
+    y: usize,
+    rows: usize,
+};
+
+const Region = struct {
+    rows: *const fn (*App) usize,
+    draw: *const fn (*App, *Painter, Rect) void,
+};
+
+const bottom_regions = [_]Region{
+    .{ .rows = pickerRows, .draw = drawPickerRegion },
+    .{ .rows = composerRows, .draw = drawComposerRegion },
+    .{ .rows = statusRows, .draw = drawStatusRegion },
+    .{ .rows = greeterRows, .draw = drawGreeterRegion },
+};
 
 pub fn transcriptPaddingX() u16 {
     return padding_x;
@@ -121,91 +134,40 @@ fn internSegments(out: ?*RowScratch, segments: []const RowSegment) []const RowSe
     return dest;
 }
 
-pub const DrawTiming = struct {
-    clear_ns: u64 = 0,
-    layout_ns: u64 = 0,
-    transcript_ns: u64 = 0,
-    transcript_total_ns: u64 = 0,
-    transcript_item_rows_ns: u64 = 0,
-    transcript_tail_ns: u64 = 0,
-    transcript_build_ns: u64 = 0,
-    transcript_build_message_ns: u64 = 0,
-    transcript_build_thinking_ns: u64 = 0,
-    transcript_build_tool_ns: u64 = 0,
-    transcript_build_status_ns: u64 = 0,
-    transcript_build_custom_ns: u64 = 0,
-    transcript_emit_ns: u64 = 0,
-    greeter_ns: u64 = 0,
-    status_ns: u64 = 0,
-    notify_ns: u64 = 0,
-    composer_ns: u64 = 0,
-    picker_ns: u64 = 0,
-};
+pub const DrawTiming = struct {};
 
 /// Paint the whole frame into vaxis' screen. Infallible by design: the
 /// fallible half of the render transaction is the terminal write that
 /// follows in Terminal.renderIfDirty.
 pub fn draw(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch) void {
-    drawProfiled(app, vx, scratch, null, null);
-}
-
-pub fn drawTimed(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch, io: std.Io) DrawTiming {
-    var timing: DrawTiming = .{};
-    drawProfiled(app, vx, scratch, io, &timing);
-    return timing;
-}
-
-fn drawProfiled(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch, maybe_io: ?std.Io, timing: ?*DrawTiming) void {
-    var mark = DrawMark.init(maybe_io);
     scratch.reset();
     var painter = Painter.init(vx);
     painter.clear(app.theme.app_bg);
-    if (timing) |t| t.clear_ns = mark.lap();
     if (app.width == 0 or app.height == 0) return;
 
-    const composer_rows = composerRows(app);
-    const picker_rows = pickerRows(app);
-    const status_rows = statusRows(app);
-    const greeter_rows = greeterRows(app);
-    const visible_rows = transcriptVisibleRows(app);
-    if (timing) |t| t.layout_ns = mark.lap();
-
-    drawTranscript(app, &painter, scratch, visible_rows, maybe_io, timing);
-    if (timing) |t| t.transcript_ns = mark.lap();
-    if (greeter_rows > 0) {
-        const y: u16 = @intCast(@as(usize, app.height) - picker_rows - composer_rows - status_rows - greeter_rows);
-        drawGreeter(app, &painter, y);
-    }
-    if (timing) |t| t.greeter_ns = mark.lap();
-    if (status_rows > 0 and @as(usize, app.height) > composer_rows + picker_rows) {
-        const y: u16 = @intCast(@as(usize, app.height) - picker_rows - composer_rows - 1);
-        drawStatusLine(app, &painter, y);
-    }
-    if (timing) |t| t.status_ns = mark.lap();
-    drawNotifyOverlay(app, &painter, scratch, composer_rows, picker_rows, status_rows);
-    if (timing) |t| t.notify_ns = mark.lap();
-    drawComposer(app, &painter, composer_rows, picker_rows);
-    if (timing) |t| t.composer_ns = mark.lap();
-    if (app.visiblePicker()) |picker| {
-        drawPicker(app, picker, &painter, picker_rows, app.visiblePickerFocusesFilter());
-    }
-    if (timing) |t| t.picker_ns = mark.lap();
+    const layout = layoutRegions(app);
+    drawTranscript(app, &painter, scratch, layout.transcript.rows);
+    drawRegion(app, &painter, layout.region_rects[3]);
+    drawRegion(app, &painter, layout.region_rects[2]);
+    drawNotifyOverlay(app, &painter, scratch, layout.region_rects);
+    drawRegion(app, &painter, layout.region_rects[1]);
+    drawRegion(app, &painter, layout.region_rects[0]);
 }
 
-const DrawMark = struct {
-    io: ?std.Io,
-    last_ns: i96 = 0,
+pub fn drawTimed(app: *App, vx: *vaxis.Vaxis, scratch: *RowScratch, io: std.Io) DrawTiming {
+    _ = io;
+    draw(app, vx, scratch);
+    return .{};
+}
 
-    fn init(io: ?std.Io) DrawMark {
-        return .{ .io = io, .last_ns = if (io) |value| std.Io.Clock.awake.now(value).nanoseconds else 0 };
-    }
+const RegionRect = struct {
+    region: *const Region,
+    rect: Rect,
+};
 
-    fn lap(self: *DrawMark) u64 {
-        const io = self.io orelse return 0;
-        const now = std.Io.Clock.awake.now(io).nanoseconds;
-        defer self.last_ns = now;
-        return @intCast(now - self.last_ns);
-    }
+const Layout = struct {
+    transcript: Rect,
+    region_rects: [bottom_regions.len]RegionRect,
 };
 
 fn clampedScrollRows(app: *App) usize {
@@ -217,10 +179,28 @@ pub fn transcriptScrollMax(app: *App) usize {
 }
 
 pub fn transcriptVisibleRows(app: *App) usize {
-    if (app.height == 0) return 0;
-    const body_rows = @as(usize, app.height) - transcript_top;
-    const reserved = @min(composerRows(app) + statusRows(app) + pickerRows(app) + greeterRows(app), body_rows);
-    return body_rows - reserved;
+    return transcriptRect(app).rows;
+}
+
+pub fn transcriptRect(app: *App) Rect {
+    return layoutRegions(app).transcript;
+}
+
+fn layoutRegions(app: *App) Layout {
+    var rects: [bottom_regions.len]RegionRect = undefined;
+    var y = @as(usize, app.height);
+    const top = @as(usize, transcript_top);
+    inline for (&bottom_regions, 0..) |*region, index| {
+        const rows = @min(region.rows(app), y -| top);
+        y -|= rows;
+        rects[index] = .{ .region = region, .rect = .{ .y = y, .rows = rows } };
+    }
+    return .{ .transcript = .{ .y = top, .rows = y -| top }, .region_rects = rects };
+}
+
+fn drawRegion(app: *App, painter: *Painter, region_rect: RegionRect) void {
+    if (region_rect.rect.rows == 0) return;
+    region_rect.region.draw(app, painter, region_rect.rect);
 }
 
 pub fn transcriptTotalRows(app: *App) usize {
@@ -663,18 +643,9 @@ pub fn composerTextWidth(width: u16) u16 {
 
 // --- transcript ---
 
-fn drawTranscript(
-    app: *App,
-    painter: *Painter,
-    scratch: *RowScratch,
-    visible_rows: usize,
-    maybe_io: ?std.Io,
-    timing: ?*DrawTiming,
-) void {
+fn drawTranscript(app: *App, painter: *Painter, scratch: *RowScratch, visible_rows: usize) void {
     if (visible_rows == 0 or app.width == 0) return;
-    var mark = DrawMark.init(maybe_io);
     const total = transcriptTotalRows(app);
-    if (timing) |t| t.transcript_total_ns += mark.lap();
     var skip_remaining = clampedScrollRows(app);
     const initial_skip = skip_remaining;
     const drawn = @min(total - skip_remaining, visible_rows);
@@ -693,7 +664,6 @@ fn drawTranscript(
         index -= 1;
         const item = &app.transcript.items.items[index];
         const rows = itemRows(item, app.width, &app.theme, app.tools_expanded);
-        if (timing) |t| t.transcript_item_rows_ns += mark.lap();
         if (skip_remaining >= rows) {
             skip_remaining -= rows;
             continue;
@@ -702,26 +672,11 @@ fn drawTranscript(
         skip_remaining = 0;
         const draw_end = rows - skip_from_bottom;
         const draw_start = draw_end - @min(draw_end, sink.draw_remaining);
-        if (tryDrawAssistantTailWindow(app, scratch, item, draw_start, draw_end, &sink)) {
-            if (timing) |t| t.transcript_tail_ns += mark.lap();
-            continue;
-        }
-        if (timing) |t| t.transcript_tail_ns += mark.lap();
+        if (tryDrawAssistantTailWindow(app, scratch, item, draw_start, draw_end, &sink)) continue;
 
         sink.skip_remaining = skip_from_bottom;
         var count: usize = 0;
         buildItemRowsFrame(scratch, &count, item, app.width, &app.theme, app.tools_expanded);
-        if (timing) |t| {
-            const elapsed = mark.lap();
-            t.transcript_build_ns += elapsed;
-            switch (item.body) {
-                .message => t.transcript_build_message_ns += elapsed,
-                .thinking => t.transcript_build_thinking_ns += elapsed,
-                .tool => t.transcript_build_tool_ns += elapsed,
-                .status => t.transcript_build_status_ns += elapsed,
-                .custom => t.transcript_build_custom_ns += elapsed,
-            }
-        }
         std.debug.assert(count == rows); // memo and fresh build must agree
         // Rows are built top-down; the sink consumes newest-first.
         var k = count;
@@ -729,7 +684,6 @@ fn drawTranscript(
             k -= 1;
             sink.emit(scratch.rows[k]);
         }
-        if (timing) |t| t.transcript_emit_ns += mark.lap();
     }
 }
 
@@ -1613,6 +1567,10 @@ const greeter_logo = [_][]const u8{
     "  ░▀▀▀░▀▀▀",
 };
 
+fn drawGreeterRegion(app: *App, painter: *Painter, rect: Rect) void {
+    drawGreeter(app, painter, @intCast(rect.y));
+}
+
 fn drawGreeter(app: *App, painter: *Painter, y: u16) void {
     const greeter = if (app.greeter) |*value| value else return;
     var row: usize = 0;
@@ -1640,6 +1598,10 @@ fn statusShimmerConfig(theme: *const theme_mod.Theme) shimmer.Config {
         .base_style = theme.shimmer_base,
         .peak_style = theme.shimmer_peak,
     };
+}
+
+fn drawStatusRegion(app: *App, painter: *Painter, rect: Rect) void {
+    drawStatusLine(app, painter, @intCast(rect.y));
 }
 
 fn drawStatusLine(app: *App, painter: *Painter, y: u16) void {
@@ -1692,18 +1654,16 @@ fn drawNotifyOverlay(
     app: *App,
     painter: *Painter,
     scratch: *RowScratch,
-    composer_rows: usize,
-    picker_rows: usize,
-    status_rows: usize,
+    region_rects: [bottom_regions.len]RegionRect,
 ) void {
     var views: [notify_mod.item_count_max]notify_mod.View = undefined;
     const view_count = app.notify.ordered(app.now_ms, views[0..]);
     if (view_count == 0 or app.width == 0) return;
 
-    const reserved_bottom = composer_rows + picker_rows;
+    const reserved_bottom = @as(usize, app.height) - region_rects[1].rect.y;
     if (@as(usize, app.height) <= reserved_bottom) return;
     const base_y = @as(usize, app.height) - reserved_bottom - 1;
-    const status_left = if (status_rows > 0) statusLineWidth(app) else 0;
+    const status_left = if (region_rects[2].rect.rows > 0) statusLineWidth(app) else 0;
     var text_buffer: [notify_mod.text_bytes_max + notify_mod.annote_bytes_max + 32]u8 = undefined;
 
     for (views[0..view_count], 0..) |view, index| {
@@ -1859,13 +1819,10 @@ fn advance(x: u16, width: usize) u16 {
 
 // --- composer ---
 
-fn drawComposer(app: *App, painter: *Painter, composer_rows: usize, bottom_reserved: usize) void {
-    if (composer_rows < 3 or app.height == 0 or app.width == 0) return;
-    const available_bottom = @as(usize, app.height) -| bottom_reserved;
-    const height = @min(composer_rows, available_bottom);
-    if (height < 3) return;
-    const box_y: u16 = @intCast(available_bottom - height);
-    const box_height: u16 = @intCast(height);
+fn drawComposerRegion(app: *App, painter: *Painter, rect: Rect) void {
+    if (rect.rows < 3 or app.height == 0 or app.width == 0) return;
+    const box_y: u16 = @intCast(rect.y);
+    const box_height: u16 = @intCast(rect.rows);
     if (app.width >= 2 and box_height >= 2) {
         painter.roundedBorder(0, box_y, app.width, box_height, app.theme.composer_chrome);
         if (app.width >= 4) {
@@ -1873,7 +1830,7 @@ fn drawComposer(app: *App, painter: *Painter, composer_rows: usize, bottom_reser
             drawComposerSlots(
                 app,
                 painter,
-                @intCast(@as(usize, box_y) + height - 1),
+                @intCast(@as(usize, box_y) + rect.rows - 1),
                 .composer_bottom_left,
                 .composer_bottom_right,
             );
@@ -1882,7 +1839,7 @@ fn drawComposer(app: *App, painter: *Painter, composer_rows: usize, bottom_reser
 
     var rows: [Composer.visible_rows_max]Composer.VisualRow = undefined;
     const projection = app.composer.visibleRows(composerTextWidth(app.width), &rows);
-    const visible_count = @min(projection.visible_count, height - 2);
+    const visible_count = @min(projection.visible_count, rect.rows - 2);
     var index: usize = 0;
     while (index < visible_count) : (index += 1) {
         const y: u16 = @intCast(@as(usize, box_y) + 1 + index);
@@ -1928,23 +1885,28 @@ fn drawComposerSlots(
 
 // --- picker ---
 
-fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved: usize, focus_filter: bool) void {
+fn drawPickerRegion(app: *App, painter: *Painter, rect: Rect) void {
+    const picker = app.visiblePicker() orelse return;
+    drawPicker(app, picker, painter, rect, app.visiblePickerFocusesFilter());
+}
+
+fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rect: Rect, focus_filter: bool) void {
     if (app.width < 4 or app.height < 4) return;
 
     const match_count = picker.matchCount();
     const chrome_rows: usize = if (focus_filter) 1 else 0;
     const footer_rows: usize = if (picker.isTruncated()) 1 else 0;
-    if (rows_reserved < chrome_rows + 1) return;
-    const body_rows = rows_reserved - chrome_rows;
+    if (rect.rows < chrome_rows + 1) return;
+    const body_rows = rect.rows - chrome_rows;
     const item_rows = if (body_rows > footer_rows) body_rows - footer_rows else body_rows;
     const box_width: u16 = app.width;
     const x: u16 = 0;
-    const y: u16 = @intCast(@as(usize, app.height) - rows_reserved);
+    const y: u16 = @intCast(rect.y);
 
     // Clear the area behind the picker so it does not composite over the
     // transcript. Row background and text roles are separate so selection can
     // highlight the full row instead of only printed glyph cells.
-    painter.fillRect(x, y, box_width, @intCast(rows_reserved), app.theme.picker_row);
+    painter.fillRect(x, y, box_width, @intCast(rect.rows), app.theme.picker_row);
 
     const inner_width = if (box_width > 2) @as(usize, box_width) - 2 else 1;
     const item_start_row: usize = if (focus_filter) 1 else 0;
@@ -2007,7 +1969,7 @@ fn drawPicker(app: *App, picker: *const Picker, painter: *Painter, rows_reserved
     }
 
     if (footer_rows > 0) {
-        const footer_y: u16 = @intCast(@as(usize, y) + rows_reserved - 1);
+        const footer_y: u16 = @intCast(@as(usize, y) + rect.rows - 1);
         const message = if (picker.omittedCount() > 0)
             "results truncated; keep typing"
         else

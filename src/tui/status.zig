@@ -53,6 +53,7 @@ const Entry = struct {
 pub const Store = struct {
     entries: [entry_count_max]Entry = undefined,
     len: usize = 0,
+    revision: u64 = 0,
 
     /// Set or replace a contribution. Text is sanitized (invalid UTF-8 and
     /// line breaks never reach render) and truncated to the inline capacity.
@@ -86,6 +87,7 @@ pub const Store = struct {
         entry.tone = update.tone;
         @memcpy(entry.text[0..len], text[0..len]);
         entry.text_len = @intCast(len);
+        self.revision +%= 1;
         return .ok;
     }
 
@@ -94,6 +96,7 @@ pub const Store = struct {
         var i = index;
         while (i + 1 < self.len) : (i += 1) self.entries[i] = self.entries[i + 1];
         self.len -= 1;
+        self.revision +%= 1;
         return true;
     }
 

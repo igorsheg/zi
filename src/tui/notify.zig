@@ -80,15 +80,18 @@ pub const Store = struct {
     item_len: usize = 0,
     groups: [group_count_max]Group = undefined,
     group_len: usize = 0,
+    revision: u64 = 0,
 
     pub fn ensureGroup(self: *Store, group: Group) void {
         if (self.findGroupIndex(group.key)) |index| {
             self.groups[index] = group;
+            self.revision +%= 1;
             return;
         }
         if (self.group_len == self.groups.len) return;
         self.groups[self.group_len] = group;
         self.group_len += 1;
+        self.revision +%= 1;
     }
 
     pub fn notify(self: *Store, update: Notify, now_ms: i64) SetResult {
@@ -114,6 +117,7 @@ pub const Store = struct {
             item.skip_dedup = update.skip_dedup;
             if (update.ttl_ms) |ttl| item.expires_at = computeExpiry(now_ms, ttl, group.ttl_ms);
             item.last_updated = now_ms;
+            self.revision +%= 1;
             return .ok;
         }
 
@@ -134,6 +138,7 @@ pub const Store = struct {
         item.last_updated = now_ms;
         item.hidden = update.hidden;
         item.skip_dedup = update.skip_dedup;
+        self.revision +%= 1;
         return .ok;
     }
 
@@ -253,6 +258,7 @@ pub const Store = struct {
     fn clearAll(self: *Store) bool {
         if (self.item_len == 0) return false;
         self.item_len = 0;
+        self.revision +%= 1;
         return true;
     }
 
@@ -260,6 +266,7 @@ pub const Store = struct {
         var i = index;
         while (i + 1 < self.item_len) : (i += 1) self.items[i] = self.items[i + 1];
         self.item_len -= 1;
+        self.revision +%= 1;
     }
 
     fn findItem(self: *const Store, group: GroupKey, key: Key) ?usize {
