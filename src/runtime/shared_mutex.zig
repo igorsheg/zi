@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const unlocked: u32 = 0;
 const locked: u32 = 1;
@@ -39,7 +40,11 @@ pub const HoldTimer = struct {
     }
 
     pub fn assertUnderLimit(self: HoldTimer) void {
-        if (!std.debug.runtime_safety) return;
+        // Inert under the test runner: wall time on a saturated parallel
+        // runner measures descheduling, not held work, and flakes. The net
+        // targets interactive debug runs; tests assert the byte bounds
+        // directly.
+        if (!std.debug.runtime_safety or builtin.is_test) return;
         std.debug.assert(nowNs() - self.start_ns < lock_hold_assert_ns);
     }
 };
