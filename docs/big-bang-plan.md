@@ -91,7 +91,13 @@ commands submitted to the bounded mailbox, exactly as today.
 
 The two-runtime conflict is resolved by geography: the session `std.Io`/zio
 runtime lives entirely on the engine thread; the UI thread uses only plain
-threads, atomics, and kernel fds. No `std.Io` on the UI thread, ever.
+threads, atomics, and kernel fds for coordination. Refined 2026-07-04: Zig
+0.16 routes all file/tty mechanism through `std.Io`, so the frontend owns
+PRIVATE `std.Io.Threaded` instances for terminal bytes (`tui.Terminal`) and
+worker-thread file ops (`worker.zig` owns its own internally — never
+caller-supplied). The pinned invariant is: the UI thread never touches the
+engine's zio io, never blocks on another runtime's primitives, and its only
+cross-thread wait is `std.posix.poll` over wake fds.
 
 Cross-runtime signaling rule (pinned, amended 2026-07-04): no blocking
 primitive is ever shared across Io runtimes. Engine→UI wake is a kernel pipe
@@ -638,8 +644,9 @@ Pinned decisions:
   frontend worker signal the frame loop through pipe fds (input_reader
   already owns the self-pipe pattern); the frame loop's only blocking call is
   `std.posix.poll` over {input wake fd, engine wake fd, worker wake fd} with
-  the frame deadline as timeout. No `std.Io` and no `runtime.WakeEvent` on
-  this thread.
+  the frame deadline as timeout. No engine/zio io and no `runtime.WakeEvent`
+  on this thread; the Terminal's private Threaded io is mechanism only (see
+  the refined §1 geography rule).
 
 ### 6.1 Differ (`src/frontends/tui/view_diff.zig`)
 

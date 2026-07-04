@@ -21,6 +21,7 @@ pub const InputReader = struct {
     // cooperative completion tasks keep making progress while the TUI sleeps.
     wake_io: std.Io,
     wake: *runtime.WakeEvent,
+    wake_fds: [2]std.c.fd_t,
     storage: []u8,
     queue: ByteQueue,
     thread: ?std.Thread = null,
@@ -46,20 +47,25 @@ pub const InputReader = struct {
         errdefer allocator.destroy(self);
         const storage = try allocator.alloc(u8, capacity_bytes);
         errdefer allocator.free(storage);
+        const wake_fds = try createPipe();
+        errdefer closePipe(wake_fds);
         self.* = .{
             .allocator = allocator,
             .queue_io = queue_io,
             .wake_io = wake_io,
             .wake = wake,
+            .wake_fds = wake_fds,
             .storage = storage,
             .queue = ByteQueue.init(storage),
         };
         return self;
     }
 
+    // ziglint-ignore: Z030 heap owner must destroy after poison.
     pub fn deinit(self: *InputReader) void {
         const allocator = self.allocator;
         self.stop();
+        closePipe(self.wake_fds);
         allocator.free(self.storage);
         self.* = undefined;
         allocator.destroy(self);
@@ -135,6 +141,14 @@ pub const InputReader = struct {
         return self.eof.load(.acquire) or self.faulted.load(.acquire);
     }
 
+    pub fn wakeFd(self: *const InputReader) std.c.fd_t {
+        return self.wake_fds[0];
+    }
+
+    pub fn drainWakeFd(self: *InputReader) void {
+        drainPipe(self.wake_fds[0]);
+    }
+
     fn threadMain(args: ThreadArgs) void {
         args.self.run(args.stdin_fd, args.cancel_read_fd);
     }
@@ -164,7 +178,7 @@ pub const InputReader = struct {
             };
             if (read_count == 0) {
                 self.eof.store(true, .release);
-                self.wake.set(self.wake_io);
+                self.signalOwner();
                 return;
             }
 
@@ -174,14 +188,19 @@ pub const InputReader = struct {
                 const previous_count = self.queued_count.fetchAdd(queued, .release);
                 if (previous_count == 0) self.last_enqueue_ns.store(self.nowNs(), .release);
                 offset += queued;
-                self.wake.set(self.wake_io);
+                self.signalOwner();
             }
         }
     }
 
     fn publishFault(self: *InputReader) void {
         self.faulted.store(true, .release);
+        self.signalOwner();
+    }
+
+    fn signalOwner(self: *InputReader) void {
         self.wake.set(self.wake_io);
+        wakeCancel(self.wake_fds[1]);
     }
 
     fn nowNs(self: *InputReader) i64 {
@@ -211,6 +230,18 @@ fn closePipe(fds: [2]std.c.fd_t) void {
 fn wakeCancel(fd: std.c.fd_t) void {
     const byte: [1]u8 = .{1};
     _ = std.c.write(fd, &byte, byte.len);
+}
+
+fn drainPipe(fd: std.c.fd_t) void {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    while (true) {
+        _ = std.posix.poll(&fds, 0) catch return;
+        if ((fds[0].revents & std.posix.POLL.IN) == 0) return;
+        var buf: [64]u8 = undefined;
+        const n = std.posix.read(fd, &buf) catch return;
+        if (n == 0 or n < buf.len) return;
+        fds[0].revents = 0;
+    }
 }
 
 test "input reader queues bytes and wakes owner" {
@@ -259,6 +290,28 @@ test "input reader wakes session runtime io waiter" {
     var out: [drain_chunk_bytes_max]u8 = undefined;
     const drained = reader.drain(&out);
     try std.testing.expectEqualStrings(bytes, drained.bytes);
+}
+
+test "input reader wake fd signals and drains" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var wake: runtime.WakeEvent = .init;
+    const reader = try InputReader.init(std.testing.allocator, io, io, &wake);
+    defer reader.deinit();
+
+    const source = try createPipe();
+    defer closePipe(source);
+    try reader.start(source[0]);
+
+    const bytes = "abc";
+    try std.testing.expectEqual(@as(isize, bytes.len), std.c.write(source[1], bytes.ptr, bytes.len));
+    var poll_fds = [_]std.posix.pollfd{.{ .fd = reader.wakeFd(), .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expect((try std.posix.poll(&poll_fds, 1000)) > 0);
+    reader.drainWakeFd();
+    poll_fds[0].revents = 0;
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&poll_fds, 0));
 }
 
 test "input reader reports eof as bounded fact" {
