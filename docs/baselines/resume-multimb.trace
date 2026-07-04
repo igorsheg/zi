@@ -1,0 +1,22 @@
+
+zi tui trace max phase durations:
+  owner_loop: 8.924ms
+  poll_input: 0.000ms
+  drain_input: 0.085ms
+  session_step: 0.889ms
+  session_step_commands: 0.884ms
+  session_step_public_event_drain: 0.001ms
+  client_event_drain: 8.025ms
+  client_event_accept_snapshot: 7.655ms
+  pending_ui_work: 0.001ms
+  tick_time: 0.008ms
+  render_draw_foreground: 0.000ms
+  render_flush_foreground: 0.000ms
+  render_clear: 0.000ms
+  wait_input: 692.733ms
+  wait_frame: 0.001ms
+  input_reader_enqueue_to_owner_drain: 0.091ms
+  pending_status: 0.000ms
+zi tui trace rendered frames: foreground=1 scroll=0 background=0
+zi tui trace foreground renders with pending background work: 0
+zi tui trace background reasons: pending_work=0 animation=0

@@ -1,0 +1,40 @@
+
+zi tui trace max phase durations:
+  owner_loop: 31.461ms
+  poll_input: 0.000ms
+  drain_input: 19.516ms
+  session_step: 9.549ms
+  session_step_flush_pending: 0.002ms
+  session_step_completion: 0.001ms
+  session_step_commands: 1.349ms
+  session_step_prompt_progress: 9.539ms
+  session_step_prompt_progress_poll: 0.010ms
+  session_step_prompt_progress_apply: 9.523ms
+  session_step_prompt_progress_session_apply: 7.263ms
+  session_step_prompt_progress_public_event_drain: 2.253ms
+  session_step_prompt_progress_yield: 2.177ms
+  session_step_public_event_drain: 0.002ms
+  client_event_drain: 4.949ms
+  client_event_accept_snapshot: 0.053ms
+  client_event_accept_agent: 4.309ms
+  client_event_accept_session_chrome: 0.016ms
+  client_event_accept_other: 0.206ms
+  pending_ui_work: 1.586ms
+  tick_time: 0.006ms
+  render_draw_foreground: 0.002ms
+  render_draw_background: 0.003ms
+  render_flush_foreground: 0.005ms
+  render_flush_background: 0.001ms
+  render_clear: 0.002ms
+  wait_input: 1919.641ms
+  wait_frame: 17.045ms
+  input_reader_enqueue_to_owner_drain: 11.495ms
+  pending_message: 0.552ms
+  pending_tool_structure: 0.536ms
+  pending_status: 0.004ms
+zi tui trace rendered frames: foreground=3 scroll=0 background=6
+zi tui trace foreground renders with pending background work: 0
+zi tui trace background reasons: pending_work=6 animation=0
+zi tui trace slowest samples:
+  owner_loop: 31.461ms
+  drain_input: 19.516ms
