@@ -91,7 +91,15 @@ commands submitted to the bounded mailbox, exactly as today.
 
 The two-runtime conflict is resolved by geography: the session `std.Io`/zio
 runtime lives entirely on the engine thread; the UI thread uses only plain
-threads, `runtime.WakeEvent`, and mutexes. No `std.Io` on the UI thread, ever.
+threads, atomics, and kernel fds. No `std.Io` on the UI thread, ever.
+
+Cross-runtime signaling rule (pinned, amended 2026-07-04): no blocking
+primitive is ever shared across Io runtimes. Engine→UI wake is a kernel pipe
+fd (engine writes one byte on publish; UI polls it). UI→engine wake is the
+mailbox wake pipe watched by the engine's zio loop. `runtime.WakeEvent`
+(`std.Io.Event`) may only be used between parties sharing one Io instance.
+The shared ViewModel is guarded by the io-free `runtime.SharedMutex` (§3.1).
+The UI thread blocks only in `std.posix.poll` with a deadline.
 
 ## 2. What survives unchanged
 
@@ -125,7 +133,7 @@ leaf data structure with methods.
 
 ```zig
 pub const ViewModel = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: runtime.SharedMutex = .{},
     /// Bumped exactly once per publish batch. Never per field.
     generation: u64 = 0,
     /// Bumped when the live session identity changes (new/resume/switch).
@@ -159,6 +167,19 @@ Reader protocol (UI thread, at most once per frame):
 3. Copy out only sections/items whose `rev` differs from the reader's
    recorded value, into the reader's frame arena. Record new revs/cursors.
 4. `vm.mutex.unlock()`. All translation to `tui.Command` happens after unlock.
+
+**Locking primitive (pinned, amended 2026-07-04):** Zig 0.16 has no
+`std.Thread.Mutex`; blocking primitives live under `std.Io` and are
+io-parameterized. zio's futex backend is a user-mode, coroutine-only wait
+queue (`vendor/zio/src/sync/Futex.zig`), so any io-parameterized primitive on
+memory shared between the engine thread (zio io) and the UI thread loses
+wakes across runtimes. Therefore: `runtime.SharedMutex` (new file
+`src/runtime/shared_mutex.zig`) — pure `std.atomic.Value` state, `tryLock`
+plus bounded spin (`std.atomic.spinLoopHint`) then `std.Thread.yield()` loop;
+no `std.Io` anywhere in its API. This is sound because VM critical sections
+are bounded (64KiB copy cap, 2ms debug assert) and contention is
+writer-once-per-batch vs reader-at-most-60Hz. The ViewModel public API takes
+allocators but never `std.Io`.
 
 Lock-hold bound: the reader copies at most `sample_bytes_per_frame_max =
 64 * 1024` bytes per sample; if dirty payload exceeds this, copy what fits
@@ -442,7 +463,7 @@ picker/completion presentation formatting (frontend).
 pub fn start(gpa, process_runtime, options) !*Engine   // spawns thread, returns after ready
 pub fn submit(self, command) SubmitError!void          // any thread; bounded; reject-on-full
 pub fn viewModel(self) *ViewModel                      // stable pointer for readers
-pub fn attachReaderWake(self, *runtime.WakeEvent) void // exactly one TUI + optional others: bounded list, len 4, reject beyond
+pub fn attachReaderWakeFd(self, fd) void               // engine writes 1 byte on publish; bounded list, len 4, reject beyond
 pub fn requestShutdown(self) void
 pub fn join(self) void                                 // blocks until stopped; then deinit is safe
 ```
@@ -563,7 +584,7 @@ File: `src/frontends/tui/frame_loop.zig`. Replaces the loop half of
 ```text
 loop:
     deadline = min(app.nextDeadlineMs(), now + idle_wait_ms)      // idle_wait_ms = 30_000
-    wake = wait(input_wake | engine_wake | worker_wake, deadline)
+    wake = std.posix.poll([input_wake_fd, engine_wake_fd, worker_wake_fd], deadline)
     drain input bytes -> Terminal.applyInputBytes -> effects
     dispatch effects (engine commands / worker spawns / local commands)
     drain one ready worker result -> App.apply
@@ -595,6 +616,12 @@ Pinned decisions:
   `app.dirty = true` write in `Terminal.resumeAfterExternalProgram`.
 - The frame loop file must not import `coding_agent` internals beyond
   `Engine`'s public surface and `view_model` types.
+- Wake plumbing per the §1 cross-runtime rule: `input_reader` and the
+  frontend worker signal the frame loop through pipe fds (input_reader
+  already owns the self-pipe pattern); the frame loop's only blocking call is
+  `std.posix.poll` over {input wake fd, engine wake fd, worker wake fd} with
+  the frame deadline as timeout. No `std.Io` and no `runtime.WakeEvent` on
+  this thread.
 
 ### 6.1 Differ (`src/frontends/tui/view_diff.zig`)
 
