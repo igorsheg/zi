@@ -5,9 +5,9 @@ const protocol = @import("../protocol.zig");
 const provider_registry = @import("../provider_registry.zig");
 const json_parse = @import("../utils/json_parse.zig");
 
-pub const default_api = "faux";
-pub const default_provider = "faux";
-pub const default_model_id = "faux-1";
+pub const default_api = protocol.KnownApi.faux;
+pub const default_provider = protocol.KnownProvider.faux;
+pub const default_model_id = "faux-default";
 pub const default_model_name = "Faux Model";
 pub const default_base_url = "http://localhost:0";
 

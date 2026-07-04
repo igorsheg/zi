@@ -15,22 +15,13 @@ The script builds `zig-out/bin/zi`, runs the headless scenarios through a PTY wi
 |---|---|---|
 | `/resume` of a multi-MB session | `resume-multimb.trace` | Generated jsonl session under a temp `ZI_CODING_AGENT_DIR`, opened with `zi --session <file>`, then exited. |
 | 17KB paste | `paste-17kb.trace` | Bracketed paste into a fresh TUI session, then double Ctrl-C exit. |
+| Faux prompt stream | `prompt-stream-faux.trace` | Temp `settings.json` selects `faux`/`faux-default`, `ZI_ENABLE_FAUX_PROVIDER=1`, prompt typed through the real TUI, scripted response asserted in terminal output. |
+| Assistant flood | `assistant-flood.trace` | Automated with `ZI_FAUX_SCRIPT`; capped at 16,128 bytes because the faux provider uses a 256-event buffered stream (252 64-byte text deltas + start/text-start/text-end/done). |
 
 ## Manual capture required
 
-These require a real interactive terminal and/or a streaming provider path. The
-current CLI registers only real providers; the faux provider exists for tests but
-is not exposed to the TUI without a source change, so the script does not fake
-these baselines.
-
-### 1MB assistant flood
-
-1. Build: `zig build`.
-2. Start a real TUI with tracing: `ZI_TUI_TRACE=1 zig-out/bin/zi`.
-3. Use an authenticated provider/model.
-4. Prompt: `Write exactly 1 MiB of plain text in small chunks. No markdown.`
-5. Wait for completion, then exit with Ctrl-D on an empty composer.
-6. Copy the path printed as `zi tui trace: ...` to `docs/baselines/assistant-flood-1mb.trace`.
+These require a real interactive terminal and/or tool-call/scroll paths that the
+plain-text faux script does not cover.
 
 ### Chatty bash tool
 

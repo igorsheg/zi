@@ -259,6 +259,7 @@ pub const AuthManager = struct {
     }
 
     pub fn hasAuth(self: *const AuthManager, provider: ai.Provider) bool {
+        if (std.mem.eql(u8, provider, ai.KnownProvider.faux) and ai.fauxProviderEnabledFromEnviron(self.environ)) return true;
         return self.findEnvApiKey(provider) != null or self.findOAuthCredentials(provider) != null;
     }
 
@@ -468,6 +469,24 @@ test "auth manager treats missing env and store as absent auth" {
     const key = try agent_mod.GetApiKeyHook.call(std.testing.allocator, auth.hook(), ai.KnownProvider.openai);
 
     try std.testing.expectEqual(@as(?ai.ApiCredential, null), key);
+}
+
+test "auth manager accepts faux only behind env gate" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZI_ENABLE_FAUX_PROVIDER", "1");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+
+    var auth = try AuthManager.init(std.testing.allocator, std.testing.io, .{
+        .environ = &environ,
+        .paths = .{ .global_dir = "agent", .cwd = "repo" },
+        .dir = tmp.dir,
+    });
+    defer auth.deinit();
+
+    try std.testing.expect(auth.hasAuth(ai.KnownProvider.faux));
 }
 
 test "auth store loads oauth credentials from global auth file" {

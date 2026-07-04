@@ -9,6 +9,7 @@ pub const KnownApi = struct {
     pub const openai_responses = "openai-responses";
     pub const openai_codex_responses = "openai-codex-responses";
     pub const anthropic_messages = "anthropic-messages";
+    pub const faux = "faux";
 };
 
 pub const KnownProvider = struct {
@@ -17,6 +18,7 @@ pub const KnownProvider = struct {
     pub const openai_codex = "openai-codex";
     pub const openrouter = "openrouter";
     pub const fireworks = "fireworks";
+    pub const faux = "faux";
 };
 pub const Timestamp = i64;
 
