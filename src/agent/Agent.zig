@@ -471,7 +471,7 @@ fn emitFromLoop(context: ?*anyopaque, event: agent.AgentEvent) anyerror!void {
     // retain it (applyEvent re-copies what it keeps into the durable or
     // streaming arena). Resetting here drops the previous event's copy.
     _ = self.event_scratch_arena.reset(.retain_capacity);
-    try self.emitEvent(try agent.copyAgentEvent(self.event_scratch_arena.allocator(), event));
+    try self.emitEvent(try agent.loop.copyStreamEvent(self.event_scratch_arena.allocator(), event));
 }
 
 pub fn userMessageFromText(self: *Agent, text: []const u8, images: []const ai.ImageContent) !agent.AgentMessage {

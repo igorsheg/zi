@@ -135,6 +135,7 @@ pub const EventDrain = struct {
         const entry = try self.manager.prepareMessageEntry(message, &timestamp);
         errdefer self.manager.deinitPreparedEntry(entry);
         if (self.store) |store| {
+            // Bound: one buffered jsonl append, no fsync. Move to a worker only if session_step trace proves it.
             try store.appendEntry(self.io, entry, self.manager.lastEntryId());
         }
         return self.manager.commitPreparedEntry(entry);

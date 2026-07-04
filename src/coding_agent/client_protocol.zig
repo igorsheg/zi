@@ -544,7 +544,7 @@ pub const OwnedAgentEvent = struct {
     event: agent_mod.AgentEvent,
 
     pub fn init(allocator: std.mem.Allocator, event: agent_mod.AgentEvent) !OwnedAgentEvent {
-        return .{ .event = try agent_mod.copyAgentEvent(allocator, event) };
+        return .{ .event = try agent_mod.loop.copyStreamEvent(allocator, event) };
     }
 
     pub fn deinit(self: *OwnedAgentEvent, allocator: std.mem.Allocator) void {
@@ -1610,6 +1610,34 @@ test "command envelope owns prompt text" {
 
     try std.testing.expectEqual(@as(?RequestId, 7), envelope.id);
     try std.testing.expectEqualStrings("hello", envelope.command.submit.text);
+}
+
+test "owned agent stream delta drops accumulated partial text" {
+    const huge = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'x');
+    const partial: ai.AssistantMessage = .{
+        .content = &.{.{ .text = .{ .text = huge } }},
+        .api = ai.KnownApi.openai_responses,
+        .provider = ai.KnownProvider.openai,
+        .model = "test-model",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    var event = try OwnedAgentEvent.init(std.testing.allocator, .{ .message_update = .{
+        .assistant_message_event = .{ .text_delta = .{
+            .content_index = 0,
+            .delta = "x",
+            .partial = partial,
+        } },
+    } });
+    defer event.deinit(std.testing.allocator);
+
+    const delta = event.event.message_update.assistant_message_event.text_delta;
+    try std.testing.expectEqualStrings("x", delta.delta);
+    try std.testing.expectEqual(@as(usize, 0), delta.partial.content.len);
 }
 
 test "event envelope deinitializes owned client event" {

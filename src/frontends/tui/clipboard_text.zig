@@ -102,8 +102,8 @@ test "macos native copy uses pbcopy runner" {
         fn call(context: ?*anyopaque, _: std.Io, argv: []const []const u8, text: []const u8) CopyError!void {
             const state: *@This() = @ptrCast(@alignCast(context.?));
             state.called = true;
-            try std.testing.expectEqualStrings("/usr/bin/pbcopy", argv[0]);
-            try std.testing.expectEqualStrings("hello", text);
+            if (!std.mem.eql(u8, "/usr/bin/pbcopy", argv[0])) return error.ProcessExitedNonZero;
+            if (!std.mem.eql(u8, "hello", text)) return error.ProcessExitedNonZero;
         }
     };
     var state: State = .{};

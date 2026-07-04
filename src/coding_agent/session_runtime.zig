@@ -27,6 +27,7 @@ pub const StepTiming = struct {
     prompt_progress_ns: u64 = 0,
     prompt_progress_poll_ns: u64 = 0,
     prompt_progress_apply_ns: u64 = 0,
+    prompt_progress_session_apply_ns: u64 = 0,
     prompt_progress_public_event_drain_ns: u64 = 0,
     prompt_progress_yield_ns: u64 = 0,
     public_event_drain_ns: u64 = 0,
@@ -42,6 +43,7 @@ const SessionStats = client_protocol.PromptCommandSessionStats;
 const PromptProgressTiming = struct {
     poll_ns: u64 = 0,
     apply_ns: u64 = 0,
+    session_apply_ns: u64 = 0,
     public_event_drain_ns: u64 = 0,
     yield_ns: u64 = 0,
 };
@@ -412,7 +414,7 @@ pub const SessionRuntime = struct {
         };
     };
 
-    const CompletionLoadKind = enum { resume_sessions, file_index_build, file_query };
+    const CompletionLoadKind = enum { resume_sessions, file_index_build, file_query, session_open };
 
     const CompletionResultSlot = struct {
         ready: std.atomic.Value(bool) = .init(false),
@@ -462,6 +464,8 @@ pub const SessionRuntime = struct {
         agent_dir: ?[]u8 = null,
         current_session_leaf: ?[]u8 = null,
         query: ?[]u8 = null,
+        session_selector: ?[]u8 = null,
+        session_id: ?[]u8 = null,
     };
 
     const FileIndexState = union(enum) {
@@ -705,6 +709,7 @@ pub const SessionRuntime = struct {
         timing.prompt_progress_ns = elapsedNs(start, self.nowNanoseconds());
         timing.prompt_progress_poll_ns = prompt_timing.poll_ns;
         timing.prompt_progress_apply_ns = prompt_timing.apply_ns;
+        timing.prompt_progress_session_apply_ns = prompt_timing.session_apply_ns;
         timing.prompt_progress_public_event_drain_ns = prompt_timing.public_event_drain_ns;
         timing.prompt_progress_yield_ns = prompt_timing.yield_ns;
         self.startDueRetry();
@@ -743,12 +748,14 @@ pub const SessionRuntime = struct {
                     start = self.nowNanoseconds();
                     const active_timing = try self.applyActiveProgressTimed(event);
                     timing.apply_ns += elapsedNs(start, self.nowNanoseconds());
+                    timing.session_apply_ns += active_timing.apply_ns;
                     timing.public_event_drain_ns += active_timing.public_event_drain_ns;
                 },
                 .terminal => {
                     start = self.nowNanoseconds();
                     const active_timing = try self.applyActiveProgressTimed(null);
                     timing.apply_ns += elapsedNs(start, self.nowNanoseconds());
+                    timing.session_apply_ns += active_timing.apply_ns;
                     timing.public_event_drain_ns += active_timing.public_event_drain_ns;
                 },
                 .empty => {
@@ -974,23 +981,8 @@ pub const SessionRuntime = struct {
             try self.enqueueRejected(request_id, .busy, "cancel active operation before resume");
             return;
         }
-        const session_file_name = session_listing.selectRuntimeSession(self.allocator, self.services.io, .{
-            .cwd = self.services.cwd,
-            .agent_dir_override = self.services.agent_dir,
-            .dir = self.host_config.dir,
-            .environ = self.host_config.environ,
-            .selector = session_selector,
-        }) catch |err| {
-            try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
-            return;
-        } orelse {
-            try self.enqueueRejected(request_id, .invalid_command, "session not found");
-            return;
-        };
-        defer self.allocator.free(session_file_name);
-
-        const stamp = SessionStamp.now(self.services.io);
-        try self.replaceSession(request_id, stamp, .{ .resume_existing = .{ .session_file_name = session_file_name } }, .resumed, session_file_name);
+        const selector = try self.allocator.dupe(u8, session_selector);
+        try self.startSessionOpenLoad(request_id, .resumed, selector, null);
     }
 
     fn createNewSession(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
@@ -1002,67 +994,27 @@ pub const SessionRuntime = struct {
         var session_id_buffer: [48]u8 = undefined;
         const session_id = std.fmt.bufPrint(&session_id_buffer, "session-{d}", .{stamp.nanoseconds}) catch
             "session";
-        try self.replaceSession(request_id, stamp, .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } }, .created, null);
+        const owned_session_id = try self.allocator.dupe(u8, session_id);
+        try self.startSessionOpenLoad(request_id, .created, null, owned_session_id);
     }
 
-    fn replaceSession(
-        self: *SessionRuntime,
-        request_id: ?client_protocol.RequestId,
-        stamp: SessionStamp,
-        open: Open,
-        reason: client_protocol.SessionChanged.Reason,
-        resume_file_name: ?[]const u8,
-    ) !void {
-        var next_services = try RuntimeServices.init(self.allocator, .{
-            .cwd = self.services.cwd,
-            .agent_dir = self.services.agent_dir,
-            .dir = self.host_config.dir,
-            .environ = self.host_config.environ,
-            .task_runtime = self.task_runtime,
-        });
-        var next_services_owned = true;
-        errdefer if (next_services_owned) next_services.deinit();
-
-        var next_session = openSession(self.allocator, &next_services, .{
-            .cwd = self.services.cwd,
-            .agent_dir_override = self.services.agent_dir,
-            .current_date = stamp.date(),
-            .open = open,
-            .model = self.host_config.model,
-            .thinking_level = self.host_config.thinking_level,
-            .stream = self.host_config.stream,
-            .dir = self.host_config.dir,
-            .environ = self.host_config.environ,
-            .task_runtime = self.task_runtime,
-            .allow_paths_outside_cwd = self.host_config.allow_paths_outside_cwd,
-            .public_event_capacity = self.host_config.public_event_capacity,
-        }) catch |err| {
-            next_services.deinit();
-            next_services_owned = false;
-            if (resume_file_name) |file_name| {
-                try self.enqueueResumeRejected(request_id, file_name, err);
-            } else {
-                try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
-            }
-            return;
-        };
-        var next_session_owned = true;
-        errdefer if (next_session_owned) shutdownAndDeinitSession(&next_session);
-
+    fn installSessionOpenResult(self: *SessionRuntime, result: *SessionOpenResult) !void {
         self.cancelCompletionLoad();
         self.resetFileCompletionState();
 
         var old_session = self.session;
         var old_services = self.services;
-        self.services = next_services;
-        next_services_owned = false;
-        self.session = next_session;
-        next_session_owned = false;
+        self.services = result.services;
+        self.session = result.session;
+        result.owned = false;
         shutdownAndDeinitSession(&old_session);
         old_services.deinit();
 
-        try self.enqueueEvent(.{ .request_id = request_id, .event = .{ .session_changed = .{ .reason = reason } } });
-        try self.enqueueSessionChrome(request_id);
+        try self.enqueueEvent(.{
+            .request_id = result.request_id,
+            .event = .{ .session_changed = .{ .reason = result.reason } },
+        });
+        try self.enqueueSessionChrome(result.request_id);
     }
 
     fn applyActiveProgressTimed(self: *SessionRuntime, result: anytype) !ActiveProgressTiming {
@@ -1070,8 +1022,10 @@ pub const SessionRuntime = struct {
         const active = if (self.active) |*operation| operation else return timing;
         switch (active.phase) {
             .running => |run| {
+                var start = self.nowNanoseconds();
                 const more = try self.session.applyPromptRunProgress(run, result);
-                const start = self.nowNanoseconds();
+                timing.apply_ns += elapsedNs(start, self.nowNanoseconds());
+                start = self.nowNanoseconds();
                 try self.drainSessionEvents(active.request_id);
                 timing.public_event_drain_ns += elapsedNs(start, self.nowNanoseconds());
                 if (more) return timing;
@@ -1091,8 +1045,10 @@ pub const SessionRuntime = struct {
                 return timing;
             },
             .compacting => |run| {
+                var start = self.nowNanoseconds();
                 const more = try self.session.applyCompactionRunProgress(run, result);
-                const start = self.nowNanoseconds();
+                timing.apply_ns += elapsedNs(start, self.nowNanoseconds());
+                start = self.nowNanoseconds();
                 try self.drainSessionEvents(active.request_id);
                 timing.public_event_drain_ns += elapsedNs(start, self.nowNanoseconds());
                 if (more) return timing;
@@ -1648,6 +1604,69 @@ pub const SessionRuntime = struct {
         };
     }
 
+    fn startSessionOpenLoad(
+        self: *SessionRuntime,
+        request_id: ?client_protocol.RequestId,
+        reason: client_protocol.SessionChanged.Reason,
+        session_selector: ?[]u8,
+        session_id: ?[]u8,
+    ) !void {
+        var owns_session_selector = session_selector != null;
+        errdefer if (owns_session_selector) self.allocator.free(session_selector.?);
+        var owns_session_id = session_id != null;
+        errdefer if (owns_session_id) self.allocator.free(session_id.?);
+
+        if (self.completion_load != null) {
+            try self.enqueueRejected(request_id, .busy, "session open already loading");
+            if (session_selector) |selector| self.allocator.free(selector);
+            owns_session_selector = false;
+            if (session_id) |id| self.allocator.free(id);
+            owns_session_id = false;
+            return;
+        }
+
+        const cwd = try self.allocator.dupe(u8, self.services.cwd);
+        errdefer self.allocator.free(cwd);
+        const agent_dir = try self.allocator.dupe(u8, self.services.agent_dir);
+        errdefer self.allocator.free(agent_dir);
+        const stamp = SessionStamp.now(self.services.io);
+        const result_slot = try self.createCompletionResultSlot();
+        errdefer self.allocator.destroy(result_slot);
+
+        const task = std.Io.concurrent(self.services.io, publishSessionOpenWorker, .{
+            result_slot,
+            self.allocator,
+            self.task_runtime,
+            self.host_config,
+            request_id,
+            reason,
+            stamp,
+            cwd,
+            agent_dir,
+            session_selector,
+            session_id,
+        }) catch |err| {
+            try self.enqueueRejected(request_id, rejectionCode(err), @errorName(err));
+            self.allocator.free(agent_dir);
+            self.allocator.free(cwd);
+            return;
+        };
+
+        owns_session_selector = false;
+        owns_session_id = false;
+        self.completion_load = .{
+            .kind = .session_open,
+            .request_id = request_id,
+            .task = .{ .io = task },
+            .result_slot = result_slot,
+            .cwd = cwd,
+            .agent_dir = agent_dir,
+            .session_selector = session_selector,
+            .session_id = session_id,
+        };
+        try self.enqueuePromptCommand(request_id, "session", .handled, "opening session...");
+    }
+
     fn startCompletionLoad(self: *SessionRuntime, request_id: ?client_protocol.RequestId) !void {
         if (self.completion_load != null) {
             try self.enqueueRejected(request_id, .busy, "completion snapshot already loading");
@@ -1722,8 +1741,10 @@ pub const SessionRuntime = struct {
         defer if (load.agent_dir) |agent_dir| self.allocator.free(agent_dir);
         defer if (load.current_session_leaf) |leaf| self.allocator.free(leaf);
         defer if (load.query) |query| self.allocator.free(query);
+        defer if (load.session_selector) |selector| self.allocator.free(selector);
+        defer if (load.session_id) |id| self.allocator.free(id);
 
-        const payload = result catch |err| {
+        var payload = result catch |err| {
             if (load.models) |*models| models.deinit(self.allocator);
             if (load.kind == .file_index_build) {
                 if (self.pending_file_completion) |pending| {
@@ -1733,6 +1754,12 @@ pub const SessionRuntime = struct {
                     self.pending_file_completion = null;
                 } else {
                     self.file_index = .{ .failed = .init("", @errorName(err)) };
+                    try self.enqueueRejected(load.request_id, rejectionCode(err), @errorName(err));
+                }
+            } else if (load.kind == .session_open) {
+                if (load.session_selector) |selector| {
+                    try self.enqueueResumeRejected(load.request_id, selector, err);
+                } else {
                     try self.enqueueRejected(load.request_id, rejectionCode(err), @errorName(err));
                 }
             } else {
@@ -1776,6 +1803,7 @@ pub const SessionRuntime = struct {
                 });
                 event_owned = false;
             },
+            .session_open => |*open_result| try self.installSessionOpenResult(open_result),
         }
     }
 
@@ -1810,6 +1838,8 @@ pub const SessionRuntime = struct {
         if (load.agent_dir) |agent_dir| self.allocator.free(agent_dir);
         if (load.current_session_leaf) |leaf| self.allocator.free(leaf);
         if (load.query) |query| self.allocator.free(query);
+        if (load.session_selector) |selector| self.allocator.free(selector);
+        if (load.session_id) |id| self.allocator.free(id);
     }
 
     const CompletionStatus = enum { ready, missing_auth, unavailable };
@@ -2033,16 +2063,61 @@ const CompletionLoadResult = union(enum) {
     resume_sessions: client_protocol.CompletionList,
     file_index_built: file_completion.Index,
     file_completion: *file_completion.Result,
+    session_open: SessionOpenResult,
 
     fn deinit(self: *CompletionLoadResult, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .resume_sessions => |*list| list.deinit(allocator),
             .file_index_built => |*index| index.deinit(std.heap.page_allocator),
             .file_completion => |result| result.destroy(std.heap.page_allocator),
+            .session_open => |*result| result.deinit(),
         }
         self.* = undefined;
     }
 };
+
+const SessionOpenResult = struct {
+    services: RuntimeServices,
+    session: AgentSession,
+    request_id: ?client_protocol.RequestId,
+    reason: client_protocol.SessionChanged.Reason,
+    owned: bool = true,
+
+    fn deinit(self: *SessionOpenResult) void {
+        if (self.owned) {
+            shutdownAndDeinitSession(&self.session);
+            self.services.deinit();
+        }
+        self.* = undefined;
+    }
+};
+
+fn publishSessionOpenWorker(
+    slot: *SessionRuntime.CompletionResultSlot,
+    allocator: std.mem.Allocator,
+    task_runtime: *runtime.Runtime,
+    host_config: SessionRuntime.HostConfig,
+    request_id: ?client_protocol.RequestId,
+    reason: client_protocol.SessionChanged.Reason,
+    stamp: SessionStamp,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    session_selector: ?[]const u8,
+    session_id: ?[]const u8,
+) void {
+    slot.complete(buildSessionOpenWorker(
+        allocator,
+        task_runtime,
+        host_config,
+        request_id,
+        reason,
+        stamp,
+        cwd,
+        agent_dir,
+        session_selector,
+        session_id,
+    ));
+}
 
 fn publishResumeCompletionListWorker(
     slot: *SessionRuntime.CompletionResultSlot,
@@ -2079,6 +2154,68 @@ fn publishProjectFileCompletionWorker(
     query: []const u8,
 ) void {
     slot.complete(queryProjectFileCompletionWorker(index, query));
+}
+
+fn buildSessionOpenWorker(
+    allocator: std.mem.Allocator,
+    task_runtime: *runtime.Runtime,
+    host_config: SessionRuntime.HostConfig,
+    request_id: ?client_protocol.RequestId,
+    reason: client_protocol.SessionChanged.Reason,
+    stamp: SessionStamp,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    session_selector: ?[]const u8,
+    session_id: ?[]const u8,
+) anyerror!CompletionLoadResult {
+    const io = task_runtime.io();
+    const selected_session_file = if (session_selector) |selector|
+        try session_listing.selectRuntimeSession(allocator, io, .{
+            .cwd = cwd,
+            .agent_dir_override = agent_dir,
+            .dir = host_config.dir,
+            .environ = host_config.environ,
+            .selector = selector,
+        }) orelse return error.SessionNotFound
+    else
+        null;
+    defer if (selected_session_file) |file_name| allocator.free(file_name);
+    const open: Open = if (selected_session_file) |file_name|
+        .{ .resume_existing = .{ .session_file_name = file_name } }
+    else
+        .{ .create = .{ .session_id = session_id.?, .timestamp = stamp.timestamp() } };
+
+    var services = try RuntimeServices.init(allocator, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .dir = host_config.dir,
+        .environ = host_config.environ,
+        .task_runtime = task_runtime,
+    });
+    errdefer services.deinit();
+
+    var session = try openSession(allocator, &services, .{
+        .cwd = cwd,
+        .agent_dir_override = agent_dir,
+        .current_date = stamp.date(),
+        .open = open,
+        .model = host_config.model,
+        .thinking_level = host_config.thinking_level,
+        .stream = host_config.stream,
+        .dir = host_config.dir,
+        .environ = host_config.environ,
+        .task_runtime = task_runtime,
+        .allow_paths_outside_cwd = host_config.allow_paths_outside_cwd,
+        .public_event_capacity = host_config.public_event_capacity,
+    });
+    errdefer shutdownAndDeinitSession(&session);
+
+    return .{ .session_open = .{
+        .services = services,
+        .session = session,
+        .request_id = request_id,
+        .reason = reason,
+    } };
 }
 
 fn buildResumeCompletionListWorker(
@@ -2394,18 +2531,25 @@ test "session runtime completion snapshot reports model status and resume sessio
     try std.testing.expect(found_current_model);
 }
 
-fn waitForFileCompletionEvent(session_runtime: *SessionRuntime) !client_protocol.EventEnvelope {
+fn waitForClientEvent(
+    session_runtime: *SessionRuntime,
+    comptime tag: std.meta.Tag(client_protocol.ClientEvent),
+) !client_protocol.EventEnvelope {
     var iterations: usize = 0;
     while (iterations < 2000) : (iterations += 1) {
         try session_runtime.step();
         if (session_runtime.drainEvent()) |event| {
-            if (event.event == .file_completion) return event;
+            if (event.event == tag) return event;
             var ignored = event;
             ignored.deinit(std.testing.allocator);
         }
         try runtime.sleep(session_runtime.task_runtime.io(), .fromMilliseconds(1));
     }
     return error.TestUnexpectedResult;
+}
+
+fn waitForFileCompletionEvent(session_runtime: *SessionRuntime) !client_protocol.EventEnvelope {
+    return waitForClientEvent(session_runtime, .file_completion);
 }
 
 test "session runtime file completion lazily builds index coalesces and keeps ready index stable" {
@@ -2696,9 +2840,8 @@ test "session runtime switches to a selected session through the mailbox" {
     errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
     envelope_owned = false;
-    try session_runtime.step();
 
-    var event = session_runtime.drainEvent().?;
+    var event = try waitForClientEvent(&session_runtime, .session_changed);
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 9), event.request_id);
     try std.testing.expect(event.event == .session_changed);
@@ -2716,11 +2859,12 @@ test "session runtime slash new starts a fresh session" {
     defer session_runtime.deinit();
 
     var envelope = try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 12, "/new", .auto);
-    errdefer envelope.deinit(std.testing.allocator);
+    var envelope_owned = true;
+    errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
-    try session_runtime.step();
+    envelope_owned = false;
 
-    var event = session_runtime.drainEvent().?;
+    var event = try waitForClientEvent(&session_runtime, .session_changed);
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 12), event.request_id);
     try std.testing.expect(event.event == .session_changed);
@@ -2753,9 +2897,8 @@ test "session runtime keeps current session when resume file is invalid" {
     errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
     envelope_owned = false;
-    try session_runtime.step();
 
-    var event = session_runtime.drainEvent().?;
+    var event = try waitForClientEvent(&session_runtime, .rejected);
     defer event.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?client_protocol.RequestId, 11), event.request_id);
     try std.testing.expect(event.event == .rejected);
@@ -2801,9 +2944,8 @@ test "session runtime keeps owned task runtime across session switch" {
     errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
     envelope_owned = false;
-    try session_runtime.step();
 
-    var event = session_runtime.drainEvent().?;
+    var event = try waitForClientEvent(&session_runtime, .session_changed);
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event.event == .session_changed);
     try std.testing.expectEqual(client_protocol.SessionChanged.Reason.resumed, event.event.session_changed.reason);
@@ -2953,9 +3095,8 @@ test "session runtime switch restores persisted session model" {
     errdefer if (envelope_owned) envelope.deinit(std.testing.allocator);
     try session_runtime.submit(envelope);
     envelope_owned = false;
-    try session_runtime.step();
 
-    var event = session_runtime.drainEvent().?;
+    var event = try waitForClientEvent(&session_runtime, .session_changed);
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event.event == .session_changed);
     try std.testing.expectEqual(client_protocol.SessionChanged.Reason.resumed, event.event.session_changed.reason);

@@ -3,6 +3,7 @@ const std = @import("std");
 const runtime = @import("../../runtime/root.zig");
 
 pub const Phase = enum {
+    owner_loop,
     poll_input,
     drain_input,
     session_step,
@@ -12,6 +13,7 @@ pub const Phase = enum {
     session_step_prompt_progress,
     session_step_prompt_progress_poll,
     session_step_prompt_progress_apply,
+    session_step_prompt_progress_session_apply,
     session_step_prompt_progress_public_event_drain,
     session_step_prompt_progress_yield,
     session_step_public_event_drain,

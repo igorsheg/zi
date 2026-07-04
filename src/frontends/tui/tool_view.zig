@@ -179,7 +179,7 @@ pub fn streamsOutput(name: []const u8) bool {
 pub fn callPreviewText(name: []const u8, args_value: std.json.Value) ?[]const u8 {
     if (kind(name) != .write) return null;
     const content = argString(args_value, "content") orelse return null;
-    const preview = trimTrailingEmptyLines(content);
+    const preview = firstLines(trimTrailingEmptyLines(content), tool_metadata.displayForTool("write").collapse.lines_max);
     return if (preview.len > 0) preview else null;
 }
 
@@ -634,6 +634,17 @@ pub fn trimTrailingEmptyLines(text: []const u8) []const u8 {
     return text[0..end];
 }
 
+fn firstLines(text: []const u8, limit: usize) []const u8 {
+    if (limit == 0) return "";
+    var lines: usize = 1;
+    for (text, 0..) |byte, index| {
+        if (byte != '\n') continue;
+        lines += 1;
+        if (lines > limit) return text[0..index];
+    }
+    return text;
+}
+
 fn countLines(text: []const u8) usize {
     if (text.len == 0) return 0;
     var lines: usize = 1;
@@ -882,6 +893,7 @@ test "write call previews content until execution stream starts" {
         "{\"path\":\"file.txt\",\"content\":\"1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n11\\n12\"}",
     );
     defer long_args.deinit();
+    try std.testing.expectEqualStrings("1\n2\n3\n4\n5\n6\n7\n8\n9\n10", callPreviewText("write", long_args.value).?);
     try std.testing.expectEqualStrings(
         "Showing lines 1-10 of 12",
         callPreviewFooter(&footer_buffer, "write", long_args.value),

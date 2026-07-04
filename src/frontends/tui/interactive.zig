@@ -2,6 +2,7 @@
 //! ClientEvents into agent-agnostic tui Commands, and feeds tui Effects back
 //! as session commands. This is the only module that knows both vocabularies.
 const std = @import("std");
+const builtin = @import("builtin");
 
 const agent_mod = @import("../../agent/root.zig");
 const ai = @import("../../ai/root.zig");
@@ -40,6 +41,8 @@ pub const Options = struct {
 /// is background work. A pretty shimmer must never spend the user's latency
 /// budget while model/tool output is already expensive.
 const frame_interval_ms: u64 = 16;
+const frame_budget_ms_max: u64 = 50;
+const frame_budget_ns_max: u64 = frame_budget_ms_max * std.time.ns_per_ms;
 const assistant_reveal_interval_ms = presentation_queue.assistant_reveal_interval_ms;
 const animation_frame_interval_ms = presentation_queue.animation_frame_interval_ms;
 const background_pending_work_interval_ms = presentation_queue.background_pending_work_interval_ms;
@@ -157,6 +160,114 @@ const EventCursor = struct {
 };
 
 const PendingUiWork = presentation_queue.Work;
+
+const PromptImageAttachments = struct {
+    list: std.ArrayList(ai.ImageContent) = .empty,
+
+    fn images(self: *const PromptImageAttachments) []const ai.ImageContent {
+        return self.list.items;
+    }
+
+    fn deinit(allocator: std.mem.Allocator, self: *PromptImageAttachments) void {
+        for (self.list.items) |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        }
+        self.list.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const FrontendTaskKind = enum { copy_selection, clipboard_image_paste, prompt_submit };
+
+const FrontendResultSlot = struct {
+    ready: std.atomic.Value(bool) = .init(false),
+    result: anyerror!FrontendResult = undefined,
+    io: std.Io,
+    wake: *runtime.WakeEvent,
+
+    fn complete(self: *FrontendResultSlot, result: anyerror!FrontendResult) void {
+        self.result = result;
+        self.ready.store(true, .release);
+        self.wake.set(self.io);
+    }
+
+    fn isReady(self: *const FrontendResultSlot) bool {
+        return self.ready.load(.acquire);
+    }
+};
+
+const FrontendTask = struct {
+    kind: FrontendTaskKind,
+    thread: std.Thread,
+    slot: *FrontendResultSlot,
+};
+
+const FrontendResult = union(enum) {
+    copy_selection: CopySelectionResult,
+    clipboard_image_paste: ClipboardImagePasteResult,
+    prompt_submit: PromptSubmitResult,
+
+    fn deinit(self: *FrontendResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .copy_selection => |*result| result.deinit(allocator),
+            .clipboard_image_paste => |*result| result.deinit(allocator),
+            .prompt_submit => |*result| result.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+const CopySelectionResult = struct {
+    text: []u8,
+    native_copied: bool,
+
+    fn deinit(self: *CopySelectionResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+};
+
+const ClipboardImagePasteResult = struct {
+    path: []u8,
+
+    fn deinit(self: *ClipboardImagePasteResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+const PromptSubmitResult = struct {
+    prompt: []u8,
+    attachments: PromptImageAttachments,
+
+    fn deinit(self: *PromptSubmitResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        PromptImageAttachments.deinit(allocator, &self.attachments);
+        self.* = undefined;
+    }
+};
+
+const WatchdogExemption = enum { none, external_editor, shutdown, resize_storm };
+
+const FrameWatchdog = struct {
+    start_ns: i96 = 0,
+
+    fn begin(self: *FrameWatchdog, now_ns: i96) void {
+        self.start_ns = now_ns;
+    }
+
+    fn elapsedNs(self: *const FrameWatchdog, now_ns: i96) u64 {
+        std.debug.assert(now_ns >= self.start_ns);
+        return @intCast(now_ns - self.start_ns);
+    }
+
+    fn assertWithinBudget(self: *const FrameWatchdog, now_ns: i96, exemption: WatchdogExemption) void {
+        if (builtin.mode != .Debug) return;
+        if (exemption != .none) return;
+        std.debug.assert(self.elapsedNs(now_ns) <= frame_budget_ns_max);
+    }
+};
 
 const FramePriority = enum { none, background, scroll, foreground };
 
@@ -325,6 +436,8 @@ const InteractiveController = struct {
     assistant_text_delta_seen: bool = false,
     assistant_thinking_seen: [assistant_content_index_max]bool = @splat(false),
     render_throttle: RenderThrottle = .{},
+    owner_loop_exemption: WatchdogExemption = .none,
+    frontend_task: ?FrontendTask = null,
     tool_timers: [tool_timer_count_max]?ToolTimer = @splat(null),
     thinking_level: agent_mod.ThinkingLevel = .off,
     hide_thinking: bool = true,
@@ -412,6 +525,7 @@ const InteractiveController = struct {
         if (self.history_oldest_entry_id) |id| self.allocator.free(id);
         self.pending_ui_work.deinit(self.allocator);
         self.last_file_completion_query.deinit(self.allocator);
+        self.cancelFrontendTask();
         self.app.setFrontendWake(null);
         if (self.input_reader) |input_reader| input_reader.deinit();
         if (self.frontend_wake) |wake| self.allocator.destroy(wake);
@@ -426,19 +540,27 @@ const InteractiveController = struct {
     }
 
     fn run(self: *InteractiveController) !void {
+        var watchdog: FrameWatchdog = .{};
+        watchdog.begin(self.nowNs());
         while (self.terminal.isRunning()) {
-            if (try self.pollAndDrainInput()) continue;
+            if (try self.pollAndDrainInput()) {
+                self.finishOwnerLoopIteration(&watchdog, if (self.terminal.isRunning()) .none else .shutdown);
+                watchdog.begin(self.nowNs());
+                continue;
+            }
 
             const immediate = try self.serviceImmediateWork();
-            if (!self.terminal.isRunning()) break;
-
             const frame_active = self.pending_ui_work.items.items.len > 0 or
                 self.terminal.isDirty() or
                 self.terminal.hasAnimation();
             const wake_delay = self.clampWakeDelayToDeadline(nextWakeDelayMs(immediate, frame_active));
+            self.finishOwnerLoopIteration(&watchdog, if (self.terminal.isRunning()) .none else .shutdown);
+            if (!self.terminal.isRunning()) break;
+
             const wait_start = self.nowNs();
             const wake = try self.waitForFrontendWake(wake_delay);
             self.recordWakeDuration(wake, wait_start);
+            watchdog.begin(self.nowNs());
             // Time enters the product through ticks; refresh before handling
             // the wake so wall-clock policies (ctrl+c double press, shimmer)
             // never see stale time after a long idle wait.
@@ -447,8 +569,27 @@ const InteractiveController = struct {
                 .input => self.requestInputFrame(try self.timedDrainInput()),
                 .session, .frame => {},
             }
-            if (try self.terminal.drainPendingResize()) self.render_throttle.requestForegroundFrame();
+            if (try self.terminal.drainPendingResize()) {
+                self.render_throttle.requestForegroundFrame();
+                self.noteOwnerLoopExemption(.resize_storm);
+            }
         }
+    }
+
+    fn finishOwnerLoopIteration(
+        self: *InteractiveController,
+        watchdog: *const FrameWatchdog,
+        exemption: WatchdogExemption,
+    ) void {
+        const now_ns = self.nowNs();
+        self.trace.record(.owner_loop, watchdog.elapsedNs(now_ns));
+        const stored_exemption = self.owner_loop_exemption;
+        self.owner_loop_exemption = .none;
+        watchdog.assertWithinBudget(now_ns, if (stored_exemption != .none) stored_exemption else exemption);
+    }
+
+    fn noteOwnerLoopExemption(self: *InteractiveController, exemption: WatchdogExemption) void {
+        if (self.owner_loop_exemption == .none) self.owner_loop_exemption = exemption;
     }
 
     fn pollAndDrainInput(self: *InteractiveController) !bool {
@@ -473,8 +614,83 @@ const InteractiveController = struct {
         return wake;
     }
 
+    fn createFrontendResultSlot(self: *InteractiveController) !*FrontendResultSlot {
+        if (self.frontend_task != null) {
+            try self.appendStatus(.warning, "clipboard operation already running");
+            return error.Busy;
+        }
+        const slot = try self.allocator.create(FrontendResultSlot);
+        slot.* = .{ .io = self.io, .wake = &self.app.owner_wake };
+        return slot;
+    }
+
+    fn installFrontendTask(
+        self: *InteractiveController,
+        kind: FrontendTaskKind,
+        slot: *FrontendResultSlot,
+        thread: std.Thread,
+    ) void {
+        self.frontend_task = .{ .kind = kind, .thread = thread, .slot = slot };
+    }
+
+    fn finishReadyFrontendTask(self: *InteractiveController) !bool {
+        const task = if (self.frontend_task) |task| task else return false;
+        if (!task.slot.isReady()) return false;
+        self.frontend_task = null;
+        task.thread.join();
+        defer self.allocator.destroy(task.slot);
+        var result = task.slot.result catch |err| {
+            try self.appendClipboardImageError(err);
+            return true;
+        };
+        defer result.deinit(self.allocator);
+        switch (result) {
+            .copy_selection => |payload| {
+                if (payload.native_copied) {
+                    try self.appendStatus(.info, "selection copied");
+                } else {
+                    self.terminal.copyTextWithOsc52(payload.text) catch {
+                        try self.appendStatus(.warning, "clipboard copy failed");
+                        return true;
+                    };
+                    try self.appendStatus(.info, "selection copied via terminal clipboard");
+                }
+            },
+            .clipboard_image_paste => |payload| {
+                const marker = try std.fmt.allocPrint(self.allocator, "@{s}", .{payload.path});
+                defer self.allocator.free(marker);
+                _ = try self.terminal.applyCommand(.{ .insert_composer_paste_marker = marker });
+            },
+            .prompt_submit => |payload| {
+                const envelope = try client_protocol.CommandEnvelope.initSubmitPromptWithImages(
+                    self.allocator,
+                    null,
+                    payload.prompt,
+                    payload.attachments.images(),
+                    .auto,
+                );
+                if (try self.submitCommand(envelope) == .queued) self.cancel_requested = false;
+            },
+        }
+        return true;
+    }
+
+    fn cancelFrontendTask(self: *InteractiveController) void {
+        var task = self.frontend_task orelse return;
+        self.frontend_task = null;
+        task.thread.join();
+        if (task.slot.isReady()) {
+            if (task.slot.result) |value| {
+                var owned = value;
+                owned.deinit(self.allocator);
+            } else |_| {}
+        }
+        self.allocator.destroy(task.slot);
+    }
+
     fn serviceImmediateWork(self: *InteractiveController) !bool {
         var start = self.nowNs();
+        const frontend_ready = try self.finishReadyFrontendTask();
         const step_timing = try self.app.stepTimed();
         self.recordDuration(.session_step, start);
         self.trace.record(.session_step_flush_pending, step_timing.flush_pending_ns);
@@ -483,6 +699,10 @@ const InteractiveController = struct {
         self.trace.record(.session_step_prompt_progress, step_timing.prompt_progress_ns);
         self.trace.record(.session_step_prompt_progress_poll, step_timing.prompt_progress_poll_ns);
         self.trace.record(.session_step_prompt_progress_apply, step_timing.prompt_progress_apply_ns);
+        self.trace.record(
+            .session_step_prompt_progress_session_apply,
+            step_timing.prompt_progress_session_apply_ns,
+        );
         self.trace.record(
             .session_step_prompt_progress_public_event_drain,
             step_timing.prompt_progress_public_event_drain_ns,
@@ -506,7 +726,8 @@ const InteractiveController = struct {
         } else 0;
         const background_reason: BackgroundRenderReason = if (applied > 0) .pending_work else .animation;
         try self.renderIfDue(now_ms, background_reason);
-        return drained.count == client_events_per_tick_max or
+        return frontend_ready or
+            drained.count == client_events_per_tick_max or
             drained.time_budget_exhausted or
             applied == pending_ui_work_per_tick_max or
             (self.pending_ui_work.items.items.len > 0 and background_due) or
@@ -856,78 +1077,51 @@ const InteractiveController = struct {
             .empty => try self.appendStatus(.warning, "no selection to copy"),
             .too_large => try self.appendStatus(.warning, "selection too large to copy"),
             .text => |text| {
-                defer self.allocator.free(text);
-                _ = clipboard_text.copyNative(self.io, self.app.services.environ, text) catch {
-                    self.terminal.copyTextWithOsc52(text) catch {
-                        try self.appendStatus(.warning, "clipboard copy failed");
+                const slot = self.createFrontendResultSlot() catch |err| switch (err) {
+                    error.Busy => {
+                        self.allocator.free(text);
                         return;
-                    };
-                    try self.appendStatus(.info, "selection copied via terminal clipboard");
+                    },
+                    else => {
+                        self.allocator.free(text);
+                        return err;
+                    },
+                };
+                const thread = std.Thread.spawn(.{}, publishCopySelectionWorker, .{
+                    slot,
+                    self.allocator,
+                    self.io,
+                    self.app.services.environ,
+                    text,
+                }) catch |err| {
+                    self.allocator.destroy(slot);
+                    self.allocator.free(text);
+                    try self.appendStatus(.warning, @errorName(err));
                     return;
                 };
-                try self.appendStatus(.info, "selection copied");
+                self.installFrontendTask(.copy_selection, slot, thread);
             },
         }
     }
 
     fn handleClipboardImagePaste(self: *InteractiveController) !void {
-        var image = clipboard_image.read(
+        const slot = self.createFrontendResultSlot() catch |err| switch (err) {
+            error.Busy => return,
+            else => return err,
+        };
+        const thread = std.Thread.spawn(.{}, publishClipboardImagePasteWorker, .{
+            slot,
             self.allocator,
             self.io,
             self.app.task_runtime,
             self.app.services.environ,
-        ) catch |err| {
-            try self.appendClipboardImageError(err);
+            self.tmp_dir,
+        }) catch |err| {
+            self.allocator.destroy(slot);
+            try self.appendStatus(.warning, @errorName(err));
             return;
         };
-        defer image.deinit(self.allocator);
-
-        const path = self.createClipboardImageTempFile(&image) catch |err| {
-            try self.appendClipboardImageError(err);
-            return;
-        };
-        defer self.allocator.free(path);
-
-        const payload = try std.fmt.allocPrint(self.allocator, "@{s}", .{path});
-        defer self.allocator.free(payload);
-        _ = try self.terminal.applyCommand(.{ .insert_composer_paste_marker = payload });
-    }
-
-    fn createClipboardImageTempFile(self: *InteractiveController, image: *const clipboard_image.ClipboardImage) ![]u8 {
-        const ext = clipboard_image.extensionForMimeType(image.mime_type) orelse return error.UnsupportedFormat;
-        var attempts: usize = 0;
-        while (attempts < 16) : (attempts += 1) {
-            self.external_editor_counter +%= 1;
-            const stamp = std.Io.Clock.awake.now(self.io).nanoseconds;
-            var name_buffer: [96]u8 = undefined;
-            const name = std.fmt.bufPrint(
-                &name_buffer,
-                "zi-clipboard-{d}-{d}.{s}",
-                .{ stamp, self.external_editor_counter, ext },
-            ) catch unreachable;
-            const path = try std.fs.path.join(self.allocator, &.{ self.tmp_dir, name });
-            errdefer self.allocator.free(path);
-
-            var file = std.Io.Dir.createFileAbsolute(self.io, path, .{
-                .read = true,
-                .exclusive = true,
-                .permissions = std.Io.File.Permissions.fromMode(0o600),
-            }) catch |err| switch (err) {
-                error.PathAlreadyExists => {
-                    self.allocator.free(path);
-                    continue;
-                },
-                else => return err,
-            };
-            defer file.close(self.io);
-
-            var write_buffer: [4096]u8 = undefined;
-            var writer = file.writer(self.io, &write_buffer);
-            try writer.interface.writeAll(image.bytes);
-            try writer.flush();
-            return path;
-        }
-        return error.PathAlreadyExists;
+        self.installFrontendTask(.clipboard_image_paste, slot, thread);
     }
 
     fn appendClipboardImageError(self: *InteractiveController, err: anyerror) !void {
@@ -943,6 +1137,7 @@ const InteractiveController = struct {
     }
 
     fn editComposerExternal(self: *InteractiveController, text: []const u8) !void {
+        self.noteOwnerLoopExemption(.external_editor);
         const path = self.createEditorTempFile(text) catch |err| {
             try self.appendEditorError("could not create editor temp file", err);
             return;
@@ -1303,71 +1498,29 @@ const InteractiveController = struct {
     }
 
     fn submitPrompt(self: *InteractiveController, prompt: []const u8) !void {
-        var attachments = try self.clipboardImageAttachmentsFromPrompt(prompt);
-        defer PromptImageAttachments.deinit(self.allocator, &attachments);
-        const envelope = try client_protocol.CommandEnvelope.initSubmitPromptWithImages(
+        const owned_prompt = try self.allocator.dupe(u8, prompt);
+        const slot = self.createFrontendResultSlot() catch |err| switch (err) {
+            error.Busy => {
+                self.allocator.free(owned_prompt);
+                return;
+            },
+            else => {
+                self.allocator.free(owned_prompt);
+                return err;
+            },
+        };
+        const thread = std.Thread.spawn(.{}, publishPromptSubmitWorker, .{
+            slot,
             self.allocator,
-            null,
-            prompt,
-            attachments.images(),
-            .auto,
-        );
-        if (try self.submitCommand(envelope) == .queued) self.cancel_requested = false;
-    }
-
-    const PromptImageAttachments = struct {
-        list: std.ArrayList(ai.ImageContent) = .empty,
-
-        fn images(self: *const PromptImageAttachments) []const ai.ImageContent {
-            return self.list.items;
-        }
-
-        fn deinit(allocator: std.mem.Allocator, self: *PromptImageAttachments) void {
-            for (self.list.items) |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            }
-            self.list.deinit(allocator);
-            self.* = undefined;
-        }
-    };
-
-    fn clipboardImageAttachmentsFromPrompt(self: *InteractiveController, prompt: []const u8) !PromptImageAttachments {
-        var attachments: PromptImageAttachments = .{};
-        errdefer PromptImageAttachments.deinit(self.allocator, &attachments);
-        var index: usize = 0;
-        while (index < prompt.len and attachments.list.items.len < clipboard_image_attachment_count_max) {
-            const at = std.mem.indexOfScalarPos(u8, prompt, index, '@') orelse break;
-            index = at + 1;
-            const path_start = index;
-            while (index < prompt.len and isPromptPathByte(prompt[index])) : (index += 1) {}
-            if (index == path_start) continue;
-            const path = prompt[path_start..index];
-            if (!isZiClipboardImagePath(path)) continue;
-            try attachments.list.append(self.allocator, try self.readPromptImageAttachment(path));
-        }
-        return attachments;
-    }
-
-    fn readPromptImageAttachment(self: *InteractiveController, path: []const u8) !ai.ImageContent {
-        const mime_type = mimeTypeForImagePath(path) orelse return error.UnsupportedFormat;
-        var file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
-        defer file.close(self.io);
-        const file_len = try file.length(self.io);
-        if (file_len == 0) return error.NoImage;
-        if (file_len > client_protocol.submit_image_data_bytes_max) return error.ImageTooLarge;
-        const raw = try self.allocator.alloc(u8, @intCast(file_len));
-        defer self.allocator.free(raw);
-        const read_len = try file.readPositionalAll(self.io, raw, 0);
-        if (read_len != raw.len) return error.ShortRead;
-
-        const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
-        const encoded = try self.allocator.alloc(u8, encoded_len);
-        errdefer self.allocator.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, raw);
-        const mime = try self.allocator.dupe(u8, mime_type);
-        errdefer self.allocator.free(mime);
-        return .{ .data = encoded, .mime_type = mime };
+            self.io,
+            owned_prompt,
+        }) catch |err| {
+            self.allocator.destroy(slot);
+            self.allocator.free(owned_prompt);
+            try self.appendStatus(.warning, @errorName(err));
+            return;
+        };
+        self.installFrontendTask(.prompt_submit, slot, thread);
     }
 
     fn cancelActive(self: *InteractiveController) !void {
@@ -3230,6 +3383,92 @@ test "render throttle adapts background frames but foreground renders immediatel
     try std.testing.expectEqual(FramePriority.background, throttle.shouldRender(401 + 270).?);
 }
 
+test "prompt submit worker keeps prompt and loads clipboard images off owner" {
+    var result = try buildPromptSubmitWorker(std.testing.allocator, std.testing.io, try std.testing.allocator.dupe(u8, "hello"));
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result == .prompt_submit);
+    try std.testing.expectEqualStrings("hello", result.prompt_submit.prompt);
+    try std.testing.expectEqual(@as(usize, 0), result.prompt_submit.attachments.images().len);
+}
+
+test "copy selection worker falls back to terminal clipboard over ssh" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("SSH_CONNECTION", "host");
+    var result = try buildCopySelectionWorker(
+        std.testing.allocator,
+        std.testing.io,
+        &env,
+        try std.testing.allocator.dupe(u8, "copy me"),
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result == .copy_selection);
+    try std.testing.expect(!result.copy_selection.native_copied);
+    try std.testing.expectEqualStrings("copy me", result.copy_selection.text);
+}
+
+test "controller flood work stays within frame budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var task_runtime = try runtime.Runtime.init(allocator, .{});
+    defer task_runtime.deinit();
+    var app = try session_runtime.openSessionRuntime(allocator, .{
+        .cwd = "repo",
+        .agent_dir_override = "agent",
+        .current_date = "2026-06-09",
+        .open = .{ .create = .{ .session_id = "session", .timestamp = "2026-06-09T00:00:00Z" } },
+        .dir = tmp.dir,
+        .task_runtime = task_runtime,
+    });
+    defer app.deinit();
+
+    const terminal = try tui.Terminal.init(allocator, std.testing.io, 80, 24, .{});
+    defer terminal.deinit();
+    var stdout_discard = std.Io.Writer.Discarding.init(&.{});
+    var stderr_discard = std.Io.Writer.Discarding.init(&.{});
+    var controller: InteractiveController = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .app = &app,
+        .stdout = &stdout_discard.writer,
+        .stderr = &stderr_discard.writer,
+        .terminal = terminal,
+    };
+    defer controller.pending_ui_work.deinit(allocator);
+    defer controller.clearPendingUiWork();
+
+    var seq: client_protocol.EventSeq = 1;
+    const large_chunk = try allocator.alloc(u8, 512);
+    defer allocator.free(large_chunk);
+    @memset(large_chunk, 'x');
+
+    for (0..client_events_per_tick_max) |_| {
+        try enqueueAssistantDeltaFloodEvent(allocator, &app, &seq, large_chunk);
+    }
+    try expectServiceImmediateWorkWithinFrameBudget(&controller);
+    try drainFloodWorkWithinFrameBudget(&controller, 64);
+
+    const accumulated = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(accumulated);
+    @memset(accumulated, 'y');
+    for (0..client_events_per_tick_max) |_| {
+        try enqueueAssistantDeltaFloodEventWithPartial(allocator, &app, &seq, large_chunk, accumulated);
+    }
+    try expectServiceImmediateWorkWithinFrameBudget(&controller);
+    try drainFloodWorkWithinFrameBudget(&controller, 64);
+
+    try enqueueToolStartFloodEvent(allocator, &app, &seq);
+    for (0..client_events_per_tick_max - 1) |_| {
+        try enqueueToolOutputFloodEvent(allocator, &app, &seq, large_chunk);
+    }
+    try expectServiceImmediateWorkWithinFrameBudget(&controller);
+    try drainFloodWorkWithinFrameBudget(&controller, 64);
+
+    try enqueueHistoryPageFloodEvent(allocator, &app, &seq, large_chunk);
+    try expectServiceImmediateWorkWithinFrameBudget(&controller);
+}
+
 test "resume picker starts from newest existing session when present" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3327,6 +3566,295 @@ test "TUI recovers event gaps by requesting snapshot directly" {
     const notify_count = terminal.app.notify.ordered(terminal.app.now_ms, &notify_views);
     try std.testing.expectEqual(@as(usize, 1), notify_count);
     try std.testing.expectEqualStrings("recovering event gap", notify_views[0].message);
+}
+
+fn publishCopySelectionWorker(
+    slot: *FrontendResultSlot,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    text: []u8,
+) void {
+    slot.complete(buildCopySelectionWorker(allocator, io, environ, text));
+}
+
+fn buildCopySelectionWorker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: ?*const std.process.Environ.Map,
+    text: []u8,
+) anyerror!FrontendResult {
+    _ = allocator;
+    const native_copied = if (clipboard_text.copyNative(io, environ, text)) |_| true else |_| false;
+    return .{ .copy_selection = .{ .text = text, .native_copied = native_copied } };
+}
+
+fn publishClipboardImagePasteWorker(
+    slot: *FrontendResultSlot,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    task_runtime: *runtime.Runtime,
+    environ: ?*const std.process.Environ.Map,
+    tmp_dir: []const u8,
+) void {
+    slot.complete(buildClipboardImagePasteWorker(allocator, io, task_runtime, environ, tmp_dir));
+}
+
+fn buildClipboardImagePasteWorker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    task_runtime: *runtime.Runtime,
+    environ: ?*const std.process.Environ.Map,
+    tmp_dir: []const u8,
+) anyerror!FrontendResult {
+    var image = try clipboard_image.read(allocator, io, task_runtime, environ);
+    defer image.deinit(allocator);
+    const path = try writeClipboardImageTempFile(allocator, io, tmp_dir, &image);
+    return .{ .clipboard_image_paste = .{ .path = path } };
+}
+
+fn writeClipboardImageTempFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tmp_dir: []const u8,
+    image: *const clipboard_image.ClipboardImage,
+) ![]u8 {
+    const ext = clipboard_image.extensionForMimeType(image.mime_type) orelse return error.UnsupportedFormat;
+    const stamp = std.Io.Clock.awake.now(io).nanoseconds;
+    var attempts: usize = 0;
+    while (attempts < 16) : (attempts += 1) {
+        var name_buffer: [96]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "zi-clipboard-{d}-{d}.{s}", .{ stamp, attempts, ext }) catch unreachable;
+        const path = try std.fs.path.join(allocator, &.{ tmp_dir, name });
+        errdefer allocator.free(path);
+        var file = std.Io.Dir.createFileAbsolute(io, path, .{
+            .read = true,
+            .exclusive = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
+            else => return err,
+        };
+        defer file.close(io);
+        var write_buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &write_buffer);
+        try writer.interface.writeAll(image.bytes);
+        try writer.flush();
+        return path;
+    }
+    return error.PathAlreadyExists;
+}
+
+fn publishPromptSubmitWorker(
+    slot: *FrontendResultSlot,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prompt: []u8,
+) void {
+    slot.complete(buildPromptSubmitWorker(allocator, io, prompt));
+}
+
+fn buildPromptSubmitWorker(allocator: std.mem.Allocator, io: std.Io, prompt: []u8) anyerror!FrontendResult {
+    errdefer allocator.free(prompt);
+    var attachments = try promptImageAttachmentsFromPromptWorker(allocator, io, prompt);
+    errdefer PromptImageAttachments.deinit(allocator, &attachments);
+    return .{ .prompt_submit = .{ .prompt = prompt, .attachments = attachments } };
+}
+
+fn promptImageAttachmentsFromPromptWorker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prompt: []const u8,
+) !PromptImageAttachments {
+    var attachments: PromptImageAttachments = .{};
+    errdefer PromptImageAttachments.deinit(allocator, &attachments);
+    var index: usize = 0;
+    while (index < prompt.len and attachments.list.items.len < clipboard_image_attachment_count_max) {
+        const at = std.mem.indexOfScalarPos(u8, prompt, index, '@') orelse break;
+        index = at + 1;
+        const path_start = index;
+        while (index < prompt.len and isPromptPathByte(prompt[index])) : (index += 1) {}
+        if (index == path_start) continue;
+        const path = prompt[path_start..index];
+        if (!isZiClipboardImagePath(path)) continue;
+        try attachments.list.append(allocator, try readPromptImageAttachmentWorker(allocator, io, path));
+    }
+    return attachments;
+}
+
+fn readPromptImageAttachmentWorker(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !ai.ImageContent {
+    const mime_type = mimeTypeForImagePath(path) orelse return error.UnsupportedFormat;
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    const file_len = try file.length(io);
+    if (file_len == 0) return error.NoImage;
+    if (file_len > client_protocol.submit_image_data_bytes_max) return error.ImageTooLarge;
+    const raw = try allocator.alloc(u8, @intCast(file_len));
+    defer allocator.free(raw);
+    const read_len = try file.readPositionalAll(io, raw, 0);
+    if (read_len != raw.len) return error.ShortRead;
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    errdefer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, raw);
+    const mime = try allocator.dupe(u8, mime_type);
+    errdefer allocator.free(mime);
+    return .{ .data = encoded, .mime_type = mime };
+}
+
+fn expectServiceImmediateWorkWithinFrameBudget(controller: *InteractiveController) !void {
+    controller.render_throttle.pending = .none;
+    controller.render_throttle.next_background_render_ms = std.math.maxInt(i64);
+    var watchdog: FrameWatchdog = .{};
+    watchdog.begin(controller.nowNs());
+    _ = try controller.serviceImmediateWork();
+    const elapsed_ns = watchdog.elapsedNs(controller.nowNs());
+    controller.finishOwnerLoopIteration(&watchdog, .none);
+    try std.testing.expect(elapsed_ns <= frame_budget_ns_max);
+}
+
+fn drainFloodWorkWithinFrameBudget(controller: *InteractiveController, limit: usize) !void {
+    var iteration: usize = 0;
+    while (controller.pending_ui_work.items.items.len > 0) : (iteration += 1) {
+        try std.testing.expect(iteration < limit);
+        var watchdog: FrameWatchdog = .{};
+        watchdog.begin(controller.nowNs());
+        _ = try controller.applyPendingUiWorkBounded(std.math.maxInt(i64));
+        const elapsed_ns = watchdog.elapsedNs(controller.nowNs());
+        controller.finishOwnerLoopIteration(&watchdog, .none);
+        try std.testing.expect(elapsed_ns <= frame_budget_ns_max);
+    }
+}
+
+fn enqueueAssistantDeltaFloodEvent(
+    allocator: std.mem.Allocator,
+    app: *session_runtime.SessionRuntime,
+    seq: *client_protocol.EventSeq,
+    chunk: []const u8,
+) !void {
+    try enqueueAssistantDeltaFloodEventWithPartial(allocator, app, seq, chunk, "");
+}
+
+fn enqueueAssistantDeltaFloodEventWithPartial(
+    allocator: std.mem.Allocator,
+    app: *session_runtime.SessionRuntime,
+    seq: *client_protocol.EventSeq,
+    chunk: []const u8,
+    accumulated: []const u8,
+) !void {
+    const content_storage = [_]ai.AssistantContent{.{ .text = .{ .text = accumulated } }};
+    const content: []const ai.AssistantContent = if (accumulated.len == 0) &.{} else &content_storage;
+    const partial: ai.AssistantMessage = .{
+        .content = content,
+        .api = "test",
+        .provider = "test",
+        .model = "test-model",
+        .usage = ai.protocol.emptyUsage(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    try enqueueAgentFloodEvent(allocator, app, seq, .{ .message_update = .{ .assistant_message_event = .{
+        .text_delta = .{ .content_index = 0, .delta = chunk, .partial = partial },
+    } } });
+}
+
+fn enqueueToolStartFloodEvent(
+    allocator: std.mem.Allocator,
+    app: *session_runtime.SessionRuntime,
+    seq: *client_protocol.EventSeq,
+) !void {
+    try enqueueAgentFloodEvent(allocator, app, seq, .{ .tool_execution_start = .{
+        .tool_call_id = "call-flood",
+        .tool_name = "bash",
+        .args = .{ .null = {} },
+    } });
+}
+
+fn enqueueToolOutputFloodEvent(
+    allocator: std.mem.Allocator,
+    app: *session_runtime.SessionRuntime,
+    seq: *client_protocol.EventSeq,
+    chunk: []const u8,
+) !void {
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = chunk } }};
+    try enqueueAgentFloodEvent(allocator, app, seq, .{ .tool_execution_update = .{
+        .tool_call_id = "call-flood",
+        .tool_name = "bash",
+        .args = .{ .null = {} },
+        .partial_result = .{ .content = &content },
+    } });
+}
+
+fn enqueueHistoryPageFloodEvent(
+    allocator: std.mem.Allocator,
+    app: *session_runtime.SessionRuntime,
+    seq: *client_protocol.EventSeq,
+    chunk: []const u8,
+) !void {
+    const item_count = 24;
+    var items = try allocator.alloc(client_protocol.HistorySnapshotItem, item_count);
+    var owns_items = true;
+    errdefer if (owns_items) allocator.free(items);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+    }
+
+    for (items) |*item| {
+        var entry_buffer: [32]u8 = undefined;
+        const entry_id_text = std.fmt.bufPrint(&entry_buffer, "entry-{d}", .{initialized}) catch unreachable;
+        var entry_id = try client_protocol.EventText.init(allocator, entry_id_text);
+        const text = client_protocol.EventText.init(allocator, chunk) catch |err| {
+            entry_id.deinit(allocator);
+            return err;
+        };
+        item.* = .{ .entry_id = entry_id, .kind = .assistant, .text = text };
+        initialized += 1;
+    }
+
+    var before_entry_id = try client_protocol.EventText.init(allocator, "after-flood");
+    var owns_before_entry_id = true;
+    errdefer if (owns_before_entry_id) before_entry_id.deinit(allocator);
+    owns_items = false;
+    initialized = 0;
+    owns_before_entry_id = false;
+    try enqueueClientFloodEvent(allocator, app, seq, .{ .history_page = .{
+        .before_entry_id = before_entry_id,
+        .items = items,
+    } });
+}
+
+fn enqueueAgentFloodEvent(
+    allocator: std.mem.Allocator,
+    app: *session_runtime.SessionRuntime,
+    seq: *client_protocol.EventSeq,
+    event: agent_mod.AgentEvent,
+) !void {
+    const owned = try client_protocol.OwnedAgentEvent.init(allocator, event);
+    try enqueueClientFloodEvent(allocator, app, seq, .{ .agent_event = owned });
+}
+
+fn enqueueClientFloodEvent(
+    allocator: std.mem.Allocator,
+    app: *session_runtime.SessionRuntime,
+    seq: *client_protocol.EventSeq,
+    event: client_protocol.ClientEvent,
+) !void {
+    var envelope: client_protocol.EventEnvelope = .{ .seq = seq.*, .event = event };
+    app.events.push(envelope) catch |err| {
+        envelope.deinit(allocator);
+        return err;
+    };
+    seq.* += 1;
+    app.next_event_seq = seq.*;
 }
 
 fn selectResumeSession(process: runtime.Process, stderr: *std.Io.Writer, options: Options) !?[]const u8 {

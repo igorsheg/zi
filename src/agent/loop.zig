@@ -187,14 +187,14 @@ pub const Error = error{
     MissingAssistantResult,
 };
 
-fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
+pub fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent.AgentEvent {
     return switch (event) {
         .tool_execution_start => |payload| blk: {
             const tool_call_id = try allocator.dupe(u8, payload.tool_call_id);
             errdefer allocator.free(tool_call_id);
             const tool_name = try allocator.dupe(u8, payload.tool_name);
             errdefer allocator.free(tool_name);
-            const args = try runtime.cloneJsonValue(allocator, payload.args);
+            const args = try copyToolArgumentPreview(allocator, payload.args);
             errdefer runtime.freeJsonValue(allocator, args);
             break :blk .{ .tool_execution_start = .{
                 .tool_call_id = tool_call_id,
@@ -207,7 +207,7 @@ fn copyStreamEvent(allocator: std.mem.Allocator, event: agent.AgentEvent) !agent
             errdefer allocator.free(tool_call_id);
             const tool_name = try allocator.dupe(u8, payload.tool_name);
             errdefer allocator.free(tool_name);
-            const args = try runtime.cloneJsonValue(allocator, payload.args);
+            const args = try copyToolArgumentPreview(allocator, payload.args);
             errdefer runtime.freeJsonValue(allocator, args);
             const partial_result = try agent.copyAgentToolResult(allocator, payload.partial_result);
             errdefer agent.deinitAgentToolResult(allocator, partial_result);
@@ -1060,6 +1060,26 @@ test "stream event copy bounds delta partial to changed content" {
         @as(i64, 20),
         copied_partial.content[1].tool_call.arguments.object.get("limit").?.integer,
     );
+}
+
+test "stream event copy bounds tool execution args" {
+    var args = std.json.ObjectMap.empty;
+    defer args.deinit(std.testing.allocator);
+    try args.put(std.testing.allocator, "path", .{ .string = "file.txt" });
+    try args.put(std.testing.allocator, "content", .{ .string = "x" ** (stream_tool_argument_preview_bytes_max * 2) });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const copied = try copyStreamEvent(arena.allocator(), .{ .tool_execution_start = .{
+        .tool_call_id = "call-write",
+        .tool_name = "write",
+        .args = .{ .object = args },
+    } });
+
+    const copied_args = copied.tool_execution_start.args.object;
+    try std.testing.expectEqualStrings("file.txt", copied_args.get("path").?.string);
+    try std.testing.expectEqual(@as(usize, stream_tool_argument_preview_bytes_max), copied_args.get("content").?.string.len);
 }
 
 test "compact text delta partial with real content drops to empty content" {

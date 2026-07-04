@@ -83,6 +83,7 @@ agent event -> queue/status mirror -> bounded ClientEvent queue
   diff/render, colors/styles, and width.
 - Rendering is draw -> synchronous flush -> clear dirty only after success.
 - Every owner loop drain must have a per-turn event and/or time budget.
+- The owner loop performs no filesystem read of unbounded size, no subprocess wait, and no blocking network I/O.
 - Treat typed input as foreground work; model/session drains are background work.
 - Coalesce stream fragments before layout/render when ordering allows.
 - Do not introduce local ANSI encoders, raw-mode managers, cell buffers, diff
