@@ -81,6 +81,7 @@ pub const Engine = struct {
         stream: ?ai.StreamFunction = null,
         dir: std.Io.Dir = .cwd(),
         environ: ?*const std.process.Environ.Map = null,
+        home_dir: ?[]const u8 = null,
         task_runtime: ?*runtime.Runtime = null,
         allow_paths_outside_cwd: bool = true,
         public_event_capacity: usize = AgentSession.public_event_capacity_default,
@@ -145,6 +146,7 @@ pub const Engine = struct {
             .wake_pipe = wake_pipe,
         };
         self.drain = engine_drain.EngineDrain.init(allocator, &self.view_model);
+        self.drain.home_dir = options.home_dir;
         self.thread = try std.Thread.spawn(.{}, threadMain, .{ self, options });
         while (self.init_state.load(.acquire) == 0) std.Thread.yield() catch {};
         if (self.init_state.load(.acquire) == 2) {

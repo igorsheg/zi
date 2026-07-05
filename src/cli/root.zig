@@ -168,6 +168,7 @@ fn runTui(
             .current_date = Engine.SessionStamp.now(process.io).date(),
             .dir = options.dir,
             .environ = options.environ,
+            .home_dir = process.env("HOME"),
         })
     else
         try openEngineRuntime("tui", process, stderr, app_args, options);
@@ -300,6 +301,7 @@ fn openEngineRuntime(
             .open = .{ .resume_existing = .{ .session_file_name = session_file } },
             .dir = options.dir,
             .environ = options.environ,
+            .home_dir = process.env("HOME"),
         });
     }
     var session_id_buffer: [48]u8 = undefined;
@@ -312,6 +314,7 @@ fn openEngineRuntime(
         .open = .{ .create = .{ .session_id = session_id, .timestamp = stamp.timestamp() } },
         .dir = options.dir,
         .environ = options.environ,
+        .home_dir = process.env("HOME"),
     });
 }
 

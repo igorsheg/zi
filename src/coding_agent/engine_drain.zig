@@ -20,6 +20,7 @@ pub const EngineDrain = struct {
     tools: std.ArrayList(ToolCursor) = .empty,
     /// Test-only clock override for throttle tests; null in production.
     test_now_ms: ?i64 = null,
+    home_dir: ?[]const u8 = null,
 
     const Pending = struct {
         user: ?u64 = null,
@@ -265,7 +266,15 @@ pub const EngineDrain = struct {
             .tool_result => |tool| {
                 const cursor = try self.ensureTool(writer, tool.tool_call_id, tool.tool_name);
                 self.pending.tool = cursor.item_id;
-                if (!cursor.streams_output) try writer.replaceItemText(self.allocator, cursor.item_id, toolResultBody(tool.tool_name, tool.is_error, tool.content, tool.details));
+                if (!cursor.streams_output) try replaceToolResultBody(
+                    writer,
+                    self.allocator,
+                    cursor.item_id,
+                    tool.tool_name,
+                    tool.is_error,
+                    tool.content,
+                    tool.details,
+                );
                 setToolDetails(writer, cursor.item_id, tool.details);
             },
             .custom => |custom| self.pending.custom = try writer.addItem(self.allocator, .system_notice, .streaming, custom.kind, null),
@@ -319,14 +328,8 @@ pub const EngineDrain = struct {
             }
         }
         cursor.last_preview_ms = now;
-        updateToolTitle(writer, cursor.item_id, call.name, call.arguments);
-        if (std.mem.eql(u8, call.name, "write")) {
-            try self.writePreview(writer, cursor, call.arguments);
-            return;
-        }
-        const preview = try jsonPreview(self.allocator, call.arguments);
-        defer self.allocator.free(preview);
-        try writer.replaceItemText(self.allocator, cursor.item_id, preview);
+        updateToolTitle(writer, cursor.item_id, call.name, call.arguments, self.home_dir);
+        if (std.mem.eql(u8, call.name, "write")) try self.writePreview(writer, cursor, call.arguments);
     }
 
     /// Write-tool call preview: the first `lines_max` content lines stream
@@ -360,6 +363,7 @@ pub const EngineDrain = struct {
     fn toolStart(self: *EngineDrain, writer: *vm.Writer, payload: agent_mod.AgentEvent.ToolExecutionStart) !void {
         const cursor = try self.ensureTool(writer, payload.tool_call_id, payload.tool_name);
         cursor.started_ms = nowMs();
+        updateToolTitle(writer, cursor.item_id, payload.tool_name, payload.args, self.home_dir);
         try writer.replaceItemText(self.allocator, cursor.item_id, "");
         if (findItem(writer, cursor.item_id)) |item| {
             if (item.tool) |*tool| tool.started_ms = cursor.started_ms;
@@ -370,12 +374,20 @@ pub const EngineDrain = struct {
 
     fn toolUpdate(self: *EngineDrain, writer: *vm.Writer, payload: agent_mod.AgentEvent.ToolExecutionUpdate) !void {
         const cursor = try self.ensureTool(writer, payload.tool_call_id, payload.tool_name);
-        try writer.appendItemText(self.allocator, cursor.item_id, toolResultText(payload.partial_result.content));
+        try appendItemTextNormalized(writer, self.allocator, cursor.item_id, toolResultText(payload.partial_result.content));
     }
 
     fn toolEnd(self: *EngineDrain, writer: *vm.Writer, payload: agent_mod.AgentEvent.ToolExecutionEnd) !void {
         const cursor = try self.ensureTool(writer, payload.tool_call_id, payload.tool_name);
-        if (!cursor.streams_output) try writer.replaceItemText(self.allocator, cursor.item_id, toolResultBody(payload.tool_name, payload.is_error, payload.result.content, payload.result.details));
+        if (!cursor.streams_output) try replaceToolResultBody(
+            writer,
+            self.allocator,
+            cursor.item_id,
+            payload.tool_name,
+            payload.is_error,
+            payload.result.content,
+            payload.result.details,
+        );
         if (findItem(writer, cursor.item_id)) |item| {
             if (item.tool) |*tool| {
                 tool.duration_ms = if (cursor.started_ms) |start| @intCast(@max(nowMs() - start, 0)) else 0;
@@ -391,7 +403,6 @@ pub const EngineDrain = struct {
         var meta: vm.ToolMeta = .{};
         meta.tool_call_id.set(id);
         meta.name.set(name);
-        meta.title.set(name);
         meta.display = tool_metadata.displayForTool(name);
         meta.streams_output = meta.display.streams_output;
         const item_id = try writer.addItem(self.allocator, .tool, .streaming, "", meta);
@@ -470,6 +481,62 @@ fn toolResultBody(tool_name: []const u8, is_error: bool, content: []const ai.Too
     return toolResultText(content);
 }
 
+fn replaceToolResultBody(
+    writer: *vm.Writer,
+    allocator: std.mem.Allocator,
+    item_id: u64,
+    tool_name: []const u8,
+    is_error: bool,
+    content: []const ai.ToolResultContent,
+    details: ?std.json.Value,
+) !void {
+    try replaceItemTextNormalized(
+        writer,
+        allocator,
+        item_id,
+        toolResultBody(tool_name, is_error, content, details),
+    );
+}
+
+fn appendItemTextNormalized(writer: *vm.Writer, allocator: std.mem.Allocator, item_id: u64, text: []const u8) !void {
+    var buffer: [4096]u8 = undefined;
+    var rest = text;
+    while (rest.len > 0) {
+        const chunk = normalizedOutputChunk(&buffer, rest);
+        if (chunk.consumed == 0) return;
+        if (chunk.text.len > 0) try writer.appendItemText(allocator, item_id, chunk.text);
+        rest = rest[chunk.consumed..];
+    }
+}
+
+fn replaceItemTextNormalized(writer: *vm.Writer, allocator: std.mem.Allocator, item_id: u64, text: []const u8) !void {
+    var buffer: [vm.tool_output_bytes_max + 1]u8 = undefined;
+    const chunk = normalizedOutputChunk(&buffer, text);
+    try writer.replaceItemText(allocator, item_id, chunk.text);
+}
+
+const NormalizedChunk = struct {
+    text: []const u8,
+    consumed: usize,
+};
+
+fn normalizedOutputChunk(buffer: []u8, text: []const u8) NormalizedChunk {
+    var out: usize = 0;
+    var consumed: usize = 0;
+    for (text) |byte| {
+        if (byte == '\r') {
+            consumed += 1;
+            continue;
+        }
+        const replacement = if (byte == '\t') "   " else text[consumed .. consumed + 1];
+        if (out + replacement.len > buffer.len) break;
+        @memcpy(buffer[out..][0..replacement.len], replacement);
+        out += replacement.len;
+        consumed += 1;
+    }
+    return .{ .text = buffer[0..out], .consumed = consumed };
+}
+
 fn setToolDetails(writer: *vm.Writer, item_id: u64, details: ?std.json.Value) void {
     if (findItem(writer, item_id)) |item| if (item.tool) |*tool| {
         setDetailsJson(tool, details);
@@ -478,12 +545,21 @@ fn setToolDetails(writer: *vm.Writer, item_id: u64, details: ?std.json.Value) vo
     };
 }
 
-fn updateToolTitle(writer: *vm.Writer, item_id: u64, name: []const u8, arguments: std.json.Value) void {
-    var buffer: [(vm.ToolMeta{}).title.bytes.len]u8 = undefined;
-    const title = formatToolTitle(&buffer, name, arguments);
+fn updateToolTitle(
+    writer: *vm.Writer,
+    item_id: u64,
+    name: []const u8,
+    arguments: std.json.Value,
+    home_dir: ?[]const u8,
+) void {
+    var title_buffer: [(vm.ToolMeta{}).title.bytes.len]u8 = undefined;
+    var compact_buffer: [(vm.ToolMeta{}).compact_title.bytes.len]u8 = undefined;
+    const title = formatToolTitle(&title_buffer, name, arguments, home_dir);
+    const compact_title = formatCompactToolTitle(&compact_buffer, name, arguments);
     if (findItem(writer, item_id)) |item| if (item.tool) |*tool| {
-        if (tool.title.eql(title)) return;
+        if (tool.title.eql(title) and tool.compact_title.eql(compact_title)) return;
         tool.title.set(title);
+        tool.compact_title.set(compact_title);
         bumpItem(item);
         writer.touched = true;
     };
@@ -499,8 +575,13 @@ fn toolKind(name: []const u8) ToolKind {
     return .custom;
 }
 
-fn formatToolTitle(buffer: []u8, name: []const u8, arguments: std.json.Value) []const u8 {
-    var title: TitleBuilder = .{ .buffer = buffer };
+fn formatToolTitle(
+    buffer: []u8,
+    name: []const u8,
+    arguments: std.json.Value,
+    home_dir: ?[]const u8,
+) []const u8 {
+    var title: TitleBuilder = .{ .buffer = buffer, .home_dir = home_dir };
     switch (toolKind(name)) {
         .bash => {
             title.add("$ ");
@@ -513,21 +594,77 @@ fn formatToolTitle(buffer: []u8, name: []const u8, arguments: std.json.Value) []
         },
         .read => {
             title.add("read ");
-            title.add(argString(arguments, "file_path") orelse argStringOrEllipsis(arguments, "path"));
+            title.addPath(argString(arguments, "file_path") orelse argStringOrEllipsis(arguments, "path"));
             addReadLineRange(&title, arguments);
         },
         .edit, .write => {
             title.add(name);
             title.add(" ");
-            title.add(argString(arguments, "file_path") orelse argStringOrEllipsis(arguments, "path"));
+            title.addPath(argString(arguments, "file_path") orelse argStringOrEllipsis(arguments, "path"));
         },
-        .custom => title.add(name),
+        .custom => return "",
     }
     return title.slice();
 }
 
+fn formatCompactToolTitle(buffer: []u8, name: []const u8, arguments: std.json.Value) []const u8 {
+    if (toolKind(name) != .read) return "";
+    const classification = compactReadClassification(arguments) orelse return "";
+    var title: TitleBuilder = .{ .buffer = buffer };
+    switch (classification.kind) {
+        .skill => {
+            title.add("[skill] ");
+            title.add(classification.label);
+        },
+        .docs => {
+            title.add("read docs ");
+            title.add(classification.label);
+        },
+        .resource => {
+            title.add("read resource ");
+            title.add(classification.label);
+        },
+    }
+    addReadLineRange(&title, arguments);
+    title.add(" (ctrl+o to expand)");
+    return title.slice();
+}
+
+const CompactReadKind = enum { skill, docs, resource };
+
+const CompactReadClassification = struct {
+    kind: CompactReadKind,
+    label: []const u8,
+};
+
+fn compactReadClassification(arguments: std.json.Value) ?CompactReadClassification {
+    const path = argString(arguments, "file_path") orelse argString(arguments, "path") orelse return null;
+    const leaf = std.fs.path.basename(path);
+    if (std.mem.eql(u8, leaf, "SKILL.md")) {
+        const parent = if (std.fs.path.dirname(path)) |dirname| std.fs.path.basename(dirname) else leaf;
+        return .{ .kind = .skill, .label = if (parent.len > 0) parent else leaf };
+    }
+    if (isCompactResourceLeaf(leaf)) return .{ .kind = .resource, .label = path };
+    if (!std.fs.path.isAbsolute(path) and isCompactDocsPath(path)) return .{ .kind = .docs, .label = path };
+    return null;
+}
+
+fn isCompactResourceLeaf(leaf: []const u8) bool {
+    return std.mem.eql(u8, leaf, "AGENTS.md") or
+        std.mem.eql(u8, leaf, "AGENTS.MD") or
+        std.mem.eql(u8, leaf, "CLAUDE.md") or
+        std.mem.eql(u8, leaf, "CLAUDE.MD");
+}
+
+fn isCompactDocsPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "README.md") or
+        std.mem.startsWith(u8, path, "docs/") or
+        std.mem.startsWith(u8, path, "examples/");
+}
+
 const TitleBuilder = struct {
     buffer: []u8,
+    home_dir: ?[]const u8 = null,
     len: usize = 0,
 
     fn add(self: *TitleBuilder, text: []const u8) void {
@@ -543,12 +680,40 @@ const TitleBuilder = struct {
         self.add(std.fmt.bufPrint(&digits, "{d}", .{value}) catch return);
     }
 
+    fn addPath(self: *TitleBuilder, path: []const u8) void {
+        const suffix = homePathSuffix(path, self.home_dir) orelse {
+            self.add(path);
+            return;
+        };
+        self.add("~");
+        self.add(suffix);
+    }
+
     fn slice(self: *const TitleBuilder) []const u8 {
         var end = self.len;
         while (end > 0 and !std.unicode.utf8ValidateSlice(self.buffer[0..end])) end -= 1;
         return self.buffer[0..end];
     }
 };
+
+fn homePathSuffix(path: []const u8, home_dir_raw: ?[]const u8) ?[]const u8 {
+    const home_raw = home_dir_raw orelse return null;
+    const home = trimTrailingPathSeparators(home_raw);
+    if (home.len == 0 or !std.mem.startsWith(u8, path, home)) return null;
+    if (path.len == home.len) return "";
+    if (!isPathSeparator(path[home.len])) return null;
+    return path[home.len..];
+}
+
+fn trimTrailingPathSeparators(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and isPathSeparator(path[end - 1])) end -= 1;
+    return path[0..end];
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == '/' or byte == '\\';
+}
 
 fn addReadLineRange(title: *TitleBuilder, arguments: std.json.Value) void {
     const offset = argPositiveInt(arguments, "offset");
@@ -595,13 +760,6 @@ fn setDetailsJson(tool: *vm.ToolMeta, details: ?std.json.Value) void {
         error.WriteFailed => {},
     };
     tool.details_json.set(writer.buffered());
-}
-
-fn jsonPreview(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    errdefer writer.deinit();
-    try std.json.Stringify.value(value, .{}, &writer.writer);
-    return writer.toOwnedSlice();
 }
 
 fn compactionTrigger(reason: client_protocol.CompactionReason) vm.CompactionTrigger {
@@ -691,6 +849,7 @@ test "tool preview derives bash and write titles from arguments" {
     first.finish();
     try std.testing.expectEqualStrings("$ rg foo", model.transcript.items.items[0].tool.?.title.slice());
     try std.testing.expectEqualStrings("bash", model.transcript.items.items[0].tool.?.name.slice());
+    try std.testing.expectEqualStrings("", model.transcript.items.items[0].text.items);
 
     var write_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"src/file.zig\"}", .{});
     defer write_args.deinit();
@@ -702,6 +861,97 @@ test "tool preview derives bash and write titles from arguments" {
     second.finish();
     try std.testing.expectEqualStrings("write src/file.zig", model.transcript.items.items[1].tool.?.title.slice());
     try std.testing.expectEqualStrings("write", model.transcript.items.items[1].tool.?.name.slice());
+}
+
+test "tool title builder mirrors pre-cutover goldens" {
+    const gpa = std.testing.allocator;
+    var buffer: [(vm.ToolMeta{}).title.bytes.len]u8 = undefined;
+
+    var bash_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"command\":\"pwd\",\"timeout\":5}", .{});
+    defer bash_args.deinit();
+    try std.testing.expectEqualStrings("$ pwd (timeout 5s)", formatToolTitle(&buffer, "bash", bash_args.value, null));
+
+    var read_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"src/main.zig\",\"offset\":10,\"limit\":20}", .{});
+    defer read_args.deinit();
+    try std.testing.expectEqualStrings("read src/main.zig:10-29", formatToolTitle(&buffer, "read", read_args.value, null));
+
+    var home_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"/Users/me/repo/src/main.zig\"}", .{});
+    defer home_args.deinit();
+    try std.testing.expectEqualStrings("read ~/repo/src/main.zig", formatToolTitle(&buffer, "read", home_args.value, "/Users/me"));
+
+    var home_root_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"/Users/me\"}", .{});
+    defer home_root_args.deinit();
+    try std.testing.expectEqualStrings("read ~", formatToolTitle(&buffer, "read", home_root_args.value, "/Users/me"));
+
+    var empty_args = try std.json.parseFromSlice(std.json.Value, gpa, "{}", .{});
+    defer empty_args.deinit();
+    try std.testing.expectEqualStrings("$ ...", formatToolTitle(&buffer, "bash", empty_args.value, null));
+    try std.testing.expectEqualStrings("", formatToolTitle(&buffer, "mystery", empty_args.value, null));
+
+    var multiline_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"command\":\"echo a\\necho b\"}", .{});
+    defer multiline_args.deinit();
+    try std.testing.expectEqualStrings("$ echo a echo b", formatToolTitle(&buffer, "bash", multiline_args.value, null));
+}
+
+test "compact tool titles mirror pre-cutover read headers" {
+    const gpa = std.testing.allocator;
+    var buffer: [(vm.ToolMeta{}).compact_title.bytes.len]u8 = undefined;
+
+    var skill_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\".zi/skills/review/SKILL.md\",\"limit\":10}", .{});
+    defer skill_args.deinit();
+    try std.testing.expectEqualStrings(
+        "[skill] review:1-10 (ctrl+o to expand)",
+        formatCompactToolTitle(&buffer, "read", skill_args.value),
+    );
+
+    var docs_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"docs/themes.md\"}", .{});
+    defer docs_args.deinit();
+    try std.testing.expectEqualStrings(
+        "read docs docs/themes.md (ctrl+o to expand)",
+        formatCompactToolTitle(&buffer, "read", docs_args.value),
+    );
+
+    var resource_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"AGENTS.md\"}", .{});
+    defer resource_args.deinit();
+    try std.testing.expectEqualStrings(
+        "read resource AGENTS.md (ctrl+o to expand)",
+        formatCompactToolTitle(&buffer, "read", resource_args.value),
+    );
+
+    var regular_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"src/main.zig\"}", .{});
+    defer regular_args.deinit();
+    try std.testing.expectEqualStrings("", formatCompactToolTitle(&buffer, "read", regular_args.value));
+}
+
+test "tool output normalization removes carriage returns and expands tabs" {
+    var buffer: [16]u8 = undefined;
+    const chunk = normalizedOutputChunk(&buffer, "a\tb\rc");
+    try std.testing.expectEqualStrings("a   bc", chunk.text);
+    try std.testing.expectEqual(@as(usize, 5), chunk.consumed);
+
+    const bounded = normalizedOutputChunk(buffer[0..5], "a\tb\tc");
+    try std.testing.expectEqualStrings("a   b", bounded.text);
+    try std.testing.expectEqual(@as(usize, 3), bounded.consumed);
+}
+
+test "live tool update output is normalized" {
+    const gpa = std.testing.allocator;
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+
+    var args = try std.json.parseFromSlice(std.json.Value, gpa, "{}", .{});
+    defer args.deinit();
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = "a\tb\rc" } }};
+    try drain.agentEvent(.{ .tool_execution_update = .{
+        .tool_call_id = "call-b",
+        .tool_name = "bash",
+        .args = args.value,
+        .partial_result = .{ .content = &content },
+    } });
+
+    try std.testing.expectEqualStrings("a   bc", model.transcript.items.items[0].text.items);
 }
 
 test "tool preview title updates after throttle window" {
@@ -767,9 +1017,8 @@ test "tool preview rebuilds are throttled to the interval" {
             last_rev = rev;
         }
     }
-    // First build plus at most one rebuild per 32ms window: 100/32 + 2.
-    try std.testing.expect(rebuilds <= 5);
-    try std.testing.expect(rebuilds >= 2);
+    // Stable args mutate only once; throttled rebuilds do not produce duplicate view churn.
+    try std.testing.expectEqual(@as(usize, 1), rebuilds);
 }
 
 test "write preview caps visible lines and grows the count footer" {

@@ -554,6 +554,7 @@ pub const ToolMeta = struct {
     tool_call_id: BoundedText(128) = .{},
     name: BoundedText(64) = .{},
     title: BoundedText(256) = .{},
+    compact_title: BoundedText(256) = .{},
     display: tool_metadata.Display = .{},
     streams_output: bool = false,
     started_ms: ?i64 = null,

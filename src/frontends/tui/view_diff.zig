@@ -308,10 +308,13 @@ fn appendDeltaCommand(
     commands: *std.ArrayList(tui.Command),
 ) !void {
     switch (item.kind) {
-        .tool => if (item.tool) |*tool| try commands.append(gpa, .{ .tool_output_delta = .{
-            .tool_call_id = tool.tool_call_id.slice(),
-            .text = delta,
-        } }),
+        .tool => if (item.tool != null) {
+            const tool = &item.tool.?;
+            try commands.append(gpa, .{ .tool_output_delta = .{
+                .tool_call_id = tool.tool_call_id.slice(),
+                .text = delta,
+            } });
+        },
         .assistant => try commands.append(gpa, .{ .append_transcript = .{ .message = .{
             .role = .assistant,
             .text = delta,
@@ -360,7 +363,7 @@ fn toolAppend(item: *const vm.ItemDelta, footer: []const u8) tui.Transcript.Appe
         .body_mode = bodyMode(display.body_mode),
         .collapse = .{ .mode = collapseMode(display.collapse.mode), .lines_max = display.collapse.lines_max },
         .title = tool.title.slice(),
-        .compact_title = tool.title.slice(),
+        .compact_title = tool.compact_title.slice(),
         .output = item.text_suffix,
         .footer = footer,
     };
@@ -398,12 +401,13 @@ fn toolStatus(state: vm.Item.State) tui.Transcript.ToolStatus {
 }
 
 fn updateToolFooter(gpa: std.mem.Allocator, cursor: *ItemCursor, item: *const vm.ItemDelta) !void {
-    const tool = item.tool orelse {
+    if (item.tool == null) {
         cursor.footer_len = 0;
         cursor.static_footer_len = 0;
         cursor.shows_duration = false;
         return;
-    };
+    }
+    const tool = &item.tool.?;
     cursor.shows_duration = tool.display.shows_duration;
     cursor.started_ms = tool.started_ms;
     cursor.duration_ms = tool.duration_ms;
