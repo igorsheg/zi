@@ -182,3 +182,5 @@ Cut-over baseline: `46b6276~1`. Sources audited only: old `interactive.zig`, old
 8. Session change notices (`started new session` / `resumed session`) are gone.
 9. Live tool-output normalization (remove `\r`, expand tabs) is gone.
 10. Old presentation queue reveal cadences/coalescing/bounds/drop notice are gone.
+
+| 114 | Unbroken single-line items re-wrap O(len) per append in App apply-side scroll math; 64KiB single line costs ~84ms in Debug. Pre-existing (parity with old architecture) but should gain an incremental wrap path. | render/Transcript layout | KNOWN COST (backlog) | tui layout cache |

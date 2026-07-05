@@ -266,7 +266,7 @@ pub const EngineDrain = struct {
             .tool_result => |tool| {
                 const cursor = try self.ensureTool(writer, tool.tool_call_id, tool.tool_name);
                 self.pending.tool = cursor.item_id;
-                if (!cursor.streams_output) try replaceToolResultBody(
+                try replaceToolResultBody(
                     writer,
                     self.allocator,
                     cursor.item_id,
@@ -275,7 +275,7 @@ pub const EngineDrain = struct {
                     tool.content,
                     tool.details,
                 );
-                setToolDetails(writer, cursor.item_id, tool.details);
+                setToolResultMeta(writer, cursor.item_id, tool.is_error, tool.details);
             },
             .custom => |custom| self.pending.custom = try writer.addItem(self.allocator, .system_notice, .streaming, custom.kind, null),
         }
@@ -336,7 +336,7 @@ pub const EngineDrain = struct {
     /// as append-only item text (reader sampling stays O(delta)); past the
     /// cap only the "Showing lines" footer grows.
     fn writePreview(self: *EngineDrain, writer: *vm.Writer, cursor: *ToolCursor, arguments: std.json.Value) !void {
-        const content = argContentString(arguments) orelse return;
+        const content = trimTrailingEmptyLines(argContentString(arguments) orelse return);
         const lines_max: usize = tool_metadata.displayForTool("write").collapse.lines_max;
         const visible = firstLines(content, lines_max);
         if (visible.len > cursor.preview_len) {
@@ -364,7 +364,10 @@ pub const EngineDrain = struct {
         const cursor = try self.ensureTool(writer, payload.tool_call_id, payload.tool_name);
         cursor.started_ms = nowMs();
         updateToolTitle(writer, cursor.item_id, payload.tool_name, payload.args, self.home_dir);
-        try writer.replaceItemText(self.allocator, cursor.item_id, "");
+        if (toolKind(payload.tool_name) == .write) {
+            try writer.replaceItemText(self.allocator, cursor.item_id, "");
+            try writer.setItemFooter(cursor.item_id, "");
+        }
         if (findItem(writer, cursor.item_id)) |item| {
             if (item.tool) |*tool| tool.started_ms = cursor.started_ms;
             bumpItem(item);
@@ -379,7 +382,7 @@ pub const EngineDrain = struct {
 
     fn toolEnd(self: *EngineDrain, writer: *vm.Writer, payload: agent_mod.AgentEvent.ToolExecutionEnd) !void {
         const cursor = try self.ensureTool(writer, payload.tool_call_id, payload.tool_name);
-        if (!cursor.streams_output) try replaceToolResultBody(
+        try replaceToolResultBody(
             writer,
             self.allocator,
             cursor.item_id,
@@ -391,6 +394,7 @@ pub const EngineDrain = struct {
         if (findItem(writer, cursor.item_id)) |item| {
             if (item.tool) |*tool| {
                 tool.duration_ms = if (cursor.started_ms) |start| @intCast(@max(nowMs() - start, 0)) else 0;
+                tool.is_error = payload.is_error;
                 setDetailsJson(tool, payload.result.details);
             }
             bumpItem(item);
@@ -474,11 +478,32 @@ fn toolResultText(content: []const ai.ToolResultContent) []const u8 {
     return "";
 }
 
-fn toolResultBody(tool_name: []const u8, is_error: bool, content: []const ai.ToolResultContent, details: ?std.json.Value) []const u8 {
-    if (!is_error and std.mem.eql(u8, tool_name, "edit")) {
-        if (details) |value| if (value == .object) if (value.object.get("diff")) |diff| if (diff == .string) return diff.string;
+fn toolResultBody(
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    is_error: bool,
+    content: []const ai.ToolResultContent,
+    details: ?std.json.Value,
+) ![]u8 {
+    if (!is_error and toolKind(tool_name) == .edit) {
+        if (details) |value| if (value == .object) if (value.object.get("diff")) |diff| if (diff == .string)
+            return allocator.dupe(u8, diff.string);
     }
-    return toolResultText(content);
+
+    const trim = shouldTrimResult(tool_name, is_error);
+    var body = try formatResultContent(allocator, content, trim);
+    errdefer allocator.free(body);
+    if (details) |value| if (value == .object) if (outputPrefixFromDetails(value.object, body)) |prefix| {
+        const clipped = try allocator.dupe(u8, prefix);
+        allocator.free(body);
+        body = clipped;
+    };
+
+    return switch (toolKind(tool_name)) {
+        .bash => try bashBodyFromDetails(allocator, details, body),
+        .read => if (!is_error) try trimOwnedTrailingEmptyLines(allocator, body) else body,
+        .edit, .write, .custom => body,
+    };
 }
 
 fn replaceToolResultBody(
@@ -490,12 +515,186 @@ fn replaceToolResultBody(
     content: []const ai.ToolResultContent,
     details: ?std.json.Value,
 ) !void {
-    try replaceItemTextNormalized(
-        writer,
-        allocator,
-        item_id,
-        toolResultBody(tool_name, is_error, content, details),
-    );
+    if (shouldHideSuccessfulToolResult(tool_name, is_error, details)) return;
+    const body = try toolResultBody(allocator, tool_name, is_error, content, details);
+    defer allocator.free(body);
+    try replaceItemTextNormalized(writer, allocator, item_id, body);
+}
+
+fn formatResultContent(
+    allocator: std.mem.Allocator,
+    content: []const ai.ToolResultContent,
+    trim_trailing_empty_lines: bool,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var wrote_any = false;
+    for (content) |item| {
+        const text = switch (item) {
+            .text => |text_content| if (trim_trailing_empty_lines)
+                trimTrailingEmptyLines(text_content.text)
+            else
+                text_content.text,
+            .image => |image| imageFallbackText(image.mime_type),
+        };
+        if (text.len == 0) continue;
+        if (wrote_any) try writer.writer.writeByte('\n');
+        try writer.writer.writeAll(text);
+        wrote_any = true;
+    }
+    return writer.toOwnedSlice();
+}
+
+fn imageFallbackText(mime_type: []const u8) []const u8 {
+    if (mime_type.len == 0) return "[Image]";
+    if (std.mem.eql(u8, mime_type, "image/png")) return "[Image: image/png]";
+    if (std.mem.eql(u8, mime_type, "image/jpeg")) return "[Image: image/jpeg]";
+    if (std.mem.eql(u8, mime_type, "image/gif")) return "[Image: image/gif]";
+    if (std.mem.eql(u8, mime_type, "image/webp")) return "[Image: image/webp]";
+    return "[Image]";
+}
+
+fn bashBodyFromDetails(allocator: std.mem.Allocator, details: ?std.json.Value, owned_text: []u8) ![]u8 {
+    errdefer allocator.free(owned_text);
+    const object = if (details) |value| if (value == .object) value.object else return owned_text else return owned_text;
+    const output = trimTrailingEmptyLines(stripLegacyBashNotices(owned_text));
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var wrote_any = false;
+    if (output.len > 0) {
+        try writer.writer.writeAll(output);
+        wrote_any = true;
+    }
+    try writeBashStatus(&writer.writer, object, &wrote_any);
+    allocator.free(owned_text);
+    return writer.toOwnedSlice();
+}
+
+fn shouldHideSuccessfulToolResult(tool_name: []const u8, is_error: bool, details: ?std.json.Value) bool {
+    if (is_error or toolKind(tool_name) != .write) return false;
+    const value = details orelse return false;
+    if (value != .object) return false;
+    return jsonInt(value.object, "bytesWritten") != null;
+}
+
+fn shouldTrimResult(name: []const u8, is_error: bool) bool {
+    if (is_error) return false;
+    return switch (toolKind(name)) {
+        .bash, .read, .write => true,
+        .edit, .custom => false,
+    };
+}
+
+fn trimOwnedTrailingEmptyLines(allocator: std.mem.Allocator, owned_text: []u8) ![]u8 {
+    const trimmed = trimTrailingEmptyLines(owned_text);
+    if (trimmed.len == owned_text.len) return owned_text;
+    const copy = try allocator.dupe(u8, trimmed);
+    allocator.free(owned_text);
+    return copy;
+}
+
+fn trimTrailingEmptyLines(text: []const u8) []const u8 {
+    var end = text.len;
+    while (end > 0 and text[end - 1] == '\n') {
+        end -= 1;
+        if (end > 0 and text[end - 1] == '\r') end -= 1;
+    }
+    return text[0..end];
+}
+
+fn outputPrefixFromDetails(object: std.json.ObjectMap, text: []const u8) ?[]const u8 {
+    const truncation = jsonObject(object, "truncation") orelse return null;
+    const output_bytes = jsonInt(truncation, "outputBytes") orelse return null;
+    if (output_bytes < 0) return null;
+    const end = std.math.cast(usize, output_bytes) orelse return null;
+    if (end > text.len) return null;
+    return utf8Prefix(text, end);
+}
+
+fn utf8Prefix(text: []const u8, end: usize) []const u8 {
+    var valid_end = end;
+    while (valid_end > 0 and !std.unicode.utf8ValidateSlice(text[0..valid_end])) valid_end -= 1;
+    return text[0..valid_end];
+}
+
+fn stripLegacyBashNotices(text: []const u8) []const u8 {
+    var end = trimTrailingEmptyLines(text).len;
+    while (end > 0) {
+        const start = if (std.mem.lastIndexOfScalar(u8, text[0..end], '\n')) |index| index + 1 else 0;
+        const line = text[start..end];
+        if (!isLegacyBashNotice(line)) break;
+        end = trimTrailingEmptyLines(text[0..start]).len;
+    }
+    return text[0..end];
+}
+
+fn isLegacyBashNotice(line: []const u8) bool {
+    return (std.mem.startsWith(u8, line, "[Showing ") and std.mem.endsWith(u8, line, "]")) or
+        (std.mem.startsWith(u8, line, "[Command exited with code ") and std.mem.endsWith(u8, line, "]")) or
+        std.mem.eql(u8, line, "[Command timed out]") or
+        std.mem.eql(u8, line, "[bash output limit exceeded]") or
+        std.mem.eql(u8, line, "[Command aborted]") or
+        (std.mem.startsWith(u8, line, "[Command killed by signal ") and std.mem.endsWith(u8, line, "]")) or
+        (std.mem.startsWith(u8, line, "[Command stopped by signal ") and std.mem.endsWith(u8, line, "]")) or
+        (std.mem.startsWith(u8, line, "[Command exited with unknown status ") and std.mem.endsWith(u8, line, "]"));
+}
+
+fn writeBashStatus(writer: *std.Io.Writer, object: std.json.ObjectMap, wrote_any: *bool) !void {
+    if (jsonInt(object, "exitCode")) |code| {
+        if (code == 0) return;
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.print("Command exited with code {d}", .{code});
+        return;
+    }
+    if (jsonBool(object, "timedOut") orelse false) {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.writeAll("Command timed out");
+        return;
+    }
+    if (jsonBool(object, "outputLimitExceeded") orelse false) {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.writeAll("bash output limit exceeded");
+        return;
+    }
+    if (jsonBool(object, "cancelled") orelse false) {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.writeAll("Command aborted");
+        return;
+    }
+    if (jsonInt(object, "signal")) |signal| {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.print("Command killed by signal {d}", .{signal});
+        return;
+    }
+    if (jsonInt(object, "stopped")) |signal| {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.print("Command stopped by signal {d}", .{signal});
+        return;
+    }
+    if (jsonInt(object, "unknown")) |code| {
+        try writeStatusSeparator(writer, wrote_any);
+        try writer.print("Command exited with unknown status {d}", .{code});
+    }
+}
+
+fn writeStatusSeparator(writer: *std.Io.Writer, wrote_any: *bool) !void {
+    if (wrote_any.*) try writer.writeByte('\n');
+    wrote_any.* = true;
+}
+
+fn jsonObject(object: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = object.get(key) orelse return null;
+    return if (value == .object) value.object else null;
+}
+
+fn jsonInt(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = object.get(key) orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
+fn jsonBool(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = object.get(key) orelse return null;
+    return if (value == .bool) value.bool else null;
 }
 
 fn appendItemTextNormalized(writer: *vm.Writer, allocator: std.mem.Allocator, item_id: u64, text: []const u8) !void {
@@ -537,8 +736,9 @@ fn normalizedOutputChunk(buffer: []u8, text: []const u8) NormalizedChunk {
     return .{ .text = buffer[0..out], .consumed = consumed };
 }
 
-fn setToolDetails(writer: *vm.Writer, item_id: u64, details: ?std.json.Value) void {
+fn setToolResultMeta(writer: *vm.Writer, item_id: u64, is_error: bool, details: ?std.json.Value) void {
     if (findItem(writer, item_id)) |item| if (item.tool) |*tool| {
+        tool.is_error = is_error;
         setDetailsJson(tool, details);
         bumpItem(item);
         writer.touched = true;
@@ -830,6 +1030,151 @@ test "edit tool end publishes diff body and details json" {
     try std.testing.expectEqualStrings("--- a/file\n+++ b/file", item.text.items);
     try std.testing.expect(item.tool != null);
     try std.testing.expect(std.mem.indexOf(u8, item.tool.?.details_json.slice(), "\"diff\"") != null);
+}
+
+test "settled tool result body joins text blocks and image fallback" {
+    const gpa = std.testing.allocator;
+    const content = [_]ai.ToolResultContent{
+        .{ .text = .{ .text = "Read image file [image/png]\n" } },
+        .{ .image = .{ .data = "base64", .mime_type = "image/png" } },
+        .{ .text = .{ .text = "tail" } },
+    };
+    const text = try toolResultBody(gpa, "read", false, &content, null);
+    defer gpa.free(text);
+
+    try std.testing.expectEqualStrings("Read image file [image/png]\n[Image: image/png]\ntail", text);
+}
+
+test "settled bash result strips legacy notices and appends status from details" {
+    const gpa = std.testing.allocator;
+    var details = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        "{\"exitCode\":1,\"truncation\":{\"truncated\":true,\"truncatedBy\":\"lines\"," ++
+            "\"outputLines\":5,\"totalLines\":100,\"outputBytes\":16,\"maxBytes\":51200}}",
+        .{},
+    );
+    defer details.deinit();
+    const content = [_]ai.ToolResultContent{.{ .text = .{
+        .text = "line 96\nline 100\n\n[Showing lines 96-100 of 100 (50KB limit)]\n\nCommand exited with code 1",
+    } }};
+    const text = try toolResultBody(gpa, "bash", true, &content, details.value);
+    defer gpa.free(text);
+
+    try std.testing.expectEqualStrings("line 96\nline 100\nCommand exited with code 1", text);
+}
+
+test "settled read result moves continuation notices out of body" {
+    const gpa = std.testing.allocator;
+    var details = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        "{\"nextOffset\":4,\"truncation\":{\"truncated\":false,\"userLimit\":true," ++
+            "\"remainingLines\":1,\"outputBytes\":9}}",
+        .{},
+    );
+    defer details.deinit();
+    const content = [_]ai.ToolResultContent{.{ .text = .{
+        .text = "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]",
+    } }};
+    const text = try toolResultBody(gpa, "read", false, &content, details.value);
+    defer gpa.free(text);
+
+    try std.testing.expectEqualStrings("two\nthree", text);
+}
+
+test "settled write success keeps preview body and error flag is retained" {
+    const gpa = std.testing.allocator;
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+
+    var args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"f.txt\",\"content\":\"one\\n\\n\"}", .{});
+    defer args.deinit();
+    const call_content = [_]ai.AssistantContent{ai.faux.toolCall("call-w", "write", args.value)};
+    const assistant = ai.faux.assistantMessage(&call_content, .{});
+    var preview = model.lockWriter();
+    try drain.toolPreview(&preview, assistant, 0, true);
+    preview.finish();
+    try std.testing.expectEqualStrings("one", model.transcript.items.items[0].text.items);
+
+    var details = try std.json.parseFromSlice(std.json.Value, gpa, "{\"bytesWritten\":5,\"path\":\"f.txt\"}", .{});
+    defer details.deinit();
+    const result_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "Wrote file" } }};
+    try drain.agentEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "call-w",
+        .tool_name = "write",
+        .result = .{ .content = &result_content, .details = details.value },
+        .is_error = false,
+    } });
+
+    try std.testing.expectEqualStrings("one", model.transcript.items.items[0].text.items);
+    try std.testing.expect(!model.transcript.items.items[0].tool.?.is_error);
+}
+
+test "tool start only clears write body and footer" {
+    const gpa = std.testing.allocator;
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+
+    var write_args = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        "{\"path\":\"f.txt\",\"content\":\"l1\\nl2\\nl3\\nl4\\nl5\\nl6\\nl7\\nl8\\nl9\\nl10\\nl11\"}",
+        .{},
+    );
+    defer write_args.deinit();
+    const write_call = [_]ai.AssistantContent{ai.faux.toolCall("call-w", "write", write_args.value)};
+    const write_assistant = ai.faux.assistantMessage(&write_call, .{});
+    var preview = model.lockWriter();
+    try drain.toolPreview(&preview, write_assistant, 0, true);
+    preview.finish();
+    try std.testing.expectEqualStrings("Showing lines 1-10 of 11", model.transcript.items.items[0].footer.slice());
+
+    try drain.agentEvent(.{ .tool_execution_start = .{
+        .tool_call_id = "call-w",
+        .tool_name = "write",
+        .args = write_args.value,
+    } });
+    try std.testing.expectEqualStrings("", model.transcript.items.items[0].text.items);
+    try std.testing.expectEqualStrings("", model.transcript.items.items[0].footer.slice());
+
+    var bash_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"command\":\"pwd\"}", .{});
+    defer bash_args.deinit();
+    const bash_content = [_]ai.ToolResultContent{.{ .text = .{ .text = "already streamed" } }};
+    try drain.agentEvent(.{ .tool_execution_update = .{
+        .tool_call_id = "call-b",
+        .tool_name = "bash",
+        .args = bash_args.value,
+        .partial_result = .{ .content = &bash_content },
+    } });
+    try drain.agentEvent(.{ .tool_execution_start = .{
+        .tool_call_id = "call-b",
+        .tool_name = "bash",
+        .args = bash_args.value,
+    } });
+    try std.testing.expectEqualStrings("already streamed", model.transcript.items.items[1].text.items);
+}
+
+test "settled tool error flag is retained" {
+    const gpa = std.testing.allocator;
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = "nope" } }};
+    try drain.agentEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "call-read",
+        .tool_name = "read",
+        .result = .{ .content = &content },
+        .is_error = true,
+    } });
+
+    try std.testing.expect(model.transcript.items.items[0].tool.?.is_error);
 }
 
 test "tool preview derives bash and write titles from arguments" {

@@ -256,11 +256,18 @@ fn appendNewItem(
     try updateToolFooter(gpa, &item_cursor, item);
     try cursor.items.append(gpa, item_cursor);
     const stored_cursor = &cursor.items.items[cursor.items.items.len - 1];
+    // tui.Transcript caps a single append; the first chunk carries the item
+    // shape, the remainder streams as extend/output deltas.
+    const first = vm.utf8Prefix(item.text_suffix, transcript_chunk_bytes_max);
     try commands.append(gpa, .{ .append_transcript = appendCommandForItem(
         item,
         .new_item,
         stored_cursor.footer(item.footer.slice()),
+        first,
     ) });
+    if (first.len < item.text_suffix.len) {
+        try appendDeltaCommand(gpa, item, item.text_suffix[first.len..], commands);
+    }
 }
 
 fn diffExistingItem(
@@ -270,18 +277,24 @@ fn diffExistingItem(
     commands: *std.ArrayList(tui.Command),
 ) !void {
     if (item.full_text) {
+        if (item.text_suffix.len > 16 * 1024) std.debug.print("DIFF-BIGREPLACE kind={s} len={d} replaced_rev={?d}\n", .{ @tagName(item.kind), item.text_suffix.len, item.text_replaced_at_rev });
+        const first = vm.utf8Prefix(item.text_suffix, transcript_chunk_bytes_max);
         if (item.kind == .tool and item.tool != null) {
             const tool = &item.tool.?;
             try commands.append(gpa, .{ .replace_tool_output = .{
                 .tool_call_id = tool.tool_call_id.slice(),
-                .text = item.text_suffix,
+                .text = first,
             } });
         } else {
             try commands.append(gpa, .{ .append_transcript = appendCommandForItem(
                 item,
                 .new_item,
                 cursor.footer(item.footer.slice()),
+                first,
             ) });
+        }
+        if (first.len < item.text_suffix.len) {
+            try appendDeltaCommand(gpa, item, item.text_suffix[first.len..], commands);
         }
         cursor.text_replaced_rev = item.text_replaced_at_rev;
     } else if (item.text_suffix.len > 0) {
@@ -290,18 +303,45 @@ fn diffExistingItem(
 
     try updateToolFooter(gpa, cursor, item);
     const footer = cursor.footer(item.footer.slice());
-    if (item.kind == .tool and item.tool != null and footer.len > 0) {
-        try commands.append(gpa, .{ .replace_tool_footer = .{
-            .tool_call_id = cursor.toolCallId(),
-            .text = footer,
-        } });
+    if (item.kind == .tool and item.tool != null) {
+        if (footer.len > 0) {
+            try commands.append(gpa, .{ .replace_tool_footer = .{
+                .tool_call_id = cursor.toolCallId(),
+                .text = footer,
+            } });
+        } else if (item.state == .final and item.tool.?.is_error) {
+            // Errored tool with no metadata clears any stale footer.
+            try commands.append(gpa, .{ .replace_tool_footer = .{
+                .tool_call_id = cursor.toolCallId(),
+                .text = "",
+            } });
+        }
     }
     if (item.state == .canceled and cursor.state != .canceled) try commands.append(gpa, .mark_pending_tools_canceled);
     cursor.rev = item.rev;
     cursor.state = item.state;
 }
 
+const transcript_chunk_bytes_max = tui.Transcript.append_size_bytes_max;
+
+/// Splits a delta into Transcript-sized chunks; a single oversize append
+/// would otherwise be silently truncated by the Transcript's bound.
 fn appendDeltaCommand(
+    gpa: std.mem.Allocator,
+    item: *const vm.ItemDelta,
+    delta: []const u8,
+    commands: *std.ArrayList(tui.Command),
+) !void {
+    var offset: usize = 0;
+    while (offset < delta.len) {
+        const chunk = vm.utf8Prefix(delta[offset..], transcript_chunk_bytes_max);
+        if (chunk.len == 0) break;
+        try appendDeltaChunk(gpa, item, chunk, commands);
+        offset += chunk.len;
+    }
+}
+
+fn appendDeltaChunk(
     gpa: std.mem.Allocator,
     item: *const vm.ItemDelta,
     delta: []const u8,
@@ -338,19 +378,20 @@ fn appendCommandForItem(
     item: *const vm.ItemDelta,
     mode: tui.Transcript.AppendMode,
     footer: []const u8,
+    text: []const u8,
 ) tui.Transcript.Append {
     return switch (item.kind) {
-        .user => .{ .message = .{ .role = .user, .text = item.text_suffix, .mode = mode } },
-        .assistant => .{ .message = .{ .role = .assistant, .text = item.text_suffix, .mode = mode } },
-        .thinking => .{ .thinking = .{ .text = item.text_suffix, .hidden = false, .mode = mode } },
-        .tool => .{ .tool = toolAppend(item, footer) },
-        .banner => .{ .custom = .{ .title = "notice", .text = item.text_suffix } },
-        .compaction_summary => .{ .custom = .{ .title = "compaction", .text = item.text_suffix, .format = .markdown } },
-        .system_notice => .{ .status = .{ .level = .info, .text = item.text_suffix } },
+        .user => .{ .message = .{ .role = .user, .text = text, .mode = mode } },
+        .assistant => .{ .message = .{ .role = .assistant, .text = text, .mode = mode } },
+        .thinking => .{ .thinking = .{ .text = text, .hidden = false, .mode = mode } },
+        .tool => .{ .tool = toolAppend(item, footer, text) },
+        .banner => .{ .custom = .{ .title = "notice", .text = text } },
+        .compaction_summary => .{ .custom = .{ .title = "compaction", .text = text, .format = .markdown } },
+        .system_notice => .{ .status = .{ .level = .info, .text = text } },
     };
 }
 
-fn toolAppend(item: *const vm.ItemDelta, footer: []const u8) tui.Transcript.Append.ToolAppend {
+fn toolAppend(item: *const vm.ItemDelta, footer: []const u8, output: []const u8) tui.Transcript.Append.ToolAppend {
     // Pointer, not copy: the returned slices must point into the sample-owned
     // ItemDelta, never into this frame's stack.
     const tool = &item.tool.?;
@@ -359,12 +400,12 @@ fn toolAppend(item: *const vm.ItemDelta, footer: []const u8) tui.Transcript.Appe
         .tool_call_id = tool.tool_call_id.slice(),
         .name = tool.name.slice(),
         .presentation = presentation(display.presentation),
-        .status = toolStatus(item.state),
+        .status = toolStatus(item.state, tool.is_error),
         .body_mode = bodyMode(display.body_mode),
         .collapse = .{ .mode = collapseMode(display.collapse.mode), .lines_max = display.collapse.lines_max },
         .title = tool.title.slice(),
         .compact_title = tool.compact_title.slice(),
-        .output = item.text_suffix,
+        .output = output,
         .footer = footer,
     };
 }
@@ -392,10 +433,10 @@ fn collapseMode(value: coding_agent.tool_metadata.CollapseMode) tui.Transcript.T
     };
 }
 
-fn toolStatus(state: vm.Item.State) tui.Transcript.ToolStatus {
+fn toolStatus(state: vm.Item.State, is_error: bool) tui.Transcript.ToolStatus {
     return switch (state) {
         .streaming => .pending,
-        .final => .success,
+        .final => if (is_error) .err else .success,
         .canceled => .canceled,
     };
 }
@@ -848,4 +889,37 @@ test "streaming turn paints incremental assistant text through the full chain" {
 
     // Every streamed byte must have been painted before the final replace.
     try std.testing.expectEqual(accumulated.items.len, streamed_assistant_bytes);
+}
+
+test "oversize deltas split into transcript-sized chunks with no byte loss" {
+    const gpa = std.testing.allocator;
+    const big = try gpa.alloc(u8, transcript_chunk_bytes_max * 2 + 100);
+    defer gpa.free(big);
+    @memset(big, 'z');
+
+    var delta: vm.ItemDelta = .{
+        .id = 1,
+        .rev = 2,
+        .kind = .assistant,
+        .state = .streaming,
+        .entry_id = null,
+        .text_suffix = big,
+        .full_text = false,
+        .text_replaced_at_rev = null,
+        .text_len = big.len,
+        .footer = .{},
+        .tool = null,
+    };
+    var commands: std.ArrayList(tui.Command) = .empty;
+    defer commands.deinit(gpa);
+    try appendDeltaCommand(gpa, &delta, delta.text_suffix, &commands);
+
+    try std.testing.expectEqual(@as(usize, 3), commands.items.len);
+    var total: usize = 0;
+    for (commands.items) |command| {
+        const text = command.append_transcript.message.text;
+        try std.testing.expect(text.len <= transcript_chunk_bytes_max);
+        total += text.len;
+    }
+    try std.testing.expectEqual(big.len, total);
 }
