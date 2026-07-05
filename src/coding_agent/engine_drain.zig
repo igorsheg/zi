@@ -319,6 +319,7 @@ pub const EngineDrain = struct {
             }
         }
         cursor.last_preview_ms = now;
+        updateToolTitle(writer, cursor.item_id, call.name, call.arguments);
         if (std.mem.eql(u8, call.name, "write")) {
             try self.writePreview(writer, cursor, call.arguments);
             return;
@@ -477,6 +478,112 @@ fn setToolDetails(writer: *vm.Writer, item_id: u64, details: ?std.json.Value) vo
     };
 }
 
+fn updateToolTitle(writer: *vm.Writer, item_id: u64, name: []const u8, arguments: std.json.Value) void {
+    var buffer: [(vm.ToolMeta{}).title.bytes.len]u8 = undefined;
+    const title = formatToolTitle(&buffer, name, arguments);
+    if (findItem(writer, item_id)) |item| if (item.tool) |*tool| {
+        if (tool.title.eql(title)) return;
+        tool.title.set(title);
+        bumpItem(item);
+        writer.touched = true;
+    };
+}
+
+const ToolKind = enum { bash, read, edit, write, custom };
+
+fn toolKind(name: []const u8) ToolKind {
+    if (std.mem.eql(u8, name, "bash")) return .bash;
+    if (std.mem.eql(u8, name, "read")) return .read;
+    if (std.mem.eql(u8, name, "edit")) return .edit;
+    if (std.mem.eql(u8, name, "write")) return .write;
+    return .custom;
+}
+
+fn formatToolTitle(buffer: []u8, name: []const u8, arguments: std.json.Value) []const u8 {
+    var title: TitleBuilder = .{ .buffer = buffer };
+    switch (toolKind(name)) {
+        .bash => {
+            title.add("$ ");
+            title.add(argStringOrEllipsis(arguments, "command"));
+            if (argInt(arguments, "timeout")) |timeout| {
+                title.add(" (timeout ");
+                title.addInt(timeout);
+                title.add("s)");
+            }
+        },
+        .read => {
+            title.add("read ");
+            title.add(argString(arguments, "file_path") orelse argStringOrEllipsis(arguments, "path"));
+            addReadLineRange(&title, arguments);
+        },
+        .edit, .write => {
+            title.add(name);
+            title.add(" ");
+            title.add(argString(arguments, "file_path") orelse argStringOrEllipsis(arguments, "path"));
+        },
+        .custom => title.add(name),
+    }
+    return title.slice();
+}
+
+const TitleBuilder = struct {
+    buffer: []u8,
+    len: usize = 0,
+
+    fn add(self: *TitleBuilder, text: []const u8) void {
+        for (text) |byte| {
+            if (self.len >= self.buffer.len) return;
+            self.buffer[self.len] = if (byte == '\n' or byte == '\r' or byte == '\t') ' ' else byte;
+            self.len += 1;
+        }
+    }
+
+    fn addInt(self: *TitleBuilder, value: i64) void {
+        var digits: [24]u8 = undefined;
+        self.add(std.fmt.bufPrint(&digits, "{d}", .{value}) catch return);
+    }
+
+    fn slice(self: *const TitleBuilder) []const u8 {
+        var end = self.len;
+        while (end > 0 and !std.unicode.utf8ValidateSlice(self.buffer[0..end])) end -= 1;
+        return self.buffer[0..end];
+    }
+};
+
+fn addReadLineRange(title: *TitleBuilder, arguments: std.json.Value) void {
+    const offset = argPositiveInt(arguments, "offset");
+    const limit = argPositiveInt(arguments, "limit");
+    if (offset == null and limit == null) return;
+    const start = offset orelse 1;
+    title.add(":");
+    title.addInt(start);
+    if (limit) |count| {
+        title.add("-");
+        title.addInt(start +| count -| 1);
+    }
+}
+
+fn argString(arguments: std.json.Value, key: []const u8) ?[]const u8 {
+    if (arguments != .object) return null;
+    const value = arguments.object.get(key) orelse return null;
+    return if (value == .string and value.string.len > 0) value.string else null;
+}
+
+fn argStringOrEllipsis(arguments: std.json.Value, key: []const u8) []const u8 {
+    return argString(arguments, key) orelse "...";
+}
+
+fn argPositiveInt(arguments: std.json.Value, key: []const u8) ?i64 {
+    const value = argInt(arguments, key) orelse return null;
+    return if (value > 0) value else null;
+}
+
+fn argInt(arguments: std.json.Value, key: []const u8) ?i64 {
+    if (arguments != .object) return null;
+    const value = arguments.object.get(key) orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
 fn setDetailsJson(tool: *vm.ToolMeta, details: ?std.json.Value) void {
     const value = details orelse {
         tool.details_json.len = 0;
@@ -565,6 +672,72 @@ test "edit tool end publishes diff body and details json" {
     try std.testing.expectEqualStrings("--- a/file\n+++ b/file", item.text.items);
     try std.testing.expect(item.tool != null);
     try std.testing.expect(std.mem.indexOf(u8, item.tool.?.details_json.slice(), "\"diff\"") != null);
+}
+
+test "tool preview derives bash and write titles from arguments" {
+    const gpa = std.testing.allocator;
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+
+    var bash_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"command\":\"rg foo\"}", .{});
+    defer bash_args.deinit();
+    const bash_content = [_]ai.AssistantContent{ai.faux.toolCall("call-b", "bash", bash_args.value)};
+    const bash_assistant = ai.faux.assistantMessage(&bash_content, .{});
+
+    var first = model.lockWriter();
+    try drain.toolPreview(&first, bash_assistant, 0, true);
+    first.finish();
+    try std.testing.expectEqualStrings("$ rg foo", model.transcript.items.items[0].tool.?.title.slice());
+    try std.testing.expectEqualStrings("bash", model.transcript.items.items[0].tool.?.name.slice());
+
+    var write_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"path\":\"src/file.zig\"}", .{});
+    defer write_args.deinit();
+    const write_content = [_]ai.AssistantContent{ai.faux.toolCall("call-w", "write", write_args.value)};
+    const write_assistant = ai.faux.assistantMessage(&write_content, .{});
+
+    var second = model.lockWriter();
+    try drain.toolPreview(&second, write_assistant, 0, true);
+    second.finish();
+    try std.testing.expectEqualStrings("write src/file.zig", model.transcript.items.items[1].tool.?.title.slice());
+    try std.testing.expectEqualStrings("write", model.transcript.items.items[1].tool.?.name.slice());
+}
+
+test "tool preview title updates after throttle window" {
+    const gpa = std.testing.allocator;
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+    drain.test_now_ms = 0;
+
+    var first_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"command\":\"rg\"}", .{});
+    defer first_args.deinit();
+    const first_content = [_]ai.AssistantContent{ai.faux.toolCall("call-b", "bash", first_args.value)};
+    const first_assistant = ai.faux.assistantMessage(&first_content, .{});
+
+    var first = model.lockWriter();
+    try drain.toolPreview(&first, first_assistant, 0, false);
+    first.finish();
+    try std.testing.expectEqualStrings("$ rg", model.transcript.items.items[0].tool.?.title.slice());
+
+    var grown_args = try std.json.parseFromSlice(std.json.Value, gpa, "{\"command\":\"rg foo\"}", .{});
+    defer grown_args.deinit();
+    const grown_content = [_]ai.AssistantContent{ai.faux.toolCall("call-b", "bash", grown_args.value)};
+    const grown_assistant = ai.faux.assistantMessage(&grown_content, .{});
+
+    drain.test_now_ms = preview_rebuild_interval_ms - 1;
+    var throttled = model.lockWriter();
+    try drain.toolPreview(&throttled, grown_assistant, 0, false);
+    throttled.finish();
+    try std.testing.expectEqualStrings("$ rg", model.transcript.items.items[0].tool.?.title.slice());
+
+    drain.test_now_ms = preview_rebuild_interval_ms;
+    var rebuilt = model.lockWriter();
+    try drain.toolPreview(&rebuilt, grown_assistant, 0, false);
+    rebuilt.finish();
+    try std.testing.expectEqualStrings("$ rg foo", model.transcript.items.items[0].tool.?.title.slice());
 }
 
 test "tool preview rebuilds are throttled to the interval" {
