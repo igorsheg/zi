@@ -782,6 +782,10 @@ pub fn chrome(self: *const AgentSession, cwd: []const u8) vm.Chrome {
         .high => .high,
         .xhigh => .xhigh,
     };
+    const usage = self.clientContextUsage();
+    if (usage.percent_tenths) |tenths| {
+        out.context_used_pct = @intCast(@min(tenths / 10, 100));
+    }
     return out;
 }
 

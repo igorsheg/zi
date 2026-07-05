@@ -193,6 +193,7 @@ fn runTui(
     defer worker.deinit();
 
     var loop = try frame_loop.Loop.init(process.gpa, terminal, engine, input_reader, &worker);
+    loop.view_cursor.home_dir = process.env("HOME");
     loop.trace = trace_mod.Stats.init(process);
     defer loop.deinit();
     try loop.bootstrap(

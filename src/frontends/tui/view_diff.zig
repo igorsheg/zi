@@ -10,6 +10,8 @@ const vm = coding_agent.view_model;
 
 const status_id_working: tui.status.ContributionId = 1;
 const status_id_queue: tui.status.ContributionId = 2;
+const status_id_cwd: tui.status.ContributionId = 3;
+const status_id_session: tui.status.ContributionId = 4;
 
 pub const ViewCursor = struct {
     epoch: u32 = 0,
@@ -25,6 +27,11 @@ pub const ViewCursor = struct {
     latest_query_kind: vm.CompletionSlot.Kind = .none,
     queue_status_bytes: [64]u8 = undefined,
     queue_status_len: usize = 0,
+    home_dir: ?[]const u8 = null,
+    chrome_left_bytes: [tui.status.text_bytes_max]u8 = undefined,
+    chrome_left_len: usize = 0,
+    chrome_right_bytes: [tui.status.text_bytes_max]u8 = undefined,
+    chrome_right_len: usize = 0,
 
     pub fn deinit(self: *ViewCursor, gpa: std.mem.Allocator) void {
         self.items.deinit(gpa);
@@ -42,12 +49,15 @@ pub const ViewCursor = struct {
     }
 
     fn resetForEpoch(self: *ViewCursor, gpa: std.mem.Allocator, epoch: u32) void {
-        self.items.clearRetainingCapacity();
         _ = gpa;
+        var items = self.items;
+        items.clearRetainingCapacity();
         self.* = .{
             .epoch = epoch,
             .latest_query_id = self.latest_query_id,
             .latest_query_kind = self.latest_query_kind,
+            .items = items,
+            .home_dir = self.home_dir,
         };
     }
 
@@ -117,6 +127,7 @@ pub fn diff(gpa: std.mem.Allocator, sample: *const vm.Sample, cursor: *ViewCurso
     }
 
     try emitNotices(gpa, sample, cursor, &result.commands);
+    try emitChrome(gpa, sample, cursor, &result.commands);
     try emitOperation(gpa, sample, cursor, &result.commands);
     try emitQueue(gpa, sample, cursor, &result.commands);
     try emitCompletion(gpa, sample, cursor, &result.commands);
@@ -144,6 +155,86 @@ pub fn diff(gpa: std.mem.Allocator, sample: *const vm.Sample, cursor: *ViewCurso
     if (sample.history) |history| cursor.history_rev = history.rev;
     if (sample.completion) |completion| cursor.completion_rev = completion.rev;
     return result;
+}
+
+fn emitChrome(
+    gpa: std.mem.Allocator,
+    sample: *const vm.Sample,
+    cursor: *ViewCursor,
+    commands: *std.ArrayList(tui.Command),
+) !void {
+    if (sample.chrome.rev == cursor.chrome_rev) return;
+    const left = formatChromeCwd(&cursor.chrome_left_bytes, sample.chrome.cwd.slice(), cursor.home_dir);
+    cursor.chrome_left_len = left.len;
+    try commands.append(gpa, .{ .set_status = .{
+        .slot = .composer_left,
+        .id = status_id_cwd,
+        .priority = 1,
+        .text = cursor.chrome_left_bytes[0..cursor.chrome_left_len],
+    } });
+    const right = formatChromeRight(&cursor.chrome_right_bytes, &sample.chrome);
+    cursor.chrome_right_len = right.len;
+    try commands.append(gpa, .{ .set_status = .{
+        .slot = .composer_right,
+        .id = status_id_session,
+        .priority = 1,
+        .text = cursor.chrome_right_bytes[0..cursor.chrome_right_len],
+    } });
+}
+
+fn formatChromeCwd(buffer: []u8, cwd: []const u8, home_dir_raw: ?[]const u8) []const u8 {
+    const bounded = vm.utf8Prefix(cwd, buffer.len);
+    const suffix = homePathSuffix(bounded, home_dir_raw) orelse {
+        @memcpy(buffer[0..bounded.len], bounded);
+        return buffer[0..bounded.len];
+    };
+    if (suffix.len == 0) {
+        buffer[0] = '~';
+        return buffer[0..1];
+    }
+    return std.fmt.bufPrint(buffer, "~{s}", .{vm.utf8Prefix(suffix, buffer.len - 1)}) catch buffer[0..0];
+}
+
+fn homePathSuffix(path: []const u8, home_dir_raw: ?[]const u8) ?[]const u8 {
+    const home_dir = trimTrailingPathSeparators(home_dir_raw orelse return null);
+    if (home_dir.len == 0) return null;
+    if (std.mem.eql(u8, path, home_dir)) return "";
+    if (!std.mem.startsWith(u8, path, home_dir)) return null;
+    if (path.len <= home_dir.len or !isPathSeparator(path[home_dir.len])) return null;
+    return path[home_dir.len..];
+}
+
+fn trimTrailingPathSeparators(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and isPathSeparator(path[end - 1])) : (end -= 1) {}
+    return path[0..end];
+}
+
+fn isPathSeparator(byte: u8) bool {
+    return byte == '/' or byte == '\\';
+}
+
+fn formatChromeRight(buffer: []u8, chrome: *const vm.Chrome) []const u8 {
+    var pct_buffer: [8]u8 = undefined;
+    const pct = if (chrome.context_used_pct) |value|
+        std.fmt.bufPrint(&pct_buffer, "{d}%", .{value}) catch "?%"
+    else
+        "?%";
+    const provider = chrome.provider_label.slice();
+    const model = chrome.model_id.slice();
+    if (provider.len == 0 or std.mem.eql(u8, provider, "unknown")) {
+        return std.fmt.bufPrint(buffer, "{s} \u{2022} no authenticated model", .{pct}) catch buffer[0..0];
+    }
+    return std.fmt.bufPrint(buffer, "{s} \u{2022} {s}/{s} ({s})", .{
+        pct,
+        provider,
+        model,
+        @tagName(chrome.thinking_level),
+    }) catch {
+        const bounded = vm.utf8Prefix(model, buffer.len);
+        @memcpy(buffer[0..bounded.len], bounded);
+        return buffer[0..bounded.len];
+    };
 }
 
 fn appendNewItem(
@@ -627,9 +718,75 @@ test "stale completion query_id ignored" {
         .partial = false,
     };
     defer sample.deinit(gpa);
-    var cursor: ViewCursor = .{ .epoch = 1, .latest_query_id = 2 };
+    var cursor: ViewCursor = .{ .epoch = 1, .latest_query_id = 2, .chrome_rev = 1 };
     defer cursor.deinit(gpa);
     var out = try diff(gpa, &sample, &cursor);
     defer out.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 2), out.commands.items.len);
+}
+
+test "streaming turn paints incremental assistant text through the full chain" {
+    const gpa = std.testing.allocator;
+    const engine_drain = @import("../../coding_agent/engine_drain.zig");
+    const ai_mod = @import("../../ai/root.zig");
+    const agent_mod = @import("../../agent/root.zig");
+
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = engine_drain.EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+
+    var reader_cursor: vm.ReaderCursor = .{};
+    defer reader_cursor.deinit(gpa);
+    var view_cursor: ViewCursor = .{};
+    defer view_cursor.deinit(gpa);
+
+    const user_message = agent_mod.AgentMessage{ .user = .{
+        .content = .{ .string = "hi" },
+        .timestamp = 0,
+    } };
+    try drain.agentEvent(.{ .message_start = .{ .message = user_message } });
+    try drain.agentEvent(.{ .message_end = .{ .message = user_message } });
+
+    const deltas = [_][]const u8{ "alpha ", "beta ", "gamma" };
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(gpa);
+    var streamed_assistant_bytes: usize = 0;
+
+    for (deltas, 0..) |delta, index| {
+        try accumulated.appendSlice(gpa, delta);
+        const content = [_]ai_mod.AssistantContent{ai_mod.faux.text(accumulated.items)};
+        const partial = ai_mod.faux.assistantMessage(&content, .{});
+        if (index == 0) {
+            try drain.agentEvent(.{ .message_start = .{ .message = .{ .assistant = partial } } });
+        }
+        try drain.agentEvent(.{ .message_update = .{ .assistant_message_event = .{ .text_delta = .{
+            .content_index = 0,
+            .delta = delta,
+            .partial = partial,
+        } } } });
+
+        // Mirrors frame_loop.sampleViewModel: sample, guard, diff.
+        var sample = try model.sample(gpa, &reader_cursor, vm.sample_bytes_per_frame_max);
+        defer sample.deinit(gpa);
+        if (!(sample.generation == view_cursor.generation and
+            sample.session_epoch == view_cursor.epoch and
+            !sample.partial))
+        {
+            var out = try diff(gpa, &sample, &view_cursor);
+            defer out.deinit(gpa);
+            for (out.commands.items) |command| switch (command) {
+                .append_transcript => |append| switch (append) {
+                    .message => |message| {
+                        if (message.role == .assistant) streamed_assistant_bytes += message.text.len;
+                    },
+                    else => {},
+                },
+                else => {},
+            };
+        }
+    }
+
+    // Every streamed byte must have been painted before the final replace.
+    try std.testing.expectEqual(accumulated.items.len, streamed_assistant_bytes);
 }

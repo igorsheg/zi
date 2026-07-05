@@ -124,7 +124,11 @@ fn initFauxProvider(
 ) !*ai.FauxProvider {
     const provider = try allocator.create(ai.FauxProvider);
     errdefer allocator.destroy(provider);
-    provider.* = try ai.FauxProvider.init(allocator, .{ .min_token_size = 16, .max_token_size = 16 });
+    provider.* = try ai.FauxProvider.init(allocator, .{
+        .min_token_size = 16,
+        .max_token_size = 16,
+        .delay_per_delta_ms = fauxDelayMs(environ),
+    });
     errdefer provider.deinit();
 
     const script = try loadFauxScript(allocator, io, dir, environ);
@@ -134,6 +138,12 @@ fn initFauxProvider(
     try provider.setResponses(&.{message});
     try provider.register(registry);
     return provider;
+}
+
+fn fauxDelayMs(environ: ?*const std.process.Environ.Map) u32 {
+    const env = environ orelse return 0;
+    const text = env.get("ZI_FAUX_DELAY_MS") orelse return 0;
+    return std.fmt.parseInt(u32, text, 10) catch 0;
 }
 
 fn loadFauxScript(
