@@ -265,7 +265,8 @@ pub const EngineDrain = struct {
             .tool_result => |tool| {
                 const cursor = try self.ensureTool(writer, tool.tool_call_id, tool.tool_name);
                 self.pending.tool = cursor.item_id;
-                if (!cursor.streams_output) try writer.replaceItemText(self.allocator, cursor.item_id, toolResultText(tool.content));
+                if (!cursor.streams_output) try writer.replaceItemText(self.allocator, cursor.item_id, toolResultBody(tool.tool_name, tool.is_error, tool.content, tool.details));
+                setToolDetails(writer, cursor.item_id, tool.details);
             },
             .custom => |custom| self.pending.custom = try writer.addItem(self.allocator, .system_notice, .streaming, custom.kind, null),
         }
@@ -373,9 +374,12 @@ pub const EngineDrain = struct {
 
     fn toolEnd(self: *EngineDrain, writer: *vm.Writer, payload: agent_mod.AgentEvent.ToolExecutionEnd) !void {
         const cursor = try self.ensureTool(writer, payload.tool_call_id, payload.tool_name);
-        if (!cursor.streams_output) try writer.replaceItemText(self.allocator, cursor.item_id, toolResultText(payload.result.content));
+        if (!cursor.streams_output) try writer.replaceItemText(self.allocator, cursor.item_id, toolResultBody(payload.tool_name, payload.is_error, payload.result.content, payload.result.details));
         if (findItem(writer, cursor.item_id)) |item| {
-            if (item.tool) |*tool| tool.duration_ms = if (cursor.started_ms) |start| @intCast(@max(nowMs() - start, 0)) else 0;
+            if (item.tool) |*tool| {
+                tool.duration_ms = if (cursor.started_ms) |start| @intCast(@max(nowMs() - start, 0)) else 0;
+                setDetailsJson(tool, payload.result.details);
+            }
             bumpItem(item);
             writer.touched = true;
         }
@@ -458,6 +462,34 @@ fn toolResultText(content: []const ai.ToolResultContent) []const u8 {
     return "";
 }
 
+fn toolResultBody(tool_name: []const u8, is_error: bool, content: []const ai.ToolResultContent, details: ?std.json.Value) []const u8 {
+    if (!is_error and std.mem.eql(u8, tool_name, "edit")) {
+        if (details) |value| if (value == .object) if (value.object.get("diff")) |diff| if (diff == .string) return diff.string;
+    }
+    return toolResultText(content);
+}
+
+fn setToolDetails(writer: *vm.Writer, item_id: u64, details: ?std.json.Value) void {
+    if (findItem(writer, item_id)) |item| if (item.tool) |*tool| {
+        setDetailsJson(tool, details);
+        bumpItem(item);
+        writer.touched = true;
+    };
+}
+
+fn setDetailsJson(tool: *vm.ToolMeta, details: ?std.json.Value) void {
+    const value = details orelse {
+        tool.details_json.len = 0;
+        return;
+    };
+    var buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    std.json.Stringify.value(value, .{}, &writer) catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
+    tool.details_json.set(writer.buffered());
+}
+
 fn jsonPreview(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -509,6 +541,30 @@ fn countLines(text: []const u8) usize {
         if (ch == '\n') lines += 1;
     }
     return lines;
+}
+
+test "edit tool end publishes diff body and details json" {
+    const gpa = std.testing.allocator;
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+
+    var details = try std.json.parseFromSlice(std.json.Value, gpa, "{\"diff\":\"--- a/file\\n+++ b/file\"}", .{});
+    defer details.deinit();
+    const content = [_]ai.ToolResultContent{.{ .text = .{ .text = "Edited file" } }};
+
+    try drain.agentEvent(.{ .tool_execution_end = .{
+        .tool_call_id = "call-edit",
+        .tool_name = "edit",
+        .result = .{ .content = &content, .details = details.value },
+        .is_error = false,
+    } });
+
+    const item = &model.transcript.items.items[0];
+    try std.testing.expectEqualStrings("--- a/file\n+++ b/file", item.text.items);
+    try std.testing.expect(item.tool != null);
+    try std.testing.expect(std.mem.indexOf(u8, item.tool.?.details_json.slice(), "\"diff\"") != null);
 }
 
 test "tool preview rebuilds are throttled to the interval" {

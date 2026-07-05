@@ -73,8 +73,10 @@ const ItemCursor = struct {
     consumed_len: usize = 0,
     text_replaced_rev: ?u32 = null,
     state: vm.Item.State = .streaming,
-    footer_bytes: [96]u8 = undefined,
+    footer_bytes: [tool_view.footer_bytes_max]u8 = undefined,
     footer_len: usize = 0,
+    static_footer_bytes: [tool_view.footer_bytes_max]u8 = undefined,
+    static_footer_len: usize = 0,
     tool_call_id: [128]u8 = undefined,
     tool_call_id_len: usize = 0,
     shows_duration: bool = false,
@@ -107,8 +109,7 @@ pub fn tickDurations(gpa: std.mem.Allocator, cursor: *ViewCursor, now_ms: i64) !
         if (!item.shows_duration or item.started_ms == null or item.duration_ms != null) continue;
         if (item.tool_call_id_len == 0) continue;
         const elapsed: u64 = @intCast(@max(@as(i64, 0), now_ms - item.started_ms.?));
-        const footer = tool_view.durationChip(&item.footer_bytes, "running", elapsed);
-        item.footer_len = footer.len;
+        renderToolFooter(item, elapsed);
         try result.commands.append(gpa, .{ .replace_tool_footer = .{
             .tool_call_id = item.toolCallId(),
             .text = item.footer(""),
@@ -252,7 +253,7 @@ fn appendNewItem(
         .text_replaced_rev = item.text_replaced_at_rev,
         .state = item.state,
     };
-    updateDurationFooter(&item_cursor, item);
+    try updateToolFooter(gpa, &item_cursor, item);
     try cursor.items.append(gpa, item_cursor);
     const stored_cursor = &cursor.items.items[cursor.items.items.len - 1];
     try commands.append(gpa, .{ .append_transcript = appendCommandForItem(
@@ -270,8 +271,9 @@ fn diffExistingItem(
 ) !void {
     if (item.full_text) {
         if (item.kind == .tool and item.tool != null) {
+            const tool = &item.tool.?;
             try commands.append(gpa, .{ .replace_tool_output = .{
-                .tool_call_id = item.tool.?.tool_call_id.slice(),
+                .tool_call_id = tool.tool_call_id.slice(),
                 .text = item.text_suffix,
             } });
         } else {
@@ -286,11 +288,11 @@ fn diffExistingItem(
         try appendDeltaCommand(gpa, item, item.text_suffix, commands);
     }
 
-    updateDurationFooter(cursor, item);
+    try updateToolFooter(gpa, cursor, item);
     const footer = cursor.footer(item.footer.slice());
     if (item.kind == .tool and item.tool != null and footer.len > 0) {
         try commands.append(gpa, .{ .replace_tool_footer = .{
-            .tool_call_id = item.tool.?.tool_call_id.slice(),
+            .tool_call_id = cursor.toolCallId(),
             .text = footer,
         } });
     }
@@ -306,7 +308,7 @@ fn appendDeltaCommand(
     commands: *std.ArrayList(tui.Command),
 ) !void {
     switch (item.kind) {
-        .tool => if (item.tool) |tool| try commands.append(gpa, .{ .tool_output_delta = .{
+        .tool => if (item.tool) |*tool| try commands.append(gpa, .{ .tool_output_delta = .{
             .tool_call_id = tool.tool_call_id.slice(),
             .text = delta,
         } }),
@@ -346,7 +348,9 @@ fn appendCommandForItem(
 }
 
 fn toolAppend(item: *const vm.ItemDelta, footer: []const u8) tui.Transcript.Append.ToolAppend {
-    const tool = item.tool.?;
+    // Pointer, not copy: the returned slices must point into the sample-owned
+    // ItemDelta, never into this frame's stack.
+    const tool = &item.tool.?;
     const display = tool.display;
     return .{
         .tool_call_id = tool.tool_call_id.slice(),
@@ -393,9 +397,10 @@ fn toolStatus(state: vm.Item.State) tui.Transcript.ToolStatus {
     };
 }
 
-fn updateDurationFooter(cursor: *ItemCursor, item: *const vm.ItemDelta) void {
+fn updateToolFooter(gpa: std.mem.Allocator, cursor: *ItemCursor, item: *const vm.ItemDelta) !void {
     const tool = item.tool orelse {
         cursor.footer_len = 0;
+        cursor.static_footer_len = 0;
         cursor.shows_duration = false;
         return;
     };
@@ -405,28 +410,54 @@ fn updateDurationFooter(cursor: *ItemCursor, item: *const vm.ItemDelta) void {
     const call_id = tool.tool_call_id.slice();
     @memcpy(cursor.tool_call_id[0..call_id.len], call_id);
     cursor.tool_call_id_len = call_id.len;
-    if (!tool.display.shows_duration) {
-        cursor.footer_len = 0;
-        return;
-    }
+
+    var metadata_buffer: [tool_view.metadata_bytes_max]u8 = undefined;
+    const metadata = try toolMetadata(gpa, &metadata_buffer, tool.name.slice(), tool.details_json.slice());
+    const static_footer = if (metadata.len > 0) metadata else item.footer.slice();
+    copyCursorText(&cursor.static_footer_bytes, &cursor.static_footer_len, static_footer);
+    renderToolFooter(cursor, null);
+}
+
+fn toolMetadata(
+    gpa: std.mem.Allocator,
+    buffer: []u8,
+    tool_name: []const u8,
+    details_json: []const u8,
+) ![]const u8 {
+    if (details_json.len == 0) return "";
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, details_json, .{}) catch return "";
+    defer parsed.deinit();
+    return tool_view.metadataForDetails(buffer, tool_name, parsed.value);
+}
+
+fn renderToolFooter(cursor: *ItemCursor, running_elapsed_ms: ?u64) void {
+    const static_footer = cursor.static_footer_bytes[0..cursor.static_footer_len];
     var duration_buffer: [32]u8 = undefined;
-    const duration = if (tool.duration_ms) |duration_ms|
+    const duration = if (cursor.duration_ms) |duration_ms|
         tool_view.durationChip(&duration_buffer, "took", duration_ms)
-    else if (tool.started_ms != null)
+    else if (running_elapsed_ms) |elapsed_ms|
+        tool_view.durationChip(&duration_buffer, "running", elapsed_ms)
+    else if (cursor.started_ms != null)
         tool_view.durationChip(&duration_buffer, "running", 0)
     else
         "";
-    if (duration.len > 0) {
-        if (item.footer.slice().len == 0) {
-            @memcpy(cursor.footer_bytes[0..duration.len], duration);
-            cursor.footer_len = duration.len;
-            return;
-        }
-        const text = tool_view.joinMetadata(&cursor.footer_bytes, item.footer.slice(), duration);
-        cursor.footer_len = text.len;
+
+    if (!cursor.shows_duration or duration.len == 0) {
+        copyCursorText(&cursor.footer_bytes, &cursor.footer_len, static_footer);
         return;
     }
-    cursor.footer_len = 0;
+    if (static_footer.len == 0) {
+        copyCursorText(&cursor.footer_bytes, &cursor.footer_len, duration);
+        return;
+    }
+    const joined = tool_view.joinMetadata(&cursor.footer_bytes, static_footer, duration);
+    cursor.footer_len = joined.len;
+}
+
+fn copyCursorText(buffer: []u8, len: *usize, text: []const u8) void {
+    const clipped = vm.utf8Prefix(text, buffer.len);
+    @memcpy(buffer[0..clipped.len], clipped);
+    len.* = clipped.len;
 }
 
 fn emitNotices(
@@ -648,6 +679,30 @@ test "tool duration footer golden" {
     defer first.deinit(gpa);
     const append = first.commands.items[first.commands.items.len - 1].append_transcript;
     try std.testing.expectEqualStrings("took 1.2s", append.tool.footer);
+}
+
+test "bash truncation details join duration footer golden" {
+    const gpa = std.testing.allocator;
+    var tool: vm.ToolMeta = .{};
+    tool.tool_call_id.set("t1");
+    tool.name.set("bash");
+    tool.display = coding_agent.tool_metadata.displayForTool("bash");
+    tool.duration_ms = 1234;
+    tool.details_json.set(
+        "{\"exitCode\":1,\"truncation\":{\"truncated\":true,\"truncatedBy\":\"lines\"," ++
+            "\"outputLines\":5,\"totalLines\":100,\"outputBytes\":16,\"maxBytes\":51200}}",
+    );
+    var item: vm.Item = .{ .id = 1, .kind = .tool, .state = .streaming, .tool = tool, .rev = 1 };
+    defer item.deinit(gpa);
+    try item.text.appendSlice(gpa, "line 96\nline 100");
+    var sample = try oneItemSample(gpa, &item, .{});
+    defer sample.deinit(gpa);
+    var cursor: ViewCursor = .{ .epoch = 1 };
+    defer cursor.deinit(gpa);
+    var first = try diff(gpa, &sample, &cursor);
+    defer first.deinit(gpa);
+    const append = first.commands.items[first.commands.items.len - 1].append_transcript;
+    try std.testing.expectEqualStrings("Truncated: showing 5 of 100 lines • took 1.2s", append.tool.footer);
 }
 
 test "tool duration tick footer golden" {

@@ -559,6 +559,7 @@ pub const ToolMeta = struct {
     started_ms: ?i64 = null,
     duration_ms: ?u64 = null,
     exit_meta: BoundedText(128) = .{},
+    details_json: BoundedText(2048) = .{},
 };
 
 pub const HistoryWindow = struct {
