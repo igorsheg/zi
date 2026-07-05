@@ -35,7 +35,8 @@ pub const Loop = struct {
     next_request_id: u64 = 1,
     trace: trace_mod.Stats = .{},
     chrome: vm.Chrome = .{},
-    history_oldest_entry_id: ?u64 = null,
+    history_oldest_entry_id: [vm.history_entry_id_bytes_max]u8 = undefined,
+    history_oldest_entry_id_len: usize = 0,
     last_file_completion_query: std.ArrayList(u8) = .empty,
     external_editor_counter: usize = 0,
 
@@ -167,9 +168,11 @@ pub const Loop = struct {
                 if (result.priority != .none) self.render_due_ms = nowMs();
                 try self.dispatchEffects(effects[0..result.effect_count]);
                 try self.requestFileCompletionForComposer();
+                if (result.truncated) try self.notice("input truncated");
+                if (result.effect_overflow) try self.notice("input effects dropped");
             }
             if (drained.eof) self.terminal.requestStop();
-            if (drained.faulted) try self.notice("terminal input reader failed");
+            if (drained.faulted) try self.notice("input reader stopped");
             if (drained.bytes.len == 0) break;
         }
         if (self.input_reader.hasQueuedBytes()) self.render_due_ms = nowMs();
@@ -185,7 +188,7 @@ pub const Loop = struct {
     fn dispatchEffect(self: *Loop, effect: tui.App.Effect) !void {
         switch (effect) {
             .submit_text => |text| try self.submitText(text),
-            .interrupt => self.submitSimple(.{ .cancel = .{} }) catch |err| try self.notice(@errorName(err)),
+            .interrupt => self.submitSimple(.{ .cancel = .{} }) catch |err| try self.notice(submitErrorText(err)),
             .request_shutdown => {
                 self.engine.requestShutdown();
                 self.terminal.requestStop();
@@ -251,7 +254,7 @@ pub const Loop = struct {
         errdefer envelope.deinit(self.allocator);
         self.engine.submit(envelope) catch |err| {
             envelope.deinit(self.allocator);
-            try self.notice(@errorName(err));
+            try self.notice(submitErrorText(err));
         };
     }
 
@@ -281,9 +284,8 @@ pub const Loop = struct {
     }
 
     fn requestHistoryPage(self: *Loop) !void {
-        var buffer: [32]u8 = undefined;
-        const before = if (self.history_oldest_entry_id) |id|
-            std.fmt.bufPrint(&buffer, "{d}", .{id}) catch ""
+        const before = if (self.history_oldest_entry_id_len > 0)
+            self.history_oldest_entry_id[0..self.history_oldest_entry_id_len]
         else
             self.terminal.transcriptOldestSourceId() orelse "";
         if (before.len == 0) return;
@@ -295,12 +297,17 @@ pub const Loop = struct {
         errdefer envelope.deinit(self.allocator);
         self.engine.submit(envelope) catch |err| {
             envelope.deinit(self.allocator);
-            try self.notice(@errorName(err));
+            try self.notice(submitErrorText(err));
         };
     }
 
     fn requestTranscriptTail(self: *Loop) !void {
+        if (!self.view_cursor.history_open) return;
         try self.submitSimple(.history_tail);
+        self.reader_cursor.resetTranscript();
+        self.view_cursor.resetTranscript();
+        self.history_oldest_entry_id_len = 0;
+        _ = try self.applyCommand(.clear_transcript);
     }
 
     fn handlePickerSelection(self: *Loop, selection: tui.Picker.Selection) !void {
@@ -319,7 +326,7 @@ pub const Loop = struct {
                 errdefer envelope.deinit(self.allocator);
                 self.engine.submit(envelope) catch |err| {
                     envelope.deinit(self.allocator);
-                    try self.notice(@errorName(err));
+                    try self.notice(submitErrorText(err));
                 };
             },
             pickers.settings_picker_id => {
@@ -506,13 +513,13 @@ pub const Loop = struct {
             .ok => |result| switch (result) {
                 .clipboard_copy => |payload| {
                     if (payload.native_copied) {
-                        try self.notice("selection copied");
+                        try self.noticeLevel(.info, "selection copied");
                     } else {
                         self.terminal.copyTextWithOsc52(payload.text) catch {
                             try self.notice("clipboard copy failed");
                             return;
                         };
-                        try self.notice("selection copied via terminal clipboard");
+                        try self.noticeLevel(.info, "selection copied via terminal clipboard");
                     }
                 },
                 .clipboard_image_paste => |payload| {
@@ -531,7 +538,7 @@ pub const Loop = struct {
                     errdefer command.deinit(self.allocator);
                     self.engine.submit(command) catch |err| {
                         command.deinit(self.allocator);
-                        try self.notice(@errorName(err));
+                        try self.notice(submitErrorText(err));
                     };
                 },
             },
@@ -548,7 +555,11 @@ pub const Loop = struct {
         self.trace.record(.sample, @intCast(nowNs() - phase_start));
         defer sample.deinit(self.allocator);
         self.chrome = sample.chrome;
-        if (sample.history) |history| self.history_oldest_entry_id = history.oldest_entry_id;
+        if (sample.history) |*history| {
+            const oldest = history.oldest_entry_id.slice();
+            @memcpy(self.history_oldest_entry_id[0..oldest.len], oldest);
+            self.history_oldest_entry_id_len = oldest.len;
+        }
         if (sample.generation == self.view_cursor.generation and
             sample.session_epoch == self.view_cursor.epoch and
             !sample.partial) return;
@@ -587,10 +598,14 @@ pub const Loop = struct {
     }
 
     fn notice(self: *Loop, message: []const u8) !void {
+        try self.noticeLevel(.warning, message);
+    }
+
+    fn noticeLevel(self: *Loop, level: tui.notify.Level, message: []const u8) !void {
         _ = try self.terminal.applyCommand(.{ .notify = .{
             .key = notice_key_todo,
             .message = message,
-            .level = .warning,
+            .level = level,
             .skip_dedup = true,
         } });
         self.render_due_ms = nowMs();
@@ -632,6 +647,13 @@ pub fn pollTimeoutMs(now_ms: i64, app_deadline_ms: ?i64, render_due_ms: i64) i32
 pub fn nextRenderDueMs(now_ms: i64, last_render_cost_ns: u64) i64 {
     const render_ms: i64 = @intCast(last_render_cost_ns / std.time.ns_per_ms);
     return now_ms + @max(frame_interval_ms, render_ms * 3);
+}
+
+fn submitErrorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Full => "command queue full",
+        else => @errorName(err),
+    };
 }
 
 fn workerErrorText(err: anyerror) []const u8 {

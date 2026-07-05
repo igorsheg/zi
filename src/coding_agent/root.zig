@@ -15,7 +15,6 @@ pub const wire_protocol = @import("wire_protocol.zig");
 // Internal modules, referenced here so `zig build test` reaches their tests.
 const auth = @import("auth.zig");
 const engine_drain = @import("engine_drain.zig");
-const event_drain = @import("event_drain.zig");
 const file_completion = @import("file_completion.zig");
 const message_policy = @import("message_policy.zig");
 const paths = @import("paths.zig");
@@ -34,7 +33,6 @@ test {
     _ = auth;
     _ = Engine;
     _ = engine_drain;
-    _ = event_drain;
     _ = file_completion;
     _ = message_policy;
     _ = paths;

@@ -93,6 +93,7 @@ pub const Append = union(enum) {
 };
 
 pub const Prepend = struct {
+    thinking: ?Append.ThinkingAppend = null,
     message: ?Append.MessageAppend = null,
     tools: []const Append.ToolAppend = &.{},
 };
@@ -280,6 +281,12 @@ pub fn prepend(self: *Transcript, gpa: std.mem.Allocator, rows: Prepend) error{O
     defer self.revision +%= 1;
     var outcome: Outcome = .{};
     var insertion_index: usize = 0;
+
+    if (rows.thinking) |thinking| {
+        const thinking_outcome = try self.insertThinkingAt(gpa, insertion_index, thinking);
+        outcome.truncated = outcome.truncated or thinking_outcome.truncated;
+        insertion_index += 1;
+    }
 
     if (rows.message) |message| {
         const message_outcome = try self.insertMessageAt(gpa, insertion_index, message);
@@ -546,6 +553,26 @@ fn appendMessage(
     source_id = null;
     self.total_size_bytes += body.text.items.len;
     self.evictUntilBounded(gpa);
+    return .{ .truncated = truncated };
+}
+
+fn insertThinkingAt(
+    self: *Transcript,
+    gpa: std.mem.Allocator,
+    index: usize,
+    thinking: Append.ThinkingAppend,
+) error{OutOfMemory}!Outcome {
+    const bounded = text_mod.utf8Prefix(thinking.text, append_size_bytes_max);
+    const truncated = bounded.len < thinking.text.len;
+
+    var source_id = try copySourceId(gpa, thinking.source_id);
+    errdefer if (source_id) |id| gpa.free(id);
+    var body: Thinking = .{ .hidden = thinking.hidden };
+    errdefer body.text.deinit(gpa);
+    if (bounded.len > 0) try appendStreamBytes(gpa, &body.text, &body.pending, bounded);
+
+    try self.insertOwnedItem(gpa, index, .{ .source_id = source_id, .body = .{ .thinking = body } });
+    source_id = null;
     return .{ .truncated = truncated };
 }
 

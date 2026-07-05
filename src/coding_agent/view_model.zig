@@ -18,6 +18,7 @@ pub const assistant_text_bytes_max: usize = 256 * 1024;
 pub const thinking_text_bytes_max: usize = assistant_text_bytes_max;
 pub const tool_output_bytes_max: usize = 64 * 1024;
 pub const history_item_text_bytes_max: usize = 16 * 1024;
+pub const history_entry_id_bytes_max: usize = 128;
 pub const history_page_item_text_bytes_max: usize = history_item_text_bytes_max;
 pub const history_page_total_text_bytes_max: usize = 64 * 1024;
 pub const snapshot_history_item_text_bytes_max: usize = history_item_text_bytes_max;
@@ -88,6 +89,8 @@ pub fn BoundedArray(comptime T: type, comptime cap: usize) type {
 
 pub const ThinkingLevel = enum { off, minimal, low, medium, high, xhigh };
 pub const CompactionTrigger = enum { manual, context_overflow, startup };
+pub const CompactionReason = enum { manual, threshold, overflow };
+pub const CompactionMeta = struct { reason: CompactionReason, tokens_before: u64 };
 
 pub const ViewModel = struct {
     mutex: runtime.SharedMutex = .{},
@@ -156,32 +159,35 @@ pub const ViewModel = struct {
         if (self.generation == cursor.generation) return out;
 
         var bytes: usize = 0;
-        for (self.transcript.items.items) |*item| {
-            var item_cursor = try cursor.getItem(gpa, item.id);
-            if (item.rev == item_cursor.rev and item.text.items.len == item_cursor.consumed_len) continue;
+        const suppress_tail = self.history.state == .open;
+        if (!suppress_tail) {
+            for (self.transcript.items.items) |*item| {
+                var item_cursor = try cursor.getItem(gpa, item.id);
+                if (item.rev == item_cursor.rev and item.text.items.len == item_cursor.consumed_len) continue;
 
-            const replacement = item.text_replaced_at_rev != null and item_cursor.rev < item.text_replaced_at_rev.?;
-            const start = if (replacement) 0 else @min(item_cursor.consumed_len, item.text.items.len);
-            const suffix = item.text.items[start..];
-            const remaining = max_bytes -| bytes;
-            if (remaining == 0 and suffix.len > 0) {
-                out.partial = true;
-                break;
-            }
-            const take = if (suffix.len > remaining) utf8Prefix(suffix, remaining) else suffix;
-            if (take.len == 0 and suffix.len > 0) {
-                out.partial = true;
-                break;
-            }
+                const replacement = item.text_replaced_at_rev != null and item_cursor.rev < item.text_replaced_at_rev.?;
+                const start = if (replacement) 0 else @min(item_cursor.consumed_len, item.text.items.len);
+                const suffix = item.text.items[start..];
+                const remaining = max_bytes -| bytes;
+                if (remaining == 0 and suffix.len > 0) {
+                    out.partial = true;
+                    break;
+                }
+                const take = if (suffix.len > remaining) utf8Prefix(suffix, remaining) else suffix;
+                if (take.len == 0 and suffix.len > 0) {
+                    out.partial = true;
+                    break;
+                }
 
-            try out.items.append(gpa, try ItemDelta.init(gpa, item, take, start == 0));
-            bytes += take.len;
-            item_cursor.consumed_len = start + take.len;
-            if (item_cursor.consumed_len == item.text.items.len) {
-                item_cursor.rev = item.rev;
-            } else {
-                out.partial = true;
-                break;
+                try out.items.append(gpa, try ItemDelta.init(gpa, item, take, start == 0));
+                bytes += take.len;
+                item_cursor.consumed_len = start + take.len;
+                if (item_cursor.consumed_len == item.text.items.len) {
+                    item_cursor.rev = item.rev;
+                } else {
+                    out.partial = true;
+                    break;
+                }
             }
         }
 
@@ -248,6 +254,11 @@ pub const Writer = struct {
         self.touched = true;
     }
 
+    pub fn pushFailureNotice(self: *Writer, severity: Notice.Severity, category: NoticeFailureCategory, text: []const u8) void {
+        self.vm.notices.pushFailure(severity, category, text);
+        self.touched = true;
+    }
+
     pub fn finish(self: *Writer) void {
         if (self.touched) self.vm.generation +%= 1;
         self.timer.assertUnderLimit();
@@ -267,6 +278,11 @@ pub const ReaderCursor = struct {
     pub fn deinit(self: *ReaderCursor, gpa: std.mem.Allocator) void {
         self.items.deinit(gpa);
         self.* = undefined;
+    }
+
+    pub fn resetTranscript(self: *ReaderCursor) void {
+        self.generation = 0;
+        self.items.clearRetainingCapacity();
     }
 
     fn resetForEpoch(self: *ReaderCursor) void {
@@ -314,7 +330,8 @@ pub const Chrome = struct {
     provider_label: BoundedText(64) = .{},
     thinking_level: ThinkingLevel = .off,
     hide_thinking: bool = true,
-    context_used_pct: ?u8 = null,
+    context_percent_tenths: ?u32 = null,
+    context_window: u64 = 0,
     session_title: BoundedText(256) = .{},
 
     pub fn bumpRev(self: *Chrome) void {
@@ -332,7 +349,13 @@ pub const OperationStatus = struct {
         idle,
         running: struct { op_id: u64, started_ms: i64 },
         compacting: struct { op_id: u64, started_ms: i64, trigger: CompactionTrigger },
-        retry_wait: struct { until_ms: i64, attempt: u32, reason: BoundedText(256) },
+        retry_wait: struct {
+            until_ms: i64,
+            attempt: u32,
+            max_attempts: u32,
+            delay_ms: u64,
+            reason: BoundedText(256),
+        },
         shutting_down,
         stopped,
     };
@@ -442,12 +465,16 @@ pub const Item = struct {
     kind: Kind,
     state: State,
     entry_id: ?u64 = null,
+    source_id: BoundedText(history_entry_id_bytes_max) = .{},
     text: std.ArrayList(u8) = .empty,
     text_replaced_at_rev: ?u32 = null,
     footer: BoundedText(footer_bytes_max) = .{},
+    title: BoundedText(256) = .{},
+    markdown: bool = false,
+    compaction: ?CompactionMeta = null,
     tool: ?ToolMeta = null,
 
-    pub const Kind = enum { user, assistant, thinking, tool, banner, compaction_summary, system_notice };
+    pub const Kind = enum { user, assistant, system, thinking, tool, banner, compaction_summary, system_notice };
     pub const State = enum { streaming, final, canceled };
 
     pub fn deinit(self: *Item, gpa: std.mem.Allocator) void {
@@ -512,11 +539,15 @@ pub const ItemDelta = struct {
     kind: Item.Kind,
     state: Item.State,
     entry_id: ?u64,
+    source_id: BoundedText(history_entry_id_bytes_max),
     text_suffix: []u8,
     full_text: bool,
     text_replaced_at_rev: ?u32,
     text_len: usize,
     footer: BoundedText(footer_bytes_max),
+    title: BoundedText(256),
+    markdown: bool,
+    compaction: ?CompactionMeta,
     tool: ?ToolMeta,
 
     pub fn init(gpa: std.mem.Allocator, item: *const Item, text_suffix: []const u8, full_text: bool) !ItemDelta {
@@ -526,11 +557,15 @@ pub const ItemDelta = struct {
             .kind = item.kind,
             .state = item.state,
             .entry_id = item.entry_id,
+            .source_id = item.source_id,
             .text_suffix = try gpa.dupe(u8, text_suffix),
             .full_text = full_text,
             .text_replaced_at_rev = item.text_replaced_at_rev,
             .text_len = if (full_text) text_suffix.len else item.text.items.len,
             .footer = item.footer,
+            .title = item.title,
+            .markdown = item.markdown,
+            .compaction = item.compaction,
             .tool = item.tool,
         };
     }
@@ -546,7 +581,7 @@ fn textCap(kind: Item.Kind) usize {
         .assistant => assistant_text_bytes_max,
         .thinking => thinking_text_bytes_max,
         .tool => tool_output_bytes_max,
-        .user, .banner, .compaction_summary, .system_notice => assistant_text_bytes_max,
+        .user, .system, .banner, .compaction_summary, .system_notice => assistant_text_bytes_max,
     };
 }
 
@@ -562,6 +597,7 @@ pub const ToolMeta = struct {
     duration_ms: ?u64 = null,
     exit_meta: BoundedText(128) = .{},
     details_json: BoundedText(2048) = .{},
+    arguments_json: BoundedText(2048) = .{},
 };
 
 pub const HistoryWindow = struct {
@@ -570,8 +606,8 @@ pub const HistoryWindow = struct {
     items: std.ArrayList(Item) = .empty,
     has_more_before: bool = false,
     has_more_after: bool = false,
-    oldest_entry_id: ?u64 = null,
-    newest_entry_id: ?u64 = null,
+    oldest_entry_id: BoundedText(history_entry_id_bytes_max) = .{},
+    newest_entry_id: BoundedText(history_entry_id_bytes_max) = .{},
 
     pub const State = enum { closed, loading, open };
 
@@ -595,6 +631,7 @@ pub const CompletionSlot = struct {
     query_id: u64 = 0,
     kind: Kind = .none,
     items: std.ArrayList(CompletionItem) = .empty,
+    in_flight: bool = false,
 
     pub const Kind = enum { none, file, model, resume_session, slash_arg, settings };
 
@@ -612,6 +649,16 @@ pub const CompletionSlot = struct {
         return out;
     }
 
+    pub fn start(self: *CompletionSlot, gpa: std.mem.Allocator, query_id: u64, kind: Kind) void {
+        self.items.deinit(gpa);
+        self.items = .empty;
+        self.query_id = query_id;
+        self.kind = kind;
+        self.in_flight = true;
+        self.rev +%= 1;
+        if (self.rev == 0) self.rev = 1;
+    }
+
     pub fn set(self: *CompletionSlot, gpa: std.mem.Allocator, query_id: u64, kind: Kind, items: []const CompletionItem) !void {
         var next: std.ArrayList(CompletionItem) = .empty;
         errdefer next.deinit(gpa);
@@ -621,6 +668,7 @@ pub const CompletionSlot = struct {
         self.items = next;
         self.query_id = query_id;
         self.kind = kind;
+        self.in_flight = false;
         self.rev +%= 1;
         if (self.rev == 0) self.rev = 1;
     }
@@ -640,12 +688,25 @@ pub const NoticeRing = struct {
     evicted_through_id: u64 = 0,
 
     pub fn push(self: *NoticeRing, severity: Notice.Severity, semantic: NoticeSemantic, text: []const u8) void {
-        const notice: Notice = .{
-            .id = self.next_id,
+        self.pushNotice(.{
             .severity = severity,
             .semantic = semantic,
             .text = BoundedText(512).init(text),
-        };
+        });
+    }
+
+    pub fn pushFailure(self: *NoticeRing, severity: Notice.Severity, category: NoticeFailureCategory, text: []const u8) void {
+        self.pushNotice(.{
+            .severity = severity,
+            .semantic = .operation_failed,
+            .failure_category = category,
+            .text = BoundedText(512).init(text),
+        });
+    }
+
+    fn pushNotice(self: *NoticeRing, notice_raw: Notice) void {
+        var notice = notice_raw;
+        notice.id = self.next_id;
         self.next_id += 1;
         if (self.len < notice_ring_len) {
             self.entries[(self.start + self.len) % notice_ring_len] = notice;
@@ -683,6 +744,7 @@ pub const Notice = struct {
     id: u64 = 0,
     severity: Severity = .info,
     semantic: NoticeSemantic = .generic,
+    failure_category: ?NoticeFailureCategory = null,
     text: BoundedText(512) = .{},
 
     pub const Severity = enum { info, warn, err };
@@ -695,7 +757,23 @@ pub const NoticeSemantic = enum {
     retry_start,
     retry_end,
     queue_full,
+    command_queue_full,
+    cancel_requested,
+    cancel_done,
+    recovering_event_gap,
     terminal_bell,
+};
+
+pub const NoticeFailureCategory = enum {
+    auth_missing,
+    auth_rejected,
+    rate_limited,
+    context_overflow,
+    provider_unavailable,
+    transport,
+    malformed_response,
+    canceled,
+    unknown,
 };
 
 pub const Sample = struct {
@@ -843,6 +921,43 @@ test "reader samples only text suffix after consumed_len" {
     try std.testing.expectEqual(@as(usize, 1), second.items.items.len);
     try std.testing.expect(!second.items.items[0].full_text);
     try std.testing.expectEqualStrings("llo", second.items.items[0].text_suffix);
+}
+
+test "open history suppresses tail sampling without consuming item cursors" {
+    const gpa = std.testing.allocator;
+    var model = try ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var writer = model.lockWriter();
+    const id = try writer.addItem(gpa, .assistant, .streaming, "head", null);
+    writer.finish();
+
+    var cursor: ReaderCursor = .{};
+    defer cursor.deinit(gpa);
+    var first = try model.sample(gpa, &cursor, sample_bytes_per_frame_max);
+    first.deinit(gpa);
+
+    var open = model.lockWriter();
+    open.vm.history.state = .open;
+    open.vm.history.rev +%= 1;
+    try open.appendItemText(gpa, id, "tail");
+    open.touched = true;
+    open.finish();
+
+    var suppressed = try model.sample(gpa, &cursor, sample_bytes_per_frame_max);
+    defer suppressed.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), suppressed.items.items.len);
+    try std.testing.expectEqual(@as(usize, 4), cursor.findItem(id).?.consumed_len);
+
+    var close = model.lockWriter();
+    close.vm.history.state = .closed;
+    close.vm.history.rev +%= 1;
+    close.touched = true;
+    close.finish();
+
+    var tail = try model.sample(gpa, &cursor, sample_bytes_per_frame_max);
+    defer tail.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), tail.items.items.len);
+    try std.testing.expectEqualStrings("tail", tail.items.items[0].text_suffix);
 }
 
 test "append at text cap sets footer and bumps rev" {

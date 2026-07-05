@@ -124,8 +124,8 @@ Do not redesign these; they are correct:
   fan-in, `CancelSource` two-phase cancel. (Run-handle unification in Phase 5
   is a re-plumbing of `AgentSession`/Engine dispatch, not of `agent`.)
 - `session_manager.zig` jsonl store: durable truth, prepare/commit ordering.
-- `event_drain.zig`'s single-writer discipline — the *pattern* survives; the
-  file is refitted to write the ViewModel instead of a ClientEvent queue.
+- `engine_drain.zig`'s single-writer discipline — the *pattern* survives;
+  `AgentSession` keeps session event persistence/queue state private.
 - All named bounds keep their values unless this plan states otherwise.
 
 ## 3. ViewModel specification
@@ -284,8 +284,8 @@ Written by the engine at the same points `queue_mirror.zig` writes today.
 `QueuedPrompt.id` is assigned at enqueue time and carried through the real
 `agent` queues (add an id field to the queued message), so consumption removes
 by id, not by string match — this deletes the string-equality removal hazard
-in `event_drain.zig`. `queue_mirror.zig` is deleted; the ViewModel section is
-the mirror.
+in the old session event path. `queue_mirror.zig` is deleted; the ViewModel
+section is the mirror.
 
 ### 3.5 ItemStore (the transcript tail)
 
@@ -470,7 +470,7 @@ deleted in Phase 3). `pub const Engine`.
    this carries over from frame-loop-plan step 2a unchanged.
 4. Own the operation table (one active operation; `.busy` reject policy as
    today) and drive `AgentSession` run progress.
-5. Be the single writer of the ViewModel (via the refitted `event_drain`).
+5. Be the single writer of the ViewModel (via `engine_drain.zig`).
 6. Own coding-agent-side workers: file index (existing raw-thread worker),
    completion loads, session opens. Their results land on the engine thread
    and are applied there.
@@ -507,11 +507,12 @@ observe terminal outcome) → join workers → final publish
 returns → caller deinits. The UI thread never calls `deinit` before `join`
 returns. `deinit` poisons the struct.
 
-### 4.3 The refitted drain
+### 4.3 The ViewModel drain
 
-`event_drain.zig` keeps its name, single-writer role, and drain order, but its
-output changes: instead of enqueueing ClientEvents it applies agent events to
-the ViewModel:
+`engine_drain.zig` is the ViewModel writer. `AgentSession` owns the private
+session event state for persistence, retry counters, and the bounded legacy
+public event queue; it forwards ViewModel facts to `EngineDrain` when an
+engine is attached:
 
 ```text
 agent event -> ViewModel mutation (items/op/queue) -> jsonl persistence on
@@ -757,8 +758,8 @@ Done when: both modules fully tested standalone; `zi` binary unchanged.
 
 ### Phase 2 — Engine (addition, wired to nothing)
 
-- Implement `Engine.zig` per §4: thread, mailbox, refitted `event_drain`
-  writing the ViewModel, worker ownership, shutdown order. Reuse
+- Implement `Engine.zig` per §4: thread, mailbox, `engine_drain` writing the
+  ViewModel, worker ownership, shutdown order. Reuse
   `AgentSession`, `session_manager`, `RuntimeServices` as-is; do not do the
   §5 consolidations yet.
 - Integration tests using the faux provider (`src/ai/providers/faux.zig`):

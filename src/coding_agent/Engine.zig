@@ -17,10 +17,12 @@ const vm = @import("view_model.zig");
 
 const prompt_progress_events_per_turn_max: usize = 16;
 const active_work_poll_interval_ms: u64 = 16;
+const SessionStats = client_protocol.PromptCommandSessionStats;
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     services: RuntimeServices = undefined,
+    services_initialized: bool = false,
     session: AgentSession = undefined,
     task_runtime: *runtime.Runtime = undefined,
     dir: std.Io.Dir = .cwd(),
@@ -202,11 +204,11 @@ pub const Engine = struct {
             var owned = envelope;
             owned.deinit(allocator);
         }
-        if (self.initialized) {
-            if (self.active) |active| self.destroyActive(active);
-            if (self.file_index) |*index| index.deinit(std.heap.page_allocator);
-            if (self.session_open) |load| self.allocator.free(load.selector);
-            shutdownAndDeinitSession(&self.session);
+        if (self.active) |active| self.destroyActive(active);
+        if (self.file_index) |*index| index.deinit(std.heap.page_allocator);
+        if (self.session_open) |load| self.allocator.free(load.selector);
+        if (self.initialized) shutdownAndDeinitSession(&self.session);
+        if (self.services_initialized) {
             self.services.deinit();
             self.task_runtime.deinit();
         }
@@ -257,7 +259,11 @@ pub const Engine = struct {
             .environ = options.environ,
             .task_runtime = self.task_runtime,
         });
-        errdefer self.services.deinit();
+        self.services_initialized = true;
+        errdefer {
+            self.services.deinit();
+            self.services_initialized = false;
+        }
         if (options.open != .none) {
             self.session = try openSession(self.allocator, &self.services, options, &self.drain);
             errdefer shutdownAndDeinitSession(&self.session);
@@ -274,7 +280,7 @@ pub const Engine = struct {
         while (true) {
             self.drainWakePipe();
             try self.drainMailbox();
-            try self.finishSessionOpen();
+            self.finishSessionOpen() catch |err| self.drain.notice(.warn, .operation_failed, @errorName(err));
             try self.stepActive();
             self.wakeReadersIfDirty();
 
@@ -356,9 +362,9 @@ pub const Engine = struct {
             .file_completion => |request| try self.publishFileCompletion(envelope.id orelse 0, request.query),
             .switch_session => |request| try self.startSwitchSession(request.session_file_name),
             .history_tail => self.drain.closeHistory(),
+            .history_page => |request| try self.publishHistoryPage(request.before_entry_id),
             .snapshot,
             .replay,
-            .history_page,
             => self.drain.notice(.warn, .operation_failed, "command not implemented in Engine run B"),
         }
     }
@@ -382,7 +388,7 @@ pub const Engine = struct {
             },
             .thinking_level => |level| try self.applySessionSetting(level, null),
             .hide_thinking => |hidden| try self.applySessionSetting(null, hidden),
-            .session => self.publishChrome(),
+            .session => try self.publishSessionInfo(),
             .settings => self.drain.notice(.info, .generic, "choose a setting"),
             .unknown => |name| self.drain.notice(.warn, .operation_failed, name),
         }
@@ -404,6 +410,7 @@ pub const Engine = struct {
 
     fn publishCompletionSnapshot(self: *Engine, query_id: u64) !void {
         if (query_id == 3) return self.publishResumeCompletion(query_id);
+        self.drain.startCompletion(query_id, .model);
         var items = std.ArrayList(vm.CompletionItem).empty;
         defer items.deinit(self.allocator);
         outer: for (ai.getProviders()) |provider| {
@@ -422,6 +429,7 @@ pub const Engine = struct {
     }
 
     fn publishResumeCompletion(self: *Engine, query_id: u64) !void {
+        self.drain.startCompletion(query_id, .resume_session);
         var summaries = try session_listing.listRuntimeSessionSummaries(self.allocator, self.services.io, .{
             .cwd = self.services.cwd,
             .agent_dir_override = self.services.agent_dir,
@@ -443,6 +451,7 @@ pub const Engine = struct {
     }
 
     fn publishFileCompletion(self: *Engine, query_id: u64, query: []const u8) !void {
+        self.drain.startCompletion(query_id, .file);
         if (self.file_index == null) self.file_index = try buildProjectFileIndex(self.dir, self.services.cwd);
         const result = try self.file_index.?.query(std.heap.page_allocator, query);
         defer result.destroy(std.heap.page_allocator);
@@ -456,6 +465,33 @@ pub const Engine = struct {
             count += 1;
         }
         try self.drain.setCompletion(query_id, .file, items[0..count]);
+    }
+
+    fn publishHistoryPage(self: *Engine, before_entry_id: []const u8) !void {
+        if (!self.initialized) return self.drain.notice(.warn, .operation_failed, "no session");
+        var page = client_protocol.HistoryPage.beforeEntry(
+            self.allocator,
+            self.session.manager,
+            before_entry_id,
+        ) catch |err| {
+            self.drain.notice(.warn, .operation_failed, @errorName(err));
+            return;
+        };
+        defer page.deinit(self.allocator);
+        try self.drain.publishHistoryPage(page);
+    }
+
+    fn publishSessionInfo(self: *Engine) !void {
+        if (!self.initialized) return self.drain.notice(.warn, .operation_failed, "no session");
+        var buffer: [2048]u8 = undefined;
+        const stats = collectSessionStats(self.session.manager);
+        const text = formatSessionInfo(
+            &buffer,
+            if (self.session.store) |store| store.file_name else null,
+            self.session.manager.header.id,
+            stats,
+        );
+        try self.drain.transcriptCustom("Session Info", text, true);
     }
 
     fn startSwitchSession(self: *Engine, selector: []const u8) !void {
@@ -494,8 +530,9 @@ pub const Engine = struct {
         errdefer next_services.deinit();
         var next_drain = engine_drain.EngineDrain.init(self.allocator, &self.view_model);
         errdefer next_drain.deinit();
+        const stamp = SessionStamp.now(self.services.io);
         const open: Open = if (load.create)
-            .{ .create = .{ .session_id = load.selector, .timestamp = "2026-07-04T00:00:00Z" } }
+            .{ .create = .{ .session_id = load.selector, .timestamp = stamp.timestamp() } }
         else
             .{ .resume_existing = .{ .session_file_name = load.selector } };
         const current_model = if (self.initialized) self.session.agent.state.model else agent_mod.Agent.defaultModel();
@@ -504,7 +541,7 @@ pub const Engine = struct {
         var next_session = try openSession(self.allocator, &next_services, .{
             .cwd = self.services.cwd,
             .agent_dir_override = self.services.agent_dir,
-            .current_date = "2026-07-04",
+            .current_date = stamp.date(),
             .open = open,
             .model = current_model,
             .thinking_level = current_thinking,
@@ -524,6 +561,7 @@ pub const Engine = struct {
         if (had_session) shutdownAndDeinitSession(&old_session);
         old_services.deinit();
         self.drain.bumpEpoch();
+        self.drain.notice(.info, .generic, if (load.create) "started new session" else "resumed session");
         self.publishChrome();
     }
 
@@ -560,6 +598,7 @@ pub const Engine = struct {
                     },
                     .settled => try self.settleActive(active, handle),
                 }
+                if (self.drain.isDirty()) return;
                 continue;
             }
             const wait = active.retry_wait orelse return;
@@ -571,6 +610,8 @@ pub const Engine = struct {
             handle.setWake(self.services.io, &self.owner_wake);
             active.retry_wait = null;
             active.handle = handle;
+            self.drain.operationRunning(self.nextOperationId());
+            if (self.drain.isDirty()) return;
         }
     }
 
@@ -618,7 +659,7 @@ pub const Engine = struct {
         const active = self.takeActive() orelse return;
         self.freeActive(active);
         if (self.session.latestOperationalFailure()) |failure| {
-            self.drain.notice(.err, .operation_failed, failure.message);
+            self.drain.operationalFailure(failure);
         } else {
             self.drain.notice(.err, .operation_failed, message);
         }
@@ -704,6 +745,68 @@ pub const Engine = struct {
     }
 };
 
+fn collectSessionStats(manager: *const session_manager.SessionManager) SessionStats {
+    var stats: SessionStats = .{};
+    for (manager.entries.items) |entry| switch (entry) {
+        .compaction, .model_change, .thinking_level_change => {},
+        .message => |message_entry| {
+            stats.total_messages += 1;
+            switch (message_entry.message) {
+                .user => stats.user_messages += 1,
+                .assistant => |assistant| {
+                    stats.assistant_messages += 1;
+                    stats.input_tokens +|= assistant.usage.input;
+                    stats.output_tokens +|= assistant.usage.output;
+                    stats.cache_read_tokens +|= assistant.usage.cache_read;
+                    stats.cache_write_tokens +|= assistant.usage.cache_write;
+                    stats.total_tokens +|= assistant.usage.input +|
+                        assistant.usage.output +|
+                        assistant.usage.cache_read +|
+                        assistant.usage.cache_write;
+                    stats.cost += assistant.usage.cost.total;
+                    for (assistant.content) |content| switch (content) {
+                        .tool_call => stats.tool_calls += 1,
+                        .text, .thinking => {},
+                    };
+                },
+                .tool_result => stats.tool_results += 1,
+                .custom => {},
+            }
+        },
+    };
+    return stats;
+}
+
+fn formatSessionInfo(buffer: []u8, file: ?[]const u8, id: []const u8, stats: SessionStats) []const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    if (file) |path| {
+        writer.print("File: {s}\n", .{path}) catch return "session status unavailable";
+    } else {
+        writer.writeAll("File: In-memory\n") catch return "session status unavailable";
+    }
+    writer.print("ID: {s}\n\n", .{id}) catch return "session status unavailable";
+    writer.writeAll("**Messages**\n") catch return "session status unavailable";
+    writer.print("User: {d}\n", .{stats.user_messages}) catch return "session status unavailable";
+    writer.print("Assistant: {d}\n", .{stats.assistant_messages}) catch return "session status unavailable";
+    writer.print("Tool Calls: {d}\n", .{stats.tool_calls}) catch return "session status unavailable";
+    writer.print("Tool Results: {d}\n", .{stats.tool_results}) catch return "session status unavailable";
+    writer.print("Total: {d}\n\n", .{stats.total_messages}) catch return "session status unavailable";
+    writer.writeAll("**Tokens**\n") catch return "session status unavailable";
+    writer.print("Input: {d}\n", .{stats.input_tokens}) catch return "session status unavailable";
+    writer.print("Output: {d}\n", .{stats.output_tokens}) catch return "session status unavailable";
+    if (stats.cache_read_tokens > 0) {
+        writer.print("Cache Read: {d}\n", .{stats.cache_read_tokens}) catch return "session status unavailable";
+    }
+    if (stats.cache_write_tokens > 0) {
+        writer.print("Cache Write: {d}\n", .{stats.cache_write_tokens}) catch return "session status unavailable";
+    }
+    writer.print("Total: {d}", .{stats.total_tokens}) catch return "session status unavailable";
+    if (stats.cost > 0) {
+        writer.print("\n\n**Cost**\nTotal: {d:.4}", .{stats.cost}) catch return "session status unavailable";
+    }
+    return writer.buffered();
+}
+
 fn openSession(
     allocator: std.mem.Allocator,
     services: *RuntimeServices,
@@ -769,7 +872,7 @@ fn openSession(
         .allow_paths_outside_cwd = options.allow_paths_outside_cwd,
         .public_event_capacity = options.public_event_capacity,
         .retry_settings = retry,
-        .event_sink = drain,
+        .view_sink = drain,
         .task_runtime = services.task_runtime,
     };
     if (session_options.stream == null) {
@@ -980,6 +1083,19 @@ test "engine retry wait phase visible then resolves" {
     try waitForAssistant(engine, "recovered", true);
 }
 
+test "engine slash session publishes transcript info" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var provider = try ai.FauxProvider.init(std.testing.allocator, .{});
+    defer provider.deinit();
+    const engine = try Engine.start(std.testing.allocator, null, try engineTestOptions(&tmp, &provider));
+    defer engine.join();
+    defer engine.requestShutdown();
+
+    try engine.submit(try client_protocol.CommandEnvelope.initSubmitPrompt(std.testing.allocator, 1, "/session", .auto));
+    try waitForCustom(engine, "Session Info", "**Messages**");
+}
+
 test "engine file completion publishes latest slot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1065,6 +1181,21 @@ fn waitForRetryWait(engine: *Engine) !void {
         var sample = try engine.viewModel().sample(std.testing.allocator, &cursor, vm.sample_bytes_per_frame_max);
         defer sample.deinit(std.testing.allocator);
         if (sample.op.phase == .retry_wait) return;
+        std.Thread.yield() catch {};
+    }
+    return error.Timeout;
+}
+
+fn waitForCustom(engine: *Engine, title: []const u8, needle: []const u8) !void {
+    var cursor: vm.ReaderCursor = .{};
+    defer cursor.deinit(std.testing.allocator);
+    var iterations: usize = 0;
+    while (iterations < 4000) : (iterations += 1) {
+        var sample = try engine.viewModel().sample(std.testing.allocator, &cursor, vm.sample_bytes_per_frame_max);
+        defer sample.deinit(std.testing.allocator);
+        for (sample.items.items) |item| {
+            if (item.kind == .banner and item.title.eql(title) and std.mem.indexOf(u8, item.text_suffix, needle) != null) return;
+        }
         std.Thread.yield() catch {};
     }
     return error.Timeout;

@@ -53,6 +53,10 @@ pub const EngineDrain = struct {
         self.* = undefined;
     }
 
+    pub fn isDirty(self: *const EngineDrain) bool {
+        return self.dirty;
+    }
+
     pub fn takeDirty(self: *EngineDrain) bool {
         const value = self.dirty;
         self.dirty = false;
@@ -84,6 +88,7 @@ pub const EngineDrain = struct {
         } orelse return;
         if (findItem(&writer, id)) |item| {
             item.entry_id = parseEntryId(entry_id);
+            item.source_id.set(entry_id);
             item.state = .final;
             bumpItem(item);
             writer.touched = true;
@@ -112,6 +117,7 @@ pub const EngineDrain = struct {
         var writer = self.view_model.lockWriter();
         writer.vm.op.cancel_requested = true;
         bumpOp(&writer);
+        writer.pushNotice(.info, .cancel_requested, "cancel requested");
         self.finish(&writer);
     }
 
@@ -135,6 +141,7 @@ pub const EngineDrain = struct {
                 }
             } else |_| {}
         }
+        writer.pushNotice(.info, .cancel_done, "canceled");
         self.finish(&writer);
     }
 
@@ -150,16 +157,38 @@ pub const EngineDrain = struct {
         self.setPhase(.{ .compacting = .{ .op_id = 0, .started_ms = nowMs(), .trigger = compactionTrigger(reason) } }, false);
     }
 
-    pub fn compactionEnd(self: *EngineDrain, aborted: bool, message: ?[]const u8) void {
-        if (aborted) self.notice(.warn, .operation_failed, message orelse "compaction aborted");
+    pub fn compactionEnd(self: *EngineDrain, end: client_protocol.CompactionEnd) void {
+        var writer = self.view_model.lockWriter();
+        if (end.result) |result| {
+            if (writer.addItem(self.allocator, .compaction_summary, .streaming, result.summary.text, null)) |id| {
+                if (findItem(&writer, id)) |item| {
+                    item.markdown = true;
+                    item.compaction = .{ .reason = compactionReason(end.reason), .tokens_before = result.tokens_before };
+                    item.state = .final;
+                    bumpItem(item);
+                    writer.touched = true;
+                }
+            } else |_| {}
+        }
+        if (end.error_message) |message| writer.pushNotice(.warn, .operation_failed, message.text);
+        self.finish(&writer);
     }
 
-    pub fn retryStart(self: *EngineDrain, attempt: usize, delay_ms: u64, reason: []const u8, _: ?ai.OperationalFailure.Category) void {
+    pub fn retryStart(
+        self: *EngineDrain,
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+        reason: []const u8,
+        _: ?ai.OperationalFailure.Category,
+    ) void {
         var writer = self.view_model.lockWriter();
         const bounded = vm.BoundedText(256).init(reason);
         writer.vm.op.phase = .{ .retry_wait = .{
             .until_ms = nowMs() + @as(i64, @intCast(delay_ms)),
             .attempt = @intCast(attempt),
+            .max_attempts = @intCast(max_attempts),
+            .delay_ms = delay_ms,
             .reason = bounded,
         } };
         writer.vm.op.cancel_requested = false;
@@ -176,6 +205,83 @@ pub const EngineDrain = struct {
         var writer = self.view_model.lockWriter();
         writer.pushNotice(severity, semantic, text);
         self.finish(&writer);
+    }
+
+    pub fn operationalFailure(self: *EngineDrain, failure: ai.OperationalFailure) void {
+        var writer = self.view_model.lockWriter();
+        writer.pushFailureNotice(.err, noticeFailureCategory(failure.category), failure.message);
+        self.finish(&writer);
+    }
+
+    pub fn transcriptCustom(self: *EngineDrain, title: []const u8, text: []const u8, markdown: bool) !void {
+        if (title.len == 0 and text.len == 0) return;
+        var writer = self.view_model.lockWriter();
+        defer self.finish(&writer);
+        const id = try writer.addItem(self.allocator, .banner, .streaming, text, null);
+        if (findItem(&writer, id)) |item| {
+            item.title.set(title);
+            item.markdown = markdown;
+            item.state = .final;
+            bumpItem(item);
+            writer.touched = true;
+        }
+    }
+
+    pub fn promptCommand(self: *EngineDrain, command: client_protocol.PromptCommand) void {
+        switch (command.presentation) {
+            .transcript => self.transcriptCustom(
+                if (command.session_info != null) "Session Info" else "Command",
+                command.message.text,
+                true,
+            ) catch {},
+            .status => self.notice(
+                if (command.result == .failed) .warn else .info,
+                .generic,
+                command.message.text,
+            ),
+        }
+    }
+
+    pub fn rejection(self: *EngineDrain, rejection_value: client_protocol.Rejection) void {
+        self.notice(
+            .warn,
+            if (rejection_value.code == .queue_full) .queue_full else .operation_failed,
+            rejection_value.message.text,
+        );
+    }
+
+    pub fn eventOverflow(self: *EngineDrain, overflow: client_protocol.EventOverflow) void {
+        var buffer: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buffer,
+            "event overflow: dropped {d}",
+            .{overflow.dropped_count},
+        ) catch "event overflow";
+        self.notice(.warn, .notices_dropped, text);
+    }
+
+    pub fn clientEvent(self: *EngineDrain, event: client_protocol.ClientEvent) void {
+        switch (event) {
+            .compaction_start => |start| self.compactionStart(start.reason),
+            .compaction_end => |end| self.compactionEnd(end),
+            .auto_retry_start => |retry| self.retryStart(
+                retry.attempt,
+                retry.max_attempts,
+                retry.delay_ms,
+                retry.error_message.text,
+                if (retry.failure) |failure| failure.category else null,
+            ),
+            .auto_retry_end => |retry| self.retryEnd(
+                retry.success,
+                @intCast(retry.attempt),
+                if (retry.final_error) |err| err.text else null,
+                null,
+            ),
+            .rejected => |rejection_value| self.rejection(rejection_value),
+            .event_overflow => |overflow| self.eventOverflow(overflow),
+            .prompt_command => |command| self.promptCommand(command),
+            else => {},
+        }
     }
 
     pub fn queueAdd(self: *EngineDrain, id: u64, kind: anytype, text: []const u8) void {
@@ -211,9 +317,47 @@ pub const EngineDrain = struct {
 
     pub fn closeHistory(self: *EngineDrain) void {
         var writer = self.view_model.lockWriter();
+        for (writer.vm.history.items.items) |*item| item.deinit(self.allocator);
+        writer.vm.history.items.clearRetainingCapacity();
         writer.vm.history.state = .closed;
+        writer.vm.history.has_more_before = false;
+        writer.vm.history.has_more_after = false;
+        writer.vm.history.oldest_entry_id.len = 0;
+        writer.vm.history.newest_entry_id.len = 0;
         writer.vm.history.rev +%= 1;
         if (writer.vm.history.rev == 0) writer.vm.history.rev = 1;
+        writer.touched = true;
+        self.finish(&writer);
+    }
+
+    pub fn publishHistoryPage(self: *EngineDrain, page: client_protocol.HistoryPage) !void {
+        var next_items = try buildHistoryItems(self.allocator, page.items, self.home_dir);
+        errdefer deinitHistoryItems(self.allocator, &next_items);
+
+        var writer = self.view_model.lockWriter();
+        for (writer.vm.history.items.items) |*item| item.deinit(self.allocator);
+        writer.vm.history.items.deinit(self.allocator);
+        writer.vm.history.items = next_items;
+        next_items = .empty;
+        writer.vm.history.state = if (page.items.len > 0) .open else .closed;
+        writer.vm.history.has_more_before = page.items.len > 0 and page.has_more_before;
+        writer.vm.history.has_more_after = page.items.len > 0;
+        if (page.items.len > 0) {
+            writer.vm.history.oldest_entry_id.set(page.items[0].entry_id.text);
+            writer.vm.history.newest_entry_id.set(page.items[page.items.len - 1].entry_id.text);
+        } else {
+            writer.vm.history.oldest_entry_id.len = 0;
+            writer.vm.history.newest_entry_id.len = 0;
+        }
+        writer.vm.history.rev +%= 1;
+        if (writer.vm.history.rev == 0) writer.vm.history.rev = 1;
+        writer.touched = true;
+        self.finish(&writer);
+    }
+
+    pub fn startCompletion(self: *EngineDrain, query_id: u64, kind: vm.CompletionSlot.Kind) void {
+        var writer = self.view_model.lockWriter();
+        writer.vm.completion.start(self.allocator, query_id, kind);
         writer.touched = true;
         self.finish(&writer);
     }
@@ -282,7 +426,11 @@ pub const EngineDrain = struct {
     }
 
     fn ensureAssistantItems(self: *EngineDrain, writer: *vm.Writer, assistant: ai.AssistantMessage) !void {
-        for (assistant.content) |content| switch (content) {
+        try self.ensureAssistantItemsBefore(writer, assistant, assistant.content.len);
+    }
+
+    fn ensureAssistantItemsBefore(self: *EngineDrain, writer: *vm.Writer, assistant: ai.AssistantMessage, index: usize) !void {
+        for (assistant.content[0..@min(index, assistant.content.len)]) |content| switch (content) {
             .text => {
                 if (self.assistant_item == null) {
                     self.assistant_item = try writer.addItem(self.allocator, .assistant, .streaming, "", null);
@@ -319,6 +467,7 @@ pub const EngineDrain = struct {
 
     fn toolPreview(self: *EngineDrain, writer: *vm.Writer, assistant: ai.AssistantMessage, index: usize, final: bool) !void {
         if (index >= assistant.content.len or assistant.content[index] != .tool_call) return;
+        try self.ensureAssistantItemsBefore(writer, assistant, index);
         const call = assistant.content[index].tool_call;
         const cursor = try self.ensureTool(writer, call.id, call.name);
         const now = self.currentMs();
@@ -439,6 +588,153 @@ pub const EngineDrain = struct {
         if (touched) self.dirty = true;
     }
 };
+
+fn deinitHistoryItems(allocator: std.mem.Allocator, items: *std.ArrayList(vm.Item)) void {
+    for (items.items) |*item| item.deinit(allocator);
+    items.deinit(allocator);
+    items.* = .empty;
+}
+
+fn buildHistoryItems(
+    allocator: std.mem.Allocator,
+    source_items: []const client_protocol.HistorySnapshotItem,
+    home_dir: ?[]const u8,
+) !std.ArrayList(vm.Item) {
+    var items: std.ArrayList(vm.Item) = .empty;
+    errdefer deinitHistoryItems(allocator, &items);
+
+    var next_id: u64 = 1;
+    for (source_items) |source| {
+        switch (source.kind) {
+            .user => try appendHistoryVmItem(
+                allocator,
+                &items,
+                &next_id,
+                .user,
+                .final,
+                source.text.text,
+                source.entry_id.text,
+                null,
+            ),
+            .system => try appendHistoryVmItem(
+                allocator,
+                &items,
+                &next_id,
+                .system,
+                .final,
+                source.text.text,
+                source.entry_id.text,
+                null,
+            ),
+            .assistant => {
+                if (source.has_thinking) try appendHistoryVmItem(
+                    allocator,
+                    &items,
+                    &next_id,
+                    .thinking,
+                    .final,
+                    "",
+                    source.entry_id.text,
+                    null,
+                );
+                if (source.text.text.len > 0) try appendHistoryVmItem(
+                    allocator,
+                    &items,
+                    &next_id,
+                    .assistant,
+                    .final,
+                    source.text.text,
+                    source.entry_id.text,
+                    null,
+                );
+                for (source.tool_calls) |tool_call| {
+                    const meta = try historyToolCallMeta(allocator, tool_call, home_dir);
+                    try appendHistoryVmItem(
+                        allocator,
+                        &items,
+                        &next_id,
+                        .tool,
+                        .streaming,
+                        "",
+                        source.entry_id.text,
+                        meta,
+                    );
+                }
+            },
+            .tool_result => {
+                const meta = historyToolResultMeta(source);
+                try appendHistoryVmItem(
+                    allocator,
+                    &items,
+                    &next_id,
+                    .tool,
+                    .final,
+                    source.text.text,
+                    source.entry_id.text,
+                    meta,
+                );
+            },
+        }
+    }
+    return items;
+}
+
+fn appendHistoryVmItem(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(vm.Item),
+    next_id: *u64,
+    kind: vm.Item.Kind,
+    state: vm.Item.State,
+    text: []const u8,
+    source_id: []const u8,
+    tool: ?vm.ToolMeta,
+) !void {
+    var item: vm.Item = .{ .id = next_id.*, .kind = kind, .state = .streaming, .tool = tool };
+    errdefer item.deinit(allocator);
+    item.source_id.set(source_id);
+    if (text.len > 0) try item.appendStreaming(allocator, text);
+    item.state = state;
+    try items.append(allocator, item);
+    next_id.* += 1;
+}
+
+fn historyToolCallMeta(
+    allocator: std.mem.Allocator,
+    tool_call: client_protocol.HistoryToolCall,
+    home_dir: ?[]const u8,
+) !vm.ToolMeta {
+    var meta: vm.ToolMeta = .{};
+    meta.tool_call_id.set(tool_call.id.text);
+    meta.name.set(tool_call.name.text);
+    meta.display = tool_metadata.displayForTool(tool_call.name.text);
+    meta.streams_output = meta.display.streams_output;
+    meta.arguments_json.set(tool_call.arguments_json.text);
+    meta.title.set(tool_call.title.text);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, tool_call.arguments_json.text, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+    if (parsed) |value| {
+        var title_buffer: [(vm.ToolMeta{}).title.bytes.len]u8 = undefined;
+        var compact_buffer: [(vm.ToolMeta{}).compact_title.bytes.len]u8 = undefined;
+        const title = formatToolTitle(&title_buffer, tool_call.name.text, value.value, home_dir);
+        if (title.len > 0) meta.title.set(title);
+        meta.compact_title.set(formatCompactToolTitle(&compact_buffer, tool_call.name.text, value.value));
+    }
+    return meta;
+}
+
+fn historyToolResultMeta(source: client_protocol.HistorySnapshotItem) vm.ToolMeta {
+    var meta: vm.ToolMeta = .{};
+    if (source.tool_call_id) |id| meta.tool_call_id.set(id.text);
+    if (source.tool_name) |name| {
+        meta.name.set(name.text);
+        meta.display = tool_metadata.displayForTool(name.text);
+        meta.streams_output = meta.display.streams_output;
+    }
+    meta.is_error = source.is_error;
+    if (source.details_json) |json| meta.details_json.set(json.text);
+    return meta;
+}
 
 fn findItem(writer: *vm.Writer, id: u64) ?*vm.Item {
     for (writer.vm.transcript.items.items) |*item| if (item.id == id) return item;
@@ -757,9 +1053,12 @@ fn updateToolTitle(
     const title = formatToolTitle(&title_buffer, name, arguments, home_dir);
     const compact_title = formatCompactToolTitle(&compact_buffer, name, arguments);
     if (findItem(writer, item_id)) |item| if (item.tool) |*tool| {
-        if (tool.title.eql(title) and tool.compact_title.eql(compact_title)) return;
+        var arguments_buffer: [2048]u8 = undefined;
+        const arguments_json = stringifyJson(&arguments_buffer, arguments);
+        if (tool.title.eql(title) and tool.compact_title.eql(compact_title) and tool.arguments_json.eql(arguments_json)) return;
         tool.title.set(title);
         tool.compact_title.set(compact_title);
+        tool.arguments_json.set(arguments_json);
         bumpItem(item);
         writer.touched = true;
     };
@@ -955,11 +1254,15 @@ fn setDetailsJson(tool: *vm.ToolMeta, details: ?std.json.Value) void {
         return;
     };
     var buffer: [2048]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buffer);
+    tool.details_json.set(stringifyJson(&buffer, value));
+}
+
+fn stringifyJson(buffer: []u8, value: std.json.Value) []const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
     std.json.Stringify.value(value, .{}, &writer) catch |err| switch (err) {
         error.WriteFailed => {},
     };
-    tool.details_json.set(writer.buffered());
+    return writer.buffered();
 }
 
 fn compactionTrigger(reason: client_protocol.CompactionReason) vm.CompactionTrigger {
@@ -969,8 +1272,30 @@ fn compactionTrigger(reason: client_protocol.CompactionReason) vm.CompactionTrig
     };
 }
 
+fn compactionReason(reason: client_protocol.CompactionReason) vm.CompactionReason {
+    return switch (reason) {
+        .manual => .manual,
+        .threshold => .threshold,
+        .overflow => .overflow,
+    };
+}
+
+fn noticeFailureCategory(category: ai.OperationalFailure.Category) vm.NoticeFailureCategory {
+    return switch (category) {
+        .auth_missing => .auth_missing,
+        .auth_rejected => .auth_rejected,
+        .rate_limited => .rate_limited,
+        .context_overflow => .context_overflow,
+        .provider_unavailable => .provider_unavailable,
+        .transport => .transport,
+        .malformed_response => .malformed_response,
+        .canceled => .canceled,
+        .unknown => .unknown,
+    };
+}
+
 fn parseEntryId(text: []const u8) ?u64 {
-    return std.fmt.parseInt(u64, text, 10) catch null;
+    return std.fmt.parseInt(u64, text, 16) catch null;
 }
 
 fn nowMs() i64 {
@@ -1081,6 +1406,30 @@ test "settled read result moves continuation notices out of body" {
     defer gpa.free(text);
 
     try std.testing.expectEqualStrings("two\nthree", text);
+}
+
+test "tool preview preserves prior thinking order" {
+    const gpa = std.testing.allocator;
+    var model = try vm.ViewModel.init(gpa);
+    defer model.deinit(gpa);
+    var drain = EngineDrain.init(gpa, &model);
+    defer drain.deinit();
+
+    var args = try std.json.parseFromSlice(std.json.Value, gpa, "{}", .{});
+    defer args.deinit();
+    const content = [_]ai.AssistantContent{
+        ai.faux.thinking("Planning bash tool usage"),
+        ai.faux.toolCall("call-b", "bash", args.value),
+    };
+    const assistant = ai.faux.assistantMessage(&content, .{});
+    var writer = model.lockWriter();
+    try drain.toolPreview(&writer, assistant, 1, false);
+    try drain.replaceAssistantFinal(&writer, assistant);
+    writer.finish();
+
+    try std.testing.expectEqual(vm.Item.Kind.thinking, model.transcript.items.items[0].kind);
+    try std.testing.expectEqual(vm.Item.Kind.tool, model.transcript.items.items[1].kind);
+    try std.testing.expectEqualStrings("Planning bash tool usage", model.transcript.items.items[0].text.items);
 }
 
 test "settled write success keeps preview body and error flag is retained" {

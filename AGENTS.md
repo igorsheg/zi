@@ -57,9 +57,8 @@ When touching `src/runtime` or code that uses it:
 - Frontends submit commands and sample the ViewModel; they do not mutate sessions
   directly.
 - `AgentSession` owns one long-lived `agent.Agent` plus resources, tools,
-  persistence, retry, and compaction.
-- The event drain is the only writer of message-derived ViewModel state,
-  retry/compaction state, and jsonl commit facts.
+  persistence, retry, compaction, and private session event state.
+- `EngineDrain` is the only writer of message-derived ViewModel state.
 - Drain order is:
 
 ```text

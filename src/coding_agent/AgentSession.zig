@@ -10,7 +10,7 @@ const agent_mod = @import("../agent/root.zig");
 const ai = @import("../ai/root.zig");
 const runtime = @import("../runtime/root.zig");
 const bash_tool = @import("tools/bash.zig");
-const event_drain_mod = @import("event_drain.zig");
+const engine_drain = @import("engine_drain.zig");
 const message_policy = @import("message_policy.zig");
 const resources = @import("resources.zig");
 const client_protocol = @import("client_protocol.zig");
@@ -132,7 +132,7 @@ builtin_tools: *tool_registry.BuiltinTools,
 manager: *session_manager.SessionManager,
 store: ?*session_manager.SessionStore = null,
 agent: *agent_mod.Agent,
-event_drain: *event_drain_mod.EventDrain,
+events: *SessionEvents,
 lifecycle: Lifecycle = .accepting,
 compaction_settings: session_manager.CompactionSettings = .{},
 retry_settings: RetrySettings = .{},
@@ -155,7 +155,7 @@ pub const Options = struct {
     environ: ?*const std.process.Environ.Map = null,
     allow_paths_outside_cwd: bool = true,
     public_event_capacity: usize = public_event_capacity_default,
-    event_sink: event_drain_mod.Sink = null,
+    view_sink: ViewSink = null,
     store: ?StoreOptions = null,
     task_runtime: *runtime.Runtime,
 };
@@ -417,19 +417,19 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
     core_agent.* = try agent_mod.Agent.init(allocator, io, agent_options);
     errdefer core_agent.deinit();
 
-    const event_drain = try allocator.create(event_drain_mod.EventDrain);
-    errdefer allocator.destroy(event_drain);
-    event_drain.* = try event_drain_mod.EventDrain.initWithSink(
+    const events = try allocator.create(SessionEvents);
+    errdefer allocator.destroy(events);
+    events.* = try SessionEvents.init(
         allocator,
         io,
         manager,
         store,
         options.public_event_capacity,
-        options.event_sink,
+        options.view_sink,
     );
-    errdefer event_drain.deinit();
+    errdefer events.deinit();
 
-    _ = try core_agent.subscribe(.{ .context = event_drain, .call_fn = drainAgentEvent });
+    _ = try core_agent.subscribe(.{ .context = events, .call_fn = drainAgentEvent });
 
     return .{
         .allocator = allocator,
@@ -440,7 +440,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) !AgentSe
         .manager = manager,
         .store = store,
         .agent = core_agent,
-        .event_drain = event_drain,
+        .events = events,
         .lifecycle = .accepting,
         .compaction_settings = options.compaction_settings,
         .retry_settings = options.retry_settings,
@@ -454,8 +454,8 @@ pub fn deinit(self: *AgentSession) void {
     std.debug.assert(self.shutdownComplete());
     self.agent.deinit();
     self.allocator.destroy(self.agent);
-    self.event_drain.deinit();
-    self.allocator.destroy(self.event_drain);
+    self.events.deinit();
+    self.allocator.destroy(self.events);
     if (self.store) |store| {
         store.deinit();
         self.allocator.destroy(store);
@@ -618,7 +618,7 @@ pub fn shutdownComplete(self: *AgentSession) bool {
     self.reconcileLifecycle();
     return self.lifecycle == .stopped and
         self.agent.waitForIdle() and
-        self.event_drain.publicEventsEmpty();
+        self.events.publicEventsEmpty();
 }
 
 pub fn clientSnapshot(
@@ -626,7 +626,7 @@ pub fn clientSnapshot(
     allocator: std.mem.Allocator,
     active_request_id: ?client_protocol.RequestId,
 ) !client_protocol.Snapshot {
-    var queue = try self.event_drain.queueSnapshot(allocator);
+    var queue = try self.events.queueSnapshot(allocator);
     errdefer queue.deinit(allocator);
     var header = try client_protocol.SessionHeaderSnapshot.init(allocator, self.manager.header);
     errdefer header.deinit(allocator);
@@ -735,7 +735,7 @@ pub fn clientHistoryPage(
 
 pub fn clearQueue(self: *AgentSession) void {
     self.agent.clearAllQueues();
-    self.event_drain.clearQueueMirror();
+    self.events.clearQueueMirror();
 }
 
 pub fn setModel(self: *AgentSession, model: ai.Model, stream: ?ai.StreamFunction) !void {
@@ -783,22 +783,21 @@ pub fn chrome(self: *const AgentSession, cwd: []const u8) vm.Chrome {
         .xhigh => .xhigh,
     };
     const usage = self.clientContextUsage();
-    if (usage.percent_tenths) |tenths| {
-        out.context_used_pct = @intCast(@min(tenths / 10, 100));
-    }
+    out.context_window = usage.window;
+    if (usage.percent_tenths) |tenths| out.context_percent_tenths = tenths;
     return out;
 }
 
 pub fn drainPublicEvent(self: *AgentSession) ?client_protocol.ClientEvent {
-    return self.event_drain.drainPublicEvent();
+    return self.events.drainPublicEvent();
 }
 
 pub fn publicEventWake(self: *AgentSession) *runtime.WakeEvent {
-    return self.event_drain.publicEventWake();
+    return self.events.publicEventWake();
 }
 
 pub fn publicEventsEmpty(self: *const AgentSession) bool {
-    return self.event_drain.publicEventsEmpty();
+    return self.events.publicEventsEmpty();
 }
 
 pub fn queuePrompt(
@@ -813,11 +812,11 @@ pub fn queuePrompt(
         .follow_up => if (!self.agent.follow_up_queue.hasCapacity()) return error.QueueFull,
     }
     switch (kind) {
-        .steer => try self.event_drain.appendSteering(text),
-        .follow_up => try self.event_drain.appendFollowUp(text),
+        .steer => try self.events.appendSteering(text),
+        .follow_up => try self.events.appendFollowUp(text),
     }
     var mirror_committed = false;
-    errdefer if (!mirror_committed) self.event_drain.removeQueuedText(text);
+    errdefer if (!mirror_committed) self.events.removeQueuedText(text);
 
     const message = try self.agent.userMessageFromText(text, images);
     switch (kind) {
@@ -825,7 +824,7 @@ pub fn queuePrompt(
         .follow_up => try self.agent.followUp(message),
     }
     mirror_committed = true;
-    self.event_drain.emitQueueUpdate();
+    self.events.emitQueueUpdate();
 }
 
 /// Terminal session policy after a prompt run settles. Decides between
@@ -836,7 +835,7 @@ pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdi
     // Context overflow: start one summary run per operation; the owner
     // drives it as the compacting phase and resubmits on success.
     if (!context.overflow_retry_used and
-        self.event_drain.context_overflow_count > context.overflow_count_before)
+        self.events.context_overflow_count > context.overflow_count_before)
     {
         if (try self.startCompactionRun(.overflow, true, null)) |compaction_run| {
             return .{ .compact = compaction_run };
@@ -850,9 +849,9 @@ pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdi
     const last = self.agent.state.messages[self.agent.state.messages.len - 1];
     if (self.retry_settings.enabled and
         message_policy.isRetryableAssistant(last.assistant) and
-        self.event_drain.retry_attempt < self.retry_settings.max_attempts)
+        self.events.retry_attempt < self.retry_settings.max_attempts)
     {
-        const attempt = self.event_drain.beginRetryAttempt();
+        const attempt = self.events.beginRetryAttempt();
         const delay_ms = retryBackoffMs(self.retry_settings, attempt);
         var error_message = try client_protocol.EventText.init(self.allocator, error_text);
         errdefer error_message.deinit(self.allocator);
@@ -861,7 +860,7 @@ pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdi
         else
             null;
         errdefer if (failure) |*value| value.deinit(self.allocator);
-        self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
+        self.events.enqueuePublicEvent(.{ .auto_retry_start = .{
             .attempt = attempt,
             .max_attempts = self.retry_settings.max_attempts,
             .delay_ms = delay_ms,
@@ -872,13 +871,13 @@ pub fn settlePromptRun(self: *AgentSession, context: SettleContext) !SettleVerdi
         return .{ .retry = .{ .kind = .continue_run, .delay_ms = delay_ms } };
     }
 
-    self.event_drain.failRetry(error_text, last.assistant.operational_failure);
+    self.events.failRetry(error_text, last.assistant.operational_failure);
     return .failed;
 }
 
 /// Settle an in-flight retry that will not run (cancel or shutdown).
 pub fn cancelRetryWait(self: *AgentSession) void {
-    self.event_drain.failRetry("Retry cancelled", .{
+    self.events.failRetry("Retry cancelled", .{
         .category = .canceled,
         .message = "Retry cancelled",
         .retryable = .no,
@@ -894,7 +893,7 @@ fn retryBackoffMs(settings: RetrySettings, attempt: u8) u64 {
 }
 
 pub fn contextOverflowCount(self: *const AgentSession) usize {
-    return self.event_drain.context_overflow_count;
+    return self.events.context_overflow_count;
 }
 
 fn createPromptRun(self: *AgentSession) !*PromptRun {
@@ -1036,7 +1035,7 @@ pub fn startCompactionRun(
     config.before_tool_call = null;
     config.after_tool_call = null;
 
-    self.event_drain.enqueuePublicEvent(.{ .compaction_start = .{ .reason = reason } });
+    self.events.enqueuePublicEvent(.{ .compaction_start = .{ .reason = reason } });
     agent_mod.loop.startPromptStream(
         &run.stream,
         self.allocator,
@@ -1250,14 +1249,14 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
                 else => error.MissingCompactionSummary,
             };
             const error_message = try client_protocol.EventText.init(self.allocator, @errorName(err));
-            self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
+            self.events.enqueuePublicEvent(.{ .compaction_end = .{
                 .reason = run.reason,
                 .aborted = err == error.OperationCancelled,
                 .will_retry = false,
                 .error_message = error_message,
             } });
             if (run.will_retry) {
-                self.event_drain.failRetry(@errorName(err), null);
+                self.events.failRetry(@errorName(err), null);
                 return .failed;
             }
             if (run.reason == .manual) return .failed;
@@ -1290,7 +1289,7 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
     defer session_manager.SessionManager.deinitContextMessages(self.allocator, messages);
     try self.agent.replaceMessages(messages);
 
-    self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
+    self.events.enqueuePublicEvent(.{ .compaction_end = .{
         .reason = run.reason,
         .result = result,
         .aborted = false,
@@ -1298,9 +1297,9 @@ pub fn settleCompactionRun(self: *AgentSession, run: *CompactionRun) !SettleVerd
     } });
 
     if (run.will_retry) {
-        const attempt = self.event_drain.beginRetryAttempt();
+        const attempt = self.events.beginRetryAttempt();
         const error_message = try client_protocol.EventText.init(self.allocator, "context overflow");
-        self.event_drain.enqueuePublicEvent(.{ .auto_retry_start = .{
+        self.events.enqueuePublicEvent(.{ .auto_retry_start = .{
             .attempt = attempt,
             .max_attempts = attempt,
             .delay_ms = 0,
@@ -1320,14 +1319,9 @@ pub fn cancelCompactionRun(self: *AgentSession, run: *CompactionRun) void {
         const ignored_cancel_error = @errorName(err);
         _ = ignored_cancel_error;
     };
+    if (run.outcome == .summary) self.allocator.free(run.outcome.summary);
+    run.outcome = .{ .failure = error.OperationCancelled };
     run.state = .settled;
-    const error_message = client_protocol.EventText.init(self.allocator, "OperationCancelled") catch null;
-    self.event_drain.enqueuePublicEvent(.{ .compaction_end = .{
-        .reason = run.reason,
-        .aborted = true,
-        .will_retry = false,
-        .error_message = error_message,
-    } });
 }
 
 pub fn destroyCompactionRun(self: *AgentSession, run: *CompactionRun) void {
@@ -1414,14 +1408,287 @@ fn toolResultRequestsError(details: ?std.json.Value) bool {
     return is_error == .bool and is_error.bool;
 }
 
+// Session-owned event state: persistence, bounded public events, retry counters, and queue mirror.
+const ViewSink = ?*engine_drain.EngineDrain;
+
+const PublicEventQueue = runtime.BoundedQueue(client_protocol.ClientEvent);
+
+const DummyQueueMirror = struct {
+    steering_count: usize = 0,
+    follow_up_count: usize = 0,
+    revision: u64 = 0,
+
+    pub fn changed(self: *const DummyQueueMirror) client_protocol.QueueChanged {
+        return .{ .steering_count = self.steering_count, .follow_up_count = self.follow_up_count, .revision = self.revision };
+    }
+};
+
+const QueuedEcho = struct {
+    id: u64,
+    kind: Kind,
+    text: []u8,
+
+    const Kind = enum { steering, follow_up };
+};
+
+const SessionEvents = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    manager: *session_manager.SessionManager,
+    store: ?*session_manager.SessionStore,
+    view_sink: ViewSink,
+    public_event_buffer: []client_protocol.ClientEvent,
+    public_events: PublicEventQueue,
+    queue_mirror: DummyQueueMirror = .{},
+    public_event_wake: runtime.WakeEvent = .init,
+    pending_public_event_overflow_count: usize = 0,
+    queued_echoes: std.ArrayList(QueuedEcho) = .empty,
+    next_queue_id: u64 = 1,
+    context_overflow_count: usize = 0,
+    retry_attempt: u8 = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        manager: *session_manager.SessionManager,
+        store: ?*session_manager.SessionStore,
+        public_event_capacity: usize,
+        view_sink: ViewSink,
+    ) !SessionEvents {
+        if (public_event_capacity == 0) return error.PublicEventCapacityZero;
+        const buffer = try allocator.alloc(client_protocol.ClientEvent, public_event_capacity);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .manager = manager,
+            .store = store,
+            .view_sink = view_sink,
+            .public_event_buffer = buffer,
+            .public_events = PublicEventQueue.init(buffer),
+        };
+    }
+
+    pub fn deinit(self: *SessionEvents) void {
+        for (self.queued_echoes.items) |entry| self.allocator.free(entry.text);
+        self.queued_echoes.deinit(self.allocator);
+        while (self.public_events.pop()) |event| {
+            var owned = event;
+            owned.deinit(self.allocator);
+        }
+        self.allocator.free(self.public_event_buffer);
+        self.* = undefined;
+    }
+
+    pub fn handle(self: *SessionEvents, event: agent_mod.AgentEvent) !void {
+        if (event == .message_start and event.message_start.message == .user) {
+            if (message_policy.userText(event.message_start.message.user)) |text| {
+                _ = self.removeQueuedTextInternal(text);
+            }
+        }
+
+        if (self.view_sink) |sink| {
+            try sink.agentEvent(event);
+        } else {
+            self.enqueuePublicEvent(.{ .agent_event = try client_protocol.OwnedAgentEvent.init(self.allocator, event) });
+        }
+
+        var persist_error: ?anyerror = null;
+        if (event == .message_end) {
+            const entry_id = self.persistMessage(event.message_end.message) catch |err| blk: {
+                persist_error = err;
+                break :blk null;
+            };
+            if (entry_id) |id| {
+                if (self.view_sink) |sink| {
+                    sink.messageCommitted(id, event.message_end.message);
+                } else {
+                    self.enqueuePublicEvent(.{
+                        .message_committed = try client_protocol.MessageCommitted.init(self.allocator, id, event.message_end.message),
+                    });
+                }
+            }
+        }
+
+        if (event == .message_end and event.message_end.message == .assistant) {
+            const assistant = event.message_end.message.assistant;
+            if (message_policy.isContextOverflowAssistant(assistant, assistantContextWindow(assistant))) {
+                self.context_overflow_count += 1;
+            }
+            if (assistant.stop_reason != .error_ and self.retry_attempt > 0) {
+                const attempt = self.retry_attempt;
+                self.retry_attempt = 0;
+                if (self.view_sink) |sink| {
+                    sink.retryEnd(true, attempt, null, null);
+                } else {
+                    self.enqueuePublicEvent(.{ .auto_retry_end = .{ .success = true, .attempt = attempt } });
+                }
+            }
+        }
+        if (persist_error) |err| return err;
+    }
+
+    pub fn beginRetryAttempt(self: *SessionEvents) u8 {
+        std.debug.assert(self.retry_attempt < std.math.maxInt(u8));
+        self.retry_attempt += 1;
+        return self.retry_attempt;
+    }
+
+    pub fn failRetry(self: *SessionEvents, error_text: []const u8, failure: ?ai.OperationalFailure) void {
+        if (self.retry_attempt == 0) return;
+        const attempt = self.retry_attempt;
+        self.retry_attempt = 0;
+        if (self.view_sink) |sink| {
+            sink.retryEnd(false, attempt, error_text, failure);
+        } else {
+            const final_error = client_protocol.EventText.init(self.allocator, error_text) catch null;
+            const owned_failure = if (failure) |value|
+                client_protocol.OperationalFailure.init(self.allocator, value) catch null
+            else
+                null;
+            self.enqueuePublicEvent(.{ .auto_retry_end = .{
+                .success = false,
+                .attempt = attempt,
+                .final_error = final_error,
+                .failure = owned_failure,
+            } });
+        }
+    }
+
+    fn assistantContextWindow(message: ai.AssistantMessage) u64 {
+        if (ai.getModel(message.provider, message.model)) |model| return model.context_window;
+        return 0;
+    }
+
+    fn persistMessage(self: *SessionEvents, message: agent_mod.AgentMessage) !?[]const u8 {
+        const timestamp = session_manager.timestampNow(self.io);
+        const entry = try self.manager.prepareMessageEntry(message, &timestamp);
+        errdefer self.manager.deinitPreparedEntry(entry);
+        if (self.store) |store| try store.appendEntry(self.io, entry, self.manager.lastEntryId());
+        return self.manager.commitPreparedEntry(entry);
+    }
+
+    pub fn emitQueueUpdate(self: *SessionEvents) void {
+        self.enqueuePublicEvent(.{ .queue_changed = self.queue_mirror.changed() });
+    }
+
+    pub fn enqueuePublicEvent(self: *SessionEvents, event: client_protocol.ClientEvent) void {
+        if (self.view_sink) |sink| {
+            sink.clientEvent(event);
+            var owned = event;
+            owned.deinit(self.allocator);
+        } else {
+            self.enqueueClientEvent(event);
+        }
+    }
+
+    fn enqueueClientEvent(self: *SessionEvents, event: client_protocol.ClientEvent) void {
+        var owned_event = event;
+        if (!self.public_events.pushOrDrop(owned_event)) {
+            owned_event.deinit(self.allocator);
+            self.pending_public_event_overflow_count += 1;
+        }
+        self.public_event_wake.set(self.io);
+    }
+
+    pub fn queueSnapshot(self: *const SessionEvents, allocator: std.mem.Allocator) !client_protocol.QueueSnapshot {
+        _ = self;
+        return .{
+            .revision = 0,
+            .steering = try client_protocol.EventTextList.init(allocator, &.{}),
+            .follow_up = try client_protocol.EventTextList.init(allocator, &.{}),
+        };
+    }
+
+    pub fn appendSteering(self: *SessionEvents, text: []const u8) !void {
+        try self.appendQueueEcho(text, .steering);
+    }
+
+    pub fn appendFollowUp(self: *SessionEvents, text: []const u8) !void {
+        try self.appendQueueEcho(text, .follow_up);
+    }
+
+    fn appendQueueEcho(self: *SessionEvents, text: []const u8, kind: QueuedEcho.Kind) !void {
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        switch (kind) {
+            .steering => self.queue_mirror.steering_count += 1,
+            .follow_up => self.queue_mirror.follow_up_count += 1,
+        }
+        self.queue_mirror.revision += 1;
+        const id = self.next_queue_id;
+        self.next_queue_id +%= 1;
+        try self.queued_echoes.append(self.allocator, .{ .id = id, .kind = kind, .text = owned });
+        if (self.view_sink) |sink| sink.queueAdd(id, kind, text);
+    }
+
+    pub fn removeQueuedText(self: *SessionEvents, text: []const u8) void {
+        _ = self.removeQueuedTextInternal(text);
+    }
+
+    fn removeQueuedTextInternal(self: *SessionEvents, text: []const u8) bool {
+        var index: usize = 0;
+        while (index < self.queued_echoes.items.len) : (index += 1) {
+            if (!std.mem.eql(u8, self.queued_echoes.items[index].text, text)) continue;
+            const entry = self.queued_echoes.orderedRemove(index);
+            if (self.view_sink) |sink| sink.queueRemove(entry.id);
+            switch (entry.kind) {
+                .steering => self.queue_mirror.steering_count -|= 1,
+                .follow_up => self.queue_mirror.follow_up_count -|= 1,
+            }
+            self.queue_mirror.revision += 1;
+            self.allocator.free(entry.text);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn clearQueueMirror(self: *SessionEvents) void {
+        if (self.view_sink) |sink| sink.queueClear();
+        for (self.queued_echoes.items) |entry| self.allocator.free(entry.text);
+        self.queued_echoes.clearRetainingCapacity();
+        self.queue_mirror.steering_count = 0;
+        self.queue_mirror.follow_up_count = 0;
+        self.queue_mirror.revision += 1;
+        self.emitQueueUpdate();
+    }
+
+    pub fn drainPublicEvent(self: *SessionEvents) ?client_protocol.ClientEvent {
+        const event = self.public_events.pop() orelse return null;
+        if (self.pending_public_event_overflow_count > 0) {
+            const dropped_count = self.pending_public_event_overflow_count;
+            if (self.public_events.pushOrDrop(.{ .event_overflow = .{ .dropped_count = dropped_count } })) {
+                self.pending_public_event_overflow_count = 0;
+                self.public_event_wake.set(self.io);
+            }
+        }
+        return event;
+    }
+
+    pub fn publicEventWake(self: *SessionEvents) *runtime.WakeEvent {
+        return &self.public_event_wake;
+    }
+
+    pub fn publicEventCount(self: *const SessionEvents) usize {
+        return self.public_events.count();
+    }
+
+    pub fn droppedPublicEventCount(self: *const SessionEvents) usize {
+        return self.public_events.dropped();
+    }
+
+    pub fn publicEventsEmpty(self: *const SessionEvents) bool {
+        return self.public_events.empty();
+    }
+};
+
 fn drainAgentEvent(
     _: std.Io,
     context: ?*anyopaque,
     event: agent_mod.AgentEvent,
     _: runtime.CancelToken,
 ) anyerror!void {
-    const drain: *event_drain_mod.EventDrain = @ptrCast(@alignCast(context.?));
-    try drain.handle(event);
+    const events: *SessionEvents = @ptrCast(@alignCast(context.?));
+    try events.handle(event);
 }
 
 test "tool result details can request error classification" {
@@ -1582,7 +1849,7 @@ test "settle verdict arms backoff retry and repairs the runtime transcript" {
     try std.testing.expectEqual(@as(usize, 1), session.agent.state.messages.len);
     try std.testing.expect(session.agent.state.messages[0] == .user);
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
-    try std.testing.expectEqual(@as(u8, 1), session.event_drain.retry_attempt);
+    try std.testing.expectEqual(@as(u8, 1), session.events.retry_attempt);
 
     var start_event = session.drainPublicEvent().?;
     defer start_event.deinit(std.testing.allocator);
@@ -1612,7 +1879,7 @@ test "settle verdict fails after exhausted attempts with terminal retry end" {
     });
     defer shutdownAndDeinit(&session);
 
-    session.event_drain.retry_attempt = 2;
+    session.events.retry_attempt = 2;
     _ = try session.agent.beginRun();
     try emitAssistantError(&session, "rate limit exceeded");
     session.agent.finishRun();
@@ -1620,7 +1887,7 @@ test "settle verdict fails after exhausted attempts with terminal retry end" {
 
     const verdict = try session.settlePromptRun(.{ .overflow_count_before = 0, .overflow_retry_used = false });
     try std.testing.expect(verdict == .failed);
-    try std.testing.expectEqual(@as(u8, 0), session.event_drain.retry_attempt);
+    try std.testing.expectEqual(@as(u8, 0), session.events.retry_attempt);
 
     var end_event = session.drainPublicEvent().?;
     defer end_event.deinit(std.testing.allocator);
@@ -1657,9 +1924,9 @@ test "retry failure still emits end event when final error allocation fails" {
         session.deinit();
     }
 
-    session.event_drain.retry_attempt = 1;
+    session.events.retry_attempt = 1;
     failing.fail_index = failing.alloc_index;
-    session.event_drain.failRetry("rate limit exceeded", null);
+    session.events.failRetry("rate limit exceeded", null);
     failing.fail_index = std.math.maxInt(usize);
 
     var end_event = session.drainPublicEvent().?;
@@ -1697,7 +1964,7 @@ test "settle verdict ignores non retryable errors and clean runs" {
         .overflow_count_before = 0,
         .overflow_retry_used = false,
     }) == .failed);
-    try std.testing.expectEqual(@as(u8, 0), session.event_drain.retry_attempt);
+    try std.testing.expectEqual(@as(u8, 0), session.events.retry_attempt);
 }
 
 test "drain settles in-flight retry on successful assistant message" {
@@ -1708,12 +1975,12 @@ test "drain settles in-flight retry on successful assistant message" {
     var session = try initTestSession(task_runtime, tmp.dir, .{});
     defer shutdownAndDeinit(&session);
 
-    session.event_drain.retry_attempt = 2;
+    session.events.retry_attempt = 2;
     _ = try session.agent.beginRun();
     try emitAssistantText(&session, "recovered");
     session.agent.finishRun();
 
-    try std.testing.expectEqual(@as(u8, 0), session.event_drain.retry_attempt);
+    try std.testing.expectEqual(@as(u8, 0), session.events.retry_attempt);
     var message_event = session.drainPublicEvent().?;
     message_event.deinit(std.testing.allocator);
     var commit_event = session.drainPublicEvent().?;
@@ -1784,7 +2051,7 @@ test "queue prompt rolls back mirror when agent queue allocation fails" {
     failing.fail_index = failing.alloc_index + 2;
 
     try std.testing.expectError(error.OutOfMemory, session.queuePrompt("hello", &.{}, .steer));
-    const changed = session.event_drain.queue_mirror.changed();
+    const changed = session.events.queue_mirror.changed();
     try std.testing.expectEqual(@as(usize, 0), changed.steering_count);
     try std.testing.expect(!session.agent.steering_queue.hasItems());
 }
@@ -1799,7 +2066,7 @@ test "agent session public event enqueue sets coalesced wake" {
 
     try std.testing.expect(!session.publicEventWake().isSet());
 
-    session.event_drain.enqueuePublicEvent(.{ .queue_changed = .{
+    session.events.enqueuePublicEvent(.{ .queue_changed = .{
         .steering_count = 0,
         .follow_up_count = 0,
         .revision = 1,
@@ -1828,7 +2095,7 @@ test "agent session persists message_end and exposes caller-drained events" {
     session.agent.finishRun();
 
     try std.testing.expectEqual(@as(usize, 1), session.manager.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), session.event_drain.publicEventCount());
+    try std.testing.expectEqual(@as(usize, 2), session.events.publicEventCount());
     var event = session.drainPublicEvent().?;
     defer event.deinit(std.testing.allocator);
     try std.testing.expect(event == .agent_event);
@@ -1866,8 +2133,8 @@ test "agent session public event queue overflow is explicit" {
     try emitUserMessageEnd(&session, "overflow");
     try emitUserMessageEnd(&session, "overflow");
 
-    try std.testing.expectEqual(@as(usize, 1), session.event_drain.publicEventCount());
-    try std.testing.expectEqual(@as(usize, 3), session.event_drain.droppedPublicEventCount());
+    try std.testing.expectEqual(@as(usize, 1), session.events.publicEventCount());
+    try std.testing.expectEqual(@as(usize, 3), session.events.droppedPublicEventCount());
 
     var first = session.drainPublicEvent().?;
     first.deinit(std.testing.allocator);
@@ -2110,7 +2377,7 @@ test "overflow settle starts compaction and arms the resubmit retry" {
     try std.testing.expect(retry_event == .auto_retry_start);
     try std.testing.expectEqual(@as(usize, 1), retry_event.auto_retry_start.attempt);
     try std.testing.expectEqual(@as(u64, 0), retry_event.auto_retry_start.delay_ms);
-    try std.testing.expectEqual(@as(u8, 1), session.event_drain.retry_attempt);
+    try std.testing.expectEqual(@as(u8, 1), session.events.retry_attempt);
 
     // The overflow budget is one compaction per operation.
     const second = try session.settlePromptRun(.{ .overflow_count_before = 0, .overflow_retry_used = true });
@@ -2156,6 +2423,7 @@ test "cancel compaction run emits the aborted compaction end" {
 
     const run = (try session.startCompactionRun(.threshold, false, null)).?;
     session.cancelCompactionRun(run);
+    _ = try session.settleCompactionRun(run);
     session.destroyCompactionRun(run);
     try std.testing.expectEqual(@as(usize, 2), session.manager.entries.items.len);
 
