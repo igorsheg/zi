@@ -50,6 +50,27 @@ pub fn timestampNow(io: std.Io) [timestamp_bytes_len]u8 {
     return timestampFromNanoseconds(std.Io.Timestamp.now(io, .real).nanoseconds);
 }
 
+pub const SessionStamp = struct {
+    text: [timestamp_bytes_len]u8,
+    nanoseconds: i96,
+
+    pub fn now(io: std.Io) SessionStamp {
+        const nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds;
+        return .{
+            .text = timestampFromNanoseconds(nanoseconds),
+            .nanoseconds = nanoseconds,
+        };
+    }
+
+    pub fn date(self: *const SessionStamp) []const u8 {
+        return self.text[0..10];
+    }
+
+    pub fn timestamp(self: *const SessionStamp) []const u8 {
+        return &self.text;
+    }
+};
+
 pub const SessionHeader = struct {
     version: u32 = current_session_version,
     id: []const u8,

@@ -7,12 +7,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const client_protocol = @import("client_protocol.zig");
-
 pub const item_count_max: usize = 64;
 pub const index_entry_count_max: usize = 20_000;
 pub const index_path_bytes_max: usize = 2 * 1024 * 1024;
-pub const index_path_bytes_per_entry_max: usize = client_protocol.completion_id_bytes_max;
+pub const completion_id_bytes_max = 256;
+pub const completion_label_bytes_max = 160;
+pub const completion_detail_bytes_max = 160;
+pub const file_completion_query_bytes_max = 256;
+pub const index_path_bytes_per_entry_max: usize = completion_id_bytes_max;
 
 const pending_dirs_max: usize = index_entry_count_max;
 const scope_match_max: usize = 32;
@@ -20,19 +22,21 @@ const scope_match_max: usize = 32;
 const PendingDir = struct { path: []u8 };
 const EntryKind = enum { file, directory };
 
+pub const Source = struct { id: []const u8, label: []const u8, detail: []const u8 };
+
 pub const Item = struct {
-    id: [client_protocol.completion_id_bytes_max]u8 = undefined,
+    id: [completion_id_bytes_max]u8 = undefined,
     id_len: u16 = 0,
-    label: [client_protocol.completion_label_bytes_max]u8 = undefined,
+    label: [completion_label_bytes_max]u8 = undefined,
     label_len: u16 = 0,
-    detail: [client_protocol.completion_detail_bytes_max]u8 = undefined,
+    detail: [completion_detail_bytes_max]u8 = undefined,
     detail_len: u16 = 0,
 
     pub fn idSlice(self: *const Item) []const u8 {
         return self.id[0..self.id_len];
     }
 
-    fn source(self: *const Item) client_protocol.CompletionItem.Source {
+    fn source(self: *const Item) Source {
         return .{
             .id = self.idSlice(),
             .label = self.label[0..self.label_len],
@@ -42,7 +46,7 @@ pub const Item = struct {
 };
 
 pub const Result = struct {
-    query: [client_protocol.file_completion_query_bytes_max]u8 = undefined,
+    query: [file_completion_query_bytes_max]u8 = undefined,
     query_len: u16 = 0,
     items: [item_count_max]Item = undefined,
     item_len: u16 = 0,
@@ -60,17 +64,17 @@ pub const Result = struct {
         const index = self.item_len;
         self.item_len += 1;
         self.items[index].id_len = copyRawField(
-            client_protocol.completion_id_bytes_max,
+            completion_id_bytes_max,
             &self.items[index].id,
             path,
         );
         self.items[index].label_len = copyRawField(
-            client_protocol.completion_label_bytes_max,
+            completion_label_bytes_max,
             &self.items[index].label,
             pathLabel(path),
         );
         self.items[index].detail_len = copyRawField(
-            client_protocol.completion_detail_bytes_max,
+            completion_detail_bytes_max,
             &self.items[index].detail,
             detail,
         );
@@ -89,8 +93,8 @@ pub const Result = struct {
 
     pub fn sources(
         self: *const Result,
-        out: *[item_count_max]client_protocol.CompletionItem.Source,
-    ) []const client_protocol.CompletionItem.Source {
+        out: *[item_count_max]Source,
+    ) []const Source {
         for (self.items[0..self.item_len], 0..) |*item, index| out[index] = item.source();
         return out[0..self.item_len];
     }
@@ -187,7 +191,7 @@ pub const Index = struct {
         errdefer allocator.destroy(result);
         result.* = .{};
         result.truncated = self.truncated;
-        result.query_len = copyRawField(client_protocol.file_completion_query_bytes_max, &result.query, raw_query);
+        result.query_len = copyRawField(file_completion_query_bytes_max, &result.query, raw_query);
 
         const bounded_query = result.querySlice();
         const scope_end = if (std.mem.findScalarLast(u8, bounded_query, '/')) |slash| slash + 1 else 0;
@@ -225,7 +229,7 @@ pub const Index = struct {
 
         for (self.entries) |entry| {
             const entry_path = self.entryPath(entry);
-            var path_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            var path_buffer: [completion_id_bytes_max + 1]u8 = undefined;
             const child = directChildPath(&path_buffer, scope_path, entry_path, entry.kind) orelse continue;
             if (!shouldShowPath(child, scope, "")) continue;
             result.appendUnique(child, pathDirname(child));
@@ -237,7 +241,7 @@ pub const Index = struct {
         const exact_count = self.countDirectoryAliasMatches(alias_query, true);
         if (exact_count == 1) {
             const resolved = self.firstDirectoryAliasMatch(alias_query, true).?;
-            var scope_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            var scope_buffer: [completion_id_bytes_max + 1]u8 = undefined;
             const resolved_scope = std.fmt.bufPrint(&scope_buffer, "{s}/", .{resolved}) catch return;
             _ = try self.collectDirectChildren(resolved_scope, result);
             return;
@@ -250,7 +254,7 @@ pub const Index = struct {
         const fuzzy_count = self.countDirectoryAliasMatches(alias_query, false);
         if (fuzzy_count == 1) {
             const resolved = self.firstDirectoryAliasMatch(alias_query, false).?;
-            var scope_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            var scope_buffer: [completion_id_bytes_max + 1]u8 = undefined;
             const resolved_scope = std.fmt.bufPrint(&scope_buffer, "{s}/", .{resolved}) catch return;
             _ = try self.collectDirectChildren(resolved_scope, result);
             return;
@@ -287,7 +291,7 @@ pub const Index = struct {
             const entry_path = self.entryPath(entry);
             if (!shouldShowPath(entry_path, "", alias_query)) continue;
             if (!directoryAliasMatches(entry_path, alias_query, exact)) continue;
-            var path_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            var path_buffer: [completion_id_bytes_max + 1]u8 = undefined;
             const completion_path = std.fmt.bufPrint(&path_buffer, "{s}/", .{entry_path}) catch {
                 result.truncated = true;
                 continue;
@@ -328,7 +332,7 @@ pub const Index = struct {
 
         std.mem.sort(ScoredPath, candidates[0..candidate_len], {}, scoredPathLessThan);
         for (candidates[0..candidate_len]) |candidate| {
-            var path_buffer: [client_protocol.completion_id_bytes_max + 1]u8 = undefined;
+            var path_buffer: [completion_id_bytes_max + 1]u8 = undefined;
             const completion_path = if (candidate.kind == .directory)
                 std.fmt.bufPrint(&path_buffer, "{s}/", .{candidate.path}) catch {
                     result.truncated = true;
@@ -420,7 +424,7 @@ fn hasUnsafePathSegment(path: []const u8) bool {
 }
 
 fn directChildPath(
-    buffer: *[client_protocol.completion_id_bytes_max + 1]u8,
+    buffer: *[completion_id_bytes_max + 1]u8,
     scope: []const u8,
     entry_path: []const u8,
     kind: EntryKind,

@@ -1,372 +1,280 @@
-//! The single terminal-byte authority. Owns the vaxis terminal state, the
-//! input parser, the product App, and the render transaction; nothing else
-//! in the process touches the tty.
-//!
-//! Heap-pinned: vaxis.Tty keeps a pointer into `tty_buffer` and vaxis.Vaxis
-//! keeps a pointer to `env`, so this struct must never move after `init` —
-//! `init` allocates it and hands out the pointer.
-//!
-//! Input has one non-obvious platform split: vaxis opens /dev/tty for raw
-//! mode, size, and writes, while the owner loop selects/reads *stdin* for
-//! readiness, because kqueue on macOS cannot poll /dev/tty reliably.
 const std = @import("std");
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
-const App = @import("App.zig");
-const input_mod = @import("input.zig");
-const theme_mod = @import("theme.zig");
-const render = @import("render.zig");
+const screen_mod = @import("screen.zig");
+pub const query_timeout_ms = 500;
+
+allocator: std.mem.Allocator,
+io: std.Io,
+tty: ?vaxis.Tty = null,
+vx: ?vaxis.Vaxis = null,
+screen: screen_mod.Screen = .{},
+setup_done: bool = false,
+tty_buffer: [4096]u8 = undefined,
 
 const Terminal = @This();
 
-pub const effects_per_read_max = 128;
-const read_size_bytes_max = 4096;
-const pending_input_bytes_max = 256;
-
-gpa: std.mem.Allocator,
-io: std.Io,
-env: std.process.Environ.Map,
-vx: vaxis.Vaxis,
-app: App,
-/// Draw scratch for render; lives here so frame builds use no large stack.
-scratch: render.RowScratch = undefined,
-tty_buffer: [4096]u8 = undefined,
-tty: ?vaxis.Tty = null,
-parser: vaxis.Parser = .{},
-/// Carry for an incomplete escape sequence split across reads.
-pending: [pending_input_bytes_max]u8 = undefined,
-pending_len: usize = 0,
-running: bool = false,
-resize_handler_installed: bool = false,
-resize_pending: std.atomic.Value(bool) = .init(false),
-
-pub const InputPriority = enum { none, scroll, foreground };
-
-pub const ReadResult = struct {
-    bytes_read: usize = 0,
-    event_count: usize = 0,
-    effect_count: usize = 0,
-    priority: InputPriority = .none,
-    /// Input bytes were dropped (unparseable or pending overflow). The
-    /// caller surfaces this as a warning; it never tears the loop down.
-    truncated: bool = false,
-    effect_overflow: bool = false,
-    shutdown_requested: bool = false,
-    eof: bool = false,
+pub const ParserEventResult = enum {
+    ignored,
+    consumed,
+    resized,
 };
 
 pub fn init(
-    gpa: std.mem.Allocator,
+    self: *Terminal,
+    allocator: std.mem.Allocator,
     io: std.Io,
-    width: u16,
-    height: u16,
-    terminal_info: theme_mod.TerminalInfo,
-) !*Terminal {
-    const self = try gpa.create(Terminal);
-    errdefer gpa.destroy(self);
+    env_map: *std.process.Environ.Map,
+) !void {
     self.* = .{
-        .gpa = gpa,
+        .allocator = allocator,
         .io = io,
-        .env = std.process.Environ.Map.init(gpa),
-        .vx = undefined,
-        .app = App.init(width, height, terminal_info),
     };
-    errdefer self.env.deinit();
-    self.vx = try vaxis.init(io, gpa, &self.env, .{});
-    return self;
+    errdefer self.deinit();
+
+    self.tty = try vaxis.Tty.init(io, &self.tty_buffer);
+    self.vx = try vaxis.init(io, allocator, env_map, .{});
+    try self.resizeFromTty();
 }
 
-// The heap owner poisons itself before destroy; gpa is copied out first.
-// ziglint-ignore: Z030 linter wants poison as last statement, but heap destroy must follow it.
 pub fn deinit(self: *Terminal) void {
-    const gpa = self.gpa;
-    self.app.deinit(gpa);
-    if (self.tty) |*tty| {
-        self.vx.deinit(gpa, tty.writer());
-    } else {
-        var discard = std.Io.Writer.Discarding.init(&.{});
-        self.vx.deinit(gpa, &discard.writer);
+    self.shutdown() catch {};
+    if (self.vx) |*vx| {
+        if (self.tty) |*tty| {
+            vx.deinit(self.allocator, tty.writer());
+        }
     }
     if (self.tty) |*tty| tty.deinit();
-    self.env.deinit();
     self.* = undefined;
-    gpa.destroy(self);
 }
 
 pub fn setup(self: *Terminal) !void {
-    self.tty = try vaxis.Tty.init(self.io, &self.tty_buffer);
-    try self.vx.enterAltScreen(self.tty.?.writer());
-    try self.vx.setBracketedPaste(self.tty.?.writer(), true);
-    try self.vx.setMouseMode(self.tty.?.writer(), true);
-    const ws = self.tty.?.getWinsize() catch vaxis.Winsize{
-        .cols = self.app.width,
-        .rows = self.app.height,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    };
-    try self.applyWinsize(ws);
-    try self.installResizeHandler();
-    self.running = true;
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    if (self.setup_done) return;
+
+    try vx.enterAltScreen(tty.writer());
+    try vx.queryTerminalSend(tty.writer());
+    if (builtin.is_test) {
+        vx.queries_done.store(true, .unordered);
+        try vx.enableDetectedFeatures(tty.writer());
+    } else {
+        try std.Io.futexWaitTimeout(
+            self.io,
+            std.atomic.Value(u32),
+            &vx.query_futex,
+            .init(0),
+            .{ .duration = .{ .clock = .real, .raw = .fromMilliseconds(query_timeout_ms) } },
+        );
+        vx.queries_done.store(true, .unordered);
+        try vx.enableDetectedFeatures(tty.writer());
+    }
+    try vx.setBracketedPaste(tty.writer(), true);
+    try vx.setMouseMode(tty.writer(), true);
+    try self.resizeFromTty();
+    self.setup_done = true;
 }
 
 pub fn shutdown(self: *Terminal) !void {
-    self.requestStop();
-    if (self.tty) |*tty| try self.vx.resetState(tty.writer());
+    if (!self.setup_done) return;
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    try vx.resetState(tty.writer());
+    self.setup_done = false;
 }
 
-pub fn suspendForExternalProgram(self: *Terminal) !void {
-    self.pending_len = 0;
-    self.parser = .{};
-    self.resize_pending.store(false, .release);
-    if (self.tty) |*tty| {
-        try self.vx.resetState(tty.writer());
-        tty.deinit();
-        self.tty = null;
+pub fn resizeFromTty(self: *Terminal) !void {
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    try vx.resize(self.allocator, tty.writer(), try tty.getWinsize());
+}
+
+pub fn winsize(self: *Terminal) !vaxis.Winsize {
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    return tty.getWinsize();
+}
+
+pub fn resizeTo(self: *Terminal, size: vaxis.Winsize) !bool {
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    if (vx.screen.width == size.cols and
+        vx.screen.height == size.rows and
+        vx.screen.width_pix == size.x_pixel and
+        vx.screen.height_pix == size.y_pixel)
+    {
+        return false;
     }
-}
-
-pub fn resumeAfterExternalProgram(self: *Terminal) !void {
-    if (self.tty == null) try self.setup();
-    self.app.dirty = true;
-}
-
-pub fn resumeAfterExternalProgramCommandPath(self: *Terminal) !void {
-    if (self.tty == null) try self.setup();
-}
-
-pub fn requestStop(self: *Terminal) void {
-    self.running = false;
-}
-
-pub fn isRunning(self: *const Terminal) bool {
-    return self.running;
-}
-
-/// Readiness fd for the owner loop's select; see the platform note above.
-pub fn inputFd(self: *const Terminal) std.posix.fd_t {
-    _ = self;
-    return std.posix.STDIN_FILENO;
-}
-
-pub fn isDirty(self: *const Terminal) bool {
-    return self.app.dirty;
-}
-
-pub fn hasAnimation(self: *const Terminal) bool {
-    return self.app.hasAnimation();
-}
-
-pub fn nextDeadlineMs(self: *const Terminal) ?i64 {
-    return self.app.nextDeadlineMs();
-}
-
-pub fn transcriptAtTail(self: *const Terminal) bool {
-    return self.app.transcriptAtTail();
-}
-
-pub fn transcriptOldestSourceId(self: *const Terminal) ?[]const u8 {
-    return self.app.transcript.oldestSourceId();
-}
-
-pub fn composerText(self: *const Terminal) []const u8 {
-    return self.app.composer.text();
-}
-
-fn nowNs(self: *const Terminal) i96 {
-    return std.Io.Clock.awake.now(self.io).nanoseconds;
-}
-
-pub fn activeFileCompletionQuery(self: *const Terminal) ?[]const u8 {
-    return self.app.activeFileCompletionQuery();
-}
-
-pub fn applyCommand(self: *Terminal, command: App.Command) error{OutOfMemory}!?App.Effect {
-    return self.app.apply(self.gpa, command);
-}
-
-pub fn selectedText(self: *Terminal) error{OutOfMemory}!render.SelectionCopy {
-    return render.selectedText(self.gpa, &self.app, &self.scratch, App.copy_selection_bytes_max);
-}
-
-pub fn copyTextWithOsc52(self: *Terminal, text: []const u8) !void {
-    try self.vx.copyToSystemClipboard(self.tty.?.writer(), text, self.gpa);
-}
-
-/// Read whatever bytes are available on stdin and apply them as input.
-/// Call only after the input fd reported readable so the read cannot block
-/// the owner loop. Resize events are applied to vaxis and App here; product
-/// effects land in `effects`.
-pub fn readAvailableInput(self: *Terminal, effects: []App.Effect) !ReadResult {
-    var bytes: [read_size_bytes_max]u8 = undefined;
-    const read_count = std.posix.read(std.posix.STDIN_FILENO, &bytes) catch |err| switch (err) {
-        error.WouldBlock => return .{},
-        else => return err,
-    };
-    if (read_count == 0) return self.applyInputEof();
-    return self.applyInputBytes(bytes[0..read_count], effects);
-}
-
-/// Apply raw terminal bytes already read by the frontend. Terminal remains the
-/// only Vaxis parser owner; the frontend reader is allowed to move bytes only.
-pub fn applyInputBytes(self: *Terminal, bytes: []const u8, effects: []App.Effect) !ReadResult {
-    var buf: [pending_input_bytes_max + read_size_bytes_max]u8 = undefined;
-    @memcpy(buf[0..self.pending_len], self.pending[0..self.pending_len]);
-    const copy_len = @min(bytes.len, read_size_bytes_max);
-    @memcpy(buf[self.pending_len..][0..copy_len], bytes[0..copy_len]);
-    var result: ReadResult = .{ .bytes_read = copy_len };
-    if (copy_len < bytes.len) result.truncated = true;
-
-    const total = self.pending_len + copy_len;
-    self.pending_len = 0;
-    var start: usize = 0;
-    while (start < total) {
-        const parsed = self.parser.parse(buf[start..total], null) catch {
-            result.truncated = true;
-            break;
-        };
-        if (parsed.n == 0) {
-            // Incomplete sequence: carry it into the next read, bounded.
-            const remaining = total - start;
-            if (remaining <= self.pending.len) {
-                @memcpy(self.pending[0..remaining], buf[start..total]);
-                self.pending_len = remaining;
-            } else {
-                result.truncated = true;
-            }
-            break;
-        }
-        start += parsed.n;
-        result.event_count += 1;
-        const event = parsed.event orelse continue;
-        switch (event) {
-            .winsize => |ws| {
-                try self.applyWinsize(ws);
-                noteInputPriority(&result, .foreground);
-            },
-            else => try self.applyInput(input_mod.fromVaxis(event), effects, &result),
-        }
-    }
-    if (result.truncated) _ = try self.app.apply(self.gpa, .{ .input = .paste_end });
-    if (containsShutdown(effects[0..result.effect_count])) {
-        result.shutdown_requested = true;
-        self.requestStop();
-    }
-    return result;
-}
-
-pub fn applyInputEof(self: *Terminal) ReadResult {
-    self.requestStop();
-    return .{ .eof = true, .shutdown_requested = true };
-}
-
-fn applyInput(
-    self: *Terminal,
-    event: input_mod.Input,
-    effects: []App.Effect,
-    result: *ReadResult,
-) error{OutOfMemory}!void {
-    if (event == .ignored) return;
-    noteInputPriority(result, inputPriority(event));
-    if (try self.app.apply(self.gpa, .{ .input = event })) |effect| {
-        if (result.effect_count == effects.len) {
-            effect.deinit(self.gpa);
-            result.effect_overflow = true;
-            return;
-        }
-        effects[result.effect_count] = effect;
-        result.effect_count += 1;
-    }
-}
-
-pub const RenderTiming = struct {
-    draw_ns: u64,
-    flush_ns: u64,
-    draw_detail: ?render.DrawTiming = null,
-};
-
-fn inputPriority(event: input_mod.Input) InputPriority {
-    if (event == .shortcut or event == .mouse_down or event == .mouse_drag or event == .mouse_up) return .foreground;
-    return switch (input_mod.resolve(event)) {
-        .transcript_scroll_up, .transcript_scroll_down, .transcript_page_up, .transcript_page_down => .scroll,
-        .none => .none,
-        else => .foreground,
-    };
-}
-
-fn noteInputPriority(result: *ReadResult, priority: InputPriority) void {
-    result.priority = switch (result.priority) {
-        .foreground => .foreground,
-        .scroll => if (priority == .foreground) .foreground else .scroll,
-        .none => priority,
-    };
-}
-
-/// The render transaction: paint into vaxis' screen, then write the diff to
-/// the terminal. State stays dirty until the write succeeds, so a failed
-/// write retries on the next wake instead of losing the frame.
-pub fn renderIfDirty(self: *Terminal) !void {
-    _ = try self.renderIfDirtyTimed(false);
-}
-
-pub fn renderIfDirtyTimed(self: *Terminal, collect_detail: bool) !?RenderTiming {
-    if (!self.app.dirty) return null;
-    const draw_start = self.nowNs();
-    const draw_detail: ?render.DrawTiming = if (collect_detail) blk: {
-        break :blk render.drawTimed(&self.app, &self.vx, &self.scratch, self.io);
-    } else blk: {
-        render.draw(&self.app, &self.vx, &self.scratch);
-        break :blk null;
-    };
-    const flush_start = self.nowNs();
-    try self.vx.render(self.tty.?.writer());
-    const done = self.nowNs();
-    self.app.dirty = false;
-    return .{
-        .draw_ns = @intCast(flush_start - draw_start),
-        .flush_ns = @intCast(done - flush_start),
-        .draw_detail = draw_detail,
-    };
-}
-
-pub fn resizeFromTerminal(self: *Terminal) !void {
-    const ws = try self.tty.?.getWinsize();
-    try self.applyWinsize(ws);
-}
-
-pub fn drainPendingResize(self: *Terminal) !bool {
-    if (!self.resize_pending.swap(false, .acquire)) return false;
-    try self.resizeFromTerminal();
+    try vx.resize(self.allocator, tty.writer(), size);
     return true;
 }
 
-fn installResizeHandler(self: *Terminal) !void {
-    if (self.resize_handler_installed) return;
-    switch (builtin.os.tag) {
-        .windows => {},
-        else => if (!builtin.is_test) {
-            const handler: vaxis.Tty.SignalHandler = .{
-                .context = self,
-                .callback = Terminal.winsizeCallback,
-            };
-            try vaxis.Tty.notifyWinsize(handler);
+pub fn applyParserEvent(self: *Terminal, event: vaxis.Event) !ParserEventResult {
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    switch (event) {
+        .key_press => |key| return try self.applyQueryKey(key),
+        .cap_kitty_keyboard => {
+            vx.caps.kitty_keyboard = true;
+            try self.enableDetectedFeaturesOnce();
+            return .consumed;
         },
+        .cap_kitty_graphics => {
+            vx.caps.kitty_graphics = true;
+            return .consumed;
+        },
+        .cap_rgb => {
+            vx.caps.rgb = true;
+            return .consumed;
+        },
+        .cap_unicode => {
+            vx.caps.unicode = .unicode;
+            vx.screen.width_method = .unicode;
+            try self.enableDetectedFeaturesOnce();
+            return .consumed;
+        },
+        .cap_sgr_pixels => {
+            vx.caps.sgr_pixels = true;
+            if (vx.state.mouse) try vx.setMouseMode(tty.writer(), true);
+            return .consumed;
+        },
+        .cap_color_scheme_updates => {
+            vx.caps.color_scheme_updates = true;
+            return .consumed;
+        },
+        .cap_multi_cursor => {
+            vx.caps.multi_cursor = true;
+            return .consumed;
+        },
+        .cap_da1 => {
+            std.Io.futexWake(vx.io, std.atomic.Value(u32), &vx.query_futex, 10);
+            vx.queries_done.store(true, .unordered);
+            return .consumed;
+        },
+        .winsize => |size| {
+            vx.state.in_band_resize = true;
+            return if (try self.resizeTo(size)) .resized else .consumed;
+        },
+        .color_report, .color_scheme => return .consumed,
+        else => return .ignored,
     }
-    self.resize_handler_installed = true;
 }
 
-fn winsizeCallback(context: *anyopaque) void {
-    const self: *Terminal = @ptrCast(@alignCast(context));
-    // SIGWINCH may arrive outside the owner loop. The handler records only a
-    // bounded fact; the owner applies the resize at its next wake/drain site.
-    self.resize_pending.store(true, .release);
+fn applyQueryKey(self: *Terminal, key: vaxis.Key) !ParserEventResult {
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    if (vx.queries_done.load(.unordered)) return .ignored;
+    if (key.codepoint == vaxis.Key.f3 and key.mods.shift) {
+        vx.caps.explicit_width = true;
+        vx.caps.unicode = .unicode;
+        vx.screen.width_method = .unicode;
+        return .consumed;
+    }
+    if (key.codepoint == vaxis.Key.f3 and key.mods.alt) {
+        vx.caps.scaled_text = true;
+        return .consumed;
+    }
+    return .ignored;
 }
 
-fn applyWinsize(self: *Terminal, ws: vaxis.Winsize) !void {
-    try self.vx.resize(self.gpa, self.tty.?.writer(), ws);
-    _ = try self.app.apply(self.gpa, .{ .resize = .{ .width = ws.cols, .height = ws.rows } });
+fn enableDetectedFeaturesOnce(self: *Terminal) !void {
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    if (!vx.state.kitty_keyboard) return vx.enableDetectedFeatures(tty.writer());
+
+    const kitty_cap = vx.caps.kitty_keyboard;
+    vx.caps.kitty_keyboard = false;
+    defer vx.caps.kitty_keyboard = kitty_cap;
+    try vx.enableDetectedFeatures(tty.writer());
 }
 
-fn containsShutdown(effects: []const App.Effect) bool {
-    for (effects) |effect| if (effect == .request_shutdown) return true;
-    return false;
+pub fn setTitle(self: *Terminal, title: []const u8) !void {
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    try vx.setTitle(tty.writer(), title);
+}
+
+pub fn paint(self: *Terminal, frame: screen_mod.Frame) !void {
+    const tty = if (self.tty) |*tty| tty else return error.TerminalNotInitialized;
+    const vx = if (self.vx) |*vx| vx else return error.TerminalNotInitialized;
+    try self.screen.paint(vx, tty.writer(), frame);
+}
+
+test "terminal wrapper paints a frame into vaxis screen" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    var terminal: Terminal = undefined;
+    try terminal.init(std.testing.allocator, std.testing.io, &env);
+    defer terminal.deinit();
+
+    var frame: screen_mod.Frame = .{};
+    try frame.appendLine(screen_mod.singleSpanLine("hi", screen_mod.styles.normal));
+    frame.cursor = .{ .col = 1, .row = 0 };
+    try terminal.paint(frame);
+
+    const vx = &terminal.vx.?;
+    const cell = vx.screen.readCell(0, 0).?;
+    try std.testing.expectEqualStrings("h", cell.char.grapheme);
+    try std.testing.expect(vx.screen.cursor_vis);
+}
+
+test "terminal setup and shutdown are idempotent" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    var terminal: Terminal = undefined;
+    try terminal.init(std.testing.allocator, std.testing.io, &env);
+    defer terminal.deinit();
+
+    try terminal.setup();
+    try terminal.setup();
+    try std.testing.expect(terminal.setup_done);
+    try terminal.shutdown();
+    try terminal.shutdown();
+    try std.testing.expect(!terminal.setup_done);
+}
+
+test "terminal applies parser capability and resize events" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    var terminal: Terminal = undefined;
+    try terminal.init(std.testing.allocator, std.testing.io, &env);
+    defer terminal.deinit();
+
+    try std.testing.expectEqual(ParserEventResult.consumed, try terminal.applyParserEvent(.cap_rgb));
+    try std.testing.expect(terminal.vx.?.caps.rgb);
+
+    const resized = try terminal.applyParserEvent(.{ .winsize = .{
+        .rows = 24,
+        .cols = 100,
+        .x_pixel = 1000,
+        .y_pixel = 480,
+    } });
+    try std.testing.expectEqual(ParserEventResult.resized, resized);
+    try std.testing.expectEqual(@as(u16, 100), terminal.vx.?.screen.width);
+    try std.testing.expectEqual(@as(u16, 24), terminal.vx.?.screen.height);
+
+    const duplicate = try terminal.applyParserEvent(.{ .winsize = .{
+        .rows = 24,
+        .cols = 100,
+        .x_pixel = 1000,
+        .y_pixel = 480,
+    } });
+    try std.testing.expectEqual(ParserEventResult.consumed, duplicate);
+}
+
+test "terminal consumes query-only key reports" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    var terminal: Terminal = undefined;
+    try terminal.init(std.testing.allocator, std.testing.io, &env);
+    defer terminal.deinit();
+
+    terminal.vx.?.queries_done.store(false, .unordered);
+    try std.testing.expectEqual(ParserEventResult.consumed, try terminal.applyParserEvent(.{ .key_press = .{
+        .codepoint = vaxis.Key.f3,
+        .mods = .{ .shift = true },
+    } }));
+    try std.testing.expect(terminal.vx.?.caps.explicit_width);
 }
